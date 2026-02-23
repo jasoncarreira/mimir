@@ -6,6 +6,9 @@ Fast-path heuristic annotations + optional LLM slow-path.
 import re
 import json
 
+from .config import get_config as _get_config
+_cfg = _get_config()
+
 # ─── Fast Path: Heuristic Annotations ────────────────────────────
 
 # High-arousal indicators
@@ -91,11 +94,13 @@ def classify_profile(content: str) -> str:
     word_count = len(words)
     
     # Simple facts: short, declarative
-    if word_count <= 20:
+    _lightweight_max = _cfg('atoms', 'profile_lightweight_max_words', 20)
+    if word_count <= _lightweight_max:
         return "lightweight"
-    
+
     # Rich content: long, complex
-    if word_count > 80:
+    _full_min = _cfg('atoms', 'profile_full_min_words', 80)
+    if word_count > _full_min:
         return "full"
     
     return "standard"

@@ -88,9 +88,9 @@ class NvidiaNimProvider(EmbeddingProvider):
         return self._call_api([text[:self.max_chars]], input_type)[0]
 
     def batch_embed(self, texts: list[str], input_type: str = "passage") -> list[list[float]]:
-        """Batch embed via NIM API (up to 50 per request)."""
+        """Batch embed via NIM API."""
         results = []
-        batch_size = 50
+        batch_size = _cfg('embedding', 'batch_size', 50)
         for i in range(0, len(texts), batch_size):
             chunk = [t[:self.max_chars] for t in texts[i:i + batch_size]]
             results.extend(self._call_api(chunk, input_type))

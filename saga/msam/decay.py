@@ -34,20 +34,20 @@ if not logger.handlers:
 THRESHOLD_ACTIVE_TO_FADING = _cfg('decay', 'active_to_fading_threshold', 0.3)
 THRESHOLD_FADING_TO_DORMANT = _cfg('decay', 'fading_to_dormant_threshold', 0.1)
 
-# Profile compaction thresholds
-COMPACTION_FULL_TO_STANDARD_MIN_AGE_DAYS = 7
-COMPACTION_FULL_TO_STANDARD_MAX_ACCESS = 3
-COMPACTION_STANDARD_TO_LIGHTWEIGHT_MIN_AGE_DAYS = 14
-COMPACTION_STANDARD_TO_LIGHTWEIGHT_MAX_ACCESS = 2
+# Profile compaction thresholds -- read from config
+COMPACTION_FULL_TO_STANDARD_MIN_AGE_DAYS = _cfg('decay', 'compaction_full_min_age_days', 7)
+COMPACTION_FULL_TO_STANDARD_MAX_ACCESS = _cfg('decay', 'compaction_full_max_access', 3)
+COMPACTION_STANDARD_TO_LIGHTWEIGHT_MIN_AGE_DAYS = _cfg('decay', 'compaction_standard_min_age_days', 14)
+COMPACTION_STANDARD_TO_LIGHTWEIGHT_MAX_ACCESS = _cfg('decay', 'compaction_standard_max_access', 2)
 
 PROFILE_TARGET_CHARS = {
-    "lightweight": 90,    # ~22 tokens
-    "standard": 240,      # ~60 tokens
+    "lightweight": _cfg('decay', 'profile_target_lightweight_chars', 90),
+    "standard": _cfg('decay', 'profile_target_standard_chars', 240),
 }
-COMPACTION_TRIGGER_RATIO = 1.5  # only compact if content > target * 1.5
+COMPACTION_TRIGGER_RATIO = _cfg('decay', 'compaction_trigger_ratio', 1.5)
 
-# Protection: never transition atoms accessed within 7 days
-PROTECTION_DAYS = 7
+# Protection: never transition atoms accessed within N days
+PROTECTION_DAYS = _cfg('decay', 'protection_days', 7)
 
 # Token budget ceiling -- read from config
 TOKEN_BUDGET = _cfg('storage', 'token_budget_ceiling', 40_000)

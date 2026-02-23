@@ -50,12 +50,14 @@ _DEFAULTS = {
         "timeout_seconds": 10,
         "api_key": None,
         "api_key_env": "OPENAI_API_KEY",
+        "batch_size": 50,
     },
     "storage": {
         "db_path": "msam.db",
         "metrics_db_path": "msam_metrics.db",
         "token_budget_ceiling": 40000,
         "auto_compact_threshold_pct": 85,
+        "db_busy_timeout_ms": 5000,
         "refuse_threshold_pct": 95,
     },
     "retrieval": {
@@ -95,6 +97,14 @@ _DEFAULTS = {
         "forgetting_contradiction_threshold": 0.85,
         "forgetting_confidence_floor": 0.1,
         "forgetting_grace_days": 14,
+        "protection_days": 7,
+        "compaction_full_min_age_days": 7,
+        "compaction_full_max_access": 3,
+        "compaction_standard_min_age_days": 14,
+        "compaction_standard_max_access": 2,
+        "compaction_trigger_ratio": 1.5,
+        "profile_target_lightweight_chars": 90,
+        "profile_target_standard_chars": 240,
     },
     "working_memory": {
         "default_ttl_minutes": 120,
@@ -106,10 +116,15 @@ _DEFAULTS = {
         "default_encoding_confidence": 0.7,
         "default_arousal": 0.5,
         "default_valence": 0.0,
+        "profile_lightweight_max_words": 20,
+        "profile_full_min_words": 80,
     },
     "merge": {
         "similarity_threshold": 0.85,
         "max_candidates": 20,
+    },
+    "vector_index": {
+        "approx_threshold": 50000,
     },
     "consolidation": {
         "similarity_threshold": 0.80,

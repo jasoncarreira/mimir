@@ -8,6 +8,7 @@ model = "nvidia/nv-embedqa-e5-v5"
 dimensions = 1024
 max_input_chars = 2000                      # truncate input beyond this
 timeout_seconds = 10
+batch_size = 50                                # max texts per API batch request
 # api_key_env = "NVIDIA_NIM_API_KEY"        # env var name for API key (provider-specific default)
 
 # ONNX Runtime (local, no API key, lightweight):
@@ -22,6 +23,7 @@ metrics_db_path = "db/msam_metrics.db"
 token_budget_ceiling = 40000                # max tokens across all active atoms
 auto_compact_threshold_pct = 85             # above this: force lightweight profile on new atoms
 refuse_threshold_pct = 95                   # above this: reject new atoms entirely
+db_busy_timeout_ms = 5000                    # SQLite busy timeout in milliseconds
 
 [retrieval]
 default_top_k = 12                          # atoms returned per query
@@ -52,6 +54,15 @@ confidence_decay_grace_days = 7             # days before confidence starts deca
 confidence_floor = 0.1                      # minimum confidence value
 stability_dampen_factor = 0.9               # applied to over-retrieved low-value atoms
 stability_boost_factor = 1.1                # applied to high-contribution atoms
+max_stability = 10.0                         # cap on stability value (prevents runaway)
+protection_days = 7                          # never transition atoms accessed within N days
+compaction_full_min_age_days = 7             # min age before full -> standard compaction
+compaction_full_max_access = 3               # max access count for full -> standard compaction
+compaction_standard_min_age_days = 14        # min age before standard -> lightweight compaction
+compaction_standard_max_access = 2           # max access count for standard -> lightweight
+compaction_trigger_ratio = 1.5               # only compact if content > target * ratio
+profile_target_lightweight_chars = 90        # target chars for lightweight profile (~22 tokens)
+profile_target_standard_chars = 240          # target chars for standard profile (~60 tokens)
 
 [working_memory]
 default_ttl_minutes = 120                   # session atom lifespan
@@ -60,6 +71,8 @@ default_profile = "lightweight"             # working memory always uses this pr
 
 [atoms]
 default_profile = "standard"                # lightweight | standard | full
+profile_lightweight_max_words = 20           # word count threshold: below = lightweight
+profile_full_min_words = 80                  # word count threshold: above = full
 default_encoding_confidence = 0.7
 default_arousal = 0.5
 default_valence = 0.0
@@ -80,6 +93,9 @@ high_arousal_recent_bonus = 0.3             # bonus for recent atoms when arousa
 [relations]
 supersedes_demotion = 2.0                   # activation penalty for superseded atoms
 supports_bonus = 0.5                        # activation bonus for supported atoms
+
+[vector_index]
+approx_threshold = 50000                     # switch from exact to approximate FAISS at this atom count
 
 [consolidation]
 similarity_threshold = 0.80                 # cosine similarity to group atoms

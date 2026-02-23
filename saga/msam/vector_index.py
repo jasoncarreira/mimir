@@ -14,6 +14,9 @@ import threading
 
 import numpy as np
 
+from .config import get_config as _get_config
+_cfg = _get_config()
+
 logger = logging.getLogger("msam.vector_index")
 
 try:
@@ -28,7 +31,7 @@ class VectorIndex:
     """FAISS-backed ANN index with entity ID mapping."""
 
     # Threshold to switch from exact to approximate index
-    APPROX_THRESHOLD = 50_000
+    APPROX_THRESHOLD = _cfg('vector_index', 'approx_threshold', 50_000)
 
     def __init__(self, dimension: int = 1024):
         self.dimension = dimension
