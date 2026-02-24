@@ -182,6 +182,16 @@ CREATE INDEX IF NOT EXISTS idx_topic_name ON topic_timeseries(topic);
 CREATE INDEX IF NOT EXISTS idx_embedding_ts ON embedding_metrics(timestamp);
 CREATE INDEX IF NOT EXISTS idx_age_dist_ts ON age_distribution(timestamp);
 CREATE INDEX IF NOT EXISTS idx_continuity_ts ON continuity_metrics(timestamp);
+
+CREATE TABLE IF NOT EXISTS agreement_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    agent_id TEXT DEFAULT 'default',
+    signal TEXT CHECK(signal IN ('agree','disagree','neutral','challenge')),
+    context TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_agreement_agent ON agreement_signals(agent_id, created_at);
 """
 
 
@@ -568,6 +578,89 @@ def log_cache_stats(hits, misses, cache_size, hit_rate):
     conn.close()
 
 
+def record_agreement(signal, context=None, session_id=None, agent_id='default'):
+    """Record an agreement/disagreement signal.
+
+    Parameters
+    ----------
+    signal : str
+        One of 'agree', 'disagree', 'neutral', 'challenge'.
+    context : str, optional
+        Free-text context about what was agreed/disagreed with.
+    session_id : str, optional
+    agent_id : str
+
+    Returns
+    -------
+    dict
+        Confirmation with current rate.
+    """
+    conn = get_metrics_db()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO agreement_signals (session_id, agent_id, signal, context, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (session_id, agent_id, signal, context, now),
+    )
+    conn.commit()
+    conn.close()
+
+    # Return current rate after recording
+    rate_info = get_agreement_rate(agent_id=agent_id)
+    return {"recorded": signal, "agent_id": agent_id, "current_rate": rate_info}
+
+
+def get_agreement_rate(agent_id='default', window=None):
+    """Calculate agreement rate over last N interactions.
+
+    Parameters
+    ----------
+    agent_id : str
+    window : int, optional
+        Number of recent signals to consider. Defaults from config.
+
+    Returns
+    -------
+    dict
+        {rate, count, warning, signals}
+    """
+    if window is None:
+        window = _cfg('sycophancy', 'window_size', 20)
+    threshold = _cfg('sycophancy', 'warning_threshold', 0.85)
+
+    conn = get_metrics_db()
+    rows = conn.execute(
+        """SELECT signal FROM agreement_signals
+           WHERE agent_id = ?
+           ORDER BY created_at DESC LIMIT ?""",
+        (agent_id, window),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return {"rate": 0.0, "count": 0, "warning": False, "signals": []}
+
+    signals = [r["signal"] for r in rows]
+    agree_count = sum(1 for s in signals if s == "agree")
+    total = len(signals)
+    rate = agree_count / total if total > 0 else 0.0
+
+    warning = rate >= threshold and total >= window
+    result = {
+        "rate": round(rate, 3),
+        "count": total,
+        "agree_count": agree_count,
+        "warning": warning,
+        "signals": signals,
+    }
+    if warning:
+        result["warning_message"] = (
+            f"Agreement rate {rate:.0%} over last {total} interactions exceeds "
+            f"threshold ({threshold:.0%}). Consider increasing pushback."
+        )
+    return result
+
+
 def prune_old_metrics(days=30):
     """Delete metrics older than N days from all tables."""
     from datetime import timedelta
@@ -579,7 +672,7 @@ def prune_old_metrics(days=30):
         "comparison_metrics", "access_events", "canary_metrics",
         "decay_metrics", "emotional_metrics", "topic_timeseries",
         "embedding_metrics", "age_distribution", "continuity_metrics",
-        "cache_metrics",
+        "cache_metrics", "agreement_signals",
     ]
     
     total_deleted = 0

@@ -14,7 +14,7 @@ Usage:
     stats = get_stats()                        # database statistics
 """
 
-__version__ = "2026.02.23"
+__version__ = "2026.02.24"
 
 from msam.core import (
     store_atom,
@@ -39,6 +39,8 @@ from msam.core import (
     get_associations,
     emotional_drift,
     episodic_replay,
+    record_outcome,
+    get_outcome_history,
 )
 
 from msam.triples import (
@@ -49,6 +51,9 @@ from msam.triples import (
     graph_path,
     detect_contradictions,
     get_triple_stats,
+    query_world,
+    update_world,
+    world_history,
 )
 
 from msam.decay import run_decay_cycle
@@ -59,6 +64,8 @@ from msam.prediction import PredictiveEngine
 from msam.agents import register_agent, list_agents, share_atom, agent_stats
 from msam.forgetting import identify_forgetting_candidates
 from msam.calibration import calibrate, re_embed
+from msam.metrics import record_agreement, get_agreement_rate
+from msam.prediction import track_temporal_pattern, track_co_retrievals
 
 __all__ = [
     "store_atom",
@@ -105,4 +112,13 @@ __all__ = [
     "identify_forgetting_candidates",
     "calibrate",
     "re_embed",
+    "record_outcome",
+    "get_outcome_history",
+    "query_world",
+    "update_world",
+    "world_history",
+    "record_agreement",
+    "get_agreement_rate",
+    "track_temporal_pattern",
+    "track_co_retrievals",
 ]

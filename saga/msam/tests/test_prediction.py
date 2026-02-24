@@ -251,3 +251,135 @@ class TestLearnFromSession:
         engine = PredictiveEngine(conn=conn)
         engine.learn_from_session([])
         # No error means success -- function returns early for empty list
+
+
+def _make_temporal_db():
+    """Create an in-memory DB with temporal_patterns table for Feature 2 tests."""
+    conn = _make_in_memory_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS temporal_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            atom_id TEXT NOT NULL,
+            hour_of_day INTEGER,
+            day_of_week INTEGER,
+            retrieval_count INTEGER DEFAULT 1,
+            last_retrieved_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(atom_id, hour_of_day, day_of_week)
+        );
+        CREATE INDEX IF NOT EXISTS idx_temporal_atom ON temporal_patterns(atom_id);
+        CREATE INDEX IF NOT EXISTS idx_temporal_time ON temporal_patterns(hour_of_day, day_of_week);
+    """)
+    return conn
+
+
+class TestTemporalTracking:
+    def test_temporal_tracking(self):
+        from msam.prediction import track_temporal_pattern
+        conn = _make_temporal_db()
+        conn.execute("INSERT INTO atoms (id, content, state) VALUES ('tt1', 'tracked atom', 'active')")
+        conn.commit()
+
+        track_temporal_pattern(["tt1"], conn=conn)
+
+        row = conn.execute(
+            "SELECT retrieval_count FROM temporal_patterns WHERE atom_id = 'tt1'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] >= 1
+
+    def test_temporal_tracking_increments(self):
+        from msam.prediction import track_temporal_pattern
+        conn = _make_temporal_db()
+        conn.execute("INSERT INTO atoms (id, content, state) VALUES ('tt2', 'tracked atom 2', 'active')")
+        conn.commit()
+
+        track_temporal_pattern(["tt2"], conn=conn)
+        track_temporal_pattern(["tt2"], conn=conn)
+
+        row = conn.execute(
+            "SELECT retrieval_count FROM temporal_patterns WHERE atom_id = 'tt2'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] >= 2
+
+
+class TestCoRetrievalTracking:
+    def test_co_retrieval_tracking(self):
+        from msam.prediction import track_co_retrievals
+        conn = _make_temporal_db()
+        conn.execute("INSERT INTO atoms (id, content, state) VALUES ('cr1', 'co atom 1', 'active')")
+        conn.execute("INSERT INTO atoms (id, content, state) VALUES ('cr2', 'co atom 2', 'active')")
+        conn.commit()
+
+        track_co_retrievals(["cr1", "cr2"], conn=conn)
+
+        row = conn.execute(
+            "SELECT co_count FROM co_retrieval WHERE atom_a = 'cr1' AND atom_b = 'cr2'"
+        ).fetchone()
+        # Should have a co-retrieval record (order may vary)
+        if row is None:
+            row = conn.execute(
+                "SELECT co_count FROM co_retrieval WHERE atom_a = 'cr2' AND atom_b = 'cr1'"
+            ).fetchone()
+        assert row is not None
+
+
+class TestPredictContext:
+    @pytest.fixture(autouse=True)
+    def disable_warmup(self, monkeypatch):
+        """Disable warmup guard so predict_context doesn't require session boundaries."""
+        import msam.prediction as pred_mod
+        orig_cfg = pred_mod._cfg
+        def _patched_cfg(section, key, default=None):
+            if section == 'prediction' and key == 'warmup_sessions':
+                return 0
+            return orig_cfg(section, key, default)
+        monkeypatch.setattr(pred_mod, '_cfg', _patched_cfg)
+
+    def test_predict_returns_temporal_matches(self):
+        from msam.prediction import PredictiveEngine
+        conn = _make_temporal_db()
+        conn.execute("INSERT INTO atoms (id, content, state) VALUES ('pc1', 'morning routine', 'active')")
+        # Insert temporal pattern for hour 9, day 0 (Monday), with high count
+        conn.execute(
+            "INSERT INTO temporal_patterns (atom_id, hour_of_day, day_of_week, retrieval_count) VALUES (?, ?, ?, ?)",
+            ("pc1", 9, 0, 10),
+        )
+        conn.commit()
+
+        engine = PredictiveEngine(conn=conn)
+        result = engine.predict_context(hour=9, day_of_week=0, top_k=5)
+        assert len(result) >= 1
+        assert result[0]["id"] == "pc1"
+
+    def test_predict_expands_co_retrievals(self):
+        from msam.prediction import PredictiveEngine
+        conn = _make_temporal_db()
+        conn.execute("INSERT INTO atoms (id, content, state) VALUES ('pce1', 'base atom', 'active')")
+        conn.execute("INSERT INTO atoms (id, content, state) VALUES ('pce2', 'co-atom', 'active')")
+        # Temporal pattern for pce1
+        conn.execute(
+            "INSERT INTO temporal_patterns (atom_id, hour_of_day, day_of_week, retrieval_count) VALUES (?, ?, ?, ?)",
+            ("pce1", 14, 2, 10),
+        )
+        # Co-retrieval link
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO co_retrieval (atom_a, atom_b, co_count, last_co_retrieval) VALUES (?, ?, ?, ?)",
+            ("pce1", "pce2", 5, now),
+        )
+        conn.commit()
+
+        engine = PredictiveEngine(conn=conn)
+        result = engine.predict_context(hour=14, day_of_week=2, top_k=10)
+        ids = [r["id"] for r in result]
+        assert "pce1" in ids
+        assert "pce2" in ids
+
+    def test_predict_empty_db(self):
+        from msam.prediction import PredictiveEngine
+        conn = _make_temporal_db()
+        engine = PredictiveEngine(conn=conn)
+        result = engine.predict_context(hour=12, day_of_week=3)
+        assert result == []

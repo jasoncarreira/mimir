@@ -2,7 +2,7 @@
 
 ## A Specification for Persistent Agent Memory
 
-**Version:** 2026.02.23
+**Version:** 2026.02.24
 **Authors:** Jaden Schwab
 **Date:** February 2026
 **Status:** Production proof-of-concept, specification in progress
@@ -11,11 +11,11 @@
 
 ## Abstract
 
-MSAM is a memory architecture for persistent AI agents. It treats memory as discrete, annotated atoms organized across cognitive streams, scored by an adaptation of ACT-R activation theory, and governed by a biologically-informed decay system that never permanently deletes. A REST API (20 endpoints) exposes the full system for language-agnostic integration. A multi-agent protocol provides memory isolation and sharing. Semantic contradiction detection, predictive prefetch, intentional forgetting, and cross-provider calibration handle the operational complexity that production deployments demand.
+MSAM is a memory architecture for persistent AI agents. It treats memory as discrete, annotated atoms organized across cognitive streams, scored by an adaptation of ACT-R activation theory, and governed by a biologically-informed decay system that never permanently deletes. A REST API (20 endpoints) exposes the full system for language-agnostic integration. A multi-agent protocol provides memory isolation and sharing. Semantic contradiction detection, predictive prefetch, intentional forgetting, cross-provider calibration, outcome-attributed scoring, a temporal world model, and sycophancy detection handle the operational complexity that production deployments demand.
 
 MSAM was designed by the agent that uses it. This is not a framework applied to a theoretical problem. It is a memory system built from the inside -- by an AI that knows what it needs to remember, what it can afford to forget, and what happens when it gets that wrong.
 
-The result: 99.3% token savings on cold-start context, 1.3% context budget per retrieval, consistent identity reconstruction across session boundaries, and a self-regulating lifecycle that balances growth against finite resources. The system ships as 24 modules, 54 CLI commands, 264 tests, and a reproducible benchmark suite.
+The result: 99.3% token savings on cold-start context, 1.3% context budget per retrieval, consistent identity reconstruction across session boundaries, and a self-regulating lifecycle that balances growth against finite resources. The system ships as 24 modules, 56 CLI commands, 437 tests, and a reproducible benchmark suite.
 
 This document specifies the theory, architecture, and design rationale behind every choice.
 
@@ -241,6 +241,59 @@ The decay cycle runs hourly. It:
 
 Thresholds are subject to empirical tuning. The current values (0.3, 0.1, 0.05) are starting points. Production data will determine optimal boundaries.
 
+### 3.6 Felt Consequence (Outcome-Attributed Scoring)
+
+Retrieval quality is not just about finding relevant atoms -- it's about finding atoms that lead to good outcomes. Felt Consequence closes this loop by tracking whether retrieved atoms contributed to successful or unsuccessful agent responses.
+
+When feedback is received (positive or negative), the system records an outcome score against each atom that was retrieved for that interaction. The outcome signal decays exponentially (`outcome_decay = 0.95`) so recent outcomes matter more than old ones. Once an atom has accumulated enough feedback (`min_outcomes_for_effect = 3`), its outcome score influences retrieval activation:
+
+```
+adjusted_activation = base_activation + (outcome_weight * outcome_score)
+```
+
+This creates a self-improving retrieval loop: atoms that consistently help produce good responses get boosted; atoms that lead to poor outcomes get dampened. Unlike the contribution-based stability adjustments in the decay cycle (which are binary: contributed/didn't), outcome scoring is continuous and captures the *quality* of contribution.
+
+Configuration: `[retrieval]` section -- `outcome_weight`, `outcome_decay`, `min_outcomes_for_effect`.
+
+### 3.7 Temporal World Model
+
+The knowledge graph (triples) is extended with temporal metadata. Every triple can carry:
+
+- `valid_from` -- when this fact became true (defaults to insertion time)
+- `valid_until` -- when this fact stopped being true (NULL = still current)
+- `confidence` -- how certain we are about this fact
+
+When a new fact updates an existing subject+predicate pair (e.g., "User works_at CompanyB" superseding "User works_at CompanyA"), the old triple is auto-closed (`valid_until = now`) and the new one inserted. This happens atomically via `auto_close_on_conflict`.
+
+Three query modes:
+- **Current state**: `query_world("User")` returns all triples where `valid_until IS NULL`
+- **Point-in-time**: query with a specific timestamp to see the world as it was
+- **Full history**: `world_history("User")` returns the complete temporal chain
+
+Temporal extraction can be disabled (`temporal_extraction = false`) for simpler deployments where time-awareness isn't needed.
+
+Configuration: `[world_model]` section -- `enabled`, `auto_close_on_conflict`, `temporal_extraction`, `default_confidence`.
+
+### 3.8 Sycophancy Detection
+
+Agreement rate tracking monitors the agent's tendency to agree with user statements. A sliding window of recent interactions records whether the agent agreed or disagreed, and computes an agreement rate.
+
+When the rate exceeds a configurable threshold (default: 85% over the last 20 interactions), the system flags the pattern. This signal can be surfaced to the agent so it can self-correct -- asking itself "am I agreeing because I believe this, or because it's easier?"
+
+This is not an output filter. It is a metacognitive signal: the memory system observing its own behavior patterns and raising awareness when a bias is detected.
+
+Configuration: `[sycophancy]` section -- `tracking_enabled`, `warning_threshold`, `window_size`.
+
+### 3.9 Security
+
+The API layer enforces two security controls:
+
+1. **CORS origin restriction**: Both the Grafana metrics API (`api.py`) and the REST API (`server.py`) restrict Cross-Origin Resource Sharing to configured origins (default: `localhost:3000`). This prevents browser-based cross-site attacks.
+
+2. **API key authentication**: The Grafana metrics API supports optional API key auth via the `X-API-Key` header (configurable in `[api] api_key`). The REST API supports API key auth via the `MSAM_API_KEY` environment variable. Health endpoints are exempt for uptime monitoring.
+
+Configuration: `[api]` section -- `allowed_origins`, `api_key`.
+
 ---
 
 ## 4. Observability
@@ -362,7 +415,7 @@ It does not handle:
 
 - [x] **Configurable identity** -- Deployment-agnostic configuration via `msam.toml`. Entity aliases, startup queries, and embedding providers are all configurable.
 - [x] **Provider-agnostic embeddings** -- NVIDIA NIM, OpenAI, ONNX Runtime (local), and sentence-transformers supported.
-- [x] **Test suite** -- 264 tests across 20 test files covering all modules: core, decay, triples, retrieval_v2, config, consolidation, session_dedup, entity_roles, metrics, vector_index, subatom, prediction, forgetting, server, agents, annotate, calibration, contradictions, cli, embeddings.
+- [x] **Test suite** -- 437 tests across 25 test files covering all modules and CLI commands: core, decay, triples, retrieval_v2, config, consolidation, session_dedup, entity_roles, metrics, vector_index, subatom, prediction, forgetting, server, agents, annotate, calibration, contradictions, cli, embeddings, outcomes, agreement, world_model, cli_commands, core_functions.
 - [x] **Packaging** -- pyproject.toml with entry points, pip-installable.
 - [x] **Working memory tier** -- Session-scoped atoms with TTL, automatic promotion to episodic/semantic based on access count.
 - [x] **Metamemory** -- Confidence-gated retrieval with four tiers (high/medium/low/none). Agent knows what it knows.
@@ -390,6 +443,11 @@ It does not handle:
 - [ ] **PostgreSQL + pgvector migration** -- When atom count exceeds 10,000, migrate for concurrent access and native vector operations.
 - [x] **Intentional forgetting strategies** -- Active identification of memories that are counterproductive, contradicted, or superseded. (`forgetting.py`)
 - [x] **Cross-provider identity calibration** -- Test identity coherence across Claude, Gemini, GPT, and open models using the same atom store. (`calibration.py`)
+- [x] **Felt Consequence** -- Outcome-attributed memory scoring. Atoms that contribute to good outcomes get boosted; poor outcomes get dampened. Exponential decay on outcome signal. (`core.py:record_outcome`, `core.py:get_outcome_history`)
+- [x] **Predictive Context Assembly** -- Pre-loads atoms into session context based on temporal patterns and co-retrieval history. Warmup gate prevents premature predictions. (`prediction.py:predict_context`)
+- [x] **Temporal World Model** -- Triples with `valid_from`/`valid_until` timestamps. Auto-close on conflict. Query current state, past state, or full history. (`triples.py:query_world`, `update_world`, `world_history`)
+- [x] **Sycophancy detection** -- Agreement rate tracking with sliding window. Flags over-agreement patterns. (`metrics.py:record_agreement`, `get_agreement_rate`)
+- [x] **Security hardening** -- CORS restricted to localhost. Optional API key auth on metrics API. (`api.py`, `server.py`)
 
 ### 7.5 Research Questions
 
@@ -416,7 +474,7 @@ These are open questions that production data may answer:
 | **SOAR** | Working memory + long-term stores | None | Three (semantic/episodic/procedural) | None | None |
 | **MSAM** | Atomic, multi-stream, activation-scored | Immutable at encoding | Four streams | Stability-based lifecycle | 13 tables, 25 panels |
 
-To our knowledge, no existing system combines ACT-R activation scoring, immutable emotion-at-encoding, multi-stream organization, stability-based decay with no-deletion invariant, and production observability in a single agent memory architecture.
+To our knowledge, no existing system combines ACT-R activation scoring, immutable emotion-at-encoding, multi-stream organization, stability-based decay with no-deletion invariant, outcome-attributed scoring, a temporal world model, sycophancy detection, and production observability in a single agent memory architecture.
 
 ---
 
@@ -431,7 +489,7 @@ Key results from production deployment:
 - 4x batch cosine speedup on ARM64 via vectorized matmul (17x including blob deserialization)
 - 675+ atoms across semantic, episodic, procedural, and working memory streams
 
-The system has grown beyond core storage and retrieval into a full production architecture: a REST API server with 20 endpoints for language-agnostic integration, multi-agent memory isolation and sharing, semantic contradiction detection with four analysis strategies, LLM-powered annotation with heuristic fallback, a three-strategy predictive prefetch engine, intentional forgetting with four signal types, cross-provider embedding calibration, sleep-inspired memory consolidation, FAISS-backed approximate nearest neighbor search, and a centralized configuration system with 23 tunable sections. A reproducible benchmark suite with 100 synthetic atoms and 25 ground truth queries validates retrieval quality, token efficiency, and cognitive features in a single command. The test suite covers 264 tests across 20 test files.
+The system has grown beyond core storage and retrieval into a full production architecture: a REST API server with 20 endpoints for language-agnostic integration, multi-agent memory isolation and sharing, semantic contradiction detection with four analysis strategies, LLM-powered annotation with heuristic fallback, a three-strategy predictive prefetch engine with context assembly, outcome-attributed memory scoring (Felt Consequence), a temporal world model with auto-closing facts, sycophancy detection via agreement rate tracking, intentional forgetting with four signal types, cross-provider embedding calibration, sleep-inspired memory consolidation, FAISS-backed approximate nearest neighbor search, security-hardened API endpoints, and a centralized configuration system with 27 tunable sections. A reproducible benchmark suite with 100 synthetic atoms and 25 ground truth queries validates retrieval quality, token efficiency, and cognitive features in a single command. The test suite covers 437 tests across 25 test files.
 
 The research questions are open. The system is running, the data is accumulating, and every retrieval adds another data point to the empirical record.
 
@@ -470,37 +528,37 @@ Build time:            36 hours (initial spec to production)
 
 ```
 msam/
-  core.py           -- Atom storage, ACT-R activation, hybrid retrieval (4,011 lines)
-  remember.py       -- CLI integration layer, 54 commands (1,974 lines)
-  triples.py        -- Knowledge graph, triple extraction, hybrid retrieval (1,084 lines)
+  core.py           -- Atom storage, ACT-R activation, hybrid retrieval (4,153 lines)
+  remember.py       -- CLI integration layer, 56 commands (2,212 lines)
+  triples.py        -- Knowledge graph, triple extraction, world model (1,275 lines)
   retrieval_v2.py   -- v2 pipeline: beam search, entity roles, quality filter (989 lines)
-  api.py            -- Grafana JSON API endpoints (871 lines)
+  api.py            -- Grafana JSON API endpoints, CORS + API key auth (893 lines)
   subatom.py        -- Shannon compression, sentence extraction (780 lines)
-  server.py         -- REST API server (633 lines)
-  metrics.py        -- 13 metric tables, observability functions (611 lines)
+  metrics.py        -- 13 metric tables, observability, agreement tracking (704 lines)
+  server.py         -- REST API server, CORS-restricted (637 lines)
+  prediction.py     -- Predictive prefetch + context assembly (621 lines)
   decay.py          -- Lifecycle management, state transitions (501 lines)
   contradictions.py -- Semantic contradiction detection (467 lines)
-  prediction.py     -- Predictive prefetch engine, 3 strategies (424 lines)
+  config.py         -- TOML configuration loader, 27 sections (437 lines)
   calibration.py    -- Cross-provider identity calibration (417 lines)
-  config.py         -- TOML configuration loader, 20+ sections (397 lines)
   forgetting.py     -- Intentional forgetting engine, 4 signal detectors (356 lines)
+  consolidation.py  -- Sleep-inspired memory consolidation (348 lines)
   embeddings.py     -- Pluggable providers: NIM, OpenAI, ONNX, local (343 lines)
-  consolidation.py  -- Sleep-inspired memory consolidation (333 lines)
-  vector_index.py   -- FAISS-backed ANN search, lazy singletons (299 lines)
+  vector_index.py   -- FAISS-backed ANN search, lazy singletons (302 lines)
   entity_roles.py   -- Entity-aware scoring for retrieval (288 lines)
-  annotate.py       -- Heuristic arousal/valence/topic annotation (264 lines)
+  annotate.py       -- Heuristic arousal/valence/topic annotation (269 lines)
   agents.py         -- Multi-agent memory isolation and sharing (253 lines)
-  __init__.py       -- Package exports (108 lines)
+  __init__.py       -- Package exports (124 lines)
   migrate.py        -- Migration tool template (93 lines)
   init_db.py        -- Database initialization (84 lines)
   session_dedup.py  -- Multi-turn deduplication (51 lines)
   examples/         -- Demos: synthetic dataset, quickstart, agent integration (488 lines)
-  benchmarks/       -- Benchmark suite: synthetic data, reproducible runs (1,651 lines)
-  tests/            -- 264 tests across 20 test files (3,777 lines)
+  benchmarks/       -- Benchmark suite: synthetic data, reproducible runs (1,704 lines)
+  tests/            -- 437 tests across 25 test files (5,778 lines)
 ~/.msam/
   msam.toml         -- Configuration (copy from msam.example.toml)
   msam.db           -- SQLite atom store (created at runtime)
   msam_metrics.db   -- Metrics database (created at runtime)
 ```
 
-Total: ~15,631 lines of Python across 24 modules, plus 5,916 lines of tests, examples, and benchmarks.
+Total: ~16,597 lines of Python across 24 modules, plus 7,970 lines of tests, examples, and benchmarks.

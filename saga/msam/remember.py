@@ -360,6 +360,7 @@ def cmd_query(args):
 
     # Record served atom IDs and annotate output with dedup count
     returned_ids = [r["id"] for r in atom_results]
+    output["_last_retrieval"] = returned_ids
     previously_served_count = sum(1 for aid in returned_ids if aid in served_ids)
     output["previously_served_count"] = previously_served_count
     try:
@@ -696,6 +697,36 @@ def cmd_context(args=None):
 
         output["sections"][section_name] = section_atoms
 
+    # ── Predicted atoms (Predictive Context Assembly) ─────────────────────────
+    if _cfg('prediction', 'enabled', True):
+        try:
+            from .prediction import PredictiveEngine
+            engine = PredictiveEngine()
+            predicted = engine.predict_context(
+                top_k=_cfg('prediction', 'max_predicted_atoms', 8)
+            )
+            predicted_atoms = []
+            for p in predicted:
+                pid = p.get("id", "")
+                if pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+                content = _compress(p.get("content", ""))
+                tok = max(1, len(content) // 4)
+                if total_tokens + tok > global_budget:
+                    continue
+                total_tokens += tok
+                predicted_atoms.append({
+                    "content": content,
+                    "score": round(p.get("score", 0), 3),
+                    "stream": "predicted",
+                    "predicted_by": p.get("predicted_by", "unknown"),
+                })
+            if predicted_atoms:
+                output["sections"]["predicted"] = predicted_atoms
+        except Exception:
+            pass
+
     # ── Persist updated hashes for next run (delta encoding state) ────────────
     try:
         # Merge: keep hashes for sections we didn't touch this run
@@ -731,6 +762,16 @@ def cmd_context(args=None):
         "shannon_floor_tokens": shannon_floor,
         "shannon_efficiency_pct": shannon_eff,
     }
+
+    # Sycophancy warning check
+    if _cfg('sycophancy', 'tracking_enabled', True):
+        try:
+            from .metrics import get_agreement_rate
+            agreement = get_agreement_rate()
+            if agreement.get("warning"):
+                output["_sycophancy_warning"] = agreement.get("warning_message", "High agreement rate detected")
+        except Exception:
+            pass
 
     # Compute activation stats across all atoms
     act_min, act_max, act_p50, act_p90, sim_min, sim_max = _compute_activation_stats(all_results)
@@ -1203,10 +1244,53 @@ def cmd_quality(args):
 
 
 def cmd_feedback(args):
-    """Run self-improving retrieval analysis."""
-    from .core import compute_retrieval_adjustments
-    result = compute_retrieval_adjustments()
+    """Record outcome feedback or run retrieval analysis.
+
+    Usage:
+        msam feedback <atom_id> positive|negative|neutral   -- record outcome
+        msam feedback --analyze                             -- run retrieval analysis
+    """
+    if not args or "--analyze" in args:
+        from .core import compute_retrieval_adjustments
+        result = compute_retrieval_adjustments()
+        print(json.dumps(result, indent=2))
+        return
+
+    # Outcome recording mode
+    from .core import record_outcome
+    atom_id = args[0]
+    feedback_type = args[1] if len(args) > 1 else "neutral"
+    if feedback_type not in ("positive", "negative", "neutral", "silence"):
+        print(json.dumps({"error": f"Invalid feedback type: {feedback_type}. Use positive|negative|neutral|silence"}))
+        return
+    result = record_outcome([atom_id], feedback_type)
     print(json.dumps(result, indent=2))
+
+
+def cmd_outcomes(args):
+    """Show outcome feedback history.
+
+    Usage:
+        msam outcomes <atom_id>    -- history for specific atom
+        msam outcomes --summary    -- summary of all outcomes
+    """
+    from .core import get_outcome_history, get_db
+    if args and args[0] != "--summary":
+        atom_id = args[0]
+        history = get_outcome_history(atom_id)
+        # Also get current atom scores
+        conn = get_db()
+        row = conn.execute(
+            "SELECT outcome_score, outcome_count, last_outcome_at FROM atoms WHERE id = ?",
+            (atom_id,),
+        ).fetchone()
+        conn.close()
+        atom_info = dict(row) if row else {}
+        print(json.dumps({"atom_id": atom_id, "current": atom_info,
+                           "history": history}, indent=2, default=str))
+    else:
+        history = get_outcome_history(limit=20)
+        print(json.dumps({"recent_outcomes": history}, indent=2, default=str))
 
 
 def cmd_explain(args):
@@ -1568,11 +1652,22 @@ def cmd_session_clear(args=None):
 
 
 def cmd_predict(args):
-    """Run predictive pre-retrieval."""
+    """Run predictive pre-retrieval.
+
+    Flags:
+      --learn         Learn from provided atom IDs
+      --time          Time bucket (morning|afternoon|evening|night)
+      --day           Day type (weekday|weekend|show_day)
+      --topics        Comma-separated topics
+      --active        User is active
+      --warm          Pre-warm context
+      --hour N        Specific hour (0-23) for predict_context
+      --day-of-week D Day name (monday..sunday) for predict_context
+      --format context Use predict_context instead of predict_needed_atoms
+    """
     from .core import predict_needed_atoms, pre_warm_context
 
     if "--learn" in args:
-        # Learn from provided atom IDs
         from .prediction import PredictiveEngine
         atom_ids = [a for a in args if a != "--learn" and not a.startswith("--")]
         engine = PredictiveEngine()
@@ -1582,6 +1677,9 @@ def cmd_predict(args):
 
     # Build context from args or defaults
     context = {}
+    use_predict_context = False
+    predict_hour = None
+    predict_dow = None
     i = 0
     while i < len(args):
         if args[i] == "--time" and i + 1 < len(args):
@@ -1596,9 +1694,32 @@ def cmd_predict(args):
             result = pre_warm_context(context)
             print(json.dumps(result, indent=2))
             return
+        elif args[i] == "--format" and i + 1 < len(args):
+            if args[i+1] == "context":
+                use_predict_context = True
+            i += 2
+        elif args[i] == "--hour" and i + 1 < len(args):
+            predict_hour = int(args[i+1])
+            use_predict_context = True
+            i += 2
+        elif args[i] == "--day-of-week" and i + 1 < len(args):
+            day_names = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+                         "friday": 4, "saturday": 5, "sunday": 6}
+            predict_dow = day_names.get(args[i+1].lower())
+            use_predict_context = True
+            i += 2
         else:
             i += 1
-    
+
+    if use_predict_context:
+        from .prediction import PredictiveEngine
+        engine = PredictiveEngine()
+        predicted = engine.predict_context(hour=predict_hour, day_of_week=predict_dow)
+        print(json.dumps({"mode": "predict_context", "hour": predict_hour,
+                           "day_of_week": predict_dow, "predictions": len(predicted),
+                           "atoms": predicted}, indent=2))
+        return
+
     predictions = predict_needed_atoms(context)
     print(json.dumps({"context": context, "predictions": len(predictions),
                        "atoms": predictions[:10]}, indent=2))
@@ -1729,6 +1850,119 @@ def cmd_serve(args):
         else:
             i += 1
     run_server(host=host, port=port)
+
+
+def cmd_world(args):
+    """World model query/update -- temporal knowledge graph.
+
+    Usage:
+        msam world                              Show all currently-valid triples
+        msam world "Jaden"                      Show current state for entity
+        msam world "Jaden" --at "2026-02-20"    Point-in-time query
+        msam world --set "Jaden" "is_in" "Oakland" [--from ...] [--until ...]
+        msam world --history "Jaden" ["is_in"]  Show all values over time
+    """
+    from .triples import query_world, update_world, world_history
+
+    if not args:
+        # Show all currently-valid triples
+        result = query_world()
+        print(json.dumps({"triples": result, "count": len(result)}, indent=2, default=str))
+        return
+
+    if args[0] == "--set":
+        # Update mode: --set subject predicate object [--from ...] [--until ...]
+        if len(args) < 4:
+            print(json.dumps({"error": "Usage: world --set <subject> <predicate> <object> [--from <ts>] [--until <ts>]"}))
+            return
+        subject = args[1]
+        predicate = args[2]
+        obj = args[3]
+        valid_from = None
+        valid_until = None
+        source_atom_id = None
+        i = 4
+        while i < len(args):
+            if args[i] == "--from" and i + 1 < len(args):
+                valid_from = args[i + 1]; i += 2
+            elif args[i] == "--until" and i + 1 < len(args):
+                valid_until = args[i + 1]; i += 2
+            elif args[i] == "--source" and i + 1 < len(args):
+                source_atom_id = args[i + 1]; i += 2
+            else:
+                i += 1
+        result = update_world(subject, predicate, obj,
+                              valid_from=valid_from, valid_until=valid_until,
+                              source_atom_id=source_atom_id)
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    if args[0] == "--history":
+        # History mode
+        if len(args) < 2:
+            print(json.dumps({"error": "Usage: world --history <subject> [<predicate>]"}))
+            return
+        subject = args[1]
+        predicate = args[2] if len(args) > 2 else None
+        result = world_history(subject, predicate)
+        print(json.dumps({"subject": subject, "predicate": predicate,
+                           "history": result, "count": len(result)}, indent=2, default=str))
+        return
+
+    # Entity query mode
+    entity = args[0]
+    at_time = None
+    predicate = None
+    i = 1
+    while i < len(args):
+        if args[i] == "--at" and i + 1 < len(args):
+            at_time = args[i + 1]; i += 2
+        elif args[i] == "--predicate" and i + 1 < len(args):
+            predicate = args[i + 1]; i += 2
+        else:
+            i += 1
+    result = query_world(entity=entity, predicate=predicate, at_time=at_time)
+    print(json.dumps({"entity": entity, "at_time": at_time,
+                       "triples": result, "count": len(result)}, indent=2, default=str))
+
+
+def cmd_agreement(args):
+    """Agreement rate tracking -- detect sycophancy.
+
+    Usage:
+        msam agreement                              Show current agreement rate
+        msam agreement record agree|disagree|...    Record a signal
+        msam agreement --agent <id>                 Check specific agent
+    """
+    from .metrics import record_agreement, get_agreement_rate
+
+    if not args:
+        result = get_agreement_rate()
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    if args[0] == "record":
+        signal = args[1] if len(args) > 1 else "neutral"
+        if signal not in ("agree", "disagree", "neutral", "challenge"):
+            print(json.dumps({"error": f"Invalid signal: {signal}. Use agree|disagree|neutral|challenge"}))
+            return
+        context = args[2] if len(args) > 2 else None
+        result = record_agreement(signal, context=context)
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    agent_id = "default"
+    window = 20
+    i = 0
+    while i < len(args):
+        if args[i] == "--agent" and i + 1 < len(args):
+            agent_id = args[i + 1]; i += 2
+        elif args[i] == "--window" and i + 1 < len(args):
+            window = int(args[i + 1]); i += 2
+        else:
+            i += 1
+    result = get_agreement_rate(agent_id=agent_id, window=window)
+    print(json.dumps(result, indent=2, default=str))
 
 
 def cmd_help(args=None):
@@ -1956,6 +2190,9 @@ def main():
         "forget": cmd_forget,
         "calibrate": cmd_calibrate,
         "re-embed": cmd_reembed,
+        "outcomes": cmd_outcomes,
+        "world": cmd_world,
+        "agreement": cmd_agreement,
     }
     
     if command in commands:

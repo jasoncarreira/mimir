@@ -45,6 +45,10 @@ spreading_activation_enabled = true         # enable co-retrieval spreading acti
 max_spread_hops = 2                         # max hops for spreading activation
 spread_decay_factor = 0.3                   # decay per hop
 temporal_recency_hours = 24                 # hours to consider "recent" for temporal queries
+# Felt Consequence -- outcome-attributed memory scoring
+outcome_weight = 0.15                      # weight of outcome score in activation
+outcome_decay = 0.95                       # exponential decay applied to existing score before new feedback
+min_outcomes_for_effect = 3                # minimum feedback count before outcome affects retrieval
 
 [decay]
 active_to_fading_threshold = 0.3            # retrievability R below this: active -> fading
@@ -135,6 +139,13 @@ coretrieval_weight = 0.4                    # weight for co-retrieval patterns
 momentum_weight = 0.2                       # weight for topic momentum
 lookback_days = 30                          # how far back to analyze patterns
 min_confidence = 0.3                        # minimum confidence for predictions
+# Predictive Context Assembly
+enabled = true                             # enable predictive pre-retrieval in context
+temporal_window_hours = 2                  # +/- hours to match temporal patterns
+min_pattern_count = 5                      # minimum retrievals before pattern is trusted
+co_retrieval_threshold = 3                 # minimum co-retrievals to expand predictions
+max_predicted_atoms = 8                    # cap on predicted atoms blended into context
+warmup_sessions = 50                       # sessions before prediction engine activates
 
 [agents]
 default_agent_id = "default"                # agent ID when none specified
@@ -194,6 +205,10 @@ probe_atom_queries = ["What is the user's profession?", "Who is the agent?"]
 [api]
 port = 3001
 host = "127.0.0.1"                          # localhost only by default
+# Restrict CORS to specific origins (default: localhost Grafana only)
+allowed_origins = ["http://127.0.0.1:3000", "http://localhost:3000"]
+# Optional API key for metrics endpoint (default: none/open)
+# api_key = "your-secret-key-here"
 
 [metrics]
 enabled = true
@@ -204,3 +219,14 @@ default_emotional_intensity = 0.5           # fallback when emotional state file
 default_emotional_warmth = 0.5
 continuity_history_limit = 100              # rows for system history queries
 retrieval_history_limit = 100               # rows for retrieval history queries
+
+[world_model]
+enabled = true                             # enable temporal world model (query_world, update_world)
+auto_close_on_conflict = true              # auto-expire previous triple when updating same subject+predicate
+temporal_extraction = true                 # enable temporal metadata (valid_from/valid_until) on triples
+default_confidence = 1.0                   # default confidence for world model triples
+
+[sycophancy]
+tracking_enabled = true                    # enable agreement rate tracking
+warning_threshold = 0.85                   # agreement rate above this triggers sycophancy warning
+window_size = 20                           # number of recent signals to compute rate over

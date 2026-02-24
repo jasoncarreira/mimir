@@ -414,8 +414,18 @@ def compute_activation(atom: dict, query_similarity: float = 0.0, mode: str = "t
     # Provisional penalty
     if atom.get("provisional"):
         annotation_boost -= 0.2
-    
-    return base + similarity + annotation_boost + stability_factor
+
+    # Outcome attribution (Felt Consequence)
+    outcome_weight = _cfg('retrieval', 'outcome_weight', 0.15)
+    min_outcomes = _cfg('retrieval', 'min_outcomes_for_effect', 3)
+    outcome_count = atom.get("outcome_count", 0)
+    outcome_score_val = atom.get("outcome_score", 0.0)
+    outcome_bonus = 0.0
+    if outcome_count >= min_outcomes:
+        normalized = max(-5.0, min(5.0, outcome_score_val)) / max(outcome_count, 1)
+        outcome_bonus = outcome_weight * normalized
+
+    return base + similarity + annotation_boost + stability_factor + outcome_bonus
 
 
 # ─── Spreading Activation ─────────────────────────────────────────
@@ -1054,6 +1064,14 @@ def hybrid_retrieve(
             log_topic_hits(list(all_topics), source='retrieval')
         except Exception:
             pass
+
+    # Track temporal patterns for predictive context
+    try:
+        from .prediction import track_temporal_pattern
+        result_ids = [r["id"] for r in results[:8]]
+        track_temporal_pattern(result_ids)
+    except Exception:
+        pass
 
     # Log metrics
     latency_ms = (time.time() - start_time) * 1000
@@ -1934,7 +1952,7 @@ def merge_atoms(atom_id_keep: str, atom_id_remove: str, merged_content: str = No
 
 # ─── Feature: Schema Migration ───────────────────────────────────
 
-SCHEMA_VERSION = 7  # Increment when schema changes
+SCHEMA_VERSION = 8  # Increment when schema changes
 
 MIGRATIONS = {
     1: [
@@ -2003,6 +2021,45 @@ MIGRATIONS = {
     7: [
         # Cross-provider identity calibration: track which provider created each embedding.
         "ALTER TABLE atoms ADD COLUMN embedding_provider TEXT",
+    ],
+    8: [
+        # Feature 1: Felt Consequence -- outcome-attributed memory
+        "ALTER TABLE atoms ADD COLUMN outcome_score REAL DEFAULT 0.0",
+        "ALTER TABLE atoms ADD COLUMN outcome_count INTEGER DEFAULT 0",
+        "ALTER TABLE atoms ADD COLUMN last_outcome_at TEXT",
+        """CREATE TABLE IF NOT EXISTS retrieval_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            atom_ids TEXT NOT NULL,
+            query TEXT,
+            feedback TEXT CHECK(feedback IN ('positive','negative','neutral','silence')),
+            feedback_at TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_outcomes_session ON retrieval_outcomes(session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_outcomes_feedback ON retrieval_outcomes(feedback)",
+
+        # Feature 2: Predictive Context -- temporal_patterns table
+        """CREATE TABLE IF NOT EXISTS temporal_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            atom_id TEXT NOT NULL,
+            hour_of_day INTEGER,
+            day_of_week INTEGER,
+            retrieval_count INTEGER DEFAULT 1,
+            last_retrieved_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(atom_id, hour_of_day, day_of_week)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_temporal_atom ON temporal_patterns(atom_id)",
+        "CREATE INDEX IF NOT EXISTS idx_temporal_time ON temporal_patterns(hour_of_day, day_of_week)",
+
+        # Feature 3: Temporal World Model -- extend triples table
+        "ALTER TABLE triples ADD COLUMN valid_from TEXT",
+        "ALTER TABLE triples ADD COLUMN valid_until TEXT",
+        "ALTER TABLE triples ADD COLUMN source_atom_id TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_triples_temporal ON triples(valid_from, valid_until)",
+        "CREATE INDEX IF NOT EXISTS idx_triples_subject_temporal ON triples(subject, valid_from, valid_until)",
+
+        # Feature 4: Agreement Rate -- in metrics DB, handled separately
     ],
 }
 
@@ -2145,6 +2202,87 @@ def mark_contributions(retrieved_atom_ids: list[str], response_text: str,
         "contributed_ids": contributed_ids,
         "contribution_rate": round(len(contributed_ids) / max(len(retrieved_atom_ids), 1), 3),
     }
+
+
+# ─── Feature: Felt Consequence (Outcome Attribution) ─────────────
+
+def record_outcome(atom_ids, feedback, session_id=None, query=None):
+    """Record outcome feedback for retrieved atoms.
+
+    Score deltas: positive=+1, negative=-1, neutral=+0.1, silence=0.
+    Applies exponential decay to existing score before adding new delta.
+    Clamps outcome_score to [-5.0, 5.0].
+    """
+    if not atom_ids:
+        return {"updated": 0}
+
+    delta_map = {
+        "positive": 1.0,
+        "negative": -1.0,
+        "neutral": 0.1,
+        "silence": 0.0,
+    }
+    delta = delta_map.get(feedback, 0.0)
+    decay = _cfg('retrieval', 'outcome_decay', 0.95)
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = get_db()
+    updated = 0
+
+    if isinstance(atom_ids, str):
+        atom_ids = [atom_ids]
+
+    for atom_id in atom_ids:
+        row = conn.execute(
+            "SELECT outcome_score, outcome_count FROM atoms WHERE id = ?",
+            (atom_id,),
+        ).fetchone()
+        if not row:
+            continue
+
+        old_score = row["outcome_score"] if row["outcome_score"] is not None else 0.0
+        old_count = row["outcome_count"] if row["outcome_count"] is not None else 0
+
+        # Decay existing score, then add new delta
+        new_score = old_score * decay + delta
+        new_score = max(-5.0, min(5.0, new_score))
+        new_count = old_count + 1
+
+        conn.execute(
+            "UPDATE atoms SET outcome_score = ?, outcome_count = ?, last_outcome_at = ? WHERE id = ?",
+            (new_score, new_count, now, atom_id),
+        )
+        updated += 1
+
+    # Log to retrieval_outcomes table
+    conn.execute(
+        """INSERT INTO retrieval_outcomes (session_id, atom_ids, query, feedback, feedback_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (session_id, json.dumps(atom_ids), query, feedback, now),
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {"updated": updated, "feedback": feedback, "atom_ids": atom_ids}
+
+
+def get_outcome_history(atom_id=None, limit=50):
+    """Get outcome feedback history, optionally filtered by atom_id."""
+    conn = get_db()
+    if atom_id:
+        rows = conn.execute(
+            """SELECT * FROM retrieval_outcomes
+               WHERE atom_ids LIKE ? ORDER BY created_at DESC LIMIT ?""",
+            (f'%"{atom_id}"%', limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM retrieval_outcomes ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # ─── Feature: Association Chains ─────────────────────────────────

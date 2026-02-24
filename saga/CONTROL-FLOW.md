@@ -193,6 +193,90 @@ annotate.classify_stream(content)
   -> DEFAULT: semantic (facts, knowledge, descriptions)
 ```
 
+### 8. OUTCOME FEEDBACK (Felt Consequence)
+
+```
+Agent responds to user
+  -> user provides feedback (positive/negative)
+  -> core.record_outcome(atom_ids, score)
+    -> for each atom:
+      -> existing = get current outcome_score (0.0 if none)
+      -> decayed = existing * outcome_decay (0.95)
+      -> new_score = decayed + score
+      -> UPDATE retrieval_outcomes SET outcome_score = new_score, feedback_count += 1
+
+retrieve -> activation scoring:
+  -> if atom.feedback_count >= min_outcomes_for_effect (3):
+    -> activation += outcome_weight * outcome_score
+  -> high outcome_score = boosted retrieval
+  -> low/negative outcome_score = dampened retrieval
+```
+
+### 9. WORLD MODEL (Temporal Knowledge)
+
+```
+triples.update_world(subject, predicate, object, valid_from, valid_until)
+  -> CHECK world_model.enabled (skip if disabled)
+  -> CHECK world_model.temporal_extraction
+    -> if disabled: strip valid_from/valid_until
+    -> if enabled: default valid_from = now
+  -> CHECK auto_close_on_conflict (and temporal_extraction):
+    -> SELECT existing triples WHERE subject=s AND predicate=p AND valid_until IS NULL
+    -> UPDATE existing SET valid_until = now (auto-close)
+  -> INSERT new triple with temporal metadata
+
+triples.query_world(entity)
+  -> CHECK world_model.enabled (return [] if disabled)
+  -> SELECT * FROM triples WHERE subject = entity AND valid_until IS NULL
+  -> returns current state of the world for this entity
+
+triples.world_history(entity)
+  -> CHECK world_model.enabled (return [] if disabled)
+  -> SELECT * FROM triples WHERE subject = entity ORDER BY valid_from
+  -> returns full temporal chain (past + current)
+```
+
+### 10. PREDICTIVE CONTEXT ASSEMBLY
+
+```
+prediction.PredictiveEngine.predict_context(hour, day_of_week)
+  -> WARMUP GATE:
+    -> count session_boundary atoms in DB
+    -> if count < warmup_sessions (50): return [] (not enough data)
+
+  -> TEMPORAL PATTERN QUERY:
+    -> SELECT atoms from temporal_patterns
+      WHERE hour_of_day within +/- temporal_window_hours (2)
+      AND retrieval_count >= min_pattern_count (5)
+    -> returns atoms frequently retrieved at this time of day
+
+  -> CO-RETRIEVAL EXPANSION:
+    -> for each temporal candidate:
+      -> SELECT co-retrieved atoms from co_retrieval
+        WHERE co_count >= co_retrieval_threshold (3)
+      -> add co-retrieved atoms to candidate pool
+
+  -> MERGE + RANK:
+    -> deduplicate, weight by pattern strength
+    -> cap at max_predicted_atoms (8)
+    -> return predicted atom set for context injection
+```
+
+### 11. AGREEMENT TRACKING (Sycophancy Detection)
+
+```
+Agent responds to user
+  -> metrics.record_agreement(agreed: bool, agent_id)
+    -> INSERT INTO agreement_signals (agent_id, agreed, timestamp)
+
+metrics.get_agreement_rate(agent_id, window)
+  -> SELECT last N signals for agent_id
+  -> compute: agreement_rate = sum(agreed) / count
+  -> if rate > warning_threshold (0.85):
+    -> flag: sycophancy_warning = true
+  -> return { rate, count, warning }
+```
+
 ## State Machines and Decision Trees
 
 The following diagrams show the internal state machines that govern atom lifecycle and retrieval confidence. These are the core invariants of the system -- every atom follows the same state machine, and every query passes through the same confidence gate.
@@ -326,9 +410,9 @@ calibration.py (cross-provider identity)
 | Metric | Value |
 |--------|-------|
 | Modules | 24 |
-| CLI commands | 54 |
+| CLI commands | 56 |
 | REST API endpoints | 20 |
-| Tests | 264 across 20 test files |
+| Tests | 437 across 25 test files |
 | Atoms | 675+ |
 | Triples | 1,500+ |
 | DB size | ~26MB |
@@ -338,4 +422,4 @@ calibration.py (cross-provider identity)
 | Query latency | ~870ms |
 | Shannon efficiency | 51% of theoretical minimum |
 | Embedding providers | 4 (NVIDIA NIM, OpenAI, ONNX Runtime, sentence-transformers) |
-| Config sections | 23 (100+ parameters) |
+| Config sections | 27 (160+ parameters) |

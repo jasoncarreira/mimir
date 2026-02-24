@@ -338,3 +338,75 @@ class TestResolveContradictions:
             }
             resolved = resolve_contradictions([contradiction], strategy="newest")
             assert resolved >= 1
+
+
+# ─── Extract and Store ─────────────────────────────────────────────────────
+
+
+class TestExtractAndStore:
+    def test_extract_and_store_no_api_key(self, monkeypatch):
+        """Without NVIDIA_NIM_API_KEY, extract_and_store returns 0."""
+        monkeypatch.delenv("NVIDIA_NIM_API_KEY", raising=False)
+        conn = _setup_db()
+        emb = struct.pack('1024f', *np.random.randn(1024).astype(np.float32))
+        conn.execute("""
+            INSERT INTO atoms (id, content, content_hash, created_at, state,
+                embedding, topics, metadata, encoding_confidence)
+            VALUES ('ext1', 'The sky is blue', 'hashext1', datetime('now'), 'active',
+                ?, '[]', '{}', 0.7)
+        """, (emb,))
+        conn.commit()
+        conn.close()
+
+        from msam.triples import extract_and_store
+        count = extract_and_store("ext1", "The sky is blue")
+        assert count == 0
+
+    def test_extract_and_store_with_mock_llm(self, monkeypatch):
+        """With mocked LLM, extract_and_store stores triples."""
+        conn = _setup_db()
+        emb = struct.pack('1024f', *np.random.randn(1024).astype(np.float32))
+        conn.execute("""
+            INSERT INTO atoms (id, content, content_hash, created_at, state,
+                embedding, topics, metadata, encoding_confidence)
+            VALUES ('ext2', 'Jaden lives in Oakland', 'hashext2', datetime('now'), 'active',
+                ?, '[]', '{}', 0.7)
+        """, (emb,))
+        conn.commit()
+        conn.close()
+
+        # Mock extract_triples_llm to return triples directly
+        monkeypatch.setattr("msam.triples.extract_triples_llm", lambda c, aid="": [
+            {"atom_id": aid, "subject": "Jaden", "predicate": "lives_in", "object": "Oakland"},
+        ])
+
+        from msam.triples import extract_and_store
+        count = extract_and_store("ext2", "Jaden lives in Oakland")
+        assert count == 1
+
+
+class TestExtractTriplesLlm:
+    def test_no_api_key_returns_empty(self, monkeypatch):
+        """Without API key, returns empty list."""
+        monkeypatch.delenv("NVIDIA_NIM_API_KEY", raising=False)
+        from msam.triples import extract_triples_llm
+        result = extract_triples_llm("The sky is blue")
+        assert result == []
+
+    def test_with_mocked_api(self, monkeypatch):
+        """With mocked API response, extracts triples."""
+        monkeypatch.setenv("NVIDIA_NIM_API_KEY", "test-key")
+
+        import requests
+
+        class MockResponse:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {"content": "(Jaden, lives_in, Oakland)"}}]}
+
+        monkeypatch.setattr(requests, "post", lambda *a, **kw: MockResponse())
+        from msam.triples import extract_triples_llm
+        result = extract_triples_llm("Jaden lives in Oakland", atom_id="test1")
+        assert len(result) >= 1
+        assert result[0]["subject"] == "Jaden"
