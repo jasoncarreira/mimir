@@ -213,7 +213,7 @@ Note: Cognitive accuracy is bounded by embedding quality. With n-gram hashes, me
 
 ## Test Suite Results
 
-264 tests across 20 test files, covering all modules.
+437 tests across 25 test files, covering all modules and CLI commands.
 
 | Test Category | Score | Notes |
 |---|---|---|

@@ -6,7 +6,7 @@ MSAM gives agents persistent, structured memory that self-regulates what it stor
 
 When MSAM knows something, it delivers. When it doesn't, it says so. Output volume is proportional to confidence -- not padded with noise.
 
-Built for production. Running in production. 675+ atoms, 1,500+ triples, 99.3% startup compression, 89% session savings vs. flat files. 24 modules, 54 CLI commands, 20 API endpoints, 264 tests.
+Built for production. Running in production. 675+ atoms, 1,500+ triples, 99.3% startup compression, 89% session savings vs. flat files. 24 modules, 56 CLI commands, 20 API endpoints, 437 tests.
 
 ## Benchmark Highlights
 
@@ -55,9 +55,15 @@ Most agent memory systems are vector stores with a retrieval wrapper. MSAM is di
 
 - **Multi-agent memory.** Agent isolation via namespaced atoms, selective sharing between agents, per-agent statistics. Multiple agents can share a single MSAM instance without interference.
 
-- **Predictive prefetch.** Three-strategy prediction engine (temporal patterns, co-retrieval history, topic momentum) anticipates what atoms an agent will need before it asks.
+- **Predictive prefetch.** Three-strategy prediction engine (temporal patterns, co-retrieval history, topic momentum) anticipates what atoms an agent will need before it asks. Predictive Context Assembly pre-loads atoms into session context based on time-of-day and co-retrieval patterns, with a configurable warmup gate.
 
-- **REST API.** Full HTTP interface (`msam serve`) with 20 endpoints covering every subsystem -- store, query, context, feedback, decay, triples, contradictions, prediction, consolidation, forgetting, calibration, and multi-agent operations.
+- **Felt Consequence.** Outcome-attributed memory scoring tracks whether retrieved atoms led to good or bad outcomes. Atoms that consistently contribute to successful responses get boosted; atoms that produce poor outcomes get dampened. The feedback signal decays exponentially so recent outcomes matter more.
+
+- **Temporal World Model.** A structured knowledge graph layer where triples carry temporal metadata (`valid_from`, `valid_until`). When facts change, the old triple auto-closes and the new one opens. Query the current state of the world, the state at a past time, or the full history of an entity.
+
+- **Sycophancy detection.** Agreement rate tracking monitors whether the agent is over-agreeing with the user. When the agreement rate exceeds a configurable threshold across a sliding window, the system flags the pattern so the agent can self-correct.
+
+- **REST API.** Full HTTP interface (`msam serve`) with 20 endpoints covering every subsystem -- store, query, context, feedback, decay, triples, contradictions, prediction, consolidation, forgetting, calibration, and multi-agent operations. CORS restricted to localhost by default with optional API key authentication.
 
 - **Cross-provider calibration.** Switch embedding providers (NIM, OpenAI, ONNX, local) without losing retrieval quality. Calibration re-embeds atoms and adjusts similarity thresholds to maintain identity.
 
@@ -139,7 +145,7 @@ msam help
 
 ## Configuration
 
-Every subsystem is configurable via `~/.msam/msam.toml` (23 sections, 100+ parameters). Copy from `msam.example.toml` for documented defaults with inline explanations.
+Every subsystem is configurable via `~/.msam/msam.toml` (27 sections, 160+ parameters). Copy from `msam.example.toml` for documented defaults with inline explanations.
 
 Key sections:
 
@@ -160,14 +166,16 @@ Key sections:
 | `[annotation]` | LLM URL, model, timeout for annotation |
 | `[triples]` | LLM URL and model for triple extraction |
 | `[compression]` | Subatom extraction, sentence dedup, synthesis model and thresholds |
-| `[prediction]` | Temporal/co-retrieval/momentum weights, lookback, confidence |
+| `[prediction]` | Temporal/co-retrieval/momentum weights, lookback, warmup gate, predictive context assembly |
 | `[agents]` | Default agent ID, sharing toggle |
 | `[context]` | Startup queries, probe queries, token budgets |
-| `[api]` | Server port, host binding |
+| `[api]` | Server port, host binding, CORS allowed origins, API key auth |
 | `[metrics]` | Metrics logging toggles, probe settings |
 | `[entity_resolution]` | Alias mappings (nicknames to canonical names) |
 | `[query_expansion]` | Synonym groups for query rewriting |
 | `[predictive_retrieval]` | Context keys for predictive prefetch |
+| `[world_model]` | Temporal world model: enable/disable, auto-close on conflict, temporal extraction |
+| `[sycophancy]` | Agreement rate tracking: enable/disable, warning threshold, window size |
 
 ### Embedding Providers
 
@@ -280,7 +288,7 @@ ACTIVE --(R < 0.3)--> FADING --(R < 0.1)--> DORMANT --(manual)--> TOMBSTONE
 
 ## CLI Reference
 
-54 commands. Highlights below -- run `msam help` for the full list.
+56 commands. Highlights below -- run `msam help` for the full list.
 
 ```bash
 # Storage
@@ -317,11 +325,18 @@ msam contradictions                # detect conflicts
 msam gaps <entity>                 # knowledge gap analysis
 msam graph <entity>                # traverse relationships
 
+# World model (temporal knowledge)
+msam world <entity>                # query current world state
+msam world update <s> <p> <o>      # update world fact
+msam world history <entity>        # temporal history of an entity
+
 # Analysis
 msam metamemory "topic"            # coverage assessment
 msam stats                         # database statistics
 msam analytics                     # retrieval analytics
 msam predict                       # predictive prefetch
+msam outcomes <atom_id>            # outcome feedback history
+msam agreement                     # sycophancy/agreement rate
 
 # Administration
 msam serve                         # start REST API server
@@ -361,7 +376,7 @@ ONNX is slower on ARM64 due to single-core inference. On x86_64 with AVX2/AVX-51
 ```
 msam/
   core.py            # Atom storage, ACT-R retrieval, batch cosine, scoring
-  remember.py        # CLI integration (54 commands, confidence gating)
+  remember.py        # CLI integration (56 commands, confidence gating)
   triples.py         # Knowledge graph, triple extraction, hybrid retrieval
   retrieval_v2.py    # v2 pipeline: beam search, entity roles, quality filter
   subatom.py         # Shannon compression: sentence extraction, dedup
@@ -386,7 +401,7 @@ msam/
   scripts/           # CLI entrypoints (msam, msam-remember, msam-backup)
   examples/          # quickstart.py, agent_integration.py, synthetic_dataset.py
   benchmarks/        # Reproducible benchmark suite (python -m msam.benchmarks.run)
-  tests/             # 264 tests across 20 test files
+  tests/             # 437 tests across 25 test files
 ~/.msam/             # Data directory (created at runtime)
   msam.toml          # Configuration (copy from msam.example.toml)
   msam.db            # Main atom + triple store (SQLite)
@@ -408,7 +423,15 @@ CONTROL-FLOW.md      # Architecture and flow reference
 
 ## Roadmap
 
-### Current (2026.02.23)
+### Current (2026.02.24)
+- **Felt Consequence** -- outcome-attributed memory scoring. Atoms that consistently contribute to good outcomes get boosted; poor outcomes get dampened. Exponential decay on outcome signal so recent feedback matters more. Configurable via `outcome_weight`, `outcome_decay`, `min_outcomes_for_effect`.
+- **Predictive Context Assembly** -- pre-loads atoms into session context based on temporal patterns and co-retrieval history. Warmup gate prevents premature predictions. Configurable via `[prediction]` section.
+- **Temporal World Model** -- structured knowledge graph with temporal metadata. Triples carry `valid_from`/`valid_until` timestamps. Auto-close previous facts when updating same subject+predicate. Query current state, past state, or full history. Configurable via `[world_model]` section.
+- **Sycophancy detection** -- agreement rate tracking with sliding window. Monitors whether the agent over-agrees with the user. Configurable warning threshold and window size via `[sycophancy]` section.
+- **Security hardening** -- CORS restricted to localhost by default (configurable via `api.allowed_origins`). Optional API key authentication on the Grafana metrics API (`api.api_key`). FastAPI REST API retains existing `MSAM_API_KEY` env var auth.
+- **437-test suite** across 25 test files covering all modules and CLI commands
+
+### Previous (2026.02.23)
 - **REST API server** -- language-agnostic HTTP interface (`msam serve`), 20 endpoints covering store/query/context/feedback/decay/stats/triples/contradictions/predict/consolidate/replay/forget/calibrate/re-embed/agents
 - **Multi-agent memory protocol** -- agent isolation via `agent_id` column, atom sharing between agents, per-agent statistics
 - **Semantic contradiction detection** -- embedding-based detection with negation, temporal supersession, value conflict, and antonym analysis
@@ -421,8 +444,7 @@ CONTROL-FLOW.md      # Architecture and flow reference
 - Vectorized batch cosine similarity (~3.7x on ARM64 matmul)
 - ONNX Runtime local embeddings (zero API dependency)
 - Batch embedding API (up to 50 per request)
-- 54-command CLI with help, grep, export/import, serve
-- 264-test suite across 20 test files covering all modules: core, decay, triples, retrieval_v2, config, consolidation, metrics, entity_roles, vector_index, subatom, prediction, forgetting, server, agents, annotate, calibration, contradictions, cli, embeddings, session_dedup
+- 56-command CLI with help, grep, export/import, serve
 - 675+ atoms, 1,500+ triples in production
 
 ### Next

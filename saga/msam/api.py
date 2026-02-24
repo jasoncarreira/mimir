@@ -21,7 +21,20 @@ from .metrics import get_metrics_db, get_retrieval_history, get_system_history, 
 from .core import get_stats
 
 app = Flask(__name__)
-CORS(app)
+
+# Security: restrict CORS origins and optionally require API key
+_api_origins = _cfg("api", "allowed_origins", ["http://127.0.0.1:3000", "http://localhost:3000"])
+_api_key = _cfg("api", "api_key", None)
+
+CORS(app, origins=_api_origins)
+
+@app.before_request
+def _check_api_key():
+    """Require API key if configured. Skip for health endpoint."""
+    if _api_key and request.path != "/":
+        provided = request.headers.get("X-API-Key") or request.args.get("api_key")
+        if provided != _api_key:
+            return jsonify({"error": "unauthorized", "message": "Valid X-API-Key header required"}), 401
 
 
 @app.route("/")
@@ -801,6 +814,15 @@ def grafana_annotations():
 
 
 # ─── Triple Metrics Endpoints ─────────────────────────────────────
+
+@app.route("/api/agreement_rate")
+def api_agreement_rate():
+    """Get current agreement rate for sycophancy detection."""
+    from .metrics import get_agreement_rate
+    agent_id = request.args.get("agent_id", "default")
+    window = request.args.get("window", 20, type=int)
+    return jsonify(get_agreement_rate(agent_id=agent_id, window=window))
+
 
 @app.route("/api/triples/stats")
 def api_triple_stats():

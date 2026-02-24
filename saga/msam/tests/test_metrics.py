@@ -299,3 +299,18 @@ class TestPruneOldMetrics:
         remaining = conn.execute("SELECT COUNT(*) FROM retrieval_metrics").fetchone()[0]
         conn.close()
         assert remaining >= 1  # recent record should survive
+
+
+# ─── Retrieval Miss ─────────────────────────────────────────────────────────
+
+
+class TestLogRetrievalMiss:
+    def test_logs_retrieval_miss(self):
+        from msam.metrics import log_retrieval_miss, get_metrics_db
+        log_retrieval_miss("unknown query", "task", 0.5, threshold=2.0)
+        conn = get_metrics_db()
+        rows = conn.execute(
+            "SELECT * FROM access_events WHERE event_type = 'retrieval_miss'"
+        ).fetchall()
+        conn.close()
+        assert len(rows) >= 1

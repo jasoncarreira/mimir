@@ -1082,3 +1082,194 @@ def log_triple_store_snapshot():
         conn.close()
     except Exception:
         pass
+
+
+# ─── Temporal World Model ────────────────────────────────────────
+
+
+def query_world(entity=None, predicate=None, at_time=None, include_expired=False):
+    """Query world model for current or historical state.
+
+    Parameters
+    ----------
+    entity : str, optional
+        Filter by subject entity.
+    predicate : str, optional
+        Filter by predicate.
+    at_time : str, optional
+        ISO timestamp for point-in-time query. If None, returns currently-valid triples.
+    include_expired : bool
+        If True, include triples whose valid_until has passed.
+
+    Returns
+    -------
+    list[dict]
+        Matching triples with temporal metadata.
+    """
+    if not _cfg('world_model', 'enabled', True):
+        return []
+
+    conn = _get_db()
+    conditions = ["state = 'active'"]
+    params = []
+
+    if entity:
+        conditions.append("LOWER(subject) = LOWER(?)")
+        params.append(entity)
+
+    if predicate:
+        conditions.append("LOWER(predicate) = LOWER(?)")
+        params.append(predicate)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    if at_time:
+        # Point-in-time query: valid_from <= at_time AND (valid_until IS NULL OR valid_until > at_time)
+        conditions.append("(valid_from IS NULL OR valid_from <= ?)")
+        params.append(at_time)
+        conditions.append("(valid_until IS NULL OR valid_until > ?)")
+        params.append(at_time)
+    elif not include_expired:
+        # Current state: valid_until IS NULL or in the future
+        conditions.append("(valid_until IS NULL OR valid_until > ?)")
+        params.append(now_iso)
+
+    where = " AND ".join(conditions)
+    rows = conn.execute(
+        f"""SELECT id, atom_id, subject, predicate, object, confidence,
+                   valid_from, valid_until, source_atom_id, created_at
+            FROM triples WHERE {where}
+            ORDER BY subject, predicate, created_at DESC""",
+        params,
+    ).fetchall()
+    conn.close()
+
+    return [dict(r) for r in rows]
+
+
+def update_world(subject, predicate, object_val, valid_from=None, valid_until=None,
+                 confidence=None, source_atom_id=None):
+    """Update world model. Auto-closes existing active triple with same subject+predicate.
+
+    Parameters
+    ----------
+    subject : str
+    predicate : str
+    object_val : str
+        The new value for this subject+predicate.
+    valid_from : str, optional
+        ISO timestamp. Defaults to now.
+    valid_until : str, optional
+        ISO timestamp for when this fact expires.
+    confidence : float, optional
+        Confidence score. Defaults from config.
+    source_atom_id : str, optional
+        The atom that sourced this fact.
+
+    Returns
+    -------
+    dict
+        Result with new triple id, any closed triple ids.
+    """
+    if not _cfg('world_model', 'enabled', True):
+        return {"error": "world_model disabled"}
+
+    auto_close = _cfg('world_model', 'auto_close_on_conflict', True)
+    temporal_extraction = _cfg('world_model', 'temporal_extraction', True)
+    if confidence is None:
+        confidence = _cfg('world_model', 'default_confidence', 1.0)
+
+    conn = _get_db()
+    # Disable FK checks for world updates that may not reference real atoms
+    conn.execute("PRAGMA foreign_keys=OFF")
+    now = datetime.now(timezone.utc).isoformat()
+
+    # When temporal_extraction is disabled, strip temporal metadata
+    if not temporal_extraction:
+        valid_from = None
+        valid_until = None
+    elif valid_from is None:
+        valid_from = now
+
+    closed_ids = []
+
+    # Auto-close existing active triples with same subject+predicate
+    # (only when temporal_extraction is enabled — otherwise just overwrite)
+    if auto_close and temporal_extraction:
+        existing = conn.execute(
+            """SELECT id FROM triples
+               WHERE LOWER(subject) = LOWER(?) AND LOWER(predicate) = LOWER(?)
+               AND state = 'active' AND (valid_until IS NULL OR valid_until > datetime('now'))""",
+            (subject, predicate),
+        ).fetchall()
+        for row in existing:
+            conn.execute(
+                "UPDATE triples SET valid_until = ? WHERE id = ?",
+                (now, row["id"]),
+            )
+            closed_ids.append(row["id"])
+
+    # Insert new triple
+    triple_id = generate_triple_id(source_atom_id or "world", subject, predicate, object_val)
+
+    # Embed the triple text
+    from .core import embed_text, pack_embedding
+    triple_text = _triple_text(subject, predicate, object_val)
+    try:
+        emb = embed_text(triple_text)
+        emb_blob = pack_embedding(emb)
+    except Exception:
+        emb_blob = None
+
+    atom_id_val = source_atom_id or "world_update"
+    conn.execute(
+        """INSERT OR REPLACE INTO triples
+           (id, atom_id, subject, predicate, object, confidence, state, embedding, created_at,
+            valid_from, valid_until, source_atom_id)
+           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)""",
+        (triple_id, atom_id_val, subject, predicate, object_val,
+         confidence, emb_blob, now, valid_from, valid_until, source_atom_id),
+    )
+
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.close()
+
+    return {
+        "triple_id": triple_id,
+        "subject": subject,
+        "predicate": predicate,
+        "object": object_val,
+        "valid_from": valid_from,
+        "valid_until": valid_until,
+        "closed_ids": closed_ids,
+    }
+
+
+def world_history(subject, predicate=None):
+    """Show all values over time (including expired) for subject+predicate.
+
+    Returns triples ordered by created_at descending (newest first).
+    """
+    if not _cfg('world_model', 'enabled', True):
+        return []
+
+    conn = _get_db()
+    conditions = ["LOWER(subject) = LOWER(?)"]
+    params = [subject]
+
+    if predicate:
+        conditions.append("LOWER(predicate) = LOWER(?)")
+        params.append(predicate)
+
+    where = " AND ".join(conditions)
+    rows = conn.execute(
+        f"""SELECT id, atom_id, subject, predicate, object, confidence,
+                   valid_from, valid_until, source_atom_id, state, created_at
+            FROM triples WHERE {where}
+            ORDER BY predicate, created_at DESC""",
+        params,
+    ).fetchall()
+    conn.close()
+
+    return [dict(r) for r in rows]

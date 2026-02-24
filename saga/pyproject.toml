@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "msam"
-version = "2026.02.23"
+version = "2026.02.24"
 description = "Multi-Stream Adaptive Memory -- cognitive memory system for AI agents"
 readme = "README.md"
 license = "MIT"

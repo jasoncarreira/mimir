@@ -80,6 +80,10 @@ _DEFAULTS = {
         "confidence_score_high": 40.0,
         "confidence_score_medium": 10.0,
         "temporal_recency_hours": 24,
+        # Felt Consequence (outcome attribution)
+        "outcome_weight": 0.15,
+        "outcome_decay": 0.95,
+        "min_outcomes_for_effect": 3,
     },
     "decay": {
         "active_to_fading_threshold": 0.3,
@@ -202,6 +206,13 @@ _DEFAULTS = {
         "momentum_weight": 0.2,
         "lookback_days": 30,
         "min_confidence": 0.3,
+        # Predictive Context Assembly
+        "enabled": True,
+        "temporal_window_hours": 2,
+        "min_pattern_count": 5,
+        "co_retrieval_threshold": 3,
+        "max_predicted_atoms": 8,
+        "warmup_sessions": 50,
     },
     "context": {
         "default_token_budget": 500,
@@ -242,6 +253,8 @@ _DEFAULTS = {
     "api": {
         "port": 3001,
         "host": "127.0.0.1",
+        "allowed_origins": ["http://127.0.0.1:3000", "http://localhost:3000"],
+        "api_key": None,
     },
     "metrics": {
         "enabled": True,
@@ -252,6 +265,17 @@ _DEFAULTS = {
         "default_emotional_warmth": 0.5,
         "continuity_history_limit": 100,
         "retrieval_history_limit": 100,
+    },
+    "world_model": {
+        "enabled": True,
+        "auto_close_on_conflict": True,
+        "temporal_extraction": True,
+        "default_confidence": 1.0,
+    },
+    "sycophancy": {
+        "tracking_enabled": True,
+        "warning_threshold": 0.85,
+        "window_size": 20,
     },
 }
 
