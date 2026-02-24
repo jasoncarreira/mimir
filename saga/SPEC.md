@@ -458,7 +458,6 @@ Build time:            36 hours (initial spec to production)
 
 - Anderson, J.R. (2007). *How Can the Human Mind Occur in the Physical Universe?* Oxford University Press. (ACT-R)
 - Damasio, A. (1994). *Descartes' Error*. Putnam. (Somatic Marker Hypothesis)
-- de Ridder, L. (2026). *AI Agent Framework Analysis*. 44 frameworks analyzed.
 - Ebbinghaus, H. (1885). *Memory: A Contribution to Experimental Psychology*.
 - Hudon, A. & Stip, E. (2025). "AI Psychosis: Risk Factors in Human-AI Relationships."
 - McGaugh, J.L. (2004). "The amygdala modulates the consolidation of memories of emotionally arousing experiences." *Annual Review of Neuroscience*.
