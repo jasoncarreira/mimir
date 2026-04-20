@@ -294,15 +294,15 @@ class ConsolidationEngine:
 
     def _restructure_phase(self, syntheses: list[dict]) -> dict:
         """Store synthesis atoms, create atom_relations, reduce source stability."""
-        conn = get_db()
         now = datetime.now(timezone.utc).isoformat()
 
         atoms_stored = 0
         relations_created = 0
         sources_reduced = 0
 
+        # Phase A: store each synthesis atom (store_atom opens/closes its own connection)
+        stored = []
         for syn in syntheses:
-            # Store synthesis atom
             syn_id = store_atom(
                 content=syn["content"],
                 stream=syn["stream"],
@@ -310,36 +310,39 @@ class ConsolidationEngine:
                 metadata={"consolidated_from": syn["source_ids"][:10],
                           "cluster_size": syn["cluster_size"]},
             )
-
             if syn_id is None:
                 continue
             atoms_stored += 1
+            stored.append((syn_id, syn["source_ids"]))
 
-            # Create atom_relations (consolidated_into)
-            for source_id in syn["source_ids"]:
-                try:
-                    conn.execute("""
-                        INSERT OR IGNORE INTO atom_relations
-                            (source_id, target_id, relation_type, confidence, created_at)
-                        VALUES (?, ?, 'consolidated_into', 1.0, ?)
-                    """, (source_id, syn_id, now))
-                    relations_created += 1
-                except Exception:
-                    pass
+        # Phase B: create relations and reduce stability in a single connection
+        conn = get_db()
+        try:
+            for syn_id, source_ids in stored:
+                for source_id in source_ids:
+                    try:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO atom_relations
+                                (source_id, target_id, relation_type, confidence, created_at)
+                            VALUES (?, ?, 'consolidated_into', 1.0, ?)
+                        """, (source_id, syn_id, now))
+                        relations_created += 1
+                    except Exception:
+                        pass
 
-            # Reduce source atom stability
-            for source_id in syn["source_ids"]:
-                try:
-                    conn.execute(
-                        "UPDATE atoms SET stability = stability * ? WHERE id = ?",
-                        (self.stability_reduction, source_id)
-                    )
-                    sources_reduced += 1
-                except Exception:
-                    pass
+                for source_id in source_ids:
+                    try:
+                        conn.execute(
+                            "UPDATE atoms SET stability = stability * ? WHERE id = ?",
+                            (self.stability_reduction, source_id)
+                        )
+                        sources_reduced += 1
+                    except Exception:
+                        pass
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
 
         return {
             "synthesis_atoms_stored": atoms_stored,
