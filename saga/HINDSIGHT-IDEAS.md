@@ -227,7 +227,7 @@ Once P1 lands, trend state becomes a standalone retrieval *filter* the agent can
 - `retrieve(query, filter=include_weakening)` — when the agent wants to flag uncertainty
 - `retrieve(query, filter=recent_strengthening)` — for "what have I learned lately"
 
-Also: **expose trend in the startup context**. Currently startup shows identity/partner/recent/emotional sections. Add a fifth section: `recently_strengthening` — beliefs the system is gaining confidence in. A signal that the memory system is doing work.
+Also: **expose trend via a new primitive**. If P6 lands (removing startup context), this becomes `msam trends --filter strengthening` as its own command. If startup context stays, add a fifth section to it (`recently_strengthening` — beliefs the system is gaining confidence in). Either way, the value is giving the agent a signal that the memory system is actively learning.
 
 #### Why
 
@@ -281,6 +281,61 @@ Memory systems that require explicit store calls have adoption friction. The wra
 
 ---
 
+---
+
+### P6 — Remove the startup context and delta encoding
+
+**Value: cleanup. Effort: ~2 hours. Reversible: yes (revert a commit).**
+
+#### What
+
+Delete:
+- `msam/remember.py`: `cmd_context()` (~340 lines) and its helpers — `_CODEBOOK`, `_compress`/`_decompress`, `_shannon_floor_tokens`, `_load_hashes`/`_save_hashes`/`_section_hash`, `_DELTA_HASH_FILE` (~60 lines)
+- `msam/server.py`: `POST /v1/context` endpoint + `ContextRequest` model (~50 lines)
+- One line each in: CLI dispatch, help text, test_server's `/v1/context` test
+- `[context]` section from `msam.example.toml`
+- Headline "99.3% startup savings" claims from `README.md`, `BENCHMARKS.md`, `CONTROL-FLOW.md`
+
+Leave `msam/subatom.py` alone — subatom extraction is a general-purpose utility even if startup is no longer the primary caller. Leave `msam/api.py`'s Grafana filters referencing `caller=session_startup` — harmless, purely a no-op metrics filter.
+
+Total: ~450 LOC deleted, zero refactoring.
+
+#### Why
+
+Two reasons, independent of Hindsight:
+
+1. **The default startup queries don't match real deployments.** When this was exercised against muninn's 1,242-active-atom corpus (2026-04-19), the canonical queries — `"agent identity core traits personality"` / `"user preferences relationship current situation"` / `"what happened today recent activity"` / `"emotional state mood current feeling"` — returned mediocre matches (similarity 0.30–0.52) that were not identity, not partner info, not emotional state, and not the most salient recent activity. They were whatever atoms happened to contain those words. The feature depends on a corpus style (atoms *about* the agent and its partner) that MSAM's actual users don't produce.
+
+2. **Muninn's architecture doesn't need it.** Jason's stated position: agent state is in context immediately at session start. Startup context was designed as a replacement for the "cold-read SOUL.md + USER.md + MEMORY.md" pattern. If that pattern isn't being used, the feature has no consumer.
+
+Beyond the specific case: `remember.py` is 2,212 lines and growing. The startup-context block is ~20% of the file. Every commit that touches adjacent commands has to reason around it. Zero runtime cost when nobody calls it — but non-zero mental cost for anyone editing `remember.py`.
+
+#### Why this belongs in the Hindsight document
+
+Hindsight's recall layer does *not* have a "startup context" concept at all. Retrieval is on-demand, per-query. The hierarchy (Mental Models → Observations → Raw Facts — see P1) is exposed through ordinary recall, not through a special cold-start path. If P1 lands, the agent gets the same "give me the distilled beliefs first" behavior on every retrieval — startup context becomes strictly redundant.
+
+So: P6 is the cleanup that *follows* P1 naturally. Raw facts → observations works regardless of whether the call is labeled "session start."
+
+#### Acceptance criteria
+
+- Single focused commit (or two: one for delta encoding, one for the rest) with docs updated in the same commit
+- `pytest msam/tests/` still passes (only one test touches `/v1/context` — delete it)
+- `msam help` output no longer lists `context`
+- `README.md` benchmark table either removes the startup-compression row or replaces it with something factual about query-time output volume
+- No dangling imports, no broken Grafana dashboards (check `api.py` metric query filters still resolve)
+
+#### Risks
+
+- **Narrative cost.** The "Shannon-compressed startup" is the README's most distinctive claim. Removing it means repositioning MSAM away from "99.3% token savings" as the headline. The underlying architectural advantages (multi-stream, ACT-R scoring, forgetting, world model) don't change — but the pitch does.
+- **External API contract.** Any deployment that calls `POST /v1/context` breaks with a 404. Safe to delete in a project that's not versioning its REST surface; otherwise note in release notes.
+- **Undo if we're wrong.** Single commit, single revert. Low blast radius.
+
+#### Do this *when*?
+
+After the LongMemEval baseline lands and before P1 work starts. Reason: the removal touches `remember.py` which is where CLI wiring for future P4 trend commands will go — clean slate first.
+
+---
+
 ## 4. Ideas from Hindsight that we should *not* copy
 
 ### Personality parameters (skepticism, literalism, empathy)
@@ -302,11 +357,12 @@ Hindsight reranks fused results with a cross-encoder (a small transformer that s
 Order chosen to maximize information gain per unit of work:
 
 1. **Establish the baseline first** (in progress at the time of writing — see `msam/benchmarks/longmemeval/`). No proposal is worth implementing without a measurable starting point.
-2. **P2 (RRF).** Smallest diff, cleanly A/B-able. Tells us if our current weighted-sum fusion is actually holding us back.
-3. **P3 (four-pathway split).** RRF is only meaningful if pathways are independent. Do these together.
-4. **P1 (observations tier).** Where the biggest expected win lives. Build on a benchmark that already moves.
-5. **P4 (trend-as-filter).** Small icing on P1. Only interesting if P1 shows a lift.
-6. **P5 (wrapper).** Production-value work, do it when the architecture pieces are stable.
+2. **P6 (remove startup context + delta encoding).** Clean slate. 2 hours, one commit, makes everything downstream easier to reason about. Do right after baseline, before P1.
+3. **P2 (RRF).** Smallest diff, cleanly A/B-able. Tells us if our current weighted-sum fusion is actually holding us back.
+4. **P3 (four-pathway split).** RRF is only meaningful if pathways are independent. Do these together.
+5. **P1 (observations tier).** Where the biggest expected win lives. Build on a benchmark that already moves. Also subsumes the retrieval behavior that startup context was trying to emulate.
+6. **P4 (trend-as-filter).** Small icing on P1. Only interesting if P1 shows a lift.
+7. **P5 (wrapper).** Production-value work, do it when the architecture pieces are stable.
 
 Each step gets its own benchmark run. The goal is a dose-response curve, not a big-bang reveal.
 
