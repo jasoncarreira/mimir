@@ -225,8 +225,8 @@ def store_atom(
     metadata: dict = None,
     embedding: list[float] = None,
     agent_id: str = "default",
-) -> str:
-    """Store a new atom. Returns atom ID, or None if budget exhausted."""
+) -> str | tuple[None, str]:
+    """Store a new atom. Returns atom ID, or (None, reason) if failed."""
     if not content or not content.strip():
         return None
     content = content.strip()
@@ -243,7 +243,7 @@ def store_atom(
             f"store_atom REFUSED: token budget at {budget_pct:.1f}% (>{_refuse_pct}%). "
             f"Run decay cycle to free space."
         )
-        return None
+        return (None, f"token budget exhausted ({int(budget_pct)}% of {_token_budget} tokens)")
     if budget_pct > _compact_pct:
         # Auto-compact: downgrade profile to lightweight regardless of input
         import logging
@@ -294,7 +294,7 @@ def store_atom(
     if cursor.rowcount == 0:
         # Duplicate content_hash in active/fading state -- dedup triggered
         conn.close()
-        return None
+        return (None, "duplicate content")
 
     # Populate atom_topics junction table
     if topics:
