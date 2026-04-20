@@ -209,15 +209,37 @@ async def api_store(req: StoreRequest):
         profile = req.profile or classify_profile(req.content)
         annotations = smart_annotate(req.content, use_llm=req.use_llm_annotate)
 
-        atom_id = store_atom(
+        result = store_atom(
             content=req.content, stream=stream, profile=profile,
             **annotations, source_type=req.source_type, metadata=req.metadata,
         )
 
+        # Handle both old return format (str) and new format (tuple)
+        if isinstance(result, tuple):
+            atom_id, reason = result
+        else:
+            atom_id = result
+            reason = "duplicate content" if result is None else None
+
         if atom_id is None:
-            return {"stored": False, "atom_id": None, "stream": stream,
-                    "profile": profile, "annotations": annotations,
-                    "triples_extracted": 0, "reason": "duplicate content"}
+            response = {"stored": False, "atom_id": None, "stream": stream,
+                       "profile": profile, "annotations": annotations,
+                       "triples_extracted": 0, "reason": reason}
+
+            # Add helpful recovery suggestions for budget exhaustion
+            if reason and "budget exhausted" in reason:
+                from .core import get_stats
+                stats = get_stats()
+                response["error_details"] = {
+                    "current_tokens": stats.get("est_active_tokens", 0),
+                    "suggestions": [
+                        "POST /v1/decay - Run decay cycle to retire old memories",
+                        "POST /v1/forget - Identify and remove unused memories",
+                        "POST /v1/consolidate - Merge similar memories",
+                        "Increase token_budget_ceiling in msam.toml config"
+                    ]
+                }
+            return response
 
         triples_extracted = 0
         if stream == "semantic":
@@ -306,6 +328,14 @@ async def api_query(req: QueryRequest):
                     topics = json.loads(topics)
                 except (json.JSONDecodeError, TypeError):
                     topics = []
+
+            # Parse metadata if it's a JSON string
+            metadata = a.get("metadata", {})
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
             output_atoms.append({
                 "id": a["id"], "content": a["content"],
                 "stream": a.get("stream", "semantic"),
@@ -313,6 +343,8 @@ async def api_query(req: QueryRequest):
                 "score": round(a.get("_combined_score", a.get("_activation", 0)), 3),
                 "confidence_tier": a.get("_confidence_tier", "unknown"),
                 "topics": topics,
+                "metadata": metadata,
+                "source_type": a.get("source_type", "unknown"),
             })
 
         total_tokens = sum(len(a["content"]) // 4 for a in output_atoms)
@@ -396,6 +428,24 @@ async def api_feedback(req: FeedbackRequest):
         from .core import mark_contributions
         return mark_contributions(req.atom_ids, req.response_text)
     return await asyncio.to_thread(_feedback)
+
+
+# ─── POST /v1/outcome ─────────────────────────────────────────────────────────
+
+class OutcomeRequest(BaseModel):
+    atom_ids: list[str]
+    feedback: str  # "positive", "negative", "neutral", or "silence"
+    query: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+@app.post("/v1/outcome", dependencies=[Depends(verify_api_key)])
+async def api_outcome(req: OutcomeRequest):
+    """Record explicit feedback (upvote/downvote) on retrieved atoms."""
+    def _outcome():
+        from .core import record_outcome
+        return record_outcome(req.atom_ids, req.feedback, req.session_id, req.query)
+    return await asyncio.to_thread(_outcome)
 
 
 # ─── POST /v1/decay ───────────────────────────────────────────────────────────
