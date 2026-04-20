@@ -7,17 +7,15 @@ Usage:
     msam query "What does the user like?"
     msam query "server config" --mode companion
     msam store "User mentioned they prefer sushi over pizza"
-    msam context   # Get session startup context (replaces file loads)
     msam snapshot  # Log system metrics
-    
-    All commands accept --caller <name> (heartbeat|session_startup|conversation|pulse|cron|unknown)
+
+    All commands accept --caller <name> (heartbeat|conversation|pulse|cron|unknown)
 """
 
 import sys
 import os
 import json
 import time
-import hashlib
 from pathlib import Path
 
 
@@ -37,66 +35,6 @@ from .triples import (
     init_triples_schema,
 )
 from .session_dedup import get_served_ids, record_served, clear_session
-
-
-# ─── Shannon compression codebook for recurring entities ─────────────────────
-_CODEBOOK = {
-    'Agent': 'A',
-    'User': 'U',
-    'MSAM': 'M',
-    # Add your entity codebook entries here
-    
-    
-}
-_CODEBOOK_REVERSE = {v: k for k, v in _CODEBOOK.items()}
-
-
-def _shannon_floor_tokens(text: str) -> int:
-    """Compute Shannon entropy floor in tokens for given text."""
-    import math, collections
-    if not text.strip():
-        return 0
-    chars = text.lower()
-    freq = collections.Counter(chars)
-    total = len(chars)
-    entropy = -sum((c / total) * math.log2(c / total) for c in freq.values())
-    min_bits = entropy * total
-    return int(min_bits / 8 / 4)  # bits -> bytes -> tokens
-
-
-def _compress(text: str) -> str:
-    """Apply codebook compression to text."""
-    for full, short in _CODEBOOK.items():
-        text = text.replace(full, short)
-    return text
-
-
-def _decompress(text: str) -> str:
-    """Reverse codebook compression."""
-    for short, full in _CODEBOOK_REVERSE.items():
-        text = text.replace(short, full)
-    return text
-
-
-# ─── Delta encoding: track section hashes between startups ───────────────────
-from .config import get_data_dir as _get_data_dir
-_DELTA_HASH_FILE = _get_data_dir() / "last_context_hash.json"
-
-
-def _load_hashes():
-    try:
-        return json.loads(_DELTA_HASH_FILE.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def _save_hashes(hashes):
-    _DELTA_HASH_FILE.write_text(json.dumps(hashes))
-
-
-def _section_hash(atoms):
-    content = "|".join(a.get("content", "") for a in atoms)
-    return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
 _last_snapshot_time = 0
@@ -249,9 +187,6 @@ def cmd_query(args):
         "latency_ms": round(latency_ms, 2),
     }
 
-    # Shannon efficiency calculated after compression (placeholder, updated below)
-    output["shannon"] = {}
-
     # Add advisory text for low/none confidence
     if confidence_tier == "none":
         output["confidence_advisory"] = "[NO_DATA] No reliable memory on this topic."
@@ -341,22 +276,10 @@ def cmd_query(args):
         topics = json.loads(r.get("topics", "[]")) if isinstance(r.get("topics"), str) else r.get("topics", [])
         all_topics.update(topics)
 
-    # Shannon metrics for query -- computed AFTER confidence gating
-    all_text = ' '.join(a['content'] for a in output['atoms'])
     actual_tokens = tokens_total + sum(
         len(f'{t["subject"]} {t["predicate"]} {t["object"]}') // 4 for t in output["triples"]
     )
-    raw_pre_gate = result["total_tokens"]  # what pipeline produced before gating
-    shannon_floor = _shannon_floor_tokens(all_text) if all_text.strip() else 0
     output["total_tokens"] = actual_tokens
-    output["shannon"] = {
-        "raw_tokens": actual_tokens,
-        "pre_gate_tokens": raw_pre_gate,
-        "compressed_tokens": actual_tokens,
-        "compression_pct": round((1 - actual_tokens / raw_pre_gate) * 100, 1) if raw_pre_gate > 0 else 0,
-        "shannon_floor_tokens": shannon_floor,
-        "shannon_efficiency_pct": round(shannon_floor / actual_tokens * 100, 1) if actual_tokens > 0 else 0,
-    }
 
     # Record served atom IDs and annotate output with dedup count
     returned_ids = [r["id"] for r in atom_results]
@@ -476,342 +399,6 @@ def cmd_store(args):
     }, indent=2))
 
 
-def cmd_context(args=None):
-    """
-    Generate session startup context from MSAM.
-    Replaces loading SOUL.md, USER.md, MEMORY.md, and context files.
-    Retrieves the most relevant atoms for a general session start.
-
-    Shannon-limit optimizations applied:
-      1. Triple-only format for identity/partner (compact S|predicate|object lines)
-      2. Codebook compression on all section content (entity shortening)
-      3. Delta encoding: identity/partner emit [no_change] if unchanged since last run
-      4. Tighter semantic dedup threshold (0.75) for startup context
-    """
-    if args is None:
-        args = []
-    caller, _ = _extract_caller(list(args))
-
-    t0 = time.time()
-
-    # Update system metrics
-    _snapshot_safe()
-
-    identity_query = _cfg('context', 'startup_identity_query', "agent identity core traits personality")
-    user_query = _cfg('context', 'startup_user_query', "user preferences relationship current situation")
-    recent_query = _cfg('context', 'startup_recent_query', "what happened today recent activity")
-    emotional_query = _cfg('context', 'startup_emotional_query', "emotional state mood current feeling")
-    probe_top_k = _cfg('context', 'probe_top_k', 5)
-
-    # Core identity atoms (used for delta hash and subatom fallback)
-    identity = hybrid_retrieve(identity_query, mode="task", top_k=probe_top_k)
-
-    # User context atoms
-    partner = hybrid_retrieve(user_query, mode="companion", top_k=probe_top_k)
-
-    # Recent activity
-    recent = hybrid_retrieve(recent_query, mode="task", top_k=probe_top_k)
-
-    # Emotional state
-    emotional = hybrid_retrieve(emotional_query, mode="companion", top_k=3)
-
-    latency_ms = (time.time() - t0) * 1000
-
-    total_tokens = 0
-    all_results = identity + partner + recent + emotional
-    all_topics = set()
-    seen_ids = set()
-    global_budget = _cfg('context', 'default_token_budget', 500)
-    enable_subatom = _cfg('compression', 'enable_subatom', False)
-    subatom_budget_per_section = _cfg('compression', 'subatom_section_budget', 30)
-
-    output = {"sections": {}, "total_tokens": 0}
-
-    # ── Load stored hashes for delta encoding ────────────────────────────────
-    stored_hashes = _load_hashes()
-    new_hashes = {}
-
-    # ── Opt 1 + 2 + 3: identity and partner via triples + codebook + delta ───
-    STABLE_SECTIONS = {
-        "identity": (identity, identity_query, "task"),
-        "partner": (partner, user_query, "companion"),
-    }
-
-    for section_name, (atoms, query, mode) in STABLE_SECTIONS.items():
-        section_atoms = []
-
-        # Opt 3: delta encoding — hash the raw atoms
-        section_h = _section_hash(atoms)
-        new_hashes[section_name] = section_h
-
-        if stored_hashes.get(section_name) == section_h and atoms:
-            # No change since last startup — emit marker (saves tokens)
-            output["sections"][section_name] = [{"content": "[no_change]", "delta": True}]
-            total_tokens += 1  # marker costs ~1 token
-            for a in atoms:
-                seen_ids.add(a.get("id", a.get("content_hash", "")))
-            continue
-
-        # Opt 1: try triple-only format first
-        try:
-            triple_result = hybrid_retrieve_with_triples(query, mode=mode, token_budget=60)
-            triples = triple_result.get("triples", [])
-            if len(triples) >= 2:
-                for t in triples:
-                    subj = t.get("subject", "")
-                    pred = t.get("predicate", "")
-                    obj = t.get("object", "")
-                    raw_line = f"{subj}|{pred}|{obj}"
-                    # Opt 2: codebook compress
-                    line = _compress(raw_line)
-                    tok = max(1, len(line) // 4)
-                    if total_tokens + tok > global_budget:
-                        break
-                    total_tokens += tok
-                    section_atoms.append({
-                        "content": line,
-                        "stream": "triple",
-                        "score": 1.0,
-                    })
-                for a in atoms:
-                    seen_ids.add(a.get("id", a.get("content_hash", "")))
-                    topics = json.loads(a.get("topics", "[]")) if isinstance(a.get("topics"), str) else a.get("topics", [])
-                    all_topics.update(topics)
-                output["sections"][section_name] = section_atoms
-                continue
-        except Exception:
-            pass  # fall through to subatom
-
-        # Fallback: subatom extraction (Opt 4: tighter dedup threshold)
-        if enable_subatom:
-            try:
-                from .subatom import extract_relevant_sentences, deduplicate_sentences
-                unseen = [a for a in atoms if a.get("id", a.get("content_hash", "")) not in seen_ids]
-                for a in unseen:
-                    seen_ids.add(a.get("id", a.get("content_hash", "")))
-                sentences = extract_relevant_sentences(query, unseen, token_budget=subatom_budget_per_section)
-                # Opt 4: tighter dedup (0.75 vs default 0.85)
-                sentences = deduplicate_sentences(sentences, similarity_threshold=0.75)
-                for s in sentences:
-                    raw_content = s['sentence']
-                    content = _compress(raw_content)  # Opt 2
-                    tok = s.get('tokens', max(1, len(content) // 4))
-                    if total_tokens + tok > global_budget:
-                        continue
-                    total_tokens += tok
-                    section_atoms.append({
-                        "content": content,
-                        "score": round(s.get('score', 0), 3),
-                        "stream": "subatom",
-                        "source_atom": s.get('atom_id', ''),
-                    })
-                    for a in unseen:
-                        if a.get("id") == s.get('atom_id'):
-                            topics = json.loads(a.get("topics", "[]")) if isinstance(a.get("topics"), str) else a.get("topics", [])
-                            all_topics.update(topics)
-                            break
-            except ImportError:
-                enable_subatom = False
-
-        if not enable_subatom or not section_atoms:
-            # Whole-atom fallback
-            for a in atoms:
-                atom_id = a.get("id", a.get("content_hash", ""))
-                if atom_id in seen_ids:
-                    continue
-                seen_ids.add(atom_id)
-                raw_content = a["content"]
-                content = _compress(raw_content)  # Opt 2
-                tok = max(1, len(content) // 4)
-                if total_tokens + tok > global_budget:
-                    continue
-                total_tokens += tok
-                section_atoms.append({
-                    "content": content,
-                    "score": round(a.get("_combined_score", 0), 3),
-                    "stream": a["stream"],
-                })
-                topics = json.loads(a.get("topics", "[]")) if isinstance(a.get("topics"), str) else a.get("topics", [])
-                all_topics.update(topics)
-
-        output["sections"][section_name] = section_atoms
-
-    # ── recent + emotional: always fresh (no delta, use subatom if enabled) ──
-    DYNAMIC_SECTIONS = {
-        "recent": (recent, recent_query),
-        "emotional": (emotional, emotional_query),
-    }
-
-    for section_name, (atoms, query) in DYNAMIC_SECTIONS.items():
-        section_atoms = []
-
-        if enable_subatom:
-            try:
-                from .subatom import extract_relevant_sentences, deduplicate_sentences
-                unseen = [a for a in atoms if a.get("id", a.get("content_hash", "")) not in seen_ids]
-                for a in unseen:
-                    seen_ids.add(a.get("id", a.get("content_hash", "")))
-                sentences = extract_relevant_sentences(query, unseen, token_budget=subatom_budget_per_section)
-                # Opt 4: tighter dedup threshold for startup
-                sentences = deduplicate_sentences(sentences, similarity_threshold=0.75)
-                for s in sentences:
-                    raw_content = s['sentence']
-                    content = _compress(raw_content)  # Opt 2
-                    tok = s.get('tokens', max(1, len(content) // 4))
-                    if total_tokens + tok > global_budget:
-                        continue
-                    total_tokens += tok
-                    section_atoms.append({
-                        "content": content,
-                        "score": round(s.get('score', 0), 3),
-                        "stream": "subatom",
-                        "source_atom": s.get('atom_id', ''),
-                    })
-                    for a in unseen:
-                        if a.get("id") == s.get('atom_id'):
-                            topics = json.loads(a.get("topics", "[]")) if isinstance(a.get("topics"), str) else a.get("topics", [])
-                            all_topics.update(topics)
-                            break
-            except ImportError:
-                enable_subatom = False
-
-        if not enable_subatom or not section_atoms:
-            for a in atoms:
-                atom_id = a.get("id", a.get("content_hash", ""))
-                if atom_id in seen_ids:
-                    continue
-                seen_ids.add(atom_id)
-                raw_content = a["content"]
-                content = _compress(raw_content)  # Opt 2
-                tok = max(1, len(content) // 4)
-                if total_tokens + tok > global_budget:
-                    continue
-                total_tokens += tok
-                section_atoms.append({
-                    "content": content,
-                    "score": round(a.get("_combined_score", 0), 3),
-                    "stream": a["stream"],
-                })
-                topics = json.loads(a.get("topics", "[]")) if isinstance(a.get("topics"), str) else a.get("topics", [])
-                all_topics.update(topics)
-
-        output["sections"][section_name] = section_atoms
-
-    # ── Predicted atoms (Predictive Context Assembly) ─────────────────────────
-    if _cfg('prediction', 'enabled', True):
-        try:
-            from .prediction import PredictiveEngine
-            engine = PredictiveEngine()
-            predicted = engine.predict_context(
-                top_k=_cfg('prediction', 'max_predicted_atoms', 8)
-            )
-            predicted_atoms = []
-            for p in predicted:
-                pid = p.get("id", "")
-                if pid in seen_ids:
-                    continue
-                seen_ids.add(pid)
-                content = _compress(p.get("content", ""))
-                tok = max(1, len(content) // 4)
-                if total_tokens + tok > global_budget:
-                    continue
-                total_tokens += tok
-                predicted_atoms.append({
-                    "content": content,
-                    "score": round(p.get("score", 0), 3),
-                    "stream": "predicted",
-                    "predicted_by": p.get("predicted_by", "unknown"),
-                })
-            if predicted_atoms:
-                output["sections"]["predicted"] = predicted_atoms
-        except Exception:
-            pass
-
-    # ── Persist updated hashes for next run (delta encoding state) ────────────
-    try:
-        # Merge: keep hashes for sections we didn't touch this run
-        merged_hashes = dict(stored_hashes)
-        merged_hashes.update(new_hashes)
-        _save_hashes(merged_hashes)
-    except Exception:
-        pass  # hash persistence should never break retrieval
-
-    output["total_tokens"] = total_tokens
-    output["atom_count"] = sum(len(v) for v in output["sections"].values())
-    output["method"] = "shannon_optimized"
-    output["codebook"] = _CODEBOOK  # Opt 2: consumer needs this to decompress
-
-    # Compare to current approach -- measure REAL markdown cost
-    md_tokens = _measure_markdown_startup_tokens()
-    savings_pct = round((1 - total_tokens / md_tokens) * 100, 1) if md_tokens > 0 else 0
-    # Shannon efficiency analysis
-    all_content = ' '.join(
-        a['content'] for s in output['sections'].values()
-        for a in s if a.get('content', '') != '[no_change]'
-    )
-    shannon_floor = _shannon_floor_tokens(all_content) if all_content.strip() else 0
-    shannon_eff = round(shannon_floor / total_tokens * 100, 1) if total_tokens > 0 else 0
-
-    output["comparison"] = {
-        "current_startup_tokens": md_tokens,
-        "msam_startup_tokens": total_tokens,
-        "savings_pct": savings_pct,
-        "raw_markdown_tokens": md_tokens,
-        "compressed_tokens": total_tokens,
-        "compression_pct": savings_pct,
-        "shannon_floor_tokens": shannon_floor,
-        "shannon_efficiency_pct": shannon_eff,
-    }
-
-    # Sycophancy warning check
-    if _cfg('sycophancy', 'tracking_enabled', True):
-        try:
-            from .metrics import get_agreement_rate
-            agreement = get_agreement_rate()
-            if agreement.get("warning"):
-                output["_sycophancy_warning"] = agreement.get("warning_message", "High agreement rate detected")
-        except Exception:
-            pass
-
-    # Compute activation stats across all atoms
-    act_min, act_max, act_p50, act_p90, sim_min, sim_max = _compute_activation_stats(all_results)
-
-    # Log access event
-    try:
-        log_access_event(
-            event_type="context",
-            caller=caller,
-            query="session_startup_context",
-            mode="task+companion",
-            atoms_accessed=output["atom_count"],
-            tokens_used=total_tokens,
-            latency_ms=latency_ms,
-            activation_min=act_min,
-            activation_max=act_max,
-            activation_p50=act_p50,
-            activation_p90=act_p90,
-            similarity_min=sim_min,
-            similarity_max=sim_max,
-            topics_hit=list(all_topics),
-        )
-    except Exception:
-        pass
-
-    # Log comparison to metrics DB for Grafana
-    try:
-        log_comparison(
-            query="session_startup_context",
-            msam_tokens=total_tokens,
-            msam_latency_ms=latency_ms,
-            msam_atoms=output["atom_count"],
-            md_tokens=md_tokens,
-            md_latency_ms=0,
-            md_results=0,
-        )
-    except Exception:
-        pass  # metrics logging should never break retrieval
-
-    print(json.dumps(output, indent=2))
 
 
 def cmd_snapshot(args=None):
@@ -1976,7 +1563,6 @@ Storage:
 
 Retrieval:
   query <query>                Confidence-gated retrieval
-  context                      Session startup context (Shannon-compressed)
   hybrid <query>               Hybrid retrieve (atoms + triples)
   diverse <query>              MMR diverse retrieval
   dry <query>                  Dry-run retrieve (no side effects)
@@ -2139,7 +1725,6 @@ def main():
         "stats": cmd_stats,
         "query": cmd_query,
         "store": cmd_store,
-        "context": cmd_context,
         "snapshot": cmd_snapshot,
         "emotional": cmd_emotional,
         "hybrid": cmd_hybrid,
