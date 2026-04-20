@@ -39,7 +39,7 @@ class TestStoreAndRetrieve:
         from msam.core import store_atom
         store_atom("Duplicate content test")
         result = store_atom("Duplicate content test")
-        assert result is None
+        assert result == (None, "duplicate content")
 
     def test_retrieve_finds_stored(self):
         from msam.core import store_atom, retrieve

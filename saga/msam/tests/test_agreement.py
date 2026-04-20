@@ -86,6 +86,7 @@ class TestAgreementRateEmpty:
 
 class TestGrafanaEndpoint:
     def test_grafana_endpoint(self):
+        pytest.importorskip("flask", reason="flask not installed (grafana extra)")
         from msam.metrics import record_agreement
         # Record some signals first
         record_agreement("agree")
