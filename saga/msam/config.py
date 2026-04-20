@@ -389,6 +389,9 @@ def _load_config() -> dict:
     return _config
 
 
+_SENTINEL = object()
+
+
 def get_config():
     """Return the config accessor function.
 
@@ -399,13 +402,15 @@ def get_config():
 
     For nested sections (entity_resolution.aliases, etc.) use:
         aliases = cfg('entity_resolution', 'aliases', {})
-    """
-    config = _load_config()
 
-    _SENTINEL = object()
+    The accessor reads the current live config each call, so reload_config()
+    takes effect for every _cfg reference captured at import time.
+    """
+    _load_config()
 
     def accessor(section, key, default=_SENTINEL):
-        sec = config.get(section, {})
+        current = _config if _config is not None else _DEFAULTS
+        sec = current.get(section, {})
         if key in sec:
             return sec[key]
         if default is not _SENTINEL:
