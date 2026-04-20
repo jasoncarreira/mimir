@@ -108,6 +108,9 @@ class OpenAIProvider(EmbeddingProvider):
         self.api_key_env = _cfg('embedding', 'api_key_env', 'OPENAI_API_KEY')
 
     def embed(self, text: str, input_type: str = "passage") -> list[float]:
+        return self._call_api([text[:self.max_chars]])[0]
+
+    def _call_api(self, inputs: list[str]) -> list[list[float]]:
         import requests
         api_key = os.environ.get(self.api_key_env)
         if not api_key:
@@ -117,14 +120,23 @@ class OpenAIProvider(EmbeddingProvider):
             r = requests.post(
                 self.url,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"input": text[:self.max_chars], "model": self.model},
+                json={"input": inputs, "model": self.model},
                 timeout=self.timeout,
             )
             r.raise_for_status()
             return r
 
         r = _retry_with_backoff(_do_request)
-        return r.json()["data"][0]["embedding"]
+        data = r.json()["data"]
+        return [d["embedding"] for d in sorted(data, key=lambda x: x["index"])]
+
+    def batch_embed(self, texts: list[str], input_type: str = "passage") -> list[list[float]]:
+        results: list[list[float]] = []
+        batch_size = _cfg('embedding', 'batch_size', 256)
+        for i in range(0, len(texts), batch_size):
+            chunk = [t[:self.max_chars] for t in texts[i:i + batch_size]]
+            results.extend(self._call_api(chunk))
+        return results
 
 
 class LocalProvider(EmbeddingProvider):
