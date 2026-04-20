@@ -141,14 +141,17 @@ class TestTimeBuckets:
 
 class TestTemporalPatterns:
     def test_returns_candidates_for_known_bucket(self):
+        from datetime import datetime, timedelta
         from msam.prediction import PredictiveEngine
         conn = _make_in_memory_db()
-        # Insert an atom and access log entries during morning hours
+        # Insert an atom and access log entries during morning hours,
+        # dated within the default lookback window.
         conn.execute("INSERT INTO atoms (id, content, state) VALUES ('t1', 'morning thought', 'active')")
+        today = datetime.now() - timedelta(days=1)
         for hour in [7, 8, 9, 10]:
             conn.execute(
                 "INSERT INTO access_log (atom_id, accessed_at) VALUES (?, ?)",
-                ("t1", f"2026-02-20 {hour:02d}:00:00"),
+                ("t1", today.strftime(f"%Y-%m-%d {hour:02d}:00:00")),
             )
         conn.commit()
 
