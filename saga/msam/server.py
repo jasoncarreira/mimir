@@ -22,7 +22,6 @@ Endpoints:
     GET  /v1/health              Health check
     POST /v1/store               Store a memory atom
     POST /v1/query               Query memories (confidence-gated)
-    POST /v1/context             Session startup context (parallel)
     POST /v1/feedback            Mark atom contributions
     POST /v1/decay               Run decay cycle
     GET  /v1/stats               Database statistics
@@ -105,10 +104,6 @@ class QueryRequest(BaseModel):
     mode: str = "task"
     top_k: int = 12
     token_budget: int = 500
-
-
-class ContextRequest(BaseModel):
-    top_k: int = 5
 
 
 class FeedbackRequest(BaseModel):
@@ -376,50 +371,6 @@ async def api_query(req: QueryRequest):
     return await asyncio.to_thread(_query)
 
 
-# ─── POST /v1/context ─────────────────────────────────────────────────────────
-
-@app.post("/v1/context", dependencies=[Depends(verify_api_key)])
-async def api_context(req: ContextRequest = ContextRequest()):
-    """Parallel context retrieval using asyncio.gather()."""
-    from .core import dry_retrieve
-
-    identity_q = _cfg('context', 'startup_identity_query', 'agent identity')
-    user_q = _cfg('context', 'startup_user_query', 'user preferences')
-    recent_q = _cfg('context', 'startup_recent_query', 'recent activity')
-    emotional_q = _cfg('context', 'startup_emotional_query', 'emotional state')
-
-    async def _retrieve_section(name, query):
-        atoms = await asyncio.to_thread(dry_retrieve, query, "task", req.top_k)
-        section_atoms = []
-        for a in atoms:
-            section_atoms.append({
-                "id": a["id"], "content": a["content"],
-                "stream": a.get("stream", "semantic"),
-                "score": round(a.get("_activation", 0), 3),
-            })
-        return name, section_atoms
-
-    # Run all 4 context queries in parallel
-    results = await asyncio.gather(
-        _retrieve_section("identity", identity_q),
-        _retrieve_section("user", user_q),
-        _retrieve_section("recent", recent_q),
-        _retrieve_section("emotional", emotional_q),
-    )
-
-    sections = {name: atoms for name, atoms in results}
-    total_tokens = sum(
-        max(1, len(a["content"]) // 4)
-        for section in sections.values() for a in section
-    )
-
-    return {
-        "sections": sections,
-        "total_tokens": total_tokens,
-        "atom_count": sum(len(v) for v in sections.values()),
-    }
-
-
 # ─── POST /v1/feedback ────────────────────────────────────────────────────────
 
 @app.post("/v1/feedback", dependencies=[Depends(verify_api_key)])
@@ -659,7 +610,6 @@ def run_server(host=None, port=None):
     print(f"  GET  /v1/health              Health check")
     print(f"  POST /v1/store               Store a memory atom")
     print(f"  POST /v1/query               Query memories")
-    print(f"  POST /v1/context             Session startup context (parallel)")
     print(f"  POST /v1/feedback            Mark atom contributions")
     print(f"  POST /v1/decay               Run decay cycle")
     print(f"  GET  /v1/stats               Database statistics")

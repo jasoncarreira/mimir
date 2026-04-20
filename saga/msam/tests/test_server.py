@@ -159,24 +159,6 @@ class TestStats:
 # ─── Context ────────────────────────────────────────────────────────────────
 
 
-class TestContext:
-    def test_context_endpoint(self, client, monkeypatch):
-        """Test context endpoint with mocked dry_retrieve."""
-        import msam.core
-        monkeypatch.setattr(msam.core, "dry_retrieve", lambda q, mode="task", top_k=5: [
-            {"id": "ctx1", "content": "I am an AI agent", "stream": "semantic", "_activation": 0.9},
-        ])
-
-        rv = client.post("/v1/context", json={})
-        assert rv.status_code == 200
-        data = rv.json()
-        assert "sections" in data
-        assert "identity" in data["sections"]
-        assert "user" in data["sections"]
-        assert "recent" in data["sections"]
-        assert "emotional" in data["sections"]
-
-
 # ─── Feedback ────────────────────────────────────────────────────────────────
 
 

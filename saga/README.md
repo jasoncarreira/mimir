@@ -6,28 +6,17 @@ MSAM gives agents persistent, structured memory that self-regulates what it stor
 
 When MSAM knows something, it delivers. When it doesn't, it says so. Output volume is proportional to confidence -- not padded with noise.
 
-Built for production. Running in production. 675+ atoms, 1,500+ triples, 99.3% startup compression, 89% session savings vs. flat files. 24 modules, 56 CLI commands, 20 API endpoints, 437 tests.
+Built for production. Running in production. 24 modules, 56 CLI commands, 19 API endpoints, 437 tests.
 
 ## Benchmark Highlights
 
-Measured on production hardware (Hetzner CAX11, 2 vCPU ARM64, 4GB RAM).
+Measured on production hardware (Hetzner CAX11, 2 vCPU ARM64, 4GB RAM). Per-query output tracks how much context MSAM delivers relative to loading a flat markdown baseline at query time.
 
-| Scenario | MD Baseline | Output | vs MD | Shannon Eff | Tier | Latency |
-|---|---|---|---|---|---|---|
-| Startup (delta) | 7,327t | 51t | **99.3%** | 51.0% | -- | 2,477ms |
-| Known query | 7,327t | 91t | **98.8%** | 14.3% | medium | 1,082ms |
-| Unknown query | 7,327t | 33t | **99.5%** | 57.6% | low | 1,082ms |
-| No data | 7,327t | 0t | **100%** | -- | none | 1,064ms |
-
-### Session Economics (startup + 10 queries)
-
-| Metric | Flat Files (selective) | MSAM | Savings |
-|---|---|---|---|
-| Tokens per session | ~12,000t | ~1,351t | **89%** |
-| Cost (Opus @ $15/MTok) | ~$0.18 | $0.02 | **$0.16** |
-| Context window usage | ~30% of 40K | 0.3% of 40K | ~30% freed |
-
-Note: file baseline assumes selective loading (only relevant files per query). Naive full-reload systems see 98%+ savings.
+| Scenario | MD Baseline | Output | vs MD | Tier | Latency |
+|---|---|---|---|---|---|
+| Known query | 7,327t | 91t | **98.8%** | medium | 1,082ms |
+| Unknown query | 7,327t | 33t | **99.5%** | low | 1,082ms |
+| No data | 7,327t | 0t | **100%** | none | 1,064ms |
 
 Full benchmark data: [BENCHMARKS.md](BENCHMARKS.md)
 
@@ -38,8 +27,6 @@ Most agent memory systems are vector stores with a retrieval wrapper. MSAM is di
 - **Adaptive output.** Confidence-gated retrieval: high confidence returns full results, low returns minimal context, none returns nothing. The system doesn't hallucinate -- it admits gaps.
 
 - **Multi-stream architecture.** Semantic (facts), episodic (events), procedural (how-to), and working (session-scoped) streams. Each has different retrieval behavior, decay characteristics, and promotion rules.
-
-- **Shannon-compressed startup.** Session context uses subatom extraction, codebook compression, delta encoding, and semantic deduplication to reach 51 tokens from a 7,327-token markdown baseline. 51% of Shannon's theoretical minimum.
 
 - **Cognitive scoring.** ACT-R activation model: base-level activation (frequency + recency) x sigmoid similarity x annotation bonuses x stability. Not just "closest vector."
 
@@ -133,11 +120,7 @@ msam store "The user prefers dark mode and concise responses"
 
 # Retrieve (confidence-gated output)
 msam query "What are the user's preferences?"
-# Returns: atoms, triples, confidence_tier, shannon metrics
-
-# Session startup context (compressed)
-msam context
-# Returns: 51-90 tokens vs thousands from flat files
+# Returns: atoms, triples, confidence_tier
 
 # See all commands
 msam help
@@ -215,12 +198,6 @@ Confidence gating:
   |
   v
 Output (91-176t high, 0-33t low, 0t none)
-
-
-Context startup:
-  4 queries (identity/partner/recent/emotional)
-  -> subatom extraction -> codebook -> delta encoding -> dedup
-  -> 51 tokens (99.3% compression)
 ```
 
 ### Confidence Tier System
@@ -303,9 +280,6 @@ msam hybrid "search query"         # atoms + triples
 msam explain "query"               # detailed scoring breakdown
 msam diverse "query"               # diversity-optimized retrieval
 
-# Session startup
-msam context                       # compressed startup context
-
 # Feedback and contribution tracking
 msam feedback-mark <atom_ids> <response_text>
 msam contribute <atom_id>          # mark atom as contributed
@@ -379,8 +353,8 @@ msam/
   remember.py        # CLI integration (56 commands, confidence gating)
   triples.py         # Knowledge graph, triple extraction, hybrid retrieval
   retrieval_v2.py    # v2 pipeline: beam search, entity roles, quality filter
-  subatom.py         # Shannon compression: sentence extraction, dedup
-  server.py          # REST API server (FastAPI, 20 endpoints)
+  subatom.py         # Sentence extraction and dedup utilities
+  server.py          # REST API server (FastAPI, 19 endpoints)
   embeddings.py      # Pluggable providers: NIM, OpenAI, ONNX, local
   decay.py           # Lifecycle management, state transitions, forgetting
   metrics.py         # Time-series metrics for Grafana
@@ -416,7 +390,6 @@ CONTROL-FLOW.md      # Architecture and flow reference
 
 - **ACT-R** (Anderson, 1993) -- activation-based memory retrieval
 - **Ebbinghaus forgetting curve** (1885) -- exponential decay of retrievability
-- **Shannon entropy** (1948) -- theoretical compression floor for startup context
 - **Maximal Marginal Relevance** (Carbonell & Goldstein, 1998) -- diversity in retrieval
 - **Dual-process theory** -- semantic vs. episodic stream separation
 - **Metamemory** (Nelson & Narens, 1990) -- monitoring and control of memory
@@ -432,14 +405,13 @@ CONTROL-FLOW.md      # Architecture and flow reference
 - **437-test suite** across 25 test files covering all modules and CLI commands
 
 ### Previous (2026.02.23)
-- **REST API server** -- language-agnostic HTTP interface (`msam serve`), 20 endpoints covering store/query/context/feedback/decay/stats/triples/contradictions/predict/consolidate/replay/forget/calibrate/re-embed/agents
+- **REST API server** -- language-agnostic HTTP interface (`msam serve`), 19 endpoints covering store/query/feedback/decay/stats/triples/contradictions/predict/consolidate/replay/forget/calibrate/re-embed/agents
 - **Multi-agent memory protocol** -- agent isolation via `agent_id` column, atom sharing between agents, per-agent statistics
 - **Semantic contradiction detection** -- embedding-based detection with negation, temporal supersession, value conflict, and antonym analysis
 - **LLM-powered annotation** -- optional slow-path emotion annotation via NVIDIA NIM, graceful fallback to heuristic
 - **Predictive prefetch engine** -- 3-strategy prediction (temporal patterns, co-retrieval, topic momentum) replacing the stub implementation
 - **Reproducible benchmark suite** -- 100 synthetic atoms, 25 ground truth queries, one-command runner (`python msam/benchmarks/run.py`)
 - Confidence-gated retrieval (honest unknown pattern)
-- Shannon-compressed context startup (99.3% reduction)
 - Adaptive beam search (scales with data, sleeps when small)
 - Vectorized batch cosine similarity (~3.7x on ARM64 matmul)
 - ONNX Runtime local embeddings (zero API dependency)

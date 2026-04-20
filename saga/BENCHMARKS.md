@@ -13,34 +13,24 @@ This report measures MSAM against the alternative it replaces: loading flat mark
 
 ## Token Efficiency
 
-| Scenario | MD Baseline | Pre-Gate | Output | vs MD | Shannon Floor | Shannon Eff | Tier | Gated | Latency |
-|---|---|---|---|---|---|---|---|---|---|
-| **Startup (first-run)** | 7,327t | -- | 90t | **98.8%** | 48t | 53.3% | -- | | 4,557ms |
-| **Startup (delta)** | 7,327t | -- | 51t | **99.3%** | 26t | 51.0% | -- | | 2,477ms |
-| Known: user profession | 7,327t | 201t | 91t | **98.8%** | 13t | 14.3% | medium | Y | 1,082ms |
-| Known: user birthday | 7,327t | 158t | 176t | **97.6%** | 49t | 27.8% | high | Y | 1,090ms |
-| Known: MSAM architecture | 7,327t | 232t | 140t | **98.1%** | 26t | 18.6% | high | Y | 1,111ms |
-| Partial: known topic | 7,327t | 162t | 131t | **98.2%** | 39t | 29.8% | medium | Y | 1,062ms |
-| Temporal: mood right now | 7,327t | 177t | 33t | **99.5%** | 18t | 54.5% | low | Y | 1,092ms |
-| Temporal: today's activity | 7,327t | 120t | 0t | **100%** | 0t | -- | low | Y | 1,064ms |
-| Unknown: xyzzy foobar | 7,327t | 247t | 33t | **99.5%** | 19t | 57.6% | low | Y | 1,082ms |
+| Scenario | MD Baseline | Pre-Gate | Output | vs MD | Tier | Gated | Latency |
+|---|---|---|---|---|---|---|---|
+| Known: user profession | 7,327t | 201t | 91t | **98.8%** | medium | Y | 1,082ms |
+| Known: user birthday | 7,327t | 158t | 176t | **97.6%** | high | Y | 1,090ms |
+| Known: MSAM architecture | 7,327t | 232t | 140t | **98.1%** | high | Y | 1,111ms |
+| Partial: known topic | 7,327t | 162t | 131t | **98.2%** | medium | Y | 1,062ms |
+| Temporal: mood right now | 7,327t | 177t | 33t | **99.5%** | low | Y | 1,092ms |
+| Temporal: today's activity | 7,327t | 120t | 0t | **100%** | low | Y | 1,064ms |
+| Unknown: xyzzy foobar | 7,327t | 247t | 33t | **99.5%** | low | Y | 1,082ms |
 
 ### Key Metrics
-- **Compression range**: 96.5% -- 100% vs markdown baseline
-- **Shannon efficiency**: 51% on startup -- the output carries roughly twice the theoretical minimum of information-bearing tokens. The remaining 49% is structural overhead (section markers, formatting). This is near the practical floor for human-readable output.
+- **Compression range**: 96.5% -- 100% vs markdown baseline at query time
 - **Confidence gating**: output volume scales proportionally to knowledge confidence. High-confidence queries return full results; unknown queries return nothing and an advisory. The system never pads output to look complete.
-- **Latency**: ~870ms per query, ~2,477ms startup (delta)
+- **Latency**: ~870ms per query
 
 ---
 
 ## Session Economics
-
-### Startup (cold start -- loading identity, user, recent, emotional context)
-
-| Metric | Flat Files | MSAM | Savings |
-|---|---|---|---|
-| Tokens per startup | 7,327t (all context files) | 51t (delta) / 90t (first-run) | 98.8-99.3% |
-| Context window usage | 18.3% of 40K | 0.1-0.2% of 40K | 18% freed |
 
 ### Per-Query (targeted retrieval vs selective file reads)
 
@@ -49,15 +39,7 @@ This report measures MSAM against the alternative it replaces: loading flat mark
 | Tokens per query | ~500-2,000t (load relevant file) | 91-176t (confidence-gated) | 64-91% |
 | Token scaling | Linear with file count | Constant (top-k gated) | Bounded |
 
-### Session Total (startup + 10 queries)
-
-| Metric | Flat Files | MSAM | Savings |
-|---|---|---|---|
-| Tokens (optimistic file caching) | ~12,327t | ~1,351t | 89% |
-| Tokens (naive full reload) | ~80,000t+ | ~1,351t | 98% |
-| Cost (Claude Opus @ $15/MTok) | $0.18-$1.20 | $0.02 | $0.16-$1.18 saved |
-
-Note: flat file baselines depend on implementation. "Selective file load" assumes a system that loads only relevant files per query. Many agent frameworks reload full context per turn, which is closer to the naive baseline.
+Note: flat file baselines depend on implementation. "Selective file load" assumes a system that loads only relevant files per query. Many agent frameworks reload full context per turn, which compounds the savings.
 
 ---
 
@@ -73,8 +55,6 @@ Note: flat file baselines depend on implementation. "Selective file load" assume
 | Triple retrieval + scoring | 200ms | 18% |
 | Pipeline overhead | 422ms | 49% |
 | **Total query** | **~870ms** | |
-| **Total startup (delta)** | **2,477ms** | |
-| **Total startup (first-run)** | **4,557ms** | |
 
 ### With Vectorized Cosine (NumPy matmul)
 
@@ -109,28 +89,6 @@ MSAM classifies retrieval confidence to prevent hallucination from weak data.
 
 ### Temporal Query Demotion
 Queries containing temporal markers ("right now", "today", "currently") require atoms from the last 24 hours with similarity ≥ 0.30. Stale atoms are demoted to `low` regardless of similarity score.
-
----
-
-## Compression Pipeline
-
-MSAM applies compression selectively. Startup context (which loads identity, user knowledge, recent events, and emotional state) benefits enormously from compression because the same information is loaded every session. Per-query output is already compact enough that compression adds overhead without meaningful savings.
-
-### Context Startup (7,327t → 51t)
-
-Applied to session startup context only, where compression earns its compute:
-
-1. **Subatom extraction**: Sentence-level extraction from atoms (full atoms → relevant sentences)
-2. **Codebook compression**: Recurring entities shortened (Agent→A, User→U, MSAM→M)
-3. **Delta encoding**: Unchanged sections emit `[no_change]` marker (identity/partner stable across sessions)
-4. **Semantic dedup**: 0.75 similarity threshold catches overlapping sentences from different atoms
-
-### Query Output (no compression)
-
-Atoms are already compact (median 103 chars). Benchmarking proved compression adds noise at this scale:
-- Subatom extraction: 0% gain at every threshold tested (0-300+ chars)
-- Codebook-only: 3.3% savings, not worth compute overhead
-- Output passes through clean; gating handles volume control
 
 ---
 
@@ -222,7 +180,7 @@ Note: Cognitive accuracy is bounded by embedding quality. With n-gram hashes, me
 | Stream classification | 8/8 | Semantic, episodic, procedural correct |
 | Multi-turn dedup | 2/2 | Previously served atoms flagged |
 | Data correctness (fact verification) | 3/3 | Birthday, profession, designation verified |
-| Token efficiency > 80% | PASS | 99.3% (startup delta) |
+| Token efficiency > 80% | PASS | 97.6–100% vs markdown baseline |
 | Query latency < 5,000ms | PASS | ~870ms average |
 
 ---
@@ -241,11 +199,6 @@ Output → confidence gating:
   medium: top 3 atoms (sim > 0.15), ≤8 triples  
   low:    1 atom, no triples, advisory
   none:   empty, advisory only
-
-Context startup → Shannon compression:
-  4 queries (identity/partner/recent/emotional)
-  → subatom extraction → codebook → delta encoding → dedup
-  → 51 tokens (99.3% compression)
 ```
 
 ---
@@ -256,8 +209,6 @@ All measurements are from a production system under real operating conditions, n
 
 - All benchmarks run on production hardware (Hetzner CAX11, ARM64)
 - Latency measured end-to-end including CLI overhead
-- Shannon floor computed via character-level entropy analysis
 - Token counts use chars//4 approximation (standard for English text)
 - Session dedup cleared between benchmark queries for isolation
-- Delta hash cleared for first-run vs delta comparison
 - Synthetic benchmarks use deterministic n-gram hash embeddings for reproducibility across machines

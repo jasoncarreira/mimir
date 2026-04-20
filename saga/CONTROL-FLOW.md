@@ -6,7 +6,7 @@ This document maps every path through the MSAM system: how atoms are stored, how
 
 ## System Overview
 
-Three entry points drive the system: scheduled heartbeats (cron-based decay, snapshots, canary checks), session events (startup context, session boundaries), and direct user or CLI commands (store, query, admin). All paths converge on the same atom store, metrics infrastructure, and feedback loop.
+Three entry points drive the system: scheduled heartbeats (cron-based decay, snapshots, canary checks), session events (session boundaries), and direct user or CLI commands (store, query, admin). All paths converge on the same atom store, metrics infrastructure, and feedback loop.
 
 ```
                         EXTERNAL TRIGGERS
@@ -23,8 +23,8 @@ Three entry points drive the system: scheduled heartbeats (cron-based decay, sna
     | store_atom|     | retrieve_v2   |      | decay_cycle|
     | dedup     |     | confidence    |      | transitions|
     | budget    |     | gating        |      | compaction |
-    | embed     |     | shannon       |      | confidence |
-    | annotate  |     | metrics       |      | feedback   |
+    | embed     |     | metrics       |      | confidence |
+    | annotate  |     |               |      | feedback   |
     | metrics   |     |               |      | metrics    |
     +-----------+     +-------+-------+      +-----+-----+
                               |                    |
@@ -92,41 +92,10 @@ remember.cmd_query
     -> flag previously_served atoms
     -> record served IDs for next query
 
-  -> SHANNON METRICS:
-    -> compute post-gate token count
-    -> compute Shannon entropy floor
-    -> output: raw_tokens, compressed_tokens, shannon_floor, efficiency %
-
   -> metrics.log_access_event
 ```
 
-### 3. CONTEXT STARTUP (Shannon-Compressed)
-
-```
-remember.cmd_context
-  -> 4 retrieval queries:
-    -> identity:  "agent identity core traits personality"
-    -> partner:   "user preferences relationship current situation"
-    -> recent:    "what happened today recent activity"
-    -> emotional: "emotional state mood current feeling"
-
-  -> COMPRESSION PIPELINE (per section):
-    -> subatom extraction (sentence-level, not full atoms)
-    -> codebook compression (Agent->A, User->U, MSAM->M, etc.)
-    -> semantic dedup (0.75 similarity threshold)
-
-  -> DELTA ENCODING (identity + partner only):
-    -> hash section content
-    -> compare to stored hash from last startup
-    -> if unchanged: emit "[no_change]" marker (~1 token)
-    -> if changed: emit full content, update stored hash
-
-  -> output: 51 tokens (delta) / 90 tokens (first-run)
-  -> comparison: 7,327 tokens markdown baseline
-  -> savings: 99.3%
-```
-
-### 4. DECAY CYCLE
+### 3. DECAY CYCLE
 
 ```
 decay.run_decay_cycle (heartbeat, hourly)
@@ -150,7 +119,7 @@ decay.run_decay_cycle (heartbeat, hourly)
   -> metrics.log_decay
 ```
 
-### 5. FEEDBACK LOOP
+### 4. FEEDBACK LOOP
 
 ```
 retrieve -> atoms surfaced with scores
@@ -170,7 +139,7 @@ retrieve -> adjusted scores from stability changes
   (cycle repeats)
 ```
 
-### 6. SESSION BOUNDARY CAPTURE
+### 5. SESSION BOUNDARY CAPTURE
 
 ```
 heartbeat -> scripts/session-capture.sh
@@ -182,7 +151,7 @@ heartbeat -> scripts/session-capture.sh
   -> msam snapshot (metrics to Grafana)
 ```
 
-### 7. STREAM CLASSIFICATION
+### 6. STREAM CLASSIFICATION
 
 ```
 annotate.classify_stream(content)
@@ -193,7 +162,7 @@ annotate.classify_stream(content)
   -> DEFAULT: semantic (facts, knowledge, descriptions)
 ```
 
-### 8. OUTCOME FEEDBACK (Felt Consequence)
+### 7. OUTCOME FEEDBACK (Felt Consequence)
 
 ```
 Agent responds to user
@@ -212,7 +181,7 @@ retrieve -> activation scoring:
   -> low/negative outcome_score = dampened retrieval
 ```
 
-### 9. WORLD MODEL (Temporal Knowledge)
+### 8. WORLD MODEL (Temporal Knowledge)
 
 ```
 triples.update_world(subject, predicate, object, valid_from, valid_until)
@@ -236,7 +205,7 @@ triples.world_history(entity)
   -> returns full temporal chain (past + current)
 ```
 
-### 10. PREDICTIVE CONTEXT ASSEMBLY
+### 9. PREDICTIVE CONTEXT ASSEMBLY
 
 ```
 prediction.PredictiveEngine.predict_context(hour, day_of_week)
@@ -262,7 +231,7 @@ prediction.PredictiveEngine.predict_context(hour, day_of_week)
     -> return predicted atom set for context injection
 ```
 
-### 11. AGREEMENT TRACKING (Sycophancy Detection)
+### 10. AGREEMENT TRACKING (Sycophancy Detection)
 
 ```
 Agent responds to user
@@ -367,7 +336,7 @@ remember.py (CLI + gating layer)
   +-- retrieval_v2.py (v2 pipeline, beam search, entity roles)
   |     +-- entity_roles.py (entity-aware scoring)
   +-- triples.py (knowledge graph, hybrid retrieval)
-  +-- subatom.py (Shannon compression, sentence extraction)
+  +-- subatom.py (sentence extraction, dedup)
   +-- session_dedup.py (multi-turn dedup)
   +-- annotate.py (stream classification, topic extraction)
   +-- prediction.py (predictive prefetch, 3 strategies)
@@ -411,15 +380,13 @@ calibration.py (cross-provider identity)
 |--------|-------|
 | Modules | 24 |
 | CLI commands | 56 |
-| REST API endpoints | 20 |
+| REST API endpoints | 19 |
 | Tests | 437 across 25 test files |
 | Atoms | 675+ |
 | Triples | 1,500+ |
 | DB size | ~26MB |
-| Startup tokens | 51 (delta) / 90 (first-run) |
-| Markdown baseline | 7,327 tokens |
-| Compression | 99.3% |
+| Markdown baseline (per query) | 7,327 tokens |
+| Compression vs markdown (per query) | 96.5–100% |
 | Query latency | ~870ms |
-| Shannon efficiency | 51% of theoretical minimum |
 | Embedding providers | 4 (NVIDIA NIM, OpenAI, ONNX Runtime, sentence-transformers) |
 | Config sections | 27 (160+ parameters) |

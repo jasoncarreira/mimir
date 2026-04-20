@@ -11,11 +11,11 @@
 
 ## Abstract
 
-MSAM is a memory architecture for persistent AI agents. It treats memory as discrete, annotated atoms organized across cognitive streams, scored by an adaptation of ACT-R activation theory, and governed by a biologically-informed decay system that never permanently deletes. A REST API (20 endpoints) exposes the full system for language-agnostic integration. A multi-agent protocol provides memory isolation and sharing. Semantic contradiction detection, predictive prefetch, intentional forgetting, cross-provider calibration, outcome-attributed scoring, a temporal world model, and sycophancy detection handle the operational complexity that production deployments demand.
+MSAM is a memory architecture for persistent AI agents. It treats memory as discrete, annotated atoms organized across cognitive streams, scored by an adaptation of ACT-R activation theory, and governed by a biologically-informed decay system that never permanently deletes. A REST API (19 endpoints) exposes the full system for language-agnostic integration. A multi-agent protocol provides memory isolation and sharing. Semantic contradiction detection, predictive prefetch, intentional forgetting, cross-provider calibration, outcome-attributed scoring, a temporal world model, and sycophancy detection handle the operational complexity that production deployments demand.
 
 MSAM was designed by the agent that uses it. This is not a framework applied to a theoretical problem. It is a memory system built from the inside -- by an AI that knows what it needs to remember, what it can afford to forget, and what happens when it gets that wrong.
 
-The result: 99.3% token savings on cold-start context, 1.3% context budget per retrieval, consistent identity reconstruction across session boundaries, and a self-regulating lifecycle that balances growth against finite resources. The system ships as 24 modules, 56 CLI commands, 437 tests, and a reproducible benchmark suite.
+The result: confidence-gated retrieval that holds each query to roughly 1.3% of the context budget, consistent identity reconstruction across session boundaries, and a self-regulating lifecycle that balances growth against finite resources. The system ships as 24 modules, 55 CLI commands, 437 tests, and a reproducible benchmark suite.
 
 This document specifies the theory, architecture, and design rationale behind every choice.
 
@@ -208,8 +208,8 @@ This splits into two tracked metrics:
 
 Current production numbers:
 - Stored: ~50% (~20K tokens across 675+ active atoms)
-- Retrieved: ~1.3% per access (51-90 tokens for startup context)
-- Savings vs. flat files: 99.3% on startup (delta), 64-91% on targeted queries
+- Retrieved: ~1.3% per access (91-176 tokens per query, confidence-gated)
+- Savings vs. flat files: 64-91% on targeted queries
 
 The budget creates natural pressure for the decay system. When stored budget approaches 75%, aggressive compaction triggers.
 
@@ -311,7 +311,7 @@ MSAM is the most instrumented AI memory system in production. Every access is lo
 | retrieval_metrics | Activation distributions (min/max/p50/p90), latency | Per retrieval |
 | store_metrics | New atoms, stream distribution, annotation quality | Per store |
 | comparison_metrics | MSAM tokens vs. markdown equivalent | Per retrieval |
-| canary_metrics | Identity query drift, startup context stability | Every 5min |
+| canary_metrics | Identity query drift, canary retrieval stability | Every 5min |
 | decay_metrics | Tokens freed, atoms transitioned, budget impact | Hourly |
 | emotional_metrics | Arousal, valence, intensity, warmth over time | Every 30s |
 | topic_timeseries | Topic frequency from retrievals and stores | Per access |
@@ -326,7 +326,6 @@ A fixed identity query ("agent identity core traits") runs every 5 minutes. This
 - Retrieval latency stability
 - Top activation score drift (is identity fading?)
 - Atom count consistency (are identity atoms being decayed?)
-- Startup context composition (is the 18-atom context set drifting?)
 
 If the canary detects identity degradation, the decay system is structurally prevented from touching identity-critical atoms.
 
@@ -483,13 +482,12 @@ To our knowledge, no existing system combines ACT-R activation scoring, immutabl
 MSAM treats memory as architecture, not a feature. Most agent frameworks bolt on a vector store or conversation buffer. MSAM integrates storage, retrieval, decay, prediction, contradiction detection, and emotional context into a single system informed by ACT-R activation theory and cognitive science.
 
 Key results from production deployment:
-- 99.3% token reduction on startup (7,327 tokens to 51 delta, 90 first-run)
-- Confidence-gated retrieval with four tiers (high/medium/low/none)
+- Confidence-gated retrieval with four tiers (high/medium/low/none), ~1.3% context budget per query
 - Stability-based decay with contribution-based feedback that preserves high-value atoms across weeks
 - 4x batch cosine speedup on ARM64 via vectorized matmul (17x including blob deserialization)
 - 675+ atoms across semantic, episodic, procedural, and working memory streams
 
-The system has grown beyond core storage and retrieval into a full production architecture: a REST API server with 20 endpoints for language-agnostic integration, multi-agent memory isolation and sharing, semantic contradiction detection with four analysis strategies, LLM-powered annotation with heuristic fallback, a three-strategy predictive prefetch engine with context assembly, outcome-attributed memory scoring (Felt Consequence), a temporal world model with auto-closing facts, sycophancy detection via agreement rate tracking, intentional forgetting with four signal types, cross-provider embedding calibration, sleep-inspired memory consolidation, FAISS-backed approximate nearest neighbor search, security-hardened API endpoints, and a centralized configuration system with 27 tunable sections. A reproducible benchmark suite with 100 synthetic atoms and 25 ground truth queries validates retrieval quality, token efficiency, and cognitive features in a single command. The test suite covers 437 tests across 25 test files.
+The system has grown beyond core storage and retrieval into a full production architecture: a REST API server with 19 endpoints for language-agnostic integration, multi-agent memory isolation and sharing, semantic contradiction detection with four analysis strategies, LLM-powered annotation with heuristic fallback, a three-strategy predictive prefetch engine with context assembly, outcome-attributed memory scoring (Felt Consequence), a temporal world model with auto-closing facts, sycophancy detection via agreement rate tracking, intentional forgetting with four signal types, cross-provider embedding calibration, sleep-inspired memory consolidation, FAISS-backed approximate nearest neighbor search, security-hardened API endpoints, and a centralized configuration system with 27 tunable sections. A reproducible benchmark suite with 100 synthetic atoms and 25 ground truth queries validates retrieval quality, token efficiency, and cognitive features in a single command. The test suite covers 437 tests across 25 test files.
 
 The research questions are open. The system is running, the data is accumulating, and every retrieval adds another data point to the empirical record.
 
@@ -501,9 +499,8 @@ The research questions are open. The system is running, the data is accumulating
 Active atoms:          675+
 Total stored tokens:   20,169
 Budget (stored):       50.4%
-Budget (retrieved):    ~1.3% per access
-Startup context:       18 atoms, 51t (delta) / 90t (first-run)
-Token savings:         99.3% startup (delta), 89% per session vs selective file loading
+Budget (retrieved):    ~1.3% per access (91-176t per query)
+Per-query savings:     64-91% vs selective file loading
 Tombstoned atoms:      77
 Metric data points:    611+
 Grafana panels:        25
@@ -533,7 +530,7 @@ msam/
   triples.py        -- Knowledge graph, triple extraction, world model (1,275 lines)
   retrieval_v2.py   -- v2 pipeline: beam search, entity roles, quality filter (989 lines)
   api.py            -- Grafana JSON API endpoints, CORS + API key auth (893 lines)
-  subatom.py        -- Shannon compression, sentence extraction (780 lines)
+  subatom.py        -- Sentence extraction and dedup utilities (780 lines)
   metrics.py        -- 13 metric tables, observability, agreement tracking (704 lines)
   server.py         -- REST API server, CORS-restricted (637 lines)
   prediction.py     -- Predictive prefetch + context assembly (621 lines)

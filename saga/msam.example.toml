@@ -192,12 +192,7 @@ user_active = false                         # whether primary user is present
 default_token_budget = 500                  # token budget for query/hybrid commands
 default_top_k = 10                          # default atoms for query command
 probe_token_budget = 200                    # token budget for snapshot probe queries
-probe_top_k = 5                             # atoms for startup context and probe queries
-# Startup context queries (customize for your agent's identity)
-startup_identity_query = "agent identity core traits personality"
-startup_user_query = "user preferences relationship current situation"
-startup_recent_query = "what happened today recent activity"
-startup_emotional_query = "emotional state mood current feeling"
+probe_top_k = 5                             # atoms for snapshot probe queries
 # Snapshot probe queries (keep metrics fresh between sessions)
 probe_queries = ["current situation schedule", "identity personality traits"]
 probe_atom_queries = ["What is the user's profession?", "Who is the agent?"]
