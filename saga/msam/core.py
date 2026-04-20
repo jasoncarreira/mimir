@@ -942,29 +942,49 @@ def hybrid_retrieve(
     _sem_weight = _cfg('retrieval', 'semantic_weight', 0.7)
     _kw_weight = 1.0 - _sem_weight
     _quality_threshold = _cfg('retrieval', 'quality_threshold', 2.0)
+    _fusion = _cfg('retrieval', 'fusion', 'weighted_sum')
     semantic_results = retrieve(query, mode=mode, top_k=top_k * 2, stream=stream, topic_filter=topic_filter, agent_id=agent_id)
     kw_results = keyword_search(query, top_k=top_k)
-    
-    combined = {}
-    
-    # Score semantic results at full activation (not downweighted)
+
+    combined: dict = {}
     for atom in semantic_results:
-        aid = atom["id"]
-        combined[aid] = atom
-        combined[aid]["_combined_score"] = atom.get("_activation", 0)
-    
-    # Keyword results get a bonus on top if they overlap, or standalone score if not
+        combined[atom["id"]] = atom
     for atom in kw_results:
-        aid = atom["id"]
-        kw_bonus = atom.get("_keyword_score", 0) * _kw_weight
-        if aid in combined:
-            # Multi-signal bonus: found by both semantic AND keyword
-            combined[aid]["_combined_score"] += kw_bonus
-        else:
-            combined[aid] = atom
-            combined[aid]["_combined_score"] = kw_bonus
-    
-    results = sorted(combined.values(), key=lambda x: x["_combined_score"], reverse=True)
+        combined.setdefault(atom["id"], atom)
+
+    if _fusion == 'rrf':
+        from .retrieval_fusion import reciprocal_rank_fusion
+        _k = _cfg('retrieval', 'rrf_k', 60)
+        weights = {
+            'semantic': _cfg('retrieval', 'rrf_semantic_weight', 1.0),
+            'keyword': _cfg('retrieval', 'rrf_keyword_weight', 1.0),
+        }
+        ranked = reciprocal_rank_fusion(
+            {
+                'semantic': [a["id"] for a in semantic_results],
+                'keyword': [a["id"] for a in kw_results],
+            },
+            k=_k,
+            weights=weights,
+        )
+        for aid, score in ranked:
+            if aid in combined:
+                combined[aid]["_combined_score"] = score
+        results = [combined[aid] for aid, _ in ranked if aid in combined]
+    else:
+        # weighted_sum: semantic activation at full weight; keyword adds a
+        # bonus when it corroborates or stands alone.
+        for atom in semantic_results:
+            combined[atom["id"]]["_combined_score"] = atom.get("_activation", 0)
+        for atom in kw_results:
+            aid = atom["id"]
+            kw_bonus = atom.get("_keyword_score", 0) * _kw_weight
+            if "_combined_score" in combined[aid]:
+                combined[aid]["_combined_score"] += kw_bonus
+            else:
+                combined[aid]["_combined_score"] = kw_bonus
+        results = sorted(combined.values(), key=lambda x: x["_combined_score"], reverse=True)
+
     results = results[:top_k]
 
     # Confidence tier classification
