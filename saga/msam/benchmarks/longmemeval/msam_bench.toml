@@ -1,0 +1,82 @@
+# MSAM config used during LongMemEval runs.
+# Loaded via MSAM_CONFIG env var before msam imports resolve.
+# Keeps the prod ~/.msam/msam.toml untouched.
+
+[embedding]
+provider = "openai"
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dimensions = 1536
+max_input_chars = 8000
+timeout_seconds = 30
+batch_size = 256
+api_key_env = "OPENAI_API_KEY"
+
+[storage]
+db_path = "msam.db"
+metrics_db_path = "msam_metrics.db"
+# Disable the storage backpressure: per-question haystacks can push thousands
+# of atoms; MSAM's production budget (40k tokens) would auto-compact/refuse.
+token_budget_ceiling = 100000000
+auto_compact_threshold_pct = 99
+refuse_threshold_pct = 100
+db_busy_timeout_ms = 5000
+
+[retrieval]
+default_top_k = 20
+semantic_weight = 0.7
+fusion = "rrf"
+rrf_k = 60
+rrf_semantic_weight = 1.0
+rrf_keyword_weight = 1.0
+similarity_threshold = 0.15
+sigmoid_midpoint = 0.35
+sigmoid_steepness = 15.0
+base_activation_cap = 3.0
+quality_threshold = 0.0
+confidence_sim_high = 0.45
+confidence_sim_medium = 0.30
+confidence_sim_low = 0.10
+confidence_score_high = 40.0
+confidence_score_medium = 10.0
+context_quality_floor = 0.0
+mmr_lambda = 0.7
+keyword_top_k = 20
+spreading_activation_enabled = false
+temporal_recency_hours = 24
+outcome_weight = 0.0
+outcome_decay = 1.0
+
+[retrieval_v2]
+enabled = false
+
+[compression]
+enable_subatom = false
+enable_fact_dedup = false
+enable_synthesis = false
+
+[triples]
+# Skip LLM-based triple extraction for baseline runs.
+enable_extraction = false
+
+[annotation]
+# Use heuristic-only annotation (fast, deterministic, free).
+use_llm = false
+
+[prediction]
+enabled = false
+
+[world_model]
+enabled = false
+
+[sycophancy]
+enabled = false
+
+[decay]
+enabled = false
+
+[consolidation]
+enabled = false
+
+[agents]
+default_agent_id = "longmemeval"
