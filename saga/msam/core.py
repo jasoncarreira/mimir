@@ -942,7 +942,7 @@ def hybrid_retrieve(
     _sem_weight = _cfg('retrieval', 'semantic_weight', 0.7)
     _kw_weight = 1.0 - _sem_weight
     _quality_threshold = _cfg('retrieval', 'quality_threshold', 2.0)
-    _fusion = _cfg('retrieval', 'fusion', 'weighted_sum')
+    _fusion = _cfg('retrieval', 'fusion', 'rrf')
     semantic_results = retrieve(query, mode=mode, top_k=top_k * 2, stream=stream, topic_filter=topic_filter, agent_id=agent_id)
     kw_results = keyword_search(query, top_k=top_k)
 
