@@ -102,3 +102,67 @@ class TestHybridRetrieveFusionConfig:
         assert isinstance(results, list)
         for r in results:
             assert "_combined_score" in r
+
+
+class TestTemporalPathway:
+    def test_no_temporal_scope_returns_empty(self, fake_embeddings):
+        import msam.core
+        msam.core.get_db().close()
+        msam.core.run_migrations()
+        msam.core.store_atom("unrelated content")
+        assert msam.core.temporal_retrieve("no time expression here") == []
+
+    def test_returns_atoms_in_window(self, fake_embeddings):
+        import msam.core
+        from datetime import datetime, timezone
+        msam.core.get_db().close()
+        msam.core.run_migrations()
+        # Store one atom, then backdate it so it sits inside "yesterday"
+        # relative to a known reference date.
+        atom_id = msam.core.store_atom("user went for a run")
+        ref = datetime(2026, 4, 20, 12, 0, 0, tzinfo=timezone.utc)
+        backdated = datetime(2026, 4, 19, 9, 0, 0, tzinfo=timezone.utc).isoformat()
+        conn = msam.core.get_db()
+        conn.execute(
+            "UPDATE atoms SET created_at = ? WHERE id = ?",
+            (backdated, atom_id),
+        )
+        conn.commit()
+        conn.close()
+        results = msam.core.temporal_retrieve(
+            "what did I do yesterday?", top_k=5, reference_date=ref
+        )
+        assert len(results) == 1
+        assert results[0]["id"] == atom_id
+        assert results[0]["_temporal_score"] == 1.0
+
+    def test_atoms_outside_window_excluded(self, fake_embeddings):
+        import msam.core
+        from datetime import datetime, timezone
+        msam.core.get_db().close()
+        msam.core.run_migrations()
+        atom_id = msam.core.store_atom("old content")
+        ref = datetime(2026, 4, 20, 12, 0, 0, tzinfo=timezone.utc)
+        # Backdate to 10 days ago — outside the "yesterday" window.
+        backdated = datetime(2026, 4, 10, 9, 0, 0, tzinfo=timezone.utc).isoformat()
+        conn = msam.core.get_db()
+        conn.execute(
+            "UPDATE atoms SET created_at = ? WHERE id = ?",
+            (backdated, atom_id),
+        )
+        conn.commit()
+        conn.close()
+        results = msam.core.temporal_retrieve(
+            "what did I do yesterday?", top_k=5, reference_date=ref
+        )
+        assert results == []
+
+
+class TestGraphPathway:
+    def test_empty_triple_store_returns_empty(self, fake_embeddings):
+        import msam.core
+        msam.core.get_db().close()
+        msam.core.run_migrations()
+        msam.core.store_atom("some content")
+        # No triples have been extracted — pathway must degrade gracefully.
+        assert msam.core.graph_retrieve("anything", top_k=5) == []

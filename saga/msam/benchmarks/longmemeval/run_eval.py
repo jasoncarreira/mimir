@@ -131,7 +131,14 @@ def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
             t_ingest = time.time() - t0
 
             t0 = time.time()
-            atoms = hybrid_retrieve(q["question"], mode="task", top_k=RETRIEVAL_TOP_K)
+            from datetime import datetime, timezone
+            try:
+                ref_date = datetime.strptime(q["question_date"], "%Y/%m/%d (%a) %H:%M").replace(tzinfo=timezone.utc)
+            except (ValueError, KeyError):
+                ref_date = None
+            atoms = hybrid_retrieve(
+                q["question"], mode="task", top_k=RETRIEVAL_TOP_K, reference_date=ref_date,
+            )
             t_retrieve = time.time() - t0
 
             t0 = time.time()
