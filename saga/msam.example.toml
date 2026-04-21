@@ -28,7 +28,7 @@ db_busy_timeout_ms = 5000                    # SQLite busy timeout in millisecon
 [retrieval]
 default_top_k = 12                          # atoms returned per query
 semantic_weight = 0.7                       # vs keyword (0.3); applies when fusion = "weighted_sum"
-fusion = "weighted_sum"                     # how hybrid_retrieve merges pathways: "weighted_sum" | "rrf"
+fusion = "rrf"                              # how hybrid_retrieve merges pathways: "rrf" | "weighted_sum"
 rrf_k = 60                                  # RRF damping constant (Cormack default)
 rrf_semantic_weight = 1.0                   # RRF weight for semantic pathway
 rrf_keyword_weight = 1.0                    # RRF weight for keyword pathway

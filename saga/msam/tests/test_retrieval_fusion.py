@@ -63,8 +63,27 @@ class TestRRF:
 class TestHybridRetrieveFusionConfig:
     """Integration smoke: hybrid_retrieve respects the fusion config flag."""
 
-    def test_weighted_sum_default_runs(self, fake_embeddings):
+    def _force_fusion(self, monkeypatch, mode):
         import msam.core
+        real_cfg = msam.core._cfg
+        def fake_cfg(section, key, default=None):
+            if section == "retrieval" and key == "fusion":
+                return mode
+            return real_cfg(section, key, default)
+        monkeypatch.setattr(msam.core, "_cfg", fake_cfg)
+
+    def test_default_runs(self, fake_embeddings):
+        import msam.core
+        msam.core.get_db().close()
+        msam.core.run_migrations()
+        msam.core.store_atom("The user prefers Sony cameras over Canon")
+        msam.core.store_atom("User's favorite hobby is landscape photography")
+        results = msam.core.hybrid_retrieve("camera preferences", top_k=5)
+        assert isinstance(results, list)
+
+    def test_weighted_sum_runs(self, fake_embeddings, monkeypatch):
+        import msam.core
+        self._force_fusion(monkeypatch, "weighted_sum")
         msam.core.get_db().close()
         msam.core.run_migrations()
         msam.core.store_atom("The user prefers Sony cameras over Canon")
@@ -74,16 +93,11 @@ class TestHybridRetrieveFusionConfig:
 
     def test_rrf_fusion_runs(self, fake_embeddings, monkeypatch):
         import msam.core
+        self._force_fusion(monkeypatch, "rrf")
         msam.core.get_db().close()
         msam.core.run_migrations()
         msam.core.store_atom("The user prefers Sony cameras over Canon")
         msam.core.store_atom("User's favorite hobby is landscape photography")
-        real_cfg = msam.core._cfg
-        def fake_cfg(section, key, default=None):
-            if section == "retrieval" and key == "fusion":
-                return "rrf"
-            return real_cfg(section, key, default)
-        monkeypatch.setattr(msam.core, "_cfg", fake_cfg)
         results = msam.core.hybrid_retrieve("camera preferences", top_k=5)
         assert isinstance(results, list)
         for r in results:
