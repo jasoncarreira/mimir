@@ -919,6 +919,85 @@ def keyword_search(query: str, top_k: int = None) -> list[dict]:
     return scored[:top_k]
 
 
+# ─── Graph & Temporal Retrieval Pathways ─────────────────────────
+
+def graph_retrieve(query: str, top_k: int = 20) -> list[dict]:
+    """
+    Triple-graph pathway: surface atoms whose extracted SPO triples match
+    the query, ranked by triple similarity score. Returns an empty list
+    when the triple store is empty or the triples module is unavailable.
+
+    Atoms are deduped by id; an atom's rank is the best triple it backs.
+    """
+    try:
+        from .triples import retrieve_triples
+    except Exception:
+        return []
+    triples = retrieve_triples(query, top_k=top_k * 2)
+    if not triples:
+        return []
+    seen: dict[str, float] = {}
+    for t in triples:
+        aid = t.get("atom_id")
+        if not aid or aid in seen:
+            continue
+        seen[aid] = t.get("_triple_score", t.get("_similarity", 0.0))
+        if len(seen) >= top_k:
+            break
+    if not seen:
+        return []
+    conn = get_db()
+    placeholders = ",".join(["?"] * len(seen))
+    rows = conn.execute(
+        f"SELECT * FROM atoms WHERE id IN ({placeholders}) "
+        f"AND state IN ('active', 'fading')",
+        tuple(seen.keys()),
+    ).fetchall()
+    atoms_by_id = {row["id"]: dict(row) for row in rows}
+    conn.close()
+    ordered = []
+    for aid, score in seen.items():
+        atom = atoms_by_id.get(aid)
+        if atom is None:
+            continue
+        atom.pop("embedding", None)
+        atom["_graph_score"] = score
+        ordered.append(atom)
+    return ordered
+
+
+def temporal_retrieve(
+    query: str, top_k: int = 20, reference_date=None
+) -> list[dict]:
+    """
+    Temporal pathway: atoms whose ``created_at`` falls inside the time
+    window inferred from the query. Returns an empty list when no
+    temporal expression is detected, so callers can safely skip fusion
+    weighting in the common case.
+    """
+    from .temporal import parse_temporal_scope
+
+    scope = parse_temporal_scope(query, reference_date=reference_date)
+    if scope is None:
+        return []
+    start, end = scope
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM atoms WHERE state IN ('active', 'fading') "
+        "AND created_at >= ? AND created_at <= ? "
+        "ORDER BY created_at DESC LIMIT ?",
+        (start.isoformat(), end.isoformat(), top_k),
+    ).fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        atom = dict(row)
+        atom.pop("embedding", None)
+        atom["_temporal_score"] = 1.0  # presence in window is the signal
+        results.append(atom)
+    return results
+
+
 # ─── Hybrid Retrieval ────────────────────────────────────────────
 
 def hybrid_retrieve(
@@ -928,11 +1007,18 @@ def hybrid_retrieve(
     stream: str = None,
     topic_filter: list[str] = None,
     agent_id: str = None,
+    reference_date=None,
 ) -> list[dict]:
     """
-    Combine semantic retrieval + keyword search.
-    Semantic results weighted 0.7, keyword results weighted 0.3.
-    Deduplicate by atom ID, take highest combined score.
+    Combine semantic + keyword + (optional) graph + temporal pathways.
+
+    Under ``fusion = "rrf"`` all four pathways contribute ranked lists and
+    are fused with Reciprocal Rank Fusion. Graph and temporal pathways
+    return empty lists when they don't apply (no triples / no time
+    expression), so they cost near-zero on queries that don't need them.
+
+    Under ``fusion = "weighted_sum"`` only the original semantic + keyword
+    pathways run (back-compat path).
     """
     start_time = time.time()
 
@@ -946,10 +1032,32 @@ def hybrid_retrieve(
     semantic_results = retrieve(query, mode=mode, top_k=top_k * 2, stream=stream, topic_filter=topic_filter, agent_id=agent_id)
     kw_results = keyword_search(query, top_k=top_k)
 
+    graph_results: list[dict] = []
+    temporal_results: list[dict] = []
+    if _fusion == 'rrf':
+        if _cfg('retrieval', 'enable_graph_pathway', True):
+            try:
+                graph_results = graph_retrieve(query, top_k=_cfg('retrieval', 'graph_pathway_top_k', top_k))
+            except Exception:
+                graph_results = []
+        if _cfg('retrieval', 'enable_temporal_pathway', True):
+            try:
+                temporal_results = temporal_retrieve(
+                    query,
+                    top_k=_cfg('retrieval', 'temporal_pathway_top_k', top_k),
+                    reference_date=reference_date,
+                )
+            except Exception:
+                temporal_results = []
+
     combined: dict = {}
     for atom in semantic_results:
         combined[atom["id"]] = atom
     for atom in kw_results:
+        combined.setdefault(atom["id"], atom)
+    for atom in graph_results:
+        combined.setdefault(atom["id"], atom)
+    for atom in temporal_results:
         combined.setdefault(atom["id"], atom)
 
     if _fusion == 'rrf':
@@ -958,15 +1066,18 @@ def hybrid_retrieve(
         weights = {
             'semantic': _cfg('retrieval', 'rrf_semantic_weight', 1.0),
             'keyword': _cfg('retrieval', 'rrf_keyword_weight', 1.0),
+            'graph': _cfg('retrieval', 'rrf_graph_weight', 0.7),
+            'temporal': _cfg('retrieval', 'rrf_temporal_weight', 1.0),
         }
-        ranked = reciprocal_rank_fusion(
-            {
-                'semantic': [a["id"] for a in semantic_results],
-                'keyword': [a["id"] for a in kw_results],
-            },
-            k=_k,
-            weights=weights,
-        )
+        ranked_lists = {
+            'semantic': [a["id"] for a in semantic_results],
+            'keyword': [a["id"] for a in kw_results],
+        }
+        if graph_results:
+            ranked_lists['graph'] = [a["id"] for a in graph_results]
+        if temporal_results:
+            ranked_lists['temporal'] = [a["id"] for a in temporal_results]
+        ranked = reciprocal_rank_fusion(ranked_lists, k=_k, weights=weights)
         for aid, score in ranked:
             if aid in combined:
                 combined[aid]["_combined_score"] = score
