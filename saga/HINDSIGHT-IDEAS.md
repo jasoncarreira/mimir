@@ -283,6 +283,37 @@ Memory systems that require explicit store calls have adoption friction. The wra
 
 ---
 
+### P7 — Batch the triple extraction LLM call
+
+**Value: enables graph-pathway benchmarking. Effort: ~1 day. Reversible: yes.**
+
+#### What
+
+`msam/triples.py::extract_triples_llm` currently makes one LLM call per atom. MSAM's bench ingest is a serial `for turn in turns: store_atom(...)` loop, so with extraction enabled you eat one network round-trip per atom.
+
+On LongMemEval that's 500 questions × ~500 atoms × ~1.5s = ~100 hours of ingest. Way too slow to actually benchmark the graph pathway's contribution. Hindsight avoids this by batching 5–10 items per retain-extract call (visible as `sub-batch N/M` in their logs).
+
+Add a `extract_and_store_batch(atoms: list[dict]) -> list[int]` that packs multiple atom contents into one extraction prompt and parses the response back per atom. Use it from `ingest.py`'s main loop.
+
+#### Why this matters *now*
+
+P3 lands a graph pathway that returns `[]` whenever the triple store is empty. Without P7, we can't measure the graph pathway's real contribution — we'd be picking between "turn extraction on and wait 100h" or "leave it off and measure nothing." P7 unblocks the measurement.
+
+It's also the right shape for the P5 wrapper later (the wrapper extracts on the assistant-turn boundary, which is naturally batchable across the turn's content chunks).
+
+#### Acceptance criteria
+
+- Ingest throughput with extraction enabled: ≥ 5× current per-atom pace. Concretely: LongMemEval 500-question run with `[triples] enable_extraction = true` completes in ≤ 6h (matches or beats Hindsight's wall clock).
+- Per-atom triple yield doesn't drop vs. the single-shot version (prompt format has to be robust under batching).
+- Existing `extract_and_store(atom_id, content)` remains as a thin wrapper over the batched version for the non-bench call sites.
+
+#### Risks
+
+- Prompt parsing fragility — batching increases the odds the model emits a stray extra triple or drops one. Mitigate with a per-batch header + explicit `ATOM_N:` delimiters and a robust regex on the response.
+- Larger prompts hit context limits for pathological atoms (LongMemEval has some very long turns). Cap batch size by token budget, not item count.
+
+---
+
 ### P6 — Remove the startup context and delta encoding
 
 **Value: cleanup. Effort: ~2 hours. Reversible: yes (revert a commit).**
@@ -356,13 +387,14 @@ Hindsight reranks fused results with a cross-encoder (a small transformer that s
 
 Order chosen to maximize information gain per unit of work:
 
-1. **Establish the baseline first** (in progress at the time of writing — see `msam/benchmarks/longmemeval/`). No proposal is worth implementing without a measurable starting point.
-2. **P6 (remove startup context + delta encoding).** Clean slate. 2 hours, one commit, makes everything downstream easier to reason about. Do right after baseline, before P1.
-3. **P2 (RRF).** Smallest diff, cleanly A/B-able. Tells us if our current weighted-sum fusion is actually holding us back.
-4. **P3 (four-pathway split).** RRF is only meaningful if pathways are independent. Do these together.
-5. **P1 (observations tier).** Where the biggest expected win lives. Build on a benchmark that already moves. Also subsumes the retrieval behavior that startup context was trying to emulate.
-6. **P4 (trend-as-filter).** Small icing on P1. Only interesting if P1 shows a lift.
-7. **P5 (wrapper).** Production-value work, do it when the architecture pieces are stable.
+1. **Establish the baseline first** (done — see `msam/benchmarks/longmemeval/` and `BENCHMARK-RESULTS.md`). No proposal is worth implementing without a measurable starting point.
+2. **P6 (remove startup context + delta encoding).** Clean slate. 2 hours, one commit, makes everything downstream easier to reason about. Do right after baseline, before P1. ✅ landed (`39b633d`)
+3. **P2 (RRF).** Smallest diff, cleanly A/B-able. Tells us if our current weighted-sum fusion is actually holding us back. ✅ landed (`5f665d1`); default flipped to `rrf`.
+4. **P3 (four-pathway split).** RRF is only meaningful if pathways are independent. Do these together. ✅ landed (`d9d7602`); graph pathway returns `[]` until triples exist.
+5. **P7 (batch triple extraction).** Unblocks measurement of P3's graph pathway. Do before P1 if we want to know what the graph lever is actually worth.
+6. **P1 (observations tier).** Where the biggest expected win lives. Build on a benchmark that already moves. Also subsumes the retrieval behavior that startup context was trying to emulate.
+7. **P4 (trend-as-filter).** Small icing on P1. Only interesting if P1 shows a lift.
+8. **P5 (wrapper).** Production-value work, do it when the architecture pieces are stable.
 
 Each step gets its own benchmark run. The goal is a dose-response curve, not a big-bang reveal.
 
