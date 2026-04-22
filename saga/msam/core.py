@@ -1064,12 +1064,12 @@ def hybrid_retrieve(
     graph_results: list[dict] = []
     temporal_results: list[dict] = []
     if _fusion == 'rrf':
-        if _cfg('retrieval', 'enable_graph_pathway', True):
+        if _cfg('retrieval', 'enable_graph_pathway', False):
             try:
                 graph_results = graph_retrieve(query, top_k=_cfg('retrieval', 'graph_pathway_top_k', top_k))
             except Exception:
                 graph_results = []
-        if _cfg('retrieval', 'enable_temporal_pathway', True):
+        if _cfg('retrieval', 'enable_temporal_pathway', False):
             try:
                 temporal_results = temporal_retrieve(
                     query,
