@@ -971,9 +971,15 @@ def temporal_retrieve(
 ) -> list[dict]:
     """
     Temporal pathway: atoms whose ``created_at`` falls inside the time
-    window inferred from the query. Returns an empty list when no
-    temporal expression is detected, so callers can safely skip fusion
-    weighting in the common case.
+    window inferred from the query, ranked by semantic similarity to the
+    query within that window. Returns an empty list when no temporal
+    expression is detected, so callers can safely skip fusion weighting
+    in the common case.
+
+    The in-window filter is the temporal signal; cosine similarity to
+    the query is the relevance signal. Ranking by both means RRF gets
+    a well-ordered list instead of chronological noise that drowns out
+    the semantic pathway.
     """
     from .temporal import parse_temporal_scope
 
@@ -982,20 +988,43 @@ def temporal_retrieve(
         return []
     start, end = scope
     conn = get_db()
+    # Pull a generous candidate set before scoring so we don't miss
+    # semantically-strong atoms just because they're older inside the window.
     rows = conn.execute(
         "SELECT * FROM atoms WHERE state IN ('active', 'fading') "
         "AND created_at >= ? AND created_at <= ? "
         "ORDER BY created_at DESC LIMIT ?",
-        (start.isoformat(), end.isoformat(), top_k),
+        (start.isoformat(), end.isoformat(), max(top_k * 5, 50)),
     ).fetchall()
     conn.close()
-    results = []
+    if not rows:
+        return []
+
+    try:
+        query_vec = cached_embed_query(query)
+    except Exception:
+        query_vec = None
+
+    scored: list[tuple[float, dict]] = []
     for row in rows:
         atom = dict(row)
-        atom.pop("embedding", None)
-        atom["_temporal_score"] = 1.0  # presence in window is the signal
-        results.append(atom)
-    return results
+        emb_blob = atom.pop("embedding", None)
+        sim = 0.0
+        if query_vec is not None and emb_blob:
+            try:
+                atom_vec = unpack_embedding(emb_blob)
+                dot = sum(a * b for a, b in zip(query_vec, atom_vec))
+                mag_q = sum(a * a for a in query_vec) ** 0.5
+                mag_a = sum(a * a for a in atom_vec) ** 0.5
+                sim = dot / (mag_q * mag_a) if mag_q and mag_a else 0.0
+            except Exception:
+                sim = 0.0
+        atom["_temporal_score"] = float(sim)
+        scored.append((sim, atom))
+
+    # Best first; fall back to chronological (recent first) for ties or zero-sim.
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [atom for _, atom in scored[:top_k]]
 
 
 # ─── Hybrid Retrieval ────────────────────────────────────────────
