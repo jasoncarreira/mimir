@@ -1135,7 +1135,15 @@ def hybrid_retrieve(
                 atom = combined[aid]
                 if atom.get("memory_type") == "observation":
                     ec = atom.get("evidence_count") or 0
-                    multiplier = 1.0 + _obs_alpha * math.log(ec + 1)
+                    # An evidence_count=1 observation is just a paraphrase
+                    # of a single raw atom — not more evidence, and both
+                    # the raw atom and the paraphrase tend to surface
+                    # together, so boosting it double-counts. Require at
+                    # least two backing atoms before the bonus kicks in.
+                    if ec < 2:
+                        multiplier = 1.0
+                    else:
+                        multiplier = 1.0 + _obs_alpha * math.log(ec + 1)
                     trend = atom.get("trend")
                     if trend == "weakening":
                         multiplier *= _trend_weakening
