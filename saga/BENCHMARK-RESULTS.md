@@ -14,7 +14,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_rrf_v1` | MiniMax-M2.7 | rrf | sem + kw | 500 (498 graded) | **0.799** |
 | `msam_rrf_gpt4omini_v1` | gpt-4o-mini | rrf | sem + kw | 500 | **0.728** |
 | `pref_probe_max1024` | MiniMax-M2.7 | weighted_sum | sem + kw | 30 (pref only) | **0.333** |
-| `msam_p3_minimax_v1` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal | 500 | (running) |
+| `msam_p3_minimax_v1` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal | 500 | **0.772** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -56,6 +56,28 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 **Overall: 0.799 → 0.728 (-7.1 pp)**. Reader downgrade hurts across the board.
 MiniMax-M2.7's `<think>`-budgeted reasoning beats gpt-4o-mini on this task
 despite the token-cap overhead. Keep MiniMax for future MSAM runs.
+
+### `msam_p3_minimax_v1` — RRF + graph + temporal, MiniMax (500q)
+| Subtype | Score | N | Δ vs RRF+MiniMax (P2) |
+|---|---|---|---|
+| single-session-assistant | 0.982 | 56 | -1.8 |
+| single-session-user | 0.971 | 70 | +1.4 |
+| knowledge-update | 0.923 | 78 | -2.6 |
+| temporal-reasoning | 0.789 | 133 | -3.8 |
+| multi-session | 0.594 | 133 | -4.0 |
+| single-session-preference | 0.233 | 30 | -3.4 |
+
+**Overall: 0.799 → 0.772 (-2.7 pp). P3 regresses at default weights.**
+Critically, temporal-reasoning *drops* 3.8 pp — the subtype the temporal
+pathway was supposed to help. Suspected cause: the temporal pathway ranks
+every in-window atom at score 1.0 regardless of semantic relevance, so
+RRF over-weights topically-unrelated-but-chronologically-close atoms.
+Follow-up work:
+1. Score-then-rank within the temporal pathway (cosine on the filtered set)
+   instead of chronological order.
+2. Lower `rrf_temporal_weight` from 1.0 → 0.3-0.5 by default.
+3. Gate pathway activation on window-width (only fire for narrow scopes).
+Graph pathway has no effect this run — triples disabled.
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.
