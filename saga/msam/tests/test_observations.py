@@ -109,6 +109,39 @@ class TestRetrievalBonus:
         """A smoke check on the bonus math: higher evidence_count → higher multiplier."""
         from msam.core import _cfg  # noqa: F401  (just ensure import)
         alpha = 0.3
-        low = 1.0 + alpha * math.log(2)     # evidence=1
+        low = 1.0 + alpha * math.log(3)     # evidence=2 (minimum boostable)
         high = 1.0 + alpha * math.log(51)   # evidence=50
         assert high > low
+
+    def test_evidence_count_one_gets_no_bonus(self, fake_embeddings, monkeypatch):
+        """An observation backed by a single atom is a paraphrase, not new
+        evidence — the multiplier must be exactly 1.0."""
+        import msam.core
+        obs_id = msam.core.store_atom(
+            "user plays the ukulele at weekends",
+            memory_type="observation",
+            evidence_count=1,
+        )
+        assert isinstance(obs_id, str)
+
+        def fake_retrieve(query, mode="task", top_k=20, **kw):
+            conn = msam.core.get_db()
+            rows = conn.execute("SELECT * FROM atoms WHERE id = ?", (obs_id,)).fetchall()
+            conn.close()
+            atoms = []
+            for r in rows:
+                a = dict(r); a.pop("embedding", None); a["_activation"] = 1.0; a["_similarity"] = 0.5
+                atoms.append(a)
+            return atoms
+
+        monkeypatch.setattr(msam.core, "retrieve", fake_retrieve)
+        monkeypatch.setattr(msam.core, "keyword_search", lambda q, top_k=10: fake_retrieve(q))
+
+        # Compute the plain (un-boosted) RRF score a single-pathway rank-1
+        # atom receives: weight / (k + 1) — here 1.0 / (60 + 1) per pathway,
+        # ranked in both sem and kw, so 2 * 1/61.
+        expected_rrf = 2.0 * (1.0 / 61.0)
+        results = msam.core.hybrid_retrieve("ukulele", top_k=5)
+        score = results[0]["_combined_score"]
+        # Must match un-boosted score; a +21% bonus would put it ~0.0397.
+        assert abs(score - expected_rrf) < 1e-6
