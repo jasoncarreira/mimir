@@ -9,9 +9,9 @@ RESULTS_DIR = REPO_ROOT / "results" / "longmemeval"
 UPSTREAM_DIR = REPO_ROOT / "external" / "longmemeval"
 BENCH_MSAM_CONFIG = Path(__file__).parent / "msam_bench.toml"
 
-READER_BASE_URL = "https://api.openai.com/v1"
-READER_MODEL = "gpt-4o-mini-2024-07-18"
-READER_API_KEY_ENV = "OPENAI_API_KEY"
+READER_BASE_URL = "https://api.minimax.io/v1"
+READER_MODEL = "MiniMax-M2.7"
+READER_API_KEY_ENV = "MINIMAX_API_KEY"
 
 RETRIEVAL_TOP_K = 20
 READER_MAX_TOKENS = 512
