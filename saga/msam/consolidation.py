@@ -309,6 +309,8 @@ class ConsolidationEngine:
                 source_type="consolidation",
                 metadata={"consolidated_from": syn["source_ids"][:10],
                           "cluster_size": syn["cluster_size"]},
+                memory_type="observation",
+                evidence_count=syn["cluster_size"],
             )
             if syn_id is None:
                 continue

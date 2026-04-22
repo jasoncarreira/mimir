@@ -71,7 +71,14 @@ CREATE TABLE IF NOT EXISTS atoms (
     -- Denormalized columns (Phase 1C)
     is_pinned INTEGER DEFAULT 0,
     session_id TEXT,
-    working_expires_at REAL
+    working_expires_at REAL,
+
+    -- Observations tier (P1): consolidation output gets memory_type='observation'
+    -- and evidence_count = number of raw atoms backing the synthesis.
+    -- trend is populated by the decay cycle once trend labeling lands.
+    memory_type TEXT DEFAULT 'raw',
+    evidence_count INTEGER DEFAULT 0,
+    trend TEXT
 );
 
 CREATE TABLE IF NOT EXISTS atom_topics (
@@ -108,6 +115,7 @@ CREATE INDEX IF NOT EXISTS idx_atoms_created ON atoms(created_at);
 CREATE INDEX IF NOT EXISTS idx_access_log_atom ON access_log(atom_id);
 CREATE INDEX IF NOT EXISTS idx_atoms_agent ON atoms(agent_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_atoms_dedup ON atoms(content_hash, agent_id) WHERE state IN ('active', 'fading');
+CREATE INDEX IF NOT EXISTS idx_atoms_memory_type ON atoms(memory_type);
 """
 
 
@@ -225,6 +233,8 @@ def store_atom(
     metadata: dict = None,
     embedding: list[float] = None,
     agent_id: str = "default",
+    memory_type: str = "raw",
+    evidence_count: int = 0,
 ) -> str | tuple[None, str]:
     """Store a new atom. Returns atom ID, or (None, reason) if failed."""
     if not content or not content.strip():
@@ -281,14 +291,16 @@ def store_atom(
             id, profile, stream, content, content_hash, created_at,
             arousal, valence, topics, encoding_confidence, provisional,
             source_type, embedding, metadata, agent_id,
-            embedding_provider, is_pinned, session_id, working_expires_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            embedding_provider, is_pinned, session_id, working_expires_at,
+            memory_type, evidence_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         atom_id, profile, stream, content, content_hash, now,
         arousal, valence, json.dumps(topics or []),
         encoding_confidence, int(provisional), source_type,
         emb_blob, json.dumps(meta), agent_id,
-        _embedding_provider, _is_pinned, _session_id, _working_expires_at
+        _embedding_provider, _is_pinned, _session_id, _working_expires_at,
+        memory_type, evidence_count
     ))
 
     if cursor.rowcount == 0:
@@ -1110,7 +1122,33 @@ def hybrid_retrieve(
         for aid, score in ranked:
             if aid in combined:
                 combined[aid]["_combined_score"] = score
-        results = [combined[aid] for aid, _ in ranked if aid in combined]
+        # P1: observation bonus. Well-supported distilled beliefs (memory_type
+        # = 'observation', evidence_count > 0) get a log-scaled multiplier so
+        # they can outrank raw atoms with similar RRF score. Trend penalties
+        # are scaffolded but no-op until trend labeling lands.
+        if _cfg('retrieval', 'enable_observation_bonus', True):
+            _obs_alpha = _cfg('retrieval', 'observation_bonus_alpha', 0.3)
+            _trend_weakening = _cfg('retrieval', 'trend_penalty_weakening', 0.7)
+            _trend_stale = _cfg('retrieval', 'trend_penalty_stale', 0.4)
+            import math
+            for aid in list(combined.keys()):
+                atom = combined[aid]
+                if atom.get("memory_type") == "observation":
+                    ec = atom.get("evidence_count") or 0
+                    multiplier = 1.0 + _obs_alpha * math.log(ec + 1)
+                    trend = atom.get("trend")
+                    if trend == "weakening":
+                        multiplier *= _trend_weakening
+                    elif trend == "stale":
+                        multiplier *= _trend_stale
+                    atom["_combined_score"] = atom.get("_combined_score", 0.0) * multiplier
+            results = sorted(
+                (combined[aid] for aid, _ in ranked if aid in combined),
+                key=lambda x: x.get("_combined_score", 0),
+                reverse=True,
+            )
+        else:
+            results = [combined[aid] for aid, _ in ranked if aid in combined]
     else:
         # weighted_sum: semantic activation at full weight; keyword adds a
         # bonus when it corroborates or stands alone.
@@ -2220,6 +2258,26 @@ MIGRATIONS = {
         "CREATE INDEX IF NOT EXISTS idx_triples_subject_temporal ON triples(subject, valid_from, valid_until)",
 
         # Feature 4: Agreement Rate -- in metrics DB, handled separately
+    ],
+    9: [
+        # P1: Observations tier. Promote consolidation output to a
+        # first-class memory type so the retriever can prefer distilled
+        # beliefs over raw atoms and weigh them by evidence strength.
+        # memory_type: 'raw' | 'observation' | 'mental_model' (mental_model reserved, not used yet)
+        # evidence_count: number of raw atoms that support an observation
+        # trend: NULL | 'stable' | 'strengthening' | 'weakening' | 'stale' (populated by decay cycle)
+        "ALTER TABLE atoms ADD COLUMN memory_type TEXT DEFAULT 'raw'",
+        "ALTER TABLE atoms ADD COLUMN evidence_count INTEGER DEFAULT 0",
+        "ALTER TABLE atoms ADD COLUMN trend TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_atoms_memory_type ON atoms(memory_type)",
+        # Back-fill: atoms whose metadata mentions consolidated_from are
+        # observations by construction. JSON1 is available in SQLite
+        # 3.38+; all MSAM deployments ship with that.
+        """UPDATE atoms
+           SET memory_type = 'observation',
+               evidence_count = json_array_length(json_extract(metadata, '$.consolidated_from'))
+           WHERE json_extract(metadata, '$.consolidated_from') IS NOT NULL
+             AND json_array_length(json_extract(metadata, '$.consolidated_from')) > 0""",
     ],
 }
 
