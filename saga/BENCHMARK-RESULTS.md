@@ -14,7 +14,8 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_rrf_v1` | MiniMax-M2.7 | rrf | sem + kw | 500 (498 graded) | **0.799** |
 | `msam_rrf_gpt4omini_v1` | gpt-4o-mini | rrf | sem + kw | 500 | **0.728** |
 | `pref_probe_max1024` | MiniMax-M2.7 | weighted_sum | sem + kw | 30 (pref only) | **0.333** |
-| `msam_p3_minimax_v1` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal | 500 | **0.772** |
+| `msam_p3_minimax_v1` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal (chrono) | 500 | **0.772** |
+| `msam_p3_minimax_v2` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal (cos-ranked) | 500 | **0.768** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -78,6 +79,32 @@ Follow-up work:
 2. Lower `rrf_temporal_weight` from 1.0 → 0.3-0.5 by default.
 3. Gate pathway activation on window-width (only fire for narrow scopes).
 Graph pathway has no effect this run — triples disabled.
+
+### `msam_p3_minimax_v2` — temporal pathway ranks by cosine within window (500q)
+| Subtype | Score | N | Δ vs P3v1 | Δ vs P2 (RRF+MiniMax) |
+|---|---|---|---|---|
+| single-session-assistant | 0.982 | 56 | 0.0 | -1.8 |
+| single-session-user | 0.957 | 70 | -1.4 | 0.0 |
+| knowledge-update | 0.936 | 78 | +1.3 | -1.3 |
+| temporal-reasoning | 0.729 | 133 | -6.0 | -9.8 |
+| multi-session | 0.647 | 133 | +5.3 | +1.3 |
+| single-session-preference | 0.200 | 30 | -3.3 | -6.7 |
+
+**Overall: 0.768 (-3.1 vs P2, -0.4 vs P3v1).** Fixing the pathway's internal
+ordering (chrono → cosine) helped multi-session but hurt temporal-reasoning
+even more. Adding any new ranked list to RRF dilutes rank-1 positions from
+semantic/keyword even when the new list is "well-ordered," because the top
+atoms overlap heavily with what semantic already surfaces. Net effect:
+temporal pathway doesn't add new signal, just redistributes RRF mass.
+
+Conclusion: P3's structural hypothesis (more pathways = better) isn't
+supported at these weights. Potential rescues:
+1. Gate temporal pathway activation on window width (only fire narrow
+   scopes where dates actually differentiate candidates).
+2. Drop `rrf_temporal_weight` to 0.3 or lower — treat it as a boost
+   for narrow-window queries, not a full ranked list.
+3. Move temporal handling from "parallel pathway" to "post-filter boost"
+   on the semantic list (multiply by an in-window bonus).
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.
