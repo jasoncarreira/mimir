@@ -231,16 +231,29 @@ class ConsolidationEngine:
     def _synthesize_phase(self, clusters: list[list[dict]]) -> list[dict]:
         """Call LLM to generate a synthesis atom per cluster.
 
-        Uses same NVIDIA NIM endpoint as triples.py for consistency.
-        Falls back to simple concatenation if LLM is unavailable.
+        Reads [consolidation] LLM config; falls back to [annotation]
+        values for deployments that haven't migrated their config, and
+        finally to the NVIDIA NIM defaults. API key pulls from
+        CONSOLIDATION_API_KEY (or OPENAI_API_KEY / NVIDIA_API_KEY) env
+        vars, or the legacy embedding.api_key TOML field.
         """
         import requests
 
         import os
-        api_key = _cfg('embedding', 'api_key', None) or os.environ.get('NVIDIA_API_KEY', '')
-        llm_url = _cfg('annotation', 'llm_url', 'https://integrate.api.nvidia.com/v1/chat/completions')
-        llm_model = _cfg('annotation', 'llm_model', 'mistralai/mistral-large-3-675b-instruct-2512')
-        timeout = _cfg('annotation', 'timeout_seconds', 15)
+        llm_url = _cfg('consolidation', 'llm_url',
+                       _cfg('annotation', 'llm_url', 'https://integrate.api.nvidia.com/v1/chat/completions'))
+        llm_model = _cfg('consolidation', 'llm_model',
+                         _cfg('annotation', 'llm_model', 'mistralai/mistral-large-3-675b-instruct-2512'))
+        timeout = _cfg('consolidation', 'timeout_seconds',
+                       _cfg('annotation', 'timeout_seconds', 15))
+        api_key_env = _cfg('consolidation', 'api_key_env', None)
+        if api_key_env:
+            api_key = os.environ.get(api_key_env, '')
+        else:
+            api_key = (_cfg('embedding', 'api_key', None)
+                       or os.environ.get('CONSOLIDATION_API_KEY', '')
+                       or os.environ.get('OPENAI_API_KEY', '')
+                       or os.environ.get('NVIDIA_API_KEY', ''))
 
         syntheses = []
         for cluster in clusters:
@@ -253,9 +266,22 @@ class ConsolidationEngine:
             synthesis_content = None
             try:
                 prompt = (
-                    f"Synthesize the following {len(cluster)} related memory atoms into "
-                    f"a single concise summary that captures the essential information. "
-                    f"Output ONLY the synthesis, no explanations.\n\n"
+                    f"You are consolidating {len(cluster)} related memory atoms into a "
+                    f"single observation. These atoms share a topic but may not say the "
+                    f"same thing. Write ONE sentence (two at most) that accurately "
+                    f"captures what the atoms collectively convey.\n\n"
+                    f"Rules:\n"
+                    f"- Preserve specific dates, times, numbers, names, and direct quotes "
+                    f"VERBATIM when they appear in the atoms. Do not generalize "
+                    f"'on 2023-05-14' into 'recently' or '$23.50' into 'some money'.\n"
+                    f"- If atoms disagree on a fact, keep both versions rather than "
+                    f"choosing one (e.g. 'user first mentioned X on date A, then "
+                    f"updated to Y on date B').\n"
+                    f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
+                    f"in the observation when the date matters to the content.\n"
+                    f"- Do not invent details not present in the atoms.\n"
+                    f"- Output ONLY the observation sentence(s), no preamble, no "
+                    f"explanations, no bullet lists.\n\n"
                     f"Atoms:\n- {joined}"
                 )
                 resp = requests.post(
