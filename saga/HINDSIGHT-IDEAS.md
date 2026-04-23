@@ -283,6 +283,88 @@ Memory systems that require explicit store calls have adoption friction. The wra
 
 ---
 
+### P8 — Cluster merging pass after greedy consolidation
+
+**Value: medium. Effort: ~0.5 day. Reversible: yes (config flag).**
+
+#### What
+
+Add an agglomerative merge pass after `_cluster_phase` in
+`msam/consolidation.py`. Greedy clustering walks atoms once and
+grabs unclustered similar neighbors, which fragments on the
+"A is near B, B is near C, but A isn't near C" pattern — MSAM's
+benchmarks hit this because conversational topics drift over many
+turns, producing long similarity chains.
+
+The merge pass computes each cluster's centroid (mean of member
+embeddings), compares cluster pairs, and merges when centroid cosine
+≥ `merge_threshold` (default 0.75; deliberately lower than greedy's
+0.80 because centroids smooth noise across members). Loops until no
+more merges. Two guardrails:
+
+- `max_cluster_size` cap — prevents runaway merges; synthesis over
+  50 atoms loses specificity anyway.
+- Within-stream only — preserves the semantic/episodic/procedural
+  separation that consolidation already respects.
+
+#### Why
+
+Observed directly in the P1 LongMemEval runs: clusters hit 20 at the
+cap but feel fragmented — the same topic surfaces in multiple small
+clusters rather than one coherent observation. A merge pass produces
+fewer, larger observations with better evidence counts, which the P1
+bonus already rewards with its `log(evidence_count + 1)` multiplier.
+Higher-quality observations at the same cost.
+
+#### Implementation sketch
+
+```python
+def _merge_phase(self, clusters):
+    centroids = [np.mean([unpack(a['embedding']) for a in c], axis=0) for c in clusters]
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(clusters)):
+            if not clusters[i]: continue
+            for j in range(i+1, len(clusters)):
+                if not clusters[j]: continue
+                if len(clusters[i]) + len(clusters[j]) > self.max_cluster_size:
+                    continue
+                if clusters[i][0]['stream'] != clusters[j][0]['stream']:
+                    continue
+                if cosine(centroids[i], centroids[j]) >= self.merge_threshold:
+                    clusters[i].extend(clusters[j])
+                    clusters[j] = []
+                    centroids[i] = np.mean([unpack(a['embedding']) for a in clusters[i]], axis=0)
+                    merged = True
+    return [c for c in clusters if c]
+```
+
+Wire into `consolidate()` between clustering and synthesis, gated by
+`consolidation.enable_merge_pass` (default `true`), with `merge_threshold`
+and `max_cluster_size` configurable.
+
+#### Acceptance criteria
+
+- `msam_p1_minimax_v3` (P1 + merge pass) produces observations with
+  larger average evidence_count than `msam_p1_minimax_v2`.
+- Overall LongMemEval accuracy improves ≥ 2 pp vs. `msam_p1_minimax_v2`,
+  OR multi-session / preference subtypes improve measurably.
+- Number of observations per question stays bounded (max_cluster_size
+  cap prevents balloon clusters).
+
+#### Risks
+
+- Over-merging creates soupy observations that lose specificity.
+  Mitigated by `max_cluster_size` cap and the higher-than-it-looks
+  merge threshold (0.75 on centroids is meaningfully tight).
+- Cost: ~O(k²) per consolidation pass where k is cluster count.
+  With `max_clusters_per_run = 20`, that's 400 centroid comparisons
+  plus recomputation, all local numpy — negligible vs. the LLM synthesis
+  calls that dominate the pipeline.
+
+---
+
 ### P7 — Batch the triple extraction LLM call
 
 **Value: enables graph-pathway benchmarking. Effort: ~1 day. Reversible: yes.**
@@ -393,8 +475,9 @@ Order chosen to maximize information gain per unit of work:
 4. **P3 (four-pathway split).** RRF is only meaningful if pathways are independent. Do these together. ✅ landed (`d9d7602`); graph pathway returns `[]` until triples exist.
 5. **P7 (batch triple extraction).** Unblocks measurement of P3's graph pathway. Do before P1 if we want to know what the graph lever is actually worth.
 6. **P1 (observations tier).** Where the biggest expected win lives. Build on a benchmark that already moves. Also subsumes the retrieval behavior that startup context was trying to emulate.
-7. **P4 (trend-as-filter).** Small icing on P1. Only interesting if P1 shows a lift.
-8. **P5 (wrapper).** Production-value work, do it when the architecture pieces are stable.
+7. **P8 (cluster merge pass).** Do together with P1 iteration — produces fewer, higher-evidence-count observations that the P1 bonus already rewards.
+8. **P4 (trend-as-filter).** Small icing on P1. Only interesting if P1 shows a lift.
+9. **P5 (wrapper).** Production-value work, do it when the architecture pieces are stable.
 
 Each step gets its own benchmark run. The goal is a dose-response curve, not a big-bang reveal.
 
