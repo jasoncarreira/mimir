@@ -16,6 +16,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `pref_probe_max1024` | MiniMax-M2.7 | weighted_sum | sem + kw | 30 (pref only) | **0.333** |
 | `msam_p3_minimax_v1` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal (chrono) | 500 | **0.772** |
 | `msam_p3_minimax_v2` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal (cos-ranked) | 500 | **0.768** |
+| `msam_p1_minimax_v1` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (obs enabled, consolidation on) | 500 | **0.720** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -105,6 +106,46 @@ supported at these weights. Potential rescues:
    for narrow-window queries, not a full ranked list.
 3. Move temporal handling from "parallel pathway" to "post-filter boost"
    on the semantic list (multiply by an in-window bonus).
+
+### `msam_p1_minimax_v1` — observations tier + bonus, MiniMax (500q)
+
+Bench config: `[consolidation] enabled=true` with `min_cluster_size=2`
+and `max_clusters_per_run=20`; consolidation LLM = gpt-4o-mini;
+`retrieval.enable_observation_bonus = true` (default alpha=0.3).
+
+| Subtype | Score | N | Δ vs P2 (RRF+MiniMax) |
+|---|---|---|---|
+| single-session-assistant | 0.964 | 56 | -3.6 |
+| single-session-user | 0.900 | 70 | -5.7 |
+| knowledge-update | 0.872 | 78 | -7.7 |
+| temporal-reasoning | 0.654 | 133 | **-17.3** |
+| multi-session | 0.571 | 133 | -6.3 |
+| **single-session-preference** | **0.400** | 30 | **+13.3** |
+
+**Overall: 0.720 (-7.9 pp vs P2).** Only preference improved — a clean
+"user prefers X" observation beats scattered raw evidence for rubric-
+style questions, consistent with the P1 thesis. Everything else
+regressed, hard.
+
+Likely cause: with `min_cluster_size=2` and a fresh per-question DB,
+consolidation produces ~20 LLM-synthesized observations per question.
+The evidence-count bonus pulls them into top-20 retrieval even when
+the original atoms carry more precise evidence (dates, exact quotes).
+The reader gets summaries instead of primary evidence — fatal for
+temporal-reasoning which lost 17 pp.
+
+Paths to rescue P1:
+1. Tighten consolidation: raise `min_cluster_size` to 4–5 so only
+   high-confidence observations form. Fewer observations, less
+   displacement of primary evidence.
+2. Lower bonus alpha from 0.3 to 0.1 — observations only tie-break,
+   don't dominate.
+3. Hybrid retrieval contract change: return top-K raws AND include
+   observations as a separate tier in the reader prompt, instead of
+   boosting observations into the raw top-K. Closer to Hindsight's
+   "observations surface first, raw atoms as evidence" design.
+4. Gate the bonus on query type — preference-ish queries get it,
+   factual/temporal queries skip it.
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.
