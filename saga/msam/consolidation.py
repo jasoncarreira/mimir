@@ -255,59 +255,73 @@ class ConsolidationEngine:
                        or os.environ.get('OPENAI_API_KEY', '')
                        or os.environ.get('NVIDIA_API_KEY', ''))
 
+        enable_llm = _cfg('consolidation', 'enable_llm', True)
+
+        import re as _re
+        _prefix_pat = _re.compile(r"^\[Consolidated from \d+ atoms?\]\s*")
+
+        def _strip_prefix(s: str) -> str:
+            return _prefix_pat.sub("", s or "")
+
         syntheses = []
         for cluster in clusters:
-            contents = [a['content'] for a in cluster]
+            # Strip any prior consolidation prefix from cluster members so
+            # re-consolidation doesn't cause "[Consolidated from X] [Consolidated from Y] ..." stacking in either path.
+            contents = [_strip_prefix(a['content']) for a in cluster]
             joined = "\n- ".join(contents)
             stream = cluster[0].get('stream', 'semantic')
             source_ids = [a['id'] for a in cluster]
 
-            # Try LLM synthesis
+            # Try LLM synthesis (skipped entirely when consolidation.enable_llm = false)
             synthesis_content = None
-            try:
-                prompt = (
-                    f"You are consolidating {len(cluster)} related memory atoms into a "
-                    f"single observation. These atoms share a topic but may not say the "
-                    f"same thing. Write ONE sentence (two at most) that accurately "
-                    f"captures what the atoms collectively convey.\n\n"
-                    f"Rules:\n"
-                    f"- Preserve specific dates, times, numbers, names, and direct quotes "
-                    f"VERBATIM when they appear in the atoms. Do not generalize "
-                    f"'on 2023-05-14' into 'recently' or '$23.50' into 'some money'.\n"
-                    f"- If atoms disagree on a fact, keep both versions rather than "
-                    f"choosing one (e.g. 'user first mentioned X on date A, then "
-                    f"updated to Y on date B').\n"
-                    f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
-                    f"in the observation when the date matters to the content.\n"
-                    f"- Do not invent details not present in the atoms.\n"
-                    f"- Output ONLY the observation sentence(s), no preamble, no "
-                    f"explanations, no bullet lists.\n\n"
-                    f"Atoms:\n- {joined}"
-                )
-                resp = requests.post(
-                    llm_url,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": llm_model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 300,
-                        "temperature": 0.3,
-                    },
-                    timeout=timeout,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    synthesis_content = data["choices"][0]["message"]["content"].strip()
-            except Exception as e:
-                logger.warning(f"LLM synthesis failed: {e}")
+            if enable_llm:
+                try:
+                    prompt = (
+                        f"You are consolidating {len(cluster)} related memory atoms into a "
+                        f"single observation. These atoms share a topic but may not say the "
+                        f"same thing. Write ONE sentence (two at most) that accurately "
+                        f"captures what the atoms collectively convey.\n\n"
+                        f"Rules:\n"
+                        f"- Preserve specific dates, times, numbers, names, and direct quotes "
+                        f"VERBATIM when they appear in the atoms. Do not generalize "
+                        f"'on 2023-05-14' into 'recently' or '$23.50' into 'some money'.\n"
+                        f"- If atoms disagree on a fact, keep both versions rather than "
+                        f"choosing one (e.g. 'user first mentioned X on date A, then "
+                        f"updated to Y on date B').\n"
+                        f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
+                        f"in the observation when the date matters to the content.\n"
+                        f"- Do not invent details not present in the atoms.\n"
+                        f"- Output ONLY the observation sentence(s), no preamble, no "
+                        f"explanations, no bullet lists.\n\n"
+                        f"Atoms:\n- {joined}"
+                    )
+                    resp = requests.post(
+                        llm_url,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": llm_model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 300,
+                            "temperature": 0.3,
+                        },
+                        timeout=timeout,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        synthesis_content = data["choices"][0]["message"]["content"].strip()
+                except Exception as e:
+                    logger.warning(f"LLM synthesis failed: {e}")
 
-            # Fallback: take the longest content as the representative
+            # Fallback: take the longest (already-stripped) content as the
+            # representative, then wrap with a single-layer prefix.
             if not synthesis_content:
-                synthesis_content = max(contents, key=len)
-                synthesis_content = f"[Consolidated from {len(cluster)} atoms] {synthesis_content}"
+                synthesis_content = f"[Consolidated from {len(cluster)} atoms] {max(contents, key=len)}"
+            else:
+                # Defensive: in case the LLM echoed a prefix into its output.
+                synthesis_content = _strip_prefix(synthesis_content)
 
             syntheses.append({
                 "content": synthesis_content,
