@@ -76,7 +76,13 @@ enabled = false
 enabled = false
 
 [consolidation]
-enabled = false
+enabled = true
+# LLM synthesis disabled: use the "longest atom, prefixed" fallback path.
+# Free, instant, preserves specifics perfectly. A/B against the LLM-
+# synthesized runs tells us whether the LLM was net-positive on this bench.
+enable_llm = false
+min_cluster_size = 2
+max_clusters_per_run = 20
 
 [agents]
 default_agent_id = "longmemeval"
