@@ -344,6 +344,47 @@ Edge cases:
 - **`stability_reduction` softened later (e.g. 0.8):** multiplier
   auto-scales to 1.25, still principled.
 
+#### Observation gating
+
+Observations are a **supplemental** signal, not a replacement for raw
+atoms. Two gates apply before they enter the tier or boost evidence:
+
+- **Top-K gate.** Cap observations at `retrieval.observations_top_k`
+  (default 5). Prevents a long list of weak observations from diluting
+  the reader's attention and — more importantly — prevents a pile of
+  weak obs from each contributing their small evidence boosts and
+  collectively dominating the raws tier.
+- **Confidence gate.** Only observations whose own RRF score clears a
+  threshold (reusing the existing `confidence_sim_medium` logic or a
+  dedicated `observation_confidence_threshold`) enter the observation
+  tier OR apply evidence boosts. A rank-20 observation with near-zero
+  RRF shouldn't be in the prompt AND shouldn't silently pull its
+  evidence into the raws top-K.
+
+Combined: the observation tier is **at most K obs, all above the
+confidence floor**, and only those qualifying observations contribute
+evidence boosts. Low-confidence obs are treated as if they weren't
+retrieved at all.
+
+#### Top-K semantics
+
+`top_k` means **raws only**; observations have their own
+`observations_top_k`. Reasons:
+
+- Preserves existing caller semantics — a deployment passing `top_k=12`
+  keeps getting 12 raws. Adding observations doesn't silently shrink
+  their evidence.
+- Observations are supplemental; forcing them into the same budget
+  competes for slots unnecessarily.
+- Two knobs match the two tiers' distinct purposes: one for primary
+  evidence volume, one for distilled-belief breadth.
+
+Defaults:
+- `top_k = 12` (raws)
+- `observations_top_k = 5`
+- `observation_confidence_threshold` = equivalent of "medium" tier
+  (sim ≥ 0.30 or combined score ≥ 10)
+
 #### Implementation sketch
 
 - `consolidation._restructure_phase`: emit reverse `evidenced_by` edge
