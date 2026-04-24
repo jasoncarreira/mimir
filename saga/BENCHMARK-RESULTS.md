@@ -17,6 +17,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p3_minimax_v1` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal (chrono) | 500 | **0.772** |
 | `msam_p3_minimax_v2` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal (cos-ranked) | 500 | **0.768** |
 | `msam_p1_minimax_v1` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (obs enabled, consolidation on) | 500 | **0.720** |
+| `msam_p1_minimax_v2` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (preserve-specifics consolidation prompt) | 500 | **0.692** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -146,6 +147,46 @@ Paths to rescue P1:
    "observations surface first, raw atoms as evidence" design.
 4. Gate the bonus on query type — preference-ish queries get it,
    factual/temporal queries skip it.
+
+### `msam_p1_minimax_v2` — consolidation prompt v2 (preserve dates, numbers, named entities), MiniMax (500q)
+
+Prompt changed from "synthesize a concise summary" to a version that
+requires verbatim preservation of dates, times, numbers, names, direct
+quotes — and explicitly keeps both versions when atoms disagree. All
+other settings match P1v1.
+
+| Subtype | Score | N | Δ vs P1v1 | Δ vs P2 |
+|---|---|---|---|---|
+| single-session-assistant | 0.964 | 56 | 0.0 | -3.6 |
+| single-session-user | 0.857 | 70 | -4.3 | -10.0 |
+| knowledge-update | 0.872 | 78 | 0.0 | -7.7 |
+| **temporal-reasoning** | **0.684** | 133 | **+3.0** | -14.3 |
+| multi-session | 0.504 | 133 | -6.7 | -13.0 |
+| **single-session-preference** | **0.200** | 30 | **-20.0** | -6.7 |
+
+**Overall: 0.692 (-2.8 vs P1v1, -10.7 vs P2).**
+
+The prompt fix did what it was designed to do — temporal-reasoning
+recovered 3 pp because dates now survive consolidation. But it broke
+preference hard (-20 pp): preference queries benefit from *abstract*
+observations ("user prefers Sony gear") synthesized out of scattered
+specific episodes, and the preserve-specifics prompt kills that
+abstraction. V1's preference gain came from the opposite of what v2
+asks for.
+
+Real tension uncovered: **consolidation abstraction helps preference,
+hurts temporal; literal preservation helps temporal, kills preference.**
+One prompt can't do both. The architectural response is probably
+query-type-aware consolidation, or routing different memory_type
+variants ("abstract_observation" vs "literal_observation") — closer
+to Hindsight's disposition-aware reflect than to our current single-
+tier observation design.
+
+For now: P1 at default settings is net-negative on LongMemEval across
+both prompt variants. Schema + wiring are useful for future work
+(production deployments with real outcome loops can still benefit),
+but we should stop defaulting `enable_observation_bonus = true` until
+we have a design that doesn't trade one subtype for another.
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.
