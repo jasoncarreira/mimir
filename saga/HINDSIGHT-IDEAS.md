@@ -283,6 +283,103 @@ Memory systems that require explicit store calls have adoption friction. The wra
 
 ---
 
+### P9 — Two-tier retrieval with observation→evidence boost
+
+**Value: high. Effort: ~1–2 days. Reversible: yes (config flag).**
+
+#### What
+
+Replace P1's single-list-with-observation-bonus retrieval with two
+independently-ranked tiers that are returned together:
+
+- **Observations tier**: RRF over observation-only pool. Top-K_obs.
+- **Raws tier**: RRF over raw-only pool. Top-K_raw. Surfaced observations
+  lift their supporting evidence atoms via a boost (below).
+
+The reader prompt presents both as labeled blocks:
+
+```
+Observations (distilled beliefs):
+  [OBS evidence=7]  User prefers Sony-compatible photography gear...
+  [OBS evidence=4]  User commutes 45 minutes each way...
+
+Evidence (raw memory turns, chronological):
+  [1] [2023-05-14 user] I got the Sony A7 III...
+  [2] [2023-05-22 user] listening to audiobooks on my daily commute...
+```
+
+Preference-shaped questions lean on the observation block; temporal /
+factual questions lean on the raw block. The reader decides — no single
+prompt trying to serve both, which is the core tension P1v1 and P1v2
+hit from opposite directions.
+
+#### The evidence boost
+
+When consolidation creates an observation, it currently halves the
+stability of every source atom (`stability_reduction = 0.5`). On
+LongMemEval that demonstrably hurts temporal-reasoning because the
+exact-date atoms that a reader needs are at 0.5× stability when they
+should be front-of-mind.
+
+Fix: add a reverse `observation → raw` edge at consolidation time
+(`relation_type = 'evidenced_by'`). When an observation lands in the
+observation tier's top-K, apply a boost to its evidence atoms in the
+raws tier:
+
+```
+boost = (1 / stability_reduction) × observation_RRF_score
+```
+
+With defaults (`stability_reduction = 0.5`), multiplier is 2 — exactly
+cancelling the downgrade — scaled by how strongly the observation
+matched the query. A rank-1 observation fully restores its evidence;
+a weak observation contributes a negligible boost.
+
+Edge cases:
+
+- **One atom evidences multiple surfaced observations:** sum the
+  boosts, capped at `3 × own_RRF` to prevent a single atom flooding
+  the raws top-K.
+- **Observation not in top-K_obs:** no boost at all. Noise dies.
+- **`stability_reduction` softened later (e.g. 0.8):** multiplier
+  auto-scales to 1.25, still principled.
+
+#### Implementation sketch
+
+- `consolidation._restructure_phase`: emit reverse `evidenced_by` edge
+  alongside existing `consolidated_into`.
+- `hybrid_retrieve` gains a `two_tier: bool` mode returning
+  `{observations: [...], raws: [...]}` instead of a merged list.
+- Two RRF passes with independent candidate pools; observation tier
+  runs first so its top-K is known when we rank raws.
+- Boost application: after observation tier ranked, walk their
+  `evidenced_by` edges and add boost to evidence atoms' raws RRF
+  score before the raws final sort.
+- Benchmark harness `build_prompt` updated to format two blocks.
+- Remove `evidence_count` multiplier from P1 (this design supersedes
+  it — observations earn their spot on their own RRF, not via bonus).
+
+#### Acceptance criteria
+
+- LongMemEval overall: matches or beats P2 (0.799) — unlike every
+  P1 run so far.
+- **No regression** on temporal-reasoning (the canary P1 couldn't
+  hold onto while helping preference).
+- **Preference** improves vs P2 baseline (0.267) — the tier-split is
+  supposed to give abstract observations space to help here.
+- Multi-session improves; `evidenced_by` boost means atom reordering
+  reflects cross-session themes without the stability penalty.
+
+#### Risks
+
+- Prompt token cost: two blocks instead of one merged top-K. Mitigate
+  with separate budgets (observations 500t, raws 1000t, say).
+- Design complexity: more config surface, more moving parts than P1.
+  Mitigated by being additive behind a flag and strictly supersetting
+  the single-tier path.
+
+---
+
 ### P8 — Cluster merging pass after greedy consolidation
 
 **Value: medium. Effort: ~0.5 day. Reversible: yes (config flag).**
@@ -474,10 +571,11 @@ Order chosen to maximize information gain per unit of work:
 3. **P2 (RRF).** Smallest diff, cleanly A/B-able. Tells us if our current weighted-sum fusion is actually holding us back. ✅ landed (`5f665d1`); default flipped to `rrf`.
 4. **P3 (four-pathway split).** RRF is only meaningful if pathways are independent. Do these together. ✅ landed (`d9d7602`); graph pathway returns `[]` until triples exist.
 5. **P7 (batch triple extraction).** Unblocks measurement of P3's graph pathway. Do before P1 if we want to know what the graph lever is actually worth.
-6. **P1 (observations tier).** Where the biggest expected win lives. Build on a benchmark that already moves. Also subsumes the retrieval behavior that startup context was trying to emulate.
-7. **P8 (cluster merge pass).** Do together with P1 iteration — produces fewer, higher-evidence-count observations that the P1 bonus already rewards.
-8. **P4 (trend-as-filter).** Small icing on P1. Only interesting if P1 shows a lift.
-9. **P5 (wrapper).** Production-value work, do it when the architecture pieces are stable.
+6. **P1 (observations tier).** Where the biggest expected win lives. Build on a benchmark that already moves. Also subsumes the retrieval behavior that startup context was trying to emulate. (Initial implementation shipped but regressed on LongMemEval — see BENCHMARK-RESULTS.md. Superseded by P9 for the tier architecture.)
+7. **P9 (two-tier retrieval with evidence boost).** Replaces P1's single-list-with-bonus design. Observations and raws ranked independently; observation→raw edge boost restores the stability-halving cost exactly when an observation surfaces.
+8. **P8 (cluster merge pass).** Complements P9 by producing fewer, higher-evidence observations; still useful once the tier split lands.
+9. **P4 (trend-as-filter).** Small icing on P1/P9. Only interesting once the observations tier produces a real lift.
+10. **P5 (wrapper).** Production-value work, do it when the architecture pieces are stable.
 
 Each step gets its own benchmark run. The goal is a dose-response curve, not a big-bang reveal.
 
