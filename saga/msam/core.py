@@ -541,6 +541,7 @@ def retrieve(
     before: str = None,
     explain: bool = False,
     agent_id: str = None,
+    memory_type: str = None,
 ) -> list[dict]:
     """
     Hybrid retrieval: embedding similarity + activation scoring.
@@ -589,6 +590,10 @@ def retrieve(
     if before:
         sql += " AND a.created_at <= ?" if topic_filter else " AND created_at <= ?"
         params.append(before)
+
+    if memory_type:
+        sql += " AND a.memory_type = ?" if topic_filter else " AND memory_type = ?"
+        params.append(memory_type)
 
     # Get query embedding (cached)
     query_emb = cached_embed_query(query)
@@ -844,7 +849,7 @@ def _fts5_query(text: str) -> str:
     return " OR ".join(safe_terms) if safe_terms else text.lower()
 
 
-def keyword_search(query: str, top_k: int = None) -> list[dict]:
+def keyword_search(query: str, top_k: int = None, memory_type: str = None) -> list[dict]:
     """Keyword matching using FTS5 BM25 scoring, falling back to Python TF-IDF."""
     if top_k is None:
         top_k = _cfg('retrieval', 'keyword_top_k', 10)
@@ -853,12 +858,21 @@ def keyword_search(query: str, top_k: int = None) -> list[dict]:
     # Try FTS5 first (fast path)
     fts_query = _fts5_query(query)
     try:
-        rows = conn.execute("""
-            SELECT a.*, bm25(atoms_fts) as _bm25
-            FROM atoms_fts f JOIN atoms a ON a.rowid = f.rowid
-            WHERE atoms_fts MATCH ? AND a.state IN ('active', 'fading')
-            ORDER BY bm25(atoms_fts) LIMIT ?
-        """, (fts_query, top_k)).fetchall()
+        if memory_type:
+            rows = conn.execute("""
+                SELECT a.*, bm25(atoms_fts) as _bm25
+                FROM atoms_fts f JOIN atoms a ON a.rowid = f.rowid
+                WHERE atoms_fts MATCH ? AND a.state IN ('active', 'fading')
+                  AND a.memory_type = ?
+                ORDER BY bm25(atoms_fts) LIMIT ?
+            """, (fts_query, memory_type, top_k)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT a.*, bm25(atoms_fts) as _bm25
+                FROM atoms_fts f JOIN atoms a ON a.rowid = f.rowid
+                WHERE atoms_fts MATCH ? AND a.state IN ('active', 'fading')
+                ORDER BY bm25(atoms_fts) LIMIT ?
+            """, (fts_query, top_k)).fetchall()
 
         scored = []
         for row in rows:
@@ -1041,6 +1055,101 @@ def temporal_retrieve(
 
 # ─── Hybrid Retrieval ────────────────────────────────────────────
 
+def _two_tier_split(
+    obs_combined: dict,
+    obs_ranked: list[tuple[str, float]],
+    raw_combined: dict,
+    raw_ranked: list[tuple[str, float]],
+    top_k_raws: int,
+    observations_top_k: int,
+    obs_conf_min_sim: float,
+    stability_reduction: float,
+    boost_cap_multiplier: float,
+) -> dict:
+    """
+    P9: build the two-tier return and apply the observation->raw evidence
+    boost. Observations and raws are fused on their own pools upstream —
+    this function only gates, boosts, and truncates.
+
+    Observations are gated by top-K and by a similarity floor so weak
+    observations can't pollute the tier or silently boost their evidence.
+    Surfaced observations add a per-observation boost to their evidence
+    atoms in the raws tier, capped at ``boost_cap_multiplier × own RRF``
+    to prevent a single atom from flooding the top-K.
+    """
+    surfaced_obs: list[dict] = []
+    for aid, score in obs_ranked:
+        atom = obs_combined.get(aid)
+        if atom is None:
+            continue
+        sim = atom.get("_similarity", 0.0) or 0.0
+        if sim < obs_conf_min_sim:
+            continue
+        atom["_combined_score"] = score
+        surfaced_obs.append(atom)
+        if len(surfaced_obs) >= observations_top_k:
+            break
+
+    # Evidence boost: surfaced observations lift their backing raws.
+    if surfaced_obs and stability_reduction > 0:
+        multiplier = 1.0 / stability_reduction
+        edge_conn = get_db()
+        try:
+            boost_map: dict[str, float] = {}
+            for obs in surfaced_obs:
+                obs_score = obs.get("_combined_score", 0.0) or 0.0
+                if obs_score <= 0:
+                    continue
+                try:
+                    rows = edge_conn.execute(
+                        "SELECT target_id FROM atom_relations "
+                        "WHERE source_id = ? AND relation_type = 'evidenced_by'",
+                        (obs["id"],),
+                    ).fetchall()
+                except Exception:
+                    rows = []
+                for (target_id,) in rows:
+                    boost_map[target_id] = boost_map.get(target_id, 0.0) + multiplier * obs_score
+        finally:
+            edge_conn.close()
+
+        # Apply boost to raws, capped at (cap_multiplier − 1) × own RRF.
+        raw_score_map = dict(raw_ranked)
+        for aid, base in list(raw_score_map.items()):
+            if aid in boost_map:
+                cap = max(0.0, base * (boost_cap_multiplier - 1.0))
+                raw_score_map[aid] = base + min(boost_map[aid], cap)
+        # Evidence atoms that didn't appear in raw_ranked: pull them in
+        # so an observation's backing is always available in the raws tier.
+        if boost_map:
+            missing_ids = [aid for aid in boost_map if aid not in raw_score_map]
+            if missing_ids:
+                conn = get_db()
+                placeholders = ",".join(["?"] * len(missing_ids))
+                rows = conn.execute(
+                    f"SELECT * FROM atoms WHERE id IN ({placeholders}) "
+                    f"AND state IN ('active','fading')",
+                    tuple(missing_ids),
+                ).fetchall()
+                conn.close()
+                for row in rows:
+                    atom = dict(row); atom.pop("embedding", None)
+                    raw_combined[atom["id"]] = atom
+                    raw_score_map[atom["id"]] = boost_map[atom["id"]]
+
+        raw_ranked = sorted(raw_score_map.items(), key=lambda x: -x[1])
+
+    raws_final: list[dict] = []
+    for aid, score in raw_ranked[:top_k_raws]:
+        atom = raw_combined.get(aid)
+        if atom is None:
+            continue
+        atom["_combined_score"] = score
+        raws_final.append(atom)
+
+    return {"observations": surfaced_obs, "raws": raws_final}
+
+
 def hybrid_retrieve(
     query: str,
     mode: str = "task",
@@ -1049,7 +1158,8 @@ def hybrid_retrieve(
     topic_filter: list[str] = None,
     agent_id: str = None,
     reference_date=None,
-) -> list[dict]:
+    two_tier: bool = False,
+):
     """
     Combine semantic + keyword + (optional) graph + temporal pathways.
 
@@ -1060,6 +1170,13 @@ def hybrid_retrieve(
 
     Under ``fusion = "weighted_sum"`` only the original semantic + keyword
     pathways run (back-compat path).
+
+    If ``two_tier=True`` the function returns
+    ``{"observations": [...], "raws": [...]}`` with observations and raws
+    RRF-ranked independently. Surfaced observations lift their evidence
+    atoms in the raws tier via the ``evidenced_by`` edges — see P9 in
+    HINDSIGHT-IDEAS.md for the full design. ``top_k`` controls the raws
+    list; observations have a separate ``observations_top_k`` cap.
     """
     start_time = time.time()
 
@@ -1070,8 +1187,31 @@ def hybrid_retrieve(
     _kw_weight = 1.0 - _sem_weight
     _quality_threshold = _cfg('retrieval', 'quality_threshold', 2.0)
     _fusion = _cfg('retrieval', 'fusion', 'rrf')
-    semantic_results = retrieve(query, mode=mode, top_k=top_k * 2, stream=stream, topic_filter=topic_filter, agent_id=agent_id)
-    kw_results = keyword_search(query, top_k=top_k)
+
+    # In two_tier mode we run independent semantic + keyword passes per
+    # tier so observations and raws don't compete for candidate slots.
+    # Without this split, observations (often shorter and more abstract)
+    # can be crowded out of the candidate pool by raw atoms before they
+    # ever get a chance to rank.
+    if two_tier and _fusion == 'rrf':
+        obs_top_k = _cfg('retrieval', 'observations_top_k', 5)
+        semantic_results_obs = retrieve(
+            query, mode=mode, top_k=obs_top_k * 4, stream=stream,
+            topic_filter=topic_filter, agent_id=agent_id,
+            memory_type='observation',
+        )
+        kw_results_obs = keyword_search(query, top_k=obs_top_k * 2, memory_type='observation')
+        semantic_results = retrieve(
+            query, mode=mode, top_k=top_k * 2, stream=stream,
+            topic_filter=topic_filter, agent_id=agent_id,
+            memory_type='raw',
+        )
+        kw_results = keyword_search(query, top_k=top_k, memory_type='raw')
+    else:
+        semantic_results = retrieve(query, mode=mode, top_k=top_k * 2, stream=stream, topic_filter=topic_filter, agent_id=agent_id)
+        kw_results = keyword_search(query, top_k=top_k)
+        semantic_results_obs = []
+        kw_results_obs = []
 
     graph_results: list[dict] = []
     temporal_results: list[dict] = []
@@ -1122,6 +1262,35 @@ def hybrid_retrieve(
         for aid, score in ranked:
             if aid in combined:
                 combined[aid]["_combined_score"] = score
+
+        # ─── P9: two-tier return ────────────────────────────────────────
+        if two_tier:
+            # Fuse observations on their own pool so they aren't drowned by raws.
+            obs_combined: dict = {}
+            for atom in semantic_results_obs:
+                obs_combined[atom["id"]] = atom
+            for atom in kw_results_obs:
+                obs_combined.setdefault(atom["id"], atom)
+            obs_ranked = reciprocal_rank_fusion(
+                {
+                    'semantic': [a["id"] for a in semantic_results_obs],
+                    'keyword': [a["id"] for a in kw_results_obs],
+                },
+                k=_k,
+                weights={'semantic': weights['semantic'], 'keyword': weights['keyword']},
+            )
+            return _two_tier_split(
+                obs_combined=obs_combined,
+                obs_ranked=obs_ranked,
+                raw_combined=combined,
+                raw_ranked=ranked,
+                top_k_raws=top_k,
+                observations_top_k=_cfg('retrieval', 'observations_top_k', 5),
+                obs_conf_min_sim=_cfg('retrieval', 'observation_confidence_min_sim', 0.30),
+                stability_reduction=_cfg('consolidation', 'stability_reduction_factor', 0.5),
+                boost_cap_multiplier=_cfg('retrieval', 'evidence_boost_cap_multiplier', 3.0),
+            )
+
         # P1: observation bonus. Well-supported distilled beliefs (memory_type
         # = 'observation', evidence_count > 0) get a log-scaled multiplier so
         # they can outrank raw atoms with similar RRF score. Trend penalties

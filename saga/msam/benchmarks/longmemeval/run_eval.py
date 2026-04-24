@@ -130,19 +130,51 @@ def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
             stats = ingest_question(q)
             t_ingest = time.time() - t0
 
+            # P1: consolidate clusters into observations before retrieval,
+            # so the observation_bonus has material to boost.
+            from msam.config import get_config
+            _c = get_config()
+            t_consolidate = 0.0
+            clusters_consolidated = 0
+            if _c('consolidation', 'enabled', False):
+                from msam.consolidation import ConsolidationEngine
+                t0 = time.time()
+                try:
+                    cresult = ConsolidationEngine().consolidate()
+                    clusters_consolidated = cresult.get("clusters_consolidated", 0)
+                except Exception as ce:
+                    import traceback as _tb
+                    _tb.print_exc()
+                    print(f"  consolidation error on {qid}: {ce}")
+                t_consolidate = time.time() - t0
+
             t0 = time.time()
             from datetime import datetime, timezone
             try:
                 ref_date = datetime.strptime(q["question_date"], "%Y/%m/%d (%a) %H:%M").replace(tzinfo=timezone.utc)
             except (ValueError, KeyError):
                 ref_date = None
-            atoms = hybrid_retrieve(
-                q["question"], mode="task", top_k=RETRIEVAL_TOP_K, reference_date=ref_date,
+            two_tier = bool(_c('retrieval', 'two_tier_enabled', False))
+            retrieved = hybrid_retrieve(
+                q["question"],
+                mode="task",
+                top_k=RETRIEVAL_TOP_K,
+                reference_date=ref_date,
+                two_tier=two_tier,
             )
             t_retrieve = time.time() - t0
 
+            if two_tier:
+                n_obs = len(retrieved.get("observations", []))
+                n_raw = len(retrieved.get("raws", []))
+                n_retrieved = n_obs + n_raw
+            else:
+                n_obs = 0
+                n_raw = len(retrieved)
+                n_retrieved = n_raw
+
             t0 = time.time()
-            reader = read(q["question"], q["question_date"], atoms)
+            reader = read(q["question"], q["question_date"], retrieved)
             t_read = time.time() - t0
 
             record = {"question_id": qid, "hypothesis": reader["hypothesis"]}
@@ -152,8 +184,12 @@ def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
                 "question_id": qid,
                 "question_type": q["question_type"],
                 "n_atoms_ingested": stats["ingested"],
-                "n_atoms_retrieved": len(atoms),
+                "n_observations": n_obs,
+                "n_raws": n_raw,
+                "n_atoms_retrieved": n_retrieved,
                 "ingest_s": round(t_ingest, 2),
+                "consolidate_s": round(t_consolidate, 2),
+                "clusters_consolidated": clusters_consolidated,
                 "retrieve_s": round(t_retrieve, 2),
                 "read_s": round(t_read, 2),
                 "reader_prompt_tokens": reader.get("reader_prompt_tokens"),
@@ -162,10 +198,12 @@ def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
 
             n_processed += 1
             elapsed = time.time() - t_start
+            atoms_out = f"{n_obs}obs+{n_raw}raws" if two_tier else f"{n_raw}"
             print(
                 f"[{i+1}/{len(dataset)}] {qid} ({q['question_type']}) "
-                f"ingest={t_ingest:.1f}s retrieve={t_retrieve:.1f}s "
-                f"read={t_read:.1f}s atoms={stats['ingested']}/{len(atoms)} "
+                f"ingest={t_ingest:.1f}s cons={t_consolidate:.1f}s(n={clusters_consolidated}) "
+                f"retrieve={t_retrieve:.1f}s read={t_read:.1f}s "
+                f"atoms={stats['ingested']}/{atoms_out} "
                 f"elapsed={elapsed:.0f}s",
                 flush=True,
             )

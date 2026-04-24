@@ -29,6 +29,13 @@ fusion = "rrf"
 rrf_k = 60
 rrf_semantic_weight = 1.0
 rrf_keyword_weight = 1.0
+# P9: two-tier retrieval with observation->raw evidence boost.
+two_tier_enabled = true
+observations_top_k = 5
+observation_confidence_min_sim = 0.30
+evidence_boost_cap_multiplier = 3.0
+# Single-tier bonus is redundant in two_tier mode; leave off to avoid double-handling.
+enable_observation_bonus = false
 similarity_threshold = 0.15
 sigmoid_midpoint = 0.35
 sigmoid_steepness = 15.0
@@ -77,12 +84,17 @@ enabled = false
 
 [consolidation]
 enabled = true
-# LLM synthesis disabled: use the "longest atom, prefixed" fallback path.
-# Free, instant, preserves specifics perfectly. A/B against the LLM-
-# synthesized runs tells us whether the LLM was net-positive on this bench.
-enable_llm = false
+# P9: LLM synthesis back on for observations using MiniMax-M2.7. With the
+# two-tier retrieval design the raws preserve specifics; observations are
+# free to be genuinely abstract summaries, which is what MiniMax is good at.
+enable_llm = true
+llm_url = "https://api.minimax.io/v1/chat/completions"
+llm_model = "MiniMax-M2.7"
+timeout_seconds = 60
+api_key_env = "MINIMAX_API_KEY"
 min_cluster_size = 2
 max_clusters_per_run = 20
+stability_reduction_factor = 0.5
 
 [agents]
 default_agent_id = "longmemeval"

@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Any
 
 from .config import READER_BASE_URL, READER_MODEL, READER_API_KEY_ENV, READER_MAX_TOKENS, READER_TIMEOUT_S
+
+_CONSOLIDATION_PREFIX = re.compile(r"^\[Consolidated from \d+ atoms?\]\s*")
 
 _SYSTEM = """You answer questions about a user based on excerpts from their own chat history with an AI assistant.
 
@@ -37,17 +40,60 @@ def _format_atoms(atoms: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_prompt(question: str, question_date: str, atoms: list[dict]) -> list[dict]:
-    context_block = _format_atoms(atoms) or "(no relevant memories retrieved)"
-    user = (
-        f"Today's date: {question_date}\n\n"
-        f"Relevant excerpts from the user's chat history (chronological):\n{context_block}\n\n"
-        f"Question: {question}\n\n"
-        "Think step by step: which excerpts (if any) contain the answer, and what do they say? "
-        "If multiple excerpts conflict, which is most recent? "
-        "If no excerpt answers the question, say so. "
-        "Then give the final answer on its own line."
-    )
+def _format_observations(obs: list[dict]) -> str:
+    lines = []
+    for i, o in enumerate(obs, 1):
+        content = (o.get("content") or "").strip()
+        content = _CONSOLIDATION_PREFIX.sub("", content)
+        if not content:
+            continue
+        ec = o.get("evidence_count") or 0
+        lines.append(f"[O{i} evidence={ec}] {content}")
+    return "\n".join(lines)
+
+
+def build_prompt(question: str, question_date: str, retrieved) -> list[dict]:
+    """
+    Build the reader prompt. Accepts either a list of atoms (single-tier,
+    existing callers) or a dict with ``observations`` + ``raws`` keys
+    (two-tier, P9). In the two-tier path both blocks are labeled and the
+    reader is told to prefer Evidence for specifics.
+    """
+    if isinstance(retrieved, dict):
+        obs_block = _format_observations(retrieved.get("observations") or [])
+        raw_block = _format_atoms(retrieved.get("raws") or [])
+        sections = [f"Today's date: {question_date}"]
+        if obs_block:
+            sections.append(
+                "Observations (distilled beliefs synthesized from multiple turns):\n"
+                + obs_block
+            )
+        sections.append(
+            "Evidence (raw chat turns, chronological):\n"
+            + (raw_block or "(no relevant memories retrieved)")
+        )
+        sections.append(f"Question: {question}")
+        sections.append(
+            "Observations summarize patterns and preferences across many turns — "
+            "treat them as secondary. Evidence is verbatim user/assistant text — "
+            "prefer it for specific dates, names, numbers, and direct quotes. "
+            "When Observation and Evidence conflict, Evidence wins.\n\n"
+            "Think step by step: which items contain the answer? "
+            "If multiple conflict, which is most recent? "
+            "If no item answers, say so. Then give the final answer on its own line."
+        )
+        user = "\n\n".join(sections)
+    else:
+        context_block = _format_atoms(retrieved) or "(no relevant memories retrieved)"
+        user = (
+            f"Today's date: {question_date}\n\n"
+            f"Relevant excerpts from the user's chat history (chronological):\n{context_block}\n\n"
+            f"Question: {question}\n\n"
+            "Think step by step: which excerpts (if any) contain the answer, and what do they say? "
+            "If multiple excerpts conflict, which is most recent? "
+            "If no excerpt answers the question, say so. "
+            "Then give the final answer on its own line."
+        )
     return [
         {"role": "system", "content": _SYSTEM},
         {"role": "user", "content": user},
@@ -94,8 +140,9 @@ def call_reader(messages: list[dict], *, max_tokens: int = READER_MAX_TOKENS) ->
 call_minimax = call_reader
 
 
-def read(question: str, question_date: str, atoms: list[dict]) -> dict[str, Any]:
-    messages = build_prompt(question, question_date, atoms)
+def read(question: str, question_date: str, retrieved) -> dict[str, Any]:
+    """Accepts a list of atoms (single-tier) or a dict (two-tier)."""
+    messages = build_prompt(question, question_date, retrieved)
     result = call_reader(messages)
     return {
         "hypothesis": result["text"],
