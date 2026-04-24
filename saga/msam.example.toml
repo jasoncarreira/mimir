@@ -36,10 +36,14 @@ rrf_graph_weight = 0.7                      # RRF weight for triple-graph pathwa
 rrf_temporal_weight = 1.0                   # RRF weight for temporal pathway
 enable_graph_pathway = false                # include triple-graph pathway in RRF (off by default; LongMemEval A/B was neutral/negative)
 enable_temporal_pathway = false             # include temporal pathway in RRF (off by default; see BENCHMARK-RESULTS.md §msam_p3_minimax_v2)
-enable_observation_bonus = true             # boost consolidated observations by evidence_count under RRF
+enable_observation_bonus = true             # boost consolidated observations by evidence_count under RRF (single-tier mode)
 observation_bonus_alpha = 0.3               # multiplier = 1 + alpha * log(evidence_count + 1)
 trend_penalty_weakening = 0.7               # score multiplier when trend = 'weakening'
 trend_penalty_stale = 0.4                   # score multiplier when trend = 'stale'
+# P9: two-tier retrieval (returns {observations, raws}). See HINDSIGHT-IDEAS.md §P9.
+observations_top_k = 5                      # cap on observations returned in two_tier mode
+observation_confidence_min_sim = 0.30       # similarity floor; observations below this are skipped
+evidence_boost_cap_multiplier = 3.0         # cap evidence boost at (this - 1) × own RRF
 graph_pathway_top_k = 20                    # pre-fusion candidates from triples
 temporal_pathway_top_k = 20                 # pre-fusion atoms in the detected time window
 similarity_threshold = 0.2                  # below this: cosine similarity contributes zero
@@ -120,6 +124,15 @@ similarity_threshold = 0.80                 # cosine similarity to group atoms
 min_cluster_size = 3                        # minimum atoms to form a cluster
 max_clusters_per_run = 50                   # cap clusters per consolidation run
 stability_reduction_factor = 0.5            # stability reduction for merged atoms
+# LLM used to synthesize observation atoms from a cluster. Any
+# OpenAI-compatible /chat/completions endpoint works.
+llm_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+llm_model = "mistralai/mistral-large-3-675b-instruct-2512"
+timeout_seconds = 15
+# api_key_env selects which env var to read for the Bearer token.
+# If unset, falls back to embedding.api_key, then CONSOLIDATION_API_KEY,
+# OPENAI_API_KEY, NVIDIA_API_KEY — in that order.
+# api_key_env = "OPENAI_API_KEY"
 
 [annotation]
 llm_url = "https://integrate.api.nvidia.com/v1/chat/completions"

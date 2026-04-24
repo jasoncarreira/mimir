@@ -357,7 +357,10 @@ class ConsolidationEngine:
             atoms_stored += 1
             stored.append((syn_id, syn["source_ids"]))
 
-        # Phase B: create relations and reduce stability in a single connection
+        # Phase B: create relations and reduce stability in a single connection.
+        # Two edge directions:
+        #   raw -> observation  (consolidated_into)  — legacy, used by spread activation
+        #   observation -> raw  (evidenced_by)       — new, used by P9 evidence boost
         conn = get_db()
         try:
             for syn_id, source_ids in stored:
@@ -368,6 +371,15 @@ class ConsolidationEngine:
                                 (source_id, target_id, relation_type, confidence, created_at)
                             VALUES (?, ?, 'consolidated_into', 1.0, ?)
                         """, (source_id, syn_id, now))
+                        relations_created += 1
+                    except Exception:
+                        pass
+                    try:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO atom_relations
+                                (source_id, target_id, relation_type, confidence, created_at)
+                            VALUES (?, ?, 'evidenced_by', 1.0, ?)
+                        """, (syn_id, source_id, now))
                         relations_created += 1
                     except Exception:
                         pass
