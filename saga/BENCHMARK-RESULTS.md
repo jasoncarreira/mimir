@@ -18,6 +18,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p3_minimax_v2` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal (cos-ranked) | 500 | **0.768** |
 | `msam_p1_minimax_v1` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (obs enabled, consolidation on) | 500 | **0.720** |
 | `msam_p1_minimax_v2` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (preserve-specifics consolidation prompt) | 500 | **0.692** |
+| `msam_p1_minimax_v3` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (consolidation.enable_llm=false, longest-atom fallback) | 500 | **0.704** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -187,6 +188,53 @@ both prompt variants. Schema + wiring are useful for future work
 (production deployments with real outcome loops can still benefit),
 but we should stop defaulting `enable_observation_bonus = true` until
 we have a design that doesn't trade one subtype for another.
+
+### `msam_p1_minimax_v3` — LLM off in consolidation, longest-atom fallback (500q)
+
+Bench config: `consolidation.enable_llm = false`. The fallback path
+picks the longest atom in each cluster, prefixes with "[Consolidated
+from N atoms]", and stores it as an observation with the usual
+evidence_count bonus at retrieval time. Consolidation completes in
+~10s per question (vs 40-60s with the LLM).
+
+| Subtype | Score | N | Δ vs P1v1 | Δ vs P1v2 | Δ vs P2 |
+|---|---|---|---|---|---|
+| single-session-assistant | 0.929 | 56 | -3.5 | -3.5 | -7.1 |
+| **knowledge-update** | **0.949** | 78 | **+7.7** | **+7.7** | **0.0** |
+| single-session-user | 0.900 | 70 | 0.0 | +4.3 | -5.7 |
+| multi-session | 0.511 | 133 | -6.0 | +0.7 | -12.3 |
+| temporal-reasoning | 0.662 | 133 | +0.8 | -2.2 | -16.5 |
+| single-session-preference | 0.233 | 30 | -16.7 | +3.3 | -3.4 |
+
+**Overall: 0.704 (+1.2 vs v2, -1.6 vs v1, -9.5 vs P2).**
+
+No-LLM recovered knowledge-update to P2 levels — literal content
+survives intact, no LLM distortion. But it lost all of v1's preference
+gain because the fallback doesn't actually synthesize anything; it
+just re-tags the longest atom. That helps factual queries but gives
+preference nothing to lean on.
+
+## P1 summary: three variants, all regressed
+
+Three P1 variants tried, each trading subtypes against others:
+
+- v1 (LLM, abstract prompt): preference +13, temporal -17
+- v2 (LLM, preserve-specifics prompt): temporal +3 vs v1, preference -20
+- v3 (no LLM, longest-atom fallback): knowledge-update back to P2 (0.949),
+  preference back to baseline (0.233)
+
+None beat P2 (0.799). The issue isn't the prompt or the consolidation
+model — it's that a single merged top-K forces observations and raws
+to compete for the same slots, and consolidation halves source
+stability regardless of whether the resulting observation is any good.
+
+Response: P9 in HINDSIGHT-IDEAS.md — two-tier retrieval with
+observation→raw evidence boost. Observations and raws are RRF-ranked
+independently; when an observation surfaces it lifts its backing
+evidence atoms in the raw tier by (1 / stability_reduction) × obs_RRF.
+Reader prompt presents both as labeled blocks so preference queries
+lean on observations, temporal queries lean on raws. Expected to land
+the preference lift without sacrificing temporal/multi-session.
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.
