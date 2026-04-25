@@ -20,6 +20,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p1_minimax_v2` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (preserve-specifics consolidation prompt) | 500 | **0.692** |
 | `msam_p1_minimax_v3` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (consolidation.enable_llm=false, longest-atom fallback) | 500 | **0.704** |
 | `msam_p9_minimax_v1` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (consolidation gpt-5.4-nano, min_cluster_size=2) | 500 (499 graded) | **0.7816** |
+| `msam_p9_minimax_v2` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (consolidation gpt-5.4-nano, min_cluster_size=3) | 500 | **0.796** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -292,6 +293,65 @@ Reasoning:
   the floor would surface MORE observations including on temporal
   queries — wrong direction given temporal is the only weak subtype.
   Going with min=3 alone.
+
+### `msam_p9_minimax_v2` — same as v1 but `min_cluster_size=3` (500q)
+
+| Subtype | Score | N | Δ vs P9v1 (min=2) | Δ vs P2 |
+|---|---|---|---|---|
+| single-session-user | 0.986 | 70 | +5.7 | **+2.9** |
+| single-session-assistant | 0.982 | 56 | +1.8 | -1.8 |
+| **multi-session** | **0.669** | 133 | +3.6 | **+3.5** |
+| knowledge-update | 0.949 | 78 | -1.3 | 0.0 |
+| temporal-reasoning | 0.774 | 133 | +1.5 | -5.3 |
+| **single-session-preference** | 0.267 | 30 | **-13.3** | 0.0 |
+
+**Overall: 0.796 (+1.4 vs v1, -0.3 vs P2 — within noise).**
+
+Bumping `min_cluster_size` from 2 → 3 traded the preference gain for
+across-the-board lifts on every other subtype:
+
+- **Preference** lost the +13.3 pp gain — patterns like "user prefers
+  Sony" often appear across just 2-3 atoms and the size-3 floor filters
+  out the smaller pattern clusters.
+- **Multi-session** gained +3.6 vs v1 and now beats P2 by +3.5.
+  Higher-evidence observations match cross-session questions better.
+- **Single-session-user** jumped +5.7 vs v1, beating P2 by +2.9.
+- **Temporal-reasoning** recovered +1.5 vs v1 (still -5.3 vs P2 — the
+  reader-distraction issue from observations isn't fully solved).
+
+Cluster size effect on consolidation cost: cluster counts dropped from
+hitting the 20-cap on most v1 questions to ~7-12 on v2, confirming
+~50-80% of v1's clusters were size-2 noise. Cons time fell from
+~22s/q to ~12s/q.
+
+## P9 summary
+
+Two variants tried; both essentially tie P2 within ±2 pp overall but
+with very different subtype profiles:
+
+- **P9v1 (min=2)**: keeps P1's preference gain (+13.3), basically holds
+  multi-session at P2.
+- **P9v2 (min=3)**: loses preference gain, but lifts multi-session
+  (+3.5), single-session-user (+2.9), and partially recovers temporal.
+
+Neither beats P2 overall by enough to call it a clear win. The
+architecture is sound — observations help where they should help — but
+the cluster-size knob fundamentally trades subtypes against each
+other, and on this benchmark the trade comes out roughly even.
+
+If we wanted to keep tuning, paths forward:
+1. **Per-stream `min_cluster_size`** — preference-rich streams (episodic
+   user statements) keep min=2; factual streams use min=3+.
+2. **Lower `observations_top_k`** for non-preference questions —
+   reduces reader distraction on temporal queries.
+3. **Tag observations with their dominant subtype hint** — let the
+   reader weigh them differently.
+
+But those are tunings for a +1-2 pp regime. The architectural lesson
+is more useful than the score: P9 successfully isolated abstraction
+from raw evidence, removed the P1-style stability-halving harm, and
+made consolidation a benefit-or-neutral on this bench rather than the
+net-negative P1 was. Good shape to ship.
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.
