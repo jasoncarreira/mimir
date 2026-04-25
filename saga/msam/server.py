@@ -23,6 +23,7 @@ Endpoints:
     POST /v1/store               Store a memory atom
     POST /v1/query               Query memories (confidence-gated)
     POST /v1/feedback            Mark atom contributions
+    POST /v1/sessions/end        Write a session boundary atom
     POST /v1/decay               Run decay cycle
     GET  /v1/stats               Database statistics
     POST /v1/triples/extract     Extract triples
@@ -110,6 +111,16 @@ class FeedbackRequest(BaseModel):
     atom_ids: list[str]
     response_text: str
     feedback: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+class SessionEndRequest(BaseModel):
+    session_id: str
+    summary: str
+    topics_discussed: Optional[list[str]] = None
+    decisions_made: Optional[list[str]] = None
+    unfinished: Optional[list[str]] = None
+    emotional_state: Optional[str] = None
 
 
 class TriplesExtractRequest(BaseModel):
@@ -377,8 +388,27 @@ async def api_query(req: QueryRequest):
 async def api_feedback(req: FeedbackRequest):
     def _feedback():
         from .core import mark_contributions
-        return mark_contributions(req.atom_ids, req.response_text)
+        return mark_contributions(req.atom_ids, req.response_text, req.session_id)
     return await asyncio.to_thread(_feedback)
+
+
+# ─── POST /v1/sessions/end ───────────────────────────────────────────────────
+
+@app.post("/v1/sessions/end", dependencies=[Depends(verify_api_key)])
+async def api_session_end(req: SessionEndRequest):
+    """Write a session_boundary atom marking the close of a session."""
+    def _end():
+        from .core import store_session_boundary
+        atom_id = store_session_boundary(
+            session_id=req.session_id,
+            summary=req.summary,
+            topics_discussed=req.topics_discussed,
+            decisions_made=req.decisions_made,
+            unfinished=req.unfinished,
+            emotional_state=req.emotional_state,
+        )
+        return {"atom_id": atom_id, "session_id": req.session_id}
+    return await asyncio.to_thread(_end)
 
 
 # ─── POST /v1/outcome ─────────────────────────────────────────────────────────
@@ -611,6 +641,7 @@ def run_server(host=None, port=None):
     print(f"  POST /v1/store               Store a memory atom")
     print(f"  POST /v1/query               Query memories")
     print(f"  POST /v1/feedback            Mark atom contributions")
+    print(f"  POST /v1/sessions/end        Write a session boundary atom")
     print(f"  POST /v1/decay               Run decay cycle")
     print(f"  GET  /v1/stats               Database statistics")
     print(f"  POST /v1/triples/extract     Extract triples")
