@@ -107,63 +107,6 @@ class ConsolidationEngine:
 
         return result
 
-    def _build_synthesis_prompt(self, stream: str, cluster_size: int, joined_atoms: str) -> str:
-        """Per-stream synthesis prompt. Episodic streams (user statements
-        and behaviors) want pattern-level abstraction; semantic/procedural
-        streams want fact preservation with chronological anchoring.
-        """
-        if stream == "episodic":
-            return (
-                f"You are abstracting {cluster_size} related personal-history "
-                f"excerpts into a single observation about the user. The atoms "
-                f"are things the user said, did, or experienced — they share a "
-                f"theme. Write ONE sentence (two at most) that captures the "
-                f"PATTERN across the atoms: what does the user prefer, do "
-                f"repeatedly, or feel about this topic?\n\n"
-                f"Rules:\n"
-                f"- Generalize: 'user prefers Sony cameras' beats 'user mentioned "
-                f"a Sony A7 III on 2023-05-14 and a Sony lens on 2023-06-02'.\n"
-                f"- Preserve only the pattern-relevant specifics (named brands, "
-                f"named places, named people). Drop incidental details that don't "
-                f"support the pattern.\n"
-                f"- If atoms disagree, name the most-recent state ('user used "
-                f"to prefer X but switched to Y in May').\n"
-                f"- Do not invent details not present in the atoms.\n"
-                f"- Output ONLY the observation sentence(s), no preamble, no "
-                f"explanations, no bullet lists.\n\n"
-                f"Atoms:\n- {joined_atoms}"
-            )
-        # semantic / procedural: preserve specifics, anchor in time.
-        return (
-            f"You are consolidating {cluster_size} related fact/procedure atoms "
-            f"into a single observation. These atoms share a topic and may "
-            f"describe the same fact across different times.\n\n"
-            f"Rules:\n"
-            f"- Preserve specific dates, times, numbers, names, and direct "
-            f"quotes VERBATIM. Do not generalize '2023-05-14' into 'recently' "
-            f"or '$23.50' into 'some money'.\n"
-            f"- If atoms describe the same fact at different times, include "
-            f"the chronology (e.g. 'on date A user said X; updated on date B "
-            f"to Y').\n"
-            f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
-            f"in the observation when the date matters to the content.\n"
-            f"- Do not invent details not present in the atoms.\n"
-            f"- Output ONLY the observation sentence(s), no preamble, no "
-            f"explanations, no bullet lists.\n\n"
-            f"Atoms:\n- {joined_atoms}"
-        )
-
-    def _min_cluster_size_for_stream(self, stream: str) -> int:
-        """Per-stream minimum cluster size. Episodic streams (where user
-        preferences and recurring behaviors live) often pattern across just
-        2 atoms — bumping the global threshold to 3 filters them out. Other
-        streams benefit from a higher floor that drops noisy pair-clusters.
-        """
-        per_stream = _cfg('consolidation', f'min_cluster_size_{stream}', None)
-        if per_stream is not None:
-            return int(per_stream)
-        return self.min_cluster_size
-
     def _cluster_phase(self) -> list[list[dict]]:
         """Use FAISS (or brute-force) to find clusters of similar atoms.
 
@@ -171,7 +114,7 @@ class ConsolidationEngine:
         - Only active atoms with embeddings
         - Never cluster pinned atoms
         - Same stream only
-        - Minimum cluster size (per-stream override)
+        - Minimum cluster size
         """
         conn = get_db()
         rows = conn.execute("""
@@ -194,10 +137,9 @@ class ConsolidationEngine:
 
         clusters = []
         for stream, group in stream_groups.items():
-            stream_min = self._min_cluster_size_for_stream(stream)
-            if len(group) < stream_min:
+            if len(group) < self.min_cluster_size:
                 continue
-            stream_clusters = self._find_clusters_in_group(group, conn, stream_min)
+            stream_clusters = self._find_clusters_in_group(group, conn)
             clusters.extend(stream_clusters)
 
         conn.close()
@@ -206,31 +148,26 @@ class ConsolidationEngine:
         clusters.sort(key=len, reverse=True)
         return clusters
 
-    def _find_clusters_in_group(self, atoms: list[dict], conn, min_size: int = None) -> list[list[dict]]:
+    def _find_clusters_in_group(self, atoms: list[dict], conn) -> list[list[dict]]:
         """Find clusters within a stream group using FAISS k-NN or brute-force."""
-        if min_size is None:
-            min_size = self.min_cluster_size
         # Try FAISS
         try:
             from .vector_index import get_atoms_index, FAISS_AVAILABLE
             if FAISS_AVAILABLE:
-                return self._cluster_with_faiss(atoms, conn, min_size)
+                return self._cluster_with_faiss(atoms, conn)
         except Exception:
             pass
 
         # Fallback: simple greedy clustering
-        return self._cluster_brute_force(atoms, min_size)
+        return self._cluster_brute_force(atoms)
 
-    def _cluster_with_faiss(self, atoms: list[dict], conn, min_size: int = None) -> list[list[dict]]:
+    def _cluster_with_faiss(self, atoms: list[dict], conn) -> list[list[dict]]:
         """Use FAISS to find clusters via k-NN graph."""
         from .vector_index import get_atoms_index
 
-        if min_size is None:
-            min_size = self.min_cluster_size
-
         idx = get_atoms_index(conn=conn)
         if idx is None or not idx._built:
-            return self._cluster_brute_force(atoms, min_size)
+            return self._cluster_brute_force(atoms)
 
         clustered = set()
         clusters = []
@@ -256,17 +193,14 @@ class ConsolidationEngine:
                     cluster.append(neighbor)
                     clustered.add(neighbor_id)
 
-            if len(cluster) >= min_size:
+            if len(cluster) >= self.min_cluster_size:
                 clusters.append(cluster)
 
         return clusters
 
-    def _cluster_brute_force(self, atoms: list[dict], min_size: int = None) -> list[list[dict]]:
+    def _cluster_brute_force(self, atoms: list[dict]) -> list[list[dict]]:
         """Simple greedy clustering using pairwise cosine similarity."""
         from .core import cosine_similarity
-
-        if min_size is None:
-            min_size = self.min_cluster_size
 
         clustered = set()
         clusters = []
@@ -289,7 +223,7 @@ class ConsolidationEngine:
                     cluster.append(other)
                     clustered.add(other['id'])
 
-            if len(cluster) >= min_size:
+            if len(cluster) >= self.min_cluster_size:
                 clusters.append(cluster)
 
         return clusters
@@ -342,7 +276,25 @@ class ConsolidationEngine:
             synthesis_content = None
             if enable_llm:
                 try:
-                    prompt = self._build_synthesis_prompt(stream, len(cluster), joined)
+                    prompt = (
+                        f"You are consolidating {len(cluster)} related memory atoms into a "
+                        f"single observation. These atoms share a topic but may not say the "
+                        f"same thing. Write ONE sentence (two at most) that accurately "
+                        f"captures what the atoms collectively convey.\n\n"
+                        f"Rules:\n"
+                        f"- Preserve specific dates, times, numbers, names, and direct quotes "
+                        f"VERBATIM when they appear in the atoms. Do not generalize "
+                        f"'on 2023-05-14' into 'recently' or '$23.50' into 'some money'.\n"
+                        f"- If atoms disagree on a fact, keep both versions rather than "
+                        f"choosing one (e.g. 'user first mentioned X on date A, then "
+                        f"updated to Y on date B').\n"
+                        f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
+                        f"in the observation when the date matters to the content.\n"
+                        f"- Do not invent details not present in the atoms.\n"
+                        f"- Output ONLY the observation sentence(s), no preamble, no "
+                        f"explanations, no bullet lists.\n\n"
+                        f"Atoms:\n- {joined}"
+                    )
                     resp = requests.post(
                         llm_url,
                         headers={
