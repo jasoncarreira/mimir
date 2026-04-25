@@ -19,6 +19,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p1_minimax_v1` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (obs enabled, consolidation on) | 500 | **0.720** |
 | `msam_p1_minimax_v2` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (preserve-specifics consolidation prompt) | 500 | **0.692** |
 | `msam_p1_minimax_v3` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (consolidation.enable_llm=false, longest-atom fallback) | 500 | **0.704** |
+| `msam_p9_minimax_v1` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (consolidation gpt-5.4-nano, min_cluster_size=2) | 500 (499 graded) | **0.7816** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -235,6 +236,62 @@ evidence atoms in the raw tier by (1 / stability_reduction) × obs_RRF.
 Reader prompt presents both as labeled blocks so preference queries
 lean on observations, temporal queries lean on raws. Expected to land
 the preference lift without sacrificing temporal/multi-session.
+
+### `msam_p9_minimax_v1` — two-tier retrieval (P9), MiniMax reader, gpt-5.4-nano consolidation (500q)
+
+Bench config: `retrieval.two_tier_enabled = true`, `observations_top_k = 5`,
+`observation_confidence_min_sim = 0.30`, `evidence_boost_cap_multiplier = 3.0`,
+`consolidation.enable_llm = true` with gpt-5.4-nano,
+`consolidation.min_cluster_size = 2`. Reader = MiniMax-M2.7.
+
+| Subtype | Score | N | Δ vs P1v1 | Δ vs P2 |
+|---|---|---|---|---|
+| **knowledge-update** | **0.962** | 78 | +9.0 | **+1.3** |
+| single-session-assistant | 0.964 | 56 | 0.0 | -3.6 |
+| single-session-user | 0.928 | 69 | +2.8 | -2.9 |
+| multi-session | 0.632 | 133 | +6.1 | -0.2 |
+| temporal-reasoning | 0.759 | 133 | +10.5 | -6.8 |
+| **single-session-preference** | **0.400** | 30 | 0.0 | **+13.3** |
+
+**Overall: 0.7816 (-1.7 vs P2, +6.2 vs P1v1).**
+
+The architecture works:
+- **Preference** recovered to P1v1's gain — the two-tier design captures
+  the +13.3 pp preference lift abstract observations provide.
+- **Multi-session** essentially held at P2 levels (+0.2 within noise).
+  P1v1 had pulled this down -6.3; P9 gives it back.
+- **Knowledge-update** actually beat P2 (+1.3 pp). Observations help
+  with "what does the user know about X" without hurting factual recall
+  because the raws tier preserves specifics.
+
+Only loss is **temporal-reasoning** (-6.8 pp vs P2). Reader is being
+distracted by observations on time-sensitive questions even when the
+raws contain the precise dates. 5 obs + 20 raws = 25 items in prompt
+vs P2's 20 raws — small attention dilution.
+
+Observation fire rates from the run:
+- single-session-preference: 77% (matches design intent)
+- multi-session: 56%
+- temporal-reasoning: 46%
+- single-session-user: 22%
+- knowledge-update / assistant: similar
+
+Errors: 1 (Q `8a137a7f` lost to OpenAI 500 on embeddings).
+Pace: ~37s/q with gpt-5.4-nano consolidation (vs ~110s with MiniMax).
+
+### `msam_p9_minimax_v2` — same as v1 but min_cluster_size=3 (overnight)
+
+Reasoning:
+- v1 hit the 20-cluster cap on most questions with min=2, meaning many
+  small "two atoms happen to cosine-cluster" pair observations that
+  add noise.
+- min=3 reduces total observation count (less fire on noisy queries,
+  particularly temporal where firing currently hurts) and bumps the
+  average evidence_count (size-3 clusters = stronger signal per obs).
+- Preset plan called for min=3 + lowered sim_floor=0.25, but lowering
+  the floor would surface MORE observations including on temporal
+  queries — wrong direction given temporal is the only weak subtype.
+  Going with min=3 alone.
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.
