@@ -41,8 +41,8 @@ observation_bonus_alpha = 0.3               # multiplier = 1 + alpha * log(evide
 trend_penalty_weakening = 0.7               # score multiplier when trend = 'weakening'
 trend_penalty_stale = 0.4                   # score multiplier when trend = 'stale'
 # P9: two-tier retrieval (returns {observations, raws}). See HINDSIGHT-IDEAS.md §P9.
-observations_top_k = 5                      # cap on observations returned in two_tier mode
-observation_confidence_min_sim = 0.30       # similarity floor; observations below this are skipped
+observations_top_k = 3                      # cap on observations returned in two_tier mode
+observation_confidence_min_sim = 0.35       # similarity floor; observations below this are skipped
 evidence_boost_cap_multiplier = 3.0         # cap evidence boost at (this - 1) × own RRF
 graph_pathway_top_k = 20                    # pre-fusion candidates from triples
 temporal_pathway_top_k = 20                 # pre-fusion atoms in the detected time window
@@ -121,7 +121,15 @@ approx_threshold = 50000                     # switch from exact to approximate 
 
 [consolidation]
 similarity_threshold = 0.80                 # cosine similarity to group atoms
-min_cluster_size = 3                        # minimum atoms to form a cluster
+min_cluster_size = 3                        # default minimum atoms to form a cluster
+# Per-stream overrides for min_cluster_size. Episodic atoms (user
+# preferences, behaviors) often pattern across just 2 atoms; bumping
+# the global floor to 3 filters them out. Other streams benefit from
+# higher floors that drop noisy pair-clusters.
+# min_cluster_size_episodic = 2
+# min_cluster_size_semantic = 3
+# min_cluster_size_procedural = 3
+# min_cluster_size_working = 3
 max_clusters_per_run = 50                   # cap clusters per consolidation run
 stability_reduction_factor = 0.5            # stability reduction for merged atoms
 # LLM used to synthesize observation atoms from a cluster. Any
