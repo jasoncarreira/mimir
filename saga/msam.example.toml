@@ -119,6 +119,12 @@ similarity_threshold = 0.80                 # cosine similarity to group atoms
 min_cluster_size = 3                        # minimum atoms to form a cluster
 max_clusters_per_run = 50                   # cap clusters per consolidation run
 stability_reduction_factor = 0.5            # stability reduction for merged atoms
+# P8: agglomerative merge pass after greedy clustering. Combines clusters
+# whose centroids are close enough that the "A near B, B near C, but A not
+# near C" fragmentation matters.
+enable_merge_pass = true                    # gate the merge pass
+merge_threshold = 0.75                      # centroid cosine to trigger merge (lower than similarity_threshold)
+max_cluster_size = 50                       # post-merge cap; synthesis on huge clusters loses specificity
 # LLM used to synthesize observation atoms from a cluster. Any
 # OpenAI-compatible /chat/completions endpoint works.
 llm_url = "https://integrate.api.nvidia.com/v1/chat/completions"

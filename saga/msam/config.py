@@ -130,6 +130,10 @@ _DEFAULTS = {
         "min_cluster_size": 3,
         "max_clusters_per_run": 50,
         "stability_reduction_factor": 0.5,
+        # P8: agglomerative merge pass after greedy clustering.
+        "enable_merge_pass": True,
+        "merge_threshold": 0.75,
+        "max_cluster_size": 50,
     },
     "negative_knowledge": {
         "default_ttl_hours": 168,
