@@ -173,8 +173,8 @@ class TestFeedback:
 
     def test_feedback_success(self, client, monkeypatch):
         import msam.core
-        monkeypatch.setattr(msam.core, "mark_contributions", lambda ids, text: {
-            "contributed": ids, "not_contributed": [],
+        monkeypatch.setattr(msam.core, "mark_contributions", lambda ids, text, sid=None: {
+            "contributed": ids, "not_contributed": [], "session_id": sid,
         })
 
         rv = client.post("/v1/feedback", json={
@@ -184,6 +184,76 @@ class TestFeedback:
         assert rv.status_code == 200
         data = rv.json()
         assert "contributed" in data
+        assert data["session_id"] is None  # session_id not provided
+
+    def test_feedback_with_session_id(self, client, monkeypatch):
+        import msam.core
+        monkeypatch.setattr(msam.core, "mark_contributions", lambda ids, text, sid=None: {
+            "contributed": ids, "not_contributed": [], "session_id": sid,
+        })
+
+        rv = client.post("/v1/feedback", json={
+            "atom_ids": ["abc123"],
+            "response_text": "The user prefers dark mode",
+            "session_id": "slack-dm-jcarreira:2026-04-25",
+        })
+        assert rv.status_code == 200
+        assert rv.json()["session_id"] == "slack-dm-jcarreira:2026-04-25"
+
+
+# ─── Sessions ───────────────────────────────────────────────────────────────
+
+
+class TestSessionsEnd:
+    def test_session_end_requires_session_id_and_summary(self, client):
+        rv = client.post("/v1/sessions/end", json={"summary": "ok"})
+        assert rv.status_code == 422
+        rv = client.post("/v1/sessions/end", json={"session_id": "abc"})
+        assert rv.status_code == 422
+
+    def test_session_end_minimal(self, client, monkeypatch):
+        import msam.core
+        captured = {}
+        def fake_store(**kwargs):
+            captured.update(kwargs)
+            return "boundary_atom_id_xyz"
+        monkeypatch.setattr(msam.core, "store_session_boundary", fake_store)
+
+        rv = client.post("/v1/sessions/end", json={
+            "session_id": "abc",
+            "summary": "Discussed Q2 roadmap",
+        })
+        assert rv.status_code == 200
+        data = rv.json()
+        assert data["atom_id"] == "boundary_atom_id_xyz"
+        assert data["session_id"] == "abc"
+        assert captured["session_id"] == "abc"
+        assert captured["summary"] == "Discussed Q2 roadmap"
+        # Optional fields default to None
+        assert captured["topics_discussed"] is None
+        assert captured["decisions_made"] is None
+
+    def test_session_end_full(self, client, monkeypatch):
+        import msam.core
+        captured = {}
+        def fake_store(**kwargs):
+            captured.update(kwargs)
+            return "boundary_atom_id_xyz"
+        monkeypatch.setattr(msam.core, "store_session_boundary", fake_store)
+
+        rv = client.post("/v1/sessions/end", json={
+            "session_id": "slack-dm-jcarreira:2026-04-25",
+            "summary": "Discussed Q2 roadmap and shipped P8",
+            "topics_discussed": ["roadmap", "P8"],
+            "decisions_made": ["Ship P8 by Friday"],
+            "unfinished": ["Run benchmark"],
+            "emotional_state": "engaged",
+        })
+        assert rv.status_code == 200
+        assert captured["topics_discussed"] == ["roadmap", "P8"]
+        assert captured["decisions_made"] == ["Ship P8 by Friday"]
+        assert captured["unfinished"] == ["Run benchmark"]
+        assert captured["emotional_state"] == "engaged"
 
 
 # ─── API Key Auth ────────────────────────────────────────────────────────────
