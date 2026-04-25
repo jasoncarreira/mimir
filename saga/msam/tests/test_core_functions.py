@@ -1,7 +1,7 @@
 """Comprehensive tests for untested core.py public functions.
 
 Covers: associations, relations, advanced retrieval, knowledge management,
-negative knowledge, session/working memory, provenance, hooks, pins,
+negative knowledge, session boundaries, provenance, hooks, pins,
 forgetting, cache, confidence, schema, and access patterns.
 """
 
@@ -303,14 +303,6 @@ class TestSessionWorkingMemory:
         result = get_last_sessions(count=2)
         assert isinstance(result, list)
 
-    def test_expire_working_memory(self):
-        from msam.core import store_working, expire_working_memory
-        store_working("Temp working memory data", session_id="wm-test")
-        result = expire_working_memory(session_id="wm-test")
-        assert isinstance(result, dict)
-        assert "tombstoned" in result
-
-
 # ─── Provenance & Hooks ───────────────────────────────────────────────────────
 
 
@@ -482,14 +474,6 @@ class TestContextQuality:
             for a in scored:
                 assert "_quality_score" in a
                 assert "_include" in a
-
-    def test_pre_warm_context(self):
-        from msam.core import pre_warm_context
-        result = pre_warm_context({"time_of_day": "morning", "user_active": True})
-        assert isinstance(result, dict)
-        assert "predicted" in result
-        assert "pre_warmed" in result
-
 
 # ─── Confidence ───────────────────────────────────────────────────────────────
 

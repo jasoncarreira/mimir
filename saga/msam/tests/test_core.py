@@ -142,15 +142,6 @@ class TestKeywordSearch:
         # but the fallback handles this
 
 
-class TestWorkingMemory:
-    def test_store_working(self):
-        from msam.core import store_working, get_stats
-        wid = store_working("Temporary scratchpad data", ttl_minutes=5)
-        assert wid is not None
-        stats = get_stats()
-        assert stats["by_stream"].get("working", 0) >= 1
-
-
 class TestMerge:
     def test_merge_atoms(self):
         from msam.core import store_atom, merge_atoms

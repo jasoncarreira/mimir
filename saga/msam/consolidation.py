@@ -133,7 +133,7 @@ class ConsolidationEngine:
                 f"explanations, no bullet lists.\n\n"
                 f"Atoms:\n- {joined_atoms}"
             )
-        # semantic / procedural / working: preserve specifics, anchor in time.
+        # semantic / procedural: preserve specifics, anchor in time.
         return (
             f"You are consolidating {cluster_size} related fact/procedure atoms "
             f"into a single observation. These atoms share a topic and may "

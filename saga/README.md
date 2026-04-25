@@ -2,7 +2,7 @@
 
 **Multi-Stream Adaptive Memory** -- a production-grade cognitive memory architecture for AI agents.
 
-MSAM gives agents persistent, structured memory that self-regulates what it stores, how it retrieves, and when it forgets. Knowledge lives as discrete atoms across semantic, episodic, procedural, and working memory streams, scored using ACT-R activation theory, and retrieved through a hybrid pipeline combining embedding similarity, keyword matching, and a knowledge graph of subject-predicate-object triples. A REST API exposes the full system for language-agnostic integration, and a multi-agent protocol lets multiple agents share or isolate memories.
+MSAM gives agents persistent, structured memory that self-regulates what it stores, how it retrieves, and when it forgets. Knowledge lives as discrete atoms across semantic, episodic, and procedural streams, scored using ACT-R activation theory, and retrieved through a hybrid pipeline combining embedding similarity, keyword matching, and a knowledge graph of subject-predicate-object triples. A REST API exposes the full system for language-agnostic integration, and a multi-agent protocol lets multiple agents share or isolate memories.
 
 When MSAM knows something, it delivers. When it doesn't, it says so. Output volume is proportional to confidence -- not padded with noise.
 
@@ -26,7 +26,7 @@ Most agent memory systems are vector stores with a retrieval wrapper. MSAM is di
 
 - **Adaptive output.** Confidence-gated retrieval: high confidence returns full results, low returns minimal context, none returns nothing. The system doesn't hallucinate -- it admits gaps.
 
-- **Multi-stream architecture.** Semantic (facts), episodic (events), procedural (how-to), and working (session-scoped) streams. Each has different retrieval behavior, decay characteristics, and promotion rules.
+- **Multi-stream architecture.** Semantic (facts), episodic (events), and procedural (how-to) streams. Each has different retrieval behavior, decay characteristics, and promotion rules.
 
 - **Cognitive scoring.** ACT-R activation model: base-level activation (frequency + recency) x sigmoid similarity x annotation bonuses x stability. Not just "closest vector."
 
@@ -139,7 +139,6 @@ Key sections:
 | `[retrieval]` | top_k, similarity threshold, sigmoid curve, semantic/keyword weights, confidence tiers |
 | `[retrieval_v2]` | Beam search gate, entity roles, quality filter, temporal detection, reranking |
 | `[decay]` | State transition thresholds, confidence decay rate, stability factors |
-| `[working_memory]` | Session atom TTL, promotion threshold, default profile |
 | `[atoms]` | Default profile, encoding confidence, arousal, valence |
 | `[merge]` | Similarity threshold for merge suggestions |
 | `[negative_knowledge]` | TTL for negative examples |

@@ -439,20 +439,6 @@ class TestConfidence:
 # ─── Tier 3: Mutation commands ────────────────────────────────────────────────
 
 
-class TestWorking:
-    def test_working_store(self, capsys):
-        from msam.remember import cmd_working
-        cmd_working(["store", "temporary", "working", "memory"])
-        data = json.loads(capsys.readouterr().out)
-        assert "stored" in data
-
-    def test_working_expire(self, capsys):
-        from msam.remember import cmd_working
-        cmd_working([])  # default is expire
-        data = json.loads(capsys.readouterr().out)
-        assert isinstance(data, dict)
-
-
 class TestContribute:
     def test_contribute_no_args(self, capsys):
         from msam.remember import cmd_contribute

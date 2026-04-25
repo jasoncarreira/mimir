@@ -132,7 +132,7 @@ atoms (
     id TEXT PRIMARY KEY,            -- content-derived hash
     schema_version INTEGER,
     profile TEXT,                   -- lightweight (~50tok), standard (~150tok), full (~300tok)
-    stream TEXT,                    -- working, episodic, semantic, procedural
+    stream TEXT,                    -- episodic, semantic, procedural
 
     content TEXT NOT NULL,          -- the memory itself
     content_hash TEXT NOT NULL,     -- deduplication
@@ -163,8 +163,7 @@ atoms (
 
     -- Denormalized columns
     is_pinned INTEGER,              -- pinned atoms skip decay transitions
-    session_id TEXT,                -- working memory session tracking
-    working_expires_at REAL         -- TTL for working memory atoms
+    session_id TEXT                 -- session tag (set by agent on store)
 )
 ```
 
@@ -485,7 +484,7 @@ Key results from production deployment:
 - Confidence-gated retrieval with four tiers (high/medium/low/none), ~1.3% context budget per query
 - Stability-based decay with contribution-based feedback that preserves high-value atoms across weeks
 - 4x batch cosine speedup on ARM64 via vectorized matmul (17x including blob deserialization)
-- 675+ atoms across semantic, episodic, procedural, and working memory streams
+- 675+ atoms across semantic, episodic, and procedural streams
 
 The system has grown beyond core storage and retrieval into a full production architecture: a REST API server with 19 endpoints for language-agnostic integration, multi-agent memory isolation and sharing, semantic contradiction detection with four analysis strategies, LLM-powered annotation with heuristic fallback, a three-strategy predictive prefetch engine with context assembly, outcome-attributed memory scoring (Felt Consequence), a temporal world model with auto-closing facts, sycophancy detection via agreement rate tracking, intentional forgetting with four signal types, cross-provider embedding calibration, sleep-inspired memory consolidation, FAISS-backed approximate nearest neighbor search, security-hardened API endpoints, and a centralized configuration system with 27 tunable sections. A reproducible benchmark suite with 100 synthetic atoms and 25 ground truth queries validates retrieval quality, token efficiency, and cognitive features in a single command. The test suite covers 437 tests across 25 test files.
 

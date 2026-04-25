@@ -385,16 +385,11 @@ def run_decay_cycle() -> dict:
 
     # Step 4.5: Update confidence gradient from evidence
     try:
-        from .core import update_confidence_from_evidence, expire_working_memory, compute_retrieval_adjustments, expire_negatives, decay_confidence, is_pinned
+        from .core import update_confidence_from_evidence, compute_retrieval_adjustments, expire_negatives, decay_confidence, is_pinned
         confidence_result = update_confidence_from_evidence()
         logger.info(f"confidence_update: {confidence_result['triples_updated']} triples updated, "
                     f"{confidence_result['multi_source_facts']} multi-source facts")
-        
-        # Expire working memory
-        working_result = expire_working_memory()
-        logger.info(f"working_memory: {working_result['tombstoned']} expired, "
-                    f"{working_result['promoted_to_episodic']} promoted")
-        
+
         # Self-improving retrieval: adjust stability based on contribution history
         feedback_result = compute_retrieval_adjustments()
         logger.info(f"retrieval_feedback: {feedback_result['adjustments_made']} adjustments, "
@@ -413,9 +408,8 @@ def run_decay_cycle() -> dict:
                        f"{conf_decay_result['exempt_pinned']} pinned, "
                        f"{conf_decay_result['exempt_recent']} recent")
     except Exception as e:
-        logger.warning(f"confidence/working/feedback update failed: {e}")
+        logger.warning(f"confidence/feedback update failed: {e}")
         confidence_result = {"triples_updated": 0}
-        working_result = {"tombstoned": 0, "promoted_to_episodic": 0}
         feedback_result = {"adjustments_made": 0}
 
     # Step 4.6: Intentional forgetting engine

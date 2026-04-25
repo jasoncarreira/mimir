@@ -113,9 +113,6 @@ decay.run_decay_cycle (heartbeat, hourly)
   -> compute_retrieval_adjustments (feedback loop)
     -> over-retrieved + low-contribution -> dampen (0.9x)
     -> high-contribution -> boost (1.1x)
-  -> expire_working_memory
-    -> access_count > 3: PROMOTE to episodic
-    -> TTL expired: TOMBSTONE
   -> metrics.log_decay
 ```
 

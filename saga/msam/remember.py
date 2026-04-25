@@ -698,27 +698,6 @@ def cmd_decay(args):
     print(json.dumps(result, indent=2))
 
 
-def cmd_working(args):
-    """Store or manage working memory atoms."""
-    from .core import store_working, expire_working_memory
-
-    if not args or args[0] == "expire":
-        session_id = args[1] if len(args) > 1 else None
-        result = expire_working_memory(session_id=session_id)
-        print(json.dumps(result, indent=2))
-    elif args[0] == "store":
-        content = " ".join(args[1:])
-        session_id = None
-        if "--session" in args:
-            idx = args.index("--session")
-            session_id = args[idx + 1]
-            content = " ".join(a for i, a in enumerate(args[1:]) if i not in (idx-1, idx))
-        atom_id = store_working(content, session_id=session_id)
-        print(json.dumps({"stored": atom_id}))
-    else:
-        print(json.dumps({"error": "Usage: working store <content> | working expire [session_id]"}))
-
-
 def cmd_metamemory(args):
     """Query what the system knows about a topic and how confident it is."""
     from .core import metamemory_query
@@ -1247,12 +1226,11 @@ def cmd_predict(args):
       --day           Day type (weekday|weekend|show_day)
       --topics        Comma-separated topics
       --active        User is active
-      --warm          Pre-warm context
       --hour N        Specific hour (0-23) for predict_context
       --day-of-week D Day name (monday..sunday) for predict_context
       --format context Use predict_context instead of predict_needed_atoms
     """
-    from .core import predict_needed_atoms, pre_warm_context
+    from .core import predict_needed_atoms
 
     if "--learn" in args:
         from .prediction import PredictiveEngine
@@ -1277,10 +1255,6 @@ def cmd_predict(args):
             context["recent_topics"] = args[i+1].split(","); i += 2
         elif args[i] == "--active":
             context["user_active"] = True; i += 1
-        elif args[i] == "--warm":
-            result = pre_warm_context(context)
-            print(json.dumps(result, indent=2))
-            return
         elif args[i] == "--format" and i + 1 < len(args):
             if args[i+1] == "context":
                 use_predict_context = True
@@ -1559,7 +1533,6 @@ def cmd_help(args=None):
 Storage:
   store <content>              Store a new memory atom
   batch <file>                 Batch store from JSONL file
-  working <content>            Store working memory (session-scoped)
 
 Retrieval:
   query <query>                Confidence-gated retrieval
@@ -1732,7 +1705,6 @@ def main():
         "graph": cmd_graph,
         "contradictions": cmd_contradictions,
         "decay": cmd_decay,
-        "working": cmd_working,
         "metamemory": cmd_metamemory,
         "drift": cmd_drift,
         "confidence": cmd_confidence,

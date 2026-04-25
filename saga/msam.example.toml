@@ -86,11 +86,6 @@ compaction_trigger_ratio = 1.5               # only compact if content > target 
 profile_target_lightweight_chars = 90        # target chars for lightweight profile (~22 tokens)
 profile_target_standard_chars = 240          # target chars for standard profile (~60 tokens)
 
-[working_memory]
-default_ttl_minutes = 120                   # session atom lifespan
-promotion_threshold = 3                     # access count to promote working -> episodic
-default_profile = "lightweight"             # working memory always uses this profile
-
 [atoms]
 default_profile = "standard"                # lightweight | standard | full
 profile_lightweight_max_words = 20           # word count threshold: below = lightweight
@@ -129,7 +124,6 @@ min_cluster_size = 3                        # default minimum atoms to form a cl
 # min_cluster_size_episodic = 2
 # min_cluster_size_semantic = 3
 # min_cluster_size_procedural = 3
-# min_cluster_size_working = 3
 max_clusters_per_run = 50                   # cap clusters per consolidation run
 stability_reduction_factor = 0.5            # stability reduction for merged atoms
 # LLM used to synthesize observation atoms from a cluster. Any
