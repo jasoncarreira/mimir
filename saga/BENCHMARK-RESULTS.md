@@ -21,6 +21,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p1_minimax_v3` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (consolidation.enable_llm=false, longest-atom fallback) | 500 | **0.704** |
 | `msam_p9_minimax_v1` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (consolidation gpt-5.4-nano, min_cluster_size=2) | 500 (499 graded) | **0.7816** |
 | `msam_p9_minimax_v2` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (consolidation gpt-5.4-nano, min_cluster_size=3) | 500 | **0.796** |
+| `msam_p9_minimax_v3` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (per-stream cluster floors, obs_top_k=3, obs_sim≥0.35, per-stream prompts) | 500 | **0.760** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -324,34 +325,82 @@ hitting the 20-cap on most v1 questions to ~7-12 on v2, confirming
 ~50-80% of v1's clusters were size-2 noise. Cons time fell from
 ~22s/q to ~12s/q.
 
+### `msam_p9_minimax_v3` — per-stream cluster floors + tighter obs gating + per-stream prompts (500q)
+
+Four tunings stacked on top of v2 to try to recover the v1 preference
+gain without losing v2's multi-session lift:
+
+1. `min_cluster_size_episodic = 2`, `min_cluster_size = 3` (others) —
+   episodic preference patterns cluster at 2; semantic/procedural keep
+   the 3-floor noise filter.
+2. `observations_top_k = 5 → 3` — fewer observations in the reader
+   prompt, less distraction on factual queries.
+3. `observation_confidence_min_sim = 0.30 → 0.35` — observations only
+   surface when they're strongly relevant.
+4. Per-stream consolidation prompts — episodic abstracts the pattern
+   ("user prefers X"); semantic/procedural preserves specifics
+   verbatim (dates, numbers, named entities).
+
+| Subtype | Score | N | Δ vs P9v2 | Δ vs P2 |
+|---|---|---|---|---|
+| single-session-assistant | 1.000 | 56 | +1.8 | 0.0 |
+| single-session-user | 0.929 | 70 | -5.7 | -2.9 |
+| knowledge-update | 0.936 | 78 | -1.3 | -1.3 |
+| **multi-session** | 0.639 | 133 | **-3.0** | +0.5 |
+| **temporal-reasoning** | 0.707 | 133 | **-6.7** | **-12.0** |
+| **single-session-preference** | 0.233 | 30 | -3.4 | -3.4 |
+
+**Overall: 0.760 (-3.6 vs P9v2, -3.9 vs P2).** Regressed across nearly
+every subtype except single-session-assistant. The tunings worked
+*against* each other rather than additively:
+
+- Episodic `min=2` was supposed to recover preference, but preference
+  *slipped* slightly (0.267 → 0.233). Likely cause: the abstract
+  episodic prompt produces observations like "user prefers concise
+  responses" that don't lexically match preference probe wording,
+  hurting retrieval even though the cluster forms.
+- The tighter obs gating (top_k 5→3, min_sim 0.30→0.35) starved
+  multi-session, which was P9v2's main win. Multi-session lost -3.0
+  exactly as expected — fewer observations, less coverage.
+- Temporal-reasoning lost -6.7 vs v2 and is now -12.0 vs P2. The new
+  episodic abstraction prompt is the most plausible culprit: temporal
+  questions need verbatim dates from raw atoms, and abstracted episodic
+  observations may have leaked into the semantic top-K via the
+  evidence-boost edge, displacing primary date evidence.
+
+In short: each tuning was individually defensible; together they
+compounded into a net loss. P9v2 is still the best P9 variant.
+
 ## P9 summary
 
-Two variants tried; both essentially tie P2 within ±2 pp overall but
-with very different subtype profiles:
+Three variants tried:
 
 - **P9v1 (min=2)**: keeps P1's preference gain (+13.3), basically holds
-  multi-session at P2.
+  multi-session at P2. **Overall 0.7816.**
 - **P9v2 (min=3)**: loses preference gain, but lifts multi-session
   (+3.5), single-session-user (+2.9), and partially recovers temporal.
+  **Overall 0.796.** Best of the three.
+- **P9v3 (per-stream cluster floors + tighter obs gating + per-stream
+  prompts)**: regressed -3.6 from v2 across nearly every subtype.
+  Stacked tunings interacted badly. **Overall 0.760.**
 
 Neither beats P2 overall by enough to call it a clear win. The
 architecture is sound — observations help where they should help — but
 the cluster-size knob fundamentally trades subtypes against each
 other, and on this benchmark the trade comes out roughly even.
 
-If we wanted to keep tuning, paths forward:
-1. **Per-stream `min_cluster_size`** — preference-rich streams (episodic
-   user statements) keep min=2; factual streams use min=3+.
-2. **Lower `observations_top_k`** for non-preference questions —
-   reduces reader distraction on temporal queries.
-3. **Tag observations with their dominant subtype hint** — let the
-   reader weigh them differently.
+The v3 lesson is that the four "obvious" knobs do not stack additively.
+Episodic-only `min=2` doesn't recover preference if the consolidation
+prompt is also changed to abstract patterns instead of preserve
+specifics — the abstract observations don't match probe wording.
+Tightening obs gating reduces multi-session signal, which was the main
+v2 win. The takeaway: tune one knob per run.
 
-But those are tunings for a +1-2 pp regime. The architectural lesson
-is more useful than the score: P9 successfully isolated abstraction
-from raw evidence, removed the P1-style stability-halving harm, and
-made consolidation a benefit-or-neutral on this bench rather than the
-net-negative P1 was. Good shape to ship.
+Architectural lesson is more useful than the score: P9 successfully
+isolated abstraction from raw evidence, removed the P1-style
+stability-halving harm, and made consolidation a benefit-or-neutral
+on this bench rather than the net-negative P1 was. P9v2 is the
+recommended P9 configuration. Good shape to ship.
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.
