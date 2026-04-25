@@ -31,8 +31,8 @@ rrf_semantic_weight = 1.0
 rrf_keyword_weight = 1.0
 # P9: two-tier retrieval with observation->raw evidence boost.
 two_tier_enabled = true
-observations_top_k = 3
-observation_confidence_min_sim = 0.35
+observations_top_k = 5
+observation_confidence_min_sim = 0.30
 evidence_boost_cap_multiplier = 3.0
 # Single-tier bonus is redundant in two_tier mode; leave off to avoid double-handling.
 enable_observation_bonus = false
@@ -93,10 +93,7 @@ llm_url = "https://api.openai.com/v1/chat/completions"
 llm_model = "gpt-5.4-nano"
 timeout_seconds = 30
 api_key_env = "OPENAI_API_KEY"
-# Per-stream cluster floors: preferences cluster at size-2; everything
-# else cleans up noise at size-3.
-min_cluster_size = 3                      # default for non-episodic streams
-min_cluster_size_episodic = 2             # episodic atoms (preferences, behaviors)
+min_cluster_size = 3
 max_clusters_per_run = 20
 stability_reduction_factor = 0.5
 
