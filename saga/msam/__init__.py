@@ -4,7 +4,9 @@ MSAM -- Multi-Stream Adaptive Memory
 Cognitive memory system for AI agents. Stores knowledge as atoms across
 semantic, episodic, and procedural streams with ACT-R-inspired activation
 scoring, hybrid retrieval (atoms + knowledge graph triples), and adaptive
-decay with contribution-based feedback.
+decay with contribution-based feedback. Cross-turn conversation state is
+the agent's responsibility (e.g. message history in the LLM context),
+not MSAM's.
 
 Usage:
     from msam import store_atom, retrieve, hybrid_retrieve
@@ -23,8 +25,6 @@ from msam.core import (
     batch_cosine_similarity,
     get_stats,
     metamemory_query,
-    store_working,
-    expire_working_memory,
     dry_retrieve,
     retrieve_with_rewrite,
     retrieve_with_emotion,
@@ -74,8 +74,6 @@ __all__ = [
     "batch_cosine_similarity",
     "get_stats",
     "metamemory_query",
-    "store_working",
-    "expire_working_memory",
     "dry_retrieve",
     "retrieve_with_rewrite",
     "retrieve_with_emotion",

@@ -177,7 +177,6 @@ def grafana_search():
         # --- Feedback & lifecycle ---
         "contribution_rate",
         "pinned_atom_count",
-        "working_memory_count",
         "confidence_avg",
         "forgetting_events_count",
     ])
@@ -689,7 +688,7 @@ def grafana_query():
                     except (ValueError, TypeError):
                         continue
 
-        elif metric in ("contribution_rate", "pinned_atom_count", "working_memory_count",
+        elif metric in ("contribution_rate", "pinned_atom_count",
                         "confidence_avg", "forgetting_events_count"):
             # Live-computed metrics from main MSAM database
             try:
@@ -713,12 +712,6 @@ def grafana_query():
                 elif metric == "pinned_atom_count":
                     r = msam_conn.execute(
                         "SELECT COUNT(*) FROM atoms WHERE state='active' AND is_pinned = 1"
-                    ).fetchone()
-                    datapoints = [[r[0], now_ts]]
-
-                elif metric == "working_memory_count":
-                    r = msam_conn.execute(
-                        "SELECT COUNT(*) FROM atoms WHERE stream='working' AND state='active'"
                     ).fetchone()
                     datapoints = [[r[0], now_ts]]
 

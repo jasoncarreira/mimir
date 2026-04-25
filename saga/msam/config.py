@@ -110,11 +110,6 @@ _DEFAULTS = {
         "profile_target_lightweight_chars": 90,
         "profile_target_standard_chars": 240,
     },
-    "working_memory": {
-        "default_ttl_minutes": 120,
-        "promotion_threshold": 3,
-        "default_profile": "lightweight",
-    },
     "atoms": {
         "default_profile": "standard",
         "default_encoding_confidence": 0.7,

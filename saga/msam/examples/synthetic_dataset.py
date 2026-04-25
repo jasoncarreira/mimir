@@ -73,7 +73,7 @@ def main():
     print("=" * 70)
 
     from msam.core import store_atom, retrieve, hybrid_retrieve, get_stats
-    from msam.core import get_db, run_migrations, metamemory_query, store_working
+    from msam.core import get_db, run_migrations, metamemory_query
 
     conn = get_db()
     run_migrations(conn)
@@ -125,15 +125,6 @@ def main():
         "If user mentions being tired, offer to summarize key points and defer detailed work.",
     ]
 
-    # Working memory (~5): current session context
-    working_atoms = [
-        "Current topic: discussing MSAM synthetic dataset creation",
-        "User mood: focused and productive",
-        "Active project: msam-release test coverage improvement",
-        "Today's goals: write tests, create demo dataset, update documentation",
-        "Context: working on open-source release preparation",
-    ]
-
     stored_count = 0
     for content in semantic_atoms:
         aid = store_atom(content, stream="semantic")
@@ -146,10 +137,6 @@ def main():
     for content in procedural_atoms:
         aid = store_atom(content, stream="procedural")
         if aid:
-            stored_count += 1
-    for content in working_atoms:
-        wid = store_working(content, ttl_minutes=120)
-        if wid:
             stored_count += 1
 
     stats = get_stats()

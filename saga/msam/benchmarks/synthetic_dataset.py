@@ -3,7 +3,7 @@
 Synthetic Benchmark Dataset for MSAM
 
 Generates ~100 realistic memory atoms for a fictional user named "Alex" across all
-4 memory streams (semantic, episodic, procedural, working) and 8 topic domains
+3 memory streams (semantic, episodic, procedural) and 8 topic domains
 (work, family, health, hobbies, schedule, personality, relationships, skills).
 
 Includes contradictory pairs, temporal sequences, and absent-topic negative queries
@@ -469,62 +469,62 @@ def generate_dataset() -> list[dict]:
     atoms += [
         _make_atom(
             "Currently debugging the auth module at DataFlow -- check JWT expiry logic and refresh token rotation.",
-            stream="working", topics=["work", "skills"], valence=-0.1, arousal=0.6,
+            stream="episodic", topics=["work", "skills"], valence=-0.1, arousal=0.6,
             encoding_confidence=0.6, profile="lightweight",
         ),
         _make_atom(
             "Need to finish onboarding paperwork for DataFlow by end of this week.",
-            stream="working", topics=["work", "schedule"], valence=-0.1, arousal=0.4,
+            stream="episodic", topics=["work", "schedule"], valence=-0.1, arousal=0.4,
             encoding_confidence=0.5, profile="lightweight",
         ),
         _make_atom(
             "Planning to call Emma this weekend to discuss her visit next month.",
-            stream="working", topics=["family", "schedule", "relationships"], valence=0.4, arousal=0.3,
+            stream="episodic", topics=["family", "schedule", "relationships"], valence=0.4, arousal=0.3,
             encoding_confidence=0.5, profile="lightweight",
         ),
         _make_atom(
             "Jordan suggested trying the new Thai restaurant on South Congress for Friday date night.",
-            stream="working", topics=["relationships", "schedule"], valence=0.5, arousal=0.4,
+            stream="episodic", topics=["relationships", "schedule"], valence=0.5, arousal=0.4,
             encoding_confidence=0.5, profile="lightweight",
         ),
         _make_atom(
             "Pixel has a vet appointment on Thursday at 4pm.",
-            stream="working", topics=["family", "schedule"], valence=0.0, arousal=0.3,
+            stream="episodic", topics=["family", "schedule"], valence=0.0, arousal=0.3,
             encoding_confidence=0.5, profile="lightweight",
         ),
         _make_atom(
             "Need to buy new running shoes -- current pair has over 500 miles.",
-            stream="working", topics=["health", "hobbies"], valence=-0.1, arousal=0.3,
+            stream="episodic", topics=["health", "hobbies"], valence=-0.1, arousal=0.3,
             encoding_confidence=0.5, profile="lightweight",
         ),
         _make_atom(
             "Working on learning Rust's async runtime for a side project -- stuck on lifetime issues.",
-            stream="working", topics=["skills", "hobbies"], valence=-0.2, arousal=0.5,
+            stream="episodic", topics=["skills", "hobbies"], valence=-0.2, arousal=0.5,
             encoding_confidence=0.5, profile="lightweight",
         ),
         _make_atom(
             "Marcus invited Alex to a board game night next Saturday.",
-            stream="working", topics=["relationships", "schedule", "hobbies"], valence=0.5, arousal=0.4,
+            stream="episodic", topics=["relationships", "schedule", "hobbies"], valence=0.5, arousal=0.4,
             encoding_confidence=0.5, profile="lightweight",
         ),
         _make_atom(
             "Alex is reading 'The Pragmatic Programmer' for the DataFlow book club.",
-            stream="working", topics=["work", "hobbies", "skills"], valence=0.3, arousal=0.3,
+            stream="episodic", topics=["work", "hobbies", "skills"], valence=0.3, arousal=0.3,
             encoding_confidence=0.5, profile="lightweight",
         ),
         _make_atom(
             "Considering signing up for a half-marathon in March 2026.",
-            stream="working", topics=["health", "hobbies", "schedule"], valence=0.4, arousal=0.5,
+            stream="episodic", topics=["health", "hobbies", "schedule"], valence=0.4, arousal=0.5,
             encoding_confidence=0.4, profile="lightweight",
         ),
         _make_atom(
             "Alex is feeling optimistic about the new role at DataFlow but slightly anxious about proving himself.",
-            stream="working", topics=["work", "personality"], valence=0.2, arousal=0.6,
+            stream="episodic", topics=["work", "personality"], valence=0.2, arousal=0.6,
             encoding_confidence=0.6, profile="lightweight",
         ),
         _make_atom(
             "The analytics pipeline POC needs to process 10K events/sec -- current design handles 7K.",
-            stream="working", topics=["work", "skills"], valence=-0.2, arousal=0.5,
+            stream="episodic", topics=["work", "skills"], valence=-0.2, arousal=0.5,
             encoding_confidence=0.6, profile="lightweight",
         ),
     ]
@@ -960,7 +960,7 @@ def generate_ground_truth(atoms: list[dict], id_map: dict[str, str]) -> dict:
 if __name__ == "__main__":
     atoms = generate_dataset()
     print(f"Generated {len(atoms)} synthetic atoms")
-    print(f"  Streams: { {s: sum(1 for a in atoms if a['stream'] == s) for s in ('semantic', 'episodic', 'procedural', 'working')} }")
+    print(f"  Streams: { {s: sum(1 for a in atoms if a['stream'] == s) for s in ('semantic', 'episodic', 'procedural')} }")
     topics = set()
     for a in atoms:
         topics.update(a["topics"])

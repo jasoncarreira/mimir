@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS atoms (
     id TEXT PRIMARY KEY,
     schema_version INTEGER DEFAULT 1,
     profile TEXT CHECK(profile IN ('lightweight', 'standard', 'full')) DEFAULT 'standard',
-    stream TEXT CHECK(stream IN ('working', 'episodic', 'semantic', 'procedural')) DEFAULT 'semantic',
+    stream TEXT CHECK(stream IN ('episodic', 'semantic', 'procedural')) DEFAULT 'semantic',
     
     -- Content
     content TEXT NOT NULL,
@@ -71,7 +71,6 @@ CREATE TABLE IF NOT EXISTS atoms (
     -- Denormalized columns (Phase 1C)
     is_pinned INTEGER DEFAULT 0,
     session_id TEXT,
-    working_expires_at REAL,
 
     -- Observations tier (P1): consolidation output gets memory_type='observation'
     -- and evidence_count = number of raw atoms backing the synthesis.
@@ -282,7 +281,6 @@ def store_atom(
     meta = metadata or {}
     _is_pinned = 1 if meta.get("pinned", False) else 0
     _session_id = meta.get("session_id")
-    _working_expires_at = meta.get("working_expires_at")
 
     _embedding_provider = _cfg('embedding', 'provider', 'nvidia-nim')
 
@@ -291,15 +289,15 @@ def store_atom(
             id, profile, stream, content, content_hash, created_at,
             arousal, valence, topics, encoding_confidence, provisional,
             source_type, embedding, metadata, agent_id,
-            embedding_provider, is_pinned, session_id, working_expires_at,
+            embedding_provider, is_pinned, session_id,
             memory_type, evidence_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         atom_id, profile, stream, content, content_hash, now,
         arousal, valence, json.dumps(topics or []),
         encoding_confidence, int(provisional), source_type,
         emb_blob, json.dumps(meta), agent_id,
-        _embedding_provider, _is_pinned, _session_id, _working_expires_at,
+        _embedding_provider, _is_pinned, _session_id,
         memory_type, evidence_count
     ))
 
@@ -1509,91 +1507,6 @@ def get_stats() -> dict:
     return result
 
 
-# ─── Feature: Working Memory Tier ────────────────────────────────
-
-def store_working(content: str, session_id: str = None, ttl_minutes: int = None,
-                  **kwargs) -> str:
-    """Store a working memory atom (session-scoped, auto-expires).
-    
-    Working atoms live for the duration of a session or ttl_minutes,
-    whichever comes first. They are automatically tombstoned by
-    expire_working_memory().
-    
-    Use for: conversation state, retrieved context tracking, 
-    temporary scratchpad, in-flight task state.
-    """
-    if ttl_minutes is None:
-        ttl_minutes = _cfg('working_memory', 'default_ttl_minutes', 120)
-    metadata = kwargs.pop('metadata', {}) or {}
-    metadata['session_id'] = session_id or f"session_{int(time.time())}"
-    metadata['ttl_minutes'] = ttl_minutes
-    metadata['working_expires_at'] = (
-        datetime.now(timezone.utc).timestamp() + (ttl_minutes * 60)
-    )
-    
-    return store_atom(
-        content=content,
-        stream='working',
-        profile='lightweight',  # working memory is always lightweight
-        metadata=metadata,
-        **kwargs,
-    )
-
-
-def expire_working_memory(session_id: str = None) -> dict:
-    """Tombstone expired working memory atoms.
-
-    If session_id is provided, expire all working atoms for that session.
-    Otherwise, expire all working atoms past their TTL.
-
-    Atoms with high access counts (>3) are promoted to episodic instead
-    of tombstoned -- they proved useful enough to keep.
-    """
-    conn = get_db()
-    now = datetime.now(timezone.utc).timestamp()
-
-    if session_id:
-        # Expire all atoms for this session -- use denormalized session_id column
-        rows = conn.execute("""
-            SELECT id, content, access_count, metadata FROM atoms
-            WHERE stream = 'working' AND state = 'active' AND session_id = ?
-        """, (session_id,)).fetchall()
-        targets = [dict(r) for r in rows]
-    else:
-        # Expire atoms past TTL -- use denormalized working_expires_at column
-        rows = conn.execute("""
-            SELECT id, content, access_count, metadata FROM atoms
-            WHERE stream = 'working' AND state = 'active'
-              AND working_expires_at IS NOT NULL AND working_expires_at < ?
-        """, (now,)).fetchall()
-        targets = [dict(r) for r in rows]
-
-    tombstoned = 0
-    promoted = 0
-
-    _promotion_threshold = _cfg('working_memory', 'promotion_threshold', 3)
-    for atom in targets:
-        if atom['access_count'] > _promotion_threshold:
-            # Promote to episodic -- this working memory proved valuable
-            meta = json.loads(atom['metadata'] or '{}')
-            meta['promoted_from'] = 'working'
-            conn.execute(
-                "UPDATE atoms SET stream = 'episodic', metadata = ? WHERE id = ?",
-                (json.dumps(meta), atom['id'])
-            )
-            _fire_hook('on_promote', atom_id=atom['id'], from_stream='working', to_stream='episodic')
-            promoted += 1
-        else:
-            conn.execute("UPDATE atoms SET state = 'tombstone' WHERE id = ?", (atom['id'],))
-            _fire_hook('on_expire', atom_id=atom['id'], stream='working')
-            tombstoned += 1
-
-    conn.commit()
-    conn.close()
-
-    return {"tombstoned": tombstoned, "promoted_to_episodic": promoted}
-
-
 # ─── Feature: Metamemory ─────────────────────────────────────────
 
 def metamemory_query(topic: str) -> dict:
@@ -2353,12 +2266,11 @@ MIGRATIONS = {
         "CREATE INDEX IF NOT EXISTS idx_rel_type ON atom_relations(relation_type)",
     ],
     3: [
-        # Phase 1C: Denormalization -- atom_topics junction table, is_pinned, session_id, working_expires_at
+        # Phase 1C: Denormalization -- atom_topics junction table, is_pinned, session_id
         "CREATE TABLE IF NOT EXISTS atom_topics (atom_id TEXT NOT NULL, topic TEXT NOT NULL, PRIMARY KEY(atom_id, topic))",
         "CREATE INDEX IF NOT EXISTS idx_atom_topics_topic ON atom_topics(topic)",
         "ALTER TABLE atoms ADD COLUMN is_pinned INTEGER DEFAULT 0",
         "ALTER TABLE atoms ADD COLUMN session_id TEXT",
-        "ALTER TABLE atoms ADD COLUMN working_expires_at REAL",
         "CREATE INDEX IF NOT EXISTS idx_triples_subject_lower ON triples(LOWER(subject))",
         "CREATE INDEX IF NOT EXISTS idx_triples_object_lower ON triples(LOWER(object))",
         "CREATE INDEX IF NOT EXISTS idx_triples_predicate_lower ON triples(LOWER(predicate))",
@@ -2368,11 +2280,10 @@ MIGRATIONS = {
            WHERE a.topics IS NOT NULL AND a.topics != '[]'""",
         # Backfill is_pinned from metadata JSON
         "UPDATE atoms SET is_pinned = 1 WHERE metadata LIKE '%\"pinned\": true%'",
-        # Backfill session_id and working_expires_at from metadata JSON
-        """UPDATE atoms SET
-               session_id = json_extract(metadata, '$.session_id'),
-               working_expires_at = json_extract(metadata, '$.working_expires_at')
-           WHERE stream = 'working' AND metadata IS NOT NULL AND metadata != '{}'""",
+        # Backfill session_id from metadata JSON
+        """UPDATE atoms SET session_id = json_extract(metadata, '$.session_id')
+           WHERE metadata IS NOT NULL AND metadata != '{}'
+             AND json_extract(metadata, '$.session_id') IS NOT NULL""",
     ],
     4: [
         # Phase 1B: FTS5 full-text search virtual tables
@@ -4012,33 +3923,6 @@ def _simple_predict(context: dict) -> list[dict]:
     # Sort by activation and cap
     predictions.sort(key=lambda x: x["activation"], reverse=True)
     return predictions[:20]
-
-
-def pre_warm_context(context: dict) -> dict:
-    """Run predictive pre-retrieval and store results as working memory.
-    
-    Called at session start by the agent. Predicted atoms go into working memory
-    for instant access. If not used, they expire naturally.
-    """
-    predictions = predict_needed_atoms(context)
-    
-    warmed = 0
-    for pred in predictions[:10]:  # cap at 10 pre-warmed atoms
-        try:
-            store_working(
-                content=f"[pre-warmed] {pred['content']}",
-                ttl_minutes=30,
-                metadata={"predicted_by": pred["predicted_by"], "source_atom": pred["id"]},
-            )
-            warmed += 1
-        except Exception:
-            pass
-    
-    return {
-        "predicted": len(predictions),
-        "pre_warmed": warmed,
-        "queries_used": [p["predicted_by"] for p in predictions[:10]],
-    }
 
 
 # ─── Feature: Episodic Replay ─────────────────────────────────────
