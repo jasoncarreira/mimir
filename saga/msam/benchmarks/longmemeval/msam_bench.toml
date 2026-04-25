@@ -84,15 +84,16 @@ enabled = false
 
 [consolidation]
 enabled = true
-# P9: LLM synthesis back on for observations using MiniMax-M2.7. With the
-# two-tier retrieval design the raws preserve specifics; observations are
-# free to be genuinely abstract summaries, which is what MiniMax is good at.
+# P9: LLM synthesis using gpt-5.4-nano — fast and cheap, good enough for
+# the "combine N atoms into one observation" task. With the two-tier
+# retrieval design the raws preserve specifics, so observations just need
+# to be passable abstractions.
 enable_llm = true
-llm_url = "https://api.minimax.io/v1/chat/completions"
-llm_model = "MiniMax-M2.7"
-timeout_seconds = 60
-api_key_env = "MINIMAX_API_KEY"
-min_cluster_size = 2
+llm_url = "https://api.openai.com/v1/chat/completions"
+llm_model = "gpt-5.4-nano"
+timeout_seconds = 30
+api_key_env = "OPENAI_API_KEY"
+min_cluster_size = 3
 max_clusters_per_run = 20
 stability_reduction_factor = 0.5
 
