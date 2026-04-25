@@ -94,7 +94,7 @@ def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
     # before reload_config ran (msam/__init__.py eagerly imports core).
     import msam.embeddings
     msam.embeddings._provider_instance = None
-    from msam.core import hybrid_retrieve
+    from msam.core import hybrid_retrieve, mark_contributions
     from .ingest import ingest_question
     from .harness import read
 
@@ -180,13 +180,45 @@ def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
             record = {"question_id": qid, "hypothesis": reader["hypothesis"]}
             out_f.write(json.dumps(record) + "\n")
 
+            # P10: contribution tracking for diagnostics. Logs which retrieved
+            # atoms ended up in the response (heuristic phrase/keyword overlap)
+            # and populates co_retrieval pairs. Doesn't affect this question's
+            # retrieval (per-question DB), but gives us per-question_type
+            # contribution_rate and turns the feedback loop into a real signal
+            # if we ever switch to a shared-DB run.
+            retrieved_ids: list[str] = []
+            if two_tier:
+                for o in retrieved.get("observations", []) or []:
+                    if o.get("id"):
+                        retrieved_ids.append(o["id"])
+                for r in retrieved.get("raws", []) or []:
+                    if r.get("id"):
+                        retrieved_ids.append(r["id"])
+            else:
+                for r in retrieved or []:
+                    if r.get("id"):
+                        retrieved_ids.append(r["id"])
+
+            contribution_rate = None
+            n_contributed = None
+            if retrieved_ids:
+                try:
+                    contrib = mark_contributions(retrieved_ids, reader["hypothesis"])
+                    contribution_rate = contrib.get("contribution_rate")
+                    n_contributed = contrib.get("contributed")
+                except Exception:
+                    pass
+
             met_f.write(json.dumps({
                 "question_id": qid,
                 "question_type": q["question_type"],
                 "n_atoms_ingested": stats["ingested"],
+                "n_session_boundaries": stats.get("session_boundaries", 0),
                 "n_observations": n_obs,
                 "n_raws": n_raw,
                 "n_atoms_retrieved": n_retrieved,
+                "n_contributed": n_contributed,
+                "contribution_rate": contribution_rate,
                 "ingest_s": round(t_ingest, 2),
                 "consolidate_s": round(t_consolidate, 2),
                 "clusters_consolidated": clusters_consolidated,
