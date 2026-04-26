@@ -23,6 +23,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p9_minimax_v2` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (consolidation gpt-5.4-nano, min_cluster_size=3) | 500 | **0.796** |
 | `msam_p9_minimax_v3` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (per-stream cluster floors, obs_top_k=3, obs_sim≥0.35, per-stream prompts) | 500 | **0.760** |
 | `msam_p8_minimax_v1` | MiniMax-M2.7 | rrf + two-tier (P9v2) + cluster merge pass (P8) + session_boundaries + mark_contributions (P10) | sem + kw (merge_threshold=0.75, max_cluster_size=50) | 500 | **0.752** |
+| `msam_p8_minimax_v2` | MiniMax-M2.7 | P8v1 stack with tighter merge knobs | sem + kw (merge_threshold=0.85, max_cluster_size=15) | 500 | **0.758** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -434,6 +435,63 @@ Pace: ~50s/q (vs P9v2's ~38s/q). The slowdown is from session_boundary
 embedding calls during ingest — each boundary goes through `store_atom`
 without a pre-computed embedding, so each hits the OpenAI API solo
 instead of being batched.
+
+### `msam_p8_minimax_v2` — P8v1 stack with tighter merge knobs (500q)
+
+Same code, same P10 wiring, only two config changes:
+- `merge_threshold` 0.75 → 0.85
+- `max_cluster_size` 50 → 15
+
+Hypothesis: tighter knobs limit the runaway-merge that produced
+over-broad observations in P8v1, especially the multi-session
+collapse.
+
+| Subtype | Score | N | Δ vs P8v1 | Δ vs P9v2 | Δ vs P2 |
+|---|---|---|---|---|---|
+| single-session-assistant | 0.929 | 56 | 0.0 | -5.4 | -7.1 |
+| single-session-user | 0.943 | 70 | 0.0 | -4.3 | -1.4 |
+| **knowledge-update** | 0.923 | 78 | +1.3 | -2.6 | -2.6 |
+| **temporal-reasoning** | 0.729 | 133 | **-5.3** | **-4.5** | **-9.8** |
+| **multi-session** | 0.639 | 133 | **+6.8** | -3.0 | +0.5 |
+| single-session-preference | 0.233 | 30 | 0.0 | -3.4 | -3.4 |
+
+**Overall: 0.758 (+0.6 vs P8v1, -3.8 vs P9v2, -4.1 vs P2).**
+
+The tighter knobs partly worked: **multi-session recovered 6.8 pp**
+and now matches P2 (the prior best on that subtype). Knowledge-update
+also nudged up. But the gain came at temporal-reasoning's expense —
+it dropped 5.3 pp vs P8v1, the run that *had* the over-broad merge
+problem.
+
+Why temporal regressed under tighter merge:
+
+- Tighter `merge_threshold=0.85` means fewer merges happen, so we
+  end up with **more clusters total** (each smaller). The bench cap
+  of 20 post-merge clusters fills up faster.
+- Each surviving observation has lower `evidence_count` (fewer atoms
+  per cluster) and represents a narrower topic.
+- Temporal-reasoning queries need specific dates from raw atoms.
+  The two-tier retrieval pulls observations into the prompt
+  alongside raws. With more observations in the prompt (via
+  evidence_boost edges), the reader sees more abstracted statements
+  and fewer raw `[YYYY-MM-DD ...]` lines competing for attention.
+  Net: dates get diluted.
+
+So this isn't a clean win — it's a subtype trade. P8v1 traded
+multi-session for everything else; P8v2 trades temporal for
+multi-session. Neither beats P9v2 overall.
+
+**The merge pass appears to be the wrong intervention on this
+benchmark.** Greedy clustering's fragmentation isn't actually
+hurting us — clusters are coherent enough as-is. Adding a merge
+layer just shifts where observations help and where they hurt,
+without producing a net lift.
+
+P10 wiring is still in this run too; it's the load-bearing
+unknown. To isolate, we'd need a P10-only run (P9v2 + P10 wiring,
+no merge). That would tell us whether the session_boundary atoms
+themselves are dragging single-session subtypes — they all dropped
+~5 pp vs P9v2 in both P8v1 and P8v2, which is suspicious.
 
 ## P9 summary
 
