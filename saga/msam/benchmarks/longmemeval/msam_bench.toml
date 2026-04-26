@@ -103,5 +103,12 @@ stability_reduction_factor = 0.5
 # of that (it would just duplicate work and slow ingest).
 auto_resolve_supersedes_on_write = false
 
+[benchmark]
+# P10 wiring (session boundaries + mark_contributions). Disabled while we
+# isolate the P4-bench supersedes effect — the boundary atoms appeared to
+# crowd top-K retrieval and drag single-session subtypes ~5pp in P8 runs.
+enable_session_boundaries = false
+enable_mark_contributions = false
+
 [agents]
 default_agent_id = "longmemeval"

@@ -217,7 +217,7 @@ def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
 
             contribution_rate = None
             n_contributed = None
-            if retrieved_ids:
+            if retrieved_ids and _c('benchmark', 'enable_mark_contributions', True):
                 try:
                     contrib = mark_contributions(retrieved_ids, reader["hypothesis"])
                     contribution_rate = contrib.get("contribution_rate")
