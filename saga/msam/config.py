@@ -126,10 +126,12 @@ _DEFAULTS = {
         "default_valence": 0.0,
         "profile_lightweight_max_words": 20,
         "profile_full_min_words": 80,
-        # P4-bench prod path: write-time supersedes resolution. Off by default
-        # — opt in when agents need contradicted facts demoted immediately.
+        # P4-bench prod path: write-time supersedes resolution. On by default
+        # so contradicted facts get demoted immediately on the next retrieval.
         # Adds ~5ms per write (FAISS top-K + heuristic checks on top-5 atoms).
-        "auto_resolve_supersedes_on_write": False,
+        # Bench harnesses that explicitly call resolve_contradictions_to_supersedes
+        # in their pipeline should set this to false to avoid double-resolving.
+        "auto_resolve_supersedes_on_write": True,
         "supersedes_resolution_threshold": 0.85,
     },
     "merge": {
