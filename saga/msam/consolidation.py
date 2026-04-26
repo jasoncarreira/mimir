@@ -232,17 +232,15 @@ class ConsolidationEngine:
 
         return clusters
 
-    def _existing_observation_for_cluster(self, source_ids: list[str]) -> str | None:
-        """Find an active/fading observation whose evidenced_by source set is
-        identical to the given cluster source_ids.
+    def _candidate_observations_for_cluster(self, source_ids: list[str]) -> dict[str, set[str]]:
+        """Fetch active/fading observations whose evidenced_by source set
+        overlaps with ``source_ids``, returning {obs_id: existing_source_set}.
 
-        Used by the synthesize phase to skip re-running the LLM on a cluster
-        that's already been consolidated. Returns the existing observation's
-        atom id if found, else None.
+        Single shared query feeds both the identity check (skip on exact match)
+        and the subset check (supersede on strict superset).
         """
         if not source_ids:
-            return None
-        target_set = set(source_ids)
+            return {}
         conn = get_db()
         try:
             placeholders = ",".join("?" * len(source_ids))
@@ -254,24 +252,57 @@ class ConsolidationEngine:
             ).fetchall()
             candidate_ids = [r[0] for r in rows]
             if not candidate_ids:
-                return None
+                return {}
+            out: dict[str, set[str]] = {}
             for obs_id in candidate_ids:
+                state_row = conn.execute(
+                    "SELECT state FROM atoms WHERE id = ?", (obs_id,)
+                ).fetchone()
+                if not state_row or state_row[0] not in ("active", "fading"):
+                    continue
                 obs_rows = conn.execute(
                     "SELECT target_id FROM atom_relations "
                     "WHERE relation_type = 'evidenced_by' AND source_id = ?",
                     (obs_id,),
                 ).fetchall()
                 existing_set = {r[0] for r in obs_rows}
-                if existing_set != target_set:
-                    continue
-                state_row = conn.execute(
-                    "SELECT state FROM atoms WHERE id = ?", (obs_id,)
-                ).fetchone()
-                if state_row and state_row[0] in ("active", "fading"):
-                    return obs_id
-            return None
+                if existing_set:
+                    out[obs_id] = existing_set
+            return out
         finally:
             conn.close()
+
+    def _existing_observation_for_cluster(self, source_ids: list[str]) -> str | None:
+        """Find an active/fading observation whose evidenced_by source set is
+        identical to the given cluster source_ids. Used by the synthesize
+        phase to skip re-running the LLM on a cluster that's already been
+        consolidated.
+        """
+        target_set = set(source_ids or [])
+        if not target_set:
+            return None
+        for obs_id, existing_set in self._candidate_observations_for_cluster(source_ids).items():
+            if existing_set == target_set:
+                return obs_id
+        return None
+
+    def _subset_observations_for_cluster(self, source_ids: list[str]) -> list[str]:
+        """Find active/fading observations whose evidenced_by source set is a
+        strict subset of the given cluster source_ids.
+
+        Used by the synthesize phase to identify observations that are
+        obsoleted by a new observation that covers strictly more evidence —
+        those will receive a ``supersedes`` edge from the new observation in
+        the restructure phase.
+        """
+        target_set = set(source_ids or [])
+        if len(target_set) < 2:
+            return []
+        out = []
+        for obs_id, existing_set in self._candidate_observations_for_cluster(source_ids).items():
+            if existing_set and existing_set < target_set:  # strict subset
+                out.append(obs_id)
+        return out
 
     def _synthesize_phase(self, clusters: list[list[dict]]) -> list[dict]:
         """Call LLM to generate a synthesis atom per cluster.
@@ -329,6 +360,12 @@ class ConsolidationEngine:
                 skipped_existing += 1
                 continue
 
+            # If the cluster's source set is a strict superset of an existing
+            # observation, the new observation will supersede the old one.
+            # Collected here so _restructure_phase can write the edges after
+            # the new observation atom is stored.
+            subset_obs = self._subset_observations_for_cluster(source_ids)
+
             # Try LLM synthesis (skipped entirely when consolidation.enable_llm = false)
             synthesis_content = None
             if enable_llm:
@@ -385,6 +422,7 @@ class ConsolidationEngine:
                 "stream": stream,
                 "source_ids": source_ids,
                 "cluster_size": len(cluster),
+                "supersedes_observations": subset_obs,
             })
 
         self._last_skipped_existing = skipped_existing
@@ -397,6 +435,7 @@ class ConsolidationEngine:
         atoms_stored = 0
         relations_created = 0
         sources_reduced = 0
+        observations_superseded = 0
 
         # Phase A: store each synthesis atom (store_atom opens/closes its own connection)
         stored = []
@@ -413,7 +452,7 @@ class ConsolidationEngine:
             if syn_id is None:
                 continue
             atoms_stored += 1
-            stored.append((syn_id, syn["source_ids"]))
+            stored.append((syn_id, syn["source_ids"], syn.get("supersedes_observations", [])))
 
         # Phase B: create relations and reduce stability in a single connection.
         # Two edge directions:
@@ -421,7 +460,7 @@ class ConsolidationEngine:
         #   observation -> raw  (evidenced_by)       — new, used by P9 evidence boost
         conn = get_db()
         try:
-            for syn_id, source_ids in stored:
+            for syn_id, source_ids, supersedes_obs in stored:
                 for source_id in source_ids:
                     try:
                         conn.execute("""
@@ -452,6 +491,23 @@ class ConsolidationEngine:
                     except Exception:
                         pass
 
+                # The new observation supersedes any prior observation whose
+                # evidence set is a strict subset. The retrieval-side
+                # demotion (msam.core._apply_supersedes_demotion) handles
+                # the score penalty.
+                for old_obs_id in supersedes_obs:
+                    try:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO atom_relations
+                                (source_id, target_id, relation_type, confidence, created_at, metadata)
+                            VALUES (?, ?, 'supersedes', 1.0, ?, ?)
+                        """, (syn_id, old_obs_id, now,
+                              json.dumps({"trigger": "consolidation"})))
+                        observations_superseded += 1
+                        relations_created += 1
+                    except Exception:
+                        pass
+
             conn.commit()
         finally:
             conn.close()
@@ -460,4 +516,5 @@ class ConsolidationEngine:
             "synthesis_atoms_stored": atoms_stored,
             "relations_created": relations_created,
             "source_atoms_reduced": sources_reduced,
+            "observations_superseded": observations_superseded,
         }
