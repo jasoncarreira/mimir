@@ -97,5 +97,11 @@ min_cluster_size = 3
 max_clusters_per_run = 20
 stability_reduction_factor = 0.5
 
+[atoms]
+# Bench harness runs resolve_contradictions_to_supersedes() once per
+# question post-consolidation; we don't need per-write resolution on top
+# of that (it would just duplicate work and slow ingest).
+auto_resolve_supersedes_on_write = false
+
 [agents]
 default_agent_id = "longmemeval"
