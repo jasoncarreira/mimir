@@ -32,9 +32,6 @@ DEFAULT_SIMILARITY_THRESHOLD = _cfg('consolidation', 'similarity_threshold', 0.8
 DEFAULT_MIN_CLUSTER_SIZE = _cfg('consolidation', 'min_cluster_size', 3)
 DEFAULT_MAX_CLUSTERS = _cfg('consolidation', 'max_clusters_per_run', 50)
 DEFAULT_STABILITY_REDUCTION = _cfg('consolidation', 'stability_reduction_factor', 0.5)
-DEFAULT_ENABLE_MERGE_PASS = _cfg('consolidation', 'enable_merge_pass', True)
-DEFAULT_MERGE_THRESHOLD = _cfg('consolidation', 'merge_threshold', 0.75)
-DEFAULT_MAX_CLUSTER_SIZE = _cfg('consolidation', 'max_cluster_size', 50)
 
 
 class ConsolidationEngine:
@@ -47,19 +44,11 @@ class ConsolidationEngine:
     def __init__(self, similarity_threshold: float = None,
                  min_cluster_size: int = None,
                  max_clusters: int = None,
-                 stability_reduction: float = None,
-                 enable_merge_pass: bool = None,
-                 merge_threshold: float = None,
-                 max_cluster_size: int = None):
+                 stability_reduction: float = None):
         self.similarity_threshold = similarity_threshold or DEFAULT_SIMILARITY_THRESHOLD
         self.min_cluster_size = min_cluster_size or DEFAULT_MIN_CLUSTER_SIZE
         self.max_clusters = max_clusters or DEFAULT_MAX_CLUSTERS
         self.stability_reduction = stability_reduction or DEFAULT_STABILITY_REDUCTION
-        self.enable_merge_pass = (
-            DEFAULT_ENABLE_MERGE_PASS if enable_merge_pass is None else enable_merge_pass
-        )
-        self.merge_threshold = merge_threshold or DEFAULT_MERGE_THRESHOLD
-        self.max_cluster_size = max_cluster_size or DEFAULT_MAX_CLUSTER_SIZE
 
     def consolidate(self, dry_run: bool = False, max_clusters: int = None) -> dict:
         """Main entry: cluster -> synthesize -> restructure.
@@ -75,14 +64,6 @@ class ConsolidationEngine:
 
         # Phase 1: Cluster
         clusters = self._cluster_phase()
-
-        # Phase 1.5: Merge — combine cluster pairs whose centroids are close
-        # enough that greedy clustering's "A-B-C chain but A not near C"
-        # fragmentation matters. Caps prevent runaway merges.
-        clusters_before_merge = len(clusters)
-        if self.enable_merge_pass:
-            clusters = self._merge_phase(clusters)
-
         clusters = clusters[:max_clusters]
 
         if dry_run:
@@ -109,8 +90,6 @@ class ConsolidationEngine:
             return {
                 "dry_run": True,
                 "clusters_found": len(clusters),
-                "clusters_before_merge": clusters_before_merge,
-                "clusters_merged": clusters_before_merge - len(clusters) if self.enable_merge_pass else 0,
                 "clusters": cluster_details,
                 "total_atoms_in_clusters": sum(len(c) for c in clusters),
                 "avg_similarity": round(total_sim / total_pairs, 3) if total_pairs else 0.0,
@@ -123,69 +102,10 @@ class ConsolidationEngine:
         result = self._restructure_phase(syntheses)
 
         result["clusters_found"] = len(clusters)
-        result["clusters_before_merge"] = clusters_before_merge
-        result["clusters_merged"] = clusters_before_merge - len(clusters) if self.enable_merge_pass else 0
         result["clusters_consolidated"] = len(syntheses)
         result["dry_run"] = False
 
         return result
-
-    def _merge_phase(self, clusters: list[list[dict]]) -> list[list[dict]]:
-        """Agglomerative merge pass over clusters from greedy clustering.
-
-        Greedy clustering walks atoms once and grabs unclustered similar
-        neighbors. That fragments on "A is near B, B is near C, but A
-        isn't near C" — common when conversational topics drift across
-        many turns. This pass computes each cluster's centroid (mean of
-        member embeddings) and merges pairs whose centroid cosine >=
-        merge_threshold (default 0.75; lower than greedy's 0.80 because
-        centroids smooth member-level noise).
-
-        Guardrails:
-        - Within-stream only (same as clustering).
-        - max_cluster_size cap — synthesis over very large clusters
-          loses specificity.
-        - Loops until no more merges land.
-        """
-        if not clusters or len(clusters) < 2:
-            return clusters
-
-        from .core import cosine_similarity
-
-        # Compute centroids; skip clusters with no embeddings.
-        def _centroid(cluster):
-            vecs = [unpack_embedding(a['embedding']) for a in cluster if a.get('embedding')]
-            if not vecs:
-                return None
-            dim = len(vecs[0])
-            n = len(vecs)
-            return [sum(v[i] for v in vecs) / n for i in range(dim)]
-
-        centroids: list[list[float] | None] = [_centroid(c) for c in clusters]
-        # Use list-of-clusters with None sentinel for merged-away entries.
-        active: list[list[dict] | None] = list(clusters)
-
-        merged_any = True
-        while merged_any:
-            merged_any = False
-            for i in range(len(active)):
-                if active[i] is None or centroids[i] is None:
-                    continue
-                for j in range(i + 1, len(active)):
-                    if active[j] is None or centroids[j] is None:
-                        continue
-                    if active[i][0]['stream'] != active[j][0]['stream']:
-                        continue
-                    if len(active[i]) + len(active[j]) > self.max_cluster_size:
-                        continue
-                    sim = cosine_similarity(centroids[i], centroids[j])
-                    if sim >= self.merge_threshold:
-                        active[i].extend(active[j])
-                        active[j] = None
-                        centroids[i] = _centroid(active[i])
-                        merged_any = True
-
-        return [c for c in active if c]
 
     def _cluster_phase(self) -> list[list[dict]]:
         """Use FAISS (or brute-force) to find clusters of similar atoms.
