@@ -356,6 +356,59 @@ which they actually use.
 
 ---
 
+### P31 — Decide whether to clean up the single-tier retrieval path
+
+**What.** With the bench running exclusively in two-tier mode (P9 +
+later improvements) and the new agent harness configured for two-tier,
+ask whether the single-tier code path is still earning its keep.
+
+**Single-tier surface area:**
+- `hybrid_retrieve_with_triples` in `msam/triples.py` — wraps
+  `hybrid_retrieve` (single-tier mode) and merges triples results.
+- The `else` branch in `hybrid_retrieve` (`core.py:1486-1517`) —
+  RRF combine + observation_bonus + sort path. Different from the
+  two-tier branch, which uses `_two_tier_split`.
+- The single-tier branch in `api_query` (`server.py`) — confidence-
+  tier gating, atom-volume reduction, triples-merging.
+
+**What single-tier provides that two-tier currently doesn't:**
+- **Confidence-tier gating.** Single-tier returns
+  `confidence_tier ∈ {none, low, medium, high}` and demotes/limits
+  output by tier. Two-tier returns observations + raws raw, no gating.
+- **Triples merged in the response.** Single-tier returns triples
+  alongside atoms; two-tier returns `triples=[]` (intentionally — the
+  triple pathway in two-tier is unwired by default).
+- **Single flat list shape** for callers that don't want to model
+  observations vs raws separately.
+
+**Three options:**
+1. **Keep single-tier, fix two-tier feature gaps.** Add confidence-tier
+   gating to two-tier, add triples merging to two-tier. Then both
+   paths offer feature parity; users pick by response shape preference.
+2. **Delete single-tier, port the missing features into two-tier
+   only.** All callers eventually move to two-tier; the bench already
+   has, and the new agent harness will. Confidence gating becomes a
+   property of the surfaced obs+raws set.
+3. **Keep both, document the trade-off.** No code changes. Status
+   quo. The cost is two parallel scoring paths to maintain forever.
+
+**Effort.** 1-2 days for option 1 or 2. Zero for option 3.
+
+**Decision criterion.** If, by the time the cherry-picks (P11-P13)
+land, no caller is actively asking for the single-tier shape AND
+two-tier has feature parity, option 2 (delete) is the right call.
+Otherwise option 1 (keep both, fix gaps) is the conservative choice.
+
+**Risk.** Medium for option 2 — we'd be removing a working public API
+and any external caller relying on the single-tier shape would break.
+Low for option 1 — additive feature parity work.
+
+**Recommendation.** Defer. Revisit after P30 + cherry-picks land and
+we have a clearer picture of which retrieval mode is the canonical
+production answer.
+
+---
+
 ## D. Architecture / design questions
 
 ### P24 — Channels as first-class scoping (option B from prior memo)
