@@ -24,6 +24,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p9_minimax_v3` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (per-stream cluster floors, obs_top_k=3, obs_sim≥0.35, per-stream prompts) | 500 | **0.760** |
 | `msam_p8_minimax_v1` | MiniMax-M2.7 | rrf + two-tier (P9v2) + cluster merge pass (P8) + session_boundaries + mark_contributions (P10) | sem + kw (merge_threshold=0.75, max_cluster_size=50) | 500 | **0.752** |
 | `msam_p8_minimax_v2` | MiniMax-M2.7 | P8v1 stack with tighter merge knobs | sem + kw (merge_threshold=0.85, max_cluster_size=15) | 500 | **0.758** |
+| `msam_p4_minimax_v1` | MiniMax-M2.7 | P9v2 + P4-bench (contradiction→supersedes→demotion); P10 disabled | sem + kw (supersedes_resolution_threshold=0.85, supersedes_score_multiplier=0.4) | 500 | **0.766** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -492,6 +493,83 @@ unknown. To isolate, we'd need a P10-only run (P9v2 + P10 wiring,
 no merge). That would tell us whether the session_boundary atoms
 themselves are dragging single-session subtypes — they all dropped
 ~5 pp vs P9v2 in both P8v1 and P8v2, which is suspicious.
+
+### `msam_p4_minimax_v1` — P9v2 + P4-bench supersedes resolution (500q)
+
+P9v2 baseline + per-question contradiction-to-supersedes resolution
+between consolidation and retrieval, plus retrieval-side multiplicative
+demotion (0.4×) for any raw atom marked as the target of a `supersedes`
+edge from another candidate. P10 wiring (session boundaries, mark
+contributions) **disabled** in this run to isolate the P4-bench effect.
+
+Supersedes signal observed across the run:
+- single-session-user: 23% of questions wrote ≥1 edge, avg 0.9/q
+- single-session-preference: 27%, avg 0.6/q
+- multi-session: 46%, avg 1.5/q (strongest signal as expected — cross-
+  session preference flips)
+- temporal-reasoning: 36%, avg 0.9/q
+- knowledge-update: ~50% (later in the run)
+
+| Subtype | Score | N | Δ vs P9v2 | Δ vs P2 |
+|---|---|---|---|---|
+| single-session-assistant | 1.000 | 56 | +1.8 | 0.0 |
+| **single-session-user** | 0.957 | 70 | -2.9 | 0.0 |
+| **knowledge-update** | 0.936 | 78 | **-1.3** | -1.3 |
+| **temporal-reasoning** | 0.707 | 133 | **-6.7** | **-12.0** |
+| multi-session | 0.647 | 133 | -2.2 | +1.3 |
+| single-session-preference | 0.233 | 30 | -3.4 | -3.4 |
+
+**Overall: 0.766 (-3.0 vs P9v2, -3.3 vs P2).** Regressed on five of
+six subtypes. Most damaging: **temporal-reasoning -6.7pp**.
+
+Why this regressed:
+
+- **The supersedes mechanism is too aggressive for time-aware queries.**
+  A typical pattern: user said "Alex started at Acme" in May, "Alex
+  moved to Beta" in November. The November atom is newer, so P4 writes
+  a `supersedes` edge from November → May. Retrieval demotes the May
+  atom by 0.4×. For queries about *current* state ("Where does Alex
+  work?"), this is fine. For queries about *historical* state ("Where
+  did Alex work in May?"), the May atom is the correct answer — and
+  it's been demoted out of top-K.
+- **Knowledge-update was the prime target and didn't move.** The
+  hypothesis was that supersedes would help "user changed their mind"
+  questions by demoting the older state. Instead it stayed flat
+  (-1.3pp). Likely because the LongMemEval reader is already good at
+  picking the most-recent dated turn from chronological evidence —
+  supersedes was solving a problem the reader already handled.
+- **Temporal-reasoning is the exact wrong subtype to apply blanket
+  supersession to.** It depends on time-stratified retrieval, and we
+  collapsed the time dimension by demoting older atoms uniformly.
+
+Cost: ~44s/q (vs P9v2's ~38s/q). The supersedes resolution adds ~13s
+per question (FAISS-less brute force pairwise cosine inside topic
+groups, in `find_semantic_contradictions`). P14 in NEXT-EXPERIMENTS.md
+proposes optimizing this; given the negative result, optimization is
+no longer warranted unless we redesign the demotion to be query-aware.
+
+**The architectural lesson:** supersession is a global tag, but
+retrieval is query-dependent. An atom that's superseded for "current
+state" queries is still primary evidence for "state at time X" queries.
+The retrieval-side demotion can't tell which query it's serving, so
+it applies uniformly — and that's wrong on this benchmark.
+
+Possible follow-ups (not yet tried):
+1. **Query-type detection** — only apply supersedes demotion when the
+   query implies "current state" (no temporal scope detected). Reuses
+   `retrieval_v2.detect_temporal_scope()`. This effectively narrows the
+   demotion to the "user changed their mind" case where it was
+   designed to help.
+2. **Lighter demotion** — multiplier 0.7 or 0.8 instead of 0.4. Lets
+   superseded atoms still appear in top-K when nothing else is more
+   relevant.
+3. **Drop the demotion entirely** — keep the supersedes edges as a
+   diagnostic / metadata tag, but don't penalize scores. The reader
+   can be told "this atom was superseded by Y on date Z" via the
+   prompt and decide for itself.
+
+P9v2 (0.796) remains the best configuration. P4-bench is a clear
+regression on this benchmark and should not ship as default.
 
 ## P9 summary
 
