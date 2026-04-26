@@ -91,9 +91,11 @@ _DEFAULTS = {
         "min_outcomes_for_effect": 3,
     },
     "decay": {
-        # P4-bench prod path: resolve contradictions to supersedes edges
-        # during the decay cycle. Cheap relative to the rest of decay.
-        "auto_resolve_supersedes": True,
+        # Atom-level supersedes batch resolution. Off by default — see the
+        # comment on [atoms] auto_resolve_supersedes_on_write. The function
+        # resolve_contradictions_to_supersedes() remains callable manually
+        # for callers who want it; nothing in the main loop fires it.
+        "auto_resolve_supersedes": False,
         "supersedes_resolution_threshold": 0.85,
         "active_to_fading_threshold": 0.3,
         "fading_to_dormant_threshold": 0.1,
@@ -126,12 +128,14 @@ _DEFAULTS = {
         "default_valence": 0.0,
         "profile_lightweight_max_words": 20,
         "profile_full_min_words": 80,
-        # P4-bench prod path: write-time supersedes resolution. On by default
-        # so contradicted facts get demoted immediately on the next retrieval.
-        # Adds ~5ms per write (FAISS top-K + heuristic checks on top-5 atoms).
-        # Bench harnesses that explicitly call resolve_contradictions_to_supersedes
-        # in their pipeline should set this to false to avoid double-resolving.
-        "auto_resolve_supersedes_on_write": True,
+        # Atom-level supersedes resolution at write time. Off by default —
+        # the LongMemEval P4-bench experiment (commit bb4b6c8 result)
+        # showed this regressed temporal-reasoning -6.7pp because demoting
+        # superseded raw atoms breaks queries about historical state
+        # ("where did Alex work in May?"). Observation-level supersedes
+        # (consolidation writing edges between observations) is still on
+        # and applied during retrieval — that's a different story.
+        "auto_resolve_supersedes_on_write": False,
         "supersedes_resolution_threshold": 0.85,
     },
     "merge": {

@@ -1187,7 +1187,27 @@ def _two_tier_split(
     Surfaced observations add a per-observation boost to their evidence
     atoms in the raws tier, capped at ``boost_cap_multiplier × own RRF``
     to prevent a single atom from flooding the top-K.
+
+    Observation-level supersedes demotion is also applied here:
+    consolidation writes ``supersedes`` edges between observations whose
+    new evidence set is a strict superset of an older observation. The
+    older observation gets the standard demotion multiplier so the
+    newer, better-evidenced observation surfaces first.
     """
+    # Apply scores from obs_ranked to obs_combined entries first so the
+    # demotion has a base to multiply.
+    for aid, score in obs_ranked:
+        if aid in obs_combined:
+            obs_combined[aid]["_combined_score"] = score
+
+    if _cfg('retrieval', 'enable_supersedes_demotion', True) and obs_combined:
+        _supersedes_factor = _cfg('retrieval', 'supersedes_score_multiplier', 0.4)
+        _apply_supersedes_demotion(obs_combined, _supersedes_factor)
+        obs_ranked = sorted(
+            ((aid, obs_combined[aid].get("_combined_score", 0.0)) for aid in obs_combined),
+            key=lambda x: -x[1],
+        )
+
     surfaced_obs: list[dict] = []
     for aid, score in obs_ranked:
         atom = obs_combined.get(aid)
