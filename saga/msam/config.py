@@ -91,6 +91,10 @@ _DEFAULTS = {
         "min_outcomes_for_effect": 3,
     },
     "decay": {
+        # P4-bench prod path: resolve contradictions to supersedes edges
+        # during the decay cycle. Cheap relative to the rest of decay.
+        "auto_resolve_supersedes": True,
+        "supersedes_resolution_threshold": 0.85,
         "active_to_fading_threshold": 0.3,
         "fading_to_dormant_threshold": 0.1,
         "confidence_decay_rate": 0.01,
@@ -122,6 +126,11 @@ _DEFAULTS = {
         "default_valence": 0.0,
         "profile_lightweight_max_words": 20,
         "profile_full_min_words": 80,
+        # P4-bench prod path: write-time supersedes resolution. Off by default
+        # — opt in when agents need contradicted facts demoted immediately.
+        # Adds ~5ms per write (FAISS top-K + heuristic checks on top-5 atoms).
+        "auto_resolve_supersedes_on_write": False,
+        "supersedes_resolution_threshold": 0.85,
     },
     "merge": {
         "similarity_threshold": 0.85,

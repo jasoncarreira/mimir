@@ -428,6 +428,24 @@ def run_decay_cycle() -> dict:
     except Exception as e:
         logger.warning(f"Intentional forgetting failed: {e}")
 
+    # Step 4.7: Resolve contradictions to supersedes edges (P4-bench prod path).
+    # The retrieval-side demotion is always-on; this is the periodic producer.
+    # Cheap relative to the rest of the cycle (FAISS top-K + heuristic checks).
+    supersedes_result = {"contradictions_found": 0, "supersedes_written": 0}
+    try:
+        if _cfg('decay', 'auto_resolve_supersedes', True):
+            from .core import resolve_contradictions_to_supersedes
+            supersedes_result = resolve_contradictions_to_supersedes(
+                threshold=_cfg('decay', 'supersedes_resolution_threshold', 0.85),
+            )
+            if supersedes_result.get("supersedes_written", 0) > 0:
+                logger.info(
+                    f"supersedes: {supersedes_result['supersedes_written']} edges written "
+                    f"({supersedes_result['contradictions_found']} contradictions detected)"
+                )
+    except Exception as e:
+        logger.warning(f"Supersedes resolution failed: {e}")
+
     # Step 5: Budget check AFTER
     budget_after = budget_check()
 
