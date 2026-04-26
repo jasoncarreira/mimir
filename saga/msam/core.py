@@ -352,10 +352,70 @@ def store_atom(
     except Exception:
         pass
 
+    # P4-bench prod path: write-time supersedes resolution. Uses
+    # check_before_store (FAISS top-K, ~ms per call) so the cost is
+    # bounded per write. Gated off by default; agents that care about
+    # immediate demotion of contradicted facts can flip it on.
+    if _cfg('atoms', 'auto_resolve_supersedes_on_write', False):
+        try:
+            _resolve_supersedes_for_new_atom(atom_id, content)
+        except Exception:
+            pass
+
     # Fire lifecycle hook
     _fire_hook('on_store', atom_id=atom_id, stream=stream, profile=profile, content_preview=content[:80])
 
     return atom_id
+
+
+def _resolve_supersedes_for_new_atom(new_atom_id: str, content: str,
+                                     top_k: int = 5,
+                                     threshold: float = None) -> int:
+    """Find atoms the new write contradicts and write supersedes edges.
+
+    Uses check_before_store (FAISS top-K) so the per-write cost is bounded.
+    Writes ``supersedes`` from the newer atom (the new one) to each older
+    atom that contradicts it. Skips antonym/semantic-opposition pairs.
+    Returns the number of edges written.
+    """
+    from .contradictions import check_before_store
+
+    if threshold is None:
+        threshold = _cfg('atoms', 'supersedes_resolution_threshold', 0.85)
+
+    contradictions = check_before_store(content, top_k=top_k)
+    if not contradictions:
+        return 0
+
+    # Filter by threshold + skip noisy contradiction types.
+    written = 0
+    for c in contradictions:
+        if c.get("similarity", 0.0) < threshold:
+            continue
+        if c.get("contradiction_type") == "semantic_opposition":
+            continue
+
+        # check_before_store always puts the candidate (new) content in
+        # atom_a with id="__pending__" and the existing atom in atom_b.
+        existing = c["atom_b"]
+        existing_id = existing.get("id")
+        if not existing_id or existing_id == new_atom_id or existing_id == "__pending__":
+            continue
+
+        # The new atom is by definition newer than anything the contradiction
+        # detector found in the DB; we don't need a timestamp comparison here.
+        try:
+            add_atom_relation(
+                new_atom_id, existing_id, "supersedes",
+                confidence=float(c.get("similarity", threshold)),
+                metadata={"contradiction_type": c.get("contradiction_type", "unknown"),
+                          "trigger": "store_atom"},
+            )
+            written += 1
+        except Exception:
+            pass
+
+    return written
 
 
 # ─── Activation Scoring (ACT-R) ──────────────────────────────────

@@ -261,3 +261,78 @@ class TestSupersedesDemotionInRetrieval:
         d = {"a": {"_combined_score": 1.0}}
         _apply_supersedes_demotion(d, demotion_factor=1.0)
         assert d["a"]["_combined_score"] == 1.0  # untouched
+
+
+class TestResolveSupersedesForNewAtom:
+    """P4-bench prod write-time path: store_atom hook calls
+    _resolve_supersedes_for_new_atom which uses check_before_store."""
+
+    def test_writes_edge_for_value_conflict(self, monkeypatch):
+        from msam import core
+
+        # Simulate one contradiction returned from check_before_store.
+        fake = [{
+            "atom_a": {"id": "__pending__", "content": "user works at Beta",
+                       "created_at": "2026-04-26T00:00:00+00:00"},
+            "atom_b": {"id": "existing-id", "content": "user works at Acme",
+                       "created_at": "2026-01-01T00:00:00+00:00"},
+            "similarity": 0.9,
+            "contradiction_type": "value_conflict",
+            "suggestion": "...",
+        }]
+
+        monkeypatch.setattr("msam.contradictions.check_before_store",
+                            lambda content, top_k=5: fake)
+        captured = []
+        monkeypatch.setattr(core, "add_atom_relation",
+                            lambda src, tgt, rt, **k: captured.append((src, tgt, rt, k)))
+
+        n = core._resolve_supersedes_for_new_atom("new-id", "user works at Beta")
+        assert n == 1
+        src, tgt, rt, kwargs = captured[0]
+        assert src == "new-id"
+        assert tgt == "existing-id"
+        assert rt == "supersedes"
+        assert kwargs["metadata"]["trigger"] == "store_atom"
+
+    def test_skips_antonym_contradiction(self, monkeypatch):
+        from msam import core
+        fake = [{
+            "atom_a": {"id": "__pending__", "content": "user is happy",
+                       "created_at": "2026-04-26T00:00:00+00:00"},
+            "atom_b": {"id": "existing-id", "content": "user is sad",
+                       "created_at": "2026-01-01T00:00:00+00:00"},
+            "similarity": 0.9,
+            "contradiction_type": "semantic_opposition",
+            "suggestion": "...",
+        }]
+        monkeypatch.setattr("msam.contradictions.check_before_store",
+                            lambda content, top_k=5: fake)
+        captured = []
+        monkeypatch.setattr(core, "add_atom_relation",
+                            lambda *a, **k: captured.append((a, k)))
+
+        n = core._resolve_supersedes_for_new_atom("new-id", "user is happy")
+        assert n == 0
+        assert captured == []
+
+    def test_skips_below_threshold(self, monkeypatch):
+        from msam import core
+        fake = [{
+            "atom_a": {"id": "__pending__", "content": "x",
+                       "created_at": "2026-04-26T00:00:00+00:00"},
+            "atom_b": {"id": "existing-id", "content": "y",
+                       "created_at": "2026-01-01T00:00:00+00:00"},
+            "similarity": 0.5,  # below 0.85
+            "contradiction_type": "value_conflict",
+            "suggestion": "...",
+        }]
+        monkeypatch.setattr("msam.contradictions.check_before_store",
+                            lambda content, top_k=5: fake)
+        captured = []
+        monkeypatch.setattr(core, "add_atom_relation",
+                            lambda *a, **k: captured.append((a, k)))
+
+        n = core._resolve_supersedes_for_new_atom("new-id", "x", threshold=0.85)
+        assert n == 0
+        assert captured == []
