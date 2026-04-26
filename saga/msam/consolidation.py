@@ -49,6 +49,7 @@ class ConsolidationEngine:
         self.min_cluster_size = min_cluster_size or DEFAULT_MIN_CLUSTER_SIZE
         self.max_clusters = max_clusters or DEFAULT_MAX_CLUSTERS
         self.stability_reduction = stability_reduction or DEFAULT_STABILITY_REDUCTION
+        self._last_skipped_existing = 0
 
     def consolidate(self, dry_run: bool = False, max_clusters: int = None) -> dict:
         """Main entry: cluster -> synthesize -> restructure.
@@ -103,6 +104,7 @@ class ConsolidationEngine:
 
         result["clusters_found"] = len(clusters)
         result["clusters_consolidated"] = len(syntheses)
+        result["clusters_skipped_existing"] = self._last_skipped_existing
         result["dry_run"] = False
 
         return result
@@ -113,6 +115,7 @@ class ConsolidationEngine:
         Filters:
         - Only active atoms with embeddings
         - Never cluster pinned atoms
+        - memory_type='raw' only (observations are consolidation output, not input)
         - Same stream only
         - Minimum cluster size
         """
@@ -121,6 +124,7 @@ class ConsolidationEngine:
             SELECT id, content, stream, embedding, access_count, topics, is_pinned
             FROM atoms
             WHERE state = 'active' AND embedding IS NOT NULL AND is_pinned = 0
+              AND (memory_type IS NULL OR memory_type = 'raw')
         """).fetchall()
 
         if not rows:
@@ -228,6 +232,47 @@ class ConsolidationEngine:
 
         return clusters
 
+    def _existing_observation_for_cluster(self, source_ids: list[str]) -> str | None:
+        """Find an active/fading observation whose evidenced_by source set is
+        identical to the given cluster source_ids.
+
+        Used by the synthesize phase to skip re-running the LLM on a cluster
+        that's already been consolidated. Returns the existing observation's
+        atom id if found, else None.
+        """
+        if not source_ids:
+            return None
+        target_set = set(source_ids)
+        conn = get_db()
+        try:
+            placeholders = ",".join("?" * len(source_ids))
+            rows = conn.execute(
+                f"SELECT DISTINCT source_id FROM atom_relations "
+                f"WHERE relation_type = 'evidenced_by' "
+                f"AND target_id IN ({placeholders})",
+                tuple(source_ids),
+            ).fetchall()
+            candidate_ids = [r[0] for r in rows]
+            if not candidate_ids:
+                return None
+            for obs_id in candidate_ids:
+                obs_rows = conn.execute(
+                    "SELECT target_id FROM atom_relations "
+                    "WHERE relation_type = 'evidenced_by' AND source_id = ?",
+                    (obs_id,),
+                ).fetchall()
+                existing_set = {r[0] for r in obs_rows}
+                if existing_set != target_set:
+                    continue
+                state_row = conn.execute(
+                    "SELECT state FROM atoms WHERE id = ?", (obs_id,)
+                ).fetchone()
+                if state_row and state_row[0] in ("active", "fading"):
+                    return obs_id
+            return None
+        finally:
+            conn.close()
+
     def _synthesize_phase(self, clusters: list[list[dict]]) -> list[dict]:
         """Call LLM to generate a synthesis atom per cluster.
 
@@ -236,6 +281,10 @@ class ConsolidationEngine:
         finally to the NVIDIA NIM defaults. API key pulls from
         CONSOLIDATION_API_KEY (or OPENAI_API_KEY / NVIDIA_API_KEY) env
         vars, or the legacy embedding.api_key TOML field.
+
+        Skips a cluster entirely when an existing observation already has
+        the same evidence set — avoids paying the LLM cost to re-synthesize
+        a belief we already have.
         """
         import requests
 
@@ -264,6 +313,7 @@ class ConsolidationEngine:
             return _prefix_pat.sub("", s or "")
 
         syntheses = []
+        skipped_existing = 0
         for cluster in clusters:
             # Strip any prior consolidation prefix from cluster members so
             # re-consolidation doesn't cause "[Consolidated from X] [Consolidated from Y] ..." stacking in either path.
@@ -271,6 +321,13 @@ class ConsolidationEngine:
             joined = "\n- ".join(contents)
             stream = cluster[0].get('stream', 'semantic')
             source_ids = [a['id'] for a in cluster]
+
+            # Idempotence: skip clusters that already have an observation with
+            # the identical source set. Saves the LLM call and prevents
+            # duplicate observations from re-running consolidation.
+            if self._existing_observation_for_cluster(source_ids) is not None:
+                skipped_existing += 1
+                continue
 
             # Try LLM synthesis (skipped entirely when consolidation.enable_llm = false)
             synthesis_content = None
@@ -330,6 +387,7 @@ class ConsolidationEngine:
                 "cluster_size": len(cluster),
             })
 
+        self._last_skipped_existing = skipped_existing
         return syntheses
 
     def _restructure_phase(self, syntheses: list[dict]) -> dict:
