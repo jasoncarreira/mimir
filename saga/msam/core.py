@@ -600,6 +600,7 @@ def retrieve(
     explain: bool = False,
     agent_id: str = None,
     memory_type: str = None,
+    include_session_boundaries: bool = False,
 ) -> list[dict]:
     """
     Hybrid retrieval: embedding similarity + activation scoring.
@@ -653,6 +654,13 @@ def retrieve(
         sql += " AND a.memory_type = ?" if topic_filter else " AND memory_type = ?"
         params.append(memory_type)
 
+    # Continuity beacons (session_boundary atoms) are excluded by default —
+    # they're for get_last_sessions(), not generic similarity retrieval.
+    if not include_session_boundaries:
+        sql += (" AND (a.source_type IS NULL OR a.source_type != 'session_boundary')"
+                if topic_filter else
+                " AND (source_type IS NULL OR source_type != 'session_boundary')")
+
     # Get query embedding (cached)
     query_emb = cached_embed_query(query)
 
@@ -667,10 +675,13 @@ def retrieve(
                     candidate_ids = [c[0] for c in candidates]
                     sim_map = {c[0]: c[1] for c in candidates}
                     placeholders = ','.join(['?'] * len(candidate_ids))
-                    rows = conn.execute(
-                        f"SELECT * FROM atoms WHERE id IN ({placeholders}) AND state IN ('active', 'fading')",
-                        candidate_ids
-                    ).fetchall()
+                    faiss_sql = (
+                        f"SELECT * FROM atoms WHERE id IN ({placeholders}) "
+                        f"AND state IN ('active', 'fading')"
+                    )
+                    if not include_session_boundaries:
+                        faiss_sql += " AND (source_type IS NULL OR source_type != 'session_boundary')"
+                    rows = conn.execute(faiss_sql, candidate_ids).fetchall()
 
                     scored = []
                     for row in rows:
@@ -907,28 +918,34 @@ def _fts5_query(text: str) -> str:
     return " OR ".join(safe_terms) if safe_terms else text.lower()
 
 
-def keyword_search(query: str, top_k: int = None, memory_type: str = None) -> list[dict]:
+def keyword_search(query: str, top_k: int = None, memory_type: str = None,
+                   include_session_boundaries: bool = False) -> list[dict]:
     """Keyword matching using FTS5 BM25 scoring, falling back to Python TF-IDF."""
     if top_k is None:
         top_k = _cfg('retrieval', 'keyword_top_k', 10)
     conn = get_db()
 
+    # Build the optional source_type filter for session boundaries.
+    boundary_clause = ""
+    if not include_session_boundaries:
+        boundary_clause = " AND (a.source_type IS NULL OR a.source_type != 'session_boundary')"
+
     # Try FTS5 first (fast path)
     fts_query = _fts5_query(query)
     try:
         if memory_type:
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 SELECT a.*, bm25(atoms_fts) as _bm25
                 FROM atoms_fts f JOIN atoms a ON a.rowid = f.rowid
                 WHERE atoms_fts MATCH ? AND a.state IN ('active', 'fading')
-                  AND a.memory_type = ?
+                  AND a.memory_type = ?{boundary_clause}
                 ORDER BY bm25(atoms_fts) LIMIT ?
             """, (fts_query, memory_type, top_k)).fetchall()
         else:
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 SELECT a.*, bm25(atoms_fts) as _bm25
                 FROM atoms_fts f JOIN atoms a ON a.rowid = f.rowid
-                WHERE atoms_fts MATCH ? AND a.state IN ('active', 'fading')
+                WHERE atoms_fts MATCH ? AND a.state IN ('active', 'fading'){boundary_clause}
                 ORDER BY bm25(atoms_fts) LIMIT ?
             """, (fts_query, top_k)).fetchall()
 
@@ -1253,6 +1270,7 @@ def hybrid_retrieve(
     agent_id: str = None,
     reference_date=None,
     two_tier: bool = False,
+    include_session_boundaries: bool = False,
 ):
     """
     Combine semantic + keyword + (optional) graph + temporal pathways.
@@ -1293,17 +1311,32 @@ def hybrid_retrieve(
             query, mode=mode, top_k=obs_top_k * 4, stream=stream,
             topic_filter=topic_filter, agent_id=agent_id,
             memory_type='observation',
+            include_session_boundaries=include_session_boundaries,
         )
-        kw_results_obs = keyword_search(query, top_k=obs_top_k * 2, memory_type='observation')
+        kw_results_obs = keyword_search(
+            query, top_k=obs_top_k * 2, memory_type='observation',
+            include_session_boundaries=include_session_boundaries,
+        )
         semantic_results = retrieve(
             query, mode=mode, top_k=top_k * 2, stream=stream,
             topic_filter=topic_filter, agent_id=agent_id,
             memory_type='raw',
+            include_session_boundaries=include_session_boundaries,
         )
-        kw_results = keyword_search(query, top_k=top_k, memory_type='raw')
+        kw_results = keyword_search(
+            query, top_k=top_k, memory_type='raw',
+            include_session_boundaries=include_session_boundaries,
+        )
     else:
-        semantic_results = retrieve(query, mode=mode, top_k=top_k * 2, stream=stream, topic_filter=topic_filter, agent_id=agent_id)
-        kw_results = keyword_search(query, top_k=top_k)
+        semantic_results = retrieve(
+            query, mode=mode, top_k=top_k * 2, stream=stream,
+            topic_filter=topic_filter, agent_id=agent_id,
+            include_session_boundaries=include_session_boundaries,
+        )
+        kw_results = keyword_search(
+            query, top_k=top_k,
+            include_session_boundaries=include_session_boundaries,
+        )
         semantic_results_obs = []
         kw_results_obs = []
 
@@ -3881,20 +3914,30 @@ def store_session_boundary(session_id: str, summary: str,
                            topics_discussed: list[str] = None,
                            decisions_made: list[str] = None,
                            unfinished: list[str] = None,
-                           emotional_state: str = None) -> str:
+                           emotional_state: str = None,
+                           channel: str = None) -> str:
     """Store a session boundary atom when a session ends.
-    
+
     Creates a structured episodic atom capturing:
     - What was discussed
     - What was decided
     - What was left unfinished
     - Emotional state at close
-    
+
     The agent calls this at session end. Next session can query for continuity:
     'What were we doing last time?'
+
+    The atom is tagged ``source_type='session_boundary'`` so generic semantic
+    retrieval excludes it by default — these are continuity beacons, not
+    primary content. Use ``get_last_sessions()`` for the continuity query, or
+    pass ``include_session_boundaries=True`` to retrieve()/hybrid_retrieve().
+
+    The session_id and (optional) channel are persisted to atom metadata so
+    they can be queried later — session_id auto-denormalizes to the
+    ``atoms.session_id`` column; channel is reachable via json_extract.
     """
     boundary_content = f"Session Boundary [{session_id}]: {summary}"
-    
+
     if topics_discussed:
         boundary_content += f"\nTopics: {', '.join(topics_discussed)}"
     if decisions_made:
@@ -3903,8 +3946,11 @@ def store_session_boundary(session_id: str, summary: str,
         boundary_content += f"\nUnfinished: {'; '.join(unfinished)}"
     if emotional_state:
         boundary_content += f"\nMood at close: {emotional_state}"
-    
-    # Store as episodic with high confidence
+
+    metadata = {"session_id": session_id}
+    if channel:
+        metadata["channel"] = channel
+
     atom_id = store_atom(
         content=boundary_content,
         stream="episodic",
@@ -3912,30 +3958,61 @@ def store_session_boundary(session_id: str, summary: str,
         arousal=0.3,
         valence=0.0,
         topics=topics_discussed or ["session_boundary"],
-        source_type="inference",
+        source_type="session_boundary",
         encoding_confidence=0.9,
+        metadata=metadata,
     )
-    
-    # Log provenance
+
     log_provenance("atom", atom_id, "session_boundary",
                    metadata={"session_id": session_id,
-                            "unfinished_count": len(unfinished or [])})
-    
+                             "channel": channel,
+                             "unfinished_count": len(unfinished or [])})
+
     return atom_id
 
 
-def get_last_sessions(count: int = 3) -> list[dict]:
-    """Get the most recent session boundary atoms. 'What were we doing?'"""
+def get_last_sessions(count: int = 3, channel: str = None,
+                      session_id: str = None) -> list[dict]:
+    """Get the most recent session boundary atoms. 'What were we doing?'
+
+    Filters:
+        channel: only boundaries tagged with this channel (matched against
+                 metadata.channel via json_extract).
+        session_id: only the boundary for this exact session. Matched on the
+                    denormalized session_id column.
+    """
     conn = get_db()
-    rows = conn.execute("""
-        SELECT id, content, created_at, topics
-        FROM atoms WHERE content LIKE 'Session Boundary%' AND state = 'active'
-        ORDER BY created_at DESC LIMIT ?
-    """, (count,)).fetchall()
+    sql = ("SELECT id, content, created_at, topics, session_id, metadata "
+           "FROM atoms "
+           "WHERE source_type = 'session_boundary' AND state = 'active'")
+    params: list = []
+    if session_id:
+        sql += " AND session_id = ?"
+        params.append(session_id)
+    if channel:
+        sql += " AND json_extract(metadata, '$.channel') = ?"
+        params.append(channel)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(count)
+
+    rows = conn.execute(sql, tuple(params)).fetchall()
     conn.close()
-    
-    return [{"id": r[0], "content": r[1], "timestamp": r[2],
-             "topics": json.loads(r[3] or '[]')} for r in rows]
+
+    out = []
+    for r in rows:
+        try:
+            meta = json.loads(r[5] or '{}')
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+        out.append({
+            "id": r[0],
+            "content": r[1],
+            "timestamp": r[2],
+            "topics": json.loads(r[3] or '[]'),
+            "session_id": r[4],
+            "channel": meta.get("channel"),
+        })
+    return out
 
 
 # ─── Feature: Knowledge Gap Detection ────────────────────────────
