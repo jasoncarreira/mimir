@@ -145,3 +145,43 @@ class TestRetrievalBonus:
         score = results[0]["_combined_score"]
         # Must match un-boosted score; a +21% bonus would put it ~0.0397.
         assert abs(score - expected_rrf) < 1e-6
+
+
+class TestSupersedesDemotionInHybridRetrieve:
+    """P4-bench: full path. Two raws with a supersedes edge — superseded one
+    is demoted in the final hybrid_retrieve output."""
+
+    def test_superseded_atom_is_demoted(self, fake_embeddings, monkeypatch):
+        import msam.core
+        # Two raw atoms; B supersedes A. Both should turn up in retrieval.
+        a_id = msam.core.store_atom("user works at Acme")
+        b_id = msam.core.store_atom("user works at Beta")
+        msam.core.add_atom_relation(b_id, a_id, "supersedes", confidence=0.9)
+
+        # Make both atoms appear in semantic + keyword pathways at rank 1.
+        def fake_retrieve(q, **kwargs):
+            conn = msam.core.get_db()
+            rows = conn.execute(
+                "SELECT * FROM atoms WHERE id IN (?, ?) ORDER BY id", (a_id, b_id)
+            ).fetchall()
+            conn.close()
+            atoms = []
+            for r in rows:
+                a = dict(r); a.pop("embedding", None)
+                a["_activation"] = 1.0; a["_similarity"] = 0.5
+                atoms.append(a)
+            return atoms
+
+        monkeypatch.setattr(msam.core, "retrieve", fake_retrieve)
+        monkeypatch.setattr(msam.core, "keyword_search",
+                            lambda q, top_k=10, memory_type=None: fake_retrieve(q))
+
+        results = msam.core.hybrid_retrieve("user works", top_k=5)
+        # Both atoms returned, but the superseded one (a_id) should have a
+        # lower _combined_score than b_id (factor 0.4 by default).
+        scores = {r["id"]: r["_combined_score"] for r in results}
+        assert a_id in scores and b_id in scores
+        assert scores[a_id] < scores[b_id]
+        # Diagnostic tag must be set on superseded atom.
+        a_atom = next(r for r in results if r["id"] == a_id)
+        assert a_atom.get("_relation_note") == "superseded"

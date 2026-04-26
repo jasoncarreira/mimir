@@ -63,6 +63,11 @@ _DEFAULTS = {
     "retrieval": {
         "default_top_k": 12,
         "semantic_weight": 0.7,
+        # P4-bench: supersedes demotion. When enabled, atoms that have been
+        # marked as superseded by another atom in the candidate pool get a
+        # multiplicative score penalty in hybrid_retrieve.
+        "enable_supersedes_demotion": True,
+        "supersedes_score_multiplier": 0.4,
         "similarity_threshold": 0.2,
         "sigmoid_midpoint": 0.35,
         "sigmoid_steepness": 15.0,

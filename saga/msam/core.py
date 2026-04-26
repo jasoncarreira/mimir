@@ -1053,6 +1053,42 @@ def temporal_retrieve(
 
 # ─── Hybrid Retrieval ────────────────────────────────────────────
 
+def _apply_supersedes_demotion(combined: dict, demotion_factor: float) -> None:
+    """P4-bench: in-place multiplicative demotion for atoms that have been
+    superseded by another atom in the same candidate pool.
+
+    Looks up ``atom_relations`` rows where the relation_type is
+    ``supersedes`` and BOTH source and target are present in ``combined``.
+    Multiplies the target's ``_combined_score`` by ``demotion_factor``
+    (matching the existing trend=stale multiplier semantics) and tags
+    the atom with ``_relation_note='superseded'`` for diagnostics.
+    """
+    if not combined or demotion_factor >= 1.0:
+        return
+    candidate_ids = list(combined.keys())
+    if not candidate_ids:
+        return
+    conn = get_db()
+    try:
+        placeholders = ",".join("?" * len(candidate_ids))
+        rows = conn.execute(
+            f"SELECT target_id FROM atom_relations "
+            f"WHERE relation_type = 'supersedes' "
+            f"AND source_id IN ({placeholders}) "
+            f"AND target_id IN ({placeholders})",
+            (*candidate_ids, *candidate_ids),
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+    for (target_id,) in rows:
+        atom = combined.get(target_id)
+        if atom is not None:
+            atom["_combined_score"] = atom.get("_combined_score", 0.0) * demotion_factor
+            atom["_relation_note"] = "superseded"
+
+
 def _two_tier_split(
     obs_combined: dict,
     obs_ranked: list[tuple[str, float]],
@@ -1260,6 +1296,19 @@ def hybrid_retrieve(
         for aid, score in ranked:
             if aid in combined:
                 combined[aid]["_combined_score"] = score
+
+        # P4-bench: demote raws superseded by other raws in the candidate
+        # pool. The supersedes edges are written by
+        # resolve_contradictions_to_supersedes (e.g. during the bench's
+        # consolidation step). Re-rank afterwards so the demoted scores
+        # propagate into the two-tier split / final sort.
+        if _cfg('retrieval', 'enable_supersedes_demotion', True):
+            _supersedes_factor = _cfg('retrieval', 'supersedes_score_multiplier', 0.4)
+            _apply_supersedes_demotion(combined, _supersedes_factor)
+            ranked = sorted(
+                ((aid, combined[aid].get("_combined_score", 0.0)) for aid in combined),
+                key=lambda x: -x[1],
+            )
 
         # ─── P9: two-tier return ────────────────────────────────────────
         if two_tier:
@@ -3534,6 +3583,78 @@ def add_atom_relation(source_id: str, target_id: str, relation_type: str,
         conn.close()
     
     return {"source": source_id, "target": target_id, "type": relation_type, "confidence": confidence}
+
+
+def resolve_contradictions_to_supersedes(threshold: float = 0.85,
+                                         raws_only: bool = True) -> dict:
+    """Run the contradiction detector and write supersedes edges.
+
+    For each detected contradiction pair (excluding antonym/semantic-opposition
+    which is too noisy), the atom with the more recent ``created_at`` is
+    declared to supersede the older one. Idempotent — UNIQUE on
+    (source, target, relation_type) prevents duplicates.
+
+    By default operates only on ``memory_type='raw'`` atoms so consolidation-
+    time observation timestamps don't end up "superseding" their underlying
+    evidence. Set raws_only=False if you want all atoms in the pool.
+
+    Returns a dict with counts: contradictions_found, supersedes_written.
+    """
+    from .contradictions import find_semantic_contradictions
+
+    contradictions = find_semantic_contradictions(threshold)
+    if not contradictions:
+        return {"contradictions_found": 0, "supersedes_written": 0}
+
+    memory_type_filter = None
+    if raws_only:
+        atom_ids = set()
+        for c in contradictions:
+            atom_ids.add(c["atom_a"]["id"])
+            atom_ids.add(c["atom_b"]["id"])
+        if atom_ids:
+            conn = get_db()
+            placeholders = ",".join("?" * len(atom_ids))
+            rows = conn.execute(
+                f"SELECT id, memory_type FROM atoms WHERE id IN ({placeholders})",
+                tuple(atom_ids),
+            ).fetchall()
+            conn.close()
+            memory_type_filter = {r[0]: r[1] for r in rows}
+
+    written = 0
+    skipped_type = 0
+    for c in contradictions:
+        if c["contradiction_type"] == "semantic_opposition":
+            continue
+        a = c["atom_a"]
+        b = c["atom_b"]
+
+        if raws_only and memory_type_filter is not None:
+            if memory_type_filter.get(a["id"]) != "raw" or memory_type_filter.get(b["id"]) != "raw":
+                skipped_type += 1
+                continue
+
+        # Newer atom supersedes the older one. Tie-break: leave alone.
+        if a["created_at"] == b["created_at"]:
+            continue
+        newer, older = (a, b) if a["created_at"] > b["created_at"] else (b, a)
+
+        try:
+            add_atom_relation(
+                newer["id"], older["id"], "supersedes",
+                confidence=float(c["similarity"]),
+                metadata={"contradiction_type": c["contradiction_type"]},
+            )
+            written += 1
+        except Exception:
+            pass
+
+    return {
+        "contradictions_found": len(contradictions),
+        "supersedes_written": written,
+        "skipped_non_raw": skipped_type,
+    }
 
 
 def get_atom_relations(atom_id: str, direction: str = "both") -> list[dict]:
