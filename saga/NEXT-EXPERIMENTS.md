@@ -3,7 +3,22 @@
 Proposed list of investigations and code changes to look at next. Companion
 to `HINDSIGHT-IDEAS.md`, which captured the original P1–P10 roadmap.
 
-This document is the output of a session on 2026-04-26. MSAM head is `c6909a2`.
+This document is the output of a session on 2026-04-26. MSAM head is `591e48a`.
+
+## Status updates since this doc was created
+
+- **P4-bench shipped and rolled back.** Result: 0.766 on LongMemEval (regressed
+  -3.0pp vs P9v2). Atom-level supersedes demotion broke temporal-reasoning
+  (-6.7pp) because retrieval is query-dependent but supersession is a global
+  tag. **Auto-triggers disabled** in `591e48a`. The function
+  `resolve_contradictions_to_supersedes` stays callable for users who want
+  it. Observation-level supersedes (consolidation writing edges between
+  observations whose evidence is a strict superset) is **kept and now
+  applied in the obs tier** of two-tier retrieval.
+- **P14 (optimize supersedes resolver)** — deferred. Only relevant if
+  atom-level supersedes is revisited; not currently a planned experiment.
+- **Skip-on-identical and superset-supersedes for observations** shipped
+  in `34a4243` and `c6909a2`. Both safe defaults.
 
 The P-series numbering keeps going — P11+ is anything below — but the
 groupings reflect the *kind* of work, not the order they should ship in.
@@ -95,7 +110,7 @@ threshold ≥ 0.85.
 
 ---
 
-### P30 — Compute true base score for missing evidence atoms in two-tier retrieval
+### P30 — Compute true base score for missing evidence atoms in two-tier retrieval [shipped: option 1, awaiting bench]
 
 **What.** In `_two_tier_split` (`core.py:1191-1251`), surfaced observations
 boost their evidence atoms via the `evidenced_by` edges. The boost is
@@ -459,14 +474,18 @@ If the goal is **bench score progress**, ship in this order:
 1. **P30 (fix missing-atom base score in two-tier)** — ranking
    correctness bug; in-top-K vs missing atoms are scored asymmetrically.
    Smallest diff for option 1 (compute cosine for missing atoms).
+   Started 2026-04-26; the next planned bench run.
 2. **P11 + P12 + P13 (cherry-picks)** — composable with P9, low risk,
    modest score upside on different subtypes.
 3. **P18 (re-run P10 with the new filter)** — zero code, one bench run,
    settles whether P10 was the regression cause.
 4. **P19 (delete `retrieve_with_relations`)** — deduplication while
    P-related code is fresh in our heads.
-5. **P14 (optimize supersedes resolver)** — only worth it if P4-bench
-   shows score lift; otherwise we're optimizing dead code.
+
+(P14 — optimize supersedes resolver — removed from the bench-score path.
+P4-bench result said the demotion approach itself was the wrong shape,
+not the cost. Re-evaluate only if we revisit atom-level supersedes with
+query-type-aware demotion.)
 
 If the goal is **codebase hygiene**, ship in this order:
 

@@ -1176,6 +1176,7 @@ def _two_tier_split(
     obs_conf_min_sim: float,
     stability_reduction: float,
     boost_cap_multiplier: float,
+    query_emb: list[float] = None,
 ) -> dict:
     """
     P9: build the two-tier return and apply the observation->raw evidence
@@ -1252,6 +1253,11 @@ def _two_tier_split(
                 raw_score_map[aid] = base + min(boost_map[aid], cap)
         # Evidence atoms that didn't appear in raw_ranked: pull them in
         # so an observation's backing is always available in the raws tier.
+        # P30: compute each missing atom's actual cosine similarity to the
+        # query, scale to the bottom of the in-pool RRF magnitude, then
+        # apply the same capped boost formula used for in-pool atoms.
+        # Without this, missing atoms would just take the uncapped boost as
+        # their final score and could outrank legitimate top-K evidence.
         if boost_map:
             missing_ids = [aid for aid in boost_map if aid not in raw_score_map]
             if missing_ids:
@@ -1263,10 +1269,32 @@ def _two_tier_split(
                     tuple(missing_ids),
                 ).fetchall()
                 conn.close()
+
+                # Reference magnitude for the missing-atom base score:
+                # smallest positive in-pool RRF score. Missing atoms with
+                # sim=1.0 reach this magnitude; less-similar atoms scale
+                # proportionally lower. Defaults to a small floor when the
+                # raw pool is empty.
+                in_pool_scores = [s for _, s in raw_ranked if s > 0]
+                ref_score = min(in_pool_scores) if in_pool_scores else 0.01
+
                 for row in rows:
-                    atom = dict(row); atom.pop("embedding", None)
+                    atom = dict(row)
+                    emb_blob = atom.pop("embedding", None)
+                    sim = 0.0
+                    if query_emb is not None and emb_blob:
+                        try:
+                            atom_vec = unpack_embedding(emb_blob)
+                            sim = max(0.0, cosine_similarity(query_emb, atom_vec))
+                        except Exception:
+                            sim = 0.0
+                    base = ref_score * sim
+                    cap = max(0.0, base * (boost_cap_multiplier - 1.0))
+                    final_score = base + min(boost_map[atom["id"]], cap)
+                    atom["_similarity"] = sim
+                    atom["_combined_score"] = final_score
                     raw_combined[atom["id"]] = atom
-                    raw_score_map[atom["id"]] = boost_map[atom["id"]]
+                    raw_score_map[atom["id"]] = final_score
 
         raw_ranked = sorted(raw_score_map.items(), key=lambda x: -x[1])
 
@@ -1449,6 +1477,7 @@ def hybrid_retrieve(
                 obs_conf_min_sim=_cfg('retrieval', 'observation_confidence_min_sim', 0.30),
                 stability_reduction=_cfg('consolidation', 'stability_reduction_factor', 0.5),
                 boost_cap_multiplier=_cfg('retrieval', 'evidence_boost_cap_multiplier', 3.0),
+                query_emb=cached_embed_query(query),
             )
 
         # P1: observation bonus. Well-supported distilled beliefs (memory_type
