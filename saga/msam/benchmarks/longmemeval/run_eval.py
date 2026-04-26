@@ -94,7 +94,7 @@ def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
     # before reload_config ran (msam/__init__.py eagerly imports core).
     import msam.embeddings
     msam.embeddings._provider_instance = None
-    from msam.core import hybrid_retrieve, mark_contributions, resolve_contradictions_to_supersedes
+    from msam.core import hybrid_retrieve, mark_contributions
     from .ingest import ingest_question
     from .harness import read
 
@@ -147,22 +147,6 @@ def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
                     _tb.print_exc()
                     print(f"  consolidation error on {qid}: {ce}")
                 t_consolidate = time.time() - t0
-
-            # P4-bench: detect contradictions among raw atoms and write
-            # supersedes edges so hybrid_retrieve can demote stale evidence.
-            # Targets the knowledge-update subtype (user changed their mind).
-            t_supersede = 0.0
-            supersedes_written = 0
-            if _c('retrieval', 'enable_supersedes_resolution', True):
-                t0 = time.time()
-                try:
-                    sres = resolve_contradictions_to_supersedes(
-                        threshold=_c('retrieval', 'supersedes_resolution_threshold', 0.85),
-                    )
-                    supersedes_written = sres.get("supersedes_written", 0)
-                except Exception as se:
-                    print(f"  supersedes resolution error on {qid}: {se}")
-                t_supersede = time.time() - t0
 
             t0 = time.time()
             from datetime import datetime, timezone
@@ -235,10 +219,8 @@ def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
                 "n_atoms_retrieved": n_retrieved,
                 "n_contributed": n_contributed,
                 "contribution_rate": contribution_rate,
-                "supersedes_written": supersedes_written,
                 "ingest_s": round(t_ingest, 2),
                 "consolidate_s": round(t_consolidate, 2),
-                "supersede_s": round(t_supersede, 2),
                 "clusters_consolidated": clusters_consolidated,
                 "retrieve_s": round(t_retrieve, 2),
                 "read_s": round(t_read, 2),
@@ -252,7 +234,6 @@ def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
             print(
                 f"[{i+1}/{len(dataset)}] {qid} ({q['question_type']}) "
                 f"ingest={t_ingest:.1f}s cons={t_consolidate:.1f}s(n={clusters_consolidated}) "
-                f"super={t_supersede:.1f}s(s={supersedes_written}) "
                 f"retrieve={t_retrieve:.1f}s read={t_read:.1f}s "
                 f"atoms={stats['ingested']}/{atoms_out} "
                 f"elapsed={elapsed:.0f}s",

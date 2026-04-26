@@ -185,3 +185,52 @@ class TestSupersedesDemotionInHybridRetrieve:
         # Diagnostic tag must be set on superseded atom.
         a_atom = next(r for r in results if r["id"] == a_id)
         assert a_atom.get("_relation_note") == "superseded"
+
+    def test_superseded_observation_is_demoted_in_two_tier(self, fake_embeddings, monkeypatch):
+        """Consolidation may write supersedes between observations (a new
+        observation covering a strict superset). The two-tier path must
+        demote the older observation so the newer one surfaces first."""
+        import msam.core
+        # Two observation atoms — new (B) supersedes old (A).
+        a_id = msam.core.store_atom(
+            "user enjoys hiking",
+            memory_type="observation",
+            evidence_count=3,
+        )
+        b_id = msam.core.store_atom(
+            "user loves outdoor activities including hiking",
+            memory_type="observation",
+            evidence_count=5,
+        )
+        assert isinstance(a_id, str) and isinstance(b_id, str)
+        msam.core.add_atom_relation(b_id, a_id, "supersedes", confidence=1.0,
+                                    metadata={"trigger": "consolidation"})
+
+        # Both observations match a hiking query.
+        def fake_retrieve(q, **kw):
+            mt = kw.get("memory_type")
+            if mt == "raw":
+                return []
+            conn = msam.core.get_db()
+            rows = conn.execute("SELECT * FROM atoms WHERE id IN (?, ?) ORDER BY id",
+                                (a_id, b_id)).fetchall()
+            conn.close()
+            atoms = []
+            for r in rows:
+                a = dict(r); a.pop("embedding", None)
+                a["_activation"] = 1.0; a["_similarity"] = 0.5
+                atoms.append(a)
+            return atoms
+
+        monkeypatch.setattr(msam.core, "retrieve", fake_retrieve)
+        monkeypatch.setattr(
+            msam.core, "keyword_search",
+            lambda q, top_k=10, memory_type=None, include_session_boundaries=False: fake_retrieve(q, memory_type=memory_type),
+        )
+
+        result = msam.core.hybrid_retrieve("hiking", top_k=5, two_tier=True)
+        observations = result["observations"]
+        # Both surface, but the new one (B) must rank above the superseded old (A).
+        ids_in_order = [o["id"] for o in observations]
+        assert b_id in ids_in_order and a_id in ids_in_order
+        assert ids_in_order.index(b_id) < ids_in_order.index(a_id)
