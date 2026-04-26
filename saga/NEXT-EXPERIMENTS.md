@@ -95,6 +95,75 @@ threshold ≥ 0.85.
 
 ---
 
+### P30 — Compute true base score for missing evidence atoms in two-tier retrieval
+
+**What.** In `_two_tier_split` (`core.py:1191-1251`), surfaced observations
+boost their evidence atoms via the `evidenced_by` edges. The boost is
+applied two ways:
+
+- **Evidence atom in raws top-K candidate pool**: final score is
+  `base_RRF + min(boost, cap_multiplier × base_RRF)`. The boost is
+  *capped relative to the atom's own RRF*, preventing one atom from
+  dominating the top-K.
+- **Evidence atom NOT in raws top-K**: final score is
+  `boost_map[atom_id]` — *just the boost, no own-score, no cap*.
+
+This is asymmetric in a way that **systematically favors atoms outside
+the candidate pool over atoms inside it**. A missing atom evidenced by
+3 surfaced observations gets `3 × multiplier × obs_score` (uncapped),
+which can exceed the in-top-K atom's bounded `base × cap_multiplier`.
+In other words: an atom that *just barely missed* the candidate pool
+on its own merit can outscore an atom that *did make it* — purely
+because the missing one doesn't have an own-RRF to cap against.
+
+**Why this matters.** The fix is a real ranking correctness issue, not
+a niceness change. Whether it moves the bench score depends on how
+often the missing-atom path activates and whether the reader benefits
+from those particular missing atoms over the in-top-K ones they're
+displacing.
+
+**Three implementation options:**
+
+1. **Compute cosine similarity for missing atoms against the query
+   embedding** and use that as a base score. Apply the same
+   cap-relative-to-base boost formula. Cost: ~one cosine per missing
+   atom (typically 3-15 atoms per query). No retrieval re-run needed.
+2. **Re-run `retrieve()` and `keyword_search()` with a much larger
+   `top_k`** (e.g. 5×) so missing atoms get real RRF scores. Cost:
+   one extra retrieval pass per query, but probably caches
+   embeddings/FAISS index well. Yields same kind of score as in-top-K
+   atoms (RRF rank-based), which is the cleanest comparison.
+3. **Don't pull missing atoms in at all.** If an atom couldn't make
+   the top-K on its own relevance, it shouldn't be in the raws tier
+   just because it backs an observation — the observation itself
+   surfaces the synthesized claim, and the raws tier is for primary
+   evidence relevant *to the query*. This is the most aggressive
+   change and shifts the design philosophy.
+
+**Effort.** 0.5 day for option 1, 1 day for option 2, 0.25 day for
+option 3.
+
+**Risk.**
+- Option 1: low. Cosine similarity is the same signal `retrieve()`
+  uses; just applied here.
+- Option 2: low. Same algorithm, more compute. Need to check the
+  retrieve cost doesn't bottleneck the bench.
+- Option 3: medium. Could lose evidence atoms that the reader actually
+  needs (e.g. an observation says "user prefers Sony" and the missing
+  raw is the original "I love my Sony A7" turn — the date might
+  matter for a temporal-reasoning probe).
+
+**Recommendation.** Ship option 1 first. It's the smallest diff that
+fixes the asymmetry. If the bench result is neutral or positive,
+consider option 3 as a more aggressive follow-up.
+
+**Score expectation.** Hard to predict. The bug systematically inflates
+out-of-pool atoms. Fixing it may help (better atoms now have a fair
+shot at top-K) or hurt (some missing atoms that were genuinely useful
+get dropped). A/B is the only way to know.
+
+---
+
 ### P15 — Evaluate cross-encoder rerank
 
 **What.** Hindsight uses a cross-encoder reranker as their final stage
@@ -387,13 +456,16 @@ decision (P16) than a decay-cycle flag.
 
 If the goal is **bench score progress**, ship in this order:
 
-1. **P11 + P12 + P13 (cherry-picks)** — composable with P9, low risk,
+1. **P30 (fix missing-atom base score in two-tier)** — ranking
+   correctness bug; in-top-K vs missing atoms are scored asymmetrically.
+   Smallest diff for option 1 (compute cosine for missing atoms).
+2. **P11 + P12 + P13 (cherry-picks)** — composable with P9, low risk,
    modest score upside on different subtypes.
-2. **P18 (re-run P10 with the new filter)** — zero code, one bench run,
+3. **P18 (re-run P10 with the new filter)** — zero code, one bench run,
    settles whether P10 was the regression cause.
-3. **P19 (delete `retrieve_with_relations`)** — deduplication while
+4. **P19 (delete `retrieve_with_relations`)** — deduplication while
    P-related code is fresh in our heads.
-4. **P14 (optimize supersedes resolver)** — only worth it if P4-bench
+5. **P14 (optimize supersedes resolver)** — only worth it if P4-bench
    shows score lift; otherwise we're optimizing dead code.
 
 If the goal is **codebase hygiene**, ship in this order:
