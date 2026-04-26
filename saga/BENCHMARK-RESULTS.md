@@ -22,6 +22,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p9_minimax_v1` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (consolidation gpt-5.4-nano, min_cluster_size=2) | 500 (499 graded) | **0.7816** |
 | `msam_p9_minimax_v2` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (consolidation gpt-5.4-nano, min_cluster_size=3) | 500 | **0.796** |
 | `msam_p9_minimax_v3` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (per-stream cluster floors, obs_top_k=3, obs_sim≥0.35, per-stream prompts) | 500 | **0.760** |
+| `msam_p8_minimax_v1` | MiniMax-M2.7 | rrf + two-tier (P9v2) + cluster merge pass (P8) + session_boundaries + mark_contributions (P10) | sem + kw (merge_threshold=0.75, max_cluster_size=50) | 500 | **0.752** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -370,6 +371,69 @@ every subtype except single-session-assistant. The tunings worked
 
 In short: each tuning was individually defensible; together they
 compounded into a net loss. P9v2 is still the best P9 variant.
+
+### `msam_p8_minimax_v1` — P9v2 + cluster merge pass + P10 wiring (500q)
+
+P9v2 baseline (the best P9 variant) + P8 merge pass + P10 session
+boundary writes during ingest + mark_contributions after each probe.
+Two new things compared to any prior P9 run:
+
+1. **Cluster merge pass.** Centroid-distance agglomerative pass after
+   greedy clustering (merge_threshold=0.75, max_cluster_size=50).
+   Combines clusters fragmented by greedy walking's "A near B, B near
+   C, but A not near C" pattern. Result is fewer, broader observations
+   with higher evidence counts.
+2. **P10 wiring.** Each haystack session gets one episodic
+   session_boundary atom written during ingest with summary "<date>:
+   conversation with N user turns, M assistant turns" (40-52 boundary
+   atoms per question on top of ~470-540 turn atoms). After each probe,
+   mark_contributions runs against the response.
+
+| Subtype | Score | N | Δ vs P9v2 | Δ vs P2 |
+|---|---|---|---|---|
+| single-session-assistant | 0.929 | 56 | -5.4 | -7.1 |
+| single-session-user | 0.943 | 70 | -4.3 | -1.4 |
+| knowledge-update | 0.910 | 78 | -3.8 | -3.9 |
+| temporal-reasoning | 0.782 | 133 | +0.8 | -4.5 |
+| **multi-session** | 0.571 | 133 | **-9.7** | **-6.2** |
+| single-session-preference | 0.233 | 30 | -3.4 | -3.4 |
+
+**Overall: 0.752 (-4.4 vs P9v2, -4.7 vs P2).** Regressed on five of
+six subtypes. The collapse is concentrated in **multi-session
+(-9.7)** — exactly the subtype P9v2 was winning vs P2 (+3.5).
+
+What likely went wrong:
+
+- **The merge pass produced observations that are too broad.** With
+  merge_threshold=0.75 and max_cluster_size=50, three or four related
+  clusters now collapse into a single observation covering 15-20+
+  atoms. The synthesis is forced to abstract over a wider topic span,
+  producing more general statements that match fewer specific probes.
+  Multi-session questions especially need observations that recall
+  specific cross-session details — broader observations dilute that
+  signal.
+- **P10's session_boundary atoms compete for retrieval slots.** ~45
+  extra episodic atoms per question. With a top_k=20 raws cap, the
+  boundary beacons (which contain only "N user turns, M assistant
+  turns" — no semantic content) can crowd out genuinely relevant
+  raw atoms. Suspect this is part of the across-the-board single-session
+  drop too.
+
+Confounders: P10 + P8 landed in the same run. We can't cleanly
+attribute the loss to one or the other. Two follow-up experiments to
+disambiguate:
+
+1. **P8-only ablation:** turn off P10 (skip session_boundary writes
+   and mark_contributions), keep P8 merge. If this recovers most of
+   the loss, P10 was the main culprit.
+2. **Tighter merge:** drop max_cluster_size to 15-20 and raise
+   merge_threshold to 0.85. Limits the runaway-merge case while
+   keeping the fragment-fix benefit.
+
+Pace: ~50s/q (vs P9v2's ~38s/q). The slowdown is from session_boundary
+embedding calls during ingest — each boundary goes through `store_atom`
+without a pre-computed embedding, so each hits the OpenAI API solo
+instead of being batched.
 
 ## P9 summary
 
