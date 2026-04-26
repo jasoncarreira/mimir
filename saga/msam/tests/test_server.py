@@ -135,6 +135,98 @@ class TestQuery:
         data = rv.json()
         assert data["confidence_tier"] == "none"
 
+    def test_query_two_tier_request_field(self, client, monkeypatch):
+        """When the request body asks for two_tier=true, the response shape
+        switches to {observations, raws, triples=[]} via hybrid_retrieve."""
+        import msam.core
+        captured = {}
+
+        def fake_hybrid_retrieve(query, **kw):
+            captured.update(kw)
+            return {
+                "observations": [{
+                    "id": "obs1", "content": "user prefers dark mode",
+                    "stream": "semantic", "memory_type": "observation",
+                    "_similarity": 0.7, "_combined_score": 0.05,
+                    "evidence_count": 4,
+                }],
+                "raws": [{
+                    "id": "raw1", "content": "I love the dark theme",
+                    "stream": "semantic", "memory_type": "raw",
+                    "_similarity": 0.6, "_combined_score": 0.04,
+                }],
+            }
+
+        monkeypatch.setattr(msam.core, "hybrid_retrieve", fake_hybrid_retrieve)
+
+        rv = client.post("/v1/query", json={
+            "query": "preferences", "two_tier": True, "top_k": 10,
+        })
+        assert rv.status_code == 200
+        data = rv.json()
+        assert data["two_tier"] is True
+        assert "observations" in data and len(data["observations"]) == 1
+        assert "raws" in data and len(data["raws"]) == 1
+        assert data["observations"][0]["memory_type"] == "observation"
+        assert data["observations"][0]["evidence_count"] == 4
+        assert data["raws"][0]["memory_type"] == "raw"
+        assert data["triples"] == []
+        assert data["items_returned"] == 2
+        # Verify hybrid_retrieve was actually called with two_tier=True
+        assert captured.get("two_tier") is True
+        assert captured.get("top_k") == 10
+
+    def test_query_two_tier_via_config_default(self, client, monkeypatch):
+        """When request omits two_tier and config sets two_tier_enabled=true,
+        the server picks up the config and returns two-tier shape."""
+        import msam.core
+        import msam.server
+        # Force the config lookup to return True for two_tier_enabled.
+        real_cfg = msam.server._cfg
+        def fake_cfg(section, key, default=None):
+            if section == "retrieval" and key == "two_tier_enabled":
+                return True
+            return real_cfg(section, key, default)
+        monkeypatch.setattr(msam.server, "_cfg", fake_cfg)
+
+        monkeypatch.setattr(msam.core, "hybrid_retrieve", lambda q, **kw: {
+            "observations": [], "raws": [],
+        })
+
+        rv = client.post("/v1/query", json={"query": "anything"})
+        assert rv.status_code == 200
+        data = rv.json()
+        assert data["two_tier"] is True
+        assert "atoms" not in data
+        assert "observations" in data
+
+    def test_query_request_overrides_config_two_tier_false(self, client, monkeypatch):
+        """Request body two_tier=false must override config two_tier_enabled=true."""
+        import msam.triples
+        import msam.server
+        real_cfg = msam.server._cfg
+        def fake_cfg(section, key, default=None):
+            if section == "retrieval" and key == "two_tier_enabled":
+                return True
+            return real_cfg(section, key, default)
+        monkeypatch.setattr(msam.server, "_cfg", fake_cfg)
+
+        monkeypatch.setattr(msam.triples, "hybrid_retrieve_with_triples",
+                            lambda q, mode="task", token_budget=500: {
+            "triples": [], "atoms": [], "_raw_atoms": [],
+            "triple_tokens": 0, "atom_tokens": 0, "total_tokens": 0,
+            "items_returned": 0, "query_type": "mixed", "triple_ratio": 0,
+            "latency_ms": 0,
+        })
+
+        rv = client.post("/v1/query", json={"query": "x", "two_tier": False})
+        assert rv.status_code == 200
+        data = rv.json()
+        # Single-tier shape returned; no two_tier key in response
+        assert "atoms" in data
+        assert "confidence_tier" in data
+        assert data.get("two_tier") is None or "two_tier" not in data
+
 
 # ─── Stats ───────────────────────────────────────────────────────────────────
 
