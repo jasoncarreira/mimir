@@ -105,6 +105,13 @@ class QueryRequest(BaseModel):
     mode: str = "task"
     top_k: int = 12
     token_budget: int = 500
+    # Opt-in per call. When None, falls back to [retrieval] two_tier_enabled
+    # (default False). When True, response shape changes to {observations,
+    # raws, triples=[]} instead of the single-tier {atoms, triples}.
+    two_tier: Optional[bool] = None
+    # ISO 8601 datetime; only used when two_tier=True to parameterize the
+    # temporal pathway. Single-tier path ignores this.
+    reference_date: Optional[str] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -197,6 +204,38 @@ def _get_version():
         return "unknown"
 
 
+def _format_atom(a: dict) -> dict:
+    """Shape an atom dict for the wire. Used by both single-tier and two-tier
+    /v1/query paths so callers see a consistent atom shape regardless of
+    which retrieval mode was used.
+    """
+    topics = a.get("topics", [])
+    if isinstance(topics, str):
+        try:
+            topics = json.loads(topics)
+        except (json.JSONDecodeError, TypeError):
+            topics = []
+    metadata = a.get("metadata", {})
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    return {
+        "id": a["id"],
+        "content": a["content"],
+        "stream": a.get("stream", "semantic"),
+        "similarity": round(a.get("_similarity", 0) or 0, 3),
+        "score": round(a.get("_combined_score", a.get("_activation", 0)) or 0, 3),
+        "confidence_tier": a.get("_confidence_tier", "unknown"),
+        "topics": topics,
+        "metadata": metadata,
+        "source_type": a.get("source_type", "unknown"),
+        "memory_type": a.get("memory_type", "raw"),
+        "evidence_count": a.get("evidence_count", 0) or 0,
+    }
+
+
 # ─── Health Check ─────────────────────────────────────────────────────────────
 
 @app.get("/v1/health")
@@ -268,9 +307,49 @@ async def api_store(req: StoreRequest):
 @app.post("/v1/query", dependencies=[Depends(verify_api_key)])
 async def api_query(req: QueryRequest):
     def _query():
+        t0 = time.time()
+
+        # Determine whether the caller wants the two-tier
+        # {observations, raws} shape. Per-call request field wins; falls back
+        # to [retrieval] two_tier_enabled config; final default False.
+        two_tier = req.two_tier
+        if two_tier is None:
+            two_tier = bool(_cfg('retrieval', 'two_tier_enabled', False))
+
+        if two_tier:
+            from datetime import datetime
+            from .core import hybrid_retrieve
+
+            ref_date = None
+            if req.reference_date:
+                try:
+                    iso = req.reference_date.replace('Z', '+00:00')
+                    ref_date = datetime.fromisoformat(iso)
+                except (ValueError, AttributeError):
+                    ref_date = None
+
+            result = hybrid_retrieve(
+                req.query,
+                mode=req.mode,
+                top_k=req.top_k,
+                reference_date=ref_date,
+                two_tier=True,
+            )
+            obs = result.get("observations", []) or []
+            raws = result.get("raws", []) or []
+            return {
+                "query": req.query,
+                "mode": req.mode,
+                "two_tier": True,
+                "observations": [_format_atom(o) for o in obs],
+                "raws": [_format_atom(r) for r in raws],
+                "triples": [],
+                "items_returned": len(obs) + len(raws),
+                "latency_ms": round((time.time() - t0) * 1000, 2),
+            }
+
         from .triples import hybrid_retrieve_with_triples
 
-        t0 = time.time()
         result = hybrid_retrieve_with_triples(req.query, mode=req.mode,
                                                token_budget=req.token_budget)
         latency_ms = (time.time() - t0) * 1000
