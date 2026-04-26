@@ -62,7 +62,7 @@ class TestTwoTierReturn:
                 out.append(a)
             return out
         monkeypatch.setattr(msam.core, "retrieve", fake_retrieve)
-        monkeypatch.setattr(msam.core, "keyword_search", lambda q, top_k=10, memory_type=None: fake_retrieve(q, memory_type=memory_type))
+        monkeypatch.setattr(msam.core, "keyword_search", lambda q, top_k=10, memory_type=None, include_session_boundaries=False: fake_retrieve(q, memory_type=memory_type))
 
         result = msam.core.hybrid_retrieve("cameras", top_k=5, two_tier=True)
         assert isinstance(result, dict)
@@ -93,7 +93,7 @@ class TestTwoTierReturn:
                 out.append(a)
             return out
         monkeypatch.setattr(msam.core, "retrieve", fake_retrieve)
-        monkeypatch.setattr(msam.core, "keyword_search", lambda q, top_k=10, memory_type=None: fake_retrieve(q, memory_type=memory_type))
+        monkeypatch.setattr(msam.core, "keyword_search", lambda q, top_k=10, memory_type=None, include_session_boundaries=False: fake_retrieve(q, memory_type=memory_type))
 
         result = msam.core.hybrid_retrieve("anything", top_k=5, two_tier=True)
         assert result["observations"] == []  # gated out
@@ -123,7 +123,7 @@ class TestTwoTierReturn:
                 out.append(a)
             return out
         monkeypatch.setattr(msam.core, "retrieve", fake_retrieve)
-        monkeypatch.setattr(msam.core, "keyword_search", lambda q, top_k=10, memory_type=None: fake_retrieve(q, memory_type=memory_type))
+        monkeypatch.setattr(msam.core, "keyword_search", lambda q, top_k=10, memory_type=None, include_session_boundaries=False: fake_retrieve(q, memory_type=memory_type))
 
         real_cfg = msam.core._cfg
         monkeypatch.setattr(msam.core, "_cfg", lambda s, k, d=None: 3 if (s, k) == ("retrieval", "observations_top_k") else real_cfg(s, k, d))
@@ -167,7 +167,7 @@ class TestEvidenceBoost:
             out.sort(key=lambda a: a["_similarity"], reverse=True)
             return out
         monkeypatch.setattr(msam.core, "retrieve", fake_retrieve)
-        monkeypatch.setattr(msam.core, "keyword_search", lambda q, top_k=10, memory_type=None: fake_retrieve(q, memory_type=memory_type))
+        monkeypatch.setattr(msam.core, "keyword_search", lambda q, top_k=10, memory_type=None, include_session_boundaries=False: fake_retrieve(q, memory_type=memory_type))
 
         result = msam.core.hybrid_retrieve("photography", top_k=3, two_tier=True)
 

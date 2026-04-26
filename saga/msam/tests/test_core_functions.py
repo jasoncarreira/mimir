@@ -299,7 +299,47 @@ class TestSessionWorkingMemory:
     def test_get_last_sessions(self):
         from msam.core import store_session_boundary, get_last_sessions
         store_session_boundary(session_id="s1", summary="First session")
-        store_session_boundary(session_id="s2", summary="Second session")
+        store_session_boundary(session_id="s2", summary="Second session", channel="slack-dm-x")
+        # Default: returns all
+        all_sessions = get_last_sessions(count=5)
+        assert len(all_sessions) >= 2
+        # Channel filter
+        ch = get_last_sessions(count=5, channel="slack-dm-x")
+        assert len(ch) == 1
+        assert ch[0]["channel"] == "slack-dm-x"
+        # session_id filter
+        only_s1 = get_last_sessions(count=5, session_id="s1")
+        assert len(only_s1) == 1
+        assert only_s1[0]["session_id"] == "s1"
+
+    def test_session_boundary_excluded_from_retrieve(self):
+        """Continuity beacons must not pollute generic semantic retrieval."""
+        from msam.core import store_session_boundary, store_atom, retrieve
+        # Write a regular atom and a session boundary covering similar ground.
+        regular_id = store_atom("user discussed project planning today")
+        store_session_boundary(
+            session_id="ssn-x", summary="discussed project planning",
+            topics_discussed=["project", "planning"],
+        )
+        results = retrieve("project planning")
+        ids = {r["id"] for r in results}
+        assert regular_id in ids
+        for r in results:
+            assert r.get("source_type") != "session_boundary"
+
+    def test_session_boundary_included_when_opt_in(self):
+        from msam.core import store_session_boundary, retrieve
+        store_session_boundary(
+            session_id="ssn-y", summary="weekend retro",
+            topics_discussed=["retro"],
+        )
+        results = retrieve("retro", include_session_boundaries=True)
+        assert any(r.get("source_type") == "session_boundary" for r in results)
+
+    def test_get_last_sessions_legacy_signature(self):
+        # The original signature get_last_sessions(count) still works.
+        from msam.core import store_session_boundary, get_last_sessions
+        store_session_boundary(session_id="legacy", summary="legacy session")
         result = get_last_sessions(count=2)
         assert isinstance(result, list)
 

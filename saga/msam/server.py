@@ -121,6 +121,7 @@ class SessionEndRequest(BaseModel):
     decisions_made: Optional[list[str]] = None
     unfinished: Optional[list[str]] = None
     emotional_state: Optional[str] = None
+    channel: Optional[str] = None
 
 
 class TriplesExtractRequest(BaseModel):
@@ -406,8 +407,9 @@ async def api_session_end(req: SessionEndRequest):
             decisions_made=req.decisions_made,
             unfinished=req.unfinished,
             emotional_state=req.emotional_state,
+            channel=req.channel,
         )
-        return {"atom_id": atom_id, "session_id": req.session_id}
+        return {"atom_id": atom_id, "session_id": req.session_id, "channel": req.channel}
     return await asyncio.to_thread(_end)
 
 

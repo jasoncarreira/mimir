@@ -81,7 +81,7 @@ class TestRetrievalBonus:
                 atoms.append(a)
             return atoms
 
-        def fake_keyword(query, top_k=10):
+        def fake_keyword(query, top_k=10, **kwargs):
             return fake_retrieve(query)
 
         monkeypatch.setattr(msam.core, "retrieve", fake_retrieve)
@@ -135,7 +135,7 @@ class TestRetrievalBonus:
             return atoms
 
         monkeypatch.setattr(msam.core, "retrieve", fake_retrieve)
-        monkeypatch.setattr(msam.core, "keyword_search", lambda q, top_k=10: fake_retrieve(q))
+        monkeypatch.setattr(msam.core, "keyword_search", lambda q, top_k=10, include_session_boundaries=False: fake_retrieve(q))
 
         # Compute the plain (un-boosted) RRF score a single-pathway rank-1
         # atom receives: weight / (k + 1) — here 1.0 / (60 + 1) per pathway,
@@ -174,7 +174,7 @@ class TestSupersedesDemotionInHybridRetrieve:
 
         monkeypatch.setattr(msam.core, "retrieve", fake_retrieve)
         monkeypatch.setattr(msam.core, "keyword_search",
-                            lambda q, top_k=10, memory_type=None: fake_retrieve(q))
+                            lambda q, top_k=10, memory_type=None, include_session_boundaries=False: fake_retrieve(q))
 
         results = msam.core.hybrid_retrieve("user works", top_k=5)
         # Both atoms returned, but the superseded one (a_id) should have a
