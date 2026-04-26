@@ -166,3 +166,98 @@ class TestFindSemanticContradictions:
         result = find_semantic_contradictions()
         assert result == []
         assert isinstance(result, list)
+
+
+class TestResolveContradictionsToSupersedes:
+    """P4-bench: resolver picks newer atom and writes supersedes edges."""
+
+    def test_skips_antonyms(self, monkeypatch):
+        """Antonym contradictions are too noisy — should not produce edges."""
+        from msam import core
+
+        fake_pair = [{
+            "atom_a": {"id": "a", "content": "user is happy", "created_at": "2026-01-02T00:00:00+00:00"},
+            "atom_b": {"id": "b", "content": "user is sad", "created_at": "2026-01-01T00:00:00+00:00"},
+            "similarity": 0.9,
+            "contradiction_type": "semantic_opposition",
+            "suggestion": "...",
+        }]
+
+        called = []
+        monkeypatch.setattr("msam.contradictions.find_semantic_contradictions",
+                            lambda threshold=0.85: fake_pair)
+        monkeypatch.setattr(core, "add_atom_relation",
+                            lambda *a, **k: called.append((a, k)))
+
+        result = core.resolve_contradictions_to_supersedes(raws_only=False)
+        assert result["contradictions_found"] == 1
+        assert result["supersedes_written"] == 0
+        assert called == []
+
+    def test_writes_edge_for_value_conflict_newer_wins(self, monkeypatch):
+        from msam import core
+
+        # b is newer; b should supersede a.
+        fake_pair = [{
+            "atom_a": {"id": "a", "content": "user works at Acme",
+                       "created_at": "2026-01-01T00:00:00+00:00"},
+            "atom_b": {"id": "b", "content": "user works at Beta",
+                       "created_at": "2026-03-01T00:00:00+00:00"},
+            "similarity": 0.9,
+            "contradiction_type": "value_conflict",
+            "suggestion": "...",
+        }]
+
+        captured = []
+        monkeypatch.setattr("msam.contradictions.find_semantic_contradictions",
+                            lambda threshold=0.85: fake_pair)
+        monkeypatch.setattr(core, "add_atom_relation",
+                            lambda src, tgt, rt, **k: captured.append((src, tgt, rt, k)))
+
+        result = core.resolve_contradictions_to_supersedes(raws_only=False)
+        assert result["supersedes_written"] == 1
+        src, tgt, rt, kwargs = captured[0]
+        assert src == "b"  # newer
+        assert tgt == "a"  # older
+        assert rt == "supersedes"
+        assert kwargs["confidence"] == 0.9
+        assert kwargs["metadata"]["contradiction_type"] == "value_conflict"
+
+    def test_skips_when_timestamps_equal(self, monkeypatch):
+        from msam import core
+
+        same_ts = "2026-01-01T00:00:00+00:00"
+        fake_pair = [{
+            "atom_a": {"id": "a", "content": "x", "created_at": same_ts},
+            "atom_b": {"id": "b", "content": "y", "created_at": same_ts},
+            "similarity": 0.9,
+            "contradiction_type": "negation",
+            "suggestion": "...",
+        }]
+
+        captured = []
+        monkeypatch.setattr("msam.contradictions.find_semantic_contradictions",
+                            lambda threshold=0.85: fake_pair)
+        monkeypatch.setattr(core, "add_atom_relation",
+                            lambda *a, **k: captured.append((a, k)))
+
+        result = core.resolve_contradictions_to_supersedes(raws_only=False)
+        assert result["supersedes_written"] == 0
+        assert captured == []
+
+
+class TestSupersedesDemotionInRetrieval:
+    """P4-bench: hybrid_retrieve demotes superseded atoms in the candidate pool."""
+
+    def test_apply_supersedes_demotion_no_op_on_empty(self):
+        from msam.core import _apply_supersedes_demotion
+        # Just verify the function tolerates empty input.
+        d = {}
+        _apply_supersedes_demotion(d, demotion_factor=0.4)
+        assert d == {}
+
+    def test_apply_supersedes_demotion_skips_when_factor_one(self):
+        from msam.core import _apply_supersedes_demotion
+        d = {"a": {"_combined_score": 1.0}}
+        _apply_supersedes_demotion(d, demotion_factor=1.0)
+        assert d["a"]["_combined_score"] == 1.0  # untouched
