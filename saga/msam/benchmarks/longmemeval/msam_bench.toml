@@ -96,11 +96,6 @@ api_key_env = "OPENAI_API_KEY"
 min_cluster_size = 3
 max_clusters_per_run = 20
 stability_reduction_factor = 0.5
-# P8 v2: tighter merge knobs to avoid the over-broad observations that
-# regressed multi-session in P8 v1 (max_cluster_size=50, threshold=0.75).
-enable_merge_pass = true
-merge_threshold = 0.85
-max_cluster_size = 15
 
 [agents]
 default_agent_id = "longmemeval"
