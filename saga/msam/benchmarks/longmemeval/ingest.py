@@ -120,33 +120,37 @@ def ingest_question(question: dict, batch_size: int = 256) -> dict:
     # P10: write one episodic session_boundary per haystack session so
     # multi-session probes can retrieve session-level beacons. Summary is
     # deliberately minimal to avoid polluting retrieval with synthetic content.
-    session_groups: dict[str, list[dict]] = {}
-    for turn in turns:
-        session_groups.setdefault(turn["session_id"], []).append(turn)
-
+    # Gated because boundary atoms compete for retrieval slots and may
+    # displace genuine raw atoms in the top-K.
     boundary_stored = 0
-    boundary_ids: list[tuple[str, str]] = []
-    for sid, sturns in session_groups.items():
-        n_user = sum(1 for t in sturns if t["role"] == "user")
-        n_asst = len(sturns) - n_user
-        date_iso = sturns[0]["session_date_iso"]
-        date_tag = date_iso[:10]
-        summary = f"{date_tag}: conversation with {n_user} user turns, {n_asst} assistant turns"
-        try:
-            bid = store_session_boundary(session_id=sid, summary=summary)
-            if isinstance(bid, str):
-                boundary_stored += 1
-                boundary_ids.append((bid, date_iso))
-        except Exception:
-            pass
+    from msam.config import get_config as _gc
+    if _gc()('benchmark', 'enable_session_boundaries', True):
+        session_groups: dict[str, list[dict]] = {}
+        for turn in turns:
+            session_groups.setdefault(turn["session_id"], []).append(turn)
 
-    if boundary_ids:
-        for atom_id, iso in boundary_ids:
-            conn.execute(
-                "UPDATE atoms SET created_at = ? WHERE id = ?",
-                (iso, atom_id),
-            )
-        conn.commit()
+        boundary_ids: list[tuple[str, str]] = []
+        for sid, sturns in session_groups.items():
+            n_user = sum(1 for t in sturns if t["role"] == "user")
+            n_asst = len(sturns) - n_user
+            date_iso = sturns[0]["session_date_iso"]
+            date_tag = date_iso[:10]
+            summary = f"{date_tag}: conversation with {n_user} user turns, {n_asst} assistant turns"
+            try:
+                bid = store_session_boundary(session_id=sid, summary=summary)
+                if isinstance(bid, str):
+                    boundary_stored += 1
+                    boundary_ids.append((bid, date_iso))
+            except Exception:
+                pass
+
+        if boundary_ids:
+            for atom_id, iso in boundary_ids:
+                conn.execute(
+                    "UPDATE atoms SET created_at = ? WHERE id = ?",
+                    (iso, atom_id),
+                )
+            conn.commit()
 
     return {
         "ingested": ingested,
