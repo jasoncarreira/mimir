@@ -208,6 +208,107 @@ class TestSkipExistingObservation:
         # Tombstoned observation should be ignored.
         assert engine._existing_observation_for_cluster(["raw_a", "raw_b"]) is None
 
+    def test_subset_observations_helper(self):
+        from msam.core import get_db, run_migrations, add_atom_relation
+        from msam.consolidation import ConsolidationEngine
+
+        conn = get_db()
+        run_migrations(conn)
+        same_emb = struct.pack('1024f', *np.random.randn(1024).astype(np.float32))
+        # Three raw atoms + one observation that covers ONLY raw_a, raw_b.
+        for aid in ("raw_a", "raw_b", "raw_c", "obs_old"):
+            content = f"content {aid}"
+            ch = hashlib.sha256(content.encode()).hexdigest()[:32]
+            mt = "observation" if aid == "obs_old" else "raw"
+            conn.execute("""
+                INSERT INTO atoms (id, content, content_hash, created_at, state,
+                    is_pinned, embedding, topics, metadata, encoding_confidence,
+                    stream, profile, access_count, stability, memory_type)
+                VALUES (?, ?, ?, datetime('now'), 'active', 0, ?, '[]', '{}', 0.7,
+                    'semantic', 'standard', 0, 1.0, ?)
+            """, (aid, content, ch, same_emb, mt))
+        conn.commit()
+        conn.close()
+        add_atom_relation("obs_old", "raw_a", "evidenced_by", confidence=1.0)
+        add_atom_relation("obs_old", "raw_b", "evidenced_by", confidence=1.0)
+
+        engine = ConsolidationEngine()
+        # New cluster covers a strict superset of obs_old's evidence.
+        assert engine._subset_observations_for_cluster(["raw_a", "raw_b", "raw_c"]) == ["obs_old"]
+        # Identical → not a strict subset, returns empty.
+        assert engine._subset_observations_for_cluster(["raw_a", "raw_b"]) == []
+        # Disjoint → empty.
+        assert engine._subset_observations_for_cluster(["raw_x", "raw_y", "raw_z"]) == []
+        # Single-atom new cluster → guarded out.
+        assert engine._subset_observations_for_cluster(["raw_a"]) == []
+
+    def test_consolidate_writes_supersedes_for_strict_superset(self, monkeypatch):
+        """End-to-end: a cluster that covers a strict superset of an
+        existing observation's evidence creates a new observation AND
+        writes a supersedes edge from new → old."""
+        from msam.core import get_db, run_migrations, add_atom_relation
+        from msam.consolidation import ConsolidationEngine
+
+        conn = get_db()
+        run_migrations(conn)
+
+        same_emb = struct.pack('1024f', *np.random.randn(1024).astype(np.float32))
+        # 5 raw atoms in the same cluster.
+        cluster_ids = [f"raw_super_{i}" for i in range(5)]
+        for aid in cluster_ids:
+            content = f"shared topic super content {aid}"
+            ch = hashlib.sha256(content.encode()).hexdigest()[:32]
+            conn.execute("""
+                INSERT INTO atoms (id, content, content_hash, created_at, state,
+                    is_pinned, embedding, topics, metadata, encoding_confidence,
+                    stream, profile, access_count, stability, memory_type)
+                VALUES (?, ?, ?, datetime('now'), 'active', 0, ?, '[]', '{}', 0.7,
+                    'semantic', 'standard', 0, 1.0, 'raw')
+            """, (aid, content, ch, same_emb))
+
+        # Pre-existing observation covering only the FIRST 3 of those raws.
+        obs_id = "obs_super_old"
+        obs_content = "[Consolidated from 3 atoms] earlier coverage"
+        ch = hashlib.sha256(obs_content.encode()).hexdigest()[:32]
+        conn.execute("""
+            INSERT INTO atoms (id, content, content_hash, created_at, state,
+                is_pinned, embedding, topics, metadata, encoding_confidence,
+                stream, profile, access_count, stability, memory_type, evidence_count)
+            VALUES (?, ?, ?, datetime('now'), 'active', 0, ?, '[]', '{}', 0.9,
+                'semantic', 'standard', 0, 1.0, 'observation', 3)
+        """, (obs_id, obs_content, ch, same_emb))
+        conn.commit()
+        conn.close()
+        for src_id in cluster_ids[:3]:
+            add_atom_relation(obs_id, src_id, "evidenced_by", confidence=1.0)
+
+        # Stub the LLM so synthesis runs without external calls.
+        import requests
+        def fake_post(*a, **k):
+            class _R:
+                status_code = 200
+                def json(self):
+                    return {"choices": [{"message": {"content": "user enjoys topic super"}}]}
+            return _R()
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        engine = ConsolidationEngine(similarity_threshold=0.5, min_cluster_size=3)
+        result = engine.consolidate()
+        assert result["clusters_skipped_existing"] == 0
+        assert result["observations_superseded"] >= 1
+
+        # Verify the supersedes edge points new_obs → obs_super_old.
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT source_id, target_id FROM atom_relations "
+            "WHERE relation_type = 'supersedes' AND target_id = ?",
+            (obs_id,),
+        ).fetchall()
+        conn.close()
+        assert len(rows) >= 1
+        new_obs_id = rows[0][0]
+        assert new_obs_id != obs_id
+
     def test_consolidate_skips_existing(self, monkeypatch):
         """End-to-end: clusters_skipped_existing reports the count and the
         LLM is not called for an already-consolidated cluster."""
