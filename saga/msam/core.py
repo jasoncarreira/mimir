@@ -120,8 +120,22 @@ CREATE INDEX IF NOT EXISTS idx_atoms_memory_type ON atoms(memory_type);
 
 # ─── Database ─────────────────────────────────────────────────────
 
+# Tracks DB paths whose migrations have already run within this process.
+# Without this, callers that hit get_db() directly (e.g. via /v1/store)
+# would never get migration-created tables like atom_relations, silently
+# breaking consolidation. init_db.py runs migrations explicitly, but not
+# every harness goes through it.
+_migrations_done: set[str] = set()
+_migrations_lock = threading.Lock()
+
+
 def get_db() -> sqlite3.Connection:
-    """Get database connection, creating schema if needed."""
+    """Get database connection, creating schema if needed.
+
+    On first call per DB path within a process, runs pending migrations
+    so callers that skip `python -m msam.init_db` still get the full
+    schema (atom_relations, FTS, etc.).
+    """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -129,6 +143,14 @@ def get_db() -> sqlite3.Connection:
     conn.execute(f"PRAGMA busy_timeout={_cfg('storage', 'db_busy_timeout_ms', 5000)}")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA_SQL)
+
+    db_key = str(DB_PATH)
+    if db_key not in _migrations_done:
+        with _migrations_lock:
+            if db_key not in _migrations_done:
+                run_migrations(conn)
+                _migrations_done.add(db_key)
+
     return conn
 
 
