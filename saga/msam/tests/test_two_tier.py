@@ -245,3 +245,80 @@ class TestMissingEvidenceBaseScore:
         # missing atom got the uncapped boost as its full score and would
         # often outrank in-pool atoms.
         assert ids.index(in_pool_id) <= ids.index(missing_id)
+
+
+class TestKeywordOnlyTierBackfill:
+    """Regression: in two-tier mode, atoms surfaced only via keyword_search
+    (not retrieve) lacked _similarity / _confidence_tier because
+    keyword_search doesn't compute cosine. They reached the API filter
+    with `_confidence_tier` absent → defaulted to "none" → rejected at any
+    floor ≥ "low". Fix: _two_tier_split backfills both fields by
+    re-fetching embeddings for atoms missing _similarity."""
+
+    def test_keyword_only_atom_gets_classified(self, env, monkeypatch):
+        import msam.core
+
+        # Two raws stored. The fake retrieve() returns only one (semantic
+        # path); keyword_search returns both. Without the backfill, the
+        # keyword-only atom would surface with no tier set.
+        sem_id = msam.core.store_atom("semantic match for the query")
+        kw_only_id = msam.core.store_atom("keyword-only match content")
+
+        def fake_retrieve(query, mode="task", top_k=20, memory_type=None, **kw):
+            conn = msam.core.get_db()
+            if memory_type == "raw":
+                # Only return the semantic-matched one
+                rows = conn.execute(
+                    "SELECT * FROM atoms WHERE id = ?", (sem_id,)
+                ).fetchall()
+            else:
+                rows = []
+            conn.close()
+            out = []
+            for r in rows:
+                a = dict(r)
+                a.pop("embedding", None)
+                a["_activation"] = 1.0
+                a["_similarity"] = 0.5  # would classify as "high" at default thresholds
+                a["_confidence_tier"] = "high"
+                out.append(a)
+            return out
+
+        def fake_keyword_search(q, top_k=10, memory_type=None, include_session_boundaries=False):
+            conn = msam.core.get_db()
+            if memory_type == "raw":
+                rows = conn.execute(
+                    "SELECT * FROM atoms WHERE id IN (?, ?)", (sem_id, kw_only_id)
+                ).fetchall()
+            else:
+                rows = []
+            conn.close()
+            out = []
+            for r in rows:
+                a = dict(r)
+                a.pop("embedding", None)
+                # keyword_search does NOT set _similarity or _confidence_tier
+                a["_keyword_score"] = 1.0
+                out.append(a)
+            return out
+
+        monkeypatch.setattr(msam.core, "retrieve", fake_retrieve)
+        monkeypatch.setattr(msam.core, "keyword_search", fake_keyword_search)
+
+        result = msam.core.hybrid_retrieve("test query", top_k=5, two_tier=True)
+        raws = result["raws"]
+
+        # Both atoms should surface
+        ids = {r["id"] for r in raws}
+        assert sem_id in ids
+        assert kw_only_id in ids
+
+        # Critical: keyword-only atom must have _confidence_tier set.
+        # The exact tier depends on the backfilled cosine, but it must
+        # be one of the recognized values, NOT absent.
+        kw_atom = next(r for r in raws if r["id"] == kw_only_id)
+        assert "_confidence_tier" in kw_atom
+        assert kw_atom["_confidence_tier"] in ("high", "medium", "low", "none")
+        # Likewise _similarity should be backfilled (≥ 0).
+        assert "_similarity" in kw_atom
+        assert kw_atom["_similarity"] >= 0.0
