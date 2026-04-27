@@ -409,7 +409,151 @@ def _load_config() -> dict:
 
     _config = config
     _config_loaded = True
+
+    # Surface user-config typos: keys in known sections that don't match
+    # any known key. Catches things like Mimir's `cluster_similarity_threshold`
+    # (real key: `similarity_threshold`) silently falling through to defaults.
+    if toml_path is not None and tomllib is not None:
+        try:
+            with open(toml_path, "rb") as f:
+                user_data = tomllib.load(f)
+            _warn_unknown_keys(user_data)
+        except Exception:
+            pass
+
     return _config
+
+
+# ─── Unknown-key detection ─────────────────────────────────────────
+#
+# Some legitimate keys aren't in `_DEFAULTS` because the code calls
+# `_cfg(section, key, default)` and only relies on the runtime default.
+# The registry below lists those so we don't false-warn on them.
+# When you add a new feature flag that's read with a runtime default,
+# add it here (or to `_DEFAULTS`).
+_KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
+    "retrieval": {
+        "fusion", "rrf_k",
+        "rrf_semantic_weight", "rrf_keyword_weight",
+        "rrf_graph_weight", "rrf_temporal_weight",
+        "two_tier_enabled", "observations_top_k",
+        "observation_confidence_min_sim", "evidence_boost_cap_multiplier",
+        "enable_observation_bonus", "observation_bonus_alpha",
+        "trend_penalty_weakening", "trend_penalty_stale",
+        "enable_graph_pathway", "graph_pathway_top_k",
+        "enable_temporal_pathway", "temporal_pathway_top_k",
+        "min_outcomes_for_effect",
+    },
+    "retrieval_v2": {
+        # P11/P12/P13 cherry-picks. Read with runtime default in core.py.
+        "enable_query_rewriting",
+    },
+    "consolidation": {
+        "enabled", "enable_llm", "llm_url", "llm_model",
+        "timeout_seconds", "api_key_env",
+    },
+    "embedding": {
+        "max_chars", "dimensions",
+    },
+    "triples": {
+        "enable_extraction", "llm_url", "llm_model", "api_key_env",
+    },
+    "annotation": {
+        "use_llm", "llm_url", "llm_model", "api_key_env",
+    },
+    "decay": {
+        "enabled",
+    },
+    "world_model": {
+        "auto_close_on_conflict", "temporal_extraction", "default_confidence",
+    },
+    "agents": {
+        "enable_sharing",
+    },
+    "atoms": set(),
+    "api": {
+        "host", "port", "allowed_origins", "api_key",
+    },
+}
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Compute Levenshtein distance between two strings (no deps)."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i]
+        for j, cb in enumerate(b, 1):
+            ins = curr[j - 1] + 1
+            dlt = prev[j] + 1
+            sub = prev[j - 1] + (0 if ca == cb else 1)
+            curr.append(min(ins, dlt, sub))
+        prev = curr
+    return prev[-1]
+
+
+def _suggest_key(typo: str, known: set[str]) -> Optional[str]:
+    """Return the closest known key by Levenshtein distance, or None.
+
+    Threshold scales with the longer string's length so suffix omissions
+    on long keys (e.g. `stability_reduction` for `stability_reduction_factor`,
+    distance 7) still get suggested. Bounded between 4 and 8 to avoid
+    nonsense matches on tiny strings or runaway matches on very long ones.
+    """
+    if not known:
+        return None
+    # Sort by (distance, key) so ties resolve deterministically — sets
+    # are unordered and `min` over a set is non-deterministic across
+    # Python invocations.
+    best = sorted(known, key=lambda k: (_levenshtein(typo, k), k))[0]
+    distance = _levenshtein(typo, best)
+    longer = max(len(typo), len(best))
+    max_distance = max(4, min(8, longer * 30 // 100))
+    return best if distance <= max_distance else None
+
+
+def _warn_unknown_keys(user_data: dict) -> None:
+    """Warn for user-supplied keys that don't match any known key in
+    sections that exist in `_DEFAULTS`. Sections not in `_DEFAULTS` are
+    skipped (legitimate add-on features may live there).
+
+    Suppress with environment variable `MSAM_QUIET_CONFIG=1`.
+    """
+    if os.environ.get("MSAM_QUIET_CONFIG"):
+        return
+    import logging
+    log = logging.getLogger("msam.config")
+    for section, kvs in user_data.items():
+        if not isinstance(kvs, dict):
+            continue
+        if section not in _DEFAULTS:
+            continue
+        known = set(_DEFAULTS[section].keys()) | _KNOWN_EXTRA_KEYS.get(section, set())
+        for key, value in kvs.items():
+            # Nested tables (e.g. [retrieval_v2.entity_mappings]) appear
+            # here as dicts. The top-level table key is what we check;
+            # contents of nested tables are user-defined and not validated.
+            if isinstance(value, dict):
+                continue
+            if key in known:
+                continue
+            suggestion = _suggest_key(key, known)
+            if suggestion:
+                log.warning(
+                    f"Unknown config key [{section}] {key!r} "
+                    f"— did you mean {suggestion!r}? "
+                    f"(falling through to default)"
+                )
+            else:
+                log.warning(
+                    f"Unknown config key [{section}] {key!r} "
+                    f"— falling through to default"
+                )
 
 
 _SENTINEL = object()
