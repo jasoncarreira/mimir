@@ -20,6 +20,7 @@ from aiohttp import web
 
 from .agent import Agent
 from .bridges.bench import BenchBridge
+from .bridges.web_chat import WebChatBridge
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .dispatcher import Dispatcher
@@ -31,9 +32,11 @@ from .msam_client import MsamClient
 from .scheduler import Scheduler
 from .search import Indexer
 from .session_manager import ChannelSession, SessionManager
+from .skill_defs import seed_skills
 from .subagent_defs import seed_subagent_defs
 from .subagent_inbox import SubagentInbox
 from .turn_logger import TurnLogger
+from . import web_ui
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +88,7 @@ def build_app(config: Config) -> web.Application:
     (config.home / "messages").mkdir(parents=True, exist_ok=True)
     (config.home / ".claude" / "agents").mkdir(parents=True, exist_ok=True)
     seeded = seed_subagent_defs(config.home)
+    seeded_skills_map = seed_skills(config.home)
 
     init_logger(config.events_log, make_process_session_id(), max_events=config.max_events_kept)
     turn_logger = TurnLogger(config.turns_log, max_turns=config.max_turns_kept)
@@ -108,9 +112,11 @@ def build_app(config: Config) -> web.Application:
     sessions = SessionManager(idle_minutes=config.msam_session_idle_minutes)
     inbox = SubagentInbox()
 
-    # Channel layer (SPEC §7.2). Phase 6.3 ships the BenchBridge by default
-    # so the benchmark adapter has a working outbound surface; Slack/Discord/
-    # Bluesky/WebUI bridges register here in later batches.
+    # Channel layer (SPEC §7.2). BenchBridge always registers — it's how the
+    # benchmark adapter gets outbound. WebChatBridge registers if a
+    # web_chat-friendly aiohttp app is hosting us; routes mount below in
+    # _on_startup. Discord / Slack / Bluesky bridges register based on env
+    # tokens (DISCORD_TOKEN etc.).
     channels = ChannelRegistry()
     channels.register(BenchBridge(home=config.home))
 
@@ -136,6 +142,27 @@ def build_app(config: Config) -> web.Application:
         channel_registry=channels,
     )
     dispatcher.set_run_turn(agent.run_turn)
+
+    # WebChatBridge needs the dispatcher (for inbound) — built after dispatcher
+    # exists, registered before channels.connect_all() runs at startup.
+    web_chat = WebChatBridge(enqueue=dispatcher.enqueue, home=config.home)
+    channels.register(web_chat)
+
+    # DiscordBridge — opt-in via DISCORD_TOKEN. Import is deferred so absent
+    # discord-py doesn't crash deployments that don't use Discord.
+    if config.discord_token:
+        try:
+            from .bridges.discord import DiscordBridge
+
+            channels.register(
+                DiscordBridge(token=config.discord_token, enqueue=dispatcher.enqueue)
+            )
+        except ImportError as exc:
+            log.warning(
+                "DISCORD_TOKEN set but discord-py not installed (%s); "
+                "skipping DiscordBridge. Install with `pip install mimir[discord]`.",
+                exc,
+            )
 
     # When a session goes idle, enqueue the synthesis turn through the same
     # dispatcher so it runs in channel-FIFO order alongside any new traffic.
@@ -171,9 +198,14 @@ def build_app(config: Config) -> web.Application:
     app["channels"] = channels
     app["replayed_messages"] = replayed
     app["seeded_subagents"] = seeded
+    app["seeded_skills"] = seeded_skills_map
 
     app.router.add_post("/event", _handle_event)
     app.router.add_get("/health", _handle_health)
+    # Turn viewer + log API (SPEC §11).
+    web_ui.register_routes(app, turns_log=config.turns_log, events_log=config.events_log)
+    # Web chat bridge — POST /chat + GET /chat/stream for the local UI.
+    web_chat.register_routes(app)
 
     async def _on_startup(app: web.Application) -> None:
         await indexer.start(run_initial_sweep=False, sweep_loop=True)
@@ -203,6 +235,7 @@ def build_app(config: Config) -> web.Application:
             msam_consolidate_cron=config.msam_consolidate_cron if consolidate_registered else "",
             msam_session_idle_minutes=config.msam_session_idle_minutes,
             seeded_subagents=seeded,
+            seeded_skills=seeded_skills_map,
             scheduled_jobs_registered=reload_stats["registered"],
             scheduled_jobs_invalid=reload_stats["invalid"],
         )

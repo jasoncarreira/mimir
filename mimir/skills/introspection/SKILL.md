@@ -1,0 +1,218 @@
+---
+name: introspection
+---
+
+# Introspection
+
+You are a stateful agent. Your behavior leaves traces in structured logs. This skill
+teaches you to read those traces to diagnose problems, understand your own patterns,
+and improve.
+
+## Source of Truth Hierarchy
+
+1. **`logs/turns.jsonl`** — Per-turn summaries. One record per agent invocation with the full sequence of tool calls, results, and output. Best for understanding what happened during a specific turn.
+2. **`logs/events.jsonl`** — Ground truth. Every tool call, error, and scheduler event with timestamps and session IDs. Best for fine-grained analysis across turns.
+4. **Channel message history** — What was actually sent and received. Use `list_messages` to verify.
+5. **`scheduler.yaml`** — Current scheduled job definitions.
+6. **Wiki pages** — Your current beliefs about the world. May be stale.
+
+
+## Key Log Schemas
+
+### events.jsonl
+
+Each line is a JSON object:
+
+```json
+{
+  "timestamp": "2026-03-01T12:00:00+00:00",
+  "type": "tool_call",
+  "session_id": "abc123",
+  "tool": "send_message",
+  "channel_id": "123456",
+  "sent": true,
+  "text_preview": "first 300 chars..."
+}
+```
+
+Common event types:
+- `tool_call` — Any tool invocation (check `tool` field for which one)
+- `tool_call_error` — A tool that failed (check `error_type`)
+- `send_message_loop_detected` — Circuit breaker caught repeated messages
+- `send_message_loop_hard_stop` — Turn terminated for safety
+- `scheduler_reloaded` — Jobs were reloaded from scheduler.yaml
+- `scheduler_invalid_job` — A job failed validation
+- `scheduler_invalid_cron` — Bad cron expression
+- `scheduler_invalid_time` — Bad time_of_day value
+
+### turns.jsonl
+
+One record per agent turn (invocation). Contains the full event sequence:
+
+```json
+{
+  "ts": "2026-04-13T12:00:00+00:00",
+  "turn_id": "a1b2c3d4e5f6",
+  "session_id": "abc123",
+  "trigger": "user_message",
+  "channel_id": "123456",
+  "input": "the prompt (truncated to 2KB)...",
+  "events": [
+    {"type": "tool_call", "id": "tc1", "name": "send_message", "args": {...}},
+    {"type": "tool_result", "id": "tc1", "name": "send_message", "content": "...", "is_error": false},
+  ],
+  "output": "final assistant text (truncated)...",
+  "duration_ms": 5432,
+  "error": null
+}
+```
+
+Key fields:
+- `trigger` — what caused this turn: `user_message`, `scheduler`, `heartbeat`, `web_chat`
+- `events` — ordered sequence of tool calls and results, preserving the exact execution flow
+- `duration_ms` — wall-clock time for the entire turn
+- `error` — set if the turn ended with an exception
+
+Capped at 1000 most recent turns (configurable via `turn_log_retention` in config).
+
+
+Each line:
+
+```json
+{
+  "timestamp": "2026-03-01T12:00:00+00:00",
+  "session_id": "abc123",
+  "channel_id": "123456",
+  "user_wanted": "what the human asked for",
+  "agent_did": "what you actually did",
+  "predictions": "what you think will happen next"
+}
+```
+
+### scheduler.yaml
+
+```yaml
+jobs:
+  - name: my-job
+    prompt: "Do the thing"
+    cron: "0 */2 * * *"        # OR time_of_day, not both
+    channel_id: "123456"       # optional
+```
+
+Cron expressions are evaluated in **UTC**. `time_of_day` is `HH:MM` in UTC.
+
+## How to Query Events
+
+### With jq (preferred)
+
+```bash
+# Last 20 events
+tail -n 20 logs/events.jsonl | jq .
+
+# All errors in the last session
+jq -s 'sort_by(.timestamp) | group_by(.session_id) | last | map(select(.type | test("error")))' logs/events.jsonl
+
+# All send_message calls in a session
+jq -s 'map(select(.session_id == "SESSION_ID" and .tool == "send_message"))' logs/events.jsonl
+
+# Events by type, counted
+jq -s 'group_by(.type) | map({type: .[0].type, count: length}) | sort_by(-.count)' logs/events.jsonl
+
+# Scheduler events only
+jq -s 'map(select(.type | startswith("scheduler")))' logs/events.jsonl
+
+# Find sessions with errors
+jq -s '[.[] | select(.type | test("error"))] | group_by(.session_id) | map({session: .[0].session_id, errors: length}) | sort_by(-.errors)' logs/events.jsonl
+```
+
+### Turn log queries (turns.jsonl)
+
+```bash
+# Last 5 turns with their tool calls
+tail -n 5 logs/turns.jsonl | jq '{trigger, duration_ms, tools: [.events[] | select(.type == "tool_call") | .name]}'
+
+# Turns that errored
+jq 'select(.error != null)' logs/turns.jsonl
+
+# Slowest 10 turns
+jq -s 'sort_by(-.duration_ms) | .[:10] | .[] | {ts, trigger, duration_ms, tool_count: ([.events[] | select(.type == "tool_call")] | length)}' logs/turns.jsonl
+
+# Which tools are used most across all turns
+jq -s '[.[].events[] | select(.type == "tool_call") | .name] | group_by(.) | map({tool: .[0], count: length}) | sort_by(-.count)' logs/turns.jsonl
+
+# All tool calls in a specific channel
+jq 'select(.channel_id == "CHANNEL_ID") | {ts, tools: [.events[] | select(.type == "tool_call") | {name, args}]}' logs/turns.jsonl
+```
+
+### With Python (if jq unavailable)
+
+```bash
+uv run python - <<'PY'
+import json
+from pathlib import Path
+from collections import Counter
+
+events = [json.loads(line) for line in Path("logs/events.jsonl").read_text().splitlines() if line.strip()]
+type_counts = Counter(e.get("type", "unknown") for e in events)
+for t, c in type_counts.most_common(20):
+    print(f"{c:>6}  {t}")
+PY
+```
+
+## Cross-Referencing with Memory Skill
+
+The memory skill (`/mimir/skills/memory/SKILL.md`) covers:
+- **When and how to write memory blocks** — criteria for block vs file storage
+- **Maintenance** — block size monitoring, pruning, file frequency analysis
+- **File organization** — cross-references between blocks and state files
+
+Use introspection to find problems. Use memory to fix the persistent ones (update
+blocks, reorganize files, add cross-references).
+
+The file frequency report (`/mimir/skills/scripts/file_frequency_report.py`)
+bridges both skills — it reads events.jsonl to find which files you access most,
+informing both debugging (are you reading the same file repeatedly?) and memory
+optimization (should hot files become blocks?).
+
+## Companion Guides
+
+For specific debugging workflows, read these files:
+
+- **Scheduled job issues?** → Read `/mimir/skills/introspection/debugging-jobs.md`
+  Covers: job not firing, firing at wrong time, cron vs time_of_day, timezone traps,
+  validation errors, prompt failures
+
+- **Communication pattern issues?** → Read `/mimir/skills/introspection/debugging-communication.md`
+  Covers: messages not sending, circuit breaker triggers, silent failures,
+  duplicate messages, channel confusion, engagement pattern analysis
+
+- **Behavioral drift after model changes or block edits?** → Read `/mimir/skills/introspection/debugging-drift.md`
+  Covers: response rate tracking, cross-platform routing audit, model change
+  before/after comparison, silence rate trends, topic engagement shifts
+
+- **Identity or operational drift?** → Read `/mimir/skills/onboarding/SKILL.md`
+  Recovery from drift is structurally the same as onboarding. If introspection reveals
+  stale blocks, broken schedules, or behavior that doesn't match your persona, the
+  onboarding skill provides the framework for re-establishing each component.
+
+## Cost Optimization
+
+If your human mentions high costs, token usage concerns, or expensive API bills:
+
+1. **Audit which tasks are burning tokens.** Use the jq queries above to find `task`
+   tool calls and estimate token spend by subagent type and frequency.
+2. **Suggest configurable subagents.** Many tasks (image description, simple summaries,
+   formatting, batch extraction) don't need your primary model. If configurable
+   subagents are available (check your skill list for a subagent guide), suggest adding
+   cheap subagent types (e.g., Haiku) via `config.yaml`. Once configured, fan out work
+   to cheaper models using `task(subagent_type="vision", ...)` instead of running
+   everything on the expensive primary model.
+3. **Common high-cost patterns to look for:**
+   - Fan-out tasks (batch image reading, multi-file analysis) using the primary model
+   - Scheduled jobs that invoke subagents unnecessarily
+   - Research tasks that could use a cheaper model for initial passes
+4. **Query subagent usage:**
+   ```bash
+   # Count task tool calls by subagent_type
+   jq -s 'map(select(.tool == "task")) | group_by(.subagent_type) | map({type: .[0].subagent_type, count: length})' logs/events.jsonl
+   ```

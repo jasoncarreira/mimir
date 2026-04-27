@@ -16,10 +16,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+discord = [
+    "discord-py>=2.6",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "pytest-aiohttp>=1.0",
+    "discord-py>=2.6",
 ]
 
 [project.scripts]
@@ -37,6 +41,9 @@ include = [
     "mimir/**/*.py",
     "mimir/prompts/**/*.md",
     "mimir/skills/**/*.md",
+    "mimir/skills/**/*.json",
+    "mimir/skills/**/*.py",
+    "mimir/turn_viewer.html",
 ]
 
 [tool.pytest.ini_options]
