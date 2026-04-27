@@ -641,25 +641,44 @@ def migrate_embeddings(new_model: str, batch_size: int = 10):
 
 _QUERY_REWRITES = [
     # "user" → actual user name
-    (r'\buser\b', 'User'),
-    (r'\bthe user\b', 'User'),
-    (r"\buser's\b", "User's"),
-    # "agent" → actual agent name  
-    (r'\bagent\b', 'Agent'),
-    (r'\bthe agent\b', 'Agent'),
-    (r"\bagent's\b", "Agent's"),
+    ("user", "User"),
+    ("the user", "User"),
+    ("user's", "User's"),
+    # "agent" → actual agent name
+    ("agent", "Agent"),
+    ("the agent", "Agent"),
+    ("agent's", "Agent's"),
     # "system" / "server" → actual hostname
-    (r'\bthis system\b', 'system'),
-    (r'\bthis server\b', 'system'),
+    ("this system", "system"),
+    ("this server", "system"),
 ]
+
 
 # Configurable entity mappings (loaded from TOML)
 def _get_entity_mappings() -> list[tuple]:
-    """Get entity mappings from config, with defaults."""
-    mappings = _cfg('retrieval_v2', 'entity_mappings', None)
-    if mappings and isinstance(mappings, dict):
-        return [(re.compile(rf'\b{k}\b', re.IGNORECASE), v) for k, v in mappings.items()]
-    return [(re.compile(pattern, re.IGNORECASE), repl) for pattern, repl in _QUERY_REWRITES]
+    """Return ``[(compiled_regex, replacement), ...]`` — built-in
+    defaults plus any user-supplied mappings from
+    ``[retrieval_v2.entity_mappings]``.
+
+    Merge semantics:
+    - Built-in ``_QUERY_REWRITES`` apply by default.
+    - User keys are ADDED to the list; on key conflict (same pattern as
+      a built-in), the user's replacement wins.
+    - To suppress a built-in entirely, override it with a no-op (e.g.
+      ``"user" = "user"``).
+    - Keys are bare tokens; they get ``\\b…\\b`` wrapped automatically.
+    - Keys are interpreted as regex (no auto-escape), matching the
+      original behavior — e.g. ``"user|customer"`` matches either.
+    """
+    merged = dict(_QUERY_REWRITES)  # preserves insertion order
+    user_mappings = _cfg('retrieval_v2', 'entity_mappings', None)
+    if user_mappings and isinstance(user_mappings, dict):
+        for k, v in user_mappings.items():
+            merged[k] = v
+    return [
+        (re.compile(rf'\b{k}\b', re.IGNORECASE), v)
+        for k, v in merged.items()
+    ]
 
 
 def rewrite_query(query: str) -> str:

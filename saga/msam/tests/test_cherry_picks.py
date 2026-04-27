@@ -52,6 +52,49 @@ class TestQueryRewriting:
         # rewrite_query maps lowercase "user" -> "User" via _QUERY_REWRITES
         assert "User" in out
 
+    def test_user_mappings_extend_defaults(self, cfg_override):
+        """User-supplied entity_mappings should ADD to built-in defaults,
+        not replace them. Built-in `user → User` should still apply when
+        the user adds a custom mapping."""
+        from msam.core import _apply_query_rewriting
+        cfg_override.setdefault("retrieval_v2", {})["enable_query_rewriting"] = True
+        cfg_override["retrieval_v2"]["entity_mappings"] = {
+            "the bot": "Mimir",
+        }
+        out = _apply_query_rewriting("what did the user tell the bot?")
+        # Both the built-in (user→User) and the custom (the bot→Mimir) apply.
+        assert "User" in out
+        assert "Mimir" in out
+
+    def test_user_mappings_override_default_on_conflict(self, cfg_override):
+        from msam.core import _apply_query_rewriting
+        cfg_override.setdefault("retrieval_v2", {})["enable_query_rewriting"] = True
+        cfg_override["retrieval_v2"]["entity_mappings"] = {
+            # Override the built-in `user → User` with a specific name.
+            "user": "Joe",
+        }
+        out = _apply_query_rewriting("what does the user think?")
+        # User's override wins; the default's "User" replacement is gone.
+        assert "Joe" in out
+        # "User" might still appear as part of "Joe"... it doesn't, but
+        # check explicitly that the lowercase token is gone (replaced).
+        assert " user " not in f" {out} "
+
+    def test_user_mapping_can_disable_default(self, cfg_override):
+        """Documented escape hatch: override a default with a no-op to
+        effectively disable it. Only that exact key is suppressed —
+        sibling defaults (`the user`, `user's`) still apply unless
+        explicitly overridden too."""
+        from msam.core import _apply_query_rewriting
+        cfg_override.setdefault("retrieval_v2", {})["enable_query_rewriting"] = True
+        cfg_override["retrieval_v2"]["entity_mappings"] = {
+            "user": "user",  # no-op override of the bare "user" mapping
+        }
+        # Use phrasing that only triggers the bare `user` mapping
+        # (not `the user`).
+        out = _apply_query_rewriting("what does user think?")
+        assert "User" not in out
+
 
 # ─── P12: synonym expansion (keyword pathway only) ───────────────────────
 
