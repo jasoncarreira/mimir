@@ -1,0 +1,604 @@
+"""SQLite + fastembed hybrid indexer (SPEC §6).
+
+Recipe ported from muninnbot's ``scripts/state_search.py`` (PostgreSQL+pgvector
+in source) → SQLite + FTS5 here so the benchmark container has no Postgres
+dependency. Same hybrid score weights:
+
+    score = 0.5 * cosine + 0.2 * fts_bm25 + 0.3 * recency
+
+Lifecycle:
+- ``start()`` — create schema, run an initial mtime sweep, kick off the 60s
+  background sweep loop.
+- File writes call ``enqueue_path()`` (non-blocking) → indexer thread reads,
+  embeds, writes. The ``flush()`` helper waits for the queue to drain in tests.
+- ``search()`` returns ranked ``SearchResult`` rows.
+- ``stop()`` cancels the sweep loop and lets the worker drain.
+
+The ``Embedder`` interface is split so tests can plug in a deterministic fake
+without paying the fastembed cold-start (model download + ONNX load).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import sqlite3
+import struct
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Protocol
+
+from .memory import describe_file
+
+log = logging.getLogger(__name__)
+
+DEFAULT_CHUNK_SIZE = 1000
+DEFAULT_CHUNK_OVERLAP = 150
+SWEEP_INTERVAL_S = 60.0
+RECENCY_HALF_LIFE_DAYS = 30.0
+W_COSINE = 0.5
+W_BM25 = 0.2
+W_RECENCY = 0.3
+
+
+# ---------------------------------------------------------------------------
+# Embedder
+# ---------------------------------------------------------------------------
+
+
+class Embedder(Protocol):
+    dim: int
+
+    def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+
+class FastEmbedder:
+    """Wraps ``fastembed.TextEmbedding``. Lazy-loads the ONNX model on first use."""
+
+    def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5", dim: int = 384) -> None:
+        self._model_name = model_name
+        self.dim = dim
+        self._impl = None
+        self._lock = threading.Lock()
+
+    def _ensure(self) -> None:
+        if self._impl is None:
+            with self._lock:
+                if self._impl is None:
+                    from fastembed import TextEmbedding
+
+                    self._impl = TextEmbedding(model_name=self._model_name)
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        self._ensure()
+        # ``list(v)`` on a numpy array yields np.float32 scalars — coerce to
+        # Python floats here so cosines, scores, and json.dumps all stay clean.
+        return [[float(x) for x in v] for v in self._impl.embed(texts)]  # type: ignore[union-attr]
+
+
+class HashEmbedder:
+    """Deterministic fake for tests — pseudo-embeddings derived from the text's
+    SHA-256 digest, normalized to unit length. Same text → same vector;
+    different texts produce different vectors with reasonable spread."""
+
+    dim = 16
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        import hashlib
+
+        out: list[list[float]] = []
+        for t in texts:
+            h = hashlib.sha256(t.encode("utf-8")).digest()
+            vec = [(b / 127.5) - 1.0 for b in h[: self.dim]]
+            norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+            out.append([v / norm for v in vec])
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
+
+
+def chunk_text(text: str, size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[str]:
+    """Sliding-window character chunks. Empty input → empty list."""
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]
+    if overlap >= size:
+        raise ValueError("overlap must be smaller than chunk size")
+    out: list[str] = []
+    step = size - overlap
+    i = 0
+    while i < len(text):
+        out.append(text[i : i + size])
+        i += step
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+_SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS files (
+        path        TEXT PRIMARY KEY,
+        scope       TEXT NOT NULL,
+        mtime       REAL NOT NULL,
+        size        INTEGER NOT NULL,
+        chunk_count INTEGER NOT NULL,
+        description TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS chunks (
+        path        TEXT NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        content     TEXT NOT NULL,
+        embedding   BLOB NOT NULL,
+        PRIMARY KEY (path, chunk_index),
+        FOREIGN KEY (path) REFERENCES files(path) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+        path UNINDEXED,
+        chunk_index UNINDEXED,
+        content,
+        tokenize = 'porter unicode61'
+    )
+    """,
+]
+
+
+# ---------------------------------------------------------------------------
+# Search result
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SearchResult:
+    path: str
+    scope: str
+    chunk_index: int
+    score: float
+    cosine: float
+    bm25: float
+    recency: float
+    snippet: str
+    description: str | None
+
+    def to_dict(self) -> dict:
+        return {
+            "path": self.path,
+            "scope": self.scope,
+            "chunk_index": self.chunk_index,
+            "score": round(float(self.score), 4),
+            "cosine": round(float(self.cosine), 4),
+            "bm25": round(float(self.bm25), 4),
+            "recency": round(float(self.recency), 4),
+            "snippet": self.snippet,
+            "description": self.description,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Indexer
+# ---------------------------------------------------------------------------
+
+
+def _pack_vec(vec: list[float]) -> bytes:
+    return struct.pack(f"{len(vec)}f", *vec)
+
+
+def _unpack_vec(blob: bytes) -> list[float]:
+    n = len(blob) // 4
+    return list(struct.unpack(f"{n}f", blob))
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1.0
+    nb = math.sqrt(sum(x * x for x in b)) or 1.0
+    return dot / (na * nb)
+
+
+def _recency(mtime: float, now: float) -> float:
+    age_days = max(0.0, (now - mtime) / 86400.0)
+    return math.exp(-age_days / RECENCY_HALF_LIFE_DAYS)
+
+
+def _bm25_norm(raw: float) -> float:
+    """SQLite returns a negative bm25 score; lower is better. Map to (0, 1]."""
+    return 1.0 / (1.0 + abs(raw))
+
+
+def _classify_scope(rel: str) -> str | None:
+    if rel.startswith("memory/"):
+        if rel.startswith("memory/core/") or rel == "memory/INDEX.md":
+            return None
+        return "memory"
+    if rel.startswith("state/"):
+        if rel == "state/INDEX.md":
+            return None
+        return "state"
+    return None
+
+
+@dataclass
+class IndexerStats:
+    files: int = 0
+    chunks: int = 0
+    last_full_reindex: float | None = None
+    last_sweep: float | None = None
+
+
+class Indexer:
+    """Owns the SQLite db + embedder. All blocking work runs in a worker
+    thread via ``asyncio.to_thread`` so the event loop never stalls."""
+
+    def __init__(
+        self,
+        home: Path,
+        embedder: Embedder | None = None,
+        db_path: Path | None = None,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+    ) -> None:
+        self._home = home
+        self._embedder: Embedder = embedder or FastEmbedder()
+        self._db_path = db_path or (home / ".mimir" / "index.db")
+        self._chunk_size = chunk_size
+        self._chunk_overlap = chunk_overlap
+        self._db_lock = threading.Lock()
+        self._sweep_task: asyncio.Task | None = None
+        self._closed = False
+
+    # ---- lifecycle ----
+
+    def init_schema(self) -> None:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            for stmt in _SCHEMA:
+                conn.execute(stmt)
+            conn.commit()
+
+    async def start(self, run_initial_sweep: bool = True, sweep_loop: bool = True) -> None:
+        await asyncio.to_thread(self.init_schema)
+        if run_initial_sweep:
+            await self.sweep()
+        if sweep_loop:
+            self._sweep_task = asyncio.create_task(self._sweep_loop(), name="mimir-indexer-sweep")
+
+    async def stop(self) -> None:
+        self._closed = True
+        if self._sweep_task and not self._sweep_task.done():
+            self._sweep_task.cancel()
+            try:
+                await self._sweep_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _sweep_loop(self) -> None:
+        try:
+            while not self._closed:
+                await asyncio.sleep(SWEEP_INTERVAL_S)
+                if self._closed:
+                    return
+                try:
+                    await self.sweep()
+                except Exception:  # noqa: BLE001
+                    log.exception("indexer sweep failed")
+        except asyncio.CancelledError:
+            return
+
+    # ---- public ops ----
+
+    async def reindex_path(self, rel_path: str) -> bool:
+        """Reindex a single file by relative path. Returns True if it indexed,
+        False if the file is out of scope or missing."""
+        return await asyncio.to_thread(self._reindex_sync, rel_path)
+
+    async def sweep(self) -> dict[str, int]:
+        """Walk memory/ + state/, reindex any drift; remove db rows for
+        deleted files. Returns a small stats dict."""
+        return await asyncio.to_thread(self._sweep_sync)
+
+    async def search(
+        self,
+        query: str,
+        scope: str = "all",
+        k: int = 5,
+        candidate_pool: int = 50,
+    ) -> list[SearchResult]:
+        if not query.strip():
+            return []
+        query_vec = await asyncio.to_thread(lambda: self._embedder.embed([query])[0])
+        return await asyncio.to_thread(
+            self._search_sync, query, query_vec, scope, k, candidate_pool
+        )
+
+    async def stats(self) -> IndexerStats:
+        return await asyncio.to_thread(self._stats_sync)
+
+    # ---- sync internals ----
+
+    def _connect(self) -> sqlite3.Connection:
+        # Re-create the parent dir if it was removed out-of-band — a
+        # benchmark cleanup or test-fixture rm doesn't crash the sweep loop;
+        # next sweep just starts from an empty schema.
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self._db_path, isolation_level=None)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _stats_sync(self) -> IndexerStats:
+        with self._connect() as conn:
+            files = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        return IndexerStats(files=files, chunks=chunks)
+
+    def _abs_path(self, rel: str) -> Path:
+        return self._home / rel
+
+    def _resolve_rel(self, abs_path: Path) -> str | None:
+        try:
+            rel = abs_path.relative_to(self._home).as_posix()
+        except ValueError:
+            return None
+        return rel
+
+    def _walk_indexable(self) -> list[Path]:
+        roots = [self._home / "memory", self._home / "state"]
+        out: list[Path] = []
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for p in root.rglob("*.md"):
+                if not p.is_file():
+                    continue
+                rel = self._resolve_rel(p)
+                if rel is None:
+                    continue
+                if _classify_scope(rel) is None:
+                    continue
+                out.append(p)
+        return sorted(out)
+
+    def _reindex_sync(self, rel_path: str) -> bool:
+        scope = _classify_scope(rel_path)
+        if scope is None:
+            return False
+        abs_path = self._abs_path(rel_path)
+        if not abs_path.is_file():
+            # File deleted — drop from index.
+            with self._db_lock, self._connect() as conn:
+                conn.execute("DELETE FROM files WHERE path = ?", (rel_path,))
+                conn.execute("DELETE FROM chunks_fts WHERE path = ?", (rel_path,))
+            return False
+        try:
+            text = abs_path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        stat = abs_path.stat()
+        chunks = chunk_text(text, self._chunk_size, self._chunk_overlap)
+        embeddings: list[list[float]] = []
+        if chunks:
+            embeddings = self._embedder.embed(chunks)
+        desc, _ = describe_file(text)
+        with self._db_lock, self._connect() as conn:
+            conn.execute("DELETE FROM chunks WHERE path = ?", (rel_path,))
+            conn.execute("DELETE FROM chunks_fts WHERE path = ?", (rel_path,))
+            conn.execute(
+                "INSERT OR REPLACE INTO files (path, scope, mtime, size, chunk_count, description)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (rel_path, scope, stat.st_mtime, stat.st_size, len(chunks), desc),
+            )
+            for i, (chunk, vec) in enumerate(zip(chunks, embeddings)):
+                conn.execute(
+                    "INSERT INTO chunks (path, chunk_index, content, embedding) VALUES (?, ?, ?, ?)",
+                    (rel_path, i, chunk, _pack_vec(vec)),
+                )
+                conn.execute(
+                    "INSERT INTO chunks_fts (path, chunk_index, content) VALUES (?, ?, ?)",
+                    (rel_path, i, chunk),
+                )
+        return True
+
+    def _sweep_sync(self) -> dict[str, int]:
+        on_disk: dict[str, float] = {}
+        for p in self._walk_indexable():
+            rel = self._resolve_rel(p)
+            if rel is None:
+                continue
+            try:
+                on_disk[rel] = p.stat().st_mtime
+            except OSError:
+                continue
+
+        with self._db_lock, self._connect() as conn:
+            indexed_rows = conn.execute("SELECT path, mtime FROM files").fetchall()
+        indexed = {row[0]: row[1] for row in indexed_rows}
+
+        added = 0
+        updated = 0
+        removed = 0
+
+        # Add or update
+        for rel, mtime in on_disk.items():
+            if rel not in indexed:
+                if self._reindex_sync(rel):
+                    added += 1
+            elif mtime > indexed[rel] + 1e-6:
+                if self._reindex_sync(rel):
+                    updated += 1
+
+        # Remove deletions
+        for rel in list(indexed.keys()):
+            if rel not in on_disk:
+                with self._db_lock, self._connect() as conn:
+                    conn.execute("DELETE FROM files WHERE path = ?", (rel,))
+                    conn.execute("DELETE FROM chunks_fts WHERE path = ?", (rel,))
+                removed += 1
+
+        return {"added": added, "updated": updated, "removed": removed}
+
+    def _search_sync(
+        self,
+        query: str,
+        query_vec: list[float],
+        scope: str,
+        k: int,
+        candidate_pool: int,
+    ) -> list[SearchResult]:
+        # Sanitize FTS5 query — strip operators that would otherwise raise.
+        fts_query = _to_fts_query(query)
+        scope_filter = ""
+        params: list = []
+        if scope in ("memory", "state"):
+            scope_filter = " AND f.scope = ?"
+            params.append(scope)
+
+        candidates: dict[tuple[str, int], dict] = {}
+
+        with self._db_lock, self._connect() as conn:
+            # 1) FTS5 candidates by BM25.
+            if fts_query:
+                rows = conn.execute(
+                    f"""
+                    SELECT c.path, c.chunk_index, c.content, c.embedding,
+                           bm25(chunks_fts) AS bm25, f.mtime, f.scope, f.description
+                      FROM chunks_fts
+                      JOIN chunks AS c
+                        ON c.path = chunks_fts.path AND c.chunk_index = chunks_fts.chunk_index
+                      JOIN files AS f
+                        ON f.path = c.path
+                     WHERE chunks_fts MATCH ?{scope_filter}
+                     ORDER BY bm25 ASC
+                     LIMIT ?
+                    """,
+                    [fts_query, *params, candidate_pool],
+                ).fetchall()
+                for row in rows:
+                    key = (row[0], row[1])
+                    candidates[key] = {
+                        "path": row[0],
+                        "chunk_index": row[1],
+                        "content": row[2],
+                        "embedding": _unpack_vec(row[3]),
+                        "bm25": row[4],
+                        "mtime": row[5],
+                        "scope": row[6],
+                        "description": row[7],
+                    }
+
+            # 2) Fill remaining pool with cosine candidates from any chunk —
+            #    important when FTS5 misses paraphrased queries.
+            if len(candidates) < candidate_pool:
+                exclude_clause = ""
+                exclude_params: list = []
+                if candidates:
+                    placeholders = ",".join(["(?, ?)"] * len(candidates))
+                    exclude_clause = (
+                        f" AND (c.path, c.chunk_index) NOT IN ({placeholders})"
+                    )
+                    for key in candidates.keys():
+                        exclude_params.extend(key)
+                more_rows = conn.execute(
+                    f"""
+                    SELECT c.path, c.chunk_index, c.content, c.embedding,
+                           f.mtime, f.scope, f.description
+                      FROM chunks AS c
+                      JOIN files AS f ON f.path = c.path
+                     WHERE 1=1{scope_filter}{exclude_clause}
+                     LIMIT ?
+                    """,
+                    [*params, *exclude_params, candidate_pool - len(candidates)],
+                ).fetchall()
+                for row in more_rows:
+                    key = (row[0], row[1])
+                    candidates[key] = {
+                        "path": row[0],
+                        "chunk_index": row[1],
+                        "content": row[2],
+                        "embedding": _unpack_vec(row[3]),
+                        "bm25": 0.0,
+                        "mtime": row[4],
+                        "scope": row[5],
+                        "description": row[6],
+                    }
+
+        if not candidates:
+            return []
+
+        now = time.time()
+        scored: list[SearchResult] = []
+        for c in candidates.values():
+            cos = _cosine(query_vec, c["embedding"])
+            cos_norm = max(0.0, cos)
+            bm25_norm = _bm25_norm(c["bm25"]) if c["bm25"] else 0.0
+            recency = _recency(c["mtime"], now)
+            score = W_COSINE * cos_norm + W_BM25 * bm25_norm + W_RECENCY * recency
+            snippet = _make_snippet(c["content"], query)
+            scored.append(
+                SearchResult(
+                    path=c["path"],
+                    scope=c["scope"],
+                    chunk_index=c["chunk_index"],
+                    score=score,
+                    cosine=cos,
+                    bm25=c["bm25"],
+                    recency=recency,
+                    snippet=snippet,
+                    description=c["description"],
+                )
+            )
+
+        scored.sort(key=lambda r: r.score, reverse=True)
+        return scored[:k]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _to_fts_query(text: str) -> str:
+    """Sanitize a free-form query for FTS5 MATCH. Operators and parens are
+    stripped; tokens are OR-joined. Empty input → empty string."""
+    safe: list[str] = []
+    for tok in text.split():
+        clean = "".join(ch for ch in tok if ch.isalnum() or ch in "-_")
+        if clean:
+            safe.append(clean)
+    return " OR ".join(safe)
+
+
+def _make_snippet(text: str, query: str, window: int = 200) -> str:
+    """Cheap snippet: first window chars, or window centered around the first
+    keyword hit. Avoids invoking FTS5's snippet() across joins."""
+    if not text:
+        return ""
+    needle = query.split()[0].lower() if query.strip() else ""
+    if needle:
+        idx = text.lower().find(needle)
+        if idx >= 0:
+            half = window // 2
+            start = max(0, idx - half)
+            end = min(len(text), start + window)
+            snip = text[start:end]
+            prefix = "…" if start > 0 else ""
+            suffix = "…" if end < len(text) else ""
+            return prefix + snip.strip() + suffix
+    return text[:window].strip() + ("…" if len(text) > window else "")

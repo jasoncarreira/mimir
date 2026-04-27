@@ -1,0 +1,330 @@
+"""Indexer + file_search tool (SPEC §6, §8.1).
+
+Uses the deterministic ``HashEmbedder`` to keep tests offline and fast — the
+real ``FastEmbedder`` cold-starts an ONNX model and downloads weights, which
+isn't appropriate for unit tests.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+from mimir.hooks import make_post_tool_use_hook
+from mimir.search import (
+    HashEmbedder,
+    Indexer,
+    SearchResult,
+    chunk_text,
+    _classify_scope,
+    _to_fts_query,
+)
+from mimir.searchtools import build_search_tools
+
+
+def _seed(home: Path) -> None:
+    (home / "memory" / "core").mkdir(parents=True)
+    (home / "memory" / "topics").mkdir(parents=True)
+    (home / "memory" / "channels" / "alice").mkdir(parents=True)
+    (home / "state" / "transcripts").mkdir(parents=True)
+
+    # Core file — must be excluded from indexing.
+    (home / "memory" / "core" / "00-persona.md").write_text(
+        "<!-- desc: persona -->\n# Persona\nI am Mimir."
+    )
+    # Memory entries.
+    (home / "memory" / "topics" / "quantum.md").write_text(
+        "<!-- desc: quantum mechanics notes -->\n# Quantum\n"
+        "Quantum mechanics describes nature at atomic and subatomic scales. "
+        "Particles exhibit wave-particle duality."
+    )
+    (home / "memory" / "topics" / "boids.md").write_text(
+        "<!-- desc: boids flocking -->\n# Boids\n"
+        "Boids is a flocking simulation by Craig Reynolds with three rules: "
+        "separation, alignment, cohesion."
+    )
+    (home / "memory" / "channels" / "alice" / "preferences.md").write_text(
+        "<!-- desc: alice preferences -->\nAlice prefers terse messages and dark mode."
+    )
+    # State entry.
+    (home / "state" / "transcripts" / "kickoff.md").write_text(
+        "<!-- desc: kickoff transcript -->\n# Kickoff\n"
+        "We discussed quantum entanglement at length."
+    )
+    # INDEX files — should be skipped by the indexer.
+    (home / "memory" / "INDEX.md").write_text("# auto")
+    (home / "state" / "INDEX.md").write_text("# auto")
+
+
+def _make_indexer(home: Path) -> Indexer:
+    return Indexer(home, embedder=HashEmbedder())
+
+
+# ---- chunk_text ----------------------------------------------------------
+
+
+def test_chunk_text_short_returns_one():
+    assert chunk_text("short", size=100, overlap=10) == ["short"]
+
+
+def test_chunk_text_overlaps():
+    text = "x" * 250
+    chunks = chunk_text(text, size=100, overlap=20)
+    assert len(chunks) == 4
+    # Each successive chunk starts size-overlap chars later.
+    assert chunks[0] == "x" * 100
+    # Verify overlap on a non-uniform text:
+    text2 = "0123456789" * 12  # 120 chars
+    chunks2 = chunk_text(text2, size=50, overlap=10)
+    assert chunks2[0][-10:] == chunks2[1][:10]
+
+
+def test_chunk_text_overlap_too_big_raises():
+    long_text = "x" * 100
+    with pytest.raises(ValueError):
+        chunk_text(long_text, size=10, overlap=10)
+
+
+def test_chunk_text_empty():
+    assert chunk_text("") == []
+
+
+# ---- _classify_scope -----------------------------------------------------
+
+
+def test_classify_scope_excludes_core_and_indexes():
+    assert _classify_scope("memory/core/00-persona.md") is None
+    assert _classify_scope("memory/INDEX.md") is None
+    assert _classify_scope("state/INDEX.md") is None
+    assert _classify_scope("memory/topics/foo.md") == "memory"
+    assert _classify_scope("state/seeds/x.md") == "state"
+    assert _classify_scope("logs/events.jsonl") is None
+
+
+# ---- FTS sanitization ----------------------------------------------------
+
+
+def test_fts_query_strips_operators():
+    # Parentheses get stripped to nothing; alnum tokens kept and OR-joined.
+    assert _to_fts_query("foo (bar) baz") == "foo OR bar OR baz"
+    # Hyphen and underscore are preserved as part of identifiers.
+    assert _to_fts_query("hello-world_v2") == "hello-world_v2"
+    assert _to_fts_query("") == ""
+    assert _to_fts_query("   ") == ""
+
+
+# ---- Indexer init + sweep + scope filtering -----------------------------
+
+
+@pytest.mark.asyncio
+async def test_init_schema_creates_tables(tmp_path: Path):
+    idx = _make_indexer(tmp_path)
+    await asyncio.to_thread(idx.init_schema)
+    stats = await idx.stats()
+    assert stats.files == 0
+    assert stats.chunks == 0
+
+
+@pytest.mark.asyncio
+async def test_sweep_indexes_memory_and_state(tmp_path: Path):
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+    stats = await idx.stats()
+    assert stats.files == 4  # excludes core + 2 INDEX.md
+    assert stats.chunks >= 4
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_core_and_indexes(tmp_path: Path):
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+    results = await idx.search("Mimir", scope="all", k=10)
+    paths = {r.path for r in results}
+    assert "memory/core/00-persona.md" not in paths
+    assert "memory/INDEX.md" not in paths
+    assert "state/INDEX.md" not in paths
+
+
+# ---- Incremental reindex --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reindex_path_picks_up_new_file(tmp_path: Path):
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+    before = (await idx.stats()).files
+
+    new_file = tmp_path / "memory" / "topics" / "fresh.md"
+    new_file.write_text("<!-- desc: fresh -->\nA shiny new topic about physics.")
+    ok = await idx.reindex_path("memory/topics/fresh.md")
+    assert ok is True
+
+    after = (await idx.stats()).files
+    assert after == before + 1
+
+
+@pytest.mark.asyncio
+async def test_reindex_path_drops_deleted_file(tmp_path: Path):
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+    target = tmp_path / "memory" / "topics" / "boids.md"
+    target.unlink()
+    ok = await idx.reindex_path("memory/topics/boids.md")
+    assert ok is False
+    stats = await idx.stats()
+    # Sweep would also drop it, but reindex_path should handle deletion directly.
+    assert stats.files == 3
+
+
+@pytest.mark.asyncio
+async def test_sweep_detects_mtime_drift(tmp_path: Path):
+    """SPEC §6.3: 60s sweep detects bash-driven writes the tool runner can't see."""
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    target = tmp_path / "memory" / "topics" / "boids.md"
+    target.write_text(
+        "<!-- desc: boids updated -->\n# Boids\nUpdated content here."
+    )
+    # Bump mtime explicitly to ensure drift is detectable on fast filesystems.
+    new_mtime = time.time() + 5
+    os.utime(target, (new_mtime, new_mtime))
+
+    stats = await idx.sweep()
+    assert stats["updated"] >= 1
+
+
+# ---- Search semantics -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_finds_keyword_match(tmp_path: Path):
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    results = await idx.search("quantum", scope="all", k=5)
+    paths = [r.path for r in results]
+    assert any("quantum.md" in p for p in paths)
+
+
+@pytest.mark.asyncio
+async def test_search_scope_filter(tmp_path: Path):
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    mem = await idx.search("quantum", scope="memory", k=5)
+    state = await idx.search("quantum", scope="state", k=5)
+
+    assert all(r.scope == "memory" for r in mem)
+    assert all(r.scope == "state" for r in state)
+    assert any("memory/topics/quantum.md" in r.path for r in mem)
+    assert any("state/transcripts/kickoff.md" in r.path for r in state)
+
+
+@pytest.mark.asyncio
+async def test_search_score_in_unit_range(tmp_path: Path):
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+    results = await idx.search("flocking", scope="all", k=5)
+    for r in results:
+        assert 0.0 <= r.score <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_search_returns_empty_for_blank(tmp_path: Path):
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+    assert await idx.search("", scope="all", k=5) == []
+
+
+# ---- file_search tool wrapper --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_file_search_tool_returns_json(tmp_path: Path):
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    tools = {t.name: t for t in build_search_tools(idx)}
+    out = await tools["file_search"].handler({"query": "boids", "scope": "memory", "k": 3})
+    assert out.get("is_error") is not True
+    text = out["content"][0]["text"]
+    payload = json.loads(text)
+    assert isinstance(payload, list)
+    assert any("boids.md" in r["path"] for r in payload)
+
+
+@pytest.mark.asyncio
+async def test_file_search_tool_invalid_scope(tmp_path: Path):
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=False, sweep_loop=False)
+    tools = {t.name: t for t in build_search_tools(idx)}
+    out = await tools["file_search"].handler({"query": "x", "scope": "weird"})
+    assert out.get("is_error") is True
+
+
+@pytest.mark.asyncio
+async def test_rebuild_index_tool_reports_counts(tmp_path: Path):
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=False, sweep_loop=False)
+
+    tools = {t.name: t for t in build_search_tools(idx)}
+    out = await tools["rebuild_index"].handler({"scope": "all"})
+    assert out.get("is_error") is not True
+    text = out["content"][0]["text"]
+    # First-time sweep should add the seeded files.
+    assert "added=" in text
+
+
+# ---- PostToolUse hook → indexer reindex ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_tool_use_hook_reindexes_after_write(tmp_path: Path):
+    """SDK preset Write fires PostToolUse; the hook calls indexer.reindex_path."""
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    async def reindex(rel: str) -> None:
+        await idx.reindex_path(rel)
+
+    hook = make_post_tool_use_hook(tmp_path, reindex)
+
+    # Simulate the SDK invoking Write successfully then firing PostToolUse.
+    target = tmp_path / "memory" / "topics" / "relativity.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "<!-- desc: special and general -->\nE=mc^2 and curved spacetime."
+    )
+
+    await hook(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(target)},
+            "tool_response": {"is_error": False},
+            "tool_use_id": "tu-1",
+        },
+        "tu-1",
+        {"signal": None},
+    )
+
+    results = await idx.search("relativity", scope="memory", k=5)
+    assert any("relativity.md" in r.path for r in results)

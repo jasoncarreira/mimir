@@ -1,0 +1,145 @@
+"""Dispatcher concurrency & ordering (SPEC §4.5)."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from mimir.config import Config
+from mimir.dispatcher import Dispatcher
+from mimir.event_logger import init_logger
+from mimir.models import AgentEvent
+
+
+def _make_config(home: Path, **overrides) -> Config:
+    cfg = Config.from_env()
+    return replace(
+        cfg,
+        home=home,
+        max_concurrent_turns=overrides.get("max_concurrent_turns", 4),
+        max_channel_queue=overrides.get("max_channel_queue", 100),
+        worker_idle_timeout_s=overrides.get("worker_idle_timeout_s", 1),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _logger(tmp_path: Path):
+    (tmp_path / "logs").mkdir()
+    init_logger(tmp_path / "logs" / "events.jsonl", session_id="test-proc")
+
+
+@pytest.mark.asyncio
+async def test_within_channel_events_run_in_order(tmp_path: Path):
+    cfg = _make_config(tmp_path)
+
+    seen: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        await asyncio.sleep(0.01)
+        seen.append(event.content)
+
+    disp = Dispatcher(cfg, runner)
+    for i in range(5):
+        await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content=str(i)))
+
+    await disp.drain()
+    assert seen == ["0", "1", "2", "3", "4"]
+
+
+@pytest.mark.asyncio
+async def test_separate_channels_run_concurrently(tmp_path: Path):
+    cfg = _make_config(tmp_path)
+    started = asyncio.Event()
+    second_started = asyncio.Event()
+    release = asyncio.Event()
+    finished: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        if event.channel_id == "slow":
+            started.set()
+            await release.wait()
+            finished.append("slow")
+        else:
+            second_started.set()
+            finished.append("fast")
+
+    disp = Dispatcher(cfg, runner)
+    await disp.enqueue(AgentEvent(trigger="x", channel_id="slow", content="0"))
+    await started.wait()
+    # slow channel is parked; a different channel must still progress
+    await disp.enqueue(AgentEvent(trigger="x", channel_id="fast", content="0"))
+    await asyncio.wait_for(second_started.wait(), timeout=1.0)
+    assert finished == ["fast"]
+    release.set()
+    await disp.drain()
+    assert "slow" in finished
+
+
+@pytest.mark.asyncio
+async def test_global_semaphore_caps_in_flight(tmp_path: Path):
+    cfg = _make_config(tmp_path, max_concurrent_turns=2)
+    in_flight = 0
+    peak = 0
+    lock = asyncio.Lock()
+
+    async def runner(event: AgentEvent) -> None:
+        nonlocal in_flight, peak
+        async with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        await asyncio.sleep(0.05)
+        async with lock:
+            in_flight -= 1
+
+    disp = Dispatcher(cfg, runner)
+    for i in range(8):
+        # Different channels so workers run concurrently.
+        await disp.enqueue(AgentEvent(trigger="x", channel_id=f"c{i}", content="0"))
+
+    await disp.drain()
+    assert peak <= 2
+
+
+@pytest.mark.asyncio
+async def test_runner_exception_does_not_wedge_channel(tmp_path: Path):
+    cfg = _make_config(tmp_path)
+    seen: list[str] = []
+    raised_once = False
+
+    async def runner(event: AgentEvent) -> None:
+        nonlocal raised_once
+        if not raised_once:
+            raised_once = True
+            raise RuntimeError("synthetic")
+        seen.append(event.content)
+
+    disp = Dispatcher(cfg, runner)
+    await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="0"))
+    await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="1"))
+    await disp.drain()
+    # First event raised; second event still ran.
+    assert seen == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_queue_full_returns_false(tmp_path: Path):
+    cfg = _make_config(tmp_path, max_channel_queue=1)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def runner(event: AgentEvent) -> None:
+        started.set()
+        await release.wait()
+
+    disp = Dispatcher(cfg, runner)
+    # Block one event in the runner so the next put hits maxsize.
+    assert await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="a"))
+    await started.wait()
+    assert await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="b"))
+    accepted = await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="c"))
+    assert accepted is False
+    release.set()
+    await disp.drain()

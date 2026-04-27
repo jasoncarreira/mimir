@@ -1,0 +1,323 @@
+"""Per-channel + global message buffer (SPEC §5.4).
+
+On startup ``chat_history.jsonl`` is replayed into two ``deque``s:
+- ``message_history_all`` (bounded, default 500)
+- ``message_history_by_channel[channel_id]`` (each bounded, default 250)
+
+New messages append to both. Eviction is ``deque.maxlen`` only — same model
+as open-strix. The on-disk file grows unbounded by default.
+
+``recent_activity()`` produces the chronological merge that goes into the
+turn prompt under ``## Recent activity``: within-channel last N + cross-channel
+same-author last M (DM channels excluded from the cross pull — privacy rule).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Literal
+
+log = logging.getLogger(__name__)
+
+MessageKind = Literal["user_message", "assistant_message", "system_note"]
+
+
+@dataclass
+class Message:
+    ts: str
+    msg_id: str | None
+    channel_id: str
+    author: str | None
+    author_display: str | None
+    kind: MessageKind
+    content: str
+    thread_id: str | None = None
+    # Origin tag for the Recent-activity allowlist. None on legacy records;
+    # set to the inbound AgentEvent.source on new records (SPEC §5.4).
+    source: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "ts": self.ts,
+            "msg_id": self.msg_id,
+            "channel_id": self.channel_id,
+            "author": self.author,
+            "author_display": self.author_display,
+            "kind": self.kind,
+            "content": self.content,
+            "thread_id": self.thread_id,
+            "source": self.source,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Message":
+        return cls(
+            ts=data.get("ts", ""),
+            msg_id=data.get("msg_id"),
+            channel_id=data.get("channel_id", ""),
+            author=data.get("author"),
+            author_display=data.get("author_display"),
+            kind=data.get("kind", "user_message"),
+            content=data.get("content", ""),
+            thread_id=data.get("thread_id"),
+            source=data.get("source"),
+        )
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _is_private_channel(channel_id: str) -> bool:
+    """SPEC §5.4 privacy rule — any ``dm-*`` channel is private."""
+    return channel_id.startswith("dm-")
+
+
+@dataclass
+class MessageBuffer:
+    """In-memory deques + JSONL append. One instance per process."""
+
+    history_path: Path
+    global_max: int = 500
+    per_channel_max: int = 250
+    _all: deque[Message] = field(default_factory=deque)
+    _by_channel: dict[str, deque[Message]] = field(default_factory=dict)
+    _write_lock: asyncio.Lock | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        self._all = deque(maxlen=self.global_max)
+        # Per-channel deques are created lazily on first message for that channel.
+
+    def replay(self) -> int:
+        """Read ``chat_history.jsonl`` from disk and rehydrate the deques.
+
+        Returns the number of messages loaded. Idempotent — replaying twice
+        just re-overwrites with the same tail (deques are bounded).
+        """
+        self._all = deque(maxlen=self.global_max)
+        self._by_channel = {}
+        if not self.history_path.is_file():
+            return 0
+        loaded = 0
+        try:
+            with self.history_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = Message.from_dict(data)
+                    self._append_in_memory(msg)
+                    loaded += 1
+        except OSError as exc:
+            log.warning("chat_history.jsonl replay failed: %s", exc)
+        return loaded
+
+    def _append_in_memory(self, msg: Message) -> None:
+        self._all.append(msg)
+        ch = self._by_channel.get(msg.channel_id)
+        if ch is None:
+            ch = deque(maxlen=self.per_channel_max)
+            self._by_channel[msg.channel_id] = ch
+        ch.append(msg)
+
+    async def append(self, msg: Message) -> None:
+        """Append to disk + both deques. Lock-serialized writes."""
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        async with self._write_lock:
+            self._append_in_memory(msg)
+            await asyncio.to_thread(self._append_disk, msg)
+
+    def _append_disk(self, msg: Message) -> None:
+        self.history_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with self.history_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(msg.to_dict(), ensure_ascii=True, default=str) + "\n")
+        except OSError as exc:
+            log.warning("chat_history.jsonl append failed: %s", exc)
+
+    def make_message(
+        self,
+        *,
+        channel_id: str,
+        kind: MessageKind,
+        content: str,
+        author: str | None = None,
+        author_display: str | None = None,
+        msg_id: str | None = None,
+        thread_id: str | None = None,
+        ts: str | None = None,
+        source: str | None = None,
+    ) -> Message:
+        return Message(
+            ts=ts or _utc_now_iso(),
+            msg_id=msg_id,
+            channel_id=channel_id,
+            author=author,
+            author_display=author_display,
+            kind=kind,
+            content=content,
+            thread_id=thread_id,
+            source=source,
+        )
+
+    # ---- read paths --------------------------------------------------------
+
+    def channel_count(self, channel_id: str) -> int:
+        ch = self._by_channel.get(channel_id)
+        return len(ch) if ch is not None else 0
+
+    def total_count(self) -> int:
+        return len(self._all)
+
+    def recent_for_channel(
+        self,
+        channel_id: str,
+        limit: int,
+        *,
+        source_allowlist: frozenset[str] | None = None,
+    ) -> list[Message]:
+        """Last ``limit`` messages on ``channel_id``. Falls back to global if
+        the channel queue is empty (open-strix's exact rule, SPEC §5.4).
+        ``limit=0`` returns nothing (used to disable Recent activity in
+        benchmarks; bare slicing with ``[-0:]`` would return the full list).
+
+        ``source_allowlist`` filters the candidate pool by ``Message.source``.
+        ``None`` means no filter; a frozenset means "only these sources".
+        Messages with ``source=None`` are excluded when an allowlist is set.
+        """
+        if limit <= 0:
+            return []
+        ch = self._by_channel.get(channel_id)
+        pool = list(ch) if ch is not None and len(ch) > 0 else list(self._all)
+        if source_allowlist is not None:
+            pool = [m for m in pool if m.source in source_allowlist]
+        return pool[-limit:]
+
+    def cross_author_messages(
+        self,
+        *,
+        author: str,
+        exclude_channel: str,
+        limit: int,
+        within_hours: int,
+        source_allowlist: frozenset[str] | None = None,
+    ) -> list[Message]:
+        """Last ``limit`` messages by ``author`` on channels other than
+        ``exclude_channel``, within the time window. DMs always excluded.
+
+        ``source_allowlist`` filters by ``Message.source`` (same semantics as
+        ``recent_for_channel``)."""
+        if not author or limit <= 0:
+            return []
+        cutoff = datetime.now(tz=timezone.utc).timestamp() - within_hours * 3600
+        out: list[Message] = []
+        # Walk newest-first for cheap early exit.
+        for msg in reversed(self._all):
+            if len(out) >= limit:
+                break
+            if msg.channel_id == exclude_channel:
+                continue
+            if _is_private_channel(msg.channel_id):
+                continue
+            if msg.author != author:
+                continue
+            if source_allowlist is not None and msg.source not in source_allowlist:
+                continue
+            try:
+                msg_ts = datetime.fromisoformat(msg.ts.replace("Z", "+00:00")).timestamp()
+            except (ValueError, AttributeError):
+                continue
+            if msg_ts < cutoff:
+                # Older than the window — and since we're walking newest-first,
+                # everything else is older too.
+                break
+            out.append(msg)
+        out.reverse()
+        return out
+
+    def assemble_recent_activity(
+        self,
+        *,
+        channel_id: str,
+        author: str | None,
+        recent_per_channel: int,
+        recent_author_cross: int,
+        cross_hours: int,
+        source_allowlist: frozenset[str] | None = None,
+    ) -> list[Message]:
+        """Merge within-channel + cross-channel author streams, chronological.
+
+        Cross-channel pull is skipped when ``author`` is None (e.g. scheduled
+        ticks have no inbound author).
+
+        ``source_allowlist`` (SPEC §5.4) keeps benchmark / API / scheduler
+        events out of the prompt by default — only "real conversation"
+        sources participate. Mirrors open-strix's hard-coded
+        ``{"discord","web","stdin"}`` filter (``app.py:734``).
+        """
+        within = self.recent_for_channel(
+            channel_id, recent_per_channel, source_allowlist=source_allowlist
+        )
+        cross: list[Message] = []
+        if author and not _is_private_channel(channel_id):
+            cross = self.cross_author_messages(
+                author=author,
+                exclude_channel=channel_id,
+                limit=recent_author_cross,
+                within_hours=cross_hours,
+                source_allowlist=source_allowlist,
+            )
+
+        # Merge by ts (string ISO compares lexicographically).
+        merged = sorted(within + cross, key=lambda m: m.ts)
+
+        # De-dup on (channel_id, msg_id, ts) so the same message doesn't
+        # appear twice if a cross-pull happens to overlap (unlikely but cheap).
+        seen: set[tuple] = set()
+        unique: list[Message] = []
+        for m in merged:
+            key = (m.channel_id, m.msg_id, m.ts)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(m)
+        return unique
+
+
+def render_recent_activity(
+    messages: Iterable[Message],
+    *,
+    max_chars: int = 0,
+) -> str:
+    """Render messages as ``[<ts> <channel>] <author>: <content>`` lines.
+
+    ``max_chars`` (>0) caps each individual message's content; longer bodies
+    are truncated with ``…[truncated]`` (same convention as ``turn_logger``'s
+    tool-result cap). The per-message cap protects against a single huge
+    inbound (e.g. a 500-post bluesky seed transcript) blowing the model's
+    context when prior messages are included via the SPEC §5.4 deque pull.
+    """
+    lines: list[str] = []
+    for m in messages:
+        ts_short = m.ts[:16] if m.ts else ""
+        author = m.author_display or m.author or (
+            "(assistant)" if m.kind == "assistant_message" else "(system)"
+        )
+        if m.kind == "assistant_message":
+            author = "(assistant)"
+        content = m.content or ""
+        if max_chars > 0 and len(content) > max_chars:
+            content = content[:max_chars] + "…[truncated]"
+        lines.append(f"[{ts_short} {m.channel_id}] {author}: {content}")
+    return "\n".join(lines)

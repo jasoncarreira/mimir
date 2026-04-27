@@ -1,0 +1,106 @@
+"""System + turn prompt assembly (SPEC §9).
+
+Phase 2 wires in:
+- ``## Core memory`` — every ``memory/core/*.md`` block, lexicographic order
+- ``## Memory index`` — ``memory/INDEX.md`` body (NOT the state index)
+- ``## Recent activity`` — within-channel + cross-channel author pull (§5.4)
+
+Tool catalog and skills catalog (§9.1 ``## Available tools`` / ``## Available
+skills``) come in later phases when the registry is dynamic.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Iterable
+
+from .history import Message, render_recent_activity
+from .memory import CoreBlock, render_core_section
+from .models import AgentEvent
+
+_DEFAULT_PERSONA = """You are Mimir, a memory-centric agent built on the Claude Agent SDK.
+You communicate through channels (Slack, Discord, Bluesky, web, benchmark
+stdout). You can use bash and file-op tools to organize your own notes
+under memory/, search them via the file_search skill, and call MSAM
+through the msam skill for semantic memory."""
+
+_DEFAULT_CONVENTIONS = """## Conventions
+
+- Always-in-context blocks live under memory/core/, ordered by numeric prefix
+  (00-, 10-, 20-, ...). To insert at position N, name the file N-<topic>.md.
+  Renumber with `mv` if gaps close.
+- Anything else under memory/ is non-core: organize it however helps you.
+  It is listed in memory/INDEX.md and is searchable via the file_search skill.
+- Bulk verbatim content goes in state/. state/INDEX.md is NOT in the system
+  prompt — read it directly with `read_file <home>/state/INDEX.md` when you
+  want an overview, or use the file_search skill to find files by topic.
+- Each file's first line should be: <!-- desc: short description -->.
+  If absent, the indexes fall back to the file's first sentence and prefix
+  the entry with [auto].
+- The INDEX.md files are auto-generated; do not hand-edit them.
+- Edit memory blocks with bash and file-op tools — no dedicated memory-block
+  tools exist."""
+
+
+def build_system_prompt(
+    *,
+    persona: str | None = None,
+    conventions: str | None = None,
+    core_blocks: list[CoreBlock] | None = None,
+    memory_index_body: str | None = None,
+) -> str:
+    """Assemble the system prompt. ``state/INDEX.md`` is intentionally absent —
+    it's read on demand (SPEC §9.1)."""
+    parts: list[str] = [persona or _DEFAULT_PERSONA]
+
+    if core_blocks:
+        rendered = render_core_section(core_blocks)
+        if rendered:
+            parts.append("## Core memory\n\n" + rendered)
+
+    if memory_index_body:
+        parts.append("## Memory index\n\n" + memory_index_body.rstrip())
+
+    parts.append(conventions or _DEFAULT_CONVENTIONS)
+
+    return "\n\n".join(parts)
+
+
+def build_turn_prompt(
+    event: AgentEvent,
+    *,
+    recent_messages: Iterable[Message] | None = None,
+    msam_block: str | None = None,
+    subagent_block: str | None = None,
+    recent_message_chars: int = 0,
+) -> str:
+    """Assemble the turn prompt: recent activity, MSAM atom hits, subagent
+    completion notifications (from prior turns), event header + body.
+
+    ``recent_message_chars`` (>0) caps each Recent-activity message's
+    rendered content with ``…[truncated]``; protects against single huge
+    inbounds blowing the context (SPEC §5.4)."""
+    sections: list[str] = []
+
+    if recent_messages:
+        rendered = render_recent_activity(
+            recent_messages, max_chars=recent_message_chars
+        )
+        if rendered:
+            sections.append("## Recent activity\n\n" + rendered)
+
+    if msam_block:
+        sections.append("## Possibly relevant memories (from MSAM)\n\n" + msam_block.rstrip())
+
+    if subagent_block:
+        sections.append("## Subagent updates\n\n" + subagent_block.rstrip())
+
+    ts = datetime.now(tz=timezone.utc).isoformat()
+    header = (
+        f"[event_kind: {event.trigger}, channel: {event.channel_id}, "
+        f"author: {event.author or '-'}, ts: {ts}]"
+    )
+    body = event.content or "(no content)"
+    sections.append(f"{header}\n{body}")
+
+    return "\n\n".join(sections)
