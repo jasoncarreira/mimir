@@ -25,6 +25,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p8_minimax_v1` | MiniMax-M2.7 | rrf + two-tier (P9v2) + cluster merge pass (P8) + session_boundaries + mark_contributions (P10) | sem + kw (merge_threshold=0.75, max_cluster_size=50) | 500 | **0.752** |
 | `msam_p8_minimax_v2` | MiniMax-M2.7 | P8v1 stack with tighter merge knobs | sem + kw (merge_threshold=0.85, max_cluster_size=15) | 500 | **0.758** |
 | `msam_p4_minimax_v1` | MiniMax-M2.7 | P9v2 + P4-bench (contradiction→supersedes→demotion); P10 disabled | sem + kw (supersedes_resolution_threshold=0.85, supersedes_score_multiplier=0.4) | 500 | **0.766** |
+| `msam_p30_minimax_v1` | MiniMax-M2.7 | P9v2 + P30 (missing-atom base score in two-tier); atom-level supersedes off; obs-level supersedes on | sem + kw (additive boost + P30 cosine-based missing-atom pull-in) | 500 | **0.780** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -570,6 +571,51 @@ Possible follow-ups (not yet tried):
 
 P9v2 (0.796) remains the best configuration. P4-bench is a clear
 regression on this benchmark and should not ship as default.
+
+### `msam_p30_minimax_v1` — P9v2 + P30 missing-atom base score fix (500q)
+
+P9v2 baseline + P30 (asymmetric missing-atom scoring fix) + atom-level
+supersedes auto-triggers disabled (commit `591e48a`) + observation-level
+supersedes demotion in two-tier (kept). Mechanism in this run: additive
+boost on in-pool raws + cosine-derived base score for missing endorsed
+raws (P30's original implementation).
+
+| Subtype | Score | N | Δ vs P9v2 | Δ vs P2 |
+|---|---|---|---|---|
+| **single-session-preference** | **0.367** | 30 | **+10.0** | **+10.0** |
+| single-session-assistant | 0.982 | 56 | 0.0 | -1.8 |
+| single-session-user | 0.957 | 70 | -2.9 | 0.0 |
+| knowledge-update | 0.923 | 78 | -2.6 | -2.6 |
+| temporal-reasoning | 0.752 | 133 | -2.2 | -7.5 |
+| multi-session | 0.639 | 133 | -3.0 | +0.5 |
+
+**Overall: 0.780 (-1.6 vs P9v2, -1.9 vs P2).** Net regression, but the
+subtype profile is the most interesting we've seen:
+
+- **Preference jumped +10.0pp** — to **0.367**, the highest preference
+  score ever logged on this bench. P9v2 / P2 / baseline were all stuck
+  at 0.267, and P9v1 hit 0.400 but lost everything else. P30 cracked
+  preference without P9v1's losses.
+- **Other subtypes dropped 2-3pp uniformly.** No subtype-specific
+  breakage; just a moderate, broad cost.
+
+The trade is: P30's mechanism pulls in evidence atoms that didn't make
+the candidate top-K (with cosine-similarity-derived base + boost). On
+preference questions, those missing-but-endorsed raws are exactly the
+ones the reader needs (specific user statements that didn't lexically
+match the probe but are evidence for a preference observation that did
+match). On other subtypes — especially temporal and knowledge-update —
+the missing atoms displace better-ranked direct evidence, so the
+score drops.
+
+Note that this run used the **additive boost + P30 missing-atom
+pull-in** mechanism (commits up to `7049e0f`). The next bench will
+measure the **flat 2× restoration** variant (commit `fa365a0`),
+which removes the obs_score-dependent magnitude and prevents weak
+raws from being inflated above their relevance.
+
+Pace: ~28s/q (vs P9v2's ~38s/q). The supersedes resolver is gone, so
+each question runs ~10s faster.
 
 ## P9 summary
 
