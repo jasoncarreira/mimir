@@ -66,9 +66,10 @@ class TestTwoTierReturn:
 
         result = msam.core.hybrid_retrieve("cameras", top_k=5, two_tier=True)
         assert isinstance(result, dict)
-        assert set(result.keys()) == {"observations", "raws"}
+        assert {"observations", "raws", "confidence_tier"} <= set(result.keys())
         assert any(a["id"] == obs_id for a in result["observations"])
         assert any(a["id"] == raw_id for a in result["raws"])
+        assert result["confidence_tier"] in ("none", "low", "medium", "high")
 
     def test_observation_below_confidence_floor_dropped(self, env, monkeypatch):
         import msam.core

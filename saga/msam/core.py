@@ -1306,7 +1306,38 @@ def _two_tier_split(
         atom["_combined_score"] = score
         raws_final.append(atom)
 
-    return {"observations": surfaced_obs, "raws": raws_final}
+    # Compute confidence tier across the union of observations + raws so
+    # callers (REST, agent harnesses) can gate volume the same way the
+    # single-tier path does. Same thresholds as hybrid_retrieve's
+    # single-tier confidence calc — change one, change both.
+    _sim_high = _cfg('retrieval', 'confidence_sim_high', 0.45)
+    _sim_medium = _cfg('retrieval', 'confidence_sim_medium', 0.30)
+    _sim_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
+    _score_high = _cfg('retrieval', 'confidence_score_high', 40.0)
+    _score_medium = _cfg('retrieval', 'confidence_score_medium', 10.0)
+
+    all_atoms = surfaced_obs + raws_final
+    if not all_atoms:
+        confidence_tier = "none"
+    else:
+        max_sim = max((a.get('_similarity', 0) or 0) for a in all_atoms)
+        top_score = max((a.get('_combined_score', 0) or 0) for a in all_atoms)
+        has_semantic_signal = max_sim >= 0.20
+
+        if max_sim >= _sim_high or (has_semantic_signal and top_score >= _score_high):
+            confidence_tier = "high"
+        elif max_sim >= _sim_medium or (has_semantic_signal and top_score >= _score_medium):
+            confidence_tier = "medium"
+        elif max_sim >= _sim_low:
+            confidence_tier = "low"
+        else:
+            confidence_tier = "none"
+
+    return {
+        "observations": surfaced_obs,
+        "raws": raws_final,
+        "confidence_tier": confidence_tier,
+    }
 
 
 def hybrid_retrieve(
