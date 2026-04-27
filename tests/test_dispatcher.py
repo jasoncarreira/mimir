@@ -125,6 +125,42 @@ async def test_runner_exception_does_not_wedge_channel(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_is_channel_busy_tracks_in_flight_and_queued(tmp_path: Path):
+    """``is_channel_busy`` distinguishes parked-on-get from work-in-flight.
+
+    True iff a turn is currently inside ``run_turn`` for the channel OR
+    events are queued for it. False once the worker is back on
+    ``queue.get()``. Used by SessionManager to defer synthesis (SPEC §5.6).
+    """
+    cfg = _make_config(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def runner(event: AgentEvent) -> None:
+        started.set()
+        await release.wait()
+
+    disp = Dispatcher(cfg, runner)
+
+    # No worker yet for "c1" — not busy.
+    assert disp.is_channel_busy("c1") is False
+
+    # Enqueue while runner is paused; turn enters run_turn → busy.
+    await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="0"))
+    await started.wait()
+    assert disp.is_channel_busy("c1") is True
+
+    # Queue a second event while the first is still in flight — still busy.
+    await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="1"))
+    assert disp.is_channel_busy("c1") is True
+
+    # Release; both turns drain. After drain, no queue depth and no in-flight.
+    release.set()
+    await disp.drain()
+    assert disp.is_channel_busy("c1") is False
+
+
+@pytest.mark.asyncio
 async def test_queue_full_returns_false(tmp_path: Path):
     cfg = _make_config(tmp_path, max_channel_queue=1)
     started = asyncio.Event()

@@ -142,7 +142,7 @@ class Config:
             ),
             recent_message_chars=_env_int("MIMIR_RECENT_MESSAGE_CHARS", 4096),
 
-            msam_session_idle_minutes=_env_int("MIMIR_MSAM_SESSION_IDLE_MINUTES", 30),
+            msam_session_idle_minutes=_env_int("MIMIR_MSAM_SESSION_IDLE_MINUTES", 10),
             msam_consolidate_cron=_env("MIMIR_MSAM_CONSOLIDATE_CRON", "0 4 * * 0"),
             msam_pre_message_min_tier=_env("MIMIR_MSAM_PRE_MSG_MIN_TIER", ""),
 

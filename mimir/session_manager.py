@@ -6,8 +6,13 @@ inbound event (bridge, scheduler tick, HTTP injection) calls ``touch()``
 asyncio idle timer that fires after ``MIMIR_MSAM_SESSION_IDLE_MINUTES``
 of silence; when it fires the manager:
 
-1. Marks the session ended and drops it from the in-memory dict.
-2. Calls the ``on_idle`` callback (registered by the server) which
+1. **Busy check (SPEC §5.6).** Asks the dispatcher's ``is_channel_busy``
+   predicate whether a turn is in flight or events are queued for this
+   channel. If yes — the conversation isn't actually parked, just slow —
+   re-arm the timer for another idle window and emit
+   ``msam_session_idle_deferred``.
+2. Otherwise: marks the session ended, drops it from the in-memory dict,
+   and calls the ``on_idle`` callback (registered by the server) which
    enqueues a synthesis turn with ``trigger="msam_session_end"`` carrying
    the old ``msam_session_id`` in ``event.extra``.
 
@@ -52,16 +57,20 @@ def _make_msam_session_id(channel_id: str) -> str:
 
 # Type alias for the on-idle callback the server registers.
 OnIdle = Callable[["ChannelSession"], Awaitable[None]]
+# Type alias for the dispatcher's busy predicate.
+IsBusy = Callable[[str], bool]
 
 
 class SessionManager:
     def __init__(
         self,
-        idle_minutes: int = 30,
+        idle_minutes: int = 10,
         on_idle: OnIdle | None = None,
+        is_busy: IsBusy | None = None,
     ) -> None:
         self._idle_seconds = max(1, int(idle_minutes * 60))
         self._on_idle = on_idle
+        self._is_busy = is_busy
         self._sessions: dict[str, ChannelSession] = {}
         self._lock = asyncio.Lock()
 
@@ -72,6 +81,12 @@ class SessionManager:
         """Register the idle callback after construction (avoids circular
         wiring: session manager → dispatcher → agent → run_turn)."""
         self._on_idle = on_idle
+
+    def set_is_busy(self, is_busy: IsBusy) -> None:
+        """Register the dispatcher's busy predicate. When the timer fires and
+        the channel is busy, we defer instead of synthesizing — the
+        conversation isn't actually parked, just slow."""
+        self._is_busy = is_busy
 
     async def touch(self, channel_id: str) -> ChannelSession:
         """Ensure a session exists for ``channel_id`` and reset its idle timer.
@@ -147,6 +162,26 @@ class SessionManager:
         )
 
     async def _fire_idle(self, msam_session_id: str, channel_id: str) -> None:
+        # Defer if the dispatcher reports the channel is busy (queued events
+        # or a turn currently in run_turn). Re-arm the timer instead of
+        # firing synthesis; the conversation isn't parked yet.
+        if self._is_busy is not None and self._is_busy(channel_id):
+            async with self._lock:
+                session = self._sessions.get(channel_id)
+                if session is None or session.msam_session_id != msam_session_id:
+                    return
+                if session.ended:
+                    return
+                # Re-arm. The just-fired handle is dead; replace it.
+                session.idle_handle = self._schedule_idle(session)
+            await log_event(
+                "msam_session_idle_deferred",
+                channel_id=channel_id,
+                msam_session_id=msam_session_id,
+                reason="worker_busy",
+            )
+            return
+
         async with self._lock:
             session = self._sessions.get(channel_id)
             if session is None or session.msam_session_id != msam_session_id:

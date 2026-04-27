@@ -34,6 +34,20 @@ class Dispatcher:
         self._semaphore = asyncio.Semaphore(config.max_concurrent_turns)
         self._closed = False
         self._high_water_logged: dict[str, bool] = {}
+        # Channels with a turn currently inside run_turn (held the semaphore,
+        # past the dispatch into the agent). Used by SessionManager to decide
+        # whether the worker is parked on queue.get() — so the synthesis-fire
+        # timer can defer when work is in flight (SPEC §5.6).
+        self._in_flight: set[str] = set()
+
+    def is_channel_busy(self, channel_id: str) -> bool:
+        """True iff a turn is in flight for ``channel_id`` or events are queued
+        for it. False means the worker is parked on ``queue.get()`` (or the
+        channel has no worker at all)."""
+        queue = self._queues.get(channel_id)
+        if queue is not None and queue.qsize() > 0:
+            return True
+        return channel_id in self._in_flight
 
     def set_run_turn(self, run_turn: TurnRunner) -> None:
         """Late-bind the runner. Used to break the agent ↔ dispatcher
@@ -104,6 +118,7 @@ class Dispatcher:
                         )
                         queue.task_done()
                         continue
+                    self._in_flight.add(channel_id)
                     try:
                         await self._run_turn(event)
                     except Exception as exc:  # noqa: BLE001
@@ -114,6 +129,8 @@ class Dispatcher:
                             channel_id=channel_id,
                             message=f"{type(exc).__name__}: {exc}",
                         )
+                    finally:
+                        self._in_flight.discard(channel_id)
                 queue.task_done()
         except asyncio.CancelledError:
             await log_event("worker_cancelled", channel_id=channel_id)

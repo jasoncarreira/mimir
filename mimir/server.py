@@ -188,6 +188,10 @@ def build_app(config: Config) -> web.Application:
             )
 
     sessions.set_on_idle(_on_session_idle)
+    # Busy-defer (SPEC §5.6): when the session timer fires while a turn is
+    # in flight or events are queued for the channel, re-arm rather than
+    # synthesize behind the in-flight work.
+    sessions.set_is_busy(dispatcher.is_channel_busy)
 
     app["config"] = config
     app["agent"] = agent

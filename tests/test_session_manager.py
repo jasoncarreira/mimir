@@ -143,3 +143,54 @@ async def test_shutdown_cancels_without_firing():
     await mgr.shutdown()
     # No synthesis turn on shutdown — the worker pool is draining.
     assert fired == []
+
+
+@pytest.mark.asyncio
+async def test_idle_timer_defers_when_dispatcher_reports_busy():
+    """SPEC §5.6: if the dispatcher reports the channel is busy when the
+    session timer fires, defer (re-arm) instead of synthesizing. Synthesis
+    fires only once the channel is actually parked.
+    """
+    fired: list[ChannelSession] = []
+
+    async def on_idle(session: ChannelSession) -> None:
+        fired.append(session)
+
+    busy_state = {"busy": True}
+
+    def is_busy(channel_id: str) -> bool:
+        return busy_state["busy"]
+
+    mgr = SessionManager(idle_minutes=60, on_idle=on_idle, is_busy=is_busy)
+    s = await mgr.touch("c1")
+
+    # Timer fires while busy — must defer.
+    await mgr._fire_idle(s.msam_session_id, "c1")
+    assert fired == [], "synthesis fired even though channel was busy"
+    # Session is still active; idle_handle was re-armed.
+    assert "c1" in mgr._sessions
+    assert mgr._sessions["c1"].ended is False
+    assert mgr._sessions["c1"].idle_handle is not None
+
+    # Channel goes parked. Next timer fire dispatches.
+    busy_state["busy"] = False
+    await mgr._fire_idle(s.msam_session_id, "c1")
+    assert len(fired) == 1
+    assert fired[0].msam_session_id == s.msam_session_id
+
+
+@pytest.mark.asyncio
+async def test_set_is_busy_can_be_wired_after_construction():
+    """``set_is_busy`` lets the server wire the dispatcher's predicate after
+    both objects exist (same pattern as ``set_on_idle``)."""
+    fired: list[ChannelSession] = []
+
+    async def on_idle(session: ChannelSession) -> None:
+        fired.append(session)
+
+    mgr = SessionManager(idle_minutes=60, on_idle=on_idle)
+    mgr.set_is_busy(lambda channel_id: True)  # always busy
+    s = await mgr.touch("c1")
+    await mgr._fire_idle(s.msam_session_id, "c1")
+    assert fired == []
+    assert "c1" in mgr._sessions  # still alive, deferred

@@ -461,7 +461,7 @@ class ChannelSession:
     idle_handle: asyncio.TimerHandle | None
 ```
 
-Each session has an asyncio timer that fires after `MIMIR_MSAM_SESSION_IDLE_MINUTES` of inactivity (default 30, configurable per `§14`).
+Each session has an asyncio timer that fires after `MIMIR_MSAM_SESSION_IDLE_MINUTES` of inactivity (default 10, configurable per `§14`). When the timer fires, the manager first asks the dispatcher whether the channel is *busy* (any turn in flight or events queued); if so, it re-arms the timer and emits `msam_session_idle_deferred` to events.jsonl rather than firing synthesis behind the in-flight work. Synthesis dispatches only once the channel is genuinely parked.
 
 #### Lifecycle
 
