@@ -76,6 +76,74 @@ class TestStore:
         # FastAPI/Pydantic allows empty strings; the endpoint logic handles it
         assert rv.status_code in (200, 400, 422)
 
+    def test_store_skips_triple_extraction_when_disabled(self, client, monkeypatch):
+        """[triples] enable_extraction = false skips the LLM call entirely
+        on /v1/store, even for semantic atoms. Avoids per-store LLM cost
+        for callers that don't use the graph pathway."""
+        import msam.annotate
+        monkeypatch.setattr(msam.annotate, "classify_stream", lambda c: "semantic")
+        monkeypatch.setattr(msam.annotate, "classify_profile", lambda c: "standard")
+        monkeypatch.setattr(msam.annotate, "smart_annotate", lambda c, use_llm=False: {
+            "arousal": 0.5, "valence": 0.0,
+            "topics": ["test"], "encoding_confidence": 0.7,
+        })
+
+        import msam.core
+        monkeypatch.setattr(msam.core, "store_atom", lambda **kwargs: "abc123def456")
+
+        # Track whether extract_and_store was called
+        called = []
+        import msam.triples
+        monkeypatch.setattr(
+            msam.triples, "extract_and_store",
+            lambda aid, c: (called.append((aid, c)), 0)[1],
+        )
+
+        # Disable extraction via the new gate
+        import msam.server as srv
+        original_cfg = srv._cfg
+        def fake_cfg(section, key, default=None):
+            if section == 'triples' and key == 'enable_extraction':
+                return False
+            return original_cfg(section, key, default)
+        monkeypatch.setattr(srv, "_cfg", fake_cfg)
+
+        rv = client.post("/v1/store", json={"content": "user prefers dark mode"})
+        assert rv.status_code == 200
+        data = rv.json()
+        assert data["stored"] is True
+        assert data["triples_extracted"] == 0
+        # Critical: extract_and_store must NOT have been invoked.
+        assert called == []
+
+    def test_store_runs_triple_extraction_by_default(self, client, monkeypatch):
+        """Backward compatibility: with the default config (no
+        enable_extraction key set), extraction still fires for semantic
+        atoms — preserves prior behavior."""
+        import msam.annotate
+        monkeypatch.setattr(msam.annotate, "classify_stream", lambda c: "semantic")
+        monkeypatch.setattr(msam.annotate, "classify_profile", lambda c: "standard")
+        monkeypatch.setattr(msam.annotate, "smart_annotate", lambda c, use_llm=False: {
+            "arousal": 0.5, "valence": 0.0,
+            "topics": ["test"], "encoding_confidence": 0.7,
+        })
+
+        import msam.core
+        monkeypatch.setattr(msam.core, "store_atom", lambda **kwargs: "abc")
+
+        called = []
+        import msam.triples
+        monkeypatch.setattr(
+            msam.triples, "extract_and_store",
+            lambda aid, c: (called.append((aid, c)), 3)[1],
+        )
+
+        rv = client.post("/v1/store", json={"content": "user prefers dark mode"})
+        assert rv.status_code == 200
+        # Default cfg returns True for enable_extraction → call should fire.
+        assert len(called) == 1
+        assert called[0][0] == "abc"
+
 
 # ─── Query ───────────────────────────────────────────────────────────────────
 

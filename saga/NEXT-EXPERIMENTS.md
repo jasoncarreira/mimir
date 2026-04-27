@@ -181,12 +181,14 @@ get dropped). A/B is the only way to know.
 
 ### P32 — Wire triple extraction + graph pathway and measure the lift
 
-**What.** Triple extraction is currently a dead feature in two ways:
+**What.** Triple extraction is partially wired:
 
-1. **The `[triples] enable_extraction` config flag is unread.** It exists
-   in `msam_bench.toml` but no code in the codebase consults it. Real
-   gating happens implicitly via the `NVIDIA_NIM_API_KEY` env var:
-   `extract_triples_llm` returns `[]` if unset.
+1. ~~**The `[triples] enable_extraction` config flag is unread.**~~
+   **Fixed in commit forthcoming** — `/v1/store` now reads the flag.
+   Default True for back-compat; bench has it false. (Mimir hit this:
+   post-`bc2c4ce` the LLM auth flows through to triples too, so every
+   semantic store fires a triple-extraction LLM call until the gate
+   was added.)
 2. **`store_atom` in `core.py` doesn't call extraction.** Only the REST
    `/v1/store` and `/v1/triples/extract` endpoints invoke it. The bench
    ingests via `store_atom` directly (`ingest.py`), so zero triples are
@@ -195,8 +197,8 @@ get dropped). A/B is the only way to know.
    would return `[]` even if turned on.
 
 **Plumbing required:**
-1. Make `[triples] enable_extraction` actually gate (read in `store_atom`
-   and `/v1/store`).
+1. ~~Make `[triples] enable_extraction` actually gate (read in `store_atom`
+   and `/v1/store`).~~ Done for `/v1/store`.
 2. When the flag is true, call `extract_and_store(atom_id, content)` for
    `stream='semantic'` atoms inside `store_atom` (matching `/v1/store`
    behavior).
