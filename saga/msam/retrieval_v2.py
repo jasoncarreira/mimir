@@ -469,30 +469,29 @@ def get_atom_usefulness(atom_id: str) -> float:
 
 def rerank_with_llm(query: str, atoms: list[dict], top_k: int = 5) -> list[dict]:
     """
-    Re-rank retrieved atoms using LLM-as-judge via NIM API.
+    Re-rank retrieved atoms using LLM-as-judge.
     The LLM understands semantic roles (who is described vs who is describing)
     which embedding models cannot distinguish.
-    
+
     Falls back to original ranking if API fails.
     """
     import requests
-    import os
-    
-    api_key = os.environ.get('NVIDIA_NIM_API_KEY')
-    model = _cfg('retrieval_v2', 'rerank_model', 'mistralai/mistral-large-3-675b-instruct-2512')
-    
-    if not api_key or not atoms or len(atoms) <= 1:
+    from .config import resolve_llm_config
+
+    llm = resolve_llm_config('retrieval_v2')
+
+    if not llm['api_key'] or not atoms or len(atoms) <= 1:
         return atoms[:top_k]
-    
+
     # Only rerank top candidates (limit to 8 to keep prompt short)
     candidates = atoms[:min(8, len(atoms))]
-    
+
     # Build ranking prompt
     passages_text = '\n'.join(
         f'{i}: {a.get("content", "")[:150]}'
         for i, a in enumerate(candidates)
     )
-    
+
     prompt = f"""Rank these passages by relevance to the query. Return ONLY the indices in order, most relevant first. No explanation.
 
 Query: {query}
@@ -501,21 +500,21 @@ Passages:
 {passages_text}
 
 Ranking:"""
-    
+
     try:
         resp = requests.post(
-            'https://integrate.api.nvidia.com/v1/chat/completions',
+            llm['url'],
             headers={
-                'Authorization': f'Bearer {api_key}',
+                'Authorization': f"Bearer {llm['api_key']}",
                 'Content-Type': 'application/json',
             },
             json={
-                'model': model,
+                'model': llm['model'],
                 'messages': [{'role': 'user', 'content': prompt}],
                 'max_tokens': 30,
                 'temperature': 0,
             },
-            timeout=15,
+            timeout=llm['timeout'],
         )
         
         if resp.ok:

@@ -256,26 +256,25 @@ def extract_triples_llm(content: str, atom_id: str = "") -> list[dict]:
     Returns list of {subject, predicate, object} dicts.
     Returns empty list if atom is skipped or extraction fails."""
     import requests
+    from .config import resolve_llm_config
 
-    api_key = os.environ.get("NVIDIA_NIM_API_KEY")
-    if not api_key:
+    llm = resolve_llm_config('triples')
+    if not llm['api_key']:
         return []
 
     prompt = EXTRACTION_PROMPT.format(content=content)
 
-    _llm_url = _cfg('triples', 'llm_url', 'https://integrate.api.nvidia.com/v1/chat/completions')
-    _llm_model = _cfg('triples', 'llm_model', 'mistralai/mistral-large-3-675b-instruct-2512')
     try:
         r = requests.post(
-            _llm_url,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            llm['url'],
+            headers={"Authorization": f"Bearer {llm['api_key']}", "Content-Type": "application/json"},
             json={
-                "model": _llm_model,
+                "model": llm['model'],
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
                 "max_tokens": 500,
             },
-            timeout=30,
+            timeout=llm['timeout'],
         )
         r.raise_for_status()
         msg = r.json()["choices"][0]["message"]
