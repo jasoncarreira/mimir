@@ -249,6 +249,71 @@ SKIP for too many atoms (probably). Worth A/B'ing the prompt.
 
 ---
 
+### P33 — Recalibrate confidence_sim_{high,medium,low} thresholds
+
+**What.** The current defaults (`high=0.45, medium=0.30, low=0.15`) were
+set for tightly-coupled paraphrase matches. Real "ask a question, find a
+fact" probes land lower than the defaults assume: in a Mimir bench
+debug bundle (90 raw atoms, OpenAI text-embedding-3-small, 3 indirect
+probes against a Bluesky-feed corpus), the *correct* top match scored
+0.34–0.43, with only 0–2 atoms per probe clearing the medium floor.
+Result: when the API caller passes `min_confidence_tier="medium"`, the
+per-atom filter drops nearly everything — including atoms that are
+clearly the right answer.
+
+**Why this is a real problem, not a one-off.** The thresholds are the
+contract between "atoms are returned" and "atoms feel relevant to the
+agent." Right now that contract assumes much tighter cosine coupling
+than indirect questions actually produce. Lowering the bar globally
+risks flooding agents with weak matches; raising it risks the Mimir
+case (zero recall on relevant atoms). We should empirically pick
+thresholds against a labelled dataset rather than carry the current
+hand-set values.
+
+**Proposed experiment:**
+1. Take LongMemEval's labelled question→evidence-atom pairs as ground
+   truth (each question has known supporting atoms in the corpus).
+2. For each question, compute cosine sim against every atom in its
+   haystack. Bucket sims for (a) gold-evidence atoms and (b) random
+   non-evidence atoms.
+3. Plot the two distributions. Pick `medium` at the crossover where
+   recall@medium covers ≥80% of gold atoms; pick `high` at the cosine
+   value where precision becomes ≥90%; `low` is the noise floor below
+   which essentially nothing is gold.
+4. Sanity-check by re-running the bench with the new defaults and
+   confirming no regression on the headline scores.
+
+Optional follow-up: per-domain calibration. If indirect-question
+domains (chat, social-feed retrieval) consistently sit lower than
+encyclopedic-fact domains, the right answer may be a per-call
+calibration rather than a global default.
+
+**Effort.** 1 day. Step 2 is straightforward (we already have the
+embeddings cached); step 3 is one Jupyter notebook; step 4 is one
+bench run.
+
+**Risk.** Low — this is a tuning exercise, not a code change. Worst
+case the new defaults regress the bench and we revert to the current
+values, having learned something about the sim distribution.
+
+**Score expectation.** Likely flat on LongMemEval (current defaults
+were probably tuned against this benchmark's question style). The
+real win is for downstream agents like Mimir whose probes don't look
+like LongMemEval's.
+
+**Sibling finding (out of scope but record-worthy).** The Mimir debug
+DB also revealed that `atom_relations` and several other migration-
+created tables were missing entirely — `get_db()` only runs
+`SCHEMA_SQL`, and `run_migrations()` is only invoked by `init_db.py`.
+If a caller wires up the DB by hitting `/v1/store` directly (no
+explicit init), consolidation will fail to write evidenced_by edges
+silently. Worth either making `get_db()` run pending migrations on
+first connect, or adding a startup check in `server.py` that bails if
+the schema is below current. Tracking under a separate "harden DB
+init" item, not P33.
+
+---
+
 ### P15 — Evaluate cross-encoder rerank
 
 **What.** Hindsight uses a cross-encoder reranker as their final stage

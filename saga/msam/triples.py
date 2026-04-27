@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS triples (
     state TEXT CHECK(state IN ('active', 'tombstone')) DEFAULT 'active',
     embedding BLOB,
     created_at TEXT NOT NULL,
+    valid_from TEXT,
+    valid_until TEXT,
+    source_atom_id TEXT,
     FOREIGN KEY (atom_id) REFERENCES atoms(id)
 );
 
