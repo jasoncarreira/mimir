@@ -1175,12 +1175,13 @@ def _two_tier_split(
     observations_top_k: int,
     obs_conf_min_sim: float,
     stability_reduction: float,
+    boost_cap_multiplier: float,
     query_emb: list[float] = None,
 ) -> dict:
     """
-    P9: build the two-tier {observations, raws, confidence_tier_*} return.
-    Observations and raws are fused on their own pools upstream — this
-    function only gates, demotes, restores, and truncates.
+    P9: build the two-tier {observations, raws} return. Observations and
+    raws are fused on their own pools upstream — this function only
+    gates, demotes, boosts, and truncates.
 
     Observations are gated by ``observations_top_k`` and by a similarity
     floor (``obs_conf_min_sim``) so weak observations can't pollute the
@@ -1191,13 +1192,17 @@ def _two_tier_split(
     the newer one surfaces first.
 
     For each observation that survives both gates (i.e. is in
-    ``surfaced_obs``), the raw atoms it consolidated from get a flat
-    ``1/stability_reduction`` (= 2× by default) score restoration —
-    exactly undoing the consolidation stability halving. No additive
-    boost, no obs_score-dependent magnitude. Endorsed raws not in the
-    raws candidate pool are pulled in with a cosine-derived base score,
-    then restored alongside the in-pool ones. Top-K cut and per-tier
-    confidence classification (similarity-only) follow.
+    ``surfaced_obs``), the raw atoms it consolidated from get an
+    additive evidence boost: ``base + min(2 × obs_score, boost_cap × base)``
+    where ``2 = 1/stability_reduction``. Endorsed raws not in the raws
+    candidate pool are pulled in with a cosine-derived base score, then
+    boosted with the same formula. The boost lifts weak-but-endorsed
+    raws into top-K (notably preference probes whose answers are short
+    user statements that miss lexically); the cap prevents one
+    observation from flooding the top-K with all its evidence.
+
+    Per-atom ``_confidence_tier`` is set on pulled-in atoms (in-pool
+    atoms get it from ``retrieve()``); callers gate by per-atom tier.
     """
     if _cfg('retrieval', 'enable_supersedes_demotion', True) and obs_combined:
         # Seed _combined_score on each candidate observation so the
@@ -1226,95 +1231,100 @@ def _two_tier_split(
         if len(surfaced_obs) >= observations_top_k:
             break
 
-    # Restoration: when an observation passed both gates (confidence-floor
-    # via obs_conf_min_sim AND the observations_top_k cap), the raw atoms
-    # that consolidated into it are also relevant by transitivity.
-    # Consolidation halved their stability (which propagates into RRF rank
-    # and score); restoration multiplies their _combined_score by
-    # 1/stability_reduction (= 2.0 with default) to undo the penalty.
-    #
-    # No additive boost, no obs_score-dependent magnitude. The observation
-    # surfacing is a binary signal — if it surfaced for this query, the
-    # raw is restored; if not, the raw stays at its halved score.
+    # Evidence boost: surfaced observations lift their backing raws.
+    # Tracked as boost_map[raw_id] = sum(2 * obs_score) over the
+    # observations endorsing this raw. Applied additively with a cap
+    # of (boost_cap_multiplier - 1) × base RRF so a single observation
+    # can't flood the top-K. The 2× factor is 1/stability_reduction —
+    # designed to compensate for the consolidation halving — but
+    # delivered as an additive lift over the raw's own RRF score, not
+    # a multiplicative restoration. (P30v2 tested the multiplicative
+    # form and lost preference -16.7pp because the magnitude was too
+    # conservative for weak-similarity preference raws; the additive
+    # form is the canonical model.)
     raw_score_map = dict(raw_ranked)
     if surfaced_obs and stability_reduction > 0:
-        restoration_factor = 1.0 / stability_reduction
+        multiplier = 1.0 / stability_reduction
 
-        # Single query: union of raws endorsed by any surfaced observation.
-        surfaced_obs_ids = [o["id"] for o in surfaced_obs]
+        # Per-observation rows so each surfaced obs's score contributes
+        # individually to the cumulative boost on its evidence raws.
         edge_conn = get_db()
         try:
-            placeholders = ",".join("?" * len(surfaced_obs_ids))
-            rows = edge_conn.execute(
-                f"SELECT DISTINCT target_id FROM atom_relations "
-                f"WHERE relation_type = 'evidenced_by' "
-                f"AND source_id IN ({placeholders})",
-                tuple(surfaced_obs_ids),
-            ).fetchall()
-            endorsed_raws = {r[0] for r in rows}
+            boost_map: dict[str, float] = {}
+            for obs in surfaced_obs:
+                obs_score = obs.get("_combined_score", 0.0) or 0.0
+                if obs_score <= 0:
+                    continue
+                try:
+                    rows = edge_conn.execute(
+                        "SELECT target_id FROM atom_relations "
+                        "WHERE source_id = ? AND relation_type = 'evidenced_by'",
+                        (obs["id"],),
+                    ).fetchall()
+                except Exception:
+                    rows = []
+                for (target_id,) in rows:
+                    boost_map[target_id] = boost_map.get(target_id, 0.0) + multiplier * obs_score
         finally:
             edge_conn.close()
 
-        # Pull in endorsed raws that didn't make the raws candidate pool.
+        # Apply boost to in-pool raws, capped at (cap_multiplier - 1) × own RRF.
+        for aid, base in list(raw_score_map.items()):
+            if aid in boost_map:
+                cap = max(0.0, base * (boost_cap_multiplier - 1.0))
+                raw_score_map[aid] = base + min(boost_map[aid], cap)
+
+        # Pull in endorsed raws that didn't make the candidate pool.
         # Their base score is derived from cosine similarity to the query
         # (scaled to the smallest positive in-pool RRF magnitude so the
-        # numbers are comparable). Restoration is applied below alongside
-        # in-pool endorsed raws, so the order is: pull in → restore →
-        # top-K cut → confidence gate.
-        missing_endorsed = endorsed_raws - set(raw_score_map.keys())
-        if missing_endorsed:
-            conn = get_db()
-            placeholders = ",".join("?" * len(missing_endorsed))
-            rows = conn.execute(
-                f"SELECT * FROM atoms WHERE id IN ({placeholders}) "
-                f"AND state IN ('active','fading')",
-                tuple(missing_endorsed),
-            ).fetchall()
-            conn.close()
+        # numbers are comparable), then boosted the same way.
+        if boost_map:
+            missing_ids = [aid for aid in boost_map if aid not in raw_score_map]
+            if missing_ids:
+                conn = get_db()
+                placeholders = ",".join("?" * len(missing_ids))
+                rows = conn.execute(
+                    f"SELECT * FROM atoms WHERE id IN ({placeholders}) "
+                    f"AND state IN ('active','fading')",
+                    tuple(missing_ids),
+                ).fetchall()
+                conn.close()
 
-            in_pool_scores = [s for _, s in raw_ranked if s > 0]
-            ref_score = min(in_pool_scores) if in_pool_scores else 0.01
+                in_pool_scores = [s for _, s in raw_ranked if s > 0]
+                ref_score = min(in_pool_scores) if in_pool_scores else 0.01
 
-            # Per-atom tier thresholds (used to populate _confidence_tier
-            # on pulled-in atoms — same thresholds as the per-tier
-            # classifier below).
-            _t_high = _cfg('retrieval', 'confidence_sim_high', 0.45)
-            _t_med = _cfg('retrieval', 'confidence_sim_medium', 0.30)
-            _t_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
+                # Per-atom tier thresholds for pulled-in atoms.
+                _t_high = _cfg('retrieval', 'confidence_sim_high', 0.45)
+                _t_med = _cfg('retrieval', 'confidence_sim_medium', 0.30)
+                _t_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
 
-            for row in rows:
-                atom = dict(row)
-                emb_blob = atom.pop("embedding", None)
-                sim = 0.0
-                if query_emb is not None and emb_blob:
-                    try:
-                        atom_vec = unpack_embedding(emb_blob)
-                        sim = max(0.0, cosine_similarity(query_emb, atom_vec))
-                    except Exception:
-                        sim = 0.0
-                base = ref_score * sim
-                atom["_similarity"] = sim
-                atom["_combined_score"] = base
-                # Set per-atom confidence tier so _format_atom doesn't
-                # report "unknown" on the wire. In-pool atoms get this
-                # set inside retrieve(); pulled-in atoms bypass that path.
-                if sim >= _t_high:
-                    atom["_confidence_tier"] = "high"
-                elif sim >= _t_med:
-                    atom["_confidence_tier"] = "medium"
-                elif sim >= _t_low:
-                    atom["_confidence_tier"] = "low"
-                else:
-                    atom["_confidence_tier"] = "none"
-                raw_combined[atom["id"]] = atom
-                raw_score_map[atom["id"]] = base
-
-        # Apply flat 2× restoration to every endorsed raw (in-pool and
-        # just-pulled-in). No cap, no obs_score factor — the multiplier
-        # exactly undoes consolidation's stability halving.
-        for aid in list(raw_score_map.keys()):
-            if aid in endorsed_raws:
-                raw_score_map[aid] *= restoration_factor
+                for row in rows:
+                    atom = dict(row)
+                    emb_blob = atom.pop("embedding", None)
+                    sim = 0.0
+                    if query_emb is not None and emb_blob:
+                        try:
+                            atom_vec = unpack_embedding(emb_blob)
+                            sim = max(0.0, cosine_similarity(query_emb, atom_vec))
+                        except Exception:
+                            sim = 0.0
+                    base = ref_score * sim
+                    cap = max(0.0, base * (boost_cap_multiplier - 1.0))
+                    final_score = base + min(boost_map[atom["id"]], cap)
+                    atom["_similarity"] = sim
+                    atom["_combined_score"] = final_score
+                    # Per-atom confidence tier (in-pool atoms get this in
+                    # retrieve(); pulled-in atoms don't go through that path).
+                    if sim >= _t_high:
+                        atom["_confidence_tier"] = "high"
+                    elif sim >= _t_med:
+                        atom["_confidence_tier"] = "medium"
+                    elif sim >= _t_low:
+                        atom["_confidence_tier"] = "low"
+                    else:
+                        atom["_confidence_tier"] = "none"
+                    raw_combined[atom["id"]] = atom
+                    raw_score_map[atom["id"]] = final_score
 
     raw_ranked = sorted(raw_score_map.items(), key=lambda x: -x[1])
 
@@ -1508,6 +1518,7 @@ def hybrid_retrieve(
                 observations_top_k=_cfg('retrieval', 'observations_top_k', 5),
                 obs_conf_min_sim=_cfg('retrieval', 'observation_confidence_min_sim', 0.30),
                 stability_reduction=_cfg('consolidation', 'stability_reduction_factor', 0.5),
+                boost_cap_multiplier=_cfg('retrieval', 'evidence_boost_cap_multiplier', 3.0),
                 query_emb=cached_embed_query(query),
             )
 
