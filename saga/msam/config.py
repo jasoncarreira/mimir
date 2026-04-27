@@ -188,15 +188,52 @@ _DEFAULTS = {
     },
     "query_expansion": {
         "synonyms": {
-            "profession": ["job", "career", "work", "occupation"],
-            "show": ["performance", "tour", "concert"],
-            "anime": ["manga", "japanese animation"],
-            "music": ["songs", "playlist", "listening"],
-            "schedule": ["routine", "calendar", "plan", "timetable"],
-            "home": ["hometown", "residence", "where lives", "based"],
-            "family": ["parents", "siblings", "relatives"],
-            "feelings": ["emotions", "mood", "emotional state"],
-            "memory": ["remember", "recall", "memories", "msam"],
+            # Identity / role
+            "profession": ["job", "career", "work", "occupation", "employment"],
+            "job":        ["profession", "career", "work", "occupation"],
+            "company":    ["employer", "office", "workplace", "firm"],
+
+            # People
+            "spouse":     ["partner", "wife", "husband", "married"],
+            "partner":    ["spouse", "wife", "husband", "boyfriend", "girlfriend"],
+            "family":     ["parents", "siblings", "relatives"],
+
+            # Where
+            "location":   ["city", "town", "address", "where"],
+            "home":       ["hometown", "residence", "where lives", "based"],
+
+            # When
+            "birthday":   ["birth", "born", "age"],
+            "schedule":   ["routine", "calendar", "plan", "timetable"],
+
+            # Activity / preference
+            "favorite":   ["preferred", "like", "love", "enjoy"],
+            "prefer":     ["favorite", "like", "favourite"],
+            "purchase":   ["buy", "bought", "ordered"],
+            "buy":        ["purchase", "bought", "ordered"],
+            "own":        ["have", "possess", "got"],
+
+            # Domains
+            "food":       ["meal", "dish", "cuisine", "eat", "eating"],
+            "drink":      ["beverage", "drinking"],
+            "movie":      ["film", "watched", "watching"],
+            "book":       ["novel", "read", "reading"],
+            "music":      ["songs", "playlist", "listening"],
+            "show":       ["performance", "tour", "concert"],
+            "anime":      ["manga", "japanese animation"],
+            "pet":        ["dog", "cat", "animal"],
+            "travel":     ["trip", "vacation", "visit", "journey"],
+            "exercise":   ["workout", "gym", "fitness", "training"],
+
+            # Communication verbs (probe phrasing vs. haystack statements)
+            "told":       ["said", "mentioned", "discussed", "talked"],
+            "discussed":  ["talked", "mentioned", "covered"],
+
+            # Emotion / state
+            "feelings":   ["emotions", "mood", "emotional state"],
+
+            # Meta
+            "memory":     ["remember", "recall", "memories", "msam"],
         },
     },
     "retrieval_v2": {
