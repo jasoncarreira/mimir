@@ -106,6 +106,14 @@ class ConsolidationEngine:
         result["clusters_consolidated"] = len(syntheses)
         result["clusters_skipped_existing"] = self._last_skipped_existing
         result["dry_run"] = False
+        # Intent-named alias for callers that care about "how many
+        # observation atoms did this run actually create?"
+        # (== synthesis_atoms_stored from _restructure_phase under
+        # normal conditions; differs only if a synthesis stored
+        # successfully without the LLM, which is rare.)
+        result["observations_created"] = result.get(
+            "synthesis_atoms_stored", len(syntheses)
+        )
 
         return result
 

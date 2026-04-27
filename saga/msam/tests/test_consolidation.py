@@ -100,6 +100,19 @@ class TestConsolidate:
         assert "clusters_found" in result
         assert "clusters" in result
 
+    def test_observations_created_field(self):
+        """Live (non-dry) runs surface `observations_created` so callers
+        don't have to know about the cluster_consolidated /
+        synthesis_atoms_stored distinction."""
+        from msam.core import get_db, run_migrations, store_atom
+        from msam.consolidation import ConsolidationEngine
+        run_migrations(get_db())
+        # Empty DB - 0 clusters. The field should still exist with value 0.
+        engine = ConsolidationEngine()
+        result = engine.consolidate(dry_run=False)
+        assert "observations_created" in result
+        assert result["observations_created"] == 0
+
     def test_skips_pinned(self):
         from msam.core import get_db, run_migrations
         from msam.consolidation import ConsolidationEngine
