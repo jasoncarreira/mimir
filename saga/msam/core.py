@@ -1306,37 +1306,43 @@ def _two_tier_split(
         atom["_combined_score"] = score
         raws_final.append(atom)
 
-    # Compute confidence tier across the union of observations + raws so
-    # callers (REST, agent harnesses) can gate volume the same way the
-    # single-tier path does. Same thresholds as hybrid_retrieve's
-    # single-tier confidence calc — change one, change both.
+    # Confidence tiers: per-tier (observations vs raws) drives gating, so
+    # weak raws can't ride on the back of strong observations or vice versa.
+    # The top-level confidence_tier is the max-of-the-two as a summary signal
+    # but doesn't drive behavior. Same thresholds as the single-tier calc —
+    # change one, change both.
     _sim_high = _cfg('retrieval', 'confidence_sim_high', 0.45)
     _sim_medium = _cfg('retrieval', 'confidence_sim_medium', 0.30)
     _sim_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
     _score_high = _cfg('retrieval', 'confidence_score_high', 40.0)
     _score_medium = _cfg('retrieval', 'confidence_score_medium', 10.0)
 
-    all_atoms = surfaced_obs + raws_final
-    if not all_atoms:
-        confidence_tier = "none"
-    else:
-        max_sim = max((a.get('_similarity', 0) or 0) for a in all_atoms)
-        top_score = max((a.get('_combined_score', 0) or 0) for a in all_atoms)
+    def _classify(atoms: list[dict]) -> str:
+        if not atoms:
+            return "none"
+        max_sim = max((a.get('_similarity', 0) or 0) for a in atoms)
+        top_score = max((a.get('_combined_score', 0) or 0) for a in atoms)
         has_semantic_signal = max_sim >= 0.20
-
         if max_sim >= _sim_high or (has_semantic_signal and top_score >= _score_high):
-            confidence_tier = "high"
-        elif max_sim >= _sim_medium or (has_semantic_signal and top_score >= _score_medium):
-            confidence_tier = "medium"
-        elif max_sim >= _sim_low:
-            confidence_tier = "low"
-        else:
-            confidence_tier = "none"
+            return "high"
+        if max_sim >= _sim_medium or (has_semantic_signal and top_score >= _score_medium):
+            return "medium"
+        if max_sim >= _sim_low:
+            return "low"
+        return "none"
+
+    obs_tier = _classify(surfaced_obs)
+    raws_tier = _classify(raws_final)
+    # Top-level tier: max of the two. Used as a summary; not used for gating.
+    _tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
+    union_tier = obs_tier if _tier_rank[obs_tier] >= _tier_rank[raws_tier] else raws_tier
 
     return {
         "observations": surfaced_obs,
         "raws": raws_final,
-        "confidence_tier": confidence_tier,
+        "confidence_tier": union_tier,
+        "confidence_tier_observations": obs_tier,
+        "confidence_tier_raws": raws_tier,
     }
 
 

@@ -157,6 +157,8 @@ class TestQuery:
                 }],
                 # 0.7 max sim → "high" tier; gating keeps full output.
                 "confidence_tier": "high",
+                "confidence_tier_observations": "high",
+                "confidence_tier_raws": "high",
             }
 
         monkeypatch.setattr(msam.core, "hybrid_retrieve", fake_hybrid_retrieve)
@@ -180,7 +182,7 @@ class TestQuery:
         assert captured.get("top_k") == 10
 
     def test_query_two_tier_low_confidence_gated(self, client, monkeypatch):
-        """confidence_tier=low gates the response down to 1 raw, no obs."""
+        """Both tiers low → 0 obs, 1 raw."""
         import msam.core
         monkeypatch.setattr(msam.core, "hybrid_retrieve", lambda q, **kw: {
             "observations": [{
@@ -195,13 +197,46 @@ class TestQuery:
                 for i in range(5)
             ],
             "confidence_tier": "low",
+            "confidence_tier_observations": "low",
+            "confidence_tier_raws": "low",
         })
         rv = client.post("/v1/query", json={"query": "x", "two_tier": True})
         assert rv.status_code == 200
         data = rv.json()
         assert data["confidence_tier"] == "low"
+        assert data["confidence_tier_observations"] == "low"
+        assert data["confidence_tier_raws"] == "low"
         assert data["gated"] is True
         assert len(data["observations"]) == 0
+        assert len(data["raws"]) == 1
+
+    def test_query_two_tier_per_tier_gating_protects_against_noise(self, client, monkeypatch):
+        """Strong obs + weak raws: obs keeps full, raws gates aggressively.
+        This is the noise-dilution scenario per-tier gating prevents."""
+        import msam.core
+        monkeypatch.setattr(msam.core, "hybrid_retrieve", lambda q, **kw: {
+            "observations": [{
+                "id": "obs1", "content": "strong observation",
+                "stream": "semantic", "memory_type": "observation",
+                "_similarity": 0.7, "_combined_score": 0.05, "evidence_count": 5,
+            }],
+            "raws": [
+                {"id": f"raw{i}", "content": f"weak raw {i}",
+                 "stream": "semantic", "memory_type": "raw",
+                 "_similarity": 0.18, "_combined_score": 0.02}
+                for i in range(5)
+            ],
+            "confidence_tier": "high",  # union dominated by strong obs
+            "confidence_tier_observations": "high",
+            "confidence_tier_raws": "low",
+        })
+        rv = client.post("/v1/query", json={"query": "x", "two_tier": True})
+        assert rv.status_code == 200
+        data = rv.json()
+        # Obs side stays full thanks to high obs_tier...
+        assert len(data["observations"]) == 1
+        # ...but raws are gated to 1 because raws_tier=low. Pre-fix, the
+        # union "high" tier would have kept multiple raws.
         assert len(data["raws"]) == 1
 
     def test_query_two_tier_none_confidence_suppresses(self, client, monkeypatch):
@@ -216,6 +251,8 @@ class TestQuery:
                       "stream": "semantic", "_similarity": 0.05,
                       "_combined_score": 0.01, "memory_type": "raw"}],
             "confidence_tier": "none",
+            "confidence_tier_observations": "none",
+            "confidence_tier_raws": "none",
         })
         rv = client.post("/v1/query", json={"query": "x", "two_tier": True})
         assert rv.status_code == 200
