@@ -1226,6 +1226,79 @@ def _two_tier_split(
     Per-atom ``_confidence_tier`` is set on pulled-in atoms (in-pool
     atoms get it from ``retrieve()``); callers gate by per-atom tier.
     """
+    # Backfill _similarity + _confidence_tier on atoms that arrived via
+    # the keyword pathway only. keyword_search() returns BM25 hits without
+    # computing cosine, so those atoms have no _similarity. Without this,
+    # the per-atom confidence filter (api_query) sees _confidence_tier
+    # absent, defaults to "none", and drops the atom at any floor ≥ "low"
+    # — even when its real cosine similarity is high.
+    _t_high = _cfg('retrieval', 'confidence_sim_high', 0.45)
+    _t_med = _cfg('retrieval', 'confidence_sim_medium', 0.30)
+    _t_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
+
+    def _classify(sim: float) -> str:
+        if sim >= _t_high:
+            return "high"
+        if sim >= _t_med:
+            return "medium"
+        if sim >= _t_low:
+            return "low"
+        return "none"
+
+    def _backfill_pool(pool: dict) -> None:
+        if not pool:
+            return
+        needs_sim = [aid for aid, atom in pool.items() if atom.get("_similarity") is None]
+        if not needs_sim:
+            # Make sure every atom has a _confidence_tier even if its
+            # similarity was already set elsewhere.
+            for atom in pool.values():
+                if "_confidence_tier" not in atom:
+                    atom["_confidence_tier"] = _classify(atom.get("_similarity", 0.0) or 0.0)
+            return
+        # Re-fetch embeddings only for atoms that need them.
+        if query_emb is not None:
+            conn = get_db()
+            try:
+                placeholders = ",".join("?" * len(needs_sim))
+                rows = conn.execute(
+                    f"SELECT id, embedding FROM atoms WHERE id IN ({placeholders})",
+                    tuple(needs_sim),
+                ).fetchall()
+            finally:
+                conn.close()
+            for row in rows:
+                aid = row[0]
+                emb_blob = row[1]
+                atom = pool.get(aid)
+                if atom is None:
+                    continue
+                sim = 0.0
+                if emb_blob:
+                    try:
+                        atom_vec = unpack_embedding(emb_blob)
+                        sim = max(0.0, cosine_similarity(query_emb, atom_vec))
+                    except Exception:
+                        sim = 0.0
+                atom["_similarity"] = sim
+                atom["_confidence_tier"] = _classify(sim)
+        # Anything still missing (no query_emb, or atom not found in DB)
+        # gets sim=0 / tier=none. Better than a stale "unknown" leaking
+        # to the wire.
+        for aid in needs_sim:
+            atom = pool.get(aid)
+            if atom is not None and atom.get("_similarity") is None:
+                atom["_similarity"] = 0.0
+                atom["_confidence_tier"] = "none"
+        # Final pass: any atom with similarity but no tier (rare but
+        # possible if mode-specific paths set sim without classifying).
+        for atom in pool.values():
+            if "_confidence_tier" not in atom:
+                atom["_confidence_tier"] = _classify(atom.get("_similarity", 0.0) or 0.0)
+
+    _backfill_pool(obs_combined)
+    _backfill_pool(raw_combined)
+
     if _cfg('retrieval', 'enable_supersedes_demotion', True) and obs_combined:
         # Seed _combined_score on each candidate observation so the
         # demotion has a value to multiply, then re-rank from the
