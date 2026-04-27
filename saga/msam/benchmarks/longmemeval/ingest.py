@@ -81,11 +81,16 @@ def ingest_question(question: dict, batch_size: int = 256) -> dict:
     ingested = 0
     skipped = 0
     stored_ids: list[tuple[str, str]] = []  # (atom_id, session_date_iso)
+    # P32: collect semantic atoms for batch triple extraction. Only the
+    # semantic stream gets triples (matching /v1/store behavior). Episodic
+    # atoms are user turns; their triples would be too noisy.
+    semantic_for_triples: list[tuple[str, str]] = []  # (atom_id, content)
 
     for turn, emb in zip(turns, embeddings):
+        stream = "episodic" if turn["role"] == "user" else "semantic"
         result = store_atom(
             content=turn["text_for_atom"],
-            stream="episodic" if turn["role"] == "user" else "semantic",
+            stream=stream,
             profile="standard",
             arousal=0.5,
             valence=0.0,
@@ -105,6 +110,8 @@ def ingest_question(question: dict, batch_size: int = 256) -> dict:
         if isinstance(result, str):
             ingested += 1
             stored_ids.append((result, turn["session_date_iso"]))
+            if stream == "semantic":
+                semantic_for_triples.append((result, turn["text_for_atom"]))
         else:
             skipped += 1
 
@@ -152,9 +159,22 @@ def ingest_question(question: dict, batch_size: int = 256) -> dict:
                 )
             conn.commit()
 
+    # P32: batch-extract triples for the semantic atoms now that they're
+    # all stored. Gated by [triples] enable_extraction. Uses P7's batched
+    # LLM call so the per-question cost is ~ceil(n_semantic/20) calls
+    # instead of n_semantic.
+    triples_extracted = 0
+    if _gc()('triples', 'enable_extraction', False) and semantic_for_triples:
+        try:
+            from msam.triples import batch_extract_and_store
+            triples_extracted = batch_extract_and_store(semantic_for_triples)
+        except Exception:
+            triples_extracted = 0
+
     return {
         "ingested": ingested,
         "skipped": skipped,
         "total_turns": len(turns),
         "session_boundaries": boundary_stored,
+        "triples_extracted": triples_extracted,
     }

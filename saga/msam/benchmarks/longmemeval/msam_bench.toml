@@ -34,6 +34,9 @@ two_tier_enabled = true
 observations_top_k = 5
 observation_confidence_min_sim = 0.30
 evidence_boost_cap_multiplier = 3.0
+# P32: enable the graph pathway so RRF fuses sem + kw + graph.
+# Requires triples to be populated; bench's batch_extract_and_store does that.
+enable_graph_pathway = true
 # Single-tier bonus is redundant in two_tier mode; leave off to avoid double-handling.
 enable_observation_bonus = false
 similarity_threshold = 0.15
@@ -56,13 +59,21 @@ outcome_decay = 1.0
 
 [retrieval_v2]
 enabled = false
-# Cherry-picks (P11/P12/P13). Each gated independently; defaults False
-# in prod; bench enables all three to measure combined lift. The
-# synonym dict for P12 lives in config._DEFAULTS["query_expansion"]
-# so every caller with the flag on gets the same behavior.
-enable_query_rewriting = true   # P11: pattern-based query normalization
-enable_query_expansion = true   # P12: synonym expansion (keyword pathway only)
-enable_quality_filter  = true   # P13: atom info-density multiplier
+# Cherry-picks (P11/P12/P13) regressed -2.8pp in msam_cherrypicks_minimax_v1
+# (logged 2026-04-27). Disabled while we decide whether to ablate or skip.
+enable_query_rewriting = false
+enable_query_expansion = false
+enable_quality_filter  = false
+
+[llm]
+# Unified LLM endpoint for every MSAM subsystem (consolidation synthesis,
+# annotation, triple extraction, rerank, subatom synthesis). Bench routes
+# through OpenRouter to test gpt-oss-120b end-to-end (paid tier — free
+# tier daily caps would kill a 500q run).
+url             = "https://openrouter.ai/api/v1/chat/completions"
+model           = "openai/gpt-oss-120b"
+api_key_env     = "OPENROUTER_API_KEY"
+timeout_seconds = 60
 
 [compression]
 enable_subatom = false
@@ -70,8 +81,10 @@ enable_fact_dedup = false
 enable_synthesis = false
 
 [triples]
-# Skip LLM-based triple extraction for baseline runs.
-enable_extraction = false
+# P32: turn on triple extraction for the bench. Bench ingest.py runs
+# batch_extract_and_store (P7) once per question after atoms land —
+# ~ceil(n_semantic/20) LLM calls per question instead of n_semantic.
+enable_extraction = true
 
 [annotation]
 # Use heuristic-only annotation (fast, deterministic, free).

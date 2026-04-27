@@ -410,3 +410,178 @@ class TestExtractTriplesLlm:
         result = extract_triples_llm("Jaden lives in Oakland", atom_id="test1")
         assert len(result) >= 1
         assert result[0]["subject"] == "Jaden"
+
+
+class TestBatchExtractTriples:
+    """P7 batch extraction — single LLM call returns triples for many atoms."""
+
+    def test_no_api_key_returns_empty_per_atom(self, monkeypatch):
+        monkeypatch.delenv("NVIDIA_NIM_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+        from msam.triples import batch_extract_triples_llm
+        items = [("a1", "User likes sushi"), ("a2", "Movie 9/10")]
+        result = batch_extract_triples_llm(items)
+        assert result == {"a1": [], "a2": []}
+
+    def test_empty_items_returns_empty(self, monkeypatch):
+        from msam.triples import batch_extract_triples_llm
+        assert batch_extract_triples_llm([]) == {}
+
+    def test_parses_per_atom_blocks(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+        import requests
+
+        # Three atoms; LLM returns mixed (triples / SKIP / triples).
+        response_text = (
+            "[ATOM_1]\n"
+            "(User, likes_food, sushi)\n"
+            "(User, lives_in, Boston)\n"
+            "\n"
+            "[ATOM_2]\n"
+            "SKIP\n"
+            "\n"
+            "[ATOM_3]\n"
+            "(Code_Geass, has_rating, 9/10)\n"
+        )
+
+        class MockResponse:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {"content": response_text}}]}
+
+        monkeypatch.setattr(requests, "post", lambda *a, **kw: MockResponse())
+
+        from msam.triples import batch_extract_triples_llm
+        items = [
+            ("aid_1", "User likes sushi and lives in Boston"),
+            ("aid_2", "User feels reflective today"),
+            ("aid_3", "Code Geass R2 9/10"),
+        ]
+        result = batch_extract_triples_llm(items)
+        assert set(result.keys()) == {"aid_1", "aid_2", "aid_3"}
+        assert len(result["aid_1"]) == 2
+        # Map atom_id back through to the parsed triples
+        assert all(t["atom_id"] == "aid_1" for t in result["aid_1"])
+        assert {t["predicate"] for t in result["aid_1"]} == {"likes_food", "lives_in"}
+        assert result["aid_2"] == []  # SKIP
+        assert len(result["aid_3"]) == 1
+        assert result["aid_3"][0]["subject"] == "Code_Geass"
+
+    def test_batch_size_chunks(self, monkeypatch):
+        """With batch_size=2 over 3 items, the function should make 2
+        LLM calls and merge results."""
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+        import requests
+
+        # Each call returns one triple per atom in the batch.
+        call_count = {"n": 0}
+        def mock_post(*args, **kwargs):
+            call_count["n"] += 1
+            n = call_count["n"]
+            # First call: 2 atoms; second call: 1 atom.
+            if n == 1:
+                content = "[ATOM_1]\n(User, has_x, AAA)\n\n[ATOM_2]\n(User, has_x, BBB)"
+            else:
+                content = "[ATOM_1]\n(User, has_x, CCC)"
+
+            class R:
+                status_code = 200
+                def raise_for_status(self): pass
+                def json(self):
+                    return {"choices": [{"message": {"content": content}}]}
+            return R()
+
+        monkeypatch.setattr(requests, "post", mock_post)
+        from msam.triples import batch_extract_triples_llm
+        items = [("a1", "1"), ("a2", "2"), ("a3", "3")]
+        result = batch_extract_triples_llm(items, batch_size=2)
+        assert call_count["n"] == 2
+        assert len(result["a1"]) == 1
+        assert len(result["a2"]) == 1
+        assert len(result["a3"]) == 1
+        assert result["a3"][0]["object"] == "CCC"
+
+    def test_batch_failure_returns_empty_for_that_batch(self, monkeypatch):
+        """If a batch's LLM call raises, atoms in that batch get empty
+        triple lists but other batches still succeed."""
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+        import requests
+
+        call_count = {"n": 0}
+        def mock_post(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise requests.exceptions.ConnectionError("simulated")
+
+            class R:
+                status_code = 200
+                def raise_for_status(self): pass
+                def json(self):
+                    return {"choices": [{"message": {"content": "[ATOM_1]\n(User, has_x, okk)"}}]}
+            return R()
+
+        monkeypatch.setattr(requests, "post", mock_post)
+        from msam.triples import batch_extract_triples_llm
+        items = [("a1", "1"), ("a2", "2"), ("a3", "3"), ("a4", "4")]
+        result = batch_extract_triples_llm(items, batch_size=2)
+        # First batch failed: a1, a2 get empty.
+        assert result["a1"] == []
+        assert result["a2"] == []
+        # Second batch succeeded: a3 has the triple, a4 has nothing
+        # (mock only emitted ATOM_1).
+        assert len(result["a3"]) == 1
+
+    def test_falls_back_to_reasoning_field(self, monkeypatch):
+        """Reasoning models put output in message.reasoning when content is None."""
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+        import requests
+
+        class MockResponse:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {
+                    "content": None,
+                    "reasoning": "[ATOM_1]\n(User, lives_in, Boston)",
+                }}]}
+
+        monkeypatch.setattr(requests, "post", lambda *a, **kw: MockResponse())
+        from msam.triples import batch_extract_triples_llm
+        result = batch_extract_triples_llm([("aid", "User lives in Boston")])
+        assert len(result["aid"]) == 1
+        assert result["aid"][0]["object"] == "Boston"
+
+
+class TestBatchExtractAndStore:
+    def test_stores_via_existing_path(self, monkeypatch):
+        """batch_extract_and_store should write triples through
+        store_triples_batch and return the count."""
+        _setup_db()
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+        import requests
+
+        class MockResponse:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {"content":
+                    "[ATOM_1]\n(User, lives_in, Boston)\n\n"
+                    "[ATOM_2]\n(User, likes_food, sushi)"
+                }}]}
+
+        monkeypatch.setattr(requests, "post", lambda *a, **kw: MockResponse())
+        from msam.triples import batch_extract_and_store
+        # Need real atoms in the DB for the FK constraint on triples.atom_id
+        from msam.core import store_atom
+        a1 = store_atom("user lives in boston")
+        a2 = store_atom("user likes sushi")
+        count = batch_extract_and_store([(a1, "User lives in Boston"), (a2, "User likes sushi")])
+        assert count == 2

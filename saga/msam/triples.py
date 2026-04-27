@@ -336,6 +336,173 @@ def extract_and_store(atom_id: str, content: str) -> int:
     return count
 
 
+# ─── P7: Batch triple extraction ─────────────────────────────────
+
+BATCH_EXTRACTION_PROMPT = """Extract factual triples (subject, predicate, object) from each atom below.
+
+Same rules as single-atom extraction:
+- Subject must be a NAMED ENTITY (person, system, tool, show, place), max 30 chars
+- Object must be a SHORT SPECIFIC VALUE, max 30 chars
+- Predicate must be lowercase_snake_case
+- Lists become multiple triples (one per item)
+- If an atom has no concrete facts, output [ATOM_N] then SKIP on its own line
+- Implicit subjects: if about user's preferences, subject = "User"
+
+Output format: one block per atom, prefixed with [ATOM_N] header (matching
+the input number). Do not omit any atoms. Triples or SKIP only — no
+commentary. Example output for 3 atoms:
+
+[ATOM_1]
+(User, wake_time, 8:00-9:00_AM)
+
+[ATOM_2]
+SKIP
+
+[ATOM_3]
+(Code_Geass_R2, has_rating, 9/10)
+(User, likes_genre, war_films)
+
+Atoms:
+{atoms_block}"""
+
+
+def _format_atoms_for_batch(items: list[tuple[str, str]]) -> str:
+    """Render (atom_id, content) pairs into the prompt block. Atom ids
+    aren't sent — we use ordinal `[ATOM_N]` headers and map back."""
+    lines: list[str] = []
+    for i, (_aid, content) in enumerate(items, start=1):
+        lines.append(f"[ATOM_{i}]")
+        lines.append(content)
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _parse_batch_response(text: str, items: list[tuple[str, str]]) -> dict[str, list[dict]]:
+    """Parse `[ATOM_N] ...` blocks into per-atom_id triple lists."""
+    out: dict[str, list[dict]] = {aid: [] for aid, _ in items}
+
+    # Split on `[ATOM_N]` headers, capturing N. Tolerant of leading
+    # whitespace and either `ATOM_1` or `ATOM 1`.
+    header = re.compile(r'\[ATOM[_ ](\d+)\]', re.IGNORECASE)
+    parts = header.split(text)
+    # parts = [pre, n1, body1, n2, body2, ...]
+    if len(parts) < 3:
+        return out
+
+    for i in range(1, len(parts), 2):
+        try:
+            idx = int(parts[i])
+        except ValueError:
+            continue
+        body = parts[i + 1] if i + 1 < len(parts) else ""
+        if 1 <= idx <= len(items):
+            atom_id = items[idx - 1][0]
+            if "SKIP" in body.upper() and len(body.strip()) < 30:
+                continue
+            out[atom_id] = _parse_triples(body, atom_id)
+    return out
+
+
+def batch_extract_triples_llm(
+    items: list[tuple[str, str]],
+    batch_size: int = 20,
+) -> dict[str, list[dict]]:
+    """Extract triples for many atoms in one LLM call per batch.
+
+    Args:
+        items: list of (atom_id, content) tuples.
+        batch_size: atoms per LLM call. Larger reduces calls; smaller
+            avoids max_tokens truncation. 20 is a reasonable default
+            for ~200-char atoms with ~5 triples each.
+
+    Returns:
+        Dict mapping every input atom_id to its triple list (empty if
+        SKIP, error, or genuinely no triples).
+    """
+    import requests
+    from .config import resolve_llm_config
+
+    out: dict[str, list[dict]] = {aid: [] for aid, _ in items}
+    if not items:
+        return out
+
+    llm = resolve_llm_config('triples')
+    if not llm['api_key']:
+        return out
+
+    for start in range(0, len(items), batch_size):
+        batch = items[start : start + batch_size]
+        atoms_block = _format_atoms_for_batch(batch)
+        prompt = BATCH_EXTRACTION_PROMPT.format(atoms_block=atoms_block)
+
+        try:
+            r = requests.post(
+                llm['url'],
+                headers={
+                    "Authorization": f"Bearer {llm['api_key']}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": llm['model'],
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    # Generous budget: ~10 lines per atom * 20 atoms = 200
+                    # lines plus headers. Reasoning models burn tokens on
+                    # CoT before emitting content, so we err high.
+                    "max_tokens": 4000,
+                },
+                timeout=llm['timeout'],
+            )
+            r.raise_for_status()
+            msg = r.json()["choices"][0]["message"]
+            response_text = (msg.get("content") or msg.get("reasoning") or "").strip()
+        except Exception:
+            # On batch failure, leave all atoms with empty triples and
+            # continue. One bad batch shouldn't kill the run.
+            continue
+
+        parsed = _parse_batch_response(response_text, batch)
+        out.update(parsed)
+
+    return out
+
+
+def batch_extract_and_store(
+    items: list[tuple[str, str]],
+    batch_size: int = 20,
+) -> int:
+    """Extract triples for many atoms and store the results in one bulk
+    write. Returns total triples stored.
+
+    Logs per-atom extraction metrics so the existing observability path
+    keeps working — but the LLM cost is amortized across the batch."""
+    if not items:
+        return 0
+    start = time.time()
+    by_atom = batch_extract_triples_llm(items, batch_size=batch_size)
+    elapsed_ms = (time.time() - start) * 1000
+
+    all_triples: list[dict] = []
+    for aid, triples in by_atom.items():
+        all_triples.extend(triples)
+
+    stored = store_triples_batch(all_triples) if all_triples else 0
+
+    # Per-atom metrics: divide elapsed across the batch so individual
+    # rows show the amortized cost rather than a single row owning it.
+    n = max(len(items), 1)
+    per_atom_ms = elapsed_ms / n
+    for aid, triples in by_atom.items():
+        if not triples:
+            _log_extraction_metric(aid, 0, 0, per_atom_ms, skipped=True)
+        else:
+            # store count is best-effort (whole-batch insert reports a
+            # single number); attribute proportionally for the metric.
+            _log_extraction_metric(aid, len(triples), len(triples), per_atom_ms)
+
+    return stored
+
+
 # ─── Retrieval ────────────────────────────────────────────────────
 
 def retrieve_triples(query: str, top_k: int = 20) -> list[dict]:
