@@ -112,6 +112,12 @@ class QueryRequest(BaseModel):
     # ISO 8601 datetime; only used when two_tier=True to parameterize the
     # temporal pathway. Single-tier path ignores this.
     reference_date: Optional[str] = None
+    # Per-atom confidence floor (two-tier path only). Atoms whose own
+    # _confidence_tier is below this value are dropped before top_k.
+    # Allowed: "none" (no filter), "low", "medium", "high". When None,
+    # falls back to [retrieval] default_min_confidence_tier (default "low",
+    # which drops only "none"-tier atoms).
+    min_confidence_tier: Optional[str] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -337,49 +343,40 @@ async def api_query(req: QueryRequest):
             )
             obs = result.get("observations", []) or []
             raws = result.get("raws", []) or []
-            confidence_tier = result.get("confidence_tier", "none")
-            obs_tier = result.get("confidence_tier_observations", "none")
-            raws_tier = result.get("confidence_tier_raws", "none")
 
-            # Per-tier confidence gating. Each tier is gated by its own
-            # confidence value, so weak raws don't get a free pass when
-            # observations are strong (and vice versa). Disable via
-            # [retrieval] enable_confidence_gating = false.
+            # Per-atom confidence filtering. Each atom carries its own
+            # _confidence_tier (set in retrieve() for in-pool atoms; in
+            # _two_tier_split for pulled-in missing atoms). Atoms whose
+            # tier ranks below the floor are dropped before the response
+            # is returned.
             gated_reason = None
             if _cfg('retrieval', 'enable_confidence_gating', True):
-                _sim_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
-                # Observations gating
-                if obs_tier == "none":
-                    obs = []
-                elif obs_tier == "low":
-                    obs = []
-                elif obs_tier == "medium":
-                    obs = obs[:1]
-                # high: keep full (already capped by observations_top_k)
+                floor = req.min_confidence_tier or _cfg(
+                    'retrieval', 'default_min_confidence_tier', 'low'
+                )
+                _tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
+                floor_rank = _tier_rank.get(floor, 1)  # default to "low"
 
-                # Raws gating
-                if raws_tier == "none":
-                    raws = []
-                elif raws_tier == "low":
-                    raws = raws[:1]
-                elif raws_tier == "medium":
-                    raws = [r for r in raws if (r.get("_similarity", 0) or 0) > _sim_low][:3] or raws[:2]
-                elif raws_tier == "high":
-                    good_raws = [r for r in raws if (r.get("_similarity", 0) or 0) > 0.10]
-                    if good_raws:
-                        raws = good_raws
+                def _passes(a: dict) -> bool:
+                    t = a.get("_confidence_tier", "none")
+                    return _tier_rank.get(t, 0) >= floor_rank
 
-                # Compose a human-readable reason describing what each tier did.
-                gated_parts = [f"obs:{obs_tier}", f"raws:{raws_tier}"]
-                gated_reason = " / ".join(gated_parts)
+                obs_before = len(obs)
+                raws_before = len(raws)
+                obs = [o for o in obs if _passes(o)]
+                raws = [r for r in raws if _passes(r)]
+                obs_dropped = obs_before - len(obs)
+                raws_dropped = raws_before - len(raws)
+                if obs_dropped or raws_dropped:
+                    gated_reason = (
+                        f"floor={floor}: dropped {obs_dropped} obs and "
+                        f"{raws_dropped} raws below threshold"
+                    )
 
             return {
                 "query": req.query,
                 "mode": req.mode,
                 "two_tier": True,
-                "confidence_tier": confidence_tier,
-                "confidence_tier_observations": obs_tier,
-                "confidence_tier_raws": raws_tier,
                 "gated": gated_reason is not None,
                 "gated_reason": gated_reason,
                 "observations": [_format_atom(o) for o in obs],

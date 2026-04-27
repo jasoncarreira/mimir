@@ -1326,39 +1326,14 @@ def _two_tier_split(
         atom["_combined_score"] = score
         raws_final.append(atom)
 
-    # Per-tier confidence classification, similarity-only. Two-tier runs
-    # under RRF fusion; the legacy [retrieval] confidence_score_* thresholds
-    # were calibrated for the weighted_sum activation scale (atomic scores
-    # in the 1-100+ range) and never trigger in RRF mode where scores are
-    # ~0.05. Single-tier under weighted_sum still uses them; here we don't.
-    _sim_high = _cfg('retrieval', 'confidence_sim_high', 0.45)
-    _sim_medium = _cfg('retrieval', 'confidence_sim_medium', 0.30)
-    _sim_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
-
-    def _classify(atoms: list[dict]) -> str:
-        if not atoms:
-            return "none"
-        max_sim = max((a.get('_similarity', 0) or 0) for a in atoms)
-        if max_sim >= _sim_high:
-            return "high"
-        if max_sim >= _sim_medium:
-            return "medium"
-        if max_sim >= _sim_low:
-            return "low"
-        return "none"
-
-    obs_tier = _classify(surfaced_obs)
-    raws_tier = _classify(raws_final)
-    # Top-level tier: max of the two. Used as a summary; not used for gating.
-    _tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
-    union_tier = obs_tier if _tier_rank[obs_tier] >= _tier_rank[raws_tier] else raws_tier
-
+    # Per-atom confidence_tier is already set on every surfacing path
+    # (retrieve() for in-pool atoms; the pull-in branch for missing
+    # endorsed atoms above). Callers that want to gate by confidence
+    # filter on each atom's own _confidence_tier — there's no
+    # bucket-level tier here.
     return {
         "observations": surfaced_obs,
         "raws": raws_final,
-        "confidence_tier": union_tier,
-        "confidence_tier_observations": obs_tier,
-        "confidence_tier_raws": raws_tier,
     }
 
 
