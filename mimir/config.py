@@ -114,7 +114,7 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        home = Path(_env("MIMIR_HOME", "/home")).resolve()
+        home = Path(_env("MIMIR_HOME") or Path.cwd()).resolve()
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
         max_events_raw = _env("MIMIR_MAX_EVENTS")

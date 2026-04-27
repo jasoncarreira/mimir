@@ -27,7 +27,7 @@ dev = [
 ]
 
 [project.scripts]
-mimir = "mimir.server:main"
+mimir = "mimir.cli:main"
 
 [build-system]
 requires = ["hatchling"]
