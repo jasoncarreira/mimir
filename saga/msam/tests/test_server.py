@@ -155,6 +155,8 @@ class TestQuery:
                     "stream": "semantic", "memory_type": "raw",
                     "_similarity": 0.6, "_combined_score": 0.04,
                 }],
+                # 0.7 max sim → "high" tier; gating keeps full output.
+                "confidence_tier": "high",
             }
 
         monkeypatch.setattr(msam.core, "hybrid_retrieve", fake_hybrid_retrieve)
@@ -165,6 +167,7 @@ class TestQuery:
         assert rv.status_code == 200
         data = rv.json()
         assert data["two_tier"] is True
+        assert data["confidence_tier"] == "high"
         assert "observations" in data and len(data["observations"]) == 1
         assert "raws" in data and len(data["raws"]) == 1
         assert data["observations"][0]["memory_type"] == "observation"
@@ -175,6 +178,52 @@ class TestQuery:
         # Verify hybrid_retrieve was actually called with two_tier=True
         assert captured.get("two_tier") is True
         assert captured.get("top_k") == 10
+
+    def test_query_two_tier_low_confidence_gated(self, client, monkeypatch):
+        """confidence_tier=low gates the response down to 1 raw, no obs."""
+        import msam.core
+        monkeypatch.setattr(msam.core, "hybrid_retrieve", lambda q, **kw: {
+            "observations": [{
+                "id": "obs1", "content": "weak observation",
+                "stream": "semantic", "memory_type": "observation",
+                "_similarity": 0.18, "_combined_score": 0.02, "evidence_count": 2,
+            }],
+            "raws": [
+                {"id": f"raw{i}", "content": f"weak content {i}",
+                 "stream": "semantic", "memory_type": "raw",
+                 "_similarity": 0.18, "_combined_score": 0.02}
+                for i in range(5)
+            ],
+            "confidence_tier": "low",
+        })
+        rv = client.post("/v1/query", json={"query": "x", "two_tier": True})
+        assert rv.status_code == 200
+        data = rv.json()
+        assert data["confidence_tier"] == "low"
+        assert data["gated"] is True
+        assert len(data["observations"]) == 0
+        assert len(data["raws"]) == 1
+
+    def test_query_two_tier_none_confidence_suppresses(self, client, monkeypatch):
+        """confidence_tier=none returns empty results."""
+        import msam.core
+        monkeypatch.setattr(msam.core, "hybrid_retrieve", lambda q, **kw: {
+            "observations": [{"id": "obs1", "content": "irrelevant",
+                              "stream": "semantic", "_similarity": 0.05,
+                              "_combined_score": 0.01, "memory_type": "observation",
+                              "evidence_count": 1}],
+            "raws": [{"id": "raw1", "content": "irrelevant",
+                      "stream": "semantic", "_similarity": 0.05,
+                      "_combined_score": 0.01, "memory_type": "raw"}],
+            "confidence_tier": "none",
+        })
+        rv = client.post("/v1/query", json={"query": "x", "two_tier": True})
+        assert rv.status_code == 200
+        data = rv.json()
+        assert data["confidence_tier"] == "none"
+        assert data["observations"] == []
+        assert data["raws"] == []
+        assert data["items_returned"] == 0
 
     def test_query_two_tier_via_config_default(self, client, monkeypatch):
         """When request omits two_tier and config sets two_tier_enabled=true,

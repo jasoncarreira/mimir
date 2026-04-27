@@ -337,10 +337,40 @@ async def api_query(req: QueryRequest):
             )
             obs = result.get("observations", []) or []
             raws = result.get("raws", []) or []
+            confidence_tier = result.get("confidence_tier", "none")
+
+            # Confidence-gated output volume (matches single-tier semantics).
+            # Disable via [retrieval] enable_confidence_gating = false to get
+            # raw retrieval output (the LongMemEval bench skips gating; agent
+            # callers usually want it).
+            gated_reason = None
+            if _cfg('retrieval', 'enable_confidence_gating', True):
+                if confidence_tier == "none":
+                    obs = []
+                    raws = []
+                    gated_reason = "no data -- output suppressed"
+                elif confidence_tier == "low":
+                    obs = []
+                    raws = raws[:1]
+                    gated_reason = "low confidence -- output minimized (1 raw, no observations)"
+                elif confidence_tier == "medium":
+                    _sim_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
+                    raws = [r for r in raws if (r.get("_similarity", 0) or 0) > _sim_low][:3] or raws[:2]
+                    obs = obs[:1]
+                    gated_reason = "medium confidence -- pruned zero-sim raws, capped at 3 raws + 1 observation"
+                elif confidence_tier == "high":
+                    good_raws = [r for r in raws if (r.get("_similarity", 0) or 0) > 0.10]
+                    if good_raws:
+                        raws = good_raws
+                    gated_reason = "high confidence -- pruned zero-sim raws, full output"
+
             return {
                 "query": req.query,
                 "mode": req.mode,
                 "two_tier": True,
+                "confidence_tier": confidence_tier,
+                "gated": gated_reason is not None,
+                "gated_reason": gated_reason,
                 "observations": [_format_atom(o) for o in obs],
                 "raws": [_format_atom(r) for r in raws],
                 "triples": [],

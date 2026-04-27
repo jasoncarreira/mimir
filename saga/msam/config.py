@@ -68,6 +68,12 @@ _DEFAULTS = {
         # multiplicative score penalty in hybrid_retrieve.
         "enable_supersedes_demotion": True,
         "supersedes_score_multiplier": 0.4,
+        # Confidence-tier gating on the REST two-tier /v1/query path. When
+        # enabled (the default) the response is volume-gated by confidence
+        # tier, matching single-tier behavior. In-process callers
+        # (benchmarks) get the full result regardless — gating happens in
+        # api_query, not _two_tier_split.
+        "enable_confidence_gating": True,
         "similarity_threshold": 0.2,
         "sigmoid_midpoint": 0.35,
         "sigmoid_steepness": 15.0,
