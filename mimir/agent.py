@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     HookMatcher,
+    ResultMessage,
     TaskNotificationMessage,
     TaskStartedMessage,
     query,
@@ -387,6 +388,15 @@ class Agent:
         events_list, output = extract_turn_events(messages)
         duration_ms = int((time.monotonic() - ctx.started_at) * 1000)
 
+        # 7a. ResultMessage capture (Phase 8 — resume detection + cost).
+        #     The SDK emits one ResultMessage per turn at end-of-stream. We
+        #     keep the last one in case retries land more than one. None
+        #     when query() crashed before emitting any.
+        result_msg: ResultMessage | None = None
+        for msg in messages:
+            if isinstance(msg, ResultMessage):
+                result_msg = msg
+
         # 7b. Subagent notification side-channel (SPEC §4.4). The SDK yields
         #     ``TaskStartedMessage`` / ``TaskNotificationMessage`` on the parent
         #     stream — we collect descriptions when the task starts so we can
@@ -448,6 +458,13 @@ class Agent:
             output=output,
             duration_ms=duration_ms,
             error=error,
+            result_subtype=getattr(result_msg, "subtype", None),
+            result_is_error=getattr(result_msg, "is_error", None),
+            stop_reason=getattr(result_msg, "stop_reason", None),
+            num_turns=getattr(result_msg, "num_turns", None),
+            total_cost_usd=getattr(result_msg, "total_cost_usd", None),
+            usage=getattr(result_msg, "usage", None),
+            permission_denials=list(getattr(result_msg, "permission_denials", []) or []),
         )
         await self._turn_logger.write(record)
 
@@ -457,6 +474,9 @@ class Agent:
             channel_id=ctx.channel_id,
             duration_ms=duration_ms,
             error=error,
+            result_subtype=getattr(result_msg, "subtype", None),
+            result_is_error=getattr(result_msg, "is_error", None),
+            total_cost_usd=getattr(result_msg, "total_cost_usd", None),
             event_count=len(events_list),
             output_chars=len(output),
             msam_atoms_total=len(record.msam_atom_ids),

@@ -46,6 +46,13 @@ _MAX_QUERY_TOKENS = 64
 # truncation it would still blow up MSAM (e.g. one giant URL).
 _MAX_QUERY_CHARS = 1500
 
+# Retry policy for transient MSAM failures (5xx, ClientError, TimeoutError).
+# 4xx is permanent and never retried. Total wait: 0.2 + 0.4 + 0.8 = 1.4s
+# across 4 attempts, which covers a typical sidecar restart without hanging
+# the agent. Past that, surface the error and let the caller log+continue.
+_MAX_RETRIES = 3
+_RETRY_DELAYS_S = (0.2, 0.4, 0.8)
+
 
 class MsamError(RuntimeError):
     def __init__(self, message: str, status: int | None = None, body: str | None = None) -> None:
@@ -95,20 +102,61 @@ class MsamClient:
             return False
 
     async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        """POST with exponential-backoff retry on transient failures.
+
+        Retries: ``aiohttp.ClientError``, ``asyncio.TimeoutError``, and 5xx
+        responses are retried up to ``_MAX_RETRIES`` times with delays
+        ``[0.2s, 0.4s, 0.8s]``. 4xx responses are permanent — no retry.
+
+        The MSAM sidecar restarts in <1s; the backoff window covers a typical
+        restart without making the agent wait too long. Past 1.4s of total
+        backoff, the failure is surfaced and the caller decides what to do.
+        """
         sess = await self._ensure_session()
         url = f"{self._endpoint}{path}"
-        async with sess.post(url, json=body) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                raise MsamError(
-                    f"MSAM {path} returned {resp.status}",
-                    status=resp.status,
-                    body=text,
-                )
+        last_exc: Exception | None = None
+        last_status: int | None = None
+        last_body: str | None = None
+        for attempt in range(_MAX_RETRIES + 1):
             try:
-                return await _parse_json(text)
-            except ValueError as exc:
-                raise MsamError(f"MSAM {path} returned non-JSON body: {exc}") from exc
+                async with sess.post(url, json=body) as resp:
+                    text = await resp.text()
+                    if resp.status >= 500:
+                        last_status = resp.status
+                        last_body = text
+                        if attempt < _MAX_RETRIES:
+                            await asyncio.sleep(_RETRY_DELAYS_S[attempt])
+                            continue
+                        raise MsamError(
+                            f"MSAM {path} returned {resp.status} after {attempt + 1} attempts",
+                            status=resp.status,
+                            body=text,
+                        )
+                    if resp.status >= 400:
+                        # 4xx is permanent — bad request, auth failure, etc.
+                        raise MsamError(
+                            f"MSAM {path} returned {resp.status}",
+                            status=resp.status,
+                            body=text,
+                        )
+                    try:
+                        return await _parse_json(text)
+                    except ValueError as exc:
+                        raise MsamError(f"MSAM {path} returned non-JSON body: {exc}") from exc
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_exc = exc
+                if attempt < _MAX_RETRIES:
+                    await asyncio.sleep(_RETRY_DELAYS_S[attempt])
+                    continue
+                raise MsamError(
+                    f"MSAM {path} failed after {attempt + 1} attempts: {type(exc).__name__}: {exc}"
+                ) from exc
+        # Unreachable — the loop either returns or raises every iteration.
+        raise MsamError(
+            f"MSAM {path} retry loop exhausted",
+            status=last_status,
+            body=last_body,
+        )
 
     # ---- public API -----------------------------------------------------
 

@@ -77,6 +77,16 @@ class TurnRecord:
     output: str = ""
     duration_ms: int = 0
     error: str | None = None
+    # SDK ResultMessage capture (Phase 8 — resume detection + cost). Populated
+    # from the final ``ResultMessage`` the SDK emits per turn. ``None`` when
+    # no ResultMessage was received (e.g. query() crashed mid-stream).
+    result_subtype: str | None = None      # "success" | "error_max_turns" | "error_during_execution"
+    result_is_error: bool | None = None
+    stop_reason: str | None = None
+    num_turns: int | None = None           # SDK's internal model-turn count
+    total_cost_usd: float | None = None    # None for non-Anthropic gateways
+    usage: dict[str, Any] | None = None    # input/output/cache token counts
+    permission_denials: list[Any] = field(default_factory=list)
 
 
 def make_turn_id() -> str:
