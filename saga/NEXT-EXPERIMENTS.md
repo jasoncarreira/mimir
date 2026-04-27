@@ -179,6 +179,76 @@ get dropped). A/B is the only way to know.
 
 ---
 
+### P32 — Wire triple extraction + graph pathway and measure the lift
+
+**What.** Triple extraction is currently a dead feature in two ways:
+
+1. **The `[triples] enable_extraction` config flag is unread.** It exists
+   in `msam_bench.toml` but no code in the codebase consults it. Real
+   gating happens implicitly via the `NVIDIA_NIM_API_KEY` env var:
+   `extract_triples_llm` returns `[]` if unset.
+2. **`store_atom` in `core.py` doesn't call extraction.** Only the REST
+   `/v1/store` and `/v1/triples/extract` endpoints invoke it. The bench
+   ingests via `store_atom` directly (`ingest.py`), so zero triples are
+   written for any benchmark run, and the graph pathway in
+   `hybrid_retrieve` (gated by `enable_graph_pathway`, default false)
+   would return `[]` even if turned on.
+
+**Plumbing required:**
+1. Make `[triples] enable_extraction` actually gate (read in `store_atom`
+   and `/v1/store`).
+2. When the flag is true, call `extract_and_store(atom_id, content)` for
+   `stream='semantic'` atoms inside `store_atom` (matching `/v1/store`
+   behavior).
+3. Enable `[retrieval] enable_graph_pathway = true` in the bench config.
+4. Set `[triples] enable_extraction = true` in the bench config.
+5. (Pre-req or co-experiment) **P7 — batch the triple extraction LLM
+   call** (already in HINDSIGHT-IDEAS.md). Single-shot extraction is
+   ~1.5s/atom; with ~500 atoms per question and 500 questions, that's
+   ~100 hours per bench run. P7 brings this to ≤ 6h via batching.
+
+**Effort.** 1 day for the gating + bench config. P7 is separate (~1 day,
+already speced).
+
+**Score expectation.** Honestly uncertain. Triples shine on multi-hop
+queries ("what shows is the user performing in?" → user → performs_in →
+Hamilton), where embedding similarity misses but triples bridge. P3's
+graph-pathway result was neutral-to-negative because the triple store
+was empty — same root cause we'd be fixing. With actual triples in
+place, multi-session and temporal-reasoning are the most plausible
+lift candidates.
+
+**The bar.** This experiment costs real money — every semantic atom
+ingestion adds an LLM call, and we re-run the bench. **Must move the
+overall score by ≥ 1pp** vs P9v2 (the current ship configuration) to
+be worth shipping. Sub-1pp lift means we eat the LLM cost in production
+forever for marginal benefit; that's a bad trade. If the lift is < 1pp,
+formally mark triples as research-only and document the cost/benefit
+in the architecture spec.
+
+**Risks.**
+- **LLM cost & latency.** Even batched, every semantic write adds
+  noticeable latency. Mimir's agent harness writes turn-by-turn; ~1s
+  added latency per turn is user-visible.
+- **Triple quality.** Heuristic-parsed (subject, predicate, object)
+  tuples from an LLM are noisy. Bad triples are worse than no triples
+  because graph traversal pulls in irrelevant atoms.
+- **Storage.** Triples table grows linearly with atoms. Probably fine
+  but worth monitoring.
+
+**Recommendation.** Sequence as:
+1. Land P7 (batch extraction) first.
+2. Wire the gating + flip the bench flag.
+3. Enable graph pathway.
+4. Run bench, measure.
+5. Decide ship/no-ship by the 1pp bar.
+
+If we're going to invest the LLM cost long-term, this is also the right
+moment to revisit the triple extraction prompt — the current one returns
+SKIP for too many atoms (probably). Worth A/B'ing the prompt.
+
+---
+
 ### P15 — Evaluate cross-encoder rerank
 
 **What.** Hindsight uses a cross-encoder reranker as their final stage
@@ -356,7 +426,7 @@ which they actually use.
 
 ---
 
-### P31 — Decide whether to clean up the single-tier retrieval path
+### P31 — Decide whether to clean up the single-tier retrieval path [decision: keep two-tier]
 
 **What.** With the bench running exclusively in two-tier mode (P9 +
 later improvements) and the new agent harness configured for two-tier,
@@ -407,6 +477,14 @@ Low for option 1 — additive feature parity work.
 **Recommendation.** Defer. Revisit after P30 + cherry-picks land and
 we have a clearer picture of which retrieval mode is the canonical
 production answer.
+
+**Decision (2026-04-26): keep two-tier as the canonical path.** Per the
+agent harness work, two-tier is the production answer. The remaining
+single-tier-only feature (triples merging in the response) tracks via
+P32, which is independently scoped. Cleanup of the single-tier code
+path itself becomes a follow-up to P32: once two-tier serves triples
+in its response, single-tier is structurally redundant and can be
+deleted. Bumping P31 from "decide" to "delete after P32 lands."
 
 ---
 
