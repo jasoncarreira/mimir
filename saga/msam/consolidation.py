@@ -318,22 +318,13 @@ class ConsolidationEngine:
         a belief we already have.
         """
         import requests
+        from .config import resolve_llm_config
 
-        import os
-        llm_url = _cfg('consolidation', 'llm_url',
-                       _cfg('annotation', 'llm_url', 'https://integrate.api.nvidia.com/v1/chat/completions'))
-        llm_model = _cfg('consolidation', 'llm_model',
-                         _cfg('annotation', 'llm_model', 'mistralai/mistral-large-3-675b-instruct-2512'))
-        timeout = _cfg('consolidation', 'timeout_seconds',
-                       _cfg('annotation', 'timeout_seconds', 15))
-        api_key_env = _cfg('consolidation', 'api_key_env', None)
-        if api_key_env:
-            api_key = os.environ.get(api_key_env, '')
-        else:
-            api_key = (_cfg('embedding', 'api_key', None)
-                       or os.environ.get('CONSOLIDATION_API_KEY', '')
-                       or os.environ.get('OPENAI_API_KEY', '')
-                       or os.environ.get('NVIDIA_API_KEY', ''))
+        llm = resolve_llm_config('consolidation')
+        llm_url = llm['url']
+        llm_model = llm['model']
+        timeout = llm['timeout']
+        api_key = llm['api_key']
 
         enable_llm = _cfg('consolidation', 'enable_llm', True)
 

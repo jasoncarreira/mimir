@@ -187,30 +187,27 @@ Text: {content}"""
 
 def llm_annotate(content: str) -> dict:
     """
-    Slow-path annotation using an LLM endpoint (NVIDIA NIM).
+    Slow-path annotation using an LLM endpoint.
     Falls back to heuristic_annotate on any failure.
     """
-    llm_url = _cfg('annotation', 'llm_url', 'https://integrate.api.nvidia.com/v1/chat/completions')
-    llm_model = _cfg('annotation', 'llm_model', 'mistralai/mistral-large-3-675b-instruct-2512')
-    timeout = _cfg('annotation', 'timeout_seconds', 15)
-
-    api_key = os.environ.get("NVIDIA_NIM_API_KEY")
-    if not api_key:
+    from .config import resolve_llm_config
+    llm = resolve_llm_config('annotation')
+    if not llm['api_key']:
         return heuristic_annotate(content)  # fallback
 
     prompt = _LLM_ANNOTATION_PROMPT.format(content=content[:2000])
 
     try:
         r = requests.post(
-            llm_url,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            llm['url'],
+            headers={"Authorization": f"Bearer {llm['api_key']}", "Content-Type": "application/json"},
             json={
-                "model": llm_model,
+                "model": llm['model'],
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
                 "max_tokens": 500,
             },
-            timeout=timeout,
+            timeout=llm['timeout'],
         )
         r.raise_for_status()
         response_text = r.json()["choices"][0]["message"]["content"].strip()

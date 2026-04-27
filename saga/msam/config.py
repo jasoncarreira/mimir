@@ -162,9 +162,19 @@ _DEFAULTS = {
     "negative_knowledge": {
         "default_ttl_hours": 168,
     },
+    # Top-level LLM config. Every subsystem that calls a Chat Completions
+    # endpoint (consolidation synthesis, annotation, triple extraction,
+    # rerank, subatom synthesis) falls back to this section if its own
+    # subsystem-specific keys are not set. To configure all five at once,
+    # set [llm] and skip the per-subsystem llm_url/llm_model/api_key_env.
+    "llm": {
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "model": "mistralai/mistral-large-3-675b-instruct-2512",
+        "api_key_env": "NVIDIA_NIM_API_KEY",
+        "timeout_seconds": 30,
+    },
     "annotation": {
-        "llm_url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "llm_model": "mistralai/mistral-large-3-675b-instruct-2512",
+        # Per-subsystem overrides; if absent, [llm] is used.
         "timeout_seconds": 15,
     },
     "emotional_context": {
@@ -254,7 +264,7 @@ _DEFAULTS = {
         "enable_rerank": False,  # LLM rerank off by default (latency)
         "enable_feedback": True,
         "max_expansion_terms": 5,
-        "rerank_model": "mistralai/mistral-large-3-675b-instruct-2512",
+        # rerank_model defaults via [llm] section; can still be overridden here.
         "entity_mappings": None,
     },
     "predictive_retrieval": {
@@ -300,15 +310,14 @@ _DEFAULTS = {
         "sentence_similarity_threshold": 0.25,
         "dedup_similarity_threshold": 0.85,
         "synthesis_max_tokens": 30,
-        "synthesis_model": "mistralai/mistral-large-3-675b-instruct-2512",
+        # synthesis_model defaults via [llm] section; can still be overridden here.
     },
     "comparison": {
         "startup_files": [],
         "query_files": [],
     },
     "triples": {
-        "llm_url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "llm_model": "mistralai/mistral-large-3-675b-instruct-2512",
+        # Per-subsystem overrides; if absent, [llm] is used.
     },
     "api": {
         "port": 3001,
@@ -494,9 +503,16 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
     },
     "triples": {
         "enable_extraction", "llm_url", "llm_model", "api_key_env",
+        "timeout_seconds",
     },
     "annotation": {
         "use_llm", "llm_url", "llm_model", "api_key_env",
+    },
+    "llm": {
+        # All keys are in _DEFAULTS, but listed here for clarity.
+    },
+    "compression": {
+        "api_key_env", "llm_url", "llm_model", "timeout_seconds",
     },
     "decay": {
         "enabled",
@@ -635,6 +651,84 @@ def reload_config():
 def get_raw_config() -> dict:
     """Return the full config dict (for debugging)."""
     return _load_config()
+
+
+# ─── LLM config resolution ────────────────────────────────────────
+
+def resolve_llm_config(subsystem: str) -> dict:
+    """Resolve LLM endpoint + auth for one of the LLM-using subsystems.
+
+    Resolution order for each field:
+        1. ``[<subsystem>]`` specific key (e.g. ``[consolidation] llm_url``)
+        2. ``[llm]`` top-level fallback
+        3. Built-in default
+
+    For the API key, ``api_key_env`` from the same resolution chain
+    selects which environment variable to read. If that variable isn't
+    set (or no api_key_env was specified), we fall through a final chain:
+    ``OPENAI_API_KEY`` → ``NVIDIA_NIM_API_KEY`` → ``NVIDIA_API_KEY``.
+    Empty string is returned if no key is found anywhere; subsystems are
+    expected to handle that gracefully.
+
+    Args:
+        subsystem: section name — one of ``consolidation``, ``annotation``,
+            ``triples``, ``retrieval_v2``, ``compression``.
+
+    Returns:
+        ``{"url": str, "model": str, "api_key": str, "timeout": int}``
+    """
+    cfg = get_config()
+
+    # url, model, timeout: subsystem-specific keys take precedence over
+    # [llm], which takes precedence over the section's built-in defaults.
+    # The subsystem keys vary slightly: consolidation/annotation/triples
+    # use llm_url/llm_model; rerank uses rerank_model; synthesis uses
+    # synthesis_model. We probe both styles for backward compatibility.
+    def _resolve(field: str, llm_key: str, default):
+        # subsystem-specific (preferred)
+        v = cfg(subsystem, f'llm_{field}', None)
+        if v is not None:
+            return v
+        # subsystem-specific alternate keys (rerank_model, synthesis_model)
+        if field == 'model':
+            v = cfg(subsystem, 'rerank_model', None) or cfg(subsystem, 'synthesis_model', None)
+            if v is not None:
+                return v
+        # [llm] fallback
+        v = cfg('llm', llm_key, None)
+        if v is not None:
+            return v
+        return default
+
+    url = _resolve('url', 'url', 'https://integrate.api.nvidia.com/v1/chat/completions')
+    model = _resolve('model', 'model', 'mistralai/mistral-large-3-675b-instruct-2512')
+    timeout = (
+        cfg(subsystem, 'timeout_seconds', None)
+        or cfg('llm', 'timeout_seconds', None)
+        or 30
+    )
+
+    # API key resolution: the env-var name comes from the same chain.
+    api_key_env = (
+        cfg(subsystem, 'api_key_env', None)
+        or cfg('llm', 'api_key_env', None)
+    )
+    api_key = ''
+    if api_key_env:
+        api_key = os.environ.get(api_key_env, '') or ''
+    if not api_key:
+        # Final fallback chain — common deployment patterns.
+        for var in ('OPENAI_API_KEY', 'NVIDIA_NIM_API_KEY', 'NVIDIA_API_KEY'):
+            api_key = os.environ.get(var, '') or ''
+            if api_key:
+                break
+
+    return {
+        "url": url,
+        "model": model,
+        "api_key": api_key,
+        "timeout": int(timeout),
+    }
 
 
 # ─── Convenience: direct attribute access ────────────────────────

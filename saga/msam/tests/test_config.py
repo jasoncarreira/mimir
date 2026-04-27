@@ -116,11 +116,20 @@ class TestNewConfigSections:
         assert cfg('comparison', 'startup_files') == []
         assert cfg('comparison', 'query_files') == []
 
-    def test_triples_section(self):
+    def test_triples_resolves_via_llm_section(self):
+        # [triples] no longer has its own LLM defaults; resolve_llm_config()
+        # falls back to [llm] which carries the canonical defaults.
+        from msam.config import resolve_llm_config
+        out = resolve_llm_config('triples')
+        assert "api.nvidia.com" in out['url']
+        assert "mistral" in out['model']
+
+    def test_llm_section(self):
         from msam.config import get_config
         cfg = get_config()
-        assert "api.nvidia.com" in cfg('triples', 'llm_url')
-        assert "mistral" in cfg('triples', 'llm_model')
+        assert "api.nvidia.com" in cfg('llm', 'url')
+        assert "mistral" in cfg('llm', 'model')
+        assert cfg('llm', 'api_key_env') == "NVIDIA_NIM_API_KEY"
 
     def test_retrieval_confidence_keys(self):
         from msam.config import get_config
@@ -227,6 +236,103 @@ class TestUnknownKeyWarnings:
             "consolidation": {"cluster_similarity_threshold": 0.75},
         })
         assert not caplog.records
+
+
+class TestResolveLLMConfig:
+    """Verify the unified LLM config helper picks up overrides correctly."""
+
+    def test_falls_back_to_top_level_llm_section(self, monkeypatch):
+        from msam.config import resolve_llm_config
+        import msam.config as cfg_mod
+        monkeypatch.setattr(cfg_mod, "_config", {
+            "llm": {
+                "url": "https://example.com/v1/chat",
+                "model": "test-model",
+                "api_key_env": "TEST_KEY",
+                "timeout_seconds": 17,
+            },
+            "consolidation": {},
+        })
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        monkeypatch.setenv("TEST_KEY", "secret-token")
+        out = resolve_llm_config("consolidation")
+        assert out["url"] == "https://example.com/v1/chat"
+        assert out["model"] == "test-model"
+        assert out["api_key"] == "secret-token"
+        assert out["timeout"] == 17
+
+    def test_subsystem_overrides_top_level(self, monkeypatch):
+        from msam.config import resolve_llm_config
+        import msam.config as cfg_mod
+        monkeypatch.setattr(cfg_mod, "_config", {
+            "llm": {
+                "url": "https://default.example/v1/chat",
+                "model": "default-model",
+                "api_key_env": "DEFAULT_KEY",
+            },
+            "triples": {
+                "llm_url": "https://triples.example/v1/chat",
+                "llm_model": "triples-model",
+            },
+        })
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        monkeypatch.setenv("DEFAULT_KEY", "default-token")
+        out = resolve_llm_config("triples")
+        # triples overrides url + model
+        assert out["url"] == "https://triples.example/v1/chat"
+        assert out["model"] == "triples-model"
+        # but inherits api_key_env from [llm]
+        assert out["api_key"] == "default-token"
+
+    def test_subsystem_api_key_env_override(self, monkeypatch):
+        from msam.config import resolve_llm_config
+        import msam.config as cfg_mod
+        monkeypatch.setattr(cfg_mod, "_config", {
+            "llm": {"api_key_env": "WRONG_KEY"},
+            "annotation": {"api_key_env": "RIGHT_KEY"},
+        })
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        monkeypatch.setenv("WRONG_KEY", "")
+        monkeypatch.setenv("RIGHT_KEY", "annotation-token")
+        out = resolve_llm_config("annotation")
+        assert out["api_key"] == "annotation-token"
+
+    def test_falls_back_to_common_envs_if_no_api_key_env(self, monkeypatch):
+        from msam.config import resolve_llm_config
+        import msam.config as cfg_mod
+        monkeypatch.setattr(cfg_mod, "_config", {"llm": {}, "consolidation": {}})
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        # Clear all
+        for k in ("OPENAI_API_KEY", "NVIDIA_NIM_API_KEY", "NVIDIA_API_KEY"):
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-fallback-token")
+        out = resolve_llm_config("consolidation")
+        assert out["api_key"] == "openai-fallback-token"
+
+    def test_returns_empty_api_key_when_none_set(self, monkeypatch):
+        from msam.config import resolve_llm_config
+        import msam.config as cfg_mod
+        monkeypatch.setattr(cfg_mod, "_config", {"llm": {}, "triples": {}})
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        for k in ("OPENAI_API_KEY", "NVIDIA_NIM_API_KEY", "NVIDIA_API_KEY"):
+            monkeypatch.delenv(k, raising=False)
+        out = resolve_llm_config("triples")
+        assert out["api_key"] == ""
+
+    def test_alternate_subsystem_model_keys(self, monkeypatch):
+        """retrieval_v2 uses `rerank_model`, compression uses
+        `synthesis_model` historically — those should still resolve."""
+        from msam.config import resolve_llm_config
+        import msam.config as cfg_mod
+        monkeypatch.setattr(cfg_mod, "_config", {
+            "llm": {"model": "default"},
+            "retrieval_v2": {"rerank_model": "rerank-special"},
+            "compression": {"synthesis_model": "synth-special"},
+        })
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        monkeypatch.setenv("OPENAI_API_KEY", "k")
+        assert resolve_llm_config("retrieval_v2")["model"] == "rerank-special"
+        assert resolve_llm_config("compression")["model"] == "synth-special"
 
 
 class TestLevenshtein:

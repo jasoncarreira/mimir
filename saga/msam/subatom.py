@@ -466,16 +466,18 @@ def synthesize_sentences(
         }
     """
     import requests
-    import os
     import time
-    
+    from .config import resolve_llm_config
+
     if max_tokens is None:
         max_tokens = _cfg('compression', 'synthesis_max_tokens', 30)
+
+    llm = resolve_llm_config('compression')
+    # Allow per-call model override; otherwise use resolved value.
     if model is None:
-        model = _cfg('compression', 'synthesis_model', 'mistralai/mistral-large-3-675b-instruct-2512')
-    
-    api_key = os.environ.get('NVIDIA_NIM_API_KEY')
-    if not api_key:
+        model = llm['model']
+
+    if not llm['api_key']:
         # No API key -- return sentences as-is
         text = ' '.join(s['sentence'] for s in sentences)
         return {
@@ -485,16 +487,16 @@ def synthesize_sentences(
             "model": "passthrough",
             "latency_ms": 0,
         }
-    
+
     input_text = '\n'.join(f'- {s["sentence"]}' for s in sentences)
     input_tokens = sum(s.get('tokens', 0) for s in sentences)
-    
+
     t0 = time.time()
     try:
         resp = requests.post(
-            'https://integrate.api.nvidia.com/v1/chat/completions',
+            llm['url'],
             headers={
-                'Authorization': f'Bearer {api_key}',
+                'Authorization': f"Bearer {llm['api_key']}",
                 'Content-Type': 'application/json',
             },
             json={
@@ -506,7 +508,7 @@ def synthesize_sentences(
                 'max_tokens': max_tokens,
                 'temperature': 0.1,
             },
-            timeout=20,
+            timeout=llm['timeout'],
         )
         latency_ms = (time.time() - t0) * 1000
         
