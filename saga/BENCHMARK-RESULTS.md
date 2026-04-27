@@ -27,6 +27,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p4_minimax_v1` | MiniMax-M2.7 | P9v2 + P4-bench (contradiction→supersedes→demotion); P10 disabled | sem + kw (supersedes_resolution_threshold=0.85, supersedes_score_multiplier=0.4) | 500 | **0.766** |
 | `msam_p30_minimax_v1` | MiniMax-M2.7 | P9v2 + P30 (missing-atom base score in two-tier); atom-level supersedes off; obs-level supersedes on | sem + kw (additive boost + P30 cosine-based missing-atom pull-in) | 500 | **0.780** |
 | `msam_p30_minimax_v2` | MiniMax-M2.7 | P30v1 stack with **flat 2× restoration** replacing the additive boost; per-atom confidence filtering | sem + kw (raws endorsed by surfaced obs get score×2; no additive boost) | 500 | **0.756** |
+| `msam_p30_minimax_v3` | MiniMax-M2.7 | P30v1 stack reinstated (additive boost) + per-atom confidence filtering retained from P30v2 | sem + kw (additive boost + P30 cosine-based missing-atom pull-in; per-atom tiers) | 500 | **0.784** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -657,6 +658,56 @@ general "less-aggressive boost = less endorsement-driven retrieval" story.
 mechanism) is the canonical model.** It was a trade — preference lift
 at the cost of moderate losses elsewhere — and that trade is the
 right one given the data.
+
+### `msam_p30_minimax_v3` — P30v1 additive boost reinstated + per-atom tiers (500q)
+
+After P30v2 confirmed flat restoration was strictly worse (commit `5cbcb26`
+reverted it), this run measures the additive boost on the **current**
+codebase, which has acquired several other small changes since P30v1:
+per-atom `_confidence_tier` (replaced bucket-level inheritance), revised
+`_two_tier_split` docstring, and a few minor fixups. The intent: confirm
+that the revert restored P30v1's overall ~0.78 and ship cherry-picks
+behind it.
+
+| Subtype | Score | N | Δ vs P30v1 | Δ vs P30v2 | Δ vs P9v2 |
+|---|---|---|---|---|---|
+| single-session-assistant | 0.982 | 56 | 0.0 | -1.8 | 0.0 |
+| single-session-user | 0.971 | 70 | +1.4 | +4.3 | +0.0 |
+| knowledge-update | 0.949 | 78 | +2.6 | +2.6 | +0.0 |
+| temporal-reasoning | 0.759 | 133 | +0.7 | +4.5 | -6.7 |
+| multi-session | 0.647 | 133 | +0.8 | +1.5 | -3.0 |
+| **single-session-preference** | **0.267** | 30 | **-10.0** | **+6.7** | 0.0 |
+
+**Overall: 0.784 (+0.4 vs P30v1, +2.8 vs P30v2, -1.2 vs P9v2).**
+
+Within ±0.4pp of P30v1 overall — the revert restored the canonical
+additive-boost behavior, as intended. The bench thus serves the
+workflow's gating function: the additive boost is the right mechanism;
+proceed with the cherry-picks (P11/P12/P13) on top of this stack.
+
+**The preference divergence is the interesting finding.** P30v1 hit
+0.367 on preference (the all-time high on this bench); P30v3 fell back
+to 0.267 (matching P9v2 and most other runs). What changed: P30v1 used
+**bucket-level** confidence inheritance (a low-similarity raw endorsed
+by a strong observation inherited the bucket's "high" tier and survived
+the per-atom filter). P30v3 keeps the **per-atom** tier model from P30v2
+— each raw gets its own tier from its own similarity, regardless of
+which observation endorses it. With per-atom tiers + a `medium` floor
+(where this bench is run), exactly the preference-helpful raws — weak
+on their own, but endorsed — get filtered out before the reader sees
+them.
+
+This is a clean experimental result: bucket-tier inheritance was the
+load-bearing preference mechanism, not the additive boost on its own.
+The other subtypes prefer the per-atom model (knowledge-update +2.6,
+single-session-user +1.4, temporal +0.7, multi-session +0.8). Net
+trade is +0.4pp overall but a 10pp loss on preference. The preference
+loss is now the most expensive single-subtype regression on this bench
+and an explicit choice we are making — bucket-tier inheritance is
+exactly the kind of "globally tagged, query-blind" mechanism that
+P4-bench's atom-level supersedes also fell to.
+
+Pace: ~31s/q (within noise of P30v1's ~28s/q).
 
 ## P9 summary
 
