@@ -1369,6 +1369,72 @@ def _two_tier_split(
     }
 
 
+# ─── Cherry-picks from retrieval_v2 (P11/P12/P13) ────────────────
+# Three small enhancements moved into the canonical hybrid_retrieve
+# pathway, each gated by its own [retrieval_v2] config flag. Defaults
+# are False in prod; the bench config flips them on.
+
+def _apply_query_rewriting(query: str) -> str:
+    """P11 — pattern-based query normalization (entity aliases).
+
+    Defers to retrieval_v2.rewrite_query() so the same regex patterns and
+    config-driven entity_mappings are used. No-op when the flag is off.
+    """
+    if not _cfg('retrieval_v2', 'enable_query_rewriting', False):
+        return query
+    from .retrieval_v2 import rewrite_query
+    return rewrite_query(query)
+
+
+def _expand_query_for_keyword(query: str) -> str:
+    """P12 — append config-driven synonyms for the keyword pathway only.
+
+    Reads a synonym dict from `[query_expansion] synonyms`:
+
+        [query_expansion.synonyms]
+        profession = ["job", "career", "work", "occupation"]
+
+    For each key found in the query (case-insensitive), the listed
+    synonyms are appended. The semantic pathway already handles
+    synonyms via embedding similarity; expansion is FTS5-only.
+    """
+    if not _cfg('retrieval_v2', 'enable_query_expansion', False):
+        return query
+    synonyms = _cfg('query_expansion', 'synonyms', {})
+    if not synonyms or not isinstance(synonyms, dict):
+        return query
+    extras: list[str] = []
+    q_lower = query.lower()
+    for word, syns in synonyms.items():
+        if word.lower() in q_lower and isinstance(syns, list):
+            extras.extend(s for s in syns if isinstance(s, str))
+    if not extras:
+        return query
+    return query + ' ' + ' '.join(extras)
+
+
+def _apply_quality_scoring(atoms_dict: dict) -> bool:
+    """P13 — multiply ``_combined_score`` by an info-density factor.
+
+    Uses retrieval_v2.compute_atom_quality(): low quality (<0.3) ×0.5,
+    high quality (>0.7) ×1.1. Mutates atoms_dict in place. Returns True
+    if any score was changed (caller should re-rank).
+    """
+    if not _cfg('retrieval_v2', 'enable_quality_filter', False):
+        return False
+    from .retrieval_v2 import compute_atom_quality
+    changed = False
+    for atom in atoms_dict.values():
+        quality = compute_atom_quality(atom.get('content', '') or '')
+        if quality < 0.3:
+            atom['_combined_score'] = atom.get('_combined_score', 0.0) * 0.5
+            changed = True
+        elif quality > 0.7:
+            atom['_combined_score'] = atom.get('_combined_score', 0.0) * 1.1
+            changed = True
+    return changed
+
+
 def hybrid_retrieve(
     query: str,
     mode: str = "task",
@@ -1403,6 +1469,11 @@ def hybrid_retrieve(
     if not query or not query.strip():
         return []
 
+    # P11: pattern-based query rewriting (no-op unless flag set).
+    # Both pathways use the rewritten query so semantic + keyword stay
+    # in sync. Two-tier candidates also use this rewritten query.
+    query = _apply_query_rewriting(query)
+
     _sem_weight = _cfg('retrieval', 'semantic_weight', 0.7)
     _kw_weight = 1.0 - _sem_weight
     _quality_threshold = _cfg('retrieval', 'quality_threshold', 2.0)
@@ -1413,6 +1484,11 @@ def hybrid_retrieve(
     # Without this split, observations (often shorter and more abstract)
     # can be crowded out of the candidate pool by raw atoms before they
     # ever get a chance to rank.
+    # P12: synonym expansion for the keyword pathway only. The semantic
+    # side handles synonyms via embedding similarity; expanding it adds
+    # noise. No-op unless the flag is set and synonyms dict is populated.
+    kw_query = _expand_query_for_keyword(query)
+
     if two_tier and _fusion == 'rrf':
         obs_top_k = _cfg('retrieval', 'observations_top_k', 5)
         semantic_results_obs = retrieve(
@@ -1422,7 +1498,7 @@ def hybrid_retrieve(
             include_session_boundaries=include_session_boundaries,
         )
         kw_results_obs = keyword_search(
-            query, top_k=obs_top_k * 2, memory_type='observation',
+            kw_query, top_k=obs_top_k * 2, memory_type='observation',
             include_session_boundaries=include_session_boundaries,
         )
         semantic_results = retrieve(
@@ -1432,7 +1508,7 @@ def hybrid_retrieve(
             include_session_boundaries=include_session_boundaries,
         )
         kw_results = keyword_search(
-            query, top_k=top_k, memory_type='raw',
+            kw_query, top_k=top_k, memory_type='raw',
             include_session_boundaries=include_session_boundaries,
         )
     else:
@@ -1442,7 +1518,7 @@ def hybrid_retrieve(
             include_session_boundaries=include_session_boundaries,
         )
         kw_results = keyword_search(
-            query, top_k=top_k,
+            kw_query, top_k=top_k,
             include_session_boundaries=include_session_boundaries,
         )
         semantic_results_obs = []
@@ -1498,6 +1574,15 @@ def hybrid_retrieve(
             if aid in combined:
                 combined[aid]["_combined_score"] = score
 
+        # P13: atom quality multiplier (no-op unless flag set). Applied
+        # before supersedes demotion / two-tier split so all downstream
+        # re-ranks see the quality-adjusted scores.
+        if _apply_quality_scoring(combined):
+            ranked = sorted(
+                ((aid, combined[aid].get("_combined_score", 0.0)) for aid in combined),
+                key=lambda x: -x[1],
+            )
+
         # Atom-level supersedes demotion. With the auto-resolve writers
         # disabled by default ([atoms] auto_resolve_supersedes_on_write=false,
         # [decay] auto_resolve_supersedes=false; commit 591e48a), no
@@ -1531,6 +1616,17 @@ def hybrid_retrieve(
                 k=_k,
                 weights={'semantic': weights['semantic'], 'keyword': weights['keyword']},
             )
+            # P13: quality scoring on observations too. We need a pre-set
+            # baseline score for the multiplier; seed from RRF before
+            # applying.
+            for aid, score in obs_ranked:
+                if aid in obs_combined:
+                    obs_combined[aid]["_combined_score"] = score
+            if _apply_quality_scoring(obs_combined):
+                obs_ranked = sorted(
+                    ((aid, obs_combined[aid].get("_combined_score", 0.0)) for aid in obs_combined),
+                    key=lambda x: -x[1],
+                )
             return _two_tier_split(
                 obs_combined=obs_combined,
                 obs_ranked=obs_ranked,
