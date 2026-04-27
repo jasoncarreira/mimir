@@ -195,11 +195,24 @@ class MessageBuffer:
         ``source_allowlist`` filters the candidate pool by ``Message.source``.
         ``None`` means no filter; a frozenset means "only these sources".
         Messages with ``source=None`` are excluded when an allowlist is set.
+
+        Privacy: when we fall back to global, DM channels are filtered out so
+        a bot replying in ``#eng`` (with empty ``#eng`` history) can never see
+        its own DM transcripts as "Recent activity". This diverges from
+        open-strix-base, which predates the cross-channel pull and doesn't
+        face this leak.
         """
         if limit <= 0:
             return []
         ch = self._by_channel.get(channel_id)
-        pool = list(ch) if ch is not None and len(ch) > 0 else list(self._all)
+        if ch is not None and len(ch) > 0:
+            pool = list(ch)
+        else:
+            # Global fallback — but never surface DMs into a non-DM channel.
+            if _is_private_channel(channel_id):
+                pool = list(self._all)
+            else:
+                pool = [m for m in self._all if not _is_private_channel(m.channel_id)]
         if source_allowlist is not None:
             pool = [m for m in pool if m.source in source_allowlist]
         return pool[-limit:]
