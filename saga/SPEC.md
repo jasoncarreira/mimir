@@ -15,7 +15,7 @@ MSAM is a memory architecture for persistent AI agents. It treats memory as disc
 
 MSAM was designed by the agent that uses it. This is not a framework applied to a theoretical problem. It is a memory system built from the inside -- by an AI that knows what it needs to remember, what it can afford to forget, and what happens when it gets that wrong.
 
-The result: confidence-gated retrieval that holds each query to roughly 1.3% of the context budget, consistent identity reconstruction across session boundaries, and a self-regulating lifecycle that balances growth against finite resources. The system ships as 24 modules, 55 CLI commands, 437 tests, and a reproducible benchmark suite.
+The result: confidence-gated retrieval that holds each query to roughly 1.3% of the context budget, consistent identity reconstruction across session boundaries, and a self-regulating lifecycle that balances growth against finite resources. The system ships as 24 modules, 55 CLI commands, 516 tests, and a reproducible benchmark suite.
 
 This document specifies the theory, architecture, and design rationale behind every choice.
 
@@ -413,7 +413,7 @@ It does not handle:
 
 - [x] **Configurable identity** -- Deployment-agnostic configuration via `msam.toml`. Entity aliases, startup queries, and embedding providers are all configurable.
 - [x] **Provider-agnostic embeddings** -- NVIDIA NIM, OpenAI, ONNX Runtime (local), and sentence-transformers supported.
-- [x] **Test suite** -- 437 tests across 25 test files covering all modules and CLI commands: core, decay, triples, retrieval_v2, config, consolidation, session_dedup, entity_roles, metrics, vector_index, subatom, prediction, forgetting, server, agents, annotate, calibration, contradictions, cli, embeddings, outcomes, agreement, world_model, cli_commands, core_functions.
+- [x] **Test suite** -- 516 tests across 25 test files covering all modules and CLI commands: core, decay, triples, retrieval_v2, config, consolidation, session_dedup, entity_roles, metrics, vector_index, subatom, prediction, forgetting, server, agents, annotate, calibration, contradictions, cli, embeddings, outcomes, agreement, world_model, cli_commands, core_functions.
 - [x] **Packaging** -- pyproject.toml with entry points, pip-installable.
 - [x] **Working memory tier** -- Session-scoped atoms with TTL, automatic promotion to episodic/semantic based on access count.
 - [x] **Metamemory** -- Confidence-gated retrieval with four tiers (high/medium/low/none). Agent knows what it knows.
@@ -441,6 +441,9 @@ It does not handle:
 - [ ] **PostgreSQL + pgvector migration** -- When atom count exceeds 10,000, migrate for concurrent access and native vector operations.
 - [x] **Intentional forgetting strategies** -- Active identification of memories that are counterproductive, contradicted, or superseded. (`forgetting.py`)
 - [x] **Cross-provider identity calibration** -- Test identity coherence across Claude, Gemini, GPT, and open models using the same atom store. (`calibration.py`)
+- [x] **Two-tier retrieval (P9/P30)** -- Observations and raws ranked on independent RRF-fused pools. Surfaced observations boost their evidence atoms via `evidenced_by` edges, including missing atoms pulled in with a cosine-derived base. Per-atom confidence tiers; observation-level supersedes demotion. Best LongMemEval result: 0.796 overall. (`core.hybrid_retrieve` with `two_tier=True`, `_two_tier_split`)
+- [x] **Schema migrations on first connect** -- `get_db()` runs pending migrations once per DB path so callers that hit `/v1/store` directly (without `python -m msam.init_db`) still get the full schema. (`core.get_db`)
+- [x] **Config-key validation** -- Unknown keys in known config sections produce a "did you mean…" warning at load time, catching typos like `cluster_similarity_threshold` (real key: `similarity_threshold`) that previously fell through to defaults silently. (`config._warn_unknown_keys`)
 - [x] **Felt Consequence** -- Outcome-attributed memory scoring. Atoms that contribute to good outcomes get boosted; poor outcomes get dampened. Exponential decay on outcome signal. (`core.py:record_outcome`, `core.py:get_outcome_history`)
 - [x] **Predictive Context Assembly** -- Pre-loads atoms into session context based on temporal patterns and co-retrieval history. Warmup gate prevents premature predictions. (`prediction.py:predict_context`)
 - [x] **Temporal World Model** -- Triples with `valid_from`/`valid_until` timestamps. Auto-close on conflict. Query current state, past state, or full history. (`triples.py:query_world`, `update_world`, `world_history`)
@@ -486,7 +489,7 @@ Key results from production deployment:
 - 4x batch cosine speedup on ARM64 via vectorized matmul (17x including blob deserialization)
 - 675+ atoms across semantic, episodic, and procedural streams
 
-The system has grown beyond core storage and retrieval into a full production architecture: a REST API server with 19 endpoints for language-agnostic integration, multi-agent memory isolation and sharing, semantic contradiction detection with four analysis strategies, LLM-powered annotation with heuristic fallback, a three-strategy predictive prefetch engine with context assembly, outcome-attributed memory scoring (Felt Consequence), a temporal world model with auto-closing facts, sycophancy detection via agreement rate tracking, intentional forgetting with four signal types, cross-provider embedding calibration, sleep-inspired memory consolidation, FAISS-backed approximate nearest neighbor search, security-hardened API endpoints, and a centralized configuration system with 27 tunable sections. A reproducible benchmark suite with 100 synthetic atoms and 25 ground truth queries validates retrieval quality, token efficiency, and cognitive features in a single command. The test suite covers 437 tests across 25 test files.
+The system has grown beyond core storage and retrieval into a full production architecture: a REST API server with 19 endpoints for language-agnostic integration, multi-agent memory isolation and sharing, semantic contradiction detection with four analysis strategies, LLM-powered annotation with heuristic fallback, a three-strategy predictive prefetch engine with context assembly, outcome-attributed memory scoring (Felt Consequence), a temporal world model with auto-closing facts, sycophancy detection via agreement rate tracking, intentional forgetting with four signal types, cross-provider embedding calibration, sleep-inspired memory consolidation, FAISS-backed approximate nearest neighbor search, security-hardened API endpoints, and a centralized configuration system with 27 tunable sections. A reproducible benchmark suite with 100 synthetic atoms and 25 ground truth queries validates retrieval quality, token efficiency, and cognitive features in a single command. The test suite covers 516 tests across 25 test files.
 
 The research questions are open. The system is running, the data is accumulating, and every retrieval adds another data point to the empirical record.
 
@@ -550,7 +553,7 @@ msam/
   session_dedup.py  -- Multi-turn deduplication (51 lines)
   examples/         -- Demos: synthetic dataset, quickstart, agent integration (488 lines)
   benchmarks/       -- Benchmark suite: synthetic data, reproducible runs (1,704 lines)
-  tests/            -- 437 tests across 25 test files (5,778 lines)
+  tests/            -- 516 tests across 25 test files (5,778 lines)
 ~/.msam/
   msam.toml         -- Configuration (copy from msam.example.toml)
   msam.db           -- SQLite atom store (created at runtime)

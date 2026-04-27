@@ -9,6 +9,13 @@
 
 This report measures MSAM against the alternative it replaces: loading flat markdown files into the context window. Every number is from a production deployment on low-cost ARM hardware, not a synthetic ideal. Two benchmark types are reported: production benchmarks (real atoms, real embeddings, real queries) and a reproducible synthetic suite (100 atoms, deterministic embeddings, no API key required).
 
+> **Note (2026-04+).** Numbers in this report are from the pre-P9 single-tier
+> pipeline. Active development tracks against the LongMemEval public
+> benchmark with the two-tier retrieval architecture (P9/P30); see
+> [BENCHMARK-RESULTS.md](BENCHMARK-RESULTS.md) for the running log of
+> graded runs. The token-efficiency / latency profile in this document
+> remains representative of single-tier production deployments.
+
 ---
 
 ## Token Efficiency
