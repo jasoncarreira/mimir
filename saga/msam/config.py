@@ -68,12 +68,14 @@ _DEFAULTS = {
         # multiplicative score penalty in hybrid_retrieve.
         "enable_supersedes_demotion": True,
         "supersedes_score_multiplier": 0.4,
-        # Confidence-tier gating on the REST two-tier /v1/query path. When
-        # enabled (the default) the response is volume-gated by confidence
-        # tier, matching single-tier behavior. In-process callers
-        # (benchmarks) get the full result regardless — gating happens in
-        # api_query, not _two_tier_split.
+        # Confidence filtering on the REST two-tier /v1/query path. When
+        # enabled (the default) atoms are filtered per-atom by their own
+        # _confidence_tier. In-process callers (benchmarks) bypass this —
+        # filtering happens in api_query, not _two_tier_split.
         "enable_confidence_gating": True,
+        # Default per-atom floor used when a request omits min_confidence_tier.
+        # "low" drops only atoms classified "none" (sim < confidence_sim_low).
+        "default_min_confidence_tier": "low",
         "similarity_threshold": 0.2,
         "sigmoid_midpoint": 0.35,
         "sigmoid_steepness": 15.0,

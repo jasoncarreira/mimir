@@ -148,17 +148,15 @@ class TestQuery:
                     "id": "obs1", "content": "user prefers dark mode",
                     "stream": "semantic", "memory_type": "observation",
                     "_similarity": 0.7, "_combined_score": 0.05,
+                    "_confidence_tier": "high",
                     "evidence_count": 4,
                 }],
                 "raws": [{
                     "id": "raw1", "content": "I love the dark theme",
                     "stream": "semantic", "memory_type": "raw",
                     "_similarity": 0.6, "_combined_score": 0.04,
+                    "_confidence_tier": "high",
                 }],
-                # 0.7 max sim → "high" tier; gating keeps full output.
-                "confidence_tier": "high",
-                "confidence_tier_observations": "high",
-                "confidence_tier_raws": "high",
             }
 
         monkeypatch.setattr(msam.core, "hybrid_retrieve", fake_hybrid_retrieve)
@@ -169,98 +167,117 @@ class TestQuery:
         assert rv.status_code == 200
         data = rv.json()
         assert data["two_tier"] is True
-        assert data["confidence_tier"] == "high"
+        # No bucket-level confidence_tier on the response — per-atom only.
+        assert "confidence_tier" not in data
+        assert "confidence_tier_observations" not in data
+        assert "confidence_tier_raws" not in data
         assert "observations" in data and len(data["observations"]) == 1
         assert "raws" in data and len(data["raws"]) == 1
-        assert data["observations"][0]["memory_type"] == "observation"
-        assert data["observations"][0]["evidence_count"] == 4
-        assert data["raws"][0]["memory_type"] == "raw"
+        # Per-atom confidence_tier still on each atom.
+        assert data["observations"][0]["confidence_tier"] == "high"
+        assert data["raws"][0]["confidence_tier"] == "high"
         assert data["triples"] == []
         assert data["items_returned"] == 2
         # Verify hybrid_retrieve was actually called with two_tier=True
         assert captured.get("two_tier") is True
         assert captured.get("top_k") == 10
 
-    def test_query_two_tier_low_confidence_gated(self, client, monkeypatch):
-        """Both tiers low → 0 obs, 1 raw."""
+    def test_query_two_tier_default_floor_drops_none_tier(self, client, monkeypatch):
+        """Default floor is "low" — atoms classified "none" (sim below
+        confidence_sim_low) get dropped. Higher tiers stay."""
         import msam.core
         monkeypatch.setattr(msam.core, "hybrid_retrieve", lambda q, **kw: {
-            "observations": [{
-                "id": "obs1", "content": "weak observation",
-                "stream": "semantic", "memory_type": "observation",
-                "_similarity": 0.18, "_combined_score": 0.02, "evidence_count": 2,
-            }],
-            "raws": [
-                {"id": f"raw{i}", "content": f"weak content {i}",
-                 "stream": "semantic", "memory_type": "raw",
-                 "_similarity": 0.18, "_combined_score": 0.02}
-                for i in range(5)
+            "observations": [
+                {"id": "obs_high", "content": "strong",
+                 "stream": "semantic", "memory_type": "observation",
+                 "_similarity": 0.7, "_combined_score": 0.05,
+                 "_confidence_tier": "high", "evidence_count": 5},
+                {"id": "obs_none", "content": "weak",
+                 "stream": "semantic", "memory_type": "observation",
+                 "_similarity": 0.05, "_combined_score": 0.01,
+                 "_confidence_tier": "none", "evidence_count": 1},
             ],
-            "confidence_tier": "low",
-            "confidence_tier_observations": "low",
-            "confidence_tier_raws": "low",
+            "raws": [
+                {"id": "raw_low", "content": "borderline",
+                 "stream": "semantic", "memory_type": "raw",
+                 "_similarity": 0.18, "_combined_score": 0.03,
+                 "_confidence_tier": "low"},
+                {"id": "raw_none", "content": "irrelevant",
+                 "stream": "semantic", "memory_type": "raw",
+                 "_similarity": 0.05, "_combined_score": 0.01,
+                 "_confidence_tier": "none"},
+            ],
         })
         rv = client.post("/v1/query", json={"query": "x", "two_tier": True})
         assert rv.status_code == 200
         data = rv.json()
-        assert data["confidence_tier"] == "low"
-        assert data["confidence_tier_observations"] == "low"
-        assert data["confidence_tier_raws"] == "low"
+        # "none" tier atoms dropped, "low" and above kept.
+        ids = [o["id"] for o in data["observations"]] + [r["id"] for r in data["raws"]]
+        assert "obs_high" in ids
+        assert "raw_low" in ids
+        assert "obs_none" not in ids
+        assert "raw_none" not in ids
         assert data["gated"] is True
-        assert len(data["observations"]) == 0
-        assert len(data["raws"]) == 1
+        assert "floor=low" in data["gated_reason"]
 
-    def test_query_two_tier_per_tier_gating_protects_against_noise(self, client, monkeypatch):
-        """Strong obs + weak raws: obs keeps full, raws gates aggressively.
-        This is the noise-dilution scenario per-tier gating prevents."""
+    def test_query_two_tier_request_floor_overrides_config(self, client, monkeypatch):
+        """min_confidence_tier in the request body overrides the config
+        default. Setting "medium" drops everything below medium."""
         import msam.core
         monkeypatch.setattr(msam.core, "hybrid_retrieve", lambda q, **kw: {
-            "observations": [{
-                "id": "obs1", "content": "strong observation",
-                "stream": "semantic", "memory_type": "observation",
-                "_similarity": 0.7, "_combined_score": 0.05, "evidence_count": 5,
-            }],
-            "raws": [
-                {"id": f"raw{i}", "content": f"weak raw {i}",
-                 "stream": "semantic", "memory_type": "raw",
-                 "_similarity": 0.18, "_combined_score": 0.02}
-                for i in range(5)
+            "observations": [
+                {"id": "obs_high", "content": "strong",
+                 "stream": "semantic", "memory_type": "observation",
+                 "_similarity": 0.7, "_combined_score": 0.05,
+                 "_confidence_tier": "high", "evidence_count": 5},
             ],
-            "confidence_tier": "high",  # union dominated by strong obs
-            "confidence_tier_observations": "high",
-            "confidence_tier_raws": "low",
+            "raws": [
+                {"id": "raw_medium", "content": "ok",
+                 "stream": "semantic", "memory_type": "raw",
+                 "_similarity": 0.32, "_combined_score": 0.04,
+                 "_confidence_tier": "medium"},
+                {"id": "raw_low", "content": "borderline",
+                 "stream": "semantic", "memory_type": "raw",
+                 "_similarity": 0.18, "_combined_score": 0.03,
+                 "_confidence_tier": "low"},
+            ],
         })
-        rv = client.post("/v1/query", json={"query": "x", "two_tier": True})
+        rv = client.post("/v1/query", json={
+            "query": "x", "two_tier": True, "min_confidence_tier": "medium",
+        })
         assert rv.status_code == 200
         data = rv.json()
-        # Obs side stays full thanks to high obs_tier...
-        assert len(data["observations"]) == 1
-        # ...but raws are gated to 1 because raws_tier=low. Pre-fix, the
-        # union "high" tier would have kept multiple raws.
-        assert len(data["raws"]) == 1
+        ids = [o["id"] for o in data["observations"]] + [r["id"] for r in data["raws"]]
+        assert "obs_high" in ids       # high passes "medium" floor
+        assert "raw_medium" in ids     # medium passes "medium" floor
+        assert "raw_low" not in ids    # low fails "medium" floor
 
-    def test_query_two_tier_none_confidence_suppresses(self, client, monkeypatch):
-        """confidence_tier=none returns empty results."""
+    def test_query_two_tier_floor_none_keeps_everything(self, client, monkeypatch):
+        """min_confidence_tier="none" disables filtering entirely."""
         import msam.core
         monkeypatch.setattr(msam.core, "hybrid_retrieve", lambda q, **kw: {
-            "observations": [{"id": "obs1", "content": "irrelevant",
-                              "stream": "semantic", "_similarity": 0.05,
-                              "_combined_score": 0.01, "memory_type": "observation",
-                              "evidence_count": 1}],
-            "raws": [{"id": "raw1", "content": "irrelevant",
-                      "stream": "semantic", "_similarity": 0.05,
-                      "_combined_score": 0.01, "memory_type": "raw"}],
-            "confidence_tier": "none",
-            "confidence_tier_observations": "none",
-            "confidence_tier_raws": "none",
+            "observations": [
+                {"id": "obs_none", "content": "weak",
+                 "stream": "semantic", "memory_type": "observation",
+                 "_similarity": 0.05, "_combined_score": 0.01,
+                 "_confidence_tier": "none", "evidence_count": 1},
+            ],
+            "raws": [
+                {"id": "raw_none", "content": "irrelevant",
+                 "stream": "semantic", "memory_type": "raw",
+                 "_similarity": 0.05, "_combined_score": 0.01,
+                 "_confidence_tier": "none"},
+            ],
         })
-        rv = client.post("/v1/query", json={"query": "x", "two_tier": True})
+        rv = client.post("/v1/query", json={
+            "query": "x", "two_tier": True, "min_confidence_tier": "none",
+        })
         assert rv.status_code == 200
         data = rv.json()
-        assert data["confidence_tier"] == "none"
-        assert data["observations"] == []
-        assert data["raws"] == []
-        assert data["items_returned"] == 0
+        # Floor "none" keeps everything.
+        assert len(data["observations"]) == 1
+        assert len(data["raws"]) == 1
+        assert data["gated"] is False
 
     def test_query_two_tier_via_config_default(self, client, monkeypatch):
         """When request omits two_tier and config sets two_tier_enabled=true,
