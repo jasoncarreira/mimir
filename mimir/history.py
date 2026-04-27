@@ -283,7 +283,15 @@ class MessageBuffer:
             channel_id, recent_per_channel, source_allowlist=source_allowlist
         )
         cross: list[Message] = []
-        if author and not _is_private_channel(channel_id):
+        if author:
+            # Cross-pull is one-directional: DM messages are excluded by
+            # ``cross_author_messages`` itself (source-side filter on
+            # ``_is_private_channel(msg.channel_id)``). The target channel
+            # being a DM does NOT block the pull — surfacing Alice's #eng
+            # context inside her private DM with the bot is just useful
+            # context, not a privacy leak. The leak would be the other
+            # direction (DM content into a public channel), and that's
+            # already prevented at the source.
             cross = self.cross_author_messages(
                 author=author,
                 exclude_channel=channel_id,

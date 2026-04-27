@@ -165,16 +165,16 @@ async def test_dm_messages_excluded_from_cross_channel_pull_in_eng(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_dm_target_skips_cross_channel_pull(tmp_path: Path):
-    """SPEC §5.4: cross-channel pull is skipped when the current channel is a
-    DM. Seed the DM with its own messages so the within-channel deque is
-    populated (avoiding the empty-deque global fallback path, which is a
-    separate code path with separate semantics).
+async def test_dm_target_pulls_public_cross_channel_context(tmp_path: Path):
+    """Cross-pull into a DM target is one-directional: Alice's public #eng
+    activity SHOULD surface inside her private DM with the bot (it's her
+    own public messages — useful context, not a leak). Only DM *messages*
+    are blocked from cross-pull, regardless of target.
     """
     buf = MessageBuffer(history_path=tmp_path / "chat_history.jsonl")
     now = datetime.now(tz=timezone.utc)
 
-    # Alice in #eng (would be cross-pulled if the target were public)
+    # Alice in #eng — public, should surface in her DM with the bot.
     await buf.append(
         buf.make_message(
             channel_id="eng",
@@ -185,7 +185,7 @@ async def test_dm_target_skips_cross_channel_pull(tmp_path: Path):
             source="slack",
         )
     )
-    # Alice in her DM with the bot (within-channel context for the DM target)
+    # Alice in her DM with the bot.
     await buf.append(
         buf.make_message(
             channel_id="dm-slack-alice",
@@ -205,6 +205,51 @@ async def test_dm_target_skips_cross_channel_pull(tmp_path: Path):
         cross_hours=24,
         source_allowlist=frozenset({"slack", "discord", "web"}),
     )
-    # Cross-pull is skipped — only the DM's own messages surface.
-    assert {m.channel_id for m in activity} == {"dm-slack-alice"}
-    assert "public-eng-content" not in [m.content for m in activity]
+    contents = [m.content for m in activity]
+    assert "public-eng-content" in contents, "public cross-channel context should surface in DM"
+    assert "dm-context" in contents, "within-DM history should also surface"
+
+
+@pytest.mark.asyncio
+async def test_dm_messages_never_pulled_regardless_of_target(tmp_path: Path):
+    """Source-side privacy: a DM message NEVER appears in cross-pull, no
+    matter what the target channel is — even if the target is itself a
+    different DM. The privacy rule is about the source, not the target.
+    """
+    buf = MessageBuffer(history_path=tmp_path / "chat_history.jsonl")
+    now = datetime.now(tz=timezone.utc)
+
+    # Alice's DM with the bot.
+    await buf.append(
+        buf.make_message(
+            channel_id="dm-slack-alice",
+            kind="user_message",
+            content="alice-dm-secret",
+            author="alice",
+            ts=(now - timedelta(minutes=10)).isoformat(),
+            source="slack",
+        )
+    )
+    # Alice in #eng (so within-channel for the eng target isn't empty).
+    await buf.append(
+        buf.make_message(
+            channel_id="eng",
+            kind="user_message",
+            content="eng-context",
+            author="alice",
+            ts=(now - timedelta(minutes=2)).isoformat(),
+            source="slack",
+        )
+    )
+
+    activity = buf.assemble_recent_activity(
+        channel_id="eng",
+        author="alice",
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+        source_allowlist=frozenset({"slack", "discord", "web"}),
+    )
+    contents = [m.content for m in activity]
+    assert "alice-dm-secret" not in contents
+    assert "eng-context" in contents
