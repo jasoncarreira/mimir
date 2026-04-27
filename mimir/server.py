@@ -78,7 +78,12 @@ async def _handle_health(request: web.Request) -> web.Response:
 
 
 def build_app(config: Config) -> web.Application:
-    app = web.Application()
+    # 10MB body cap (aiohttp default is 1MB). Mimir takes JSON-only bodies on
+    # /event and /chat — long bluesky transcripts and seed payloads can run
+    # well past 1MB. Bridges read attachment bytes from disk via filesystem
+    # paths (``attachment_names``), not from the request body, so the cap
+    # doesn't need to accommodate binary uploads.
+    app = web.Application(client_max_size=10 * 1024 * 1024)
 
     config.logs_dir.mkdir(parents=True, exist_ok=True)
     (config.home / "memory" / "core").mkdir(parents=True, exist_ok=True)

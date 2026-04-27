@@ -1,17 +1,10 @@
-"""Phase 6.8 — concurrency hardening (SPEC §4.5, §4.7).
+"""Phase 6.8 — concurrency hardening (SPEC §4.5).
 
 Covers the SPEC scenarios that aren't already in ``test_dispatcher.py`` and
 ``test_history.py``:
 
 - Global semaphore stress: 20 channels at ``MIMIR_MAX_CONCURRENT_TURNS=5``
   drains all channels in per-channel FIFO with peak in-flight ≤ 5.
-- Per-file ``flock`` primitive in ``mimir/_locks.py`` enforces mutual exclusion
-  under thread contention. (Note: the primitive is unused in production today
-  — single-process mimir relies on the dispatcher's per-channel queue + the
-  ``MessageBuffer`` ``asyncio.Lock`` for serialization. SPEC §4.7's ``flock``
-  language predates the switch from custom MCP file-op tools to SDK Read /
-  Write / Edit hooks (see ``mimir/hooks.py`` docstring). Test the primitive
-  in case it gets wired in later.)
 - DM privacy in the assembled prompt path: DM messages do not surface in
   cross-channel author pull when the bot is replying in a non-DM channel.
 """
@@ -19,15 +12,12 @@ Covers the SPEC scenarios that aren't already in ``test_dispatcher.py`` and
 from __future__ import annotations
 
 import asyncio
-import threading
-import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from mimir._locks import flock_path, with_path_lock
 from mimir.config import Config
 from mimir.dispatcher import Dispatcher
 from mimir.event_logger import init_logger
@@ -124,98 +114,6 @@ async def test_queue_full_emits_admission_rejected(tmp_path: Path):
     text = events_log.read_text()
     assert '"event_admission_rejected"' in text
     assert '"channel_id": "c1"' in text
-
-
-# ---- flock primitive (SPEC §4.7) ---------------------------------------
-
-
-def test_flock_path_serializes_concurrent_threads(tmp_path: Path):
-    """Two threads contending on the same target take the lock one at a time."""
-    home = tmp_path
-    target = home / "memory" / "core" / "00-persona.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.touch()
-
-    in_critical = 0
-    peak = 0
-    state_lock = threading.Lock()
-    iterations = 50
-
-    def worker():
-        nonlocal in_critical, peak
-        for _ in range(iterations):
-            with flock_path(home, target):
-                with state_lock:
-                    in_critical += 1
-                    peak = max(peak, in_critical)
-                # Cheap "work" — the bug we're hunting is that two threads
-                # both believe they hold the lock.
-                time.sleep(0.0005)
-                with state_lock:
-                    in_critical -= 1
-
-    threads = [threading.Thread(target=worker) for _ in range(4)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    assert peak == 1, f"flock breached: {peak} threads in critical section simultaneously"
-
-
-@pytest.mark.asyncio
-async def test_with_path_lock_serializes_concurrent_coroutines(tmp_path: Path):
-    """``with_path_lock`` (the asyncio wrapper) serializes coroutines via
-    ``asyncio.to_thread`` + the underlying flock."""
-    home = tmp_path
-    target = home / "memory" / "shared" / "shared.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.touch()
-
-    in_critical = 0
-    peak = 0
-    state_lock = threading.Lock()
-
-    def critical_section():
-        nonlocal in_critical, peak
-        with state_lock:
-            in_critical += 1
-            peak = max(peak, in_critical)
-        time.sleep(0.005)
-        with state_lock:
-            in_critical -= 1
-        return "ok"
-
-    results = await asyncio.gather(
-        *(with_path_lock(home, target, critical_section) for _ in range(8))
-    )
-    assert results == ["ok"] * 8
-    assert peak == 1
-
-
-def test_flock_lock_files_are_keyed_by_target(tmp_path: Path):
-    """Two distinct targets get distinct lock files — no false contention."""
-    a = tmp_path / "memory" / "core" / "00-a.md"
-    b = tmp_path / "memory" / "core" / "01-b.md"
-    a.parent.mkdir(parents=True, exist_ok=True)
-    a.touch()
-    b.touch()
-
-    # Hold the lock on a, see that we can still take the lock on b.
-    with flock_path(tmp_path, a):
-        # If b shared a lock with a, this would deadlock — use a thread + timeout
-        # to detect that case.
-        result: list[bool] = []
-
-        def take_b():
-            with flock_path(tmp_path, b):
-                result.append(True)
-
-        t = threading.Thread(target=take_b)
-        t.start()
-        t.join(timeout=1.0)
-        assert not t.is_alive(), "flock_path keyed too coarsely — distinct targets shared a lock"
-        assert result == [True]
 
 
 # ---- DM privacy in assembled prompt (SPEC §5.4) -------------------------

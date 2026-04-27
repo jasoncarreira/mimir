@@ -57,3 +57,32 @@ def test_memory_skill_no_brand_leaks(tmp_path: Path):
     # Mimir-specific surface should be present.
     assert "memory/core/" in body
     assert "msam_store" in body or "MSAM" in body
+
+
+def test_seed_skills_recovers_poisoned_destination(tmp_path: Path):
+    """A pre-existing skill folder missing SKILL.md (a half-copy from a
+    crashed prior run) gets re-seeded from the bundle, not skipped."""
+    target = tmp_path / ".claude" / "skills" / "memory"
+    target.mkdir(parents=True)
+    # Half-copied: a stray file landed but SKILL.md never made it.
+    (target / "stray.md").write_text("partial")
+
+    out = seed_skills(tmp_path)
+    assert out["memory"] == "created"
+    # The half-copy was replaced with a real bundle.
+    assert (target / "SKILL.md").is_file()
+    assert not (target / "stray.md").exists(), "poisoned remnants should be gone"
+
+
+def test_seed_skills_cleans_up_tmp_from_prior_crash(tmp_path: Path):
+    """A leftover ``<name>.tmp`` from a crashed prior copy is wiped before
+    the next attempt."""
+    leftover = tmp_path / ".claude" / "skills" / "memory.tmp"
+    leftover.mkdir(parents=True)
+    (leftover / "garbage.md").write_text("from a dead process")
+
+    seed_skills(tmp_path)
+    # The .tmp dir was either renamed into place (success) or wiped (error).
+    # Either way it shouldn't survive as ``<name>.tmp``.
+    assert not leftover.exists()
+    assert (tmp_path / ".claude" / "skills" / "memory" / "SKILL.md").is_file()

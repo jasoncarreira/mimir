@@ -92,3 +92,13 @@ def test_main_no_args_runs_server(tmp_path: Path):
         main([])
 
     assert called["yes"] is True
+
+
+def test_setup_rejects_non_directory_home(tmp_path: Path):
+    """``mimir setup --home <some-file>`` refuses to scaffold over a regular file."""
+    target = tmp_path / "not-a-dir"
+    target.write_text("i am a file, not a directory")
+    with pytest.raises(ValueError, match="not a directory"):
+        setup_home(target)
+    # The original file is untouched.
+    assert target.read_text() == "i am a file, not a directory"

@@ -36,9 +36,15 @@ def seed_skills(home: Path) -> dict[str, str]:
     """Copy missing skill folders to ``<home>/.claude/skills/<name>/``.
 
     Returns a ``{name: status}`` map where status is ``"created"``,
-    ``"present"``, or ``"skipped"`` (no SKILL.md in the bundled folder).
+    ``"present"``, or ``"skipped"`` (copy failed or destination is broken).
     User-installed skills already in the target dir are left alone — we
     only create *new* folders, never overwrite existing files.
+
+    Atomicity: each copy lands in a sibling ``<name>.tmp`` directory and is
+    renamed into place only after the copy completes. A crash mid-copy
+    leaves the half-copy in ``.tmp`` (cleaned up on the next run); the
+    canonical ``<name>/`` either fully exists or doesn't. A pre-existing
+    ``<name>/`` missing its ``SKILL.md`` is treated as broken and re-seeded.
     """
     target_root = home / ".claude" / "skills"
     target_root.mkdir(parents=True, exist_ok=True)
@@ -46,13 +52,32 @@ def seed_skills(home: Path) -> dict[str, str]:
     for name in _bundled_skill_names():
         src = _BUNDLED_ROOT / name
         dst = target_root / name
+        tmp = target_root / f"{name}.tmp"
+
+        # Clean up any half-copy from a prior crashed run.
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+
         if dst.exists():
-            out[name] = "present"
-            continue
+            # Heuristic integrity check: a complete bundled skill has a
+            # SKILL.md at the top. If it's missing, the dir is poisoned —
+            # likely a partial copy from before the atomic-rename fix.
+            # Replace it from the bundle.
+            if (dst / "SKILL.md").is_file():
+                out[name] = "present"
+                continue
+            log.warning(
+                "seed_skills: %s missing SKILL.md, re-seeding from bundle",
+                name,
+            )
+            shutil.rmtree(dst, ignore_errors=True)
+
         try:
-            shutil.copytree(src, dst)
+            shutil.copytree(src, tmp)
+            tmp.rename(dst)
             out[name] = "created"
         except OSError as exc:
             log.warning("seed_skills: failed to copy %s: %s", name, exc)
+            shutil.rmtree(tmp, ignore_errors=True)
             out[name] = "skipped"
     return out

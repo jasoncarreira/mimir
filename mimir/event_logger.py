@@ -50,17 +50,6 @@ class EventLogger:
         except OSError as exc:
             log.warning("events.jsonl mkdir failed: %s", exc)
 
-    def log_sync(self, event_type: str, **payload: Any) -> None:
-        """Sync write — for code paths outside an asyncio context."""
-        record = self._record(event_type, payload)
-        try:
-            self._ensure_dir()
-            with self._path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
-            self._line_count += 1
-        except OSError as exc:
-            log.warning("events.jsonl write failed: %s", exc)
-
     async def log(self, event_type: str, **payload: Any) -> None:
         record = self._record(event_type, payload)
         async with self._ensure_lock():
@@ -114,7 +103,3 @@ def get_logger() -> EventLogger:
 
 async def log_event(event_type: str, **payload: Any) -> None:
     await get_logger().log(event_type, **payload)
-
-
-def log_event_sync(event_type: str, **payload: Any) -> None:
-    get_logger().log_sync(event_type, **payload)

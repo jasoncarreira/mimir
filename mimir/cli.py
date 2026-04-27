@@ -98,6 +98,10 @@ def _write_if_missing(path: Path, content: str) -> bool:
 def setup_home(home: Path) -> dict[str, object]:
     """Scaffold an agent home directory. Returns a status dict for printing."""
     home = home.resolve()
+    if home.exists() and not home.is_dir():
+        raise ValueError(
+            f"--home {home} exists and is not a directory; refusing to scaffold over it."
+        )
     home.mkdir(parents=True, exist_ok=True)
 
     created_dirs: list[str] = []
