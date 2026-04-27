@@ -372,9 +372,10 @@ ask whether the single-tier code path is still earning its keep.
   tier gating, atom-volume reduction, triples-merging.
 
 **What single-tier provides that two-tier currently doesn't:**
-- **Confidence-tier gating.** Single-tier returns
-  `confidence_tier ∈ {none, low, medium, high}` and demotes/limits
-  output by tier. Two-tier returns observations + raws raw, no gating.
+- ~~**Confidence-tier gating.**~~ Closed in `c4f0cb0`. Two-tier now
+  computes `confidence_tier` and the REST `/v1/query` two-tier path
+  applies volume gating matching single-tier semantics, gated by
+  `[retrieval] enable_confidence_gating` (default true).
 - **Triples merged in the response.** Single-tier returns triples
   alongside atoms; two-tier returns `triples=[]` (intentionally — the
   triple pathway in two-tier is unwired by default).
