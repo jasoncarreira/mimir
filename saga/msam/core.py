@@ -1175,33 +1175,37 @@ def _two_tier_split(
     observations_top_k: int,
     obs_conf_min_sim: float,
     stability_reduction: float,
-    boost_cap_multiplier: float,
     query_emb: list[float] = None,
 ) -> dict:
     """
-    P9: build the two-tier return and apply the observation->raw evidence
-    boost. Observations and raws are fused on their own pools upstream —
-    this function only gates, boosts, and truncates.
+    P9: build the two-tier {observations, raws, confidence_tier_*} return.
+    Observations and raws are fused on their own pools upstream — this
+    function only gates, demotes, restores, and truncates.
 
-    Observations are gated by top-K and by a similarity floor so weak
-    observations can't pollute the tier or silently boost their evidence.
-    Surfaced observations add a per-observation boost to their evidence
-    atoms in the raws tier, capped at ``boost_cap_multiplier × own RRF``
-    to prevent a single atom from flooding the top-K.
+    Observations are gated by ``observations_top_k`` and by a similarity
+    floor (``obs_conf_min_sim``) so weak observations can't pollute the
+    tier or silently lift their evidence raws. An observation-level
+    supersedes demotion runs first: consolidation writes ``supersedes``
+    edges between observations when the newer one's evidence is a strict
+    superset, and the older observation gets a multiplicative demotion so
+    the newer one surfaces first.
 
-    Observation-level supersedes demotion is also applied here:
-    consolidation writes ``supersedes`` edges between observations whose
-    new evidence set is a strict superset of an older observation. The
-    older observation gets the standard demotion multiplier so the
-    newer, better-evidenced observation surfaces first.
+    For each observation that survives both gates (i.e. is in
+    ``surfaced_obs``), the raw atoms it consolidated from get a flat
+    ``1/stability_reduction`` (= 2× by default) score restoration —
+    exactly undoing the consolidation stability halving. No additive
+    boost, no obs_score-dependent magnitude. Endorsed raws not in the
+    raws candidate pool are pulled in with a cosine-derived base score,
+    then restored alongside the in-pool ones. Top-K cut and per-tier
+    confidence classification (similarity-only) follow.
     """
-    # Apply scores from obs_ranked to obs_combined entries first so the
-    # demotion has a base to multiply.
-    for aid, score in obs_ranked:
-        if aid in obs_combined:
-            obs_combined[aid]["_combined_score"] = score
-
     if _cfg('retrieval', 'enable_supersedes_demotion', True) and obs_combined:
+        # Seed _combined_score on each candidate observation so the
+        # demotion has a value to multiply, then re-rank from the
+        # demoted scores.
+        for aid, score in obs_ranked:
+            if aid in obs_combined:
+                obs_combined[aid]["_combined_score"] = score
         _supersedes_factor = _cfg('retrieval', 'supersedes_score_multiplier', 0.4)
         _apply_supersedes_demotion(obs_combined, _supersedes_factor)
         obs_ranked = sorted(
@@ -1271,6 +1275,13 @@ def _two_tier_split(
             in_pool_scores = [s for _, s in raw_ranked if s > 0]
             ref_score = min(in_pool_scores) if in_pool_scores else 0.01
 
+            # Per-atom tier thresholds (used to populate _confidence_tier
+            # on pulled-in atoms — same thresholds as the per-tier
+            # classifier below).
+            _t_high = _cfg('retrieval', 'confidence_sim_high', 0.45)
+            _t_med = _cfg('retrieval', 'confidence_sim_medium', 0.30)
+            _t_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
+
             for row in rows:
                 atom = dict(row)
                 emb_blob = atom.pop("embedding", None)
@@ -1284,6 +1295,17 @@ def _two_tier_split(
                 base = ref_score * sim
                 atom["_similarity"] = sim
                 atom["_combined_score"] = base
+                # Set per-atom confidence tier so _format_atom doesn't
+                # report "unknown" on the wire. In-pool atoms get this
+                # set inside retrieve(); pulled-in atoms bypass that path.
+                if sim >= _t_high:
+                    atom["_confidence_tier"] = "high"
+                elif sim >= _t_med:
+                    atom["_confidence_tier"] = "medium"
+                elif sim >= _t_low:
+                    atom["_confidence_tier"] = "low"
+                else:
+                    atom["_confidence_tier"] = "none"
                 raw_combined[atom["id"]] = atom
                 raw_score_map[atom["id"]] = base
 
@@ -1304,26 +1326,22 @@ def _two_tier_split(
         atom["_combined_score"] = score
         raws_final.append(atom)
 
-    # Confidence tiers: per-tier (observations vs raws) drives gating, so
-    # weak raws can't ride on the back of strong observations or vice versa.
-    # The top-level confidence_tier is the max-of-the-two as a summary signal
-    # but doesn't drive behavior. Same thresholds as the single-tier calc —
-    # change one, change both.
+    # Per-tier confidence classification, similarity-only. Two-tier runs
+    # under RRF fusion; the legacy [retrieval] confidence_score_* thresholds
+    # were calibrated for the weighted_sum activation scale (atomic scores
+    # in the 1-100+ range) and never trigger in RRF mode where scores are
+    # ~0.05. Single-tier under weighted_sum still uses them; here we don't.
     _sim_high = _cfg('retrieval', 'confidence_sim_high', 0.45)
     _sim_medium = _cfg('retrieval', 'confidence_sim_medium', 0.30)
     _sim_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
-    _score_high = _cfg('retrieval', 'confidence_score_high', 40.0)
-    _score_medium = _cfg('retrieval', 'confidence_score_medium', 10.0)
 
     def _classify(atoms: list[dict]) -> str:
         if not atoms:
             return "none"
         max_sim = max((a.get('_similarity', 0) or 0) for a in atoms)
-        top_score = max((a.get('_combined_score', 0) or 0) for a in atoms)
-        has_semantic_signal = max_sim >= 0.20
-        if max_sim >= _sim_high or (has_semantic_signal and top_score >= _score_high):
+        if max_sim >= _sim_high:
             return "high"
-        if max_sim >= _sim_medium or (has_semantic_signal and top_score >= _score_medium):
+        if max_sim >= _sim_medium:
             return "medium"
         if max_sim >= _sim_low:
             return "low"
@@ -1473,11 +1491,15 @@ def hybrid_retrieve(
             if aid in combined:
                 combined[aid]["_combined_score"] = score
 
-        # P4-bench: demote raws superseded by other raws in the candidate
-        # pool. The supersedes edges are written by
-        # resolve_contradictions_to_supersedes (e.g. during the bench's
-        # consolidation step). Re-rank afterwards so the demoted scores
-        # propagate into the two-tier split / final sort.
+        # Atom-level supersedes demotion. With the auto-resolve writers
+        # disabled by default ([atoms] auto_resolve_supersedes_on_write=false,
+        # [decay] auto_resolve_supersedes=false; commit 591e48a), no
+        # supersedes edges between raws are written automatically — this
+        # call becomes a no-op in the default configuration. It still
+        # applies if a caller manually adds a supersedes edge between
+        # raws via add_atom_relation, or if a future config flips the
+        # writers on. Observation-level supersedes (between observations)
+        # is applied separately inside _two_tier_split.
         if _cfg('retrieval', 'enable_supersedes_demotion', True):
             _supersedes_factor = _cfg('retrieval', 'supersedes_score_multiplier', 0.4)
             _apply_supersedes_demotion(combined, _supersedes_factor)
@@ -1511,7 +1533,6 @@ def hybrid_retrieve(
                 observations_top_k=_cfg('retrieval', 'observations_top_k', 5),
                 obs_conf_min_sim=_cfg('retrieval', 'observation_confidence_min_sim', 0.30),
                 stability_reduction=_cfg('consolidation', 'stability_reduction_factor', 0.5),
-                boost_cap_multiplier=_cfg('retrieval', 'evidence_boost_cap_multiplier', 3.0),
                 query_emb=cached_embed_query(query),
             )
 
