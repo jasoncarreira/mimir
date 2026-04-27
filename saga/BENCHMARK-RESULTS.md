@@ -28,6 +28,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p30_minimax_v1` | MiniMax-M2.7 | P9v2 + P30 (missing-atom base score in two-tier); atom-level supersedes off; obs-level supersedes on | sem + kw (additive boost + P30 cosine-based missing-atom pull-in) | 500 | **0.780** |
 | `msam_p30_minimax_v2` | MiniMax-M2.7 | P30v1 stack with **flat 2× restoration** replacing the additive boost; per-atom confidence filtering | sem + kw (raws endorsed by surfaced obs get score×2; no additive boost) | 500 | **0.756** |
 | `msam_p30_minimax_v3` | MiniMax-M2.7 | P30v1 stack reinstated (additive boost) + per-atom confidence filtering retained from P30v2 | sem + kw (additive boost + P30 cosine-based missing-atom pull-in; per-atom tiers) | 500 | **0.784** |
+| `msam_cherrypicks_minimax_v1` | MiniMax-M2.7 | P30v3 + P11/P12/P13 cherry-picks (query rewriting + synonym expansion + atom quality multiplier), all on | sem + kw (P11 rewriting on both pathways; P12 synonyms on keyword only; P13 quality ×0.5/×1.1 multiplier) | 500 | **0.756** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -708,6 +709,78 @@ exactly the kind of "globally tagged, query-blind" mechanism that
 P4-bench's atom-level supersedes also fell to.
 
 Pace: ~31s/q (within noise of P30v1's ~28s/q).
+
+### `msam_cherrypicks_minimax_v1` — P30v3 + all three cherry-picks (500q)
+
+The full P11/P12/P13 cherry-pick stack (commits `fa201ec` + `3d5d497`)
+on top of the P30v3 baseline:
+- **P11 (`enable_query_rewriting`)** applied to both pathways — built-in
+  patterns (`user → User`, `agent → Agent`) plus the additive
+  `entity_mappings` mechanism (4033c85). The bench config doesn't add
+  custom mappings, so only the built-in normalization fires.
+- **P12 (`enable_query_expansion`)** on keyword pathway only — 29-key
+  synonym dict from `_DEFAULTS["query_expansion"]["synonyms"]`
+  (3d5d497). Keys appearing in the query (case-insensitive) get their
+  synonym list appended to the FTS5 query string.
+- **P13 (`enable_quality_filter`)** on both raws and observations —
+  info-density multiplier (×0.5 for quality<0.3, ×1.1 for >0.7,
+  no-op in between).
+
+| Subtype | Score | N | Δ vs P30v3 | Δ vs P9v2 |
+|---|---|---|---|---|
+| **single-session-preference** | **0.333** | 30 | **+6.7** | **+6.7** |
+| knowledge-update | 0.949 | 78 | 0.0 | 0.0 |
+| single-session-user | 0.943 | 70 | -2.8 | -1.4 |
+| single-session-assistant | 0.946 | 56 | -3.6 | -3.6 |
+| multi-session | 0.609 | 133 | -3.8 | -2.5 |
+| temporal-reasoning | 0.707 | 133 | -5.3 | -12.0 |
+
+**Overall: 0.756 (-2.8 vs P30v3, -4.0 vs P9v2).**
+
+Net regression. Only one subtype gained — preference (+6.7pp). Every
+other subtype was flat or lost ground, with temporal-reasoning hit
+hardest at -5.3pp.
+
+**Reading the per-subtype profile:**
+
+- **Temporal-reasoning -5.3pp.** Predicted in the pre-bench risk note:
+  P12 synonym expansion adds terms to the FTS5 query string that
+  dilute precise time-bound matches. Atom "the user said yesterday X"
+  vs probe "what did I tell you yesterday?" → expansion appends "last
+  day previous day" which then matches *every* atom containing
+  similar generic time language. Keyword pathway noise compounds.
+- **Multi-session -3.8pp.** Same FTS5-noise story — multi-session
+  questions span turns and rely on precise topic matching.
+- **Single-session-assistant -3.6pp** and **single-session-user
+  -2.8pp.** Suggests P13 quality scoring is firing — short
+  answer-bearing turns ("1:10 ratio", "Patagonia", "Veja") score
+  low quality and get demoted by ×0.5. The other risk note that
+  materialized.
+- **Preference +6.7pp** (recovered most of the drop from P30v1's
+  0.367 → P30v3's 0.267). The query-rewriting + quality multiplier
+  on observations seems to lift dense user-statement raws into
+  surfacing range. Or possibly noise — n=30 is small.
+- **Knowledge-update flat.** No effect either way.
+
+**Decision: don't ship the bundle as configured.** Net -2.8pp is too
+expensive for a +6.7pp preference gain on 30 questions. Two paths
+forward:
+
+1. **Ablate.** Run three separate bench probes with one of P11/P12/P13
+   enabled at a time. Cheap signal for which is helping vs hurting.
+   Best candidate to ship-alone: **P11 (query rewriting)** —
+   theoretically lowest noise, just identity normalization. Worst:
+   **P12** — clear FTS5-noise story.
+2. **Skip.** Keep the cherry-pick code in place (gated, off in prod by
+   default) and revisit when we have evidence about which one carries
+   the preference gain.
+
+The cherry-picks are not a regression in the codebase — they're
+opt-in flags, prod is unaffected. Just leave the bench config with
+them off until ablation says otherwise. Updating msam_bench.toml to
+disable the three flags accordingly is a follow-up task (next
+session). Pace: ~32s/q (vs P30v3's ~31s/q — synonym expansion +
+quality scoring add minor overhead).
 
 ## P9 summary
 
