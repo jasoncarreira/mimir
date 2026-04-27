@@ -57,27 +57,12 @@ outcome_decay = 1.0
 [retrieval_v2]
 enabled = false
 # Cherry-picks (P11/P12/P13). Each gated independently; defaults False
-# in prod; bench enables all three to measure combined lift.
+# in prod; bench enables all three to measure combined lift. The
+# synonym dict for P12 lives in config._DEFAULTS["query_expansion"]
+# so every caller with the flag on gets the same behavior.
 enable_query_rewriting = true   # P11: pattern-based query normalization
 enable_query_expansion = true   # P12: synonym expansion (keyword pathway only)
 enable_quality_filter  = true   # P13: atom info-density multiplier
-
-[query_expansion]
-# Synonym dict for the keyword pathway (FTS5). Keys are matched
-# case-insensitively in the query; matching keys append their
-# synonym list to the keyword query string. The semantic pathway
-# is unchanged.
-[query_expansion.synonyms]
-profession  = ["job", "career", "work", "occupation", "employment"]
-job         = ["profession", "career", "work", "occupation"]
-location    = ["city", "town", "address", "where"]
-spouse      = ["partner", "wife", "husband", "married"]
-partner     = ["spouse", "wife", "husband", "boyfriend", "girlfriend"]
-birthday    = ["birth", "born", "age"]
-purchase    = ["buy", "bought", "ordered"]
-buy         = ["purchase", "bought", "ordered"]
-favorite    = ["preferred", "like", "love", "enjoy"]
-prefer      = ["favorite", "like", "favourite"]
 
 [compression]
 enable_subatom = false
