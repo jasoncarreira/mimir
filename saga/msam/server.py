@@ -294,7 +294,11 @@ async def api_store(req: StoreRequest):
             return response
 
         triples_extracted = 0
-        if stream == "semantic":
+        # Gated by [triples] enable_extraction (default True for backward
+        # compatibility). Setting it false skips the LLM call entirely —
+        # useful for benches and deployments that don't use the graph
+        # pathway. Per-stream gate stays: only semantic atoms get triples.
+        if stream == "semantic" and _cfg('triples', 'enable_extraction', True):
             try:
                 from .triples import extract_and_store
                 triples_extracted = extract_and_store(atom_id, req.content)
