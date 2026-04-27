@@ -338,37 +338,48 @@ async def api_query(req: QueryRequest):
             obs = result.get("observations", []) or []
             raws = result.get("raws", []) or []
             confidence_tier = result.get("confidence_tier", "none")
+            obs_tier = result.get("confidence_tier_observations", "none")
+            raws_tier = result.get("confidence_tier_raws", "none")
 
-            # Confidence-gated output volume (matches single-tier semantics).
-            # Disable via [retrieval] enable_confidence_gating = false to get
-            # raw retrieval output (the LongMemEval bench skips gating; agent
-            # callers usually want it).
+            # Per-tier confidence gating. Each tier is gated by its own
+            # confidence value, so weak raws don't get a free pass when
+            # observations are strong (and vice versa). Disable via
+            # [retrieval] enable_confidence_gating = false.
             gated_reason = None
             if _cfg('retrieval', 'enable_confidence_gating', True):
-                if confidence_tier == "none":
+                _sim_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
+                # Observations gating
+                if obs_tier == "none":
                     obs = []
-                    raws = []
-                    gated_reason = "no data -- output suppressed"
-                elif confidence_tier == "low":
+                elif obs_tier == "low":
                     obs = []
-                    raws = raws[:1]
-                    gated_reason = "low confidence -- output minimized (1 raw, no observations)"
-                elif confidence_tier == "medium":
-                    _sim_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
-                    raws = [r for r in raws if (r.get("_similarity", 0) or 0) > _sim_low][:3] or raws[:2]
+                elif obs_tier == "medium":
                     obs = obs[:1]
-                    gated_reason = "medium confidence -- pruned zero-sim raws, capped at 3 raws + 1 observation"
-                elif confidence_tier == "high":
+                # high: keep full (already capped by observations_top_k)
+
+                # Raws gating
+                if raws_tier == "none":
+                    raws = []
+                elif raws_tier == "low":
+                    raws = raws[:1]
+                elif raws_tier == "medium":
+                    raws = [r for r in raws if (r.get("_similarity", 0) or 0) > _sim_low][:3] or raws[:2]
+                elif raws_tier == "high":
                     good_raws = [r for r in raws if (r.get("_similarity", 0) or 0) > 0.10]
                     if good_raws:
                         raws = good_raws
-                    gated_reason = "high confidence -- pruned zero-sim raws, full output"
+
+                # Compose a human-readable reason describing what each tier did.
+                gated_parts = [f"obs:{obs_tier}", f"raws:{raws_tier}"]
+                gated_reason = " / ".join(gated_parts)
 
             return {
                 "query": req.query,
                 "mode": req.mode,
                 "two_tier": True,
                 "confidence_tier": confidence_tier,
+                "confidence_tier_observations": obs_tier,
+                "confidence_tier_raws": raws_tier,
                 "gated": gated_reason is not None,
                 "gated_reason": gated_reason,
                 "observations": [_format_atom(o) for o in obs],
