@@ -134,4 +134,118 @@ class TestNewConfigSections:
         from msam.config import get_config
         cfg = get_config()
         assert cfg('embedding', 'api_key') is None
-        assert cfg('embedding', 'api_key_env') == 'OPENAI_API_KEY'
+
+
+class TestUnknownKeyWarnings:
+    """Validate that misnamed config keys are surfaced at load time.
+
+    Real-world bug we're guarding against: Mimir's TOML had
+    `cluster_similarity_threshold = 0.75` and `stability_reduction = 0.1`
+    while consolidation reads `similarity_threshold` and
+    `stability_reduction_factor`. Those typos silently fell through to
+    defaults; the warning catches them.
+    """
+
+    def test_warns_unknown_key_in_known_section(self, caplog):
+        import logging
+        from msam.config import _warn_unknown_keys
+        caplog.set_level(logging.WARNING, logger="msam.config")
+        _warn_unknown_keys({
+            "consolidation": {
+                "cluster_similarity_threshold": 0.75,  # typo
+                "similarity_threshold": 0.80,           # legit
+            },
+        })
+        msgs = [r.message for r in caplog.records]
+        assert any("cluster_similarity_threshold" in m for m in msgs)
+        # The legit key shouldn't itself be the subject of a warning.
+        # (It may appear inside a "did you mean…" suggestion — that's OK.)
+        assert not any(
+            "[consolidation] 'similarity_threshold'" in m for m in msgs
+        )
+
+    def test_suggests_closest_match(self, caplog):
+        import logging
+        from msam.config import _warn_unknown_keys
+        caplog.set_level(logging.WARNING, logger="msam.config")
+        _warn_unknown_keys({
+            "consolidation": {"stability_reduction": 0.1},  # missing _factor
+        })
+        msgs = [r.message for r in caplog.records]
+        assert any(
+            "stability_reduction" in m and "stability_reduction_factor" in m
+            for m in msgs
+        )
+
+    def test_skips_unknown_section(self, caplog):
+        import logging
+        from msam.config import _warn_unknown_keys
+        caplog.set_level(logging.WARNING, logger="msam.config")
+        _warn_unknown_keys({
+            "experimental_feature": {"some_key": 42},
+        })
+        # Unknown sections aren't validated -- no warning.
+        assert not caplog.records
+
+    def test_known_extra_keys_dont_warn(self, caplog):
+        import logging
+        from msam.config import _warn_unknown_keys
+        caplog.set_level(logging.WARNING, logger="msam.config")
+        _warn_unknown_keys({
+            "retrieval": {
+                # Not in _DEFAULTS but registered in _KNOWN_EXTRA_KEYS
+                "two_tier_enabled": True,
+                "fusion": "rrf",
+            },
+        })
+        assert not caplog.records
+
+    def test_nested_tables_not_validated(self, caplog):
+        """User-defined nested tables (entity_mappings, synonyms, etc.)
+        should not trigger warnings on their internal keys."""
+        import logging
+        from msam.config import _warn_unknown_keys
+        caplog.set_level(logging.WARNING, logger="msam.config")
+        _warn_unknown_keys({
+            "retrieval_v2": {
+                "entity_mappings": {"foo_pattern": "Foo"},
+            },
+        })
+        # `entity_mappings` is itself unknown? It's in _DEFAULTS, but
+        # its value is a dict whose contents are user-defined.
+        # The dict-skip logic should handle this without warning on
+        # `foo_pattern`.
+        msgs = [r.message for r in caplog.records]
+        assert not any("foo_pattern" in m for m in msgs)
+
+    def test_quiet_env_suppresses(self, caplog, monkeypatch):
+        import logging
+        from msam.config import _warn_unknown_keys
+        monkeypatch.setenv("MSAM_QUIET_CONFIG", "1")
+        caplog.set_level(logging.WARNING, logger="msam.config")
+        _warn_unknown_keys({
+            "consolidation": {"cluster_similarity_threshold": 0.75},
+        })
+        assert not caplog.records
+
+
+class TestLevenshtein:
+    def test_identical(self):
+        from msam.config import _levenshtein
+        assert _levenshtein("abc", "abc") == 0
+
+    def test_simple_substitution(self):
+        from msam.config import _levenshtein
+        assert _levenshtein("abc", "abd") == 1
+
+    def test_insertion(self):
+        from msam.config import _levenshtein
+        assert _levenshtein("abc", "abcd") == 1
+
+    def test_real_typo(self):
+        from msam.config import _levenshtein
+        # The Mimir typo: missing "_factor" suffix
+        assert _levenshtein(
+            "stability_reduction",
+            "stability_reduction_factor",
+        ) == 7

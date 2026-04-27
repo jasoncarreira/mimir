@@ -310,7 +310,75 @@ explicit init), consolidation will fail to write evidenced_by edges
 silently. Worth either making `get_db()` run pending migrations on
 first connect, or adding a startup check in `server.py` that bails if
 the schema is below current. Tracking under a separate "harden DB
-init" item, not P33.
+init" item, not P33. **Update: shipped in `8b326e6`.**
+
+---
+
+### P34 — Recalibrate consolidation similarity_threshold
+
+**What.** Default `consolidation.similarity_threshold = 0.80` and
+`min_cluster_size = 3` were inherited from early experiments. Cluster
+analysis on Mimir's 90-atom corpus (where the user expected many
+duplicates given the data) shows:
+
+| threshold | clusters of size ≥2 | atoms covered |
+|---|---|---|
+| 0.85 | 0 | 0 |
+| 0.80 (default) | 2 | 5 |
+| 0.75 | 5 | 13 |
+| 0.70 | 5 | 16 |
+
+Real semantic duplicates in this corpus sit in the 0.75–0.79 band:
+two pairs of FY27-budget atoms (sim 0.78), two pairs of Artemis II
+splashdown atoms (sim 0.79), three AI-hallucination atoms (sim 0.75).
+At default 0.80 they all miss; at 0.75 they all cluster correctly.
+None of the 0.65–0.74 candidates were genuine duplicates on
+inspection, so 0.75 looks like the right floor for this corpus.
+
+**Why this is a real problem, not a one-off.** Consolidation gates
+the entire two-tier boost mechanism. If the threshold is too tight,
+no observations form, no boost lifts evidence atoms, and the bench
+can't measure what two-tier is actually capable of. The Mimir DB
+result is the clearest data point we have on where real duplicates
+actually sit on the cosine axis.
+
+**Caveat for LongMemEval.** The bench config already overrides to
+`min_cluster_size = 3` and gets meaningful clusters. The bench may
+be on the right side of this curve already. Worth confirming with a
+similar pair-similarity histogram on a typical LME haystack DB.
+
+**Proposed experiment.**
+
+1. After a normal LME bench run, dump the active raw atoms +
+   embeddings to a sidecar DB.
+2. Compute pairwise cosine sim, histogram. Inspect the 0.70–0.85
+   band: how many pairs are real duplicates (manual eyeball, ≤30
+   pairs) vs. coincidental?
+3. Pick a new default `similarity_threshold` at the boundary where
+   real-duplicate fraction drops below ~50%.
+4. Re-run the bench with the new threshold, confirm no regression.
+
+**Connection to P33.** Both are calibration items on the same axis
+(cosine sim distribution under text-embedding-3-small) but at
+different operating points. P33 is about "is this atom relevant
+enough to surface" (retrieval gate). P34 is about "is this atom a
+duplicate of that one" (consolidation gate). The shapes are likely
+similar — pick from a labelled dataset rather than guessing.
+
+**Sibling finding (already addressed).** Mimir's TOML had
+`cluster_similarity_threshold = 0.75` and `stability_reduction = 0.1`
+as configuration intent — but the code reads `similarity_threshold`
+and `stability_reduction_factor`. The misnamed keys silently fell
+through to defaults, which is exactly what the new config-key
+warnings (commit forthcoming) are designed to surface.
+
+**Effort.** 1 day. Half for the analysis, half for the bench A/B.
+
+**Risk.** Low — reverse the change if the bench regresses.
+
+**Score expectation.** Net flat or small positive on LongMemEval.
+The clearer benefit is for downstream agents like Mimir whose
+domain produces real duplicates that the current threshold misses.
 
 ---
 
