@@ -26,6 +26,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p8_minimax_v2` | MiniMax-M2.7 | P8v1 stack with tighter merge knobs | sem + kw (merge_threshold=0.85, max_cluster_size=15) | 500 | **0.758** |
 | `msam_p4_minimax_v1` | MiniMax-M2.7 | P9v2 + P4-bench (contradiction→supersedes→demotion); P10 disabled | sem + kw (supersedes_resolution_threshold=0.85, supersedes_score_multiplier=0.4) | 500 | **0.766** |
 | `msam_p30_minimax_v1` | MiniMax-M2.7 | P9v2 + P30 (missing-atom base score in two-tier); atom-level supersedes off; obs-level supersedes on | sem + kw (additive boost + P30 cosine-based missing-atom pull-in) | 500 | **0.780** |
+| `msam_p30_minimax_v2` | MiniMax-M2.7 | P30v1 stack with **flat 2× restoration** replacing the additive boost; per-atom confidence filtering | sem + kw (raws endorsed by surfaced obs get score×2; no additive boost) | 500 | **0.756** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
@@ -616,6 +617,46 @@ raws from being inflated above their relevance.
 
 Pace: ~28s/q (vs P9v2's ~38s/q). The supersedes resolver is gone, so
 each question runs ~10s faster.
+
+### `msam_p30_minimax_v2` — P30v1 stack with flat 2× restoration (500q)
+
+Replaced the additive boost (`base + min(2 × obs_score, 2 × base)`) with
+a flat `base × 2` restoration applied to raws endorsed by surfaced
+observations. Same missing-atom pull-in (P30 cosine-based base). Same
+obs-tier supersedes demotion. Same atom-level supersedes disabled.
+
+| Subtype | Score | N | Δ vs P30v1 | Δ vs P9v2 |
+|---|---|---|---|---|
+| single-session-assistant | 1.000 | 56 | +1.8 | +1.8 |
+| **single-session-preference** | **0.200** | 30 | **-16.7** | **-6.7** |
+| single-session-user | 0.929 | 70 | -2.9 | -5.7 |
+| knowledge-update | 0.923 | 78 | 0.0 | -2.6 |
+| temporal-reasoning | 0.714 | 133 | -3.8 | -6.0 |
+| multi-session | 0.632 | 133 | -0.8 | -3.7 |
+
+**Overall: 0.756 (-2.4 vs P30v1, -4.0 vs P9v2).**
+
+The flat restoration is **strictly worse** than the additive boost. The
+clearest signal is preference: P30v1 scored 0.367 (the highest preference
+ever logged on this bench); P30v2 collapsed to 0.200, **worse than the
+0.233 baseline.**
+
+Why: preference probes are exactly the case where the additive boost
+mattered. A weak raw with sim=0.18 (low tier) endorsed by a strong
+observation got significantly lifted by `base + 2×obs_score` —
+typically pushing it from ~0.025 to ~0.10 or so. With flat restoration,
+that same atom only gets `0.025 × 2 = 0.05`, half of what additive
+delivered. Top-K rankings shift accordingly: weak-but-endorsed atoms
+fall out of top-20 under flat restoration, taking preference answers
+with them.
+
+Other subtypes saw smaller losses (-3 to -6 pp), consistent with the
+general "less-aggressive boost = less endorsement-driven retrieval" story.
+
+**Decision: revert the flat restoration. The additive boost (P30v1's
+mechanism) is the canonical model.** It was a trade — preference lift
+at the cost of moderate losses elsewhere — and that trade is the
+right one given the data.
 
 ## P9 summary
 
