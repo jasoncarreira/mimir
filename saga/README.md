@@ -6,7 +6,7 @@ MSAM gives agents persistent, structured memory that self-regulates what it stor
 
 When MSAM knows something, it delivers. When it doesn't, it says so. Output volume is proportional to confidence -- not padded with noise.
 
-Built for production. Running in production. 24 modules, 56 CLI commands, 19 API endpoints, 437 tests.
+Built for production. Running in production. 24 modules, 56 CLI commands, 20 API endpoints, 516 tests.
 
 ## Benchmark Highlights
 
@@ -29,6 +29,8 @@ Most agent memory systems are vector stores with a retrieval wrapper. MSAM is di
 - **Multi-stream architecture.** Semantic (facts), episodic (events), and procedural (how-to) streams. Each has different retrieval behavior, decay characteristics, and promotion rules.
 
 - **Cognitive scoring.** ACT-R activation model: base-level activation (frequency + recency) x sigmoid similarity x annotation bonuses x stability. Not just "closest vector."
+
+- **Two-tier retrieval.** Observations (consolidation output) and raw atoms are ranked on independent pools and fused with Reciprocal Rank Fusion. Surfaced observations boost their evidence atoms via `evidenced_by` edges, including atoms that didn't make the candidate top-K (pulled in with a cosine-derived base score). Lifts weak-but-endorsed atoms — notably preference signals where the answer is a short user statement that doesn't lexically match the probe.
 
 - **Adaptive scaling.** Multi-beam retrieval sleeps until the database is large enough to benefit. Compression only runs where it earns its compute. The pipeline doesn't pay scale-tax before scale arrives.
 

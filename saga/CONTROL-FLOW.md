@@ -44,7 +44,9 @@ The five primary flows below represent the complete operational surface of MSAM.
 ### 1. STORE
 
 ```
-remember.cmd_store
+remember.cmd_store  /  server.api_store
+  -> core.get_db (first call: runs SCHEMA_SQL + pending migrations,
+                  process-cached so subsequent calls are fast)
   -> core.store_atom
     -> content_hash dedup (SHA256, reject active/fading dupes)
     -> budget check (>95% refuse, >85% auto-compact to lightweight)
@@ -52,40 +54,90 @@ remember.cmd_store
     -> annotate.heuristic_annotate
       -> classify_stream (semantic / episodic / procedural)
       -> extract topics, arousal, valence
-    -> INSERT atoms table
-    -> triples.extract_triples (SPO extraction)
+    -> INSERT atoms table (memory_type='raw' by default; 'observation'
+                           reserved for consolidation output)
+    -> triples.extract_triples (SPO extraction; gated by
+                                [triples] enable_extraction)
     -> metrics.log_store + log_access_event
 ```
 
-### 2. RETRIEVE (Confidence-Gated)
+### 1b. CONSOLIDATE (Sleep Cycle)
 
 ```
-remember.cmd_query
-  -> retrieve_v2 pipeline:
-    -> rewrite_query (entity resolution: aliases -> canonical names)
-    -> detect_temporal_scope ("right now" / "today" -> require recent atoms)
-    -> ADAPTIVE GATE:
-        atoms < 10K? -> single hybrid_retrieve
-        atoms >= 10K? -> beam_search_retrieve (3 beams, merged)
-    -> triple_augment (entity-linked atoms from triple graph)
-    -> entity_role_scoring (query entity vs atom entity matching)
-    -> quality_filter (penalize low-quality atoms)
-    -> sort + trim to top_k
+server.api_consolidate  /  ConsolidationEngine.consolidate
+  -> _cluster_phase: greedy anchor-and-absorb over active raw atoms
+       within each stream. Threshold = [consolidation] similarity_threshold
+       (default 0.80); min cluster size = min_cluster_size (default 3).
+  -> skip-on-identical: clusters whose source set already has an
+       observation are skipped.
+  -> _synthesize_phase: LLM rolls each cluster into one observation atom
+       (memory_type='observation', evidence_count=N).
+  -> _restructure_phase:
+       INSERT observation atom
+       INSERT atom_relations rows: observation -evidenced_by-> raws
+       optionally INSERT supersedes edges between observations whose
+       evidence set is a strict superset of an existing observation
+       reduce source raw stability by stability_reduction_factor (0.5)
+```
 
-  -> triples.hybrid_retrieve_with_triples
-    -> triples.retrieve_triples (embedding similarity on SPO store)
-    -> merge atoms + triples within token budget
+### 2. RETRIEVE (Two-Tier, Confidence-Gated)
 
-  -> CONFIDENCE TIER CLASSIFICATION:
-    -> per-atom: similarity thresholds (high >= 0.45, medium >= 0.30, low >= 0.15)
-    -> temporal demotion: stale atoms capped at "low" for temporal queries
-    -> overall tier: best tier across all atoms
+The canonical path is `core.hybrid_retrieve` with `two_tier=True`, gated
+through the REST `/v1/query` endpoint. `retrieval_v2.py` is no longer
+the default pipeline — its useful pieces (query rewriting, synonym
+expansion, atom quality scoring) were cherry-picked into
+`hybrid_retrieve` as opt-in flags (P11/P12/P13).
 
-  -> CONFIDENCE-GATED OUTPUT:
-    -> high:   full atoms (zero-sim pruned), <= 12 triples
-    -> medium: top 3 atoms (sim > 0.15), <= 8 triples
-    -> low:    1 atom, 0 triples, advisory text
-    -> none:   0 atoms, 0 triples, advisory only
+```
+server.api_query  /  remember.cmd_query
+  -> core.hybrid_retrieve(query, two_tier=True)
+    -> P11 (opt-in): _apply_query_rewriting
+        pattern-based rewrites (user -> User, agent -> Agent, plus
+        user-supplied [retrieval_v2.entity_mappings])
+    -> P12 (opt-in): _expand_query_for_keyword
+        append synonyms from [query_expansion.synonyms] to the
+        keyword pathway only (semantic side handles synonyms via
+        embedding similarity)
+
+    -> CANDIDATE FETCH (split by memory_type):
+        -> retrieve(memory_type='observation')  -- semantic similarity
+        -> keyword_search(memory_type='observation')  -- FTS5 BM25
+        -> retrieve(memory_type='raw')           -- semantic similarity
+        -> keyword_search(memory_type='raw')     -- FTS5 BM25
+
+    -> RRF FUSION (per pool):
+        -> observations: RRF over (semantic, keyword)
+        -> raws:         RRF over (semantic, keyword [+ graph, temporal
+                         if pathways enabled])
+
+    -> P13 (opt-in): _apply_quality_scoring
+        compute_atom_quality(content) -> ×0.5 if <0.3, ×1.1 if >0.7
+        applied to both pools, re-rank
+
+    -> _two_tier_split (P9 / P30):
+        -> observation supersedes demotion (skip-on-identical,
+           strict-superset between observations from consolidation)
+        -> obs surfacing gate: similarity >= obs_conf_min_sim (0.30)
+                              AND rank within observations_top_k
+        -> for each surfaced observation:
+              find evidenced_by raws via atom_relations
+              boost = (1 / stability_reduction) × obs_score
+              for in-pool raws: score = base + min(boost, cap × base)
+              for missing raws: pull in with cosine-derived base score,
+                                then apply same formula
+        -> per-atom _confidence_tier from each atom's own similarity
+
+  -> REST: api_query
+    -> per-atom filter by min_confidence_tier (default "low";
+       drops only "none"-tier atoms unless caller raises the floor)
+    -> return {"observations": [...], "raws": [...]}
+
+  -> CLI: remember.cmd_query
+    -> CONFIDENCE-GATED OUTPUT:
+        high:   full atoms (zero-sim pruned), <= 12 triples
+        medium: top 3 atoms (sim > 0.15), <= 8 triples
+        low:    1 atom, 0 triples, advisory text
+        none:   0 atoms, 0 triples, advisory only
 
   -> SESSION DEDUP:
     -> check served atom IDs (file-based, hourly window)

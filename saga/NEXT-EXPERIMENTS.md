@@ -28,7 +28,7 @@ The "Recommended order" at the bottom proposes a sequence by goal.
 
 ## A. Retrieval improvements
 
-### P11 — Cherry-pick query rewriting from `retrieval_v2`
+### P11 — Cherry-pick query rewriting from `retrieval_v2` [shipped: `fa201ec`, awaiting bench]
 
 **What.** Pattern-based query normalization (entity aliases). Currently in
 `retrieval_v2.rewrite_query()`. Plumb to the front of `hybrid_retrieve`
@@ -47,7 +47,7 @@ where the user phrases things differently from how facts were stored.
 
 ---
 
-### P12 — Cherry-pick query expansion from `retrieval_v2`
+### P12 — Cherry-pick query expansion from `retrieval_v2` [shipped: `fa201ec` + `3d5d497`, awaiting bench]
 
 **What.** Synonym expansion via `[query_expansion] synonyms` config dict
 (e.g. `profession → [job, career, work, occupation]`). Currently in
@@ -68,7 +68,7 @@ where the haystack uses different vocabulary than the probe.
 
 ---
 
-### P13 — Cherry-pick atom quality scoring from `retrieval_v2`
+### P13 — Cherry-pick atom quality scoring from `retrieval_v2` [shipped: `fa201ec`, awaiting bench]
 
 **What.** `compute_atom_quality(content)` — info-density score (length,
 named-entity count, specificity). Apply as a multiplier inside
