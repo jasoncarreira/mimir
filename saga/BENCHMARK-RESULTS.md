@@ -29,7 +29,13 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p30_minimax_v2` | MiniMax-M2.7 | P30v1 stack with **flat 2× restoration** replacing the additive boost; per-atom confidence filtering | sem + kw (raws endorsed by surfaced obs get score×2; no additive boost) | 500 | **0.756** |
 | `msam_p30_minimax_v3` | MiniMax-M2.7 | P30v1 stack reinstated (additive boost) + per-atom confidence filtering retained from P30v2 | sem + kw (additive boost + P30 cosine-based missing-atom pull-in; per-atom tiers) | 500 | **0.784** |
 | `msam_cherrypicks_minimax_v1` | MiniMax-M2.7 | P30v3 + P11/P12/P13 cherry-picks (query rewriting + synonym expansion + atom quality multiplier), all on | sem + kw (P11 rewriting on both pathways; P12 synonyms on keyword only; P13 quality ×0.5/×1.1 multiplier) | 500 | **0.756** |
+| `msam_cherrypicks_off_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 mechanism (cherry-picks reverted to off); reader + MSAM consolidation + judge ALL on `openai/gpt-oss-120b` via OpenRouter | sem + kw (P30v3 stack — additive boost + per-atom tiers + missing-atom pull-in) | 500 | **0.668** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
+
+¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
+all switched to gpt-oss-120b for this run. Direct comparison to MiniMax /
+gpt-4o-judged runs above is not strictly apples-to-apples; absolute numbers
+shift, deltas-vs-baseline within this same configuration would be.
 
 \* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
 
@@ -781,6 +787,71 @@ them off until ablation says otherwise. Updating msam_bench.toml to
 disable the three flags accordingly is a follow-up task (next
 session). Pace: ~32s/q (vs P30v3's ~31s/q — synonym expansion +
 quality scoring add minor overhead).
+
+### `msam_cherrypicks_off_gptoss_v1` — P30v3 mechanism, gpt-oss-120b for everything (500q)
+
+Two changes from the prior P30v3 baseline (0.784):
+- **Cherry-picks reverted to off** (post `msam_cherrypicks_minimax_v1` regression).
+  Mechanism is exactly the P30v3 stack: additive boost, per-atom confidence
+  tiers, missing-atom cosine pull-in.
+- **Every LLM in the bench loop switched to `openai/gpt-oss-120b`** via
+  OpenRouter — reader (was MiniMax-M2.7), MSAM's consolidation synthesizer
+  (was gpt-5.4-nano), and the judge (was gpt-4o). Auth via the new unified
+  `[llm]` section + `OPENAI_BASE_URL` override on the judge.
+
+| Subtype | Score | N | Δ vs P30v3 (gpt-4o judge) |
+|---|---|---|---|
+| single-session-user | 0.943 | 70 | -2.8 |
+| single-session-assistant | 0.911 | 56 | -7.1 |
+| knowledge-update | 0.833 | 78 | -11.6 |
+| multi-session | 0.549 | 133 | -9.8 |
+| **temporal-reasoning** | **0.549** | 133 | **-21.0** |
+| single-session-preference | 0.200 | 30 | -6.7 |
+
+**Overall: 0.668 (-11.6 vs P30v3, -12.8 vs P9v2).**
+
+Big absolute drop, but **the comparison isn't apples-to-apples** —
+three things changed at once. Most of the headline regression is
+likely coming from the **judge swap**, not the reader. gpt-oss-120b's
+chain-of-thought reasoning produces stricter / different yes-no
+verdicts on borderline cases that gpt-4o would mark correct.
+Temporal-reasoning cratered (-21pp) because temporal answers have the
+most ambiguous "is this close enough" calls — exactly where judge
+disagreement bites hardest.
+
+**Operational notes from running this:**
+
+- **Reader speed: gpt-oss-120b is ~2× faster than MiniMax-M2.7.** Read
+  phase dropped from ~5–10s/q to ~1s/q. Total ingest 3h25m vs 4h20m
+  on prior runs — meaningful for iteration speed, less for cost.
+- **Reasoning models break the LongMemEval judge.** evaluate_qa.py
+  hard-coded `max_tokens=10` and read `message.content`. gpt-oss-120b
+  put its yes/no inside `message.reasoning` (content was None),
+  killing the judge on Q1. Patched upstream evaluate_qa.py to fall
+  back to `reasoning` and bumped `max_tokens` to 256. Re-running just
+  the judge took ~2 min.
+- **Cost: trivial.** 500 reader + 500 judge + ~5 consolidation calls
+  on the paid OpenRouter route, roughly $0.30 total at gpt-oss-120b's
+  pricing.
+
+**Take on gpt-oss-120b as the bench reader:** **viable for ablation
+runs but not for headline numbers.** It's fast, cheap, and the
+deltas-within-this-config are meaningful. But absolute scores aren't
+comparable to gpt-4o-judged / MiniMax-read runs, and the reasoning-
+model footguns (judge max_tokens, content vs reasoning) need handling
+in any future bench harness that uses one. For headline numbers stick
+with MiniMax reader + gpt-4o judge.
+
+**Take on the cherry-picks-off mechanism (P30v3 config):** the bench
+config is in a sensible "go-forward" state — cherry-picks off, P30v3
+mechanism intact. To get a clean comparable number to confirm the
+revert worked, re-run with reader=MiniMax-M2.7 and judge=gpt-4o
+(uncommitted bench config + reader changes can be reverted to do
+that). Expected: ≈ P30v3 (0.784) ± small drift from the keyword-only-
+atom backfill fix in `29efa38`.
+
+Pace: ~25s/q ingest (vs P30v3's ~31s/q — gpt-oss-120b reader is
+faster than MiniMax). Judge: ~2 min for 500q (vs ~7 min on gpt-4o).
 
 ## P9 summary
 
