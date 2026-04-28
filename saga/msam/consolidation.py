@@ -370,6 +370,111 @@ class ConsolidationEngine:
                 out.append(obs_id)
         return out
 
+    def _persist_consolidation_triples(
+        self,
+        cluster_triples: list[dict],
+        new_obs_id: str,
+        superseded_obs_ids: list[str],
+    ) -> int:
+        """Persist triples emitted by the consolidation LLM.
+
+        For each emitted triple, three cases:
+
+        1. **New triple** (no existing row with this content): INSERT
+           a fresh row attached to ``new_obs_id``.
+        2. **Restated triple** (same content as a row attached to one
+           of the about-to-be-superseded observations): UPDATE the
+           existing row's ``atom_id`` to ``new_obs_id``. Preserves
+           dedup and follows the LLM's "still-true" verdict.
+        3. **Pre-existing on a non-superseded observation** (rare —
+           e.g., the same SPO is genuinely attested by two unrelated
+           clusters): leave the existing row alone, no insert. Acts as
+           the natural dedup layer.
+
+        Returns the number of triples successfully persisted (counts
+        both inserts and ownership transfers).
+        """
+        if not cluster_triples:
+            return 0
+        from .triples import _embed_triple_safe
+        import hashlib
+        from datetime import datetime, timezone
+
+        # Resolve atom_id and compute the content-level triple_id once
+        # per emitted triple. Skip triples that fail validation (no
+        # content fields).
+        prepared: list[tuple[str, dict]] = []
+        for t in cluster_triples:
+            subj = (t.get("subject") or "").strip()
+            pred = (t.get("predicate") or "").strip()
+            obj = (t.get("object") or "").strip()
+            if not (subj and pred and obj):
+                continue
+            norm_key = f"{subj.lower()}:{pred.lower()}:{obj.lower()}"
+            tid = hashlib.sha256(norm_key.encode()).hexdigest()[:16]
+            prepared.append((tid, {**t, "subject": subj, "predicate": pred, "object": obj}))
+
+        if not prepared:
+            return 0
+
+        persisted = 0
+        now = datetime.now(timezone.utc).isoformat()
+        superseded_set = set(superseded_obs_ids or [])
+
+        conn = get_db()
+        try:
+            for tid, t in prepared:
+                row = conn.execute(
+                    "SELECT atom_id FROM triples WHERE id = ?", (tid,)
+                ).fetchone()
+
+                if row is None:
+                    # Fresh insert
+                    embedding = _embed_triple_safe(
+                        t["subject"], t["predicate"], t["object"]
+                    )
+                    try:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO triples "
+                            "(id, atom_id, subject, predicate, object, "
+                            " confidence, embedding, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (tid, new_obs_id, t["subject"], t["predicate"],
+                             t["object"], float(t.get("confidence", 1.0)),
+                             embedding, now),
+                        )
+                        persisted += 1
+                    except Exception:
+                        pass
+                    continue
+
+                existing_atom_id = row[0]
+                if existing_atom_id == new_obs_id:
+                    # Already attached — defensive idempotency, no-op.
+                    continue
+                if existing_atom_id in superseded_set:
+                    # Restate case: transfer ownership to the new
+                    # (superseding) observation. The LLM saw this
+                    # prior triple in context and chose to restate it,
+                    # which means it survives the merger.
+                    try:
+                        conn.execute(
+                            "UPDATE triples SET atom_id = ?, created_at = ? WHERE id = ?",
+                            (new_obs_id, now, tid),
+                        )
+                        persisted += 1
+                    except Exception:
+                        pass
+                # else: triple is attested by some other unrelated
+                # observation. Leave it alone — content-level dedup is
+                # the right default outside the supersedes window.
+
+            conn.commit()
+        finally:
+            conn.close()
+
+        return persisted
+
     def _fetch_prior_triples(self, observation_ids: list[str]) -> list[dict]:
         """Return active triples attached to the given observation atoms.
 
@@ -606,13 +711,10 @@ class ConsolidationEngine:
             if persist_triples:
                 cluster_triples = syn.get("triples") or []
                 if cluster_triples:
-                    from .triples import store_triples_batch
-                    for t in cluster_triples:
-                        t["atom_id"] = syn_id
-                    try:
-                        triples_persisted += store_triples_batch(cluster_triples)
-                    except Exception as e:
-                        logger.warning(f"triple persistence failed for {syn_id}: {e}")
+                    superseded_obs_ids = syn.get("supersedes_observations") or []
+                    triples_persisted += self._persist_consolidation_triples(
+                        cluster_triples, syn_id, superseded_obs_ids
+                    )
 
         # Phase B: create relations and reduce stability in a single connection.
         # Two edge directions:

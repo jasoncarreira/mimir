@@ -433,6 +433,146 @@ class TestPriorTriplesOnSupersede:
         assert len(result) == 20
 
 
+class TestPersistConsolidationTriples:
+    """P35.2: when the consolidation LLM restates a triple already
+    attached to a soon-to-be-superseded observation, transfer
+    ownership rather than dedup-skip the write."""
+
+    def _setup(self):
+        from msam.core import get_db, run_migrations, store_atom
+        from msam.triples import init_triples_schema, store_triples_batch
+        run_migrations(get_db())
+        init_triples_schema()
+
+        old_obs_id = store_atom(
+            "old observation", memory_type="observation", evidence_count=2,
+        )
+        store_triples_batch([
+            {"atom_id": old_obs_id, "subject": "User",
+             "predicate": "lives_in", "object": "Boston"},
+            {"atom_id": old_obs_id, "subject": "User",
+             "predicate": "has_pet", "object": "cat"},
+        ])
+        new_obs_id = store_atom(
+            "new observation (supersedes old)",
+            memory_type="observation", evidence_count=5,
+        )
+        return old_obs_id, new_obs_id
+
+    def test_fresh_triple_inserted(self):
+        from msam.consolidation import ConsolidationEngine
+        old_obs, new_obs = self._setup()
+        engine = ConsolidationEngine()
+        n = engine._persist_consolidation_triples(
+            [{"subject": "User", "predicate": "works_at", "object": "Acme"}],
+            new_obs_id=new_obs,
+            superseded_obs_ids=[old_obs],
+        )
+        assert n == 1
+        # Newly inserted triple is attached to the new observation
+        from msam.core import get_db
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT atom_id FROM triples WHERE subject='User' AND predicate='works_at'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == new_obs
+
+    def test_restated_triple_transfers_ownership(self):
+        """If the LLM restates a triple already attached to the
+        superseded observation, ownership transfers to the new
+        observation. No duplicate row is created."""
+        from msam.consolidation import ConsolidationEngine
+        from msam.core import get_db
+        old_obs, new_obs = self._setup()
+
+        engine = ConsolidationEngine()
+        n = engine._persist_consolidation_triples(
+            [{"subject": "User", "predicate": "lives_in", "object": "Boston"}],
+            new_obs_id=new_obs,
+            superseded_obs_ids=[old_obs],
+        )
+        assert n == 1  # transfer counts as persisted
+
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT atom_id FROM triples WHERE subject='User' AND predicate='lives_in' AND object='Boston'"
+        ).fetchall()
+        # Exactly one row (no duplicate created)
+        assert len(rows) == 1
+        # Ownership moved to the new observation
+        assert rows[0][0] == new_obs
+
+    def test_unrestated_triple_stays_with_old_observation(self):
+        """Triples the LLM did NOT restate stay attached to the old
+        (now-superseded) observation. They'll be demoted at retrieval
+        via the supersedes edge but aren't deleted."""
+        from msam.consolidation import ConsolidationEngine
+        from msam.core import get_db
+        old_obs, new_obs = self._setup()
+
+        engine = ConsolidationEngine()
+        # LLM only restates one of the two prior triples (lives_in).
+        # The has_pet triple is missing from its output — it judged
+        # that fact no longer holds.
+        engine._persist_consolidation_triples(
+            [{"subject": "User", "predicate": "lives_in", "object": "Boston"}],
+            new_obs_id=new_obs,
+            superseded_obs_ids=[old_obs],
+        )
+
+        conn = get_db()
+        # has_pet triple should still exist, attached to old_obs
+        rows = conn.execute(
+            "SELECT atom_id FROM triples WHERE subject='User' AND predicate='has_pet'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == old_obs
+
+    def test_existing_triple_on_unrelated_observation_left_alone(self):
+        """If the same SPO is attested by some OTHER (non-superseded)
+        observation, leave it alone. Don't accidentally hijack it."""
+        from msam.consolidation import ConsolidationEngine
+        from msam.core import get_db, store_atom
+        from msam.triples import store_triples_batch
+        old_obs, new_obs = self._setup()
+
+        # A third, unrelated observation also claims (User, lives_in, Boston).
+        # Wait — content dedup means only one row exists. To simulate
+        # "unrelated" we attach the existing Boston triple to a
+        # different observation and ensure that observation is NOT in
+        # superseded_obs_ids.
+        unrelated = store_atom(
+            "an unrelated observation", memory_type="observation",
+            evidence_count=2,
+        )
+        # Move the triple to the unrelated obs to simulate the case
+        conn = get_db()
+        conn.execute(
+            "UPDATE triples SET atom_id = ? "
+            "WHERE subject='User' AND predicate='lives_in' AND object='Boston'",
+            (unrelated,),
+        )
+        conn.commit()
+        conn.close()
+
+        engine = ConsolidationEngine()
+        n = engine._persist_consolidation_triples(
+            [{"subject": "User", "predicate": "lives_in", "object": "Boston"}],
+            new_obs_id=new_obs,
+            superseded_obs_ids=[old_obs],   # unrelated NOT in this list
+        )
+        assert n == 0  # no transfer, no insert (existing row untouched)
+
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT atom_id FROM triples WHERE subject='User' AND predicate='lives_in'"
+        ).fetchall()
+        # Still one row, still attached to the unrelated observation
+        assert len(rows) == 1
+        assert rows[0][0] == unrelated
+
+
 class TestParseStructuredSynthesis:
     """P35: parse the OBSERVATION + TRIPLES dual-output format."""
 
