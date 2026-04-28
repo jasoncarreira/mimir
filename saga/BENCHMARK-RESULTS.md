@@ -33,6 +33,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p32_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 + P32 (triple extraction via P7 batched, graph pathway joins RRF as 4th ranker) | sem + kw + **graph** (triples populated per-question via batch_extract_and_store) | 500 | **0.646** |
 | `msam_rerank_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 + P15 (cross-encoder LLM rerank on top-8 candidates); triples + graph pathway off | sem + kw, then LLM rerank on top-8 | 500 | **0.648** |
 | `msam_p35_canon_v1` | MiniMax-M2.7 | P30v3 + P35 (consolidation as structured-cognition pass: observation + triples in one LLM call); graph pathway on; cherry-picks off; rerank off | sem + kw + **graph** (triples-as-byproduct of consolidation, not separate extraction pipeline) | 500 | **0.758** |
+| `msam_p11_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P11 ONLY (`enable_query_rewriting=true`); P12/P13 off | sem + kw (P11 rewriting on both pathways via built-in `_QUERY_REWRITES`) | 498 (2 errors) | **0.771** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
@@ -1106,6 +1107,50 @@ LongMemEval, kept in code for production-graph-feature deployments."
 
 Pace: ~38s/q (vs P30v3's ~31s/q — consolidation prompt produces more
 output and gpt-5.4-nano takes a bit longer for the structured format).
+
+### `msam_p11_canon_v1` — cherry-pick ablation: P11 alone (498q, 2 errors)
+
+First of three ablation runs disambiguating the cherry-picks bundle
+regression (`msam_cherrypicks_minimax_v1` = 0.756, -2.8pp vs P30v3 =
+0.784). P11 is built-in query rewriting (`user → User`,
+`agent → Agent`, etc.) applied on both pathways via
+`_apply_query_rewriting`. P12 and P13 stay off.
+
+| Subtype | Score | N | Δ vs P30v3 (0.784) | Δ vs bundle (0.756) |
+|---|---|---|---|---|
+| **single-session-preference** | **0.300** | 30 | **+3.3** ✓ | -3.3 |
+| single-session-assistant | 0.946 | 56 | -3.6 | 0.0 |
+| single-session-user | 0.943 | 70 | -2.8 | 0.0 |
+| knowledge-update | 0.936 | 78 | -1.3 | -1.3 |
+| temporal-reasoning | 0.752 | 133 | -0.7 | +4.5 |
+| multi-session | 0.634 | 131 | -1.3 | +2.5 |
+
+**Overall: 0.771 (-1.3pp vs P30v3, +1.5pp vs bundle).**
+
+P11 alone sits between the bundle (0.756) and the canonical baseline
+(0.784): better than the bundle, but still slightly worse than no
+cherry-picks. Preference recovers (+3.3pp vs P30v3) — the bundle's
+preference gain was apparently coming from P11 specifically. Other
+subtypes regress 1-4pp, similar to the bundle's pattern but milder.
+
+Net interpretation so far (P11 done, P12/P13 pending): the bundle's
+-2.8pp regression decomposes partially into P11's -1.3pp. The
+remaining ~1.5pp gap between P11 alone and the bundle must come
+from P12 or P13. Specifically:
+
+- P11 contributes the preference gain (+3.3pp) and ~1.3pp of broad
+  regression
+- P12 and/or P13 must contribute an additional ~1.5pp of regression
+  on top of P11's
+
+The next two ablations (P12 alone, P13 alone) will tell us which of
+those is the primary culprit.
+
+**Two errors note.** 498 processed instead of 500 — likely MiniMax
+API hiccups during the run. Subtype counts shifted slightly
+(multi-session 131 vs 133). Doesn't materially change the headline.
+
+Pace: ~33s/q (~4h29m for 500 questions).
 
 ## P9 summary
 
