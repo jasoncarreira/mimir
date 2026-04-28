@@ -629,6 +629,140 @@ fine for a feature whose primary value is non-bench.
 
 ---
 
+### P38 — Confidence-gated HyDE (escalate to hypothetical-doc embedding only when first pass is weak)
+
+**What.** Standard HyDE replaces the query embedding with the
+embedding of an LLM-generated hypothetical answer. Cheap-path-first
+HyDE wraps that in a confidence gate:
+
+```
+Stage 1: hybrid_retrieve(original_query)
+Stage 2: if max(top_K._similarity) >= hyde_trigger_confidence:
+             return  # cheap path was good enough
+Stage 3: hypothetical = LLM("Write a 1-2 sentence answer to: {query}")
+         hybrid_retrieve(hypothetical)
+         (optionally: RRF-fuse both passes)
+```
+
+The agent pays for HyDE's extra LLM call only when the first pass
+produces no confident match. P33 data says ~67% of queries find a
+gold atom at sim ≥ 0.40 on the first pass — those don't need HyDE.
+The ~33% that don't are exactly where HyDE would help most.
+
+**Why this is the right shape for LongMemEval.** P33 showed gold
+atoms median sim only 0.44 to their queries. The question-vs-answer
+shape mismatch is real:
+
+| Text | Sim to gold atom (typical) |
+|---|---|
+| Question ("What degree did I graduate with?") | 0.44 |
+| HyDE hypothetical ("I graduated with a Business Administration degree.") | 0.70+ |
+| Gold atom ("[user] I graduated with a degree in Business Administration...") | — |
+
+Even if the LLM guesses the wrong degree, the hypothetical lives in
+**answer-shape** — same syntactic register as real atoms — and the
+embedding distance is dominated by shape, not content.
+
+**Why gate it.** Two reasons:
+
+1. **Cost in production.** An always-on HyDE adds an LLM call per
+   query forever. For an agent making 100s of memory queries per
+   session, that's real. The gate only escalates when needed.
+2. **Bad hypotheticals can hurt.** If the LLM hallucinates an
+   off-topic answer, retrieval shifts toward that. Gating on
+   first-pass confidence means we only pay the bad-hypothetical
+   risk on queries where the cheap path already failed — there's
+   not much to lose.
+
+**Connection to P11 (query rewriting).** P11 alone scored -1.3pp
+because regex rewrites apply uniformly even when not helpful. Gated
+HyDE is the higher-quality version of the same idea: **don't
+rewrite when retrieval is already confident.** If we ship gated
+HyDE, P11 becomes mostly redundant — could either retire it or
+gate it the same way (run only when first pass is weak).
+
+**Implementation:**
+
+1. New helper `_hyde_query(query)` in `core.py`:
+   ```python
+   def _hyde_query(query: str) -> str | None:
+       if not _cfg('retrieval', 'enable_hyde', False):
+           return None
+       llm = resolve_llm_config('retrieval_v2')
+       if not llm['api_key']:
+           return None
+       prompt = (
+           "Write a 1-2 sentence hypothetical answer to this question, "
+           "in the voice of a user describing themselves or an "
+           "assistant providing the fact. The answer doesn't need to "
+           "be factually accurate — write it in conversational "
+           "answer-shape, not as a question.\n\n"
+           f"Question: {query}\n\nHypothetical answer:"
+       )
+       # POST to llm['url'], return text or None on failure
+   ```
+
+2. In `hybrid_retrieve`, after the first-pass result is built but
+   before two-tier split / supersedes:
+   ```python
+   max_sim = max(
+       (r.get("_similarity", 0) for r in combined.values()),
+       default=0.0,
+   )
+   trigger_thr = _cfg('retrieval', 'hyde_trigger_confidence', 0.45)
+   if max_sim < trigger_thr:
+       hyp = _hyde_query(query)
+       if hyp:
+           # Re-run semantic pathway with HyDE'd embedding,
+           # keep keyword pathway on original (BM25 needs question
+           # vocabulary), RRF-fuse the result with the first-pass
+           ...
+   ```
+
+3. Two new config keys:
+   - `[retrieval] enable_hyde` — defaults False
+   - `[retrieval] hyde_trigger_confidence` — defaults 0.45 (matches
+     the new P33 high-tier threshold)
+
+4. RRF fusion strategy: combine first-pass + HyDE-pass results via
+   RRF, so atoms that score well in either pass surface. Don't
+   replace; augment.
+
+**Effort.** 1 day for the gated implementation + 1 bench run.
+
+**Risk.** Low — gated. Worst case the LLM call is wasted on
+already-confident queries (avoided by the gate) or produces noise
+(absorbed by RRF fusion with the first pass).
+
+**Score expectation.** This is the highest-expected-value untested
+lever for LongMemEval. The P33 mismatch data directly motivates it.
+
+- multi-session is the most likely beneficiary (these queries have
+  the lowest first-pass sim — P33 showed median 0.41 there). HyDE
+  could move them up substantially.
+- knowledge-update second (median 0.49 on P33) — HyDE helps when
+  the question doesn't lexically match the answer's phrasing.
+- single-session-* probably already at the ceiling for the cheap
+  path, won't trigger the gate often.
+
+**Relationship to other levers:**
+- Composes with rerank (P15): better candidates → better rerank input
+- Composes with triples (P32/P35): orthogonal — HyDE shifts the
+  semantic pathway; triples add a separate one
+- Mostly subsumes P11 (query rewriting): gated HyDE is the
+  smarter version of "modify the query when retrieval is weak"
+
+If gated HyDE lifts the bench by even 1pp, it's the first lever
+that's earned its keep on this benchmark since P30. If it doesn't,
+the question-shape gap may be inherent and we're at LongMemEval's
+ceiling for this architecture.
+
+**File location:** new function in `core.py` next to
+`_apply_query_rewriting`. Tests for the gating logic and for the
+HyDE LLM call (mock the LLM, verify gate triggers correctly).
+
+---
+
 ### P15 — Evaluate cross-encoder rerank
 
 **What.** Hindsight uses a cross-encoder reranker as their final stage
