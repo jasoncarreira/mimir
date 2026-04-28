@@ -1232,9 +1232,9 @@ def _two_tier_split(
     # the per-atom confidence filter (api_query) sees _confidence_tier
     # absent, defaults to "none", and drops the atom at any floor ≥ "low"
     # — even when its real cosine similarity is high.
-    _t_high = _cfg('retrieval', 'confidence_sim_high', 0.45)
+    _t_high = _cfg('retrieval', 'confidence_sim_high', 0.40)
     _t_med = _cfg('retrieval', 'confidence_sim_medium', 0.30)
-    _t_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
+    _t_low = _cfg('retrieval', 'confidence_sim_low', 0.20)
 
     def _classify(sim: float) -> str:
         if sim >= _t_high:
@@ -1389,9 +1389,9 @@ def _two_tier_split(
                 ref_score = min(in_pool_scores) if in_pool_scores else 0.01
 
                 # Per-atom tier thresholds for pulled-in atoms.
-                _t_high = _cfg('retrieval', 'confidence_sim_high', 0.45)
+                _t_high = _cfg('retrieval', 'confidence_sim_high', 0.40)
                 _t_med = _cfg('retrieval', 'confidence_sim_medium', 0.30)
-                _t_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
+                _t_low = _cfg('retrieval', 'confidence_sim_low', 0.20)
 
                 for row in rows:
                     atom = dict(row)
@@ -1768,9 +1768,9 @@ def hybrid_retrieve(
     # Uses TWO signals: max semantic similarity (primary) and combined score (secondary)
     # Similarity is the strongest signal -- keyword-only hits with zero similarity = noise
     # Temporal queries get stricter thresholds -- "right now" needs recent atoms
-    _sim_high = _cfg('retrieval', 'confidence_sim_high', 0.45)
+    _sim_high = _cfg('retrieval', 'confidence_sim_high', 0.40)
     _sim_medium = _cfg('retrieval', 'confidence_sim_medium', 0.30)
-    _sim_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
+    _sim_low = _cfg('retrieval', 'confidence_sim_low', 0.20)
     _score_high = _cfg('retrieval', 'confidence_score_high', 40.0)
     _score_medium = _cfg('retrieval', 'confidence_score_medium', 10.0)
 

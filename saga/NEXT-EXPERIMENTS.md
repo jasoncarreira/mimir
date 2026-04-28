@@ -251,7 +251,44 @@ SKIP for too many atoms (probably). Worth A/B'ing the prompt.
 
 ---
 
-### P33 — Recalibrate confidence_sim_{high,medium,low} thresholds
+### P33 — Recalibrate confidence_sim_{high,medium,low} thresholds [shipped 2026-04-28]
+
+**Result.** Offline analysis on 50 LongMemEval questions
+(`p33_threshold_analysis.py`, 97 gold atoms, 24,872 noise atoms) showed
+the gold/noise sim distributions are well-separated (gold median 0.44,
+noise median 0.10). Threshold sweep:
+
+| thr | gold ≥ thr | noise ≥ thr | precision | recall |
+|---|---|---|---|---|
+| 0.50 | 24 | 46 | 0.343 | 0.247 |
+| 0.45 (was high) | 40 | 106 | 0.274 | **0.412** |
+| 0.40 (new high) | 65 | 191 | 0.254 | **0.670** |
+| 0.30 (medium, unchanged) | 89 | 660 | 0.119 | 0.918 |
+| 0.20 (new low) | 97 | 2442 | 0.038 | 1.000 |
+| 0.15 (was low) | 97 | 5683 | 0.017 | 1.000 |
+
+**Shipped defaults (commit 2026-04-28):**
+- `confidence_sim_high`: 0.45 → **0.40** (recall +25pp; the old default
+  was missing 60% of gold-evidence atoms)
+- `confidence_sim_medium`: 0.30 → unchanged (already at 92% recall)
+- `confidence_sim_low`: 0.15 → **0.20** (same 100% recall, half the
+  noise — old 0.15 was an over-permissive noise floor)
+
+**Caveat from the original spec.** Bench results don't bear on this
+calibration — `_confidence_tier` is set on atoms by retrieval but the
+LongMemEval bench harness bypasses both api_query (which filters by
+tier) and the single-tier output volume gate. The data motivating the
+change is the offline gold/noise distribution analysis.
+
+**Why this matters.** Affects the REST `/v1/query` per-atom filter
+when callers pass `min_confidence_tier`, and the single-tier bucket
+output volume gating. Downstream agents like Mimir whose probes were
+hitting the old over-strict 0.45 floor will now see appropriate
+"high"-tier atoms surface.
+
+---
+
+### P33 (original proposal — preserved for context)
 
 **What.** The current defaults (`high=0.45, medium=0.30, low=0.15`) were
 set for tightly-coupled paraphrase matches. Real "ask a question, find a

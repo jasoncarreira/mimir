@@ -87,9 +87,17 @@ _DEFAULTS = {
         "spreading_activation_enabled": True,
         "max_spread_hops": 2,
         "spread_decay_factor": 0.3,
-        "confidence_sim_high": 0.45,
+        # Per-atom confidence tier thresholds. Recalibrated against
+        # LongMemEval gold/noise distribution (P33 analysis 2026-04-28):
+        # - high 0.45 → 0.40 (recall jumps from 0.41 to 0.67 with
+        #   marginal precision loss — old 0.45 was missing 60% of
+        #   gold atoms)
+        # - medium 0.30 unchanged (already at 92% recall)
+        # - low 0.15 → 0.20 (same 100% recall, half the noise atoms
+        #   admitted — old 0.15 was an over-permissive noise floor)
+        "confidence_sim_high": 0.40,
         "confidence_sim_medium": 0.30,
-        "confidence_sim_low": 0.15,
+        "confidence_sim_low": 0.20,
         "confidence_score_high": 40.0,
         "confidence_score_medium": 10.0,
         "temporal_recency_hours": 24,
