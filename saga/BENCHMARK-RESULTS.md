@@ -30,6 +30,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p30_minimax_v3` | MiniMax-M2.7 | P30v1 stack reinstated (additive boost) + per-atom confidence filtering retained from P30v2 | sem + kw (additive boost + P30 cosine-based missing-atom pull-in; per-atom tiers) | 500 | **0.784** |
 | `msam_cherrypicks_minimax_v1` | MiniMax-M2.7 | P30v3 + P11/P12/P13 cherry-picks (query rewriting + synonym expansion + atom quality multiplier), all on | sem + kw (P11 rewriting on both pathways; P12 synonyms on keyword only; P13 quality ×0.5/×1.1 multiplier) | 500 | **0.756** |
 | `msam_cherrypicks_off_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 mechanism (cherry-picks reverted to off); reader + MSAM consolidation + judge ALL on `openai/gpt-oss-120b` via OpenRouter | sem + kw (P30v3 stack — additive boost + per-atom tiers + missing-atom pull-in) | 500 | **0.668** |
+| `msam_p32_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 + P32 (triple extraction via P7 batched, graph pathway joins RRF as 4th ranker) | sem + kw + **graph** (triples populated per-question via batch_extract_and_store) | 500 | **0.646** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
@@ -852,6 +853,83 @@ atom backfill fix in `29efa38`.
 
 Pace: ~25s/q ingest (vs P30v3's ~31s/q — gpt-oss-120b reader is
 faster than MiniMax). Judge: ~2 min for 500q (vs ~7 min on gpt-4o).
+
+### `msam_p32_gptoss_v1` — P30v3 + triples + graph pathway (500q)
+
+P32 wired end-to-end. Bench's `ingest.py` now collects (atom_id, content)
+for every semantic-stream atom, then calls `batch_extract_and_store`
+(P7) once per question after embedding. ~12 LLM calls per question
+instead of ~250 single-shot. Graph pathway joins RRF as a fourth
+ranked list (`enable_graph_pathway = true`). All other knobs match
+P30v3 + cherry-picks-off baseline. Reader, MSAM consolidation, judge,
+and triple extraction all on `openai/gpt-oss-120b` via OpenRouter.
+
+| Subtype | Score | N | Δ vs `cherrypicks_off_gptoss` (0.668) |
+|---|---|---|---|
+| single-session-assistant | 0.929 | 56 | **+1.8** ✓ |
+| single-session-user | 0.929 | 70 | -1.4 |
+| **single-session-preference** | **0.233** | 30 | **+3.3** ✓ |
+| temporal-reasoning | 0.534 | 133 | -1.5 |
+| knowledge-update | 0.795 | 78 | -3.8 |
+| multi-session | 0.496 | 133 | **-5.3** |
+
+**Overall: 0.646 (-2.2 vs cherrypicks_off_gptoss).**
+
+Triples + graph pathway **regressed -2.2pp** on the apples-to-apples
+gpt-oss baseline. Two subtypes gained — single-session-assistant
+(+1.8pp) and preference (+3.3pp), the latter consistent with the
+P30v1 / preference-helps-from-graph-features pattern. But
+multi-session cratered (-5.3pp) and knowledge-update lost -3.8pp.
+
+**Reading the per-subtype profile:**
+
+- **Multi-session -5.3pp** is the dominant signal. These questions
+  span sessions and depend on linking facts across turns. The graph
+  pathway should *help* here — it's exactly the cross-session
+  fact-linking signal triples theoretically provide. The opposite
+  happened. Possible explanations:
+  1. Triple extraction noise: gpt-oss-120b extracted bad triples
+     (mis-attributed subjects, hallucinated relations) and those
+     surfaced via graph pathway, displacing better atoms in RRF.
+  2. Graph pathway returned high-confidence-but-irrelevant atoms
+     because triples on bench data ("[2023-04-12 user] What's the
+     weather?") are extraction-poor.
+  3. The 4-way RRF fusion gave too much weight to the graph ranker.
+     Default `rrf_graph_weight=0.7`, but with a noisy ranker that
+     might still be too much.
+- **Knowledge-update -3.8pp** suggests fact-replacement queries
+  (where the graph "knows" the *old* fact and surfaces it) are
+  getting hurt. This is the temporal-staleness problem the world
+  model was designed to handle, but `auto_close_on_conflict` is off
+  in the bench (`[world_model] enabled = false`).
+- **Preference +3.3pp** and **single-session-assistant +1.8pp** —
+  the wins are on tightly-scoped questions where the graph adds a
+  redundant correct signal.
+
+**Cost: bad.** P32 took **9h40m** wall time vs cherrypicks-off-gptoss
+~3h25m. Triple extraction cost ~6h on top of regular ingest. ~6,500
+batched LLM calls at ~3-5s each (gpt-oss reasoning model burns CoT
+tokens before emitting). Even amortized via P7 batching, this is a
+massive cost increase for what turned out to be a regression.
+
+**Decision: don't ship triples + graph pathway as wired.** The
+mechanism is in place and tested but the bench says it hurts more
+than it helps on this corpus / this judge. Keep the code (triples
+have other uses — graph traversal, contradiction detection, world
+model), but leave `[triples] enable_extraction = false` in the bench
+config and `[retrieval] enable_graph_pathway = false` in retrieval.
+
+**What might rescue triples in a future experiment:**
+1. Lower `rrf_graph_weight` substantially (e.g. 0.3) so graph votes
+   only break ties rather than overwhelm the fusion.
+2. Filter graph-pathway hits by triple-confidence threshold.
+3. Use a more conservative triple extraction prompt (current
+   extraction is greedy — accepts more triples).
+4. Test on a stronger reader/judge stack (gpt-4o reader + gpt-4o
+   judge) where the bench-score noise floor is lower.
+
+But these are follow-on experiments, not corrections to the running
+P32 baseline. P32 is a **null result** for this corpus + judge.
 
 ## P9 summary
 
