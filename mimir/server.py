@@ -169,6 +169,34 @@ def build_app(config: Config) -> web.Application:
                 exc,
             )
 
+    # SlackBridge — opt-in via SLACK_BOT_TOKEN + SLACK_APP_TOKEN. Both required
+    # because we use Socket Mode (no public webhook needed). Same deferred-
+    # import pattern as Discord.
+    if config.slack_bot_token and config.slack_app_token:
+        try:
+            from .bridges.slack import SlackBridge
+
+            channels.register(
+                SlackBridge(
+                    bot_token=config.slack_bot_token,
+                    app_token=config.slack_app_token,
+                    enqueue=dispatcher.enqueue,
+                )
+            )
+        except ImportError as exc:
+            log.warning(
+                "SLACK_BOT_TOKEN/SLACK_APP_TOKEN set but slack-bolt not installed (%s); "
+                "skipping SlackBridge. Install with `pip install mimir[slack]`.",
+                exc,
+            )
+    elif config.slack_bot_token or config.slack_app_token:
+        log.warning(
+            "Slack tokens partially configured (bot=%s, app=%s) — both required for "
+            "Socket Mode. Skipping SlackBridge.",
+            bool(config.slack_bot_token),
+            bool(config.slack_app_token),
+        )
+
     # When a session goes idle, enqueue the synthesis turn through the same
     # dispatcher so it runs in channel-FIFO order alongside any new traffic.
     async def _on_session_idle(session: ChannelSession) -> None:
