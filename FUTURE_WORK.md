@@ -252,15 +252,120 @@ Subagent invocations land as a single `tool_result` event in turns.jsonl with `n
 
 ## 6. Operational
 
-### 6.1 Identity reconciliation
+### 6.1 Identity reconciliation (cross-platform context)
 
-**Status:** SPEC §16, item 11.
+**Status:** designed (this doc); SPEC §16, item 11.
 
-Author keying is strict-equality on `Message.author`. When Alice's Slack ID changes (workspace migration, account replacement), continuity is lost.
+Today `Message.author` is a raw platform ID — Slack `U123ABC`, Discord numeric, Bluesky handle. Cross-channel pull (`MessageBuffer.cross_author_messages`) does strict equality, so Alice on Slack and Alice on Discord look like different people to the bot. A turn for Alice on Slack does NOT pull her Discord public history. The original SPEC framing was workspace migration ("Alice's Slack ID changed"); the bigger use case is cross-platform — the bot should treat one human as one human regardless of which bridge their inbound landed on.
 
-**Approach:** persistent `author_aliases.yaml` mapping old-id → canonical-id. Looked up on history append + on cross-channel pull. Operator-managed initially; could be agent-suggested via a "merge these identities?" tool.
+#### Core mechanism
 
-**Effort:** ~80 LOC + tooling.
+One operator-managed file, `<home>/state/identities.yaml`:
+
+```yaml
+people:
+  - canonical: alice
+    display_name: Alice Smith
+    aliases:
+      - slack-U123ABC
+      - discord-456789
+      - bsky:alice.bsky.social
+    notes: Eng team lead, prefers async
+```
+
+Loaded at startup into a flat `dict[platform_id, canonical]` lookup table. A resolver function:
+
+```python
+def resolve_canonical(author: str | None) -> str | None:
+    if not author: return None
+    return _alias_map.get(author, author)  # falls through if no alias
+```
+
+Falls through to the raw ID when no entry exists, so the system degrades gracefully — a human who only uses Slack still gets cross-channel pull from their own Slack channels even without a YAML row.
+
+#### Pre-requisite: platform-prefixed `event.author`
+
+This is a small breaking change that has to land **before** identity reconciliation makes sense. Bridges today set `event.author` to a naked platform ID (`"99"` for Discord, `"U123"` for Slack). Those collide — a Slack user `99` and Discord user `99` would alias to each other accidentally.
+
+Each bridge's inbound construction needs to prefix:
+
+```python
+# bridges/discord.py
+author_id = f"discord-{message.author.id}"
+
+# bridges/slack.py (when it lands)
+author_id = f"slack-{user_id}"
+```
+
+`MessageBuffer.replay` needs to be tolerant of legacy unprefixed records in `chat_history.jsonl` — leave them alone; they won't match new prefixed queries (so they fall out of cross-pull naturally), which is acceptable for old history.
+
+#### Where the resolver wires in
+
+`MessageBuffer.cross_author_messages` is the main consumer:
+
+```python
+def cross_author_messages(self, *, author, exclude_channel, limit, ...):
+    target_canonical = resolve_canonical(author)
+    for msg in reversed(self._all):
+        if msg.channel_id == exclude_channel: continue
+        if _is_private_channel(msg.channel_id): continue
+        if resolve_canonical(msg.author) != target_canonical: continue
+        ...
+```
+
+`MessageBuffer.recent_for_channel` doesn't need it — within-channel matching is by `channel_id`, not author.
+
+Memory file conventions can shift to canonical: `memory/people/alice.md` instead of `memory/people/<platform-id>.md`. The agent writes there using the canonical name. The auto-generated memory index already keys by filename, so the agent searching "what do I know about Alice?" finds one place.
+
+#### Privacy: still one-directional
+
+The DM rule applies at the source side. `cross_author_messages` filters `_is_private_channel(msg.channel_id)` regardless of canonical match. Worked example:
+
+| Source channel | Source content | Target = `slack-eng` (public) | Target = `dm-discord-alice` (DM) |
+|---|---|---|---|
+| `slack-eng` | public | ✓ | ✓ (her own public msgs as DM context) |
+| `discord-eng` | public | ✓ (cross-platform) | ✓ |
+| `dm-slack-alice` | DM | ✗ (DM rule) | ✗ (DM rule) |
+| `dm-discord-alice` | DM | ✗ (DM rule) | ✗ (DM rule) |
+
+Identity reconciliation is orthogonal to the DM rule. Identity says "who is this person?"; DM rule says "what content is private?" Both compose.
+
+#### Operator UX
+
+Manual YAML editing for v1, hot-reloaded (or just reload-on-event — file is tiny). Add a CLI:
+
+```
+mimir identities add --canonical alice --alias discord-456789
+mimir identities list
+mimir identities remove --alias discord-456789
+```
+
+~50 LOC, optional.
+
+**Auto-discovery is tempting but risky.** Two patterns to consider, neither in v1:
+
+1. **Display-name observation.** Every inbound message records `(author_id, author_display)`. When the same display name shows up under two different prefixes, log an `identity_match_proposal` event. Operator reviews and adds to YAML. False-positive prone (multiple "Alice"s); low signal on its own, useful as a hint.
+2. **Agent-driven proposals.** MCP tool `propose_identity_merge(slack="...", discord="...")` the agent calls when a user *tells* it ("by the way, my Discord is alice#1234"). Writes a pending entry; operator confirms. Better signal (explicit assertion) but introduces a new write path with a confirmation gate. Worth doing if cross-platform usage takes off.
+
+Ship v1 with pure manual; revisit auto-discovery only if operators ask.
+
+#### Subtleties
+
+- **Display name conflict.** Alice's Slack display is "Alice Smith"; her Discord display is "alice_eng". The agent's prompt currently shows whichever the bridge passes. With identity merging, prefer the YAML's `display_name` field for consistency. ~10 LOC in `render_recent_activity`.
+- **Self-identity.** The bot has IDs across platforms (different Discord bot user, different Slack bot user). The per-bridge self-skip check stays correct; if you want the agent to treat its own messages as one thing across platforms (it already does — `kind="assistant_message"` is the same), a `canonical: self` row keeps the alias map consistent.
+- **Alias removal / staleness.** If Alice leaves the org and her Slack ID gets reassigned, the YAML row needs an audit. No automatic mechanism. A `last_seen` timestamp per alias would help operators prune; cheap to add.
+- **MSAM session continuity is unchanged.** Sessions stay per-channel (Alice's `slack-eng` session is distinct from her `discord-eng` session, correctly — different conversations). Only the bot's *memory* of Alice (the `memory/people/alice.md` file, MSAM atoms about her) gets unified across platforms.
+- **Privacy opt-out.** Some operators may want to disable cross-platform pull entirely (privacy reasons, regulatory). A `MIMIR_CROSS_PLATFORM_PULL=true|false` flag (default true) gives them the kill switch. ~5 LOC.
+
+#### Implementation plan
+
+Three commits, in order:
+
+1. **Foundation** (~100 LOC): schema + YAML loader + resolver + bridge prefix change for `event.author`. `MessageBuffer.replay` tolerant of legacy unprefixed records. Tests for the loader and resolver.
+2. **Cross-pull rewrite** (~30 LOC + tests): `cross_author_messages` resolves both sides through the alias map. End-to-end tests for cross-platform pull ("Alice on Slack pulls her Discord public history").
+3. **CLI + display-name preference** (~80 LOC, optional): `mimir identities {add,list,remove}` and the `render_recent_activity` display-name override.
+
+Realistic budget: **~250 LOC including tests, ~1 day of focused work.** Gated on having a real cross-platform deployment to test with — without that the feature ships dark.
 
 ### 6.2 Token-cost monitoring per turn
 
