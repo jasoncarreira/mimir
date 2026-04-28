@@ -505,6 +505,67 @@ Common operations: "switch to a faster model for one channel," "wipe a single ch
 
 ---
 
+## 10. Deployment recipes
+
+Per-installation integrations that mimir core should NOT bundle, but that
+have a known shape. Add as recipes accumulate.
+
+### 10.1 Bluesky via social-cli
+
+**Status:** designed (this section); deliberately not bundled in mimir.
+
+Mimir core stays platform-agnostic. For deployments that want Bluesky,
+the recipe is to layer `social-cli` (https://github.com/letta-ai/social-cli)
+on top of an existing mimir home rather than building a `BlueskyBridge`.
+This is a better fit than the bridge model for Bluesky's batch-asynchronous
+usage pattern (mention floods, async-feeling DMs, scheduled triage), and
+social-cli already solves auth + retry + multi-platform (Bluesky + X) +
+per-author user-context enrichment.
+
+**Layout** (operator sets up in their agent home):
+
+- **Working dir:** `<home>/state/social/` — social-cli runs from here.
+  Holds `inbox.yaml`, `outbox.yaml`, `outbox_archive/`, `dispatch_result.yaml`,
+  `processed-bsky.yaml`, `sent_ledger-bsky.yaml`, `attachments/`, plus a
+  local `.env` with `ATPROTO_HANDLE` + `ATPROTO_APP_PASSWORD` and a
+  `config.yaml` declaring the account. Indexed under scope `state` so the
+  agent can `file_search` past inboxes.
+- **User-context dir:** `state/wiki/entities/` — pass to social-cli via
+  `--users-dir <home>/state/wiki/entities/`. Each notification gets its
+  author's wiki entity file (if present) injected as `userContext`. Zero
+  glue code: any markdown content in the file works as user context;
+  social-cli reads it as raw text. **Filename exception** for Bluesky
+  entities: keep the handle as-is (e.g. `alice.bsky.social.md`), not
+  lowercase-hyphenated, so social-cli's lookup finds the file. Wikilinks
+  become `[[alice.bsky.social]]` for those entities. Other-platform
+  entities stay lowercase-hyphenated.
+- **Skill:** an operator-supplied `bluesky/SKILL.md` under the agent's
+  `.claude/skills/`, NOT bundled. Teaches the sync→check→decide→dispatch
+  loop, the outbox YAML schema, the wiki integration ("ingest interesting
+  notification authors as wiki entities"), and the failure modes from
+  social-cli's `AGENT_GUIDE.md` (don't use `social-cli reply` on inbox
+  notifications — only `dispatch`; use `ignore` liberally; dry-run
+  complex outboxes).
+- **Scheduler:** a `scheduler.yaml` entry that fires the triage every
+  N minutes, dispatching onto the synthetic `scheduler:bluesky-triage`
+  channel (no `channel_id` set, so it's serialized per-job).
+
+**Install path:** clone + `pnpm install && pnpm build`, then either
+`pnpm link` to put `social-cli` on `$PATH` or invoke
+`node /path/to/dist/cli.js`. The skill should document whichever the
+deployment chose.
+
+**What's not covered by social-cli today:** Bluesky DMs (`chat.bsky.convo.*`
+namespace). If a deployment wants real-time DM behavior, that's a small
+mimir-side bridge to write — but most agent use cases (broadcast, mentions,
+thread participation) work fine via social-cli's polling.
+
+**What changes for the bench:** nothing. The benchmark adapter operates
+on synthetic Bluesky data, not the real API; this recipe is for live
+deployments only.
+
+---
+
 ## Maintenance
 
-When an item from this doc lands, move it to a `## 10. Recently shipped` section (date-stamped) rather than deleting it — preserves the "why" for future archeology.
+When an item from this doc lands, move it to a `## 11. Recently shipped` section (date-stamped) rather than deleting it — preserves the "why" for future archeology.
