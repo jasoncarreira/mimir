@@ -49,8 +49,6 @@ Frontmatter is for human readability and lightweight categorization — it's not
 ```markdown
 # Page Title
 
-**Source:** raw/filename.md (date)
-
 ## Overview
 1-2 sentence summary.
 
@@ -64,9 +62,12 @@ How this applies to the project, persona, or ongoing thread.
 **Related:** [[other-page]], [[another-page]]
 
 ## Sources
-- raw/filename.md
+- raw/2026-04-15-thread-import.md
+- raw/2026-04-22-followup.md
 - [External links if any]
 ```
+
+A page can cite many sources — the **Sources** list grows as the page accumulates material. New material goes into the body; the source goes into the list.
 
 ### Wikilinks
 
@@ -75,7 +76,17 @@ Use `[[page-name]]` to link between wiki pages. Two places they go:
 - **Inline in prose**, where natural: "Alice mentioned [[stigmergy]] as a coordination model."
 - **In a "Related" section** at the bottom: `**Related:** [[bob]], [[stigmergy]], [[async-culture]]`
 
-Links are not optional — they make the wiki a graph, not a list. A page with no links is an island. Before finishing a page, scan `index.md` and ask: which existing pages relate? Add the links both directions.
+`page-name` must match the filename (without `.md`). Filenames are
+lowercase-hyphenated: `entities/alice-smith.md` → `[[alice-smith]]`,
+`concepts/async-culture.md` → `[[async-culture]]`. There's no resolver
+that fixes case mismatches — `[[Alice]]` is a different string than
+`[[alice]]` and won't traverse to the same page. Pick one canonical
+form and stick to it.
+
+Links are not optional — they make the wiki a graph, not a list. A
+page with no links is an island. Before finishing a page, scan
+`index.md` and ask: which existing pages relate? Add the links both
+directions.
 
 ### Categories
 
@@ -89,18 +100,30 @@ If you're unsure between `concepts/` and `topics/`, ask: is this an *idea* (conc
 
 ### Ingest: raw → wiki
 
-This is the primary operation. Every raw file should result in a fully cross-linked wiki page (or update to existing pages).
+This is the primary operation. Every raw file should land in the wiki —
+either by creating a new page, by updating one or more existing pages,
+or both. A single source can inform many pages; a single page can cite
+many sources. The mapping is many-to-many.
 
 1. Read the raw source file (`Read state/raw/<filename>.md`)
-2. Determine category — entity, concept, or topic
-3. Scan `state/wiki/index.md` for related pages — concepts/entities/topics this source connects to
-4. Write the wiki page following the conventions above:
-   - Core content from source (your synthesis, not a quote)
-   - "Connection to My Work" section
-   - Wikilinks to related pages, both inline and in "Related"
-5. Append a one-line description to `state/wiki/index.md` under the correct category
-6. Append a log entry to `state/wiki/log.md` with date and the file(s) created/updated
-7. **Update existing pages that should link TO the new page.** This is the easy step to skip and the most important one for graph health.
+2. Identify what's in it — which entities, concepts, topics does it touch?
+3. Scan `state/wiki/index.md` for existing pages on those subjects.
+   (On the very first ingest the index is empty — that's fine; you're
+   bootstrapping the graph. The cross-reference discipline kicks in once
+   you have a few pages.)
+4. For each subject:
+   - If a page exists, **update it** with the new material and add the
+     source to its **Sources** list.
+   - If no page exists, **create one** following the conventions above:
+     core content as your synthesis, "Connection to My Work" section,
+     wikilinks to related pages both inline and in "Related".
+5. Update `state/wiki/index.md` — add a one-line description for any new
+   page, refresh existing entries if their focus shifted.
+6. Append a log entry to `state/wiki/log.md` with date, source filename,
+   and which page(s) were touched.
+7. **Update existing pages that should link TO any new page.** The easy
+   step to skip and the most important one for graph health — a page
+   with no inbound links is invisible to traversal.
 
 **Quality bar.** Each page should:
 - Have a clear focus — don't try to cover everything in one page
@@ -137,9 +160,29 @@ Lint passes are slower than ingest; do them deliberately, not constantly.
 
 If a note would benefit from being linked to other notes, it belongs in `wiki/`. If it's a one-off, `memory/` is fine.
 
+## Mirroring to MSAM
+
+Wiki pages are durable, but searching them depends on knowing the page
+name (or following links from a page you already found). MSAM atoms add
+fuzzy / paraphrased recall. For pages worth retrieving by paraphrase
+("who's that engineer who keeps talking about async?"), mirror the
+page's headline as a semantic atom:
+
+```
+mcp__mimir__msam_store(
+    content="Alice Smith — eng team lead, async-first advocate. See state/wiki/entities/alice.md",
+    stream="semantic",
+)
+```
+
+The pre-message hook then surfaces the atom on relevant inbounds, and
+the path in the content lets you jump straight to the wiki page for
+the full story. Don't mirror every page — short-lived stub pages aren't
+worth the atom; the rich pages with accumulated history are.
+
 ## Lightweight rules of thumb
 
 - The wiki is **your synthesis**, not a transcript repository. Quote sparingly.
-- Wikilinks are case-insensitive in spirit — `[[Alice]]` and `[[alice]]` resolve to the same page. Be consistent within a session, but don't waste time fixing inconsistencies.
+- Wikilinks must match filenames exactly (lowercase-hyphenated). No resolver fixes case or whitespace mismatches.
 - `index.md` and `log.md` are append-only in normal operation. Edit them only during lint.
 - A page that's just a stub (one line of description) is fine if you don't have content yet — it gives later pages something to link to.

@@ -37,11 +37,18 @@ search index. Reach it by:
 
 Organize however helps you. Common shapes:
 
-- `memory/people/<slug>.md` — entity files for humans/agents you interact with
-- `memory/topics/<slug>.md` — concept/topic notes
 - `memory/channels/<channel_id>/<slug>.md` — channel-scoped notes (no
-  cross-channel race; only that channel's worker writes here)
-- `memory/shared/<slug>.md` — cross-channel facts
+  cross-channel race; only that channel's worker writes here). Things
+  that only matter inside one conversation belong here.
+- `memory/shared/<slug>.md` — cross-channel facts that don't need a
+  graph: one-off observations, durable facts that stand alone.
+
+For people, recurring topics, concepts, and anything else that benefits
+from cross-references (a graph of who-relates-to-whom, which-concept-
+underlies-which-topic), use `state/wiki/` instead — see the **wiki skill**.
+The wiki handles entity / topic / concept files with `[[wikilinks]]` so
+the graph compounds in value as it grows. `memory/` is for content that
+doesn't need that machinery.
 
 ### `state/` — verbatim bulk content
 
@@ -69,24 +76,29 @@ injects relevant atoms automatically; mid-turn queries via
 ## Things to Track
 
 - **People or agents**: contact info, things they've done, interests,
-  novelties, preferences → `memory/people/<slug>.md` + MSAM atom.
-- **Places (channels, repos, projects)**: ids to use in `send_message`,
-  topics, ongoing context → `memory/channels/<id>/notes.md` (per-channel) or
-  `memory/topics/<slug>.md` (cross-channel).
-- **Ideas, projects, important events**: if they're standalone, file under
-  `memory/topics/` or `memory/shared/` and mirror the headline as a
-  semantic atom. If they're part of an evolving graph (recurring topic
-  with linked entities, concept that ties many sources together), prefer
-  the wiki under `state/wiki/topics/` or `state/wiki/concepts/` — the
-  link graph pays off as the graph grows.
+  novelties, preferences → `state/wiki/entities/<slug>.md` (graph-shaped,
+  cross-linked with topics they engage in). Mirror the headline as an
+  MSAM atom for fuzzy retrieval.
+- **Channel context (private to one conversation)**: `memory/channels/<id>/notes.md`.
+  Ids to use in `send_message`, ongoing thread state, channel-specific
+  preferences.
+- **Topics, projects, concepts that recur**: `state/wiki/topics/` for
+  concrete subjects, `state/wiki/concepts/` for abstract ideas. Use
+  wikilinks `[[name]]` to connect to related entities and other topics.
+- **One-off cross-channel facts**: `memory/shared/<slug>.md`. Standalone,
+  no graph needed.
 - **Schedules**: `scheduler.yaml` for cron-driven prompts, plus a pinned core
   block when the schedule is core to your identity.
 - **Environment**: the agent home you run in is your body. Keep careful watch
   over what your environment is capable of — and not.
 
-Cross-reference where appropriate: `[memory/people/alice.md]`-style
-references in prose let you (and the search index) connect ideas. Also link
-from a topic file back to the people/places it relates to.
+Cross-reference style depends on where you're writing:
+
+- **Inside `state/wiki/` pages**: use `[[page-name]]` wikilinks.
+- **Inside `memory/` files**: use a relative path —
+  `[Alice](../state/wiki/entities/alice.md)` for a wiki entity, or
+  `[other-note](../shared/other.md)` for another memory file. The
+  search index follows both styles.
 
 ## Logs as Source of Truth
 
@@ -96,8 +108,11 @@ When sources conflict, trust the logs:
 - `logs/turns.jsonl` — per-turn rollups (full event sequence + final output).
 - `messages/chat_history.jsonl` — every inbound + outbound message, channel-tagged.
 
-Mimir does not have a journal — your interpretation of "what happened" is
-implicit in the memory files you wrote, not a separate stream.
+Mimir does not keep a personal journal of feelings or daily entries —
+your interpretation of "what happened" is implicit in the memory and
+wiki files you wrote, not a separate stream. The wiki's `state/wiki/log.md`
+is a narrow operations log (which raw sources got wired into which wiki
+pages), not a substitute.
 
 ## Maintenance
 
