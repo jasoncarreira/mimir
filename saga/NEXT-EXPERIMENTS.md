@@ -474,6 +474,124 @@ knowledge-update where cross-time facts cluster well), bigger win.
 
 ---
 
+### P36 — Lower `rrf_graph_weight` to test graph pathway as tiebreaker
+
+**What.** P32 and P35 both regressed ~-2.5pp when the graph pathway
+joined RRF as a fourth ranker. Graph pathway runs at default
+`rrf_graph_weight = 0.7` (vs 1.0 for sem and kw). Hypothesis: 0.7 is
+too much voice for a noisier ranker; the graph pathway should be a
+tiebreaker, not a vote.
+
+**Proposed sweep:**
+- `rrf_graph_weight = 0.3` — graph influences ordering only when
+  sem+kw produce a tie or near-tie
+- `rrf_graph_weight = 0.5` — moderate influence
+- (already measured) `rrf_graph_weight = 0.7` — current default
+
+Run on the canonical stack with P35 features ON (triples-as-
+byproduct, graph pathway on). Tag `msam_p35_canon_lowgraph_v1` etc.
+
+**Why it might rescue triples:** the graph pathway's atoms are noisier
+than direct atom embeddings (triples synthesize away per-turn
+specificity). At weight 0.7, even mediocre triples shift rankings.
+At 0.3, only consistently-strong graph signals matter — sem+kw stays
+the dominant signal, graph just breaks ties when both other pathways
+are confused.
+
+**Effort.** 1-2 bench runs (canonical stack, P35 features ON, vary
+the weight).
+
+**Risk.** Low — pure tuning, no code change beyond editing the bench
+config.
+
+**Score expectation.** If graph pathway is the regression source,
+weight=0.3 should partially recover the -2.6pp gap. If it doesn't
+recover, triples themselves are the problem (irrespective of fusion
+weight) and we close the question definitively.
+
+**Connection to P32/P35.** This is the last untested hypothesis on
+why triples regress. If P36 doesn't help, ship triples + graph
+pathway as a production-only feature (off-by-default) and stop
+benchmarking them on LongMemEval.
+
+---
+
+### P37 — Temporal world model: explicit pathway separate from graph
+
+**What.** The temporal world model API exists (`update_world`,
+`query_world`, `world_history` in `triples.py`; `valid_from` /
+`valid_until` columns in the triples schema since `8b326e6`) but has
+never been wired into retrieval. Two ways to do it:
+
+**a. Implicit (consolidation-time tagging).** Extend the P35
+structured-output prompt to emit `valid_from` / `valid_until` on
+triples when atom dates indicate fact evolution. The synthesizer
+already sees cluster atoms with `[YYYY-MM-DD role]` prefixes — it
+can output time-bound triples directly into the world model.
+`auto_close_on_conflict` fires naturally on the new emissions.
+
+**b. Explicit (separate retrieval pathway).** Add
+`enable_world_model_pathway` to retrieval. At query time:
+- Detect entities mentioned in the query (existing
+  `extract_query_entities` helper)
+- For each, call `query_world(entity)` to get current-state triples
+- Emit those triples' source atoms as a fifth RRF ranked list
+
+Option (a) needs (b) to be useful (no point producing temporal
+triples if nothing reads them). But (b) can run on existing
+update_world calls (production users who explicitly populate the
+world model) without (a).
+
+**Why this is its own experiment, not part of P35.** The P35 graph
+pathway just regressed -2.6pp on canonical. Temporal-tagged triples
+would flow through the same graph pathway and inherit that
+regression. A separate world-model pathway is a different code path
+— it queries by entity rather than by triple-embedding-similarity,
+and it's filtered to current-state triples by construction (no
+stale-fact noise). Clean A/B vs the failed graph pathway.
+
+**Where it might lift the bench:**
+
+- **knowledge-update (-3.8pp on P35 canon)** — fact-replacement
+  questions are the world model's home turf. "When did the user
+  change jobs?" → `world_history(User)` returns the timeline.
+- **temporal-reasoning (-0.7pp on P35 canon)** — most LongMemEval
+  temporal questions are "how long ago" / "earlier today" style;
+  the world model probably doesn't help those. Some are "did X
+  happen before Y" which the timeline does help.
+- **multi-session (-4.5pp on P35 canon)** — the world model could
+  help cross-session entity questions ("what did the user mention
+  about their job across our conversations?") via `query_world` on
+  the entity. Different shape than triple-similarity-search.
+
+**Where it won't help:** single-session subtypes (the answer is in
+one session, no temporal reasoning needed) — should be flat.
+
+**Pre-req: P36.** If lowering `rrf_graph_weight` rescues triples
+(P36 result), then implicit temporal tagging via the existing graph
+pathway becomes worth trying — option (a) on top of P36's tuning.
+If P36 doesn't rescue, only option (b) is on the table.
+
+**Effort.** Option (b) is ~1 day: detect entities, call query_world,
+add as RRF ranker, test. Option (a) on top is ~0.5 day to extend
+the consolidation prompt.
+
+**Risk.** Low for option (b) — pure additive, off by default. Worst
+case it's flat and we ship as production-only. Medium for option (a)
+because it stacks on P35's already-questionable graph pathway.
+
+**Score expectation.** Knowledge-update is the most likely
+beneficiary (+1 to +3pp). Multi-session second (could go either
+way). Other subtypes flat.
+
+**Connection to production users.** Even if this lever is flat on
+LongMemEval, the world model is genuinely useful for production
+agents that need fact-evolution audit ("when did the user start
+preferring X?"). Test with eyes open — neutral on the bench is
+fine for a feature whose primary value is non-bench.
+
+---
+
 ### P15 — Evaluate cross-encoder rerank
 
 **What.** Hindsight uses a cross-encoder reranker as their final stage
