@@ -65,6 +65,25 @@ Two structured subtrees live under `state/`:
   durable, cross-referenced knowledge that grows over time. Wikilinks
   `[[page-name]]` connect pages into a navigable graph.
 
+**Output-window constraint — important.** A `Write` materializes the
+whole file content through your model's output budget on that turn —
+every byte counts the same as reasoning or other tool output. On smaller
+models (32k output windows are common), you cannot write a 300KB
+transcript verbatim in one `Write` call; the turn fails mid-write. Two
+options when the source is large:
+
+- **Chunk via synthesis (preferred).** Process the input incrementally,
+  writing focused wiki pages as you go — one entity, one topic, one
+  concept per `Write`. Naturally chunked; the synthesis is the value,
+  not the verbatim copy.
+- **Chunked appends.** Successive `Write` then `Edit` calls. Slow (each
+  is a model turn) and fragile (a mid-stream failure leaves a partial
+  file). Only when verbatim is genuinely required AND the source is
+  too large for a single `Write`.
+
+If a `Write` fails because the content is too long, that's the signal
+to switch strategies — not to retry the same call.
+
 ### MSAM atoms — semantic recall
 
 Mirror durable facts as semantic atoms via
