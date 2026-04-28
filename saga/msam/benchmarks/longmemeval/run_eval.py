@@ -37,11 +37,17 @@ from .config import (
 from .env_loader import load_env
 
 
-def _prepare_environment(work_dir: Path):
-    """Set env vars MSAM reads at import time."""
+def _prepare_environment(work_dir: Path, config_path: Path | None = None):
+    """Set env vars MSAM reads at import time.
+
+    config_path overrides the default BENCH_MSAM_CONFIG so two parallel
+    benches can run with different threshold variants without touching
+    each other's TOMLs. Pass None to use the default bench config.
+    """
     repo_root = Path(__file__).resolve().parents[3]
     load_env(repo_root / ".env")
-    os.environ["MSAM_CONFIG"] = str(BENCH_MSAM_CONFIG)
+    cfg_path = Path(config_path) if config_path else BENCH_MSAM_CONFIG
+    os.environ["MSAM_CONFIG"] = str(cfg_path)
     os.environ["MSAM_DATA_DIR"] = str(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     if not os.environ.get("OPENAI_API_KEY"):
@@ -84,8 +90,16 @@ def _format_atom_for_reader(atom: dict) -> dict:
     }
 
 
-def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
-    _prepare_environment(WORK_DIR)
+def run(
+    limit: int | None,
+    run_tag: str,
+    resume: bool,
+    keep_dbs: bool,
+    config_path: Path | None = None,
+    work_dir: Path | None = None,
+) -> Path:
+    wd = Path(work_dir) if work_dir else WORK_DIR
+    _prepare_environment(wd, config_path=config_path)
 
     # Import AFTER env is set so config resolves to the benchmark toml.
     from msam.config import reload_config
@@ -120,7 +134,7 @@ def run(limit: int | None, run_tag: str, resume: bool, keep_dbs: bool) -> Path:
         if qid in done:
             continue
 
-        db_path = WORK_DIR / f"q_{qid}.db"
+        db_path = wd / f"q_{qid}.db"
         try:
             if db_path.exists():
                 db_path.unlink()
@@ -266,8 +280,20 @@ def main():
     ap.add_argument("--run-tag", default="msam_baseline_v0", help="tag for output files")
     ap.add_argument("--resume", action="store_true", help="skip questions already in JSONL")
     ap.add_argument("--keep-dbs", action="store_true", help="don't delete per-question SQLite files")
+    ap.add_argument(
+        "--config", default=None,
+        help="path to MSAM config (overrides default bench msam_bench.toml — "
+             "useful for parallel runs with different threshold variants)",
+    )
+    ap.add_argument(
+        "--work-dir", default=None,
+        help="override per-question DB work dir (parallel runs need separate dirs)",
+    )
     args = ap.parse_args()
-    run(args.limit, args.run_tag, args.resume, args.keep_dbs)
+    run(
+        args.limit, args.run_tag, args.resume, args.keep_dbs,
+        config_path=args.config, work_dir=args.work_dir,
+    )
 
 
 if __name__ == "__main__":

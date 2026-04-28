@@ -1,6 +1,9 @@
-# MSAM config used during LongMemEval runs.
-# Loaded via MSAM_CONFIG env var before msam imports resolve.
-# Keeps the prod ~/.msam/msam.toml untouched.
+# MSAM config — P36 variant (graph pathway as tiebreaker).
+# Triples + graph pathway ON (same as P35 features) EXCEPT
+# rrf_graph_weight = 0.3 (default 0.7). Tests whether the P35
+# regression was caused by the graph pathway voting too loudly in
+# RRF; at 0.3 it acts as a tiebreaker rather than a vote.
+# See NEXT-EXPERIMENTS.md P36.
 
 [embedding]
 provider = "openai"
@@ -29,15 +32,18 @@ fusion = "rrf"
 rrf_k = 60
 rrf_semantic_weight = 1.0
 rrf_keyword_weight = 1.0
+# P36: drop graph pathway weight from default 0.7 to 0.3 — graph
+# becomes a tiebreaker rather than a co-equal vote.
+rrf_graph_weight = 0.3
 # P9: two-tier retrieval with observation->raw evidence boost.
 two_tier_enabled = true
 observations_top_k = 5
 observation_confidence_min_sim = 0.30
 evidence_boost_cap_multiplier = 3.0
-# P32/P35: graph pathway off — triples-as-byproduct of consolidation
-# regressed -2.6pp on canonical (msam_p35_canon_v1). Code stays for
-# production-graph-feature deployments; bench defaults to off.
-enable_graph_pathway = false
+# P36: graph pathway ON, but with rrf_graph_weight=0.3 (above) so it
+# only breaks ties rather than overwhelming the fusion. Tests whether
+# weight tuning rescues triples-as-byproduct.
+enable_graph_pathway = true
 # Single-tier bonus is redundant in two_tier mode; leave off to avoid double-handling.
 enable_observation_bonus = false
 similarity_threshold = 0.15
@@ -83,11 +89,10 @@ enable_fact_dedup = false
 enable_synthesis = false
 
 [triples]
-# P35: triples are extracted *during consolidation* now (one LLM call
-# per cluster produces both observation + triples). This flag gates
-# persistence — off for the bench (P35 regressed -2.6pp on canonical),
-# on for production deployments that use the graph pathway.
-enable_extraction = false
+# P36: triples ON (same as P35) so the graph pathway has material to
+# retrieve from. The whole point is testing whether the graph pathway
+# is useful AT THE RIGHT WEIGHT.
+enable_extraction = true
 
 [annotation]
 # Use heuristic-only annotation (fast, deterministic, free).

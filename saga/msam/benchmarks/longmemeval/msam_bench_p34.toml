@@ -1,6 +1,9 @@
-# MSAM config used during LongMemEval runs.
-# Loaded via MSAM_CONFIG env var before msam imports resolve.
-# Keeps the prod ~/.msam/msam.toml untouched.
+# MSAM config — P34 variant (consolidation threshold sweep).
+# Same as msam_bench.toml (canonical P30v3 mechanism) EXCEPT
+# [consolidation] similarity_threshold = 0.75 (default 0.80).
+# Tests whether lowering the consolidation threshold lifts retrieval
+# by producing more clusters → more observations → more two-tier boost.
+# See NEXT-EXPERIMENTS.md P34.
 
 [embedding]
 provider = "openai"
@@ -119,6 +122,8 @@ api_key_env = "OPENAI_API_KEY"
 min_cluster_size = 3
 max_clusters_per_run = 20
 stability_reduction_factor = 0.5
+# P34: lower clustering threshold from 0.80 to 0.75.
+similarity_threshold = 0.75
 
 [atoms]
 # Bench harness runs resolve_contradictions_to_supersedes() once per
