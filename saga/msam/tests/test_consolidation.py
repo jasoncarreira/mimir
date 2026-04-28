@@ -13,6 +13,7 @@ def temp_db(monkeypatch, tmp_path):
     """Use a temporary database for all tests."""
     db_path = tmp_path / "test_msam.db"
     monkeypatch.setattr("msam.core.DB_PATH", db_path)
+    monkeypatch.setattr("msam.triples.DB_PATH", db_path)
     fake_emb = list(np.random.randn(1024).astype(float))
     monkeypatch.setattr("msam.core.embed_text", lambda t: fake_emb)
     monkeypatch.setattr("msam.core.embed_query", lambda t: fake_emb)
@@ -379,6 +380,57 @@ class TestSkipExistingObservation:
         assert result["clusters_skipped_existing"] >= 1
         # No LLM calls — synthesis was skipped because the observation already exists.
         assert called == []
+
+
+class TestPriorTriplesOnSupersede:
+    """When a new cluster strictly supersedes an existing observation,
+    the synthesizer prompt should include the existing observation's
+    triples as 'previous beliefs' context."""
+
+    def test_fetch_prior_triples_returns_active_only(self):
+        from msam.core import get_db, run_migrations, store_atom
+        from msam.triples import init_triples_schema, store_triples_batch
+        from msam.consolidation import ConsolidationEngine
+        run_migrations(get_db())
+        init_triples_schema()
+
+        obs_id = store_atom(
+            "Old observation about user", memory_type="observation",
+            evidence_count=2,
+        )
+        store_triples_batch([
+            {"atom_id": obs_id, "subject": "User", "predicate": "lives_in", "object": "Oakland"},
+            {"atom_id": obs_id, "subject": "User", "predicate": "has_pet", "object": "cat"},
+        ])
+
+        engine = ConsolidationEngine()
+        result = engine._fetch_prior_triples([obs_id])
+        assert len(result) == 2
+        assert {t["object"] for t in result} == {"Oakland", "cat"}
+        # No atom_id in the prompt-context shape
+        assert all("atom_id" not in t for t in result)
+
+    def test_fetch_prior_triples_empty_input(self):
+        from msam.consolidation import ConsolidationEngine
+        engine = ConsolidationEngine()
+        assert engine._fetch_prior_triples([]) == []
+        assert engine._fetch_prior_triples(None) == []
+
+    def test_fetch_prior_triples_caps_at_20(self):
+        from msam.core import get_db, run_migrations, store_atom
+        from msam.triples import init_triples_schema, store_triples_batch
+        from msam.consolidation import ConsolidationEngine
+        run_migrations(get_db())
+        init_triples_schema()
+
+        obs_id = store_atom("o", memory_type="observation", evidence_count=2)
+        store_triples_batch([
+            {"atom_id": obs_id, "subject": f"User{i}", "predicate": "knows", "object": f"thing{i}"}
+            for i in range(30)
+        ])
+        engine = ConsolidationEngine()
+        result = engine._fetch_prior_triples([obs_id])
+        assert len(result) == 20
 
 
 class TestParseStructuredSynthesis:

@@ -370,6 +370,38 @@ class ConsolidationEngine:
                 out.append(obs_id)
         return out
 
+    def _fetch_prior_triples(self, observation_ids: list[str]) -> list[dict]:
+        """Return active triples attached to the given observation atoms.
+
+        Used when a new cluster is a strict superset of an existing
+        observation — the synthesizer prompt includes these as
+        "previous beliefs" context so the LLM can decide whether to
+        keep, update, or drop each one in its emitted TRIPLES.
+
+        Returns dicts with subject/predicate/object only — atom_id and
+        embedding are intentionally omitted (this is just for prompt
+        framing). Capped at 20 entries to keep prompts bounded.
+        """
+        if not observation_ids:
+            return []
+        conn = get_db()
+        try:
+            placeholders = ",".join("?" * len(observation_ids))
+            rows = conn.execute(
+                f"SELECT subject, predicate, object FROM triples "
+                f"WHERE atom_id IN ({placeholders}) AND state = 'active' "
+                f"LIMIT 20",
+                tuple(observation_ids),
+            ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            conn.close()
+        return [
+            {"subject": r[0], "predicate": r[1], "object": r[2]}
+            for r in rows
+        ]
+
     def _synthesize_phase(self, clusters: list[list[dict]]) -> list[dict]:
         """Call LLM to generate a synthesis atom per cluster.
 
@@ -423,6 +455,31 @@ class ConsolidationEngine:
             # the new observation atom is stored.
             subset_obs = self._subset_observations_for_cluster(source_ids)
 
+            # When this cluster supersedes prior observations, pull their
+            # triples in as "previous beliefs" context for the synthesizer.
+            # The LLM gets to decide which still hold, which need updating,
+            # and which to drop — informed by both the new evidence in the
+            # cluster and the prior conclusions we'd reached on a smaller
+            # evidence set. Old triples stay attached to the (about-to-be-
+            # demoted) old observation; new triples are emitted as the
+            # canonical going-forward set on the new observation.
+            prior_triples = self._fetch_prior_triples(subset_obs) if subset_obs else []
+            prior_block = ""
+            if prior_triples:
+                prior_lines = [
+                    f"({t['subject']}, {t['predicate']}, {t['object']})"
+                    for t in prior_triples
+                ]
+                prior_block = (
+                    "Previous beliefs about these atoms (from earlier "
+                    "consolidations on a smaller evidence set):\n"
+                    + "\n".join(prior_lines)
+                    + "\n\nFor each previous belief: if the new atoms still "
+                    "support it, restate it in your TRIPLES section; if the "
+                    "new atoms revise or contradict it, output the updated "
+                    "version (or omit if it's no longer true).\n\n"
+                )
+
             # Try LLM synthesis (skipped entirely when consolidation.enable_llm = false)
             synthesis_content = None
             cluster_triples: list[dict] = []
@@ -454,6 +511,7 @@ class ConsolidationEngine:
                         f"- Implicit subject 'User' for user-preference statements\n"
                         f"- Lists become multiple triples (one per item)\n"
                         f"- Skip emotional/philosophical/meta-commentary content (write NONE)\n\n"
+                        f"{prior_block}"
                         f"Atoms:\n- {joined}"
                     )
                     resp = requests.post(
