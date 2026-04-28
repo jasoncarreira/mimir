@@ -139,6 +139,15 @@ class TestNewConfigSections:
         assert isinstance(cfg('retrieval', 'temporal_recency_hours'), (int, float))
         assert cfg('retrieval', 'temporal_recency_hours') > 0
 
+    def test_confidence_sim_defaults_p33(self):
+        """Pin the P33-recalibrated defaults so a future change is intentional.
+        See NEXT-EXPERIMENTS.md P33 for the offline analysis behind these."""
+        from msam.config import get_config
+        cfg = get_config()
+        assert cfg('retrieval', 'confidence_sim_high') == 0.40
+        assert cfg('retrieval', 'confidence_sim_medium') == 0.30
+        assert cfg('retrieval', 'confidence_sim_low') == 0.20
+
     def test_embedding_api_key(self):
         from msam.config import get_config
         cfg = get_config()
