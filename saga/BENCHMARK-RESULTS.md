@@ -31,6 +31,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_cherrypicks_minimax_v1` | MiniMax-M2.7 | P30v3 + P11/P12/P13 cherry-picks (query rewriting + synonym expansion + atom quality multiplier), all on | sem + kw (P11 rewriting on both pathways; P12 synonyms on keyword only; P13 quality ×0.5/×1.1 multiplier) | 500 | **0.756** |
 | `msam_cherrypicks_off_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 mechanism (cherry-picks reverted to off); reader + MSAM consolidation + judge ALL on `openai/gpt-oss-120b` via OpenRouter | sem + kw (P30v3 stack — additive boost + per-atom tiers + missing-atom pull-in) | 500 | **0.668** |
 | `msam_p32_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 + P32 (triple extraction via P7 batched, graph pathway joins RRF as 4th ranker) | sem + kw + **graph** (triples populated per-question via batch_extract_and_store) | 500 | **0.646** |
+| `msam_rerank_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 + P15 (cross-encoder LLM rerank on top-8 candidates); triples + graph pathway off | sem + kw, then LLM rerank on top-8 | 500 | **0.648** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
@@ -930,6 +931,78 @@ config and `[retrieval] enable_graph_pathway = false` in retrieval.
 
 But these are follow-on experiments, not corrections to the running
 P32 baseline. P32 is a **null result** for this corpus + judge.
+
+### `msam_rerank_gptoss_v1` — P30v3 + cross-encoder LLM rerank (500q)
+
+P15 cherry-picked from `retrieval_v2.rerank_with_llm`. After RRF
+fusion produces the top-K candidates, the top 8 atoms are sent to
+gpt-oss-120b with a "rank these passages by relevance" prompt; the
+returned ordering replaces RRF's. Triples + graph pathway OFF for
+this run (clean rerank-only signal vs `cherrypicks_off_gptoss`
+baseline).
+
+| Subtype | Score | N | Δ vs `cherrypicks_off_gptoss` (0.668) | Δ vs P32 (0.646) |
+|---|---|---|---|---|
+| single-session-user | 0.943 | 70 | 0.0 | +1.4 |
+| single-session-assistant | 0.929 | 56 | **+1.8** ✓ | 0.0 |
+| **single-session-preference** | **0.233** | 30 | **+3.3** ✓ | 0.0 |
+| temporal-reasoning | 0.526 | 133 | -2.3 | -0.8 |
+| knowledge-update | 0.795 | 78 | -3.8 | 0.0 |
+| multi-session | 0.504 | 133 | **-4.5** | +0.8 |
+
+**Overall: 0.648 (-2.0 vs baseline, +0.2 vs P32).**
+
+The striking finding: **rerank-only and triples-only produced
+almost identical scores** (0.648 vs 0.646) with **almost identical
+per-subtype profiles** — both gained on single-session-assistant
+(+1.8) and preference (+3.3), both lost on multi-session (-4.5
+to -5.3), knowledge-update (-3.8 each), and temporal-reasoning
+(-1.5 to -2.3). Two completely different mechanisms — one adds a
+fourth RRF ranker fed by extracted facts, the other replaces the
+final ordering with an LLM judge — and they hit the same numbers.
+
+**The most likely explanation:** the regression isn't about the
+mechanisms. It's the gpt-oss-120b reader-and-judge combo
+producing a noisy ceiling that any reordering past RRF runs into.
+Multi-session is hardest for the reader; the judge is hardest on
+multi-session calls. Both reorder paths shuffle which atoms land in
+the reader's context window — and shuffling away from RRF's
+default produces marginal-but-correlated regressions across the
+hard subtypes regardless of how the reordering happens.
+
+The +1.8/+3.3 gains on the easy subtypes are real — single-session-
+assistant and preference both benefit from "second-look" mechanisms
+in general (graph fact-linking for preference, LLM judging for the
+short-answer cases in single-session-assistant). But these gains
+are small and correlate, suggesting they reflect a property of the
+gpt-oss stack rather than the levers.
+
+**Decision summary across the gpt-oss bench triplet:**
+
+| Bench | Score | vs baseline | Cost | Verdict |
+|---|---|---|---|---|
+| `cherrypicks_off_gptoss_v1` | 0.668 | — | ~3h25m | Baseline. Two-tier P30v3 mechanism is the floor. |
+| `p32_gptoss_v1` | 0.646 | -2.2 | ~9h40m | **Don't ship.** 6h extra cost for a regression. |
+| `rerank_gptoss_v1` | 0.648 | -2.0 | ~3h12m + ~5min judge | **Don't ship.** Cheap, but doesn't help. |
+
+**Take on which lever earned its keep:** **neither, on this stack.**
+Both cost something (triples = a lot of LLM calls + ingest time;
+rerank = an LLM call per query in production); both regressed
+equally on the gpt-oss-judged baseline. The strong correlation
+between their per-subtype regressions suggests the issue is with
+the gpt-oss-120b reader + judge being noisy on the hard subtypes,
+not the levers themselves.
+
+**Next bench worth running:** rerank-only on the **MiniMax + gpt-4o
+canonical stack** (the original benchmark configuration). If rerank
+helps there, the levers are real and the gpt-oss noise was masking
+them. If it doesn't, rerank is just dead weight on this benchmark
+and we can definitively kill P15. Same logic applies to triples,
+but rerank is cheaper to test (one bench instead of one + 6h
+extraction cost).
+
+Pace: rerank ~24s/q (vs baseline ~25s/q — rerank adds ~100ms per
+query in the LLM call but cons/retrieve/read sum dominates).
 
 ## P9 summary
 
