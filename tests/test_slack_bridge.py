@@ -64,6 +64,29 @@ def test_is_dm_channel():
     assert _is_dm_channel("C01ABC") is False
 
 
+def test_is_dm_channel_mpim_via_channel_type():
+    """Multi-party DMs (MPIMs) have G-prefix IDs but are conversation-shaped
+    DMs — channel_type='mpim' is the authoritative signal."""
+    # MPIM via the channel_type signal — must be DM.
+    assert _is_dm_channel("G09ABCDEF", "mpim") is True
+    # Legacy private channel (group) shares the G prefix but is org-shaped.
+    assert _is_dm_channel("G09ABCDEF", "group") is False
+    # 1:1 DM via signal.
+    assert _is_dm_channel("D01XYZ", "im") is True
+    # Public channel.
+    assert _is_dm_channel("C01ABC", "channel") is False
+
+
+def test_slack_channel_to_id_mpim():
+    """MPIMs (group DMs) route through dm-slack- so the privacy filter
+    treats them as DMs even though the Slack channel id starts with G."""
+    assert _slack_channel_to_id("G09GROUP1", "mpim") == "dm-slack-G09GROUP1"
+    # Without channel_type, G-prefix is ambiguous so we don't assume DM.
+    assert _slack_channel_to_id("G09GROUP1") == "slack-G09GROUP1"
+    # Private channel (group) stays non-DM.
+    assert _slack_channel_to_id("G09GROUP1", "group") == "slack-G09GROUP1"
+
+
 def test_normalize_emoji_strips_wrapping():
     assert _normalize_emoji(":thumbsup:") == "thumbsup"
     assert _normalize_emoji("thumbsup") == "thumbsup"
@@ -221,6 +244,7 @@ async def test_on_message_dm_marks_private(bridge_with_fake_app):
             "channel": "D01ALICE",
             "text": "private",
             "ts": "1.000",
+            "channel_type": "im",
         }
     )
     assert len(enqueued) == 1
@@ -228,6 +252,48 @@ async def test_on_message_dm_marks_private(bridge_with_fake_app):
     assert e.channel_id == "dm-slack-D01ALICE"
     assert e.extra["channel_conversation_type"] == "dm"
     assert e.extra["channel_visibility"] == "private"
+
+
+@pytest.mark.asyncio
+async def test_on_message_mpim_marks_private(bridge_with_fake_app):
+    """A multi-party DM (MPIM) has a G-prefix id but channel_type='mpim'.
+    Must route to dm-slack- so the §5.4 privacy filter treats it as a DM."""
+    bridge, enqueued, _ = bridge_with_fake_app
+    await bridge._on_message(
+        {
+            "user": "U05ALICE",
+            "channel": "G09GROUPDM",
+            "text": "shh",
+            "ts": "1.000",
+            "channel_type": "mpim",
+        }
+    )
+    assert len(enqueued) == 1
+    e = enqueued[0]
+    assert e.channel_id == "dm-slack-G09GROUPDM"
+    assert e.extra["channel_conversation_type"] == "dm"
+    assert e.extra["channel_visibility"] == "private"
+
+
+@pytest.mark.asyncio
+async def test_on_message_private_channel_not_dm(bridge_with_fake_app):
+    """A legacy private channel (channel_type='group') has a G-prefix id
+    but is org-shaped — keep the plain slack- prefix, not dm-slack-."""
+    bridge, enqueued, _ = bridge_with_fake_app
+    await bridge._on_message(
+        {
+            "user": "U05ALICE",
+            "channel": "G09PRIVCHAN",
+            "text": "in private channel",
+            "ts": "1.000",
+            "channel_type": "group",
+        }
+    )
+    assert len(enqueued) == 1
+    e = enqueued[0]
+    assert e.channel_id == "slack-G09PRIVCHAN"
+    assert e.extra["channel_conversation_type"] == "multi_user"
+    assert e.extra["channel_visibility"] == "public"
 
 
 @pytest.mark.asyncio

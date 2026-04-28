@@ -57,9 +57,22 @@ SLACK_MESSAGE_CHAR_LIMIT = 3500
 # ---------------------------------------------------------------------------
 
 
-def _slack_channel_to_id(channel: str) -> str:
-    """Convert a Slack channel id (C... or D...) to mimir's channel_id."""
-    if channel.startswith("D"):
+def _slack_channel_to_id(channel: str, channel_type: str | None = None) -> str:
+    """Convert a Slack channel to mimir's channel_id.
+
+    Both 1:1 DMs (``im``, ``D...``) and multi-party DMs (``mpim``, ``G...``)
+    route through the ``dm-slack-`` prefix so the SPEC §5.4 privacy filter
+    treats them as private. Legacy private channels (``group``) keep the
+    plain ``slack-`` prefix — they're org-shaped, not DM-shaped.
+
+    ``channel_type`` is the authoritative signal (from the event payload).
+    Prefix is a fallback for callers that don't have the event in hand.
+    """
+    if channel_type in ("im", "mpim"):
+        return f"dm-slack-{channel}"
+    if channel_type is None and channel.startswith("D"):
+        # Fallback when the caller didn't carry channel_type — only D-prefix
+        # IDs are unambiguous DMs.
         return f"dm-slack-{channel}"
     return f"slack-{channel}"
 
@@ -72,9 +85,15 @@ def _channel_id_to_slack(channel_id: str) -> str | None:
     return None
 
 
-def _is_dm_channel(channel: str) -> bool:
-    """Slack DMs use channel ids that start with 'D'."""
-    return channel.startswith("D")
+def _is_dm_channel(channel: str, channel_type: str | None = None) -> bool:
+    """Both 1:1 IMs and multi-party DMs (MPIMs) are DMs for the §5.4
+    privacy filter. ``channel_type`` is authoritative; prefix is a
+    fallback (only ``D...`` is unambiguous)."""
+    if channel_type in ("im", "mpim"):
+        return True
+    if channel_type is None:
+        return channel.startswith("D")
+    return False
 
 
 def _chunk_message(text: str, limit: int = SLACK_MESSAGE_CHAR_LIMIT) -> list[str]:
@@ -341,8 +360,9 @@ class SlackBridge(Bridge):
             return
 
         slack_channel = event.get("channel") or ""
-        channel_id = _slack_channel_to_id(slack_channel)
-        is_dm = _is_dm_channel(slack_channel)
+        channel_type = event.get("channel_type")
+        channel_id = _slack_channel_to_id(slack_channel, channel_type)
+        is_dm = _is_dm_channel(slack_channel, channel_type)
 
         text = (event.get("text") or "").strip()
         if not text:
