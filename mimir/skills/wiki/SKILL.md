@@ -135,10 +135,20 @@ many sources. The mapping is many-to-many.
 
 Before doing new research or going to raw sources:
 
-1. Search `state/wiki/index.md` for the topic
-2. If a page exists, read it — your prior synthesis is the answer
-3. Follow wikilinks to related pages for additional context
-4. Only go to `state/raw/` if the wiki doesn't have it
+1. **Paraphrased query** — `mcp__mimir__file_search(query="...", scope="state")`
+   does hybrid keyword + vector search over the whole wiki (and raw/).
+   Best when you remember the gist but not the page name —
+   "who's the engineer who keeps talking about async?" finds Alice
+   even if her page never uses the exact phrase.
+2. **Browse by category** — read `state/wiki/index.md`. Useful when
+   you want to see what's in a category at a glance, or you know the
+   page name and just need to navigate.
+3. **Wikilink traversal** — once you've found one page, follow
+   `[[name]]` references to related pages for additional context.
+4. Only go to `state/raw/` if the wiki doesn't have it. Raw sources
+   are also indexed (`scope="state"` covers both wiki and raw), so a
+   broad query may surface raw content the wiki hasn't synthesized
+   yet — that's a signal to ingest.
 
 ### Lint: periodic health check
 
