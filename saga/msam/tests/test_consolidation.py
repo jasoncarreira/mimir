@@ -379,3 +379,113 @@ class TestSkipExistingObservation:
         assert result["clusters_skipped_existing"] >= 1
         # No LLM calls — synthesis was skipped because the observation already exists.
         assert called == []
+
+
+class TestParseStructuredSynthesis:
+    """P35: parse the OBSERVATION + TRIPLES dual-output format."""
+
+    def test_clean_format(self):
+        from msam.consolidation import _parse_structured_synthesis
+        text = (
+            "OBSERVATION:\n"
+            "User graduated with a Business Administration degree.\n"
+            "\n"
+            "TRIPLES:\n"
+            "(User, has_degree, Business_Administration)\n"
+            "(User, graduation_year, 2023)\n"
+        )
+        obs, triples = _parse_structured_synthesis(text)
+        assert obs == "User graduated with a Business Administration degree."
+        assert len(triples) == 2
+        assert triples[0]["subject"] == "User"
+        assert triples[0]["predicate"] == "has_degree"
+        assert triples[0]["object"] == "Business_Administration"
+
+    def test_observation_only_no_triples_section(self):
+        from msam.consolidation import _parse_structured_synthesis
+        text = "OBSERVATION:\nUser likes pizza."
+        obs, triples = _parse_structured_synthesis(text)
+        assert obs == "User likes pizza."
+        assert triples == []
+
+    def test_triples_none_block(self):
+        from msam.consolidation import _parse_structured_synthesis
+        text = (
+            "OBSERVATION:\n"
+            "User reflects on whether life has meaning.\n"
+            "\n"
+            "TRIPLES:\n"
+            "NONE\n"
+        )
+        obs, triples = _parse_structured_synthesis(text)
+        assert obs == "User reflects on whether life has meaning."
+        assert triples == []
+
+    def test_legacy_observation_only_format(self):
+        """Old-style single-section response should still parse — the
+        whole text becomes the observation."""
+        from msam.consolidation import _parse_structured_synthesis
+        text = "User said they prefer dark mode UI."
+        obs, triples = _parse_structured_synthesis(text)
+        assert "User said they prefer dark mode UI." in obs
+        assert triples == []
+
+    def test_markdown_bold_headers(self):
+        """Some models emit `**OBSERVATION:**` instead of plain
+        `OBSERVATION:`. The parser tolerates either."""
+        from msam.consolidation import _parse_structured_synthesis
+        text = (
+            "**OBSERVATION:**\n"
+            "User lives in Boston.\n"
+            "\n"
+            "**TRIPLES:**\n"
+            "(User, lives_in, Boston)\n"
+        )
+        obs, triples = _parse_structured_synthesis(text)
+        assert obs == "User lives in Boston."
+        assert len(triples) == 1
+
+    def test_trailing_section_ignored(self):
+        """If the model emits CONTRADICTIONS: or other sections after
+        TRIPLES, those don't pollute the triple parse."""
+        from msam.consolidation import _parse_structured_synthesis
+        text = (
+            "OBSERVATION:\n"
+            "User likes pizza.\n"
+            "\n"
+            "TRIPLES:\n"
+            "(User, likes_food, pizza)\n"
+            "\n"
+            "CONTRADICTIONS:\n"
+            "atom 1 vs atom 3 disagree on day of week\n"
+        )
+        obs, triples = _parse_structured_synthesis(text)
+        assert obs == "User likes pizza."
+        assert len(triples) == 1
+        # CONTRADICTIONS shouldn't end up in the triples list
+        assert all("disagree" not in t.get("object", "") for t in triples)
+
+    def test_empty_input(self):
+        from msam.consolidation import _parse_structured_synthesis
+        obs, triples = _parse_structured_synthesis("")
+        assert obs is None
+        assert triples == []
+
+    def test_invalid_triples_filtered(self):
+        """Malformed triples (too long, missing components) are dropped
+        by the underlying _parse_triples validation."""
+        from msam.consolidation import _parse_structured_synthesis
+        text = (
+            "OBSERVATION:\n"
+            "Mixed quality output.\n"
+            "\n"
+            "TRIPLES:\n"
+            "(User, lives_in, Boston)\n"
+            "(this is not a triple line)\n"
+            "(A, b, C)\n"  # too short - rejected
+            "(SomeReallyLongSubjectThatExceedsTheLimitForSubjects, has, x)\n"  # too long subject
+        )
+        obs, triples = _parse_structured_synthesis(text)
+        # Only the first valid one survives validation
+        assert len(triples) == 1
+        assert triples[0]["subject"] == "User"
