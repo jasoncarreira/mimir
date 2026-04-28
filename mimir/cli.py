@@ -83,6 +83,79 @@ DEFAULT_IDENTITY_MD = dedent(
 )
 
 
+DEFAULT_WIKI_AGENTS_MD = dedent(
+    """\
+    # AGENTS.md
+
+    Schema for maintaining the wiki under ``state/wiki/``. The full skill
+    is at ``.claude/skills/wiki/SKILL.md`` — this file is a quick reference.
+
+    ## Three layers
+
+    1. **Raw sources** — ``state/raw/`` — immutable source documents,
+       never modified after landing.
+    2. **Wiki** — ``state/wiki/`` — your synthesis with cross-references.
+    3. **Schema** — this file — conventions for maintaining the wiki.
+
+    ## Categories
+
+    - ``entities/`` — named things (people, agents, organizations, products)
+    - ``concepts/`` — abstract ideas, patterns, frameworks
+    - ``topics/`` — concrete subjects, projects, events
+
+    ## Conventions
+
+    - Frontmatter: ``title``, ``description``, ``type``, optional ``tags``.
+      Descriptive, not enforced — typos won't break anything.
+    - Wikilinks: ``[[page-name]]``. Add inline in prose AND in a Related
+      section. Links are not optional — they make the wiki a graph.
+    - Each page should have a "Connection to My Work" section so it's
+      synthesis, not summary.
+
+    ## Operations (see SKILL.md for detail)
+
+    - **Ingest:** raw/ → wiki/. Read source, create/update page, link.
+    - **Query:** search wiki/ first; only fall back to raw/ if needed.
+    - **Lint:** periodic — orphan pages, missing cross-refs, stale claims.
+    """
+)
+
+
+DEFAULT_WIKI_INDEX_MD = dedent(
+    """\
+    # Wiki Index
+
+    Catalog of wiki pages. Update on every ingest.
+
+    ## Entities
+
+    (none yet)
+
+    ## Concepts
+
+    (none yet)
+
+    ## Topics
+
+    (none yet)
+    """
+)
+
+
+DEFAULT_WIKI_LOG_MD = dedent(
+    """\
+    # Wiki Log
+
+    Chronological record of wiki operations. Append on every ingest / lint.
+
+    Format:
+    ```
+    YYYY-MM-DD — <operation>: <file(s) affected>
+    ```
+    """
+)
+
+
 def _write_if_missing(path: Path, content: str) -> bool:
     """Write ``content`` to ``path`` only if the file doesn't exist.
 
@@ -111,6 +184,11 @@ def setup_home(home: Path) -> dict[str, object]:
         "memory/channels",
         "memory/shared",
         "state",
+        "state/raw",
+        "state/wiki",
+        "state/wiki/entities",
+        "state/wiki/concepts",
+        "state/wiki/topics",
         "messages",
         ".claude/agents",
         ".claude/skills",
@@ -127,6 +205,12 @@ def setup_home(home: Path) -> dict[str, object]:
         files_created.append("scheduler.yaml")
     if _write_if_missing(home / "memory" / "core" / "identity.md", DEFAULT_IDENTITY_MD):
         files_created.append("memory/core/identity.md")
+    if _write_if_missing(home / "state" / "wiki" / "AGENTS.md", DEFAULT_WIKI_AGENTS_MD):
+        files_created.append("state/wiki/AGENTS.md")
+    if _write_if_missing(home / "state" / "wiki" / "index.md", DEFAULT_WIKI_INDEX_MD):
+        files_created.append("state/wiki/index.md")
+    if _write_if_missing(home / "state" / "wiki" / "log.md", DEFAULT_WIKI_LOG_MD):
+        files_created.append("state/wiki/log.md")
 
     seeded_subagents = seed_subagent_defs(home)
     seeded_skills = seed_skills(home)

@@ -19,6 +19,11 @@ def test_setup_creates_home_layout(tmp_path: Path):
     assert (home / "memory" / "channels").is_dir()
     assert (home / "memory" / "shared").is_dir()
     assert (home / "state").is_dir()
+    # Wiki layer + raw source store (Karpathy's LLM Wiki pattern).
+    assert (home / "state" / "raw").is_dir()
+    assert (home / "state" / "wiki" / "entities").is_dir()
+    assert (home / "state" / "wiki" / "concepts").is_dir()
+    assert (home / "state" / "wiki" / "topics").is_dir()
     assert (home / "messages").is_dir()
     assert (home / ".claude" / "agents").is_dir()
     assert (home / ".claude" / "skills").is_dir()
@@ -26,11 +31,16 @@ def test_setup_creates_home_layout(tmp_path: Path):
     assert (home / ".env").is_file()
     assert (home / "scheduler.yaml").is_file()
     assert (home / "memory" / "core" / "identity.md").is_file()
+    assert (home / "state" / "wiki" / "AGENTS.md").is_file()
+    assert (home / "state" / "wiki" / "index.md").is_file()
+    assert (home / "state" / "wiki" / "log.md").is_file()
     # Skills + subagents got seeded.
     assert (home / ".claude" / "skills" / "memory" / "SKILL.md").is_file()
+    assert (home / ".claude" / "skills" / "wiki" / "SKILL.md").is_file()
     # Status report covers what we did.
     assert status["home"] == str(home.resolve())
     assert "memory/core" in status["dirs_created"]
+    assert "state/wiki/entities" in status["dirs_created"]
 
 
 def test_setup_is_idempotent_and_preserves_user_edits(tmp_path: Path):

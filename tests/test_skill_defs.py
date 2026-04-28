@@ -20,9 +20,28 @@ def test_bundled_skills_include_expected_set():
         "skill-acquisition",
         "skill-creator",
         "view-attachment",
+        "wiki",
     }
     missing = expected - names
     assert not missing, f"missing bundled skills: {missing}"
+
+
+def test_wiki_skill_is_domain_neutral():
+    """The wiki skill should NOT mention bench-specific domains. The whole
+    point is that it's general-purpose graph memory; benchmark guidance
+    belongs in the bench-task prompts, not the bundled skill."""
+    skill = (Path(__file__).parent.parent / "mimir" / "skills" / "wiki" / "SKILL.md").read_text()
+    body = skill.lower()
+    for bad in ("bluesky", "bsky", "bench-", "minimax"):
+        assert bad not in body, f"wiki skill leaks domain reference: {bad}"
+
+
+def test_memory_skill_references_wiki(tmp_path: Path):
+    seed_skills(tmp_path)
+    body = (tmp_path / ".claude" / "skills" / "memory" / "SKILL.md").read_text()
+    assert "state/wiki" in body or "wiki skill" in body.lower(), (
+        "memory skill should point at the wiki layer for graph-shaped content"
+    )
 
 
 def test_seed_skills_creates_missing_skills(tmp_path: Path):

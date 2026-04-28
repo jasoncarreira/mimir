@@ -49,6 +49,15 @@ Long documents, transcripts, equations, references you want unmolested by
 summarization go in `state/`. Listed in `state/INDEX.md` (NOT in the prompt;
 read on demand). Same `<!-- desc: -->` rule applies.
 
+Two structured subtrees live under `state/`:
+
+- **`state/raw/`** — immutable source documents. Once a file lands here,
+  never edit it. The wiki cites raw files by path.
+- **`state/wiki/`** — graph-shaped synthesis with `entities/`, `concepts/`,
+  `topics/`, plus `index.md` and `log.md`. Use the **wiki skill** for
+  durable, cross-referenced knowledge that grows over time. Wikilinks
+  `[[page-name]]` connect pages into a navigable graph.
+
 ### MSAM atoms — semantic recall
 
 Mirror durable facts as semantic atoms via
@@ -64,9 +73,12 @@ injects relevant atoms automatically; mid-turn queries via
 - **Places (channels, repos, projects)**: ids to use in `send_message`,
   topics, ongoing context → `memory/channels/<id>/notes.md` (per-channel) or
   `memory/topics/<slug>.md` (cross-channel).
-- **Ideas, projects, important events**: probably files under
-  `memory/topics/` or `memory/shared/`. Mirror the headline as a semantic
-  atom.
+- **Ideas, projects, important events**: if they're standalone, file under
+  `memory/topics/` or `memory/shared/` and mirror the headline as a
+  semantic atom. If they're part of an evolving graph (recurring topic
+  with linked entities, concept that ties many sources together), prefer
+  the wiki under `state/wiki/topics/` or `state/wiki/concepts/` — the
+  link graph pays off as the graph grows.
 - **Schedules**: `scheduler.yaml` for cron-driven prompts, plus a pinned core
   block when the schedule is core to your identity.
 - **Environment**: the agent home you run in is your body. Keep careful watch

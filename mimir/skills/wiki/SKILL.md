@@ -1,0 +1,145 @@
+---
+name: wiki
+description: Maintain a structured wiki under state/wiki/ — ingest raw sources from state/raw/, synthesize cross-linked pages, and lint for health. Use this skill whenever you need to build durable, graph-shaped knowledge with cross-references (entities with relationships, topics that recur, concepts you trace across many sources).
+---
+
+# Wiki
+
+Based on Karpathy's LLM Wiki pattern (https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). The wiki is your synthesis of raw sources — not just summaries. Pages are cross-linked. The graph is the value.
+
+## Three layers
+
+```
+state/
+├── raw/          # immutable source documents (transcripts, dumps, fetched articles)
+└── wiki/
+    ├── entities/    # named things: people, agents, organizations, products
+    ├── concepts/    # abstract ideas, patterns, frameworks
+    ├── topics/      # concrete subjects, projects, events
+    ├── index.md     # catalog of all wiki pages
+    ├── log.md       # chronological record of operations
+    └── AGENTS.md    # schema reference (this file's conventions)
+```
+
+`raw/` is **immutable**. Once a source lands, never edit it. Wiki pages cite raw files by path.
+
+`wiki/` is yours to maintain. Pages are markdown with frontmatter and `[[wikilinks]]` to other pages.
+
+## Page conventions
+
+### Frontmatter
+
+Every wiki page starts with YAML frontmatter:
+
+```yaml
+---
+title: Alice Smith
+description: Eng team lead, advocate for async-first culture
+type: entity        # entity | concept | topic
+tags:
+  - engineering
+  - async
+---
+```
+
+Frontmatter is for human readability and lightweight categorization — it's not parsed for control flow. Don't stress about getting it perfect; descriptive over rigid.
+
+### Body structure
+
+```markdown
+# Page Title
+
+**Source:** raw/filename.md (date)
+
+## Overview
+1-2 sentence summary.
+
+## Core Content
+Main material organized by headings. Quote sparingly; this is your synthesis.
+
+## Connection to My Work
+How this applies to the project, persona, or ongoing thread.
+
+## Related
+**Related:** [[other-page]], [[another-page]]
+
+## Sources
+- raw/filename.md
+- [External links if any]
+```
+
+### Wikilinks
+
+Use `[[page-name]]` to link between wiki pages. Two places they go:
+
+- **Inline in prose**, where natural: "Alice mentioned [[stigmergy]] as a coordination model."
+- **In a "Related" section** at the bottom: `**Related:** [[bob]], [[stigmergy]], [[async-culture]]`
+
+Links are not optional — they make the wiki a graph, not a list. A page with no links is an island. Before finishing a page, scan `index.md` and ask: which existing pages relate? Add the links both directions.
+
+### Categories
+
+- **`entities/`** — named things. People, agents, organizations, products, services. Each has a definite referent.
+- **`concepts/`** — abstract ideas. Patterns, frameworks, theories. Could be discussed in many contexts.
+- **`topics/`** — concrete subjects. Projects, events, technologies, ongoing threads.
+
+If you're unsure between `concepts/` and `topics/`, ask: is this an *idea* (concept) or a *thing* (topic)? "Stigmergy" is a concept. "Project Hermes" is a topic. "Alice" is an entity.
+
+## Operations
+
+### Ingest: raw → wiki
+
+This is the primary operation. Every raw file should result in a fully cross-linked wiki page (or update to existing pages).
+
+1. Read the raw source file (`Read state/raw/<filename>.md`)
+2. Determine category — entity, concept, or topic
+3. Scan `state/wiki/index.md` for related pages — concepts/entities/topics this source connects to
+4. Write the wiki page following the conventions above:
+   - Core content from source (your synthesis, not a quote)
+   - "Connection to My Work" section
+   - Wikilinks to related pages, both inline and in "Related"
+5. Append a one-line description to `state/wiki/index.md` under the correct category
+6. Append a log entry to `state/wiki/log.md` with date and the file(s) created/updated
+7. **Update existing pages that should link TO the new page.** This is the easy step to skip and the most important one for graph health.
+
+**Quality bar.** Each page should:
+- Have a clear focus — don't try to cover everything in one page
+- Link to related pages via wikilinks (not just mention them by name)
+- Include "Connection to My Work" so the page isn't just a summary
+- Avoid forced analogies that don't fit
+
+### Query: search wiki first
+
+Before doing new research or going to raw sources:
+
+1. Search `state/wiki/index.md` for the topic
+2. If a page exists, read it — your prior synthesis is the answer
+3. Follow wikilinks to related pages for additional context
+4. Only go to `state/raw/` if the wiki doesn't have it
+
+### Lint: periodic health check
+
+Do a lint pass when wiring is caught up or when prompted:
+
+- **Orphan pages.** Pages with no inbound links. Either add inbound links from related pages or merge the orphan into a parent page.
+- **Missing cross-references.** Two pages discuss the same concept but don't link each other. Add the links.
+- **Stale claims.** A new source contradicts an old wiki claim. Update the page; add a note in `log.md`.
+- **Pages that should split or merge.** A page covers two distinct things (split). Two pages cover roughly the same thing (merge).
+- **Index and log up to date.** `index.md` should list every page; `log.md` should show recent activity.
+
+Lint passes are slower than ingest; do them deliberately, not constantly.
+
+## When to use the wiki vs. plain memory/
+
+- **Wiki** is for graph-shaped, cross-referenced knowledge that grows over time — entities you keep learning about, concepts that recur across sources, topics with their own arcs. The whole point is the link graph: who relates to whom, which concept underlies which topic.
+- **`memory/core/`** is for always-in-context facts (persona, procedures, style). Always loaded; budget-tight; succinct.
+- **`memory/<anywhere>/`** is for non-core notes that don't need a graph — channel-scoped notes, one-off facts, transient context. No frontmatter required, no cross-reference discipline.
+
+If a note would benefit from being linked to other notes, it belongs in `wiki/`. If it's a one-off, `memory/` is fine.
+
+## Lightweight rules of thumb
+
+- The wiki is **your synthesis**, not a transcript repository. Quote sparingly.
+- Wikilinks are case-insensitive in spirit — `[[Alice]]` and `[[alice]]` resolve to the same page. Be consistent within a session, but don't waste time fixing inconsistencies.
+- `index.md` and `log.md` are append-only in normal operation. Edit them only during lint.
+- A page that's just a stub (one line of description) is fine if you don't have content yet — it gives later pages something to link to.
