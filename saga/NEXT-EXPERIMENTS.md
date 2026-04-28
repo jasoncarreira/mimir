@@ -384,6 +384,96 @@ domain produces real duplicates that the current threshold misses.
 
 ---
 
+### P35 — Consolidation as the structured-cognition pass
+
+**What.** Fold triple extraction (and eventually contradiction
+surfacing, temporal tagging, quality grading) into the consolidation
+LLM call. One prompt produces:
+
+```
+OBSERVATION:
+<one or two sentences>
+
+TRIPLES:
+(subject, predicate, object)
+(subject, predicate, object)
+```
+
+Persist the observation as an atom (as today) AND the triples linked
+to that observation atom. Gate triples persistence on `[triples]
+enable_extraction` so users who don't want them just write the
+observation.
+
+**Why it's the right architecture.** Consolidation already pays an
+LLM call per cluster. The cluster IS the semantic batching — atoms
+that should be reasoned about together. Triple extraction is the
+same shape of cognition ("look at related text, extract structure"),
+running on the same input atoms, yet today it's a separate LLM pass
+(per-store originally, P7-batched per-question now). Doing it twice
+is a layering mistake — the consolidation prompt is already shaped
+for "look at these atoms, produce structured output."
+
+**Cost analysis.**
+- Today (post-P7): per-question cost is ~12 (triples) + ~10
+  (consolidation) = ~22 LLM calls.
+- Post-P35: ~10 (consolidation, with structured output). Triples
+  become essentially free; the marginal output tokens are negligible
+  vs. reasoning cost.
+- Production case: agent stores ~10s of atoms per session. Per-store
+  triple extraction = an LLM call per turn. Move to consolidation-
+  time = one LLM call per cluster (per session boundary, or per
+  scheduled run). Order-of-magnitude cost reduction.
+
+**The previous P32 result was negative** (msam_p32_gptoss_v1 = 0.646,
+-2.2pp vs baseline 0.668), with multi-session and knowledge-update
+cratering. That measured "is triples-as-extra-pipeline worth it?"
+The answer was no — too expensive for too little signal. The right
+question is "is triples-as-consolidation-byproduct worth it?" That's
+a much better trade and probably answers yes.
+
+**Tradeoff.** Singleton atoms — facts stated in exactly one turn,
+never clustered with anything — get no triples. Mitigation: regular
+sem+kw retrieval still surfaces them by topical similarity. Real
+"answer" turns usually appear amidst topical context (cluster
+forms). Knowledge-update questions specifically benefit from
+triples-of-clusters because OLD and NEW facts cluster together by
+topic, and the synthesizer can emit both with temporal tags.
+
+**Implementation:**
+
+1. Update `ConsolidationEngine._synthesize_phase` prompt to request
+   structured output (two sections: OBSERVATION, TRIPLES).
+2. Parse both sections; on parse failure default to "no triples"
+   (graceful degradation — the observation still lands).
+3. In `_restructure_phase`, after storing the observation atom, call
+   `store_triples_batch` with `triples.atom_id` set to the
+   observation's atom_id.
+4. Remove standalone `batch_extract_and_store` from the bench's
+   `ingest_question` (triples now come from consolidation).
+5. Keep `batch_extract_triples_llm` and the `/v1/triples/extract`
+   endpoint as functions for ad-hoc callers.
+
+**Future extensions** (separate experiments): fold contradictions
+into the same prompt (`CONTRADICTIONS:` section emitting `supersedes`
+edges within the cluster), temporal extraction (`valid_from` /
+`valid_until` for the world model), per-cluster quality grading
+(replaces P13's heuristic with LLM judgment that's already paid for).
+
+**Effort.** 1 day to refactor + 1 bench to validate.
+
+**Risk.** Low — consolidation already produces structured-ish text;
+the LLM will handle the multi-section format. Worst case the parser
+fails on some clusters; fallback writes observation only, same as
+today.
+
+**Score expectation.** Net positive on bench by at least the cost
+delta — even if the additional triples don't lift retrieval,
+removing the separate triple-extraction phase saves ~6h on a 500q
+bench. If triples-of-clusters DO lift retrieval (especially for
+knowledge-update where cross-time facts cluster well), bigger win.
+
+---
+
 ### P15 — Evaluate cross-encoder rerank
 
 **What.** Hindsight uses a cross-encoder reranker as their final stage

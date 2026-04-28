@@ -34,8 +34,9 @@ two_tier_enabled = true
 observations_top_k = 5
 observation_confidence_min_sim = 0.30
 evidence_boost_cap_multiplier = 3.0
-# P32: enable the graph pathway so RRF fuses sem + kw + graph.
-# Requires triples to be populated; bench's batch_extract_and_store does that.
+# P32/P35: enable the graph pathway so RRF fuses sem + kw + graph.
+# Triples are now populated by consolidation (P35), not by a standalone
+# extraction pass. The flag in [triples] gates persistence.
 enable_graph_pathway = true
 # Single-tier bonus is redundant in two_tier mode; leave off to avoid double-handling.
 enable_observation_bonus = false
@@ -58,6 +59,7 @@ outcome_weight = 0.0
 outcome_decay = 1.0
 
 [retrieval_v2]
+enable_rerank = false   # P15 cross-encoder LLM rerank (regressed in msam_rerank_gptoss_v1)
 enabled = false
 # Cherry-picks (P11/P12/P13) regressed -2.8pp in msam_cherrypicks_minimax_v1
 # (logged 2026-04-27). Disabled while we decide whether to ablate or skip.
@@ -81,9 +83,9 @@ enable_fact_dedup = false
 enable_synthesis = false
 
 [triples]
-# P32: turn on triple extraction for the bench. Bench ingest.py runs
-# batch_extract_and_store (P7) once per question after atoms land —
-# ~ceil(n_semantic/20) LLM calls per question instead of n_semantic.
+# P35: triples are extracted *during consolidation* now (one LLM call
+# per cluster produces both observation + triples). This flag still
+# gates whether the extracted triples are persisted to the graph DB.
 enable_extraction = true
 
 [annotation]

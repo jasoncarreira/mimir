@@ -34,6 +34,64 @@ DEFAULT_MAX_CLUSTERS = _cfg('consolidation', 'max_clusters_per_run', 50)
 DEFAULT_STABILITY_REDUCTION = _cfg('consolidation', 'stability_reduction_factor', 0.5)
 
 
+# ─── P35: structured-output parsing for consolidation ───────────
+
+def _parse_structured_synthesis(text: str) -> tuple[str | None, list[dict]]:
+    """Parse the OBSERVATION + TRIPLES dual-output format.
+
+    Returns (observation_text_or_None, list_of_triple_dicts). On parse
+    failure, returns (None, []) — caller falls back to longest-source-
+    atom representative. If only OBSERVATION parses cleanly, returns
+    (observation, []) — graceful degradation when the LLM omits or
+    malforms the TRIPLES section.
+
+    Triples are returned without atom_id; the caller fills it in once
+    the observation is stored.
+    """
+    import re
+    if not text:
+        return None, []
+
+    # Find the OBSERVATION section header. Tolerant of leading
+    # whitespace and either `OBSERVATION:` or `**OBSERVATION:**`.
+    obs_match = re.search(r'(?im)^\s*\**\s*OBSERVATION\s*:?\s*\**\s*\n?', text)
+    if not obs_match:
+        # No header — assume the whole response is the observation
+        # (legacy single-output format).
+        return text.strip() or None, []
+
+    after_obs = text[obs_match.end():]
+
+    # Find the TRIPLES section, which terminates the observation.
+    tri_match = re.search(r'(?im)^\s*\**\s*TRIPLES\s*:?\s*\**\s*\n?', after_obs)
+    if tri_match:
+        observation = after_obs[:tri_match.start()].strip()
+        triples_block = after_obs[tri_match.end():].strip()
+    else:
+        observation = after_obs.strip()
+        triples_block = ""
+
+    if not observation:
+        observation = None
+
+    # Strip any further section headers from the triples block (some
+    # models emit trailing CONTRADICTIONS: or similar that we don't
+    # consume yet).
+    triples_block = re.split(
+        r'(?im)^\s*\**\s*(?:CONTRADICTIONS|NOTES|EXPLANATION)\s*:?\s*\**\s*\n',
+        triples_block,
+    )[0]
+
+    triples: list[dict] = []
+    if triples_block and "NONE" not in triples_block.upper().split("\n")[0]:
+        # Same triple shape as triples._parse_triples — reuse its
+        # validation. Pass empty atom_id; caller fills it in.
+        from .triples import _parse_triples
+        triples = _parse_triples(triples_block, atom_id="")
+
+    return observation, triples
+
+
 class ConsolidationEngine:
     """Sleep-inspired memory consolidation.
 
@@ -367,25 +425,35 @@ class ConsolidationEngine:
 
             # Try LLM synthesis (skipped entirely when consolidation.enable_llm = false)
             synthesis_content = None
+            cluster_triples: list[dict] = []
             if enable_llm:
                 try:
                     prompt = (
-                        f"You are consolidating {len(cluster)} related memory atoms into a "
-                        f"single observation. These atoms share a topic but may not say the "
-                        f"same thing. Write ONE sentence (two at most) that accurately "
-                        f"captures what the atoms collectively convey.\n\n"
-                        f"Rules:\n"
+                        f"You are consolidating {len(cluster)} related memory atoms. "
+                        f"Produce TWO outputs in a single response.\n\n"
+                        f"Output format (exactly these section headers, in this order):\n\n"
+                        f"OBSERVATION:\n"
+                        f"<one or two sentences capturing what the atoms collectively convey>\n\n"
+                        f"TRIPLES:\n"
+                        f"(subject, predicate, object)\n"
+                        f"(subject, predicate, object)\n"
+                        f"...\n"
+                        f"[OR write: NONE if no clean triples]\n\n"
+                        f"Rules for the OBSERVATION:\n"
                         f"- Preserve specific dates, times, numbers, names, and direct quotes "
-                        f"VERBATIM when they appear in the atoms. Do not generalize "
-                        f"'on 2023-05-14' into 'recently' or '$23.50' into 'some money'.\n"
-                        f"- If atoms disagree on a fact, keep both versions rather than "
-                        f"choosing one (e.g. 'user first mentioned X on date A, then "
-                        f"updated to Y on date B').\n"
+                        f"VERBATIM when they appear in the atoms.\n"
+                        f"- If atoms disagree on a fact, keep both versions ('user first "
+                        f"mentioned X on date A, then updated to Y on date B').\n"
                         f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
                         f"in the observation when the date matters to the content.\n"
-                        f"- Do not invent details not present in the atoms.\n"
-                        f"- Output ONLY the observation sentence(s), no preamble, no "
-                        f"explanations, no bullet lists.\n\n"
+                        f"- Do not invent details not present in the atoms.\n\n"
+                        f"Rules for TRIPLES:\n"
+                        f"- Subject must be a NAMED ENTITY (person, system, tool, place), max 30 chars\n"
+                        f"- Object must be a SHORT SPECIFIC VALUE, max 30 chars\n"
+                        f"- Predicate must be lowercase_snake_case\n"
+                        f"- Implicit subject 'User' for user-preference statements\n"
+                        f"- Lists become multiple triples (one per item)\n"
+                        f"- Skip emotional/philosophical/meta-commentary content (write NONE)\n\n"
                         f"Atoms:\n- {joined}"
                     )
                     resp = requests.post(
@@ -397,14 +465,21 @@ class ConsolidationEngine:
                         json={
                             "model": llm_model,
                             "messages": [{"role": "user", "content": prompt}],
-                            "max_tokens": 300,
+                            # Bumped from 300 to fit the structured format —
+                            # observation + ~20 triples + reasoning headroom
+                            # for reasoning models.
+                            "max_tokens": 1500,
                             "temperature": 0.3,
                         },
                         timeout=timeout,
                     )
                     if resp.status_code == 200:
                         data = resp.json()
-                        synthesis_content = data["choices"][0]["message"]["content"].strip()
+                        msg = data["choices"][0]["message"]
+                        # Reasoning models put output in `reasoning`
+                        # when content is None.
+                        raw = (msg.get("content") or msg.get("reasoning") or "").strip()
+                        synthesis_content, cluster_triples = _parse_structured_synthesis(raw)
                 except Exception as e:
                     logger.warning(f"LLM synthesis failed: {e}")
 
@@ -412,6 +487,7 @@ class ConsolidationEngine:
             # representative, then wrap with a single-layer prefix.
             if not synthesis_content:
                 synthesis_content = f"[Consolidated from {len(cluster)} atoms] {max(contents, key=len)}"
+                cluster_triples = []  # no triples without successful LLM output
             else:
                 # Defensive: in case the LLM echoed a prefix into its output.
                 synthesis_content = _strip_prefix(synthesis_content)
@@ -422,6 +498,11 @@ class ConsolidationEngine:
                 "source_ids": source_ids,
                 "cluster_size": len(cluster),
                 "supersedes_observations": subset_obs,
+                # P35: triples extracted in the same LLM call as the
+                # observation. _restructure_phase persists them with
+                # atom_id pointing at the freshly-stored observation.
+                # If the LLM didn't emit any (NONE block), this is [].
+                "triples": cluster_triples,
             })
 
         self._last_skipped_existing = skipped_existing
@@ -435,6 +516,13 @@ class ConsolidationEngine:
         relations_created = 0
         sources_reduced = 0
         observations_superseded = 0
+        triples_persisted = 0
+
+        # P35: triples are written when the consolidation prompt extracts
+        # them AND [triples] enable_extraction is on. The flag stays
+        # gating because some deployments don't want triples in the DB
+        # at all (storage / privacy / "we don't use the graph pathway").
+        persist_triples = bool(_cfg('triples', 'enable_extraction', False))
 
         # Phase A: store each synthesis atom (store_atom opens/closes its own connection)
         stored = []
@@ -452,6 +540,21 @@ class ConsolidationEngine:
                 continue
             atoms_stored += 1
             stored.append((syn_id, syn["source_ids"], syn.get("supersedes_observations", [])))
+
+            # P35: persist triples produced by the same LLM call as
+            # this observation. atom_id points at the observation atom
+            # so the triple is provenanced to the consolidated belief
+            # rather than any single source raw.
+            if persist_triples:
+                cluster_triples = syn.get("triples") or []
+                if cluster_triples:
+                    from .triples import store_triples_batch
+                    for t in cluster_triples:
+                        t["atom_id"] = syn_id
+                    try:
+                        triples_persisted += store_triples_batch(cluster_triples)
+                    except Exception as e:
+                        logger.warning(f"triple persistence failed for {syn_id}: {e}")
 
         # Phase B: create relations and reduce stability in a single connection.
         # Two edge directions:
@@ -516,4 +619,7 @@ class ConsolidationEngine:
             "relations_created": relations_created,
             "source_atoms_reduced": sources_reduced,
             "observations_superseded": observations_superseded,
+            # P35: triples extracted in the consolidation pass and
+            # persisted as graph-pathway-eligible facts.
+            "triples_persisted": triples_persisted,
         }
