@@ -32,6 +32,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_cherrypicks_off_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 mechanism (cherry-picks reverted to off); reader + MSAM consolidation + judge ALL on `openai/gpt-oss-120b` via OpenRouter | sem + kw (P30v3 stack — additive boost + per-atom tiers + missing-atom pull-in) | 500 | **0.668** |
 | `msam_p32_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 + P32 (triple extraction via P7 batched, graph pathway joins RRF as 4th ranker) | sem + kw + **graph** (triples populated per-question via batch_extract_and_store) | 500 | **0.646** |
 | `msam_rerank_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 + P15 (cross-encoder LLM rerank on top-8 candidates); triples + graph pathway off | sem + kw, then LLM rerank on top-8 | 500 | **0.648** |
+| `msam_p35_canon_v1` | MiniMax-M2.7 | P30v3 + P35 (consolidation as structured-cognition pass: observation + triples in one LLM call); graph pathway on; cherry-picks off; rerank off | sem + kw + **graph** (triples-as-byproduct of consolidation, not separate extraction pipeline) | 500 | **0.758** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
@@ -1003,6 +1004,108 @@ extraction cost).
 
 Pace: rerank ~24s/q (vs baseline ~25s/q — rerank adds ~100ms per
 query in the LLM call but cons/retrieve/read sum dominates).
+
+### `msam_p35_canon_v1` — P30v3 + P35 (triples as consolidation byproduct), canonical stack (500q)
+
+P35 takes the same end-state as P32 (triples + graph pathway on) but
+moves extraction inside consolidation: one LLM call per cluster
+produces both the observation and structured triples. Cluster-level
+extraction was hypothesized to be higher-quality than per-batch
+extraction (more topical context, better coreference, less noise from
+short atoms). Same canonical stack as P30v3 (MiniMax reader, gpt-5.4-
+nano consolidation, gpt-4o judge) — the only diff is P35 features ON.
+Plus P35.1 (prior triples passed to synthesizer on supersede) and
+P35.2 (ownership transfer on restate).
+
+| Subtype | Score | N | Δ vs P30v3 (0.784) |
+|---|---|---|---|
+| single-session-assistant | 0.982 | 56 | 0.0 |
+| single-session-user | 0.929 | 70 | -4.3 |
+| **multi-session** | **0.602** | 133 | **-4.5** |
+| temporal-reasoning | 0.752 | 133 | -0.7 |
+| knowledge-update | 0.910 | 78 | -3.8 |
+| single-session-preference | 0.267 | 30 | 0.0 |
+
+**Overall: 0.758 (-2.6 vs P30v3, -3.8 vs P9v2).**
+
+**Hypothesis falsified.** The pre-bench prediction was that cluster-level
+triple extraction (more topical context, better coreference, no
+short-atom noise) would lift multi-session by **+2 to +5pp** because
+graph fact-linking is exactly what multi-session needs. **Actual:
+multi-session DROPPED -4.5pp** — the same direction P32 went on the
+gpt-oss stack.
+
+The architecture change (extraction-during-consolidation vs separate-
+batch-extraction) cleaned up the cost story (no extra LLM calls,
+~6h ingest savings) but didn't change the retrieval signal. Both
+P32 and P35 land at roughly -2 to -3pp regression on their respective
+canonical baselines:
+
+| Bench | Stack | Triples | Δ vs same-stack baseline |
+|---|---|---|---|
+| `msam_p32_gptoss_v1` | gpt-oss | separate pipeline | -2.2 vs 0.668 |
+| `msam_p35_canon_v1` | canonical | byproduct of consolidation | -2.6 vs 0.784 |
+
+So **triples + graph pathway is just net-negative on LongMemEval**,
+independent of how they're extracted. The cluster-level quality
+hypothesis didn't save it.
+
+**Likely failure modes (post-hoc):**
+
+1. **Graph pathway has too much voice in RRF.** Default
+   `rrf_graph_weight=0.7` (vs 1.0 for sem and kw). With even decent
+   triples, the graph pathway's atoms get nontrivial fusion weight,
+   and triples on observations are noisier than direct atom
+   embeddings on raws. This is the same hypothesis the P32 writeup
+   floated.
+2. **Triples are too abstract for multi-session questions.**
+   Multi-session needs "find the specific turn in session 5 and the
+   related turn in session 12." Triples synthesize away the
+   per-turn specificity. The graph pathway then surfaces the
+   *observation* atom (which has the consolidated fact but loses
+   the source-turn provenance the reader needs).
+3. **Per-question DBs are too small for triple graphs to be useful.**
+   ~15 clusters → ~30–100 triples per question. Graph queries on
+   that scale don't have enough material to disambiguate. Production
+   deployments with months of accumulated triples might benefit;
+   this benchmark by construction doesn't.
+4. **Knowledge-update -3.8pp** is the clearest "old triple still
+   surfacing" signal — even with P35.2's ownership transfer on
+   restate, retracted facts on demoted observations are still hit
+   by graph queries when the new observation isn't in the candidate
+   pool (the conditional supersedes-demotion issue we flagged).
+
+**Decision: don't ship triples + graph pathway as default.** Keep the
+P35 architecture — it's strictly better for production agents that
+*want* the graph layer (one LLM call, free triples, ownership
+transfer, prior-belief handling). But on LongMemEval the graph
+pathway is a net regression regardless of extraction quality.
+
+`msam_bench.toml` going forward: `enable_extraction = false` (P35
+no-op when disabled — synthesizer just emits observation, skips
+triples in its prompt) and `enable_graph_pathway = false`. P30v3
+mechanism remains the canonical configuration.
+
+**What this rules out:**
+- "P32 was bad because per-atom batch extraction was noisy" — false.
+  Cluster-level extraction was equally bad.
+- "Triples need a richer LLM than gpt-oss-120b for extraction" —
+  false. gpt-5.4-nano on the canonical stack didn't fix it.
+- "Triples just need a stronger reader/judge to surface their lift"
+  — false. MiniMax + gpt-4o didn't surface a lift either.
+
+**What's still possible:**
+- Lower `rrf_graph_weight` to 0.3 or 0.2 — graph pathway becomes a
+  tiebreaker rather than a vote. Would cap the damage. Worth one
+  more bench if we want to definitively close the question.
+- Use triples for confidence/contradiction signals only, not as a
+  retrieval pathway. Different feature, different bench.
+
+For now, P32 and P35 are both archived as "tested, doesn't help on
+LongMemEval, kept in code for production-graph-feature deployments."
+
+Pace: ~38s/q (vs P30v3's ~31s/q — consolidation prompt produces more
+output and gpt-5.4-nano takes a bit longer for the structured format).
 
 ## P9 summary
 
