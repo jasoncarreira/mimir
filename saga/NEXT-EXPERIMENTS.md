@@ -631,11 +631,18 @@ fine for a feature whose primary value is non-bench.
 
 ### P38 — Confidence-gated HyDE (escalate to hypothetical-doc embedding only when first pass is weak)
 
-**Status.** Implemented 2026-04-29 (commit pending). Wired into
-`hybrid_retrieve` as a 'hyde_semantic' RRF pathway. Two new flags:
-`[retrieval] enable_hyde` (default False), `hyde_trigger_confidence`
-(default 0.45). 10 unit tests cover helper + gating logic. Bench
-validation pending.
+**Status.** Bench-tested 2026-04-29: **regressed -2.2pp on canonical
+(0.762 vs P30v3 0.784).** Code stays behind `enable_hyde=false`
+default for production deployments that may have a different
+question/answer-shape profile. Bench config will revert. Full
+post-mortem in BENCHMARK-RESULTS.md §msam_p38_canon_v1; short
+version: P33's question/answer shape-gap analysis didn't predict
+retrieval outcomes — the cohorts expected to gain the most
+(multi-session, knowledge-update) lost the most. The hypothetical-
+answer pathway shifts retrieval toward the LLM's prior rather than
+toward the user's specific facts, and RRF blending can bury clear
+top-K gold matches under a noisier consensus. P38 closes the
+"shift the query embedding via LLM" probe line on this benchmark.
 
 **What.** Standard HyDE replaces the query embedding with the
 embedding of an LLM-generated hypothetical answer. Cheap-path-first

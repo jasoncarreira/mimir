@@ -38,6 +38,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p13_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P13 ONLY (`enable_quality_filter=true`); P11/P12 off | sem + kw (P13 atom-quality multiplier ×0.5/×1.1 on raws and observations after RRF) | 500 | **0.758** |
 | `msam_p34_canon_v1` | MiniMax-M2.7 | P30v3 mechanism + `[consolidation] similarity_threshold = 0.75` (was 0.80); cherry-picks off; triples off | sem + kw (lower clustering threshold → more clusters → more observations) | 500 | **0.772** |
 | `msam_p36_canon_v1` | MiniMax-M2.7 | P35 features ON (triples + graph pathway) + `[retrieval] rrf_graph_weight = 0.3` (was 0.7) | sem + kw + **graph at lower fusion weight** (graph as tiebreaker rather than co-equal vote) | 500 | **0.760** |
+| `msam_p38_canon_v1` | MiniMax-M2.7 | P30v3 + P38 (confidence-gated HyDE: gpt-5.4-nano hypothetical answer added as RRF pathway when first-pass max sim < 0.45 AND query is question-shaped) | sem + kw + **hyde_semantic** (hypothetical-answer pathway, gated) | 500 | **0.762** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
@@ -1405,6 +1406,77 @@ config keeps `enable_extraction = false` and
 
 Pace: P34 ~42s/q (slow because more clusters → more LLM calls per
 question); P36 ~35s/q.
+
+### `msam_p38_canon_v1` — confidence-gated HyDE (500q)
+
+P38 wraps standard HyDE in a confidence gate: only generate a
+hypothetical answer (gpt-5.4-nano, 1-2 sentences) and re-run the
+semantic pathway against it when first-pass max similarity is below
+0.45 AND the query is question-shaped. The hypothetical's retrieve
+is added to RRF as a `hyde_semantic` pathway — augmenting, not
+replacing, the first pass. Trigger=0.45 chosen against the P33
+analysis (gold atoms median sim 0.44 → ~33% of queries trip the gate).
+
+| Subtype | Score | N | Δ vs P30v3 (0.784) |
+|---|---|---|---|
+| single-session-assistant | 0.964 | 56 | -1.8 |
+| single-session-user | 0.957 | 70 | -1.4 |
+| knowledge-update | 0.923 | 78 | **-2.6** |
+| temporal-reasoning | 0.744 | 133 | -1.5 |
+| multi-session | 0.617 | 133 | **-3.0** |
+| single-session-preference | 0.233 | 30 | -3.4 |
+
+**Overall: 0.762 (-2.2pp vs P30v3).** Net regression across every
+subtype. The two cohorts P33 predicted would gain the most are the
+two that lost the most: multi-session (-3.0pp, predicted
+beneficiary #1) and knowledge-update (-2.6pp, predicted
+beneficiary #2).
+
+**Why P33's prediction failed.** Three plausible mechanisms — none
+of which we ruled out before running:
+
+1. **The gate fires when gold IS findable.** Gold atoms sit at
+   median sim 0.44; trigger 0.45 trips on the same queries where
+   gold is just-below-the-line. The hypothetical's retrieval then
+   pulls in *different* atoms (the LLM's plausible-but-wrong answer
+   shape doesn't necessarily match the gold's specific phrasing).
+   RRF blends the two ranked lists, which can bury a clear top-K
+   gold atom under a noisier consensus.
+
+2. **Hypothetical drift.** gpt-5.4-nano is fast but produces
+   generic answer-shapes. If the model guesses *something* about
+   the question topic, the hypothetical embedding shifts the
+   retrieval cone toward the model's prior, which doesn't track
+   the user's specific facts in the haystack.
+
+3. **Embedding-space redundancy.** text-embedding-3-small puts
+   well-formed questions and well-formed answers fairly close
+   already (cosine ~0.6-0.7 between question and a paraphrased
+   answer in informal testing). The "shape gap" P33 measured
+   between question and *gold* atom embeddings reflects the gold
+   atom's specific phrasing, not generic answer-shape — so a
+   hypothetical answer doesn't actually narrow that gap.
+
+**Decision: don't ship.** Code stays in core.py behind the
+`enable_hyde` flag (off by default) for production deployments
+that may have a different question/answer-shape gap profile. Bench
+config will revert HyDE to off.
+
+**What this rules out for LongMemEval:**
+- "Question/answer shape gap is the dominant problem" — falsified
+- "Hypothetical-doc embeddings beat regex/synonym rewrites" —
+  falsified (P12 alone scored 0.792, the best single lever yet,
+  while P38 scored 0.762)
+- "Cheap LLM rewriting compounds positively with two-tier" —
+  falsified
+
+P38 closes the line of "shift the query embedding via LLM" probes
+on this benchmark. The remaining levers worth testing are
+orthogonal to embedding-shape (different reader, P12 + P30
+combined, larger top-K with rerank).
+
+Pace: ~31s/q. Gate-trip rate not instrumented in this run; should
+be added before re-running any HyDE variant.
 
 ## P9 summary
 
