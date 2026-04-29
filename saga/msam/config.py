@@ -517,6 +517,10 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
     "retrieval_v2": {
         # P11/P12/P13 cherry-picks. Read with runtime default in core.py.
         "enable_query_rewriting",
+        # Per-subsystem LLM overrides (resolve_llm_config falls through to
+        # [llm] when these are absent). Used by HyDE / contextual rewrite
+        # to point at a faster/cheaper model than the bench's main LLM.
+        "llm_url", "llm_model", "api_key_env", "timeout_seconds",
     },
     "consolidation": {
         "enabled", "enable_llm", "llm_url", "llm_model",
