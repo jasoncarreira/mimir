@@ -776,6 +776,119 @@ HyDE LLM call (mock the LLM, verify gate triggers correctly).
 
 ---
 
+### P39 — Pulled-in raw scoring is anchored to bottom of pool; consider raising it
+
+**Status.** Filed 2026-04-29. Not yet implemented.
+
+**What.** In `_two_tier_split`, observation-endorsed raws that miss
+the cheap-path candidate pool (the `missing_ids` branch in
+`msam/core.py`) get a base score of `ref_score × sim(query, R)`,
+where `ref_score = min positive RRF score in the in-pool raws`.
+Their cap is then `2 × base`. A pulled-in raw at sim 1.0 (perfect
+query match the cheap path missed) caps at exactly `ref_score`'s
+own value — which equals the *worst* in-pool raw's base score.
+After boosting, the pulled-in's final score is roughly half of
+that same in-pool raw's final score.
+
+In numbers, with one endorsing observation at score 0.030 and
+ref_score 0.005:
+
+| Atom | Base | Cap | Final |
+|---|---|---|---|
+| In-pool raw, RRF base 0.010 (worst-ranked) | 0.010 | 0.020 | **0.030** |
+| Pulled-in raw, sim 1.00 | 0.005 | 0.010 | **0.015** |
+| Pulled-in raw, sim 0.50 | 0.0025 | 0.005 | **0.0075** |
+
+A pulled-in raw with a perfect query match scores half of the
+worst in-pool raw. With `top_k_raws = 20` in the bench, pulled-ins
+are routinely sorted below 20 in-pool raws and dropped silently —
+even though the consolidation system's `evidenced_by` edges are
+specifically saying "include this atom because it's part of a
+coherent pattern that matters here."
+
+**Why this matters.** The pulled-in branch exists for the
+preference / multi-session failure mode: gold atom is an
+off-handed user statement ("I really love X") that doesn't match
+the question phrasing ("does the user prefer X?") at the cosine
+level, but consolidation reliably groups such statements into a
+"user prefers X" observation. P30v3 preference subtype = 0.267 —
+worst across all subtypes — suggesting the gold raw atoms aren't
+surfacing despite the observation pathway working. Multi-session
+shows similar drift (P30v3 = 0.647 vs P9v2 = 0.669). These are
+exactly the cohorts where pulled-in scoring should help most.
+
+**Why not implement immediately.** P30v2 already tested a more
+aggressive scheme (flat 2× restoration replacing the additive
+boost) and lost preference -16.7pp. The current conservatism has
+been A/B-tested and won. So this is a real experiment with real
+risk of regression.
+
+**Options to test, ordered by blast radius:**
+
+1. **Raise `ref_score` to median** of the in-pool RRF distribution
+   instead of `min`. Roughly doubles pulled-in bases and caps.
+   Cleanest single-knob change.
+
+2. **Floor the cap.** Change `cap = max(2 × base, fixed_min)` so
+   the cap doesn't collapse for low-base atoms. A pulled-in with
+   sim 0.50 still gets meaningful boost-driven lift even though
+   its base is tiny. More targeted: only changes pulled-in
+   behavior, doesn't change in-pool weak-raw behavior.
+
+3. **Decouple from `ref_score` entirely.** Use
+   `base = sim × max_in_pool_rrf` so a sim-1.0 pulled-in matches
+   the *top* of the pool, not the bottom. Most aggressive —
+   closest to "trust the observation endorsement as much as the
+   cheap-path ranking."
+
+**Implementation (option 1 — recommended starting point):**
+
+In `_two_tier_split` around line 1403:
+
+```python
+in_pool_scores = [s for _, s in raw_ranked if s > 0]
+if in_pool_scores:
+    sorted_scores = sorted(in_pool_scores)
+    ref_score = sorted_scores[len(sorted_scores) // 2]  # median
+else:
+    ref_score = 0.01
+```
+
+One new config key for the experiment:
+- `[retrieval] missing_ref_score_pivot` = `"median"` | `"min"`
+  (default `"min"` for back-compat; bench config flips to
+  `"median"` for the P39 variant).
+
+**Effort.** ~1 hour for option 1 + 1 bench run.
+
+**Risk.** Medium — the conservatism is empirically load-bearing
+on preference (P30v2 lost it). The mitigation is the per-atom
+confidence_tier filtering layered on top: any pulled-in raw still
+has to clear `min_confidence_tier` (default "low" → sim ≥ 0.20),
+so we're not flooding the response with low-quality endorsed
+noise.
+
+**Score expectation.** If pulled-ins are currently being silently
+dropped by the score math, this should lift multi-session and
+single-session-preference. If they're being correctly dampened
+because endorsement noise is high, this regresses the same
+subtypes — same A/B answer either way.
+
+**Connection to other levers:**
+- Composes with P12 (synonym expansion). P12's +21.6pp preference
+  gain was on the keyword pathway alone — adding pulled-in
+  weight could compound there if P12's keyword expansion is
+  what's filling the cheap-path pool with the right atoms.
+- Orthogonal to triples / graph pathway (those are dead anyway).
+- Doesn't touch the cap formula; just where `ref_score` lands.
+
+**File location:** `msam/core.py:_two_tier_split` around line 1403
+(the `in_pool_scores` / `ref_score` assignment). Tests should
+cover the math: synthetic atoms with known RRF scores, verify
+pulled-in atoms rank where the formula predicts.
+
+---
+
 ### P15 — Evaluate cross-encoder rerank
 
 **What.** Hindsight uses a cross-encoder reranker as their final stage
