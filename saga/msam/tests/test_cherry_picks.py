@@ -715,3 +715,89 @@ class TestRewriteHydeDispatch:
         self._seed_atom()
         hybrid_retrieve("what is my profession?", top_k=3)
         assert n == {"combined": 0, "rewrite": 0, "hyde": 0}
+
+
+class TestRetrievalPathLogging:
+    """Each LLM-using path emits a tagged log line on msam.retrieval so
+    Mimir / ops can count path frequencies in production logs.
+    """
+
+    def _seed_atom(self):
+        from msam.core import store_atom
+        return store_atom("logging probe content")
+
+    def _stub_helpers(self, monkeypatch):
+        """Stub the rewrite + HyDE helpers so we exercise the dispatch
+        without real LLM calls."""
+        monkeypatch.setattr(
+            "msam.core._resolve_query_and_hypothetical",
+            lambda q, c: ("rewritten q?", "hypothetical answer"),
+        )
+        monkeypatch.setattr(
+            "msam.core._resolve_contextual_query",
+            lambda q, c: "rewritten q",
+        )
+        monkeypatch.setattr("msam.core._hyde_query", lambda q: "hypothetical answer")
+
+    def test_combined_path_logged(self, cfg_override, monkeypatch, caplog):
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        cfg_override["retrieval"]["enable_hyde"] = True
+        cfg_override["retrieval"]["fusion"] = "rrf"
+        self._stub_helpers(monkeypatch)
+        self._seed_atom()
+
+        with caplog.at_level("INFO", logger="msam.retrieval"):
+            ctx = [{"role": "user", "content": "headphones"}]
+            hybrid_retrieve("what about that?", top_k=3, context=ctx)
+
+        msgs = [r.getMessage() for r in caplog.records if r.name == "msam.retrieval"]
+        assert any(m.startswith("path=combined") for m in msgs), msgs
+        # Combined path also logs the post-retrieval HyDE-pathway source.
+        # Stays at DEBUG so it doesn't appear at INFO.
+
+    def test_rewrite_only_path_logged(self, cfg_override, monkeypatch, caplog):
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        cfg_override["retrieval"]["enable_hyde"] = False
+        cfg_override["retrieval"]["fusion"] = "rrf"
+        self._stub_helpers(monkeypatch)
+        self._seed_atom()
+
+        with caplog.at_level("INFO", logger="msam.retrieval"):
+            ctx = [{"role": "user", "content": "context"}]
+            hybrid_retrieve("statement here", top_k=3, context=ctx)
+
+        msgs = [r.getMessage() for r in caplog.records if r.name == "msam.retrieval"]
+        assert any(m == "path=rewrite_only" for m in msgs), msgs
+
+    def test_hyde_gated_fired_logged(self, cfg_override, monkeypatch, caplog):
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = False
+        cfg_override["retrieval"]["enable_hyde"] = True
+        cfg_override["retrieval"]["hyde_trigger_confidence"] = 2.0  # force trip
+        cfg_override["retrieval"]["fusion"] = "rrf"
+        self._stub_helpers(monkeypatch)
+        self._seed_atom()
+
+        with caplog.at_level("INFO", logger="msam.retrieval"):
+            hybrid_retrieve("what is my profession?", top_k=3)
+
+        msgs = [r.getMessage() for r in caplog.records if r.name == "msam.retrieval"]
+        # Includes 'fired=yes' since the stubbed _hyde_query returns text.
+        assert any(m.startswith("path=hyde_gated fired=yes") for m in msgs), msgs
+
+    def test_no_log_when_no_llm_path(self, cfg_override, monkeypatch, caplog):
+        """The common bench/CLI case: no flags on, no context. Nothing
+        should be logged at INFO — keeps high-volume retrieval quiet."""
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = False
+        cfg_override["retrieval"]["enable_hyde"] = False
+        cfg_override["retrieval"]["fusion"] = "rrf"
+        self._seed_atom()
+
+        with caplog.at_level("INFO", logger="msam.retrieval"):
+            hybrid_retrieve("what is my profession?", top_k=3)
+
+        msgs = [r.getMessage() for r in caplog.records if r.name == "msam.retrieval"]
+        assert msgs == [], f"unexpected INFO logs: {msgs}"

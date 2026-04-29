@@ -7,6 +7,7 @@ Storage, retrieval, and activation scoring for memory atoms.
 
 import sqlite3
 import json
+import logging
 import math
 import time
 import hashlib
@@ -16,6 +17,13 @@ import sys
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Per-query path tracking for the rewrite/HyDE dispatch and the
+# post-retrieval HyDE gate. INFO logs fire only when an LLM path
+# actually did work; DEBUG covers gate-skipped cases. Mimir / ops can
+# tune ``msam.retrieval`` independently to count path frequencies in
+# production logs without changing other MSAM verbosity.
+_retrieval_log = logging.getLogger("msam.retrieval")
 
 # Ensure msam/ is on the path so config is importable when called directly
 from .config import get_config as _get_config, get_data_dir as _get_data_dir
@@ -1900,10 +1908,14 @@ def hybrid_retrieve(
     )
     if _want_rewrite and _want_hyde:
         query, pre_hypothetical = _resolve_query_and_hypothetical(query, context)
+        _retrieval_log.info(
+            "path=combined hypothetical=%s", "yes" if pre_hypothetical else "no"
+        )
     elif _want_rewrite:
         query = _resolve_contextual_query(query, context)
-    # else: no rewrite. HyDE (if applicable) fires post-retrieval, gated
-    # on first-pass confidence — see the P38 block further down.
+        _retrieval_log.info("path=rewrite_only")
+    # else: no pre-retrieval LLM. HyDE may still fire post-retrieval
+    # under the confidence gate — that path's logging lives below.
 
     # P11: pattern-based query rewriting (no-op unless flag set).
     # Both pathways use the rewritten query so semantic + keyword stay
@@ -2001,6 +2013,7 @@ def hybrid_retrieve(
     if _fusion == 'rrf':
         if pre_hypothetical:
             hyp = pre_hypothetical
+            _retrieval_log.debug("hyde_pathway=combined source=pre_hypothetical")
         elif _cfg('retrieval', 'enable_hyde', False) and _looks_like_question(query):
             first_pass_max_sim = max(
                 (a.get("_similarity", 0.0) for a in semantic_results),
@@ -2014,6 +2027,18 @@ def hybrid_retrieve(
             trigger_thr = _cfg('retrieval', 'hyde_trigger_confidence', 0.45)
             if gate_max < trigger_thr:
                 hyp = _hyde_query(query)
+                _retrieval_log.info(
+                    "path=hyde_gated fired=%s max_sim=%.3f trigger=%.3f",
+                    "yes" if hyp else "no",
+                    gate_max,
+                    trigger_thr,
+                )
+            else:
+                _retrieval_log.debug(
+                    "path=hyde_gated_skipped reason=confident max_sim=%.3f trigger=%.3f",
+                    gate_max,
+                    trigger_thr,
+                )
 
     if hyp:
         if two_tier:
