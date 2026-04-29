@@ -36,6 +36,8 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p11_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P11 ONLY (`enable_query_rewriting=true`); P12/P13 off | sem + kw (P11 rewriting on both pathways via built-in `_QUERY_REWRITES`) | 498 (2 errors) | **0.771** |
 | `msam_p12_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P12 ONLY (`enable_query_expansion=true`); P11/P13 off | sem + kw (P12 synonym expansion on keyword pathway only via 29-key default synonym dict) | 499 (1 error) | **0.792** ✓ |
 | `msam_p13_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P13 ONLY (`enable_quality_filter=true`); P11/P12 off | sem + kw (P13 atom-quality multiplier ×0.5/×1.1 on raws and observations after RRF) | 500 | **0.758** |
+| `msam_p34_canon_v1` | MiniMax-M2.7 | P30v3 mechanism + `[consolidation] similarity_threshold = 0.75` (was 0.80); cherry-picks off; triples off | sem + kw (lower clustering threshold → more clusters → more observations) | 500 | **0.772** |
+| `msam_p36_canon_v1` | MiniMax-M2.7 | P35 features ON (triples + graph pathway) + `[retrieval] rrf_graph_weight = 0.3` (was 0.7) | sem + kw + **graph at lower fusion weight** (graph as tiebreaker rather than co-equal vote) | 500 | **0.760** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
@@ -1298,6 +1300,111 @@ P35 consolidation pass (would only score atoms in clusters), or
 delete `enable_quality_filter` entirely.
 
 Pace: ~32s/q, 4h42m total ingest.
+
+### `msam_p34_canon_v1` — consolidation threshold sweep (500q)
+
+P34 lowers `[consolidation] similarity_threshold` from 0.80 to 0.75
+on the canonical stack. P34's offline pair-similarity analysis
+(`p34_threshold_analysis.py`) showed LongMemEval haystacks have
+~55 pairs/question crossing 0.80 vs ~103 crossing 0.75 — roughly
+2× the cluster-yield from a lower threshold.
+
+| Subtype | Score | N | Δ vs P30v3 (0.784) |
+|---|---|---|---|
+| single-session-assistant | 0.982 | 56 | 0.0 |
+| single-session-user | 0.957 | 70 | -1.4 |
+| single-session-preference | 0.267 | 30 | 0.0 |
+| multi-session | 0.647 | 133 | 0.0 |
+| temporal-reasoning | 0.744 | 133 | -1.5 |
+| knowledge-update | 0.910 | 78 | **-3.8** |
+
+**Overall: 0.772 (-1.2pp vs P30v3).**
+
+**More clusters didn't lift retrieval; they hurt knowledge-update.**
+The pair-sim analysis was right that the 0.75–0.80 band contains
+real paraphrase-pair content; the bench result says clustering that
+content into observations doesn't help. The biggest hit is on
+knowledge-update (-3.8pp): fact-replacement questions are exactly
+where consolidating "the user said X" + "the user said updated-X"
+into one observation produces a confused belief that retrieval
+then surfaces.
+
+The offline analysis already flagged this risk — at 0.75 we're
+clustering paraphrase pairs ("revised LinkedIn tagline" with the
+original tagline), and the consolidation prompt's ability to
+preserve "first this, then that" is imperfect. More clusters means
+more chances to confuse fact-evolution.
+
+**Decision: don't ship.** Default 0.80 is correct for LongMemEval.
+The Mimir-derived 0.75 was right for Mimir's news-feed corpus
+(which doesn't have fact-evolution patterns); LongMemEval has them
+and pays the cost.
+
+P34's clustering threshold could still help in a configuration that
+ALSO has temporal tagging on consolidation outputs (P37 option a).
+That's a future test — not run yet.
+
+---
+
+### `msam_p36_canon_v1` — graph pathway as tiebreaker (500q)
+
+P36 keeps P35's triples + graph pathway ON but drops
+`[retrieval] rrf_graph_weight` from 0.7 to 0.3. Tests whether graph
+as a tiebreaker (rather than a co-equal vote) rescues the P35
+regression.
+
+| Subtype | Score | N | Δ vs P30v3 (0.784) | Δ vs P35 canon (0.758) |
+|---|---|---|---|---|
+| single-session-assistant | 0.982 | 56 | 0.0 | **+3.6** ✓ |
+| single-session-user | 0.971 | 70 | 0.0 | **+4.2** ✓ |
+| multi-session | 0.639 | 133 | -0.8 | **+3.7** ✓ |
+| single-session-preference | 0.233 | 30 | -3.4 | -3.4 |
+| temporal-reasoning | 0.722 | 133 | -3.7 | -3.0 |
+| knowledge-update | 0.885 | 78 | **-6.4** | -2.5 |
+
+**Overall: 0.760 (-2.4pp vs P30v3, +0.2pp vs P35 canon — within noise).**
+
+The data is informative but the answer is "no, it doesn't help."
+
+**Vs P35 canon (0.758, same triples-on stack but rrf_graph_weight=0.7):**
+the lower weight DOES recover single-session subtypes by ~+3.6 to
++4.2pp each (these are the cases where a noisy graph pathway was
+displacing good direct-similarity matches). Multi-session also
+recovers +3.7pp.
+
+**Vs P30v3 (0.784, no triples at all):** still net regression
+of -2.4pp. The recovery on single-session subtypes is offset by
+even bigger losses on knowledge-update (-6.4pp), temporal-reasoning
+(-3.7pp), and preference (-3.4pp). The graph pathway, even at
+weight 0.3, still introduces structural problems in those subtypes
+that the lower weight can't fix.
+
+**Knowledge-update -6.4pp is the dominant signal.** Same shape as
+P34 but worse — fact-replacement questions are where stale-fact
+triples on superseded observations actively mislead retrieval.
+Lower graph weight reduces but doesn't eliminate the damage.
+
+**Decision: don't ship.** Triples + graph pathway is fundamentally
+net-negative on LongMemEval regardless of fusion weight. The
+hypothesis "rrf_graph_weight=0.7 was just too aggressive" is
+falsified — even at 0.3 it costs more than it gives.
+
+**What this rules out** (combined with P32 and P35 results):
+- "Per-batch extraction was noisy" — falsified by P35
+- "Cluster-level extraction is higher quality" — falsified by P35
+- "Stronger reader/judge surfaces the lift" — falsified by P35 canon
+- "Graph pathway needs lower fusion weight" — falsified here (P36)
+
+Triples + graph pathway are confirmed dead for LongMemEval
+retrieval. The P35 architecture (consolidation as structured-
+cognition pass) stays in the codebase as the right design for
+production deployments that want graph features for their own
+sake (audit trails, contradiction detection, world model). Bench
+config keeps `enable_extraction = false` and
+`enable_graph_pathway = false` as the canonical defaults.
+
+Pace: P34 ~42s/q (slow because more clusters → more LLM calls per
+question); P36 ~35s/q.
 
 ## P9 summary
 
