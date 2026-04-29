@@ -2041,28 +2041,35 @@ def hybrid_retrieve(
                 )
 
     if hyp:
-        if two_tier:
-            hyde_semantic_obs = retrieve(
-                hyp, mode=mode, top_k=obs_top_k * 4, stream=stream,
-                topic_filter=topic_filter, agent_id=agent_id,
-                memory_type='observation',
-                include_session_boundaries=include_session_boundaries,
-                session_id=session_id,
-            )
-            hyde_semantic = retrieve(
-                hyp, mode=mode, top_k=top_k * 2, stream=stream,
-                topic_filter=topic_filter, agent_id=agent_id,
-                memory_type='raw',
-                include_session_boundaries=include_session_boundaries,
-                session_id=session_id,
-            )
-        else:
-            hyde_semantic = retrieve(
-                hyp, mode=mode, top_k=top_k * 2, stream=stream,
-                topic_filter=topic_filter, agent_id=agent_id,
-                include_session_boundaries=include_session_boundaries,
-                session_id=session_id,
-            )
+        # Match the graph/temporal pathways' resilience pattern: HyDE is
+        # an augmenting pathway, so a failure here should not abort the
+        # whole retrieval — drop the pathway, keep first-pass.
+        try:
+            if two_tier:
+                hyde_semantic_obs = retrieve(
+                    hyp, mode=mode, top_k=obs_top_k * 4, stream=stream,
+                    topic_filter=topic_filter, agent_id=agent_id,
+                    memory_type='observation',
+                    include_session_boundaries=include_session_boundaries,
+                    session_id=session_id,
+                )
+                hyde_semantic = retrieve(
+                    hyp, mode=mode, top_k=top_k * 2, stream=stream,
+                    topic_filter=topic_filter, agent_id=agent_id,
+                    memory_type='raw',
+                    include_session_boundaries=include_session_boundaries,
+                    session_id=session_id,
+                )
+            else:
+                hyde_semantic = retrieve(
+                    hyp, mode=mode, top_k=top_k * 2, stream=stream,
+                    topic_filter=topic_filter, agent_id=agent_id,
+                    include_session_boundaries=include_session_boundaries,
+                    session_id=session_id,
+                )
+        except Exception:
+            hyde_semantic = []
+            hyde_semantic_obs = []
 
     combined: dict = {}
     for atom in semantic_results:
