@@ -1,5 +1,13 @@
 # MSAM Configuration
 # Copy to msam.toml and adjust for your deployment.
+#
+# Caller responsibilities (not config — applied at the API layer):
+# - Mint a session_id (any opaque string, UUID is fine) at conversation
+#   start and pass it on every /v1/query, /v1/store (via metadata),
+#   /v1/feedback, and /v1/session_end call. /v1/feedback uses it to
+#   tag every access_log row from that session, not just the most recent.
+# - When using contextual query rewriting, pass `context` (prior
+#   {role, content} messages, most recent last) on /v1/query.
 
 [embedding]
 provider = "nvidia-nim"                     # nvidia-nim | openai | onnx | local
@@ -28,6 +36,12 @@ db_busy_timeout_ms = 5000                    # SQLite busy timeout in millisecon
 [retrieval]
 default_top_k = 12                          # atoms returned per query
 semantic_weight = 0.7                       # vs keyword (0.3); applies when fusion = "weighted_sum"
+# Contextual query rewriting: when true AND the caller passes a non-empty
+# `context` list on /v1/query, an LLM rewrites the current query into a
+# self-contained form ("yes, look for that" → "What do I know about X?").
+# No-op when context is None/empty regardless of this flag, so it's safe
+# to leave on. Uses the [retrieval_v2] LLM (falls back to [llm]).
+enable_contextual_rewrite = false
 fusion = "rrf"                              # how hybrid_retrieve merges pathways: "rrf" | "weighted_sum"
 rrf_k = 60                                  # RRF damping constant (Cormack default)
 rrf_semantic_weight = 1.0                   # RRF weight for semantic pathway
@@ -41,6 +55,9 @@ observation_bonus_alpha = 0.3               # multiplier = 1 + alpha * log(evide
 trend_penalty_weakening = 0.7               # score multiplier when trend = 'weakening'
 trend_penalty_stale = 0.4                   # score multiplier when trend = 'stale'
 # P9: two-tier retrieval (returns {observations, raws}). See HINDSIGHT-IDEAS.md §P9.
+# Recommended ON: P30v3 (the canonical-best LongMemEval stack at 0.784) runs two-tier.
+# Per-request `two_tier=true` on QueryRequest overrides this default.
+two_tier_enabled = true                     # default response shape: {observations, raws} instead of {atoms, triples}
 observations_top_k = 5                      # cap on observations returned in two_tier mode
 observation_confidence_min_sim = 0.30       # similarity floor; observations below this are skipped
 evidence_boost_cap_multiplier = 3.0         # cap evidence boost at (this - 1) × own RRF
@@ -51,9 +68,12 @@ sigmoid_midpoint = 0.35                     # similarity sigmoid curve center
 sigmoid_steepness = 15.0                    # similarity sigmoid sharpness
 base_activation_cap = 3.0                   # max base activation (prevents frequency dominance)
 quality_threshold = 2.0                     # minimum activation for hybrid retrieval
-confidence_sim_high = 0.45                  # similarity above this: high confidence tier
+# Per-atom confidence tier thresholds. Recalibrated 2026-04-28 (P33) against
+# the LongMemEval gold/noise distribution. Old 0.45/0.30/0.15 were missing
+# 60% of gold atoms at the high tier and admitting too much noise at the low tier.
+confidence_sim_high = 0.40                  # similarity above this: high confidence tier
 confidence_sim_medium = 0.30                # similarity above this: medium confidence tier
-confidence_sim_low = 0.15                   # similarity above this: low confidence tier
+confidence_sim_low = 0.20                   # similarity above this: low confidence tier
 confidence_score_high = 40.0                # activation above this: high confidence
 confidence_score_medium = 10.0              # activation above this: medium confidence
 context_quality_floor = 0.15                # below this: atom rejected from context injection
