@@ -35,6 +35,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p35_canon_v1` | MiniMax-M2.7 | P30v3 + P35 (consolidation as structured-cognition pass: observation + triples in one LLM call); graph pathway on; cherry-picks off; rerank off | sem + kw + **graph** (triples-as-byproduct of consolidation, not separate extraction pipeline) | 500 | **0.758** |
 | `msam_p11_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P11 ONLY (`enable_query_rewriting=true`); P12/P13 off | sem + kw (P11 rewriting on both pathways via built-in `_QUERY_REWRITES`) | 498 (2 errors) | **0.771** |
 | `msam_p12_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P12 ONLY (`enable_query_expansion=true`); P11/P13 off | sem + kw (P12 synonym expansion on keyword pathway only via 29-key default synonym dict) | 499 (1 error) | **0.792** ✓ |
+| `msam_p13_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P13 ONLY (`enable_quality_filter=true`); P11/P12 off | sem + kw (P13 atom-quality multiplier ×0.5/×1.1 on raws and observations after RRF) | 500 | **0.758** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
@@ -1224,6 +1225,79 @@ headline (a single +/- on a 29-q subtype is ±3.4pp, well within
 the +21.6pp lift).
 
 Pace: ~32s/q. P12 took 4h42m total ingest.
+
+### `msam_p13_canon_v1` — cherry-pick ablation: P13 alone (500q)
+
+Third and final ablation. P13 is the heuristic atom-quality
+multiplier — `compute_atom_quality(content)` produces a 0-1 score
+from length, vocabulary diversity, named-entity density, and
+structure markers; atoms scoring <0.3 get `_combined_score × 0.5`,
+atoms scoring >0.7 get `_combined_score × 1.1`. P11 and P12 stay off.
+
+| Subtype | Score | N | Δ vs P30v3 (0.784) | Δ vs bundle (0.756) |
+|---|---|---|---|---|
+| single-session-assistant | 0.982 | 56 | 0.0 | +3.6 |
+| single-session-user | 0.943 | 70 | -2.8 | +1.4 |
+| temporal-reasoning | 0.737 | 133 | -2.2 | +2.2 |
+| multi-session | 0.632 | 133 | -1.5 | +1.6 |
+| knowledge-update | 0.910 | 78 | -3.8 | -3.8 |
+| **single-session-preference** | **0.167** | 30 | **-10.0** ⚠ | **-10.0** |
+
+**Overall: 0.758 (-2.6pp vs P30v3, -0.2pp vs the cherry-picks bundle).**
+
+**P13 is the bundle's primary regression source.** P13 alone is
+basically as bad as the full bundle, and the preference regression
+is severe: -10pp absolute (0.267 → 0.167), the worst single-subtype
+regression we've ever recorded.
+
+**The hypothesis materialized exactly as predicted in the
+pre-bench risk note** ("P13 may demote short answer-bearing
+turns"). Preference probes have the shortest gold answers in the
+bench: "Patagonia", "Veja", "1:10 ratio", color names, single-word
+genres. Those atoms hit the heuristic's "low quality" branch (n_words
+< 5 → length_score = 0.2) and get demoted. The reader then doesn't
+see them, can't answer, and preference cratered.
+
+**Bundle decomposition is fully legible now:**
+
+| Lever | vs P30v3 | Preference Δ |
+|---|---|---|
+| P11 alone (query rewriting) | -1.3pp | +3.3pp |
+| P12 alone (synonym expansion) | **+0.8pp** ✓ | **+21.6pp** ✓✓ |
+| P13 alone (quality multiplier) | -2.6pp | -10.0pp |
+| Sum (predicted bundle) | -3.1pp | +14.9pp |
+| Actual bundle measured | -2.8pp | +10.0pp |
+
+The sum-of-deltas (-3.1pp) closely matches the actual bundle
+(-2.8pp) — small interaction effects but no major synergies. P12's
+preference gain partially survives in the bundle (+10pp vs +21.6pp
+solo), and P13's regression dominates the overall headline.
+
+**Decision:** ship **P12 alone**, **kill P11 and P13**.
+
+P11 brings small preference gain (+3.3pp) at -1.3pp overall cost —
+not worth it when P12 alone delivers +21.6pp preference gain at
++0.8pp overall. P13 is straight-up harmful. Both should be
+default-off in the bench config and code.
+
+**Configuration to apply (next session):**
+
+```toml
+[retrieval_v2]
+enable_query_rewriting = false  # P11: small lift on preference, broader regression
+enable_query_expansion = true   # P12: +0.8pp overall, +21.6pp preference
+enable_quality_filter  = false  # P13: -10pp on preference, demotes short answer-bearing turns
+```
+
+**Cleanup follow-up.** P13's `compute_atom_quality` heuristic is
+fundamentally miscalibrated for short conversational turns where
+the answer is exactly the kind of content the heuristic flags as
+"low quality." Worth filing as a future experiment: replace the
+heuristic with an LLM-graded quality assessment as part of the
+P35 consolidation pass (would only score atoms in clusters), or
+delete `enable_quality_filter` entirely.
+
+Pace: ~32s/q, 4h42m total ingest.
 
 ## P9 summary
 
