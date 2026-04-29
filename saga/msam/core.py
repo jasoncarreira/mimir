@@ -1447,6 +1447,108 @@ def _two_tier_split(
 # pathway, each gated by its own [retrieval_v2] config flag. Defaults
 # are False in prod; the bench config flips them on.
 
+def _resolve_contextual_query(
+    query: str,
+    context: list[dict] | None,
+) -> str:
+    """Rewrite the query into a self-contained form using prior context.
+
+    Production-only feature: agents call /v1/query mid-conversation with
+    messages like "yes, let's look for that" or "tell me more about it";
+    those references are meaningless to retrieval without context.
+    Passes the prior messages and the current query to an LLM and gets
+    back a self-contained rewrite.
+
+    No-op (returns ``query`` unchanged) when:
+    - ``context`` is None or empty (most callers, including the bench
+      harness) → zero-cost pass-through.
+    - ``[retrieval] enable_contextual_rewrite`` is False (default).
+    - No LLM key is resolvable.
+    - The LLM call fails or returns empty.
+
+    Args:
+        query: the current user message.
+        context: list of ``{"role": "user"|"assistant", "content": str}``
+            dicts (OpenAI chat format). Most recent last.
+
+    Returns:
+        The (possibly rewritten) query string.
+    """
+    if not context:
+        return query
+    if not _cfg('retrieval', 'enable_contextual_rewrite', False):
+        return query
+
+    from .config import resolve_llm_config
+    llm = resolve_llm_config('retrieval_v2')
+    if not llm['api_key']:
+        return query
+
+    # Format the context as a numbered transcript so the LLM can reason
+    # about which prior turn each reference points at. Cap at the last
+    # 10 messages to keep the prompt bounded.
+    recent = context[-10:]
+    transcript_lines: list[str] = []
+    for i, msg in enumerate(recent, start=1):
+        role = (msg.get("role") or "user").strip()
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        # Truncate per-message content to keep the prompt under ~2000
+        # tokens of context — full messages are often long assistant
+        # answers that don't need to be in-prompt for reference resolution.
+        if len(content) > 400:
+            content = content[:400] + "…"
+        transcript_lines.append(f"[{i}] {role}: {content}")
+    if not transcript_lines:
+        return query
+    transcript = "\n".join(transcript_lines)
+
+    prompt = (
+        "You rewrite a user's current question into a self-contained query "
+        "for a memory-retrieval system.\n\n"
+        "Rules:\n"
+        "- If the question already stands alone, return it unchanged.\n"
+        "- If the question references prior content ('yes', 'that', "
+        "'the same one', 'those', 'it', 'them'), rewrite it to include the "
+        "specific entity or topic from the conversation transcript.\n"
+        "- Do not add information not present in the transcript.\n"
+        "- Output ONLY the rewritten question. No preamble, no explanation, "
+        "no quotes around the output.\n\n"
+        f"Conversation transcript (most recent last):\n{transcript}\n\n"
+        f"Current question: {query}\n\n"
+        "Rewritten:"
+    )
+
+    import requests
+    try:
+        r = requests.post(
+            llm['url'],
+            headers={
+                "Authorization": f"Bearer {llm['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": llm['model'],
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 200,
+            },
+            timeout=llm['timeout'],
+        )
+        r.raise_for_status()
+        msg = r.json()["choices"][0]["message"]
+        rewritten = (msg.get("content") or msg.get("reasoning") or "").strip()
+    except Exception:
+        return query
+
+    # Strip wrapping quotes the LLM occasionally adds despite the rules.
+    rewritten = rewritten.strip().strip('"').strip("'").strip()
+    if not rewritten:
+        return query
+    return rewritten
+
+
 def _apply_query_rewriting(query: str) -> str:
     """P11 — pattern-based query normalization (entity aliases).
 
@@ -1518,6 +1620,7 @@ def hybrid_retrieve(
     reference_date=None,
     two_tier: bool = False,
     include_session_boundaries: bool = False,
+    context: list[dict] | None = None,
 ):
     """
     Combine semantic + keyword + (optional) graph + temporal pathways.
@@ -1541,6 +1644,13 @@ def hybrid_retrieve(
 
     if not query or not query.strip():
         return []
+
+    # Contextual rewrite (production-only): if the caller passed prior
+    # conversation messages, ask an LLM to rewrite the query into a
+    # self-contained form. No-op if context is None/empty (bench harness,
+    # standalone CLI calls). Runs before P11/P12 so subsequent regex
+    # rewriting and synonym expansion operate on the resolved query.
+    query = _resolve_contextual_query(query, context)
 
     # P11: pattern-based query rewriting (no-op unless flag set).
     # Both pathways use the rewritten query so semantic + keyword stay

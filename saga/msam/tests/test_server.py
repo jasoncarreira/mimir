@@ -156,7 +156,7 @@ class TestQuery:
     def test_query_success(self, client, monkeypatch):
         """Test successful query with mocked hybrid retrieval."""
         import msam.triples
-        monkeypatch.setattr(msam.triples, "hybrid_retrieve_with_triples", lambda q, mode="task", token_budget=500: {
+        monkeypatch.setattr(msam.triples, "hybrid_retrieve_with_triples", lambda q, mode="task", token_budget=500, **kw: {
             "triples": [
                 {"subject": "user", "predicate": "prefers", "object": "dark mode"},
             ],
@@ -193,7 +193,7 @@ class TestQuery:
     def test_query_empty_query(self, client, monkeypatch):
         """Empty query should either be rejected or return empty results."""
         import msam.triples
-        monkeypatch.setattr(msam.triples, "hybrid_retrieve_with_triples", lambda q, mode="task", token_budget=500: {
+        monkeypatch.setattr(msam.triples, "hybrid_retrieve_with_triples", lambda q, mode="task", token_budget=500, **kw: {
             "triples": [], "atoms": [], "_raw_atoms": [],
             "triple_tokens": 0, "atom_tokens": 0, "total_tokens": 0,
             "items_returned": 0, "query_type": "mixed", "triple_ratio": 0, "latency_ms": 0,
@@ -383,7 +383,7 @@ class TestQuery:
         monkeypatch.setattr(msam.server, "_cfg", fake_cfg)
 
         monkeypatch.setattr(msam.triples, "hybrid_retrieve_with_triples",
-                            lambda q, mode="task", token_budget=500: {
+                            lambda q, mode="task", token_budget=500, **kw: {
             "triples": [], "atoms": [], "_raw_atoms": [],
             "triple_tokens": 0, "atom_tokens": 0, "total_tokens": 0,
             "items_returned": 0, "query_type": "mixed", "triple_ratio": 0,

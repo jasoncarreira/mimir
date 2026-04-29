@@ -76,6 +76,13 @@ _DEFAULTS = {
         # Default per-atom floor used when a request omits min_confidence_tier.
         # "low" drops only atoms classified "none" (sim < confidence_sim_low).
         "default_min_confidence_tier": "low",
+        # Contextual query rewriting: production-only feature. When True
+        # AND the caller passes a non-empty `context` list to /v1/query,
+        # an LLM rewrites the current message into a self-contained query
+        # by resolving references ("yes", "that", "the same one") against
+        # prior turns. No-op when context is None/empty regardless of
+        # this flag, so the bench harness pays nothing.
+        "enable_contextual_rewrite": False,
         "similarity_threshold": 0.2,
         "sigmoid_midpoint": 0.35,
         "sigmoid_steepness": 15.0,

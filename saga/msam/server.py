@@ -118,6 +118,13 @@ class QueryRequest(BaseModel):
     # falls back to [retrieval] default_min_confidence_tier (default "low",
     # which drops only "none"-tier atoms).
     min_confidence_tier: Optional[str] = None
+    # Production-only: prior conversation messages so MSAM can rewrite the
+    # current query into a self-contained form. Each entry is
+    # {"role": "user"|"assistant", "content": str}, most recent last.
+    # When provided AND [retrieval] enable_contextual_rewrite is True,
+    # an LLM rewrites the current query before retrieval. No-op when
+    # absent or empty (most callers); bench harness never sets it.
+    context: Optional[list[dict]] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -344,6 +351,7 @@ async def api_query(req: QueryRequest):
                 top_k=req.top_k,
                 reference_date=ref_date,
                 two_tier=True,
+                context=req.context,
             )
             obs = result.get("observations", []) or []
             raws = result.get("raws", []) or []
@@ -393,7 +401,8 @@ async def api_query(req: QueryRequest):
         from .triples import hybrid_retrieve_with_triples
 
         result = hybrid_retrieve_with_triples(req.query, mode=req.mode,
-                                               token_budget=req.token_budget)
+                                               token_budget=req.token_budget,
+                                               context=req.context)
         latency_ms = (time.time() - t0) * 1000
 
         # Determine confidence tier
