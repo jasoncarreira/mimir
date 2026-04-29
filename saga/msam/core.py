@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS access_log (
     activation_score REAL,
     retrieval_mode TEXT,  -- 'task' or 'companion'
     contributed INTEGER DEFAULT -1,  -- -1=unknown, 0=no, 1=yes
+    session_id TEXT,  -- session of the retrieval; mark_contributions scopes UPDATE by it
     FOREIGN KEY (atom_id) REFERENCES atoms(id)
 );
 
@@ -623,6 +624,7 @@ def retrieve(
     agent_id: str = None,
     memory_type: str = None,
     include_session_boundaries: bool = False,
+    session_id: str = None,
 ) -> list[dict]:
     """
     Hybrid retrieval: embedding similarity + activation scoring.
@@ -722,7 +724,7 @@ def retrieve(
                     scored.sort(key=lambda x: x["_activation"], reverse=True)
                     results = scored[:top_k]
                     _fire_hook('on_retrieve', query=query, mode=mode, result_count=len(results))
-                    _log_access(results, mode)
+                    _log_access(results, mode, session_id=session_id)
                     return results
         except Exception:
             pass  # Fall through to brute-force
@@ -775,7 +777,7 @@ def retrieve(
     _fire_hook('on_retrieve', query=query, mode=mode, result_count=len(results))
 
     # Log access
-    _log_access(results, mode)
+    _log_access(results, mode, session_id=session_id)
 
     return results
 
@@ -881,15 +883,20 @@ def _fire_hook(event: str, **kwargs):
             logging.getLogger("msam.hooks").warning(f"Hook {event} failed: {e}")
 
 
-def _log_access(atoms: list[dict], mode: str):
-    """Log retrieval access for stability updates."""
+def _log_access(atoms: list[dict], mode: str, session_id: str | None = None):
+    """Log retrieval access for stability updates.
+
+    session_id (optional) lets mark_contributions scope its UPDATE to the
+    rows from this session — without it, bulk end-of-session feedback can
+    only tag the globally most-recent retrieval per atom.
+    """
     conn = get_db()
     now = datetime.now(timezone.utc).isoformat()
-    
+
     for atom in atoms:
         conn.execute(
-            "INSERT INTO access_log (atom_id, accessed_at, activation_score, retrieval_mode) VALUES (?, ?, ?, ?)",
-            (atom["id"], now, atom.get("_activation", 0), mode)
+            "INSERT INTO access_log (atom_id, accessed_at, activation_score, retrieval_mode, session_id) VALUES (?, ?, ?, ?, ?)",
+            (atom["id"], now, atom.get("_activation", 0), mode, session_id)
         )
         # Update access count and last_accessed (cap stability to prevent runaway)
         _access_boost = _cfg('decay', 'stability_boost_factor', 1.1)
@@ -1621,6 +1628,7 @@ def hybrid_retrieve(
     two_tier: bool = False,
     include_session_boundaries: bool = False,
     context: list[dict] | None = None,
+    session_id: str = None,
 ):
     """
     Combine semantic + keyword + (optional) graph + temporal pathways.
@@ -1679,6 +1687,7 @@ def hybrid_retrieve(
             topic_filter=topic_filter, agent_id=agent_id,
             memory_type='observation',
             include_session_boundaries=include_session_boundaries,
+            session_id=session_id,
         )
         kw_results_obs = keyword_search(
             kw_query, top_k=obs_top_k * 2, memory_type='observation',
@@ -1689,6 +1698,7 @@ def hybrid_retrieve(
             topic_filter=topic_filter, agent_id=agent_id,
             memory_type='raw',
             include_session_boundaries=include_session_boundaries,
+            session_id=session_id,
         )
         kw_results = keyword_search(
             kw_query, top_k=top_k, memory_type='raw',
@@ -1699,6 +1709,7 @@ def hybrid_retrieve(
             query, mode=mode, top_k=top_k * 2, stream=stream,
             topic_filter=topic_filter, agent_id=agent_id,
             include_session_boundaries=include_session_boundaries,
+            session_id=session_id,
         )
         kw_results = keyword_search(
             kw_query, top_k=top_k,
@@ -2901,6 +2912,16 @@ MIGRATIONS = {
            WHERE json_extract(metadata, '$.consolidated_from') IS NOT NULL
              AND json_array_length(json_extract(metadata, '$.consolidated_from')) > 0""",
     ],
+    10: [
+        # Session-scoped contribution feedback: previously mark_contributions
+        # picked the globally most-recent access_log row per atom, so a
+        # single bulk feedback at end-of-session tagged only one retrieval
+        # even when the atom was pulled many times. Adding session_id lets
+        # the UPDATE scope to (atom_id, session_id) and tag every row.
+        # Old rows stay NULL and remain unaffected by scoped updates.
+        "ALTER TABLE access_log ADD COLUMN session_id TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_access_log_session ON access_log(session_id)",
+    ],
 }
 
 
@@ -3019,14 +3040,23 @@ def mark_contributions(retrieved_atom_ids: list[str], response_text: str,
             contributed_ids.append(atom_id)
         else:
             not_contributed_ids.append(atom_id)
-        
-        # Update most recent access_log entry for this atom
-        conn.execute("""
-            UPDATE access_log SET contributed = ?
-            WHERE atom_id = ? AND id = (
-                SELECT id FROM access_log WHERE atom_id = ? ORDER BY accessed_at DESC LIMIT 1
-            )
-        """, (1 if contributed else 0, atom_id, atom_id))
+
+        # Tag every retrieval of this atom in the session window. Without
+        # session_id we fall back to the legacy "most recent globally"
+        # behavior, which only tags one row even when bulk feedback covers
+        # many retrievals — preserved for callers that don't pass it.
+        if session_id is not None:
+            conn.execute("""
+                UPDATE access_log SET contributed = ?
+                WHERE atom_id = ? AND session_id = ?
+            """, (1 if contributed else 0, atom_id, session_id))
+        else:
+            conn.execute("""
+                UPDATE access_log SET contributed = ?
+                WHERE atom_id = ? AND id = (
+                    SELECT id FROM access_log WHERE atom_id = ? ORDER BY accessed_at DESC LIMIT 1
+                )
+            """, (1 if contributed else 0, atom_id, atom_id))
     
     # Store co-retrieval record for association chains
     if len(contributed_ids) > 1:

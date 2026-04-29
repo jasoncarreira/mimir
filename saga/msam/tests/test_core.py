@@ -157,15 +157,138 @@ class TestDryRetrieve:
     def test_dry_no_side_effects(self):
         from msam.core import store_atom, dry_retrieve, get_db
         store_atom("Dry retrieve test content")
-        
+
         conn = get_db()
         count_before = conn.execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
         conn.close()
-        
+
         dry_retrieve("test content", top_k=3)
-        
+
         conn = get_db()
         count_after = conn.execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
         conn.close()
-        
+
         assert count_after == count_before, "dry_retrieve should not log access"
+
+
+class TestSessionScopedFeedback:
+    """access_log.session_id + mark_contributions session scoping.
+
+    Before this fix, mark_contributions UPDATEd only the globally most
+    recent access_log row per atom_id. A bulk feedback at end-of-session
+    therefore tagged a single retrieval even when the same atom was
+    pulled many times. With session_id on access_log, we tag every row
+    in the session's window.
+    """
+
+    def test_log_access_persists_session_id(self):
+        from msam.core import store_atom, retrieve, get_db
+        atom_id = store_atom("Session-scoped logging test content")
+        retrieve("test content", top_k=3, session_id="sess-A")
+
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT session_id FROM access_log WHERE atom_id = ?", (atom_id,)
+        ).fetchall()
+        conn.close()
+        assert any(r["session_id"] == "sess-A" for r in rows)
+
+    def test_mark_contributions_tags_all_session_rows(self):
+        from msam.core import store_atom, retrieve, mark_contributions, get_db
+        atom_id = store_atom(
+            "The user prefers dark mode in the IDE for late-night coding."
+        )
+
+        # Retrieve the same atom three times in one session.
+        for _ in range(3):
+            retrieve("test content", top_k=3, session_id="sess-1")
+
+        conn = get_db()
+        before = conn.execute(
+            "SELECT COUNT(*) FROM access_log "
+            "WHERE atom_id = ? AND session_id = 'sess-1' AND contributed = -1",
+            (atom_id,),
+        ).fetchone()[0]
+        conn.close()
+        assert before == 3, "all three retrievals should start at contributed=-1"
+
+        # Bulk feedback (only one call covering all three retrievals).
+        # Response text overlaps the atom enough to flip contributed=1.
+        mark_contributions(
+            [atom_id],
+            "The user prefers dark mode in the IDE for late-night coding sessions.",
+            session_id="sess-1",
+        )
+
+        conn = get_db()
+        tagged = conn.execute(
+            "SELECT COUNT(*) FROM access_log "
+            "WHERE atom_id = ? AND session_id = 'sess-1' AND contributed = 1",
+            (atom_id,),
+        ).fetchone()[0]
+        conn.close()
+        assert tagged == 3, (
+            "session-scoped mark_contributions should tag every retrieval "
+            "in the session, not just the most recent"
+        )
+
+    def test_mark_contributions_does_not_cross_sessions(self):
+        from msam.core import store_atom, retrieve, mark_contributions, get_db
+        atom_id = store_atom("Cross-session isolation check content here.")
+
+        retrieve("isolation check", top_k=3, session_id="sess-A")
+        retrieve("isolation check", top_k=3, session_id="sess-B")
+
+        # Feedback only for sess-A.
+        mark_contributions(
+            [atom_id],
+            "isolation check content here works correctly",
+            session_id="sess-A",
+        )
+
+        conn = get_db()
+        a_tagged = conn.execute(
+            "SELECT contributed FROM access_log "
+            "WHERE atom_id = ? AND session_id = 'sess-A'",
+            (atom_id,),
+        ).fetchall()
+        b_untagged = conn.execute(
+            "SELECT contributed FROM access_log "
+            "WHERE atom_id = ? AND session_id = 'sess-B'",
+            (atom_id,),
+        ).fetchall()
+        conn.close()
+        assert all(r["contributed"] == 1 for r in a_tagged)
+        assert all(r["contributed"] == -1 for r in b_untagged), (
+            "feedback for sess-A must not touch sess-B's rows"
+        )
+
+    def test_mark_contributions_legacy_when_no_session_id(self):
+        """Backward compat: when caller omits session_id, fall back to
+        the legacy 'most recent globally' behavior so existing
+        deployments don't change semantics overnight.
+        """
+        from msam.core import store_atom, retrieve, mark_contributions, get_db
+        atom_id = store_atom("Legacy fallback path content for testing.")
+
+        # Three retrievals with no session_id.
+        for _ in range(3):
+            retrieve("legacy fallback", top_k=3)
+
+        mark_contributions(
+            [atom_id],
+            "legacy fallback path content for testing works",
+            session_id=None,
+        )
+
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT contributed FROM access_log WHERE atom_id = ? "
+            "ORDER BY accessed_at",
+            (atom_id,),
+        ).fetchall()
+        conn.close()
+        # Only the most recent row should be tagged in the legacy path.
+        contributed_counts = [r["contributed"] for r in rows]
+        assert contributed_counts.count(1) == 1
+        assert contributed_counts[-1] == 1, "legacy path tags only the latest row"
