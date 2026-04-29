@@ -1,6 +1,7 @@
-# MSAM config used during LongMemEval runs.
-# Loaded via MSAM_CONFIG env var before msam imports resolve.
-# Keeps the prod ~/.msam/msam.toml untouched.
+# MSAM config — P39 variant (median pivot for missing-atom base score).
+# Same as msam_bench.toml (canonical P30v3 + P12 shipped) EXCEPT
+# [retrieval] missing_ref_score_pivot = "median".
+# See NEXT-EXPERIMENTS.md P39.
 
 [embedding]
 provider = "openai"
@@ -57,6 +58,11 @@ spreading_activation_enabled = false
 temporal_recency_hours = 24
 outcome_weight = 0.0
 outcome_decay = 1.0
+# P39: pivot pulled-in (missing-atom) base scores on the MEDIAN of the
+# in-pool RRF distribution rather than the MIN (default). Roughly
+# doubles pulled-in bases so strongly-similar endorsed atoms can
+# compete with mid-rank in-pool raws instead of being silently dropped.
+missing_ref_score_pivot = "median"
 
 [retrieval_v2]
 enable_rerank = false   # P15 cross-encoder LLM rerank (regressed in msam_rerank_gptoss_v1)

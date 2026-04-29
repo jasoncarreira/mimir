@@ -1400,8 +1400,24 @@ def _two_tier_split(
                 ).fetchall()
                 conn.close()
 
+                # P39: pivot the missing-atom ref_score on either the
+                # bottom of the in-pool RRF distribution (default, back-
+                # compat with P30v1/v3) or its median. The "min" pivot
+                # caps a sim-1.0 pulled-in raw at exactly the worst
+                # in-pool raw's base, so the pulled-in routinely sorts
+                # below all in-pool raws. The "median" pivot roughly
+                # doubles pulled-in bases, letting strongly-similar
+                # endorsed atoms compete with mid-rank in-pool raws.
                 in_pool_scores = [s for _, s in raw_ranked if s > 0]
-                ref_score = min(in_pool_scores) if in_pool_scores else 0.01
+                if in_pool_scores:
+                    _pivot = _cfg('retrieval', 'missing_ref_score_pivot', 'min')
+                    if _pivot == 'median':
+                        _sorted_scores = sorted(in_pool_scores)
+                        ref_score = _sorted_scores[len(_sorted_scores) // 2]
+                    else:
+                        ref_score = min(in_pool_scores)
+                else:
+                    ref_score = 0.01
 
                 # Per-atom tier thresholds for pulled-in atoms.
                 _t_high = _cfg('retrieval', 'confidence_sim_high', 0.40)
