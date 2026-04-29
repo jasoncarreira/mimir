@@ -393,7 +393,7 @@ class TestHydeGating:
         monkeypatch.setattr("msam.core._hyde_query", _spy)
 
         self._seed_atom()
-        hybrid_retrieve("anything", top_k=3)
+        hybrid_retrieve("what is my profession?", top_k=3)
         assert called["n"] == 0
 
     def test_gate_fires_on_weak_first_pass(self, cfg_override, monkeypatch):
@@ -436,7 +436,7 @@ class TestHydeGating:
         monkeypatch.setattr("msam.core._hyde_query", _spy)
 
         self._seed_atom()
-        hybrid_retrieve("anything", top_k=3)
+        hybrid_retrieve("what is my profession?", top_k=3)
         assert called["n"] == 0
 
     def test_gate_skips_in_weighted_sum_mode(self, cfg_override, monkeypatch):
@@ -451,5 +451,76 @@ class TestHydeGating:
         monkeypatch.setattr("msam.core._hyde_query", lambda q: called.__setitem__("n", called["n"] + 1) or None)
 
         self._seed_atom()
-        hybrid_retrieve("anything", top_k=3)
+        hybrid_retrieve("what is my profession?", top_k=3)
         assert called["n"] == 0
+
+    def test_gate_skips_for_non_question_queries(self, cfg_override, monkeypatch):
+        """HyDE generates a hypothetical *answer* — that only makes sense
+        for a query asking something. Statements and commands shouldn't
+        trip the gate even when first-pass confidence is weak."""
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
+        cfg_override["retrieval"]["hyde_trigger_confidence"] = 2.0  # force-trip if reached
+        cfg_override["retrieval"]["fusion"] = "rrf"
+
+        called = {"n": 0}
+        monkeypatch.setattr("msam.core._hyde_query", lambda q: called.__setitem__("n", called["n"] + 1) or None)
+
+        self._seed_atom()
+        hybrid_retrieve("save this for later", top_k=3)
+        hybrid_retrieve("Yes, please do that", top_k=3)
+        hybrid_retrieve("That sounds good", top_k=3)
+        assert called["n"] == 0
+
+
+class TestLooksLikeQuestion:
+    """Heuristic question detector that gates HyDE."""
+
+    def test_question_mark(self):
+        from msam.core import _looks_like_question
+        assert _looks_like_question("Tell me about my dog?") is True
+        assert _looks_like_question("really?") is True
+        assert _looks_like_question("ok? ") is True
+
+    def test_wh_words(self):
+        from msam.core import _looks_like_question
+        for q in [
+            "what is my profession",
+            "Who did I meet last week",
+            "When did I buy those headphones",
+            "Where do I live",
+            "Why did I switch jobs",
+            "How does that work",
+            "Which option did I pick",
+        ]:
+            assert _looks_like_question(q) is True, f"failed: {q}"
+
+    def test_aux_verb_starts(self):
+        from msam.core import _looks_like_question
+        for q in [
+            "Is that right",
+            "Are we still on for Thursday",
+            "Do I own a car",
+            "Did I mention the trip",
+            "Can you remind me",
+            "Have we discussed this",
+        ]:
+            assert _looks_like_question(q) is True, f"failed: {q}"
+
+    def test_statements_and_commands(self):
+        from msam.core import _looks_like_question
+        for s in [
+            "Yes, please save that",
+            "Save this for later",
+            "That sounds great",
+            "I prefer dark mode",
+            "Remember the meeting on Friday",
+            "Note: I switched jobs",
+        ]:
+            assert _looks_like_question(s) is False, f"false-positive: {s}"
+
+    def test_empty_or_whitespace(self):
+        from msam.core import _looks_like_question
+        assert _looks_like_question("") is False
+        assert _looks_like_question("   ") is False
+        assert _looks_like_question(None) is False  # type: ignore[arg-type]

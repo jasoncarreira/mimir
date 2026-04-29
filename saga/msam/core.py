@@ -1512,18 +1512,27 @@ def _resolve_contextual_query(
     transcript = "\n".join(transcript_lines)
 
     prompt = (
-        "You rewrite a user's current question into a self-contained query "
-        "for a memory-retrieval system.\n\n"
+        "You rewrite a user's current message into a self-contained query "
+        "for a memory-retrieval system. The message may be a question, a "
+        "statement, or a command — preserve its original intent and shape.\n\n"
         "Rules:\n"
-        "- If the question already stands alone, return it unchanged.\n"
-        "- If the question references prior content ('yes', 'that', "
-        "'the same one', 'those', 'it', 'them'), rewrite it to include the "
-        "specific entity or topic from the conversation transcript.\n"
+        "- If the message already stands alone, return it unchanged.\n"
+        "- If the message references prior content ('yes', 'that', "
+        "'the same one', 'those', 'it', 'them', 'this'), rewrite it to "
+        "include the specific entity or topic from the conversation "
+        "transcript. Examples:\n"
+        "  - 'yes, look for that' + transcript about Sony headphones → "
+        "'look for my Sony headphones'\n"
+        "  - 'yes, please save that' + transcript about a meeting → "
+        "'save the meeting'\n"
+        "  - 'tell me more' + transcript about Italy → "
+        "'tell me more about Italy'\n"
         "- Do not add information not present in the transcript.\n"
-        "- Output ONLY the rewritten question. No preamble, no explanation, "
+        "- Do not turn statements into questions or vice versa.\n"
+        "- Output ONLY the rewritten message. No preamble, no explanation, "
         "no quotes around the output.\n\n"
         f"Conversation transcript (most recent last):\n{transcript}\n\n"
-        f"Current question: {query}\n\n"
+        f"Current message: {query}\n\n"
         "Rewritten:"
     )
 
@@ -1554,6 +1563,41 @@ def _resolve_contextual_query(
     if not rewritten:
         return query
     return rewritten
+
+
+_QUESTION_WORDS = frozenset({
+    "what", "who", "whom", "whose", "where", "when", "why", "how", "which",
+    "is", "are", "was", "were", "do", "does", "did",
+    "can", "could", "would", "should", "will", "shall", "may", "might",
+    "has", "have", "had", "am",
+})
+
+
+def _looks_like_question(text: str) -> bool:
+    """Heuristic question detector for the HyDE gate.
+
+    HyDE generates a hypothetical *answer* — that only makes sense for a
+    query that's actually asking something. Statements ("That's great"),
+    commands ("Save this"), and acknowledgments ("Yes, please do that")
+    aren't questions, so HyDE doesn't apply.
+
+    True when the text:
+    - ends with '?', OR
+    - starts with a wh- / aux-verb question word
+
+    False otherwise. Heuristic, not a parser — false negatives bias
+    HyDE off (safe: the cheap path still runs), false positives waste
+    one LLM call when the gate would fire anyway.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.rstrip().endswith("?"):
+        return True
+    first = stripped.split(maxsplit=1)[0].lower().rstrip(",.;:!")
+    return first in _QUESTION_WORDS
 
 
 def _hyde_query(query: str) -> str | None:
@@ -1806,14 +1850,19 @@ def hybrid_retrieve(
                 temporal_results = []
 
     # P38: confidence-gated HyDE. If the cheap-path's strongest semantic
-    # match is below the trigger threshold, ask an LLM for a hypothetical
-    # answer-shaped sentence and re-run the semantic pathway against it.
-    # Keep keyword on the original (BM25 needs the question's vocabulary).
-    # Adds a 'hyde_semantic' pathway to RRF — augmenting, not replacing,
-    # the first pass.
+    # match is below the trigger threshold AND the query is question-shaped
+    # (HyDE generates a hypothetical *answer* — meaningless for statements
+    # or commands), ask an LLM for the hypothetical and re-run the semantic
+    # pathway against it. Keep keyword on the original (BM25 needs the
+    # question's vocabulary). Adds a 'hyde_semantic' pathway to RRF —
+    # augmenting, not replacing, the first pass.
     hyde_semantic: list = []
     hyde_semantic_obs: list = []
-    if _fusion == 'rrf' and _cfg('retrieval', 'enable_hyde', False):
+    if (
+        _fusion == 'rrf'
+        and _cfg('retrieval', 'enable_hyde', False)
+        and _looks_like_question(query)
+    ):
         first_pass_max_sim = max(
             (a.get("_similarity", 0.0) for a in semantic_results),
             default=0.0,
