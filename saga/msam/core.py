@@ -1556,6 +1556,75 @@ def _resolve_contextual_query(
     return rewritten
 
 
+def _hyde_query(query: str) -> str | None:
+    """P38 — generate a hypothetical answer to use as a retrieval probe.
+
+    Standard HyDE: replace the query embedding with the embedding of an
+    LLM-generated answer-shaped sentence. P33 analysis showed gold atoms
+    sit at median sim 0.44 to their questions because question-shape and
+    answer-shape live in different regions of embedding space. A
+    hypothetical answer — even a factually-wrong one — closes that
+    syntactic gap.
+
+    No-op (returns None) when:
+    - ``[retrieval] enable_hyde`` is False (default).
+    - No LLM key is resolvable.
+    - The LLM call fails or returns empty.
+
+    The caller gates on first-pass confidence so we only pay for HyDE
+    when retrieval was already weak.
+
+    Args:
+        query: the user's original question.
+
+    Returns:
+        A 1-2 sentence hypothetical answer, or ``None`` to indicate the
+        caller should keep using the original query.
+    """
+    if not _cfg('retrieval', 'enable_hyde', False):
+        return None
+
+    from .config import resolve_llm_config
+    llm = resolve_llm_config('retrieval_v2')
+    if not llm['api_key']:
+        return None
+
+    prompt = (
+        "Write a 1-2 sentence hypothetical answer to this question, in "
+        "the voice of a user describing themselves or an assistant "
+        "providing the fact. The answer doesn't need to be factually "
+        "accurate — write it in conversational answer-shape, not as a "
+        "question. Output ONLY the answer sentence, no preamble.\n\n"
+        f"Question: {query}\n\n"
+        "Hypothetical answer:"
+    )
+
+    import requests
+    try:
+        r = requests.post(
+            llm['url'],
+            headers={
+                "Authorization": f"Bearer {llm['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": llm['model'],
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 200,
+            },
+            timeout=llm['timeout'],
+        )
+        r.raise_for_status()
+        msg = r.json()["choices"][0]["message"]
+        text = (msg.get("content") or msg.get("reasoning") or "").strip()
+    except Exception:
+        return None
+
+    text = text.strip().strip('"').strip("'").strip()
+    return text or None
+
+
 def _apply_query_rewriting(query: str) -> str:
     """P11 — pattern-based query normalization (entity aliases).
 
@@ -1736,6 +1805,51 @@ def hybrid_retrieve(
             except Exception:
                 temporal_results = []
 
+    # P38: confidence-gated HyDE. If the cheap-path's strongest semantic
+    # match is below the trigger threshold, ask an LLM for a hypothetical
+    # answer-shaped sentence and re-run the semantic pathway against it.
+    # Keep keyword on the original (BM25 needs the question's vocabulary).
+    # Adds a 'hyde_semantic' pathway to RRF — augmenting, not replacing,
+    # the first pass.
+    hyde_semantic: list = []
+    hyde_semantic_obs: list = []
+    if _fusion == 'rrf' and _cfg('retrieval', 'enable_hyde', False):
+        first_pass_max_sim = max(
+            (a.get("_similarity", 0.0) for a in semantic_results),
+            default=0.0,
+        )
+        first_pass_max_sim_obs = max(
+            (a.get("_similarity", 0.0) for a in semantic_results_obs),
+            default=0.0,
+        )
+        gate_max = max(first_pass_max_sim, first_pass_max_sim_obs)
+        trigger_thr = _cfg('retrieval', 'hyde_trigger_confidence', 0.45)
+        if gate_max < trigger_thr:
+            hyp = _hyde_query(query)
+            if hyp:
+                if two_tier:
+                    hyde_semantic_obs = retrieve(
+                        hyp, mode=mode, top_k=obs_top_k * 4, stream=stream,
+                        topic_filter=topic_filter, agent_id=agent_id,
+                        memory_type='observation',
+                        include_session_boundaries=include_session_boundaries,
+                        session_id=session_id,
+                    )
+                    hyde_semantic = retrieve(
+                        hyp, mode=mode, top_k=top_k * 2, stream=stream,
+                        topic_filter=topic_filter, agent_id=agent_id,
+                        memory_type='raw',
+                        include_session_boundaries=include_session_boundaries,
+                        session_id=session_id,
+                    )
+                else:
+                    hyde_semantic = retrieve(
+                        hyp, mode=mode, top_k=top_k * 2, stream=stream,
+                        topic_filter=topic_filter, agent_id=agent_id,
+                        include_session_boundaries=include_session_boundaries,
+                        session_id=session_id,
+                    )
+
     combined: dict = {}
     for atom in semantic_results:
         combined[atom["id"]] = atom
@@ -1744,6 +1858,8 @@ def hybrid_retrieve(
     for atom in graph_results:
         combined.setdefault(atom["id"], atom)
     for atom in temporal_results:
+        combined.setdefault(atom["id"], atom)
+    for atom in hyde_semantic:
         combined.setdefault(atom["id"], atom)
 
     if _fusion == 'rrf':
@@ -1754,6 +1870,7 @@ def hybrid_retrieve(
             'keyword': _cfg('retrieval', 'rrf_keyword_weight', 1.0),
             'graph': _cfg('retrieval', 'rrf_graph_weight', 0.7),
             'temporal': _cfg('retrieval', 'rrf_temporal_weight', 1.0),
+            'hyde_semantic': _cfg('retrieval', 'rrf_hyde_weight', 1.0),
         }
         ranked_lists = {
             'semantic': [a["id"] for a in semantic_results],
@@ -1763,6 +1880,8 @@ def hybrid_retrieve(
             ranked_lists['graph'] = [a["id"] for a in graph_results]
         if temporal_results:
             ranked_lists['temporal'] = [a["id"] for a in temporal_results]
+        if hyde_semantic:
+            ranked_lists['hyde_semantic'] = [a["id"] for a in hyde_semantic]
         ranked = reciprocal_rank_fusion(ranked_lists, k=_k, weights=weights)
         for aid, score in ranked:
             if aid in combined:
@@ -1802,13 +1921,23 @@ def hybrid_retrieve(
                 obs_combined[atom["id"]] = atom
             for atom in kw_results_obs:
                 obs_combined.setdefault(atom["id"], atom)
+            for atom in hyde_semantic_obs:
+                obs_combined.setdefault(atom["id"], atom)
+            obs_ranked_lists = {
+                'semantic': [a["id"] for a in semantic_results_obs],
+                'keyword': [a["id"] for a in kw_results_obs],
+            }
+            obs_weights = {
+                'semantic': weights['semantic'],
+                'keyword': weights['keyword'],
+            }
+            if hyde_semantic_obs:
+                obs_ranked_lists['hyde_semantic'] = [a["id"] for a in hyde_semantic_obs]
+                obs_weights['hyde_semantic'] = weights['hyde_semantic']
             obs_ranked = reciprocal_rank_fusion(
-                {
-                    'semantic': [a["id"] for a in semantic_results_obs],
-                    'keyword': [a["id"] for a in kw_results_obs],
-                },
+                obs_ranked_lists,
                 k=_k,
-                weights={'semantic': weights['semantic'], 'keyword': weights['keyword']},
+                weights=obs_weights,
             )
             # P13: quality scoring on observations too. We need a pre-set
             # baseline score for the multiplier; seed from RRF before

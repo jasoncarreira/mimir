@@ -83,6 +83,14 @@ _DEFAULTS = {
         # prior turns. No-op when context is None/empty regardless of
         # this flag, so the bench harness pays nothing.
         "enable_contextual_rewrite": False,
+        # P38: confidence-gated HyDE. Re-runs the semantic pathway with
+        # an LLM-generated hypothetical answer when the cheap path's max
+        # similarity is below the trigger. Free when off; one extra LLM
+        # call per query when on AND the gate fires (~33% of LongMemEval
+        # queries per P33 analysis). Augments rather than replaces the
+        # first pass: the HyDE pathway joins RRF as 'hyde_semantic'.
+        "enable_hyde": False,
+        "hyde_trigger_confidence": 0.45,
         "similarity_threshold": 0.2,
         "sigmoid_midpoint": 0.35,
         "sigmoid_steepness": 15.0,
@@ -497,6 +505,7 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
         "fusion", "rrf_k",
         "rrf_semantic_weight", "rrf_keyword_weight",
         "rrf_graph_weight", "rrf_temporal_weight",
+        "rrf_hyde_weight",
         "two_tier_enabled", "observations_top_k",
         "observation_confidence_min_sim", "evidence_boost_cap_multiplier",
         "enable_observation_bonus", "observation_bonus_alpha",
