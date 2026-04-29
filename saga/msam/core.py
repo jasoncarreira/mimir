@@ -1669,6 +1669,120 @@ def _hyde_query(query: str) -> str | None:
     return text or None
 
 
+def _resolve_query_and_hypothetical(
+    query: str,
+    context: list[dict] | None,
+) -> tuple[str, str | None]:
+    """Combined contextual rewrite + HyDE in one LLM call.
+
+    Used when the caller would otherwise pay for both:
+    contextual rewrite (because context is present and the flag is on)
+    AND HyDE (because the flag is on and the query is a question).
+    Bundling lets us get both outputs from one round-trip.
+
+    The hypothetical is generated against the *rewritten* query, so it
+    can use the resolved entity names rather than the original
+    pronouns. RRF later fuses retrieve(rewritten) + retrieve(hypothetical)
+    so a bad hypothetical can't drag a good first pass.
+
+    No-op when:
+    - ``context`` is None or empty (returns ``(query, None)``).
+    - No LLM key resolvable (returns ``(query, None)``).
+    - The LLM call fails (returns ``(query, None)``).
+    - The response can't be parsed (returns ``(query, None)`` or
+      ``(rewritten, None)`` if only the rewrite parsed cleanly).
+
+    Args:
+        query: the user's current message (question or statement).
+        context: ``[{"role", "content"}, ...]``, most recent last.
+
+    Returns:
+        ``(rewritten_query, hypothetical_or_None)``. When the LLM call
+        is skipped or fails, returns the original query unchanged.
+    """
+    if not context:
+        return query, None
+
+    from .config import resolve_llm_config
+    llm = resolve_llm_config('retrieval_v2')
+    if not llm['api_key']:
+        return query, None
+
+    recent = context[-10:]
+    transcript_lines: list[str] = []
+    for i, msg in enumerate(recent, start=1):
+        role = (msg.get("role") or "user").strip()
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        if len(content) > 400:
+            content = content[:400] + "…"
+        transcript_lines.append(f"[{i}] {role}: {content}")
+    if not transcript_lines:
+        return query, None
+    transcript = "\n".join(transcript_lines)
+
+    prompt = (
+        "You're preprocessing a user message for a memory-retrieval "
+        "system, given the prior conversation. Produce two outputs.\n\n"
+        "1. REWRITTEN — rewrite the message into a self-contained query, "
+        "resolving references ('yes', 'that', 'those', 'it', 'them', "
+        "'this'). If the message already stands alone, return it unchanged. "
+        "Do not turn statements into questions or vice versa. The message "
+        "may be a question, a statement, or a command — preserve its "
+        "intent and shape.\n\n"
+        "2. HYPOTHETICAL — write a 1-2 sentence hypothetical answer to "
+        "the rewritten message, in the voice of a user describing "
+        "themselves or an assistant providing the fact. The answer "
+        "doesn't need to be factually accurate — it's an answer-shaped "
+        "retrieval probe.\n\n"
+        "Output format — exactly these two lines, no preamble, no quotes:\n"
+        "REWRITTEN: <rewritten message>\n"
+        "HYPOTHETICAL: <hypothetical answer>\n\n"
+        f"Conversation transcript (most recent last):\n{transcript}\n\n"
+        f"Current message: {query}"
+    )
+
+    import requests
+    try:
+        r = requests.post(
+            llm['url'],
+            headers={
+                "Authorization": f"Bearer {llm['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": llm['model'],
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 400,
+            },
+            timeout=llm['timeout'],
+        )
+        r.raise_for_status()
+        msg = r.json()["choices"][0]["message"]
+        text = (msg.get("content") or msg.get("reasoning") or "").strip()
+    except Exception:
+        return query, None
+
+    # Parse the two-section output. Be forgiving of leading whitespace,
+    # missing one section, or wrapping quotes per-section.
+    rewritten = query
+    hypothetical: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.upper().startswith("REWRITTEN:"):
+            v = line.split(":", 1)[1].strip().strip('"').strip("'").strip()
+            if v:
+                rewritten = v
+        elif line.upper().startswith("HYPOTHETICAL:"):
+            v = line.split(":", 1)[1].strip().strip('"').strip("'").strip()
+            if v:
+                hypothetical = v
+
+    return rewritten, hypothetical
+
+
 def _apply_query_rewriting(query: str) -> str:
     """P11 — pattern-based query normalization (entity aliases).
 
@@ -1766,12 +1880,30 @@ def hybrid_retrieve(
     if not query or not query.strip():
         return []
 
-    # Contextual rewrite (production-only): if the caller passed prior
-    # conversation messages, ask an LLM to rewrite the query into a
-    # self-contained form. No-op if context is None/empty (bench harness,
-    # standalone CLI calls). Runs before P11/P12 so subsequent regex
-    # rewriting and synonym expansion operate on the resolved query.
-    query = _resolve_contextual_query(query, context)
+    # Pre-retrieval LLM dispatch: contextual rewrite, HyDE, or both
+    # combined. Runs before P11/P12 so subsequent regex rewriting and
+    # synonym expansion operate on the resolved query.
+    #
+    # When both contextual rewrite and HyDE would fire (rewrite needs
+    # context + question-shaped query that would also trip HyDE's
+    # criteria), we bundle them into one LLM call rather than paying
+    # two round-trips. The resulting hypothetical is reused below
+    # instead of calling _hyde_query post-retrieval.
+    pre_hypothetical: str | None = None
+    _want_rewrite = (
+        bool(context)
+        and _cfg('retrieval', 'enable_contextual_rewrite', False)
+    )
+    _want_hyde = (
+        _cfg('retrieval', 'enable_hyde', False)
+        and _looks_like_question(query)
+    )
+    if _want_rewrite and _want_hyde:
+        query, pre_hypothetical = _resolve_query_and_hypothetical(query, context)
+    elif _want_rewrite:
+        query = _resolve_contextual_query(query, context)
+    # else: no rewrite. HyDE (if applicable) fires post-retrieval, gated
+    # on first-pass confidence — see the P38 block further down.
 
     # P11: pattern-based query rewriting (no-op unless flag set).
     # Both pathways use the rewritten query so semantic + keyword stay
@@ -1849,55 +1981,63 @@ def hybrid_retrieve(
             except Exception:
                 temporal_results = []
 
-    # P38: confidence-gated HyDE. If the cheap-path's strongest semantic
-    # match is below the trigger threshold AND the query is question-shaped
-    # (HyDE generates a hypothetical *answer* — meaningless for statements
-    # or commands), ask an LLM for the hypothetical and re-run the semantic
-    # pathway against it. Keep keyword on the original (BM25 needs the
-    # question's vocabulary). Adds a 'hyde_semantic' pathway to RRF —
-    # augmenting, not replacing, the first pass.
+    # P38: HyDE pathway. Two ways to get the hypothetical:
+    #   (a) pre_hypothetical was generated up-front by the combined
+    #       rewrite+HyDE call. Use it directly — the LLM cost is already
+    #       paid, and skipping the confidence gate is intentional: when
+    #       both rewrite and HyDE were going to fire, we always want the
+    #       extra retrieval pathway. RRF absorbs the cost if the cheap
+    #       path was already strong.
+    #   (b) post-retrieval gated path — fire only when first-pass max
+    #       similarity is below the trigger and the query is
+    #       question-shaped (HyDE generates a hypothetical *answer*,
+    #       meaningless for statements/commands).
+    # Either way, keep keyword on the original (BM25 needs the question's
+    # vocabulary). Adds a 'hyde_semantic' pathway to RRF, augmenting
+    # rather than replacing the first pass.
     hyde_semantic: list = []
     hyde_semantic_obs: list = []
-    if (
-        _fusion == 'rrf'
-        and _cfg('retrieval', 'enable_hyde', False)
-        and _looks_like_question(query)
-    ):
-        first_pass_max_sim = max(
-            (a.get("_similarity", 0.0) for a in semantic_results),
-            default=0.0,
-        )
-        first_pass_max_sim_obs = max(
-            (a.get("_similarity", 0.0) for a in semantic_results_obs),
-            default=0.0,
-        )
-        gate_max = max(first_pass_max_sim, first_pass_max_sim_obs)
-        trigger_thr = _cfg('retrieval', 'hyde_trigger_confidence', 0.45)
-        if gate_max < trigger_thr:
-            hyp = _hyde_query(query)
-            if hyp:
-                if two_tier:
-                    hyde_semantic_obs = retrieve(
-                        hyp, mode=mode, top_k=obs_top_k * 4, stream=stream,
-                        topic_filter=topic_filter, agent_id=agent_id,
-                        memory_type='observation',
-                        include_session_boundaries=include_session_boundaries,
-                        session_id=session_id,
-                    )
-                    hyde_semantic = retrieve(
-                        hyp, mode=mode, top_k=top_k * 2, stream=stream,
-                        topic_filter=topic_filter, agent_id=agent_id,
-                        memory_type='raw',
-                        include_session_boundaries=include_session_boundaries,
-                        session_id=session_id,
-                    )
-                else:
-                    hyde_semantic = retrieve(
-                        hyp, mode=mode, top_k=top_k * 2, stream=stream,
-                        topic_filter=topic_filter, agent_id=agent_id,
-                        include_session_boundaries=include_session_boundaries,
-                        session_id=session_id,
-                    )
+    hyp: str | None = None
+    if _fusion == 'rrf':
+        if pre_hypothetical:
+            hyp = pre_hypothetical
+        elif _cfg('retrieval', 'enable_hyde', False) and _looks_like_question(query):
+            first_pass_max_sim = max(
+                (a.get("_similarity", 0.0) for a in semantic_results),
+                default=0.0,
+            )
+            first_pass_max_sim_obs = max(
+                (a.get("_similarity", 0.0) for a in semantic_results_obs),
+                default=0.0,
+            )
+            gate_max = max(first_pass_max_sim, first_pass_max_sim_obs)
+            trigger_thr = _cfg('retrieval', 'hyde_trigger_confidence', 0.45)
+            if gate_max < trigger_thr:
+                hyp = _hyde_query(query)
+
+    if hyp:
+        if two_tier:
+            hyde_semantic_obs = retrieve(
+                hyp, mode=mode, top_k=obs_top_k * 4, stream=stream,
+                topic_filter=topic_filter, agent_id=agent_id,
+                memory_type='observation',
+                include_session_boundaries=include_session_boundaries,
+                session_id=session_id,
+            )
+            hyde_semantic = retrieve(
+                hyp, mode=mode, top_k=top_k * 2, stream=stream,
+                topic_filter=topic_filter, agent_id=agent_id,
+                memory_type='raw',
+                include_session_boundaries=include_session_boundaries,
+                session_id=session_id,
+            )
+        else:
+            hyde_semantic = retrieve(
+                hyp, mode=mode, top_k=top_k * 2, stream=stream,
+                topic_filter=topic_filter, agent_id=agent_id,
+                include_session_boundaries=include_session_boundaries,
+                session_id=session_id,
+            )
 
     combined: dict = {}
     for atom in semantic_results:

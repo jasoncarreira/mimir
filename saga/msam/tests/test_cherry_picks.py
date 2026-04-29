@@ -524,3 +524,194 @@ class TestLooksLikeQuestion:
         assert _looks_like_question("") is False
         assert _looks_like_question("   ") is False
         assert _looks_like_question(None) is False  # type: ignore[arg-type]
+
+
+class TestCombinedRewriteHyde:
+    """Combined contextual rewrite + HyDE in one LLM call.
+
+    When both would fire (rewrite needs context-resolution AND HyDE
+    would fire on a question), bundle them. When only one applies, fall
+    back to the standalone helpers. When neither applies, no LLM call
+    pre-retrieval (HyDE may still fire post-retrieval if its gate is on).
+    """
+
+    def _llm_returns(self, monkeypatch, body: str):
+        monkeypatch.setattr(
+            "msam.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "k", "timeout": 5},
+        )
+
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {"content": body}}]}
+        monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
+
+    def test_parses_two_section_output(self, cfg_override, monkeypatch):
+        from msam.core import _resolve_query_and_hypothetical
+        self._llm_returns(monkeypatch,
+            "REWRITTEN: What do I know about my Sony WH-1000XM5?\n"
+            "HYPOTHETICAL: I bought Sony WH-1000XM5 in Boston for $399."
+        )
+        ctx = [{"role": "user", "content": "Tell me about my headphones"}]
+        rewritten, hyp = _resolve_query_and_hypothetical("yes, look for that", ctx)
+        assert rewritten == "What do I know about my Sony WH-1000XM5?"
+        assert hyp == "I bought Sony WH-1000XM5 in Boston for $399."
+
+    def test_no_context_returns_passthrough(self, cfg_override, monkeypatch):
+        from msam.core import _resolve_query_and_hypothetical
+        # No LLM should be hit when there's no context to resolve against.
+        called = {"n": 0}
+        monkeypatch.setattr("requests.post", lambda *a, **kw: called.__setitem__("n", called["n"] + 1) or None)
+        rewritten, hyp = _resolve_query_and_hypothetical("anything", None)
+        assert rewritten == "anything"
+        assert hyp is None
+        assert called["n"] == 0
+
+    def test_llm_failure_returns_originals(self, cfg_override, monkeypatch):
+        from msam.core import _resolve_query_and_hypothetical
+        monkeypatch.setattr(
+            "msam.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "k", "timeout": 5},
+        )
+        def _boom(*a, **kw): raise RuntimeError("network down")
+        monkeypatch.setattr("requests.post", _boom)
+        ctx = [{"role": "user", "content": "context here"}]
+        rewritten, hyp = _resolve_query_and_hypothetical("yes that", ctx)
+        assert rewritten == "yes that"
+        assert hyp is None
+
+    def test_partial_response_keeps_what_parsed(self, cfg_override, monkeypatch):
+        """If only REWRITTEN parses cleanly (no HYPOTHETICAL section),
+        return rewritten + None for the hypothetical."""
+        from msam.core import _resolve_query_and_hypothetical
+        self._llm_returns(monkeypatch,
+            "REWRITTEN: What about Italy?"
+        )
+        ctx = [{"role": "user", "content": "Tell me about Italy"}]
+        rewritten, hyp = _resolve_query_and_hypothetical("tell me more", ctx)
+        assert rewritten == "What about Italy?"
+        assert hyp is None
+
+
+class TestRewriteHydeDispatch:
+    """The pre-retrieval dispatch in hybrid_retrieve. The key invariant:
+    when both rewrite + HyDE conditions are met, we make ONE combined
+    LLM call. When only one applies, fall back to that helper. When
+    neither applies, skip pre-retrieval LLM entirely.
+    """
+
+    def _seed_atom(self):
+        from msam.core import store_atom
+        return store_atom("dispatch test content for retrieval probe")
+
+    def _track(self, monkeypatch):
+        """Monkeypatch the three LLM helpers and return a counter dict."""
+        n = {"combined": 0, "rewrite": 0, "hyde": 0}
+
+        def _combined(q, c):
+            n["combined"] += 1
+            return ("rewritten", "hypothetical")
+
+        def _rewrite(q, c):
+            n["rewrite"] += 1
+            return q
+
+        def _hyde(q):
+            n["hyde"] += 1
+            return None
+
+        monkeypatch.setattr("msam.core._resolve_query_and_hypothetical", _combined)
+        monkeypatch.setattr("msam.core._resolve_contextual_query", _rewrite)
+        monkeypatch.setattr("msam.core._hyde_query", _hyde)
+        return n
+
+    def test_combined_path_when_both_apply(self, cfg_override, monkeypatch):
+        """Both flags on + context + question → one combined call. No
+        standalone rewrite call. No standalone HyDE call (we already
+        have the hypothetical from the combined call).
+        """
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        cfg_override["retrieval"]["enable_hyde"] = True
+        cfg_override["retrieval"]["fusion"] = "rrf"
+        n = self._track(monkeypatch)
+
+        self._seed_atom()
+        ctx = [{"role": "user", "content": "Tell me about my headphones"}]
+        hybrid_retrieve("what about that?", top_k=3, context=ctx)
+        assert n["combined"] == 1
+        assert n["rewrite"] == 0
+        assert n["hyde"] == 0
+
+    def test_rewrite_only_when_not_a_question(self, cfg_override, monkeypatch):
+        """Both flags on + context, but query is a statement → standalone
+        rewrite (no HyDE because non-question)."""
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        cfg_override["retrieval"]["enable_hyde"] = True
+        cfg_override["retrieval"]["fusion"] = "rrf"
+        n = self._track(monkeypatch)
+
+        self._seed_atom()
+        ctx = [{"role": "user", "content": "About a meeting"}]
+        hybrid_retrieve("yes, please save that", top_k=3, context=ctx)
+        assert n["combined"] == 0
+        assert n["rewrite"] == 1
+        assert n["hyde"] == 0  # statement → HyDE skipped post-retrieval too
+
+    def test_rewrite_only_when_hyde_disabled(self, cfg_override, monkeypatch):
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        cfg_override["retrieval"]["enable_hyde"] = False
+        cfg_override["retrieval"]["fusion"] = "rrf"
+        n = self._track(monkeypatch)
+
+        self._seed_atom()
+        ctx = [{"role": "user", "content": "About headphones"}]
+        hybrid_retrieve("what about that?", top_k=3, context=ctx)
+        assert n["combined"] == 0
+        assert n["rewrite"] == 1
+        assert n["hyde"] == 0
+
+    def test_hyde_only_when_no_context(self, cfg_override, monkeypatch):
+        """HyDE flag on + question, no context → standalone HyDE
+        post-retrieval, no combined call, no rewrite call."""
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        cfg_override["retrieval"]["enable_hyde"] = True
+        cfg_override["retrieval"]["hyde_trigger_confidence"] = 2.0  # force-trip
+        cfg_override["retrieval"]["fusion"] = "rrf"
+        n = self._track(monkeypatch)
+
+        self._seed_atom()
+        hybrid_retrieve("what is my profession?", top_k=3, context=None)
+        assert n["combined"] == 0
+        assert n["rewrite"] == 0
+        assert n["hyde"] == 1
+
+    def test_hyde_only_when_rewrite_disabled(self, cfg_override, monkeypatch):
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = False
+        cfg_override["retrieval"]["enable_hyde"] = True
+        cfg_override["retrieval"]["hyde_trigger_confidence"] = 2.0
+        cfg_override["retrieval"]["fusion"] = "rrf"
+        n = self._track(monkeypatch)
+
+        self._seed_atom()
+        ctx = [{"role": "user", "content": "About headphones"}]
+        hybrid_retrieve("what is my profession?", top_k=3, context=ctx)
+        assert n["combined"] == 0
+        assert n["rewrite"] == 0
+        assert n["hyde"] == 1
+
+    def test_neither_when_both_off(self, cfg_override, monkeypatch):
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = False
+        cfg_override["retrieval"]["enable_hyde"] = False
+        cfg_override["retrieval"]["fusion"] = "rrf"
+        n = self._track(monkeypatch)
+
+        self._seed_atom()
+        hybrid_retrieve("what is my profession?", top_k=3)
+        assert n == {"combined": 0, "rewrite": 0, "hyde": 0}
