@@ -125,6 +125,12 @@ class QueryRequest(BaseModel):
     # an LLM rewrites the current query before retrieval. No-op when
     # absent or empty (most callers); bench harness never sets it.
     context: Optional[list[dict]] = None
+    # Tags every access_log row from this retrieval with the session id.
+    # /v1/feedback uses it to scope its UPDATE so a single bulk feedback
+    # call tags every retrieval in the session, not just the most recent
+    # globally. Optional — when None, rows are written with NULL session_id
+    # and feedback falls back to the legacy "most-recent row" semantics.
+    session_id: Optional[str] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -352,6 +358,7 @@ async def api_query(req: QueryRequest):
                 reference_date=ref_date,
                 two_tier=True,
                 context=req.context,
+                session_id=req.session_id,
             )
             obs = result.get("observations", []) or []
             raws = result.get("raws", []) or []
@@ -402,7 +409,8 @@ async def api_query(req: QueryRequest):
 
         result = hybrid_retrieve_with_triples(req.query, mode=req.mode,
                                                token_budget=req.token_budget,
-                                               context=req.context)
+                                               context=req.context,
+                                               session_id=req.session_id)
         latency_ms = (time.time() - t0) * 1000
 
         # Determine confidence tier
