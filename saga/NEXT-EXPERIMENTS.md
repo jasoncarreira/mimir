@@ -631,6 +631,12 @@ fine for a feature whose primary value is non-bench.
 
 ### P38 — Confidence-gated HyDE (escalate to hypothetical-doc embedding only when first pass is weak)
 
+**Status.** Implemented 2026-04-29 (commit pending). Wired into
+`hybrid_retrieve` as a 'hyde_semantic' RRF pathway. Two new flags:
+`[retrieval] enable_hyde` (default False), `hyde_trigger_confidence`
+(default 0.45). 10 unit tests cover helper + gating logic. Bench
+validation pending.
+
 **What.** Standard HyDE replaces the query embedding with the
 embedding of an LLM-generated hypothetical answer. Cheap-path-first
 HyDE wraps that in a confidence gate:

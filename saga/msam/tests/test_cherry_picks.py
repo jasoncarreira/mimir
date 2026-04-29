@@ -289,3 +289,167 @@ class TestContextualRewrite:
         monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
         ctx = [{"role": "user", "content": "context"}]
         assert _resolve_contextual_query("yes, that", ctx) == "yes, that"
+
+
+# ─── P38: confidence-gated HyDE ──────────────────────────────────────────
+
+class TestHydeHelper:
+    """The _hyde_query helper itself: gating + LLM mock + failure modes."""
+
+    def test_disabled_returns_none(self, cfg_override):
+        from msam.core import _hyde_query
+        cfg_override.setdefault("retrieval", {})["enable_hyde"] = False
+        assert _hyde_query("What is my profession?") is None
+
+    def test_no_api_key_returns_none(self, cfg_override, monkeypatch):
+        from msam.core import _hyde_query
+        cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
+        monkeypatch.setattr(
+            "msam.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "", "timeout": 5},
+        )
+        assert _hyde_query("What is my profession?") is None
+
+    def test_returns_hypothetical_when_enabled(self, cfg_override, monkeypatch):
+        from msam.core import _hyde_query
+        cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
+        monkeypatch.setattr(
+            "msam.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "k", "timeout": 5},
+        )
+
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {
+                    "content": "I work as a software engineer at TechCorp."
+                }}]}
+        monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
+        out = _hyde_query("What is my profession?")
+        assert out == "I work as a software engineer at TechCorp."
+
+    def test_llm_failure_returns_none(self, cfg_override, monkeypatch):
+        from msam.core import _hyde_query
+        cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
+        monkeypatch.setattr(
+            "msam.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "k", "timeout": 5},
+        )
+        def _boom(*a, **kw): raise RuntimeError("network down")
+        monkeypatch.setattr("requests.post", _boom)
+        assert _hyde_query("anything?") is None
+
+    def test_strips_wrapping_quotes(self, cfg_override, monkeypatch):
+        from msam.core import _hyde_query
+        cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
+        monkeypatch.setattr(
+            "msam.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "k", "timeout": 5},
+        )
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {
+                    "content": '"I prefer dark mode."'
+                }}]}
+        monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
+        assert _hyde_query("dark mode?") == "I prefer dark mode."
+
+    def test_empty_response_returns_none(self, cfg_override, monkeypatch):
+        from msam.core import _hyde_query
+        cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
+        monkeypatch.setattr(
+            "msam.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "k", "timeout": 5},
+        )
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {"content": "   "}}]}
+        monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
+        assert _hyde_query("anything?") is None
+
+
+class TestHydeGating:
+    """The gate inside hybrid_retrieve: only fire HyDE when first-pass
+    confidence is weak. The gate's job is to keep HyDE's LLM cost off
+    the queries where the cheap path already found a confident match.
+    """
+
+    def _seed_atom(self, content: str = "irrelevant content for test"):
+        from msam.core import store_atom
+        return store_atom(content)
+
+    def test_gate_does_not_fire_when_disabled(self, cfg_override, monkeypatch):
+        """enable_hyde=False → never call _hyde_query, even on weak first pass."""
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_hyde"] = False
+        cfg_override["retrieval"]["fusion"] = "rrf"
+
+        called = {"n": 0}
+        def _spy(q):
+            called["n"] += 1
+            return None
+        monkeypatch.setattr("msam.core._hyde_query", _spy)
+
+        self._seed_atom()
+        hybrid_retrieve("anything", top_k=3)
+        assert called["n"] == 0
+
+    def test_gate_fires_on_weak_first_pass(self, cfg_override, monkeypatch):
+        """When max similarity in first-pass < trigger AND enable_hyde=True,
+        _hyde_query must be called. The fixture's randomized embeddings
+        produce low cosine similarity, so the gate naturally trips here.
+        """
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
+        # Fixture's embed_query returns the same vector as embed_text, so
+        # cosine sim is 1.0. Use 2.0 to guarantee the gate trips.
+        cfg_override["retrieval"]["hyde_trigger_confidence"] = 2.0
+        cfg_override["retrieval"]["fusion"] = "rrf"
+
+        called = {"n": 0, "q": None}
+        def _spy(q):
+            called["n"] += 1
+            called["q"] = q
+            return None  # simulate LLM returning nothing — gate fires but no rerun
+        monkeypatch.setattr("msam.core._hyde_query", _spy)
+
+        self._seed_atom()
+        hybrid_retrieve("what is my profession?", top_k=3)
+        assert called["n"] == 1
+        assert called["q"] == "what is my profession?"
+
+    def test_gate_skips_when_first_pass_is_confident(self, cfg_override, monkeypatch):
+        """When the first pass already has a confident match, HyDE should
+        be skipped — that's the whole point of the gate.
+        """
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
+        cfg_override["retrieval"]["hyde_trigger_confidence"] = -1.0  # impossibly low → never trip
+        cfg_override["retrieval"]["fusion"] = "rrf"
+
+        called = {"n": 0}
+        def _spy(q):
+            called["n"] += 1
+            return None
+        monkeypatch.setattr("msam.core._hyde_query", _spy)
+
+        self._seed_atom()
+        hybrid_retrieve("anything", top_k=3)
+        assert called["n"] == 0
+
+    def test_gate_skips_in_weighted_sum_mode(self, cfg_override, monkeypatch):
+        """HyDE is a fusion-only feature. weighted_sum mode is the legacy
+        path; we don't bolt new pathways onto it."""
+        from msam.core import hybrid_retrieve
+        cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
+        cfg_override["retrieval"]["hyde_trigger_confidence"] = 2.0
+        cfg_override["retrieval"]["fusion"] = "weighted_sum"
+
+        called = {"n": 0}
+        monkeypatch.setattr("msam.core._hyde_query", lambda q: called.__setitem__("n", called["n"] + 1) or None)
+
+        self._seed_atom()
+        hybrid_retrieve("anything", top_k=3)
+        assert called["n"] == 0
