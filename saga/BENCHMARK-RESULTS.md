@@ -34,6 +34,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_rerank_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 + P15 (cross-encoder LLM rerank on top-8 candidates); triples + graph pathway off | sem + kw, then LLM rerank on top-8 | 500 | **0.648** |
 | `msam_p35_canon_v1` | MiniMax-M2.7 | P30v3 + P35 (consolidation as structured-cognition pass: observation + triples in one LLM call); graph pathway on; cherry-picks off; rerank off | sem + kw + **graph** (triples-as-byproduct of consolidation, not separate extraction pipeline) | 500 | **0.758** |
 | `msam_p11_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P11 ONLY (`enable_query_rewriting=true`); P12/P13 off | sem + kw (P11 rewriting on both pathways via built-in `_QUERY_REWRITES`) | 498 (2 errors) | **0.771** |
+| `msam_p12_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P12 ONLY (`enable_query_expansion=true`); P11/P13 off | sem + kw (P12 synonym expansion on keyword pathway only via 29-key default synonym dict) | 499 (1 error) | **0.792** ✓ |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
@@ -1151,6 +1152,78 @@ API hiccups during the run. Subtype counts shifted slightly
 (multi-session 131 vs 133). Doesn't materially change the headline.
 
 Pace: ~33s/q (~4h29m for 500 questions).
+
+### `msam_p12_canon_v1` — cherry-pick ablation: P12 alone (499q, 1 error)
+
+Second of three ablation runs. P12 is synonym expansion on the
+keyword pathway only — for query terms matching keys in the 29-entry
+default synonym dict (`profession`, `food`, `movie`, `told`, etc.),
+the synonyms are appended to the FTS5 BM25 query string. Semantic
+pathway sees the original query unchanged. P11 and P13 stay off.
+
+| Subtype | Score | N | Δ vs P30v3 (0.784) | Δ vs bundle (0.756) | Δ vs P11-alone (0.771) |
+|---|---|---|---|---|---|
+| **single-session-preference** | **0.483** | 29 | **+21.6** ✓✓ | +21.6 | +18.3 |
+| knowledge-update | 0.962 | 78 | **+1.3** ✓ | +1.3 | +2.6 |
+| single-session-user | 0.957 | 70 | -1.4 | +1.4 | +1.4 |
+| multi-session | 0.647 | 133 | 0.0 | +1.5 | +1.3 |
+| temporal-reasoning | 0.752 | 133 | -0.7 | +4.5 | 0.0 |
+| single-session-assistant | 0.946 | 56 | -3.6 | 0.0 | 0.0 |
+
+**Overall: 0.792 (+0.8pp vs P30v3, +3.6pp vs the cherry-picks bundle).**
+
+**This is the first new positive bench result on this stack since
+P30 shipped.** P12 alone beats P30v3 (canonical baseline) by +0.8pp
+overall and effectively ties P9v2 (best ever, 0.796) within
+benchmark noise.
+
+The headline number is interesting; the preference subtype number is
+**massive**: from 0.267 to 0.483, a +21.6pp absolute gain on a 30-
+question subtype. This is the biggest single-subtype lift we've ever
+recorded on this bench. Knowledge-update also gained +1.3pp, hitting
+0.962 — a new high. Multi-session held flat, temporal stayed near
+baseline, and only single-session-assistant lost meaningful ground
+(-3.6pp).
+
+**Why P12 worked here.** Preference probes are the case where the
+question vocabulary and the answer vocabulary are most likely to
+differ. A probe asks *"What kind of music do I like?"* and the gold
+atom says *"I love bluegrass"* — the FTS5 keyword pathway wouldn't
+match those tokens directly. P12's synonym expansion appends
+synonyms when keys match: `prefer → favorite/like/favourite`,
+`favorite → preferred/like/love/enjoy`. The expanded keyword query
+hits the gold atom; FTS5 brings it into the candidate pool; RRF
+fuses it with the (already-decent) semantic pathway result.
+
+Knowledge-update's +1.3pp also fits this story: fact-replacement
+questions ("the user changed jobs" → atoms about new vs old job)
+benefit from synonym coverage on `job/profession/career/work` and
+`company/employer/office`.
+
+**The bundle decomposition is now legible.** Bundle = -2.8pp vs P30v3:
+
+- P11 alone = -1.3pp (small regression, +3.3pp preference gain)
+- P12 alone = **+0.8pp** (small overall gain, +21.6pp preference gain)
+- P13 alone = pending (probably the biggest regression source)
+
+P11 and P12 each lift preference (+3.3pp and +21.6pp respectively)
+but in different ways and presumably non-additively. The bundle
+captured P12's preference gain (+13.3pp in the bundle's preference
+result) but **didn't** capture the +21.6pp P12 alone delivers — so
+P11 and P13 actively interfere with P12's lift when stacked.
+
+P13's result will tell us how much it personally costs (and where
+the residual ~3pp of bundle regression came from). Best guess
+ahead of data: P13 is -2 to -3pp because the heuristic atom-quality
+multiplier demotes short answer-bearing turns ("Patagonia",
+"1:10 ratio", "Veja") that the reader needs.
+
+**One error note.** 499 processed (single MiniMax API hiccup mid-
+run). Preference subtype n=29 instead of 30. Doesn't affect the
+headline (a single +/- on a 29-q subtype is ±3.4pp, well within
+the +21.6pp lift).
+
+Pace: ~32s/q. P12 took 4h42m total ingest.
 
 ## P9 summary
 
