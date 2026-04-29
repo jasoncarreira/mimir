@@ -182,3 +182,110 @@ class TestQualityScoring:
         atoms = self._make_atoms()
         _apply_quality_scoring(atoms)
         assert atoms["high"]["_combined_score"] > 1.0
+
+
+# ─── Contextual query rewriting (production-only) ────────────────────────
+
+class TestContextualRewrite:
+    """Production-only feature: agents may pass prior conversation
+    messages so MSAM can resolve references like 'yes, look for that'
+    into self-contained queries via an LLM. Default-off; no-op when
+    context is None/empty regardless of flag (so the bench harness pays
+    nothing).
+    """
+
+    def test_no_context_is_noop(self, cfg_override):
+        from msam.core import _resolve_contextual_query
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        assert _resolve_contextual_query("yes, look for that", None) == \
+            "yes, look for that"
+        assert _resolve_contextual_query("yes, look for that", []) == \
+            "yes, look for that"
+
+    def test_flag_off_is_noop(self, cfg_override):
+        from msam.core import _resolve_contextual_query
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = False
+        ctx = [
+            {"role": "user", "content": "Tell me about my Sony headphones"},
+            {"role": "assistant", "content": "You bought WH-1000XM5 in Boston."},
+        ]
+        assert _resolve_contextual_query("yes, look for that", ctx) == \
+            "yes, look for that"
+
+    def test_no_api_key_is_noop(self, cfg_override, monkeypatch):
+        from msam.core import _resolve_contextual_query
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        monkeypatch.setattr(
+            "msam.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "", "timeout": 5},
+        )
+        ctx = [{"role": "user", "content": "Tell me about my headphones"}]
+        assert _resolve_contextual_query("yes, that one", ctx) == "yes, that one"
+
+    def test_llm_rewrite_replaces_query(self, cfg_override, monkeypatch):
+        from msam.core import _resolve_contextual_query
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        monkeypatch.setattr(
+            "msam.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "k", "timeout": 5},
+        )
+
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {
+                    "content": "What do I know about Sony WH-1000XM5 headphones?"
+                }}]}
+        monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
+
+        ctx = [
+            {"role": "user", "content": "Tell me about my Sony WH-1000XM5"},
+            {"role": "assistant", "content": "You bought them in Boston for $399."},
+        ]
+        out = _resolve_contextual_query("yes, look for that", ctx)
+        assert "Sony WH-1000XM5" in out
+
+    def test_llm_failure_returns_original(self, cfg_override, monkeypatch):
+        from msam.core import _resolve_contextual_query
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        monkeypatch.setattr(
+            "msam.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "k", "timeout": 5},
+        )
+        def _boom(*a, **kw): raise RuntimeError("network down")
+        monkeypatch.setattr("requests.post", _boom)
+        ctx = [{"role": "user", "content": "anything"}]
+        assert _resolve_contextual_query("yes, that", ctx) == "yes, that"
+
+    def test_strips_wrapping_quotes(self, cfg_override, monkeypatch):
+        from msam.core import _resolve_contextual_query
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        monkeypatch.setattr(
+            "msam.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "k", "timeout": 5},
+        )
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {
+                    "content": '"What is my headphone model?"'
+                }}]}
+        monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
+        ctx = [{"role": "user", "content": "my headphones"}]
+        out = _resolve_contextual_query("yes, that", ctx)
+        assert out == "What is my headphone model?"
+
+    def test_empty_response_returns_original(self, cfg_override, monkeypatch):
+        from msam.core import _resolve_contextual_query
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        monkeypatch.setattr(
+            "msam.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "k", "timeout": 5},
+        )
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {"content": "   "}}]}
+        monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
+        ctx = [{"role": "user", "content": "context"}]
+        assert _resolve_contextual_query("yes, that", ctx) == "yes, that"

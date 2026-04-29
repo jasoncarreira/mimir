@@ -685,6 +685,7 @@ def hybrid_retrieve_with_triples(
     mode: str = "task",
     token_budget: int = 500,
     triple_ratio: float = None,
+    context: list[dict] | None = None,
 ) -> dict:
     """
     Polymorphic retrieval: triples for facts, atoms for context.
@@ -735,7 +736,7 @@ def hybrid_retrieve_with_triples(
         from .retrieval_v2 import retrieve_v2
         atoms = retrieve_v2(query, mode=mode, top_k=atom_top_k)
     else:
-        atoms = hybrid_retrieve(query, mode=mode, top_k=atom_top_k)
+        atoms = hybrid_retrieve(query, mode=mode, top_k=atom_top_k, context=context)
 
     # Trim atoms to budget
     atom_tokens = 0
