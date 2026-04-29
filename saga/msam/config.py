@@ -91,6 +91,13 @@ _DEFAULTS = {
         # first pass: the HyDE pathway joins RRF as 'hyde_semantic'.
         "enable_hyde": False,
         "hyde_trigger_confidence": 0.45,
+        # P39: pivot for the pulled-in (missing-atom) base score in
+        # _two_tier_split. "min" anchors at the bottom of the in-pool
+        # RRF distribution (P30v1 default, conservative — pulled-ins
+        # almost never beat in-pool raws). "median" anchors at the
+        # middle, letting strong-similarity pulled-ins compete with
+        # mid-rank in-pool raws. See NEXT-EXPERIMENTS.md P39.
+        "missing_ref_score_pivot": "min",
         "similarity_threshold": 0.2,
         "sigmoid_midpoint": 0.35,
         "sigmoid_steepness": 15.0,
