@@ -1202,26 +1202,23 @@ when triples table empty.
    below that. Untested on bench (which has ~500 atoms/question).
    We don't know if beam would help at small atom counts.
 
-2. **Beam 2 changes after P11 removal.** The cleanup batch deletes
-   `rewrite_query()` (P11 regex), so the existing beam 2 (regex-
-   rewritten query) loses its mechanism. **Replace beam 2 with a
-   synonym-expanded query** — apply P12's synonym dict to BOTH
-   semantic and keyword pathways (currently P12 only expands the
-   keyword pathway inside `hybrid_retrieve`). This gives the
-   semantic embedding side access to the synonym vocabulary too.
-   May or may not help — embeddings handle synonyms reasonably
-   already; the bench will tell us.
+2. **Drop beam 2 (regex rewrite, P11) entirely.** The cleanup batch
+   removes `rewrite_query()`, so beam 2's mechanism goes away. We
+   considered replacing it with a synonym-expanded query applied
+   to both pathways, but: P12's gain came from BM25's term-exact
+   limitation (synonyms unlock keyword recall); embeddings already
+   handle synonyms reasonably. Adding "job career work occupation"
+   to the semantic query risks shifting the embedding centroid
+   away from question intent, with no clear recall mechanism. Skip
+   the speculative beam.
 
 3. **Replace beam 3 (triple-graph term expansion)** with
    `compressed_retrieve` — sentence-level extracts via
    `enable_subatom` + `enable_fact_dedup`. Beam 3 currently calls
    `expand_query()` which appends triple-graph subject/object
-   terms to the query — that's effectively dead in our bench
-   (triples extraction is off in `msam_bench.toml`) and overlaps
-   with what P41 will surface anyway. The compressed-retrieve
-   path provides a different signal: instead of a different
-   *query* formulation, it's a different *result granularity* —
-   sentences instead of whole atoms.
+   terms to the query — effectively dead in our bench (triples
+   extraction is off in `msam_bench.toml`) and overlaps with
+   what P41 will surface via direct cosine match anyway.
 
 **Why test these together.** Beam search's value is in covering
 blind spots from any single query formulation. Three beams of
@@ -1245,25 +1242,27 @@ sentences → parent atom and use the *highest* sentence score as
 the parent atom's beam-3 score. So an atom with a tight 3-sentence
 hit ranks high; an atom with diffuse weak relevance ranks low.
 
-**Beam composition after the swap.**
+**Beam composition after cleanup + swap: 2 beams.**
 - Beam 1: original query → `hybrid_retrieve` (whole atoms; P12
   synonym expansion fires internally on the keyword pathway)
-- Beam 2 [new]: synonym-expanded query → `hybrid_retrieve`
-  (synonyms applied to BOTH semantic and keyword pathways —
-  promotes P12 to a full beam, exposing it to semantic embedding
-  too)
-- Beam 3 [new]: original query → `compressed_retrieve` (sentence-
-  level extracts, dedup'd, then mapped back to parent atom_ids)
+- Beam 2 [new, was beam 3]: original query → `compressed_retrieve`
+  (sentence-level extracts, dedup'd, mapped back to parent
+  atom_ids)
 
-Three distinct signals: original formulation (broad recall),
-synonym-vocabulary-expanded (testing whether semantic-side synonym
-expansion helps beyond keyword-only), granularity (sentence-level
-relevance within atoms).
+Two distinct signals: granularity (whole atoms vs sentences) on
+the same query. RRF fuses by atom_id keeping the max score per
+atom across beams. Tighter than 3 speculative beams; no dead
+paths.
 
-**Future expansion to 4 beams.** When P41 lands (embedding-cosine
-triple augmentation), it could become a 4th beam — a triple-
-augmented retrieve as a co-equal signal. Defer that until P41
-ships and we can A/B it. Today: 3 beams.
+**"Beam search" is then a 2-path RRF.** That's still meaningfully
+different from single-path retrieve — sentence-level matches can
+surface atoms whose whole-atom RRF ranks them out of top-K.
+
+**Future 3rd beam.** When P41 ships (embedding-cosine triple
+augmentation), it becomes the natural 3rd beam: a triple-
+augmented retrieve as a co-equal signal. Or we could keep P41 as
+a pathway-internal mechanism inside beam 1 and stay at 2 beams.
+Decide after P41 bench.
 
 **Two flags affected.**
 - `[retrieval_v2] enable_beam_search` — change default from
