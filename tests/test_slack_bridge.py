@@ -135,6 +135,7 @@ def bridge_with_fake_app():
     )
 
     sent: list[dict] = []
+    users_info_calls: list[str] = []
 
     async def fake_post(*, channel: str, text: str):
         sent.append({"channel": channel, "text": text})
@@ -144,13 +145,38 @@ def bridge_with_fake_app():
         sent.append({"reaction": name, "channel": channel, "ts": timestamp})
         return {"ok": True}
 
+    # Plausible users.info response shape — tests that want a different
+    # response can override `fake_client.users_info`.
+    _profiles: dict[str, dict] = {
+        "U05ALICE": {
+            "user": {
+                "id": "U05ALICE",
+                "name": "alice",
+                "real_name": "Alice Smith",
+                "profile": {
+                    "display_name": "Alice",
+                    "email": "alice@example.com",
+                },
+            }
+        },
+    }
+
+    async def fake_users_info(*, user: str):
+        users_info_calls.append(user)
+        if user not in _profiles:
+            # Mimic a generic resolved-but-thin profile when an unknown
+            # user shows up — Slack always returns *some* user object.
+            return {"user": {"id": user, "name": user, "profile": {}}}
+        return _profiles[user]
+
     fake_client = SimpleNamespace(
         chat_postMessage=fake_post,
         reactions_add=fake_reactions_add,
         auth_test=AsyncMock(return_value={"user_id": "UBOT123"}),
         files_upload_v2=AsyncMock(return_value={"file": {}}),
+        users_info=fake_users_info,
     )
-    fake_app = SimpleNamespace(client=fake_client)
+    fake_app = SimpleNamespace(client=fake_client, _users_info_calls=users_info_calls)
     bridge._app = fake_app  # type: ignore[assignment]
     bridge._bot_user_id = "UBOT123"
     return bridge, enqueued, sent
@@ -232,7 +258,11 @@ async def test_on_message_enqueues_user_message(bridge_with_fake_app):
     assert e.author_id == "U05ALICE"
     # FUTURE_WORK §6.1: author is the platform-prefixed matching key.
     assert e.author == "slack-U05ALICE"
-    assert e.author_display == "U05ALICE"
+    # users.info enrichment: real_name takes precedence over user_id.
+    assert e.author_display == "Alice Smith"
+    # Email is captured into extra for any future use (identity proposal,
+    # EmailBridge cross-reference).
+    assert e.extra["slack_email"] == "alice@example.com"
     assert e.extra["channel_conversation_type"] == "multi_user"
     assert e.extra["channel_visibility"] == "public"
 
@@ -375,6 +405,97 @@ async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_app):
     )
     assert len(enqueued) == 1
     assert enqueued[0].author_id == "UOTHERBOT"
+
+
+@pytest.mark.asyncio
+async def test_users_info_cached_per_user(bridge_with_fake_app):
+    """Repeated messages from the same user hit users.info exactly once —
+    the second message resolves from the in-memory cache."""
+    bridge, enqueued, _ = bridge_with_fake_app
+    for _ in range(3):
+        await bridge._on_message(
+            {
+                "user": "U05ALICE",
+                "channel": "C01ENG",
+                "text": "hello",
+                "ts": "1.000",
+                "channel_type": "channel",
+            }
+        )
+    assert len(enqueued) == 3
+    # All three messages used the enriched display name.
+    assert all(e.author_display == "Alice Smith" for e in enqueued)
+    # users.info called once total (cached after the first lookup).
+    assert bridge._app._users_info_calls == ["U05ALICE"]
+
+
+@pytest.mark.asyncio
+async def test_users_info_failure_falls_back_to_user_id(bridge_with_fake_app):
+    """If users.info raises (e.g., users:read scope missing), the bridge
+    falls back to user_id for display and leaves email as None. Failures
+    are NOT cached — next message re-tries (so the bridge self-heals if
+    the operator adds the scope post-deploy)."""
+    from slack_sdk.errors import SlackApiError
+
+    bridge, enqueued, _ = bridge_with_fake_app
+    call_count = 0
+
+    async def boom(*, user: str):
+        nonlocal call_count
+        call_count += 1
+        raise SlackApiError("missing_scope", response={"ok": False, "error": "missing_scope"})
+
+    bridge._app.client.users_info = boom
+
+    await bridge._on_message(
+        {
+            "user": "U05ALICE",
+            "channel": "C01ENG",
+            "text": "first",
+            "ts": "1.000",
+            "channel_type": "channel",
+        }
+    )
+    await bridge._on_message(
+        {
+            "user": "U05ALICE",
+            "channel": "C01ENG",
+            "text": "second",
+            "ts": "2.000",
+            "channel_type": "channel",
+        }
+    )
+    assert len(enqueued) == 2
+    # Both fell back to user_id for display.
+    assert enqueued[0].author_display == "U05ALICE"
+    assert enqueued[1].author_display == "U05ALICE"
+    # Email is None when lookup fails.
+    assert enqueued[0].extra["slack_email"] is None
+    # Failures retry — both messages tried users.info (no failure cache).
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_users_info_thin_profile_falls_back(bridge_with_fake_app):
+    """If users.info returns a profile without real_name or display_name
+    (some workspaces don't expose either), fall back to user_id rather
+    than crashing."""
+    bridge, enqueued, _ = bridge_with_fake_app
+    await bridge._on_message(
+        {
+            "user": "U99STRANGER",  # not in the fake fixture's _profiles
+            "channel": "C01ENG",
+            "text": "hi",
+            "ts": "1.000",
+            "channel_type": "channel",
+        }
+    )
+    assert len(enqueued) == 1
+    # The fake fixture returns a thin profile (no real_name, no display_name)
+    # for users not in _profiles, which falls back to user.name (= user_id
+    # in this case).
+    assert enqueued[0].author_display == "U99STRANGER"
+    assert enqueued[0].extra["slack_email"] is None
 
 
 @pytest.mark.asyncio

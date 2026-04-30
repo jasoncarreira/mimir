@@ -212,6 +212,13 @@ class SlackBridge(Bridge):
     _handler: Any | None = field(default=None, init=False, repr=False)
     _runner: asyncio.Task | None = field(default=None, init=False, repr=False)
     _bot_user_id: str | None = field(default=None, init=False, repr=False)
+    # In-memory cache of users.info results, populated lazily on first
+    # message from each user. Bounded by workspace size; lives one
+    # process lifetime. Failed lookups aren't cached so they self-heal
+    # if the operator adds the users:read scope post-deploy.
+    _user_cache: dict[str, dict[str, str | None]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     prefixes = ("slack-", "dm-slack-")
     name = "slack"
@@ -325,6 +332,39 @@ class SlackBridge(Bridge):
 
     # ---- inbound wiring -----------------------------------------------
 
+    async def _user_info_cached(self, user_id: str) -> dict[str, str | None] | None:
+        """Fetch (or return cached) Slack user profile.
+
+        Returns ``{real_name, display_name, email}`` on success, ``None`` on
+        API failure. Successful lookups are cached for the process lifetime
+        so we hit ``users.info`` at most once per distinct user.
+
+        Failures aren't cached — if the operator adds the ``users:read`` /
+        ``users:read.email`` scope post-deploy, the next message from that
+        user picks up the new permissions automatically. Slack's
+        ``users.info`` is Tier 4 (100 req/min); per-user caching keeps us
+        well under that even on chatty channels.
+        """
+        cached = self._user_cache.get(user_id)
+        if cached is not None:
+            return cached
+        if self._app is None:
+            return None
+        try:
+            resp = await self._app.client.users_info(user=user_id)
+        except SlackApiError as exc:
+            log.warning("slack users.info failed for %s: %s", user_id, exc)
+            return None
+        user = resp.get("user") or {}
+        profile = user.get("profile") or {}
+        info: dict[str, str | None] = {
+            "real_name": user.get("real_name") or profile.get("real_name"),
+            "display_name": profile.get("display_name") or user.get("name"),
+            "email": profile.get("email"),
+        }
+        self._user_cache[user_id] = info
+        return info
+
     def _register_handlers(self, app: Any) -> None:
         async def on_message(event: dict[str, Any]) -> None:
             await self._on_message(event)
@@ -369,16 +409,28 @@ class SlackBridge(Bridge):
             text = "User sent a message with no text."
 
         # Platform-prefixed stable id is the matching key for cross-channel
-        # / cross-platform pull (FUTURE_WORK §6.1). The Slack event payload
-        # doesn't reliably carry a display name; fall back to user_id for
-        # display until a users.info enrichment ships.
+        # / cross-platform pull (FUTURE_WORK §6.1).
         author_key = f"slack-{user_id}"
+
+        # Enrich author_display + capture email via users.info if available.
+        # Falls back to user_id when the lookup fails (e.g., users:read
+        # scope missing). Email lands in event.extra for any future use
+        # (identity proposal flow, EmailBridge cross-reference, etc.).
+        author_display = user_id
+        slack_email: str | None = None
+        info = await self._user_info_cached(user_id)
+        if info:
+            author_display = (
+                info.get("real_name") or info.get("display_name") or user_id
+            )
+            slack_email = info.get("email")
+
         agent_event = AgentEvent(
             trigger="user_message",
             channel_id=channel_id,
             content=text,
             author=author_key,
-            author_display=user_id,
+            author_display=author_display,
             author_id=user_id,
             source_id=event.get("ts"),
             source="slack",
@@ -386,6 +438,7 @@ class SlackBridge(Bridge):
                 "channel_conversation_type": "dm" if is_dm else "multi_user",
                 "channel_visibility": "private" if is_dm else "public",
                 "thread_ts": event.get("thread_ts"),
+                "slack_email": slack_email,
             },
         )
         await self.enqueue(agent_event)
