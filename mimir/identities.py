@@ -5,6 +5,25 @@ collapses platform-specific author ids onto a single canonical
 identity. Used by ``MessageBuffer.cross_author_messages`` so a turn
 for Alice on Slack pulls her Discord public history (and vice versa).
 
+Schema (full example):
+
+    people:
+      - canonical: alice                    # short id used as the matching key
+        display_name: Alice Smith           # optional; for prompt rendering
+        aliases:
+          - slack-U123ABC                   # Slack user id (xoxb users.list)
+          - discord-456789                  # Discord numeric user id
+          - bsky:alice.bsky.social          # Bluesky handle
+          - email:alice@example.com         # email address
+        notes: Eng team lead                # optional; surfaces in prompt
+
+Alias prefix convention (informational — the resolver treats every alias
+as an opaque string, so the convention is for human readability):
+- ``slack-<user_id>``         hyphen separator (id is alphanumeric)
+- ``discord-<numeric_id>``    hyphen separator (id is numeric)
+- ``bsky:<handle>``           colon — handle contains dots
+- ``email:<address>``         colon — address contains @ and dots
+
 Design tenets:
 - **Resolver-less callers behave identically to today.** A None resolver
   (file missing, deployment without identities.yaml) makes ``resolve``

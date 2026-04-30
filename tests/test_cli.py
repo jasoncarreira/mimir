@@ -34,6 +34,15 @@ def test_setup_creates_home_layout(tmp_path: Path):
     assert (home / "state" / "wiki" / "AGENTS.md").is_file()
     assert (home / "state" / "wiki" / "index.md").is_file()
     assert (home / "state" / "wiki" / "log.md").is_file()
+    # Identity reconciliation starter (FUTURE_WORK §6.1).
+    identities_yaml = home / "state" / "identities.yaml"
+    assert identities_yaml.is_file()
+    body = identities_yaml.read_text()
+    # Schema example covers all the documented alias prefixes.
+    for hint in ("slack-", "discord-", "bsky:", "email:"):
+        assert hint in body, f"identities.yaml missing schema hint: {hint}"
+    # Empty by default — operator adds entries.
+    assert "people: []" in body
     # Skills + subagents got seeded.
     assert (home / ".claude" / "skills" / "memory" / "SKILL.md").is_file()
     assert (home / ".claude" / "skills" / "wiki" / "SKILL.md").is_file()

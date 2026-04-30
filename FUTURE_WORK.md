@@ -270,8 +270,17 @@ people:
       - slack-U123ABC
       - discord-456789
       - bsky:alice.bsky.social
+      - email:alice@example.com
     notes: Eng team lead, prefers async
 ```
+
+Alias prefix convention (informational — resolver treats every alias as
+an opaque string, so the prefix is for human readability, not parsed):
+
+- ``slack-<user_id>``         hyphen separator (id is alphanumeric)
+- ``discord-<numeric_id>``    hyphen separator (id is numeric)
+- ``bsky:<handle>``           colon — handle contains dots
+- ``email:<address>``         colon — address contains @ and dots
 
 Loaded at startup into a flat `dict[platform_id, canonical]` lookup table. A resolver function:
 

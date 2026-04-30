@@ -156,6 +156,48 @@ DEFAULT_WIKI_LOG_MD = dedent(
 )
 
 
+DEFAULT_IDENTITIES_YAML = dedent(
+    """\
+    # Operator-managed identity reconciliation (FUTURE_WORK §6.1).
+    #
+    # Each person has a canonical id and a list of platform aliases.
+    # When messages arrive with these aliases as authors, the resolver
+    # maps them to the canonical so cross-channel pull works across
+    # platforms (Alice on Slack pulls her Discord public history, etc.).
+    #
+    # Add entries as you learn cross-platform identities. The agent
+    # doesn't write this file — only operators and the (future)
+    # `mimir identities` CLI do.
+    #
+    # Schema:
+    #
+    # people:
+    #   - canonical: alice                    # short id used as the matching key
+    #     display_name: Alice Smith           # optional; for prompt rendering
+    #     aliases:
+    #       - slack-U123ABC                   # Slack user id
+    #       - discord-456789                  # Discord numeric id
+    #       - bsky:alice.bsky.social          # Bluesky handle
+    #       - email:alice@example.com         # email address
+    #     notes: Eng team lead                # optional; surfaces in prompt
+    #
+    # Alias prefix conventions (informational — resolver treats aliases
+    # as opaque strings, so the prefix is for readability only):
+    #   slack-<id>      hyphen, alphanumeric id
+    #   discord-<id>    hyphen, numeric id
+    #   bsky:<handle>   colon (handle contains dots)
+    #   email:<addr>    colon (address contains @ and dots)
+    #
+    # Operators can disable cross-platform pull entirely (compliance,
+    # regulated workflows) by setting MIMIR_CROSS_PLATFORM_PULL=false
+    # in .env. The resolver still loads but cross_author_messages
+    # falls back to direct equality.
+
+    people: []
+    """
+)
+
+
 def _write_if_missing(path: Path, content: str) -> bool:
     """Write ``content`` to ``path`` only if the file doesn't exist.
 
@@ -211,6 +253,8 @@ def setup_home(home: Path) -> dict[str, object]:
         files_created.append("state/wiki/index.md")
     if _write_if_missing(home / "state" / "wiki" / "log.md", DEFAULT_WIKI_LOG_MD):
         files_created.append("state/wiki/log.md")
+    if _write_if_missing(home / "state" / "identities.yaml", DEFAULT_IDENTITIES_YAML):
+        files_created.append("state/identities.yaml")
 
     seeded_subagents = seed_subagent_defs(home)
     seeded_skills = seed_skills(home)

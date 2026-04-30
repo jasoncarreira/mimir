@@ -12,7 +12,7 @@ from mimir.identities import IdentityResolver
 
 def _write_identities(tmp_path: Path, body: str) -> IdentityResolver:
     state = tmp_path / "state"
-    state.mkdir()
+    state.mkdir(exist_ok=True)
     (state / "identities.yaml").write_text(dedent(body), encoding="utf-8")
     r = IdentityResolver(home=tmp_path)
     r.reload()
@@ -228,3 +228,45 @@ def test_strips_whitespace_on_canonical_and_aliases(tmp_path: Path):
         """,
     )
     assert r.resolve("slack-U123") == "alice"
+
+
+def test_email_works_as_alias(tmp_path: Path):
+    """Email addresses are valid aliases — the resolver treats every
+    alias as opaque, so ``email:user@example.com`` Just Works. Useful
+    when an EmailBridge lands and inbound events arrive with
+    ``author = email:alice@example.com``, or when the operator wants
+    to record an email as a known identifier for cross-reference."""
+    r = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: alice
+            display_name: Alice Smith
+            aliases:
+              - slack-U123ABC
+              - email:alice@example.com
+              - discord-456789
+        """,
+    )
+    assert r.resolve("email:alice@example.com") == "alice"
+    assert r.display_name("email:alice@example.com") == "Alice Smith"
+    # All three aliases collapse to the same canonical.
+    assert (
+        r.resolve("slack-U123ABC")
+        == r.resolve("email:alice@example.com")
+        == r.resolve("discord-456789")
+        == "alice"
+    )
+    # Multiple emails per person — should also Just Work.
+    r2 = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: alice
+            aliases:
+              - email:alice@work.example.com
+              - email:alice@personal.example.com
+        """,
+    )
+    assert r2.resolve("email:alice@work.example.com") == "alice"
+    assert r2.resolve("email:alice@personal.example.com") == "alice"
