@@ -93,40 +93,52 @@ def _estimate_tokens(text: str) -> int:
 
 
 def cache_sentence_embeddings(atom_id: str, content: str, conn=None):
-    """Split atom into sentences, embed each, cache in DB."""
+    """Split atom into sentences, embed each, cache in DB.
+
+    Embedding calls are batched into one provider request — sequential
+    per-sentence calls were the dominant cost when this fired during
+    retrieval (see P43 bench). The embeddings provider's batch_embed
+    short-circuits to a single API roundtrip when the provider supports
+    it (OpenAI does); falls back to per-call when it doesn't.
+    """
     from .core import get_db
-    from .embeddings import embed_text as get_embedding
-    
+    from .embeddings import batch_embed_texts
+
     if conn is None:
         conn = get_db()
-    
+
     _ensure_sentence_table(conn)
-    
+
     # Check if already cached
     existing = conn.execute(
         "SELECT COUNT(*) FROM sentence_embeddings WHERE atom_id = ?",
         (atom_id,)
     ).fetchone()[0]
-    
+
     if existing > 0:
         return existing
-    
+
     sentences = split_sentences(content)
     if not sentences:
         return 0
-    
+
+    try:
+        embeddings = batch_embed_texts(sentences)
+    except Exception:
+        embeddings = [None] * len(sentences)
+
     for idx, sent in enumerate(sentences):
-        emb = get_embedding(sent)
+        emb = embeddings[idx] if idx < len(embeddings) else None
         emb_blob = _pack_embedding(emb) if emb else None
         tok_count = _estimate_tokens(sent)
-        
+
         conn.execute(
-            """INSERT OR REPLACE INTO sentence_embeddings 
+            """INSERT OR REPLACE INTO sentence_embeddings
                (atom_id, sentence_idx, sentence, embedding, token_count)
                VALUES (?, ?, ?, ?, ?)""",
             (atom_id, idx, sent, emb_blob, tok_count)
         )
-    
+
     conn.commit()
     return len(sentences)
 
@@ -198,37 +210,70 @@ def extract_relevant_sentences(
     
     conn = get_db()
     _ensure_sentence_table(conn)
-    
+
     query_emb = get_embedding(query)
     if not query_emb:
         # Fallback: return whole atoms truncated to budget
         return _fallback_whole_atoms(atoms, token_budget)
-    
+
+    # Bulk-pre-cache: gather all uncached atoms' sentences and embed them
+    # in one batch_embed_texts call. Without this, the per-atom loop fires
+    # one batch call per atom — at 20 atoms that's 20 sequential API
+    # roundtrips, ~10s+ in practice. Bulk batches it down to one.
+    cached_set = {
+        r[0] for r in conn.execute(
+            "SELECT DISTINCT atom_id FROM sentence_embeddings WHERE atom_id IN (%s)" %
+            ",".join("?" * len(atoms)),
+            tuple(a.get('id', a.get('atom_id', '')) for a in atoms),
+        ).fetchall()
+    } if atoms else set()
+    bulk_sentences: list[tuple[str, int, str]] = []  # (atom_id, idx, sentence)
+    for atom in atoms:
+        atom_id = atom.get('id', atom.get('atom_id', ''))
+        if not atom_id or atom_id in cached_set:
+            continue
+        content = atom.get('content', '') or ''
+        if not content:
+            continue
+        for idx, sent in enumerate(split_sentences(content)):
+            bulk_sentences.append((atom_id, idx, sent))
+    if bulk_sentences:
+        from .embeddings import batch_embed_texts
+        try:
+            embs = batch_embed_texts([s for (_, _, s) in bulk_sentences])
+        except Exception:
+            embs = [None] * len(bulk_sentences)
+        for (atom_id, idx, sent), emb in zip(bulk_sentences, embs):
+            emb_blob = _pack_embedding(emb) if emb else None
+            tok_count = _estimate_tokens(sent)
+            conn.execute(
+                """INSERT OR REPLACE INTO sentence_embeddings
+                   (atom_id, sentence_idx, sentence, embedding, token_count)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (atom_id, idx, sent, emb_blob, tok_count),
+            )
+        conn.commit()
+
     scored_sentences = []
-    
+
     for atom in atoms:
         atom_id = atom.get('id', atom.get('atom_id', ''))
         atom_score = atom.get('_combined_score', atom.get('_activation', 0))
-        
-        # Get cached sentence embeddings
+
+        # Get cached sentence embeddings (the bulk pre-cache above
+        # populates this for any atoms missed; the lookup here only
+        # cache-misses on truly empty atoms).
         rows = conn.execute(
-            """SELECT sentence_idx, sentence, embedding, token_count 
+            """SELECT sentence_idx, sentence, embedding, token_count
                FROM sentence_embeddings WHERE atom_id = ?
                ORDER BY sentence_idx""",
             (atom_id,)
         ).fetchall()
-        
+
         if not rows:
-            # No sentence cache -- cache now, then retry
-            content = atom.get('content', '')
-            if content:
-                cache_sentence_embeddings(atom_id, content, conn)
-                rows = conn.execute(
-                    """SELECT sentence_idx, sentence, embedding, token_count 
-                       FROM sentence_embeddings WHERE atom_id = ?
-                       ORDER BY sentence_idx""",
-                    (atom_id,)
-                ).fetchall()
+            # Bulk pre-cache skipped this atom (no content) — fall through
+            # to whole-atom path below.
+            pass
         
         if not rows:
             # Still nothing -- use whole atom content

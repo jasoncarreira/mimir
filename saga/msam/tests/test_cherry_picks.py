@@ -844,6 +844,31 @@ class TestSubatomBeam:
         monkeypatch.setattr("msam.subatom.compressed_retrieve", _boom)
         assert _subatom_beam_atoms("anything", top_k=3, mode="task") == []
 
+    def test_recursion_guard_prevents_infinite_loop(self, cfg_override, monkeypatch):
+        """compressed_retrieve internally calls hybrid_retrieve, which
+        calls _subatom_beam_atoms. Without a guard, that loops forever.
+        Simulate the recursion: a fake compressed_retrieve calls back
+        into _subatom_beam_atoms, which must return [] on the inner call.
+        """
+        from msam.core import _subatom_beam_atoms
+        cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = True
+
+        inner_calls = {"n": 0}
+
+        def fake_compressed(*a, **kw):
+            # Simulate compressed_retrieve → hybrid_retrieve →
+            # _subatom_beam_atoms re-entry. The guard should make this
+            # inner call return [] instead of recursing.
+            from msam.core import _subatom_beam_atoms as inner
+            inner_calls["n"] += 1
+            inner_result = inner("inner", top_k=2, mode="task")
+            assert inner_result == [], "guard failed — inner call recursed"
+            return {"sentences": [{"atom_id": "x", "score": 0.5}]}
+
+        monkeypatch.setattr("msam.subatom.compressed_retrieve", fake_compressed)
+        _subatom_beam_atoms("outer", top_k=2, mode="task")
+        assert inner_calls["n"] == 1
+
 
 class TestBeamPathwaysInHybridRetrieve:
     """Confirm the new pathways wire into hybrid_retrieve's RRF correctly:
