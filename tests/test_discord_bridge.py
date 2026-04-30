@@ -230,7 +230,15 @@ async def test_on_message_enqueues_user_message(bridge_with_fake_client):
         guild=None,
         permissions_for=None,
     )
-    author = SimpleNamespace(id=99, bot=False, __str__=lambda self: "alice#1234")
+    author = SimpleNamespace(
+        id=99,
+        bot=False,
+        # Discord exposes display_name (server nickname OR global name) and
+        # global_name on the Member/User object — bridge prefers these
+        # over str() now.
+        display_name="Alice in this server",
+        global_name="Alice Smith",
+    )
     msg = SimpleNamespace(
         id=555,
         author=author,
@@ -247,12 +255,29 @@ async def test_on_message_enqueues_user_message(bridge_with_fake_client):
     assert e.source_id == "555"
     assert e.author_id == "99"
     # FUTURE_WORK §6.1: author is the platform-prefixed matching key.
-    # (author_display would be "alice#1234" but the SimpleNamespace mock's
-    # __str__ lambda doesn't actually override str() — that needs a
-    # class-level dunder. The author_display field is exercised in
-    # test_concurrency.py's cross-platform pull tests instead.)
     assert e.author == "discord-99"
+    # Discord display preference: server-nickname (display_name) wins over
+    # global_name and over str(author).
+    assert e.author_display == "Alice in this server"
     assert e.extra["channel_conversation_type"] == "multi_user"
+
+
+@pytest.mark.asyncio
+async def test_on_message_falls_back_to_global_name(bridge_with_fake_client):
+    """When the user has no server-specific nickname (display_name),
+    fall back to global_name (their cross-server display)."""
+    import discord
+
+    bridge, enqueued, _ = bridge_with_fake_client
+    channel = SimpleNamespace(
+        id=1, type=getattr(discord.ChannelType, "text", None), name="general", guild=None,
+    )
+    # display_name absent → global_name picks up. (id=77 to avoid colliding
+    # with the fake bot's user_id=42 in the fixture.)
+    author = SimpleNamespace(id=77, bot=False, global_name="Alice Smith")
+    msg = SimpleNamespace(id=1, author=author, channel=channel, content="hi", mentions=[])
+    await bridge._on_message(msg)
+    assert enqueued[0].author_display == "Alice Smith"
 
 
 @pytest.mark.asyncio

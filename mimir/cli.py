@@ -5,9 +5,11 @@ Subcommands:
   scheduler.yaml stub, skills, subagent defs). Idempotent — never overwrites
   existing files.
 - ``mimir run [--home DIR]``   — run the server (default if no subcommand).
+- ``mimir identities {list,add,remove,resolve}`` — manage identity
+  reconciliation entries (FUTURE_WORK §6.1).
 
-Both commands export ``MIMIR_HOME`` to the resolved path before loading
-``Config.from_env()``, so the CLI flag and the env var converge.
+Both run/setup commands export ``MIMIR_HOME`` to the resolved path before
+loading ``Config.from_env()``, so the CLI flag and the env var converge.
 """
 
 from __future__ import annotations
@@ -19,6 +21,9 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Sequence
 
+import yaml
+
+from .identities import IdentityResolver
 from .skill_defs import seed_skills
 from .subagent_defs import seed_subagent_defs
 
@@ -292,6 +297,146 @@ def _print_setup_report(status: dict[str, object]) -> None:
     print(f"  3. Run:  mimir run --home {home}")
 
 
+# ---------------------------------------------------------------------------
+# `mimir identities` subcommand (FUTURE_WORK §6.1)
+# ---------------------------------------------------------------------------
+
+
+def _identities_load(yaml_path: Path) -> dict:
+    """Load state/identities.yaml as a mutable dict. Missing file or empty
+    body returns ``{"people": []}``. Raises ``ValueError`` on parse error
+    (so the CLI fails loudly rather than overwriting an unreadable file)."""
+    if not yaml_path.is_file():
+        return {"people": []}
+    text = yaml_path.read_text(encoding="utf-8")
+    try:
+        data = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"identities.yaml parse failed: {exc}") from exc
+    if not isinstance(data, dict):
+        return {"people": []}
+    if not isinstance(data.get("people"), list):
+        data["people"] = []
+    return data
+
+
+def _identities_save(yaml_path: Path, data: dict) -> None:
+    """Atomic write via ``<file>.tmp + rename``. Same pattern as scheduler.yaml.
+
+    Note: this loses the comment header from the starter template. Once
+    the operator runs the CLI, the file becomes machine-managed; the
+    schema documentation lives in ``mimir/identities.py`` and
+    FUTURE_WORK §6.1 instead.
+    """
+    yaml_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = yaml_path.with_suffix(".yaml.tmp")
+    body = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+    tmp.write_text(body, encoding="utf-8")
+    tmp.rename(yaml_path)
+
+
+def _identities_list_cmd(yaml_path: Path) -> None:
+    data = _identities_load(yaml_path)
+    people = data.get("people") or []
+    if not people:
+        print("(no identities defined)")
+        return
+    for entry in people:
+        canonical = entry.get("canonical", "?")
+        display = entry.get("display_name") or ""
+        notes = entry.get("notes") or ""
+        aliases = entry.get("aliases") or []
+        head = f"- {canonical}"
+        if display:
+            head += f" — {display}"
+        if notes:
+            head += f" ({notes})"
+        print(head)
+        for alias in aliases:
+            print(f"    {alias}")
+
+
+def _identities_add_cmd(
+    yaml_path: Path,
+    canonical: str,
+    alias: str,
+    display_name: str | None,
+    notes: str | None,
+) -> None:
+    data = _identities_load(yaml_path)
+    people: list = data.setdefault("people", [])
+
+    # Reject if alias is already claimed by a different canonical — collisions
+    # in the alias map are last-wins at load, but the operator probably wants
+    # the CLI to surface the conflict instead of silently overwriting.
+    for entry in people:
+        for existing_alias in entry.get("aliases") or []:
+            if existing_alias == alias and entry.get("canonical") != canonical:
+                raise ValueError(
+                    f"alias {alias!r} already maps to canonical "
+                    f"{entry.get('canonical')!r}; remove it first or use a "
+                    f"different alias"
+                )
+
+    target = next((e for e in people if e.get("canonical") == canonical), None)
+    if target is None:
+        target = {"canonical": canonical, "aliases": []}
+        people.append(target)
+
+    if display_name:
+        target["display_name"] = display_name
+    if notes:
+        target["notes"] = notes
+    aliases = target.setdefault("aliases", [])
+    if alias not in aliases:
+        aliases.append(alias)
+
+    _identities_save(yaml_path, data)
+    print(f"added: {canonical} ← {alias}")
+
+
+def _identities_remove_cmd(
+    yaml_path: Path,
+    alias: str | None,
+    canonical: str | None,
+) -> None:
+    data = _identities_load(yaml_path)
+    people: list = data.get("people") or []
+
+    if canonical:
+        before = len(people)
+        people[:] = [p for p in people if p.get("canonical") != canonical]
+        if len(people) == before:
+            print(f"(no identity with canonical {canonical!r})")
+            return
+        data["people"] = people
+        _identities_save(yaml_path, data)
+        print(f"removed identity: {canonical}")
+        return
+
+    if alias:
+        for entry in people:
+            aliases = entry.get("aliases") or []
+            if alias in aliases:
+                aliases.remove(alias)
+                _identities_save(yaml_path, data)
+                print(f"removed alias: {alias} (from {entry.get('canonical')})")
+                return
+        print(f"(alias {alias!r} not found)")
+
+
+def _identities_resolve_cmd(home: Path, author: str) -> None:
+    resolver = IdentityResolver(home=home)
+    resolver.reload()
+    canonical = resolver.resolve(author)
+    if canonical == author:
+        print(f"{author} → (no identity record; falls through to itself)")
+        return
+    display = resolver.display_name(author)
+    suffix = f" ({display})" if display else ""
+    print(f"{author} → {canonical}{suffix}")
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="mimir",
@@ -314,11 +459,84 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
 
+    # `mimir identities {list,add,remove,resolve}` — manage the alias map
+    # at <home>/state/identities.yaml. Operator-facing; the agent doesn't
+    # use this CLI (FUTURE_WORK §6.1).
+    id_p = sub.add_parser(
+        "identities",
+        help="Manage identity reconciliation entries (state/identities.yaml).",
+    )
+    id_sub = id_p.add_subparsers(dest="identities_action")
+
+    id_list_p = id_sub.add_parser("list", help="Show all identities.")
+    id_list_p.add_argument("--home", type=Path, default=Path.cwd())
+
+    id_add_p = id_sub.add_parser(
+        "add",
+        help="Add (or extend) an identity with an alias.",
+    )
+    id_add_p.add_argument("--home", type=Path, default=Path.cwd())
+    id_add_p.add_argument("--canonical", required=True, help="Canonical id (e.g. 'alice').")
+    id_add_p.add_argument(
+        "--alias",
+        required=True,
+        help="Platform-prefixed alias (e.g. 'slack-U05ALICE', 'discord-456789', "
+             "'bsky:alice.bsky.social', 'email:alice@example.com').",
+    )
+    id_add_p.add_argument("--display-name", default=None, help="Optional display name.")
+    id_add_p.add_argument("--notes", default=None, help="Optional notes (surfaces in prompt).")
+
+    id_rm_p = id_sub.add_parser(
+        "remove",
+        help="Remove an alias or an entire identity.",
+    )
+    id_rm_p.add_argument("--home", type=Path, default=Path.cwd())
+    rm_group = id_rm_p.add_mutually_exclusive_group(required=True)
+    rm_group.add_argument("--alias", help="Alias to remove (from whichever identity owns it).")
+    rm_group.add_argument("--canonical", help="Canonical id of an identity to remove entirely.")
+
+    id_resolve_p = id_sub.add_parser(
+        "resolve",
+        help="Diagnostic: show what an author id maps to.",
+    )
+    id_resolve_p.add_argument("--home", type=Path, default=Path.cwd())
+    id_resolve_p.add_argument("author", help="Author id to resolve (e.g. 'slack-U05ALICE').")
+
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.command == "setup":
         status = setup_home(args.home)
         _print_setup_report(status)
+        return
+
+    if args.command == "identities":
+        if args.identities_action is None:
+            id_p.print_help()
+            sys.exit(1)
+        home = Path(args.home).resolve()
+        yaml_path = home / "state" / "identities.yaml"
+        try:
+            if args.identities_action == "list":
+                _identities_list_cmd(yaml_path)
+            elif args.identities_action == "add":
+                _identities_add_cmd(
+                    yaml_path,
+                    canonical=args.canonical,
+                    alias=args.alias,
+                    display_name=args.display_name,
+                    notes=args.notes,
+                )
+            elif args.identities_action == "remove":
+                _identities_remove_cmd(
+                    yaml_path,
+                    alias=args.alias,
+                    canonical=args.canonical,
+                )
+            elif args.identities_action == "resolve":
+                _identities_resolve_cmd(home, args.author)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
         return
 
     if args.command in (None, "run"):

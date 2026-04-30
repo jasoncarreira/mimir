@@ -121,3 +121,179 @@ def test_setup_rejects_non_directory_home(tmp_path: Path):
         setup_home(target)
     # The original file is untouched.
     assert target.read_text() == "i am a file, not a directory"
+
+
+# ---- mimir identities {list,add,remove,resolve} ----------------------
+
+
+def test_identities_list_empty(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path
+    main(["identities", "list", "--home", str(home)])
+    out = capsys.readouterr().out
+    assert "(no identities defined)" in out
+
+
+def test_identities_add_creates_new_canonical(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-U05ALICE",
+        "--display-name", "Alice Smith",
+        "--notes", "Eng team lead",
+    ])
+    out = capsys.readouterr().out
+    assert "added: alice ← slack-U05ALICE" in out
+
+    # File written; resolver picks it up.
+    yaml_path = home / "state" / "identities.yaml"
+    assert yaml_path.is_file()
+    body = yaml_path.read_text()
+    assert "alice" in body
+    assert "slack-U05ALICE" in body
+    assert "Alice Smith" in body
+    assert "Eng team lead" in body
+
+
+def test_identities_add_extends_existing(tmp_path: Path):
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-U05ALICE",
+    ])
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "discord-456789",
+    ])
+
+    from mimir.identities import IdentityResolver
+    r = IdentityResolver(home=home)
+    r.reload()
+    assert r.resolve("slack-U05ALICE") == "alice"
+    assert r.resolve("discord-456789") == "alice"
+    # Single canonical entry, two aliases.
+    identities = r.all_identities()
+    assert len(identities) == 1
+    assert set(identities[0].aliases) == {"slack-U05ALICE", "discord-456789"}
+
+
+def test_identities_add_rejects_alias_collision(tmp_path: Path, capsys: pytest.CaptureFixture):
+    """Adding an alias already claimed by a different canonical exits non-zero
+    with a clear error — last-wins works at load but the CLI surfaces the
+    conflict so the operator notices."""
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-shared",
+    ])
+    capsys.readouterr()  # drain
+    with pytest.raises(SystemExit) as exc_info:
+        main([
+            "identities", "add", "--home", str(home),
+            "--canonical", "bob",
+            "--alias", "slack-shared",
+        ])
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "already maps to canonical 'alice'" in err
+
+
+def test_identities_remove_alias(tmp_path: Path):
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-U05ALICE",
+    ])
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "discord-456",
+    ])
+    main([
+        "identities", "remove", "--home", str(home),
+        "--alias", "discord-456",
+    ])
+
+    from mimir.identities import IdentityResolver
+    r = IdentityResolver(home=home)
+    r.reload()
+    # Slack alias survives; discord alias is gone.
+    assert r.resolve("slack-U05ALICE") == "alice"
+    assert r.resolve("discord-456") == "discord-456"  # falls through
+
+
+def test_identities_remove_canonical(tmp_path: Path):
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-U05ALICE",
+    ])
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "bob",
+        "--alias", "slack-U07BOB",
+    ])
+    main([
+        "identities", "remove", "--home", str(home),
+        "--canonical", "alice",
+    ])
+
+    from mimir.identities import IdentityResolver
+    r = IdentityResolver(home=home)
+    r.reload()
+    # Alice gone entirely; bob unchanged.
+    assert r.resolve("slack-U05ALICE") == "slack-U05ALICE"
+    assert r.resolve("slack-U07BOB") == "bob"
+
+
+def test_identities_resolve_known(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-U05ALICE",
+        "--display-name", "Alice Smith",
+    ])
+    capsys.readouterr()
+    main([
+        "identities", "resolve", "--home", str(home),
+        "slack-U05ALICE",
+    ])
+    out = capsys.readouterr().out
+    assert "slack-U05ALICE → alice" in out
+    assert "Alice Smith" in out
+
+
+def test_identities_resolve_unknown(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path
+    main(["identities", "resolve", "--home", str(home), "slack-UUNKNOWN"])
+    out = capsys.readouterr().out
+    assert "slack-UUNKNOWN" in out
+    assert "no identity record" in out
+
+
+def test_identities_list_after_adds(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-U05ALICE",
+        "--display-name", "Alice Smith",
+    ])
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "discord-456",
+    ])
+    capsys.readouterr()
+    main(["identities", "list", "--home", str(home)])
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert "Alice Smith" in out
+    assert "slack-U05ALICE" in out
+    assert "discord-456" in out

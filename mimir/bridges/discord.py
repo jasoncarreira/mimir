@@ -364,10 +364,21 @@ class DiscordBridge(Bridge):
             content = "User sent a message with no text."
 
         author_id = str(getattr(message.author, "id", "") or "") or None
-        author_display = str(message.author)
+        # Discord exposes display info directly on the User/Member object —
+        # no API round-trip needed (unlike Slack). Preference order:
+        #   - display_name: server-specific nickname OR global name OR username
+        #     (this is the value Discord clients show; what users see)
+        #   - global_name: cross-server display name
+        #   - str(message.author): legacy-format username[#discriminator]
+        # Falling through the chain keeps us robust to Mock/SimpleNamespace
+        # test stand-ins that may only provide some fields.
+        author_display = (
+            getattr(message.author, "display_name", None)
+            or getattr(message.author, "global_name", None)
+            or str(message.author)
+        )
         # Platform-prefixed stable id is the matching key for cross-channel
-        # / cross-platform pull (FUTURE_WORK §6.1). Display name moves to
-        # author_display for rendering.
+        # / cross-platform pull (FUTURE_WORK §6.1).
         author_key = f"discord-{author_id}" if author_id else None
 
         event = AgentEvent(
