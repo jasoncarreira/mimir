@@ -456,6 +456,35 @@ Each turn rebuilds the system prompt (memory/core/ + indexes) which is ~mostly s
 
 If caching isn't hitting: silent invalidator somewhere (timestamp in system prompt, varying tool list, etc.). Audit per `shared/prompt-caching.md`.
 
+### 7.5 Cross-encoder reranker over file_search candidates
+
+**Status:** designed; not blocking.
+
+`file_search` today does first-pass hybrid retrieval — weighted linear sum of normalized cosine similarity (`W_COSINE=0.5`), normalized BM25 (`W_BM25=0.2`), and recency (`W_RECENCY=0.3`) — over a candidate pool. Both signals are computed *independently of the query-document interaction*: the embedder vectorizes query and document separately, and BM25 is a statistical match. The fusion picks the right candidates well at the broad level (Engram showed `retrieval.hit_rate=0.86`), but ordering within the pool can miss "this chunk specifically *answers* the question" vs "this chunk is on the same topic."
+
+Note: not RRF. The mimir runtime's hybrid scheme is weighted-linear; MSAM's atom-retrieval pipeline is the place that uses Reciprocal Rank Fusion, and the `rrf_keyword_weight` config lives there.
+
+**Approach:** plug a cross-encoder reranker into `Indexer._search_sync` after the candidate pool is built. The cross-encoder processes `(query, document)` jointly so it can capture the query-document interaction the bi-encoder embeddings miss.
+
+```python
+# in _search_sync, after the candidates dict is populated
+if self._reranker is not None:
+    candidates = self._reranker.rerank(query, candidates)
+candidates.sort(key=score)[:k]
+```
+
+`fastembed` (already a mimir dependency) ships a `Rerank` class with `bge-reranker-v2-m3`. Adds ~500MB ONNX model on top of the existing `bge-small-en-v1.5`. Local, CPU, ~10ms per query-document pair → ~200ms to rerank a top-20 pool. Same dependency surface as today; no new API key, no network call.
+
+**When this matters:** failures of shape "right answer is in the candidate pool but ranked too low to be returned in the top-k." Doesn't help when the answer isn't in the pool at all (that's a retrieval problem, not an ordering one).
+
+**Cost:** +200ms per `file_search` call. The agent calls `file_search` several times per turn during research-shaped work; aggregate latency on a chatty channel is meaningful. Memory: +500MB. Pi-class deployments care.
+
+**When to revisit:** after a bench rerun shows retrieval ordering (not retrieval coverage) is the limiting factor. If the failure cluster is "answer not retrieved at all" — like the cross-agent disambiguation gap on Engram — a reranker can't help, and the leverage is elsewhere (identity reconciliation, versioning convention, etc.).
+
+**Effort:** ~150 LOC. Needs a config flag (`MIMIR_RERANKER=true`), the fastembed `Rerank` lazy-loaded like `FastEmbedder`, a unit test that the reranker is called when configured, and an integration test verifying it actually changes ranking on a contrived case.
+
+**Considered alternative — contextual chunk enhancement (LLM-generated context prepended at index time, à la Anthropic's contextual retrieval).** Per-chunk LLM call at indexing means a real token bill that scales with reindex frequency, plus a new runtime dependency (LLM client in the indexer). Not cost-justified for current workloads — mimir's wiki layer keeps chunks largely self-contained, and the bench's failures aren't retrieval-coverage-limited. Reranking is the cheaper path if/when retrieval becomes the bottleneck.
+
 ---
 
 ## 8. Architecture / longer-term
