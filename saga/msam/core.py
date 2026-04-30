@@ -1834,6 +1834,159 @@ def _expand_query_for_keyword(query: str) -> str:
     return query + ' ' + ' '.join(extras)
 
 
+def _triple_augment_v2(query: str, top_k: int = 10) -> list[dict]:
+    """P41 — embedding-cosine match against active triples to surface
+    related atoms. Replaces the regex/flat-baseline triple augmentation
+    in retrieval_v2.
+
+    Strict no-op when ``[retrieval] enable_triple_augment_v2`` is False
+    (default). When on, embeds the query, cosine-matches against every
+    active triple's embedding, takes the top_k triples by cosine, then
+    follows ``triple.atom_id`` to the source atom for each.
+
+    Returns atoms in cosine-descending order; downstream RRF fusion uses
+    the rank in this list, not the raw score, so no calibration is
+    needed at this layer.
+    """
+    if not _cfg('retrieval', 'enable_triple_augment_v2', False):
+        return []
+
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT atom_id, embedding FROM triples "
+            "WHERE state = 'active' AND embedding IS NOT NULL"
+        ).fetchall()
+    except Exception:
+        conn.close()
+        return []
+    if not rows:
+        conn.close()
+        return []
+
+    try:
+        query_emb = cached_embed_query(query)
+    except Exception:
+        conn.close()
+        return []
+    if not query_emb:
+        conn.close()
+        return []
+
+    sims: list[tuple[str, float]] = []
+    for r in rows:
+        try:
+            t_emb = unpack_embedding(r['embedding'])
+            sim = cosine_similarity(query_emb, t_emb)
+            sims.append((r['atom_id'], sim))
+        except Exception:
+            continue
+    if not sims:
+        conn.close()
+        return []
+
+    # Best cosine per atom — same atom can be backed by multiple triples
+    # (one per fact); we collapse to the strongest match.
+    best_per_atom: dict[str, float] = {}
+    for atom_id, sim in sims:
+        if not atom_id:
+            continue
+        if atom_id not in best_per_atom or sim > best_per_atom[atom_id]:
+            best_per_atom[atom_id] = sim
+
+    ranked = sorted(best_per_atom.items(), key=lambda x: -x[1])[:top_k]
+    if not ranked:
+        conn.close()
+        return []
+
+    placeholders = ",".join("?" * len(ranked))
+    atom_rows = conn.execute(
+        f"SELECT * FROM atoms WHERE id IN ({placeholders}) "
+        f"AND state IN ('active','fading')",
+        tuple(aid for aid, _ in ranked),
+    ).fetchall()
+    conn.close()
+
+    by_id = {r['id']: dict(r) for r in atom_rows}
+    out: list[dict] = []
+    for atom_id, sim in ranked:
+        if atom_id not in by_id:
+            continue
+        atom = by_id[atom_id]
+        atom.pop("embedding", None)
+        atom["_similarity"] = sim
+        atom["_triple_augmented_v2"] = True
+        out.append(atom)
+    return out
+
+
+def _subatom_beam_atoms(query: str, top_k: int, mode: str) -> list[dict]:
+    """P43 beam 2 — sentence-level retrieval via compressed_retrieve,
+    folded back to parent atoms with the strongest sentence's score.
+
+    Strict no-op when ``[retrieval] enable_subatom_beam`` is False
+    (default). When on, calls compressed_retrieve to extract sentences,
+    keeps the max sentence score per parent atom, returns atoms ranked
+    by that score so RRF can fuse them with the cheap-path beams.
+    """
+    if not _cfg('retrieval', 'enable_subatom_beam', False):
+        return []
+
+    try:
+        from .subatom import compressed_retrieve
+    except Exception:
+        return []
+
+    try:
+        result = compressed_retrieve(
+            query, mode=mode,
+            top_k=max(top_k * 2, 8),
+            enable_subatom=True,
+            enable_dedup=True,
+            enable_synthesis=False,
+        )
+    except Exception:
+        return []
+
+    sentences = result.get("sentences") or []
+    if not sentences:
+        return []
+
+    best_per_atom: dict[str, float] = {}
+    for s in sentences:
+        aid = s.get("atom_id") or ""
+        if not aid:
+            continue
+        score = float(s.get("score") or 0.0)
+        if aid not in best_per_atom or score > best_per_atom[aid]:
+            best_per_atom[aid] = score
+
+    if not best_per_atom:
+        return []
+
+    ranked = sorted(best_per_atom.items(), key=lambda x: -x[1])[:top_k]
+    placeholders = ",".join("?" * len(ranked))
+    conn = get_db()
+    atom_rows = conn.execute(
+        f"SELECT * FROM atoms WHERE id IN ({placeholders}) "
+        f"AND state IN ('active','fading')",
+        tuple(aid for aid, _ in ranked),
+    ).fetchall()
+    conn.close()
+
+    by_id = {r['id']: dict(r) for r in atom_rows}
+    out: list[dict] = []
+    for atom_id, score in ranked:
+        if atom_id not in by_id:
+            continue
+        atom = by_id[atom_id]
+        atom.pop("embedding", None)
+        atom["_subatom_beam"] = True
+        atom["_subatom_score"] = score
+        out.append(atom)
+    return out
+
+
 def hybrid_retrieve(
     query: str,
     mode: str = "task",
@@ -2038,6 +2191,32 @@ def hybrid_retrieve(
             hyde_semantic = []
             hyde_semantic_obs = []
 
+    # P43 — subatom beam: sentence-level retrieval folded back to parent
+    # atoms with the strongest sentence's score. Strict no-op when
+    # [retrieval] enable_subatom_beam is False (default).
+    subatom_beam: list = []
+    if _fusion == 'rrf':
+        try:
+            subatom_beam = _subatom_beam_atoms(query, top_k=top_k, mode=mode)
+        except Exception:
+            subatom_beam = []
+        if subatom_beam:
+            _retrieval_log.info("path=subatom_beam atoms=%d", len(subatom_beam))
+
+    # P41 — triple-augmented retrieve via embedding cosine on active
+    # triples. Strict no-op when [retrieval] enable_triple_augment_v2
+    # is False (default).
+    triple_augment: list = []
+    if _fusion == 'rrf':
+        try:
+            triple_augment = _triple_augment_v2(query, top_k=top_k)
+        except Exception:
+            triple_augment = []
+        if triple_augment:
+            _retrieval_log.info(
+                "path=triple_augment_v2 atoms=%d", len(triple_augment)
+            )
+
     combined: dict = {}
     for atom in semantic_results:
         combined[atom["id"]] = atom
@@ -2046,6 +2225,10 @@ def hybrid_retrieve(
     for atom in graph_results:
         combined.setdefault(atom["id"], atom)
     for atom in hyde_semantic:
+        combined.setdefault(atom["id"], atom)
+    for atom in subatom_beam:
+        combined.setdefault(atom["id"], atom)
+    for atom in triple_augment:
         combined.setdefault(atom["id"], atom)
 
     if _fusion == 'rrf':
@@ -2056,6 +2239,8 @@ def hybrid_retrieve(
             'keyword': _cfg('retrieval', 'rrf_keyword_weight', 1.0),
             'graph': _cfg('retrieval', 'rrf_graph_weight', 0.7),
             'hyde_semantic': _cfg('retrieval', 'rrf_hyde_weight', 1.0),
+            'subatom': _cfg('retrieval', 'rrf_subatom_weight', 1.0),
+            'triple_augment': _cfg('retrieval', 'rrf_triple_augment_weight', 1.0),
         }
         ranked_lists = {
             'semantic': [a["id"] for a in semantic_results],
@@ -2065,6 +2250,10 @@ def hybrid_retrieve(
             ranked_lists['graph'] = [a["id"] for a in graph_results]
         if hyde_semantic:
             ranked_lists['hyde_semantic'] = [a["id"] for a in hyde_semantic]
+        if subatom_beam:
+            ranked_lists['subatom'] = [a["id"] for a in subatom_beam]
+        if triple_augment:
+            ranked_lists['triple_augment'] = [a["id"] for a in triple_augment]
         ranked = reciprocal_rank_fusion(ranked_lists, k=_k, weights=weights)
         for aid, score in ranked:
             if aid in combined:

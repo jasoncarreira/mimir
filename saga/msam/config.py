@@ -98,6 +98,17 @@ _DEFAULTS = {
         # middle, letting strong-similarity pulled-ins compete with
         # mid-rank in-pool raws. See NEXT-EXPERIMENTS.md P39.
         "missing_ref_score_pivot": "min",
+        # P41 — embedding-cosine triple augmentation. When True, every
+        # query also runs nearest-neighbor on the triples table; the
+        # top-K matched triples' source atoms join RRF as a
+        # 'triple_augment' pathway. Strict no-op when off; when on,
+        # adds one cosine pass over active triples per query.
+        "enable_triple_augment_v2": False,
+        # P43 — subatom (sentence-level) retrieval as an additional
+        # beam. compressed_retrieve runs on the original query, top
+        # sentences map back to their parent atom, atoms join RRF as
+        # a 'subatom' pathway. Strict no-op when off.
+        "enable_subatom_beam": False,
         "similarity_threshold": 0.2,
         "sigmoid_midpoint": 0.35,
         "sigmoid_steepness": 15.0,
@@ -502,7 +513,7 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
         "fusion", "rrf_k",
         "rrf_semantic_weight", "rrf_keyword_weight",
         "rrf_graph_weight", "rrf_temporal_weight",
-        "rrf_hyde_weight",
+        "rrf_hyde_weight", "rrf_subatom_weight", "rrf_triple_augment_weight",
         "two_tier_enabled", "observations_top_k",
         "observation_confidence_min_sim", "evidence_boost_cap_multiplier",
         "enable_observation_bonus", "observation_bonus_alpha",

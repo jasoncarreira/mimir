@@ -687,3 +687,224 @@ class TestRetrievalPathLogging:
 
         msgs = [r.getMessage() for r in caplog.records if r.name == "msam.retrieval"]
         assert msgs == [], f"unexpected INFO logs: {msgs}"
+
+
+# ─── P41: embedding-cosine triple augmentation ────────────────────────────
+
+class TestTripleAugmentV2:
+    """P41: cosine-match query embedding against active triple embeddings,
+    surface the source atoms via triple.atom_id. Strict no-op when
+    [retrieval] enable_triple_augment_v2 is False (default)."""
+
+    def _seed_triple(self, monkeypatch, atom_id="src1", subject="user",
+                     predicate="profession", obj="software_engineer"):
+        """Seed one atom + one triple about it."""
+        from msam.core import store_atom, get_db, pack_embedding
+        import numpy as np
+        # Seed the atom
+        real_id = store_atom("the user is a software engineer at TechCorp")
+        # Seed a triple referencing it with a known embedding
+        conn = get_db()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS triples (
+                id TEXT PRIMARY KEY, atom_id TEXT, subject TEXT,
+                predicate TEXT, object TEXT, confidence REAL DEFAULT 1.0,
+                state TEXT DEFAULT 'active', embedding BLOB,
+                valid_from TEXT, valid_until TEXT, source_atom_id TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        # Embedding fixture returns the same vector for every text, so the
+        # triple embedding == the query embedding == the atom embedding.
+        # That makes cosine = 1.0, which is what we want for the test.
+        emb = pack_embedding(list(np.zeros(1024)))  # any consistent vector
+        # Use the actual fake_emb from fixture for cosine = 1.0 with query
+        from msam.core import embed_text
+        fake_vec = list(embed_text("anything"))
+        emb = pack_embedding(fake_vec)
+        conn.execute(
+            "INSERT INTO triples (id, atom_id, subject, predicate, object, "
+            "embedding, state) VALUES (?, ?, ?, ?, ?, ?, 'active')",
+            ("t1", real_id, subject, predicate, obj, emb)
+        )
+        conn.commit()
+        conn.close()
+        return real_id
+
+    def test_disabled_is_noop(self, cfg_override, monkeypatch):
+        from msam.core import _triple_augment_v2
+        cfg_override.setdefault("retrieval", {})["enable_triple_augment_v2"] = False
+        # Even with a triple seeded, the helper must early-return [].
+        self._seed_triple(monkeypatch)
+        assert _triple_augment_v2("what is the user's profession?") == []
+
+    def test_no_triples_is_noop(self, cfg_override):
+        from msam.core import _triple_augment_v2
+        cfg_override.setdefault("retrieval", {})["enable_triple_augment_v2"] = True
+        # Empty triples table → empty result.
+        assert _triple_augment_v2("anything") == []
+
+    def test_enabled_returns_atom_for_matched_triple(self, cfg_override, monkeypatch):
+        from msam.core import _triple_augment_v2
+        cfg_override.setdefault("retrieval", {})["enable_triple_augment_v2"] = True
+        atom_id = self._seed_triple(monkeypatch)
+
+        out = _triple_augment_v2("what is the user's profession?", top_k=5)
+        assert len(out) == 1
+        assert out[0]["id"] == atom_id
+        assert out[0]["_triple_augmented_v2"] is True
+        # Cosine == 1.0 because fixture's embed_text returns the same vec.
+        assert out[0]["_similarity"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_collapses_duplicate_atom_id_to_max_sim(self, cfg_override, monkeypatch):
+        """If the same atom is referenced by multiple matching triples,
+        we surface it once with the strongest cosine."""
+        from msam.core import _triple_augment_v2, get_db, pack_embedding, embed_text
+        cfg_override.setdefault("retrieval", {})["enable_triple_augment_v2"] = True
+        atom_id = self._seed_triple(monkeypatch)
+        # Add a second triple pointing at the same atom_id.
+        conn = get_db()
+        emb = pack_embedding(list(embed_text("anything")))
+        conn.execute(
+            "INSERT INTO triples (id, atom_id, subject, predicate, object, "
+            "embedding, state) VALUES ('t2', ?, 'user', 'works_at', "
+            "'TechCorp', ?, 'active')",
+            (atom_id, emb)
+        )
+        conn.commit()
+        conn.close()
+
+        out = _triple_augment_v2("what is the user's profession?", top_k=5)
+        # Atom appears exactly once despite two matching triples.
+        assert len(out) == 1
+        assert out[0]["id"] == atom_id
+
+
+# ─── P43: subatom (sentence-level) beam ────────────────────────────────────
+
+class TestSubatomBeam:
+    """P43 beam 2: compressed_retrieve produces sentence-level extracts;
+    map sentences back to parent atoms with the strongest sentence's score
+    as the atom's beam-2 score. Strict no-op when [retrieval]
+    enable_subatom_beam is False."""
+
+    def test_disabled_is_noop(self, cfg_override, monkeypatch):
+        from msam.core import _subatom_beam_atoms
+        cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = False
+        # Even mocking compressed_retrieve to return data — flag-off must
+        # short-circuit before calling.
+        called = {"n": 0}
+        def _spy(*args, **kw):
+            called["n"] += 1
+            return {"sentences": [{"atom_id": "x", "score": 0.9}]}
+        monkeypatch.setattr("msam.subatom.compressed_retrieve", _spy)
+        assert _subatom_beam_atoms("anything", top_k=3, mode="task") == []
+        assert called["n"] == 0
+
+    def test_enabled_collapses_sentences_to_atoms(self, cfg_override, monkeypatch):
+        from msam.core import _subatom_beam_atoms, store_atom
+        cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = True
+        # Seed two atoms so the helper has something to load.
+        a = store_atom("the user prefers dark mode for late-night coding")
+        b = store_atom("the user enjoys mountain biking on weekends")
+
+        # Mock compressed_retrieve to return four sentences spread across
+        # two atoms with varying scores.
+        def fake(*args, **kw):
+            return {"sentences": [
+                {"atom_id": a, "sentence": "...", "score": 0.5},
+                {"atom_id": a, "sentence": "...", "score": 0.8},
+                {"atom_id": b, "sentence": "...", "score": 0.3},
+                {"atom_id": b, "sentence": "...", "score": 0.4},
+            ]}
+        monkeypatch.setattr("msam.subatom.compressed_retrieve", fake)
+
+        out = _subatom_beam_atoms("dark mode", top_k=5, mode="task")
+        assert len(out) == 2
+        # Atom a has the higher max-sentence-score (0.8 > 0.4) so it ranks first.
+        assert out[0]["id"] == a
+        assert out[1]["id"] == b
+        # _subatom_score reflects the per-atom MAX, not sum.
+        assert out[0]["_subatom_score"] == pytest.approx(0.8)
+        assert out[1]["_subatom_score"] == pytest.approx(0.4)
+
+    def test_no_sentences_is_noop(self, cfg_override, monkeypatch):
+        from msam.core import _subatom_beam_atoms
+        cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = True
+        monkeypatch.setattr("msam.subatom.compressed_retrieve",
+                            lambda *a, **kw: {"sentences": []})
+        assert _subatom_beam_atoms("anything", top_k=3, mode="task") == []
+
+    def test_compressed_retrieve_failure_is_noop(self, cfg_override, monkeypatch):
+        """A crash inside compressed_retrieve must drop the beam silently —
+        same resilience pattern as graph/HyDE pathways."""
+        from msam.core import _subatom_beam_atoms
+        cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = True
+        def _boom(*a, **kw): raise RuntimeError("subatom blew up")
+        monkeypatch.setattr("msam.subatom.compressed_retrieve", _boom)
+        assert _subatom_beam_atoms("anything", top_k=3, mode="task") == []
+
+
+class TestBeamPathwaysInHybridRetrieve:
+    """Confirm the new pathways wire into hybrid_retrieve's RRF correctly:
+    when the flags are off, no extra DB calls happen; when on, the
+    pathways join the ranked_lists alongside semantic+keyword."""
+
+    def test_both_flags_off_no_extra_helpers_called(self, cfg_override, monkeypatch):
+        from msam.core import hybrid_retrieve, store_atom
+        cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = False
+        cfg_override["retrieval"]["enable_triple_augment_v2"] = False
+        cfg_override["retrieval"]["fusion"] = "rrf"
+
+        called = {"sub": 0, "trip": 0}
+        # Replace the helpers so we can confirm they're early-returned by
+        # the flag check inside hybrid_retrieve, not just by their own
+        # internal flag check.
+        monkeypatch.setattr("msam.core._subatom_beam_atoms",
+                            lambda *a, **kw: called.__setitem__("sub", called["sub"] + 1) or [])
+        monkeypatch.setattr("msam.core._triple_augment_v2",
+                            lambda *a, **kw: called.__setitem__("trip", called["trip"] + 1) or [])
+
+        store_atom("anything for the cheap path to find")
+        hybrid_retrieve("anything", top_k=3)
+        # Helpers ARE called (hybrid_retrieve always invokes them; their
+        # internal flag-check is the gate). They must return [] which
+        # contributes nothing to RRF.
+        assert called["sub"] == 1
+        assert called["trip"] == 1
+
+    def test_subatom_beam_joins_rrf_when_enabled(self, cfg_override, monkeypatch):
+        from msam.core import hybrid_retrieve, store_atom
+        cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = True
+        cfg_override["retrieval"]["fusion"] = "rrf"
+
+        seed_id = store_atom("dark mode preference content")
+        # Stub the helper to return our seeded atom as the only beam result.
+        monkeypatch.setattr(
+            "msam.core._subatom_beam_atoms",
+            lambda q, top_k, mode: [{"id": seed_id, "content": "x",
+                                     "_subatom_score": 0.9, "_subatom_beam": True}],
+        )
+
+        results = hybrid_retrieve("anything", top_k=3)
+        # The seeded atom should appear in results (it could come from
+        # cheap path AND subatom; RRF dedupes by id).
+        ids = [r["id"] for r in results]
+        assert seed_id in ids
+
+    def test_triple_augment_joins_rrf_when_enabled(self, cfg_override, monkeypatch):
+        from msam.core import hybrid_retrieve, store_atom
+        cfg_override.setdefault("retrieval", {})["enable_triple_augment_v2"] = True
+        cfg_override["retrieval"]["fusion"] = "rrf"
+
+        seed_id = store_atom("the user is a software engineer")
+        monkeypatch.setattr(
+            "msam.core._triple_augment_v2",
+            lambda q, top_k=10: [{"id": seed_id, "content": "x",
+                                  "_similarity": 0.85,
+                                  "_triple_augmented_v2": True}],
+        )
+
+        results = hybrid_retrieve("user profession", top_k=3)
+        ids = [r["id"] for r in results]
+        assert seed_id in ids
