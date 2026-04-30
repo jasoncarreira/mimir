@@ -738,32 +738,6 @@ class TestWorldCmd:
         assert "error" in data
 
 
-class TestAgreementCmd:
-    def test_agreement_show(self, capsys, metrics_db):
-        from msam.remember import cmd_agreement
-        cmd_agreement([])
-        data = json.loads(capsys.readouterr().out)
-        assert "rate" in data
-
-    def test_agreement_record(self, capsys, metrics_db):
-        from msam.remember import cmd_agreement
-        cmd_agreement(["record", "agree"])
-        data = json.loads(capsys.readouterr().out)
-        assert data["recorded"] == "agree"
-
-    def test_agreement_invalid_signal(self, capsys, metrics_db):
-        from msam.remember import cmd_agreement
-        cmd_agreement(["record", "invalid_signal"])
-        data = json.loads(capsys.readouterr().out)
-        assert "error" in data
-
-    def test_agreement_with_agent(self, capsys, metrics_db):
-        from msam.remember import cmd_agreement
-        cmd_agreement(["--agent", "test-agent", "--window", "10"])
-        data = json.loads(capsys.readouterr().out)
-        assert "rate" in data
-
-
 class TestPredictCmd:
     def test_predict_context_mode(self, capsys, monkeypatch):
         monkeypatch.setattr("msam.prediction.PredictiveEngine.predict_context",

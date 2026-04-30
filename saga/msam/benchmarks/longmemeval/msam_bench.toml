@@ -61,13 +61,11 @@ outcome_decay = 1.0
 [retrieval_v2]
 enable_rerank = false   # P15 cross-encoder LLM rerank (regressed in msam_rerank_gptoss_v1)
 enabled = false
-# Cherry-pick ablation (logged 2026-04-27 / 2026-04-28) showed P11 alone
-# regressed -1.3pp and P13 alone regressed -2.6pp; the bundle was -2.8pp
-# (P11+P13's combined damage). P12 alone scored 0.792, the only positive
-# lever since P30 — shipped to canonical 2026-04-29.
-enable_query_rewriting = false
+# P12 (synonym expansion on the keyword pathway via _expand_query_for_keyword
+# in core.py) — the only positive single lever since P30. Shipped to
+# canonical 2026-04-29. Same flag still gates this even after the
+# triple-graph expand_query removal in the cleanup batch.
 enable_query_expansion = true
-enable_quality_filter = false
 
 [llm]
 # Unified LLM endpoint for every MSAM subsystem (consolidation synthesis,
@@ -99,9 +97,6 @@ use_llm = false
 enabled = false
 
 [world_model]
-enabled = false
-
-[sycophancy]
 enabled = false
 
 [decay]

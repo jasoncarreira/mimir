@@ -64,7 +64,6 @@ from msam.prediction import PredictiveEngine
 from msam.agents import register_agent, list_agents, share_atom, agent_stats
 from msam.forgetting import identify_forgetting_candidates
 from msam.calibration import calibrate, re_embed
-from msam.metrics import record_agreement, get_agreement_rate
 from msam.prediction import track_temporal_pattern, track_co_retrievals
 
 __all__ = [
@@ -115,8 +114,6 @@ __all__ = [
     "query_world",
     "update_world",
     "world_history",
-    "record_agreement",
-    "get_agreement_rate",
     "track_temporal_pattern",
     "track_co_retrievals",
 ]

@@ -306,21 +306,13 @@ async def api_store(req: StoreRequest):
                 }
             return response
 
-        triples_extracted = 0
-        # Gated by [triples] enable_extraction (default True for backward
-        # compatibility). Setting it false skips the LLM call entirely —
-        # useful for benches and deployments that don't use the graph
-        # pathway. Per-stream gate stays: only semantic atoms get triples.
-        if stream == "semantic" and _cfg('triples', 'enable_extraction', True):
-            try:
-                from .triples import extract_and_store
-                triples_extracted = extract_and_store(atom_id, req.content)
-            except Exception:
-                pass
-
+        # Triples are extracted during consolidation (P35), not at store
+        # time. The store-time path was removed in the cleanup batch — it
+        # cost an LLM call per semantic-stream store and produced lower-
+        # quality triples than cluster-level extraction.
         return {"stored": True, "atom_id": atom_id, "stream": stream,
                 "profile": profile, "annotations": annotations,
-                "triples_extracted": triples_extracted}
+                "triples_extracted": 0}
 
     return await asyncio.to_thread(_store)
 
@@ -334,10 +326,11 @@ async def api_query(req: QueryRequest):
 
         # Determine whether the caller wants the two-tier
         # {observations, raws} shape. Per-call request field wins; falls back
-        # to [retrieval] two_tier_enabled config; final default False.
+        # to [retrieval] two_tier_enabled config; final default True (the
+        # canonical-best mechanism on bench).
         two_tier = req.two_tier
         if two_tier is None:
-            two_tier = bool(_cfg('retrieval', 'two_tier_enabled', False))
+            two_tier = bool(_cfg('retrieval', 'two_tier_enabled', True))
 
         if two_tier:
             from datetime import datetime

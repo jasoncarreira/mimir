@@ -36,66 +36,6 @@ def cfg_override(monkeypatch):
     return snapshot
 
 
-# ─── P11: query rewriting ────────────────────────────────────────────────
-
-class TestQueryRewriting:
-    def test_disabled_is_noop(self, cfg_override):
-        from msam.core import _apply_query_rewriting
-        cfg_override.setdefault("retrieval_v2", {})["enable_query_rewriting"] = False
-        assert _apply_query_rewriting("What does the user think?") == \
-            "What does the user think?"
-
-    def test_enabled_normalizes_user(self, cfg_override):
-        from msam.core import _apply_query_rewriting
-        cfg_override.setdefault("retrieval_v2", {})["enable_query_rewriting"] = True
-        out = _apply_query_rewriting("what does the user think?")
-        # rewrite_query maps lowercase "user" -> "User" via _QUERY_REWRITES
-        assert "User" in out
-
-    def test_user_mappings_extend_defaults(self, cfg_override):
-        """User-supplied entity_mappings should ADD to built-in defaults,
-        not replace them. Built-in `user → User` should still apply when
-        the user adds a custom mapping."""
-        from msam.core import _apply_query_rewriting
-        cfg_override.setdefault("retrieval_v2", {})["enable_query_rewriting"] = True
-        cfg_override["retrieval_v2"]["entity_mappings"] = {
-            "the bot": "Mimir",
-        }
-        out = _apply_query_rewriting("what did the user tell the bot?")
-        # Both the built-in (user→User) and the custom (the bot→Mimir) apply.
-        assert "User" in out
-        assert "Mimir" in out
-
-    def test_user_mappings_override_default_on_conflict(self, cfg_override):
-        from msam.core import _apply_query_rewriting
-        cfg_override.setdefault("retrieval_v2", {})["enable_query_rewriting"] = True
-        cfg_override["retrieval_v2"]["entity_mappings"] = {
-            # Override the built-in `user → User` with a specific name.
-            "user": "Joe",
-        }
-        out = _apply_query_rewriting("what does the user think?")
-        # User's override wins; the default's "User" replacement is gone.
-        assert "Joe" in out
-        # "User" might still appear as part of "Joe"... it doesn't, but
-        # check explicitly that the lowercase token is gone (replaced).
-        assert " user " not in f" {out} "
-
-    def test_user_mapping_can_disable_default(self, cfg_override):
-        """Documented escape hatch: override a default with a no-op to
-        effectively disable it. Only that exact key is suppressed —
-        sibling defaults (`the user`, `user's`) still apply unless
-        explicitly overridden too."""
-        from msam.core import _apply_query_rewriting
-        cfg_override.setdefault("retrieval_v2", {})["enable_query_rewriting"] = True
-        cfg_override["retrieval_v2"]["entity_mappings"] = {
-            "user": "user",  # no-op override of the bare "user" mapping
-        }
-        # Use phrasing that only triggers the bare `user` mapping
-        # (not `the user`).
-        out = _apply_query_rewriting("what does user think?")
-        assert "User" not in out
-
-
 # ─── P12: synonym expansion (keyword pathway only) ───────────────────────
 
 class TestQueryExpansion:
@@ -128,60 +68,6 @@ class TestQueryExpansion:
         cfg_override["query_expansion"] = {"synonyms": {}}
         assert _expand_query_for_keyword("what is the user's profession?") == \
             "what is the user's profession?"
-
-
-# ─── P13: atom quality scoring ──────────────────────────────────────────
-
-class TestQualityScoring:
-    def _make_atoms(self):
-        return {
-            "low": {
-                "id": "low",
-                # Short, repetitive, no entities -> quality < 0.3
-                "content": "the the the the",
-                "_combined_score": 1.0,
-            },
-            "mid": {
-                "id": "mid",
-                "content": "The user mentioned they are a software engineer at TechCorp.",
-                "_combined_score": 1.0,
-            },
-            "high": {
-                "id": "high",
-                "content": (
-                    "The user reported that on 2026-01-15 they purchased a Sony WH-1000XM5 "
-                    "headphone for $399 from BestBuy in Boston. Notable: replaces previous "
-                    "Bose QC45 model. Configured Bluetooth pairing with iPhone 15 Pro and "
-                    "MacBook Pro M3 simultaneously."
-                ),
-                "_combined_score": 1.0,
-            },
-        }
-
-    def test_disabled_is_noop(self, cfg_override):
-        from msam.core import _apply_quality_scoring
-        cfg_override.setdefault("retrieval_v2", {})["enable_quality_filter"] = False
-        atoms = self._make_atoms()
-        before = {aid: a["_combined_score"] for aid, a in atoms.items()}
-        changed = _apply_quality_scoring(atoms)
-        after = {aid: a["_combined_score"] for aid, a in atoms.items()}
-        assert changed is False
-        assert before == after
-
-    def test_enabled_demotes_low_quality(self, cfg_override):
-        from msam.core import _apply_quality_scoring
-        cfg_override.setdefault("retrieval_v2", {})["enable_quality_filter"] = True
-        atoms = self._make_atoms()
-        changed = _apply_quality_scoring(atoms)
-        assert changed is True
-        assert atoms["low"]["_combined_score"] == pytest.approx(0.5)
-
-    def test_enabled_boosts_high_quality(self, cfg_override):
-        from msam.core import _apply_quality_scoring
-        cfg_override.setdefault("retrieval_v2", {})["enable_quality_filter"] = True
-        atoms = self._make_atoms()
-        _apply_quality_scoring(atoms)
-        assert atoms["high"]["_combined_score"] > 1.0
 
 
 # ─── Contextual query rewriting (production-only) ────────────────────────

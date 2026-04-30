@@ -76,50 +76,10 @@ class TestStore:
         # FastAPI/Pydantic allows empty strings; the endpoint logic handles it
         assert rv.status_code in (200, 400, 422)
 
-    def test_store_skips_triple_extraction_when_disabled(self, client, monkeypatch):
-        """[triples] enable_extraction = false skips the LLM call entirely
-        on /v1/store, even for semantic atoms. Avoids per-store LLM cost
-        for callers that don't use the graph pathway."""
-        import msam.annotate
-        monkeypatch.setattr(msam.annotate, "classify_stream", lambda c: "semantic")
-        monkeypatch.setattr(msam.annotate, "classify_profile", lambda c: "standard")
-        monkeypatch.setattr(msam.annotate, "smart_annotate", lambda c, use_llm=False: {
-            "arousal": 0.5, "valence": 0.0,
-            "topics": ["test"], "encoding_confidence": 0.7,
-        })
-
-        import msam.core
-        monkeypatch.setattr(msam.core, "store_atom", lambda **kwargs: "abc123def456")
-
-        # Track whether extract_and_store was called
-        called = []
-        import msam.triples
-        monkeypatch.setattr(
-            msam.triples, "extract_and_store",
-            lambda aid, c: (called.append((aid, c)), 0)[1],
-        )
-
-        # Disable extraction via the new gate
-        import msam.server as srv
-        original_cfg = srv._cfg
-        def fake_cfg(section, key, default=None):
-            if section == 'triples' and key == 'enable_extraction':
-                return False
-            return original_cfg(section, key, default)
-        monkeypatch.setattr(srv, "_cfg", fake_cfg)
-
-        rv = client.post("/v1/store", json={"content": "user prefers dark mode"})
-        assert rv.status_code == 200
-        data = rv.json()
-        assert data["stored"] is True
-        assert data["triples_extracted"] == 0
-        # Critical: extract_and_store must NOT have been invoked.
-        assert called == []
-
-    def test_store_runs_triple_extraction_by_default(self, client, monkeypatch):
-        """Backward compatibility: with the default config (no
-        enable_extraction key set), extraction still fires for semantic
-        atoms — preserves prior behavior."""
+    def test_store_does_not_call_triple_extraction(self, client, monkeypatch):
+        """Cleanup batch removed store-time triples extraction. Triples
+        are now produced exclusively during consolidation (P35), so
+        /v1/store must NOT call extract_and_store under any flag."""
         import msam.annotate
         monkeypatch.setattr(msam.annotate, "classify_stream", lambda c: "semantic")
         monkeypatch.setattr(msam.annotate, "classify_profile", lambda c: "standard")
@@ -140,9 +100,10 @@ class TestStore:
 
         rv = client.post("/v1/store", json={"content": "user prefers dark mode"})
         assert rv.status_code == 200
-        # Default cfg returns True for enable_extraction → call should fire.
-        assert len(called) == 1
-        assert called[0][0] == "abc"
+        data = rv.json()
+        assert data["stored"] is True
+        assert data["triples_extracted"] == 0
+        assert called == []
 
 
 # ─── Query ───────────────────────────────────────────────────────────────────
@@ -154,14 +115,13 @@ class TestQuery:
         assert rv.status_code == 422  # Pydantic validation error
 
     def test_query_success(self, client, monkeypatch):
-        """Test successful query with mocked hybrid retrieval."""
-        import msam.triples
-        monkeypatch.setattr(msam.triples, "hybrid_retrieve_with_triples", lambda q, mode="task", token_budget=500, **kw: {
-            "triples": [
-                {"subject": "user", "predicate": "prefers", "object": "dark mode"},
-            ],
-            "atoms": [],
-            "_raw_atoms": [
+        """Test successful query with mocked hybrid retrieval. Now goes
+        through the two-tier path by default (cleanup batch flipped
+        two_tier_enabled to True)."""
+        import msam.core
+        monkeypatch.setattr(msam.core, "hybrid_retrieve", lambda q, **kw: {
+            "observations": [],
+            "raws": [
                 {
                     "id": "abc123",
                     "content": "User prefers dark mode",
@@ -169,39 +129,28 @@ class TestQuery:
                     "_similarity": 0.85,
                     "_combined_score": 0.9,
                     "_confidence_tier": "high",
-                    "_retrieval_confidence_tier": "high",
                     "topics": '["preferences"]',
                 },
             ],
-            "triple_tokens": 5,
-            "atom_tokens": 6,
-            "total_tokens": 11,
-            "items_returned": 2,
-            "query_type": "mixed",
-            "triple_ratio": 0.4,
-            "latency_ms": 10.0,
         })
 
         rv = client.post("/v1/query", json={"query": "user preferences"})
         assert rv.status_code == 200
         data = rv.json()
         assert data["query"] == "user preferences"
-        assert data["confidence_tier"] in ("none", "low", "medium", "high")
-        assert "atoms" in data
-        assert "triples" in data
+        assert data["two_tier"] is True
+        assert "observations" in data
+        assert "raws" in data
 
     def test_query_empty_query(self, client, monkeypatch):
-        """Empty query should either be rejected or return empty results."""
-        import msam.triples
-        monkeypatch.setattr(msam.triples, "hybrid_retrieve_with_triples", lambda q, mode="task", token_budget=500, **kw: {
-            "triples": [], "atoms": [], "_raw_atoms": [],
-            "triple_tokens": 0, "atom_tokens": 0, "total_tokens": 0,
-            "items_returned": 0, "query_type": "mixed", "triple_ratio": 0, "latency_ms": 0,
-        })
+        """Empty query: in two-tier mode the response shape is
+        {observations, raws, triples=[]}; both lists must be empty."""
         rv = client.post("/v1/query", json={"query": ""})
         assert rv.status_code == 200
         data = rv.json()
-        assert data["confidence_tier"] == "none"
+        assert data["two_tier"] is True
+        assert data["observations"] == []
+        assert data["raws"] == []
 
     def test_query_two_tier_request_field(self, client, monkeypatch):
         """When the request body asks for two_tier=true, the response shape

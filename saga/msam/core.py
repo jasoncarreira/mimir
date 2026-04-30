@@ -1807,18 +1807,6 @@ def _resolve_query_and_hypothetical(
     return rewritten, hypothetical
 
 
-def _apply_query_rewriting(query: str) -> str:
-    """P11 — pattern-based query normalization (entity aliases).
-
-    Defers to retrieval_v2.rewrite_query() so the same regex patterns and
-    config-driven entity_mappings are used. No-op when the flag is off.
-    """
-    if not _cfg('retrieval_v2', 'enable_query_rewriting', False):
-        return query
-    from .retrieval_v2 import rewrite_query
-    return rewrite_query(query)
-
-
 def _expand_query_for_keyword(query: str) -> str:
     """P12 — append config-driven synonyms for the keyword pathway only.
 
@@ -1844,28 +1832,6 @@ def _expand_query_for_keyword(query: str) -> str:
     if not extras:
         return query
     return query + ' ' + ' '.join(extras)
-
-
-def _apply_quality_scoring(atoms_dict: dict) -> bool:
-    """P13 — multiply ``_combined_score`` by an info-density factor.
-
-    Uses retrieval_v2.compute_atom_quality(): low quality (<0.3) ×0.5,
-    high quality (>0.7) ×1.1. Mutates atoms_dict in place. Returns True
-    if any score was changed (caller should re-rank).
-    """
-    if not _cfg('retrieval_v2', 'enable_quality_filter', False):
-        return False
-    from .retrieval_v2 import compute_atom_quality
-    changed = False
-    for atom in atoms_dict.values():
-        quality = compute_atom_quality(atom.get('content', '') or '')
-        if quality < 0.3:
-            atom['_combined_score'] = atom.get('_combined_score', 0.0) * 0.5
-            changed = True
-        elif quality > 0.7:
-            atom['_combined_score'] = atom.get('_combined_score', 0.0) * 1.1
-            changed = True
-    return changed
 
 
 def hybrid_retrieve(
@@ -1902,7 +1868,7 @@ def hybrid_retrieve(
     start_time = time.time()
 
     if not query or not query.strip():
-        return []
+        return {"observations": [], "raws": []} if two_tier else []
 
     # Pre-retrieval LLM dispatch: contextual rewrite, HyDE, or both
     # combined. Runs before P11/P12 so subsequent regex rewriting and
@@ -1932,11 +1898,6 @@ def hybrid_retrieve(
         _retrieval_log.info("path=rewrite_only")
     # else: no pre-retrieval LLM. HyDE may still fire post-retrieval
     # under the confidence gate — that path's logging lives below.
-
-    # P11: pattern-based query rewriting (no-op unless flag set).
-    # Both pathways use the rewritten query so semantic + keyword stay
-    # in sync. Two-tier candidates also use this rewritten query.
-    query = _apply_query_rewriting(query)
 
     _sem_weight = _cfg('retrieval', 'semantic_weight', 0.7)
     _kw_weight = 1.0 - _sem_weight
@@ -1992,22 +1953,12 @@ def hybrid_retrieve(
         kw_results_obs = []
 
     graph_results: list[dict] = []
-    temporal_results: list[dict] = []
     if _fusion == 'rrf':
         if _cfg('retrieval', 'enable_graph_pathway', False):
             try:
                 graph_results = graph_retrieve(query, top_k=_cfg('retrieval', 'graph_pathway_top_k', top_k))
             except Exception:
                 graph_results = []
-        if _cfg('retrieval', 'enable_temporal_pathway', False):
-            try:
-                temporal_results = temporal_retrieve(
-                    query,
-                    top_k=_cfg('retrieval', 'temporal_pathway_top_k', top_k),
-                    reference_date=reference_date,
-                )
-            except Exception:
-                temporal_results = []
 
     # P38: HyDE pathway. Two ways to get the hypothetical:
     #   (a) pre_hypothetical was generated up-front by the combined
@@ -2094,8 +2045,6 @@ def hybrid_retrieve(
         combined.setdefault(atom["id"], atom)
     for atom in graph_results:
         combined.setdefault(atom["id"], atom)
-    for atom in temporal_results:
-        combined.setdefault(atom["id"], atom)
     for atom in hyde_semantic:
         combined.setdefault(atom["id"], atom)
 
@@ -2106,7 +2055,6 @@ def hybrid_retrieve(
             'semantic': _cfg('retrieval', 'rrf_semantic_weight', 1.0),
             'keyword': _cfg('retrieval', 'rrf_keyword_weight', 1.0),
             'graph': _cfg('retrieval', 'rrf_graph_weight', 0.7),
-            'temporal': _cfg('retrieval', 'rrf_temporal_weight', 1.0),
             'hyde_semantic': _cfg('retrieval', 'rrf_hyde_weight', 1.0),
         }
         ranked_lists = {
@@ -2115,8 +2063,6 @@ def hybrid_retrieve(
         }
         if graph_results:
             ranked_lists['graph'] = [a["id"] for a in graph_results]
-        if temporal_results:
-            ranked_lists['temporal'] = [a["id"] for a in temporal_results]
         if hyde_semantic:
             ranked_lists['hyde_semantic'] = [a["id"] for a in hyde_semantic]
         ranked = reciprocal_rank_fusion(ranked_lists, k=_k, weights=weights)
@@ -2124,14 +2070,6 @@ def hybrid_retrieve(
             if aid in combined:
                 combined[aid]["_combined_score"] = score
 
-        # P13: atom quality multiplier (no-op unless flag set). Applied
-        # before supersedes demotion / two-tier split so all downstream
-        # re-ranks see the quality-adjusted scores.
-        if _apply_quality_scoring(combined):
-            ranked = sorted(
-                ((aid, combined[aid].get("_combined_score", 0.0)) for aid in combined),
-                key=lambda x: -x[1],
-            )
 
         # Atom-level supersedes demotion. With the auto-resolve writers
         # disabled by default ([atoms] auto_resolve_supersedes_on_write=false,
@@ -2176,17 +2114,9 @@ def hybrid_retrieve(
                 k=_k,
                 weights=obs_weights,
             )
-            # P13: quality scoring on observations too. We need a pre-set
-            # baseline score for the multiplier; seed from RRF before
-            # applying.
             for aid, score in obs_ranked:
                 if aid in obs_combined:
                     obs_combined[aid]["_combined_score"] = score
-            if _apply_quality_scoring(obs_combined):
-                obs_ranked = sorted(
-                    ((aid, obs_combined[aid].get("_combined_score", 0.0)) for aid in obs_combined),
-                    key=lambda x: -x[1],
-                )
             return _two_tier_split(
                 obs_combined=obs_combined,
                 obs_ranked=obs_ranked,

@@ -285,17 +285,12 @@ _DEFAULTS = {
         "enable_beam_search": "auto",
         "beam_search_atom_threshold": 10000,  # dynamic gate: beam search activates above this
         "beam_width": 3,  # number of retrieval beams when active
-        "enable_rewrite": True,
         "enable_query_expansion": True,
         "enable_triple_augment": True,
-        "enable_entity_roles": True,
-        "enable_quality_filter": True,
-        "enable_temporal": True,
         "enable_rerank": False,  # LLM rerank off by default (latency)
         "enable_feedback": True,
         "max_expansion_terms": 5,
         # rerank_model defaults via [llm] section; can still be overridden here.
-        "entity_mappings": None,
     },
     "predictive_retrieval": {
         "user_active": True,
@@ -370,11 +365,6 @@ _DEFAULTS = {
         "auto_close_on_conflict": True,
         "temporal_extraction": True,
         "default_confidence": 1.0,
-    },
-    "sycophancy": {
-        "tracking_enabled": True,
-        "warning_threshold": 0.85,
-        "window_size": 20,
     },
 }
 
@@ -518,12 +508,9 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
         "enable_observation_bonus", "observation_bonus_alpha",
         "trend_penalty_weakening", "trend_penalty_stale",
         "enable_graph_pathway", "graph_pathway_top_k",
-        "enable_temporal_pathway", "temporal_pathway_top_k",
         "min_outcomes_for_effect",
     },
     "retrieval_v2": {
-        # P11/P12/P13 cherry-picks. Read with runtime default in core.py.
-        "enable_query_rewriting",
         # Per-subsystem LLM overrides (resolve_llm_config falls through to
         # [llm] when these are absent). Used by HyDE / contextual rewrite
         # to point at a faster/cheaper model than the bench's main LLM.
