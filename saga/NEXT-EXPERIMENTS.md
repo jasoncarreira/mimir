@@ -1258,11 +1258,26 @@ paths.
 different from single-path retrieve — sentence-level matches can
 surface atoms whose whole-atom RRF ranks them out of top-K.
 
-**Future 3rd beam.** When P41 ships (embedding-cosine triple
-augmentation), it becomes the natural 3rd beam: a triple-
-augmented retrieve as a co-equal signal. Or we could keep P41 as
-a pathway-internal mechanism inside beam 1 and stay at 2 beams.
-Decide after P41 bench.
+**Recommended run plan: ship P41 + P43 together, A/B in parallel.**
+Implement both behind strict-no-op flags. Bench two configs at the
+same time:
+- **A (`msam_p43_canon_v1`)**: P43 minimal — 2 beams (original-
+  hybrid + subatom). P41-as-beam flag OFF.
+- **B (`msam_p43_p41_canon_v1`)**: P43 + P41 — 3 beams (original-
+  hybrid + subatom + P41 triple-augmented). P41-as-beam flag ON.
+
+Comparisons:
+- A vs current canonical (data on hand) → P43-alone effect
+- B vs A → P41-as-3rd-beam delta on top of P43
+
+Discipline required: P41's flag-off path must early-return before
+any DB queries or embedding lookups, otherwise we contaminate A.
+Same pattern we used for `enable_hyde` (bench was clean).
+
+Trust the per-subtype shape over the overall delta. With ~±1.3pp
+overall noise, a single-run overall delta of ±1pp tells us nothing.
+A 5pp+ shift on a specific cohort (preference, multi-session,
+knowledge-update) is real signal.
 
 **Two flags affected.**
 - `[retrieval_v2] enable_beam_search` — change default from
@@ -1665,6 +1680,21 @@ Filed 2026-04-30. Confirmed via discussion + bench data.
    downstream caller that needs entity disambiguation. Removes
    `rewrite_query()`, `_apply_query_rewriting()`, and the cherry-
    pick wiring entirely.
+
+8. **Remove `expand_query` (triple-graph term expansion in
+   `retrieval_v2.py:151`).** Two call sites today:
+   - `beam_search_retrieve` beam 3 — P43 replaces with subatom.
+   - `compressed_retrieve` internal "extraction_query" alignment
+     — a vestigial step that can be rewritten to use the original
+     query directly.
+
+   Subtle catch: the SAME flag `[retrieval_v2] enable_query_expansion`
+   gates both `expand_query` (triple-graph, in retrieval_v2.py)
+   AND `_expand_query_for_keyword` (P12 synonym dict, in core.py).
+   Same name, two completely different mechanisms. **Keep the flag
+   and the P12 keyword-pathway version** (it's the +0.8pp lever
+   shipped to canonical); only remove the triple-graph
+   `expand_query` function and its call sites.
 
 6. **Remove store-time triples extraction.** P35 added the
    consolidation-time path; the store-time path
