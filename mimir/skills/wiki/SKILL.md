@@ -103,10 +103,11 @@ topic — accumulates state over many sessions. When a later turn asks
 for "the latest" or "the final" or "this week's" version, the page has
 to make clear which entry is current.
 
-**Mark currency explicitly, with a date.** Don't rely on chronological
-order in the page body, recency-of-write, or "I'll figure it out from
-context." Retrieval doesn't preserve write order, and a date-less
-"Latest:" section becomes wrong the moment it's updated.
+**Mark which entry is current, with a date.** Don't rely on
+chronological order in the page body, recency-of-write, or "I'll
+figure it out from context." Retrieval doesn't preserve write order,
+and a date-less "Latest:" section becomes wrong the moment it's
+updated.
 
 ## Operations
 
