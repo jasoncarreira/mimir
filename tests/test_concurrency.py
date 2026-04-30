@@ -345,6 +345,170 @@ async def test_cross_platform_pull_kill_switch_disabled(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_identity_block_surfaces_in_turn_prompt(tmp_path: Path):
+    """When an inbound's author has an identity record, the turn prompt
+    gets a 'Known identities' preamble + the recent activity uses the
+    canonical's display_name. Cross-platform messages from the same
+    person dedupe to one identity entry."""
+    from textwrap import dedent
+    from mimir.identities import IdentityResolver
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        dedent(
+            """\
+            people:
+              - canonical: alice
+                display_name: Alice Smith
+                aliases: [slack-U123, discord-456]
+                notes: Eng team lead
+              - canonical: bob
+                display_name: Bob
+                aliases: [slack-U777]
+            """
+        )
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+
+    buf = MessageBuffer(
+        history_path=tmp_path / "chat_history.jsonl",
+        resolver=resolver,
+    )
+    now = datetime.now(tz=timezone.utc)
+    # Alice on Slack
+    await buf.append(
+        buf.make_message(
+            channel_id="slack-eng",
+            kind="user_message",
+            content="slack-eng activity",
+            author="slack-U123",
+            author_display="alice_slack",
+            ts=(now - timedelta(minutes=10)).isoformat(),
+            source="slack",
+        )
+    )
+    # Alice on Discord (same person, different platform)
+    await buf.append(
+        buf.make_message(
+            channel_id="discord-eng",
+            kind="user_message",
+            content="discord-eng activity",
+            author="discord-456",
+            author_display="alice#1234",
+            ts=(now - timedelta(minutes=5)).isoformat(),
+            source="discord",
+        )
+    )
+    # Stranger on slack — no identity record
+    await buf.append(
+        buf.make_message(
+            channel_id="slack-eng",
+            kind="user_message",
+            content="random",
+            author="slack-UUNKNOWN",
+            author_display="random_user",
+            ts=(now - timedelta(minutes=2)).isoformat(),
+            source="slack",
+        )
+    )
+
+    recent = list(buf._all)
+    inbound = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-help",
+        content="hi",
+        author="slack-U123",
+        author_display="alice_slack",
+    )
+    prompt = build_turn_prompt(
+        inbound,
+        recent_messages=recent,
+        recent_message_chars=0,
+        resolver=resolver,
+    )
+
+    # Identity block appears, mentions alice (deduped across platforms),
+    # her display name, notes, and aliases.
+    assert "## Known identities" in prompt
+    assert "**alice**" in prompt
+    assert "Alice Smith" in prompt
+    assert "Eng team lead" in prompt
+    assert "slack-U123" in prompt and "discord-456" in prompt
+    # Bob is not in the recent window or inbound — skipped.
+    assert "**bob**" not in prompt
+
+    # Recent activity uses canonical's display_name, not per-message.
+    assert "Alice Smith: slack-eng activity" in prompt
+    assert "Alice Smith: discord-eng activity" in prompt
+    # Stranger has no record — falls back to per-message author_display.
+    assert "random_user: random" in prompt
+
+    # Header uses display name, not the raw matching key.
+    assert "author: alice_slack" in prompt or "author: Alice Smith" in prompt
+
+
+@pytest.mark.asyncio
+async def test_identity_block_absent_when_no_records_match(tmp_path: Path):
+    """No identity records for any author → no Known identities section
+    rendered (don't pollute the prompt with an empty block)."""
+    from textwrap import dedent
+    from mimir.identities import IdentityResolver
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        dedent(
+            """\
+            people:
+              - canonical: alice
+                aliases: [slack-U999]   # different alias from what's in the buffer
+            """
+        )
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+
+    buf = MessageBuffer(
+        history_path=tmp_path / "chat_history.jsonl",
+        resolver=resolver,
+    )
+    now = datetime.now(tz=timezone.utc)
+    await buf.append(
+        buf.make_message(
+            channel_id="slack-eng",
+            kind="user_message",
+            content="hi",
+            author="slack-UDIFFERENT",   # not in identities.yaml
+            author_display="someone",
+            ts=now.isoformat(),
+            source="slack",
+        )
+    )
+
+    inbound = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-eng",
+        content="ok",
+        author="slack-UDIFFERENT",
+        author_display="someone",
+    )
+    prompt = build_turn_prompt(
+        inbound,
+        recent_messages=list(buf._all),
+        resolver=resolver,
+    )
+    assert "## Known identities" not in prompt
+    # Falls back to per-message display.
+    assert "someone: hi" in prompt
+
+
+@pytest.mark.asyncio
 async def test_resolver_does_not_override_dm_rule(tmp_path: Path):
     """Identity reconciliation never lifts DM content into a non-DM
     channel. The DM filter wins regardless of canonical match."""

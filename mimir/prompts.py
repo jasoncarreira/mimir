@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Iterable
 
-from .history import Message, render_recent_activity
+from .history import Message, render_identity_context, render_recent_activity
 from .memory import CoreBlock, render_core_section
 from .models import AgentEvent
 
@@ -73,18 +73,38 @@ def build_turn_prompt(
     msam_block: str | None = None,
     subagent_block: str | None = None,
     recent_message_chars: int = 0,
+    resolver: object | None = None,
 ) -> str:
-    """Assemble the turn prompt: recent activity, MSAM atom hits, subagent
-    completion notifications (from prior turns), event header + body.
+    """Assemble the turn prompt: known identities, recent activity, MSAM
+    atom hits, subagent completion notifications (from prior turns), event
+    header + body.
 
     ``recent_message_chars`` (>0) caps each Recent-activity message's
     rendered content with ``…[truncated]``; protects against single huge
-    inbounds blowing the context (SPEC §5.4)."""
+    inbounds blowing the context (SPEC §5.4).
+
+    ``resolver`` (FUTURE_WORK §6.1) — when present, identity records for
+    any author in the recent window or the inbound event are surfaced as
+    a 'Known identities' preamble at the top of the prompt, and the
+    Recent activity render uses the canonical's display_name. None
+    falls back to the no-identity-reconciliation rendering."""
     sections: list[str] = []
 
-    if recent_messages:
+    # Materialize once if we need to scan it twice (identity + render).
+    recent_list: list[Message] | None = None
+    if recent_messages is not None:
+        recent_list = list(recent_messages)
+
+    if resolver is not None:
+        identity_block = render_identity_context(
+            recent_list or [], event.author, resolver
+        )
+        if identity_block:
+            sections.append("## Known identities\n\n" + identity_block)
+
+    if recent_list:
         rendered = render_recent_activity(
-            recent_messages, max_chars=recent_message_chars
+            recent_list, max_chars=recent_message_chars, resolver=resolver
         )
         if rendered:
             sections.append("## Recent activity\n\n" + rendered)
@@ -96,9 +116,17 @@ def build_turn_prompt(
         sections.append("## Subagent updates\n\n" + subagent_block.rstrip())
 
     ts = datetime.now(tz=timezone.utc).isoformat()
+    # Prefer the canonical's display name (or the event's author_display)
+    # over the raw matching key in the header — the agent reads "alice",
+    # not "discord-99".
+    header_author = event.author_display
+    if not header_author and resolver is not None and event.author:
+        header_author = resolver.display_name(event.author)
+    if not header_author:
+        header_author = event.author or "-"
     header = (
         f"[event_kind: {event.trigger}, channel: {event.channel_id}, "
-        f"author: {event.author or '-'}, ts: {ts}]"
+        f"author: {header_author}, ts: {ts}]"
     )
     body = event.content or "(no content)"
     sections.append(f"{header}\n{body}")

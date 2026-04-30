@@ -385,6 +385,7 @@ class Agent:
                 msam_block=msam_block,
                 subagent_block=subagent_block,
                 recent_message_chars=self._config.recent_message_chars,
+                resolver=self._buffer.resolver,
             )
 
         core_blocks = load_core(self._config.home)

@@ -354,6 +354,7 @@ def render_recent_activity(
     messages: Iterable[Message],
     *,
     max_chars: int = 0,
+    resolver: object | None = None,
 ) -> str:
     """Render messages as ``[<ts> <channel>] <author>: <content>`` lines.
 
@@ -362,17 +363,85 @@ def render_recent_activity(
     tool-result cap). The per-message cap protects against a single huge
     inbound (e.g. a 500-post bluesky seed transcript) blowing the model's
     context when prior messages are included via the SPEC §5.4 deque pull.
+
+    ``resolver`` (FUTURE_WORK §6.1) — when present and the message's author
+    has an identity record, the rendered author uses the record's
+    ``display_name`` instead of the per-message ``author_display``. So Alice
+    on Slack and Alice on Discord render with the same name. The "Known
+    identities" preamble (built separately by ``render_identity_context``)
+    surfaces the canonical + aliases so the agent connects the dots.
     """
     lines: list[str] = []
     for m in messages:
         ts_short = m.ts[:16] if m.ts else ""
-        author = m.author_display or m.author or (
-            "(assistant)" if m.kind == "assistant_message" else "(system)"
-        )
+        author = None
+        if resolver is not None and m.author and m.kind != "assistant_message":
+            author = resolver.display_name(m.author)
+        if not author:
+            author = m.author_display or m.author or (
+                "(assistant)" if m.kind == "assistant_message" else "(system)"
+            )
         if m.kind == "assistant_message":
             author = "(assistant)"
         content = m.content or ""
         if max_chars > 0 and len(content) > max_chars:
             content = content[:max_chars] + "…[truncated]"
         lines.append(f"[{ts_short} {m.channel_id}] {author}: {content}")
+    return "\n".join(lines)
+
+
+def render_identity_context(
+    messages: Iterable[Message],
+    event_author: str | None,
+    resolver: object | None,
+) -> str | None:
+    """Build a 'Known identities' block for the turn prompt (FUTURE_WORK §6.1).
+
+    Lists every identity record matching an author in ``messages`` or the
+    inbound ``event_author``, deduplicated by canonical. Format per line:
+
+        - **<canonical>** — <display_name> (<notes>) · aliases: <a1, a2, ...>
+
+    Display name, notes, and aliases are each only included when present.
+    Returns ``None`` when no resolver is wired or no author maps to a
+    record — the caller drops the section entirely in that case.
+    """
+    if resolver is None:
+        return None
+
+    candidate_authors: list[str] = []
+    if event_author:
+        candidate_authors.append(event_author)
+    for m in messages or []:
+        if m.author and m.kind != "assistant_message":
+            candidate_authors.append(m.author)
+
+    # Dedupe on canonical so cross-platform messages from one identity
+    # produce a single entry.
+    seen: dict[str, object] = {}
+    by_canonical = {i.canonical: i for i in resolver.all_identities()}
+    for author in candidate_authors:
+        canonical = resolver.resolve(author)
+        if canonical is None or canonical == author:
+            # No identity record (resolver fell through unchanged).
+            continue
+        identity = by_canonical.get(canonical)
+        if identity is None:
+            continue
+        seen[canonical] = identity
+
+    if not seen:
+        return None
+
+    lines: list[str] = []
+    for canonical, identity in seen.items():
+        parts = [f"- **{canonical}**"]
+        if getattr(identity, "display_name", None):
+            parts.append(f" — {identity.display_name}")
+        if getattr(identity, "notes", None):
+            parts.append(f" ({identity.notes})")
+        aliases = getattr(identity, "aliases", None) or []
+        if aliases:
+            parts.append(f" · aliases: {', '.join(aliases)}")
+        lines.append("".join(parts))
     return "\n".join(lines)
