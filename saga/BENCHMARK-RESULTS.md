@@ -41,6 +41,7 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p38_canon_v1` | MiniMax-M2.7 | P30v3 + P38 (confidence-gated HyDE: gpt-5.4-nano hypothetical answer added as RRF pathway when first-pass max sim < 0.45 AND query is question-shaped) | sem + kw + **hyde_semantic** (hypothetical-answer pathway, gated) | 500 | **0.762** |
 | `msam_p12_canon_v2` | MiniMax-M2.7 | P30v3 + P12 re-baseline after shipping `enable_query_expansion=true` to canonical (matches msam_p12_canon_v1's config); investigates whether P12's +0.8pp held | sem + kw (P12 synonym expansion on keyword pathway only) | 500 | **0.762** ⚠ |
 | `msam_p39_canon_v1` | MiniMax-M2.7 | P30v3 + P12 + P39 (`missing_ref_score_pivot = "median"` pivots pulled-in atom base scores on the median of in-pool RRF rather than the min) | sem + kw (median pivot lifts pulled-in atom scores so endorsed-but-cheap-path-missed raws can compete with mid-rank in-pool raws) | 500 | **0.780** |
+| `msam_p12_canon_v3` | MiniMax-M2.7 | Same config as `msam_p12_canon_v2` (canonical + P12 on, min pivot); solo re-run to factor out parallel-run interference seen in v2 | sem + kw (P12 synonym expansion only) | 500 | **0.768** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
@@ -1629,6 +1630,68 @@ fact-replacement for the same reason).
   preference gain.
 
 Pace: ~31s/q in parallel.
+
+### `msam_p12_canon_v3` — P12 solo re-baseline (500q) + variance characterization
+
+Solo re-run of the P12 baseline after v2's regression looked
+suspicious. Same config as v2 — canonical with `enable_query_expansion
+= true`, min pivot — but no parallel run sharing API/CPU.
+
+| Subtype | Score | N | Δ vs P12_v1 (0.792) | Δ vs P12_v2 (0.762) |
+|---|---|---|---|---|
+| temporal-reasoning | 0.774 | 133 | +2.3 | +4.4 |
+| single-session-user | 0.957 | 70 | 0.0 | +1.4 |
+| single-session-assistant | 0.946 | 56 | 0.0 | -1.8 |
+| **single-session-preference** | **0.333** | 30 | -15.0 | +13.3 |
+| knowledge-update | 0.910 | 78 | -5.1 | -3.8 |
+| multi-session | 0.602 | 133 | -4.5 | -3.0 |
+
+**Overall: 0.768 (-2.4pp vs P12_v1, +0.6pp vs P12_v2).**
+
+**The three nominally-identical P12 runs:**
+
+| Run | Overall | preference (N=30) | multi-session (N=133) | knowledge-update (N=78) |
+|---|---|---|---|---|
+| P12_v1 (~3 days ago) | 0.792 | **0.483** | 0.647 | **0.962** |
+| P12_v2 (parallel) | 0.762 | **0.200** | 0.632 | 0.949 |
+| P12_v3 (solo) | 0.768 | 0.333 | **0.602** | 0.910 |
+| Mean | 0.774 | 0.339 | 0.627 | 0.940 |
+| SD | 0.013 | 0.116 | 0.019 | 0.022 |
+
+**Conclusion: bench variance is large.** preference SD ≈ 12pp on a
+30q subtype; overall SD ≈ 1.3pp on the full 500q. The P12_v1
+result (0.792) was likely a high-tail outlier on preference — the
+mean of three runs (0.774) sits within noise of P30v3 (0.784).
+
+**Implications:**
+
+1. **P12 is probably flat-to-modestly-positive** vs P30v3, not the
+   +0.8pp v1 single run implied. Don't trust single-run +0.5–1.0pp
+   deltas on this bench.
+
+2. **P39's measured +1.8pp over P12_v2** is within the same noise
+   band, so we can't conclude P39 is overall-net-positive from one
+   run. But P39's *per-subtype shape* — preference +16.7pp,
+   multi-session +3.0pp, knowledge-update -2.6pp vs same-day P12_v2
+   — is large enough on the affected cohorts to be credible.
+   Knowledge-update -2.6pp on N=78 is well above the SD ~2.2pp
+   noise floor on that subtype.
+
+3. **Future single-run claims need to clear the per-subtype noise
+   floor** roughly:
+   - preference (N=30): ±10pp
+   - multi-session (N=133): ±2-3pp
+   - temporal-reasoning, knowledge-update (N=78-133): ±2pp
+   - single-session-user / -assistant (N=56-70): ±1-2pp
+   - overall (N=500): ±1.3pp
+
+   Anything below those bands is indistinguishable from noise on
+   one run; need 2-3 reps for confidence.
+
+Pace: 315 min (~37s/q) — slower than the parallel runs at the same
+time of day. Indication that the bench's bottleneck is API
+latency, not local CPU; parallel runs interleave waits well enough
+that they don't lose total wall-clock time vs solo.
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.
