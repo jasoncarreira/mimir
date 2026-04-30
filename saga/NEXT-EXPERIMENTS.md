@@ -904,6 +904,91 @@ pulled-in atoms rank where the formula predicts.
 
 ---
 
+### P40 — Disable pull-in of endorsed atoms that miss the cheap-path pool; keep boost for in-pool endorsed atoms
+
+**Status.** Filed 2026-04-30. Not yet implemented. Queued behind
+the P12 v3 solo re-run.
+
+**What.** `_two_tier_split` does two things with `evidenced_by`
+endorsements right now:
+
+1. **Boost** in-pool raws (raws already in the cheap-path candidate
+   pool) by adding `2 × obs_score` to their RRF score, capped at
+   `2 × base`.
+2. **Pull in** missing endorsed raws (atoms not in the cheap-path
+   pool but reachable via observation endorsement), score them
+   with a synthetic base `ref_score × sim`, then boost the same way.
+
+P40 keeps step 1, drops step 2. Endorsement only ever affects atoms
+that the cheap path already surfaced. Atoms that missed the cheap
+path don't get a synthetic base score injected.
+
+**Why test this.** P39's analysis showed pulled-in atoms score so
+low that they rarely make the top-K cut even with the median pivot
+(at `min` pivot they essentially never do). And the P39 bench
+showed knowledge-update -2.6pp because the median pivot's looser
+threshold pulls in superseded atoms tied to outdated facts. A clean
+A/B between P30v3 (current canonical, pull-in enabled) and P40
+(pull-in disabled, boost-only) tests:
+
+- Whether the pull-in branch is actually contributing recall on the
+  cohorts P30 was designed to help (preference, multi-session) —
+  if it is, P40 should regress those subtypes.
+- Whether knowledge-update recovers when superseded atoms can't
+  sneak in via endorsement edges.
+- Whether the boost-on-in-pool-only mechanism is enough on its
+  own — simpler code path, fewer ways to introduce noise.
+
+**Implementation:**
+
+In `_two_tier_split`, gate the missing-atom branch on a new flag:
+
+```python
+# Around line 1391 (the `if boost_map:` that triggers pull-in)
+if boost_map and _cfg('retrieval', 'enable_missing_atom_pull_in', True):
+    missing_ids = [aid for aid in boost_map if aid not in raw_score_map]
+    if missing_ids:
+        ... existing pull-in branch ...
+```
+
+One new config key:
+- `[retrieval] enable_missing_atom_pull_in` — default True
+  (back-compat with P30v1/v3); bench variant flips to False.
+
+**Effort.** 30 min for the gate + 1 bench run.
+
+**Risk.** Low. The boost-only path is a strict subset of current
+behavior. Worst case: regresses preference / multi-session by the
+amount the pull-in was actually contributing. Either way, clean
+signal.
+
+**Score expectation.** Three plausible outcomes:
+1. **P40 ≈ P30v3 (within noise).** Pull-in wasn't actually doing
+   much because its scores were anchored too low to clear top-K
+   anyway. Confirms P39's diagnosis from a different angle.
+2. **P40 < P30v3 on preference / multi-session.** The pull-in does
+   contribute recall on those cohorts; P39's median pivot was the
+   right intervention.
+3. **P40 > P30v3 on knowledge-update.** Removing the pull-in
+   prevents superseded-atom interference. Could compose with P39
+   later (median-pivot for endorsement boost, no pull-in).
+
+**Connection to other levers:**
+- Composes with P39 (median pivot) — P40 + P39 would mean: in-pool
+  endorsed atoms get the bigger pivot-based boost, but no missing
+  atoms come along for the ride. The boost cap (`2 × base`)
+  applies to bigger bases, lifting in-pool scores meaningfully.
+- Doesn't touch the LLM stack — pure scoring change.
+- Can ship behind a flag without changing prod behavior.
+
+**File location:** `msam/core.py:_two_tier_split` around line 1391
+(the `if boost_map:` that triggers the pull-in branch). Tests
+should cover both flag states and confirm that endorsed-but-
+missing atoms simply don't appear in the response when the flag
+is off.
+
+---
+
 ### P15 — Evaluate cross-encoder rerank
 
 **What.** Hindsight uses a cross-encoder reranker as their final stage
