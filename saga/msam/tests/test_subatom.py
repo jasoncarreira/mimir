@@ -18,6 +18,8 @@ def temp_db(monkeypatch, tmp_path):
     monkeypatch.setattr("msam.core.cached_embed_query", lambda t: fake_emb)
     # Also patch embeddings module for subatom
     monkeypatch.setattr("msam.embeddings.embed_text", lambda t: fake_emb)
+    monkeypatch.setattr("msam.embeddings.batch_embed_texts",
+                        lambda texts: [fake_emb] * len(texts))
     yield db_path
 
 

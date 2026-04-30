@@ -1920,6 +1920,13 @@ def _triple_augment_v2(query: str, top_k: int = 10) -> list[dict]:
     return out
 
 
+# Recursion guard: compressed_retrieve internally calls hybrid_retrieve
+# (to gather atoms before sentence-extracting). Without this guard,
+# _subatom_beam_atoms would recurse infinitely. The guard is per-thread
+# so concurrent retrieval calls don't interfere.
+_subatom_recursion_guard = threading.local()
+
+
 def _subatom_beam_atoms(query: str, top_k: int, mode: str) -> list[dict]:
     """P43 beam 2 — sentence-level retrieval via compressed_retrieve,
     folded back to parent atoms with the strongest sentence's score.
@@ -1928,8 +1935,15 @@ def _subatom_beam_atoms(query: str, top_k: int, mode: str) -> list[dict]:
     (default). When on, calls compressed_retrieve to extract sentences,
     keeps the max sentence score per parent atom, returns atoms ranked
     by that score so RRF can fuse them with the cheap-path beams.
+
+    The thread-local recursion guard prevents
+    hybrid_retrieve → _subatom_beam_atoms → compressed_retrieve →
+    hybrid_retrieve from looping.
     """
     if not _cfg('retrieval', 'enable_subatom_beam', False):
+        return []
+
+    if getattr(_subatom_recursion_guard, "active", False):
         return []
 
     try:
@@ -1937,6 +1951,7 @@ def _subatom_beam_atoms(query: str, top_k: int, mode: str) -> list[dict]:
     except Exception:
         return []
 
+    _subatom_recursion_guard.active = True
     try:
         result = compressed_retrieve(
             query, mode=mode,
@@ -1947,6 +1962,8 @@ def _subatom_beam_atoms(query: str, top_k: int, mode: str) -> list[dict]:
         )
     except Exception:
         return []
+    finally:
+        _subatom_recursion_guard.active = False
 
     sentences = result.get("sentences") or []
     if not sentences:
