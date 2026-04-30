@@ -778,7 +778,22 @@ HyDE LLM call (mock the LLM, verify gate triggers correctly).
 
 ### P39 — Pulled-in raw scoring is anchored to bottom of pool; consider raising it
 
-**Status.** Filed 2026-04-29. Not yet implemented.
+**Status.** Implemented + bench-tested 2026-04-29. **Median pivot
+is a real positive lever**: +16.7pp preference, +3.0pp multi-session
+vs the same-day P12_v2 baseline (the cohorts P39's spec predicted).
+Costs -2.6pp on knowledge-update (fact-replacement) due to
+superseded atoms getting pulled in.
+
+**Not yet shipped to canonical.** Two reasons:
+1. The P12_v2 re-baseline regressed unexpectedly (0.762 vs P12_v1's
+   historical 0.792, with preference collapsing 0.483 → 0.200) —
+   need to investigate before claiming P39's win is durable.
+2. The knowledge-update tradeoff is real and worth a follow-up
+   that gates the median pivot on whether the endorsing observation's
+   evidence is current (no superseded atoms).
+
+See BENCHMARK-RESULTS.md §msam_p39_canon_v1 for full data and the
+side-by-side with P12_v2.
 
 **What.** In `_two_tier_split`, observation-endorsed raws that miss
 the cheap-path candidate pool (the `missing_ids` branch in

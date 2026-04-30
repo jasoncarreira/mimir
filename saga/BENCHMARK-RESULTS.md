@@ -39,6 +39,8 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p34_canon_v1` | MiniMax-M2.7 | P30v3 mechanism + `[consolidation] similarity_threshold = 0.75` (was 0.80); cherry-picks off; triples off | sem + kw (lower clustering threshold → more clusters → more observations) | 500 | **0.772** |
 | `msam_p36_canon_v1` | MiniMax-M2.7 | P35 features ON (triples + graph pathway) + `[retrieval] rrf_graph_weight = 0.3` (was 0.7) | sem + kw + **graph at lower fusion weight** (graph as tiebreaker rather than co-equal vote) | 500 | **0.760** |
 | `msam_p38_canon_v1` | MiniMax-M2.7 | P30v3 + P38 (confidence-gated HyDE: gpt-5.4-nano hypothetical answer added as RRF pathway when first-pass max sim < 0.45 AND query is question-shaped) | sem + kw + **hyde_semantic** (hypothetical-answer pathway, gated) | 500 | **0.762** |
+| `msam_p12_canon_v2` | MiniMax-M2.7 | P30v3 + P12 re-baseline after shipping `enable_query_expansion=true` to canonical (matches msam_p12_canon_v1's config); investigates whether P12's +0.8pp held | sem + kw (P12 synonym expansion on keyword pathway only) | 500 | **0.762** ⚠ |
+| `msam_p39_canon_v1` | MiniMax-M2.7 | P30v3 + P12 + P39 (`missing_ref_score_pivot = "median"` pivots pulled-in atom base scores on the median of in-pool RRF rather than the min) | sem + kw (median pivot lifts pulled-in atom scores so endorsed-but-cheap-path-missed raws can compete with mid-rank in-pool raws) | 500 | **0.780** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
@@ -1508,6 +1510,125 @@ isolated abstraction from raw evidence, removed the P1-style
 stability-halving harm, and made consolidation a benefit-or-neutral
 on this bench rather than the net-negative P1 was. P9v2 is the
 recommended P9 configuration. Good shape to ship.
+
+### `msam_p12_canon_v2` — P12 re-baseline (500q) — REGRESSED unexpectedly
+
+After shipping `enable_query_expansion = true` to canonical
+`msam_bench.toml` (commit `45b7ec3`), this run was meant to confirm
+P12's +0.8pp from the original P12 ablation (`msam_p12_canon_v1` =
+0.792). Instead it scored **0.762** — a -3.0pp regression on
+identical config 3 days later.
+
+| Subtype | Score | N | Δ vs P12_v1 (0.792) | Δ vs P30v3 (0.784) |
+|---|---|---|---|---|
+| **single-session-preference** | **0.200** | 30 | **-28.3** ⚠ | -6.7 |
+| temporal-reasoning | 0.729 | 133 | -2.3 | -3.0 |
+| multi-session | 0.632 | 133 | -1.5 | -1.5 |
+| single-session-user | 0.943 | 70 | -1.4 | -2.8 |
+| knowledge-update | 0.949 | 78 | -1.3 | 0.0 |
+| single-session-assistant | 0.964 | 56 | +1.8 | -1.8 |
+
+**Overall: 0.762 (-3.0pp vs P12_v1, -2.2pp vs P30v3).**
+
+Preference collapsed from 0.483 to 0.200 — that's 14 correct → 6
+correct on a 30-question subtype, far outside bench noise. P12_v2
+also scored *below* P30v3 alone (0.267) on preference, meaning P12
+appears to be actively hurting where it previously gained +21.6pp.
+
+**Cause not identified yet.** Code changes between P12_v1 and v2
+were all flag-gated and supposed to be bench-neutral: contextual
+rewrite (off in bench), HyDE infra (off), session_id plumbing
+(unused in bench), P39 pivot config (defaults to "min" = original
+behavior). None of these obviously affect the keyword pathway P12
+operates on. Possible causes ordered by likelihood:
+
+1. **Parallel-run interference** with `msam_p39_canon_v1` sharing
+   API/CPU. Both runs ingested concurrently; even at temperature=0,
+   the consolidation LLM (gpt-5.4-nano) could behave subtly
+   differently under contention. Re-running P12_v2 solo would
+   confirm or rule out.
+
+2. **API drift** (gpt-oss-120b reader on OpenRouter, or
+   text-embedding-3-small) over the 3 days since P12_v1.
+
+3. **Subtle code regression** in flag-off paths that I haven't
+   spotted yet — would need to bisect against the P12_v1 commit.
+
+**Action required:** investigate before drawing conclusions about
+P12. The P39 result below depends on whether P12_v2 is a true
+baseline; if P12_v2 is regressed and P39 is a partial recovery,
+P39's apparent win may be smaller against a properly-behaving P12.
+
+Pace: ~31s/q in parallel.
+
+### `msam_p39_canon_v1` — median pivot for missing-atom scoring (500q)
+
+P39 changes `_two_tier_split`'s missing-atom (pulled-in) base
+scoring to pivot on the **median** of the in-pool RRF distribution
+rather than the min. Pulled-in raws (atoms endorsed by surfaced
+observations via `evidenced_by` but not in the cheap-path candidate
+pool) get roughly 2× their previous base scores, so strong-similarity
+endorsed atoms compete with mid-rank in-pool raws instead of being
+silently dropped.
+
+Run on top of P12_canon_v2 config (canonical + P12 on + median
+pivot), parallel with `msam_p12_canon_v2`. The direct comparison is
+P12_v2 (min pivot) vs P39 (median pivot) — same code, same day,
+only the pivot config differs.
+
+| Subtype | Score | N | Δ vs P12_v2 (0.762, same code, min pivot) | Δ vs P30v3 (0.784) |
+|---|---|---|---|---|
+| **single-session-preference** | **0.367** | 30 | **+16.7** ✓✓ | +10.0 |
+| **multi-session** | **0.662** | 133 | **+3.0** ✓ | +1.5 |
+| temporal-reasoning | 0.752 | 133 | +2.3 | -0.7 |
+| single-session-assistant | 0.964 | 56 | 0.0 | -1.8 |
+| single-session-user | 0.929 | 70 | -1.4 | -4.2 |
+| knowledge-update | 0.923 | 78 | **-2.6** | -2.6 |
+
+**Overall: 0.780 (+1.8pp vs P12_v2, -0.4pp vs P30v3 — within noise).**
+
+**P39 is a real positive lever on the cohorts the spec predicted.**
+Preference (+16.7pp) and multi-session (+3.0pp) are both large,
+clean lifts vs the same-day P12_v2 baseline. These are exactly the
+subtypes where consolidation observations endorse atoms whose
+question-similarity is moderate but not strong enough to make the
+cheap-path top-K — the case the median pivot was designed for.
+
+**Knowledge-update -2.6pp is the cost.** Fact-replacement questions
+("user's job is X now (was Y)") need the *most recent* atom to
+dominate. The median pivot pulls in more endorsed atoms — which
+includes superseded ones tied to old facts via observation
+edges. The reader sees both the old and the new fact and gets
+confused. Symmetric to what we saw in P36 (graph pathway hurts
+fact-replacement for the same reason).
+
+**Don't ship yet — two reasons:**
+
+1. **The P12_v2 baseline is suspect.** If P12_v2's preference 0.200
+   is a regression from a real P12 baseline of 0.483, then P39's
+   "preference +16.7pp" is partly compensating for a bug rather
+   than a clean architectural win. Need to resolve P12_v2's
+   regression before claiming P39's lift is durable.
+
+2. **The knowledge-update tradeoff is real.** Even if P39 is a net
+   win in absolute score (0.780 vs 0.784 P30v3 = within noise), we
+   shouldn't ship a -2.6pp fact-replacement regression in production
+   without thinking about how to suppress superseded-atom pull-ins.
+   Possible mitigation: skip the median pivot on observations whose
+   evidence atoms include any with `state = 'fading'` or supersedes
+   edges. Adds complexity but preserves the gains where they're
+   safe.
+
+**Next steps:**
+- Re-run P12_v2 solo to factor out parallel-run interference. If
+  it returns to ~0.792, P39 is a clean +0.8pp / -0.4pp tradeoff.
+  If it stays at 0.762, investigate the regression separately.
+- File P40 (or extend P39): conditional median-pivot — apply only
+  when none of the endorsed evidence atoms are superseded. Tests
+  whether knowledge-update can be rescued without losing the
+  preference gain.
+
+Pace: ~31s/q in parallel.
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.
