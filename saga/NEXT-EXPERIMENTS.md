@@ -1058,6 +1058,11 @@ but the underlying signal is the same.
 within it. Tests for cosine ranking, score scaling, and no-op
 when triples table is empty.
 
+**New-entity handling.** Triples are embedded at write time via
+`_embed_triple_safe(subject, predicate, object)`, so any newly
+extracted triple is searchable on the next query — no re-index,
+no maintenance, no entity-vocabulary to track.
+
 ---
 
 ### P42 — Triples as a third response block on `/v1/query`
@@ -1119,25 +1124,36 @@ match is "this triple's subject+predicate+object embedding is
 close to the query's embedding," which works without explicit
 entity matching.
 
-**`valid_until` population — caveat.** Currently mostly NULL:
-- `update_world(valid_until=...)` only fires when callers pass it
-- `auto_close_on_conflict` only sets it on a previous triple when
-  a new contradicting triple lands via `update_world`
-- Consolidation doesn't extract `valid_until` from atom content
+**`valid_until` population — currently mostly NULL.** The
+consolidation prompt asks for `(subject, predicate, object)` only
+(msam/consolidation.py:600); the temporal columns aren't being
+extracted. `update_world(valid_until=...)` only sets them when
+callers pass them explicitly, and `auto_close_on_conflict` only
+fires on the `update_world` path (not the consolidation path).
 
-To make `valid_until`-aware filtering meaningful, a follow-up
-should populate it via either:
-1. **LLM extraction during consolidation** — when synthesizing
-   observations, also extract any temporal scope phrases ("no
-   longer X", "until 2024", "after switching") into the triple's
-   `valid_until`.
-2. **Supersede-edge inference** — when consolidation writes a
-   `supersedes` edge between two observations, infer
-   `previous.valid_until = new.created_at` for triples on the
-   superseded one.
+Two complementary fixes ship as part of P42:
 
-Option 2 is free and tracks fact-replacement timing correctly for
-most cases. Bake it into consolidation.
+1. **Extend the consolidation prompt** to extract optional
+   temporal scope:
+   ```
+   TRIPLES:
+   (subject, predicate, object, valid_from?, valid_until?)
+   ```
+   Update the parser to read the optional 4th/5th fields and
+   `INSERT INTO triples (..., valid_from, valid_until, ...)`.
+   Captures phrases like "no longer X" / "until 2024" / "after
+   switching from Y" that the LLM can identify in the source
+   atoms.
+
+2. **Supersede-edge inference.** When consolidation writes a
+   `supersedes` edge from observation A to observation B, also
+   set `valid_until = A.created_at` on every triple whose
+   `atom_id` belongs to B (the superseded observation). Free,
+   automatic, tracks fact-replacement timing for the common case
+   where the LLM didn't explicitly extract a `valid_until`.
+
+Both should ship together. Option 2 is the safety net for
+anything option 1 misses.
 
 **Effort.** 1 day for the response wiring + 1 bench run; +0.5 day
 for the supersede-edge `valid_until` inference.
@@ -1172,14 +1188,19 @@ when triples table empty.
    below that. Untested on bench (which has ~500 atoms/question).
    We don't know if beam would help at small atom counts.
 
-2. **Replace beam 3 (synonym-expanded query)** with
+2. **Replace beam 3 (triple-graph term expansion)** with
    `compressed_retrieve` — sentence-level extracts via
-   `enable_subatom` + `enable_fact_dedup`. P12 (synonym expansion
-   on keyword) is already in canonical, so beam 3 was redundant
-   with the canonical path anyway. The compressed-retrieve path
-   provides a different signal: instead of a different *query*
-   formulation, it's a different *result granularity* — sentences
-   instead of whole atoms.
+   `enable_subatom` + `enable_fact_dedup`. Beam 3 currently calls
+   `expand_query()` which appends triple-graph subject/object
+   terms to the query — that's effectively dead in our bench
+   (triples extraction is off in `msam_bench.toml`) and overlaps
+   with what P41 will surface anyway. P12 is unaffected: it lives
+   in `core.py:_expand_query_for_keyword` (the keyword-pathway
+   synonym dict), not in beam 3.
+
+   The compressed-retrieve path provides a different signal:
+   instead of a different *query* formulation, it's a different
+   *result granularity* — sentences instead of whole atoms.
 
 **Why test these together.** Beam search's value is in covering
 blind spots from any single query formulation. Three beams of
@@ -1203,12 +1224,17 @@ sentences → parent atom and use the *highest* sentence score as
 the parent atom's beam-3 score. So an atom with a tight 3-sentence
 hit ranks high; an atom with diffuse weak relevance ranks low.
 
-**Why P12 doesn't conflict.** P12 is already on in canonical and
-fires inside `hybrid_retrieve` (replaces the keyword query with
-synonyms). Beam 3 here is a different mechanism, so they can both
-apply: beam 1's `hybrid_retrieve` already runs P12 internally,
-and beam 3's `compressed_retrieve` fires sentence-level scoring
-on top.
+**Beam composition after the swap.**
+- Beam 1: original query → `hybrid_retrieve` (whole atoms; P12
+  synonym expansion happens internally on the keyword pathway)
+- Beam 2: regex-rewritten query (P11) → `hybrid_retrieve`
+- Beam 3 [new]: original query → `compressed_retrieve` (sentence-
+  level extracts, dedup'd, then mapped back to parent atom_ids)
+
+The three beams now cover three distinct dimensions: original
+formulation (broad recall), entity-aliased formulation (precision
+on entity references), and granularity (sentence-level relevance
+within atoms).
 
 **Two flags affected.**
 - `[retrieval_v2] enable_beam_search` — change default from
@@ -1273,29 +1299,48 @@ at 10k+ atoms. Filter to candidate pairs that:
 That winnows from O(N²) to a few thousand pairs even for a
 moderate-size deployment.
 
-**LLM call shape.**
+**Batched LLM call shape.** One call per batch of N pairs (target
+~10–20 pairs/batch to keep prompts bounded), N labels back. Single
+API roundtrip beats N sequential calls.
 
 ```
-Atoms A and B from the same conversation. Identify their
-relationship (or "none"):
+Score each pair below. For each, output one of:
+- elaborates    (B adds detail to A)
+- supports      (B provides evidence for A's claim)
+- contextualizes (A provides context for interpreting B)
+- contradicts   (B disagrees with A)
+- supersedes    (B replaces A as more current)
+- depends_on    (A's truth depends on B)
+- refines       (B is a more precise version of A)
+- none          (no significant relationship)
 
-- elaborates: B adds detail to A
-- supports: B provides evidence for A's claim
-- contextualizes: A provides context for interpreting B
-- contradicts: B disagrees with A
-- supersedes: B replaces A as more current
-- depends_on: A's truth depends on B
-- refines: B is a more precise version of A
-- none: no significant relationship
+Output exactly one line per pair, in the format:
+PAIR_<n>: <relationship>
 
-A: {content_A}
-B: {content_B}
+Pair 1:
+A: {content_A1}
+B: {content_B1}
 
-Relationship: <one of the above>
+Pair 2:
+A: {content_A2}
+B: {content_B2}
+... etc
 ```
+
+Parser reads `PAIR_<n>: <label>` lines, writes
+`add_atom_relation()` for each non-`none` label.
+
+**Incremental: only score what's new since the last run.** Track
+`last_relations_run_at` in a `job_runs` table (or a single-row
+metadata table). On each run, candidate pairs are restricted to
+those where at least one atom has `created_at` OR `last_accessed_at`
+after the timestamp. Stable old pairs that have already been
+scored don't get re-evaluated. Idempotent on re-run; missed pairs
+get caught the next time either atom is touched.
 
 Run as a periodic decay-cycle pass — daily or weekly. Skip pairs
-already labeled (idempotent on re-run).
+that already have an `atom_relations` row between them (covers any
+relation type, since relabelling is rare).
 
 **Effort.** 2 days for the maintenance job + a small bench run
 (the lift would show up in spreading activation; bench measures
@@ -1583,11 +1628,15 @@ Filed 2026-04-30. Confirmed via discussion + bench data.
    in canonical path. Hardcoded patterns for `Things Agent Knows`,
    `Core Traits`, etc. don't generalize.
 
-5. **Remove the `_QUERY_REWRITES` hardcoded defaults** in
-   `retrieval_v2.py`. The configurable `entity_mappings` interface
-   stays available (some callers may use it for non-conversational
-   flows), but the built-in `("user" → "User", "agent" → "Agent")`
-   defaults assume one specific deployment.
+5. **Remove `_QUERY_REWRITES` + `entity_mappings` config + the
+   `enable_rewrite` and `enable_query_rewriting` flags** that gate
+   them. The hardcoded `("user" → "User", "agent" → "Agent")`
+   defaults assume one specific deployment, and the configurable
+   `entity_mappings` interface has no callers using it. Contextual
+   rewrite (LLM, context-aware) is the better path for any
+   downstream caller that needs entity disambiguation. Removes
+   `rewrite_query()`, `_apply_query_rewriting()`, and the cherry-
+   pick wiring entirely.
 
 6. **Remove store-time triples extraction.** P35 added the
    consolidation-time path; the store-time path
