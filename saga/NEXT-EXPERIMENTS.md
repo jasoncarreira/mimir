@@ -1063,6 +1063,20 @@ when triples table is empty.
 extracted triple is searchable on the next query — no re-index,
 no maintenance, no entity-vocabulary to track.
 
+**Limitation: first-time mentions miss the triple pathway.**
+Triples capture entities only after consolidation runs and
+clusters them (`min_cluster_size = 3` default). When a user first
+mentions "my co-worker Sarah", there's no Sarah-triple yet — so
+embedding-cosine match returns nothing for Sarah-related atoms
+via this path. The cheap path (semantic + keyword via
+`hybrid_retrieve`) handles first-time mentions correctly; this is
+working-as-designed, not a bug. The lag between first mention and
+triple availability depends on consolidation cadence + cluster
+threshold. Triples earn their keep by surfacing *correlated*
+atoms across many sessions, which inherently requires
+consolidation to have noticed the pattern. Accept the lag; first-
+time atoms are handled by the cheap path anyway.
+
 ---
 
 ### P42 — Triples as a third response block on `/v1/query`
@@ -1180,7 +1194,7 @@ when triples table empty.
 
 **Status.** Filed 2026-04-30. Not yet implemented.
 
-**What.** Two coupled changes:
+**What.** Three coupled changes:
 
 1. **Drop the 10,000-atom threshold** for beam search. Currently
    `enable_beam_search = "auto"` defers to
@@ -1188,19 +1202,26 @@ when triples table empty.
    below that. Untested on bench (which has ~500 atoms/question).
    We don't know if beam would help at small atom counts.
 
-2. **Replace beam 3 (triple-graph term expansion)** with
+2. **Beam 2 changes after P11 removal.** The cleanup batch deletes
+   `rewrite_query()` (P11 regex), so the existing beam 2 (regex-
+   rewritten query) loses its mechanism. **Replace beam 2 with a
+   synonym-expanded query** — apply P12's synonym dict to BOTH
+   semantic and keyword pathways (currently P12 only expands the
+   keyword pathway inside `hybrid_retrieve`). This gives the
+   semantic embedding side access to the synonym vocabulary too.
+   May or may not help — embeddings handle synonyms reasonably
+   already; the bench will tell us.
+
+3. **Replace beam 3 (triple-graph term expansion)** with
    `compressed_retrieve` — sentence-level extracts via
    `enable_subatom` + `enable_fact_dedup`. Beam 3 currently calls
    `expand_query()` which appends triple-graph subject/object
    terms to the query — that's effectively dead in our bench
    (triples extraction is off in `msam_bench.toml`) and overlaps
-   with what P41 will surface anyway. P12 is unaffected: it lives
-   in `core.py:_expand_query_for_keyword` (the keyword-pathway
-   synonym dict), not in beam 3.
-
-   The compressed-retrieve path provides a different signal:
-   instead of a different *query* formulation, it's a different
-   *result granularity* — sentences instead of whole atoms.
+   with what P41 will surface anyway. The compressed-retrieve
+   path provides a different signal: instead of a different
+   *query* formulation, it's a different *result granularity* —
+   sentences instead of whole atoms.
 
 **Why test these together.** Beam search's value is in covering
 blind spots from any single query formulation. Three beams of
@@ -1226,15 +1247,23 @@ hit ranks high; an atom with diffuse weak relevance ranks low.
 
 **Beam composition after the swap.**
 - Beam 1: original query → `hybrid_retrieve` (whole atoms; P12
-  synonym expansion happens internally on the keyword pathway)
-- Beam 2: regex-rewritten query (P11) → `hybrid_retrieve`
+  synonym expansion fires internally on the keyword pathway)
+- Beam 2 [new]: synonym-expanded query → `hybrid_retrieve`
+  (synonyms applied to BOTH semantic and keyword pathways —
+  promotes P12 to a full beam, exposing it to semantic embedding
+  too)
 - Beam 3 [new]: original query → `compressed_retrieve` (sentence-
   level extracts, dedup'd, then mapped back to parent atom_ids)
 
-The three beams now cover three distinct dimensions: original
-formulation (broad recall), entity-aliased formulation (precision
-on entity references), and granularity (sentence-level relevance
-within atoms).
+Three distinct signals: original formulation (broad recall),
+synonym-vocabulary-expanded (testing whether semantic-side synonym
+expansion helps beyond keyword-only), granularity (sentence-level
+relevance within atoms).
+
+**Future expansion to 4 beams.** When P41 lands (embedding-cosine
+triple augmentation), it could become a 4th beam — a triple-
+augmented retrieve as a co-equal signal. Defer that until P41
+ships and we can A/B it. Today: 3 beams.
 
 **Two flags affected.**
 - `[retrieval_v2] enable_beam_search` — change default from
