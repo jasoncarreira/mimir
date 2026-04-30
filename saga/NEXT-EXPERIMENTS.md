@@ -989,6 +989,338 @@ is off.
 
 ---
 
+### P41 — Triple augmentation v2: embedding-cosine match + proper score scaling
+
+**Status.** Filed 2026-04-30. Not yet implemented.
+
+**What.** The current `enable_triple_augment` (in `retrieval_v2.py`)
+has two design problems:
+
+1. **Brittle entity extraction.** `extract_query_entities` uses
+   regex on capitalized words + a tiny hardcoded entity dict
+   (`user`, `agent`, `msam`, `openclaw`). NER-free, embedding-
+   free. Misses anything not in title case or in the dict.
+2. **Flat score baseline.** Triple-augmented atoms get
+   `_combined_score = 2.0` regardless of how strong the triple's
+   relevance to the query actually is. Either dominates RRF
+   results (when other RRF scores are <1) or is invisible (when
+   they're >2). No graceful degradation.
+
+P41 replaces both with the same pattern semantic atom retrieval
+already uses: triples are already embedded
+(`_embed_triple_safe` writes `embedding` column from
+`subject + predicate + object`), so we can do nearest-neighbor
+search directly on triples for any query.
+
+**Mechanism.**
+
+```python
+def triple_augment_v2(query, query_emb, top_k=5):
+    # 1. Cosine match query_emb against all active triples' embeddings.
+    # 2. Take top_k triples by cosine.
+    # 3. For each, follow triple.atom_id → the atom that produced it.
+    # 4. Score that atom proportional to triple cosine, NOT a flat 2.0.
+    #    Calibrate to the in-pool RRF distribution so scores are
+    #    comparable (similar to P30's missing-atom math).
+```
+
+Concretely, scale via `score = sim(triple, query) × ref_score` where
+`ref_score` is the median in-pool RRF (matching P39's calibration
+approach). That makes triple-augmented atoms compete with mid-rank
+in-pool raws when their triple is highly relevant, and degrade
+gracefully when it isn't.
+
+**Why this is better.**
+- No regex / no NER / no hardcoded entity list. Works for any
+  deployment vocabulary.
+- Reuses the `triples.embedding` column we already maintain
+  (no schema change).
+- Score scaling matches the rest of the retrieval math.
+- Degrades to no-op when there are no triples in the DB (current
+  behavior) — but more usefully when triples exist.
+
+**Connection to P42.** P41 surfaces the *atoms* triples point at
+(via `atom_id` foreign key); P42 surfaces the **triples themselves**
+as a separate response block. They share the embedding-cosine
+ranking infrastructure.
+
+**Effort.** 1 day implementation + tests + 1 bench run.
+
+**Risk.** Low–medium. Replaces a known-broken mechanism with a
+better-designed one. Bench risk: if the triples-as-augmentation
+hypothesis was wrong (P32, P35, P36 all regressed when triples
+joined RRF as a pathway), then this might also regress —
+augmenting via atom is a different pattern from RRF-as-pathway,
+but the underlying signal is the same.
+
+**File location:** rewrite `triple_augmented_retrieve` in
+`msam/retrieval_v2.py:36`. Drop `extract_query_entities` calls
+within it. Tests for cosine ranking, score scaling, and no-op
+when triples table is empty.
+
+---
+
+### P42 — Triples as a third response block on `/v1/query`
+
+**Status.** Filed 2026-04-30. Not yet implemented.
+
+**What.** The two-tier `/v1/query` response shape already has a
+`triples: []` slot — currently always empty. P42 populates it
+with the top-N most relevant active triples for the query, ranked
+by embedding cosine. The reader sees compact factual triples
+alongside observations + raws and can ground answers more
+directly.
+
+**Mechanism.**
+
+```python
+# In api_query, after _two_tier_split:
+if _cfg('retrieval', 'include_triples_in_response', False):
+    candidate_triples = embedding_cosine_match(
+        query_emb,
+        active_triples,
+        top_k=_cfg('retrieval', 'response_triples_top_k', 5),
+    )
+    # Optional weighting: cosine × confidence column,
+    # tiebreaker created_at desc.
+    response['triples'] = [_format_triple(t) for t in candidate_triples]
+```
+
+**Ranking.** Primary signal is cosine similarity of query
+embedding to triple embedding (already populated by
+`_embed_triple_safe`). Then optionally:
+- × `confidence` column (default 1.0; useful when triples come
+  from sources of varying reliability)
+- recency tiebreaker (newer wins ties)
+- skip triples whose `valid_until` has expired (handled via
+  `query_world(include_expired=False)` — same path)
+
+**Scoring triples in the response.** Return both the cosine score
+and the source `atom_id` so the caller / reader can backtrack to
+the originating atom if it wants more context. Format example:
+
+```json
+{
+  "subject": "user",
+  "predicate": "profession",
+  "object": "software_engineer",
+  "valid_from": "2024-03-15T...",
+  "valid_until": null,
+  "confidence": 0.92,
+  "_similarity": 0.71,
+  "source_atom_id": "abc123..."
+}
+```
+
+**Auto entity detection — solved by embedding cosine.** Don't try
+to extract entities from the query and look them up in
+`triples.subject`. Just compute cosine on triple embeddings — the
+match is "this triple's subject+predicate+object embedding is
+close to the query's embedding," which works without explicit
+entity matching.
+
+**`valid_until` population — caveat.** Currently mostly NULL:
+- `update_world(valid_until=...)` only fires when callers pass it
+- `auto_close_on_conflict` only sets it on a previous triple when
+  a new contradicting triple lands via `update_world`
+- Consolidation doesn't extract `valid_until` from atom content
+
+To make `valid_until`-aware filtering meaningful, a follow-up
+should populate it via either:
+1. **LLM extraction during consolidation** — when synthesizing
+   observations, also extract any temporal scope phrases ("no
+   longer X", "until 2024", "after switching") into the triple's
+   `valid_until`.
+2. **Supersede-edge inference** — when consolidation writes a
+   `supersedes` edge between two observations, infer
+   `previous.valid_until = new.created_at` for triples on the
+   superseded one.
+
+Option 2 is free and tracks fact-replacement timing correctly for
+most cases. Bake it into consolidation.
+
+**Effort.** 1 day for the response wiring + 1 bench run; +0.5 day
+for the supersede-edge `valid_until` inference.
+
+**Risk.** Low. Returning extra info in the response is purely
+additive — readers can ignore the new block if they don't want
+it. Bench risk: only if the reader prompt template changes to
+include the triples block (then it's a real A/B).
+
+**Connection to other levers:**
+- Composes with P41 (triple-cosine atom augmentation): P42 returns
+  the triples themselves; P41 surfaces the atoms behind them.
+  Both leverage `triples.embedding`.
+- Orthogonal to graph pathway (which we've established is dead
+  for retrieval). P42 is presentation, not ranking.
+
+**File location:** `msam/server.py:api_query` two-tier path.
+Tests: cosine ranking, top_k cap, expired-triple filtering, empty
+when triples table empty.
+
+---
+
+### P43 — Beam search always-on; subatom retrieval as third beam
+
+**Status.** Filed 2026-04-30. Not yet implemented.
+
+**What.** Two coupled changes:
+
+1. **Drop the 10,000-atom threshold** for beam search. Currently
+   `enable_beam_search = "auto"` defers to
+   `beam_search_atom_threshold = 10000` — beam doesn't activate
+   below that. Untested on bench (which has ~500 atoms/question).
+   We don't know if beam would help at small atom counts.
+
+2. **Replace beam 3 (synonym-expanded query)** with
+   `compressed_retrieve` — sentence-level extracts via
+   `enable_subatom` + `enable_fact_dedup`. P12 (synonym expansion
+   on keyword) is already in canonical, so beam 3 was redundant
+   with the canonical path anyway. The compressed-retrieve path
+   provides a different signal: instead of a different *query*
+   formulation, it's a different *result granularity* — sentences
+   instead of whole atoms.
+
+**Why test these together.** Beam search's value is in covering
+blind spots from any single query formulation. Three beams of
+similar coverage (orig, regex-rewritten, synonym-expanded) all
+returning whole atoms is a narrower test than three beams that
+include a sentence-level pass.
+
+**Mechanism.**
+
+```python
+# Beam 1: original query, hybrid_retrieve (whole atoms)
+# Beam 2: regex-rewritten query, hybrid_retrieve (whole atoms)
+# Beam 3: original query, compressed_retrieve (sentences,
+#         dedup'd, then mapped back to parent atom_ids)
+# Merge into a single ranked list, RRF-fuse by atom_id keeping
+# max score per atom across beams.
+```
+
+Subatom returns sentences with atom_id metadata; reaggregate
+sentences → parent atom and use the *highest* sentence score as
+the parent atom's beam-3 score. So an atom with a tight 3-sentence
+hit ranks high; an atom with diffuse weak relevance ranks low.
+
+**Why P12 doesn't conflict.** P12 is already on in canonical and
+fires inside `hybrid_retrieve` (replaces the keyword query with
+synonyms). Beam 3 here is a different mechanism, so they can both
+apply: beam 1's `hybrid_retrieve` already runs P12 internally,
+and beam 3's `compressed_retrieve` fires sentence-level scoring
+on top.
+
+**Two flags affected.**
+- `[retrieval_v2] enable_beam_search` — change default from
+  "auto" to True. Drop or keep the threshold for the optional
+  user-config override.
+- `[retrieval_v2] beam_search_atom_threshold` — irrelevant if
+  beam is always-on; keep config key for back-compat, default
+  unchanged.
+
+**Effort.** 0.5 day for the beam restructure + 1 bench run.
+Compressed retrieve already exists in `subatom.py` — just need to
+glue it into beam 3.
+
+**Risk.** Medium. Three risks:
+1. Beam search at small atom counts could just be 3× the latency
+   for no recall lift.
+2. Subatom sentence scoring is a different similarity scale than
+   atom-level RRF — may not RRF-fuse cleanly.
+3. The compression LLM call (`enable_synthesis`) is OFF by default
+   so subatom shouldn't add LLM cost, but verify no path enables
+   it transitively.
+
+**Connection to other levers:**
+- The bench currently bypasses `retrieval_v2` entirely
+  (`[retrieval_v2] enabled = false`). Testing P43 means flipping
+  the bench's two-tier path through `retrieve_v2`, OR plumbing
+  beam search down into `hybrid_retrieve`. The latter is the
+  cleaner refactor. The former is the smaller change.
+- Composes with P39 (median pivot): if beam 3 surfaces sentence-
+  level matches that drag in atoms the cheap path missed, those
+  could become P39's pulled-in atoms.
+
+**File location:** `msam/retrieval_v2.py:beam_search_retrieve`.
+Tests: beam fuse correctness, atom_id-level dedup of sentence
+results, subatom path no-op when no sentences match.
+
+---
+
+### P44 — LLM-driven relations maintenance job (elaborates / supports / contextualizes)
+
+**Status.** Filed 2026-04-30. Not yet implemented.
+
+**What.** The `atom_relations` table allows
+`elaborates / supports / contextualizes / depends_on / refines /
+contradicts` edges, but **nothing in MSAM auto-writes them**.
+They exist only when callers manually call `add_atom_relation()`.
+Spreading activation reads from
+`elaborates / supports / contextualizes / consolidated_into` —
+so spreading is currently working with only `consolidated_into`
+(plus co-retrieval pairs). The other three relation types are
+dead.
+
+P44 adds a periodic LLM-driven maintenance job that scans atom
+pairs and writes relation edges where they apply.
+
+**Pre-filter to keep cost down.** O(N²) atom pairs is infeasible
+at 10k+ atoms. Filter to candidate pairs that:
+- Share at least 2 topics (`atom_topics` join), OR
+- Appear together in `co_retrieval` with `co_count ≥ 3`, OR
+- Are in the same atom_relations cluster via existing edges
+
+That winnows from O(N²) to a few thousand pairs even for a
+moderate-size deployment.
+
+**LLM call shape.**
+
+```
+Atoms A and B from the same conversation. Identify their
+relationship (or "none"):
+
+- elaborates: B adds detail to A
+- supports: B provides evidence for A's claim
+- contextualizes: A provides context for interpreting B
+- contradicts: B disagrees with A
+- supersedes: B replaces A as more current
+- depends_on: A's truth depends on B
+- refines: B is a more precise version of A
+- none: no significant relationship
+
+A: {content_A}
+B: {content_B}
+
+Relationship: <one of the above>
+```
+
+Run as a periodic decay-cycle pass — daily or weekly. Skip pairs
+already labeled (idempotent on re-run).
+
+**Effort.** 2 days for the maintenance job + a small bench run
+(the lift would show up in spreading activation; bench measures
+that path).
+
+**Risk.** Low for correctness (the relations are additive — bad
+labels can be detected and removed). Medium for cost: thousands
+of LLM calls per run, even with pre-filtering. Run on a cheap
+model (gpt-5.4-nano).
+
+**Connection to other levers:**
+- Spreading activation gets meaningfully more material to
+  traverse. Today it's mostly `consolidated_into` + co-retrieval;
+  with elaborates/supports/contextualizes populated, it covers
+  cross-cluster associations.
+- Composes with predictive retrieval (P-prediction): the relation
+  edges become inputs to topic-momentum prediction.
+- Orthogonal to triples / graph pathway (those track facts, not
+  inter-atom semantic relations).
+
+**File location:** new file `msam/relations_maintenance.py`. Hook
+into the decay cycle as an optional periodic pass.
+
+---
+
 ### P15 — Evaluate cross-encoder rerank
 
 **What.** Hindsight uses a cross-encoder reranker as their final stage
@@ -1225,6 +1557,64 @@ P32, which is independently scoped. Cleanup of the single-tier code
 path itself becomes a follow-up to P32: once two-tier serves triples
 in its response, single-tier is structurally redundant and can be
 deleted. Bumping P31 from "decide" to "delete after P32 lands."
+
+### Cleanup batch — features confirmed dead or harmful
+
+Filed 2026-04-30. Confirmed via discussion + bench data.
+
+1. **Default `[retrieval] two_tier_enabled = True`.** Canonical-best
+   retrieval is two-tier; the False default forces every caller to
+   know to flip it. Bench config already runs with this on.
+
+2. **Remove `[retrieval_v2] enable_quality_filter` (P13).** Bench-
+   regressed alone (P13_canon_v1 = 0.758, -2.6pp). Delete the flag,
+   delete the helper, drop it from cherry-pick wiring.
+
+3. **Remove `[retrieval] enable_temporal_pathway` and
+   `[retrieval_v2] enable_temporal`.** Pathway regressed in P3
+   bench. Detector untested but its design (filter atoms older
+   than max_age_days) is exactly what hurts temporal-reasoning
+   queries asking *about* old facts. Replace temporal handling
+   with `query_world(at_time=...)` against the world model
+   (covered by P42).
+
+4. **Remove `[retrieval_v2] enable_entity_roles` + `entity_roles.py`.**
+   Pattern-based, deployment-specific, untested on bench, dormant
+   in canonical path. Hardcoded patterns for `Things Agent Knows`,
+   `Core Traits`, etc. don't generalize.
+
+5. **Remove the `_QUERY_REWRITES` hardcoded defaults** in
+   `retrieval_v2.py`. The configurable `entity_mappings` interface
+   stays available (some callers may use it for non-conversational
+   flows), but the built-in `("user" → "User", "agent" → "Agent")`
+   defaults assume one specific deployment.
+
+6. **Remove store-time triples extraction.** P35 added the
+   consolidation-time path; the store-time path
+   (`server.py:314 if stream == "semantic" and ... extract_and_store(...)`)
+   should be deleted. Triples should only be extracted during
+   consolidation, not on every store.
+
+7. **Remove `sycophancy` infrastructure.** Caller-driven, no
+   auto-detection, dead in absence of explicit
+   `record_agreement()` calls. Drop the table, the metric helper,
+   the config block.
+
+All 7 are hygienic, none should affect bench scores meaningfully.
+Ship together as one cleanup commit; expected bench impact ≤ noise
+floor on the canonical configuration.
+
+---
+
+### Queued: predictive_retrieval bench after Bluesky data warmup
+
+Not a new experiment per se — `predict_needed_atoms` /
+`PredictiveEngine` exists (no LLM, pure SQL on access_log +
+co_retrieval + topic_momentum) but needs a populated DB to be
+meaningful. After a Bluesky-driven warmup run produces real
+access_log + atom history, queue a bench / smoke that exercises
+the heartbeat-turn seeding path: `predict_needed_atoms({...})` →
+extract topics from returned atoms → seed conversational ideas.
 
 ---
 
