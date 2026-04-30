@@ -211,6 +211,190 @@ async def test_dm_target_pulls_public_cross_channel_context(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_cross_platform_pull_resolves_canonical(tmp_path: Path):
+    """FUTURE_WORK §6.1: Alice on slack and Alice on discord — when an
+    IdentityResolver maps both platform ids to the canonical 'alice', a
+    turn for slack-Alice in #help cross-pulls her discord-Alice activity
+    in #eng (and vice versa)."""
+    from textwrap import dedent
+    from mimir.identities import IdentityResolver
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        dedent(
+            """\
+            people:
+              - canonical: alice
+                aliases:
+                  - slack-U123ABC
+                  - discord-456789
+            """
+        )
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+
+    buf = MessageBuffer(
+        history_path=tmp_path / "chat_history.jsonl",
+        resolver=resolver,
+    )
+    now = datetime.now(tz=timezone.utc)
+
+    # Alice on Slack in #eng (cross-pull source).
+    await buf.append(
+        buf.make_message(
+            channel_id="slack-eng",
+            kind="user_message",
+            content="slack-eng activity",
+            author="slack-U123ABC",
+            ts=(now - timedelta(minutes=10)).isoformat(),
+            source="slack",
+        )
+    )
+    # Alice on Discord in #eng (also cross-pull source).
+    await buf.append(
+        buf.make_message(
+            channel_id="discord-eng",
+            kind="user_message",
+            content="discord-eng activity",
+            author="discord-456789",
+            ts=(now - timedelta(minutes=5)).isoformat(),
+            source="discord",
+        )
+    )
+
+    # Composing a reply for Alice on a *third* platform — should pull from
+    # both prior platforms because the resolver collapses them onto 'alice'.
+    cross = buf.cross_author_messages(
+        author="bsky:alice.bsky.social",  # not yet aliased; see next assertion
+        exclude_channel="bsky-feed",
+        limit=10,
+        within_hours=24,
+        source_allowlist=frozenset({"slack", "discord", "web"}),
+    )
+    # Without alice's bsky alias mapped, target canonical is the raw bsky
+    # handle and won't match. No cross-pull.
+    assert cross == []
+
+    # Now do the realistic case — composing for slack-U123ABC pulls
+    # discord-eng activity (and slack-eng if exclude-channel allowed it).
+    cross = buf.cross_author_messages(
+        author="slack-U123ABC",
+        exclude_channel="slack-eng",
+        limit=10,
+        within_hours=24,
+        source_allowlist=frozenset({"slack", "discord", "web"}),
+    )
+    contents = [m.content for m in cross]
+    assert "discord-eng activity" in contents
+    # slack-eng excluded by exclude_channel.
+    assert "slack-eng activity" not in contents
+
+
+@pytest.mark.asyncio
+async def test_cross_platform_pull_kill_switch_disabled(tmp_path: Path):
+    """``cross_platform_pull=False`` disables resolver-based matching;
+    cross-pull falls back to direct equality. For an operator that wants
+    strict per-platform isolation."""
+    from textwrap import dedent
+    from mimir.identities import IdentityResolver
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        dedent(
+            """\
+            people:
+              - canonical: alice
+                aliases: [slack-U123, discord-456]
+            """
+        )
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+
+    buf = MessageBuffer(
+        history_path=tmp_path / "chat_history.jsonl",
+        resolver=resolver,
+        cross_platform_pull=False,
+    )
+    now = datetime.now(tz=timezone.utc)
+    await buf.append(
+        buf.make_message(
+            channel_id="discord-eng",
+            kind="user_message",
+            content="discord-eng activity",
+            author="discord-456",
+            ts=(now - timedelta(minutes=5)).isoformat(),
+            source="discord",
+        )
+    )
+
+    # Even though the resolver knows slack-U123 ≡ discord-456, the kill
+    # switch disables canonical resolution — direct equality means the
+    # discord message doesn't surface for the slack target.
+    cross = buf.cross_author_messages(
+        author="slack-U123",
+        exclude_channel="slack-eng",
+        limit=10,
+        within_hours=24,
+        source_allowlist=frozenset({"slack", "discord", "web"}),
+    )
+    assert cross == []
+
+
+@pytest.mark.asyncio
+async def test_resolver_does_not_override_dm_rule(tmp_path: Path):
+    """Identity reconciliation never lifts DM content into a non-DM
+    channel. The DM filter wins regardless of canonical match."""
+    from textwrap import dedent
+    from mimir.identities import IdentityResolver
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        dedent(
+            """\
+            people:
+              - canonical: alice
+                aliases: [slack-U123, discord-456]
+            """
+        )
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+
+    buf = MessageBuffer(
+        history_path=tmp_path / "chat_history.jsonl",
+        resolver=resolver,
+    )
+    now = datetime.now(tz=timezone.utc)
+
+    # Alice's DM (would canonical-match if not for the DM rule).
+    await buf.append(
+        buf.make_message(
+            channel_id="dm-discord-456",
+            kind="user_message",
+            content="alice-dm-secret",
+            author="discord-456",
+            ts=(now - timedelta(minutes=10)).isoformat(),
+            source="discord",
+        )
+    )
+
+    cross = buf.cross_author_messages(
+        author="slack-U123",  # canonical-matches discord-456 via resolver
+        exclude_channel="slack-eng",
+        limit=10,
+        within_hours=24,
+        source_allowlist=frozenset({"slack", "discord", "web"}),
+    )
+    contents = [m.content for m in cross]
+    assert "alice-dm-secret" not in contents
+
+
+@pytest.mark.asyncio
 async def test_dm_messages_never_pulled_regardless_of_target(tmp_path: Path):
     """Source-side privacy: a DM message NEVER appears in cross-pull, no
     matter what the target channel is — even if the target is itself a

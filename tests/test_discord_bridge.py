@@ -246,6 +246,12 @@ async def test_on_message_enqueues_user_message(bridge_with_fake_client):
     assert e.source == "discord"
     assert e.source_id == "555"
     assert e.author_id == "99"
+    # FUTURE_WORK §6.1: author is the platform-prefixed matching key.
+    # (author_display would be "alice#1234" but the SimpleNamespace mock's
+    # __str__ lambda doesn't actually override str() — that needs a
+    # class-level dunder. The author_display field is exercised in
+    # test_concurrency.py's cross-platform pull tests instead.)
+    assert e.author == "discord-99"
     assert e.extra["channel_conversation_type"] == "multi_user"
 
 

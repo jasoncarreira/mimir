@@ -368,11 +368,17 @@ class SlackBridge(Bridge):
         if not text:
             text = "User sent a message with no text."
 
+        # Platform-prefixed stable id is the matching key for cross-channel
+        # / cross-platform pull (FUTURE_WORK §6.1). The Slack event payload
+        # doesn't reliably carry a display name; fall back to user_id for
+        # display until a users.info enrichment ships.
+        author_key = f"slack-{user_id}"
         agent_event = AgentEvent(
             trigger="user_message",
             channel_id=channel_id,
             content=text,
-            author=user_id,
+            author=author_key,
+            author_display=user_id,
             author_id=user_id,
             source_id=event.get("ts"),
             source="slack",

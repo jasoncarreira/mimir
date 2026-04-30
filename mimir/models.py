@@ -14,12 +14,26 @@ from typing import Any
 
 @dataclass
 class AgentEvent:
-    """Inbound event from a bridge, scheduler tick, or HTTP injection."""
+    """Inbound event from a bridge, scheduler tick, or HTTP injection.
+
+    Author identity convention (FUTURE_WORK §6.1):
+    - ``author``         — platform-prefixed stable id used as the
+      matching key (e.g. ``"discord-99"``, ``"slack-U05ALICE"``).
+      ``MessageBuffer.cross_author_messages`` compares on this field
+      after resolving through ``IdentityResolver`` to a canonical.
+    - ``author_display`` — human-readable name for prompt rendering
+      (e.g. ``"alice#1234"``, ``"Alice Smith"``). Falls back to
+      ``author`` when not set.
+    - ``author_id``      — raw platform user id without the prefix
+      (e.g. ``"99"``, ``"U05ALICE"``). Diagnostic / cross-reference;
+      not the matching key.
+    """
 
     trigger: str                      # "user_message" | "scheduled_tick" | "msam_session_end" | ...
     channel_id: str
     content: str = ""
     author: str | None = None
+    author_display: str | None = None
     author_id: str | None = None
     source_id: str | None = None
     # Origin tag for the Recent activity allowlist (SPEC §5.4). Real

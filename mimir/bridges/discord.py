@@ -365,12 +365,17 @@ class DiscordBridge(Bridge):
 
         author_id = str(getattr(message.author, "id", "") or "") or None
         author_display = str(message.author)
+        # Platform-prefixed stable id is the matching key for cross-channel
+        # / cross-platform pull (FUTURE_WORK §6.1). Display name moves to
+        # author_display for rendering.
+        author_key = f"discord-{author_id}" if author_id else None
 
         event = AgentEvent(
             trigger="user_message",
             channel_id=channel_id,
             content=content,
-            author=author_display,
+            author=author_key,
+            author_display=author_display,
             author_id=author_id,
             source_id=str(getattr(message, "id", "") or "") or None,
             source="discord",

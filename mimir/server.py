@@ -26,6 +26,7 @@ from .config import Config
 from .dispatcher import Dispatcher
 from .event_logger import init_logger, log_event
 from .history import MessageBuffer
+from .identities import IdentityResolver
 from .index import IndexGenerator
 from .models import AgentEvent, make_process_session_id
 from .msam_client import MsamClient
@@ -98,11 +99,18 @@ def build_app(config: Config) -> web.Application:
     init_logger(config.events_log, make_process_session_id(), max_events=config.max_events_kept)
     turn_logger = TurnLogger(config.turns_log, max_turns=config.max_turns_kept)
 
+    # Identity reconciliation (FUTURE_WORK §6.1). Loads
+    # state/identities.yaml if present; gracefully empty otherwise.
+    identity_resolver = IdentityResolver(home=config.home)
+    aliases_loaded = identity_resolver.reload()
+
     history_path = config.home / "messages" / "chat_history.jsonl"
     message_buffer = MessageBuffer(
         history_path=history_path,
         global_max=config.history_global_max,
         per_channel_max=config.history_per_channel_max,
+        resolver=identity_resolver,
+        cross_platform_pull=config.cross_platform_pull,
     )
     replayed = message_buffer.replay()
 
@@ -233,7 +241,9 @@ def build_app(config: Config) -> web.Application:
     app["scheduler"] = scheduler
     app["subagent_inbox"] = inbox
     app["channels"] = channels
+    app["identity_resolver"] = identity_resolver
     app["replayed_messages"] = replayed
+    app["aliases_loaded"] = aliases_loaded
     app["seeded_subagents"] = seeded
     app["seeded_skills"] = seeded_skills_map
 

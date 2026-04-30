@@ -230,6 +230,9 @@ async def test_on_message_enqueues_user_message(bridge_with_fake_app):
     assert e.source == "slack"
     assert e.source_id == "1234567890.000001"
     assert e.author_id == "U05ALICE"
+    # FUTURE_WORK §6.1: author is the platform-prefixed matching key.
+    assert e.author == "slack-U05ALICE"
+    assert e.author_display == "U05ALICE"
     assert e.extra["channel_conversation_type"] == "multi_user"
     assert e.extra["channel_visibility"] == "public"
 

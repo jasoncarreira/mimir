@@ -107,6 +107,12 @@ class Config:
     bsky_handle: str
     bsky_app_password: str
 
+    # Identity reconciliation (FUTURE_WORK §6.1). Defaults true — operators
+    # who want strict per-platform isolation (compliance, regulated workflows)
+    # can set MIMIR_CROSS_PLATFORM_PULL=false to disable cross-platform pull
+    # without removing state/identities.yaml.
+    cross_platform_pull: bool
+
     # Logging
     max_turns_kept: int
     max_events_kept: int | None
@@ -165,6 +171,9 @@ class Config:
             slack_app_token=_env("SLACK_APP_TOKEN"),
             bsky_handle=_env("BSKY_HANDLE"),
             bsky_app_password=_env("BSKY_APP_PASSWORD"),
+
+            cross_platform_pull=_env("MIMIR_CROSS_PLATFORM_PULL", "true").lower()
+                not in {"false", "0", "no"},
 
             max_turns_kept=_env_int("MIMIR_MAX_TURNS", 1000),
             max_events_kept=int(max_events_raw) if max_events_raw else None,

@@ -119,6 +119,7 @@ class Agent:
             msam_client=msam_client,
             scheduler=scheduler,
             channel_registry=channel_registry,
+            message_buffer=message_buffer,
         )
 
         # Hooks layer mimir's path confinement + post-write reindex onto the
@@ -183,7 +184,7 @@ class Agent:
             kind=kind,
             content=event.content,
             author=event.author,
-            author_display=event.author,
+            author_display=event.author_display or event.author,
             msg_id=event.source_id,
             source=event.source,
         )
@@ -210,18 +211,43 @@ class Agent:
 
         Floors the per-atom confidence tier at the configured threshold
         (default "medium") because auto-fetched atoms cost system-prompt
-        budget every turn — low-confidence noise here is net-negative."""
+        budget every turn — low-confidence noise here is net-negative.
+
+        Passes the last few same-channel messages as ``context`` so MSAM
+        can rewrite referential queries ("yes, look for that") into
+        self-contained form when its
+        ``[retrieval] enable_contextual_rewrite`` flag is on. Filtered by
+        the same source allowlist as Recent activity so bench / API /
+        scheduler traffic stays out of the rewrite path."""
         if self._msam is None or ctx.trigger == "msam_session_end":
             return None
         if not event.content:
             return None
         min_tier = (self._config.msam_pre_message_min_tier or "").strip() or None
+        # Pull last 11 same-channel messages and drop the just-recorded
+        # inbound (step 2 of run_turn appended it); MSAM uses up to 10.
+        recent = self._buffer.recent_for_channel(
+            event.channel_id,
+            11,
+            source_allowlist=self._config.recent_sources,
+        )
+        if recent and recent[-1].kind == "user_message" and recent[-1].content == event.content:
+            recent = recent[:-1]
+        context = [
+            {
+                "role": "user" if m.kind == "user_message" else "assistant",
+                "content": m.content[:400],
+            }
+            for m in recent[-10:]
+            if m.kind in ("user_message", "assistant_message")
+        ] or None
         try:
             payload = await self._msam.query(
                 event.content,
                 top_k=12,
                 session_id=ctx.msam_session_id,
                 min_confidence_tier=min_tier,
+                context=context,
             )
         except MsamError as exc:
             await log_event(
@@ -258,11 +284,19 @@ class Agent:
             return
         if not ctx.msam_atom_ids or not output:
             return
+        atom_ids_for_feedback = list(dict.fromkeys(ctx.msam_atom_ids))
         try:
             await self._msam.feedback(
-                list(dict.fromkeys(ctx.msam_atom_ids)),  # de-dup, preserve order
+                atom_ids_for_feedback,  # de-dup, preserve order
                 output,
                 session_id=ctx.msam_session_id,
+            )
+            await log_event(
+                "msam_feedback_sent",
+                where="post_message_hook",
+                turn_id=ctx.turn_id,
+                n_atoms=len(atom_ids_for_feedback),
+                text_len=len(output),
             )
         except MsamError as exc:
             await log_event(
@@ -432,7 +466,17 @@ class Agent:
         #    Outbound inherits the inbound's source so the assistant reply
         #    participates in Recent activity rendering on the same allowlist
         #    as the human turn (open-strix-style).
-        if output and event.trigger != "msam_session_end":
+        #
+        #    Skip when send_message already wrote the delivered text to the
+        #    buffer. The SDK's `output` is final-assistant-text — when the
+        #    agent answered via mcp__mimir__send_message it's typically a
+        #    short narration ("Sent.") and persisting it would shadow the
+        #    real reply in Recent activity.
+        if (
+            output
+            and event.trigger != "msam_session_end"
+            and ctx.send_message_count == 0
+        ):
             await self._record_outbound(
                 event.channel_id, output, source=event.source
             )

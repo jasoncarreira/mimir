@@ -81,11 +81,22 @@ def _is_private_channel(channel_id: str) -> bool:
 
 @dataclass
 class MessageBuffer:
-    """In-memory deques + JSONL append. One instance per process."""
+    """In-memory deques + JSONL append. One instance per process.
+
+    ``resolver`` (FUTURE_WORK §6.1) is an optional ``IdentityResolver``
+    that maps platform-prefixed author ids to a canonical for cross-
+    channel / cross-platform pull. ``None`` (the default) makes
+    ``cross_author_messages`` fall back to direct equality on
+    ``msg.author`` — same behavior as before identity reconciliation
+    landed.
+    """
 
     history_path: Path
     global_max: int = 500
     per_channel_max: int = 250
+    resolver: object | None = None  # IdentityResolver | None — typed loosely to
+    # avoid a hard import dep in this module (history.py loads early).
+    cross_platform_pull: bool = True
     _all: deque[Message] = field(default_factory=deque)
     _by_channel: dict[str, deque[Message]] = field(default_factory=dict)
     _write_lock: asyncio.Lock | None = field(default=None, init=False)
@@ -229,10 +240,25 @@ class MessageBuffer:
         """Last ``limit`` messages by ``author`` on channels other than
         ``exclude_channel``, within the time window. DMs always excluded.
 
+        Author matching goes through the optional ``IdentityResolver``
+        (FUTURE_WORK §6.1) — so ``slack-U123ABC`` and ``discord-456789``
+        both resolve to ``alice`` and surface together when alice's
+        identity is mapped in ``state/identities.yaml``. Without a
+        resolver (or for unknown ids), comparison falls back to direct
+        equality.
+
         ``source_allowlist`` filters by ``Message.source`` (same semantics as
         ``recent_for_channel``)."""
         if not author or limit <= 0:
             return []
+        if not self.cross_platform_pull:
+            # Operator opted out of cross-platform pull (e.g. compliance);
+            # fall back to direct equality, no resolver consulted.
+            target_canonical = author
+            resolve = None
+        else:
+            target_canonical = self._resolve(author)
+            resolve = self._resolve
         cutoff = datetime.now(tz=timezone.utc).timestamp() - within_hours * 3600
         out: list[Message] = []
         # Walk newest-first for cheap early exit.
@@ -243,7 +269,8 @@ class MessageBuffer:
                 continue
             if _is_private_channel(msg.channel_id):
                 continue
-            if msg.author != author:
+            msg_canonical = resolve(msg.author) if resolve else msg.author
+            if msg_canonical != target_canonical:
                 continue
             if source_allowlist is not None and msg.source not in source_allowlist:
                 continue
@@ -258,6 +285,13 @@ class MessageBuffer:
             out.append(msg)
         out.reverse()
         return out
+
+    def _resolve(self, author: str | None) -> str | None:
+        """Map ``author`` through the resolver if one is wired; else return
+        unchanged. Falls through to direct equality when no resolver."""
+        if self.resolver is None or author is None:
+            return author
+        return self.resolver.resolve(author)
 
     def assemble_recent_activity(
         self,
