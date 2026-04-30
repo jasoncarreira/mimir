@@ -96,6 +96,18 @@ directions.
 
 If you're unsure between `concepts/` and `topics/`, ask: is this an *idea* (concept) or a *thing* (topic)? "Stigmergy" is a concept. "Project Hermes" is a topic. "Alice" is an entity.
 
+## When content evolves across sessions
+
+A wiki page on a long-running subject — a project, a team, a recurring
+topic — accumulates state over many sessions. When a later turn asks
+for "the latest" or "the final" or "this week's" version, the page has
+to make clear which entry is current.
+
+**Mark currency explicitly, with a date.** Don't rely on chronological
+order in the page body, recency-of-write, or "I'll figure it out from
+context." Retrieval doesn't preserve write order, and a date-less
+"Latest:" section becomes wrong the moment it's updated.
+
 ## Operations
 
 ### Ingest: raw → wiki

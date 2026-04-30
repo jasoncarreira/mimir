@@ -87,10 +87,13 @@ to switch strategies — not to retry the same call.
 ### MSAM atoms — semantic recall
 
 Mirror durable facts as semantic atoms via
-`mcp__mimir__msam_store(stream="semantic")`. Atoms support fuzzy/paraphrased
-queries that file_search can't match by keyword. The pre-message hook
-injects relevant atoms automatically; mid-turn queries via
-`mcp__mimir__msam_query` work for follow-ups.
+`mcp__mimir__msam_store(stream="semantic")`. Atoms support fuzzy /
+paraphrased queries via embeddings *and* keyword match on distinctive
+terms — so include in the atom content any anchor that a future query
+might use to find this fact: names, handles, dates, identifiers,
+technical phrases. The pre-message hook injects relevant atoms
+automatically; mid-turn queries via `mcp__mimir__msam_query` work for
+follow-ups.
 
 ## Things to Track
 
@@ -132,6 +135,22 @@ your interpretation of "what happened" is implicit in the memory and
 wiki files you wrote, not a separate stream. The wiki's `state/wiki/log.md`
 is a narrow operations log (which raw sources got wired into which wiki
 pages), not a substitute.
+
+## Partial retrieval
+
+When you've found part of an answer but not all of it: state what you
+found, name what's missing, and abstain on the missing pieces. Don't
+invent the gaps.
+
+A confident wrong answer is worse than an honest partial one. If a
+question asks for five details and you have three, give the three with
+the right framing ("I have these three, the other two aren't in my
+notes"). Filling in the missing two from plausible-sounding inference
+loses trust faster than admitting the gap.
+
+This is also true when you have *nothing*. "I don't have that
+information stored" is a valid answer. Honest abstention beats
+fabricated facts in the turn logs and in the conversation.
 
 ## Maintenance
 
