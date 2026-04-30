@@ -808,15 +808,6 @@ def grafana_annotations():
 
 # ─── Triple Metrics Endpoints ─────────────────────────────────────
 
-@app.route("/api/agreement_rate")
-def api_agreement_rate():
-    """Get current agreement rate for sycophancy detection."""
-    from .metrics import get_agreement_rate
-    agent_id = request.args.get("agent_id", "default")
-    window = request.args.get("window", 20, type=int)
-    return jsonify(get_agreement_rate(agent_id=agent_id, window=window))
-
-
 @app.route("/api/triples/stats")
 def api_triple_stats():
     """Current triple store statistics."""

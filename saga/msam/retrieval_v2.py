@@ -145,110 +145,6 @@ def extract_query_entities(query: str) -> list[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 2. QUERY EXPANSION VIA ENTITY RESOLUTION
-# ═══════════════════════════════════════════════════════════════════
-
-def expand_query(query: str) -> str:
-    """
-    Expand query with related terms from triple knowledge graph.
-    
-    "user's profession" → "user's profession User software_engineer developer"
-    "What projects?" → "What projects ProjectX developer contributor"
-    """
-    from .core import get_db
-    
-    conn = get_db()
-    entities = extract_query_entities(query)
-    
-    # Map "user" to actual user entity
-    q_lower = query.lower()
-    if 'user' in q_lower and 'User' not in entities:
-        entities.append('User')
-    
-    expansion_terms = set()
-    
-    for entity in entities:
-        entity_lower = entity.lower()
-        # Get all triples where entity is subject or object
-        rows = conn.execute("""
-            SELECT subject, predicate, object FROM triples 
-            WHERE state = 'active'
-            AND (LOWER(subject) LIKE ? OR LOWER(object) LIKE ?)
-        """, (f'%{entity_lower}%', f'%{entity_lower}%')).fetchall()
-        
-        for subj, pred, obj in rows:
-            pred_lower = pred.lower()
-            pred_words = set(pred_lower.replace('_', ' ').split())
-            
-            # Always-expand predicates (identity, role, profession)
-            always_expand = {'has_profession', 'works_as', 'tours_with', 'role',
-                           'has_role', 'is_a', 'profession', 'occupation',
-                           'performs_in', 'show', 'production', 'identity',
-                           'lives_in', 'based_in', 'from', 'birthday',
-                           'has_name', 'known_as', 'nickname'}
-            
-            # Query-relevant predicates (predicate words overlap with query)
-            # Simple stemming: strip common suffixes for matching
-            def _stems(word_set):
-                stems = set()
-                for w in word_set:
-                    stems.add(w)
-                    if w.endswith('ing') and len(w) > 5: stems.add(w[:-3])
-                    if w.endswith('s') and len(w) > 4: stems.add(w[:-1])
-                    if w.endswith('ed') and len(w) > 4: stems.add(w[:-2])
-                    if w.endswith('er') and len(w) > 4: stems.add(w[:-2])
-                    if w.endswith('tion') and len(w) > 6: stems.add(w[:-4])
-                return stems
-            
-            query_content_words = set(w for w in q_lower.split() if len(w) > 3)
-            query_stems = _stems(query_content_words)
-            pred_stems = _stems(pred_words)
-            # Word-level matching (not substring) on predicates
-            pred_relevant = bool(pred_stems & query_stems)
-            
-            # Object: word-level match on underscore-split tokens
-            obj_lower = obj.lower().replace('_', ' ')
-            obj_stems = _stems(set(obj_lower.split()))
-            obj_relevant = bool(obj_stems & query_stems)
-            
-            # Skip operational/browser/config predicates (noise)
-            noise_preds = {'can_perform_action_in_browser', 'uses_tool', 'uses_tool_for',
-                          'uses_command', 'config_file_path', 'config_apply_method',
-                          'requires_condition', 'data_source', 'data_scraped_date',
-                          'max_file_lines', 'uses_tool_behavior', 'uses_tool_purpose',
-                          'availability_window', 'fully_free_time',
-                          'pre_show_availability', 'post_show_response_time',
-                          'conversation_cadence_time', 'sleep_time', 'wake_time'}
-            
-            if pred_lower in noise_preds:
-                continue
-            
-            if pred_lower in always_expand or pred_relevant or obj_relevant:
-                obj_clean = obj.replace('_', ' ')
-                # Skip noisy/long objects that degrade embedding quality
-                if len(obj_clean.split()) > 4:
-                    continue  # Too long = too specific = noise
-                if any(noise in obj_clean.lower() for noise in [
-                    'knows what', 'what she', 'what he',
-                    'self improve', 'nothing to', 'builds',
-                ]):
-                    continue
-                expansion_terms.add(obj_clean)
-    
-    if expansion_terms:
-        # Limit expansion to avoid noise -- take most relevant terms
-        # Sort by length (longer = more specific = better)
-        sorted_terms = sorted(expansion_terms, key=len, reverse=True)
-        # Cap at 5 expansion terms
-        max_terms = _cfg('retrieval_v2', 'max_expansion_terms', 5)
-        selected = sorted_terms[:max_terms]
-        expanded = query + ' ' + ' '.join(selected)
-        return expanded
-    
-    return query
-
-
-# ═══════════════════════════════════════════════════════════════════
 # 3. TEMPORAL QUERY DETECTION
 # ═══════════════════════════════════════════════════════════════════
 
@@ -311,94 +207,6 @@ def apply_temporal_filter(atoms: list[dict], max_age_days: int) -> list[dict]:
     # Re-sort by boosted score
     filtered.sort(key=lambda x: x.get('_combined_score', 0), reverse=True)
     return filtered
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 4. ATOM QUALITY SCORING
-# ═══════════════════════════════════════════════════════════════════
-
-def compute_atom_quality(content: str) -> float:
-    """
-    Score atom information density. Range: 0.0 to 1.0.
-    Low-quality atoms (fragments, boilerplate) get penalized in retrieval.
-    
-    Factors:
-    - Length (very short = low quality)
-    - Unique word ratio (repetitive = low quality)  
-    - Named entity density (more entities = more informative)
-    - Structure markers (bullets, colons = structured = higher quality)
-    """
-    if not content:
-        return 0.0
-    
-    words = content.split()
-    n_words = len(words)
-    
-    # Length score: 0-10 words = poor, 10-50 = good, >100 = slightly penalized
-    if n_words < 5:
-        length_score = 0.2
-    elif n_words < 10:
-        length_score = 0.5
-    elif n_words <= 50:
-        length_score = 1.0
-    elif n_words <= 100:
-        length_score = 0.9
-    else:
-        length_score = 0.8
-    
-    # Unique word ratio
-    unique = len(set(w.lower() for w in words))
-    unique_ratio = unique / max(n_words, 1)
-    vocab_score = min(unique_ratio * 1.5, 1.0)  # normalize: 0.67+ unique = 1.0
-    
-    # Entity density: capitalized words, numbers, technical terms
-    entities = len(re.findall(r'\b[A-Z][a-z]+\b', content))
-    numbers = len(re.findall(r'\b\d+\b', content))
-    tech_terms = len(re.findall(r'\b[A-Z]{2,}\b', content))  # acronyms
-    entity_density = min((entities + numbers + tech_terms) / max(n_words, 1) * 5, 1.0)
-    
-    # Structure bonus: colons, bullets, key-value pairs
-    structure_markers = content.count(':') + content.count('•') + content.count('- ')
-    structure_score = min(structure_markers / 3, 1.0)
-    
-    quality = (length_score * 0.3 + vocab_score * 0.3 + 
-               entity_density * 0.2 + structure_score * 0.2)
-    
-    return round(quality, 3)
-
-
-def precompute_atom_quality():
-    """Pre-compute and cache quality scores for all active atoms."""
-    from .core import get_db
-    conn = get_db()
-    
-    # Add quality column if not exists
-    try:
-        conn.execute("ALTER TABLE atoms ADD COLUMN quality REAL DEFAULT 0.5")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-    
-    atoms = conn.execute("SELECT id, content FROM atoms WHERE state = 'active'").fetchall()
-
-    # Batch compute quality scores and update with executemany
-    batch = [(compute_atom_quality(content), atom_id) for atom_id, content in atoms]
-    updated = len(batch)
-    conn.executemany("UPDATE atoms SET quality = ? WHERE id = ?", batch)
-    conn.commit()
-    print(f"Quality scores computed for {updated} atoms")
-    
-    # Show distribution
-    dist = conn.execute("""
-        SELECT 
-            COUNT(CASE WHEN quality < 0.3 THEN 1 END) as low,
-            COUNT(CASE WHEN quality BETWEEN 0.3 AND 0.6 THEN 1 END) as medium,
-            COUNT(CASE WHEN quality > 0.6 THEN 1 END) as high
-        FROM atoms WHERE state = 'active'
-    """).fetchone()
-    print(f"Distribution: low={dist[0]}, medium={dist[1]}, high={dist[2]}")
-    
-    return updated
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -635,67 +443,6 @@ def migrate_embeddings(new_model: str, batch_size: int = 10):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 8. QUERY REWRITING (pattern-based)
-# ═══════════════════════════════════════════════════════════════════
-
-_QUERY_REWRITES = [
-    # "user" → actual user name
-    ("user", "User"),
-    ("the user", "User"),
-    ("user's", "User's"),
-    # "agent" → actual agent name
-    ("agent", "Agent"),
-    ("the agent", "Agent"),
-    ("agent's", "Agent's"),
-    # "system" / "server" → actual hostname
-    ("this system", "system"),
-    ("this server", "system"),
-]
-
-
-# Configurable entity mappings (loaded from TOML)
-def _get_entity_mappings() -> list[tuple]:
-    """Return ``[(compiled_regex, replacement), ...]`` — built-in
-    defaults plus any user-supplied mappings from
-    ``[retrieval_v2.entity_mappings]``.
-
-    Merge semantics:
-    - Built-in ``_QUERY_REWRITES`` apply by default.
-    - User keys are ADDED to the list; on key conflict (same pattern as
-      a built-in), the user's replacement wins.
-    - To suppress a built-in entirely, override it with a no-op (e.g.
-      ``"user" = "user"``).
-    - Keys are bare tokens; they get ``\\b…\\b`` wrapped automatically.
-    - Keys are interpreted as regex (no auto-escape), matching the
-      original behavior — e.g. ``"user|customer"`` matches either.
-    """
-    merged = dict(_QUERY_REWRITES)  # preserves insertion order
-    user_mappings = _cfg('retrieval_v2', 'entity_mappings', None)
-    if user_mappings and isinstance(user_mappings, dict):
-        for k, v in user_mappings.items():
-            merged[k] = v
-    return [
-        (re.compile(rf'\b{k}\b', re.IGNORECASE), v)
-        for k, v in merged.items()
-    ]
-
-
-def rewrite_query(query: str) -> str:
-    """
-    Apply pattern-based query rewrites.
-    Maps generic terms to specific entities.
-    """
-    rewritten = query
-    for pattern, replacement in _get_entity_mappings():
-        if isinstance(pattern, str):
-            rewritten = re.sub(pattern, replacement, rewritten, flags=re.IGNORECASE)
-        else:
-            rewritten = pattern.sub(replacement, rewritten)
-    
-    return rewritten
-
-
-# ═══════════════════════════════════════════════════════════════════
 # 9. BEAM SEARCH RETRIEVAL
 # ═══════════════════════════════════════════════════════════════════
 
@@ -705,67 +452,12 @@ def beam_search_retrieve(
     top_k: int = 12,
     beam_width: int = 3,
 ) -> list[dict]:
-    """
-    Multi-path retrieval with result merging.
-    
-    Beams:
-    1. Original query (standard hybrid retrieval)
-    2. Rewritten query (entity-resolved)
-    3. Expanded query (triple-augmented terms)
-    
-    Results are merged, deduplicated, and re-scored.
-    At 1M atoms, this ensures we don't miss results due to
-    a single query formulation's blind spots.
+    """Single-beam fallback after the cleanup batch removed regex
+    rewrite (beam 2) and triple-graph expand (beam 3). P43 reintroduces
+    a multi-beam shape with subatom as beam 2.
     """
     from .core import hybrid_retrieve
-    
-    all_results = {}  # atom_id → best result
-    
-    # Beam 1: Original query
-    beam1 = hybrid_retrieve(query, mode=mode, top_k=top_k)
-    for atom in beam1:
-        aid = atom.get('id', '')
-        if aid not in all_results or atom.get('_combined_score', 0) > all_results[aid].get('_combined_score', 0):
-            atom['_beam'] = 'original'
-            all_results[aid] = atom
-    
-    # Beam 2: Rewritten query
-    rewritten = rewrite_query(query)
-    if rewritten != query:
-        beam2 = hybrid_retrieve(rewritten, mode=mode, top_k=top_k)
-        for atom in beam2:
-            aid = atom.get('id', '')
-            if aid not in all_results or atom.get('_combined_score', 0) > all_results[aid].get('_combined_score', 0):
-                atom['_beam'] = 'rewritten'
-                all_results[aid] = atom
-    
-    # Beam 3: Expanded query  
-    if _cfg('retrieval_v2', 'enable_query_expansion', True):
-        expanded = expand_query(query)
-        if expanded != query:
-            beam3 = hybrid_retrieve(expanded, mode=mode, top_k=top_k)
-            for atom in beam3:
-                aid = atom.get('id', '')
-                if aid not in all_results or atom.get('_combined_score', 0) > all_results[aid].get('_combined_score', 0):
-                    atom['_beam'] = 'expanded'
-                    all_results[aid] = atom
-    
-    # Multi-beam bonus: atoms found by multiple beams are more likely relevant
-    beam_counts = {}
-    for beam_list, label in [(beam1, 'original'), 
-                              (hybrid_retrieve(rewritten, mode=mode, top_k=top_k) if rewritten != query else [], 'rewritten')]:
-        for atom in beam_list:
-            aid = atom.get('id', '')
-            beam_counts[aid] = beam_counts.get(aid, 0) + 1
-    
-    for aid, atom in all_results.items():
-        if beam_counts.get(aid, 0) > 1:
-            atom['_combined_score'] = atom.get('_combined_score', 0) * (1 + 0.2 * beam_counts[aid])
-            atom['_multi_beam'] = beam_counts[aid]
-    
-    # Sort and return
-    results = sorted(all_results.values(), key=lambda x: x.get('_combined_score', 0), reverse=True)
-    return results[:top_k]
+    return hybrid_retrieve(query, mode=mode, top_k=top_k)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -791,15 +483,6 @@ def retrieve_v2(
     t0 = time.time()
     
     original_query = query
-    
-    # Step 1: Query rewriting (8)
-    if _cfg('retrieval_v2', 'enable_rewrite', True):
-        query = rewrite_query(query)
-    
-    # Step 2: Temporal detection (3)
-    temporal_scope = None
-    if _cfg('retrieval_v2', 'enable_temporal', True):
-        temporal_scope = detect_temporal_scope(query)
     
     # Step 3: Beam search or standard retrieval (9)
     # Three modes: True (always), False (never), "auto" (dynamic gate on atom count)
@@ -854,37 +537,6 @@ def retrieve_v2(
                                 existing_ids.add(atom_id)
             finally:
                 conn.close()
-    
-    # Step 4b: Entity-role scoring (NEW)
-    if _cfg('retrieval_v2', 'enable_entity_roles', True):
-        from .entity_roles import classify_query_intent, entity_score_adjustment
-        query_entity, query_conf = classify_query_intent(original_query)
-        if query_entity != 'unknown':
-            for atom in atoms:
-                atom_entity = atom.get('about_entity', 'unknown')
-                entity_conf = float(atom.get('entity_confidence') or 0)
-                # Use the minimum of query and atom confidence
-                combined_conf = min(query_conf, max(entity_conf, 0.3))
-                multiplier = entity_score_adjustment(atom_entity, query_entity, combined_conf)
-                atom['_combined_score'] = atom.get('_combined_score', 0) * multiplier
-                atom['_entity_match'] = (atom_entity == query_entity)
-                atom['_query_entity'] = query_entity
-
-    # Step 5: Temporal filter (3)
-    if temporal_scope is not None:
-        atoms = apply_temporal_filter(atoms, temporal_scope)
-    
-    # Step 6: Quality filter (4)
-    if _cfg('retrieval_v2', 'enable_quality_filter', True):
-        for atom in atoms:
-            quality = atom.get('quality', None)
-            if quality is None:
-                quality = compute_atom_quality(atom.get('content', ''))
-            # Penalize low-quality atoms
-            if quality < 0.3:
-                atom['_combined_score'] = atom.get('_combined_score', 0) * 0.5
-            elif quality > 0.7:
-                atom['_combined_score'] = atom.get('_combined_score', 0) * 1.1
     
     # Re-sort after filters
     atoms.sort(key=lambda x: x.get('_combined_score', 0), reverse=True)
@@ -990,8 +642,6 @@ if __name__ == "__main__":
             beam = f' [{a.get("_beam", "")}]' if a.get('_beam') else ''
             rew = ' [R]' if a.get('_reranked') else ''
             print(f"  [{score:.2f}]{aug}{beam}{rew} {a['content'][:70]}")
-    elif cmd == "quality":
-        precompute_atom_quality()
     elif cmd == "embedding-check":
         info = check_embedding_upgrade()
         print(json.dumps(info, indent=2))

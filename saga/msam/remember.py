@@ -1487,45 +1487,6 @@ def cmd_world(args):
                        "triples": result, "count": len(result)}, indent=2, default=str))
 
 
-def cmd_agreement(args):
-    """Agreement rate tracking -- detect sycophancy.
-
-    Usage:
-        msam agreement                              Show current agreement rate
-        msam agreement record agree|disagree|...    Record a signal
-        msam agreement --agent <id>                 Check specific agent
-    """
-    from .metrics import record_agreement, get_agreement_rate
-
-    if not args:
-        result = get_agreement_rate()
-        print(json.dumps(result, indent=2, default=str))
-        return
-
-    if args[0] == "record":
-        signal = args[1] if len(args) > 1 else "neutral"
-        if signal not in ("agree", "disagree", "neutral", "challenge"):
-            print(json.dumps({"error": f"Invalid signal: {signal}. Use agree|disagree|neutral|challenge"}))
-            return
-        context = args[2] if len(args) > 2 else None
-        result = record_agreement(signal, context=context)
-        print(json.dumps(result, indent=2, default=str))
-        return
-
-    agent_id = "default"
-    window = 20
-    i = 0
-    while i < len(args):
-        if args[i] == "--agent" and i + 1 < len(args):
-            agent_id = args[i + 1]; i += 2
-        elif args[i] == "--window" and i + 1 < len(args):
-            window = int(args[i + 1]); i += 2
-        else:
-            i += 1
-    result = get_agreement_rate(agent_id=agent_id, window=window)
-    print(json.dumps(result, indent=2, default=str))
-
-
 def cmd_help(args=None):
     """Print grouped command reference."""
     help_text = """MSAM CLI -- Multi-Stream Adaptive Memory
@@ -1749,7 +1710,6 @@ def main():
         "re-embed": cmd_reembed,
         "outcomes": cmd_outcomes,
         "world": cmd_world,
-        "agreement": cmd_agreement,
     }
     
     if command in commands:

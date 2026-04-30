@@ -70,61 +70,6 @@ class TestApplyTemporalFilter:
         assert "new" in filtered[0]["content"]
 
 
-class TestComputeAtomQuality:
-    def test_short_content_low(self):
-        from msam.retrieval_v2 import compute_atom_quality
-        rich_quality = compute_atom_quality(
-            "Agent Identity: Curious, analytical, warm personality. "
-            "Values: growth, authenticity, depth."
-        )
-        short_quality = compute_atom_quality("Hi")
-        assert short_quality < rich_quality, "Short content should score lower than rich content"
-
-    def test_rich_content_high(self):
-        from msam.retrieval_v2 import compute_atom_quality
-        content = (
-            "Agent Identity: Core Traits - Curious, analytical, warm. "
-            "Values authenticity and growth. Professional in tech discussions, "
-            "casual in personal conversations. Key interests: AI systems, "
-            "music theory, cognitive science."
-        )
-        quality = compute_atom_quality(content)
-        assert quality > 0.5
-
-    def test_empty_returns_zero(self):
-        from msam.retrieval_v2 import compute_atom_quality
-        assert compute_atom_quality("") == 0.0
-
-
-class TestRewriteQuery:
-    def test_applies_entity_mappings(self):
-        from msam.retrieval_v2 import rewrite_query
-        result = rewrite_query("what does the user like?")
-        # Should replace "user" with "User" (capitalized entity)
-        assert "User" in result
-
-
-class TestPrecomputeAtomQuality:
-    def test_updates_atoms(self):
-        from msam.core import get_db, run_migrations, store_atom
-        from msam.retrieval_v2 import precompute_atom_quality
-
-        conn = get_db()
-        run_migrations(conn)
-        conn.close()
-
-        store_atom("Agent Identity: Curious, analytical, warm. Values authenticity.")
-        store_atom("Short")
-
-        updated = precompute_atom_quality()
-        assert updated >= 2
-
-        conn = get_db()
-        rows = conn.execute("SELECT quality FROM atoms WHERE state = 'active'").fetchall()
-        conn.close()
-        assert all(r[0] is not None for r in rows)
-
-
 class TestFeedbackPipeline:
     def test_init_feedback_table(self):
         from msam.core import get_db, run_migrations
@@ -162,43 +107,6 @@ class TestFeedbackPipeline:
 
         usefulness = get_atom_usefulness("atom_x")
         assert usefulness == pytest.approx(0.6, abs=0.01)  # 3/5
-
-
-class TestExpandQuery:
-    def test_returns_query_without_triples(self):
-        from msam.core import get_db, run_migrations
-        from msam.retrieval_v2 import expand_query
-        from msam.triples import init_triples_schema
-
-        conn = get_db()
-        run_migrations(conn)
-        init_triples_schema(conn)
-        conn.commit()
-        conn.close()
-
-        # No triples stored → returns original query unchanged
-        result = expand_query("What does Alice like?")
-        assert "Alice" in result
-
-    def test_expands_with_triples(self):
-        from msam.core import get_db, run_migrations
-        from msam.retrieval_v2 import expand_query
-        from msam.triples import init_triples_schema, store_triple
-
-        conn = get_db()
-        run_migrations(conn)
-        init_triples_schema(conn)
-        conn.commit()
-
-        # Need a source atom for FK
-        _store_test_atom(conn, "src1", "User is a developer")
-        conn.close()
-
-        store_triple("src1", "User", "has_profession", "developer", embed=False)
-
-        result = expand_query("What is the user's profession?")
-        # Should include the original query
-        assert "profession" in result
 
 
 class TestRetrieveV2:

@@ -584,15 +584,11 @@ def compressed_retrieve(
     # Step 1: Retrieval (v2 handles rewriting/expansion internally)
     atoms = hybrid_retrieve(query, mode=mode, top_k=top_k)
     
-    # For sentence extraction, use the expanded query if v2 is enabled
-    # so sentence similarity matches against the enriched query
+    # Sentence extraction operates on the original query — embeddings
+    # already match well across phrasings, and the rewrite/expand utilities
+    # were removed in the cleanup batch alongside their parent retrieval_v2
+    # mechanisms.
     extraction_query = query
-    if use_v2:
-        try:
-            from .retrieval_v2 import rewrite_query, expand_query
-            extraction_query = expand_query(rewrite_query(query))
-        except ImportError:
-            pass
     
     whole_atom_tokens = sum(_estimate_tokens(a.get('content', '')) for a in atoms)
     
