@@ -90,3 +90,56 @@ async def test_event_endpoint_validates_channel_id(tmp_path: Path):
             data = await r.json()
             assert data == {"ok": True}
             await app["dispatcher"].drain()
+
+
+@pytest.mark.asyncio
+async def test_event_endpoint_requires_api_key_when_configured(tmp_path: Path):
+    cfg = Config.from_env()
+    cfg = replace(cfg, home=tmp_path, api_key="secret-token")
+    fake = await _fake_query_factory("noop")
+    with patch("mimir.agent.query", new=fake):
+        app = mimir_server.build_app(cfg)
+        async with TestClient(TestServer(app)) as client:
+            # No header → 401, body never parsed.
+            r = await client.post("/event", json={"channel_id": "bench-1", "content": "x"})
+            assert r.status == 401
+
+            # Wrong header → 401.
+            r = await client.post(
+                "/event",
+                json={"channel_id": "bench-1", "content": "x"},
+                headers={"X-API-Key": "wrong"},
+            )
+            assert r.status == 401
+
+            # Right header → goes through (validates channel etc. as normal).
+            r = await client.post(
+                "/event",
+                json={"channel_id": "bench-1", "content": "x"},
+                headers={"X-API-Key": "secret-token"},
+            )
+            assert r.status == 200
+
+            # /health stays open regardless of auth state.
+            r = await client.get("/health")
+            assert r.status == 200
+
+            await app["dispatcher"].drain()
+
+
+@pytest.mark.asyncio
+async def test_event_endpoint_open_when_api_key_unset(tmp_path: Path):
+    """Default config has empty api_key — auth disabled, requests pass.
+    This is the dev / localhost-only mode."""
+    cfg = Config.from_env()
+    cfg = replace(cfg, home=tmp_path, api_key="")
+    fake = await _fake_query_factory("noop")
+    with patch("mimir.agent.query", new=fake):
+        app = mimir_server.build_app(cfg)
+        async with TestClient(TestServer(app)) as client:
+            r = await client.post(
+                "/event",
+                json={"channel_id": "bench-1", "content": "x"},
+            )
+            assert r.status == 200
+            await app["dispatcher"].drain()

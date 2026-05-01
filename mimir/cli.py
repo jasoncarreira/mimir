@@ -58,6 +58,11 @@ DEFAULT_ENV_TEMPLATE = dedent(
     MIMIR_WEB_PORT=8080
     MIMIR_MODEL=claude-opus-4-7
     MIMIR_EFFORT=high
+    # API key for the public injection endpoint (POST /event). When set,
+    # requests must carry a matching ``X-API-Key`` header. The server
+    # binds to 0.0.0.0 — any non-localhost deployment should set this.
+    # Generate with e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+    MIMIR_API_KEY=
 
     # ---- Operator config -------------------------------------------------
     # Channel the agent uses for high-priority signals to you that don't fit

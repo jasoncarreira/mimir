@@ -137,6 +137,15 @@ class Config:
     # channel id; the registered bridge dispatches by prefix.
     operator_alert_channel: str
 
+    # Server-side API key for the public injection endpoint (POST /event).
+    # When set, requests must carry a matching ``X-API-Key`` header or get
+    # 401. Empty default means no auth — fine for development on
+    # localhost, but the server binds to 0.0.0.0 so any production
+    # deployment should set this. Without it, an attacker who can reach
+    # the server can steer the agent into the synthesis path against an
+    # arbitrary session id (and call msam_end_session etc.).
+    api_key: str
+
     # Algedonic surfacing (v0.4 §2). Window for the Recent feedback
     # signals prompt section; per-polarity cap on rendered items. 0 for
     # the limit disables the section entirely. Tune small if the prompt
@@ -214,6 +223,7 @@ class Config:
                 not in {"false", "0", "no"},
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
+            api_key=_env("MIMIR_API_KEY"),
 
             feedback_window_hours=_env_int("MIMIR_FEEDBACK_WINDOW_HOURS", 24),
             feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),

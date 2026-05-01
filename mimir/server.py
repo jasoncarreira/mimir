@@ -43,6 +43,20 @@ log = logging.getLogger(__name__)
 
 
 async def _handle_event(request: web.Request) -> web.Response:
+    # Auth gate: when MIMIR_API_KEY is set, the request must carry a
+    # matching X-API-Key header. The server binds to 0.0.0.0 and the
+    # /event payload accepts arbitrary trigger strings, so an attacker
+    # who can reach the port without auth can steer the agent into the
+    # synthesis path against an unrelated session and call
+    # msam_end_session. Empty key = no auth (dev / localhost-only).
+    expected_key = request.app.get("api_key") or ""
+    if expected_key:
+        provided = request.headers.get("X-API-Key", "")
+        if not _safe_str_eq(provided, expected_key):
+            return web.json_response(
+                {"error": "unauthorized"}, status=401,
+            )
+
     try:
         body: dict[str, Any] = await request.json()
     except json.JSONDecodeError:
@@ -72,6 +86,13 @@ async def _handle_event(request: web.Request) -> web.Response:
             status=503,
         )
     return web.json_response({"ok": True, "channel_id": channel_id})
+
+
+def _safe_str_eq(a: str, b: str) -> bool:
+    """Constant-time string compare. Avoids leaking key length/prefix
+    via response-time differences."""
+    import hmac
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
 async def _handle_health(request: web.Request) -> web.Response:
@@ -246,6 +267,14 @@ def build_app(config: Config) -> web.Application:
     app["aliases_loaded"] = aliases_loaded
     app["seeded_subagents"] = seeded
     app["seeded_skills"] = seeded_skills_map
+    app["api_key"] = config.api_key
+
+    if not config.api_key:
+        log.warning(
+            "MIMIR_API_KEY is unset — POST /event accepts unauthenticated "
+            "requests. Set the env var before exposing the port beyond "
+            "localhost."
+        )
 
     app.router.add_post("/event", _handle_event)
     app.router.add_get("/health", _handle_health)
