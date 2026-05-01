@@ -1436,17 +1436,25 @@ into the decay cycle as an optional periodic pass.
 
 ---
 
-### P45 — `GET /v1/sessions/recent` endpoint (caller-driven boundary recall)
+### P45 — Caller-driven recall endpoints (boundaries + most-retrieved atoms)
 
-**Status.** Filed 2026-04-30. Not yet implemented.
+**Status.** Filed 2026-04-30, expanded 2026-05-01. Not yet
+implemented.
 
-**What.** Add a REST endpoint exposing
-`get_last_sessions(count, channel, session_id)` from `core.py`.
-The function exists with the right shape — count, channel filter,
-session_id filter — but is only callable from the CLI today. For
-prompt-assembly use cases like "the last 3 boundaries on this
-channel" (a separate person's conversation in a different channel
-isn't useful), callers need REST access.
+Two related REST endpoints that surface MSAM's chronological /
+frequency-based state for prompt assembly. Both are paired
+because they share the same auth, response shape, and latency
+profile (single SELECT, no LLM, ~5-10ms each), and callers tend
+to want them together when assembling pre-message context.
+
+#### Endpoint 1 — `GET /v1/sessions/recent`
+
+Expose `get_last_sessions(count, channel, session_id)` from
+`core.py` over REST. The function exists with the right shape but
+is only callable from the CLI today. For prompt-assembly use
+cases like "the last 3 boundaries on this channel" (a separate
+person's conversation in a different channel isn't useful),
+callers need REST access.
 
 **Why a separate endpoint, not a flag on `/v1/query`.** Two
 different intents:
@@ -1456,22 +1464,15 @@ different intents:
 - "Last 3 boundaries on this channel" is *chronological recall* —
   no query, just `ORDER BY created_at DESC LIMIT 3`.
 
-Cleaner to keep them apart even though it's a second round-trip.
-Latency budget for the second call: ~5-10ms (single SELECT,
-optional WHERE on `json_extract(metadata, '$.channel')`).
-
-**Endpoint shape:**
-
+**Shape:**
 ```
 GET /v1/sessions/recent?channel=X&count=3&session_id=...
 ```
-
 Response: list of boundary atoms with `id`, `content`, `timestamp`,
 `topics`, `session_id`, parsed `metadata` (channel, decisions,
 unfinished, emotional_state, etc.).
 
 **Implementation:**
-
 ```python
 @app.get("/v1/sessions/recent", dependencies=[Depends(verify_api_key)])
 async def api_recent_sessions(
@@ -1489,16 +1490,77 @@ async def api_recent_sessions(
 ~10 lines in `server.py`. The function in core.py already does
 all the work.
 
-**Performance caveat.** The channel filter uses
+#### Endpoint 2 — `GET /v1/atoms/most_retrieved`
+
+Top-N atoms by retrieval count over a recent time window. Useful
+for "what has the agent been thinking about lately?" pre-message
+context, or for selecting candidate atoms to surface in heartbeat
+turns when no specific query is being asked.
+
+**Shape:**
+```
+GET /v1/atoms/most_retrieved?days=7&count=10&channel=X&contributed_only=false
+```
+- `days` (default 7) — only count retrievals from the last N days
+- `count` (default 10) — top-K atoms by retrieval count
+- `channel` (optional) — filter to atoms tagged with this channel
+- `contributed_only` (default false) — when true, count only
+  retrievals where `access_log.contributed = 1` (the agent's
+  feedback indicated the atom was actually used). Surfaces "atoms
+  that earned their keep" rather than just "atoms that got pulled
+  in often."
+
+Response: list of atoms with `id`, `content`, `created_at`,
+`topics`, `session_id`, plus computed fields `retrieval_count`,
+`contributed_count`, `last_retrieved_at`.
+
+**SQL** (against `access_log` joined with `atoms`):
+```sql
+SELECT a.id, a.content, a.created_at, a.topics, a.session_id,
+       COUNT(*) AS retrieval_count,
+       SUM(CASE WHEN al.contributed = 1 THEN 1 ELSE 0 END)
+           AS contributed_count,
+       MAX(al.accessed_at) AS last_retrieved_at
+FROM access_log al
+JOIN atoms a ON a.id = al.atom_id
+WHERE al.accessed_at >= datetime('now', ?-' || ? || ' days')
+  AND a.state IN ('active', 'fading')
+  -- optional: AND al.contributed = 1
+  -- optional: AND json_extract(a.metadata, '$.channel') = ?
+GROUP BY a.id
+ORDER BY retrieval_count DESC, last_retrieved_at DESC
+LIMIT ?
+```
+
+Uses the `idx_access_log_atom` and `idx_access_log_session` (now
+indexed) to keep the time-window scan cheap. At typical access_log
+sizes (thousands to tens of thousands of rows) the query should
+return in <10ms; at very large logs we'd want a partial index on
+`(accessed_at, atom_id)` but defer until needed.
+
+**Implementation:** new helper in `core.py` named
+`get_most_retrieved(days, count, channel, contributed_only)` that
+runs the SQL above and returns the atom list. New endpoint
+`api_most_retrieved` in `server.py` wraps it. ~30 lines including
+the helper.
+
+#### Shared notes
+
+**Performance caveat (channel filter).** Both endpoints use
 `json_extract(metadata, '$.channel') = ?` which is a row scan
-(no index on JSON columns). For DBs with thousands of session
-boundaries this could get slow. Mitigation: denormalize `channel`
-to an `atoms.channel` column when volume warrants — same pattern
+(no index on JSON columns). For DBs with thousands of relevant
+atoms this could get slow. Mitigation: denormalize `channel` to
+an `atoms.channel` column when volume warrants — same pattern
 used for `session_id` in migration 3. Skip until needed.
 
-**Effort.** 30 min (endpoint + handful of tests).
+**Effort.** 1 hour total (both endpoints + helper + tests).
 
-**Risk.** None — exposes existing well-tested function.
+**Risk.** Endpoint 1: none — exposes existing well-tested
+function. Endpoint 2: medium — new SQL helper that hasn't been
+exercised; tests should cover the `days` window edge case
+(retrievals exactly at the boundary), the `contributed_only`
+filter, the channel filter, and the empty-result case (no
+retrievals in the window).
 
 ---
 
