@@ -4939,6 +4939,80 @@ def get_last_sessions(count: int = 3, channel: str = None,
     return out
 
 
+def get_most_retrieved(
+    days: int = 7,
+    count: int = 10,
+    channel: str = None,
+    contributed_only: bool = False,
+) -> list[dict]:
+    """Top-N atoms by retrieval count over a recent time window.
+
+    Useful for "what has the agent been thinking about lately?"
+    pre-message context, or for selecting candidate atoms to surface
+    in heartbeat-turn seeding when no specific query is being asked.
+
+    Args:
+        days: only count retrievals from the last N days (default 7).
+        count: top-K atoms to return (default 10).
+        channel: filter to atoms tagged with this channel via
+            metadata.channel. None = no filter.
+        contributed_only: when True, count only retrievals where
+            access_log.contributed = 1. Surfaces "atoms that earned
+            their keep" rather than just "atoms that got pulled in often."
+
+    Returns: list of atom dicts with id, content, created_at, topics,
+        session_id, retrieval_count, contributed_count, last_retrieved_at.
+    """
+    conn = get_db()
+
+    sql = (
+        "SELECT a.id, a.content, a.created_at, a.topics, a.session_id, "
+        "       a.metadata, "
+        "       COUNT(*) AS retrieval_count, "
+        "       SUM(CASE WHEN al.contributed = 1 THEN 1 ELSE 0 END) "
+        "           AS contributed_count, "
+        "       MAX(al.accessed_at) AS last_retrieved_at "
+        "FROM access_log al "
+        "JOIN atoms a ON a.id = al.atom_id "
+        "WHERE al.accessed_at >= datetime('now', ?) "
+        "  AND a.state IN ('active', 'fading')"
+    )
+    params: list = [f'-{int(days)} days']
+    if contributed_only:
+        sql += " AND al.contributed = 1"
+    if channel:
+        sql += " AND json_extract(a.metadata, '$.channel') = ?"
+        params.append(channel)
+    sql += (
+        " GROUP BY a.id "
+        "ORDER BY retrieval_count DESC, last_retrieved_at DESC "
+        "LIMIT ?"
+    )
+    params.append(int(count))
+
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    conn.close()
+
+    out: list[dict] = []
+    for r in rows:
+        try:
+            meta = json.loads(r[5] or '{}')
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+        out.append({
+            "id": r[0],
+            "content": r[1],
+            "created_at": r[2],
+            "topics": json.loads(r[3] or '[]'),
+            "session_id": r[4],
+            "channel": meta.get("channel"),
+            "retrieval_count": r[6],
+            "contributed_count": r[7] or 0,
+            "last_retrieved_at": r[8],
+        })
+    return out
+
+
 # ─── Feature: Knowledge Gap Detection ────────────────────────────
 
 def detect_knowledge_gaps(entity: str, expected_relations: list[str] = None) -> dict:

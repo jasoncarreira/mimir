@@ -24,6 +24,8 @@ Endpoints:
     POST /v1/query               Query memories (confidence-gated)
     POST /v1/feedback            Mark atom contributions
     POST /v1/sessions/end        Write a session boundary atom
+    GET  /v1/sessions/recent     Recent boundaries (chronological recall)
+    GET  /v1/atoms/most_retrieved Top-N atoms by retrieval count
     POST /v1/decay               Run decay cycle
     GET  /v1/stats               Database statistics
     POST /v1/triples/extract     Extract triples
@@ -544,6 +546,51 @@ async def api_session_end(req: SessionEndRequest):
     return await asyncio.to_thread(_end)
 
 
+# ─── GET /v1/sessions/recent ─────────────────────────────────────────────────
+
+@app.get("/v1/sessions/recent", dependencies=[Depends(verify_api_key)])
+async def api_recent_sessions(
+    count: int = 3,
+    channel: Optional[str] = None,
+    session_id: Optional[str] = None,
+):
+    """Chronological recall of session boundaries — distinct from
+    /v1/query's semantic-similarity surfacing. Returns the most-recent
+    `count` boundaries optionally filtered by channel and/or session_id.
+    """
+    def _list():
+        from .core import get_last_sessions
+        return {"sessions": get_last_sessions(
+            count=count, channel=channel, session_id=session_id,
+        )}
+    return await asyncio.to_thread(_list)
+
+
+# ─── GET /v1/atoms/most_retrieved ────────────────────────────────────────────
+
+@app.get("/v1/atoms/most_retrieved", dependencies=[Depends(verify_api_key)])
+async def api_most_retrieved(
+    days: int = 7,
+    count: int = 10,
+    channel: Optional[str] = None,
+    contributed_only: bool = False,
+):
+    """Top-N atoms by retrieval count over the last `days` days. Useful
+    for "what has the agent been thinking about lately?" pre-message
+    context, or for heartbeat-turn candidate seeding when no specific
+    query is being asked. ``contributed_only=true`` filters to
+    retrievals where the agent's feedback marked the atom as actually
+    used (access_log.contributed = 1).
+    """
+    def _list():
+        from .core import get_most_retrieved
+        return {"atoms": get_most_retrieved(
+            days=days, count=count, channel=channel,
+            contributed_only=contributed_only,
+        )}
+    return await asyncio.to_thread(_list)
+
+
 # ─── POST /v1/outcome ─────────────────────────────────────────────────────────
 
 class OutcomeRequest(BaseModel):
@@ -775,6 +822,8 @@ def run_server(host=None, port=None):
     print(f"  POST /v1/query               Query memories")
     print(f"  POST /v1/feedback            Mark atom contributions")
     print(f"  POST /v1/sessions/end        Write a session boundary atom")
+    print(f"  GET  /v1/sessions/recent     Recent boundaries (chronological recall)")
+    print(f"  GET  /v1/atoms/most_retrieved Top-N atoms by retrieval count")
     print(f"  POST /v1/decay               Run decay cycle")
     print(f"  GET  /v1/stats               Database statistics")
     print(f"  POST /v1/triples/extract     Extract triples")
