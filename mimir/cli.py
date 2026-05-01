@@ -88,6 +88,15 @@ DEFAULT_ENV_TEMPLATE = dedent(
     MIMIR_COST_RATE_SPIKE_RATIO=3.0
     MIMIR_COST_ALERT_COOLDOWN_MINUTES=60
 
+    # Per-response plan-window capture. When true (default), the SDK
+    # is configured with include_partial_messages so the streaming
+    # message_start event carries a rate_limits block — Claude.ai
+    # subscribers see current 5h / 7d / Opus / Sonnet / overage
+    # utilization on every API response. Set false to skip the
+    # streaming overhead at the cost of less-current plan data
+    # (you'll only see numbers on transition events).
+    MIMIR_CAPTURE_RATE_LIMITS=true
+
     # ---- Operator config -------------------------------------------------
     # Channel the agent uses for high-priority signals to you that don't fit
     # the current conversation (critical errors, urgent heartbeat findings,

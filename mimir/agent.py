@@ -40,6 +40,7 @@ from claude_agent_sdk import (
     HookMatcher,
     RateLimitEvent,
     ResultMessage,
+    StreamEvent,
     TaskNotificationMessage,
     TaskStartedMessage,
     query,
@@ -53,6 +54,7 @@ from .feedback import FeedbackLog
 from .history import MessageBuffer
 from .rate_limits import (
     RateLimitStore,
+    snapshot_from_response_bucket,
     snapshot_from_sdk_event,
 )
 from .session_boundary_log import SessionBoundaryLog, render_session_summaries
@@ -205,7 +207,11 @@ class Agent:
             thinking={"type": "adaptive"},
             env=self._config.sdk_env_overrides(),
             cwd=str(self._config.home),
-            include_partial_messages=False,
+            # Streaming chunks needed when capture_rate_limits is on —
+            # the message_start event carries the per-response
+            # rate_limits block we want. The extra deltas are cheap
+            # (filtered out in the run_turn message loop).
+            include_partial_messages=self._config.capture_rate_limits,
         )
 
     # ---- chat history --------------------------------------------------
@@ -582,12 +588,19 @@ class Agent:
             if isinstance(msg, ResultMessage):
                 result_msg = msg
 
-        # 7a.b. RateLimitEvent capture — the SDK emits these on plan-window
-        #       state transitions (allowed → allowed_warning → rejected) for
-        #       five_hour / seven_day / seven_day_opus / seven_day_sonnet /
-        #       overage. They're sparse: we may go many turns without one,
-        #       so we persist per-type and render the most recent until the
-        #       window resets. See mimir/rate_limits.py.
+        # 7a.b. Rate-limit capture from two sources:
+        #   - RateLimitEvent: emitted on state transitions (allowed →
+        #     allowed_warning → rejected). Sparse but authoritative.
+        #   - StreamEvent(message_start): when capture_rate_limits is on
+        #     (include_partial_messages=True), every API response's
+        #     ``message_start`` carries a ``rate_limits`` block for
+        #     Claude.ai subscribers. Captured per-response — we get
+        #     current state on every turn, not only on transitions.
+        #
+        # Both write to the same per-type store; the last update wins.
+        # In practice the per-response stream-event path is fresher, so
+        # it dominates; the transition path is a backstop when
+        # capture_rate_limits is disabled.
         for msg in messages:
             if isinstance(msg, RateLimitEvent):
                 info = msg.rate_limit_info
@@ -600,9 +613,6 @@ class Agent:
                     )
                 except Exception:  # noqa: BLE001
                     log.exception("rate_limits.record failed for %s", rl_type)
-                # Also fire a log_event so the algedonic surfacing picks
-                # up rejections. allowed_warning gets logged too — useful
-                # to see "almost over" trends in events.jsonl.
                 if info.status in ("allowed_warning", "rejected"):
                     await log_event(
                         "rate_limit_warning"
@@ -612,6 +622,27 @@ class Agent:
                         utilization=info.utilization,
                         resets_at=info.resets_at,
                     )
+            elif isinstance(msg, StreamEvent):
+                ev = msg.event or {}
+                if ev.get("type") != "message_start":
+                    continue
+                api_message = ev.get("message") or {}
+                rate_limits = api_message.get("rate_limits")
+                if not isinstance(rate_limits, dict):
+                    continue
+                for bucket_type, bucket in rate_limits.items():
+                    if not isinstance(bucket, dict):
+                        continue
+                    try:
+                        await self._rate_limits.record(
+                            bucket_type,
+                            snapshot_from_response_bucket(bucket),
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "rate_limits.record from response failed for %s",
+                            bucket_type,
+                        )
 
         # 7b. Subagent notification side-channel (SPEC §4.4). The SDK yields
         #     ``TaskStartedMessage`` / ``TaskNotificationMessage`` on the parent

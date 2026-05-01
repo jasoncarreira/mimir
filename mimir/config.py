@@ -197,6 +197,18 @@ class Config:
     cost_rate_spike_ratio: float
     cost_alert_cooldown_minutes: int
 
+    # Per-response rate-limit capture (default on). Enabling this turns
+    # on the SDK's include_partial_messages so StreamEvent messages
+    # carry the raw Anthropic streaming events; we filter for
+    # ``message_start`` and read its ``rate_limits`` block. Without
+    # this, mimir only sees rate-limit data when the SDK emits a
+    # transition event (allowed → allowed_warning → rejected) — fine
+    # for "scale back when warned" but the Plan windows section is
+    # empty most of the time. Cost: extra streaming chunks parsed per
+    # turn (cheap; local IPC, dict lookups). Disable to skip the
+    # streaming overhead at the cost of less-current plan-window data.
+    capture_rate_limits: bool
+
     # Logging — JSONL caps clamped to [1, _LOG_CAP_MAX]. Default 1000.
     # Both files are tail-streamed at read time, so the cap is mostly
     # about cumulative on-disk size; the trim logic uses 10% hysteresis
@@ -279,6 +291,9 @@ class Config:
             cost_alert_cooldown_minutes=_env_int(
                 "MIMIR_COST_ALERT_COOLDOWN_MINUTES", 60,
             ),
+
+            capture_rate_limits=_env("MIMIR_CAPTURE_RATE_LIMITS", "true").lower()
+                not in {"false", "0", "no", "off"},
 
             max_turns_kept=_turns_cap(),
             max_events_kept=_events_cap(),

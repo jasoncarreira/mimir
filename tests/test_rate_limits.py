@@ -66,6 +66,55 @@ def test_snapshot_tolerates_missing_optional_fields():
     assert snap.resets_at is None
 
 
+# ---- snapshot_from_response_bucket (per-response shape) ----------------
+
+
+def test_response_bucket_with_utilization_fraction():
+    from mimir.rate_limits import snapshot_from_response_bucket
+
+    snap = snapshot_from_response_bucket({
+        "status": "allowed_warning",
+        "utilization": 0.83,
+        "resets_at": 1714512345,
+    })
+    assert snap.status == "allowed_warning"
+    assert snap.utilization == 0.83
+    assert snap.resets_at == 1714512345
+
+
+def test_response_bucket_with_used_percentage():
+    """Statusline JSON shape uses ``used_percentage`` (0-100). The
+    bucket translator accepts either form so capture is robust across
+    CLI versions."""
+    from mimir.rate_limits import snapshot_from_response_bucket
+
+    snap = snapshot_from_response_bucket({
+        "used_percentage": 42,
+        "resets_at": 1714512345,
+    })
+    assert snap.utilization == 0.42
+
+
+def test_response_bucket_with_camel_case_resets():
+    from mimir.rate_limits import snapshot_from_response_bucket
+
+    snap = snapshot_from_response_bucket({
+        "utilization": 0.10,
+        "resetsAt": 1714512345,
+    })
+    assert snap.resets_at == 1714512345
+
+
+def test_response_bucket_minimal_fields():
+    """A bucket with only ``utilization`` should still convert."""
+    from mimir.rate_limits import snapshot_from_response_bucket
+
+    snap = snapshot_from_response_bucket({"utilization": 0.55})
+    assert snap.utilization == 0.55
+    assert snap.status == "allowed"  # default
+    assert snap.resets_at is None
+
+
 # ---- RateLimitStore -----------------------------------------------------
 
 

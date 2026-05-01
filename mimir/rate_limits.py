@@ -205,3 +205,37 @@ def snapshot_from_sdk_event(rate_limit_info: Any) -> RateLimitSnapshot:
             rate_limit_info, "overage_disabled_reason", None,
         ),
     )
+
+
+def snapshot_from_response_bucket(bucket: dict[str, Any]) -> RateLimitSnapshot:
+    """Convert one ``rate_limits[<bucket_type>]`` dict from an
+    Anthropic ``message_start`` API response to our snapshot.
+
+    The per-response shape is undocumented (Claude.ai subscription
+    private path) but observed with two possible utilization fields:
+    ``utilization`` (0.0-1.0 fraction, matches the SDK's transition
+    event shape) and ``used_percentage`` (0-100, matches the
+    statusline JSON jq expressions). We accept either so the
+    capture path is robust across CLI versions."""
+    util = _as_float(bucket.get("utilization"))
+    if util is None:
+        pct = bucket.get("used_percentage")
+        if isinstance(pct, (int, float)):
+            util = float(pct) / 100.0
+    resets_at = bucket.get("resets_at")
+    if resets_at is None:
+        resets_at = bucket.get("resetsAt")
+    return RateLimitSnapshot(
+        status=str(bucket.get("status") or "allowed"),
+        utilization=util,
+        resets_at=int(resets_at) if isinstance(resets_at, (int, float)) else None,
+        observed_at=datetime.now(tz=timezone.utc).isoformat(),
+        overage_status=bucket.get("overage_status") or bucket.get("overageStatus"),
+        overage_resets_at=(
+            bucket.get("overage_resets_at") or bucket.get("overageResetsAt")
+        ),
+        overage_disabled_reason=(
+            bucket.get("overage_disabled_reason")
+            or bucket.get("overageDisabledReason")
+        ),
+    )
