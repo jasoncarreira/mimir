@@ -38,10 +38,12 @@ class FakeMsam:
         token_budget: int = 500,
         session_id: str | None = None,
         min_confidence_tier: str | None = None,
+        context: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         self.calls.append(
             _Call("query", {"query": query, "top_k": top_k, "session_id": session_id,
-                            "min_confidence_tier": min_confidence_tier})
+                            "min_confidence_tier": min_confidence_tier,
+                            "context": context})
         )
         if "query" in self.fail_on:
             raise MsamError("synthetic query failure")

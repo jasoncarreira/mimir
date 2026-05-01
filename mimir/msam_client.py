@@ -167,10 +167,26 @@ class MsamClient:
         top_k: int = 12,
         mode: str = "task",
         token_budget: int = 500,
-        session_id: str | None = None,  # forward-compat: ignored by MSAM today
+        session_id: str | None = None,
         min_confidence_tier: str | None = None,
+        context: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """POST /v1/query. Returns the full response dict including raw atoms.
+
+        ``session_id`` (any stable string per conversation) lets MSAM scope
+        the access_log rows it writes for this retrieve, so a later
+        ``feedback(session_id=...)`` call can credit *every* retrieval in
+        the session window — not just the globally-most-recent row per
+        atom (MSAM commit e88d458, schema migration 10).
+
+        ``context`` is the prior conversation, most recent last. When MSAM
+        has ``[retrieval] enable_contextual_rewrite = true`` and ``context``
+        is non-empty, MSAM rewrites short / referential queries
+        ("yes, look for that") into self-contained form before retrieval.
+        Each entry is ``{"role": "user"|"assistant", "content": str}``;
+        MSAM uses the last 10, truncating each content to 400 chars.
+        Safe to always pass — flag-off and rewrite failures fall through
+        to the original query.
 
         ``min_confidence_tier`` (``"none" | "low" | "medium" | "high"``) is
         the per-atom floor MSAM applies before returning. ``None`` lets
@@ -192,6 +208,8 @@ class MsamClient:
             body["session_id"] = session_id
         if min_confidence_tier:
             body["min_confidence_tier"] = min_confidence_tier
+        if context:
+            body["context"] = context
         return await self._post("/v1/query", body)
 
     async def store(
