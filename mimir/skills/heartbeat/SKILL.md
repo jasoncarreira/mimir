@@ -58,9 +58,31 @@ Recent session boundaries (in the prompt's "Recent session summaries"
 section, when configured) often mention `unfinished:` lists. Anything
 that should be picked up now versus deferred?
 
+**6. Resource check (15 sec)**
+The "Resource usage" prompt section shows your last turn's cost,
+context utilization, and rolling 1h / 5h / 7d aggregates with cache
+hit rate. Three things worth a glance before picking heartbeat work:
+
+- **Cost rate alert** (⚠ marker in the section) — current $/hr is
+  unusually high, either against an absolute ceiling or against your
+  rolling-week baseline. Take this seriously: pick a small or
+  no-token-spend backlog item, prefer cheap subagents (e.g. write a
+  Bash query rather than fan out a researcher), or end silently if
+  nothing is genuinely urgent. The alert hangs around until rate
+  normalizes — don't power through it.
+- **Cache hit rate < 50%** — something's invalidating the prompt
+  cache between turns. Worth a five-whys (is core memory churning?
+  is the system prompt growing?) but only if it's persistent across
+  many turns, not a one-off.
+- **Budget % approaching limits** — if `MIMIR_USAGE_5H_LIMIT_USD` /
+  `MIMIR_USAGE_WEEKLY_LIMIT_USD` are configured and you're past
+  ~70%, scale back the same way as for the cost-rate alert.
+
 **Decision after librarian:**
 - Drift detected → fix via memory edit, then proceed
 - Dropped thread should be resumed → make that the heartbeat work
+- Cost rate or budget elevated → pick a small / no-spend item, or
+  end silently
 - Coherent and nothing pressing → move to backlog
 
 ## Step 2 — Backlog protocol
@@ -81,6 +103,30 @@ The operator may have seeded the file with research-shaped or
 maintenance-shaped items. You can append your own — when you notice a
 useful recurring task during a normal turn, drop it in active backlog
 under your name and a date stamp.
+
+### Scaling back when cost is elevated
+
+If the resource check above flagged a cost-rate alert or you're near
+budget thresholds, prefer:
+
+- **Memory cleanup** that doesn't fan out — compact a single core
+  block, prune stale entries from one extended file, run wiki orphan
+  tagging. These edit files; tokens are bounded.
+- **Backlog pruning** — read `state/heartbeat-backlog.md`, mark
+  obsolete items as done. Useful and cheap.
+- **Bash-only investigations** — jq pipelines over events.jsonl don't
+  burn agent tokens. Dropping into Bash for analysis is a lever.
+- **Skipping fan-out** — don't fan out climber / researcher / critic
+  subagents; their token cost is the parent's plus the subagent's.
+
+Avoid:
+- Multi-turn research dives. Defer to a non-elevated heartbeat.
+- Fan-out backlog items.
+- Long-form writes (multi-section wiki pages, big new memory files).
+
+End silently more readily than usual. The cost rate normalizes when
+turns stop firing for a window; sometimes the right move is to do
+nothing.
 
 ## Step 3 — What counts as work
 

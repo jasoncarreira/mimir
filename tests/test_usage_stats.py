@@ -50,18 +50,23 @@ def _write_turns(path: Path, records: list[dict]) -> None:
 # ---- aggregation -------------------------------------------------------
 
 
-def test_aggregates_into_5h_and_7d_windows(tmp_path: Path):
+def test_aggregates_into_1h_5h_and_7d_windows(tmp_path: Path):
     path = tmp_path / "turns.jsonl"
     _write_turns(path, [
-        _turn(hours_ago=200, cost=1.00, input_tokens=1000),  # outside both
+        _turn(hours_ago=200, cost=1.00, input_tokens=1000),  # outside all
         _turn(hours_ago=20, cost=2.00, input_tokens=2000),    # 7d only
-        _turn(hours_ago=2, cost=3.00, input_tokens=3000),     # both
-        _turn(hours_ago=0.1, cost=4.00, input_tokens=4000),   # both
+        _turn(hours_ago=2, cost=3.00, input_tokens=3000),     # 5h + 7d
+        _turn(hours_ago=0.1, cost=4.00, input_tokens=4000),   # all three
     ])
     rep = aggregate(path)
 
-    win_5h = rep.windows[0]
-    win_7d = rep.windows[1]
+    win_1h = rep.windows[0]
+    win_5h = rep.windows[1]
+    win_7d = rep.windows[2]
+    assert win_1h.label == "Last 1h"
+    assert win_1h.turns == 1
+    assert win_1h.total_cost_usd == 4.00
+
     assert win_5h.label == "Last 5h"
     assert win_5h.turns == 2
     assert win_5h.total_cost_usd == 7.00
@@ -109,10 +114,11 @@ def test_short_circuit_stops_at_oldest_cutoff(tmp_path: Path):
     scan is the load-bearing property."""
     path = tmp_path / "turns.jsonl"
     records = [_turn(hours_ago=200 + i, cost=0.1) for i in range(500)]  # all old
-    records.append(_turn(hours_ago=1, cost=5.00, input_tokens=10000))    # in-window
+    records.append(_turn(hours_ago=2, cost=5.00, input_tokens=10000))    # in 5h
     _write_turns(path, records)
     rep = aggregate(path)
-    win_5h = rep.windows[0]
+    # windows[1] is 5h (windows[0] is the 1h window).
+    win_5h = next(w for w in rep.windows if w.label == "Last 5h")
     assert win_5h.turns == 1
     assert win_5h.total_cost_usd == 5.00
 
@@ -227,3 +233,175 @@ def test_render_omits_budget_when_unset(tmp_path: Path):
     out = render_usage_block(rep)  # no budget
     assert out is not None
     assert "% of $" not in out
+
+
+# ---- cost-rate alert ---------------------------------------------------
+
+
+def test_evaluate_returns_none_when_no_thresholds(tmp_path: Path):
+    from mimir.usage_stats import evaluate_cost_rate
+
+    path = tmp_path / "turns.jsonl"
+    _write_turns(path, [_turn(hours_ago=0.1, cost=10.0)])
+    rep = aggregate(path)
+    assert evaluate_cost_rate(rep) is None
+    assert evaluate_cost_rate(rep, hourly_limit_usd=0, spike_ratio=0) is None
+
+
+def test_evaluate_fires_on_absolute_hourly_limit(tmp_path: Path):
+    from mimir.usage_stats import evaluate_cost_rate
+
+    path = tmp_path / "turns.jsonl"
+    # $10 in last hour vs $2/hr ceiling — clearly over.
+    _write_turns(path, [
+        _turn(hours_ago=0.5, cost=5.0),
+        _turn(hours_ago=0.1, cost=5.0),
+    ])
+    rep = aggregate(path)
+    alert = evaluate_cost_rate(rep, hourly_limit_usd=2.0)
+    assert alert is not None
+    assert alert.reason == "absolute_hourly_limit"
+    assert alert.rate_now_usd_per_hour == 10.0
+    assert alert.threshold_usd_per_hour == 2.0
+    assert alert.baseline_usd_per_hour is None
+
+
+def test_evaluate_fires_on_spike_ratio(tmp_path: Path):
+    from mimir.usage_stats import evaluate_cost_rate
+
+    path = tmp_path / "turns.jsonl"
+    # 7d total $1.68 → baseline 0.01 USD/hr. last hour $5 → 500× ratio.
+    # ratio threshold 3× → triggers.
+    _write_turns(path, [
+        _turn(hours_ago=24 * 6, cost=1.68),  # in 7d window only
+        _turn(hours_ago=0.1, cost=5.0),       # in 1h window
+    ])
+    rep = aggregate(path)
+    alert = evaluate_cost_rate(rep, spike_ratio=3.0)
+    assert alert is not None
+    assert alert.reason == "spike_ratio"
+    assert alert.rate_now_usd_per_hour == 5.0
+    assert alert.baseline_usd_per_hour is not None
+    assert alert.baseline_usd_per_hour > 0
+
+
+def test_evaluate_quiet_baseline_disables_spike_check(tmp_path: Path):
+    """A baseline below the noise floor (1¢/hr) means we don't have
+    enough signal — small spikes shouldn't false-positive."""
+    from mimir.usage_stats import evaluate_cost_rate
+
+    path = tmp_path / "turns.jsonl"
+    _write_turns(path, [
+        _turn(hours_ago=0.5, cost=0.50),  # quiet last hour
+    ])
+    rep = aggregate(path)
+    # 7d baseline = 0.50 / 168 ≈ 0.003 USD/hr — below floor.
+    alert = evaluate_cost_rate(rep, spike_ratio=2.0)
+    assert alert is None
+
+
+def test_absolute_threshold_takes_precedence_when_both_fire(tmp_path: Path):
+    from mimir.usage_stats import evaluate_cost_rate
+
+    path = tmp_path / "turns.jsonl"
+    _write_turns(path, [
+        _turn(hours_ago=24 * 6, cost=5.04),  # baseline 0.03/hr
+        _turn(hours_ago=0.1, cost=20.0),      # both abs and ratio fire
+    ])
+    rep = aggregate(path)
+    alert = evaluate_cost_rate(rep, hourly_limit_usd=10.0, spike_ratio=3.0)
+    assert alert is not None
+    assert alert.reason == "absolute_hourly_limit"
+
+
+def test_render_includes_alert_annotation(tmp_path: Path):
+    from mimir.usage_stats import CostRateAlert
+
+    path = tmp_path / "turns.jsonl"
+    _write_turns(path, [_turn(hours_ago=0.1, cost=2.0, input_tokens=100)])
+    rep = aggregate(path)
+    alert = CostRateAlert(
+        reason="absolute_hourly_limit",
+        rate_now_usd_per_hour=10.0,
+        threshold_usd_per_hour=5.0,
+        baseline_usd_per_hour=None,
+    )
+    out = render_usage_block(rep, alert=alert)
+    assert out is not None
+    assert "⚠" in out
+    assert "Cost rate alert" in out
+    assert "$10.00/hr" in out
+    assert "$5.00/hr" in out
+    assert "scaling back" in out
+
+
+def test_render_alert_uses_spike_phrasing(tmp_path: Path):
+    from mimir.usage_stats import CostRateAlert
+
+    path = tmp_path / "turns.jsonl"
+    _write_turns(path, [_turn(hours_ago=0.1, cost=2.0, input_tokens=100)])
+    rep = aggregate(path)
+    alert = CostRateAlert(
+        reason="spike_ratio",
+        rate_now_usd_per_hour=6.0,
+        threshold_usd_per_hour=3.0,  # 3× of $1
+        baseline_usd_per_hour=1.0,
+    )
+    out = render_usage_block(rep, alert=alert)
+    assert out is not None
+    assert "baseline" in out
+    assert "$1.00/hr" in out
+
+
+# ---- cooldown ---------------------------------------------------------
+
+
+def test_cooldown_returns_false_when_no_recent_alert(tmp_path: Path):
+    import json
+    from mimir.usage_stats import cost_rate_alert_recently_emitted
+
+    events = tmp_path / "events.jsonl"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    events.write_text(
+        json.dumps({"timestamp": _ts(2), "type": "turn_started"}) + "\n"
+        + json.dumps({"timestamp": _ts(1), "type": "tool_call"}) + "\n"
+    )
+    assert not cost_rate_alert_recently_emitted(events, cooldown_minutes=60)
+
+
+def test_cooldown_returns_true_for_recent_alert(tmp_path: Path):
+    import json
+    from mimir.usage_stats import cost_rate_alert_recently_emitted
+
+    events = tmp_path / "events.jsonl"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    events.write_text(
+        json.dumps({"timestamp": _ts(0.1), "type": "cost_rate_alert"}) + "\n"
+    )
+    assert cost_rate_alert_recently_emitted(events, cooldown_minutes=60)
+
+
+def test_cooldown_ignores_old_alert(tmp_path: Path):
+    import json
+    from mimir.usage_stats import cost_rate_alert_recently_emitted
+
+    events = tmp_path / "events.jsonl"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    events.write_text(
+        json.dumps({"timestamp": _ts(2), "type": "cost_rate_alert"}) + "\n"
+    )
+    assert not cost_rate_alert_recently_emitted(events, cooldown_minutes=60)
+
+
+def test_cooldown_zero_disables(tmp_path: Path):
+    """Cooldown=0 means "always emit" — the gate returns False so the
+    caller proceeds with emission."""
+    import json
+    from mimir.usage_stats import cost_rate_alert_recently_emitted
+
+    events = tmp_path / "events.jsonl"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    events.write_text(
+        json.dumps({"timestamp": _ts(0.001), "type": "cost_rate_alert"}) + "\n"
+    )
+    assert not cost_rate_alert_recently_emitted(events, cooldown_minutes=0)

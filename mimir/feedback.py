@@ -51,6 +51,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "msam_consolidate_error": ("negative", "msam_consolidate_error"),
     "msam_synthesis_dispatch_failed": ("negative", "synth_dispatch_fail"),
     "msam_synthesis_empty_window": ("negative", "synth_empty_window"),
+    "cost_rate_alert": ("negative", "cost_rate"),
     "scheduled_tick_dropped": ("negative", "tick_dropped"),
     "send_message_unknown_channel": ("negative", "unknown_channel"),
     # Positive — agent's own contribution-credit pass to MSAM is the
@@ -91,6 +92,13 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"(session={ev.get('msam_session_id') or '?'}); "
             f"{ev.get('reason') or 'no detail'}"
         )
+    if rule_kind == "cost_rate":
+        rate = ev.get("rate_now_usd_per_hour")
+        threshold = ev.get("threshold_usd_per_hour")
+        reason = ev.get("reason") or "?"
+        rate_str = f"${rate:.2f}/hr" if isinstance(rate, (int, float)) else "?"
+        thr_str = f"${threshold:.2f}/hr" if isinstance(threshold, (int, float)) else "?"
+        return f"cost rate alert: {rate_str} exceeds {thr_str} ({reason})"
     if rule_kind == "tick_dropped":
         return f"scheduled_tick dropped: {ev.get('reason') or '(no reason)'}"
     if rule_kind == "unknown_channel":

@@ -181,6 +181,20 @@ class Config:
     usage_5h_limit_usd: float
     usage_weekly_limit_usd: float
 
+    # Cost-rate alert. Two thresholds, both optional:
+    # - cost_hourly_limit_usd: absolute ceiling. 0 disables.
+    # - cost_rate_spike_ratio: multiplier of the rolling-week per-hour
+    #   baseline. Default 3.0; 0 disables. Adapts to your usual spend
+    #   so a sleeper agent that wakes up briefly doesn't false-positive.
+    # cost_alert_cooldown_minutes: minimum interval between
+    #   ``cost_rate_alert`` events landing in events.jsonl. The
+    #   algedonic surfacing keeps showing the most recent alert until
+    #   it ages out of the window, so re-emitting per turn adds no
+    #   information. Default 60.
+    cost_hourly_limit_usd: float
+    cost_rate_spike_ratio: float
+    cost_alert_cooldown_minutes: int
+
     # Logging — JSONL caps clamped to [1, _LOG_CAP_MAX]. Default 1000.
     # Both files are tail-streamed at read time, so the cap is mostly
     # about cumulative on-disk size; the trim logic uses 10% hysteresis
@@ -257,6 +271,12 @@ class Config:
                 not in {"false", "0", "no", "off"},
             usage_5h_limit_usd=_env_float("MIMIR_USAGE_5H_LIMIT_USD", 0.0),
             usage_weekly_limit_usd=_env_float("MIMIR_USAGE_WEEKLY_LIMIT_USD", 0.0),
+
+            cost_hourly_limit_usd=_env_float("MIMIR_COST_HOURLY_LIMIT_USD", 0.0),
+            cost_rate_spike_ratio=_env_float("MIMIR_COST_RATE_SPIKE_RATIO", 3.0),
+            cost_alert_cooldown_minutes=_env_int(
+                "MIMIR_COST_ALERT_COOLDOWN_MINUTES", 60,
+            ),
 
             max_turns_kept=_turns_cap(),
             max_events_kept=_events_cap(),

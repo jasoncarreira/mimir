@@ -51,7 +51,12 @@ from .event_logger import log_event
 from .feedback import FeedbackLog
 from .history import MessageBuffer
 from .session_boundary_log import SessionBoundaryLog, render_session_summaries
-from .usage_stats import aggregate as aggregate_usage, render_usage_block
+from .usage_stats import (
+    aggregate as aggregate_usage,
+    cost_rate_alert_recently_emitted,
+    evaluate_cost_rate,
+    render_usage_block,
+)
 from .hooks import make_post_tool_use_hook, make_pre_tool_use_hook
 from .index import IndexGenerator
 from .loop_detector import LoopDetector
@@ -225,9 +230,16 @@ class Agent:
     # ---- MSAM hooks ----------------------------------------------------
 
     def _assemble_usage_block(self) -> str | None:
-        """Read turns.jsonl tail-first, aggregate over 5h / 7d, render
-        the Resource usage prompt section. Returns None when disabled
-        via config or when no turns have been recorded yet."""
+        """Read turns.jsonl tail-first, aggregate over 1h / 5h / 7d,
+        evaluate the cost-rate alert, render the Resource usage prompt
+        section. Returns None when disabled via config or when no turns
+        have been recorded yet.
+
+        Side effect: emits a ``cost_rate_alert`` event when a threshold
+        is currently tripped AND no prior alert lies within the cooldown
+        window. The annotated alert is included in the rendered block
+        regardless of cooldown — the agent should keep seeing the
+        warning while the spike persists."""
         if not self._config.usage_block_enabled:
             return None
         try:
@@ -238,11 +250,36 @@ class Agent:
         except Exception:  # noqa: BLE001
             log.exception("usage_stats.aggregate failed; skipping block")
             return None
+
+        alert = evaluate_cost_rate(
+            report,
+            hourly_limit_usd=self._config.cost_hourly_limit_usd or None,
+            spike_ratio=self._config.cost_rate_spike_ratio or None,
+        )
+        if alert is not None and not cost_rate_alert_recently_emitted(
+            self._config.events_log,
+            cooldown_minutes=self._config.cost_alert_cooldown_minutes,
+        ):
+            asyncio.create_task(
+                log_event(
+                    "cost_rate_alert",
+                    reason=alert.reason,
+                    rate_now_usd_per_hour=round(alert.rate_now_usd_per_hour, 4),
+                    threshold_usd_per_hour=round(alert.threshold_usd_per_hour, 4),
+                    baseline_usd_per_hour=(
+                        round(alert.baseline_usd_per_hour, 4)
+                        if alert.baseline_usd_per_hour is not None
+                        else None
+                    ),
+                )
+            )
+
         return render_usage_block(
             report,
             fallback_model=self._config.model,
             budget_5h_usd=self._config.usage_5h_limit_usd or None,
             budget_weekly_usd=self._config.usage_weekly_limit_usd or None,
+            alert=alert,
         )
 
     async def _assemble_session_summaries(

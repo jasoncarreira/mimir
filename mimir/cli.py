@@ -77,6 +77,16 @@ DEFAULT_ENV_TEMPLATE = dedent(
     MIMIR_USAGE_5H_LIMIT_USD=
     MIMIR_USAGE_WEEKLY_LIMIT_USD=
 
+    # Cost-rate alert. When current $/hr (last hour) exceeds either
+    # threshold, a cost_rate_alert event lands in events.jsonl and the
+    # algedonic + Resource usage sections annotate the alert. Both
+    # optional. Spike ratio compares last-hour rate against the rolling
+    # 7-day baseline (default 3.0 = "alert when current is >3× baseline").
+    # Cooldown gates re-emission so the firehose doesn't churn.
+    MIMIR_COST_HOURLY_LIMIT_USD=
+    MIMIR_COST_RATE_SPIKE_RATIO=3.0
+    MIMIR_COST_ALERT_COOLDOWN_MINUTES=60
+
     # ---- Operator config -------------------------------------------------
     # Channel the agent uses for high-priority signals to you that don't fit
     # the current conversation (critical errors, urgent heartbeat findings,

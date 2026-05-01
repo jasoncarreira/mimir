@@ -124,6 +124,28 @@ class UsageReport:
     windows: list[UsageWindow] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class CostRateAlert:
+    """Triggered when current hourly spend exceeds one of two thresholds:
+
+    - **absolute_hourly_limit**: ``rate_now_usd_per_hour`` >
+      ``MIMIR_COST_HOURLY_LIMIT_USD``. Operator-set ceiling; useful for
+      "never go above $X/hour even if we usually do."
+    - **spike_ratio**: ``rate_now_usd_per_hour`` >
+      ``spike_ratio * baseline_usd_per_hour``. Adapts to your usual
+      spend; catches runaway loops (3× the rolling-week average is the
+      default).
+
+    When both fire, the absolute one wins (deterministic; no double-
+    counted reasons).
+    """
+
+    reason: str  # "absolute_hourly_limit" | "spike_ratio"
+    rate_now_usd_per_hour: float
+    threshold_usd_per_hour: float
+    baseline_usd_per_hour: float | None  # populated only for spike_ratio
+
+
 def context_window_for(model: str | None) -> int:
     """Look up the model's max input context. Unknown / None → default."""
     if not model:
@@ -134,7 +156,7 @@ def context_window_for(model: str | None) -> int:
 def aggregate(
     turns_path: Path,
     *,
-    window_hours: Iterable[float] = (5.0, 24.0 * 7),
+    window_hours: Iterable[float] = (1.0, 5.0, 24.0 * 7),
     window_labels: Iterable[str] | None = None,
     fallback_model: str | None = None,
 ) -> UsageReport:
@@ -217,12 +239,100 @@ def aggregate(
     return UsageReport(last_turn=last_turn, windows=out_windows)
 
 
+def evaluate_cost_rate(
+    report: UsageReport,
+    *,
+    hourly_limit_usd: float | None = None,
+    spike_ratio: float | None = None,
+    baseline_window_hours: float = 24.0 * 7,
+    current_window_hours: float = 1.0,
+) -> CostRateAlert | None:
+    """Inspect ``report`` and decide whether the current hourly spend
+    rate has crossed either threshold. Returns the alert (with the
+    reason that fired) or ``None`` when neither does.
+
+    The current rate is taken from the window of size
+    ``current_window_hours`` (default 1h) — its total cost equals the
+    last-hour spend, which IS the per-hour rate. The baseline is the
+    longer window (default 7d) divided by its hour count; a value
+    around 0 is treated as "no baseline" and disables the spike check
+    so a quiet history doesn't false-positive on a single $0.50 turn.
+
+    ``hourly_limit_usd <= 0`` or ``None`` disables the absolute check.
+    ``spike_ratio <= 0`` or ``None`` disables the spike check.
+    """
+    cur = _find_window(report, current_window_hours)
+    if cur is None:
+        return None
+    rate_now = cur.total_cost_usd  # cost over a 1h window IS $/hr
+
+    # Absolute hourly limit takes precedence — deterministic ordering
+    # for the case where both fire.
+    if hourly_limit_usd and hourly_limit_usd > 0 and rate_now > hourly_limit_usd:
+        return CostRateAlert(
+            reason="absolute_hourly_limit",
+            rate_now_usd_per_hour=rate_now,
+            threshold_usd_per_hour=hourly_limit_usd,
+            baseline_usd_per_hour=None,
+        )
+
+    if spike_ratio and spike_ratio > 0:
+        baseline_w = _find_window(report, baseline_window_hours)
+        if baseline_w is not None and baseline_window_hours > 0:
+            baseline_rate = baseline_w.total_cost_usd / baseline_window_hours
+            # 1¢/hr noise floor — below this we have no baseline signal
+            # and the spike check is meaningless.
+            if baseline_rate >= 0.01 and rate_now > spike_ratio * baseline_rate:
+                return CostRateAlert(
+                    reason="spike_ratio",
+                    rate_now_usd_per_hour=rate_now,
+                    threshold_usd_per_hour=spike_ratio * baseline_rate,
+                    baseline_usd_per_hour=baseline_rate,
+                )
+    return None
+
+
+def _find_window(report: UsageReport, hours: float) -> UsageWindow | None:
+    """Lookup helper: pick the window whose label matches the
+    expected ``Last Nh`` / ``Last Nd`` token, or fall back to the
+    first one with the matching turn count > 0. Returns None when
+    nothing matches."""
+    target = _default_label(hours)
+    for w in report.windows:
+        if w.label == target:
+            return w
+    return None
+
+
+def cost_rate_alert_recently_emitted(
+    events_path: Path, *, cooldown_minutes: int,
+) -> bool:
+    """True if a ``cost_rate_alert`` event lies within the cooldown
+    window. Used to gate emission so the firehose doesn't churn on a
+    sustained spike — the algedonic block surfaces the most recent
+    alert anyway, so re-emitting per turn adds no information."""
+    if cooldown_minutes <= 0:
+        return False
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(minutes=cooldown_minutes)
+    cutoff_iso = cutoff.isoformat()
+    for ev in tail_jsonl_records(events_path):
+        ts = ev.get("timestamp")
+        if not isinstance(ts, str):
+            continue
+        if ts < cutoff_iso:
+            return False  # tail-first; everything older than this is too
+        if ev.get("type") == "cost_rate_alert":
+            return True
+    return False
+
+
 def render_usage_block(
     report: UsageReport,
     *,
     fallback_model: str | None = None,
     budget_5h_usd: float | None = None,
     budget_weekly_usd: float | None = None,
+    alert: CostRateAlert | None = None,
 ) -> str | None:
     """Format the usage report as a markdown body for the
     "## Resource usage" prompt section. Returns None when there's
@@ -266,6 +376,29 @@ def render_usage_block(
             if budget and budget > 0:
                 cost_part += f" ({w.total_cost_usd / budget * 100:.0f}% of ${budget:.2f})"
             lines.append(f"{w.label}: {cost_part} / " + " / ".join(tail))
+
+    if alert is not None:
+        lines.append("")  # separator
+        if alert.reason == "absolute_hourly_limit":
+            lines.append(
+                f"⚠ Cost rate alert: ${alert.rate_now_usd_per_hour:.2f}/hr "
+                f"exceeds configured ceiling of "
+                f"${alert.threshold_usd_per_hour:.2f}/hr. "
+                f"Consider scaling back — defer expensive backlog items, "
+                f"prefer cheaper subagents, end heartbeats silently if "
+                f"nothing's urgent."
+            )
+        else:  # spike_ratio
+            base = alert.baseline_usd_per_hour or 0.0
+            ratio = (
+                alert.threshold_usd_per_hour / base if base > 0 else 0.0
+            )
+            lines.append(
+                f"⚠ Cost rate alert: ${alert.rate_now_usd_per_hour:.2f}/hr "
+                f"exceeds {ratio:.1f}× baseline (${base:.2f}/hr × {ratio:.1f}). "
+                f"Spend rate is unusual — check what's running, scale back "
+                f"if a loop or fan-out is responsible."
+            )
 
     return "\n".join(lines) if lines else None
 
