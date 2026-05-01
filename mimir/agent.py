@@ -42,6 +42,7 @@ from claude_agent_sdk import (
     ResultMessage,
     StreamEvent,
     TaskNotificationMessage,
+    TaskProgressMessage,
     TaskStartedMessage,
     query,
 )
@@ -60,6 +61,10 @@ from .rate_limits import (
     snapshot_from_sdk_event,
 )
 from .session_boundary_log import SessionBoundaryLog, render_session_summaries
+from .subagent_stats import (
+    aggregate as aggregate_subagents,
+    render_subagent_block,
+)
 from .usage_stats import (
     aggregate as aggregate_usage,
     event_recently_emitted,
@@ -328,6 +333,18 @@ class Agent:
         except Exception:  # noqa: BLE001
             log.exception("rate_limits read/projection failed")
 
+        # Subagent token spend — climbers / researchers / critics
+        # spawned via the Task tool burn tokens that count against the
+        # parent's plan budget. Surface so the agent knows where the
+        # budget is going (not just "we're at 73% of weekly Opus" but
+        # "and a climber that started 2h ago has burned 320k tokens").
+        subagent_body: str | None = None
+        try:
+            subagent_report = aggregate_subagents(self._config.events_log)
+            subagent_body = render_subagent_block(subagent_report)
+        except Exception:  # noqa: BLE001
+            log.exception("subagent_stats aggregate failed")
+
         return render_usage_block(
             report,
             fallback_model=self._config.model,
@@ -336,6 +353,7 @@ class Agent:
             alert=alert,
             plan_quota_lines=plan_lines,
             off_pace_warning=off_pace_lines,
+            subagent_block=subagent_body,
         )
 
     async def _assemble_session_summaries(
@@ -672,16 +690,46 @@ class Agent:
                             bucket_type,
                         )
 
-        # 7b. Subagent notification side-channel (SPEC §4.4). The SDK yields
-        #     ``TaskStartedMessage`` / ``TaskNotificationMessage`` on the parent
-        #     stream — we collect descriptions when the task starts so we can
-        #     attach them to the eventual completion notification.
+        # 7b. Subagent lifecycle (SPEC §4.4). The SDK yields three messages:
+        #
+        #   - TaskStartedMessage: task begins; carries description + task_type
+        #   - TaskProgressMessage: periodic during long-running tasks; carries
+        #     cumulative TaskUsage (total_tokens, tool_uses, duration_ms)
+        #   - TaskNotificationMessage: terminal (completed/failed/stopped);
+        #     carries final TaskUsage
+        #
+        # All three log to events.jsonl with task_id + usage fields so
+        # subagent_stats.py can aggregate token spend over time. Climber
+        # subagents in particular can run for hours and burn most of the
+        # parent's plan budget — surfacing this lets the agent see "where
+        # the budget is going."
         task_descriptions: dict[str, str] = {}
         for msg in messages:
             if isinstance(msg, TaskStartedMessage):
                 task_descriptions[msg.task_id] = msg.description
+                await log_event(
+                    "subagent_started",
+                    turn_id=ctx.turn_id,
+                    channel_id=event.channel_id,
+                    task_id=msg.task_id,
+                    description=msg.description,
+                    task_type=getattr(msg, "task_type", None),
+                )
         for msg in messages:
-            if isinstance(msg, TaskNotificationMessage):
+            if isinstance(msg, TaskProgressMessage):
+                u = msg.usage or {}
+                await log_event(
+                    "subagent_progress",
+                    turn_id=ctx.turn_id,
+                    channel_id=event.channel_id,
+                    task_id=msg.task_id,
+                    description=msg.description,
+                    last_tool_name=getattr(msg, "last_tool_name", None),
+                    total_tokens=u.get("total_tokens"),
+                    tool_uses=u.get("tool_uses"),
+                    duration_ms=u.get("duration_ms"),
+                )
+            elif isinstance(msg, TaskNotificationMessage):
                 await self._inbox.push(
                     event.channel_id,
                     SubagentResult(
@@ -694,12 +742,16 @@ class Agent:
                         received_ts=_utc_now_iso(),
                     ),
                 )
+                u = msg.usage or {}
                 await log_event(
                     "subagent_notification",
                     turn_id=ctx.turn_id,
                     channel_id=event.channel_id,
                     task_id=msg.task_id,
                     status=msg.status,
+                    total_tokens=u.get("total_tokens"),
+                    tool_uses=u.get("tool_uses"),
+                    duration_ms=u.get("duration_ms"),
                 )
 
         # 8. Outbound → chat_history (skip for synthesis turn — there's no
