@@ -55,14 +55,14 @@ def test_setup_creates_home_layout(tmp_path: Path):
 def test_setup_is_idempotent_and_preserves_user_edits(tmp_path: Path):
     home = tmp_path / "agent"
     setup_home(home)
-    # User edits the .env.
-    user_env = "ANTHROPIC_API_KEY=user-key\n"
+    # User edits the .env to a minimal version (and includes their own key).
+    user_env = "ANTHROPIC_API_KEY=user-key\nMIMIR_API_KEY=user-token\n"
     (home / ".env").write_text(user_env)
     # User adds a custom skill.
     custom = home / ".claude" / "skills" / "my-skill"
     custom.mkdir(parents=True)
     (custom / "SKILL.md").write_text("custom")
-    # Re-run setup — must not clobber.
+    # Re-run setup — must not clobber existing values.
     setup_home(home)
     assert (home / ".env").read_text() == user_env
     assert (custom / "SKILL.md").read_text() == "custom"
@@ -74,6 +74,113 @@ def test_setup_env_template_lists_main_keys(tmp_path: Path):
     env_text = (home / ".env").read_text()
     for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "MSAM_ENDPOINT", "DISCORD_TOKEN"):
         assert key in env_text
+
+
+def test_setup_generates_api_key_on_first_run(tmp_path: Path):
+    home = tmp_path / "agent"
+    status = setup_home(home)
+    env_text = (home / ".env").read_text()
+    line = next(l for l in env_text.splitlines() if l.startswith("MIMIR_API_KEY="))
+    value = line.split("=", 1)[1]
+    assert len(value) >= 30, f"expected ≥30-char token, got: {value!r}"
+    assert status.get("api_key_action") == "generated"
+
+
+def test_setup_preserves_existing_api_key(tmp_path: Path):
+    """Re-running setup mustn't rotate the key — operator may have
+    copied it into deployment configs."""
+    home = tmp_path / "agent"
+    setup_home(home)
+    first = next(
+        l.split("=", 1)[1]
+        for l in (home / ".env").read_text().splitlines()
+        if l.startswith("MIMIR_API_KEY=")
+    )
+    status = setup_home(home)
+    second = next(
+        l.split("=", 1)[1]
+        for l in (home / ".env").read_text().splitlines()
+        if l.startswith("MIMIR_API_KEY=")
+    )
+    assert first == second
+    assert status.get("api_key_action") is None
+
+
+def test_setup_fills_in_blank_api_key(tmp_path: Path):
+    """If the operator wipes the key (or pulls a stale .env from git),
+    the next setup must fill it in — otherwise the server runs
+    unauthenticated."""
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_path = home / ".env"
+    body = env_path.read_text()
+    blanked = "\n".join(
+        ("MIMIR_API_KEY=" if l.startswith("MIMIR_API_KEY=") else l)
+        for l in body.splitlines()
+    )
+    env_path.write_text(blanked + "\n")
+
+    status = setup_home(home)
+    line = next(
+        l for l in env_path.read_text().splitlines() if l.startswith("MIMIR_API_KEY=")
+    )
+    assert line.split("=", 1)[1] != ""
+    assert status.get("api_key_action") == "generated"
+
+
+def test_regenerate_api_key_rotates_and_preserves_others(tmp_path: Path):
+    from mimir.cli import regenerate_api_key
+
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_path = home / ".env"
+    before = next(
+        l.split("=", 1)[1]
+        for l in env_path.read_text().splitlines()
+        if l.startswith("MIMIR_API_KEY=")
+    )
+    new_key = regenerate_api_key(home)
+    after = env_path.read_text()
+    after_key = next(
+        l.split("=", 1)[1]
+        for l in after.splitlines()
+        if l.startswith("MIMIR_API_KEY=")
+    )
+    assert new_key == after_key
+    assert new_key != before
+    for unrelated in ("ANTHROPIC_API_KEY=", "MIMIR_WEB_PORT=", "MSAM_ENDPOINT="):
+        assert unrelated in after
+
+
+def test_regenerate_api_key_cli_subcommand(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path / "agent"
+    setup_home(home)
+    capsys.readouterr()  # discard setup output
+    main(["regenerate-api-key", "--home", str(home)])
+    out = capsys.readouterr()
+    # Stdout is the new key alone (pipes cleanly).
+    new_key = out.out.strip()
+    assert len(new_key) >= 30
+    # Stderr carries the explanation.
+    assert "Wrote to" in out.err
+    # File matches stdout.
+    line = next(
+        l
+        for l in (home / ".env").read_text().splitlines()
+        if l.startswith("MIMIR_API_KEY=")
+    )
+    assert line.split("=", 1)[1] == new_key
+
+
+def test_regenerate_api_key_cli_errors_when_no_env(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+):
+    home = tmp_path / "agent"
+    home.mkdir()
+    with pytest.raises(SystemExit) as exc_info:
+        main(["regenerate-api-key", "--home", str(home)])
+    assert exc_info.value.code == 1
+    assert "no .env" in capsys.readouterr().err
 
 
 def test_main_setup_subcommand_runs(tmp_path: Path, capsys: pytest.CaptureFixture):

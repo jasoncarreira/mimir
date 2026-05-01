@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
+import secrets
 import sys
 from pathlib import Path
 from textwrap import dedent
@@ -60,8 +62,10 @@ DEFAULT_ENV_TEMPLATE = dedent(
     MIMIR_EFFORT=high
     # API key for the public injection endpoint (POST /event). When set,
     # requests must carry a matching ``X-API-Key`` header. The server
-    # binds to 0.0.0.0 — any non-localhost deployment should set this.
-    # Generate with e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+    # binds to 0.0.0.0 — any non-localhost deployment must have this set.
+    # ``mimir setup`` auto-generates a value here on first run; rotate
+    # with ``mimir regenerate-api-key``. Leave blank only for local-dev
+    # mode where you understand the implications.
     MIMIR_API_KEY=
 
     # ---- Operator config -------------------------------------------------
@@ -384,6 +388,51 @@ def _write_if_missing(path: Path, content: str) -> bool:
     return True
 
 
+def _generate_api_key() -> str:
+    """A 256-bit URL-safe random token. Roughly 43 chars; safe for shells
+    and Docker env files (no quoting, no escaping)."""
+    return secrets.token_urlsafe(32)
+
+
+# Match `MIMIR_API_KEY=<anything>` (line-anchored, with optional leading
+# whitespace). The replacement preserves the leading whitespace so an
+# operator's indentation in their .env stays intact.
+_API_KEY_LINE_RE = re.compile(r"^(\s*)MIMIR_API_KEY\s*=.*$", re.MULTILINE)
+
+
+def _env_set_api_key(env_path: Path, value: str) -> None:
+    """Rewrite the MIMIR_API_KEY line in ``env_path`` with ``value``.
+    Appends a new line if the var isn't present. Leaves all other lines
+    untouched."""
+    body = env_path.read_text(encoding="utf-8") if env_path.is_file() else ""
+    new_line = f"MIMIR_API_KEY={value}"
+    if _API_KEY_LINE_RE.search(body):
+        body = _API_KEY_LINE_RE.sub(
+            lambda m: f"{m.group(1)}{new_line}", body, count=1
+        )
+    else:
+        if body and not body.endswith("\n"):
+            body += "\n"
+        body += new_line + "\n"
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text(body, encoding="utf-8")
+
+
+def _env_get_api_key(env_path: Path) -> str | None:
+    """Return the current MIMIR_API_KEY value (possibly empty), or None
+    if the var isn't set in the file. Empty string means "set but blank";
+    None means "not present at all"."""
+    if not env_path.is_file():
+        return None
+    body = env_path.read_text(encoding="utf-8")
+    match = _API_KEY_LINE_RE.search(body)
+    if not match:
+        return None
+    line = match.group(0)
+    _, _, value = line.partition("=")
+    return value.strip()
+
+
 def setup_home(home: Path) -> dict[str, object]:
     """Scaffold an agent home directory. Returns a status dict for printing."""
     home = home.resolve()
@@ -415,8 +464,15 @@ def setup_home(home: Path) -> dict[str, object]:
         p.mkdir(parents=True, exist_ok=True)
 
     files_created: list[str] = []
+    api_key_action: str | None = None
     if _write_if_missing(home / ".env", DEFAULT_ENV_TEMPLATE):
         files_created.append(".env")
+    # Generate a fresh MIMIR_API_KEY on first setup (or if the operator
+    # left the value blank). Existing non-empty keys are preserved on
+    # re-run — operators can rotate via `mimir regenerate-api-key`.
+    if (_env_get_api_key(home / ".env") or "") == "":
+        _env_set_api_key(home / ".env", _generate_api_key())
+        api_key_action = "generated"
     if _write_if_missing(home / "scheduler.yaml", DEFAULT_SCHEDULER_YAML):
         files_created.append("scheduler.yaml")
     if _write_if_missing(home / "memory" / "core" / "identity.md", DEFAULT_IDENTITY_MD):
@@ -462,6 +518,7 @@ def setup_home(home: Path) -> dict[str, object]:
         "files_created": files_created,
         "subagents": seeded_subagents,
         "skills": seeded_skills,
+        "api_key_action": api_key_action,
     }
 
 
@@ -482,6 +539,8 @@ def _print_setup_report(status: dict[str, object]) -> None:
         new_subs = sorted(n for n, s in subs.items() if s == "created")
         if new_subs:
             print(f"  subagents seeded: {', '.join(new_subs)}")
+    if status.get("api_key_action") == "generated":
+        print("  MIMIR_API_KEY:  generated (see .env; rotate via `mimir regenerate-api-key`)")
     print()
     print("Next steps:")
     print(f"  1. Edit {home}/.env (LLM gateway + any bridge tokens)")
@@ -631,6 +690,16 @@ def _identities_remove_cmd(
         print(f"(alias {alias!r} not found)")
 
 
+def regenerate_api_key(home: Path) -> str:
+    """Rewrite ``<home>/.env``'s MIMIR_API_KEY line with a fresh random
+    value. Returns the new key. Other env vars are left untouched."""
+    home = home.resolve()
+    env_path = home / ".env"
+    new_key = _generate_api_key()
+    _env_set_api_key(env_path, new_key)
+    return new_key
+
+
 def _identities_resolve_cmd(home: Path, author: str) -> None:
     resolver = IdentityResolver(home=home)
     resolver.reload()
@@ -714,6 +783,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     # parent skill's verb. Avoids the cwd/PATH brittleness of
     # `python -m mimir.skills.reflection.…`; ``mimir`` is on PATH
     # wherever the operator launched the server from.
+    regen_p = sub.add_parser(
+        "regenerate-api-key",
+        help="Rotate MIMIR_API_KEY in <home>/.env. Prints the new value.",
+    )
+    regen_p.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
     refl_p = sub.add_parser(
         "reflection",
         help="Reflection skill helpers (invoked by skills/reflection/SKILL.md).",
@@ -762,6 +842,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(1)
+        return
+
+    if args.command == "regenerate-api-key":
+        home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
+        home = Path(home_arg).resolve()
+        env_path = home / ".env"
+        if not env_path.is_file():
+            print(
+                f"error: no .env at {env_path}; run `mimir setup` first",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        new_key = regenerate_api_key(home)
+        print(new_key)
+        print(
+            f"\nWrote to {env_path}. Restart `mimir run` for the new key to take effect.",
+            file=sys.stderr,
+        )
         return
 
     if args.command == "reflection":

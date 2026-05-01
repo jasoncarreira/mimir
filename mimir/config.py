@@ -16,20 +16,33 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
-# Hard ceiling on the JSONL log caps (events.jsonl, turns.jsonl). Setting
-# the cap higher than this is almost never useful — the reflection skill
-# already filters to the last 7 days, the algedonic prompt block bounds
-# itself by hours+limit, and a 10k-row JSONL is already several MB. The
+# Hard ceilings on the JSONL log caps. Beyond these the cumulative on-disk
+# weight isn't worth the benefit — the reflection skill already filters to
+# the last 7 days, the algedonic prompt block bounds itself by
+# hours+limit, and a 10k-turn / 50k-event log is already several MB. The
 # cost of letting it grow further is paid on every prompt assembly that
-# tail-scans the file. Operators with genuine "I need full history"
-# needs should ship logs to an external store, not raise this knob.
-_LOG_CAP_MAX = 10_000
-_LOG_CAP_DEFAULT = 1_000
+# tail-scans the file. Operators with genuine "I need full history" needs
+# should ship logs to an external store, not raise these knobs.
+#
+# Events cap is 5× the turns cap — measured ~5 events/turn for mimir today
+# (turn_started/finished, event_queued, msam_feedback_sent, send_message),
+# with headroom for failure-class events (tool_call_denied, retries, loop
+# warnings) when they fire. open-strix's distribution runs ~15 events/turn
+# but is chattier; if mimir's per-turn event count grows toward that, raise
+# the multiplier.
+_TURNS_CAP_DEFAULT = 1_000
+_TURNS_CAP_MAX = 10_000
+_EVENTS_PER_TURN_RATIO = 5
+_EVENTS_CAP_DEFAULT = _TURNS_CAP_DEFAULT * _EVENTS_PER_TURN_RATIO
+_EVENTS_CAP_MAX = _TURNS_CAP_MAX * _EVENTS_PER_TURN_RATIO
 
 
-def _log_cap(name: str) -> int:
-    """Resolve a log-cap env var with the default + hard ceiling applied."""
-    return min(_env_int(name, _LOG_CAP_DEFAULT), _LOG_CAP_MAX)
+def _turns_cap() -> int:
+    return min(_env_int("MIMIR_MAX_TURNS", _TURNS_CAP_DEFAULT), _TURNS_CAP_MAX)
+
+
+def _events_cap() -> int:
+    return min(_env_int("MIMIR_MAX_EVENTS", _EVENTS_CAP_DEFAULT), _EVENTS_CAP_MAX)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -230,8 +243,8 @@ class Config:
 
             recent_boundaries=_env_int("MIMIR_RECENT_BOUNDARIES", 3),
 
-            max_turns_kept=_log_cap("MIMIR_MAX_TURNS"),
-            max_events_kept=_log_cap("MIMIR_MAX_EVENTS"),
+            max_turns_kept=_turns_cap(),
+            max_events_kept=_events_cap(),
             turns_archive_dir=Path(archive_dir).resolve() if archive_dir else None,
         )
 
