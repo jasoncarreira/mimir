@@ -11,10 +11,13 @@ def test_bundled_skills_include_expected_set():
     names = set(_bundled_skill_names())
     # Verbatim ports + the rewritten/adapted ones.
     expected = {
+        "alert",  # v0.4 §6
         "five-whys",
+        "heartbeat",  # v0.4 §1
         "introspection",
         "long-running-jobs",
         "memory",
+        "mountaineering",  # v0.4 §5
         "onboarding",
         "pollers",
         "skill-acquisition",
@@ -24,6 +27,34 @@ def test_bundled_skills_include_expected_set():
     }
     missing = expected - names
     assert not missing, f"missing bundled skills: {missing}"
+
+
+def test_mountaineering_skill_no_climber_py():
+    """v0.4 §5 sanity check: the open-strix mountaineering skill ships a
+    climber.py runtime alongside the markdown. Mimir replaces that with
+    the climber subagent in subagent_defs.py — climber.py should NOT be
+    carried over (would dead-code the package)."""
+    skill_dir = Path(__file__).parent.parent / "mimir" / "skills" / "mountaineering"
+    py_files = list(skill_dir.glob("*.py"))
+    assert py_files == [], (
+        f"mountaineering skill should be markdown-only (subagent provides "
+        f"the runtime); found stray .py files: {py_files}"
+    )
+
+
+def test_mountaineering_skill_documents_mimir_mechanism():
+    """The ported skill must explain how to actually fan out a climber in
+    mimir (subagent), not just the open-strix mechanism."""
+    skill_md = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "skills"
+        / "mountaineering"
+        / "SKILL.md"
+    ).read_text()
+    assert "Mimir-specific mechanism" in skill_md
+    assert "subagent" in skill_md
+    assert "climber.md" in skill_md
 
 
 def test_wiki_skill_is_domain_neutral():
