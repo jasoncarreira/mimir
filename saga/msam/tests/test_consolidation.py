@@ -681,3 +681,88 @@ class TestParseStructuredSynthesis:
         # Only the first valid one survives validation
         assert len(triples) == 1
         assert triples[0]["subject"] == "User"
+
+
+class TestPromptBranching:
+    """Verify the consolidation prompt branches on
+    [triples] enable_extraction so we don't waste tokens asking for a
+    TRIPLES section we'd discard."""
+
+    def test_prompt_includes_triples_when_extraction_on(self, monkeypatch):
+        """When triples.enable_extraction = True, the prompt must
+        include the TRIPLES section header and rules."""
+        import copy
+        from msam import config as cfg_mod
+        from msam.core import store_atom
+        from msam.consolidation import ConsolidationEngine
+        cfg_mod._load_config()
+        snapshot = copy.deepcopy(cfg_mod._config) if cfg_mod._config else {}
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        snapshot.setdefault("triples", {})["enable_extraction"] = True
+        snapshot.setdefault("consolidation", {})["enable_llm"] = True
+        snapshot["consolidation"]["min_cluster_size"] = 2
+
+        # Capture the prompt by intercepting requests.post.
+        captured = {}
+        class _Resp:
+            status_code = 200
+            def json(self):
+                return {"choices": [{"message": {"content":
+                    "OBSERVATION:\nA test observation.\n\nTRIPLES:\nNONE"
+                }}]}
+            text = ""
+        def fake_post(url, headers=None, json=None, timeout=None):
+            captured["prompt"] = json["messages"][0]["content"]
+            return _Resp()
+        monkeypatch.setattr("requests.post", fake_post)
+
+        # Seed enough atoms to form a cluster (LLM will be called).
+        for i in range(3):
+            store_atom(f"Atom {i} about the user enjoying jazz music")
+        ConsolidationEngine().consolidate()
+
+        assert "TRIPLES:" in captured.get("prompt", ""), (
+            f"prompt missing TRIPLES section: {captured.get('prompt', '')[:500]}"
+        )
+        assert "Rules for TRIPLES" in captured["prompt"]
+
+    def test_prompt_omits_triples_when_extraction_off(self, monkeypatch):
+        """When triples.enable_extraction = False (default), the
+        prompt must NOT include the TRIPLES section — saves tokens
+        and matches what the bench was doing implicitly with the
+        old broken consolidation."""
+        import copy
+        from msam import config as cfg_mod
+        from msam.core import store_atom
+        from msam.consolidation import ConsolidationEngine
+        cfg_mod._load_config()
+        snapshot = copy.deepcopy(cfg_mod._config) if cfg_mod._config else {}
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        snapshot.setdefault("triples", {})["enable_extraction"] = False
+        snapshot.setdefault("consolidation", {})["enable_llm"] = True
+        snapshot["consolidation"]["min_cluster_size"] = 2
+
+        captured = {}
+        class _Resp:
+            status_code = 200
+            def json(self):
+                return {"choices": [{"message": {"content":
+                    "OBSERVATION:\nA test observation."
+                }}]}
+            text = ""
+        def fake_post(url, headers=None, json=None, timeout=None):
+            captured["prompt"] = json["messages"][0]["content"]
+            return _Resp()
+        monkeypatch.setattr("requests.post", fake_post)
+
+        for i in range(3):
+            store_atom(f"Atom {i} about the user enjoying jazz music")
+        ConsolidationEngine().consolidate()
+
+        prompt = captured.get("prompt", "")
+        assert "TRIPLES:" not in prompt, (
+            f"prompt should not request triples: {prompt[:500]}"
+        )
+        assert "OBSERVATION:" in prompt
