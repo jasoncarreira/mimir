@@ -92,6 +92,16 @@ DEFAULT_SCHEDULER_YAML = dedent(
     #     cron: "*/30 * * * *"
     #     channel_id: null   # synthetic scheduler:heartbeat channel
     #     prompt: "Run the heartbeat skill: librarian protocol first, then pick one item from state/heartbeat-backlog.md and do it. End silently."
+    #
+    # Reflection (v0.4 §4) — weekly cross-session audit. Sunday 04:00 UTC
+    # so it lands after the MSAM weekly consolidation. Uncomment to
+    # enable.
+    #
+    # jobs:
+    #   - name: reflect
+    #     cron: "0 4 * * 0"
+    #     channel_id: null   # synthetic scheduler:reflect channel
+    #     prompt: "Run the reflection skill — cross-session audit of the past week."
 
     jobs: []
     """
@@ -140,6 +150,92 @@ DEFAULT_HEARTBEAT_PATTERNS = dedent(
     tasks that fit well, ones that didn't, time-of-day patterns,
     mistakes worth not repeating. Keep it tight; this block is in core
     memory.
+    """
+)
+
+
+DEFAULT_REFLECTION_POLICY = dedent(
+    """\
+    <!-- desc: which reflection actions are autonomous vs propose-only -->
+    # Reflection Policy
+
+    Read by the reflection skill at the start of every weekly audit.
+    Edit this file to widen or tighten the autonomous boundary as
+    trust builds. Conservative defaults:
+
+    ## Autonomous (the reflection turn may apply directly)
+
+    - MSAM atom decay calls
+    - MSAM triples linking (additive)
+    - Append-only edits to memory/core/40-learned-behaviors.md
+    - Wiki orphan tagging (writes to state/wiki/index.md — flag, don't delete)
+
+    ## Propose-only (write to state/proposed-changes.md, operator reviews)
+
+    - Core memory edits (cleanup, restructure, promote-to-core, demote)
+    - Persona block edits (memory/core/00-*.md)
+    - Skill creation (.claude/skills/<name>/)
+    - Wiki page deletions
+    - Memory file deletions
+
+    If this file is missing or unparseable, fall back to propose-only
+    for everything — never auto-apply when in doubt.
+    """
+)
+
+
+DEFAULT_LEARNED_BEHAVIORS = dedent(
+    """\
+    <!-- desc: behaviors learned through reflection - autonomous additions only -->
+    # Learned Behaviors
+
+    Append-only. The reflection turn writes here when it observes a
+    pattern worth keeping (a recurring approach that worked, a
+    failure mode worth avoiding, a heuristic that emerged across
+    several sessions). Never edit prior entries from a reflection —
+    propose any restructure via state/proposed-changes.md instead.
+
+    Format per entry:
+
+    ```
+    ## YYYY-MM-DD — short title
+    What I noticed: ...
+    What works: ...
+    Trigger: <when this applies>
+    ```
+    """
+)
+
+
+DEFAULT_PROPOSED_CHANGES = dedent(
+    """\
+    # Proposed Changes
+
+    Pending HITL items from the reflection skill. Operator reviews on
+    their own cadence; once an item is applied or rejected, move it
+    to a `## Applied` / `## Rejected` section below or remove it.
+
+    Format per item:
+
+    ```
+    ## YYYY-MM-DD — short title
+    Source: <reflection week / heartbeat tick / other>
+    Proposal: <what to change>
+    Rationale: <why>
+    Affected: <file paths or systems>
+    ```
+
+    ## Pending
+
+    (empty — populated by reflection)
+
+    ## Applied
+
+    (operator moves accepted items here, optionally with notes)
+
+    ## Rejected
+
+    (operator moves rejected items here, optionally with notes)
     """
 )
 
@@ -336,6 +432,20 @@ def setup_home(home: Path) -> dict[str, object]:
         DEFAULT_HEARTBEAT_PATTERNS,
     ):
         files_created.append("memory/core/50-heartbeat-patterns.md")
+    if _write_if_missing(
+        home / "memory" / "core" / "30-reflection-policy.md",
+        DEFAULT_REFLECTION_POLICY,
+    ):
+        files_created.append("memory/core/30-reflection-policy.md")
+    if _write_if_missing(
+        home / "memory" / "core" / "40-learned-behaviors.md",
+        DEFAULT_LEARNED_BEHAVIORS,
+    ):
+        files_created.append("memory/core/40-learned-behaviors.md")
+    if _write_if_missing(
+        home / "state" / "proposed-changes.md", DEFAULT_PROPOSED_CHANGES
+    ):
+        files_created.append("state/proposed-changes.md")
 
     seeded_subagents = seed_subagent_defs(home)
     seeded_skills = seed_skills(home)
