@@ -42,12 +42,49 @@ async def msam_app(aiohttp_server):
     async def boom(request: web.Request) -> web.Response:
         return web.Response(status=500, text="kaboom")
 
+    async def recent_sessions(request: web.Request) -> web.Response:
+        received.append({"path": "/v1/sessions/recent", "params": dict(request.query)})
+        return web.json_response(
+            {
+                "sessions": [
+                    {
+                        "atom_id": "atom-boundary-1",
+                        "session_id": "msam-slack-eng-1",
+                        "channel_id": "slack-eng",
+                        "ts": "2026-04-29T14:02:00+00:00",
+                        "summary": "Helped Alice debug the deploy migration.",
+                        "topics_discussed": ["deploy"],
+                        "decisions_made": [],
+                        "unfinished": ["follow up on heap config Monday"],
+                        "emotional_state": "focused",
+                    }
+                ]
+            }
+        )
+
+    async def most_retrieved(request: web.Request) -> web.Response:
+        received.append({"path": "/v1/atoms/most_retrieved", "params": dict(request.query)})
+        return web.json_response(
+            {
+                "atoms": [
+                    {
+                        "id": "atom-1",
+                        "content": "alice prefers terse messages",
+                        "retrieval_count": 12,
+                        "contributed_count": 7,
+                    }
+                ]
+            }
+        )
+
     app = web.Application()
     app.router.add_get("/v1/health", health)
     app.router.add_post("/v1/query", query)
     app.router.add_post("/v1/feedback", feedback)
     app.router.add_post("/v1/sessions/end", end_session)
     app.router.add_post("/v1/consolidate", boom)
+    app.router.add_get("/v1/sessions/recent", recent_sessions)
+    app.router.add_get("/v1/atoms/most_retrieved", most_retrieved)
     server = await aiohttp_server(app)
     return server, received
 
@@ -173,3 +210,125 @@ def test_clamp_query_handles_no_whitespace():
     huge = "x" * 5000
     out = _clamp_query(huge)
     assert len(out) <= _MAX_QUERY_CHARS
+
+
+# ---- v0.4 §3: GET helpers (sessions/recent + atoms/most_retrieved) ------
+
+
+@pytest.mark.asyncio
+async def test_recent_session_boundaries_happy_path(msam_app):
+    server, received = msam_app
+    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    try:
+        out = await client.recent_session_boundaries(channel_id="slack-eng", count=5)
+    finally:
+        await client.close()
+
+    assert isinstance(out, list)
+    assert len(out) == 1
+    assert out[0]["session_id"] == "msam-slack-eng-1"
+    # Params went through correctly.
+    call = next(c for c in received if c["path"] == "/v1/sessions/recent")
+    assert call["params"] == {"count": "5", "channel": "slack-eng"}
+
+
+@pytest.mark.asyncio
+async def test_recent_session_boundaries_omits_channel_when_unset(msam_app):
+    server, received = msam_app
+    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    try:
+        await client.recent_session_boundaries(count=3)
+    finally:
+        await client.close()
+    call = next(c for c in received if c["path"] == "/v1/sessions/recent")
+    assert "channel" not in call["params"]
+
+
+@pytest.mark.asyncio
+async def test_recent_session_boundaries_returns_empty_on_5xx(aiohttp_server):
+    """Best-effort surface — must not raise on transient MSAM failures."""
+
+    async def boom(request: web.Request) -> web.Response:
+        return web.Response(status=503, text="upstream down")
+
+    app = web.Application()
+    app.router.add_get("/v1/sessions/recent", boom)
+    server = await aiohttp_server(app)
+
+    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    try:
+        out = await client.recent_session_boundaries()
+    finally:
+        await client.close()
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_recent_session_boundaries_returns_empty_on_404(aiohttp_server):
+    app = web.Application()  # no routes registered
+    server = await aiohttp_server(app)
+    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    try:
+        out = await client.recent_session_boundaries()
+    finally:
+        await client.close()
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_recent_session_boundaries_returns_empty_on_network_failure():
+    """No server at all — connection refused must degrade silently."""
+    client = MsamClient(endpoint="http://127.0.0.1:1")  # nothing listening
+    try:
+        out = await client.recent_session_boundaries()
+    finally:
+        await client.close()
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_most_retrieved_atoms_passes_all_params(msam_app):
+    server, received = msam_app
+    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    try:
+        out = await client.most_retrieved_atoms(
+            days=14, count=20, channel_id="slack-eng", contributed_only=True,
+        )
+    finally:
+        await client.close()
+    assert isinstance(out, list) and out[0]["id"] == "atom-1"
+    call = next(c for c in received if c["path"] == "/v1/atoms/most_retrieved")
+    assert call["params"] == {
+        "days": "14",
+        "count": "20",
+        "channel": "slack-eng",
+        "contributed_only": "true",
+    }
+
+
+@pytest.mark.asyncio
+async def test_most_retrieved_atoms_serializes_contributed_only_false(msam_app):
+    server, received = msam_app
+    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    try:
+        await client.most_retrieved_atoms(contributed_only=False)
+    finally:
+        await client.close()
+    call = next(c for c in received if c["path"] == "/v1/atoms/most_retrieved")
+    assert call["params"]["contributed_only"] == "false"
+
+
+@pytest.mark.asyncio
+async def test_most_retrieved_atoms_returns_empty_on_5xx(aiohttp_server):
+    async def boom(request: web.Request) -> web.Response:
+        return web.Response(status=500, text="kaboom")
+
+    app = web.Application()
+    app.router.add_get("/v1/atoms/most_retrieved", boom)
+    server = await aiohttp_server(app)
+    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    try:
+        out = await client.most_retrieved_atoms()
+    finally:
+        await client.close()
+    assert out == []

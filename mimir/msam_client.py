@@ -298,6 +298,85 @@ class MsamClient:
             body["max_clusters"] = max_clusters
         return await self._post("/v1/consolidate", body)
 
+    async def recent_session_boundaries(
+        self,
+        *,
+        channel_id: str | None = None,
+        count: int = 3,
+    ) -> list[dict[str, Any]]:
+        """GET /v1/sessions/recent — chronological recall of session
+        boundary atoms (most recent first), optionally filtered by
+        channel. Distinct from /v1/query: query ranks by similarity,
+        this ranks by recency.
+
+        Best-effort: returns ``[]`` on any failure (4xx, 5xx, network)
+        so the prompt-assembly path doesn't crash if MSAM is briefly
+        down. The caller logs at warning."""
+        params: dict[str, Any] = {"count": count}
+        if channel_id:
+            params["channel"] = channel_id
+        data = await self._get_or_empty("/v1/sessions/recent", params)
+        # MSAM commit 5545a6e ships {"sessions": [...]}.
+        return data.get("sessions") or []
+
+    async def most_retrieved_atoms(
+        self,
+        *,
+        days: int = 7,
+        count: int = 10,
+        channel_id: str | None = None,
+        contributed_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """GET /v1/atoms/most_retrieved — top-N atoms by retrieval
+        count over the last ``days`` days.
+
+        Used by the reflection skill to identify atoms worth promoting
+        to core memory (high-value content the agent retrieves and
+        uses repeatedly), and as input for "what has the agent been
+        thinking about lately?" pre-message context.
+
+        ``contributed_only=True`` restricts the count to retrievals
+        where ``access_log.contributed=1`` — atoms whose content
+        actually showed up in the agent's reply per the credit-pass.
+        Use this for promotion candidates; pass ``False`` to also see
+        atoms that got pulled in but weren't used.
+
+        Best-effort: returns ``[]`` on any failure."""
+        params: dict[str, Any] = {
+            "days": days,
+            "count": count,
+            "contributed_only": "true" if contributed_only else "false",
+        }
+        if channel_id:
+            params["channel"] = channel_id
+        data = await self._get_or_empty("/v1/atoms/most_retrieved", params)
+        return data.get("atoms") or []
+
+    async def _get_or_empty(
+        self, path: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """GET that returns ``{}`` (instead of raising) on any failure.
+        Used by the v0.4 reflection / prompt-time helpers where missing
+        data degrades gracefully into an empty section."""
+        try:
+            sess = await self._ensure_session()
+            async with sess.get(f"{self._endpoint}{path}", params=params) as resp:
+                if resp.status >= 400:
+                    log.warning(
+                        "MSAM %s returned %d; degrading to empty",
+                        path, resp.status,
+                    )
+                    return {}
+                text = await resp.text()
+                try:
+                    return await _parse_json(text)
+                except ValueError:
+                    log.warning("MSAM %s returned non-JSON; degrading to empty", path)
+                    return {}
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.warning("MSAM %s failed: %s", path, exc)
+            return {}
+
 
 async def _parse_json(text: str) -> dict[str, Any]:
     return json.loads(text)
