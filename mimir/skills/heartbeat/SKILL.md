@@ -60,9 +60,18 @@ that should be picked up now versus deferred?
 
 **6. Resource check (15 sec)**
 The "Resource usage" prompt section shows your last turn's cost,
-context utilization, and rolling 1h / 5h / 7d aggregates with cache
-hit rate. Three things worth a glance before picking heartbeat work:
+context utilization, rolling 1h / 5h / 7d aggregates with cache
+hit rate, and — when the SDK has reported them — the actual
+Anthropic plan window utilizations (5-hour rolling, 7-day plan /
+Opus / Sonnet, overage). Four things worth a glance before picking
+work:
 
+- **Plan windows ≥ 80% used** (under "Plan windows (from Anthropic)"
+  in the section) — these are the authoritative numbers Claude Code's
+  `/usage` displays. If a window is approaching its cap, scale back
+  hard regardless of dollar cost: avoid expensive turns, prefer
+  bash-only investigations, end silently. A `rejected` status means
+  the limit has hit — defer everything until the window resets.
 - **Cost rate alert** (⚠ marker in the section) — current $/hr is
   unusually high, either against an absolute ceiling or against your
   rolling-week baseline. Take this seriously: pick a small or
@@ -74,9 +83,11 @@ hit rate. Three things worth a glance before picking heartbeat work:
   cache between turns. Worth a five-whys (is core memory churning?
   is the system prompt growing?) but only if it's persistent across
   many turns, not a one-off.
-- **Budget % approaching limits** — if `MIMIR_USAGE_5H_LIMIT_USD` /
+- **Dollar budget % approaching limits** — if `MIMIR_USAGE_5H_LIMIT_USD` /
   `MIMIR_USAGE_WEEKLY_LIMIT_USD` are configured and you're past
-  ~70%, scale back the same way as for the cost-rate alert.
+  ~70%, scale back the same way as for the cost-rate alert. (These
+  are operator-set dollar ceilings, separate from the plan windows
+  above.)
 
 **Decision after librarian:**
 - Drift detected → fix via memory edit, then proceed

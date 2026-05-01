@@ -6,15 +6,22 @@ the SDK populates from Anthropic's ``ResultMessage`` plus the
 sums by time window so the agent sees:
 
 - Cache hit rate (proportion of input tokens served from prompt cache)
-- Cost over rolling 5-hour and 7-day windows
+- Cost over rolling 1h / 5h / 7d windows
 - Token totals per window
 - Last turn's context-window utilization vs. the model cap
 
-Anthropic doesn't expose Max-plan 5h / weekly quotas through the API,
-so the dollar windows here are derived from observed cost — not from
-the plan's actual unit accounting. When the operator sets
-``MIMIR_USAGE_5H_LIMIT_USD`` or ``MIMIR_USAGE_WEEKLY_LIMIT_USD`` we
-render % of budget; otherwise just raw numbers.
+Plan-window utilization (5-hour rolling, 7-day plan / Opus / Sonnet,
+overage) lives in ``mimir/rate_limits.py`` — that data comes from the
+SDK's ``RateLimitEvent`` stream, not from turns.jsonl. The two are
+complementary: this module shows *cost* over time (in dollars,
+calculable from per-turn tokens × per-token rates), while rate_limits
+shows *plan unit consumption* (the same numbers Claude Code's
+``/usage`` surfaces).
+
+The operator-configurable budgets ``MIMIR_USAGE_5H_LIMIT_USD`` /
+``MIMIR_USAGE_WEEKLY_LIMIT_USD`` annotate dollar consumption against
+operator-set thresholds — useful as a *cost* ceiling but distinct
+from the plan's unit budget which the SDK tracks separately.
 """
 
 from __future__ import annotations
@@ -333,12 +340,14 @@ def render_usage_block(
     budget_5h_usd: float | None = None,
     budget_weekly_usd: float | None = None,
     alert: CostRateAlert | None = None,
+    plan_quota_lines: list[str] | None = None,
 ) -> str | None:
     """Format the usage report as a markdown body for the
     "## Resource usage" prompt section. Returns None when there's
     nothing to show (no last turn, no aggregated windows with data)."""
     has_windows = any(w.turns > 0 for w in report.windows)
-    if report.last_turn.ts is None and not has_windows:
+    has_plan_quotas = bool(plan_quota_lines)
+    if report.last_turn.ts is None and not has_windows and not has_plan_quotas:
         return None
 
     lines: list[str] = []
@@ -376,6 +385,13 @@ def render_usage_block(
             if budget and budget > 0:
                 cost_part += f" ({w.total_cost_usd / budget * 100:.0f}% of ${budget:.2f})"
             lines.append(f"{w.label}: {cost_part} / " + " / ".join(tail))
+
+    if has_plan_quotas:
+        if lines:
+            lines.append("")
+        lines.append("Plan windows (from Anthropic):")
+        for line in plan_quota_lines or []:
+            lines.append(f"- {line}")
 
     if alert is not None:
         lines.append("")  # separator

@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     HookMatcher,
+    RateLimitEvent,
     ResultMessage,
     TaskNotificationMessage,
     TaskStartedMessage,
@@ -50,6 +51,10 @@ from .config import Config
 from .event_logger import log_event
 from .feedback import FeedbackLog
 from .history import MessageBuffer
+from .rate_limits import (
+    RateLimitStore,
+    snapshot_from_sdk_event,
+)
 from .session_boundary_log import SessionBoundaryLog, render_session_summaries
 from .usage_stats import (
     aggregate as aggregate_usage,
@@ -134,6 +139,12 @@ class Agent:
         )
         self._session_boundary_log = SessionBoundaryLog(
             path=config.home / ".mimir" / "session_boundaries.jsonl",
+        )
+        # Plan-window rate-limit state from RateLimitEvent (5h rolling,
+        # 7d plan / Opus / Sonnet, overage). Single JSON file, replaces
+        # on each transition.
+        self._rate_limits = RateLimitStore(
+            path=config.home / ".mimir" / "rate_limits.json",
         )
 
         self._mcp_server = build_mcp_server(
@@ -274,12 +285,23 @@ class Agent:
                 )
             )
 
+        # Plan-window state from the SDK's RateLimitEvent stream.
+        # Sparse (only fires on transitions); we surface the most recent
+        # entry per type until its window resets.
+        try:
+            from .rate_limits import render_plan_quota_lines
+            plan_lines = render_plan_quota_lines(self._rate_limits.current())
+        except Exception:  # noqa: BLE001
+            log.exception("rate_limits read failed; skipping plan-quota lines")
+            plan_lines = []
+
         return render_usage_block(
             report,
             fallback_model=self._config.model,
             budget_5h_usd=self._config.usage_5h_limit_usd or None,
             budget_weekly_usd=self._config.usage_weekly_limit_usd or None,
             alert=alert,
+            plan_quota_lines=plan_lines,
         )
 
     async def _assemble_session_summaries(
@@ -559,6 +581,37 @@ class Agent:
         for msg in messages:
             if isinstance(msg, ResultMessage):
                 result_msg = msg
+
+        # 7a.b. RateLimitEvent capture — the SDK emits these on plan-window
+        #       state transitions (allowed → allowed_warning → rejected) for
+        #       five_hour / seven_day / seven_day_opus / seven_day_sonnet /
+        #       overage. They're sparse: we may go many turns without one,
+        #       so we persist per-type and render the most recent until the
+        #       window resets. See mimir/rate_limits.py.
+        for msg in messages:
+            if isinstance(msg, RateLimitEvent):
+                info = msg.rate_limit_info
+                rl_type = getattr(info, "rate_limit_type", None)
+                if not rl_type:
+                    continue
+                try:
+                    await self._rate_limits.record(
+                        rl_type, snapshot_from_sdk_event(info),
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("rate_limits.record failed for %s", rl_type)
+                # Also fire a log_event so the algedonic surfacing picks
+                # up rejections. allowed_warning gets logged too — useful
+                # to see "almost over" trends in events.jsonl.
+                if info.status in ("allowed_warning", "rejected"):
+                    await log_event(
+                        "rate_limit_warning"
+                        if info.status == "allowed_warning"
+                        else "rate_limit_rejected",
+                        rate_limit_type=rl_type,
+                        utilization=info.utilization,
+                        resets_at=info.resets_at,
+                    )
 
         # 7b. Subagent notification side-channel (SPEC §4.4). The SDK yields
         #     ``TaskStartedMessage`` / ``TaskNotificationMessage`` on the parent

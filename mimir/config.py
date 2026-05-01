@@ -174,9 +174,11 @@ class Config:
     # Usage block in the turn prompt: enable/disable, plus optional
     # dollar budgets that gate the "% of budget" annotation. The 5h /
     # weekly windows match Anthropic's Max-plan rolling-window shape;
-    # the dollar values are operator-set since the API doesn't expose
-    # plan-level quotas. Leave the budgets unset to render raw cost
-    # without thresholds.
+    # these are *operator-set dollar ceilings*, complementary to the
+    # plan's unit budget that the SDK's RateLimitEvent stream reports
+    # (captured separately in mimir/rate_limits.py and rendered as
+    # "Plan windows" in the same prompt section). Leave blank to skip
+    # the dollar-threshold annotation.
     usage_block_enabled: bool
     usage_5h_limit_usd: float
     usage_weekly_limit_usd: float

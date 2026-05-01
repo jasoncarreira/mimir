@@ -69,11 +69,12 @@ DEFAULT_ENV_TEMPLATE = dedent(
     MIMIR_API_KEY=
 
     # ---- Usage / cost surfacing ------------------------------------------
-    # Optional dollar budgets that gate the "% of budget" annotation in
-    # the turn prompt's Resource usage section. Set per your plan; leave
-    # blank to render raw cost without thresholds. The 5h / weekly windows
-    # match Anthropic's Max-plan rolling-window shape; the API doesn't
-    # expose plan-level quotas, so these are operator-set.
+    # Optional dollar ceilings that gate the "% of budget" annotation in
+    # the turn prompt's Resource usage section. These are operator-set
+    # cost thresholds; complementary to (not a replacement for) the
+    # plan's unit budget — the SDK's RateLimitEvent stream feeds the
+    # actual five_hour / seven_day / etc. utilization into the same
+    # prompt section under "Plan windows."
     MIMIR_USAGE_5H_LIMIT_USD=
     MIMIR_USAGE_WEEKLY_LIMIT_USD=
 
@@ -880,16 +881,25 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.command == "stats":
         from .config import Config as _Config
-        from .usage_stats import aggregate, render_usage_block
+        from .rate_limits import RateLimitStore, render_plan_quota_lines
+        from .usage_stats import aggregate, evaluate_cost_rate, render_usage_block
         home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
         os.environ["MIMIR_HOME"] = str(Path(home_arg).resolve())
         cfg = _Config.from_env()
         report = aggregate(cfg.turns_log, fallback_model=cfg.model)
+        store = RateLimitStore(path=cfg.home / ".mimir" / "rate_limits.json")
+        alert = evaluate_cost_rate(
+            report,
+            hourly_limit_usd=cfg.cost_hourly_limit_usd or None,
+            spike_ratio=cfg.cost_rate_spike_ratio or None,
+        )
         body = render_usage_block(
             report,
             fallback_model=cfg.model,
             budget_5h_usd=cfg.usage_5h_limit_usd or None,
             budget_weekly_usd=cfg.usage_weekly_limit_usd or None,
+            alert=alert,
+            plan_quota_lines=render_plan_quota_lines(store.current()),
         )
         if body is None:
             print("(no turns recorded yet)")
