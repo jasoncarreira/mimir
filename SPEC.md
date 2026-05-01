@@ -793,10 +793,15 @@ Pure-prompt skills (just a `SKILL.md`) are essentially free to port — copy the
 | `skill-creator/` | Create or update reusable skills for this agent. | **Adapt:** target Claude Agent SDK skill folder format, not open-strix's loader. |
 | `view-attachment/` | View image/file attachments by path. | Verbatim. |
 
-**Explicitly dropped:**
-- `mountaineering/` — replaced by SDK subagents (§4.3, §4.4).
-- `pollers/` — ported into mimir's channel layer (§7.2.2); the SKILL.md and design-patterns.md copy verbatim, the `reload_pollers` tool is wired into mimir's scheduler.
+**Explicitly dropped (initial port):**
 - `prediction-review/` — depends on the journal mimir doesn't have.
+
+**Ported back in (v0.4):**
+- `mountaineering/` — five framework files (philosophy, laws, harness, preflight, climb-design) port verbatim; the SKILL.md adds a Mimir-specific mechanism section pointing at the climber subagent (§4.3). open-strix's `climber.py` is replaced by the bundled subagent (`mimir/subagent_defs.py`); the discipline (Five Laws, four phases) is unchanged.
+
+**Bundled, not from open-strix:**
+- `pollers/` — adapted into mimir's channel layer (§7.2.2); the SKILL.md and design-patterns.md copy verbatim, the `reload_pollers` tool is wired into mimir's scheduler.
+- `heartbeat/`, `reflection/`, `alert/` — v0.4 additions (V0.4.md §1, §4, §6). Heartbeat is the autonomous-work cadence; reflection is the weekly cross-session audit; alert is the operator-escalation discipline.
 
 Skills install under `mimir/skills/` (bundled with the package) **plus** `<home>/.claude/skills/` for agent-installable ones (matches the SDK's filesystem skill convention). The bundled set is read-only at runtime; user/agent-added skills land in the home dir and survive across restarts but are reset between benchmark tasks.
 
@@ -817,12 +822,6 @@ Skills install under `mimir/skills/` (bundled with the package) **plus** `<home>
 ## Memory index
 {<home>/memory/INDEX.md content}
 
-## Available tools
-{tool catalog — auto-generated from registered tools}
-
-## Available skills
-{skill catalog — auto-generated from skills/*/SKILL.md headers}
-
 ## Conventions
 - Always-in-context blocks live under memory/core/, ordered by numeric prefix
   (00-, 10-, 20-, ...). To insert at position N, name the file N-<topic>.md.
@@ -837,15 +836,33 @@ Skills install under `mimir/skills/` (bundled with the package) **plus** `<home>
 - The INDEX.md files are auto-generated; do not hand-edit them.
 - Edit memory blocks with bash and file-op tools — no dedicated memory-block
   tools exist.
+
+## Operator config                       # only when MIMIR_OPERATOR_ALERT_CHANNEL set
+Operator alert channel: {value}
 ```
+
+(`## Available tools` and `## Available skills` sections were in the
+original sketch but never landed — the SDK surfaces both natively
+through its tool/skill registries, so duplicating in the system prompt
+was redundant.)
 
 The prompts/ directory under the *benchmark* repo (mirroring the existing open-strix layout) holds the editable text fragments. The mimir runtime reads them at boot.
 
 ### 9.2 Turn prompt
 
-For inbound messages:
+Section assembly order (each conditional — section is omitted when its
+input is empty):
 
 ```
+## Known identities                      # FUTURE_WORK §6.1; resolver-driven
+{identity records for authors visible in this turn}
+
+## Recent feedback signals               # v0.4 §2 algedonic surfacing
+{Negative (last Nh): / Positive (last Nh): bullets from feedback.py}
+
+## Recent session summaries              # v0.4 §3 session-boundary surfacing
+{recent boundaries for the current channel from MSAM (or local mirror fallback)}
+
 ## Recent activity
 {merged chronological stream:
   - last N messages from messages/<channel_id>.jsonl
@@ -855,27 +872,29 @@ For inbound messages:
 ## Possibly relevant memories (from MSAM)
 {pre_message_msam_block — see 9.3}
 
-[event_kind: {kind}, channel: {channel_id}, author: {author}]
+## Subagent updates                      # only when subagent_inbox has entries
+{TaskNotificationMessage payloads from prior turns}
+
+[event_kind: {trigger}, channel: {channel_id}, author: {author}, ts: {ts}]
 {event_body}
 ```
 
 For scheduled wakeups (no inbound author, so cross-author pull is skipped):
 
 ```
-## Recent activity
-{last N messages across all channels the schedule cares about,
- or just the channel_id specified in the schedule}
+{same conditional sections as above}
 
-## Possibly relevant memories (from MSAM)
-{pre_message_msam_block}
-
-[scheduled tick: {schedule_name} at {timestamp}, channel: {channel_id}]
-{schedule_prompt}
+[scheduled_tick: {channel_id}, ts: {ts}]
+{schedule_prompt or HEARTBEAT_DEFAULT_PROMPT — see prompts.py}
 ```
 
 No journal entries. No always-injected core memory beyond what's already in the system prompt.
 
 ### 9.3 MSAM hooks
+
+(Hook code samples below use `ctx.*` to match the actual attribute
+name on `TurnContext`; the original spec drafted these as
+`turn_state.*`.)
 
 **Pre-message** — fires after `index.rebuild()` and before `query()`. Mirrors muninnbot's `msam_hooks.mjs:PreMessage` and open-strix-hindsight's pre-message retrieval:
 
@@ -883,25 +902,25 @@ No journal entries. No always-injected core memory beyond what's already in the 
 hits = msam_client.query(
     text=event_body,
     top_k=12,
-    session_id=turn_state.msam_session_id,   # §5.6
+    session_id=ctx.msam_session_id,   # §5.6
 )
 # hits = [{atom_id, content, kind, confidence, score}, ...]
-turn_state.msam_atom_ids = [h["atom_id"] for h in hits]
-turn_state.msam_block = format_atoms_for_prompt(hits)
+ctx.msam_atom_ids = [h["atom_id"] for h in hits]
+ctx.msam_block = format_atoms_for_prompt(hits)
 ```
 
-`format_atoms_for_prompt` produces a short bullet list — kind tag, content, no IDs in the visible output. The atom IDs are stashed on `turn_state` for the post-message hook. If the query returns nothing, the block is omitted from the turn prompt entirely.
+`format_atoms_for_prompt` produces a short bullet list — kind tag, content, no IDs in the visible output. The atom IDs are stashed on `ctx` for the post-message hook. If the query returns nothing, the block is omitted from the turn prompt entirely.
 
-**Mid-turn `msam_query` tracking.** The `msam` skill's `msam_query` wrapper (§8.2) appends every returned `atom_id` to `turn_state.msam_atom_ids` in addition to passing the hits back to the model. The agent doesn't have to remember to credit mid-turn retrievals — they're auto-merged into the post-message call below.
+**Mid-turn `msam_query` tracking.** The `msam` skill's `msam_query` wrapper (§8.2) appends every returned `atom_id` to `ctx.msam_atom_ids` in addition to passing the hits back to the model. The agent doesn't have to remember to credit mid-turn retrievals — they're auto-merged into the post-message call below.
 
 **Post-message** — fires after the SDK returns the final assistant message:
 
 ```python
-if turn_state.msam_atom_ids:
+if ctx.msam_atom_ids:
     msam_client.mark_contributions(
-        atom_ids=list(set(turn_state.msam_atom_ids)),  # pre-injected ∪ mid-turn-queried
+        atom_ids=list(set(ctx.msam_atom_ids)),  # pre-injected ∪ mid-turn-queried
         response_text=final_assistant_text,
-        session_id=turn_state.msam_session_id,         # §5.6
+        session_id=ctx.msam_session_id,         # §5.6
     )
 ```
 
@@ -909,7 +928,7 @@ if turn_state.msam_atom_ids:
 
 **Subagents do not inherit the parent's `msam_atom_ids`.** A subagent sees its own `TurnContext`. If a subagent calls `msam_query` and wants the retrievals credited, it credits them via its own `msam_mark_contributions` from inside the subagent. The parent neither tracks nor credits subagent-internal MSAM activity. This keeps the parent's credit signal clean and lets each context decide what counts as "useful".
 
-`turn_state.msam_atom_ids` is per-turn (cleared between turns). MSAM session boundaries (per-channel, idle-driven) are §5.6. Weekly consolidation is a separate scheduled job (§5.6).
+`ctx.msam_atom_ids` is per-turn (cleared between turns). MSAM session boundaries (per-channel, idle-driven) are §5.6. Weekly consolidation is a separate scheduled job (§5.6).
 
 ---
 

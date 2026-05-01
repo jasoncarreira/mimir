@@ -491,11 +491,7 @@ candidates.sort(key=score)[:k]
 
 ### 8.1 Periodic reflection / memory consolidation
 
-**Status:** speculative.
-
-The agent's `memory/` accumulates. A periodic "review what I have, merge duplicates, prune stale" pass would reduce clutter and surface contradictions. Could be a scheduled tick that fires `Agent("memory-curator", ...)` weekly.
-
-**Effort:** prompt + a curator subagent definition (~50 LOC). Significant prompt-engineering investment to make the curator behave well.
+**Status:** ✅ shipped in v0.4 §4. See `mimir/skills/reflection/SKILL.md` and §11 below. The "memory architecture review" track within reflection covers cleanup + promotion across `memory/core/`, `memory/<anywhere>/`, and `state/wiki/`. Atom-to-core promotion candidates come from `mimir reflection most-retrieved --contributed-only`.
 
 ### 8.2 Cross-channel pull via MSAM (not deque)
 
@@ -511,11 +507,11 @@ The semantic filter in 1.2 is a deque-local hybrid score. An alternative is to m
 
 ### 8.3 "Wisdom-keeper" reflection loop
 
-**Status:** thematic, mimir's namesake.
+**Status:** partially shipped in v0.4 §4 (the reflection skill's "memory architecture review" track) — the structure for belief-revision exists; what's still open is the *belief* part (revising what mimir thinks vs. just what mimir remembers).
 
-Mimir is the wisdom-keeper Odin consults — implies the agent should *be the source of considered judgment*, not just a transcript-recall device. A periodic reflection loop where the agent reviews its own beliefs against new evidence and revises is the kind of behavior that justifies the name.
+Mimir is the wisdom-keeper Odin consults — implies the agent should *be the source of considered judgment*, not just a transcript-recall device. The shipped reflection covers cleanup/promotion of memory; what's still future work is the explicit "review my own claims and revise where evidence contradicts them" loop. Distinct from 8.1 (which is now done as mechanical consolidation).
 
-**Approach:** open-ended. A scheduled tick that runs with a special prompt asking the agent to review its `memory/shared/` files in light of recent traffic and revise. Distinct from 8.1 (mechanical consolidation) — this is opinion / belief revision.
+**Approach:** extend the reflection skill with a "claims audit" sub-pass — for `state/wiki/` pages where the agent has stated opinions, scan recent events for contradicting evidence, propose revisions via `state/proposed-changes.md`. Probably an additional sub-pass under reflection's Track B rather than a separate skill.
 
 ### 8.4 Multi-mimir coordination
 
@@ -606,4 +602,27 @@ deployments only.
 
 ## Maintenance
 
-When an item from this doc lands, move it to a `## 11. Recently shipped` section (date-stamped) rather than deleting it — preserves the "why" for future archeology.
+When an item from this doc lands, move it to the `## 11. Recently shipped` section below (date-stamped) rather than deleting it — preserves the "why" for future archeology.
+
+---
+
+## 11. Recently shipped
+
+### 2026-05-01 — v0.4 self-awareness loops
+
+Closed several long-standing items. See `V0.4.md` for the full plan and commit refs (`9dd50a2 .. e510178`):
+
+- **§8.1 Periodic reflection / memory consolidation** → reflection skill + weekly cron entry. Two parallel tracks (behavioral + memory-architecture-review). Propose-only by default per `memory/core/30-reflection-policy.md`. Bundled `mimir reflection most-retrieved` CLI for atom-to-core promotion candidates.
+- **§8.3 Wisdom-keeper reflection loop** → partially. Memory-architecture-review track ships; "claims audit" extension is still future work (re-scoped above).
+- **§6.1 Identity reconciliation** (commits `b6a8f9b`, `685f99a`, `4b535d2`) — resolver primitive, bridge prefix + cross-pull, identity records surfaced in turn prompt.
+- **`state/social/` indexer skip** — `search.py` now short-circuits `state/heartbeat-backlog.md`, `state/proposed-changes.md`, `state/identities.yaml`, and the `state/social/` prefix via `INDEX_SKIP_PATHS` / `INDEX_SKIP_PREFIXES`. Resolves the "social-cli artifacts shouldn't be embedded" tail of §10.1.
+
+Also shipped (not previously tracked here, captured for posterity):
+- Heartbeat tick (V0.4 §1) — autonomous-work cadence with librarian protocol + backlog. Foundation for the rest of v0.4.
+- Algedonic surfacing (V0.4 §2) — recent error/feedback signals in the turn prompt, both polarities. New `feedback.py` reads `events.jsonl` + `turns.jsonl` tail-stream.
+- Session boundary surfacing (V0.4 §3) — `## Recent session summaries` block in turn prompt; MSAM source-of-truth with local-mirror fallback at `<home>/.mimir/session_boundaries.jsonl`.
+- Mountaineering port (V0.4 §5) — five framework files verbatim from open-strix; SKILL.md adapted for the climber subagent.
+- Operator alert channel (V0.4 §6) — `MIMIR_OPERATOR_ALERT_CHANNEL` + alert skill teaching when/how to escalate.
+- Indexer exclusion list (V0.4 §7) — see §6.1 above.
+- API key auth on POST /event (post-v0.4 review) — `MIMIR_API_KEY`; without it the server's 0.0.0.0 bind exposed an arbitrary-trigger injection surface.
+- JSONL log caps + tail-streaming — `MIMIR_MAX_EVENTS` / `MIMIR_MAX_TURNS` default 1000, hard ceiling 10000, hysteresis trim, tail-streamed reads via `mimir/_jsonl_tail.py`.
