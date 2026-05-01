@@ -27,6 +27,10 @@ env/
 *.swp
 *.swo
 
+# Claude Code per-project settings (operator/host-specific permissions,
+# allowlists, and hooks — not part of the package contract).
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
