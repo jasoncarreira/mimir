@@ -223,7 +223,28 @@ def _bm25_norm(raw: float) -> float:
     return 1.0 / (1.0 + abs(raw))
 
 
+# Paths under state/ that look like operator/agent shared workspace, not
+# knowledge worth retrieving via file_search. Embedding these is waste
+# (frequent rewrites trigger reindexes) and pollution (results leak as
+# "knowledge" hits). Per-deployment customization can come later via a
+# <home>/.mimir/index-skip.txt; not needed for v0.4.
+INDEX_SKIP_PATHS: frozenset[str] = frozenset(
+    {
+        "state/heartbeat-backlog.md",  # operator/agent shared todo
+        "state/proposed-changes.md",  # pending HITL items
+        "state/identities.yaml",  # operator config; not .md but defensive
+    }
+)
+INDEX_SKIP_PREFIXES: tuple[str, ...] = (
+    "state/social/",  # social-cli artifacts (FUTURE_WORK §10.1)
+)
+
+
 def _classify_scope(rel: str) -> str | None:
+    if rel in INDEX_SKIP_PATHS:
+        return None
+    if any(rel.startswith(p) for p in INDEX_SKIP_PREFIXES):
+        return None
     if rel.startswith("memory/"):
         if rel.startswith("memory/core/") or rel == "memory/INDEX.md":
             return None

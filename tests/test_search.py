@@ -106,6 +106,21 @@ def test_classify_scope_excludes_core_and_indexes():
     assert _classify_scope("logs/events.jsonl") is None
 
 
+def test_classify_scope_excludes_skip_paths():
+    assert _classify_scope("state/heartbeat-backlog.md") is None
+    assert _classify_scope("state/proposed-changes.md") is None
+    assert _classify_scope("state/identities.yaml") is None
+    # Adjacent files in state/ still index normally.
+    assert _classify_scope("state/transcripts/kickoff.md") == "state"
+
+
+def test_classify_scope_excludes_skip_prefixes():
+    assert _classify_scope("state/social/inbox.md") is None
+    assert _classify_scope("state/social/nested/deep.md") is None
+    # Sibling state subtree unaffected.
+    assert _classify_scope("state/seeds/x.md") == "state"
+
+
 # ---- FTS sanitization ----------------------------------------------------
 
 
@@ -150,6 +165,38 @@ async def test_sweep_skips_core_and_indexes(tmp_path: Path):
     assert "memory/core/00-persona.md" not in paths
     assert "memory/INDEX.md" not in paths
     assert "state/INDEX.md" not in paths
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_workspace_paths(tmp_path: Path):
+    """v0.4 §7: heartbeat-backlog / proposed-changes / state/social are
+    operator-agent workspace, not knowledge — must not be embedded."""
+    _seed(tmp_path)
+    # Skip-listed exact paths.
+    (tmp_path / "state" / "heartbeat-backlog.md").write_text(
+        "<!-- desc: backlog -->\n# Backlog\ntokenmjzrtq items here."
+    )
+    (tmp_path / "state" / "proposed-changes.md").write_text(
+        "<!-- desc: proposals -->\n# Proposals\ntokenmjzrtq here too."
+    )
+    # Skip-listed prefix.
+    (tmp_path / "state" / "social").mkdir()
+    (tmp_path / "state" / "social" / "inbox.md").write_text(
+        "<!-- desc: social inbox -->\ntokenmjzrtq social-cli artifact."
+    )
+    # Adjacent state file that SHOULD index — control case.
+    (tmp_path / "state" / "neighbor.md").write_text(
+        "<!-- desc: neighbor -->\ntokenmjzrtq in a regular state file."
+    )
+
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+    results = await idx.search("tokenmjzrtq", scope="all", k=20)
+    paths = {r.path for r in results}
+    assert "state/heartbeat-backlog.md" not in paths
+    assert "state/proposed-changes.md" not in paths
+    assert "state/social/inbox.md" not in paths
+    assert "state/neighbor.md" in paths
 
 
 # ---- Incremental reindex --------------------------------------------------
