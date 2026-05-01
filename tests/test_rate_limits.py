@@ -250,3 +250,123 @@ def test_render_humanizes_resets_in_minutes_or_hours():
                                  resets_at=resets_at)
         [line] = render_plan_quota_lines({"five_hour": snap})
         assert expected_fragment in line, f"{resets_at} → {line!r}"
+
+
+# ---- on-pace projection ------------------------------------------------
+
+
+def test_projection_none_when_utilization_missing():
+    from mimir.rate_limits import project_window_end
+
+    snap = RateLimitSnapshot(status="allowed", utilization=None,
+                             resets_at=int(time.time()) + 3600)
+    assert project_window_end(snap, 5.0) is None
+
+
+def test_projection_none_when_resets_at_missing():
+    from mimir.rate_limits import project_window_end
+
+    snap = RateLimitSnapshot(status="allowed", utilization=0.5, resets_at=None)
+    assert project_window_end(snap, 5.0) is None
+
+
+def test_projection_on_track_at_steady_pace():
+    """Halfway through a 5h window at 30% used → on pace for 60%."""
+    from mimir.rate_limits import project_window_end
+
+    now = 1_000_000.0
+    snap = RateLimitSnapshot(
+        status="allowed",
+        utilization=0.30,
+        resets_at=int(now + 2.5 * 3600),  # 2.5h remaining of a 5h window
+    )
+    proj = project_window_end(snap, 5.0, reference_time=now)
+    assert proj is not None
+    assert proj.on_track
+    assert abs(proj.on_pace_utilization - 0.60) < 1e-9
+    assert abs(proj.elapsed_hours - 2.5) < 1e-9
+
+
+def test_projection_off_track_when_burning_fast():
+    """Quarter through a 5h window at 50% used → on pace for 200%."""
+    from mimir.rate_limits import project_window_end
+
+    now = 1_000_000.0
+    snap = RateLimitSnapshot(
+        status="allowed_warning",
+        utilization=0.50,
+        resets_at=int(now + 3.75 * 3600),  # 1.25h elapsed
+    )
+    proj = project_window_end(snap, 5.0, reference_time=now)
+    assert proj is not None
+    assert not proj.on_track
+    assert abs(proj.on_pace_utilization - 2.0) < 1e-9
+
+
+def test_projection_skips_when_too_early():
+    """Below min_elapsed_fraction (5% default) the projection is too
+    noisy to surface."""
+    from mimir.rate_limits import project_window_end
+
+    now = 1_000_000.0
+    # 1 minute into a 5h window (1/300 = 0.33%, below 5% threshold)
+    snap = RateLimitSnapshot(
+        status="allowed",
+        utilization=0.05,
+        resets_at=int(now + 5.0 * 3600 - 60),
+    )
+    assert project_window_end(snap, 5.0, reference_time=now) is None
+
+
+def test_projection_skips_when_window_already_past():
+    from mimir.rate_limits import project_window_end
+
+    now = 1_000_000.0
+    snap = RateLimitSnapshot(
+        status="allowed",
+        utilization=0.5,
+        resets_at=int(now - 60),  # already reset
+    )
+    assert project_window_end(snap, 5.0, reference_time=now) is None
+
+
+# ---- render projection inline ------------------------------------------
+
+
+def test_render_includes_on_pace_for_5h_window(monkeypatch):
+    """Half-elapsed 5h window at 30% used renders as 'on pace: 60%
+    by reset'. No warning marker since on track."""
+    now = int(time.time())
+    snap = RateLimitSnapshot(
+        status="allowed",
+        utilization=0.30,
+        resets_at=now + 2 * 3600 + 30 * 60,  # 2h 30m remaining
+    )
+    [line] = render_plan_quota_lines({"five_hour": snap})
+    assert "on pace:" in line
+    # Allow rounding tolerance — projected ≈ 60%
+    assert "60%" in line
+    assert "⚠" not in line
+
+
+def test_render_marks_off_pace_with_warning():
+    now = int(time.time())
+    snap = RateLimitSnapshot(
+        status="allowed_warning",
+        utilization=0.80,
+        resets_at=now + 3 * 3600,  # 2h elapsed of 5h
+    )
+    [line] = render_plan_quota_lines({"five_hour": snap})
+    assert "⚠ on pace:" in line
+
+
+def test_render_omits_projection_for_overage():
+    """Overage has no fixed window — no projection makes sense."""
+    now = int(time.time())
+    snap = RateLimitSnapshot(
+        status="allowed",
+        utilization=0.10,
+        resets_at=now + 86400,
+    )
+    [line] = render_plan_quota_lines({"overage": snap})
+    assert "on pace:" not in line

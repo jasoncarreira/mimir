@@ -161,6 +161,13 @@ def _render_one(key: str, snap: RateLimitSnapshot) -> str:
         parts.append(snap.status)
     if snap.resets_at:
         parts.append(f"resets {_humanize_resets(snap.resets_at)}")
+    window = _WINDOW_HOURS.get(key)
+    if window is not None:
+        proj = project_window_end(snap, window)
+        if proj is not None:
+            pct = proj.on_pace_utilization * 100
+            marker = "" if proj.on_track else "⚠ "
+            parts.append(f"{marker}on pace: {pct:.0f}% by reset")
     return " — ".join(parts)
 
 
@@ -171,6 +178,77 @@ _LABEL: dict[str, str] = {
     "seven_day_sonnet": "7-day Sonnet",
     "overage": "Overage / pay-as-you-go",
 }
+
+
+# Window length per rate_limit_type, in hours. Used to project
+# end-of-window utilization from current rate. Overage is open-ended;
+# excluded so we don't print a misleading projection.
+_WINDOW_HOURS: dict[str, float] = {
+    "five_hour": 5.0,
+    "seven_day": 24.0 * 7,
+    "seven_day_opus": 24.0 * 7,
+    "seven_day_sonnet": 24.0 * 7,
+}
+
+
+@dataclass(frozen=True)
+class WindowProjection:
+    """Where current burn rate puts us at window end.
+
+    ``on_pace_utilization`` is the projected end-of-window utilization
+    (>1.0 = will exceed quota). ``elapsed_fraction`` is how far into
+    the window we are; below ``min_elapsed_fraction`` the projection
+    is too noisy to surface (a single call in the first 30s of a 5h
+    window looks like 100× growth)."""
+
+    elapsed_hours: float
+    hours_until_reset: float
+    on_pace_utilization: float
+    on_track: bool
+
+
+def project_window_end(
+    snapshot: RateLimitSnapshot,
+    window_size_hours: float,
+    *,
+    min_elapsed_fraction: float = 0.05,
+    reference_time: float | None = None,
+) -> WindowProjection | None:
+    """Project end-of-window utilization assuming the current burn
+    rate continues. Returns None when:
+
+    - ``utilization`` is unknown (no signal to project from)
+    - ``resets_at`` is unknown (no time anchor for the window)
+    - elapsed fraction of the window < ``min_elapsed_fraction``
+      (early-window noise dominates: a single call in the first
+      few minutes of a 5h window projects to absurd multiples)
+    - elapsed time has gone non-positive (window already past)
+
+    The math is the simplest possible: rate = util / elapsed; project
+    = rate × window. Equivalent to ``util × (window / elapsed)``.
+    """
+    if snapshot.utilization is None or snapshot.resets_at is None:
+        return None
+    if window_size_hours <= 0:
+        return None
+    now = reference_time if reference_time is not None else time.time()
+    if snapshot.resets_at <= now:
+        # Window already reset — the snapshot is stale; the next event
+        # will refresh. Projecting from stale data is misleading.
+        return None
+    hours_until_reset = (snapshot.resets_at - now) / 3600.0
+    elapsed_hours = window_size_hours - hours_until_reset
+    if elapsed_hours <= 0:
+        return None
+    if elapsed_hours / window_size_hours < min_elapsed_fraction:
+        return None
+    on_pace = snapshot.utilization * (window_size_hours / elapsed_hours)
+    return WindowProjection(
+        elapsed_hours=elapsed_hours,
+        hours_until_reset=hours_until_reset,
+        on_pace_utilization=on_pace,
+        on_track=on_pace < 1.0,
+    )
 
 
 def _humanize_resets(unix_ts: int) -> str:

@@ -66,12 +66,23 @@ Anthropic plan window utilizations (5-hour rolling, 7-day plan /
 Opus / Sonnet, overage). Four things worth a glance before picking
 work:
 
-- **Plan windows ≥ 80% used** (under "Plan windows (from Anthropic)"
-  in the section) — these are the authoritative numbers Claude Code's
-  `/usage` displays. If a window is approaching its cap, scale back
-  hard regardless of dollar cost: avoid expensive turns, prefer
-  bash-only investigations, end silently. A `rejected` status means
-  the limit has hit — defer everything until the window resets.
+- **Plan window on pace > 100%** (each line under "Plan windows (from
+  Anthropic)" carries an "on pace: X% by reset" projection — what
+  utilization will be at window end if the current burn rate
+  continues). The ⚠ marker means projected to exceed quota: scale
+  back regardless of where current % stands. This is more actionable
+  than raw "% used" because a 50% used number means very different
+  things 1 hour vs 4 hours into a 5h window. Specifically:
+  * On pace > 150% → defer all expensive work; bash-only investigations
+    or memory cleanup; end silently if nothing else fits.
+  * On pace 100–150% → no fan-out, no multi-turn research, prefer the
+    cheapest backlog items.
+  * On pace < 100% AND status = `allowed` → normal behavior.
+  * Status = `rejected` → the limit has hit; defer everything until
+    the window resets.
+  * No projection shown ("on pace: ..." absent) → too early in the
+    window to project (< 5% elapsed), or no data yet. Treat as normal
+    until the projection appears.
 - **Cost rate alert** (⚠ marker in the section) — current $/hr is
   unusually high, either against an absolute ceiling or against your
   rolling-week baseline. Take this seriously: pick a small or
