@@ -121,6 +121,13 @@ class Config:
     # channel id; the registered bridge dispatches by prefix.
     operator_alert_channel: str
 
+    # Algedonic surfacing (v0.4 §2). Window for the Recent feedback
+    # signals prompt section; per-polarity cap on rendered items. 0 for
+    # the limit disables the section entirely. Tune small if the prompt
+    # is getting noisy.
+    feedback_window_hours: int
+    feedback_limit_per_polarity: int
+
     # Logging
     max_turns_kept: int
     max_events_kept: int | None
@@ -184,6 +191,9 @@ class Config:
                 not in {"false", "0", "no"},
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
+
+            feedback_window_hours=_env_int("MIMIR_FEEDBACK_WINDOW_HOURS", 24),
+            feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),
 
             max_turns_kept=_env_int("MIMIR_MAX_TURNS", 1000),
             max_events_kept=int(max_events_raw) if max_events_raw else None,

@@ -42,6 +42,7 @@ from . import _context
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .event_logger import log_event
+from .feedback import FeedbackLog
 from .history import MessageBuffer
 from .hooks import make_post_tool_use_hook, make_pre_tool_use_hook
 from .index import IndexGenerator
@@ -112,6 +113,12 @@ class Agent:
         self._scheduler = scheduler
         self._inbox = subagent_inbox or SubagentInbox()
         self._channels = channel_registry
+        self._feedback = FeedbackLog(
+            events_path=config.events_log,
+            turns_path=config.turns_log,
+            default_window_hours=config.feedback_window_hours,
+            default_limit_per_polarity=config.feedback_limit_per_polarity,
+        )
 
         self._mcp_server = build_mcp_server(
             config.home,
@@ -379,6 +386,11 @@ class Agent:
                 cross_hours=self._config.recent_cross_hours,
                 source_allowlist=self._config.recent_sources,
             )
+            feedback_block = (
+                self._feedback.recent_block()
+                if self._config.feedback_limit_per_polarity > 0
+                else None
+            )
             turn_prompt = build_turn_prompt(
                 event,
                 recent_messages=recent,
@@ -386,6 +398,7 @@ class Agent:
                 subagent_block=subagent_block,
                 recent_message_chars=self._config.recent_message_chars,
                 resolver=self._buffer.resolver,
+                feedback_block=feedback_block,
             )
 
         core_blocks = load_core(self._config.home)

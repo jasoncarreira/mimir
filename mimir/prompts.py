@@ -97,6 +97,7 @@ def build_turn_prompt(
     subagent_block: str | None = None,
     recent_message_chars: int = 0,
     resolver: object | None = None,
+    feedback_block: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, MSAM
     atom hits, subagent completion notifications (from prior turns), event
@@ -124,6 +125,12 @@ def build_turn_prompt(
         )
         if identity_block:
             sections.append("## Known identities\n\n" + identity_block)
+
+    # Algedonic channel (v0.4 §2): self-feedback signals between identities
+    # and recent activity, so the agent reads its own pain/pleasure data
+    # before it reads the conversation it's about to act on.
+    if feedback_block:
+        sections.append("## Recent feedback signals\n\n" + feedback_block.rstrip())
 
     if recent_list:
         rendered = render_recent_activity(
