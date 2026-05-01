@@ -45,8 +45,19 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p43_canon_v1` | MiniMax-M2.7 | Canonical (P30v3 + P12) + P43 subatom beam (compressed_retrieve sentence-level extracts mapped back to parent atoms, joins RRF as 'subatom' pathway). Tests whether sentence-level relevance signal complements whole-atom retrieval | sem + kw + **subatom** (sentence-level relevance via compressed_retrieve) | 500 | **0.784** |
 | `msam_p43_p41_canon_v1` | MiniMax-M2.7 | Canonical + P43 subatom + P41 triple_augment_v2 (cosine-match query embedding to active triple embeddings, surface source atoms). Three RRF pathways alongside semantic+keyword | sem + kw + subatom + **triple_augment_v2** (embedding-cosine on triples → atoms) | 500 | **0.770** |
 | `msam_p43_canon_v2` | MiniMax-M2.7 | P43 (subatom beam) re-run with the P46 list-aware sentence splitter (paragraph-level chunking, 30-char min length, list blocks stay grouped instead of fragmenting per bullet) | sem + kw + **subatom** (now coarser-grained chunks; markdown lists kept together) | 500 | **0.778** |
-| `msam_p43_p41_canon_v2` | MiniMax-M2.7 | P43+P41 re-run with the P46 splitter | sem + kw + subatom + triple_augment_v2 (with the cleaner sentence-chunking) | 500 | **0.782** ✓ |
+| `msam_p43_p41_canon_v2` | MiniMax-M2.7 | P43+P41 re-run with the P46 splitter | sem + kw + subatom + triple_augment_v2 (with the cleaner sentence-chunking) | 500 | **0.782** ⚠² |
+| `msam_p30_canon_v4` | MiniMax-M2.7 | Canonical re-baseline AFTER fixing the silent consolidation bug (`max_completion_tokens` for gpt-5.4-nano). Real LLM-synthesized observations, not source-atom fallbacks | sem + kw + two-tier with REAL observations | 500 | **0.774** |
+| `msam_p41_canon_v1` | MiniMax-M2.7 | Canonical + triple_augment_v2 only (no subatom). First clean P41 measurement — prior P41 runs had no triples populated due to the consolidation bug | sem + kw + **triple_augment_v2** (real cosine match against populated triples) | 500 | **0.768** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
+
+² CAVEAT: every run before `msam_p30_canon_v4` had silently-broken
+consolidation (`max_tokens` rejected by gpt-5.4-nano with HTTP 400,
+exception caught, fallback to source-atom + prefix). Observations
+were source-atom fallbacks, not LLM synthesis. Triples were never
+populated. Anything labeled "+P41 / triple_augment" prior to v4 was
+measuring P41 as a no-op. The post-fix canonical (v4 = 0.774) is
+the new baseline; the old "0.784 P30v3" is no longer comparable to
+post-fix runs.
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
 all switched to gpt-oss-120b for this run. Direct comparison to MiniMax /
@@ -1894,6 +1905,122 @@ variance.
 
 Pace: 287 min for P43_v2, 289 min for P43+P41_v2 (~35s/q each,
 in parallel).
+
+### `msam_p30_canon_v4` — canonical re-baseline AFTER consolidation fix (500q)
+
+**Critical context**: every prior bench run (including P30v3 = 0.784,
+all P12 / P34 / P38 / P39 / P43 / P43+P41 results) used a silently-
+broken consolidation. gpt-5.4-nano rejected `max_tokens` with HTTP
+400, the exception was caught silently, and consolidation fell back
+to "longest source atom + `[Consolidated from N atoms]` prefix" with
+zero triples written.
+
+This run is the first canonical measurement with consolidation
+actually working. Reader, judge, retrieval pipeline all unchanged
+from `msam_p30_minimax_v3`; only the consolidation LLM call is
+fixed (commit `a426959`: switch to `max_completion_tokens`).
+
+| Subtype | Score | N | Δ vs P30v3 (broken cons) |
+|---|---|---|---|
+| **single-session-assistant** | **1.000** | 56 | **+1.8** ✓✓ |
+| single-session-user | 0.957 | 70 | −1.4 |
+| single-session-preference | 0.267 | 30 | 0.0 |
+| multi-session | 0.639 | 133 | −0.8 |
+| temporal-reasoning | 0.752 | 133 | −0.7 |
+| **knowledge-update** | 0.910 | 78 | **−3.8** |
+
+**Overall: 0.774 (−1.0pp vs broken-cons P30v3 = 0.784).**
+
+**Real consolidation hits knowledge-update.** The fallback
+("[Consolidated from N atoms] <longest source atom>") preserved the
+exact phrasing of fact-replacement statements ("user used to live
+in X, then moved to Y"). Real LLM synthesis paraphrases — losing
+the temporal directionality the reader relied on. This is a real
+correctness/data-integrity vs raw-bench-score tradeoff: we should
+keep the fix even though the bench number drops, because the fix
+unblocks every other observation-using feature (P41 in particular
+becomes possible to measure cleanly for the first time).
+
+**Single-session-assistant hit perfect (1.000).** Real LLM synthesis
+of agent-attributed atoms is meaningfully better than the source-
+atom fallback for this subtype. +1.8pp clears its noise floor.
+
+**Reframing the leaderboard**: the new canonical baseline is **0.774,
+not 0.784**. Anything labeled "Δ vs canonical" in older results was
+on the broken-consolidation stack and isn't apples-to-apples with
+post-fix runs.
+
+Pace: 415 min (~50s/q). cons time roughly doubled vs broken-cons
+runs (the LLM is now actually generating output) — was ~10s/cluster
+broken, now ~3-4s/cluster fixed (the broken path's "fast" timing
+was misleading because it was just exception handling).
+
+### `msam_p41_canon_v1` — canonical + triple_augment_v2 only (500q)
+
+First clean P41 measurement. All prior P41-flagged runs (P43+P41_v1,
+v2) had no triples populated due to the consolidation bug above —
+P41 was a no-op, the deltas attributed to it were bench noise on
+top of subatom + bench variance.
+
+This run: canonical mechanism + `enable_triple_augment_v2 = true`,
+no subatom, no other experimental flags. `[triples] enable_extraction
+= true` so consolidation populates the triples table for P41 to
+cosine-match against.
+
+| Subtype | Score | N | Δ vs P30_canon_v4 (0.774) |
+|---|---|---|---|
+| **knowledge-update** | **0.962** | 78 | **+5.1** ✓✓ |
+| **single-session-preference** | **0.367** | 30 | **+10.0** ✓ |
+| single-session-assistant | 0.982 | 56 | −1.8 |
+| single-session-user | 0.943 | 70 | −1.4 |
+| **multi-session** | 0.602 | 133 | **−3.7** ⚠ |
+| **temporal-reasoning** | 0.729 | 133 | **−2.3** ⚠ |
+
+**Overall: 0.768 (−0.6pp vs canonical post-fix; within noise).**
+
+**P41's clean shape:**
+
+- **knowledge-update +5.1pp** ✓✓ — well above the subtype's ~±2pp
+  noise floor. Triples make fact-replacement direct: the
+  "user_lives_in: Seattle" triple surfaces independently of the
+  superseded "used_to_live_in: Boston" triple, and the cosine match
+  ranks them by relevance to the query rather than by raw atom
+  similarity. Net: current-state queries get the current fact, not
+  a paraphrased mush of both.
+- **single-session-preference +10.0pp** ✓ — clears the ~±10pp noise
+  floor. Triples about preferences ("user_prefers: dark_mode")
+  surface cleanly against preference probes whose embeddings would
+  otherwise have to compete with all the surrounding context atoms.
+- **multi-session −3.7pp** ⚠ — well above its ~±2-3pp floor. Triples
+  surface single canonical facts; multi-session questions need many
+  partial details across sessions, and triple_augment crowds those
+  out by surfacing one strong "fact atom" per query.
+- **temporal-reasoning −2.3pp** — also above noise. Temporal queries
+  about historical state ("where did Alex work in May?") don't
+  benefit from triples that represent current truth.
+- assistant / user: small drops within noise floors.
+
+**Real per-subtype tradeoff** — not noise. Different from the prior
+P41 results which were noise on top of a no-op P41.
+
+**Decision: don't ship to canonical, but P41 is a sharp lever for
+deployments with a heavy knowledge-update or preference query mix.**
+For Mimir's general-purpose use, the multi-session/temporal cost
+likely outweighs the knowledge-update/preference gain. For a
+deployment focused on factual recall (e.g., personal-fact lookup,
+preference-driven recommendation), P41 is a +5-10pp win on the right
+queries.
+
+The query-intent-gated variant (fire P41 only on
+fact-replacement-shaped queries) is now an obvious follow-up; the
+shape data here justifies it. Filed mentally as P47 candidate.
+
+Pace: 725 min (~12 hours). Slow because the slow run shared OpenAI
+quota with the canonical run and hit rate-limits hard mid-bench
+(cons times 60-170s on n=10-14 clusters). The user's tier upgrade
+mid-run helped but didn't fully eliminate the disparity. After the
+batch_embed fix (commit `84a0a99`), future P41-adjacent runs should
+land in the ~5-6h range like other P-experiments.
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.
