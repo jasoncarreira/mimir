@@ -1436,6 +1436,143 @@ into the decay cycle as an optional periodic pass.
 
 ---
 
+### P45 — `GET /v1/sessions/recent` endpoint (caller-driven boundary recall)
+
+**Status.** Filed 2026-04-30. Not yet implemented.
+
+**What.** Add a REST endpoint exposing
+`get_last_sessions(count, channel, session_id)` from `core.py`.
+The function exists with the right shape — count, channel filter,
+session_id filter — but is only callable from the CLI today. For
+prompt-assembly use cases like "the last 3 boundaries on this
+channel" (a separate person's conversation in a different channel
+isn't useful), callers need REST access.
+
+**Why a separate endpoint, not a flag on `/v1/query`.** Two
+different intents:
+- `/v1/query` with `include_session_boundaries = true` ranks
+  boundaries by *semantic similarity* to the query — useful for
+  "what did we discuss about X?".
+- "Last 3 boundaries on this channel" is *chronological recall* —
+  no query, just `ORDER BY created_at DESC LIMIT 3`.
+
+Cleaner to keep them apart even though it's a second round-trip.
+Latency budget for the second call: ~5-10ms (single SELECT,
+optional WHERE on `json_extract(metadata, '$.channel')`).
+
+**Endpoint shape:**
+
+```
+GET /v1/sessions/recent?channel=X&count=3&session_id=...
+```
+
+Response: list of boundary atoms with `id`, `content`, `timestamp`,
+`topics`, `session_id`, parsed `metadata` (channel, decisions,
+unfinished, emotional_state, etc.).
+
+**Implementation:**
+
+```python
+@app.get("/v1/sessions/recent", dependencies=[Depends(verify_api_key)])
+async def api_recent_sessions(
+    count: int = 3,
+    channel: Optional[str] = None,
+    session_id: Optional[str] = None,
+):
+    def _list():
+        from .core import get_last_sessions
+        return get_last_sessions(count=count, channel=channel,
+                                 session_id=session_id)
+    return await asyncio.to_thread(_list)
+```
+
+~10 lines in `server.py`. The function in core.py already does
+all the work.
+
+**Performance caveat.** The channel filter uses
+`json_extract(metadata, '$.channel') = ?` which is a row scan
+(no index on JSON columns). For DBs with thousands of session
+boundaries this could get slow. Mitigation: denormalize `channel`
+to an `atoms.channel` column when volume warrants — same pattern
+used for `session_id` in migration 3. Skip until needed.
+
+**Effort.** 30 min (endpoint + handful of tests).
+
+**Risk.** None — exposes existing well-tested function.
+
+---
+
+### P46 — Smarter sentence splitting for subatom retrieval
+
+**Status.** Filed 2026-04-30. Not yet implemented.
+
+**Why.** P43 bench (msam_p43_canon_v1) showed sentence-level
+retrieval helps multi-session +2.2pp but hurts knowledge-update
+−3.8pp. Inspecting the per-question DBs revealed the splitter
+breaks long assistant responses into way too many fragments,
+including pure markdown formatting:
+
+| Bucket | Count | Example |
+|---|---|---|
+| ≤20 chars | 46 | `1. **Lighting**:` |
+| 21–40 chars | 46 | `* Avoid harsh overhead lighting.` |
+| 41–80 chars | 151 | `* Position your chair at a comfortable height.` |
+| 81–200 chars | 343 | (well-formed sentences) |
+| 200+ chars | 25 | (long sentences, fine) |
+
+~15% of cached "sentences" are markdown fragments. Each gets a
+real embedding and competes for top-K. A concrete failure: query
+"What degree did I graduate with?" pulled in
+`* Position your chair...90-degree angle to the keyboard` from a
+home-office advice atom — a sentence-level keyword match the
+whole-atom embedding would have correctly ranked out.
+
+**Three improvements, ordered by effort:**
+
+1. **Hard min-length filter** (cheapest, high signal). Raise the
+   8-char floor to 50 chars in `split_sentences`. Drops the worst
+   markdown-formatting fragments. Risk: loses real short sentences
+   like "Yes." or "I do." but those are rare in real content and
+   low-signal anyway.
+
+2. **List-aware grouping** (the actual fix). When the splitter
+   encounters a header followed by ≥2 bullets/numbered items,
+   group them under one chunk:
+   ```
+   "1. **Lighting**:
+   * Natural light is ideal...
+   * Avoid harsh overhead lighting..."
+   → ONE chunk (300-400 chars), not 4 separate ones
+   ```
+   Detection heuristic: lookahead for `^\s*[*\-•]\s` or `^\s*\d+\.\s`
+   on subsequent lines after a header-shaped line.
+
+3. **Char-budget chunking** (industry-standard RAG approach).
+   Sliding window with target chunk size ~200-400 chars, breaking
+   on natural boundaries (sentence end > paragraph end > line
+   end > whitespace). LlamaIndex / LangChain pattern. Replaces
+   regex splitting entirely.
+
+**Recommendation: ship #1 + #2 together as one change.** Both are
+regex-level fixes inside `split_sentences`; together they
+eliminate the worst fragments without needing a new chunking
+framework. If P43's bench result improves with the cleaner
+splitter, then revisit #3 (heavier rewrite, library option).
+
+**Effort.** Half a day for #1 + #2. Tests with sample assistant-
+response atoms confirming the merge behavior. Re-bench P43 with
+the new splitter — should lift knowledge-update closer to
+canonical while keeping multi-session gain.
+
+**Risk.** Low. The current splitter has no calibrated tests, so
+any change has to be evaluated by re-benching, but the fragment
+problem is concrete and the fix is targeted.
+
+**File location:** `msam/subatom.py:split_sentences` (line 39)
++ `_SENT_SPLIT` regex (line 30). Tests in `test_subatom.py`.
+
+---
+
 ### P15 — Evaluate cross-encoder rerank
 
 **What.** Hindsight uses a cross-encoder reranker as their final stage
