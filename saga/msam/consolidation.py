@@ -630,13 +630,26 @@ class ConsolidationEngine:
                             "messages": [{"role": "user", "content": prompt}],
                             # Bumped from 300 to fit the structured format —
                             # observation + ~20 triples + reasoning headroom
-                            # for reasoning models.
-                            "max_tokens": 1500,
+                            # for reasoning models. Newer OpenAI models
+                            # (gpt-5.x) require max_completion_tokens
+                            # instead of max_tokens; older models accept
+                            # both. Safer to use the newer name.
+                            "max_completion_tokens": 1500,
                             "temperature": 0.3,
                         },
                         timeout=timeout,
                     )
-                    if resp.status_code == 200:
+                    if resp.status_code != 200:
+                        # Don't swallow non-200s silently — that hid a
+                        # max_tokens vs max_completion_tokens regression
+                        # on gpt-5.4-nano for ~3 bench runs (every P41
+                        # configuration produced 0 triples). Logging the
+                        # status + body makes the next break obvious.
+                        logger.warning(
+                            "consolidation LLM returned %d: %s",
+                            resp.status_code, resp.text[:300],
+                        )
+                    else:
                         data = resp.json()
                         msg = data["choices"][0]["message"]
                         # Reasoning models put output in `reasoning`
