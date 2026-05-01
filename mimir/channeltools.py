@@ -22,6 +22,7 @@ from ._context import get_current_turn
 from ._tool_helpers import _content_block, _need, _safe
 from .channel_registry import ChannelRegistry, UnknownChannelError
 from .event_logger import log_event
+from .history import MessageBuffer
 from .loop_detector import (
     ERROR_REACTION,
     WARNING_REACTION,
@@ -36,6 +37,7 @@ log = logging.getLogger(__name__)
 def build_channel_tools(
     registry: ChannelRegistry,
     msam_client: MsamClient | None = None,
+    message_buffer: MessageBuffer | None = None,
 ) -> list[SdkMcpTool]:
     """Build the channel-aware send_message + react tools, closed over a
     shared ``ChannelRegistry``.
@@ -49,7 +51,12 @@ def build_channel_tools(
     output" can be empty (agent only used send_message) or include
     reasoning/scratch the user never receives. The post hook becomes a
     fallback for turns that don't ``send_message`` (scheduled ticks,
-    bookkeeping turns)."""
+    bookkeeping turns).
+
+    When ``message_buffer`` is provided, the delivered text is also written
+    to chat_history as an ``assistant_message`` so the agent sees its own
+    prior replies in the next turn's Recent activity. The agent-level
+    ``_record_outbound`` is the fallback when no send_message fires."""
 
     @tool(
         "send_message",
@@ -172,11 +179,19 @@ def build_channel_tools(
             and ctx.trigger != "msam_session_end"
             and ctx.msam_atom_ids
         ):
+            atom_ids_for_feedback = list(dict.fromkeys(ctx.msam_atom_ids))
             try:
                 await msam_client.feedback(
-                    list(dict.fromkeys(ctx.msam_atom_ids)),  # de-dup, keep order
+                    atom_ids_for_feedback,  # de-dup, keep order
                     text,
                     session_id=ctx.msam_session_id,
+                )
+                await log_event(
+                    "msam_feedback_sent",
+                    where="send_message",
+                    channel_id=channel_id,
+                    n_atoms=len(atom_ids_for_feedback),
+                    text_len=len(text),
                 )
             except MsamError as exc:
                 await log_event(
@@ -188,6 +203,26 @@ def build_channel_tools(
 
         if ctx is not None:
             ctx.send_message_count += 1
+
+        # Persist the delivered text to chat_history as an assistant_message
+        # so the agent sees its own prior reply in the next turn's Recent
+        # activity. Source defaults to the inbound trigger's source when we
+        # have a turn context; bridges that route by their own conventions
+        # may pass through here even on outbound-only turns. agent.py's
+        # _record_outbound (end of turn) is gated on send_message_count to
+        # avoid duplicating this entry.
+        if message_buffer is not None:
+            try:
+                msg = message_buffer.make_message(
+                    channel_id=channel_id,
+                    kind="assistant_message",
+                    content=text,
+                    msg_id=result.message_id,
+                    source=ctx.channel_source if ctx is not None else None,
+                )
+                await message_buffer.append(msg)
+            except Exception:  # noqa: BLE001
+                log.exception("send_message: chat_history append failed")
 
         # Record the text on the event so adapters / the viewer can read what
         # was actually delivered. Cap to 4KB to keep events.jsonl small.

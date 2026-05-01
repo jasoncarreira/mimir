@@ -22,6 +22,7 @@ from claude_agent_sdk import McpSdkServerConfig, create_sdk_mcp_server, tool
 
 from .channel_registry import ChannelRegistry
 from .channeltools import build_channel_tools, channel_tool_names
+from .history import MessageBuffer
 from .msam_client import MsamClient
 from .msamtools import build_msam_tools, msam_tool_names
 from .scheduler import Scheduler
@@ -72,6 +73,7 @@ def build_mcp_server(
     msam_client: MsamClient | None = None,
     scheduler: Scheduler | None = None,
     channel_registry: ChannelRegistry | None = None,
+    message_buffer: MessageBuffer | None = None,
 ) -> McpSdkServerConfig:
     """Bundle the in-process MCP tools (everything with no SDK preset)."""
     tools = [echo]
@@ -85,8 +87,14 @@ def build_mcp_server(
         # send_message fires MSAM mark_contributions when msam_client is
         # available; handles the credit pass at the actual reply boundary
         # rather than at end-of-turn (agent.py:_post_message_hook is the
-        # fallback for non-send turns).
-        tools += build_channel_tools(channel_registry, msam_client=msam_client)
+        # fallback for non-send turns). When message_buffer is supplied, the
+        # delivered text also writes to chat_history so the agent sees its
+        # own prior replies in Recent activity.
+        tools += build_channel_tools(
+            channel_registry,
+            msam_client=msam_client,
+            message_buffer=message_buffer,
+        )
     return create_sdk_mcp_server(name="mimir", version="0.1.0", tools=tools)
 
 
