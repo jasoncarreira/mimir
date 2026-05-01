@@ -663,3 +663,93 @@ class TestErrorHandling:
     def test_method_not_allowed(self, client):
         rv = client.get("/v1/store")  # store requires POST
         assert rv.status_code == 405
+
+
+# ─── /v1/sessions/recent (P45 endpoint 1) ───────────────────────────────────
+
+
+class TestRecentSessions:
+    def test_returns_sessions(self, client, monkeypatch):
+        import msam.core
+        monkeypatch.setattr(msam.core, "get_last_sessions", lambda **kw: [
+            {"id": "s1", "content": "Session boundary 1", "timestamp": "2026-04-29T10:00:00Z",
+             "topics": [], "session_id": "sess-1", "channel": "alpha"},
+        ])
+        rv = client.get("/v1/sessions/recent?count=3")
+        assert rv.status_code == 200
+        data = rv.json()
+        assert "sessions" in data
+        assert len(data["sessions"]) == 1
+        assert data["sessions"][0]["session_id"] == "sess-1"
+
+    def test_passes_filters(self, client, monkeypatch):
+        import msam.core
+        captured = {}
+        def fake(**kw):
+            captured.update(kw)
+            return []
+        monkeypatch.setattr(msam.core, "get_last_sessions", fake)
+        rv = client.get("/v1/sessions/recent?count=5&channel=beta&session_id=sess-x")
+        assert rv.status_code == 200
+        assert captured == {"count": 5, "channel": "beta", "session_id": "sess-x"}
+
+    def test_default_count(self, client, monkeypatch):
+        import msam.core
+        captured = {}
+        def fake(**kw):
+            captured.update(kw)
+            return []
+        monkeypatch.setattr(msam.core, "get_last_sessions", fake)
+        rv = client.get("/v1/sessions/recent")
+        assert rv.status_code == 200
+        assert captured["count"] == 3
+        assert captured["channel"] is None
+        assert captured["session_id"] is None
+
+
+# ─── /v1/atoms/most_retrieved (P45 endpoint 2) ──────────────────────────────
+
+
+class TestMostRetrieved:
+    def test_returns_atoms(self, client, monkeypatch):
+        import msam.core
+        monkeypatch.setattr(msam.core, "get_most_retrieved", lambda **kw: [
+            {"id": "a1", "content": "popular atom", "created_at": "2026-04-29T10:00:00Z",
+             "topics": [], "session_id": "sess-1", "channel": None,
+             "retrieval_count": 12, "contributed_count": 8, "last_retrieved_at": "2026-04-30T11:00:00Z"},
+        ])
+        rv = client.get("/v1/atoms/most_retrieved?count=10&days=7")
+        assert rv.status_code == 200
+        data = rv.json()
+        assert "atoms" in data
+        assert len(data["atoms"]) == 1
+        assert data["atoms"][0]["retrieval_count"] == 12
+
+    def test_passes_filters(self, client, monkeypatch):
+        import msam.core
+        captured = {}
+        def fake(**kw):
+            captured.update(kw)
+            return []
+        monkeypatch.setattr(msam.core, "get_most_retrieved", fake)
+        rv = client.get(
+            "/v1/atoms/most_retrieved?days=14&count=20&channel=alpha&contributed_only=true"
+        )
+        assert rv.status_code == 200
+        assert captured == {
+            "days": 14, "count": 20, "channel": "alpha",
+            "contributed_only": True,
+        }
+
+    def test_defaults(self, client, monkeypatch):
+        import msam.core
+        captured = {}
+        def fake(**kw):
+            captured.update(kw)
+            return []
+        monkeypatch.setattr(msam.core, "get_most_retrieved", fake)
+        rv = client.get("/v1/atoms/most_retrieved")
+        assert rv.status_code == 200
+        assert captured == {
+            "days": 7, "count": 10, "channel": None, "contributed_only": False,
+        }
