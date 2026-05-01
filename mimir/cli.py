@@ -68,6 +68,15 @@ DEFAULT_ENV_TEMPLATE = dedent(
     # mode where you understand the implications.
     MIMIR_API_KEY=
 
+    # ---- Usage / cost surfacing ------------------------------------------
+    # Optional dollar budgets that gate the "% of budget" annotation in
+    # the turn prompt's Resource usage section. Set per your plan; leave
+    # blank to render raw cost without thresholds. The 5h / weekly windows
+    # match Anthropic's Max-plan rolling-window shape; the API doesn't
+    # expose plan-level quotas, so these are operator-set.
+    MIMIR_USAGE_5H_LIMIT_USD=
+    MIMIR_USAGE_WEEKLY_LIMIT_USD=
+
     # ---- Operator config -------------------------------------------------
     # Channel the agent uses for high-priority signals to you that don't fit
     # the current conversation (critical errors, urgent heartbeat findings,
@@ -794,6 +803,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
 
+    # `mimir stats` — operator-facing usage report. Same data the
+    # turn prompt's "## Resource usage" section shows, dumped to
+    # stdout for one-off inspection. Reads turns.jsonl tail-first;
+    # cheap regardless of file size.
+    stats_p = sub.add_parser(
+        "stats",
+        help="Show usage stats (cost, tokens, cache hit rate) over recent windows.",
+    )
+    stats_p.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
     refl_p = sub.add_parser(
         "reflection",
         help="Reflection skill helpers (invoked by skills/reflection/SKILL.md).",
@@ -842,6 +866,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(1)
+        return
+
+    if args.command == "stats":
+        from .config import Config as _Config
+        from .usage_stats import aggregate, render_usage_block
+        home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
+        os.environ["MIMIR_HOME"] = str(Path(home_arg).resolve())
+        cfg = _Config.from_env()
+        report = aggregate(cfg.turns_log, fallback_model=cfg.model)
+        body = render_usage_block(
+            report,
+            fallback_model=cfg.model,
+            budget_5h_usd=cfg.usage_5h_limit_usd or None,
+            budget_weekly_usd=cfg.usage_weekly_limit_usd or None,
+        )
+        if body is None:
+            print("(no turns recorded yet)")
+        else:
+            print(body)
         return
 
     if args.command == "regenerate-api-key":

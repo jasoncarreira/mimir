@@ -51,6 +51,7 @@ from .event_logger import log_event
 from .feedback import FeedbackLog
 from .history import MessageBuffer
 from .session_boundary_log import SessionBoundaryLog, render_session_summaries
+from .usage_stats import aggregate as aggregate_usage, render_usage_block
 from .hooks import make_post_tool_use_hook, make_pre_tool_use_hook
 from .index import IndexGenerator
 from .loop_detector import LoopDetector
@@ -222,6 +223,27 @@ class Agent:
         await self._buffer.append(msg)
 
     # ---- MSAM hooks ----------------------------------------------------
+
+    def _assemble_usage_block(self) -> str | None:
+        """Read turns.jsonl tail-first, aggregate over 5h / 7d, render
+        the Resource usage prompt section. Returns None when disabled
+        via config or when no turns have been recorded yet."""
+        if not self._config.usage_block_enabled:
+            return None
+        try:
+            report = aggregate_usage(
+                self._config.turns_log,
+                fallback_model=self._config.model,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("usage_stats.aggregate failed; skipping block")
+            return None
+        return render_usage_block(
+            report,
+            fallback_model=self._config.model,
+            budget_5h_usd=self._config.usage_5h_limit_usd or None,
+            budget_weekly_usd=self._config.usage_weekly_limit_usd or None,
+        )
 
     async def _assemble_session_summaries(
         self, *, channel_id: str | None
@@ -443,6 +465,7 @@ class Agent:
             session_summaries_block = await self._assemble_session_summaries(
                 channel_id=event.channel_id,
             )
+            usage_block = self._assemble_usage_block()
             turn_prompt = build_turn_prompt(
                 event,
                 recent_messages=recent,
@@ -452,6 +475,7 @@ class Agent:
                 resolver=self._buffer.resolver,
                 feedback_block=feedback_block,
                 session_summaries_block=session_summaries_block,
+                usage_block=usage_block,
             )
 
         core_blocks = load_core(self._config.home)

@@ -99,6 +99,7 @@ def build_turn_prompt(
     resolver: object | None = None,
     feedback_block: str | None = None,
     session_summaries_block: str | None = None,
+    usage_block: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, MSAM
     atom hits, subagent completion notifications (from prior turns), event
@@ -140,6 +141,13 @@ def build_turn_prompt(
         sections.append(
             "## Recent session summaries\n\n" + session_summaries_block.rstrip()
         )
+
+    # Resource usage: cost / cache hit rate / context utilization across
+    # rolling windows. Same priority as the algedonic feedback channel —
+    # it's data about the agent's own state — placed near the top so the
+    # agent reads it before the conversation it's about to act on.
+    if usage_block:
+        sections.append("## Resource usage\n\n" + usage_block.rstrip())
 
     if recent_list:
         rendered = render_recent_activity(

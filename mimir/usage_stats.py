@@ -1,0 +1,304 @@
+"""Aggregate token usage / cache hit rate / cost over time.
+
+Source of truth is ``logs/turns.jsonl`` — the per-turn ``usage`` dict
+the SDK populates from Anthropic's ``ResultMessage`` plus the
+``total_cost_usd`` field. This module reads the tail of that file and
+sums by time window so the agent sees:
+
+- Cache hit rate (proportion of input tokens served from prompt cache)
+- Cost over rolling 5-hour and 7-day windows
+- Token totals per window
+- Last turn's context-window utilization vs. the model cap
+
+Anthropic doesn't expose Max-plan 5h / weekly quotas through the API,
+so the dollar windows here are derived from observed cost — not from
+the plan's actual unit accounting. When the operator sets
+``MIMIR_USAGE_5H_LIMIT_USD`` or ``MIMIR_USAGE_WEEKLY_LIMIT_USD`` we
+render % of budget; otherwise just raw numbers.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterable
+
+from ._jsonl_tail import tail_jsonl_records
+
+log = logging.getLogger(__name__)
+
+
+# Model-name → max input context window (tokens). Used to render
+# "current turn / cap" percentage in the usage block. Best-effort:
+# unknown models fall back to ``_DEFAULT_CONTEXT_WINDOW``.
+#
+# Sources: Anthropic API docs as of the cutoff. The 1M variant of
+# Opus 4.7 reports its own model id (``claude-opus-4-7[1m]``) in the
+# Claude Code surface; bare ``claude-opus-4-7`` is the 200k variant.
+_MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    # Opus 4.x
+    "claude-opus-4-7": 200_000,
+    "claude-opus-4-7[1m]": 1_000_000,
+    "claude-opus-4-6": 200_000,
+    "claude-opus-4-5": 200_000,
+    # Sonnet 4.x
+    "claude-sonnet-4-6": 200_000,
+    "claude-sonnet-4-5": 200_000,
+    # Haiku 4.x
+    "claude-haiku-4-5": 200_000,
+    "claude-haiku-4-5-20251001": 200_000,
+}
+
+_DEFAULT_CONTEXT_WINDOW = 200_000
+
+
+@dataclass
+class UsageWindow:
+    """Aggregated usage over a contiguous time window. Field semantics
+    match the SDK's ``usage`` dict (Anthropic's ``Message.usage`` shape):
+    counts are tokens; cost is dollars."""
+
+    label: str
+    turns: int = 0
+    input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    output_tokens: int = 0
+    total_cost_usd: float = 0.0
+
+    @property
+    def total_input_tokens(self) -> int:
+        """Input + cached input combined — i.e. the full prompt size on
+        the wire, regardless of whether it was a cache hit or not."""
+        return (
+            self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+        )
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Proportion of input tokens served from cache. 0.0 when the
+        window has no input tokens recorded (avoids div/0)."""
+        denom = self.total_input_tokens
+        if denom <= 0:
+            return 0.0
+        return self.cache_read_input_tokens / denom
+
+
+@dataclass
+class LastTurnSnapshot:
+    """The most recent turn's per-call shape — used for the "current
+    context utilization" line. Distinct from UsageWindow because it's
+    a single sample, not an aggregate."""
+
+    ts: str | None = None
+    model: str | None = None
+    input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+
+    @property
+    def total_prompt_tokens(self) -> int:
+        return (
+            self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+        )
+
+    @property
+    def cache_hit_rate(self) -> float:
+        denom = self.total_prompt_tokens
+        if denom <= 0:
+            return 0.0
+        return self.cache_read_input_tokens / denom
+
+
+@dataclass
+class UsageReport:
+    last_turn: LastTurnSnapshot = field(default_factory=LastTurnSnapshot)
+    windows: list[UsageWindow] = field(default_factory=list)
+
+
+def context_window_for(model: str | None) -> int:
+    """Look up the model's max input context. Unknown / None → default."""
+    if not model:
+        return _DEFAULT_CONTEXT_WINDOW
+    return _MODEL_CONTEXT_WINDOWS.get(model, _DEFAULT_CONTEXT_WINDOW)
+
+
+def aggregate(
+    turns_path: Path,
+    *,
+    window_hours: Iterable[float] = (5.0, 24.0 * 7),
+    window_labels: Iterable[str] | None = None,
+    fallback_model: str | None = None,
+) -> UsageReport:
+    """Walk turns.jsonl tail-first; bucket each turn's usage into the
+    matching windows. Single pass — stops once the oldest window's
+    cutoff is exceeded.
+
+    ``fallback_model`` is what the last-turn snapshot reports when the
+    record itself doesn't carry a model field (mimir's TurnRecord
+    didn't capture it pre-this-commit; the operator's configured model
+    is the right fallback).
+    """
+    windows = [float(h) for h in window_hours]
+    if window_labels is None:
+        window_labels = [_default_label(h) for h in windows]
+    else:
+        window_labels = list(window_labels)
+    assert len(windows) == len(window_labels), "windows / labels length mismatch"
+
+    now = datetime.now(tz=timezone.utc)
+    cutoffs = [now - timedelta(hours=h) for h in windows]
+    # Sort window indices by cutoff age (newest cutoff first) so we can
+    # short-circuit cleanly once the OLDEST cutoff is passed.
+    order = sorted(range(len(windows)), key=lambda i: cutoffs[i], reverse=True)
+    oldest_cutoff = min(cutoffs)
+
+    out_windows = [UsageWindow(label=label) for label in window_labels]
+    last_turn = LastTurnSnapshot()
+    saw_first = False
+
+    for rec in tail_jsonl_records(turns_path):
+        ts_str = rec.get("ts")
+        if not isinstance(ts_str, str):
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except ValueError:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        if not saw_first:
+            saw_first = True
+            usage = rec.get("usage") or {}
+            last_turn = LastTurnSnapshot(
+                ts=ts_str,
+                model=rec.get("model") or _model_from_events(rec) or fallback_model,
+                input_tokens=int(usage.get("input_tokens") or 0),
+                cache_creation_input_tokens=int(
+                    usage.get("cache_creation_input_tokens") or 0
+                ),
+                cache_read_input_tokens=int(
+                    usage.get("cache_read_input_tokens") or 0
+                ),
+                output_tokens=int(usage.get("output_tokens") or 0),
+                cost_usd=float(rec.get("total_cost_usd") or 0.0),
+            )
+
+        if ts < oldest_cutoff:
+            # JSONL is chronological; tail-first iteration newest-first.
+            # First record older than the oldest cutoff means everything
+            # remaining is also older. Stop scanning.
+            break
+
+        usage = rec.get("usage") or {}
+        for idx in order:
+            if ts >= cutoffs[idx]:
+                w = out_windows[idx]
+                w.turns += 1
+                w.input_tokens += int(usage.get("input_tokens") or 0)
+                w.cache_creation_input_tokens += int(
+                    usage.get("cache_creation_input_tokens") or 0
+                )
+                w.cache_read_input_tokens += int(
+                    usage.get("cache_read_input_tokens") or 0
+                )
+                w.output_tokens += int(usage.get("output_tokens") or 0)
+                w.total_cost_usd += float(rec.get("total_cost_usd") or 0.0)
+
+    return UsageReport(last_turn=last_turn, windows=out_windows)
+
+
+def render_usage_block(
+    report: UsageReport,
+    *,
+    fallback_model: str | None = None,
+    budget_5h_usd: float | None = None,
+    budget_weekly_usd: float | None = None,
+) -> str | None:
+    """Format the usage report as a markdown body for the
+    "## Resource usage" prompt section. Returns None when there's
+    nothing to show (no last turn, no aggregated windows with data)."""
+    has_windows = any(w.turns > 0 for w in report.windows)
+    if report.last_turn.ts is None and not has_windows:
+        return None
+
+    lines: list[str] = []
+
+    # Last-turn snapshot — what the most recent prompt cost.
+    if report.last_turn.ts is not None:
+        lt = report.last_turn
+        model = lt.model or fallback_model or "?"
+        ctx_max = context_window_for(model)
+        ctx_pct = (lt.total_prompt_tokens / ctx_max * 100) if ctx_max else 0.0
+        hit_pct = lt.cache_hit_rate * 100
+        lines.append(
+            f"Last turn: {_fmt_int(lt.total_prompt_tokens)} prompt + "
+            f"{_fmt_int(lt.output_tokens)} out tokens  "
+            f"(${lt.cost_usd:.4f}; cache hit {hit_pct:.0f}%; "
+            f"context {ctx_pct:.0f}% of {_fmt_int(ctx_max)} on {model})"
+        )
+
+    if has_windows:
+        if lines:
+            lines.append("")  # blank line between sections
+        for w in report.windows:
+            if w.turns == 0:
+                continue
+            tail: list[str] = []
+            tail.append(f"{w.turns} turn(s)")
+            tail.append(f"{_fmt_int(w.total_input_tokens)} prompt tokens")
+            tail.append(f"cache hit {w.cache_hit_rate * 100:.0f}%")
+            budget = (
+                budget_5h_usd if w.label.startswith("Last 5h")
+                else budget_weekly_usd if w.label.startswith("Last 7d")
+                else None
+            )
+            cost_part = f"${w.total_cost_usd:.2f}"
+            if budget and budget > 0:
+                cost_part += f" ({w.total_cost_usd / budget * 100:.0f}% of ${budget:.2f})"
+            lines.append(f"{w.label}: {cost_part} / " + " / ".join(tail))
+
+    return "\n".join(lines) if lines else None
+
+
+def _fmt_int(n: int) -> str:
+    """Compact human-readable integer: 1_234_567 → 1.2M, 12_345 → 12k."""
+    n = int(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
+def _default_label(hours: float) -> str:
+    if hours <= 24:
+        return f"Last {int(hours)}h"
+    days = hours / 24
+    if days == int(days):
+        return f"Last {int(days)}d"
+    return f"Last {days:.1f}d"
+
+
+def _model_from_events(rec: dict) -> str | None:
+    """Extract the assistant model id from a turn record's events list,
+    if present. Pre-this-commit TurnRecords didn't capture model
+    top-level; the model name is in the per-message events."""
+    events = rec.get("events")
+    if not isinstance(events, list):
+        return None
+    for e in events:
+        if isinstance(e, dict):
+            model = e.get("model")
+            if isinstance(model, str) and model:
+                return model
+    return None

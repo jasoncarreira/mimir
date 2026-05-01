@@ -171,6 +171,16 @@ class Config:
     # block, scoped to the current channel. 0 disables the section.
     recent_boundaries: int
 
+    # Usage block in the turn prompt: enable/disable, plus optional
+    # dollar budgets that gate the "% of budget" annotation. The 5h /
+    # weekly windows match Anthropic's Max-plan rolling-window shape;
+    # the dollar values are operator-set since the API doesn't expose
+    # plan-level quotas. Leave the budgets unset to render raw cost
+    # without thresholds.
+    usage_block_enabled: bool
+    usage_5h_limit_usd: float
+    usage_weekly_limit_usd: float
+
     # Logging — JSONL caps clamped to [1, _LOG_CAP_MAX]. Default 1000.
     # Both files are tail-streamed at read time, so the cap is mostly
     # about cumulative on-disk size; the trim logic uses 10% hysteresis
@@ -242,6 +252,11 @@ class Config:
             feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),
 
             recent_boundaries=_env_int("MIMIR_RECENT_BOUNDARIES", 3),
+
+            usage_block_enabled=_env("MIMIR_USAGE_BLOCK", "true").lower()
+                not in {"false", "0", "no", "off"},
+            usage_5h_limit_usd=_env_float("MIMIR_USAGE_5H_LIMIT_USD", 0.0),
+            usage_weekly_limit_usd=_env_float("MIMIR_USAGE_WEEKLY_LIMIT_USD", 0.0),
 
             max_turns_kept=_turns_cap(),
             max_events_kept=_events_cap(),

@@ -183,6 +183,46 @@ def test_regenerate_api_key_cli_errors_when_no_env(
     assert "no .env" in capsys.readouterr().err
 
 
+def test_stats_cli_reports_no_turns_for_empty_home(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+):
+    home = tmp_path / "agent"
+    setup_home(home)
+    capsys.readouterr()  # discard setup output
+    main(["stats", "--home", str(home)])
+    assert "no turns recorded" in capsys.readouterr().out
+
+
+def test_stats_cli_renders_recent_data(tmp_path: Path, capsys: pytest.CaptureFixture):
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    home = tmp_path / "agent"
+    setup_home(home)
+    turns = home / "logs" / "turns.jsonl"
+    turns.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(tz=timezone.utc)
+    rec = {
+        "ts": (now - timedelta(minutes=5)).isoformat(),
+        "total_cost_usd": 0.42,
+        "usage": {
+            "input_tokens": 1000,
+            "cache_read_input_tokens": 9000,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 500,
+        },
+    }
+    turns.write_text(json.dumps(rec) + "\n")
+
+    capsys.readouterr()
+    main(["stats", "--home", str(home)])
+    out = capsys.readouterr().out
+    assert "Last turn:" in out
+    assert "Last 5h:" in out
+    assert "$0.42" in out
+    assert "cache hit 90%" in out
+
+
 def test_main_setup_subcommand_runs(tmp_path: Path, capsys: pytest.CaptureFixture):
     home = tmp_path / "agent"
     main(["setup", "--home", str(home)])
