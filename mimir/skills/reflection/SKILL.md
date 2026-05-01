@@ -44,9 +44,13 @@ Before either track, gather inputs:
   belongs here.
 - **Recent session boundaries** — the prompt's "Recent session
   summaries" section is channel-scoped to *this* turn (`scheduler:reflect`,
-  which has none). For cross-channel boundaries, call
-  `MsamClient.recent_session_boundaries()` directly via a script, or
-  use `mcp__mimir__msam_query` with terms that match boundary atoms.
+  which has none). For cross-channel boundaries, the local mirror at
+  `<home>/.mimir/session_boundaries.jsonl` is append-only JSONL —
+  `tail -n 50 <home>/.mimir/session_boundaries.jsonl | jq` gives you
+  the last 50 boundaries across all channels without needing a tool.
+  (Don't use `mcp__mimir__msam_query` for this — it ranks by
+  similarity, not recency, and may not surface boundary-typed atoms
+  at all.)
 - **Most-retrieved atoms** — invoke the bundled CLI subcommand via Bash:
   ```bash
   mimir reflection most-retrieved --days 7 --count 20 --contributed-only

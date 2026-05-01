@@ -94,12 +94,27 @@ Ranges from light to heavy:
   entry
 - **Wiki health** — orphan link sweep, stale-claim audit, raw → wiki
   promotion for a recent ingestion
-- **Reflection-shaped checks** — recent failure cluster from
-  `events.jsonl`, drift indicators, MSAM hygiene
 - **External world** — RSS / feed / Bluesky browse if a backlog item
   pointed at one
 - **State management** — git-commit any uncommitted memory work, tidy
   in-progress markers
+
+### Don't do reflection-shaped work here
+
+Cross-session audits — recurring failure clusters across `events.jsonl`,
+drift indicators, MSAM atom hygiene, memory architecture review — are
+the **reflection skill's** weekly job, not heartbeat work. If you find
+yourself reaching for jq pipelines over a 7-day window of logs during
+a heartbeat, stop. Drop the topic into `state/heartbeat-backlog.md` if
+it's worth flagging early, and let the next reflection turn pick it
+up. Doing reflection-shaped checks per heartbeat creates noise (every
+30 min instead of weekly) and beats up the same files the reflection
+turn is supposed to re-evaluate fresh.
+
+The exception: a single 5-whys on a failure that's currently blocking
+work *is* a heartbeat-appropriate task (run the five-whys skill on
+that one cluster). The "no reflection-shaped work" rule is about the
+sweep — don't audit everything; do the one thing.
 
 ## Step 4 — Skill compatibility
 

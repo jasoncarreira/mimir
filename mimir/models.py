@@ -70,6 +70,12 @@ class TurnContext:
     # post_message_hook only fires (as a fallback) when this is 0 — i.e.
     # for turns that produced a reply via SDK output instead of send_message.
     send_message_count: int = 0
+    # Number of send_message *attempts* — successful or failed. The
+    # outbound chat_history fallback gate uses this (not send_message_count)
+    # so a failed dispatch (unknown channel, bridge error) doesn't get the
+    # SDK's final assistant text persisted as if the user had received it.
+    # Failure is visible in events.jsonl; nothing else needs to record it.
+    send_message_attempts: int = 0
     # Channel-layer state (Phase 6.3) — populated by the agent at run_turn start.
     loop_detector: object | None = None
     last_assistant_message_id: str | None = None

@@ -15,8 +15,7 @@ climbers/
     │   └── rubric.md       # Evaluation criteria (if LLM-judged)
     ├── workspace/          # The mutable surface — what the climber can edit
     │   └── (whatever the climb targets)
-    ├── logs/               # Append-only results
-    │   └── results.jsonl   # One entry per iteration (ring buffer)
+    ├── log.jsonl           # Append-only iteration results (ring buffer)
     └── config.json         # Climb configuration
 ```
 
@@ -163,7 +162,7 @@ The adversarial judge is key — it specifically checks for gaming patterns. Con
 
 ## Results Log Format
 
-Each iteration appends one line to `logs/results.jsonl`. The log operates as a ring buffer — the climber only reads the last `results_window` entries each iteration:
+Each iteration appends one line to `<climb_dir>/log.jsonl` (matches what the climber subagent writes per `subagent_defs.py`). The log operates as a ring buffer — the climber only reads the last `results_window` entries each iteration:
 
 ```json
 {

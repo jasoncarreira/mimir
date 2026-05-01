@@ -49,3 +49,15 @@ reading it out of context, so:
 If you find yourself using this channel more than once a day, you're
 probably misusing it — re-read the "Don't use it for" list. The signal
 loses meaning when it goes off too often.
+
+## When the channel is misconfigured
+
+If `MIMIR_OPERATOR_ALERT_CHANNEL` points at a channel id no bridge
+recognizes, `send_message` returns `is_error: true` and logs a
+`send_message_unknown_channel` event in `events.jsonl` — but the
+operator never sees the alert. There's no auto-fallback. Treat
+silent loss as the failure mode and verify the channel id at
+onboarding (the operator can `send_message` to it themselves to
+confirm). If you observe `send_message_unknown_channel` events in
+the algedonic feedback block, raise it as a real issue — the alert
+channel itself has gone dark.

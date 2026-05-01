@@ -102,8 +102,20 @@ def build_memory_index(home: Path) -> str:
 
 
 def build_state_index(home: Path) -> str:
+    """Render state/INDEX.md. Mirrors search.py's exclusion rules so the
+    listed files match what file_search can actually find — listing a
+    file in INDEX.md while the indexer skips it is a misleading promise
+    to the agent."""
+    from .search import INDEX_SKIP_PATHS, INDEX_SKIP_PREFIXES
+
     state_root = home / "state"
     files = _walk_tree(state_root, exclude_names={"INDEX.md"})
+    files = [
+        p for p in files
+        if (rel := f"state/{p.relative_to(state_root).as_posix()}")
+        not in INDEX_SKIP_PATHS
+        and not any(rel.startswith(prefix) for prefix in INDEX_SKIP_PREFIXES)
+    ]
     entries = _build_entries(state_root, files)
     return render_state_index(entries)
 

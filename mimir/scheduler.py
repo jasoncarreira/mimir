@@ -224,25 +224,25 @@ class Scheduler:
         persisting; raises ``ValueError`` on bad cron/time_of_day."""
         _build_trigger(job)  # validate up front
         async with self._mutate_lock:
-            current = load_jobs(self._yaml_path)
+            current = await asyncio.to_thread(load_jobs, self._yaml_path)
             current = [j for j in current if j.name != job.name]
             current.append(job)
             await asyncio.to_thread(write_jobs, self._yaml_path, current)
-            self.reload()
+            await asyncio.to_thread(self.reload)
         return job
 
     async def remove_job(self, name: str) -> bool:
         async with self._mutate_lock:
-            current = load_jobs(self._yaml_path)
+            current = await asyncio.to_thread(load_jobs, self._yaml_path)
             kept = [j for j in current if j.name != name]
             if len(kept) == len(current):
                 return False
             await asyncio.to_thread(write_jobs, self._yaml_path, kept)
-            self.reload()
+            await asyncio.to_thread(self.reload)
         return True
 
     async def list_jobs(self) -> list[SchedulerJob]:
-        return load_jobs(self._yaml_path)
+        return await asyncio.to_thread(load_jobs, self._yaml_path)
 
     # ---- MSAM consolidation cron -------------------------------------
 

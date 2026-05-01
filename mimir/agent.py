@@ -17,13 +17,19 @@ Run-turn flow:
 10. End-of-turn INDEX.md rebuild (debounced, SPEC §3.4).
 11. Write the turns.jsonl record.
 
-The TurnContext is the only mutable per-turn state. Subagents run in distinct
-asyncio tasks → distinct ContextVar copies → they do NOT inherit the parent's
-``msam_atom_ids`` (SPEC §9.3, verified).
+The TurnContext is the only mutable per-turn state. Subagent isolation
+is enforced by the SDK spawning each Task as a separate Claude Code
+subprocess — that's the load-bearing boundary, not asyncio ContextVars
+(which would copy the parent's *reference* to the same TurnContext
+object on ``create_task``, not a deep copy). The subprocess gets its
+own contextvars from a fresh process. Don't rely on ContextVar
+isolation for any in-process subagent that ever materializes; reset
+the contextvar at the task boundary if that case arrives.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -343,10 +349,27 @@ class Agent:
 
     def _build_synthesis_prompt(self, ctx: TurnContext, event: AgentEvent) -> str:
         """For trigger='msam_session_end' — load the synthesis template,
-        embed the session's turn window from turns.jsonl."""
+        embed the session's turn window from turns.jsonl.
+
+        When the window is empty (turns.jsonl was rotated past the
+        session's records — e.g. a long-idle session with high turn
+        throughput in the meantime), the synthesis would produce a
+        meaningless boundary atom with no content. Log a warning event
+        so the algedonic surface and the operator can see it; the turn
+        still runs (the agent gets a chance to write a "no record"
+        boundary rather than crash)."""
         msam_session_id = ctx.msam_session_id or event.extra.get("msam_session_id", "")
         idle_minutes = self._config.msam_session_idle_minutes
         turns_window = _filter_session_turns(self._config.turns_log, msam_session_id)
+        if not turns_window:
+            asyncio.create_task(
+                log_event(
+                    "msam_synthesis_empty_window",
+                    msam_session_id=msam_session_id,
+                    channel_id=event.channel_id,
+                    reason="turns.jsonl rotated past this session's records",
+                )
+            )
         return render_msam_session_end(
             channel_id=event.channel_id,
             msam_session_id=msam_session_id,
@@ -517,10 +540,14 @@ class Agent:
         #    agent answered via mcp__mimir__send_message it's typically a
         #    short narration ("Sent.") and persisting it would shadow the
         #    real reply in Recent activity.
+        # Gate on attempts (not successes) — if the agent tried to send
+        # via send_message and the dispatch failed, the failure is in
+        # events.jsonl; chat_history shouldn't claim a delivery that
+        # didn't happen.
         if (
             output
             and event.trigger != "msam_session_end"
-            and ctx.send_message_count == 0
+            and ctx.send_message_attempts == 0
         ):
             await self._record_outbound(
                 event.channel_id, output, source=event.source

@@ -611,6 +611,20 @@ def _identities_remove_cmd(
             aliases = entry.get("aliases") or []
             if alias in aliases:
                 aliases.remove(alias)
+                # Drop the entire identity when its last alias is gone —
+                # otherwise the entry sits in state/identities.yaml as a
+                # canonical-only stub that the resolver loads as a
+                # no-op and that future `add` calls treat as a real
+                # pre-existing identity.
+                if not aliases:
+                    canonical = entry.get("canonical")
+                    people[:] = [p for p in people if p is not entry]
+                    _identities_save(yaml_path, data)
+                    print(
+                        f"removed alias: {alias} (and {canonical}: "
+                        "no aliases remained)"
+                    )
+                    return
                 _identities_save(yaml_path, data)
                 print(f"removed alias: {alias} (from {entry.get('canonical')})")
                 return

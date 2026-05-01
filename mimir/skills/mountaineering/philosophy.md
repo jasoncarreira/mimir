@@ -36,12 +36,12 @@ The externalization means: **the supervising agent does the mountaineering; the 
 The climber-supervisor pair is itself embedded in a larger viable system:
 
 ```
-Parent VS (e.g., Tim + Keel + Strix)
-├── S5: Tim's research direction
-├── S4: Keel's environmental scanning, Strix's observations
-├── S3: Experiment scheduling, resource allocation
-├── S2: Coordination across climbs and agents
-└── S1: Individual climbs (each a nested VS)
+Parent VS (operator + supervising agents)
+├── S5: operator's research direction
+├── S4: agents scanning the environment + raising observations
+├── S3: experiment scheduling, resource allocation
+├── S2: coordination across climbs and agents
+└── S1: individual climbs (each a nested VS)
     └── Climber VS
         ├── S5: program.md (frozen)
         ├── S4: supervising agent (externalized)
@@ -49,7 +49,7 @@ Parent VS (e.g., Tim + Keel + Strix)
         └── Algedonic: monitoring block
 ```
 
-Note that S3-S5 functions in the parent VS are shared across participants — Tim, Keel, and Strix all contribute to S3, S4, and S5 depending on context. VSM numbers are regulatory functions, not ranks in a command hierarchy.
+Note that S3-S5 functions in the parent VS are shared across participants — operator and supervising agents both contribute to S3, S4, and S5 depending on context. VSM numbers are regulatory functions, not ranks in a command hierarchy.
 
 ---
 

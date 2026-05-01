@@ -50,6 +50,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "msam_feedback_error": ("negative", "msam_feedback_error"),
     "msam_consolidate_error": ("negative", "msam_consolidate_error"),
     "msam_synthesis_dispatch_failed": ("negative", "synth_dispatch_fail"),
+    "msam_synthesis_empty_window": ("negative", "synth_empty_window"),
     "scheduled_tick_dropped": ("negative", "tick_dropped"),
     "send_message_unknown_channel": ("negative", "unknown_channel"),
     # Positive — agent's own contribution-credit pass to MSAM is the
@@ -84,6 +85,12 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f"MSAM consolidation failed: {ev.get('error') or '(no detail)'}"
     if rule_kind == "synth_dispatch_fail":
         return f"MSAM synthesis dispatch failed: {ev.get('error') or '(no detail)'}"
+    if rule_kind == "synth_empty_window":
+        return (
+            f"MSAM synthesis ran with empty turn window "
+            f"(session={ev.get('msam_session_id') or '?'}); "
+            f"{ev.get('reason') or 'no detail'}"
+        )
     if rule_kind == "tick_dropped":
         return f"scheduled_tick dropped: {ev.get('reason') or '(no reason)'}"
     if rule_kind == "unknown_channel":
@@ -97,8 +104,12 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f'react("{emoji}") from {author}'
     if rule_kind == "error":
         # Generic error event; surface .where + .error if present.
+        # Collapse whitespace so multi-line tracebacks don't break the
+        # markdown bullet structure of the Recent feedback signals
+        # block.
         where = ev.get("where") or ev.get("source") or "?"
         msg = ev.get("error") or ev.get("message") or "(no detail)"
+        msg = " ".join(str(msg).split())
         return f"error in {where}: {msg}"
     return rule_kind
 

@@ -145,6 +145,15 @@ def build_channel_tools(
                 )
                 # Soft warn doesn't refuse the send — fall through to dispatch.
 
+        # Mark the attempt up-front so a failed dispatch (UnknownChannel,
+        # bridge error, sent=False) still suppresses the agent-level
+        # outbound fallback — otherwise the SDK's final assistant text
+        # would be persisted to chat_history as if the user had received
+        # it. Failures are visible in events.jsonl; chat_history shouldn't
+        # claim a delivery that didn't happen.
+        if ctx is not None:
+            ctx.send_message_attempts += 1
+
         try:
             result = await registry.send(channel_id, text)
         except UnknownChannelError as exc:
