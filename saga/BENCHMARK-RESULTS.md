@@ -42,6 +42,8 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p12_canon_v2` | MiniMax-M2.7 | P30v3 + P12 re-baseline after shipping `enable_query_expansion=true` to canonical (matches msam_p12_canon_v1's config); investigates whether P12's +0.8pp held | sem + kw (P12 synonym expansion on keyword pathway only) | 500 | **0.762** ⚠ |
 | `msam_p39_canon_v1` | MiniMax-M2.7 | P30v3 + P12 + P39 (`missing_ref_score_pivot = "median"` pivots pulled-in atom base scores on the median of in-pool RRF rather than the min) | sem + kw (median pivot lifts pulled-in atom scores so endorsed-but-cheap-path-missed raws can compete with mid-rank in-pool raws) | 500 | **0.780** |
 | `msam_p12_canon_v3` | MiniMax-M2.7 | Same config as `msam_p12_canon_v2` (canonical + P12 on, min pivot); solo re-run to factor out parallel-run interference seen in v2 | sem + kw (P12 synonym expansion only) | 500 | **0.768** |
+| `msam_p43_canon_v1` | MiniMax-M2.7 | Canonical (P30v3 + P12) + P43 subatom beam (compressed_retrieve sentence-level extracts mapped back to parent atoms, joins RRF as 'subatom' pathway). Tests whether sentence-level relevance signal complements whole-atom retrieval | sem + kw + **subatom** (sentence-level relevance via compressed_retrieve) | 500 | **0.784** |
+| `msam_p43_p41_canon_v1` | MiniMax-M2.7 | Canonical + P43 subatom + P41 triple_augment_v2 (cosine-match query embedding to active triple embeddings, surface source atoms). Three RRF pathways alongside semantic+keyword | sem + kw + subatom + **triple_augment_v2** (embedding-cosine on triples → atoms) | 500 | **0.770** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
@@ -1692,6 +1694,100 @@ Pace: 315 min (~37s/q) — slower than the parallel runs at the same
 time of day. Indication that the bench's bottleneck is API
 latency, not local CPU; parallel runs interleave waits well enough
 that they don't lose total wall-clock time vs solo.
+
+### `msam_p43_canon_v1` — subatom beam as RRF pathway (500q)
+
+P43: `compressed_retrieve` runs sentence-level extraction on top of
+the cheap-path's retrieved atoms; sentences are mapped back to
+parent atoms with the strongest sentence's score as that atom's
+'subatom' pathway score. Joins RRF alongside semantic + keyword.
+Implementation deviates slightly from the original "two-beam"
+spec — instead of beam_search_retrieve in retrieval_v2, the
+subatom path is wired directly into hybrid_retrieve as a 4th
+pathway. Functionally equivalent; cleaner code path.
+
+| Subtype | Score | N | Δ vs P30v3 (0.784) |
+|---|---|---|---|
+| single-session-assistant | 0.982 | 56 | 0.0 |
+| single-session-user | 0.971 | 70 | 0.0 |
+| **multi-session** | **0.669** | 133 | **+2.2** ✓ |
+| temporal-reasoning | 0.759 | 133 | 0.0 |
+| **knowledge-update** | 0.910 | 78 | **−3.8** ⚠ |
+| single-session-preference | 0.267 | 30 | 0.0 |
+
+**Overall: 0.784 (exactly canonical, ±0).**
+
+Subatom is overall-flat with a clean shape change: multi-session
++2.2pp (sentence-level extraction surfaces relevant atoms whose
+whole-atom score was diffuse), knowledge-update −3.8pp (sentence-
+level pulls stale fact sentences that shouldn't outrank current
+ones — same regression shape we saw with the graph pathway).
+
+Multi-session +2.2pp clears the subtype's noise floor (~±2-3pp);
+knowledge-update −3.8pp clears its noise floor (~±2pp). These
+shape changes are real signal. But the trade is symmetric — net
+zero overall.
+
+Pace: 271 min (~33s/q), ~6s of which is the new subatom retrieve.
+Bulk batch_embed_texts kept the per-question cost manageable;
+without bulk batching, smoke showed 42s/q.
+
+### `msam_p43_p41_canon_v1` — subatom beam + triple_augment_v2 (500q)
+
+P43 + P41: subatom beam from above PLUS embedding-cosine match on
+active triples → source atoms as a 5th RRF pathway. Triples are
+populated via consolidation (which the bench config now enables —
+required for P41 to have triples to match against; previous canon
+ran with `[triples] enable_extraction = false`).
+
+| Subtype | Score | N | Δ vs P30v3 (0.784) | Δ vs P43 (0.784) |
+|---|---|---|---|---|
+| **single-session-assistant** | 0.946 | 56 | **−3.6** ⚠ | **−3.6** ⚠ |
+| single-session-user | 0.957 | 70 | −1.4 | −1.4 |
+| **knowledge-update** | **0.936** | 78 | −1.3 | **+2.6** ✓ |
+| temporal-reasoning | 0.759 | 133 | 0.0 | 0.0 |
+| **multi-session** | 0.624 | 133 | −2.3 | **−4.5** ⚠ |
+| single-session-preference | 0.267 | 30 | 0.0 | 0.0 |
+
+**Overall: 0.770 (−1.4pp vs P30v3, −1.4pp vs P43).**
+
+P41's contribution isolated (vs same-day P43 baseline, identical
+code, only the triple_augment flag differs):
+- knowledge-update **+2.6pp** ✓ — triples surface fact-relevant
+  atoms; P41 specifically rescues the cohort subatom hurt.
+- single-session-assistant **−3.6pp** ⚠ — above noise floor.
+- multi-session **−4.5pp** ⚠ — well above noise. Triples surface
+  the *single most strongly-related* atom per fact; multi-session
+  needs many partially-related atoms across sessions, and the
+  triple-augmented atoms crowd them out.
+
+**Decision: don't ship either as default.**
+
+Both P43 and P43+P41 underperform or match canonical. The
+per-subtype shape is informative: subatom helps multi-session at
+the cost of knowledge-update; triples reverse that trade. A
+combined signal that gates each pathway by query intent might
+recover both wins, but that's complex enough to be a separate
+experiment, and the bench variance (~±1.3pp overall, larger per-
+subtype) means a single run isn't decisive.
+
+**One observation worth noting**: knowledge-update at 0.936 in
+P43+P41 vs 0.910 in P43 alone — P41 specifically rescues the
+cohort subatom regresses. If a future experiment can gate P41 to
+fire only on fact-replacement queries (LLM intent classification,
+or simpler heuristic on query verbs like "is currently / now / no
+longer"), there might be a +0.5–1pp recovery on that subtype
+specifically. Filed mentally; not pursuing as standalone given
+bench noise.
+
+Both pathways stay implemented behind their flags
+(`enable_subatom_beam`, `enable_triple_augment_v2`, both default
+False) so production deployments can opt in if their query mix
+differs from LongMemEval's.
+
+Pace: 271 min for P43, 277 min for P43+P41 (~33-37s/q each, in
+parallel). Adding P41 cost ~6 min over P43 — the cosine pass on
+active triples per query is cheap once triples are populated.
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.
