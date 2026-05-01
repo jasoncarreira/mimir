@@ -12,9 +12,9 @@ and improve.
 
 1. **`logs/turns.jsonl`** — Per-turn summaries. One record per agent invocation with the full sequence of tool calls, results, and output. Best for understanding what happened during a specific turn.
 2. **`logs/events.jsonl`** — Ground truth. Every tool call, error, and scheduler event with timestamps and session IDs. Best for fine-grained analysis across turns.
-4. **Channel message history** — What was actually sent and received. Use `list_messages` to verify.
-5. **`scheduler.yaml`** — Current scheduled job definitions.
-6. **Wiki pages** — Your current beliefs about the world. May be stale.
+3. **`messages/chat_history.jsonl`** — What was actually sent and received on each channel. Read it directly (`Read` or `tail | jq`) when you need to verify a specific message landed.
+4. **`scheduler.yaml`** — Current scheduled job definitions.
+5. **Wiki pages** — Your current beliefs about the world. May be stale.
 
 
 ## Key Log Schemas
@@ -68,26 +68,12 @@ One record per agent turn (invocation). Contains the full event sequence:
 ```
 
 Key fields:
-- `trigger` — what caused this turn: `user_message`, `scheduler`, `heartbeat`, `web_chat`
+- `trigger` — what caused this turn. Real values: `user_message`, `scheduled_tick` (cron / heartbeat / reflection), `msam_session_end` (synthesis), `cron_tick` (legacy alias). The bridges and dispatcher are the source of truth — see `mimir/models.py:AgentEvent`.
 - `events` — ordered sequence of tool calls and results, preserving the exact execution flow
 - `duration_ms` — wall-clock time for the entire turn
 - `error` — set if the turn ended with an exception
 
-Capped at 1000 most recent turns (configurable via `turn_log_retention` in config).
-
-
-Each line:
-
-```json
-{
-  "timestamp": "2026-03-01T12:00:00+00:00",
-  "session_id": "abc123",
-  "channel_id": "123456",
-  "user_wanted": "what the human asked for",
-  "agent_did": "what you actually did",
-  "predictions": "what you think will happen next"
-}
-```
+Capped at 1000 most recent turns by default; configurable via `MIMIR_MAX_TURNS` env var (hard ceiling 10000). Both `events.jsonl` and `turns.jsonl` use a 10% hysteresis on trim so rewrites amortize cost.
 
 ### scheduler.yaml
 
@@ -169,10 +155,10 @@ The memory skill (`/mimir/skills/memory/SKILL.md`) covers:
 Use introspection to find problems. Use memory to fix the persistent ones (update
 blocks, reorganize files, add cross-references).
 
-The file frequency report (`/mimir/skills/scripts/file_frequency_report.py`)
-bridges both skills — it reads events.jsonl to find which files you access most,
-informing both debugging (are you reading the same file repeatedly?) and memory
-optimization (should hot files become blocks?).
+For "which files am I reading most?" patterns, the analysis is a one-liner against
+`events.jsonl` — `tool_call` rows with `tool == "Read"` carry the `file_path`
+arg; group by path and count. (open-strix's `file_frequency_report.py` was the
+prior art; mimir doesn't ship a port — write the jq pipeline inline when needed.)
 
 ## Companion Guides
 
