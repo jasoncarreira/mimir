@@ -396,7 +396,9 @@ class ConsolidationEngine:
         """
         if not cluster_triples:
             return 0
-        from .triples import _embed_triple_safe
+        from .triples import _triple_text
+        from .core import pack_embedding
+        from .embeddings import batch_embed_texts
         import hashlib
         from datetime import datetime, timezone
 
@@ -423,16 +425,40 @@ class ConsolidationEngine:
 
         conn = get_db()
         try:
+            # Pre-pass: which prepared tids are not yet in the DB? Those
+            # are the ones that need fresh embeddings. Batching the
+            # embedding calls turns N sequential ~500ms API roundtrips
+            # into one ~600ms batch — observed ~4.6s/cluster overhead
+            # on the P41-only bench was dominated by this.
+            placeholders = ",".join("?" * len(prepared))
+            existing_rows = conn.execute(
+                f"SELECT id FROM triples WHERE id IN ({placeholders})",
+                tuple(tid for tid, _ in prepared),
+            ).fetchall()
+            existing_ids = {r[0] for r in existing_rows}
+
+            new_triples = [(tid, t) for tid, t in prepared if tid not in existing_ids]
+            embeddings_by_tid: dict[str, bytes | None] = {}
+            if new_triples:
+                texts = [
+                    _triple_text(t["subject"], t["predicate"], t["object"])
+                    for _, t in new_triples
+                ]
+                try:
+                    vecs = batch_embed_texts(texts)
+                except Exception:
+                    vecs = [None] * len(texts)
+                for (tid, _), vec in zip(new_triples, vecs):
+                    embeddings_by_tid[tid] = pack_embedding(vec) if vec else None
+
             for tid, t in prepared:
                 row = conn.execute(
                     "SELECT atom_id FROM triples WHERE id = ?", (tid,)
                 ).fetchone()
 
                 if row is None:
-                    # Fresh insert
-                    embedding = _embed_triple_safe(
-                        t["subject"], t["predicate"], t["object"]
-                    )
+                    # Fresh insert — embedding pulled from the batch above.
+                    embedding = embeddings_by_tid.get(tid)
                     try:
                         conn.execute(
                             "INSERT OR IGNORE INTO triples "
