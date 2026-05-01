@@ -556,6 +556,11 @@ class ConsolidationEngine:
         api_key = llm['api_key']
 
         enable_llm = _cfg('consolidation', 'enable_llm', True)
+        # When triples extraction is off, ask the LLM only for the
+        # OBSERVATION — no point spending tokens on a TRIPLES section
+        # we'd parse and discard. Same parser is tolerant of either
+        # output shape, so this is purely a prompt simplification.
+        ask_for_triples = bool(_cfg('triples', 'enable_extraction', False))
 
         import re as _re
         _prefix_pat = _re.compile(r"^\[Consolidated from \d+ atoms?\]\s*")
@@ -601,50 +606,90 @@ class ConsolidationEngine:
                     f"({t['subject']}, {t['predicate']}, {t['object']})"
                     for t in prior_triples
                 ]
-                prior_block = (
-                    "Previous beliefs about these atoms (from earlier "
-                    "consolidations on a smaller evidence set):\n"
-                    + "\n".join(prior_lines)
-                    + "\n\nFor each previous belief: if the new atoms still "
-                    "support it, restate it in your TRIPLES section; if the "
-                    "new atoms revise or contradict it, output the updated "
-                    "version (or omit if it's no longer true).\n\n"
-                )
+                if ask_for_triples:
+                    prior_block = (
+                        "Previous beliefs about these atoms (from earlier "
+                        "consolidations on a smaller evidence set):\n"
+                        + "\n".join(prior_lines)
+                        + "\n\nFor each previous belief: if the new atoms still "
+                        "support it, restate it in your TRIPLES section; if the "
+                        "new atoms revise or contradict it, output the updated "
+                        "version (or omit if it's no longer true).\n\n"
+                    )
+                else:
+                    # Observation-only mode: phrase the prior context
+                    # the same way but ask for inclusion in the
+                    # observation prose rather than a separate triples
+                    # block.
+                    prior_block = (
+                        "Previous beliefs about these atoms (from earlier "
+                        "consolidations on a smaller evidence set):\n"
+                        + "\n".join(prior_lines)
+                        + "\n\nFor each previous belief: if the new atoms "
+                        "still support it, include it in the observation; "
+                        "if the new atoms revise or contradict it, surface "
+                        "the updated version (or omit if it's no longer "
+                        "true).\n\n"
+                    )
 
             # Try LLM synthesis (skipped entirely when consolidation.enable_llm = false)
             synthesis_content = None
             cluster_triples: list[dict] = []
             if enable_llm:
                 try:
-                    prompt = (
-                        f"You are consolidating {len(cluster)} related memory atoms. "
-                        f"Produce TWO outputs in a single response.\n\n"
-                        f"Output format (exactly these section headers, in this order):\n\n"
-                        f"OBSERVATION:\n"
-                        f"<one or two sentences capturing what the atoms collectively convey>\n\n"
-                        f"TRIPLES:\n"
-                        f"(subject, predicate, object)\n"
-                        f"(subject, predicate, object)\n"
-                        f"...\n"
-                        f"[OR write: NONE if no clean triples]\n\n"
-                        f"Rules for the OBSERVATION:\n"
-                        f"- Preserve specific dates, times, numbers, names, and direct quotes "
-                        f"VERBATIM when they appear in the atoms.\n"
-                        f"- If atoms disagree on a fact, keep both versions ('user first "
-                        f"mentioned X on date A, then updated to Y on date B').\n"
-                        f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
-                        f"in the observation when the date matters to the content.\n"
-                        f"- Do not invent details not present in the atoms.\n\n"
-                        f"Rules for TRIPLES:\n"
-                        f"- Subject must be a NAMED ENTITY (person, system, tool, place), max 30 chars\n"
-                        f"- Object must be a SHORT SPECIFIC VALUE, max 30 chars\n"
-                        f"- Predicate must be lowercase_snake_case\n"
-                        f"- Implicit subject 'User' for user-preference statements\n"
-                        f"- Lists become multiple triples (one per item)\n"
-                        f"- Skip emotional/philosophical/meta-commentary content (write NONE)\n\n"
-                        f"{prior_block}"
-                        f"Atoms:\n- {joined}"
-                    )
+                    if ask_for_triples:
+                        prompt = (
+                            f"You are consolidating {len(cluster)} related memory atoms. "
+                            f"Produce TWO outputs in a single response.\n\n"
+                            f"Output format (exactly these section headers, in this order):\n\n"
+                            f"OBSERVATION:\n"
+                            f"<one or two sentences capturing what the atoms collectively convey>\n\n"
+                            f"TRIPLES:\n"
+                            f"(subject, predicate, object)\n"
+                            f"(subject, predicate, object)\n"
+                            f"...\n"
+                            f"[OR write: NONE if no clean triples]\n\n"
+                            f"Rules for the OBSERVATION:\n"
+                            f"- Preserve specific dates, times, numbers, names, and direct quotes "
+                            f"VERBATIM when they appear in the atoms.\n"
+                            f"- If atoms disagree on a fact, keep both versions ('user first "
+                            f"mentioned X on date A, then updated to Y on date B').\n"
+                            f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
+                            f"in the observation when the date matters to the content.\n"
+                            f"- Do not invent details not present in the atoms.\n\n"
+                            f"Rules for TRIPLES:\n"
+                            f"- Subject must be a NAMED ENTITY (person, system, tool, place), max 30 chars\n"
+                            f"- Object must be a SHORT SPECIFIC VALUE, max 30 chars\n"
+                            f"- Predicate must be lowercase_snake_case\n"
+                            f"- Implicit subject 'User' for user-preference statements\n"
+                            f"- Lists become multiple triples (one per item)\n"
+                            f"- Skip emotional/philosophical/meta-commentary content (write NONE)\n\n"
+                            f"{prior_block}"
+                            f"Atoms:\n- {joined}"
+                        )
+                    else:
+                        # Observation-only — no TRIPLES section, no
+                        # triples rules. Saves tokens and shaves LLM
+                        # latency on the canonical bench config where
+                        # triples persistence is off.
+                        prompt = (
+                            f"You are consolidating {len(cluster)} related memory atoms. "
+                            f"Produce a single observation that captures what the "
+                            f"atoms collectively convey.\n\n"
+                            f"Output format (exactly this header, then the observation):\n\n"
+                            f"OBSERVATION:\n"
+                            f"<one or two sentences>\n\n"
+                            f"Rules for the OBSERVATION:\n"
+                            f"- Preserve specific dates, times, numbers, names, and direct quotes "
+                            f"VERBATIM when they appear in the atoms.\n"
+                            f"- If atoms disagree on a fact, keep both versions ('user first "
+                            f"mentioned X on date A, then updated to Y on date B').\n"
+                            f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
+                            f"in the observation when the date matters to the content.\n"
+                            f"- Do not invent details not present in the atoms.\n\n"
+                            f"{prior_block}"
+                            f"Atoms:\n- {joined}"
+                        )
                     resp = requests.post(
                         llm_url,
                         headers={
