@@ -16,6 +16,22 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+# Hard ceiling on the JSONL log caps (events.jsonl, turns.jsonl). Setting
+# the cap higher than this is almost never useful — the reflection skill
+# already filters to the last 7 days, the algedonic prompt block bounds
+# itself by hours+limit, and a 10k-row JSONL is already several MB. The
+# cost of letting it grow further is paid on every prompt assembly that
+# tail-scans the file. Operators with genuine "I need full history"
+# needs should ship logs to an external store, not raise this knob.
+_LOG_CAP_MAX = 10_000
+_LOG_CAP_DEFAULT = 1_000
+
+
+def _log_cap(name: str) -> int:
+    """Resolve a log-cap env var with the default + hard ceiling applied."""
+    return min(_env_int(name, _LOG_CAP_DEFAULT), _LOG_CAP_MAX)
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     return float(raw) if raw else default
@@ -133,9 +149,12 @@ class Config:
     # block, scoped to the current channel. 0 disables the section.
     recent_boundaries: int
 
-    # Logging
+    # Logging — JSONL caps clamped to [1, _LOG_CAP_MAX]. Default 1000.
+    # Both files are tail-streamed at read time, so the cap is mostly
+    # about cumulative on-disk size; the trim logic uses 10% hysteresis
+    # to amortize rewrite cost.
     max_turns_kept: int
-    max_events_kept: int | None
+    max_events_kept: int
     turns_archive_dir: Path | None
 
     @classmethod
@@ -143,7 +162,6 @@ class Config:
         home = Path(_env("MIMIR_HOME") or Path.cwd()).resolve()
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
-        max_events_raw = _env("MIMIR_MAX_EVENTS")
 
         return cls(
             home=home,
@@ -202,8 +220,8 @@ class Config:
 
             recent_boundaries=_env_int("MIMIR_RECENT_BOUNDARIES", 3),
 
-            max_turns_kept=_env_int("MIMIR_MAX_TURNS", 1000),
-            max_events_kept=int(max_events_raw) if max_events_raw else None,
+            max_turns_kept=_log_cap("MIMIR_MAX_TURNS"),
+            max_events_kept=_log_cap("MIMIR_MAX_EVENTS"),
             turns_archive_dir=Path(archive_dir).resolve() if archive_dir else None,
         )
 

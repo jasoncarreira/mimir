@@ -13,12 +13,13 @@ the time window or the per-polarity cap, whichever hits first."""
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Literal
+
+from ._jsonl_tail import tail_jsonl_records
 
 log = logging.getLogger(__name__)
 
@@ -263,19 +264,7 @@ def _short_ts(ts: str) -> str:
     return cleaned[:16] if len(cleaned) >= 16 else cleaned
 
 
-def _iter_jsonl_reverse(path: Path) -> Iterable[dict]:
-    """Yield JSONL records from ``path`` newest-first. Missing or
-    unreadable files yield nothing."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return
-    for line in reversed(text.splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            # Skip corrupt records — feedback is best-effort, not strict.
-            continue
+# Backwards-compatible alias for the streaming tail reader. Older code
+# in this module called ``_iter_jsonl_reverse``; new code should import
+# ``tail_jsonl_records`` directly.
+_iter_jsonl_reverse = tail_jsonl_records

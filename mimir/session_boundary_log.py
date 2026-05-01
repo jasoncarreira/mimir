@@ -21,7 +21,9 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
+from ._jsonl_tail import tail_jsonl_records
 
 log = logging.getLogger(__name__)
 
@@ -63,9 +65,12 @@ class SessionBoundaryLog:
     ) -> list[dict[str, Any]]:
         """Return up to ``count`` most-recent records, optionally
         filtered by channel. Reverse-chronological. Empty list when
-        the file is missing or unreadable."""
+        the file is missing or unreadable.
+
+        Tail-streamed: typical bound (count=3, occasional 20) resolves
+        in one chunk read regardless of how large the file has grown."""
         out: list[dict[str, Any]] = []
-        for rec in _iter_jsonl_reverse(self.path):
+        for rec in tail_jsonl_records(self.path):
             if channel_id is not None and rec.get("channel_id") != channel_id:
                 continue
             out.append(rec)
@@ -114,16 +119,3 @@ def _short_ts(ts: str) -> str:
     return cleaned[:16] if len(cleaned) >= 16 else cleaned
 
 
-def _iter_jsonl_reverse(path: Path) -> Iterable[dict[str, Any]]:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return
-    for line in reversed(text.splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            continue
