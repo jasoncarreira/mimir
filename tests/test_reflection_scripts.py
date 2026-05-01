@@ -119,3 +119,24 @@ async def test_client_is_always_closed_even_on_failure(monkeypatch: pytest.Monke
     with pytest.raises(RuntimeError, match="simulated"):
         await script._amain()
     assert fake.closed
+
+
+def test_cli_subcommand_dispatches_to_script(monkeypatch: pytest.MonkeyPatch):
+    """`mimir reflection most-retrieved` is the invocation the reflection
+    skill uses. Smoke-test that the CLI parser routes to script.run with
+    the expected args."""
+    from mimir import cli
+
+    fake = _FakeClient()
+    monkeypatch.setattr(script, "MsamClient", lambda **kw: fake)
+    monkeypatch.setenv("MSAM_ENDPOINT", "http://example.invalid")
+
+    # SystemExit is the normal flow when the CLI completes (sys.exit(0)).
+    out = io.StringIO()
+    with redirect_stdout(out), pytest.raises(SystemExit) as exc_info:
+        cli.main(["reflection", "most-retrieved", "--days", "3",
+                  "--count", "5", "--contributed-only"])
+    assert exc_info.value.code == 0
+    assert fake.calls == [
+        {"days": 3, "count": 5, "channel_id": None, "contributed_only": True}
+    ]

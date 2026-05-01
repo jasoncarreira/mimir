@@ -1,14 +1,12 @@
 """Reflection skill helper: fetch top-N most-retrieved atoms from MSAM.
 
-Invoked via Bash from the reflection skill's SKILL.md. Not exposed as
+Invoked from the reflection skill's SKILL.md via the `mimir reflection
+most-retrieved` CLI subcommand (see ``mimir/cli.py``). Not exposed as
 an MCP tool — this query fires once a week from the reflection turn,
 so paying the agent's permanent toolspace cost on every turn would be
-the wrong tradeoff. Bundling it as a script keeps the toolspace tight
-without losing reflection-time access.
-
-Usage:
-    uv run python -m mimir.skills.reflection.most_retrieved \\
-        --days 7 --count 20 --contributed-only
+the wrong tradeoff. Bundling as a CLI subcommand keeps the toolspace
+tight while keeping the script reachable without cwd / PATH gymnastics
+(``mimir`` is on PATH wherever the agent was launched from).
 """
 
 from __future__ import annotations
@@ -22,8 +20,9 @@ from mimir.config import Config
 from mimir.msam_client import MsamClient
 
 
-async def _amain() -> int:
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+def add_argparse(p: argparse.ArgumentParser) -> None:
+    """Wire flags onto ``p``. Shared between standalone module-mode (rare,
+    development-only) and the ``mimir reflection most-retrieved`` CLI."""
     p.add_argument("--days", type=int, default=7,
                    help="window in days (default 7)")
     p.add_argument("--count", type=int, default=10,
@@ -35,8 +34,9 @@ async def _amain() -> int:
         help="count only retrievals where access_log.contributed=1 — "
              "atoms that earned their keep, not just got pulled in",
     )
-    args = p.parse_args()
 
+
+async def run(args: argparse.Namespace) -> int:
     cfg = Config.from_env()
     client = MsamClient(endpoint=cfg.msam_endpoint, api_key=cfg.msam_api_key or None)
     try:
@@ -51,6 +51,14 @@ async def _amain() -> int:
     json.dump(atoms, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
     return 0
+
+
+async def _amain() -> int:
+    p = argparse.ArgumentParser(
+        description="Top-N most-retrieved MSAM atoms over a recent window."
+    )
+    add_argparse(p)
+    return await run(p.parse_args())
 
 
 def main() -> None:

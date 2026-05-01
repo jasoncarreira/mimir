@@ -47,15 +47,16 @@ Before either track, gather inputs:
   which has none). For cross-channel boundaries, call
   `MsamClient.recent_session_boundaries()` directly via a script, or
   use `mcp__mimir__msam_query` with terms that match boundary atoms.
-- **Most-retrieved atoms** — invoke the bundled script via Bash:
+- **Most-retrieved atoms** — invoke the bundled CLI subcommand via Bash:
   ```bash
-  uv run python -m mimir.skills.reflection.most_retrieved \
-      --days 7 --count 20 --contributed-only
+  mimir reflection most-retrieved --days 7 --count 20 --contributed-only
   ```
   - `--contributed-only` for promotion candidates (atoms that earned
     their keep — the agent's feedback marked them as actually used)
   - drop the flag for "what was I thinking about" (broader recency
     context, including atoms retrieved but not used)
+  - `mimir` is on PATH wherever the operator launched the server from,
+    so this works regardless of cwd
 - All `memory/core/*.md` files
 - File-count and mtime distribution under `memory/<anywhere>/` and
   `state/wiki/` (Glob + `os.stat`; cheap)
@@ -126,8 +127,10 @@ Output: cleanup + promotion proposals into
 
 ### B.3 — Atom-to-core promotion candidates
 
-Run the most-retrieved script with `--contributed-only` to get the
-atoms you actually used over the last week. For each:
+Run the most-retrieved CLI subcommand with `--contributed-only` (e.g.
+`mimir reflection most-retrieved --days 7 --count 20
+--contributed-only`) to get the atoms you actually used over the last
+week. For each:
 
 - Is this a recurring fact or pattern, not a one-off conversational
   detail?

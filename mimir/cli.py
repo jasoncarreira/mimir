@@ -15,6 +15,7 @@ loading ``Config.from_env()``, so the CLI flag and the env var converge.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -688,6 +689,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     id_resolve_p.add_argument("--home", type=Path, default=Path.cwd())
     id_resolve_p.add_argument("author", help="Author id to resolve (e.g. 'slack-U05ALICE').")
 
+    # `mimir reflection <action>` — bundled-script subcommands the
+    # reflection skill invokes from agent Bash. Pattern: each bundled
+    # script that needs CLI access registers a subcommand under its
+    # parent skill's verb. Avoids the cwd/PATH brittleness of
+    # `python -m mimir.skills.reflection.…`; ``mimir`` is on PATH
+    # wherever the operator launched the server from.
+    refl_p = sub.add_parser(
+        "reflection",
+        help="Reflection skill helpers (invoked by skills/reflection/SKILL.md).",
+    )
+    refl_sub = refl_p.add_subparsers(dest="reflection_action")
+
+    refl_mr_p = refl_sub.add_parser(
+        "most-retrieved",
+        help="Top-N MSAM atoms by retrieval count over the last N days.",
+    )
+    from .skills.reflection import most_retrieved as _most_retrieved
+    _most_retrieved.add_argparse(refl_mr_p)
+
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.command == "setup":
@@ -724,6 +744,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(1)
         return
+
+    if args.command == "reflection":
+        if args.reflection_action == "most-retrieved":
+            from .skills.reflection import most_retrieved as _most_retrieved
+            sys.exit(asyncio.run(_most_retrieved.run(args)))
+        refl_p.print_help()
+        sys.exit(1)
 
     if args.command in (None, "run"):
         home_arg = getattr(args, "home", None)

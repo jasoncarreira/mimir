@@ -48,7 +48,7 @@ def test_reflection_skill_documents_both_tracks():
 
 
 def test_reflection_skill_references_bundled_script():
-    """The skill must point at the most_retrieved.py script — that's
+    """The skill must point at the most-retrieved CLI subcommand — that's
     how the agent gets atom-to-core promotion candidates."""
     skill_path = (
         Path(__file__).parent.parent
@@ -58,7 +58,7 @@ def test_reflection_skill_references_bundled_script():
         / "SKILL.md"
     )
     body = skill_path.read_text()
-    assert "mimir.skills.reflection.most_retrieved" in body
+    assert "mimir reflection most-retrieved" in body
     assert "--contributed-only" in body
 
 
