@@ -57,6 +57,13 @@ DEFAULT_ENV_TEMPLATE = dedent(
     MIMIR_WEB_PORT=8080
     MIMIR_MODEL=claude-opus-4-7
     MIMIR_EFFORT=high
+
+    # ---- Operator config -------------------------------------------------
+    # Channel the agent uses for high-priority signals to you that don't fit
+    # the current conversation (critical errors, urgent heartbeat findings,
+    # dispatch failures). Leave blank to disable. Use a normal channel_id —
+    # typically your DM with the bot, e.g. dm-slack-U05XXXX or dm-discord-NNN.
+    MIMIR_OPERATOR_ALERT_CHANNEL=
     """
 )
 

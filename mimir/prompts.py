@@ -48,9 +48,15 @@ def build_system_prompt(
     conventions: str | None = None,
     core_blocks: list[CoreBlock] | None = None,
     memory_index_body: str | None = None,
+    operator_alert_channel: str = "",
 ) -> str:
     """Assemble the system prompt. ``state/INDEX.md`` is intentionally absent —
-    it's read on demand (SPEC §9.1)."""
+    it's read on demand (SPEC §9.1).
+
+    ``operator_alert_channel`` (v0.4 §6) — when set, append a one-line
+    Operator config section so the agent knows the channel id to use for
+    high-priority signals (the alert skill teaches *when*; this teaches
+    *what*)."""
     parts: list[str] = [persona or _DEFAULT_PERSONA]
 
     if core_blocks:
@@ -62,6 +68,12 @@ def build_system_prompt(
         parts.append("## Memory index\n\n" + memory_index_body.rstrip())
 
     parts.append(conventions or _DEFAULT_CONVENTIONS)
+
+    if operator_alert_channel:
+        parts.append(
+            "## Operator config\n\n"
+            f"Operator alert channel: {operator_alert_channel}"
+        )
 
     return "\n\n".join(parts)
 

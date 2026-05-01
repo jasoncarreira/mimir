@@ -113,6 +113,14 @@ class Config:
     # without removing state/identities.yaml.
     cross_platform_pull: bool
 
+    # Operator alert channel (v0.4 §6) — channel_id the agent uses for
+    # high-priority signals to the operator that don't fit the current
+    # conversation (critical errors, urgent heartbeat findings, dispatch
+    # failures). Empty default means feature inactive — the system prompt
+    # omits the line entirely and the alert skill no-ops. Just a normal
+    # channel id; the registered bridge dispatches by prefix.
+    operator_alert_channel: str
+
     # Logging
     max_turns_kept: int
     max_events_kept: int | None
@@ -174,6 +182,8 @@ class Config:
 
             cross_platform_pull=_env("MIMIR_CROSS_PLATFORM_PULL", "true").lower()
                 not in {"false", "0", "no"},
+
+            operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
 
             max_turns_kept=_env_int("MIMIR_MAX_TURNS", 1000),
             max_events_kept=int(max_events_raw) if max_events_raw else None,

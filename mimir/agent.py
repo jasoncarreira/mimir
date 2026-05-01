@@ -393,6 +393,7 @@ class Agent:
         system_prompt = build_system_prompt(
             core_blocks=core_blocks,
             memory_index_body=memory_index_body,
+            operator_alert_channel=self._config.operator_alert_channel,
         )
 
         await log_event(
