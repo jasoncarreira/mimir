@@ -26,7 +26,12 @@ def temp_db(monkeypatch, tmp_path):
 class TestSplitSentences:
     def test_basic_split(self):
         from msam.subatom import split_sentences
-        text = "First sentence here. Second sentence here. Third one follows."
+        # Realistic conversational sentence lengths (>30 chars each).
+        text = (
+            "I really enjoyed the concert last weekend. "
+            "The band played all my favorite songs from the new album. "
+            "We hung around afterwards to meet the lead guitarist."
+        )
         sentences = split_sentences(text)
         assert len(sentences) >= 2
 
@@ -42,9 +47,65 @@ class TestSplitSentences:
 
     def test_newline_split(self):
         from msam.subatom import split_sentences
-        text = "First paragraph content here.\n\nSecond paragraph content here."
+        text = (
+            "First paragraph has substantive content about the topic.\n\n"
+            "Second paragraph discusses something else entirely but at length."
+        )
         sentences = split_sentences(text)
         assert len(sentences) >= 2
+
+    def test_list_block_stays_grouped(self):
+        """P46: a header followed by ≥2 bullets becomes ONE chunk, not
+        N chunks. Prevents fragments like '* Foo' from competing for
+        top-K against actual sentences."""
+        from msam.subatom import split_sentences
+        text = (
+            "Here are some tips:\n\n"
+            "1. **Lighting**:\n"
+            "* Natural light is ideal, place desk near a window if possible.\n"
+            "* Avoid harsh overhead lighting which can cause eye strain.\n"
+            "* Use a desk lamp for focused task lighting."
+        )
+        chunks = split_sentences(text)
+        # Header+bullets block should be one chunk, not 4 (header + 3 bullets)
+        list_chunk = [c for c in chunks if "Natural light" in c and "harsh overhead" in c]
+        assert len(list_chunk) == 1, (
+            f"list block split into separate chunks: {chunks}"
+        )
+
+    def test_short_fragments_filtered(self):
+        """P46: chunks under 30 chars (markdown headers, single-bullet
+        formatting) get filtered out. The 30-char floor catches '1.
+        **Lighting**:' style fragments."""
+        from msam.subatom import split_sentences
+        text = (
+            "Real sentence with substantive content goes here.\n\n"
+            "TODO\n\n"
+            "1. **Header**:\n\n"
+            "Another real sentence with enough characters to count."
+        )
+        chunks = split_sentences(text)
+        for c in chunks:
+            assert len(c) >= 30, f"fragment {c!r} should have been filtered"
+
+    def test_short_atom_falls_through(self):
+        """If filtering would wipe the chunk list, the longest chunk
+        survives so short atoms still appear in the index."""
+        from msam.subatom import split_sentences
+        text = "Hi there."
+        chunks = split_sentences(text)
+        assert chunks == ["Hi there."]
+
+    def test_prose_with_inline_list_still_splits_prose(self):
+        """A prose paragraph is sentence-split as before; only blocks
+        that look list-shaped (≥2 list markers) bypass sentence-split."""
+        from msam.subatom import split_sentences
+        text = (
+            "First substantive sentence about the topic at hand. "
+            "Second sentence elaborates with additional context here."
+        )
+        chunks = split_sentences(text)
+        assert len(chunks) == 2  # both sentences survive 30-char filter
 
 
 class TestDeduplicate:
@@ -126,22 +187,26 @@ class TestCacheSentenceEmbeddings:
         from msam.core import get_db, run_migrations, store_atom
         from msam.subatom import cache_sentence_embeddings
 
+        # Realistic conversational sentence lengths so the splitter's
+        # 30-char floor doesn't merge them into a single chunk.
+        text = (
+            "I picked up a Sony WH-1000XM5 last weekend at the BestBuy. "
+            "Setup with the iPhone 15 Pro went smoothly and I'm enjoying them. "
+            "The noise cancellation works really well on the morning train."
+        )
+
         conn = get_db()
         run_migrations(conn)
         conn.close()
 
-        atom_id = store_atom(
-            "First sentence here. Second sentence here. Third one follows."
-        )
+        atom_id = store_atom(text)
 
         conn = get_db()
-        count1 = cache_sentence_embeddings(atom_id,
-            "First sentence here. Second sentence here. Third one follows.", conn)
+        count1 = cache_sentence_embeddings(atom_id, text, conn)
         assert count1 >= 2
 
         # Second call should skip (already cached)
-        count2 = cache_sentence_embeddings(atom_id,
-            "First sentence here. Second sentence here. Third one follows.", conn)
+        count2 = cache_sentence_embeddings(atom_id, text, conn)
         assert count2 == count1  # returns existing count
         conn.close()
 
@@ -155,8 +220,15 @@ class TestCacheAllSentences:
         run_migrations(conn)
         conn.close()
 
-        store_atom("Atom one content. Second sentence in atom one.")
-        store_atom("Atom two content. Another sentence in atom two.")
+        # Each atom needs ≥2 sentences with ≥30 chars each.
+        store_atom(
+            "I have been working on the new project all morning. "
+            "Progress is steady but the test suite is taking forever."
+        )
+        store_atom(
+            "Met with Alex about the system migration timeline today. "
+            "We agreed to push the rollout by another two weeks."
+        )
 
         result = cache_all_sentences()
         assert result["cached"] >= 2
