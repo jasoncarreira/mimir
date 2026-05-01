@@ -165,10 +165,12 @@ async def test_turn_logger_appends_jsonl(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_turn_logger_trims_when_over_cap(tmp_path: Path):
+    """Hysteresis: trim fires when over cap by ≥10% (rounded up to at
+    least 1 line). With cap=2 the trigger is >3 lines."""
     log_path = tmp_path / "turns.jsonl"
     logger = TurnLogger(log_path, max_turns=2)
 
-    for i in range(5):
+    for i in range(20):
         await logger.write(
             TurnRecord(
                 ts="t", turn_id=f"id{i}", session_id="c", msam_session_id=None,
@@ -177,5 +179,7 @@ async def test_turn_logger_trims_when_over_cap(tmp_path: Path):
         )
 
     lines = [json.loads(l) for l in log_path.read_text().strip().splitlines()]
-    assert len(lines) == 2
-    assert [l["turn_id"] for l in lines] == ["id3", "id4"]
+    # Bound: between cap (right after trim) and cap+10% rounded up.
+    assert 2 <= len(lines) <= 3
+    # Most recent turn always kept.
+    assert lines[-1]["turn_id"] == "id19"

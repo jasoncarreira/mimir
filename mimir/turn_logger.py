@@ -165,7 +165,10 @@ class TurnLogger:
             with self._path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
             self._line_count += 1
-            if self._line_count > self._max_turns:
+            # Hysteresis: trim only when over cap by ≥10%. Same rationale
+            # as event_logger — avoids O(file) rewrite on every write past
+            # the cap.
+            if self._line_count > self._max_turns + max(self._max_turns // 10, 1):
                 await self._trim()
         except OSError as exc:
             log.warning("turns.jsonl write failed: %s", exc)

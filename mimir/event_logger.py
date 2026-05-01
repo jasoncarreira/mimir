@@ -58,7 +58,15 @@ class EventLogger:
                 with self._path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
                 self._line_count += 1
-                if self._max_events and self._line_count > self._max_events:
+                # Hysteresis: trim only when over cap by ≥10%. Without the
+                # buffer, every event past the cap triggers an O(file)
+                # rewrite — a high-throughput agent under a small cap pays
+                # that cost on every event. The 10% margin means a
+                # 1000-cap log rewrites once per ~100 events instead.
+                if (
+                    self._max_events
+                    and self._line_count > self._max_events + max(self._max_events // 10, 1)
+                ):
                     await self._trim()
             except OSError as exc:
                 log.warning("events.jsonl write failed: %s", exc)
