@@ -311,13 +311,14 @@ def _find_window(report: UsageReport, hours: float) -> UsageWindow | None:
     return None
 
 
-def cost_rate_alert_recently_emitted(
-    events_path: Path, *, cooldown_minutes: int,
+def event_recently_emitted(
+    events_path: Path, event_type: str, *, cooldown_minutes: int,
 ) -> bool:
-    """True if a ``cost_rate_alert`` event lies within the cooldown
-    window. Used to gate emission so the firehose doesn't churn on a
-    sustained spike — the algedonic block surfaces the most recent
-    alert anyway, so re-emitting per turn adds no information."""
+    """True if any event with ``type == event_type`` lies within the
+    cooldown window. Used to gate spike-style alert emissions
+    (cost_rate_alert, rate_limit_off_pace, etc.) so the firehose
+    doesn't churn on a sustained condition — the algedonic block
+    surfaces the most recent occurrence anyway."""
     if cooldown_minutes <= 0:
         return False
     cutoff = datetime.now(tz=timezone.utc) - timedelta(minutes=cooldown_minutes)
@@ -328,9 +329,18 @@ def cost_rate_alert_recently_emitted(
             continue
         if ts < cutoff_iso:
             return False  # tail-first; everything older than this is too
-        if ev.get("type") == "cost_rate_alert":
+        if ev.get("type") == event_type:
             return True
     return False
+
+
+# Backwards-compatible alias for callers built before the rename.
+def cost_rate_alert_recently_emitted(
+    events_path: Path, *, cooldown_minutes: int,
+) -> bool:
+    return event_recently_emitted(
+        events_path, "cost_rate_alert", cooldown_minutes=cooldown_minutes,
+    )
 
 
 def render_usage_block(
@@ -341,13 +351,20 @@ def render_usage_block(
     budget_weekly_usd: float | None = None,
     alert: CostRateAlert | None = None,
     plan_quota_lines: list[str] | None = None,
+    off_pace_warning: list[str] | None = None,
 ) -> str | None:
     """Format the usage report as a markdown body for the
     "## Resource usage" prompt section. Returns None when there's
     nothing to show (no last turn, no aggregated windows with data)."""
     has_windows = any(w.turns > 0 for w in report.windows)
     has_plan_quotas = bool(plan_quota_lines)
-    if report.last_turn.ts is None and not has_windows and not has_plan_quotas:
+    has_off_pace = bool(off_pace_warning)
+    if (
+        report.last_turn.ts is None
+        and not has_windows
+        and not has_plan_quotas
+        and not has_off_pace
+    ):
         return None
 
     lines: list[str] = []
@@ -392,6 +409,15 @@ def render_usage_block(
         lines.append("Plan windows (from Anthropic):")
         for line in plan_quota_lines or []:
             lines.append(f"- {line}")
+
+    if has_off_pace:
+        if lines:
+            lines.append("")
+        # The off-pace block is itself a multi-line warning paragraph
+        # (verb line + per-bucket bullets). Caller built it via
+        # render_off_pace_warning; we just splice it in.
+        for line in off_pace_warning or []:
+            lines.append(line)
 
     if alert is not None:
         lines.append("")  # separator

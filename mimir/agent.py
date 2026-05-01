@@ -54,13 +54,15 @@ from .feedback import FeedbackLog
 from .history import MessageBuffer
 from .rate_limits import (
     RateLimitStore,
+    off_pace_buckets,
+    render_off_pace_warning,
     snapshot_from_response_bucket,
     snapshot_from_sdk_event,
 )
 from .session_boundary_log import SessionBoundaryLog, render_session_summaries
 from .usage_stats import (
     aggregate as aggregate_usage,
-    cost_rate_alert_recently_emitted,
+    event_recently_emitted,
     evaluate_cost_rate,
     render_usage_block,
 )
@@ -273,8 +275,9 @@ class Agent:
             hourly_limit_usd=self._config.cost_hourly_limit_usd or None,
             spike_ratio=self._config.cost_rate_spike_ratio or None,
         )
-        if alert is not None and not cost_rate_alert_recently_emitted(
+        if alert is not None and not event_recently_emitted(
             self._config.events_log,
+            "cost_rate_alert",
             cooldown_minutes=self._config.cost_alert_cooldown_minutes,
         ):
             asyncio.create_task(
@@ -291,15 +294,39 @@ class Agent:
                 )
             )
 
-        # Plan-window state from the SDK's RateLimitEvent stream.
-        # Sparse (only fires on transitions); we surface the most recent
-        # entry per type until its window resets.
+        # Plan-window state from the SDK's stream. Per-response capture
+        # (when capture_rate_limits=True) gives us current state on
+        # every turn; the transition-event capture is a backstop.
+        plan_lines: list[str] = []
+        off_pace_lines: list[str] = []
         try:
             from .rate_limits import render_plan_quota_lines
-            plan_lines = render_plan_quota_lines(self._rate_limits.current())
+            current = self._rate_limits.current()
+            plan_lines = render_plan_quota_lines(current)
+            off_pace = off_pace_buckets(current)
+            off_pace_lines = render_off_pace_warning(off_pace)
+            # Cooldown-gated rate_limit_off_pace event for the algedonic
+            # surfacing. Sustained spikes only re-emit once per cooldown
+            # window so the firehose stays clean; the resource block keeps
+            # showing the warning every turn while it's tripped.
+            if off_pace and not event_recently_emitted(
+                self._config.events_log,
+                "rate_limit_off_pace",
+                cooldown_minutes=self._config.cost_alert_cooldown_minutes,
+            ):
+                worst_key, worst_snap, worst_proj = off_pace[0]
+                asyncio.create_task(
+                    log_event(
+                        "rate_limit_off_pace",
+                        rate_limit_type=worst_key,
+                        utilization=worst_snap.utilization,
+                        on_pace_utilization=round(worst_proj.on_pace_utilization, 4),
+                        hours_until_reset=round(worst_proj.hours_until_reset, 2),
+                        resets_at=worst_snap.resets_at,
+                    )
+                )
         except Exception:  # noqa: BLE001
-            log.exception("rate_limits read failed; skipping plan-quota lines")
-            plan_lines = []
+            log.exception("rate_limits read/projection failed")
 
         return render_usage_block(
             report,
@@ -308,6 +335,7 @@ class Agent:
             budget_weekly_usd=self._config.usage_weekly_limit_usd or None,
             alert=alert,
             plan_quota_lines=plan_lines,
+            off_pace_warning=off_pace_lines,
         )
 
     async def _assemble_session_summaries(

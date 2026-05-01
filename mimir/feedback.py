@@ -54,6 +54,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "cost_rate_alert": ("negative", "cost_rate"),
     "rate_limit_warning": ("negative", "rate_limit_warn"),
     "rate_limit_rejected": ("negative", "rate_limit_reject"),
+    "rate_limit_off_pace": ("negative", "rate_limit_off_pace"),
     "scheduled_tick_dropped": ("negative", "tick_dropped"),
     "send_message_unknown_channel": ("negative", "unknown_channel"),
     # Positive — agent's own contribution-credit pass to MSAM is the
@@ -111,6 +112,15 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         )
         verb = "approaching" if rule_kind == "rate_limit_warn" else "hit"
         return f"plan limit {verb} ({rl_type} — {util_str})"
+    if rule_kind == "rate_limit_off_pace":
+        rl_type = ev.get("rate_limit_type") or "?"
+        on_pace = ev.get("on_pace_utilization")
+        on_pace_str = (
+            f"projects {on_pace * 100:.0f}% by reset"
+            if isinstance(on_pace, (int, float))
+            else "off pace"
+        )
+        return f"plan window off pace ({rl_type} — {on_pace_str})"
     if rule_kind == "tick_dropped":
         return f"scheduled_tick dropped: {ev.get('reason') or '(no reason)'}"
     if rule_kind == "unknown_channel":

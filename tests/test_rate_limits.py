@@ -370,3 +370,113 @@ def test_render_omits_projection_for_overage():
     )
     [line] = render_plan_quota_lines({"overage": snap})
     assert "on pace:" not in line
+
+
+# ---- off-pace warning paragraph ----------------------------------------
+
+
+def test_off_pace_buckets_returns_only_off_track():
+    from mimir.rate_limits import off_pace_buckets
+
+    now = int(time.time())
+    snaps = {
+        "five_hour": RateLimitSnapshot(
+            status="allowed", utilization=0.30, resets_at=now + 2 * 3600,
+        ),  # 60% projected — on track
+        "seven_day_opus": RateLimitSnapshot(
+            status="allowed_warning", utilization=0.80, resets_at=now + 3 * 86400,
+        ),  # ~140% projected — off track
+    }
+    out = off_pace_buckets(snaps)
+    assert len(out) == 1
+    assert out[0][0] == "seven_day_opus"
+
+
+def test_off_pace_buckets_sorts_by_severity():
+    from mimir.rate_limits import off_pace_buckets
+
+    now = int(time.time())
+    snaps = {
+        # Halfway through 7d at 60% used → 120% projected.
+        "seven_day": RateLimitSnapshot(
+            status="allowed", utilization=0.60, resets_at=now + 3.5 * 86400,
+        ),
+        # Quarter through 5h at 50% used → 200% projected (worst).
+        "five_hour": RateLimitSnapshot(
+            status="allowed_warning", utilization=0.50, resets_at=now + 3.75 * 3600,
+        ),
+    }
+    out = off_pace_buckets(snaps)
+    assert len(out) == 2
+    assert out[0][0] == "five_hour"  # worst first
+    assert out[1][0] == "seven_day"
+
+
+def test_off_pace_warning_empty_when_no_off_track():
+    from mimir.rate_limits import render_off_pace_warning
+
+    assert render_off_pace_warning([]) == []
+
+
+def test_off_pace_warning_uses_strong_verb_at_high_severity():
+    """At >150% projected, the language steps up from 'scale back'
+    to 'defer all expensive work'."""
+    from mimir.rate_limits import (
+        WindowProjection,
+        render_off_pace_warning,
+    )
+
+    snap = RateLimitSnapshot(
+        status="allowed_warning", utilization=0.50,
+        resets_at=int(time.time()) + 3600,
+    )
+    proj_severe = WindowProjection(
+        elapsed_hours=1.25, hours_until_reset=3.75,
+        on_pace_utilization=2.0, on_track=False,
+    )
+    lines = render_off_pace_warning([("five_hour", snap, proj_severe)])
+    assert any("PLAN QUOTA AT RISK" in l for l in lines)
+    assert any("defer all expensive work" in l for l in lines)
+    assert any("Do NOT fan out" in l for l in lines)
+
+
+def test_off_pace_warning_uses_moderate_verb_at_low_severity():
+    from mimir.rate_limits import (
+        WindowProjection,
+        render_off_pace_warning,
+    )
+
+    snap = RateLimitSnapshot(
+        status="allowed", utilization=0.60,
+        resets_at=int(time.time()) + 3600,
+    )
+    proj_moderate = WindowProjection(
+        elapsed_hours=4.0, hours_until_reset=1.0,
+        on_pace_utilization=1.20, on_track=False,
+    )
+    lines = render_off_pace_warning([("five_hour", snap, proj_moderate)])
+    assert any("scale back" in l.lower() for l in lines)
+    assert not any("PLAN QUOTA AT RISK" in l for l in lines)
+
+
+def test_off_pace_warning_lists_each_bucket_with_resets():
+    from mimir.rate_limits import (
+        WindowProjection,
+        render_off_pace_warning,
+    )
+
+    snap = RateLimitSnapshot(
+        status="allowed_warning", utilization=0.80,
+        resets_at=int(time.time()) + 5400,  # 1h 30m
+    )
+    proj = WindowProjection(
+        elapsed_hours=2.0, hours_until_reset=1.5,
+        on_pace_utilization=1.40, on_track=False,
+    )
+    lines = render_off_pace_warning([("seven_day_opus", snap, proj)])
+    # The verb line plus one bullet per bucket.
+    assert len(lines) == 2
+    assert "7-day Opus" in lines[1]
+    assert "80% used" in lines[1]
+    assert "140%" in lines[1]
+    assert "in 1h" in lines[1]

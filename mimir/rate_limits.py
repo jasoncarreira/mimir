@@ -152,6 +152,70 @@ def render_plan_quota_lines(
     return lines
 
 
+def off_pace_buckets(
+    snapshots: dict[str, RateLimitSnapshot],
+) -> list[tuple[str, RateLimitSnapshot, "WindowProjection"]]:
+    """Return all (key, snapshot, projection) triples whose projection
+    is off track (on_pace_utilization >= 1.0). Ordered by severity
+    (highest projected utilization first) so the worst case leads."""
+    out: list[tuple[str, RateLimitSnapshot, WindowProjection]] = []
+    for key, snap in snapshots.items():
+        window = _WINDOW_HOURS.get(key)
+        if window is None:
+            continue
+        proj = project_window_end(snap, window)
+        if proj is None or proj.on_track:
+            continue
+        out.append((key, snap, proj))
+    out.sort(key=lambda t: t[2].on_pace_utilization, reverse=True)
+    return out
+
+
+def render_off_pace_warning(
+    off_pace: list[tuple[str, RateLimitSnapshot, "WindowProjection"]],
+) -> list[str]:
+    """Multi-line callout block for the off-pace alert. The inline ⚠
+    on the bucket line is a marker; this paragraph is the "scale back
+    NOW" message the agent reads when deciding what to do next.
+
+    Tier the verb by severity:
+    - on pace > 150% → "defer all expensive work"
+    - on pace 100-150% → "scale back"
+
+    Returns empty list when nothing's off pace."""
+    if not off_pace:
+        return []
+    worst = off_pace[0][2].on_pace_utilization
+    if worst >= 1.5:
+        verb_line = (
+            "🛑 PLAN QUOTA AT RISK — defer all expensive work. "
+            "Bash-only investigations, memory cleanup, or end the turn "
+            "silently. Do NOT fan out subagents. Multi-turn research is "
+            "off the table until the burn rate normalizes."
+        )
+    else:
+        verb_line = (
+            "⚠ Plan quota tracking off pace — scale back. "
+            "Pick the cheapest backlog items, avoid fan-out, prefer "
+            "Bash queries over subagent tasks. End silently more readily "
+            "than usual."
+        )
+    lines: list[str] = [verb_line]
+    for key, snap, proj in off_pace:
+        label = _LABEL.get(key, key.replace("_", " "))
+        cur_pct = (
+            f"{snap.utilization * 100:.0f}% used"
+            if snap.utilization is not None
+            else "unknown"
+        )
+        lines.append(
+            f"- {label}: {cur_pct}, projects to "
+            f"{proj.on_pace_utilization * 100:.0f}% by reset "
+            f"({_humanize_resets(snap.resets_at) if snap.resets_at else 'no reset time'})"
+        )
+    return lines
+
+
 def _render_one(key: str, snap: RateLimitSnapshot) -> str:
     label = _LABEL.get(key, key.replace("_", " "))
     parts: list[str] = [label]
