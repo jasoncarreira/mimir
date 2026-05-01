@@ -24,6 +24,7 @@ from claude_agent_sdk import SdkMcpTool, tool
 from ._context import get_current_turn
 from ._tool_helpers import _ArgError, _content_block, _need, _safe
 from .msam_client import MsamClient, MsamError
+from .session_boundary_log import SessionBoundaryLog
 
 log = logging.getLogger(__name__)
 
@@ -152,7 +153,10 @@ def _hits_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-def build_msam_tools(client: MsamClient) -> list[SdkMcpTool]:
+def build_msam_tools(
+    client: MsamClient,
+    session_boundary_log: SessionBoundaryLog | None = None,
+) -> list[SdkMcpTool]:
     @tool(
         "msam_query",
         "Query MSAM for atoms relevant to a topic. Returns up to top_k hits, "
@@ -322,6 +326,28 @@ def build_msam_tools(client: MsamClient) -> list[SdkMcpTool]:
             )
         except MsamError as exc:
             return _content_block(f"msam_end_session failed: {exc}", is_error=True)
+
+        # v0.4 §3: append to local mirror so the prompt-time render still
+        # has session summaries available if MSAM is briefly down. Best
+        # effort — failures don't fail the tool turn.
+        if session_boundary_log is not None:
+            ctx = get_current_turn()
+            try:
+                await session_boundary_log.append(
+                    {
+                        "channel_id": ctx.channel_id if ctx else None,
+                        "msam_session_id": session_id,
+                        "atom_id": payload.get("atom_id"),
+                        "summary": summary,
+                        "topics_discussed": topics or [],
+                        "decisions_made": decisions or [],
+                        "unfinished": unfinished or [],
+                        "emotional_state": emotional,
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("session_boundary_log append failed")
+
         return _content_block(
             f"msam_end_session ok: session_id={session_id} atom_id={payload.get('atom_id')}"
         )

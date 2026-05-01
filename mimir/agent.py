@@ -44,6 +44,7 @@ from .config import Config
 from .event_logger import log_event
 from .feedback import FeedbackLog
 from .history import MessageBuffer
+from .session_boundary_log import SessionBoundaryLog, render_session_summaries
 from .hooks import make_post_tool_use_hook, make_pre_tool_use_hook
 from .index import IndexGenerator
 from .loop_detector import LoopDetector
@@ -119,6 +120,9 @@ class Agent:
             default_window_hours=config.feedback_window_hours,
             default_limit_per_polarity=config.feedback_limit_per_polarity,
         )
+        self._session_boundary_log = SessionBoundaryLog(
+            path=config.home / ".mimir" / "session_boundaries.jsonl",
+        )
 
         self._mcp_server = build_mcp_server(
             config.home,
@@ -127,6 +131,7 @@ class Agent:
             scheduler=scheduler,
             channel_registry=channel_registry,
             message_buffer=message_buffer,
+            session_boundary_log=self._session_boundary_log,
         )
 
         # Hooks layer mimir's path confinement + post-write reindex onto the
@@ -211,6 +216,27 @@ class Agent:
         await self._buffer.append(msg)
 
     # ---- MSAM hooks ----------------------------------------------------
+
+    async def _assemble_session_summaries(
+        self, *, channel_id: str | None
+    ) -> str | None:
+        """Render the Recent session summaries block. Tries MSAM first
+        (chronological recall via /v1/sessions/recent); falls back to
+        the local mirror on empty / failure. Returns None when both are
+        empty or the section is disabled."""
+        count = self._config.recent_boundaries
+        if count <= 0:
+            return None
+        boundaries: list[dict] = []
+        if self._msam is not None:
+            boundaries = await self._msam.recent_session_boundaries(
+                channel_id=channel_id, count=count,
+            )
+        if not boundaries:
+            boundaries = self._session_boundary_log.recent(
+                channel_id=channel_id, count=count,
+            )
+        return render_session_summaries(boundaries)
 
     async def _pre_message_hook(self, ctx: TurnContext, event: AgentEvent) -> str | None:
         """Query MSAM, stash atom_ids on ctx, return a formatted prompt block
@@ -391,6 +417,9 @@ class Agent:
                 if self._config.feedback_limit_per_polarity > 0
                 else None
             )
+            session_summaries_block = await self._assemble_session_summaries(
+                channel_id=event.channel_id,
+            )
             turn_prompt = build_turn_prompt(
                 event,
                 recent_messages=recent,
@@ -399,6 +428,7 @@ class Agent:
                 recent_message_chars=self._config.recent_message_chars,
                 resolver=self._buffer.resolver,
                 feedback_block=feedback_block,
+                session_summaries_block=session_summaries_block,
             )
 
         core_blocks = load_core(self._config.home)

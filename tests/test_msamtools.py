@@ -286,6 +286,50 @@ async def test_msam_end_session_drops_empty_optionals():
 
 
 @pytest.mark.asyncio
+async def test_msam_end_session_appends_to_local_mirror(tmp_path):
+    """v0.4 §3a: a successful end_session also writes a local mirror
+    record so the prompt-time render can fall back if MSAM is briefly
+    down. Mirror writing is best-effort; never fails the tool turn."""
+    import json
+
+    from mimir.session_boundary_log import SessionBoundaryLog
+
+    fake = FakeMsam()
+    mirror = SessionBoundaryLog(path=tmp_path / ".mimir" / "sb.jsonl")
+    tools = build_msam_tools(fake, session_boundary_log=mirror)  # type: ignore[arg-type]
+    end = _by_name(tools, "msam_end_session")
+
+    out = await end.handler({
+        "session_id": "msam-x-1",
+        "summary": "wrap-up",
+        "topics_discussed": ["alpha"],
+        "decisions_made": [],
+        "unfinished": ["draft response"],
+        "emotional_state": "",
+    })
+    assert out.get("is_error") is not True
+
+    body = (tmp_path / ".mimir" / "sb.jsonl").read_text()
+    rec = json.loads(body.splitlines()[0])
+    assert rec["msam_session_id"] == "msam-x-1"
+    assert rec["summary"] == "wrap-up"
+    assert rec["unfinished"] == ["draft response"]
+    assert rec["topics_discussed"] == ["alpha"]
+    assert rec["atom_id"] == fake.end_session_atom_id
+
+
+@pytest.mark.asyncio
+async def test_msam_end_session_no_mirror_when_log_unset():
+    """build_msam_tools without a SessionBoundaryLog must still work —
+    the mirror is optional; absent means no mirror writes."""
+    fake = FakeMsam()
+    tools = build_msam_tools(fake)  # type: ignore[arg-type]
+    end = _by_name(tools, "msam_end_session")
+    out = await end.handler({"session_id": "x", "summary": "y"})
+    assert out.get("is_error") is not True
+
+
+@pytest.mark.asyncio
 async def test_msam_store_passes_through():
     fake = FakeMsam()
     tools = build_msam_tools(fake)  # type: ignore[arg-type]

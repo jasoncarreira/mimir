@@ -98,6 +98,7 @@ def build_turn_prompt(
     recent_message_chars: int = 0,
     resolver: object | None = None,
     feedback_block: str | None = None,
+    session_summaries_block: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, MSAM
     atom hits, subagent completion notifications (from prior turns), event
@@ -131,6 +132,14 @@ def build_turn_prompt(
     # before it reads the conversation it's about to act on.
     if feedback_block:
         sections.append("## Recent feedback signals\n\n" + feedback_block.rstrip())
+
+    # Recent session summaries (v0.4 §3): one rung wider than the message-
+    # level recent activity. Placed before Recent activity so the agent
+    # reads the session-level context first.
+    if session_summaries_block:
+        sections.append(
+            "## Recent session summaries\n\n" + session_summaries_block.rstrip()
+        )
 
     if recent_list:
         rendered = render_recent_activity(

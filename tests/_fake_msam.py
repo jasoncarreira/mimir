@@ -128,6 +128,41 @@ class FakeMsam:
         )
         return {"clusters_processed": 5, "atoms_merged": 12}
 
+    recent_boundaries: list[dict[str, Any]] = field(default_factory=list)
+    most_retrieved: list[dict[str, Any]] = field(default_factory=list)
+
+    async def recent_session_boundaries(
+        self, *, channel_id: str | None = None, count: int = 3,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(
+            _Call("recent_session_boundaries", {"channel_id": channel_id, "count": count})
+        )
+        if "recent_session_boundaries" in self.fail_on:
+            return []
+        out = list(self.recent_boundaries)
+        if channel_id is not None:
+            out = [b for b in out if b.get("channel_id") == channel_id]
+        return out[:count]
+
+    async def most_retrieved_atoms(
+        self,
+        *,
+        days: int = 7,
+        count: int = 10,
+        channel_id: str | None = None,
+        contributed_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(
+            _Call(
+                "most_retrieved_atoms",
+                {
+                    "days": days, "count": count, "channel_id": channel_id,
+                    "contributed_only": contributed_only,
+                },
+            )
+        )
+        return list(self.most_retrieved)[:count]
+
     async def close(self) -> None:
         self.calls.append(_Call("close", {}))
 

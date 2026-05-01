@@ -26,6 +26,7 @@ from .history import MessageBuffer
 from .msam_client import MsamClient
 from .msamtools import build_msam_tools, msam_tool_names
 from .scheduler import Scheduler
+from .session_boundary_log import SessionBoundaryLog
 from .scheduletools import build_schedule_tools, schedule_tool_names
 from .search import Indexer
 from .searchtools import build_search_tools, search_tool_names
@@ -74,13 +75,14 @@ def build_mcp_server(
     scheduler: Scheduler | None = None,
     channel_registry: ChannelRegistry | None = None,
     message_buffer: MessageBuffer | None = None,
+    session_boundary_log: SessionBoundaryLog | None = None,
 ) -> McpSdkServerConfig:
     """Bundle the in-process MCP tools (everything with no SDK preset)."""
     tools = [echo]
     if indexer is not None:
         tools += build_search_tools(indexer)
     if msam_client is not None:
-        tools += build_msam_tools(msam_client)
+        tools += build_msam_tools(msam_client, session_boundary_log=session_boundary_log)
     if scheduler is not None:
         tools += build_schedule_tools(scheduler)
     if channel_registry is not None:

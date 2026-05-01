@@ -128,6 +128,11 @@ class Config:
     feedback_window_hours: int
     feedback_limit_per_polarity: int
 
+    # Session boundary surfacing (v0.4 §3). Number of recent session
+    # boundaries to render in the prompt's "Recent session summaries"
+    # block, scoped to the current channel. 0 disables the section.
+    recent_boundaries: int
+
     # Logging
     max_turns_kept: int
     max_events_kept: int | None
@@ -194,6 +199,8 @@ class Config:
 
             feedback_window_hours=_env_int("MIMIR_FEEDBACK_WINDOW_HOURS", 24),
             feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),
+
+            recent_boundaries=_env_int("MIMIR_RECENT_BOUNDARIES", 3),
 
             max_turns_kept=_env_int("MIMIR_MAX_TURNS", 1000),
             max_events_kept=int(max_events_raw) if max_events_raw else None,
