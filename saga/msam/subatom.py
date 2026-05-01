@@ -25,33 +25,70 @@ _cfg = get_config()
 
 # ─── Sentence Splitting ──────────────────────────────────────────
 
-# Regex: split on sentence boundaries (. ! ? followed by space/newline/end)
-# Also split on numbered list items, markdown headers, bullet points
-_SENT_SPLIT = re.compile(
-    r'(?<=[.!?])\s+(?=[A-Z])'       # Period/excl/question + space + capital
-    r'|(?<=\n)\s*(?=\d+[.):]\s)'     # Numbered list items
-    r'|(?<=\n)\s*(?=[-*•]\s)'        # Bullet points
-    r'|(?<=\n)\s*(?=#{1,6}\s)'       # Markdown headers
-    r'|\n{2,}'                        # Double newlines (paragraph breaks)
-)
+# P46: preserve list structures rather than splitting at every bullet
+# or numbered item. The previous splitter broke long markdown-formatted
+# assistant responses into 50+ fragments where ~15% were pure
+# formatting like '1. **Lighting**:' or '* Foo'. Each fragment got a
+# real embedding and competed for top-K, surfacing wrong-context atoms
+# (e.g., a '90-degree angle to the keyboard' bullet matching a 'what
+# degree did I graduate with' query).
+#
+# New approach: paragraph-level chunking. Blocks separated by blank
+# lines stay as one chunk if they look list-shaped (≥2 lines starting
+# with bullets/numbered markers). Prose blocks split on
+# sentence-end + capital. Min chunk length 30 chars filters out the
+# residual short fragments.
+
+_PARAGRAPH_SPLIT = re.compile(r'\n\s*\n')
+_PROSE_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
+_LIST_LINE = re.compile(r'^\s*([*\-•]|\d+[.):])\s')
+
+
+def _is_list_block(block: str) -> bool:
+    """Heuristic: a block is list-like if at least 2 of its lines look
+    like bullet or numbered list items. Nested bullets count toward the
+    threshold so a list block with a single header line plus 2 bullets
+    is detected."""
+    list_lines = sum(
+        1 for line in block.split('\n') if _LIST_LINE.match(line)
+    )
+    return list_lines >= 2
 
 
 def split_sentences(text: str) -> list[str]:
-    """Split atom content into sentences/segments."""
+    """Split atom content into chunks for sentence-level retrieval.
+
+    Paragraph-level chunking with list awareness:
+    - Blocks (separated by blank lines) that look list-shaped stay as
+      one chunk — header + bullets together.
+    - Prose blocks split on sentence-end + capital.
+    - Chunks under 30 chars are filtered out (markdown fragments).
+    - If filtering would empty the result, the longest chunk we found
+      is kept so very short atoms still surface.
+    """
     if not text or not text.strip():
         return []
-    
-    segments = _SENT_SPLIT.split(text.strip())
-    result = []
-    for seg in segments:
-        seg = seg.strip()
-        if len(seg) >= 8:  # Min 8 chars to be meaningful
-            result.append(seg)
-    
-    # If no splits found, return the whole text
+
+    chunks: list[str] = []
+    for block in _PARAGRAPH_SPLIT.split(text.strip()):
+        block = block.strip()
+        if not block:
+            continue
+        if _is_list_block(block):
+            chunks.append(block)
+            continue
+        for sent in _PROSE_SENT_SPLIT.split(block):
+            sent = sent.strip()
+            if sent:
+                chunks.append(sent)
+
+    result = [c for c in chunks if len(c) >= 30]
+    if not result and chunks:
+        # Filtering wiped everything — keep the longest chunk so
+        # very short atoms still appear in the index.
+        result = [max(chunks, key=len)]
     if not result and text.strip():
         result = [text.strip()]
-    
     return result
 
 
