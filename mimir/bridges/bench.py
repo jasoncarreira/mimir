@@ -39,7 +39,10 @@ class BenchBridge(Bridge):
     home: Path
     stream: object | None = None
 
-    prefixes = ("bench-",)
+    # Match plain "bench" (current single-channel adapter) and "bench-*"
+    # (legacy per-session channel naming). startswith semantics — "bench"
+    # matches both since "bench-seed-0".startswith("bench") is True.
+    prefixes = ("bench",)
     name = "bench"
 
     async def connect(self) -> None:
