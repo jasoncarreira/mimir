@@ -71,15 +71,75 @@ DEFAULT_ENV_TEMPLATE = dedent(
 DEFAULT_SCHEDULER_YAML = dedent(
     """\
     # mimir scheduler — APScheduler cron jobs that enqueue LLM ticks.
-    # Each job triggers a turn on ``channel_id`` with ``trigger=cron_tick``.
+    # Each job triggers a turn on ``channel_id`` with ``trigger=scheduled_tick``.
+    #
+    # Example one-off job:
     #
     # jobs:
-    #   - id: morning-checkin
+    #   - name: morning-checkin
     #     cron: "0 9 * * 1-5"
     #     channel_id: web-default
-    #     content: "Morning check-in: review yesterday and plan today."
+    #     prompt: "Morning check-in: review yesterday and plan today."
+    #
+    # Heartbeat tick (v0.4 §1) — autonomous-work cadence. Uncomment to
+    # enable. When ``prompt:`` is empty/omitted on a scheduled_tick, the
+    # turn prompt falls back to HEARTBEAT_DEFAULT_PROMPT (see
+    # mimir/prompts.py); having an explicit prompt here keeps the
+    # configuration self-documenting.
+    #
+    # jobs:
+    #   - name: heartbeat
+    #     cron: "*/30 * * * *"
+    #     channel_id: null   # synthetic scheduler:heartbeat channel
+    #     prompt: "Run the heartbeat skill: librarian protocol first, then pick one item from state/heartbeat-backlog.md and do it. End silently."
 
     jobs: []
+    """
+)
+
+
+DEFAULT_HEARTBEAT_BACKLOG = dedent(
+    """\
+    # Heartbeat Backlog
+
+    Tasks for autonomous work during scheduled heartbeats. Operator and
+    agent both append.
+
+    Format per item:
+
+    ```
+    - [ ] **<short name>** [YYYY-MM-DD added] — one-line what
+      - What: ...
+      - Why: ...
+      - How: ...
+      - Frequency: <daily | weekly | once>
+      - Priority: <HIGH | MEDIUM | LOW>
+      - Last completed: <YYYY-MM-DD or "never">
+      - Skill: <relative path or skill name, optional>
+    ```
+
+    ## Active Backlog
+
+    (Discrete tasks; pick one per heartbeat. Operator seeds initial
+    items here; agent may append observations.)
+
+    ## Standing Tasks
+
+    (Daily / weekly / recurring; agent updates `Last completed:` after
+    each run. Pick one whose slot for today is open.)
+    """
+)
+
+
+DEFAULT_HEARTBEAT_PATTERNS = dedent(
+    """\
+    <!-- desc: what works (and what doesn't) during heartbeat ticks -->
+    # Heartbeat Patterns
+
+    Empty starter. Append observations from your heartbeat experience —
+    tasks that fit well, ones that didn't, time-of-day patterns,
+    mistakes worth not repeating. Keep it tight; this block is in core
+    memory.
     """
 )
 
@@ -267,6 +327,15 @@ def setup_home(home: Path) -> dict[str, object]:
         files_created.append("state/wiki/log.md")
     if _write_if_missing(home / "state" / "identities.yaml", DEFAULT_IDENTITIES_YAML):
         files_created.append("state/identities.yaml")
+    if _write_if_missing(
+        home / "state" / "heartbeat-backlog.md", DEFAULT_HEARTBEAT_BACKLOG
+    ):
+        files_created.append("state/heartbeat-backlog.md")
+    if _write_if_missing(
+        home / "memory" / "core" / "50-heartbeat-patterns.md",
+        DEFAULT_HEARTBEAT_PATTERNS,
+    ):
+        files_created.append("memory/core/50-heartbeat-patterns.md")
 
     seeded_subagents = seed_subagent_defs(home)
     seeded_skills = seed_skills(home)

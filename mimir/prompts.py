@@ -24,6 +24,17 @@ stdout). You can use bash and file-op tools to organize your own notes
 under memory/, search them via the file_search skill, and call MSAM
 through the msam skill for semantic memory."""
 
+# Heartbeat-tick body when the scheduler.yaml job didn't set its own
+# ``prompt:``. Brief — the heartbeat skill carries the full instructions.
+HEARTBEAT_DEFAULT_PROMPT = """This is a heartbeat tick — autonomous-work cadence, not a user message.
+
+Run the heartbeat skill: librarian protocol first (state coherence,
+drift, re-anchor to current date), then pick ONE item from
+state/heartbeat-backlog.md and do it. End the turn silently when done.
+If something genuinely needs operator attention, route through the
+operator alert channel; otherwise no user-visible message."""
+
+
 _DEFAULT_CONVENTIONS = """## Conventions
 
 - Always-in-context blocks live under memory/core/, ordered by numeric prefix
@@ -128,19 +139,27 @@ def build_turn_prompt(
         sections.append("## Subagent updates\n\n" + subagent_block.rstrip())
 
     ts = datetime.now(tz=timezone.utc).isoformat()
-    # Prefer the canonical's display name (or the event's author_display)
-    # over the raw matching key in the header — the agent reads "alice",
-    # not "discord-99".
-    header_author = event.author_display
-    if not header_author and resolver is not None and event.author:
-        header_author = resolver.display_name(event.author)
-    if not header_author:
-        header_author = event.author or "-"
-    header = (
-        f"[event_kind: {event.trigger}, channel: {event.channel_id}, "
-        f"author: {header_author}, ts: {ts}]"
-    )
-    body = event.content or "(no content)"
+    if event.trigger == "scheduled_tick":
+        # Heartbeat / cron-fired tick: header omits author (the scheduler is
+        # the implicit caller), body is whatever the schedule.yaml entry
+        # provided as ``prompt:``, falling back to HEARTBEAT_DEFAULT_PROMPT
+        # when the entry was a bare scheduled tick with no instructions.
+        header = f"[scheduled_tick: {event.channel_id}, ts: {ts}]"
+        body = event.content or HEARTBEAT_DEFAULT_PROMPT
+    else:
+        # Prefer the canonical's display name (or the event's author_display)
+        # over the raw matching key in the header — the agent reads "alice",
+        # not "discord-99".
+        header_author = event.author_display
+        if not header_author and resolver is not None and event.author:
+            header_author = resolver.display_name(event.author)
+        if not header_author:
+            header_author = event.author or "-"
+        header = (
+            f"[event_kind: {event.trigger}, channel: {event.channel_id}, "
+            f"author: {header_author}, ts: {ts}]"
+        )
+        body = event.content or "(no content)"
     sections.append(f"{header}\n{body}")
 
     return "\n\n".join(sections)
