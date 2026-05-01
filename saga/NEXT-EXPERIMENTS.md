@@ -991,7 +991,18 @@ is off.
 
 ### P41 — Triple augmentation v2: embedding-cosine match + proper score scaling
 
-**Status.** Filed 2026-04-30. Not yet implemented.
+**Status.** Bench-tested 2026-04-30 (run as P43+P41 alongside P43
+solo). Standalone-equivalent delta: −1.4pp vs P43 baseline,
+−1.4pp vs P30v3 canonical. Per-subtype isolated effect:
+knowledge-update **+2.6pp** ✓, single-session-assistant
+**−3.6pp**, multi-session **−4.5pp**. P41 specifically rescues
+the fact-replacement cohort that subatom hurts, but the
+multi-session crowd-out cost dominates the overall delta.
+
+Code stays behind `enable_triple_augment_v2 = false` (default) for
+production deployments where the query mix differs. Not shipped to
+canonical. Full data + analysis: BENCHMARK-RESULTS.md
+§msam_p43_p41_canon_v1.
 
 **What.** The current `enable_triple_augment` (in `retrieval_v2.py`)
 has two design problems:
@@ -1192,7 +1203,23 @@ when triples table empty.
 
 ### P43 — Beam search always-on; subatom retrieval as third beam
 
-**Status.** Filed 2026-04-30. Not yet implemented.
+**Status.** Bench-tested 2026-04-30. **Overall flat (0.784,
+exactly canonical) with a clean shape change: multi-session
++2.2pp ✓, knowledge-update −3.8pp ⚠.** Sentence-level extraction
+helps cross-session recall (where many partially-relevant atoms
+combine) but hurts fact-replacement (where stale fact sentences
+can outrank current ones). Net trade is symmetric.
+
+Implementation deviated slightly from spec — instead of going
+through `retrieve_v2.beam_search_retrieve`, the subatom pathway
+was wired directly into `hybrid_retrieve` as a new RRF pathway
+('subatom') alongside semantic + keyword. Functionally
+equivalent; cleaner code path; no need to flip
+`retrieval_v2.enabled` in bench config.
+
+Code stays behind `enable_subatom_beam = false` (default) for
+production. Not shipped to canonical. Full data:
+BENCHMARK-RESULTS.md §msam_p43_canon_v1.
 
 **What.** Three coupled changes:
 
