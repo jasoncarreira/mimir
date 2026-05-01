@@ -44,6 +44,8 @@ Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 | `msam_p12_canon_v3` | MiniMax-M2.7 | Same config as `msam_p12_canon_v2` (canonical + P12 on, min pivot); solo re-run to factor out parallel-run interference seen in v2 | sem + kw (P12 synonym expansion only) | 500 | **0.768** |
 | `msam_p43_canon_v1` | MiniMax-M2.7 | Canonical (P30v3 + P12) + P43 subatom beam (compressed_retrieve sentence-level extracts mapped back to parent atoms, joins RRF as 'subatom' pathway). Tests whether sentence-level relevance signal complements whole-atom retrieval | sem + kw + **subatom** (sentence-level relevance via compressed_retrieve) | 500 | **0.784** |
 | `msam_p43_p41_canon_v1` | MiniMax-M2.7 | Canonical + P43 subatom + P41 triple_augment_v2 (cosine-match query embedding to active triple embeddings, surface source atoms). Three RRF pathways alongside semantic+keyword | sem + kw + subatom + **triple_augment_v2** (embedding-cosine on triples → atoms) | 500 | **0.770** |
+| `msam_p43_canon_v2` | MiniMax-M2.7 | P43 (subatom beam) re-run with the P46 list-aware sentence splitter (paragraph-level chunking, 30-char min length, list blocks stay grouped instead of fragmenting per bullet) | sem + kw + **subatom** (now coarser-grained chunks; markdown lists kept together) | 500 | **0.778** |
+| `msam_p43_p41_canon_v2` | MiniMax-M2.7 | P43+P41 re-run with the P46 splitter | sem + kw + subatom + triple_augment_v2 (with the cleaner sentence-chunking) | 500 | **0.782** ✓ |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
 ¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
@@ -1788,6 +1790,110 @@ differs from LongMemEval's.
 Pace: 271 min for P43, 277 min for P43+P41 (~33-37s/q each, in
 parallel). Adding P41 cost ~6 min over P43 — the cosine pass on
 active triples per query is cheap once triples are populated.
+
+### `msam_p43_canon_v2` — P43 re-bench with list-aware splitter (500q)
+
+P46 sentence splitter rewrite (commit `cb3ea83`): paragraph-level
+chunking with list-block detection (≥2 lines starting with bullet
+or numbered markers stay grouped) and a 30-char minimum length to
+filter markdown formatting fragments. The home-office advice atom
+that v1 fragmented into ~50 chunks now becomes 8 chunks with the
+list block as one ~2158-char unit.
+
+| Subtype | Score | N | Δ vs P30v3 (0.784) | Δ vs P43_v1 (0.784) |
+|---|---|---|---|---|
+| single-session-assistant | 0.982 | 56 | 0.0 | 0.0 |
+| single-session-user | 0.957 | 70 | −1.4 | −1.4 |
+| **single-session-preference** | **0.433** | 30 | **+16.7** ✓✓ | **+16.7** ✓✓ |
+| multi-session | 0.632 | 133 | −1.5 | **−3.7** |
+| temporal-reasoning | 0.744 | 133 | −1.5 | −1.5 |
+| knowledge-update | 0.910 | 78 | −3.8 | 0.0 |
+
+**Overall: 0.778 (−0.6pp vs P30v3, −0.6pp vs P43_v1).**
+
+The big shift is preference: 0.267 → 0.433 (+16.7pp). The
+list-aware grouping prevents random list bullets (about lighting,
+ergonomics, dietary tips) from surfacing on preference probes via
+keyword-overlap. With v1's fragmented splitter, queries like
+"what does the user prefer for breakfast?" could match a "* Avoid
+overhead lighting" fragment from a totally unrelated atom; with
+v2 those bullets stay glued to their parent block, whose overall
+embedding doesn't match preference probes.
+
+The cost: multi-session −3.7pp vs P43_v1. The fragmented per-bullet
+matches that helped multi-session in v1 are gone. Real signal —
+clears the multi-session noise floor (~±2-3pp).
+
+Knowledge-update unchanged at 0.910. The splitter fix didn't
+address the staleness problem (subatom still pulls historical fact
+sentences alongside current ones).
+
+Pace: 287 min (~34s/q). Splitter v2 produces fewer chunks per
+atom (8 vs 50 for the example), so per-question retrieve is
+3-5s instead of 5-7s with v1.
+
+### `msam_p43_p41_canon_v2` — P43+P41 re-bench with list-aware splitter (500q)
+
+Same splitter fix applied to the 3-pathway run. Direct comparison
+to v1 isolates the splitter's effect on the P41 outcome.
+
+| Subtype | Score | N | Δ vs P30v3 (0.784) | Δ vs P43+P41_v1 (0.770) | Δ vs P43_v2 (0.778) |
+|---|---|---|---|---|---|
+| **single-session-assistant** | **1.000** | 56 | **+1.8** ✓✓ | **+5.4** ✓✓ | +1.8 |
+| single-session-user | 0.929 | 70 | −4.2 | −2.9 | −2.9 |
+| **single-session-preference** | **0.400** | 30 | **+13.3** ✓✓ | **+13.3** ✓✓ | −3.3 |
+| multi-session | 0.639 | 133 | −0.8 | +1.5 | +0.7 |
+| temporal-reasoning | 0.759 | 133 | 0.0 | 0.0 | +1.5 |
+| knowledge-update | 0.923 | 78 | −2.6 | −1.3 | +1.3 |
+
+**Overall: 0.782 (−0.2pp vs P30v3 — within noise; +1.2pp vs
+P43+P41_v1).**
+
+**Three significant signals:**
+
+1. **single-session-assistant hit 1.000** — perfect score on the
+   56-question subtype. v1 had 0.946; canonical also has 0.982.
+   Means every assistant-attribution question got the right
+   answer with the cleaner splitter + triple augmentation. First
+   time we've measured a perfect subtype score.
+
+2. **single-session-preference at 0.400** — biggest preference
+   lift we've ever measured on this benchmark. P12 (synonym
+   expansion) had +21.6pp on preference (to 0.483) but did so
+   on the older codebase; the current canonical has preference at
+   0.267 and we've struggled to lift it. P43_v2 alone hit 0.433;
+   P43+P41_v2 sits at 0.400 (still well above noise floor).
+
+3. **P41 with the cleaner splitter is net positive overall**
+   (+0.4pp vs P43_v2, +1.2pp vs P43+P41_v1). Was −1.4pp before.
+   The splitter fix turned P41 from a regression into a marginal
+   win. Per-subtype P41 contribution (vs same-day P43_v2):
+
+   | Subtype | P43_v2 | P43+P41_v2 | Δ |
+   |---|---|---|---|
+   | assistant | 0.982 | 1.000 | **+1.8** ✓ |
+   | temporal | 0.744 | 0.759 | +1.5 |
+   | k-update | 0.910 | 0.923 | +1.3 |
+   | multi-sess | 0.632 | 0.639 | +0.7 |
+   | user | 0.957 | 0.929 | −2.9 |
+   | preference | 0.433 | 0.400 | −3.3 |
+   | overall | 0.778 | 0.782 | **+0.4** |
+
+**Decision: still don't ship to canonical, but the gap is now
+within noise.** P43+P41_v2 = 0.782 vs canonical 0.784, a −0.2pp
+delta on a ±1.3pp noise floor. The per-subtype shape is
+genuinely interesting — preference and assistant are both up,
+several others are flat or up. The losses (user −2.9, preference
+P41-vs-P43 −3.3) are within or near noise floors.
+
+A weighted combination (subatom on 'identity / fact' queries,
+disable for 'preference / multi-session') might do better still
+but requires query-intent classification — not pursuing as a
+standalone experiment given diminishing returns and bench
+variance.
+
+Pace: 287 min for P43_v2, 289 min for P43+P41_v2 (~35s/q each,
+in parallel).
 
 ### `pref_probe_max1024` — MiniMax, weighted_sum, 1024-token cap (30q, preference only)
 Baseline preference score: 7/30 (0.233). Probe: **10/30 (0.333, +10 pp)**.

@@ -1504,7 +1504,33 @@ used for `session_id` in migration 3. Skip until needed.
 
 ### P46 — Smarter sentence splitting for subatom retrieval
 
-**Status.** Filed 2026-04-30. Not yet implemented.
+**Status.** Bench-tested 2026-05-01 (paired with P43+P41 re-run).
+List-aware splitter shipped. Significant per-subtype shape
+changes:
+- **single-session-preference**: 0.267 → 0.433 in P43_v2 (+16.7pp,
+  largest preference lift we've ever measured on the bench).
+- **single-session-assistant** in P43+P41_v2 hit **1.000** (perfect
+  score, +5.4pp over P43+P41_v1).
+- P41 went from −1.4pp regression to +0.4pp marginal win when
+  fed the cleaner splitter.
+
+Net overall is essentially flat vs canonical (P43_v2 = 0.778,
+P43+P41_v2 = 0.782 vs P30v3 = 0.784) — within the ±1.3pp noise
+floor — but the preference and assistant subtype lifts are well
+above their respective noise floors and durable. Multi-session
+−3.7pp vs P43_v1 because the fragmented per-bullet matches that
+helped it before are gone.
+
+**Splitter fix shipped to canonical** since it costs nothing
+(faster retrieve too, 3-5s vs 5-7s per query).
+
+Subatom + triple_augment_v2 NOT shipped to canonical — net flat
+at the overall level despite favorable per-subtype shape. Stays
+behind `enable_subatom_beam = false` and `enable_triple_augment_v2
+= false` defaults.
+
+Full data: BENCHMARK-RESULTS.md §msam_p43_canon_v2 and
+§msam_p43_p41_canon_v2.
 
 **Why.** P43 bench (msam_p43_canon_v1) showed sentence-level
 retrieval helps multi-session +2.2pp but hurts knowledge-update
