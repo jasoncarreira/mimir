@@ -36,22 +36,39 @@ def question_to_event(question: dict[str, Any]) -> dict[str, Any]:
     The trigger is ``user_message`` so mimir's pre-message hook fires
     (saga query, contextual rewrite if enabled, etc.). channel_id is
     ``bench-<question_id>`` so BenchBridge handles outbound and the
-    reactions log scopes per-question. Includes ``content_meta`` with
-    the question's reference date so the agent can pass it into saga's
-    temporal pathway via ``hybrid_retrieve(reference_date=...)`` if a
-    future hook reads it.
+    reactions log scopes per-question.
+
+    ``extra.event_ts_iso`` overrides the prompt-header timestamp the
+    agent sees, anchoring "today" to the question's contemporaneous
+    date. Critical for temporal-reasoning probes — without it, the
+    agent computes "weeks ago" against the wall clock (2026) while
+    LongMemEval haystacks are dated 2023.
     """
     qid = question["question_id"]
     return {
         "trigger": "user_message",
         "channel_id": f"bench-{qid}",
         "content": question["question"],
-        "content_meta": {
+        "extra": {
             "question_id": qid,
-            "question_date": question.get("question_date"),
-            "reference_date_iso": question.get("question_date"),
+            "event_ts_iso": _question_date_to_iso(question.get("question_date")),
         },
     }
+
+
+def _question_date_to_iso(qdate: str | None) -> str | None:
+    """LongMemEval question_date is ``"2023/05/30 (Tue) 23:40"``; mimir's
+    prompt header expects ISO. Returns None if parse fails so the agent
+    falls back to wall-clock (preserving production behavior)."""
+    if not qdate:
+        return None
+    from datetime import datetime, timezone
+    try:
+        return datetime.strptime(qdate, "%Y/%m/%d (%a) %H:%M").replace(
+            tzinfo=timezone.utc
+        ).isoformat()
+    except (ValueError, TypeError):
+        return None
 
 
 def channel_id_for(question_id: str) -> str:
