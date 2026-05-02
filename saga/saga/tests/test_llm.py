@@ -241,6 +241,149 @@ def test_anthropic_import_error_falls_back_to_openai_compat(monkeypatch):
     assert called["openai_compat"]
 
 
+# ─── claude_code (Max OAuth via claude-agent-sdk) ───────────────
+
+
+class _FakeContent:
+    def __init__(self, text):
+        self.text = text
+
+
+class _FakeAssistantMsg:
+    def __init__(self, blocks):
+        self.content = blocks
+
+
+def _install_fake_claude_agent_sdk(monkeypatch, *, blocks_per_msg=None,
+                                    captured=None, raise_on_query=None):
+    """Install a fake `claude_agent_sdk` module with a query() that
+    yields AssistantMessage-like objects."""
+    fake_mod = types.ModuleType("claude_agent_sdk")
+
+    class _FakeOptions:
+        def __init__(self, **kwargs):
+            if captured is not None:
+                captured["options"] = kwargs
+
+    fake_mod.ClaudeAgentOptions = _FakeOptions
+
+    async def fake_query(*, prompt, options):
+        if captured is not None:
+            captured["prompt"] = prompt
+        if raise_on_query:
+            raise raise_on_query
+        for blocks in (blocks_per_msg or [[]]):
+            yield _FakeAssistantMsg(blocks)
+
+    fake_mod.query = fake_query
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_mod)
+
+
+def test_claude_code_happy_path(monkeypatch):
+    from saga._llm import call_llm_sync
+
+    captured = {}
+    _install_fake_claude_agent_sdk(
+        monkeypatch,
+        blocks_per_msg=[[_FakeContent("hello "), _FakeContent("world")]],
+        captured=captured,
+    )
+
+    out = call_llm_sync(
+        {"provider": "claude_code", "model": "claude-haiku-4-5"},
+        prompt="hi", system="be brief",
+    )
+    assert out == "hello world"
+    assert captured["prompt"] == "hi"
+    assert captured["options"]["model"] == "claude-haiku-4-5"
+    assert captured["options"]["system_prompt"] == "be brief"
+
+
+def test_claude_code_omits_unset_options(monkeypatch):
+    """When model/system aren't provided, ClaudeAgentOptions doesn't get
+    those keys — lets the CLI's defaults / user CLAUDE_MODEL win."""
+    from saga._llm import call_llm_sync
+
+    captured = {}
+    _install_fake_claude_agent_sdk(
+        monkeypatch,
+        blocks_per_msg=[[_FakeContent("ok")]],
+        captured=captured,
+    )
+
+    call_llm_sync({"provider": "claude_code"}, prompt="x")
+    assert "model" not in captured["options"]
+    assert "system_prompt" not in captured["options"]
+
+
+def test_claude_code_concatenates_multi_message_stream(monkeypatch):
+    """query() can yield several AssistantMessages (e.g., interleaved
+    with system messages we ignore). Text from all of them is joined."""
+    from saga._llm import call_llm_sync
+
+    _install_fake_claude_agent_sdk(
+        monkeypatch,
+        blocks_per_msg=[
+            [_FakeContent("first ")],
+            [_FakeContent("second")],
+        ],
+    )
+
+    out = call_llm_sync({"provider": "claude_code"}, prompt="x")
+    assert out == "first second"
+
+
+def test_claude_code_skips_blocks_without_text(monkeypatch):
+    """Tool_use / thinking blocks lack a .text attr — skipped."""
+    from saga._llm import call_llm_sync
+
+    class _NonText:
+        pass  # no .text
+
+    _install_fake_claude_agent_sdk(
+        monkeypatch,
+        blocks_per_msg=[[_FakeContent("a"), _NonText(), _FakeContent("b")]],
+    )
+
+    out = call_llm_sync({"provider": "claude_code"}, prompt="x")
+    assert out == "ab"
+
+
+def test_claude_code_query_exception_returns_empty(monkeypatch):
+    from saga._llm import call_llm_sync
+
+    _install_fake_claude_agent_sdk(
+        monkeypatch,
+        raise_on_query=RuntimeError("CLI not authenticated"),
+    )
+
+    out = call_llm_sync({"provider": "claude_code"}, prompt="x")
+    assert out == ""
+
+
+def test_claude_code_import_error_falls_back_to_openai_compat(monkeypatch):
+    """If claude-agent-sdk isn't installed, fall through to openai_compat —
+    keeps standalone saga environments runnable."""
+    from saga import _llm
+
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
+
+    called = {"hit": False}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        called["hit"] = True
+        return _FakeResp({"choices": [{"message": {"content": "fallback"}}]})
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    out = _llm.call_llm_sync(
+        {"provider": "claude_code", "url": "u", "api_key": "k"},
+        prompt="x",
+    )
+    assert out == "fallback"
+    assert called["hit"]
+
+
 def test_anthropic_exception_returns_empty(monkeypatch):
     from saga._llm import call_llm_sync
 

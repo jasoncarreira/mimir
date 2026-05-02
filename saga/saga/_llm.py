@@ -57,6 +57,11 @@ def call_llm_sync(
             llm, prompt=prompt, max_tokens=max_tokens,
             temperature=temperature, system=system,
         )
+    if provider == "claude_code":
+        return _call_claude_code(
+            llm, prompt=prompt, max_tokens=max_tokens,
+            temperature=temperature, system=system,
+        )
     return _call_openai_compat(
         llm, prompt=prompt, max_tokens=max_tokens,
         temperature=temperature, system=system,
@@ -105,6 +110,98 @@ def _call_anthropic(
         if text:
             pieces.append(text)
     return "".join(pieces).strip()
+
+
+def _call_claude_code(
+    llm: dict[str, Any], *,
+    prompt: str, max_tokens: int, temperature: float,
+    system: str | None,
+) -> str:
+    """Route through claude-agent-sdk's ``query()`` — a one-shot Claude
+    Code subprocess. Inherits OAuth from ``claude login`` (Max plan)
+    so saga's internal LLM calls (consolidation synthesis, contextual
+    rewrite, triple extraction, etc.) don't need a separate API key.
+
+    Tradeoffs vs. ``anthropic``:
+    - **Auth**: free under Max — no API credit needed.
+    - **Latency**: ~500ms-2s subprocess spawn per call. For bench runs
+      with many consolidation clusters this adds up; consider
+      ``provider = "openai_compat"`` with gpt-5.4-nano for direct bench
+      parity against ``saga_p30_canon_v4 = 0.774``.
+    - **Quota**: counts against your 5h / 7d Max windows. Daily mimir
+      use is fine; a 500-question bench can eat through quickly.
+    - **Reproducibility**: Max plan throttles via wait, not 429. Bench
+      numbers may drift more than direct-API runs.
+
+    saga's ``call_llm_sync`` is a sync function; we bridge to the async
+    ``query()`` via ``asyncio.run`` from a saga thread (every call site
+    is wrapped in ``asyncio.to_thread`` at mimir's boundary, so we're
+    not on the event loop here).
+
+    The ``temperature`` and ``max_tokens`` knobs aren't honored by
+    Claude Code — the CLI doesn't expose them. ``model`` from the llm
+    dict overrides the CLI default; otherwise the user's
+    ``CLAUDE_MODEL`` env or claude config wins.
+    """
+    try:
+        # Lazy import: claude-agent-sdk lives in mimir's deps but saga
+        # doesn't depend on mimir, and standalone saga environments may
+        # not have it installed.
+        from claude_agent_sdk import query, ClaudeAgentOptions
+    except ImportError:
+        log.warning("claude-agent-sdk not installed; falling back to openai_compat")
+        return _call_openai_compat(
+            llm, prompt=prompt, max_tokens=max_tokens,
+            temperature=temperature, system=system,
+        )
+
+    import asyncio
+
+    options_kwargs: dict[str, Any] = {}
+    model = llm.get("model")
+    if model:
+        options_kwargs["model"] = model
+    if system:
+        options_kwargs["system_prompt"] = system
+
+    async def _run() -> str:
+        pieces: list[str] = []
+        try:
+            async for msg in query(
+                prompt=prompt,
+                options=ClaudeAgentOptions(**options_kwargs),
+            ):
+                # AssistantMessage is the one with content blocks. Other
+                # types (ResultMessage, SystemMessage) we ignore — saga
+                # prompts don't request tools, only text.
+                content = getattr(msg, "content", None)
+                if not content:
+                    continue
+                for block in content:
+                    text = getattr(block, "text", None)
+                    if text:
+                        pieces.append(text)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("claude-agent-sdk query failed: %s", exc)
+            return ""
+        return "".join(pieces).strip()
+
+    try:
+        return asyncio.run(_run())
+    except RuntimeError as exc:
+        # asyncio.run raises if we're already inside an event loop. saga's
+        # hot paths run via asyncio.to_thread (i.e., on a worker thread
+        # without a loop), so this is rare — only happens if a caller is
+        # using saga directly from inside an async context.
+        log.warning(
+            "claude_code provider can't bridge an existing event loop "
+            "(%s); falling back to openai_compat",
+            exc,
+        )
+        return _call_openai_compat(
+            llm, prompt=prompt, max_tokens=max_tokens,
+            temperature=temperature, system=system,
+        )
 
 
 def _call_openai_compat(
