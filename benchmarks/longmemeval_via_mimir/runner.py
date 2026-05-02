@@ -222,7 +222,7 @@ async def _run_one_question(
     dispatcher: Any,
     bench_bridge: Any,
     bench_stream: io.StringIO,
-    aiohttp_app: Any,
+    client: Any,
     turns_log: Path,
 ) -> dict[str, Any] | None:
     """Drive a single LongMemEval question through mimir's dispatcher.
@@ -237,8 +237,14 @@ async def _run_one_question(
     doesn't for a normal user_message reply. We still pass through the
     bench_stream as a secondary check in case the agent did use
     send_message.
+
+    The aiohttp ``client`` is created ONCE for the whole run and reused
+    across questions. Re-creating it per question (the previous design)
+    triggered ``app.on_startup`` / ``on_cleanup`` each iteration,
+    starting and tearing down the dispatcher worker — only the LAST
+    question's turn actually completed because the worker shut down
+    between iterations.
     """
-    from aiohttp.test_utils import TestClient, TestServer
     from saga.benchmarks.longmemeval.ingest import ingest_question
 
     qid = question["question_id"]
@@ -270,12 +276,24 @@ async def _run_one_question(
     turns_pos_before = turns_log.stat().st_size if turns_log.exists() else 0
     stream_pos_before = bench_stream.tell()
 
-    async with TestClient(TestServer(aiohttp_app)) as client:
-        body = question_to_event(question)
-        resp = await client.post("/event", json=body)
-        if resp.status != 200:
-            return None
-        await dispatcher.drain()
+    body = question_to_event(question)
+    channel_id = body["channel_id"]
+    resp = await client.post("/event", json=body)
+    if resp.status != 200:
+        text = await resp.text()
+        print(
+            f"  /event POST for {qid} returned {resp.status}: {text[:300]}",
+            file=sys.stderr,
+        )
+        return None
+    # Wait for *this question's* turn to finish without closing the
+    # dispatcher. dispatcher.drain() sets _closed=True and cancels
+    # workers, breaking subsequent /event POSTs (queue_full_or_closed).
+    # Per-channel queue.join() blocks until the worker calls task_done()
+    # — i.e., until the agent finishes this turn.
+    queue = dispatcher._queues.get(channel_id)
+    if queue is not None:
+        await queue.join()
 
     # Primary hypothesis source: turns.jsonl output for the just-run turn.
     hypothesis = _extract_hypothesis_from_turns(
@@ -416,25 +434,31 @@ async def _amain(argv: list[str] | None = None) -> int:
     written: list[dict] = []
     failed: list[str] = []
     turns_log = home / "logs" / "turns.jsonl"
-    for q in dataset:
-        try:
-            rec = await _run_one_question(
-                question=q,
-                dispatcher=dispatcher,
-                bench_bridge=bench_bridge,
-                bench_stream=bench_stream,
-                aiohttp_app=app,
-                turns_log=turns_log,
-            )
-        except Exception as exc:  # noqa: BLE001 — keep going on per-question crashes
-            print(f"  question {q['question_id']} crashed: {exc}", file=sys.stderr)
-            failed.append(q["question_id"])
-            continue
 
-        if rec is None:
-            failed.append(q["question_id"])
-            continue
-        written.append(rec)
+    # Open ONE TestClient for the entire run. Each enter/exit fires
+    # app.on_startup/on_cleanup, which starts and shuts down the
+    # dispatcher worker; per-question scoping silently lost everything
+    # except the last question's turn.
+    from aiohttp.test_utils import TestClient, TestServer
+    async with TestClient(TestServer(app)) as client:
+        for q in dataset:
+            try:
+                rec = await _run_one_question(
+                    question=q,
+                    dispatcher=dispatcher,
+                    bench_bridge=bench_bridge,
+                    bench_stream=bench_stream,
+                    client=client,
+                    turns_log=turns_log,
+                )
+            except Exception as exc:  # noqa: BLE001 — keep going on per-question crashes
+                print(f"  question {q['question_id']} crashed: {exc}", file=sys.stderr)
+                failed.append(q["question_id"])
+                continue
+            if rec is None:
+                failed.append(q["question_id"])
+                continue
+            written.append(rec)
 
     n = write_hypotheses_jsonl(hypotheses_path, written)
     print(f"wrote {n} hypotheses to {hypotheses_path}")
