@@ -192,6 +192,11 @@ class _DiscordClient(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.messages = True
+        # Reaction intents — needed so on_raw_reaction_add fires for
+        # reactions to messages the bot didn't see live (i.e. bot
+        # restart between send and reaction). The "raw" variants
+        # don't require the message to be in the client's cache.
+        intents.reactions = True
         super().__init__(intents=intents)
         self._bridge = bridge
 
@@ -201,6 +206,15 @@ class _DiscordClient(discord.Client):
 
     async def on_message(self, message: discord.Message) -> None:  # pragma: no cover - network
         await self._bridge._on_message(message)
+
+    async def on_raw_reaction_add(self, payload) -> None:  # pragma: no cover - network
+        await self._bridge._on_reaction(payload, action="add")
+
+    async def on_raw_reaction_remove(self, payload) -> None:  # pragma: no cover - network
+        # We surface "react add" as the algedonic signal; removes are
+        # noise (people fix typo'd reactions). Hook is here for future
+        # use (e.g. counting net-positive reactions).
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +411,80 @@ class DiscordBridge(Bridge):
             },
         )
         await self.enqueue(event)
+
+    async def _on_reaction(self, payload: Any, action: str = "add") -> None:
+        """Handle inbound reaction-add events. Emits a ``react_received``
+        event into events.jsonl which the algedonic surfacing in
+        ``mimir.feedback`` picks up (24h window, polarity classified
+        per emoji). Skips reactions the bot itself added (bot's own
+        ``react`` tool calls). Skips non-bot-message targets so we
+        only see reactions to OUR replies, not noise from the channel.
+
+        ``payload`` is a discord.RawReactionActionEvent — unlike
+        on_reaction_add(reaction, user), the raw variant fires even
+        when the target message isn't in the client's message cache
+        (i.e., reactions to messages from before the bot started)."""
+        from ..event_logger import log_event
+        from ..reactions import classify_reaction, normalize_emoji
+
+        # Skip our own reactions (the agent reacting via the react tool).
+        client_user = getattr(self._client, "user", None) if self._client else None
+        if client_user is not None and getattr(payload, "user_id", None) == getattr(
+            client_user, "id", None
+        ):
+            return
+
+        # Only count reactions on the BOT'S messages — that's what
+        # makes them feedback. A user reacting to another user's
+        # message isn't a signal about the agent's behavior.
+        try:
+            channel = self._client.get_channel(payload.channel_id) if self._client else None
+            if channel is None:
+                return
+            target_msg = await channel.fetch_message(payload.message_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("DiscordBridge._on_reaction: could not fetch target: %s", exc)
+            return
+        target_author = getattr(target_msg, "author", None)
+        if target_author is None or getattr(target_author, "id", None) != getattr(
+            client_user, "id", None
+        ):
+            return
+
+        # Resolve emoji string. discord.PartialEmoji can be unicode
+        # or custom; ``str()`` works for both.
+        emoji_glyph = normalize_emoji(str(payload.emoji))
+        polarity = classify_reaction(emoji_glyph)
+
+        # Compute target message age for the algedonic renderer.
+        target_age_minutes: float | None = None
+        try:
+            from datetime import datetime, timezone
+            created = target_msg.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            target_age_minutes = (
+                datetime.now(tz=timezone.utc) - created
+            ).total_seconds() / 60.0
+        except Exception:  # noqa: BLE001
+            pass
+
+        author_id = str(getattr(payload, "user_id", "") or "") or None
+        channel_id = _channel_to_id(channel)
+        try:
+            await log_event(
+                "react_received",
+                bridge=self.name,
+                channel_id=channel_id,
+                emoji=emoji_glyph,
+                polarity=polarity,
+                action=action,
+                author=f"discord-{author_id}" if author_id else "?",
+                target_message_id=str(getattr(payload, "message_id", "") or "") or None,
+                target_age_minutes=target_age_minutes,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 __all__ = [

@@ -376,9 +376,13 @@ class SlackBridge(Bridge):
             # and just log the mention as observability.
             log.debug("slack app_mention from %s in %s", event.get("user"), event.get("channel"))
 
+        async def on_reaction_added(event: dict[str, Any]) -> None:
+            await self._on_reaction(event)
+
         # The slack-bolt decorator registers under the underlying app.
         app.message(on_message)
         app.event("app_mention")(on_app_mention)
+        app.event("reaction_added")(on_reaction_added)
 
     async def _on_message(self, event: dict[str, Any]) -> None:
         # Skip our own messages.
@@ -442,6 +446,66 @@ class SlackBridge(Bridge):
             },
         )
         await self.enqueue(agent_event)
+
+    async def _on_reaction(self, event: dict[str, Any]) -> None:
+        """Surface inbound reactions on the bot's messages as
+        ``react_received`` events. mimir.feedback's algedonic block
+        (24h window) picks them up and shows them in the next turn's
+        prompt under "Recent feedback signals."
+
+        Slack delivers ``reaction_added`` events for every reaction in
+        every channel the app is in — we filter to:
+          - reactions the bot itself didn't add (not own-tool feedback)
+          - reactions on the bot's own messages (signal about us)
+        """
+        from ..event_logger import log_event
+        from ..reactions import classify_reaction, normalize_emoji
+
+        user_id = event.get("user")
+        if user_id is None or (self._bot_user_id and user_id == self._bot_user_id):
+            return
+
+        item = event.get("item") or {}
+        target_user = (item.get("item_user")
+                       or event.get("item_user"))  # older payloads
+        if target_user is None or target_user != self._bot_user_id:
+            return
+
+        slack_channel = item.get("channel") or ""
+        # We don't always know the channel_type from the reaction
+        # payload; fall back to the public-channel encoding. Bench
+        # bridges never get reaction events anyway.
+        channel_id = _slack_channel_to_id(slack_channel, None)
+
+        emoji_raw = event.get("reaction") or ""
+        emoji_glyph = normalize_emoji(emoji_raw)
+        polarity = classify_reaction(emoji_glyph)
+
+        target_age_minutes: float | None = None
+        target_ts = item.get("ts")
+        if target_ts:
+            try:
+                from datetime import datetime, timezone
+                target_age_minutes = (
+                    datetime.now(tz=timezone.utc).timestamp() - float(target_ts)
+                ) / 60.0
+            except (ValueError, TypeError):
+                pass
+
+        try:
+            await log_event(
+                "react_received",
+                bridge=self.name,
+                channel_id=channel_id,
+                emoji=emoji_glyph,
+                polarity=polarity,
+                action="add",
+                author=f"slack-{user_id}",
+                target_message_id=target_ts,
+                target_age_minutes=target_age_minutes,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 __all__ = [

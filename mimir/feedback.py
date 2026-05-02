@@ -131,7 +131,18 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "react":
         emoji = ev.get("emoji") or "?"
         author = ev.get("author") or "?"
-        return f'react("{emoji}") from {author}'
+        target_age = ev.get("target_age_minutes")
+        age_suffix = ""
+        if isinstance(target_age, (int, float)):
+            if target_age < 1:
+                age_suffix = " on just-sent message"
+            elif target_age < 60:
+                age_suffix = f" on message from {int(target_age)}m ago"
+            elif target_age < 1440:
+                age_suffix = f" on message from {int(target_age / 60)}h ago"
+            else:
+                age_suffix = f" on message from {int(target_age / 1440)}d ago"
+        return f'react("{emoji}") from {author}{age_suffix}'
     if rule_kind == "error":
         # Generic error event; surface .where + .error if present.
         # Collapse whitespace so multi-line tracebacks don't break the
@@ -200,6 +211,18 @@ class FeedbackLog:
             if rule is None:
                 continue
             polarity, kind = rule
+            # react_received carries its own polarity (positive/negative/
+            # neutral) classified per-emoji at bridge level. Use that
+            # over the default-positive rule mapping. ``"neutral"`` skips
+            # the event from both polarity buckets — surfaced via the
+            # generic line below if there's render space, otherwise
+            # silently dropped (it's informational, not pain/pleasure).
+            if evtype == "react_received":
+                ev_polarity = ev.get("polarity")
+                if ev_polarity in ("positive", "negative"):
+                    polarity = ev_polarity
+                elif ev_polarity == "neutral":
+                    continue
             target = negatives if polarity == "negative" else positives
             if len(target) >= limit:
                 continue
