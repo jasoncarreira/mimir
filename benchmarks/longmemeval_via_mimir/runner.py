@@ -194,6 +194,65 @@ def _write_bench_saga_toml(home: Path) -> None:
     (home / "saga.toml").write_text(body)
 
 
+_BENCH_REFERENCE_DATE = None  # set per-question in _run_one_question
+_BENCH_TOP_K = 20  # match saga.benchmarks.longmemeval.config.RETRIEVAL_TOP_K
+
+
+def _install_saga_bench_overrides() -> None:
+    """Bench-only monkey-patches that match saga's run_eval.py shape:
+
+    1. ``saga.core.hybrid_retrieve`` injects per-question
+       ``reference_date`` (parsed from ``q["question_date"]``) when the
+       caller doesn't supply one. mimir's pre-message hook calls
+       ``saga.query()`` without ref_date — production gets ``now()``,
+       which is correct for live agents but wrong for a 2023-dated
+       LongMemEval haystack run from 2026 (every "2 weeks ago" probe
+       computes against the wrong "now"). saga's run_eval parses the
+       question_date and threads it through; we replicate that here
+       without touching the SagaClient API.
+
+    2. ``mimir.saga_client._InProcessSaga.query`` bumps any caller-
+       supplied ``top_k`` to ``_BENCH_TOP_K`` (20). saga's bench used
+       RETRIEVAL_TOP_K=20; mimir's pre-message hook hardcodes 12. The
+       agent gets more retrieved-atom context this way — same shape the
+       Minimax reader had in saga's run_eval.
+
+    Both patches are idempotent — calling this twice is safe. Both are
+    scoped to the bench process; production mimir is untouched.
+    """
+    import saga.core as _saga_core
+    if not getattr(_saga_core, "_bench_patched", False):
+        _orig_retrieve = _saga_core.hybrid_retrieve
+
+        def _patched_retrieve(*args, reference_date=None, **kwargs):
+            if reference_date is None and _BENCH_REFERENCE_DATE is not None:
+                reference_date = _BENCH_REFERENCE_DATE
+            return _orig_retrieve(*args, reference_date=reference_date, **kwargs)
+
+        _saga_core.hybrid_retrieve = _patched_retrieve
+        _saga_core._bench_patched = True
+
+    from mimir import saga_client as _sc
+    if not getattr(_sc._InProcessSaga, "_bench_patched", False):
+        _orig_query = _sc._InProcessSaga.query
+
+        async def _patched_query(self, query, *, top_k=12, **kwargs):
+            return await _orig_query(self, query, top_k=_BENCH_TOP_K, **kwargs)
+
+        _sc._InProcessSaga.query = _patched_query
+        _sc._InProcessSaga._bench_patched = True
+
+
+def _parse_question_date(question: dict) -> Any:
+    from datetime import datetime, timezone
+    try:
+        return datetime.strptime(
+            question["question_date"], "%Y/%m/%d (%a) %H:%M",
+        ).replace(tzinfo=timezone.utc)
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 def _switch_saga_db(db_path: Path) -> None:
     """Point the in-process saga at a fresh SQLite file for this question.
 
@@ -253,6 +312,12 @@ async def _run_one_question(
     work_dir = Path(os.environ.get("SAGA_DATA_DIR", "."))
     db_path = work_dir / f"q_{qid}.db"
     _switch_saga_db(db_path)
+    # Anchor saga's temporal pathway to the question's contemporaneous
+    # date; otherwise temporal-reasoning probes ("2 weeks ago", "last
+    # spring") compute against system clock and miss every time on a
+    # 2023-haystack-from-2026 bench.
+    global _BENCH_REFERENCE_DATE
+    _BENCH_REFERENCE_DATE = _parse_question_date(question)
     ingest_question(question)
 
     # Consolidate. saga's run_eval.py runs this between ingest and
@@ -420,6 +485,12 @@ async def _amain(argv: list[str] | None = None) -> int:
         os.environ["SAGA_CONFIG"] = str(custom_path)
     else:
         _write_bench_saga_toml(home)
+
+    # Install bench-only monkey-patches AFTER saga and mimir are
+    # importable but BEFORE the app builds. _install_saga_bench_overrides
+    # patches saga.core.hybrid_retrieve (per-question reference_date)
+    # and _InProcessSaga.query (top_k bump to 20 to match saga's bench).
+    _install_saga_bench_overrides()
     from mimir.config import Config
     cfg = Config.from_env()
     cfg = replace(cfg, home=home)
