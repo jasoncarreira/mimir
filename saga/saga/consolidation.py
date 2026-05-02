@@ -459,15 +459,21 @@ class ConsolidationEngine:
                 if row is None:
                     # Fresh insert — embedding pulled from the batch above.
                     embedding = embeddings_by_tid.get(tid)
+                    # P37(a): pass through valid_from/valid_until from the
+                    # consolidation LLM output. Both nullable; null means
+                    # "always valid" per query_world's filter logic.
+                    valid_from = t.get("valid_from")
+                    valid_until = t.get("valid_until")
                     try:
                         conn.execute(
                             "INSERT OR IGNORE INTO triples "
                             "(id, atom_id, subject, predicate, object, "
-                            " confidence, embedding, created_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            " confidence, embedding, created_at, "
+                            " valid_from, valid_until) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             (tid, new_obs_id, t["subject"], t["predicate"],
                              t["object"], float(t.get("confidence", 1.0)),
-                             embedding, now),
+                             embedding, now, valid_from, valid_until),
                         )
                         persisted += 1
                     except Exception:
@@ -659,7 +665,8 @@ class ConsolidationEngine:
                         f"<one or two sentences capturing what the atoms collectively convey>\n\n"
                         f"TRIPLES:\n"
                         f"(subject, predicate, object)\n"
-                        f"(subject, predicate, object)\n"
+                        f"(subject, predicate, object, valid_from=YYYY-MM-DD)\n"
+                        f"(subject, predicate, object, valid_from=YYYY-MM-DD, valid_until=YYYY-MM-DD)\n"
                         f"...\n"
                         f"[OR write: NONE if no clean triples]\n\n"
                         f"Rules for the OBSERVATION:\n"
@@ -677,6 +684,17 @@ class ConsolidationEngine:
                         f"- Implicit subject 'User' for user-preference statements\n"
                         f"- Lists become multiple triples (one per item)\n"
                         f"- Skip emotional/philosophical/meta-commentary content (write NONE)\n\n"
+                        f"Rules for TEMPORAL TAGS (optional valid_from/valid_until):\n"
+                        f"- Use ONLY when the atoms show a fact CHANGED over time. Take the\n"
+                        f"  ``YYYY-MM-DD`` from the dated atom prefix(es).\n"
+                        f"- ``valid_from`` only: fact starts on a date and is still current\n"
+                        f"  (most user-preference statements). Example: user moves to a new\n"
+                        f"  city — emit (User, lives_in, NewCity, valid_from=YYYY-MM-DD).\n"
+                        f"- Both bounds: closed interval. Example: user held a job from A to\n"
+                        f"  B — emit (User, employed_at, OldJob, valid_from=A, valid_until=B).\n"
+                        f"- DO NOT add bounds to facts that don't change (genres, languages,\n"
+                        f"  ratings, etc.). DO NOT use the consolidation date — use the\n"
+                        f"  source atom's own date.\n\n"
                         f"{prior_block}"
                         f"Atoms:\n- {joined}"
                     )

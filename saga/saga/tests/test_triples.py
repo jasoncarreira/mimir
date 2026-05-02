@@ -585,3 +585,68 @@ class TestBatchExtractAndStore:
         a2 = store_atom("user likes sushi")
         count = batch_extract_and_store([(a1, "User lives in Boston"), (a2, "User likes sushi")])
         assert count == 2
+
+
+class TestParseTriplesTemporalTags:
+    """P37(a) — _parse_triples must accept the optional valid_from /
+    valid_until kv-pair tail introduced for the temporal world model."""
+
+    def test_three_tuple_form_unchanged(self):
+        from saga.triples import _parse_triples
+        out = _parse_triples("(User, lives_in, Boston)\n(User, likes, jazz)")
+        assert len(out) == 2
+        assert out[0]["subject"] == "User"
+        assert out[0]["object"] == "Boston"
+        assert "valid_from" not in out[0]
+        assert "valid_until" not in out[0]
+
+    def test_valid_from_only(self):
+        from saga.triples import _parse_triples
+        out = _parse_triples(
+            "(User, lives_in, Boston, valid_from=2023-05-30)"
+        )
+        assert len(out) == 1
+        assert out[0]["valid_from"] == "2023-05-30"
+        assert "valid_until" not in out[0]
+
+    def test_both_temporal_bounds(self):
+        from saga.triples import _parse_triples
+        out = _parse_triples(
+            "(User, employed_at, OldJob, valid_from=2022-01-01, valid_until=2023-06-15)"
+        )
+        assert len(out) == 1
+        assert out[0]["valid_from"] == "2022-01-01"
+        assert out[0]["valid_until"] == "2023-06-15"
+
+    def test_null_temporal_value_ignored(self):
+        """``valid_until=null`` is the LLM's way of saying 'still current';
+        we represent that by simply omitting the column."""
+        from saga.triples import _parse_triples
+        out = _parse_triples(
+            "(User, lives_in, Boston, valid_from=2023-05-30, valid_until=null)"
+        )
+        assert out[0]["valid_from"] == "2023-05-30"
+        assert "valid_until" not in out[0]
+
+    def test_unknown_kv_keys_silently_dropped(self):
+        """Forward-compatibility: unknown trailing keys don't break parse."""
+        from saga.triples import _parse_triples
+        out = _parse_triples(
+            "(User, lives_in, Boston, valid_from=2023-05-30, source=email)"
+        )
+        assert len(out) == 1
+        assert out[0]["valid_from"] == "2023-05-30"
+        assert "source" not in out[0]
+
+    def test_mixed_lines(self):
+        """A block can mix 3-tuple and tagged forms — both parse."""
+        from saga.triples import _parse_triples
+        out = _parse_triples(
+            "(User, likes, jazz)\n"
+            "(User, lives_in, Boston, valid_from=2023-05-30)\n"
+            "(User, employed_at, OldJob, valid_from=2022-01-01, valid_until=2023-06-15)\n"
+        )
+        assert len(out) == 3
+        assert "valid_from" not in out[0]
+        assert out[1]["valid_from"] == "2023-05-30"
+        assert out[2]["valid_until"] == "2023-06-15"

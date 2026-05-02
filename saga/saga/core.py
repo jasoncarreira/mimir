@@ -1877,6 +1877,94 @@ def _triple_augment_v2(query: str, top_k: int = 10) -> list[dict]:
 _subatom_recursion_guard = threading.local()
 
 
+def _world_model_pathway(query: str, top_k: int = 20,
+                         reference_date=None) -> list[dict]:
+    """P37(b) — world-model retrieval pathway.
+
+    Extract entities from the query (existing
+    ``retrieval_v2.extract_query_entities``), call ``query_world(entity)``
+    for each, return the source atoms of currently-valid triples as a
+    new RRF ranker.
+
+    Different shape from triple_augment_v2 (P41):
+    - P41 cosine-matches the query embedding against every active triple
+      embedding — fires for any retrieve that has triples populated.
+    - P37 entity-matches the triple's *subject* column against entities
+      extracted from the query, and is filtered to currently-valid
+      triples by ``query_world``'s built-in temporal predicate.
+
+    Strict no-op when ``[retrieval] enable_world_model_pathway`` is
+    False (default). When on, returns atoms in entity-discovery order
+    (effectively: by entity match priority, then triple recency).
+    Downstream RRF uses rank, so per-entry score isn't sensitive.
+
+    ``reference_date`` (optional) — anchors "currently valid" to a
+    specific point in time. Bench harness passes the question's
+    contemporaneous date so 2023-haystack questions don't see
+    "current" defined as 2026 wall-clock.
+    """
+    if not _cfg('retrieval', 'enable_world_model_pathway', False):
+        return []
+
+    try:
+        from .retrieval_v2 import extract_query_entities
+        from .triples import query_world
+    except Exception:
+        return []
+
+    entities = extract_query_entities(query)
+    if not entities:
+        return []
+
+    # Anchor "currently valid" — pass the bench reference_date through
+    # query_world's at_time arg so currently-valid means valid at the
+    # question_date, not at wall-clock time.
+    at_time = None
+    if reference_date is not None:
+        at_time = reference_date.isoformat() if hasattr(reference_date, "isoformat") else str(reference_date)
+
+    seen: set[str] = set()
+    source_ids: list[str] = []
+    for ent in entities:
+        try:
+            triples = query_world(entity=ent, at_time=at_time)
+        except Exception:
+            continue
+        for t in triples:
+            sid = t.get("source_atom_id") or t.get("atom_id")
+            if sid and sid not in seen:
+                seen.add(sid)
+                source_ids.append(sid)
+        if len(source_ids) >= top_k:
+            break
+
+    if not source_ids:
+        return []
+    source_ids = source_ids[:top_k]
+
+    conn = get_db()
+    try:
+        placeholders = ",".join("?" * len(source_ids))
+        rows = conn.execute(
+            f"SELECT * FROM atoms WHERE id IN ({placeholders}) "
+            f"AND state IN ('active','fading')",
+            tuple(source_ids),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    by_id = {r['id']: dict(r) for r in rows}
+    out: list[dict] = []
+    for aid in source_ids:
+        if aid not in by_id:
+            continue
+        atom = by_id[aid]
+        atom.pop("embedding", None)
+        atom["_world_model_pathway"] = True
+        out.append(atom)
+    return out
+
+
 def _subatom_beam_atoms(query: str, top_k: int, mode: str) -> list[dict]:
     """P43 beam 2 — sentence-level retrieval via compressed_retrieve,
     folded back to parent atoms with the strongest sentence's score.
@@ -2184,6 +2272,24 @@ def hybrid_retrieve(
                 "path=triple_augment_v2 atoms=%d", len(triple_augment)
             )
 
+    # P37(b) — world-model pathway: entity-matched query_world lookup,
+    # surfaces source atoms of currently-valid triples for entities
+    # extracted from the query. Different code path from P41
+    # (entity match on subject column, not cosine on embedding).
+    # Strict no-op when [retrieval] enable_world_model_pathway is False.
+    world_model: list = []
+    if _fusion == 'rrf':
+        try:
+            world_model = _world_model_pathway(
+                query, top_k=top_k, reference_date=reference_date,
+            )
+        except Exception:
+            world_model = []
+        if world_model:
+            _retrieval_log.info(
+                "path=world_model atoms=%d", len(world_model)
+            )
+
     combined: dict = {}
     for atom in semantic_results:
         combined[atom["id"]] = atom
@@ -2197,6 +2303,8 @@ def hybrid_retrieve(
         combined.setdefault(atom["id"], atom)
     for atom in triple_augment:
         combined.setdefault(atom["id"], atom)
+    for atom in world_model:
+        combined.setdefault(atom["id"], atom)
 
     if _fusion == 'rrf':
         from .retrieval_fusion import reciprocal_rank_fusion
@@ -2208,6 +2316,7 @@ def hybrid_retrieve(
             'hyde_semantic': _cfg('retrieval', 'rrf_hyde_weight', 1.0),
             'subatom': _cfg('retrieval', 'rrf_subatom_weight', 1.0),
             'triple_augment': _cfg('retrieval', 'rrf_triple_augment_weight', 1.0),
+            'world_model': _cfg('retrieval', 'rrf_world_model_weight', 1.0),
         }
         ranked_lists = {
             'semantic': [a["id"] for a in semantic_results],
@@ -2221,6 +2330,8 @@ def hybrid_retrieve(
             ranked_lists['subatom'] = [a["id"] for a in subatom_beam]
         if triple_augment:
             ranked_lists['triple_augment'] = [a["id"] for a in triple_augment]
+        if world_model:
+            ranked_lists['world_model'] = [a["id"] for a in world_model]
         ranked = reciprocal_rank_fusion(ranked_lists, k=_k, weights=weights)
         for aid, score in ranked:
             if aid in combined:
