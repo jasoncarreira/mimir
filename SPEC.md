@@ -31,9 +31,9 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
 ├── README.md
 ├── SPEC.md                       # this document
 ├── Dockerfile
-├── docker/
-│   ├── entrypoint.sh             # starts mimir + msam under one PID 1
-│   └── supervisord.conf          # mimir agent + msam server
+├── docker/                       # (legacy — pre-v0.5 supervisord layout)
+│   ├── entrypoint.sh             # legacy: started mimir + msam under one PID 1
+│   └── supervisord.conf          # legacy: mimir agent + msam (now saga) server
 ├── mimir/                        # python package
 │   ├── __init__.py
 │   ├── server.py                 # entrypoint: HTTP + event loop
@@ -42,7 +42,11 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
 │   ├── memory.py                 # core block loading
 │   ├── index.py                  # INDEX.md generator
 │   ├── search.py                 # fastembed + sqlite indexer
-│   ├── msam_client.py            # HTTP client for in-container msam
+│   ├── saga_client.py            # SagaClient Protocol + _InProcessSaga
+│   │                             # (default) / _HttpSaga (external-saga
+│   │                             # opt-out). v0.5 §2 — saga lives in the
+│   │                             # same process unless SAGA_ENDPOINT is set
+│   │                             # to a non-localhost URL.
 │   ├── scheduler.py              # add/list/remove schedules
 │   ├── tools.py                  # tool definitions exposed to the SDK
 │   ├── channel_registry.py       # prefix → bridge dispatch (§7.2.3)
@@ -59,19 +63,34 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
 │   ├── web_ui.py                 # aiohttp routes for /turns + /api/turns
 │   ├── turn_viewer.html          # vanilla-JS single-file viewer (open-strix port)
 │   ├── config.py                 # env + config loading
-│   ├── session_manager.py        # per-channel MSAM session lifecycle (§5.6)
+│   ├── session_manager.py        # per-channel saga session lifecycle (§5.6)
 │   ├── prompts/
-│   │   └── msam_session_end.md   # synthesis-turn template (§5.6); overridable via MIMIR_PROMPTS_DIR
+│   │   └── msam_session_end.md   # synthesis-turn template (§5.6); overridable
+│   │                             # via MIMIR_PROMPTS_DIR. (Filename retained
+│   │                             # for back-compat with operator overrides;
+│   │                             # the underlying lifecycle is saga's.)
+│   ├── sagatools.py              # MCP tool wrappers around SagaClient
 │   └── skills/                   # Claude Agent SDK skills (bundled)
 │       ├── memory-search/
 │       │   ├── SKILL.md
 │       │   └── search.py
-│       ├── msam/
-│       │   ├── SKILL.md
-│       │   └── msam.py
+│       ├── memory/               # saga-backed memory tools (renamed from msam/)
+│       │   └── SKILL.md
 │       └── index/
 │           ├── SKILL.md
 │           └── rebuild.py
+├── saga/                         # v0.5 §1 — workspace member, ex-msam2.
+│   ├── pyproject.toml            # saga as a standalone uv-installable
+│   │                             # package (no mimir dep).
+│   ├── saga/                     # python source (was msam/).
+│   └── benchmarks/longmemeval/   # saga-direct retrieval bench.
+└── benchmarks/
+    └── longmemeval_via_mimir/    # v0.5 §3 — integration bench. Drives
+                                  # LongMemEval through mimir's BenchBridge
+                                  # so cache + contextual_rewrite +
+                                  # mark_contributions effects measure
+                                  # end-to-end. NOT under saga/ (saga stays
+                                  # mimir-independent).
 ├── home/                         # default agent home (volume-mounted)
 │   ├── logs/
 │   │   ├── events.jsonl          # firehose: lifecycle, queue, tool, scheduler events
@@ -98,6 +117,9 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
     ├── test_index.py
     ├── test_search.py
     └── test_scheduler.py
+
+(Per-package tests live under each package: ``saga/saga/tests/`` for
+saga, ``tests/`` at workspace root for mimir + integration glue.)
 ```
 
 ---

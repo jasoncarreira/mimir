@@ -608,6 +608,48 @@ When an item from this doc lands, move it to the `## 11. Recently shipped` secti
 
 ## 11. Recently shipped
 
+### 2026-05-01 — v0.5 saga merge + in-process integration
+
+Closed the cross-repo coordination tax between mimir and msam. See
+`V0.5.md` for the full plan and commit refs (`92577cc .. 8e269d5`):
+
+- **§1 Workspace monorepo merge** — `msam2` (hindsight-ideas branch)
+  merged into mimir at `saga/` via `git filter-repo` with full history
+  preservation. uv workspace setup in root `pyproject.toml`. saga stays
+  standalone-runnable (no mimir dep); cross-package integration benches
+  live OUTSIDE saga at `benchmarks/longmemeval_via_mimir/`.
+- **§6 Rename msam → saga** (commits `d318ed9`, `e85eff2`) — Norse
+  poet-goddess of history. Pairs with mimir at the pantheon level;
+  "saga" already carries the English meaning "ongoing chronicle" so
+  the name self-explains. Single-grep rename across imports, tests,
+  config keys, env vars (`MSAM_*` → `SAGA_*`).
+- **§7 Unified LLM transport** (commit `8e269d5`) — saga's 9
+  chat-completion call sites route through `saga._llm.call_llm_sync`
+  which dispatches on `[<section>].provider`: `anthropic` (default,
+  uses `anthropic.Anthropic` Messages API) or `openai_compat` (default
+  for the bench harness, preserves the `requests.post` path against
+  saga_p30_canon_v4 baseline 0.774).
+- **§2 In-process saga adapter** (commit `acdb7da`) — `mimir/saga_client.py`
+  becomes a Protocol with `_InProcessSaga` (default; saga.core via
+  asyncio.to_thread) and `_HttpSaga` (external-saga deployments). HTTP
+  hop eliminated for the same-host case. `mimir setup` writes
+  `<home>/saga.toml` with v0.5 defaults (contextual_rewrite on, triples
+  extraction on, augment_v2 off). Separate SQLite files (saga.db +
+  index.db) in shared `<home>/.mimir/` directory — independent lock
+  granularity for consolidation vs. per-turn reindexes.
+- **§3 Integration bench harness** — `benchmarks/longmemeval_via_mimir/`
+  drives LongMemEval through mimir's `BenchBridge` so cache /
+  contextual_rewrite / mark_contributions / session_boundary effects
+  become end-to-end measurable. Hypotheses JSONL feeds saga's existing
+  gpt-4o judge; numbers stay comparable to the saga-direct baseline.
+
+Also retired:
+- `mimir/saga_client.py` HTTP retry block (still present for `_HttpSaga`)
+  is no longer the default codepath. Production hits saga directly.
+- The "muninnbot pulls msam from local source" path — muninnbot still
+  exists per the operator notes, but mimir's saga story is now
+  self-contained.
+
 ### 2026-05-01 — v0.4 self-awareness loops
 
 Closed several long-standing items. See `V0.4.md` for the full plan and commit refs (`9dd50a2 .. e510178`):
