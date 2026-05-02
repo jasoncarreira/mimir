@@ -10,6 +10,7 @@ Supports:
 Provider is configured via saga.toml [embedding] section.
 """
 
+import logging
 import os
 import sys
 import time
@@ -170,98 +171,62 @@ class LocalProvider(EmbeddingProvider):
 
 
 class ONNXProvider(EmbeddingProvider):
-    """ONNX Runtime local embedding provider. No API key needed, lightweight.
-    
+    """Local ONNX embedding provider, backed by fastembed.
+
     Default model: BAAI/bge-small-en-v1.5 (33MB ONNX, 384 dimensions).
-    Auto-downloads model on first use to ~/.cache/msam/models/.
-    Works on both x86_64 and ARM64.
+    fastembed handles model fetch, ONNX runtime, tokenizer config, and
+    pooling — same library mimir's file_search uses, so we share one
+    on-disk cache (``~/.cache/fastembed/``) instead of paying for the
+    model twice.
+
+    Pre-fastembed implementation downloaded model.onnx + tokenizer.json
+    by hand and ran ``onnxruntime.InferenceSession`` directly with a
+    custom mean-pool. Functionally equivalent; this is just a runtime
+    wrapper swap.
     """
 
     def __init__(self):
         self.model_name = _cfg('embedding', 'model', 'BAAI/bge-small-en-v1.5')
         self.max_chars = _cfg('embedding', 'max_input_chars', 2000)
-        self._session = None
-        self._tokenizer = None
-        self._model_dir = None
-
-    def _get_model_dir(self) -> Path:
-        if self._model_dir is None:
-            cache = Path.home() / ".cache" / "msam" / "models" / self.model_name.replace("/", "--")
-            cache.mkdir(parents=True, exist_ok=True)
-            self._model_dir = cache
-        return self._model_dir
-
-    def _download_model(self):
-        """Download ONNX model and tokenizer from HuggingFace."""
-        import urllib.request
-        model_dir = self._get_model_dir()
-        base_url = f"https://huggingface.co/{self.model_name}/resolve/main"
-        
-        files = {
-            "onnx/model.onnx": "model.onnx",
-            "tokenizer.json": "tokenizer.json",
-        }
-        for remote, local in files.items():
-            local_path = model_dir / local
-            if not local_path.exists():
-                url = f"{base_url}/{remote}"
-                print(f"Downloading {url}...", file=sys.stderr)
-                urllib.request.urlretrieve(url, str(local_path))
+        self._model = None
 
     def _load(self):
-        if self._session is not None:
-            return
-        
-        self._download_model()
-        model_dir = self._get_model_dir()
-        
-        try:
-            import onnxruntime as ort
-        except ImportError:
-            raise RuntimeError("onnxruntime not installed. Run: pip install onnxruntime")
-        
-        try:
-            from tokenizers import Tokenizer
-        except ImportError:
-            raise RuntimeError("tokenizers not installed. Run: pip install tokenizers")
-        
-        self._session = ort.InferenceSession(
-            str(model_dir / "model.onnx"),
-            providers=["CPUExecutionProvider"],
-        )
-        self._tokenizer = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
-        self._tokenizer.enable_truncation(max_length=512)
-        self._tokenizer.enable_padding(length=512)
+        if self._model is None:
+            try:
+                from fastembed import TextEmbedding
+            except ImportError:
+                raise RuntimeError(
+                    "fastembed not installed. Run: pip install fastembed "
+                    "(saga's pyproject already pulls it via the workspace; "
+                    "this only fires in standalone-saga deployments that "
+                    "skipped the optional embedding deps)."
+                )
+            self._model = TextEmbedding(model_name=self.model_name)
+        return self._model
 
     def embed(self, text: str, input_type: str = "passage") -> list[float]:
-        import numpy as np
-        self._load()
-        
-        # BGE models use instruction prefix for queries
-        if input_type == "query":
-            text = f"Represent this sentence: {text}"
-        
-        encoded = self._tokenizer.encode(text[:self.max_chars])
-        input_ids = np.array([encoded.ids], dtype=np.int64)
-        attention_mask = np.array([encoded.attention_mask], dtype=np.int64)
-        token_type_ids = np.zeros_like(input_ids)
-        
-        outputs = self._session.run(
-            None,
-            {"input_ids": input_ids, "attention_mask": attention_mask, "token_type_ids": token_type_ids},
-        )
-        
-        # Mean pooling over token embeddings (output[0] = last_hidden_state)
-        token_embs = outputs[0][0]  # (seq_len, hidden_dim)
-        mask = attention_mask[0].astype(np.float32)
-        pooled = (token_embs * mask[:, np.newaxis]).sum(axis=0) / mask.sum()
-        
-        # L2 normalize
-        norm = np.linalg.norm(pooled)
-        if norm > 0:
-            pooled = pooled / norm
-        
-        return pooled.tolist()
+        model = self._load()
+        clipped = text[:self.max_chars]
+        # BGE models use an instruction prefix for queries; fastembed
+        # exposes both passage- and query-mode embedding via separate
+        # entry points. Older fastembed versions only expose ``embed``;
+        # fall back to that if ``query_embed`` is missing.
+        if input_type == "query" and hasattr(model, "query_embed"):
+            return list(model.query_embed([clipped]))[0].tolist()
+        return list(model.embed([clipped]))[0].tolist()
+
+    def batch_embed(self, texts: list[str],
+                    input_type: str = "passage") -> list[list[float]]:
+        """Override the default per-call loop with a real batch call —
+        fastembed batches inside one ONNX run, materially faster on
+        ingest than calling ``embed`` per text in Python."""
+        model = self._load()
+        clipped = [t[:self.max_chars] for t in texts]
+        if input_type == "query" and hasattr(model, "query_embed"):
+            vecs = model.query_embed(clipped)
+        else:
+            vecs = model.embed(clipped)
+        return [v.tolist() for v in vecs]
 
     def dimensions(self) -> int:
         return _cfg('embedding', 'dimensions', 384)
@@ -280,10 +245,33 @@ _provider_instance = None
 
 
 def get_provider() -> EmbeddingProvider:
-    """Get the configured embedding provider (singleton)."""
+    """Get the configured embedding provider (singleton).
+
+    Auto-fallback: if the configured provider is API-keyed (``openai``,
+    ``nvidia-nim``) and the required API key env var isn't set,
+    transparently fall through to the ``onnx`` (fastembed) provider
+    instead of raising on the first ``embed()`` call. Lets fresh
+    ``mimir setup``-only installs work out of the box without an
+    OpenAI key, while paid-tier users keep the better embeddings as
+    long as their key is in the environment.
+    """
     global _provider_instance
     if _provider_instance is None:
+        import os
         provider_name = _cfg('embedding', 'provider', 'nvidia-nim')
+
+        if provider_name in ("openai", "nvidia-nim"):
+            api_key_env = _cfg('embedding', 'api_key_env',
+                               'NVIDIA_NIM_API_KEY' if provider_name == 'nvidia-nim' else 'OPENAI_API_KEY')
+            if api_key_env and not os.environ.get(api_key_env):
+                logging.getLogger("saga.embeddings").info(
+                    "[embedding] provider=%s but %s is unset — falling back "
+                    "to onnx (fastembed, BAAI/bge-small-en-v1.5). Set %s in "
+                    "your environment to use %s.",
+                    provider_name, api_key_env, api_key_env, provider_name,
+                )
+                provider_name = "onnx"
+
         provider_cls = _PROVIDERS.get(provider_name)
         if provider_cls is None:
             raise ValueError(

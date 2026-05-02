@@ -48,6 +48,13 @@ DEFAULT_ENV_TEMPLATE = dedent(
     # ---- SAGA sidecar (memory) -------------------------------------------
     SAGA_ENDPOINT=http://localhost:3002
     SAGA_API_KEY=
+    # OpenAI key for saga's embeddings (text-embedding-3-small) AND for
+    # the bench harness's gpt-4o judge. Optional: if you leave it blank,
+    # saga falls back to fastembed (local CPU, BAAI/bge-small-en-v1.5,
+    # ~5ms/batch, no API cost). Bench parity vs the historical 0.774
+    # baseline requires text-embedding-3-small, so set this if you're
+    # running benchmarks. Daily mimir use is fine on the local fallback.
+    OPENAI_API_KEY=
 
     # ---- Channel bridges (all optional) ----------------------------------
     DISCORD_TOKEN=
@@ -717,9 +724,16 @@ def _print_setup_report(status: dict[str, object]) -> None:
         print("  SAGA_API_KEY:   generated (unused in in-process mode; preserved for external-saga use)")
     print()
     print("Next steps:")
-    print(f"  1. Edit {home}/.env (LLM gateway + any bridge tokens)")
-    print(f"  2. (optional) Edit {home}/memory/core/identity.md")
-    print(f"  3. Run:  mimir run --home {home}")
+    print(f"  1. Configure LLM auth — pick one:")
+    print(f"     a. Max plan (free):  claude setup-token")
+    print(f"        (or `claude login` for an interactive session — same effect.)")
+    print(f"     b. Anthropic API:    set ANTHROPIC_API_KEY in {home}/.env")
+    print(f"     c. Gateway (e.g. LiteLLM, OpenRouter):")
+    print(f"        set ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN in .env")
+    print(f"  2. (optional) set OPENAI_API_KEY in .env for saga's embeddings;")
+    print(f"     leave blank to fall back to local fastembed (no API needed).")
+    print(f"  3. (optional) Edit {home}/memory/core/identity.md")
+    print(f"  4. Run:  mimir run --home {home}")
 
 
 # ---------------------------------------------------------------------------
