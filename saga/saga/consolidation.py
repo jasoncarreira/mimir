@@ -568,9 +568,23 @@ class ConsolidationEngine:
         def _strip_prefix(s: str) -> str:
             return _prefix_pat.sub("", s or "")
 
-        syntheses = []
+        # Each cluster's LLM synthesis is independent (its own source_ids,
+        # its own subset/prior-triples reads), so we always fan out across
+        # a thread pool. Default 8 in flight — gpt-5.4-nano / haiku / etc.
+        # are latency-bound (~1-3s/call), so 8 concurrent turns a
+        # 30-cluster question's ~60s serial wall into ~8s. The cap keeps
+        # us under per-account concurrent-request limits on standard
+        # OpenAI / Anthropic tiers; raise it via [consolidation]
+        # parallel_workers if you've upped your limits.
+        parallel_workers = max(1, int(_cfg('consolidation', 'parallel_workers', 8)))
+
+        # PREP phase: build (idx, cluster, prompt_or_none) tuples
+        # sequentially — needs SQLite reads (existing-obs / subset-obs /
+        # prior-triples) that don't parallelize cleanly with sqlite3's
+        # default thread-checking. Skipped clusters land with prompt=None.
+        prep: list[dict] = []
         skipped_existing = 0
-        for cluster in clusters:
+        for cluster_idx, cluster in enumerate(clusters):
             # Strip any prior consolidation prefix from cluster members so
             # re-consolidation doesn't cause "[Consolidated from X] [Consolidated from Y] ..." stacking in either path.
             contents = [_strip_prefix(a['content']) for a in cluster]
@@ -632,78 +646,110 @@ class ConsolidationEngine:
                         "true).\n\n"
                     )
 
-            # Try LLM synthesis (skipped entirely when consolidation.enable_llm = false)
+            # Build the prompt for LLM synthesis (or skip it entirely when
+            # enable_llm is off — _finalize_cluster handles the fallback).
+            prompt = None
+            if enable_llm:
+                if ask_for_triples:
+                    prompt = (
+                        f"You are consolidating {len(cluster)} related memory atoms. "
+                        f"Produce TWO outputs in a single response.\n\n"
+                        f"Output format (exactly these section headers, in this order):\n\n"
+                        f"OBSERVATION:\n"
+                        f"<one or two sentences capturing what the atoms collectively convey>\n\n"
+                        f"TRIPLES:\n"
+                        f"(subject, predicate, object)\n"
+                        f"(subject, predicate, object)\n"
+                        f"...\n"
+                        f"[OR write: NONE if no clean triples]\n\n"
+                        f"Rules for the OBSERVATION:\n"
+                        f"- Preserve specific dates, times, numbers, names, and direct quotes "
+                        f"VERBATIM when they appear in the atoms.\n"
+                        f"- If atoms disagree on a fact, keep both versions ('user first "
+                        f"mentioned X on date A, then updated to Y on date B').\n"
+                        f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
+                        f"in the observation when the date matters to the content.\n"
+                        f"- Do not invent details not present in the atoms.\n\n"
+                        f"Rules for TRIPLES:\n"
+                        f"- Subject must be a NAMED ENTITY (person, system, tool, place), max 30 chars\n"
+                        f"- Object must be a SHORT SPECIFIC VALUE, max 30 chars\n"
+                        f"- Predicate must be lowercase_snake_case\n"
+                        f"- Implicit subject 'User' for user-preference statements\n"
+                        f"- Lists become multiple triples (one per item)\n"
+                        f"- Skip emotional/philosophical/meta-commentary content (write NONE)\n\n"
+                        f"{prior_block}"
+                        f"Atoms:\n- {joined}"
+                    )
+                else:
+                    # Observation-only — no TRIPLES section, no
+                    # triples rules. Saves tokens and shaves LLM
+                    # latency on the canonical bench config where
+                    # triples persistence is off.
+                    prompt = (
+                        f"You are consolidating {len(cluster)} related memory atoms. "
+                        f"Produce a single observation that captures what the "
+                        f"atoms collectively convey.\n\n"
+                        f"Output format (exactly this header, then the observation):\n\n"
+                        f"OBSERVATION:\n"
+                        f"<one or two sentences>\n\n"
+                        f"Rules for the OBSERVATION:\n"
+                        f"- Preserve specific dates, times, numbers, names, and direct quotes "
+                        f"VERBATIM when they appear in the atoms.\n"
+                        f"- If atoms disagree on a fact, keep both versions ('user first "
+                        f"mentioned X on date A, then updated to Y on date B').\n"
+                        f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
+                        f"in the observation when the date matters to the content.\n"
+                        f"- Do not invent details not present in the atoms.\n\n"
+                        f"{prior_block}"
+                        f"Atoms:\n- {joined}"
+                    )
+
+            prep.append({
+                "cluster": cluster, "contents": contents, "stream": stream,
+                "source_ids": source_ids, "subset_obs": subset_obs,
+                "prompt": prompt,
+            })
+
+        # LLM phase: fan out the synthesis calls. ThreadPoolExecutor of size
+        # parallel_workers; submit only the entries with prompts (others
+        # land in the fallback path during finalize). Results land in
+        # raw_by_idx for the in-order finalize that follows.
+        from ._llm import call_llm_sync as _call_llm
+        raw_by_idx: dict[int, str] = {}
+
+        def _do_call(idx: int, prompt_text: str) -> tuple[int, str]:
+            try:
+                return idx, _call_llm(llm, prompt=prompt_text, max_tokens=1500, temperature=0.3)
+            except Exception as e:
+                logger.warning(f"LLM synthesis failed (cluster {idx}): {e}")
+                return idx, ""
+
+        prompts_to_run = [(i, p["prompt"]) for i, p in enumerate(prep) if p["prompt"]]
+        if prompts_to_run:
+            from concurrent.futures import ThreadPoolExecutor
+            workers = min(parallel_workers, len(prompts_to_run))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = [ex.submit(_do_call, idx, prompt_text)
+                           for idx, prompt_text in prompts_to_run]
+                for fut in futures:
+                    i, raw = fut.result()
+                    raw_by_idx[i] = raw
+
+        # Finalize phase: parse, fall back, build synthesis records in
+        # cluster order so _restructure_phase processes them deterministically.
+        syntheses: list[dict] = []
+        for idx, p in enumerate(prep):
+            cluster = p["cluster"]
+            contents = p["contents"]
+            stream = p["stream"]
+            source_ids = p["source_ids"]
+            subset_obs = p["subset_obs"]
+
             synthesis_content = None
             cluster_triples: list[dict] = []
-            if enable_llm:
-                try:
-                    if ask_for_triples:
-                        prompt = (
-                            f"You are consolidating {len(cluster)} related memory atoms. "
-                            f"Produce TWO outputs in a single response.\n\n"
-                            f"Output format (exactly these section headers, in this order):\n\n"
-                            f"OBSERVATION:\n"
-                            f"<one or two sentences capturing what the atoms collectively convey>\n\n"
-                            f"TRIPLES:\n"
-                            f"(subject, predicate, object)\n"
-                            f"(subject, predicate, object)\n"
-                            f"...\n"
-                            f"[OR write: NONE if no clean triples]\n\n"
-                            f"Rules for the OBSERVATION:\n"
-                            f"- Preserve specific dates, times, numbers, names, and direct quotes "
-                            f"VERBATIM when they appear in the atoms.\n"
-                            f"- If atoms disagree on a fact, keep both versions ('user first "
-                            f"mentioned X on date A, then updated to Y on date B').\n"
-                            f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
-                            f"in the observation when the date matters to the content.\n"
-                            f"- Do not invent details not present in the atoms.\n\n"
-                            f"Rules for TRIPLES:\n"
-                            f"- Subject must be a NAMED ENTITY (person, system, tool, place), max 30 chars\n"
-                            f"- Object must be a SHORT SPECIFIC VALUE, max 30 chars\n"
-                            f"- Predicate must be lowercase_snake_case\n"
-                            f"- Implicit subject 'User' for user-preference statements\n"
-                            f"- Lists become multiple triples (one per item)\n"
-                            f"- Skip emotional/philosophical/meta-commentary content (write NONE)\n\n"
-                            f"{prior_block}"
-                            f"Atoms:\n- {joined}"
-                        )
-                    else:
-                        # Observation-only — no TRIPLES section, no
-                        # triples rules. Saves tokens and shaves LLM
-                        # latency on the canonical bench config where
-                        # triples persistence is off.
-                        prompt = (
-                            f"You are consolidating {len(cluster)} related memory atoms. "
-                            f"Produce a single observation that captures what the "
-                            f"atoms collectively convey.\n\n"
-                            f"Output format (exactly this header, then the observation):\n\n"
-                            f"OBSERVATION:\n"
-                            f"<one or two sentences>\n\n"
-                            f"Rules for the OBSERVATION:\n"
-                            f"- Preserve specific dates, times, numbers, names, and direct quotes "
-                            f"VERBATIM when they appear in the atoms.\n"
-                            f"- If atoms disagree on a fact, keep both versions ('user first "
-                            f"mentioned X on date A, then updated to Y on date B').\n"
-                            f"- If an atom is dated '[YYYY-MM-DD role] ...', include the date "
-                            f"in the observation when the date matters to the content.\n"
-                            f"- Do not invent details not present in the atoms.\n\n"
-                            f"{prior_block}"
-                            f"Atoms:\n- {joined}"
-                        )
-                    # v0.5 §7: routed through ``saga._llm.call_llm_sync``
-                    # which handles the anthropic-vs-openai_compat split
-                    # plus the ``max_completion_tokens`` / ``max_tokens``
-                    # compatibility (the gpt-5.x lesson preserved in the
-                    # helper, not in every call site).
-                    from ._llm import call_llm_sync
-                    raw = call_llm_sync(
-                        llm, prompt=prompt,
-                        max_tokens=1500, temperature=0.3,
-                    )
-                    if raw:
-                        synthesis_content, cluster_triples = _parse_structured_synthesis(raw)
-                except Exception as e:
-                    logger.warning(f"LLM synthesis failed: {e}")
+            raw = raw_by_idx.get(idx, "")
+            if raw:
+                synthesis_content, cluster_triples = _parse_structured_synthesis(raw)
 
             # Fallback: take the longest (already-stripped) content as the
             # representative, then wrap with a single-layer prefix.

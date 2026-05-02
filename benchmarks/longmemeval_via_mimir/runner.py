@@ -307,6 +307,7 @@ async def _run_one_question(
     from saga.benchmarks.longmemeval.ingest import ingest_question
 
     qid = question["question_id"]
+    import time as _time
 
     # Per-question saga DB (replicates saga's bench isolation).
     work_dir = Path(os.environ.get("SAGA_DATA_DIR", "."))
@@ -318,23 +319,26 @@ async def _run_one_question(
     # 2023-haystack-from-2026 bench.
     global _BENCH_REFERENCE_DATE
     _BENCH_REFERENCE_DATE = _parse_question_date(question)
-    ingest_question(question)
+
+    t_phase = _time.time()
+    stats = ingest_question(question)
+    t_ingest = _time.time() - t_phase
 
     # Consolidate. saga's run_eval.py runs this between ingest and
     # retrieve so the observation-bonus + two-tier observations have
     # material to surface; without it, the agent only sees raw atoms.
-    # Each cluster fires an LLM call (consolidation synthesis) — under
-    # the bench's claude_code provider that's ~one Claude Code subprocess
-    # spawn per cluster, ~30-50 clusters typical for a LongMemEval
-    # haystack. Skip if consolidation is disabled in the bench saga.toml
-    # so operators who want raw-atom-only runs can opt out.
     from saga.config import get_config as _saga_get_config
+    t_consolidate = 0.0
+    n_clusters = 0
     if _saga_get_config()('consolidation', 'enabled', False):
         from saga.consolidation import ConsolidationEngine
+        t_phase = _time.time()
         try:
-            ConsolidationEngine().consolidate()
+            cresult = ConsolidationEngine().consolidate() or {}
+            n_clusters = cresult.get("clusters_consolidated", 0) if isinstance(cresult, dict) else 0
         except Exception as exc:  # noqa: BLE001 — don't kill the run
             print(f"  consolidation failed for {qid}: {exc}", file=sys.stderr)
+        t_consolidate = _time.time() - t_phase
 
     # Snapshot turn-log size + bench stream position so we can read just
     # the new content after this question's turn finishes.
@@ -343,6 +347,7 @@ async def _run_one_question(
 
     body = question_to_event(question)
     channel_id = body["channel_id"]
+    t_phase = _time.time()
     resp = await client.post("/event", json=body)
     if resp.status != 200:
         text = await resp.text()
@@ -359,6 +364,16 @@ async def _run_one_question(
     queue = dispatcher._queues.get(channel_id)
     if queue is not None:
         await queue.join()
+    t_agent = _time.time() - t_phase
+
+    n_atoms = stats.get("ingested", 0) if isinstance(stats, dict) else 0
+    print(
+        f"  [{qid}] ingest={t_ingest:.1f}s ({n_atoms} atoms) "
+        f"consolidate={t_consolidate:.1f}s (n={n_clusters}) "
+        f"agent={t_agent:.1f}s "
+        f"total={t_ingest + t_consolidate + t_agent:.1f}s",
+        file=sys.stderr, flush=True,
+    )
 
     # Primary hypothesis source: turns.jsonl output for the just-run turn.
     hypothesis = _extract_hypothesis_from_turns(
