@@ -310,23 +310,11 @@ Passages:
 Ranking:"""
 
     try:
-        resp = requests.post(
-            llm['url'],
-            headers={
-                'Authorization': f"Bearer {llm['api_key']}",
-                'Content-Type': 'application/json',
-            },
-            json={
-                'model': llm['model'],
-                'messages': [{'role': 'user', 'content': prompt}],
-                'max_tokens': 30,
-                'temperature': 0,
-            },
-            timeout=llm['timeout'],
+        from ._llm import call_llm_sync
+        ranking_text = call_llm_sync(
+            llm, prompt=prompt, temperature=0, max_tokens=30,
         )
-        
-        if resp.ok:
-            ranking_text = resp.json()['choices'][0]['message']['content'].strip()
+        if ranking_text:
             # Parse indices from response (e.g., "2, 0, 1, 3" or "2 0 1 3")
             indices = []
             for token in re.findall(r'\d+', ranking_text):

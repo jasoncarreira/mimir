@@ -756,11 +756,23 @@ def resolve_llm_config(subsystem: str) -> dict:
             if api_key:
                 break
 
+    # v0.5 §7: provider knob. "anthropic" routes via anthropic.Anthropic;
+    # "openai_compat" keeps the legacy requests.post path (default for
+    # bench harness so historical comparability is preserved).
+    provider = (
+        cfg(subsystem, 'provider', None)
+        or cfg('llm', 'provider', None)
+        or 'openai_compat'
+    )
+    if provider == 'anthropic' and not api_key:
+        api_key = os.environ.get('ANTHROPIC_API_KEY', '') or api_key
+
     return {
         "url": url,
         "model": model,
         "api_key": api_key,
         "timeout": int(timeout),
+        "provider": str(provider),
     }
 
 

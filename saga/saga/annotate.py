@@ -197,21 +197,11 @@ def llm_annotate(content: str) -> dict:
 
     prompt = _LLM_ANNOTATION_PROMPT.format(content=content[:2000])
 
-    try:
-        r = requests.post(
-            llm['url'],
-            headers={"Authorization": f"Bearer {llm['api_key']}", "Content-Type": "application/json"},
-            json={
-                "model": llm['model'],
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 500,
-            },
-            timeout=llm['timeout'],
-        )
-        r.raise_for_status()
-        response_text = r.json()["choices"][0]["message"]["content"].strip()
-    except Exception:
+    from ._llm import call_llm_sync
+    response_text = call_llm_sync(
+        llm, prompt=prompt, temperature=0.1, max_tokens=500,
+    )
+    if not response_text:
         return heuristic_annotate(content)  # fallback
 
     # Parse and validate JSON response

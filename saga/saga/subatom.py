@@ -574,37 +574,32 @@ def synthesize_sentences(
     input_tokens = sum(s.get('tokens', 0) for s in sentences)
 
     t0 = time.time()
+    latency_ms = 0
     try:
-        resp = requests.post(
-            llm['url'],
-            headers={
-                'Authorization': f"Bearer {llm['api_key']}",
-                'Content-Type': 'application/json',
-            },
-            json={
-                'model': model,
-                'messages': [
-                    {'role': 'system', 'content': 'Compress these facts into the shortest possible text. Merge related. Fragments OK. No filler. Preserve all unique information.'},
-                    {'role': 'user', 'content': input_text},
-                ],
-                'max_tokens': max_tokens,
-                'temperature': 0.1,
-            },
-            timeout=llm['timeout'],
+        from ._llm import call_llm_sync
+        # subatom passes a per-call ``model`` distinct from the one in
+        # ``llm`` (lighter compression model). Override into a copy of the
+        # llm dict.
+        llm_for_call = dict(llm)
+        llm_for_call["model"] = model
+        output = call_llm_sync(
+            llm_for_call,
+            prompt=input_text,
+            system="Compress these facts into the shortest possible text. Merge related. Fragments OK. No filler. Preserve all unique information.",
+            temperature=0.1,
+            max_tokens=max_tokens,
         )
         latency_ms = (time.time() - t0) * 1000
-        
-        if resp.ok:
-            output = resp.json()['choices'][0]['message']['content']
-            if output:
-                out_tokens = _estimate_tokens(output)
-                return {
-                    "text": output,
-                    "tokens": out_tokens,
-                    "input_tokens": input_tokens,
-                    "model": model,
-                    "latency_ms": latency_ms,
-                }
+
+        if output:
+            out_tokens = _estimate_tokens(output)
+            return {
+                "text": output,
+                "tokens": out_tokens,
+                "input_tokens": input_tokens,
+                "model": model,
+                "latency_ms": latency_ms,
+            }
     except Exception:
         latency_ms = (time.time() - t0) * 1000
     
