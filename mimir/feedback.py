@@ -58,12 +58,19 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "scheduled_tick_dropped": ("negative", "tick_dropped"),
     "scheduled_tick_suppressed": ("negative", "tick_suppressed"),
     "heartbeat_health_degraded": ("negative", "heartbeat_health"),
+    "introspection_report_error": ("negative", "introspection_error"),
     "send_message_unknown_channel": ("negative", "unknown_channel"),
     # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
     "saga_feedback_sent": ("positive", "saga_feedback"),
     # Plumbed for when bridges emit inbound reactions; harmless when absent.
     "react_received": ("positive", "react"),
+    # Cron success signals — surface so the agent knows the maintenance
+    # crons ran (and where their output landed). Especially important
+    # for the introspection report, which produces a markdown file the
+    # agent should know about so it can Read it.
+    "saga_consolidate_ok": ("positive", "saga_consolidate_ok"),
+    "introspection_report_ok": ("positive", "introspection_ok"),
 }
 
 
@@ -137,6 +144,39 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"(threshold {thr_str}, {ev.get('successful', '?')}/"
             f"{ev.get('fired', '?')} fired)"
         )
+    if rule_kind == "introspection_error":
+        return (
+            f"introspection report failed: {ev.get('error') or '(no detail)'}"
+        )
+    if rule_kind == "saga_consolidate_ok":
+        result = ev.get("result") or {}
+        if isinstance(result, dict):
+            merged = result.get("atoms_merged")
+            retired = result.get("atoms_retired")
+            clusters = result.get("clusters_processed")
+            duration = result.get("duration_s")
+            parts: list[str] = []
+            if isinstance(clusters, (int, float)):
+                parts.append(f"{int(clusters)} clusters")
+            if isinstance(merged, (int, float)):
+                parts.append(f"{int(merged)} merged")
+            if isinstance(retired, (int, float)):
+                parts.append(f"{int(retired)} retired")
+            if isinstance(duration, (int, float)):
+                parts.append(f"{duration:.1f}s")
+            detail = ", ".join(parts) if parts else "no detail"
+            return f"saga consolidation ran ({detail})"
+        return "saga consolidation ran"
+    if rule_kind == "introspection_ok":
+        # The output file path is the load-bearing detail — the agent
+        # should be able to grep this line and Read the report.
+        out = ev.get("output") or "(no path)"
+        rate = ev.get("pipeline_success_rate")
+        if isinstance(rate, (int, float)):
+            tail = f", scheduled-tick success {rate * 100:.0f}%"
+        else:
+            tail = ""
+        return f"introspection report ready: {out}{tail}"
     if rule_kind == "unknown_channel":
         return f"send_message to unknown channel {ev.get('channel_id', '?')}"
     if rule_kind == "saga_feedback":
