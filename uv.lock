@@ -11,7 +11,7 @@ resolution-markers = [
 [manifest]
 members = [
     "mimir",
-    "msam",
+    "saga",
 ]
 
 [[package]]
@@ -1428,58 +1428,6 @@ wheels = [
 ]
 
 [[package]]
-name = "msam"
-version = "2026.2.24"
-source = { editable = "saga" }
-dependencies = [
-    { name = "faiss-cpu" },
-    { name = "fastapi" },
-    { name = "numpy" },
-    { name = "pydantic" },
-    { name = "requests" },
-    { name = "uvicorn", extra = ["standard"] },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "httpx" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-]
-grafana = [
-    { name = "flask" },
-    { name = "flask-cors" },
-]
-local = [
-    { name = "sentence-transformers" },
-]
-onnx = [
-    { name = "onnxruntime" },
-    { name = "tokenizers" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "faiss-cpu", specifier = ">=1.7" },
-    { name = "fastapi", specifier = ">=0.110" },
-    { name = "flask", marker = "extra == 'grafana'", specifier = ">=3.0" },
-    { name = "flask-cors", marker = "extra == 'grafana'", specifier = ">=4.0" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
-    { name = "numpy", specifier = ">=1.24" },
-    { name = "onnxruntime", marker = "extra == 'onnx'", specifier = ">=1.16" },
-    { name = "pydantic", specifier = ">=2.5" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
-    { name = "pytest-cov", marker = "extra == 'dev'" },
-    { name = "requests", specifier = ">=2.31" },
-    { name = "sentence-transformers", marker = "extra == 'local'", specifier = ">=2.2" },
-    { name = "tokenizers", marker = "extra == 'onnx'", specifier = ">=0.15" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.27" },
-]
-provides-extras = ["grafana", "onnx", "local", "dev"]
-
-[[package]]
 name = "multidict"
 version = "6.7.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2714,6 +2662,58 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/05/e5/cb4b713c8a93469e3c5be7c3f8d77d307e65fe89673e731f5c2bfd0a9237/safetensors-0.7.0-cp38-abi3-win32.whl", hash = "sha256:c74af94bf3ac15ac4d0f2a7c7b4663a15f8c2ab15ed0fc7531ca61d0835eccba", size = 326423, upload-time = "2025-11-19T15:18:45.74Z" },
     { url = "https://files.pythonhosted.org/packages/5d/e6/ec8471c8072382cb91233ba7267fd931219753bb43814cbc71757bfd4dab/safetensors-0.7.0-cp38-abi3-win_amd64.whl", hash = "sha256:d1239932053f56f3456f32eb9625590cc7582e905021f94636202a864d470755", size = 341380, upload-time = "2025-11-19T15:18:44.427Z" },
 ]
+
+[[package]]
+name = "saga"
+version = "2026.2.24"
+source = { editable = "saga" }
+dependencies = [
+    { name = "faiss-cpu" },
+    { name = "fastapi" },
+    { name = "numpy" },
+    { name = "pydantic" },
+    { name = "requests" },
+    { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "httpx" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+]
+grafana = [
+    { name = "flask" },
+    { name = "flask-cors" },
+]
+local = [
+    { name = "sentence-transformers" },
+]
+onnx = [
+    { name = "onnxruntime" },
+    { name = "tokenizers" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "faiss-cpu", specifier = ">=1.7" },
+    { name = "fastapi", specifier = ">=0.110" },
+    { name = "flask", marker = "extra == 'grafana'", specifier = ">=3.0" },
+    { name = "flask-cors", marker = "extra == 'grafana'", specifier = ">=4.0" },
+    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
+    { name = "numpy", specifier = ">=1.24" },
+    { name = "onnxruntime", marker = "extra == 'onnx'", specifier = ">=1.16" },
+    { name = "pydantic", specifier = ">=2.5" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
+    { name = "pytest-cov", marker = "extra == 'dev'" },
+    { name = "requests", specifier = ">=2.31" },
+    { name = "sentence-transformers", marker = "extra == 'local'", specifier = ">=2.2" },
+    { name = "tokenizers", marker = "extra == 'onnx'", specifier = ">=0.15" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.27" },
+]
+provides-extras = ["grafana", "onnx", "local", "dev"]
 
 [[package]]
 name = "scikit-learn"

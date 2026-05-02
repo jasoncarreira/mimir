@@ -106,7 +106,7 @@ def test_memory_skill_no_brand_leaks(tmp_path: Path):
     assert "open-strix" not in body
     # Mimir-specific surface should be present.
     assert "memory/core/" in body
-    assert "msam_store" in body or "MSAM" in body
+    assert "saga_store" in body or "SAGA" in body
 
 
 def test_seed_skills_recovers_poisoned_destination(tmp_path: Path):

@@ -29,7 +29,7 @@ class AgentEvent:
       not the matching key.
     """
 
-    trigger: str                      # "user_message" | "scheduled_tick" | "msam_session_end" | ...
+    trigger: str                      # "user_message" | "scheduled_tick" | "saga_session_end" | ...
     channel_id: str
     content: str = ""
     author: str | None = None
@@ -55,8 +55,8 @@ class TurnContext:
     trigger: str
     channel_id: str | None
     started_at: float
-    msam_session_id: str | None = None
-    msam_atom_ids: list[str] = field(default_factory=list)
+    saga_session_id: str | None = None
+    saga_atom_ids: list[str] = field(default_factory=list)
     # Tool-call budget tracking (SPEC §4.5 follow-on / FUTURE_WORK).
     # Incremented on every PreToolUse; the budget hook denies once over cap
     # and warns at the soft threshold. 0 = no budget enforced.
@@ -66,7 +66,7 @@ class TurnContext:
     # outbound assistant replies on the same channel inherit it).
     channel_source: str | None = None
     # Number of successful send_message calls in this turn. Each send fires
-    # an MSAM mark_contributions pass with that send's text; the agent-level
+    # an SAGA mark_contributions pass with that send's text; the agent-level
     # post_message_hook only fires (as a fallback) when this is 0 — i.e.
     # for turns that produced a reply via SDK output instead of send_message.
     send_message_count: int = 0
@@ -88,11 +88,11 @@ class TurnRecord:
     ts: str
     turn_id: str
     session_id: str
-    msam_session_id: str | None
+    saga_session_id: str | None
     trigger: str
     channel_id: str | None
     input: str
-    msam_atom_ids: list[str] = field(default_factory=list)
+    saga_atom_ids: list[str] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     output: str = ""
     duration_ms: int = 0

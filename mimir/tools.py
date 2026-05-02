@@ -9,7 +9,7 @@ The model sees a hybrid surface:
   SDK preset:
     * echo (smoke)
     * file_search, rebuild_index
-    * msam_query, msam_store, msam_feedback, msam_mark_contributions, msam_end_session
+    * saga_query, saga_store, saga_feedback, saga_mark_contributions, saga_end_session
     * list_schedules, add_schedule, remove_schedule
 """
 
@@ -23,8 +23,8 @@ from claude_agent_sdk import McpSdkServerConfig, create_sdk_mcp_server, tool
 from .channel_registry import ChannelRegistry
 from .channeltools import build_channel_tools, channel_tool_names
 from .history import MessageBuffer
-from .msam_client import MsamClient
-from .msamtools import build_msam_tools, msam_tool_names
+from .saga_client import SagaClient
+from .sagatools import build_saga_tools, saga_tool_names
 from .scheduler import Scheduler
 from .session_boundary_log import SessionBoundaryLog
 from .scheduletools import build_schedule_tools, schedule_tool_names
@@ -71,7 +71,7 @@ async def echo(args: dict[str, Any]) -> dict[str, Any]:
 def build_mcp_server(
     home: Path,
     indexer: Indexer | None = None,
-    msam_client: MsamClient | None = None,
+    saga_client: SagaClient | None = None,
     scheduler: Scheduler | None = None,
     channel_registry: ChannelRegistry | None = None,
     message_buffer: MessageBuffer | None = None,
@@ -81,12 +81,12 @@ def build_mcp_server(
     tools = [echo]
     if indexer is not None:
         tools += build_search_tools(indexer)
-    if msam_client is not None:
-        tools += build_msam_tools(msam_client, session_boundary_log=session_boundary_log)
+    if saga_client is not None:
+        tools += build_saga_tools(saga_client, session_boundary_log=session_boundary_log)
     if scheduler is not None:
         tools += build_schedule_tools(scheduler)
     if channel_registry is not None:
-        # send_message fires MSAM mark_contributions when msam_client is
+        # send_message fires SAGA mark_contributions when saga_client is
         # available; handles the credit pass at the actual reply boundary
         # rather than at end-of-turn (agent.py:_post_message_hook is the
         # fallback for non-send turns). When message_buffer is supplied, the
@@ -94,7 +94,7 @@ def build_mcp_server(
         # own prior replies in Recent activity.
         tools += build_channel_tools(
             channel_registry,
-            msam_client=msam_client,
+            saga_client=saga_client,
             message_buffer=message_buffer,
         )
     return create_sdk_mcp_server(name="mimir", version="0.1.0", tools=tools)
@@ -102,7 +102,7 @@ def build_mcp_server(
 
 def allowed_tool_names(
     include_search: bool = True,
-    include_msam: bool = True,
+    include_saga: bool = True,
     include_scheduler: bool = True,
     include_channels: bool = True,
 ) -> list[str]:
@@ -111,8 +111,8 @@ def allowed_tool_names(
     names = list(SDK_PRESET_TOOLS) + ["mcp__mimir__echo"]
     if include_search:
         names += search_tool_names()
-    if include_msam:
-        names += msam_tool_names()
+    if include_saga:
+        names += saga_tool_names()
     if include_scheduler:
         names += schedule_tool_names()
     if include_channels:

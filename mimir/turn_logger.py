@@ -1,7 +1,7 @@
 """turns.jsonl writer + Claude Agent SDK message → events extractor (SPEC §10).
 
-Schema is open-strix's ``TurnRecord`` plus two mimir additions: ``msam_session_id``
-and ``msam_atom_ids`` (SPEC §10.2). The ``events`` list shape — reasoning /
+Schema is open-strix's ``TurnRecord`` plus two mimir additions: ``saga_session_id``
+and ``saga_atom_ids`` (SPEC §10.2). The ``events`` list shape — reasoning /
 tool_call / tool_result entries — is identical so existing tooling
 (benchmark/scripts/collate_turns.py, benchmark/overview_turns.py) keeps working.
 """

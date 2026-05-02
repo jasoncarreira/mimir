@@ -148,7 +148,7 @@ async def test_turn_logger_appends_jsonl(tmp_path: Path):
         ts="2026-04-25T10:00:00+00:00",
         turn_id="abc123",
         session_id="bench-1",
-        msam_session_id=None,
+        saga_session_id=None,
         trigger="user_message",
         channel_id="bench-1",
         input="hi",
@@ -159,8 +159,8 @@ async def test_turn_logger_appends_jsonl(tmp_path: Path):
     assert len(contents) == 1
     parsed = json.loads(contents[0])
     assert parsed["turn_id"] == "abc123"
-    assert parsed["msam_session_id"] is None
-    assert parsed["msam_atom_ids"] == []
+    assert parsed["saga_session_id"] is None
+    assert parsed["saga_atom_ids"] == []
 
 
 @pytest.mark.asyncio
@@ -173,7 +173,7 @@ async def test_turn_logger_trims_when_over_cap(tmp_path: Path):
     for i in range(20):
         await logger.write(
             TurnRecord(
-                ts="t", turn_id=f"id{i}", session_id="c", msam_session_id=None,
+                ts="t", turn_id=f"id{i}", session_id="c", saga_session_id=None,
                 trigger="x", channel_id="c", input=str(i),
             )
         )

@@ -1,10 +1,10 @@
-"""v0.4 §3: local mirror of MSAM session boundary atoms.
+"""v0.4 §3: local mirror of SAGA session boundary atoms.
 
-MSAM's ``/v1/sessions/recent`` is the source of truth, but if MSAM is
+SAGA's ``/v1/sessions/recent`` is the source of truth, but if SAGA is
 briefly down at prompt-assembly time we still want the agent to see
 recent session summaries. This module owns an append-only JSONL at
 ``<home>/.mimir/session_boundaries.jsonl`` populated by the
-``msam_end_session`` tool wrapper after a successful MSAM call. The
+``saga_end_session`` tool wrapper after a successful SAGA call. The
 local mirror is best-effort: failures don't crash the tool turn; the
 prompt assembly degrades gracefully when neither source is available.
 
@@ -36,11 +36,11 @@ def _utc_now_iso() -> str:
 class SessionBoundaryLog:
     """Append-only mirror at ``<home>/.mimir/session_boundaries.jsonl``.
 
-    Records mirror the wire shape of MSAM's session boundary atoms so
+    Records mirror the wire shape of SAGA's session boundary atoms so
     the prompt-render path doesn't care which source it got data from
     (modulo the ``ts`` field — local mirror uses the append-time UTC
-    timestamp; MSAM's ``ts`` is the boundary atom's creation time on
-    the MSAM side).
+    timestamp; SAGA's ``ts`` is the boundary atom's creation time on
+    the SAGA side).
     """
 
     path: Path
@@ -88,7 +88,7 @@ def render_session_summaries(
     one-line ``Unfinished:`` bullet when the boundary's
     ``unfinished`` list is non-empty. Stored-but-not-rendered fields
     (topics_discussed, decisions_made, emotional_state) are reachable
-    via MSAM semantic retrieval; they'd add noise here.
+    via SAGA semantic retrieval; they'd add noise here.
 
     Returns ``None`` when the input is empty so the caller can skip
     rendering an empty section."""

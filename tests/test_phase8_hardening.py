@@ -1,11 +1,11 @@
-"""Phase 8 — hardening: ResultMessage capture, MSAM retry, error-path coverage.
+"""Phase 8 — hardening: ResultMessage capture, SAGA retry, error-path coverage.
 
 These tests verify that mimir survives the things production-like deployments
 actually break on:
 
 - SDK ``ResultMessage`` capture surfaces token usage + cost + stop_reason on
   every TurnRecord (resume detection + cost monitoring).
-- ``MsamClient`` retries 5xx + transient ClientError, gives up cleanly on 4xx.
+- ``SagaClient`` retries 5xx + transient ClientError, gives up cleanly on 4xx.
 - Malformed tool-use blocks (Minimax sometimes drops args) don't crash the
   turn — the TurnRecord still lands.
 - ``query()`` exception (timeout, connection drop) lands as ``error`` on the
@@ -32,7 +32,7 @@ from claude_agent_sdk import (
 
 from mimir import server as mimir_server
 from mimir.config import Config
-from mimir.msam_client import MsamClient, MsamError
+from mimir.saga_client import SagaClient, SagaError
 
 
 # ---- ResultMessage capture in TurnRecord -------------------------------
@@ -186,14 +186,14 @@ async def test_malformed_tool_use_block_does_not_crash_turn(tmp_path: Path):
     assert "recovered reply" in record["output"]
 
 
-# ---- MsamClient retry-with-backoff -------------------------------------
+# ---- SagaClient retry-with-backoff -------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_msam_client_retries_5xx_then_succeeds(aiohttp_server, monkeypatch):
+async def test_saga_client_retries_5xx_then_succeeds(aiohttp_server, monkeypatch):
     """A 503 followed by a 200 succeeds without surfacing the failure."""
     # Speed up the test by collapsing the retry delays.
-    monkeypatch.setattr("mimir.msam_client._RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+    monkeypatch.setattr("mimir.saga_client._RETRY_DELAYS_S", (0.0, 0.0, 0.0))
 
     call_count = 0
 
@@ -207,7 +207,7 @@ async def test_msam_client_retries_5xx_then_succeeds(aiohttp_server, monkeypatch
     app = web.Application()
     app.router.add_post("/v1/feedback", flaky)
     server = await aiohttp_server(app)
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
         result = await client.feedback(["a1"], "response text")
         assert result == {"ok": True, "attempts": 2}
@@ -216,9 +216,9 @@ async def test_msam_client_retries_5xx_then_succeeds(aiohttp_server, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_msam_client_does_not_retry_4xx(aiohttp_server, monkeypatch):
+async def test_saga_client_does_not_retry_4xx(aiohttp_server, monkeypatch):
     """A 400 is permanent — no retries, fails on the first attempt."""
-    monkeypatch.setattr("mimir.msam_client._RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+    monkeypatch.setattr("mimir.saga_client._RETRY_DELAYS_S", (0.0, 0.0, 0.0))
 
     call_count = 0
 
@@ -230,9 +230,9 @@ async def test_msam_client_does_not_retry_4xx(aiohttp_server, monkeypatch):
     app = web.Application()
     app.router.add_post("/v1/outcome", bad_request)
     server = await aiohttp_server(app)
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
-        with pytest.raises(MsamError) as exc_info:
+        with pytest.raises(SagaError) as exc_info:
             await client.outcome(["bad-id"], feedback="positive")
         assert exc_info.value.status == 400
         assert call_count == 1, "4xx must not be retried"
@@ -241,9 +241,9 @@ async def test_msam_client_does_not_retry_4xx(aiohttp_server, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_msam_client_gives_up_after_max_retries(aiohttp_server, monkeypatch):
-    """Persistent 503s exhaust the retry budget and raise MsamError."""
-    monkeypatch.setattr("mimir.msam_client._RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+async def test_saga_client_gives_up_after_max_retries(aiohttp_server, monkeypatch):
+    """Persistent 503s exhaust the retry budget and raise SagaError."""
+    monkeypatch.setattr("mimir.saga_client._RETRY_DELAYS_S", (0.0, 0.0, 0.0))
 
     call_count = 0
 
@@ -255,9 +255,9 @@ async def test_msam_client_gives_up_after_max_retries(aiohttp_server, monkeypatc
     app = web.Application()
     app.router.add_post("/v1/query", always_500)
     server = await aiohttp_server(app)
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
-        with pytest.raises(MsamError) as exc_info:
+        with pytest.raises(SagaError) as exc_info:
             await client.query("anything")
         assert exc_info.value.status == 503
         assert call_count == 4, f"expected 4 attempts (1 + 3 retries), got {call_count}"

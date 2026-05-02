@@ -5,7 +5,7 @@ Phase 4 surface:
   GET  /health  — basic liveness
 
 Wires together: dispatcher, agent, message buffer, index generator, search
-indexer, MSAM client, session manager, scheduler.
+indexer, SAGA client, session manager, scheduler.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from .history import MessageBuffer
 from .identities import IdentityResolver
 from .index import IndexGenerator
 from .models import AgentEvent, make_process_session_id
-from .msam_client import MsamClient
+from .saga_client import SagaClient
 from .scheduler import Scheduler
 from .search import Indexer
 from .session_manager import ChannelSession, SessionManager
@@ -48,7 +48,7 @@ async def _handle_event(request: web.Request) -> web.Response:
     # /event payload accepts arbitrary trigger strings, so an attacker
     # who can reach the port without auth can steer the agent into the
     # synthesis path against an unrelated session and call
-    # msam_end_session. Empty key = no auth (dev / localhost-only).
+    # saga_end_session. Empty key = no auth (dev / localhost-only).
     expected_key = request.app.get("api_key") or ""
     if expected_key:
         provided = request.headers.get("X-API-Key", "")
@@ -139,11 +139,11 @@ def build_app(config: Config) -> web.Application:
     indexes.mark_dirty("all")
 
     indexer = Indexer(config.home)
-    msam_client = MsamClient(
-        endpoint=config.msam_endpoint,
-        api_key=config.msam_api_key or None,
+    saga_client = SagaClient(
+        endpoint=config.saga_endpoint,
+        api_key=config.saga_api_key or None,
     )
-    sessions = SessionManager(idle_minutes=config.msam_session_idle_minutes)
+    sessions = SessionManager(idle_minutes=config.saga_session_idle_minutes)
     inbox = SubagentInbox()
 
     # Channel layer (SPEC §7.2). BenchBridge always registers — it's how the
@@ -169,7 +169,7 @@ def build_app(config: Config) -> web.Application:
         message_buffer,
         indexes,
         indexer=indexer,
-        msam_client=msam_client,
+        saga_client=saga_client,
         session_manager=sessions,
         scheduler=scheduler,
         subagent_inbox=inbox,
@@ -230,17 +230,17 @@ def build_app(config: Config) -> web.Application:
     # dispatcher so it runs in channel-FIFO order alongside any new traffic.
     async def _on_session_idle(session: ChannelSession) -> None:
         synth_event = AgentEvent(
-            trigger="msam_session_end",
+            trigger="saga_session_end",
             channel_id=session.channel_id,
             content="",
-            extra={"msam_session_id": session.msam_session_id},
+            extra={"saga_session_id": session.saga_session_id},
         )
         accepted = await dispatcher.enqueue(synth_event)
         if not accepted:
             await log_event(
-                "msam_synthesis_dispatch_failed",
+                "saga_synthesis_dispatch_failed",
                 channel_id=session.channel_id,
-                msam_session_id=session.msam_session_id,
+                saga_session_id=session.saga_session_id,
                 reason="dispatcher_rejected",
             )
 
@@ -257,7 +257,7 @@ def build_app(config: Config) -> web.Application:
     app["message_buffer"] = message_buffer
     app["indexes"] = indexes
     app["indexer"] = indexer
-    app["msam_client"] = msam_client
+    app["saga_client"] = saga_client
     app["sessions"] = sessions
     app["scheduler"] = scheduler
     app["subagent_inbox"] = inbox
@@ -287,10 +287,10 @@ def build_app(config: Config) -> web.Application:
         await indexer.start(run_initial_sweep=False, sweep_loop=True)
         await channels.connect_all()
 
-        # Register MSAM weekly consolidation. Bad cron logs and continues.
+        # Register SAGA weekly consolidation. Bad cron logs and continues.
         try:
-            consolidate_registered = scheduler.add_msam_consolidate_job(
-                msam_client, config.msam_consolidate_cron
+            consolidate_registered = scheduler.add_saga_consolidate_job(
+                saga_client, config.saga_consolidate_cron
             )
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc))
@@ -307,9 +307,9 @@ def build_app(config: Config) -> web.Application:
             home=str(config.home),
             web_port=config.web_port,
             replayed_messages=replayed,
-            msam_endpoint=config.msam_endpoint,
-            msam_consolidate_cron=config.msam_consolidate_cron if consolidate_registered else "",
-            msam_session_idle_minutes=config.msam_session_idle_minutes,
+            saga_endpoint=config.saga_endpoint,
+            saga_consolidate_cron=config.saga_consolidate_cron if consolidate_registered else "",
+            saga_session_idle_minutes=config.saga_session_idle_minutes,
             seeded_subagents=seeded,
             seeded_skills=seeded_skills_map,
             scheduled_jobs_registered=reload_stats["registered"],
@@ -324,7 +324,7 @@ def build_app(config: Config) -> web.Application:
         scheduler.stop()
         await sessions.shutdown()
         await indexer.stop()
-        await msam_client.close()
+        await saga_client.close()
         await channels.disconnect_all()
 
     app.on_startup.append(_on_startup)

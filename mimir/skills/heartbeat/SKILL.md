@@ -180,7 +180,7 @@ Ranges from light to heavy:
 ### Don't do reflection-shaped work here
 
 Cross-session audits — recurring failure clusters across `events.jsonl`,
-drift indicators, MSAM atom hygiene, memory architecture review — are
+drift indicators, SAGA atom hygiene, memory architecture review — are
 the **reflection skill's** weekly job, not heartbeat work. If you find
 yourself reaching for jq pipelines over a 7-day window of logs during
 a heartbeat, stop. Drop the topic into `state/heartbeat-backlog.md` if
