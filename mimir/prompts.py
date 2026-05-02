@@ -53,6 +53,12 @@ _DEFAULT_CONVENTIONS = """## Conventions
   tools exist."""
 
 
+# VSM: algedonic (out) — operator alert channel. When MIMIR_OPERATOR_ALERT_CHANNEL
+#                       is set, the system prompt teaches the agent the channel
+#                       id to use for high-priority signals to the operator
+#                       that don't fit the current conversation. The alert
+#                       skill teaches WHEN to fire; this teaches WHERE.
+# loop_id: 2.3
 def build_system_prompt(
     *,
     persona: str | None = None,
@@ -100,6 +106,7 @@ def build_turn_prompt(
     feedback_block: str | None = None,
     session_summaries_block: str | None = None,
     usage_block: str | None = None,
+    upcoming_block: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, SAGA
     atom hits, subagent completion notifications (from prior turns), event
@@ -148,6 +155,14 @@ def build_turn_prompt(
     # agent reads it before the conversation it's about to act on.
     if usage_block:
         sections.append("## Resource usage\n\n" + usage_block.rstrip())
+
+    # Upcoming (FUTURE_WORK §12.1): feedforward — predictable events
+    # the agent should know are coming (next-N scheduled ticks,
+    # plan-window resets). Sits next to Resource usage because both
+    # are self-state telemetry; placement above Recent activity so the
+    # agent reads "what's coming" before "what just happened."
+    if upcoming_block:
+        sections.append("## Upcoming\n\n" + upcoming_block.rstrip())
 
     if recent_list:
         rendered = render_recent_activity(

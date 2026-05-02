@@ -288,6 +288,11 @@ class FeedbackLog:
         )
 
 
+# VSM: algedonic — bypass channel for self-feedback signals; surfaces
+#                  recent error / denial / loop / saga_feedback / react
+#                  events directly into the next turn's prompt without
+#                  the embed-and-retrieve detour.
+# loop_id: 2.1
 def render_feedback_block(
     negatives: list[FeedbackSignal],
     positives: list[FeedbackSignal],

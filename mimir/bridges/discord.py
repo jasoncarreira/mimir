@@ -412,6 +412,11 @@ class DiscordBridge(Bridge):
         )
         await self.enqueue(event)
 
+    # VSM: algedonic (in) — inbound reactions on the bot's own messages,
+    #                       classified by emoji polarity, time-gated by
+    #                       feedback.py's 24h window before reaching the
+    #                       next turn's prompt.
+    # loop_id: 2.6
     async def _on_reaction(self, payload: Any, action: str = "add") -> None:
         """Handle inbound reaction-add events. Emits a ``react_received``
         event into events.jsonl which the algedonic surfacing in

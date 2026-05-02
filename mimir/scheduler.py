@@ -202,6 +202,11 @@ class Scheduler:
             registered += 1
         return {"registered": registered, "invalid": invalid}
 
+    # VSM: S4 (intelligence / foresight) — generic scheduled-tick
+    #      dispatch. Heartbeat (loop 4.1) and reflection (loop 4.2)
+    #      both ride this; the schedule_name in extra distinguishes
+    #      which skill the agent should run.
+    # loop_id: 4.1
     async def _fire(self, *, job: SchedulerJob) -> None:
         event = AgentEvent(
             trigger="scheduled_tick",
@@ -246,6 +251,10 @@ class Scheduler:
 
     # ---- SAGA consolidation cron -------------------------------------
 
+    # VSM: S3 (saga-internal) — weekly cron triggers consolidation.
+    #      Saga's hot path: clusters similar atoms, LLM-synthesizes
+    #      observations, decays source stability.
+    # loop_id: 4.3
     def add_saga_consolidate_job(
         self,
         saga_client: SagaClient,

@@ -36,6 +36,11 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
     )
 
 
+# VSM: S3* — top-N atoms by retrieval count over a window; reflection
+#          uses this to nominate candidates for promotion to core
+#          memory. Different from the algedonic surfacing (which is
+#          event-stream-tail) — this aggregates contribution counts.
+# loop_id: 2.5
 async def run(args: argparse.Namespace) -> int:
     cfg = Config.from_env()
     client = make_saga_client(endpoint=cfg.saga_endpoint, api_key=cfg.saga_api_key or None)

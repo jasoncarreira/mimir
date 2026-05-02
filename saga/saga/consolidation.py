@@ -109,6 +109,11 @@ class ConsolidationEngine:
         self.stability_reduction = stability_reduction or DEFAULT_STABILITY_REDUCTION
         self._last_skipped_existing = 0
 
+    # VSM: S3 (saga-internal) — sleep-inspired consolidation. Clusters
+    #      similar atoms, LLM-synthesizes one observation per cluster,
+    #      reduces source-atom stability. Output feeds the two-tier
+    #      retrieval pathway and (P37) the world-model audit.
+    # loop_id: 4.3
     def consolidate(self, dry_run: bool = False, max_clusters: int = None) -> dict:
         """Main entry: cluster -> synthesize -> restructure.
 

@@ -399,6 +399,12 @@ def store_atom(
     return atom_id
 
 
+# VSM: S3 (saga-internal) — write-time supersedes resolver. FAISS
+#      top-K + contradiction check; writes ``supersedes`` edges from
+#      the new atom to contradicted older ones. Retrieval applies a
+#      score multiplier (default 0.4) demoting superseded atoms,
+#      so stale facts naturally lose to current ones.
+# loop_id: 4.5
 def _resolve_supersedes_for_new_atom(new_atom_id: str, content: str,
                                      top_k: int = 5,
                                      threshold: float = None) -> int:
@@ -1912,6 +1918,11 @@ def _match_subjects_in_query(subjects: list[str], query: str) -> list[str]:
     return matched
 
 
+# VSM: S3* (saga-internal) — entity-matched query_world lookup;
+#      surfaces source atoms of currently-valid triples as a new
+#      RRF ranker. Different code path from cosine/embedding pathways
+#      because it uses the world-model "what's true now" view.
+# loop_id: 4.6
 def _world_model_pathway(query: str, top_k: int = 20,
                          reference_date=None) -> list[dict]:
     """P37(b) — world-model retrieval pathway.
@@ -4972,6 +4983,11 @@ def retrieve_diverse(query: str, mode: str = "task", top_k: int = 10,
 
 # ─── Feature: Cross-Session Continuity ────────────────────────────
 
+# VSM: S3* (cross-session audit) — writes a session_boundary atom
+#      summarizing the session at end. recent_session_boundaries()
+#      retrieves them for surfacing in the next turn's prompt
+#      (## Recent session summaries section).
+# loop_id: 2.2
 def store_session_boundary(session_id: str, summary: str,
                            topics_discussed: list[str] = None,
                            decisions_made: list[str] = None,

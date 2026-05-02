@@ -93,6 +93,9 @@ def make_pre_tool_use_hook(home: Path) -> Callable[..., Awaitable[dict[str, Any]
     """
     home_resolved = home.resolve()
 
+    # VSM: S3 — per-turn tool-call budget cap; denies tool calls past
+    #          the per-turn quota and warns at the soft threshold.
+    # loop_id: 1.4
     async def pre_tool_use(
         input_data: dict[str, Any],
         tool_use_id: str | None,

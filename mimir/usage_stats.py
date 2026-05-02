@@ -343,6 +343,11 @@ def cost_rate_alert_recently_emitted(
     )
 
 
+# VSM: S3 — self-state sensing; cost / cache / token rolls into
+#          rolling windows the agent reads in-band each turn.
+#          Threshold trips fire cost_rate_alert events that the
+#          algedonic block (loop 2.1) picks up.
+# loop_id: 2.4
 def render_usage_block(
     report: UsageReport,
     *,
