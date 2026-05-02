@@ -392,6 +392,16 @@ async def _amain(argv: list[str] | None = None) -> int:
     os.environ["MIMIR_HOME"] = str(home)
     os.environ.setdefault("SAGA_DATA_DIR", str(home / ".mimir"))
     (home / ".mimir").mkdir(parents=True, exist_ok=True)
+    # Disable saga_session_end firing during the bench. Default idle
+    # is 10 minutes; SessionManager flushes ended sessions on a timer
+    # and any channel that's been quiet long enough triggers a
+    # synthesis turn (extra LLM call, writes a session_boundary atom).
+    # Harmless for hypothesis correctness — by the time it fires the
+    # user_message turn has already produced its answer — but pure
+    # wasted work for the bench. Saga's own bench TOMLs disabled the
+    # equivalent (`enable_session_boundaries = false`); we do the
+    # mimir-side equivalent here. Operator can override.
+    os.environ.setdefault("MIMIR_SAGA_SESSION_IDLE_MINUTES", "9999")
 
     # Build the bench app.
     from mimir.cli import setup_home as _setup_home

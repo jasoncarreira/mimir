@@ -255,38 +255,94 @@ class _FakeAssistantMsg:
         self.content = blocks
 
 
-def _install_fake_claude_agent_sdk(monkeypatch, *, blocks_per_msg=None,
-                                    captured=None, raise_on_query=None):
-    """Install a fake `claude_agent_sdk` module with a query() that
-    yields AssistantMessage-like objects."""
+class _FakeAssistantMessage:
+    """Stand-in for claude_agent_sdk.AssistantMessage (isinstance check
+    in the impl checks against the fake's class — see _install_fake_sdk)."""
+    def __init__(self, content):
+        self.content = content
+
+
+def _install_fake_claude_agent_sdk(
+    monkeypatch, *, scripted_responses=None, captured=None,
+    raise_on_query=None, raise_on_connect=None,
+):
+    """Install a fake ``claude_agent_sdk`` module exposing
+    ``ClaudeSDKClient``, ``ClaudeAgentOptions``, and ``AssistantMessage``.
+
+    ``scripted_responses`` is a list of [block_list_for_call_1,
+    block_list_for_call_2, ...]; each call to ``client.query`` consumes
+    one entry. ``captured`` (optional dict) records call args so tests
+    can assert on them.
+    """
+    import sys as _sys
     fake_mod = types.ModuleType("claude_agent_sdk")
 
     class _FakeOptions:
         def __init__(self, **kwargs):
             if captured is not None:
-                captured["options"] = kwargs
+                captured.setdefault("option_inits", []).append(kwargs)
+                captured["options"] = kwargs  # last-write-wins for convenience
 
     fake_mod.ClaudeAgentOptions = _FakeOptions
+    fake_mod.AssistantMessage = _FakeAssistantMessage
 
-    async def fake_query(*, prompt, options):
-        if captured is not None:
-            captured["prompt"] = prompt
-        if raise_on_query:
-            raise raise_on_query
-        for blocks in (blocks_per_msg or [[]]):
-            yield _FakeAssistantMsg(blocks)
+    state: dict[str, Any] = {
+        "calls_so_far": 0,
+        "queue": list(scripted_responses or [[]]),
+    }
 
-    fake_mod.query = fake_query
-    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_mod)
+    class _FakeClient:
+        def __init__(self, options):
+            if captured is not None:
+                captured.setdefault("client_options", []).append(options)
+            self._next_blocks = None
+            self._connected = False
+
+        async def connect(self):
+            if raise_on_connect:
+                raise raise_on_connect
+            if captured is not None:
+                captured["connect_count"] = captured.get("connect_count", 0) + 1
+            self._connected = True
+
+        async def disconnect(self):
+            if captured is not None:
+                captured["disconnect_count"] = captured.get("disconnect_count", 0) + 1
+            self._connected = False
+
+        async def query(self, prompt):
+            if captured is not None:
+                captured.setdefault("prompts", []).append(prompt)
+            if raise_on_query:
+                raise raise_on_query
+            # Pop next response from queue (or use last if exhausted).
+            if state["queue"]:
+                self._next_blocks = state["queue"].pop(0)
+            else:
+                self._next_blocks = []
+
+        async def receive_response(self):
+            yield _FakeAssistantMessage(self._next_blocks or [])
+
+    fake_mod.ClaudeSDKClient = _FakeClient
+    monkeypatch.setitem(_sys.modules, "claude_agent_sdk", fake_mod)
+
+
+def _reset_persistent_runner():
+    """Tests should drop the module-level singleton between scenarios so
+    each test gets a fresh persistent client (with a fresh fake SDK)."""
+    import saga._llm as _llm
+    _llm._persistent_runner_singleton = None
 
 
 def test_claude_code_happy_path(monkeypatch):
+    _reset_persistent_runner()
     from saga._llm import call_llm_sync
 
-    captured = {}
+    captured: dict[str, Any] = {}
     _install_fake_claude_agent_sdk(
         monkeypatch,
-        blocks_per_msg=[[_FakeContent("hello "), _FakeContent("world")]],
+        scripted_responses=[[_FakeContent("hello "), _FakeContent("world")]],
         captured=captured,
     )
 
@@ -295,20 +351,21 @@ def test_claude_code_happy_path(monkeypatch):
         prompt="hi", system="be brief",
     )
     assert out == "hello world"
-    assert captured["prompt"] == "hi"
+    assert captured["prompts"] == ["hi"]
+    # First call connects; first connect uses the model + system prompt.
     assert captured["options"]["model"] == "claude-haiku-4-5"
     assert captured["options"]["system_prompt"] == "be brief"
+    assert captured["connect_count"] == 1
 
 
 def test_claude_code_omits_unset_options(monkeypatch):
-    """When model/system aren't provided, ClaudeAgentOptions doesn't get
-    those keys — lets the CLI's defaults / user CLAUDE_MODEL win."""
+    _reset_persistent_runner()
     from saga._llm import call_llm_sync
 
-    captured = {}
+    captured: dict[str, Any] = {}
     _install_fake_claude_agent_sdk(
         monkeypatch,
-        blocks_per_msg=[[_FakeContent("ok")]],
+        scripted_responses=[[_FakeContent("ok")]],
         captured=captured,
     )
 
@@ -317,25 +374,8 @@ def test_claude_code_omits_unset_options(monkeypatch):
     assert "system_prompt" not in captured["options"]
 
 
-def test_claude_code_concatenates_multi_message_stream(monkeypatch):
-    """query() can yield several AssistantMessages (e.g., interleaved
-    with system messages we ignore). Text from all of them is joined."""
-    from saga._llm import call_llm_sync
-
-    _install_fake_claude_agent_sdk(
-        monkeypatch,
-        blocks_per_msg=[
-            [_FakeContent("first ")],
-            [_FakeContent("second")],
-        ],
-    )
-
-    out = call_llm_sync({"provider": "claude_code"}, prompt="x")
-    assert out == "first second"
-
-
 def test_claude_code_skips_blocks_without_text(monkeypatch):
-    """Tool_use / thinking blocks lack a .text attr — skipped."""
+    _reset_persistent_runner()
     from saga._llm import call_llm_sync
 
     class _NonText:
@@ -343,7 +383,7 @@ def test_claude_code_skips_blocks_without_text(monkeypatch):
 
     _install_fake_claude_agent_sdk(
         monkeypatch,
-        blocks_per_msg=[[_FakeContent("a"), _NonText(), _FakeContent("b")]],
+        scripted_responses=[[_FakeContent("a"), _NonText(), _FakeContent("b")]],
     )
 
     out = call_llm_sync({"provider": "claude_code"}, prompt="x")
@@ -351,6 +391,7 @@ def test_claude_code_skips_blocks_without_text(monkeypatch):
 
 
 def test_claude_code_query_exception_returns_empty(monkeypatch):
+    _reset_persistent_runner()
     from saga._llm import call_llm_sync
 
     _install_fake_claude_agent_sdk(
@@ -360,6 +401,78 @@ def test_claude_code_query_exception_returns_empty(monkeypatch):
 
     out = call_llm_sync({"provider": "claude_code"}, prompt="x")
     assert out == ""
+
+
+def test_claude_code_reuses_client_across_calls(monkeypatch):
+    """Two consecutive calls with the same model should share one
+    connect()/disconnect() pair — that's the whole point of the
+    persistent client (avoids subprocess spawn per call)."""
+    _reset_persistent_runner()
+    from saga._llm import call_llm_sync
+
+    captured: dict[str, Any] = {}
+    _install_fake_claude_agent_sdk(
+        monkeypatch,
+        scripted_responses=[
+            [_FakeContent("one")],
+            [_FakeContent("two")],
+            [_FakeContent("three")],
+        ],
+        captured=captured,
+    )
+
+    cfg = {"provider": "claude_code", "model": "claude-haiku-4-5"}
+    assert call_llm_sync(cfg, prompt="p1") == "one"
+    assert call_llm_sync(cfg, prompt="p2") == "two"
+    assert call_llm_sync(cfg, prompt="p3") == "three"
+    # One connect at boot, no recycle yet (3 < default 10).
+    assert captured["connect_count"] == 1
+    assert captured.get("disconnect_count", 0) == 0
+
+
+def test_claude_code_recycles_after_threshold(monkeypatch):
+    """Past SAGA_PERSISTENT_CLAUDE_RECYCLE calls, the client is torn
+    down and a fresh one connected — bounds context bloat."""
+    _reset_persistent_runner()
+    monkeypatch.setenv("SAGA_PERSISTENT_CLAUDE_RECYCLE", "2")
+    from saga._llm import call_llm_sync
+
+    captured: dict[str, Any] = {}
+    _install_fake_claude_agent_sdk(
+        monkeypatch,
+        scripted_responses=[
+            [_FakeContent(f"r{i}")] for i in range(5)
+        ],
+        captured=captured,
+    )
+
+    cfg = {"provider": "claude_code", "model": "claude-haiku-4-5"}
+    for i in range(5):
+        call_llm_sync(cfg, prompt=f"p{i}")
+    # K=2: calls 0,1 on client A. Call 2 triggers recycle → client B
+    # handles 2,3. Call 4 triggers another recycle → client C handles 4.
+    # That's 3 connects, 2 disconnects.
+    assert captured["connect_count"] == 3
+    assert captured["disconnect_count"] == 2
+
+
+def test_claude_code_recycles_on_model_change(monkeypatch):
+    """Switching ``model`` between calls forces a recycle so the new
+    options take effect."""
+    _reset_persistent_runner()
+    from saga._llm import call_llm_sync
+
+    captured: dict[str, Any] = {}
+    _install_fake_claude_agent_sdk(
+        monkeypatch,
+        scripted_responses=[[_FakeContent("a")], [_FakeContent("b")]],
+        captured=captured,
+    )
+
+    call_llm_sync({"provider": "claude_code", "model": "claude-haiku-4-5"}, prompt="p1")
+    call_llm_sync({"provider": "claude_code", "model": "claude-opus-4-7"},  prompt="p2")
+    assert captured["connect_count"] == 2
+    assert captured["disconnect_count"] == 1
 
 
 def test_claude_code_import_error_falls_back_to_openai_compat(monkeypatch):
