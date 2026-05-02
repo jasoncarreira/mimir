@@ -64,6 +64,17 @@ Before either track, gather inputs:
 - All `memory/core/*.md` files
 - File-count and mtime distribution under `memory/<anywhere>/` and
   `state/wiki/` (Glob + `os.stat`; cheap)
+- **Applied-proposals audit** — invoke the bundled CLI subcommand:
+  ```bash
+  mimir reflection audit --weeks-back-min 1 --weeks-back-max 4
+  ```
+  Prints a `## Effects of prior proposals` block: predicted-vs-measured
+  signals (error-rate deltas, tool-call frequency deltas) for proposals
+  the operator applied 1-4 weeks ago. Empty output is fine — only
+  surface the block in your write-up when there are rows to show.
+  This closes the §12.2 double-loop: proposals you drafted that the
+  operator merged get a real feedback signal here, not just "merged
+  and forgotten."
 
 ## Step 2 — Run track A (behavioral)
 

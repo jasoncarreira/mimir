@@ -386,7 +386,16 @@ DEFAULT_PROPOSED_CHANGES = dedent(
     Proposal: <what to change>
     Rationale: <why>
     Affected: <file paths or systems>
+    Predicted effect: <measurable expectation, e.g. "error rate would drop"
+                       or "Read tool would be invoked more often">
     ```
+
+    The `Predicted effect:` line is what the §12.2 audit pass measures
+    against. Phrase it as something the agent could verify by reading
+    events.jsonl / turns.jsonl: error-rate delta, tool-call frequency
+    delta, etc. When the operator merges a proposal, they run
+    `mimir reflection mark-applied "<heading substring>"` to move it
+    here and capture the predicted effect.
 
     ## Pending
 
@@ -1021,6 +1030,43 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .skills.reflection import most_retrieved as _most_retrieved
     _most_retrieved.add_argparse(refl_mr_p)
 
+    # §12.2: applied-proposals audit — closes the double-loop.
+    refl_ma_p = refl_sub.add_parser(
+        "mark-applied",
+        help="Move a proposal from '## Pending' to '## Applied' in "
+             "state/proposed-changes.md and append to applied-proposals.jsonl.",
+    )
+    refl_ma_p.add_argument(
+        "id_match",
+        help="Substring of the proposal heading (case-insensitive).",
+    )
+    refl_ma_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
+    refl_audit_p = refl_sub.add_parser(
+        "audit",
+        help="Print the '## Effects of prior proposals' block — "
+             "predicted vs measured signals for proposals applied 1-4 weeks ago.",
+    )
+    refl_audit_p.add_argument(
+        "--weeks-back-min", type=int, default=1,
+        help="Inclusive newest age in weeks (default 1).",
+    )
+    refl_audit_p.add_argument(
+        "--weeks-back-max", type=int, default=4,
+        help="Inclusive oldest age in weeks (default 4).",
+    )
+    refl_audit_p.add_argument(
+        "--window-days", type=int, default=7,
+        help="Before/after measurement window per proposal (default 7).",
+    )
+    refl_audit_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.command == "setup":
@@ -1128,6 +1174,39 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.reflection_action == "most-retrieved":
             from .skills.reflection import most_retrieved as _most_retrieved
             sys.exit(asyncio.run(_most_retrieved.run(args)))
+        if args.reflection_action == "mark-applied":
+            from .skills.reflection import applied_audit as _applied_audit
+            home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+            try:
+                proposal = _applied_audit.mark_applied(
+                    home / "state" / "proposed-changes.md",
+                    home / "state" / "applied-proposals.jsonl",
+                    args.id_match,
+                )
+            except (FileNotFoundError, LookupError, ValueError) as exc:
+                print(f"mark-applied: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(f"Applied: {proposal.id}")
+            sys.exit(0)
+        if args.reflection_action == "audit":
+            from .skills.reflection import applied_audit as _applied_audit
+            home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+            rows = _applied_audit.audit_window(
+                home,
+                weeks_back_min=args.weeks_back_min,
+                weeks_back_max=args.weeks_back_max,
+                window_days=args.window_days,
+            )
+            block = _applied_audit.render_audit_block(rows)
+            if block is None:
+                print(
+                    f"(no proposals applied {args.weeks_back_max}–"
+                    f"{args.weeks_back_min} weeks ago)"
+                )
+            else:
+                print("## Effects of prior proposals\n")
+                print(block)
+            sys.exit(0)
         refl_p.print_help()
         sys.exit(1)
 
