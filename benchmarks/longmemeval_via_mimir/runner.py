@@ -273,6 +273,15 @@ def _switch_saga_db(db_path: Path) -> None:
     run_migrations()
     from saga.triples import init_triples_schema
     init_triples_schema()
+    # Reset FAISS singletons so they're rebuilt against the fresh DB.
+    # saga.vector_index._atoms_index is module-level; without reset, the
+    # index built for question N persists into N+1 (and grows unbounded
+    # via on_atom_stored hooks during the next ingest). Cross-question
+    # cluster lookups still produce the right answer because atom_map
+    # filters out N-1's IDs, but memory + search work grows linearly
+    # with question count for no benefit.
+    from saga.vector_index import reset_indexes
+    reset_indexes()
 
 
 async def _run_one_question(
