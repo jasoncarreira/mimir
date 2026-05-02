@@ -293,17 +293,30 @@ def _default_saga_toml(home: Path, api_key: str) -> str:
         api_key_env = "OPENAI_API_KEY"
 
         [llm]
-        # Default LLM gateway for saga's chat-completion call sites
-        # (consolidation synthesis, contextual rewrite, triples extraction,
-        # rerank, subatom synthesis). v0.5 §7 ships an anthropic provider;
-        # flip provider = "anthropic" and let api_key_env resolve via
-        # ANTHROPIC_API_KEY for direct Claude access. Default
-        # openai_compat keeps the legacy ``requests.post`` path for
-        # bench parity and OpenAI-compatible gateways (OpenRouter,
-        # Minimax, Step, etc.).
-        provider = "anthropic"
+        # Single LLM config for ALL saga internals: consolidation
+        # synthesis, contextual rewrite, triple extraction, rerank,
+        # subatom synthesis. saga.config.resolve_llm_config falls back
+        # to this section when subsystems lack overrides; we don't set
+        # any here so every call site gets the same model.
+        #
+        # provider = "claude_code" routes via claude-agent-sdk.query(),
+        # which spawns a Claude Code subprocess and inherits Max OAuth
+        # from ``claude login``. Free under Max (no API credit needed),
+        # but each call has ~500ms-2s subprocess spawn overhead and
+        # eats your 5h/7d windows. Right default for daily mimir use.
+        #
+        # For bench parity against saga_p30_canon_v4 (0.774, gpt-5.4-nano):
+        #   provider = "openai_compat"
+        #   url = "https://api.openai.com/v1/chat/completions"
+        #   model = "gpt-5.4-nano"
+        #   api_key_env = "OPENAI_API_KEY"
+        #
+        # For direct Anthropic API (paid credit, no Max OAuth):
+        #   provider = "anthropic"
+        #   model = "claude-haiku-4-5"
+        #   api_key_env = "ANTHROPIC_API_KEY"
+        provider = "claude_code"
         model = "claude-haiku-4-5"
-        api_key_env = "ANTHROPIC_API_KEY"
         timeout_seconds = 60
 
         [retrieval]
