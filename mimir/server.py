@@ -29,7 +29,7 @@ from .history import MessageBuffer
 from .identities import IdentityResolver
 from .index import IndexGenerator
 from .models import AgentEvent, make_process_session_id
-from .saga_client import SagaClient
+from .saga_client import SagaClient, make_saga_client
 from .scheduler import Scheduler
 from .search import Indexer
 from .session_manager import ChannelSession, SessionManager
@@ -139,7 +139,7 @@ def build_app(config: Config) -> web.Application:
     indexes.mark_dirty("all")
 
     indexer = Indexer(config.home)
-    saga_client = SagaClient(
+    saga_client = make_saga_client(
         endpoint=config.saga_endpoint,
         api_key=config.saga_api_key or None,
     )

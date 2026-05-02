@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from aiohttp import web
 
-from mimir.saga_client import SagaClient, SagaError
+from mimir.saga_client import _HttpSaga as SagaClient, SagaError
 
 
 @pytest.fixture
