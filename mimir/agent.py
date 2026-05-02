@@ -156,6 +156,22 @@ class Agent:
             path=config.home / ".mimir" / "rate_limits.json",
         )
 
+        # §12.4: S3-S4 homeostat. Constructed once so the scheduler
+        # consults the same instance the prompt's `## Self-state` block
+        # is rendered from. Wire into the scheduler immediately so
+        # heartbeats fired before the first turn are still arbitrated.
+        from .budget import HomeostaticArbiter
+        self._arbiter = HomeostaticArbiter(
+            home=config.home,
+            rate_limit_store=self._rate_limits,
+            turns_log=config.turns_log,
+            cost_hourly_limit_usd=config.cost_hourly_limit_usd or None,
+            cost_spike_ratio=config.cost_rate_spike_ratio or None,
+            fallback_model=config.model,
+        )
+        if scheduler is not None:
+            scheduler._arbiter = self._arbiter
+
         self._mcp_server = build_mcp_server(
             config.home,
             indexer=indexer,
@@ -368,6 +384,17 @@ class Agent:
             )
         except Exception:  # noqa: BLE001 — never crash a turn for this
             log.exception("_assemble_upcoming_block failed; skipping")
+            return None
+
+    def _assemble_self_state_block(self) -> str | None:
+        """v0.5+ §12.4: render the `## Self-state` block — homeostat's
+        view of the four layered constraints (plan window / cost rate /
+        S3-S4 share / tokens). Returns None when the homeostat has
+        nothing useful to surface yet (fresh agent, no signal)."""
+        try:
+            return self._arbiter.render_self_state_block()
+        except Exception:  # noqa: BLE001
+            log.exception("_assemble_self_state_block failed; skipping")
             return None
 
     def _assemble_skill_block(self) -> str | None:
@@ -620,6 +647,7 @@ class Agent:
             )
             usage_block = self._assemble_usage_block()
             upcoming_block = self._assemble_upcoming_block()
+            self_state_block = self._assemble_self_state_block()
             turn_prompt = build_turn_prompt(
                 event,
                 recent_messages=recent,
@@ -631,6 +659,7 @@ class Agent:
                 session_summaries_block=session_summaries_block,
                 usage_block=usage_block,
                 upcoming_block=upcoming_block,
+                self_state_block=self_state_block,
             )
 
         core_blocks = load_core(self._config.home)
