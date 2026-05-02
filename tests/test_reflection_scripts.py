@@ -53,7 +53,7 @@ def _patch_script(monkeypatch, fake_client: _FakeClient, argv: list[str]) -> Non
     """Replace the script's SagaClient constructor with one that returns
     fake_client, and the script's argv. Config.from_env happens for real
     but only reads env vars (which monkeypatch sets to harmless defaults)."""
-    monkeypatch.setattr(script, "SagaClient", lambda **kw: fake_client)
+    monkeypatch.setattr(script, "make_saga_client", lambda **kw: fake_client)
     monkeypatch.setattr("sys.argv", ["most_retrieved", *argv])
     monkeypatch.setenv("MIMIR_HOME", "/tmp/mimir-test")
     monkeypatch.setenv("SAGA_ENDPOINT", "http://example.invalid")
@@ -128,7 +128,7 @@ def test_cli_subcommand_dispatches_to_script(monkeypatch: pytest.MonkeyPatch):
     from mimir import cli
 
     fake = _FakeClient()
-    monkeypatch.setattr(script, "SagaClient", lambda **kw: fake)
+    monkeypatch.setattr(script, "make_saga_client", lambda **kw: fake)
     monkeypatch.setenv("SAGA_ENDPOINT", "http://example.invalid")
 
     # SystemExit is the normal flow when the CLI completes (sys.exit(0)).

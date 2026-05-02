@@ -169,7 +169,7 @@ async def test_saga_query_renders_per_atom_confidence_tier():
 async def test_saga_client_passes_min_confidence_tier_when_set():
     """SagaClient.query forwards min_confidence_tier into the request body
     only when explicitly set; omitting it lets SAGA use its config default."""
-    from mimir.saga_client import SagaClient
+    from mimir.saga_client import _HttpSaga as SagaClient
     captured = {}
 
     class _StubResp:

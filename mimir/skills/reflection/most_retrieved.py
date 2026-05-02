@@ -17,7 +17,7 @@ import json
 import sys
 
 from mimir.config import Config
-from mimir.saga_client import SagaClient
+from mimir.saga_client import make_saga_client
 
 
 def add_argparse(p: argparse.ArgumentParser) -> None:
@@ -38,7 +38,7 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
 
 async def run(args: argparse.Namespace) -> int:
     cfg = Config.from_env()
-    client = SagaClient(endpoint=cfg.saga_endpoint, api_key=cfg.saga_api_key or None)
+    client = make_saga_client(endpoint=cfg.saga_endpoint, api_key=cfg.saga_api_key or None)
     try:
         atoms = await client.most_retrieved_atoms(
             days=args.days,

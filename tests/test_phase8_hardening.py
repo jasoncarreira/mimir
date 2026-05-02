@@ -32,7 +32,7 @@ from claude_agent_sdk import (
 
 from mimir import server as mimir_server
 from mimir.config import Config
-from mimir.saga_client import SagaClient, SagaError
+from mimir.saga_client import _HttpSaga as SagaClient, SagaError
 
 
 # ---- ResultMessage capture in TurnRecord -------------------------------

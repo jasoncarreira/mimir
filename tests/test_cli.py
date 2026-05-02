@@ -55,8 +55,15 @@ def test_setup_creates_home_layout(tmp_path: Path):
 def test_setup_is_idempotent_and_preserves_user_edits(tmp_path: Path):
     home = tmp_path / "agent"
     setup_home(home)
-    # User edits the .env to a minimal version (and includes their own key).
-    user_env = "ANTHROPIC_API_KEY=user-key\nMIMIR_API_KEY=user-token\n"
+    # User edits the .env to a minimal version (and includes their own keys).
+    # SAGA_API_KEY is included so setup doesn't auto-fill it on re-run
+    # (v0.5 §2: setup auto-generates SAGA_API_KEY when missing/blank, same
+    # policy as MIMIR_API_KEY).
+    user_env = (
+        "ANTHROPIC_API_KEY=user-key\n"
+        "MIMIR_API_KEY=user-token\n"
+        "SAGA_API_KEY=user-saga-token\n"
+    )
     (home / ".env").write_text(user_env)
     # User adds a custom skill.
     custom = home / ".claude" / "skills" / "my-skill"
@@ -66,6 +73,48 @@ def test_setup_is_idempotent_and_preserves_user_edits(tmp_path: Path):
     setup_home(home)
     assert (home / ".env").read_text() == user_env
     assert (custom / "SKILL.md").read_text() == "custom"
+
+
+def test_setup_writes_saga_toml(tmp_path: Path):
+    """v0.5 §2: setup writes a saga.toml with mimir-prod overrides."""
+    home = tmp_path / "agent"
+    status = setup_home(home)
+    saga_toml = home / "saga.toml"
+    assert saga_toml.is_file()
+    assert "saga.toml" in (status["files_created"] or [])
+    body = saga_toml.read_text()
+    # mimir-prod overrides per V0.5.md §2.
+    assert "enable_contextual_rewrite = true" in body
+    assert "two_tier_enabled = true" in body
+    assert "enable_extraction = true" in body
+    # db_path lives under <home>/.mimir/.
+    assert str(home / ".mimir" / "saga.db") in body
+
+
+def test_setup_saga_toml_uses_generated_saga_api_key(tmp_path: Path):
+    """saga.toml's [server] api_key should match SAGA_API_KEY in .env so
+    that flipping to external-saga later doesn't require re-running setup."""
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_text = (home / ".env").read_text()
+    saga_text = (home / "saga.toml").read_text()
+    # Extract the SAGA_API_KEY value.
+    import re
+    m = re.search(r"^SAGA_API_KEY=(.+)$", env_text, re.MULTILINE)
+    assert m is not None
+    saga_key = m.group(1).strip()
+    assert saga_key  # non-empty
+    assert f'api_key = "{saga_key}"' in saga_text
+
+
+def test_setup_does_not_clobber_existing_saga_toml(tmp_path: Path):
+    """Operator edits to saga.toml are preserved on re-run."""
+    home = tmp_path / "agent"
+    setup_home(home)
+    custom_body = "# operator-edited\n[storage]\ndb_path = \"/custom/path\"\n"
+    (home / "saga.toml").write_text(custom_body)
+    setup_home(home)
+    assert (home / "saga.toml").read_text() == custom_body
 
 
 def test_setup_env_template_lists_main_keys(tmp_path: Path):
