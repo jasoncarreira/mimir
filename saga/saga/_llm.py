@@ -367,18 +367,20 @@ def _call_openai_compat(
             json=body,
             timeout=llm.get("timeout", 30),
         )
-        # raise_for_status keeps compatibility with the original call-site
-        # pattern (and saga's tests' fake response objects). Non-200 →
-        # exception → logged + empty string returned.
-        if r.status_code >= 400:
-            # Surface the response body so model/parameter mismatches
-            # are visible. raise_for_status alone shows only "400 Client
-            # Error" without the JSON body explaining what's wrong
+        # Non-200 → HTTPError → logged + empty string returned. Use
+        # raise_for_status (not a status_code check) for compatibility
+        # with saga's test fakes that only stub raise_for_status + json.
+        try:
+            r.raise_for_status()
+        except Exception as http_exc:  # noqa: BLE001
+            # Surface the response body so model/parameter mismatches are
+            # visible — raise_for_status alone shows only "400 Client
+            # Error" without the JSON body that explains what's wrong
             # (e.g., "Unsupported parameter: 'max_tokens'...").
             body_preview = (getattr(r, "text", "") or "")[:300]
             log.warning(
-                "openai_compat call failed: %s %s — body=%s",
-                r.status_code, r.reason or "", body_preview,
+                "openai_compat call failed: %s — body=%s",
+                http_exc, body_preview,
             )
             return ""
         msg = r.json()["choices"][0]["message"]

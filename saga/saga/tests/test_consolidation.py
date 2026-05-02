@@ -19,7 +19,19 @@ def temp_db(monkeypatch, tmp_path):
     monkeypatch.setattr("saga.core.embed_query", lambda t: fake_emb)
     monkeypatch.setattr("saga.core._cached_embed_query_import", lambda t: tuple(fake_emb))
     monkeypatch.setattr("saga.core.cached_embed_query", lambda t: fake_emb)
+    # Reset the module-level FAISS index singletons. Without this, the
+    # first test in this module builds saga.vector_index._atoms_index
+    # against its tmp DB; subsequent tests' temp_db fixture rotates the
+    # SQLite path but the FAISS singleton still points at the old DB's
+    # atoms, so cluster lookups miss the new test's data and consolidate
+    # returns clusters_found=0. Latent until faiss-cpu got installed via
+    # the workspace's uv sync this morning (saga's deps weren't reachable
+    # before that, so FAISS_AVAILABLE was False and _cluster_with_faiss
+    # never fired — the bug existed but never manifested).
+    from saga.vector_index import reset_indexes
+    reset_indexes()
     yield db_path
+    reset_indexes()
 
 
 def _store_atoms_with_same_embedding(conn, ids, contents, embedding):
