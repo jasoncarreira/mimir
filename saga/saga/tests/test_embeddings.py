@@ -70,8 +70,78 @@ class TestONNXProvider:
         # dimensions() reads from config; default may be 1024 if config has nvidia-nim
         assert provider.dimensions() > 0
 
-    def test_onnx_model_dir(self):
+    def test_onnx_lazy_load(self):
+        """ONNXProvider now wraps fastembed (shared cache with mimir's
+        file_search). The previous urllib-based downloader + custom
+        _get_model_dir is gone. Confirms init doesn't immediately
+        load the model (lazy load happens on first embed call)."""
         from saga.embeddings import ONNXProvider
         provider = ONNXProvider()
-        model_dir = provider._get_model_dir()
-        assert model_dir.exists()
+        assert provider._model is None
+        # model_name comes from config (defaults to nvidia/... unless
+        # the [embedding] toml overrides it); the actual value isn't
+        # what we're testing — just that __init__ stays cheap.
+        assert isinstance(provider.model_name, str)
+
+
+class TestProviderFallback:
+    """When the configured provider needs an API key but the env var
+    isn't set, get_provider() should silently fall back to onnx
+    (fastembed) instead of letting the missing-key error surface on
+    the first embed call. Lets fresh ``mimir setup``-only installs
+    work without an OpenAI key."""
+
+    def test_openai_falls_back_when_key_missing(self, monkeypatch):
+        import saga.config as cfg_mod
+        import saga.embeddings as emb
+        snapshot = {
+            "embedding": {
+                "provider": "openai",
+                "api_key_env": "OPENAI_API_KEY",
+                "model": "text-embedding-3-small",
+                "dimensions": 1536,
+            }
+        }
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(emb, "_provider_instance", None)
+
+        provider = emb.get_provider()
+        assert isinstance(provider, emb.ONNXProvider)
+
+    def test_openai_used_when_key_present(self, monkeypatch):
+        import saga.config as cfg_mod
+        import saga.embeddings as emb
+        snapshot = {
+            "embedding": {
+                "provider": "openai",
+                "api_key_env": "OPENAI_API_KEY",
+                "model": "text-embedding-3-small",
+                "dimensions": 1536,
+            }
+        }
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        monkeypatch.setenv("OPENAI_API_KEY", "fake-key-for-test")
+        monkeypatch.setattr(emb, "_provider_instance", None)
+
+        provider = emb.get_provider()
+        assert isinstance(provider, emb.OpenAIProvider)
+
+    def test_nvidia_nim_falls_back_when_key_missing(self, monkeypatch):
+        import saga.config as cfg_mod
+        import saga.embeddings as emb
+        snapshot = {
+            "embedding": {
+                "provider": "nvidia-nim",
+                "api_key_env": "NVIDIA_NIM_API_KEY",
+            }
+        }
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        monkeypatch.delenv("NVIDIA_NIM_API_KEY", raising=False)
+        monkeypatch.setattr(emb, "_provider_instance", None)
+
+        provider = emb.get_provider()
+        assert isinstance(provider, emb.ONNXProvider)
