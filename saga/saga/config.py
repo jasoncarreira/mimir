@@ -109,6 +109,15 @@ _DEFAULTS = {
         # sentences map back to their parent atom, atoms join RRF as
         # a 'subatom' pathway. Strict no-op when off.
         "enable_subatom_beam": False,
+        # P37(b) — world-model retrieval pathway. Extracts entities from
+        # the query, calls query_world(entity), surfaces source atoms
+        # of currently-valid triples as a 'world_model' RRF ranker.
+        # Different shape from triple_augment_v2: entity-match on the
+        # subject column, filtered to current-state triples by
+        # query_world's built-in valid_until predicate. Strict no-op
+        # when off.
+        "enable_world_model_pathway": False,
+        "rrf_world_model_weight": 1.0,
         "similarity_threshold": 0.2,
         "sigmoid_midpoint": 0.35,
         "sigmoid_steepness": 15.0,
@@ -514,6 +523,7 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
         "rrf_semantic_weight", "rrf_keyword_weight",
         "rrf_graph_weight", "rrf_temporal_weight",
         "rrf_hyde_weight", "rrf_subatom_weight", "rrf_triple_augment_weight",
+        "rrf_world_model_weight", "enable_world_model_pathway",
         "two_tier_enabled", "observations_top_k",
         "observation_confidence_min_sim", "evidence_boost_cap_multiplier",
         "enable_observation_bonus", "observation_bonus_alpha",

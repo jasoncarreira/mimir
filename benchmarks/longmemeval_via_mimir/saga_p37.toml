@@ -1,0 +1,94 @@
+# Integration bench: P37 — temporal world-model pathway.
+#
+# Identical to saga_p30.toml EXCEPT:
+#   [retrieval] enable_world_model_pathway = true
+#
+# What this exercises:
+#   (a) consolidation prompt now asks for optional valid_from / valid_until
+#       on triples when atom dates indicate fact evolution; saga's
+#       _parse_triples and _persist_consolidation_triples thread those
+#       columns through. (Behavior change is also active in the P30 run
+#       because the prompt change is unconditional — but P30 doesn't
+#       USE the temporal data.)
+#   (b) hybrid_retrieve now has a 'world_model' RRF ranker:
+#       extract_query_entities → query_world(entity, at_time=ref_date)
+#       → source atoms of currently-valid triples. Different shape from
+#       P41's cosine-on-triple-embedding (entity match on subject column,
+#       filtered to current-state by valid_until).
+#
+# Pair: saga_p30.toml. Sole bench delta = enable_world_model_pathway.
+# enable_triple_augment_v2 stays OFF here so we measure the world-model
+# pathway in isolation, not on top of P41.
+
+[storage]
+db_path = "saga.db"
+metrics_db_path = "saga_metrics.db"
+token_budget_ceiling = 100000000
+auto_compact_threshold_pct = 99
+refuse_threshold_pct = 100
+db_busy_timeout_ms = 5000
+
+[embedding]
+provider = "openai"
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dimensions = 1536
+api_key_env = "OPENAI_API_KEY"
+
+[llm]
+provider = "openai_compat"
+url = "https://api.openai.com/v1/chat/completions"
+model = "gpt-5.4-nano"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 120
+
+[retrieval]
+enable_contextual_rewrite = true
+two_tier_enabled = true
+enable_missing_ref_pivot = true
+enable_confidence_gating = true
+default_min_confidence_tier = "low"
+enable_triple_augment_v2 = false
+enable_subatom_beam = false
+# THE delta vs saga_p30.toml.
+enable_world_model_pathway = true
+
+[retrieval_v2]
+enable_query_expansion = true
+
+[triples]
+enable_extraction = true
+
+[consolidation]
+enabled = true
+enable_llm = true
+
+[benchmark]
+enable_session_boundaries = false
+enable_mark_contributions = false
+
+[compression]
+enable_subatom = false
+enable_fact_dedup = false
+enable_synthesis = false
+
+[annotation]
+use_llm = false
+
+[prediction]
+enabled = false
+
+[world_model]
+# saga's world_model API is enabled by default; explicit here for
+# clarity. (P37(b)'s pathway calls query_world which short-circuits
+# when this flag is False.)
+enabled = true
+
+[decay]
+enabled = false
+
+[atoms]
+auto_resolve_supersedes_on_write = false
+
+[server]
+api_key = ""

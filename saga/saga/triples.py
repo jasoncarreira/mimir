@@ -274,13 +274,24 @@ def extract_triples_llm(content: str, atom_id: str = "") -> list[dict]:
 
 
 def _parse_triples(text: str, atom_id: str = "") -> list[dict]:
-    """Parse LLM output into triple dicts with validation."""
+    """Parse LLM output into triple dicts with validation.
+
+    Recognized forms (each on its own line):
+
+        (subject, predicate, object)
+        (subject, predicate, object, valid_from=YYYY-MM-DD)
+        (subject, predicate, object, valid_from=YYYY-MM-DD, valid_until=YYYY-MM-DD)
+
+    Bare ``valid_from`` / ``valid_until`` keys must be ISO-8601 date or
+    datetime strings. Unrecognized trailing key=value pairs are ignored
+    so the parser stays forward-compatible. P37(a) — temporal world model.
+    """
     triples = []
-    # Match (subject, predicate, object) pattern
-    pattern = r'\(([^,]+),\s*([^,]+),\s*([^)]+)\)'
+    # Match (subject, predicate, object[, ...optional tail...])
+    pattern = r'\(([^,]+),\s*([^,]+),\s*([^,)]+)(?:,([^)]+))?\)'
     matches = re.findall(pattern, text)
 
-    for subj, pred, obj in matches:
+    for subj, pred, obj, tail in matches:
         subj = subj.strip().strip('"\'')
         pred = pred.strip().strip('"\'')
         obj = obj.strip().strip('"\'')
@@ -296,12 +307,24 @@ def _parse_triples(text: str, atom_id: str = "") -> list[dict]:
         if not pred:
             continue
 
-        triples.append({
+        triple = {
             "atom_id": atom_id,
             "subject": subj,
             "predicate": pred,
             "object": obj,
-        })
+        }
+        # Parse optional valid_from / valid_until kv pairs.
+        if tail:
+            for kv in tail.split(","):
+                kv = kv.strip()
+                if "=" not in kv:
+                    continue
+                key, _, val = kv.partition("=")
+                key = key.strip().lower()
+                val = val.strip().strip('"\'')
+                if key in ("valid_from", "valid_until") and val and val.lower() not in ("null", "none"):
+                    triple[key] = val
+        triples.append(triple)
 
     return triples
 

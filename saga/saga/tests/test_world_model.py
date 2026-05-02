@@ -123,3 +123,121 @@ class TestWorldHistory:
         assert "office" in objects
         assert "park" in objects
         assert len(history) >= 3
+
+
+class TestWorldModelPathway:
+    """P37(b) — _world_model_pathway extracts query entities, calls
+    query_world, returns the source atoms of currently-valid triples
+    as a new RRF ranker."""
+
+    def test_off_by_default(self, monkeypatch):
+        """Strict no-op when [retrieval] enable_world_model_pathway is False."""
+        from saga.core import _world_model_pathway
+        # Default is False — nothing should be returned regardless of state.
+        out = _world_model_pathway("Where does the user live?", top_k=20)
+        assert out == []
+
+    def test_returns_source_atoms_for_matched_entity(self, monkeypatch):
+        """When enabled, pathway returns the source atoms of triples whose
+        subject matches a query entity."""
+        import saga.config as cfg_mod
+        cfg_mod._load_config()
+        snapshot = dict(cfg_mod._config or {})
+        snapshot.setdefault("retrieval", {})["enable_world_model_pathway"] = True
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+
+        # Seed: store an atom, then add a triple with that atom as source.
+        from saga.core import store_atom, _world_model_pathway
+        from saga.triples import update_world
+        atom_id = store_atom("User lives in Boston")
+        update_world(
+            subject="User", predicate="lives_in",
+            object_val="Boston", source_atom_id=atom_id,
+        )
+
+        # extract_query_entities should pick up "User" from the question.
+        out = _world_model_pathway("Where does User live?", top_k=20)
+        assert len(out) == 1
+        assert out[0]["id"] == atom_id
+        assert out[0]["_world_model_pathway"] is True
+
+    def test_excludes_expired_triples(self, monkeypatch):
+        """A triple whose valid_until is in the past must NOT surface
+        as 'currently valid' — its source atom shouldn't be returned."""
+        import saga.config as cfg_mod
+        cfg_mod._load_config()
+        snapshot = dict(cfg_mod._config or {})
+        snapshot.setdefault("retrieval", {})["enable_world_model_pathway"] = True
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+
+        from saga.core import store_atom, _world_model_pathway
+        from saga.triples import update_world
+
+        old_atom = store_atom("User lived in Seattle")
+        update_world(
+            subject="User", predicate="lived_in",
+            object_val="Seattle", source_atom_id=old_atom,
+            valid_from="2020-01-01", valid_until="2022-12-31",
+        )
+        new_atom = store_atom("User lives in Boston")
+        update_world(
+            subject="User", predicate="lives_in",
+            object_val="Boston", source_atom_id=new_atom,
+            valid_from="2023-01-01",
+        )
+
+        # No at_time → "currently valid" defaults to wall-clock now.
+        # Both predicates are different so update_world doesn't auto-close;
+        # only the lives_in/Boston (no valid_until) is currently valid.
+        out = _world_model_pathway("Where does User live?", top_k=20)
+        atom_ids = {a["id"] for a in out}
+        assert new_atom in atom_ids
+        assert old_atom not in atom_ids
+
+    def test_reference_date_anchors_currently_valid(self, monkeypatch):
+        """When reference_date is passed, 'currently valid' anchors to
+        that point in time. Bench harness uses this so 2023-haystack
+        questions don't see 'current' as 2026 wall-clock."""
+        import saga.config as cfg_mod
+        cfg_mod._load_config()
+        snapshot = dict(cfg_mod._config or {})
+        snapshot.setdefault("retrieval", {})["enable_world_model_pathway"] = True
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+
+        from saga.core import store_atom, _world_model_pathway
+        from saga.triples import update_world
+
+        atom_2023 = store_atom("User worked at Acme")
+        update_world(
+            subject="User", predicate="employed_at",
+            object_val="Acme", source_atom_id=atom_2023,
+            valid_from="2022-01-01", valid_until="2023-12-31",
+        )
+
+        # As of 2023-06-15: Acme should match.
+        from datetime import datetime, timezone
+        ref = datetime(2023, 6, 15, tzinfo=timezone.utc)
+        out = _world_model_pathway("Where does User work?", top_k=20, reference_date=ref)
+        assert any(a["id"] == atom_2023 for a in out)
+
+        # As of 2024-06-15: expired, no match.
+        ref_after = datetime(2024, 6, 15, tzinfo=timezone.utc)
+        out = _world_model_pathway("Where does User work?", top_k=20, reference_date=ref_after)
+        assert all(a["id"] != atom_2023 for a in out)
+
+    def test_no_entities_returns_empty(self, monkeypatch):
+        """Query with no extractable entities skips the pathway cleanly."""
+        import saga.config as cfg_mod
+        cfg_mod._load_config()
+        snapshot = dict(cfg_mod._config or {})
+        snapshot.setdefault("retrieval", {})["enable_world_model_pathway"] = True
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+
+        from saga.core import _world_model_pathway
+        # All-stopword query.
+        out = _world_model_pathway("a an the of", top_k=20)
+        assert out == []
