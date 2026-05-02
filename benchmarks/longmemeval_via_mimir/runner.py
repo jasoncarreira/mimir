@@ -86,6 +86,98 @@ def _resolve_dataset(args: argparse.Namespace) -> Path:
     return DATASET_PATH
 
 
+_BENCH_SAGA_TOML_TEMPLATE = """\
+# saga.toml for the integration bench. Overwrites the default
+# mimir setup writes so token budgets don't refuse LongMemEval
+# haystacks (single-question haystacks push thousands of atoms,
+# well past the 1M-token production cap).
+
+[storage]
+db_path = "{db_path}"
+metrics_db_path = "{metrics_db_path}"
+# Match msam_bench.toml: effectively unlimited.
+token_budget_ceiling = 100000000
+auto_compact_threshold_pct = 99
+refuse_threshold_pct = 100
+db_busy_timeout_ms = 5000
+
+[embedding]
+provider = "openai"
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dimensions = 1536
+api_key_env = "OPENAI_API_KEY"
+
+[llm]
+# Bench LLM. Default claude_code (Max OAuth, free, slow) — flip to
+# openai_compat + gpt-5.4-nano via SAGA_BENCH_LLM_PROVIDER if you
+# want direct bench parity against the saga_p30_canon_v4 baseline.
+provider = "{llm_provider}"
+model = "{llm_model}"
+{llm_extra}
+timeout_seconds = 120
+
+[retrieval]
+# v0.5 §2 mimir-prod overrides — same as the default saga.toml.
+enable_contextual_rewrite = true
+two_tier_enabled = true
+enable_missing_ref_pivot = true
+enable_confidence_gating = true
+default_min_confidence_tier = "low"
+
+[retrieval_v2]
+enable_query_expansion = true
+
+[triples]
+enable_extraction = true
+
+[consolidation]
+enabled = true
+enable_llm = true
+
+[server]
+api_key = ""
+"""
+
+
+def _write_bench_saga_toml(home: Path) -> None:
+    """Overwrite ``<home>/saga.toml`` with bench-friendly settings.
+
+    The default saga.toml mimir setup writes caps storage at 1M tokens —
+    fine for daily use, fatal for LongMemEval haystacks. This bench
+    saga.toml uses msam_bench.toml's effectively-unlimited cap. LLM
+    config respects ``SAGA_BENCH_LLM_PROVIDER`` (default ``claude_code``
+    for free Max OAuth; set to ``openai_compat`` to use gpt-5.4-nano for
+    bench parity).
+    """
+    saga_dir = home / ".mimir"
+    saga_dir.mkdir(parents=True, exist_ok=True)
+
+    provider = os.environ.get("SAGA_BENCH_LLM_PROVIDER", "claude_code").strip().lower()
+    if provider == "openai_compat":
+        model = os.environ.get("SAGA_BENCH_LLM_MODEL", "gpt-5.4-nano")
+        extra = (
+            'url = "https://api.openai.com/v1/chat/completions"\n'
+            'api_key_env = "OPENAI_API_KEY"'
+        )
+    elif provider == "anthropic":
+        model = os.environ.get("SAGA_BENCH_LLM_MODEL", "claude-haiku-4-5")
+        extra = 'api_key_env = "ANTHROPIC_API_KEY"'
+    else:
+        provider = "claude_code"
+        model = os.environ.get("SAGA_BENCH_LLM_MODEL", "claude-haiku-4-5")
+        extra = ""
+
+    body = _BENCH_SAGA_TOML_TEMPLATE.format(
+        db_path=saga_dir / "saga.db",
+        metrics_db_path=saga_dir / "saga_metrics.db",
+        llm_provider=provider,
+        llm_model=model,
+        llm_extra=extra,
+    )
+    (home / "saga.toml").write_text(body)
+
+
 def _switch_saga_db(db_path: Path) -> None:
     """Point the in-process saga at a fresh SQLite file for this question.
 
@@ -115,11 +207,20 @@ async def _run_one_question(
     bench_bridge: Any,
     bench_stream: io.StringIO,
     aiohttp_app: Any,
+    turns_log: Path,
 ) -> dict[str, Any] | None:
     """Drive a single LongMemEval question through mimir's dispatcher.
 
     Returns the hypothesis record `{"question_id", "hypothesis"}` or None
     on failure (logged + skipped).
+
+    Hypothesis source: the turn record's ``output`` field in
+    ``turns.jsonl``. The agent's text reply for a default Q→A turn lands
+    there, NOT in BenchBridge — BenchBridge only captures outbound when
+    the agent explicitly calls the ``send_message`` tool, which it
+    doesn't for a normal user_message reply. We still pass through the
+    bench_stream as a secondary check in case the agent did use
+    send_message.
     """
     from aiohttp.test_utils import TestClient, TestServer
     from saga.benchmarks.longmemeval.ingest import ingest_question
@@ -132,8 +233,10 @@ async def _run_one_question(
     _switch_saga_db(db_path)
     ingest_question(question)
 
-    # BenchBridge captures outbound to the supplied stream.
-    pos_before = bench_stream.tell()
+    # Snapshot turn-log size + bench stream position so we can read just
+    # the new content after this question's turn finishes.
+    turns_pos_before = turns_log.stat().st_size if turns_log.exists() else 0
+    stream_pos_before = bench_stream.tell()
 
     async with TestClient(TestServer(aiohttp_app)) as client:
         body = question_to_event(question)
@@ -142,12 +245,52 @@ async def _run_one_question(
             return None
         await dispatcher.drain()
 
-    bench_stream.seek(pos_before)
-    new_output = bench_stream.read()
-    hypothesis = _extract_hypothesis(new_output, qid)
+    # Primary hypothesis source: turns.jsonl output for the just-run turn.
+    hypothesis = _extract_hypothesis_from_turns(
+        turns_log, channel_id_for(qid), turns_pos_before,
+    )
+    if hypothesis is None:
+        # Fallback: scrape send_message-routed output from BenchBridge.
+        bench_stream.seek(stream_pos_before)
+        new_output = bench_stream.read()
+        hypothesis = _extract_hypothesis(new_output, qid)
     if hypothesis is None:
         return None
     return {"question_id": qid, "hypothesis": hypothesis}
+
+
+def _extract_hypothesis_from_turns(
+    turns_log: Path, channel_id: str, byte_offset: int,
+) -> str | None:
+    """Read turn records appended after ``byte_offset``, return the
+    ``output`` of the most recent turn whose channel_id matches.
+
+    Scoped to *new* records (post-offset) so re-running the same channel
+    later doesn't pick up a stale prior turn.
+    """
+    if not turns_log.exists():
+        return None
+    with turns_log.open("rb") as f:
+        f.seek(byte_offset)
+        tail = f.read()
+    if not tail:
+        return None
+    out: str | None = None
+    for line in tail.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("channel_id") != channel_id:
+            continue
+        # Take the latest matching record's output.
+        out_text = rec.get("output")
+        if out_text:
+            out = str(out_text).strip()
+    return out
 
 
 def _extract_hypothesis(stream_text: str, question_id: str) -> str | None:
@@ -203,6 +346,9 @@ async def _amain(argv: list[str] | None = None) -> int:
     # Build the bench app.
     from mimir.cli import setup_home as _setup_home
     _setup_home(home)
+    # Overwrite saga.toml with bench-friendly settings — default mimir
+    # caps storage at 1M tokens (fine for daily, fatal for LongMemEval).
+    _write_bench_saga_toml(home)
     from mimir.config import Config
     cfg = Config.from_env()
     cfg = replace(cfg, home=home)
@@ -218,7 +364,7 @@ async def _amain(argv: list[str] | None = None) -> int:
     # to memory.
     channels = app["channels"]
     bench_bridge = next(
-        (b for b in channels.bridges if getattr(b, "name", None) == "bench"),
+        (b for b in channels.bridges() if getattr(b, "name", None) == "bench"),
         None,
     )
     assert bench_bridge is not None, "BenchBridge missing — server.build_app changed?"
@@ -226,6 +372,7 @@ async def _amain(argv: list[str] | None = None) -> int:
 
     written: list[dict] = []
     failed: list[str] = []
+    turns_log = home / "logs" / "turns.jsonl"
     for q in dataset:
         try:
             rec = await _run_one_question(
@@ -234,6 +381,7 @@ async def _amain(argv: list[str] | None = None) -> int:
                 bench_bridge=bench_bridge,
                 bench_stream=bench_stream,
                 aiohttp_app=app,
+                turns_log=turns_log,
             )
         except Exception as exc:  # noqa: BLE001 — keep going on per-question crashes
             print(f"  question {q['question_id']} crashed: {exc}", file=sys.stderr)
