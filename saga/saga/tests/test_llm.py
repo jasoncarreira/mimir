@@ -59,8 +59,9 @@ def test_openai_compat_happy_path(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer k"
     assert captured["body"]["model"] == "m"
     assert captured["body"]["temperature"] == 0.5
-    assert captured["body"]["max_tokens"] == 42
+    # Only max_completion_tokens is sent — gpt-5.x rejects max_tokens.
     assert captured["body"]["max_completion_tokens"] == 42
+    assert "max_tokens" not in captured["body"]
     assert captured["body"]["messages"][0] == {"role": "system", "content": "you are helpful"}
     assert captured["body"]["messages"][1] == {"role": "user", "content": "hi"}
 

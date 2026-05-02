@@ -212,11 +212,13 @@ def _call_openai_compat(
     """Legacy path — the original requests.post implementation, lifted
     here unchanged so call sites can drop their inline blocks.
 
-    Some servers (gpt-5.x family) require ``max_completion_tokens``
-    instead of ``max_tokens``; we send both for compatibility — extra
-    keys are ignored by servers that don't recognize them. (The
-    original consolidation.py fix landed in commit a426959 before this
-    refactor; this helper preserves the semantics.)
+    Sends ``max_completion_tokens`` (the newer OpenAI key). gpt-5.x
+    rejects ``max_tokens`` outright (400: ``Unsupported parameter:
+    'max_tokens' is not supported with this model. Use
+    'max_completion_tokens' instead.``); older models accept the new
+    name too. We previously sent both for back-compat — that broke
+    when gpt-5.4-nano started rejecting unknown extras (rather than
+    silently ignoring them).
     """
     import requests
 
@@ -230,7 +232,6 @@ def _call_openai_compat(
         "model": llm.get("model") or "",
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max_tokens,
         "max_completion_tokens": max_tokens,
     }
     try:
@@ -246,7 +247,17 @@ def _call_openai_compat(
         # raise_for_status keeps compatibility with the original call-site
         # pattern (and saga's tests' fake response objects). Non-200 →
         # exception → logged + empty string returned.
-        r.raise_for_status()
+        if r.status_code >= 400:
+            # Surface the response body so model/parameter mismatches
+            # are visible. raise_for_status alone shows only "400 Client
+            # Error" without the JSON body explaining what's wrong
+            # (e.g., "Unsupported parameter: 'max_tokens'...").
+            body_preview = (getattr(r, "text", "") or "")[:300]
+            log.warning(
+                "openai_compat call failed: %s %s — body=%s",
+                r.status_code, r.reason or "", body_preview,
+            )
+            return ""
         msg = r.json()["choices"][0]["message"]
         # Some models (e.g., step-3.5-flash) put answer in ``reasoning`` when
         # ``content`` is null.
