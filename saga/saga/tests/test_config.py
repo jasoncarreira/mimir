@@ -328,6 +328,43 @@ class TestResolveLLMConfig:
         out = resolve_llm_config("triples")
         assert out["api_key"] == ""
 
+    def test_provider_default_is_openai_compat(self, monkeypatch):
+        from saga.config import resolve_llm_config
+        import saga.config as cfg_mod
+        monkeypatch.setattr(cfg_mod, "_config", {"llm": {}, "consolidation": {}})
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        out = resolve_llm_config("consolidation")
+        assert out["provider"] == "openai_compat"
+
+    def test_subsystem_provider_overrides_top_level(self, monkeypatch):
+        from saga.config import resolve_llm_config
+        import saga.config as cfg_mod
+        monkeypatch.setattr(cfg_mod, "_config", {
+            "llm": {"provider": "openai_compat"},
+            "triples": {"provider": "anthropic"},
+        })
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        out = resolve_llm_config("triples")
+        assert out["provider"] == "anthropic"
+
+    def test_anthropic_provider_picks_up_anthropic_api_key_env(self, monkeypatch):
+        """When provider is anthropic and no other key resolves, fall through
+        to ANTHROPIC_API_KEY — saga's bench harness usually has only
+        OPENAI/NVIDIA keys, so production setups need this fallback."""
+        from saga.config import resolve_llm_config
+        import saga.config as cfg_mod
+        monkeypatch.setattr(cfg_mod, "_config", {
+            "llm": {"provider": "anthropic"},
+            "consolidation": {},
+        })
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        for k in ("OPENAI_API_KEY", "NVIDIA_NIM_API_KEY", "NVIDIA_API_KEY"):
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-token")
+        out = resolve_llm_config("consolidation")
+        assert out["provider"] == "anthropic"
+        assert out["api_key"] == "ant-token"
+
     def test_alternate_subsystem_model_keys(self, monkeypatch):
         """retrieval_v2 uses `rerank_model`, compression uses
         `synthesis_model` historically — those should still resolve."""

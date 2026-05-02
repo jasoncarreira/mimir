@@ -255,37 +255,21 @@ def extract_triples_llm(content: str, atom_id: str = "") -> list[dict]:
     """Extract triples from atom content using LLM.
     Returns list of {subject, predicate, object} dicts.
     Returns empty list if atom is skipped or extraction fails."""
-    import requests
     from .config import resolve_llm_config
+    from ._llm import call_llm_sync
 
     llm = resolve_llm_config('triples')
     if not llm['api_key']:
         return []
 
     prompt = EXTRACTION_PROMPT.format(content=content)
-
-    try:
-        r = requests.post(
-            llm['url'],
-            headers={"Authorization": f"Bearer {llm['api_key']}", "Content-Type": "application/json"},
-            json={
-                "model": llm['model'],
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 500,
-            },
-            timeout=llm['timeout'],
-        )
-        r.raise_for_status()
-        msg = r.json()["choices"][0]["message"]
-        # Some models (e.g. step-3.5-flash) put answer in reasoning when content is null
-        response_text = (msg.get("content") or msg.get("reasoning") or "").strip()
-    except Exception:
+    response_text = call_llm_sync(
+        llm, prompt=prompt, temperature=0.1, max_tokens=500,
+    )
+    if not response_text:
         return []
-
     if "SKIP" in response_text.upper() and len(response_text) < 20:
         return []
-
     return _parse_triples(response_text, atom_id)
 
 
@@ -435,28 +419,14 @@ def batch_extract_triples_llm(
         atoms_block = _format_atoms_for_batch(batch)
         prompt = BATCH_EXTRACTION_PROMPT.format(atoms_block=atoms_block)
 
-        try:
-            r = requests.post(
-                llm['url'],
-                headers={
-                    "Authorization": f"Bearer {llm['api_key']}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": llm['model'],
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1,
-                    # Generous budget: ~10 lines per atom * 20 atoms = 200
-                    # lines plus headers. Reasoning models burn tokens on
-                    # CoT before emitting content, so we err high.
-                    "max_tokens": 4000,
-                },
-                timeout=llm['timeout'],
-            )
-            r.raise_for_status()
-            msg = r.json()["choices"][0]["message"]
-            response_text = (msg.get("content") or msg.get("reasoning") or "").strip()
-        except Exception:
+        from ._llm import call_llm_sync
+        # Generous budget: ~10 lines per atom * 20 atoms = 200 lines plus
+        # headers. Reasoning models burn tokens on CoT before emitting
+        # content, so we err high.
+        response_text = call_llm_sync(
+            llm, prompt=prompt, temperature=0.1, max_tokens=4000,
+        )
+        if not response_text:
             # On batch failure, leave all atoms with empty triples and
             # continue. One bad batch shouldn't kill the run.
             continue

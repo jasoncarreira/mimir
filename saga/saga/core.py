@@ -1560,27 +1560,10 @@ def _resolve_contextual_query(
         "Rewritten:"
     )
 
-    import requests
-    try:
-        r = requests.post(
-            llm['url'],
-            headers={
-                "Authorization": f"Bearer {llm['api_key']}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": llm['model'],
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": 200,
-            },
-            timeout=llm['timeout'],
-        )
-        r.raise_for_status()
-        msg = r.json()["choices"][0]["message"]
-        rewritten = (msg.get("content") or msg.get("reasoning") or "").strip()
-    except Exception:
-        return query
+    from ._llm import call_llm_sync
+    rewritten = call_llm_sync(
+        llm, prompt=prompt, temperature=0.0, max_tokens=200,
+    )
 
     # Strip wrapping quotes the LLM occasionally adds despite the rules.
     rewritten = rewritten.strip().strip('"').strip("'").strip()
@@ -1667,28 +1650,10 @@ def _hyde_query(query: str) -> str | None:
         "Hypothetical answer:"
     )
 
-    import requests
-    try:
-        r = requests.post(
-            llm['url'],
-            headers={
-                "Authorization": f"Bearer {llm['api_key']}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": llm['model'],
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": 200,
-            },
-            timeout=llm['timeout'],
-        )
-        r.raise_for_status()
-        msg = r.json()["choices"][0]["message"]
-        text = (msg.get("content") or msg.get("reasoning") or "").strip()
-    except Exception:
-        return None
-
+    from ._llm import call_llm_sync
+    text = call_llm_sync(
+        llm, prompt=prompt, temperature=0.0, max_tokens=200,
+    )
     text = text.strip().strip('"').strip("'").strip()
     return text or None
 
@@ -1767,26 +1732,11 @@ def _resolve_query_and_hypothetical(
         f"Current message: {query}"
     )
 
-    import requests
-    try:
-        r = requests.post(
-            llm['url'],
-            headers={
-                "Authorization": f"Bearer {llm['api_key']}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": llm['model'],
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": 400,
-            },
-            timeout=llm['timeout'],
-        )
-        r.raise_for_status()
-        msg = r.json()["choices"][0]["message"]
-        text = (msg.get("content") or msg.get("reasoning") or "").strip()
-    except Exception:
+    from ._llm import call_llm_sync
+    text = call_llm_sync(
+        llm, prompt=prompt, temperature=0.0, max_tokens=400,
+    )
+    if not text:
         return query, None
 
     # Parse the two-section output. Be forgiving of leading whitespace,

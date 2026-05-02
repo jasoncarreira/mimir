@@ -29,6 +29,11 @@ dependencies = [
     "requests>=2.31",
     "numpy>=1.24",
     "faiss-cpu>=1.7",
+    # v0.5 §7: anthropic SDK is the default LLM transport. The
+    # ``[llm].provider = "openai_compat"`` config knob keeps the
+    # ``requests`` path live for bench parity against the gpt-5.4-nano
+    # baseline — that's why ``requests`` stays above.
+    "anthropic>=0.40",
 ]
 
 [project.optional-dependencies]
