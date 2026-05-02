@@ -1877,26 +1877,67 @@ def _triple_augment_v2(query: str, top_k: int = 10) -> list[dict]:
 _subatom_recursion_guard = threading.local()
 
 
+_FIRST_PERSON_TOKENS = {"i", "me", "my", "mine", "myself", "i'm", "i've", "i'd", "i'll"}
+
+
+def _match_subjects_in_query(subjects: list[str], query: str) -> list[str]:
+    """Word-boundary case-insensitive match of each DB subject against the
+    query text. Plus a first-person heuristic: any of {I, me, my, mine,
+    myself, ...} in the query promotes the canonical 'User' subject if
+    it exists in the DB. Returns subjects in the order they appear in
+    the input list (preserves DB ordering).
+
+    Substring-only would over-match ("the" subject hits everything);
+    word boundaries (``\\b`` regex) avoid that. For multi-word subjects
+    ("Lake Charles", "Sony WH-1000XM5") the boundaries still work
+    because re escapes the spaces literally."""
+    import re as _re
+    if not query or not subjects:
+        return []
+
+    q_tokens = {t.lower() for t in _re.findall(r"[\w']+", query)}
+    has_first_person = bool(q_tokens & _FIRST_PERSON_TOKENS)
+
+    q_lower = query.lower()
+    matched: list[str] = []
+    for s in subjects:
+        s_lower = s.lower()
+        if has_first_person and s_lower == "user":
+            matched.append(s)
+            continue
+        # Word-boundary match. Escape the subject to handle spaces,
+        # hyphens, dots, etc. literally.
+        if _re.search(rf"\b{_re.escape(s_lower)}\b", q_lower):
+            matched.append(s)
+    return matched
+
+
 def _world_model_pathway(query: str, top_k: int = 20,
                          reference_date=None) -> list[dict]:
     """P37(b) — world-model retrieval pathway.
 
-    Extract entities from the query (existing
-    ``retrieval_v2.extract_query_entities``), call ``query_world(entity)``
-    for each, return the source atoms of currently-valid triples as a
-    new RRF ranker.
+    Pulls the distinct subjects from the active triples table, matches
+    them against the query text (word-boundary, case-insensitive, plus
+    a first-person → 'User' shortcut), then calls
+    ``query_world(entity=match)`` for each hit and surfaces source atoms
+    of currently-valid triples as a new RRF ranker.
+
+    Why DB-driven matching: regex-based ``extract_query_entities`` has
+    to guess what entities MIGHT be in the DB; pulling distinct
+    subjects flips that — the DB tells us its real vocabulary, we just
+    check which of those vocabulary items appear in the query.
+    Catches multi-word entities ("Lake Charles", "WH-1000XM5") that
+    the proper-noun regex would miss.
 
     Different shape from triple_augment_v2 (P41):
-    - P41 cosine-matches the query embedding against every active triple
-      embedding — fires for any retrieve that has triples populated.
-    - P37 entity-matches the triple's *subject* column against entities
-      extracted from the query, and is filtered to currently-valid
-      triples by ``query_world``'s built-in temporal predicate.
+    - P41 cosine-matches the query embedding against every active
+      triple embedding — fires for any retrieve that has triples.
+    - P37 word-boundary-matches the triple's *subject* column against
+      the query, and filters to currently-valid triples via
+      ``query_world``'s built-in temporal predicate.
 
     Strict no-op when ``[retrieval] enable_world_model_pathway`` is
-    False (default). When on, returns atoms in entity-discovery order
-    (effectively: by entity match priority, then triple recency).
-    Downstream RRF uses rank, so per-entry score isn't sensitive.
+    False (default).
 
     ``reference_date`` (optional) — anchors "currently valid" to a
     specific point in time. Bench harness passes the question's
@@ -1907,13 +1948,21 @@ def _world_model_pathway(query: str, top_k: int = 20,
         return []
 
     try:
-        from .retrieval_v2 import extract_query_entities
         from .triples import query_world
     except Exception:
         return []
 
-    entities = extract_query_entities(query)
-    if not entities:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT subject FROM triples WHERE state = 'active'"
+        ).fetchall()
+        subjects = [r['subject'] for r in rows if r and r['subject']]
+    finally:
+        conn.close()
+
+    matched_subjects = _match_subjects_in_query(subjects, query)
+    if not matched_subjects:
         return []
 
     # Anchor "currently valid" — pass the bench reference_date through
@@ -1925,7 +1974,7 @@ def _world_model_pathway(query: str, top_k: int = 20,
 
     seen: set[str] = set()
     source_ids: list[str] = []
-    for ent in entities:
+    for ent in matched_subjects:
         try:
             triples = query_world(entity=ent, at_time=at_time)
         except Exception:

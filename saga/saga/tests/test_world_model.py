@@ -156,8 +156,8 @@ class TestWorldModelPathway:
             object_val="Boston", source_atom_id=atom_id,
         )
 
-        # extract_query_entities should pick up "User" from the question.
-        out = _world_model_pathway("Where does User live?", top_k=20)
+        # First-person query → "User" subject promoted by the matcher.
+        out = _world_model_pathway("Where do I live?", top_k=20)
         assert len(out) == 1
         assert out[0]["id"] == atom_id
         assert out[0]["_world_model_pathway"] is True
@@ -241,3 +241,58 @@ class TestWorldModelPathway:
         # All-stopword query.
         out = _world_model_pathway("a an the of", top_k=20)
         assert out == []
+
+
+class TestMatchSubjectsInQuery:
+    """The DB-driven entity matcher used by P37(b)."""
+
+    def test_word_boundary_avoids_substring_false_positives(self):
+        from saga.core import _match_subjects_in_query
+        # 'cat' shouldn't match 'category' / 'concatenate'.
+        out = _match_subjects_in_query(
+            ["cat", "Boston"],
+            "We talked about the category of cars in Boston",
+        )
+        assert "Boston" in out
+        assert "cat" not in out
+
+    def test_multi_word_subject(self):
+        from saga.core import _match_subjects_in_query
+        out = _match_subjects_in_query(
+            ["Lake Charles", "User"],
+            "What processes does the Lake Charles refinery use?",
+        )
+        assert "Lake Charles" in out
+
+    def test_first_person_promotes_user(self):
+        from saga.core import _match_subjects_in_query
+        # "I" / "my" / "me" — none would substring-match "User", but the
+        # first-person heuristic promotes "User" if it's in the DB.
+        for q in ("Where do I live?", "What's my favorite color?", "Tell me about my job"):
+            out = _match_subjects_in_query(["User", "Boston"], q)
+            assert "User" in out, f"failed for query: {q!r}"
+
+    def test_first_person_does_not_invent_user(self):
+        """If 'User' isn't in the DB's subjects, first-person doesn't
+        invent it."""
+        from saga.core import _match_subjects_in_query
+        out = _match_subjects_in_query(["Alice", "Boston"], "Where do I live?")
+        # Neither subject literally appears in the query, no first-person
+        # promotion of User (which doesn't exist in this DB), so empty.
+        assert out == []
+
+    def test_case_insensitive(self):
+        from saga.core import _match_subjects_in_query
+        out = _match_subjects_in_query(["BOSTON", "Sony"], "are sony products good in boston?")
+        assert "BOSTON" in out
+        assert "Sony" in out
+
+    def test_no_matches_returns_empty(self):
+        from saga.core import _match_subjects_in_query
+        out = _match_subjects_in_query(["Boston", "Sony"], "What time is it?")
+        assert out == []
+
+    def test_empty_inputs_safe(self):
+        from saga.core import _match_subjects_in_query
+        assert _match_subjects_in_query([], "anything") == []
+        assert _match_subjects_in_query(["X"], "") == []
