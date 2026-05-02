@@ -1984,13 +1984,15 @@ def _world_model_pathway(query: str, top_k: int = 20,
             if sid and sid not in seen:
                 seen.add(sid)
                 source_ids.append(sid)
-        if len(source_ids) >= top_k:
-            break
+        # Don't break at top_k yet — we cosine-rank below and want the
+        # full candidate pool to choose from.
 
     if not source_ids:
         return []
-    source_ids = source_ids[:top_k]
 
+    # Fetch the candidate atoms WITH embeddings so we can cosine-rank.
+    # Entity match narrowed the pool; cosine over that narrowed pool
+    # gives real relevance signal vs the prior arbitrary rank.
     conn = get_db()
     try:
         placeholders = ",".join("?" * len(source_ids))
@@ -2001,17 +2003,43 @@ def _world_model_pathway(query: str, top_k: int = 20,
         ).fetchall()
     finally:
         conn.close()
+    if not rows:
+        return []
 
-    by_id = {r['id']: dict(r) for r in rows}
-    out: list[dict] = []
-    for aid in source_ids:
-        if aid not in by_id:
-            continue
-        atom = by_id[aid]
+    # Cosine rank within the entity-filtered pool. If the query embed
+    # fails (e.g. embedding API outage), fall back to entity-discovery
+    # order (the previous arbitrary-rank behavior) so the pathway
+    # degrades to "still surfaces atoms" rather than empty.
+    try:
+        q_emb = cached_embed_query(query)
+    except Exception:
+        q_emb = None
+
+    scored: list[tuple[dict, float]] = []
+    for r in rows:
+        atom = dict(r)
+        emb_blob = atom.get("embedding")
+        try:
+            if q_emb and emb_blob:
+                sim = cosine_similarity(q_emb, unpack_embedding(emb_blob))
+            else:
+                sim = 0.0
+        except Exception:
+            sim = 0.0
         atom.pop("embedding", None)
         atom["_world_model_pathway"] = True
-        out.append(atom)
-    return out
+        atom["_similarity"] = sim
+        scored.append((atom, sim))
+
+    if q_emb:
+        scored.sort(key=lambda x: -x[1])
+    else:
+        # Preserve entity-discovery order when we couldn't embed the
+        # query (deterministic fallback rather than random rank).
+        order = {aid: i for i, aid in enumerate(source_ids)}
+        scored.sort(key=lambda x: order.get(x[0]["id"], 1 << 30))
+
+    return [atom for atom, _ in scored[:top_k]]
 
 
 def _subatom_beam_atoms(query: str, top_k: int, mode: str) -> list[dict]:
