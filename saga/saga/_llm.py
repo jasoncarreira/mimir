@@ -117,37 +117,47 @@ def _call_claude_code(
     prompt: str, max_tokens: int, temperature: float,
     system: str | None,
 ) -> str:
-    """Route through claude-agent-sdk's ``query()`` — a one-shot Claude
-    Code subprocess. Inherits OAuth from ``claude login`` (Max plan)
-    so saga's internal LLM calls (consolidation synthesis, contextual
-    rewrite, triple extraction, etc.) don't need a separate API key.
+    """Route through claude-agent-sdk against a long-lived
+    ``ClaudeSDKClient`` so the Claude Code subprocess stays warm
+    across saga's many small LLM calls. Inherits OAuth from
+    ``claude login`` (Max plan).
 
-    Tradeoffs vs. ``anthropic``:
+    Why the persistent client matters:
+      Measured one-shot ``query()`` startup: ~5-9s/call (most of it
+      subprocess spawn).
+      Measured warm ``ClaudeSDKClient.query()``: ~1.5-2s/call.
+      For a 500-question integration bench with ~30 consolidation
+      clusters per question, that's the difference between ~30 hours
+      and ~8 hours of consolidation wall-clock.
+
+    Caveat: ``ClaudeSDKClient`` accumulates conversation history
+    across ``query()`` calls — call 2 remembers what call 1 said.
+    saga's prompts are independent (one consolidation cluster has
+    nothing to do with the next), so the carry-over is pure waste.
+    We recycle the client every ``RECYCLE_AFTER`` calls
+    (``disconnect`` + new ``connect``) to bound the context bloat.
+    Recycle cost is one cold-start (~1s) every K calls; net win is
+    still ~3-4x.
+
+    Other tradeoffs vs. ``anthropic`` / ``openai_compat``:
     - **Auth**: free under Max — no API credit needed.
-    - **Latency**: ~500ms-2s subprocess spawn per call. For bench runs
-      with many consolidation clusters this adds up; consider
-      ``provider = "openai_compat"`` with gpt-5.4-nano for direct bench
-      parity against ``saga_p30_canon_v4 = 0.774``.
-    - **Quota**: counts against your 5h / 7d Max windows. Daily mimir
-      use is fine; a 500-question bench can eat through quickly.
-    - **Reproducibility**: Max plan throttles via wait, not 429. Bench
-      numbers may drift more than direct-API runs.
+    - **Quota**: counts against your 5h / 7d Max windows. Daily
+      mimir use is fine; a 500-question bench can eat through.
+    - **Reproducibility**: Max plan throttles via wait, not 429.
+      Bench numbers may drift more than direct-API runs.
 
-    saga's ``call_llm_sync`` is a sync function; we bridge to the async
-    ``query()`` via ``asyncio.run`` from a saga thread (every call site
-    is wrapped in ``asyncio.to_thread`` at mimir's boundary, so we're
-    not on the event loop here).
-
-    The ``temperature`` and ``max_tokens`` knobs aren't honored by
-    Claude Code — the CLI doesn't expose them. ``model`` from the llm
-    dict overrides the CLI default; otherwise the user's
-    ``CLAUDE_MODEL`` env or claude config wins.
+    ``temperature`` and ``max_tokens`` aren't honored — the Claude
+    Code CLI doesn't expose them. ``model`` from the llm dict picks
+    the model; otherwise ``CLAUDE_MODEL`` env or CLI default wins.
     """
     try:
         # Lazy import: claude-agent-sdk lives in mimir's deps but saga
         # doesn't depend on mimir, and standalone saga environments may
         # not have it installed.
-        from claude_agent_sdk import query, ClaudeAgentOptions
+        from claude_agent_sdk import (  # noqa: F401 — used by _PersistentClaudeCode
+            ClaudeAgentOptions,
+            ClaudeSDKClient,
+        )
     except ImportError:
         log.warning("claude-agent-sdk not installed; falling back to openai_compat")
         return _call_openai_compat(
@@ -155,53 +165,166 @@ def _call_claude_code(
             temperature=temperature, system=system,
         )
 
-    import asyncio
+    return _persistent_runner().call(
+        prompt=prompt,
+        model=llm.get("model"),
+        system=system,
+    )
 
-    options_kwargs: dict[str, Any] = {}
-    model = llm.get("model")
-    if model:
-        options_kwargs["model"] = model
-    if system:
-        options_kwargs["system_prompt"] = system
 
-    async def _run() -> str:
-        pieces: list[str] = []
+# ─── Persistent ClaudeSDKClient ──────────────────────────────────
+
+
+_RECYCLE_AFTER_CALLS = 10
+"""Recycle the ClaudeSDKClient every N saga LLM calls.
+
+ClaudeSDKClient accumulates conversation history across query() calls.
+Saga's prompts are independent, so the carry-over is wasted tokens (and
+on Max OAuth, wasted plan-window quota). 10 strikes a balance: ~10x
+amortization on the cold-start cost vs. ~10 × prompt_size tokens of
+peak context at the high end of each cycle. Adjust via the
+``SAGA_PERSISTENT_CLAUDE_RECYCLE`` env var if a particular workload
+benefits from a different K."""
+
+
+_persistent_runner_singleton: "_PersistentClaudeCode | None" = None
+
+
+def _persistent_runner() -> "_PersistentClaudeCode":
+    """Module-level singleton. Lazy because the SDK isn't installed in
+    every saga deployment (e.g., standalone bench infra)."""
+    global _persistent_runner_singleton
+    if _persistent_runner_singleton is None:
+        _persistent_runner_singleton = _PersistentClaudeCode()
+    return _persistent_runner_singleton
+
+
+class _PersistentClaudeCode:
+    """A daemon thread running an asyncio event loop with one warm
+    ``ClaudeSDKClient``. saga's sync ``call_llm_sync`` submits prompts
+    via ``run_coroutine_threadsafe`` and blocks on the result.
+
+    Recycles the client every ``_RECYCLE_AFTER_CALLS`` calls (or when
+    ``model`` changes between calls) to bound conversation bloat.
+
+    Concurrent calls from saga workers serialize on the same client
+    (``ClaudeSDKClient.query`` is single-threaded by design). For
+    parallelism we'd need a pool; saga's existing call sites are
+    sequential within a single bench question, so a single client
+    is enough. Future: bump to a small pool if mimir's pre-message
+    hook starts firing concurrent contextual_rewrite calls."""
+
+    def __init__(self) -> None:
+        import asyncio
+        import os
+        import threading
+        from concurrent.futures import Future
+
+        self._asyncio = asyncio
+        self._Future = Future
+        recycle_env = os.environ.get("SAGA_PERSISTENT_CLAUDE_RECYCLE", "")
         try:
-            async for msg in query(
-                prompt=prompt,
-                options=ClaudeAgentOptions(**options_kwargs),
-            ):
-                # AssistantMessage is the one with content blocks. Other
-                # types (ResultMessage, SystemMessage) we ignore — saga
-                # prompts don't request tools, only text.
-                content = getattr(msg, "content", None)
-                if not content:
-                    continue
-                for block in content:
+            self._recycle_after = max(1, int(recycle_env)) if recycle_env else _RECYCLE_AFTER_CALLS
+        except ValueError:
+            self._recycle_after = _RECYCLE_AFTER_CALLS
+
+        # Daemon thread runs the event loop. Daemon=True so the bench
+        # runner's process exits without us hanging on close cleanup
+        # — the OS reaps the Claude Code subprocess on parent exit.
+        self._loop_ready = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="saga-claude-code")
+        self._thread.start()
+        self._loop_ready.wait(timeout=5)
+        if self._loop is None:
+            raise RuntimeError("persistent claude-code thread failed to start")
+
+        self._client = None  # type: ignore[assignment]
+        self._client_model: str | None = None
+        self._call_count = 0
+        # Submission lock: ClaudeSDKClient is single-threaded; saga
+        # call_llm_sync usages are sequential per-thread but we lock
+        # to make this safe under unexpected concurrency too.
+        self._submit_lock = threading.Lock()
+
+    def _run_loop(self) -> None:
+        loop = self._asyncio.new_event_loop()
+        self._asyncio.set_event_loop(loop)
+        self._loop = loop
+        self._loop_ready.set()
+        try:
+            loop.run_forever()
+        finally:
+            loop.close()
+
+    def call(self, *, prompt: str, model: str | None, system: str | None) -> str:
+        """Submit a prompt to the warm client. Blocks the caller until
+        the assistant's reply is fully received, then returns the
+        flattened text."""
+        with self._submit_lock:
+            future = self._asyncio.run_coroutine_threadsafe(
+                self._do_call(prompt=prompt, model=model, system=system),
+                self._loop,  # type: ignore[arg-type]
+            )
+            try:
+                return future.result(timeout=600)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("persistent claude-code call failed: %s", exc)
+                return ""
+
+    async def _do_call(
+        self, *, prompt: str, model: str | None, system: str | None
+    ) -> str:
+        from claude_agent_sdk import (
+            AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient,
+        )
+
+        # Recycle conditions: model changed (different options needed)
+        # OR call count hit the recycle threshold.
+        if (
+            self._client is None
+            or self._client_model != model
+            or self._call_count >= self._recycle_after
+        ):
+            await self._reset_client(model=model, system=system)
+
+        assert self._client is not None
+        await self._client.query(prompt)
+
+        pieces: list[str] = []
+        async for msg in self._client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content or []:
                     text = getattr(block, "text", None)
                     if text:
                         pieces.append(text)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("claude-agent-sdk query failed: %s", exc)
-            return ""
+        self._call_count += 1
         return "".join(pieces).strip()
 
-    try:
-        return asyncio.run(_run())
-    except RuntimeError as exc:
-        # asyncio.run raises if we're already inside an event loop. saga's
-        # hot paths run via asyncio.to_thread (i.e., on a worker thread
-        # without a loop), so this is rare — only happens if a caller is
-        # using saga directly from inside an async context.
-        log.warning(
-            "claude_code provider can't bridge an existing event loop "
-            "(%s); falling back to openai_compat",
-            exc,
-        )
-        return _call_openai_compat(
-            llm, prompt=prompt, max_tokens=max_tokens,
-            temperature=temperature, system=system,
-        )
+    async def _reset_client(self, *, model: str | None, system: str | None) -> None:
+        """Disconnect any current client + spin up a fresh one. Cheap
+        relative to one-shot ``query()`` startup because most of the
+        connect cost amortizes over the next K calls."""
+        from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("persistent claude-code disconnect failed: %s", exc)
+            self._client = None
+
+        options_kwargs: dict[str, Any] = {}
+        if model:
+            options_kwargs["model"] = model
+        if system:
+            options_kwargs["system_prompt"] = system
+
+        client = ClaudeSDKClient(options=ClaudeAgentOptions(**options_kwargs))
+        await client.connect()
+        self._client = client
+        self._client_model = model
+        self._call_count = 0
 
 
 def _call_openai_compat(
