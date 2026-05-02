@@ -66,6 +66,7 @@ def build_system_prompt(
     core_blocks: list[CoreBlock] | None = None,
     memory_index_body: str | None = None,
     operator_alert_channel: str = "",
+    skill_block: str | None = None,
 ) -> str:
     """Assemble the system prompt. ``state/INDEX.md`` is intentionally absent —
     it's read on demand (SPEC §9.1).
@@ -73,7 +74,13 @@ def build_system_prompt(
     ``operator_alert_channel`` (v0.4 §6) — when set, append a one-line
     Operator config section so the agent knows the channel id to use for
     high-priority signals (the alert skill teaches *when*; this teaches
-    *what*)."""
+    *what*).
+
+    ``skill_block`` (FUTURE_WORK §12.3) — when set, append a Skills
+    section with success-rate-ordered listing. Sits in the system
+    prompt (not turn prompt) because the bucket assignment is
+    stable across turns; updates land via re-build between sessions
+    or after MIMIR_SKILL_BLOCK_REFRESH_TURNS."""
     parts: list[str] = [persona or _DEFAULT_PERSONA]
 
     if core_blocks:
@@ -85,6 +92,9 @@ def build_system_prompt(
         parts.append("## Memory index\n\n" + memory_index_body.rstrip())
 
     parts.append(conventions or _DEFAULT_CONVENTIONS)
+
+    if skill_block:
+        parts.append("## Skills\n\n" + skill_block.rstrip())
 
     if operator_alert_channel:
         parts.append(
