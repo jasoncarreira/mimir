@@ -228,6 +228,49 @@ class TestWorldModelPathway:
         out = _world_model_pathway("Where does User work?", top_k=20, reference_date=ref_after)
         assert all(a["id"] != atom_2023 for a in out)
 
+    def test_cosine_reranks_within_entity_pool(self, monkeypatch):
+        """Among atoms surfaced via entity match, cosine similarity to
+        the query embedding determines order — the relevant atom should
+        outrank the irrelevant one."""
+        import saga.config as cfg_mod
+        cfg_mod._load_config()
+        snapshot = dict(cfg_mod._config or {})
+        snapshot.setdefault("retrieval", {})["enable_world_model_pathway"] = True
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+
+        # Two atoms with embeddings that differ from each other; the
+        # query embedding matches the first more than the second.
+        relevant_emb = list(np.zeros(1024).astype(float))
+        relevant_emb[0] = 1.0
+        irrelevant_emb = list(np.zeros(1024).astype(float))
+        irrelevant_emb[1] = 1.0
+        query_emb = list(np.zeros(1024).astype(float))
+        query_emb[0] = 0.99  # closer to relevant
+
+        from saga.core import store_atom, _world_model_pathway
+        from saga.triples import update_world
+
+        # Store two atoms with controlled embeddings.
+        monkeypatch.setattr("saga.core.embed_text", lambda t: relevant_emb)
+        atom_relevant = store_atom("User lives in Boston")
+        monkeypatch.setattr("saga.core.embed_text", lambda t: irrelevant_emb)
+        atom_irrelevant = store_atom("User likes jazz")
+
+        # Both back triples for subject="User".
+        update_world(subject="User", predicate="lives_in",
+                     object_val="Boston", source_atom_id=atom_relevant)
+        update_world(subject="User", predicate="likes",
+                     object_val="jazz", source_atom_id=atom_irrelevant)
+
+        # Query embedding is closer to relevant_emb.
+        monkeypatch.setattr("saga.core.cached_embed_query", lambda t: query_emb)
+
+        out = _world_model_pathway("Where do I live?", top_k=20)
+        # Relevant atom should rank first.
+        assert out[0]["id"] == atom_relevant
+        assert out[0]["_similarity"] > out[1]["_similarity"]
+
     def test_no_entities_returns_empty(self, monkeypatch):
         """Query with no extractable entities skips the pathway cleanly."""
         import saga.config as cfg_mod
