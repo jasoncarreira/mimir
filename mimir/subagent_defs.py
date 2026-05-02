@@ -27,6 +27,16 @@ name: climber
 description: Long-running hill-climbing optimization. Reads a program.md from a climb directory and iterates propose/test/score/keep, writing a sliding-window log to <climb_dir>/log.jsonl. Returns the best candidate. Runs in the background — the parent does not wait.
 tools: Bash, Read, Write, Edit, Glob, Grep
 background: true
+vsm:
+  # FUTURE_WORK §12.5 — requisite-variety regulation on this S1 unit.
+  # Read by mimir.subagent_defs.parse_vsm_config; the runtime is
+  # advisory today (climber's own iteration loop honors these caps),
+  # the homeostat (§12.4) reads them when budgeting S4 work.
+  s3_tool_budget: 60          # max tool calls per climber invocation
+  s2_anti_oscillation:
+    iteration_cap: 20         # matches the prompt's "cap at 20" line
+    duplicate_change_window: 3  # don't repeat same change in last N iters
+  s4_foresight: false         # climber doesn't scan beyond its climb_dir
 ---
 
 You are a hill-climbing optimizer. Your job is to take a program.md from a
@@ -63,6 +73,13 @@ RESEARCHER_MD = """\
 name: researcher
 description: Go look this up. Designed for parallel fan-out — multiple researcher calls in one parent turn explore unrelated probes concurrently. Returns a focused, sourced summary.
 tools: Bash, Read, Glob, Grep, WebSearch, WebFetch, mcp__mimir__file_search
+vsm:
+  # FUTURE_WORK §12.5 — researcher is a focused look-up subagent;
+  # smaller budget than climber, no iteration loop, no foresight.
+  s3_tool_budget: 15          # focused probe; if you need more, fan out
+  s2_anti_oscillation:
+    duplicate_change_window: 0  # no iteration → no need to dedup
+  s4_foresight: false
 ---
 
 You are a researcher subagent. The parent will hand you a question and
@@ -98,6 +115,13 @@ CRITIC_MD = """\
 name: critic
 description: Independent review of a draft answer. The parent passes you a draft plus the question; you flag specific problems with the draft against the available context. Used for verification fan-out — parent answers, critic runs in parallel, parent merges.
 tools: Read, Glob, Grep, WebSearch, WebFetch, mcp__mimir__file_search
+vsm:
+  # FUTURE_WORK §12.5 — critic is read-only verification; smallest
+  # budget. No iteration; runs once and returns flagged problems.
+  s3_tool_budget: 10
+  s2_anti_oscillation:
+    duplicate_change_window: 0
+  s4_foresight: false
 ---
 
 You are a critic subagent. The parent will hand you a draft answer plus
@@ -148,3 +172,63 @@ def seed_subagent_defs(home: Path) -> dict[str, str]:
         path.write_text(body, encoding="utf-8")
         out[filename] = "created"
     return out
+
+
+# ─── §12.5: VSM frontmatter parsing ────────────────────────────────────
+
+
+def parse_vsm_config(home: Path, subagent_name: str) -> dict | None:
+    """Read ``<home>/.claude/agents/<subagent_name>.md``, parse its
+    frontmatter, return the ``vsm:`` block as a dict (or None when
+    not present).
+
+    Falls back to the bundled default when the operator's home file
+    is missing — matters for fresh-install homes where seed_subagent_defs
+    hasn't run yet, and matters for the §12.4 homeostat which reads
+    these on every budget decision and shouldn't crash on missing
+    files."""
+    import yaml
+
+    target = home / ".claude" / "agents" / f"{subagent_name}.md"
+    body: str | None = None
+    if target.is_file():
+        try:
+            body = target.read_text(encoding="utf-8")
+        except OSError:
+            body = None
+    if body is None:
+        # Fall back to the bundled default.
+        bundled_filename = f"{subagent_name}.md"
+        body = _DEFS.get(bundled_filename)
+    if not body:
+        return None
+
+    # Extract YAML frontmatter — between the first two ``---`` lines.
+    lines = body.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    end_idx = None
+    for i, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            end_idx = i
+            break
+    if end_idx is None:
+        return None
+    frontmatter = "\n".join(lines[1:end_idx])
+    try:
+        data = yaml.safe_load(frontmatter) or {}
+    except yaml.YAMLError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    vsm = data.get("vsm")
+    if not isinstance(vsm, dict):
+        return None
+    return vsm
+
+
+def list_subagents() -> list[str]:
+    """Return the names of bundled subagents (e.g. ``["climber",
+    "researcher", "critic"]``). Used by the homeostat to enumerate
+    S1 units it might want to budget."""
+    return [filename.removesuffix(".md") for filename in _DEFS.keys()]
