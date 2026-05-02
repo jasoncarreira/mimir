@@ -136,6 +136,98 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
     assert e.extra["schedule_name"] == "morning"
 
 
+def test_add_introspection_report_job_validates_cron(tmp_path: Path):
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    # Invalid cron raises.
+    with pytest.raises(ValueError):
+        sched.add_introspection_report_job(tmp_path, "this is not cron")
+
+
+def test_add_introspection_report_job_disabled_when_blank(tmp_path: Path):
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched.add_introspection_report_job(tmp_path, "") is False
+    assert sched.add_introspection_report_job(tmp_path, "   ") is False
+
+
+def test_add_introspection_report_job_registers(tmp_path: Path):
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched.add_introspection_report_job(tmp_path, "0 14 * * 5") is True
+    job = sched._scheduler.get_job("introspection-report")
+    assert job is not None
+
+
+@pytest.mark.asyncio
+async def test_introspection_report_callback_writes_report_and_emits(tmp_path: Path):
+    """End-to-end: invoke the registered callback directly and verify it
+    produces a state/reports/ file. Uses a degraded-heartbeat scenario
+    so the algedonic emit also fires."""
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    home = tmp_path
+    logs = home / "logs"
+    logs.mkdir(exist_ok=True)
+    # 4 fired ticks, only 1 successful turn → 25% pipeline rate.
+    base = datetime.now(tz=timezone.utc)
+    with (logs / "events.jsonl").open("w") as f:
+        for i in range(4):
+            f.write(json.dumps({
+                "timestamp": (base - timedelta(hours=i + 1)).isoformat(),
+                "type": "scheduled_tick",
+                "session_id": "s",
+            }) + "\n")
+    with (logs / "turns.jsonl").open("w") as f:
+        f.write(json.dumps({
+            "ts": (base - timedelta(hours=1)).isoformat(),
+            "turn_id": "t1", "session_id": "s", "saga_session_id": None,
+            "trigger": "scheduled_tick", "channel_id": "c", "input": "",
+            "events": [], "duration_ms": 100, "error": None,
+        }) + "\n")
+        f.write(json.dumps({
+            "ts": (base - timedelta(hours=2)).isoformat(),
+            "turn_id": "t2", "session_id": "s", "saga_session_id": None,
+            "trigger": "scheduled_tick", "channel_id": "c", "input": "",
+            "events": [], "duration_ms": 100, "error": "boom",
+        }) + "\n")
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched.add_introspection_report_job(
+        home, "0 14 * * 5",
+        emit_algedonic=True, health_threshold=0.80,
+    )
+
+    # Pull the registered callable and invoke it directly. APScheduler
+    # adds args/kwargs metadata; the bare async closure has no params.
+    job = sched._scheduler.get_job("introspection-report")
+    callback = job.func
+    await callback()
+
+    # Report file written.
+    reports = list((home / "state" / "reports").glob("introspection-*.md"))
+    assert len(reports) == 1
+    assert "Heartbeat / scheduled-tick health" in reports[0].read_text()
+
+    # Algedonic event appended (find by type — log_event from the
+    # callback's success path may also have written to events.jsonl
+    # if the global event-logger singleton was initialized).
+    events = (logs / "events.jsonl").read_text().splitlines()
+    types = [json.loads(line)["type"] for line in events]
+    assert "heartbeat_health_degraded" in types
+    health = next(
+        json.loads(line) for line in events
+        if json.loads(line)["type"] == "heartbeat_health_degraded"
+    )
+    assert health["success_rate"] == 0.25
+
+
 @pytest.mark.asyncio
 async def test_fire_consults_arbiter_and_suppresses(tmp_path: Path):
     """§12.4: when the homeostat returns SUPPRESS, _fire must skip the

@@ -121,7 +121,9 @@ def test_setup_scheduler_yaml_documents_reflect_entry(tmp_path: Path):
     setup_home(home)
     body = (home / "scheduler.yaml").read_text()
     assert "reflect" in body
-    assert "0 4 * * 0" in body  # Sunday 04:00 UTC
+    # Sunday 06:00 UTC — runs after the saga-consolidate cron at 04:00
+    # so the reflection turn reads post-consolidation state.
+    assert "0 6 * * 0" in body
 
 
 # ---- Constant content sanity --------------------------------------------

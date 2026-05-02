@@ -119,37 +119,44 @@ DEFAULT_SCHEDULER_YAML = dedent(
     # mimir scheduler — APScheduler cron jobs that enqueue LLM ticks.
     # Each job triggers a turn on ``channel_id`` with ``trigger=scheduled_tick``.
     #
-    # Example one-off job:
+    # Two recurring LLM ticks are enabled by default:
     #
-    # jobs:
+    #   - heartbeat: hourly autonomous-work cadence. Pulls one item from
+    #     state/heartbeat-backlog.md and does it. The §12.4 homeostat
+    #     suppresses fires when the plan window saturates or cost rate
+    #     trips, so this default is safe even at hourly cadence.
+    #   - reflect: weekly cross-session audit (Sunday 06:00 UTC, two
+    #     hours after the SAGA consolidation cron at 04:00 so the
+    #     reflection turn reads post-consolidation state).
+    #
+    # Two non-LLM crons are auto-installed by the runtime (no entry
+    # needed here):
+    #
+    #   - saga-consolidate: weekly atom merge / synthesis pass
+    #     (MIMIR_SAGA_CONSOLIDATE_CRON, default Sun 04:00).
+    #   - introspection-report: weekly behavioral / health snapshot
+    #     written to state/reports/ with algedonic emit on degraded
+    #     heartbeat success rate (MIMIR_INTROSPECTION_REPORT_CRON,
+    #     default Fri 14:00).
+    #
+    # To disable a default tick, comment it out below or remove it.
+    # To add a custom tick:
+    #
     #   - name: morning-checkin
     #     cron: "0 9 * * 1-5"
     #     channel_id: web-default
     #     prompt: "Morning check-in: review yesterday and plan today."
-    #
-    # Heartbeat tick (v0.4 §1) — autonomous-work cadence. Uncomment to
-    # enable. When ``prompt:`` is empty/omitted on a scheduled_tick, the
-    # turn prompt falls back to HEARTBEAT_DEFAULT_PROMPT (see
-    # mimir/prompts.py); having an explicit prompt here keeps the
-    # configuration self-documenting.
-    #
-    # jobs:
-    #   - name: heartbeat
-    #     cron: "*/30 * * * *"
-    #     channel_id: null   # synthetic scheduler:heartbeat channel
-    #     prompt: "Run the heartbeat skill: librarian protocol first, then pick one item from state/heartbeat-backlog.md and do it. End silently."
-    #
-    # Reflection (v0.4 §4) — weekly cross-session audit. Sunday 04:00 UTC
-    # so it lands after the SAGA weekly consolidation. Uncomment to
-    # enable.
-    #
-    # jobs:
-    #   - name: reflect
-    #     cron: "0 4 * * 0"
-    #     channel_id: null   # synthetic scheduler:reflect channel
-    #     prompt: "Run the reflection skill — cross-session audit of the past week."
 
-    jobs: []
+    jobs:
+      - name: heartbeat
+        cron: "0 * * * *"
+        channel_id: null   # synthetic scheduler:heartbeat channel
+        prompt: "Run the heartbeat skill: librarian protocol first, then pick one item from state/heartbeat-backlog.md and do it. End silently."
+
+      - name: reflect
+        cron: "0 6 * * 0"
+        channel_id: null   # synthetic scheduler:reflect channel
+        prompt: "Run the reflection skill — cross-session audit of the past week. Start with `mimir reflection introspection-report` and `mimir reflection audit`."
     """
 )
 
@@ -731,6 +738,15 @@ def _print_setup_report(status: dict[str, object]) -> None:
         print("  MIMIR_API_KEY:  generated (see .env; rotate via `mimir regenerate-api-key`)")
     if status.get("saga_api_key_action") == "generated":
         print("  SAGA_API_KEY:   generated (unused in in-process mode; preserved for external-saga use)")
+    print()
+    print("Recurring scheduled tasks (active when `mimir run` starts):")
+    print("  LLM ticks (scheduler.yaml):")
+    print("    - heartbeat:           hourly (autonomous-work cadence)")
+    print("    - reflect:             Sun 06:00 UTC (cross-session audit)")
+    print("  Non-LLM crons (auto-registered by the runtime):")
+    print("    - saga-consolidate:    Sun 04:00 UTC (atom merge / synthesis)")
+    print("    - introspection-report: Fri 14:00 UTC (behavioral / health snapshot)")
+    print("  Override any cadence via env vars or scheduler.yaml.")
     print()
     print("Next steps:")
     print(f"  1. Configure LLM auth — pick one:")

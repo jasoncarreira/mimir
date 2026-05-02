@@ -50,6 +50,13 @@ def _env_float(name: str, default: float) -> float:
     return float(raw) if raw else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _parse_sources(raw: str) -> frozenset[str] | None:
     """Parse a comma-separated source allowlist for Recent activity.
 
@@ -100,6 +107,15 @@ class Config:
     # SAGA session (§5.6)
     saga_session_idle_minutes: int
     saga_consolidate_cron: str
+
+    # Weekly event-introspection report (FEEDBACK-LOOPS §4.7) + heartbeat
+    # health monitor (§4.8). Empty string disables the cron. Default is
+    # Friday 14:00 UTC so the report lands before reflection (Sun 06:00)
+    # and operator review on Monday morning.
+    introspection_report_cron: str
+    introspection_report_days: int
+    introspection_report_health_threshold: float
+    introspection_report_emit_algedonic: bool
     # Per-atom confidence floor (post SAGA per-atom gating) for the
     # pre-message auto-fetch hook. Empty string (default) defers to SAGA's
     # ``[retrieval].default_min_confidence_tier`` config (today: "low").
@@ -248,6 +264,18 @@ class Config:
 
             saga_session_idle_minutes=_env_int("MIMIR_SAGA_SESSION_IDLE_MINUTES", 10),
             saga_consolidate_cron=_env("MIMIR_SAGA_CONSOLIDATE_CRON", "0 4 * * 0"),
+            introspection_report_cron=_env(
+                "MIMIR_INTROSPECTION_REPORT_CRON", "0 14 * * 5",
+            ),
+            introspection_report_days=_env_int(
+                "MIMIR_INTROSPECTION_REPORT_DAYS", 7,
+            ),
+            introspection_report_health_threshold=_env_float(
+                "MIMIR_INTROSPECTION_HEALTH_THRESHOLD", 0.80,
+            ),
+            introspection_report_emit_algedonic=_env_bool(
+                "MIMIR_INTROSPECTION_EMIT_ALGEDONIC", True,
+            ),
             saga_pre_message_min_tier=_env("MIMIR_SAGA_PRE_MSG_MIN_TIER", ""),
 
             send_loop_soft_limit=_env_int("MIMIR_SEND_LOOP_SOFT_LIMIT", 5),
