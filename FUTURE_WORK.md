@@ -722,39 +722,83 @@ demoted. Same shape as `mark_contributions` but at the skill layer.
 to mediate. Currently we have many S3 loops (§1.1, §2.4, §4.3-§4.6
 in FEEDBACK-LOOPS.md) and one S4 loop (heartbeat). No arbiter.
 
-**What.**
-- `mimir/budget.py`: per-day tool-call budget split into S3
-  (user-message-driven) and S4 (heartbeat / scheduled-tick-driven).
-  Default 80/20 ratio, configurable.
-- Scheduler consults budget before firing heartbeat ticks: if S3
-  is consuming most of the budget (busy day), heartbeat firings
-  are deferred. If S3 is underutilized (idle period), heartbeat
-  fires more frequently to use the slack on exploration work.
-- Rendering: `## Self-state` prompt block showing
-  `S3 used: 67%, S4 used: 12%` so the agent has the signal
-  in-band — subtle, agent can choose to scale back operations or
-  push more strategic work; doesn't enforce anything by itself.
+**What.** The arbiter consults a layered hierarchy of constraints
+(strictest first) instead of just one metric:
+
+1. **Plan-window utilization** (hardest constraint). From
+   `mimir/rate_limits.py`'s `RateLimitEvent` capture — 5h /
+   7d / 7d_opus / 7d_sonnet / overage windows. If any window
+   is at 80%+ utilization, suppress ALL S4 firings; the model
+   will literally stop responding when the window saturates,
+   so spending S4 budget there is wasted. Above 95% even S3
+   gets a soft denial (agent gets `## Plan windows` warning
+   in prompt urging it to scale back).
+2. **Cost-rate alert** (dollar constraint). From
+   `mimir/usage_stats.py` — current $/hr vs
+   `MIMIR_COST_HOURLY_LIMIT_USD`. When tripped, S4 suppressed
+   first; S3 kept running with a `cost_rate_alert` event
+   surfaced in the algedonic block (§2.1).
+3. **Tool-call budget** (soft heuristic). Per-day count split
+   80/20 between S3 (user-message-driven) and S4 (heartbeat /
+   scheduled-tick-driven). When S3 is dominating, heartbeat
+   firings deferred; when S3 idle, heartbeat boosts.
+4. **Token-count budget** (rolling). 24h / 7d token totals
+   from turns.jsonl `usage` blocks. Catches cases where
+   tool-call count looks fine but each call is expensive
+   (large-context queries on long sessions).
+
+The order matters: plan-window is a hard wall (Anthropic just
+stops responding); cost-rate is dollars; tool-call + tokens are
+soft heuristics for catching trouble before a hard wall hits.
+Constraint #1 saturating overrides all the others.
+
+**Implementation.** `mimir/budget.py`:
+- Reads RateLimitInfo (latest rate_limits.py snapshot), recent
+  usage_stats aggregates, scheduler state.
+- Exposes `should_fire_heartbeat()` returning suppress / fire /
+  boost. Scheduler hits this before each heartbeat dispatch.
+- Exposes `render_self_state_block()` for the prompt — surfaces
+  whichever constraint is closest to its limit so the agent
+  has the same signal as the arbiter:
+  ```
+  ## Self-state
+  - 7d_opus window: 68% used (resets in 3d 4h)
+  - cost rate: $1.20/hr (limit $5/hr)
+  - S3/S4 budget today: 67% / 12% (cap 80/20)
+  - tokens 24h: 2.1M (~$8 at current model)
+  ```
 
 **Why.** Without an explicit arbiter, organizations under load
 default to pure firefighting and starve foresight. The same
 failure mode applies to mimir: if user_message turns dominate
-the day's budget, heartbeat work never lands. Beer's S5
-mediates this in human orgs; mimir's equivalent is a measurable
-budget split.
+the day's budget, heartbeat work never lands. **And without the
+plan-window dimension specifically, S4 work happily burns through
+the 7d_opus quota leaving the agent unable to respond to user
+messages by Friday.** The hardest constraint must drive the
+arbiter; tool-call count alone is too soft.
 
-**Subtle tuning:** the danger is making the agent dormant during
-busy days. The 80/20 default + monotonic decay (S4 budget can
-borrow from S3 surplus, not vice-versa during peak load) is a
-defensible starting point.
+**Subtle tuning:**
+- The danger is making the agent dormant during busy days. 80/20
+  default + monotonic decay (S4 can borrow from S3 surplus, not
+  vice-versa during peak load) is the soft-budget starting point.
+- For plan-window, suppress threshold defaults to 80% (5/7d) and
+  on-pace projection >100%. The on-pace logic is already in
+  rate_limits.py — `rate_limit_off_pace` event fires when the
+  current rate projects to overflow by reset.
+- Cost-rate suppression should be cooldown-gated (already
+  exists in usage_stats — `MIMIR_COST_ALERT_COOLDOWN_MINUTES`)
+  so it doesn't oscillate.
 
-**Files:** `mimir/budget.py` (~200),
-`mimir/scheduler.py` (heartbeat suppression / boost, +50),
-`mimir/prompts.py` (`## Self-state`, +15),
+**Files:** `mimir/budget.py` (~250),
+`mimir/scheduler.py` (heartbeat suppression / boost, +60),
+`mimir/prompts.py` (`## Self-state` block, +20),
 `mimir/agent.py` (turn-boundary updates, +10),
-tests (~150).
+tests (~180).
 
-**Effort:** ~2 days. Tuning probably an additional week of
-observation before the defaults stabilize.
+**Effort:** ~2.5 days. The plan-window + cost-rate plumbing
+already exists (v0.4); §12.4 is the integration layer that turns
+those signals into S4 dispatch decisions. Tuning probably an
+additional week of observation before the defaults stabilize.
 
 ---
 
@@ -858,7 +902,9 @@ events fire under a synthetic scenario. Effort: ~0.5 day.
 3. §12.6b (`mimir loops` CLI) — 1 day, makes #4 verifiable
 4. §12.3 (skill outcomes) — 1.5 days, first real amplification
 5. §12.5 (subagent recursion) — 2 days, before climber gets used at scale
-6. §12.4 (S3-S4 homeostat) — 2 days, real arbiter
+6. §12.4 (S3-S4 homeostat) — 2.5 days, real arbiter; integrates
+   plan-window + cost-rate (already plumbed) + tool-call + token
+   counts as a layered hierarchy of constraints, hardest-first
 7. §12.2 (applied-proposals audit) — 2 days, the load-bearing
    double-loop closure; do last so the metrics it audits already
    exist
