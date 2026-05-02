@@ -1045,6 +1045,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
 
+    refl_intro_p = refl_sub.add_parser(
+        "introspection-report",
+        help="Weekly behavioral / health report from turns.jsonl + events.jsonl.",
+    )
+    from .skills.reflection import introspection_report as _intro_report
+    _intro_report.add_argparse(refl_intro_p)
+
     refl_audit_p = refl_sub.add_parser(
         "audit",
         help="Print the '## Effects of prior proposals' block — "
@@ -1174,6 +1181,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.reflection_action == "most-retrieved":
             from .skills.reflection import most_retrieved as _most_retrieved
             sys.exit(asyncio.run(_most_retrieved.run(args)))
+        if args.reflection_action == "introspection-report":
+            from .skills.reflection import introspection_report as _intro_report
+            sys.exit(_intro_report.run(args))
         if args.reflection_action == "mark-applied":
             from .skills.reflection import applied_audit as _applied_audit
             home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()

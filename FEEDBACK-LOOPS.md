@@ -108,6 +108,26 @@ before acting again.
 **Call sites:** `mimir/feedback.py`, `mimir/prompts.py:131`,
 `mimir/agent.py:571`.
 
+**Surfaced event types** (each maps to a polarity + render rule
+in `mimir/feedback.py:_EVENT_RULES`):
+
+- `error`, `tool_call_denied`, `tool_call_budget_warning`
+- `send_message_loop_warning`, `send_message_loop_hard_stop`
+- `saga_query_error`, `saga_feedback_error`,
+  `saga_consolidate_error`, `saga_synthesis_dispatch_failed`,
+  `saga_synthesis_empty_window`
+- `cost_rate_alert`, `rate_limit_warning`, `rate_limit_rejected`,
+  `rate_limit_off_pace`
+- `scheduled_tick_dropped` (dispatcher rejected),
+  `scheduled_tick_suppressed` (§12.4 arbiter blocked),
+  `heartbeat_health_degraded` (§4.7 weekly health metric)
+- `send_message_unknown_channel`
+- Positive: `saga_feedback_sent`, `react_received`
+
+Adding a new signal: one line in `_EVENT_RULES`, one renderer
+clause in `_render_event_line`, plus a test pair in
+`tests/test_feedback.py`.
+
 ### 2.2 Session boundary surfacing
 
 **S3* (audit) — between-session.** When a saga session ends
@@ -321,6 +341,58 @@ out-of-date ones automatically.
 **Call sites:** `saga/saga/core.py:402` (write-time resolver),
 `saga/saga/decay.py` (cron-driven), `saga/saga/core.py`
 `_apply_supersedes_demotion`.
+
+### 4.7 Event-introspection report — weekly behavioral snapshot
+
+**S3\* (audit) — meta on the agent.** `mimir reflection
+introspection-report` (bundled CLI; ported from muninnbot's
+`event_introspection_report.py`) reads the past N days of
+turns.jsonl + events.jsonl and produces a structured markdown
+report covering: turn counts by trigger, tool-usage and error
+rates, recurring error patterns, behavioral drift (tools
+started/stopped vs prior week), heartbeat / scheduled-tick
+pipeline health, performance trends, skill invocation counts.
+
+Replaces step-1 hand work in the reflection skill — the agent
+used to assemble all of this with `jq` in-prompt; now one CLI
+call produces the structured shape and the LLM time goes into
+*interpretation* instead of aggregation.
+
+**Frequency:** weekly (invoked by reflection cron); also
+on-demand via CLI.
+**Closes the loop:** the report itself is HITL — surfaced to
+operator via the report file under `state/reports/` and via
+the reflection skill's write-up. With `--emit-algedonic`, the
+heartbeat-health subsection also emits an event (loop §4.8).
+**Call sites:** `mimir/skills/reflection/introspection_report.py`,
+`mimir reflection introspection-report` CLI.
+
+### 4.8 Heartbeat-pipeline health monitor
+
+**Algedonic — out.** Lives inside §4.7. The introspection
+report computes a pipeline success rate for scheduled-ticks:
+`successful_turns / fired_events`. When run with
+`--emit-algedonic` and the rate drops below the threshold
+(default 0.80), it appends a `heartbeat_health_degraded` event
+to events.jsonl. The §2.1 algedonic surfacing reads it next
+turn; the agent gets a `## Recent feedback signals` line like
+"heartbeat pipeline degraded: success rate 25% (threshold 80%,
+1/4 fired)".
+
+This closes a long-standing gap: heartbeats fire silently;
+mimir didn't notice when they started failing. Now the weekly
+report turns that silence into a signal the agent can react to
+(adjust the schedule, investigate the failure mode, surface to
+operator via the §2.3 alert channel).
+
+**Frequency:** weekly check, but the resulting algedonic event
+sits in events.jsonl and surfaces on the next turn after
+emission (until 24h window expires).
+**Closes the loop:** algedonic event → next-turn prompt →
+agent investigates / alerts.
+**Call sites:** `mimir/skills/reflection/introspection_report.py:
+maybe_emit_health_event`, `mimir/feedback.py:_EVENT_RULES`
+(`heartbeat_health_degraded`).
 
 ### 4.6 World model — currently-valid facts (v0.5 §3 P37)
 

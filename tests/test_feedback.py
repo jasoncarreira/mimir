@@ -247,3 +247,37 @@ def test_render_feedback_block_uses_window_hours_in_header():
     assert block is not None
     assert "Negative (last 72h):" in block
     assert "2026-05-01 12:00" in block
+
+
+def test_heartbeat_health_degraded_renders_in_feedback(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.5),
+            "type": "heartbeat_health_degraded",
+            "session_id": "introspection-report",
+            "success_rate": 0.25,
+            "threshold": 0.80,
+            "fired": 4,
+            "successful": 1,
+        },
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "heartbeat pipeline degraded" in block
+    assert "25%" in block
+    assert "1/4 fired" in block
+
+
+def test_scheduled_tick_suppressed_renders_in_feedback(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.5),
+            "type": "scheduled_tick_suppressed",
+            "session_id": "s",
+            "reason": "plan_window_saturated:7d_opus@0.92",
+        },
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "suppressed by arbiter" in block
+    assert "plan_window_saturated" in block

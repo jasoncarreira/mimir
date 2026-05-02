@@ -36,9 +36,24 @@ What you've been remembering, and whether you should be.
 
 Before either track, gather inputs:
 
+- **Introspection report** — invoke the bundled CLI subcommand first.
+  It precomputes the structured shape work that used to be hand-rolled
+  `jq` queries — turn counts by trigger, tool error rates, recurring
+  errors, behavioral drift week-over-week, heartbeat pipeline health,
+  performance trends, skill invocation counts:
+  ```bash
+  mimir reflection introspection-report --days 7 \
+      --output state/reports/introspection-$(date +%Y-%m-%d).md \
+      --emit-algedonic
+  ```
+  The `--emit-algedonic` flag appends a `heartbeat_health_degraded`
+  event to events.jsonl when the scheduled-tick pipeline success rate
+  falls below 80%, which the algedonic surfacing then picks up. Read
+  the generated report; only fall back to raw `jq` for things the
+  report doesn't cover.
 - `logs/events.jsonl` — every tool call, denial, error, scheduler
   event. Filter to last 7 days. Use `jq` for shape work, `Read` for
-  spot checks.
+  spot checks. (The introspection report covers most cases.)
 - `logs/turns.jsonl` — per-turn rollups including `error`,
   `result_subtype`, `duration_ms`, tool sequences. Distribution work
   belongs here.

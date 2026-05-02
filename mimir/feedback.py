@@ -56,6 +56,8 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "rate_limit_rejected": ("negative", "rate_limit_reject"),
     "rate_limit_off_pace": ("negative", "rate_limit_off_pace"),
     "scheduled_tick_dropped": ("negative", "tick_dropped"),
+    "scheduled_tick_suppressed": ("negative", "tick_suppressed"),
+    "heartbeat_health_degraded": ("negative", "heartbeat_health"),
     "send_message_unknown_channel": ("negative", "unknown_channel"),
     # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
@@ -123,6 +125,18 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f"plan window off pace ({rl_type} — {on_pace_str})"
     if rule_kind == "tick_dropped":
         return f"scheduled_tick dropped: {ev.get('reason') or '(no reason)'}"
+    if rule_kind == "tick_suppressed":
+        return f"scheduled_tick suppressed by arbiter: {ev.get('reason') or '(no reason)'}"
+    if rule_kind == "heartbeat_health":
+        rate = ev.get("success_rate")
+        thr = ev.get("threshold")
+        rate_str = f"{rate * 100:.0f}%" if isinstance(rate, (int, float)) else "?"
+        thr_str = f"{thr * 100:.0f}%" if isinstance(thr, (int, float)) else "?"
+        return (
+            f"heartbeat pipeline degraded: success rate {rate_str} "
+            f"(threshold {thr_str}, {ev.get('successful', '?')}/"
+            f"{ev.get('fired', '?')} fired)"
+        )
     if rule_kind == "unknown_channel":
         return f"send_message to unknown channel {ev.get('channel_id', '?')}"
     if rule_kind == "saga_feedback":
