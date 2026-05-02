@@ -91,19 +91,21 @@ def test_setup_heartbeat_files_are_idempotent(tmp_path: Path):
     assert backlog.read_text() == user_body  # not clobbered
 
 
-def test_setup_scheduler_yaml_documents_heartbeat_entry(tmp_path: Path):
-    """The default scheduler.yaml carries a commented heartbeat example so
-    operators can uncomment without copying from docs."""
+def test_setup_scheduler_yaml_includes_default_recurring_ticks(tmp_path: Path):
+    """The default scheduler.yaml ships heartbeat + reflect ticks enabled
+    out of the box. The §12.4 homeostat suppresses fires when the plan
+    window saturates, so an hourly heartbeat is safe by default."""
     home = tmp_path / "agent"
     setup_home(home)
     body = (home / "scheduler.yaml").read_text()
-    # Both the heartbeat job pattern and the scheduled_tick trigger name
-    # should appear so operators can find / search for them.
     assert "heartbeat" in body
     assert "scheduled_tick" in body
-    assert "*/30 * * * *" in body
-    # The starter shipped jobs list is empty — operator opts in.
-    assert "jobs: []" in body
+    # Heartbeat hourly + reflect Sunday 06:00 UTC.
+    assert "0 * * * *" in body
+    assert "0 6 * * 0" in body
+    # Both jobs declared (not commented out).
+    assert "- name: heartbeat" in body
+    assert "- name: reflect" in body
 
 
 # ---- Constant content sanity --------------------------------------------

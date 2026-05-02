@@ -306,10 +306,34 @@ def build_app(config: Config) -> web.Application:
             await log_event("scheduler_invalid_cron", error=str(exc))
             consolidate_registered = False
 
+        # Register weekly introspection-report cron (FEEDBACK-LOOPS §4.7
+        # + §4.8). Non-LLM: aggregates turns/events, writes report,
+        # emits heartbeat_health_degraded events when scheduled-tick
+        # success rate drops below threshold.
+        try:
+            introspection_registered = scheduler.add_introspection_report_job(
+                config.home,
+                config.introspection_report_cron,
+                days=config.introspection_report_days,
+                emit_algedonic=config.introspection_report_emit_algedonic,
+                health_threshold=config.introspection_report_health_threshold,
+            )
+        except ValueError as exc:
+            await log_event(
+                "scheduler_invalid_cron",
+                job="introspection-report",
+                error=str(exc),
+            )
+            introspection_registered = False
+
         # Load LLM-tick jobs from scheduler.yaml.
         reload_stats = scheduler.reload()
 
-        if consolidate_registered or reload_stats["registered"] > 0:
+        if (
+            consolidate_registered
+            or introspection_registered
+            or reload_stats["registered"] > 0
+        ):
             scheduler.start()
 
         await log_event(

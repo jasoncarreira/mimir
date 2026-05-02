@@ -321,6 +321,80 @@ class Scheduler:
         )
         return True
 
+    # ---- Introspection-report cron -----------------------------------
+
+    # VSM: S3* (audit) — weekly behavioral / health snapshot. Non-LLM
+    #      cron: aggregates turns.jsonl + events.jsonl, writes a
+    #      report file, optionally emits heartbeat_health_degraded
+    #      events when the scheduled-tick pipeline degrades.
+    # loop_id: 4.7
+    def add_introspection_report_job(
+        self,
+        home: Path,
+        cron_expr: str,
+        *,
+        days: int = 7,
+        emit_algedonic: bool = True,
+        health_threshold: float = 0.80,
+        job_id: str = "introspection-report",
+    ) -> bool:
+        cron_expr = (cron_expr or "").strip()
+        if not cron_expr:
+            return False
+        try:
+            trigger = CronTrigger.from_crontab(cron_expr, timezone=UTC)
+        except (ValueError, KeyError) as exc:
+            raise ValueError(
+                f"invalid cron expression {cron_expr!r}: {exc}"
+            ) from exc
+
+        async def _run() -> None:
+            try:
+                from datetime import datetime, timezone as _tz
+                from .skills.reflection.introspection_report import (
+                    aggregate, render_markdown, maybe_emit_health_event,
+                )
+                turns_log = home / "logs" / "turns.jsonl"
+                events_log = home / "logs" / "events.jsonl"
+                report = await asyncio.to_thread(
+                    aggregate, turns_log, events_log, days=days,
+                )
+                body = render_markdown(report)
+                today = datetime.now(tz=_tz.utc).strftime("%Y-%m-%d")
+                out = home / "state" / "reports" / f"introspection-{today}.md"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(body, encoding="utf-8")
+
+                emitted = False
+                if emit_algedonic:
+                    emitted = maybe_emit_health_event(
+                        report, events_log, threshold=health_threshold,
+                    )
+
+                await log_event(
+                    "introspection_report_ok",
+                    output=str(out),
+                    days=days,
+                    pipeline_success_rate=report.heartbeat.success_rate,
+                    fired=report.heartbeat.fired,
+                    successful=report.heartbeat.successful,
+                    algedonic_emitted=emitted,
+                )
+            except Exception as exc:  # noqa: BLE001
+                await log_event(
+                    "introspection_report_error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+        self._scheduler.add_job(
+            _run,
+            trigger=trigger,
+            id=job_id,
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        return True
+
     # ---- lifecycle ---------------------------------------------------
 
     def start(self) -> None:
