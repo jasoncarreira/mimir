@@ -45,9 +45,9 @@ DEFAULT_ENV_TEMPLATE = dedent(
     ANTHROPIC_MODEL=
     ANTHROPIC_CUSTOM_MODEL_OPTION=
 
-    # ---- MSAM sidecar (memory) -------------------------------------------
-    MSAM_ENDPOINT=http://localhost:3002
-    MSAM_API_KEY=
+    # ---- SAGA sidecar (memory) -------------------------------------------
+    SAGA_ENDPOINT=http://localhost:3002
+    SAGA_API_KEY=
 
     # ---- Channel bridges (all optional) ----------------------------------
     DISCORD_TOKEN=
@@ -133,7 +133,7 @@ DEFAULT_SCHEDULER_YAML = dedent(
     #     prompt: "Run the heartbeat skill: librarian protocol first, then pick one item from state/heartbeat-backlog.md and do it. End silently."
     #
     # Reflection (v0.4 §4) — weekly cross-session audit. Sunday 04:00 UTC
-    # so it lands after the MSAM weekly consolidation. Uncomment to
+    # so it lands after the SAGA weekly consolidation. Uncomment to
     # enable.
     #
     # jobs:
@@ -204,8 +204,8 @@ DEFAULT_REFLECTION_POLICY = dedent(
 
     ## Autonomous (the reflection turn may apply directly)
 
-    - MSAM atom decay calls
-    - MSAM triples linking (additive)
+    - SAGA atom decay calls
+    - SAGA triples linking (additive)
     - Append-only edits to memory/core/40-learned-behaviors.md
     - Wiki orphan tagging (writes to state/wiki/index.md — flag, don't delete)
 
@@ -846,7 +846,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     refl_mr_p = refl_sub.add_parser(
         "most-retrieved",
-        help="Top-N MSAM atoms by retrieval count over the last N days.",
+        help="Top-N SAGA atoms by retrieval count over the last N days.",
     )
     from .skills.reflection import most_retrieved as _most_retrieved
     _most_retrieved.add_argparse(refl_mr_p)

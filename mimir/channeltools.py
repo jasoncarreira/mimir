@@ -29,23 +29,23 @@ from .loop_detector import (
     BreakerVerdict,
     LoopDetector,
 )
-from .msam_client import MsamClient, MsamError
+from .saga_client import SagaClient, SagaError
 
 log = logging.getLogger(__name__)
 
 
 def build_channel_tools(
     registry: ChannelRegistry,
-    msam_client: MsamClient | None = None,
+    saga_client: SagaClient | None = None,
     message_buffer: MessageBuffer | None = None,
 ) -> list[SdkMcpTool]:
     """Build the channel-aware send_message + react tools, closed over a
     shared ``ChannelRegistry``.
 
-    When ``msam_client`` is provided, every successful ``send_message`` fires
-    an MSAM ``mark_contributions`` pass (POST ``/v1/feedback``) with the
+    When ``saga_client`` is provided, every successful ``send_message`` fires
+    an SAGA ``mark_contributions`` pass (POST ``/v1/feedback``) with the
     sent text and the union of pre-injected + mid-turn-queried atom IDs in
-    ``TurnContext.msam_atom_ids``. Crediting at send-time is more accurate
+    ``TurnContext.saga_atom_ids``. Crediting at send-time is more accurate
     than the agent-level ``_post_message_hook`` fallback because the
     delivered text is exactly what the user sees, whereas the SDK's "final
     output" can be empty (agent only used send_message) or include
@@ -178,33 +178,33 @@ def build_channel_tools(
         if ctx is not None and result.message_id:
             ctx.last_assistant_message_id = result.message_id
 
-        # MSAM mark_contributions for the atoms in flight on this turn,
+        # SAGA mark_contributions for the atoms in flight on this turn,
         # against the actual delivered text. Skipped on synthesis turns —
-        # the agent calls msam_feedback per-atom there. Errors are logged
-        # but never block the send (MSAM down ≠ user-visible failure).
+        # the agent calls saga_feedback per-atom there. Errors are logged
+        # but never block the send (SAGA down ≠ user-visible failure).
         if (
-            msam_client is not None
+            saga_client is not None
             and ctx is not None
-            and ctx.trigger != "msam_session_end"
-            and ctx.msam_atom_ids
+            and ctx.trigger != "saga_session_end"
+            and ctx.saga_atom_ids
         ):
-            atom_ids_for_feedback = list(dict.fromkeys(ctx.msam_atom_ids))
+            atom_ids_for_feedback = list(dict.fromkeys(ctx.saga_atom_ids))
             try:
-                await msam_client.feedback(
+                await saga_client.feedback(
                     atom_ids_for_feedback,  # de-dup, keep order
                     text,
-                    session_id=ctx.msam_session_id,
+                    session_id=ctx.saga_session_id,
                 )
                 await log_event(
-                    "msam_feedback_sent",
+                    "saga_feedback_sent",
                     where="send_message",
                     channel_id=channel_id,
                     n_atoms=len(atom_ids_for_feedback),
                     text_len=len(text),
                 )
-            except MsamError as exc:
+            except SagaError as exc:
                 await log_event(
-                    "msam_feedback_error",
+                    "saga_feedback_error",
                     where="send_message",
                     channel_id=channel_id,
                     error=str(exc),

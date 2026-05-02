@@ -21,8 +21,8 @@ from .models import AgentEvent
 _DEFAULT_PERSONA = """You are Mimir, a memory-centric agent built on the Claude Agent SDK.
 You communicate through channels (Slack, Discord, Bluesky, web, benchmark
 stdout). You can use bash and file-op tools to organize your own notes
-under memory/, search them via the file_search skill, and call MSAM
-through the msam skill for semantic memory."""
+under memory/, search them via the file_search skill, and call SAGA
+through the saga skill for semantic memory."""
 
 # Heartbeat-tick body when the scheduler.yaml job didn't set its own
 # ``prompt:``. Brief — the heartbeat skill carries the full instructions.
@@ -93,7 +93,7 @@ def build_turn_prompt(
     event: AgentEvent,
     *,
     recent_messages: Iterable[Message] | None = None,
-    msam_block: str | None = None,
+    saga_block: str | None = None,
     subagent_block: str | None = None,
     recent_message_chars: int = 0,
     resolver: object | None = None,
@@ -101,7 +101,7 @@ def build_turn_prompt(
     session_summaries_block: str | None = None,
     usage_block: str | None = None,
 ) -> str:
-    """Assemble the turn prompt: known identities, recent activity, MSAM
+    """Assemble the turn prompt: known identities, recent activity, SAGA
     atom hits, subagent completion notifications (from prior turns), event
     header + body.
 
@@ -156,8 +156,8 @@ def build_turn_prompt(
         if rendered:
             sections.append("## Recent activity\n\n" + rendered)
 
-    if msam_block:
-        sections.append("## Possibly relevant memories (from MSAM)\n\n" + msam_block.rstrip())
+    if saga_block:
+        sections.append("## Possibly relevant memories (from SAGA)\n\n" + saga_block.rstrip())
 
     if subagent_block:
         sections.append("## Subagent updates\n\n" + subagent_block.rstrip())

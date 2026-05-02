@@ -1,4 +1,4 @@
-"""MSAM MCP tools (SPEC §8.2)."""
+"""SAGA MCP tools (SPEC §8.2)."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ import pytest
 
 from mimir import _context
 from mimir.models import TurnContext, make_turn_id
-from mimir.msamtools import build_msam_tools
+from mimir.sagatools import build_saga_tools
 
-from ._fake_msam import FakeMsam
+from ._fake_saga import FakeSaga
 
 
 def _by_name(tools, name):
@@ -21,20 +21,20 @@ def _by_name(tools, name):
     raise AssertionError(f"tool {name!r} not registered")
 
 
-def _ctx(channel_id: str = "c1", msam_session_id: str = "msam-c1-1") -> TurnContext:
+def _ctx(channel_id: str = "c1", saga_session_id: str = "saga-c1-1") -> TurnContext:
     return TurnContext(
         turn_id=make_turn_id(),
         session_id=channel_id,
         trigger="user_message",
         channel_id=channel_id,
         started_at=0.0,
-        msam_session_id=msam_session_id,
+        saga_session_id=saga_session_id,
     )
 
 
 @pytest.mark.asyncio
-async def test_msam_query_passes_session_id_and_appends_atom_ids():
-    fake = FakeMsam(
+async def test_saga_query_passes_session_id_and_appends_atom_ids():
+    fake = FakeSaga(
         query_response={
             "_raw_atoms": [
                 {"id": "a1", "stream": "semantic", "content": "alpha"},
@@ -42,30 +42,30 @@ async def test_msam_query_passes_session_id_and_appends_atom_ids():
             ]
         }
     )
-    tools = build_msam_tools(fake)  # type: ignore[arg-type]
-    msam_query = _by_name(tools, "msam_query")
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_query = _by_name(tools, "saga_query")
 
     ctx = _ctx()
     token = _context.set_current_turn(ctx)
     try:
-        out = await msam_query.handler({"query": "anything", "top_k": 5})
+        out = await saga_query.handler({"query": "anything", "top_k": 5})
     finally:
         _context.reset_current_turn(token)
 
     assert out.get("is_error") is not True
-    assert ctx.msam_atom_ids == ["a1", "a2"]
+    assert ctx.saga_atom_ids == ["a1", "a2"]
     payload = fake.last("query")
-    assert payload["session_id"] == "msam-c1-1"
+    assert payload["session_id"] == "saga-c1-1"
     assert payload["top_k"] == 5
 
 
 @pytest.mark.asyncio
-async def test_msam_query_extracts_from_live_atoms_key():
-    """Real MSAM (msam-hindsight-ideas server.py:api_query) returns atoms
+async def test_saga_query_extracts_from_live_atoms_key():
+    """Real SAGA (saga-hindsight-ideas server.py:api_query) returns atoms
     under the ``atoms`` key, not ``_raw_atoms``. Regression for the bug
     where contributions never marked because the extractor only looked
     at the legacy/never-shipped key."""
-    fake = FakeMsam(
+    fake = FakeSaga(
         query_response={
             "atoms": [
                 {"id": "live-1", "stream": "semantic", "content": "x"},
@@ -73,26 +73,26 @@ async def test_msam_query_extracts_from_live_atoms_key():
             ]
         }
     )
-    tools = build_msam_tools(fake)  # type: ignore[arg-type]
-    msam_query = _by_name(tools, "msam_query")
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_query = _by_name(tools, "saga_query")
 
     ctx = _ctx()
     token = _context.set_current_turn(ctx)
     try:
-        await msam_query.handler({"query": "hi"})
+        await saga_query.handler({"query": "hi"})
     finally:
         _context.reset_current_turn(token)
 
-    assert ctx.msam_atom_ids == ["live-1", "live-2"]
+    assert ctx.saga_atom_ids == ["live-1", "live-2"]
 
 
 @pytest.mark.asyncio
-async def test_msam_query_extracts_from_two_tier_observations_and_raws():
-    """When two_tier_enabled = true, MSAM returns observations and raws as
-    separate lists (msam-hindsight-ideas core.py:_two_tier_split). Both
+async def test_saga_query_extracts_from_two_tier_observations_and_raws():
+    """When two_tier_enabled = true, SAGA returns observations and raws as
+    separate lists (saga-hindsight-ideas core.py:_two_tier_split). Both
     contribute atom IDs to the contribution-tracking set, with observations
     surfacing first since they're the higher-level consolidated atoms."""
-    fake = FakeMsam(
+    fake = FakeSaga(
         query_response={
             "observations": [
                 {"id": "obs-1", "memory_type": "observation",
@@ -106,18 +106,18 @@ async def test_msam_query_extracts_from_two_tier_observations_and_raws():
             ],
         }
     )
-    tools = build_msam_tools(fake)  # type: ignore[arg-type]
-    msam_query = _by_name(tools, "msam_query")
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_query = _by_name(tools, "saga_query")
 
     ctx = _ctx()
     token = _context.set_current_turn(ctx)
     try:
-        result = await msam_query.handler({"query": "hi"})
+        result = await saga_query.handler({"query": "hi"})
     finally:
         _context.reset_current_turn(token)
 
     # Observations come before raws, both feed the contribution-tracking set.
-    assert ctx.msam_atom_ids == ["obs-1", "raw-1", "raw-2"]
+    assert ctx.saga_atom_ids == ["obs-1", "raw-1", "raw-2"]
     # The rendered hits list reflects memory_type so the agent can tell
     # observations apart from raw evidence.
     text = result["content"][0]["text"]
@@ -126,11 +126,11 @@ async def test_msam_query_extracts_from_two_tier_observations_and_raws():
 
 
 @pytest.mark.asyncio
-async def test_msam_query_renders_per_atom_confidence_tier():
-    """Per-atom confidence_tier (post MSAM commit with per-atom gating)
+async def test_saga_query_renders_per_atom_confidence_tier():
+    """Per-atom confidence_tier (post SAGA commit with per-atom gating)
     surfaces in both the slim hits dict and downstream label rendering, so
     the agent can prefer observation/high atoms over raw/low ones."""
-    from mimir.msamtools import _atom_label, _hits_summary
+    from mimir.sagatools import _atom_label, _hits_summary
     payload = {
         "two_tier": True,
         "observations": [
@@ -166,10 +166,10 @@ async def test_msam_query_renders_per_atom_confidence_tier():
 
 
 @pytest.mark.asyncio
-async def test_msam_client_passes_min_confidence_tier_when_set():
-    """MsamClient.query forwards min_confidence_tier into the request body
-    only when explicitly set; omitting it lets MSAM use its config default."""
-    from mimir.msam_client import MsamClient
+async def test_saga_client_passes_min_confidence_tier_when_set():
+    """SagaClient.query forwards min_confidence_tier into the request body
+    only when explicitly set; omitting it lets SAGA use its config default."""
+    from mimir.saga_client import SagaClient
     captured = {}
 
     class _StubResp:
@@ -187,7 +187,7 @@ async def test_msam_client_passes_min_confidence_tier_when_set():
             captured["body"] = json
             return _StubResp()
 
-    client = MsamClient("http://stub:3002")
+    client = SagaClient("http://stub:3002")
     client._session = _StubSess()  # type: ignore[assignment]
 
     await client.query("q1", top_k=5)
@@ -198,30 +198,30 @@ async def test_msam_client_passes_min_confidence_tier_when_set():
 
 
 @pytest.mark.asyncio
-async def test_msam_query_handles_msam_error_gracefully():
-    fake = FakeMsam(fail_on={"query"})
-    tools = build_msam_tools(fake)  # type: ignore[arg-type]
-    msam_query = _by_name(tools, "msam_query")
+async def test_saga_query_handles_saga_error_gracefully():
+    fake = FakeSaga(fail_on={"query"})
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_query = _by_name(tools, "saga_query")
     ctx = _ctx()
     token = _context.set_current_turn(ctx)
     try:
-        out = await msam_query.handler({"query": "x"})
+        out = await saga_query.handler({"query": "x"})
     finally:
         _context.reset_current_turn(token)
     assert out.get("is_error") is True
-    assert ctx.msam_atom_ids == []
+    assert ctx.saga_atom_ids == []
 
 
 @pytest.mark.asyncio
-async def test_msam_feedback_maps_signal_to_outcome_vocab():
-    fake = FakeMsam()
-    tools = build_msam_tools(fake)  # type: ignore[arg-type]
-    msam_feedback = _by_name(tools, "msam_feedback")
+async def test_saga_feedback_maps_signal_to_outcome_vocab():
+    fake = FakeSaga()
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_feedback = _by_name(tools, "saga_feedback")
 
     ctx = _ctx()
     token = _context.set_current_turn(ctx)
     try:
-        out = await msam_feedback.handler({"atom_id": "a1", "signal": "useful"})
+        out = await saga_feedback.handler({"atom_id": "a1", "signal": "useful"})
     finally:
         _context.reset_current_turn(token)
     assert out.get("is_error") is not True
@@ -229,23 +229,23 @@ async def test_msam_feedback_maps_signal_to_outcome_vocab():
     payload = fake.last("outcome")
     assert payload["atom_ids"] == ["a1"]
     assert payload["feedback"] == "positive"
-    assert payload["session_id"] == "msam-c1-1"
+    assert payload["session_id"] == "saga-c1-1"
 
 
 @pytest.mark.asyncio
-async def test_msam_feedback_rejects_unknown_signal():
-    fake = FakeMsam()
-    tools = build_msam_tools(fake)  # type: ignore[arg-type]
-    msam_feedback = _by_name(tools, "msam_feedback")
-    out = await msam_feedback.handler({"atom_id": "a1", "signal": "fancy"})
+async def test_saga_feedback_rejects_unknown_signal():
+    fake = FakeSaga()
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_feedback = _by_name(tools, "saga_feedback")
+    out = await saga_feedback.handler({"atom_id": "a1", "signal": "fancy"})
     assert out.get("is_error") is True
 
 
 @pytest.mark.asyncio
-async def test_msam_mark_contributions_passes_session_id():
-    fake = FakeMsam()
-    tools = build_msam_tools(fake)  # type: ignore[arg-type]
-    mark = _by_name(tools, "msam_mark_contributions")
+async def test_saga_mark_contributions_passes_session_id():
+    fake = FakeSaga()
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    mark = _by_name(tools, "saga_mark_contributions")
 
     ctx = _ctx()
     token = _context.set_current_turn(ctx)
@@ -259,17 +259,17 @@ async def test_msam_mark_contributions_passes_session_id():
     assert out.get("is_error") is not True
     payload = fake.last("feedback")
     assert payload["atom_ids"] == ["a1", "a2"]
-    assert payload["session_id"] == "msam-c1-1"
+    assert payload["session_id"] == "saga-c1-1"
 
 
 @pytest.mark.asyncio
-async def test_msam_end_session_drops_empty_optionals():
-    fake = FakeMsam()
-    tools = build_msam_tools(fake)  # type: ignore[arg-type]
-    end = _by_name(tools, "msam_end_session")
+async def test_saga_end_session_drops_empty_optionals():
+    fake = FakeSaga()
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    end = _by_name(tools, "saga_end_session")
 
     out = await end.handler({
-        "session_id": "msam-c1-1",
+        "session_id": "saga-c1-1",
         "summary": "we discussed quantum",
         "topics_discussed": ["quantum"],
         "decisions_made": [],
@@ -286,21 +286,21 @@ async def test_msam_end_session_drops_empty_optionals():
 
 
 @pytest.mark.asyncio
-async def test_msam_end_session_appends_to_local_mirror(tmp_path):
+async def test_saga_end_session_appends_to_local_mirror(tmp_path):
     """v0.4 §3a: a successful end_session also writes a local mirror
-    record so the prompt-time render can fall back if MSAM is briefly
+    record so the prompt-time render can fall back if SAGA is briefly
     down. Mirror writing is best-effort; never fails the tool turn."""
     import json
 
     from mimir.session_boundary_log import SessionBoundaryLog
 
-    fake = FakeMsam()
+    fake = FakeSaga()
     mirror = SessionBoundaryLog(path=tmp_path / ".mimir" / "sb.jsonl")
-    tools = build_msam_tools(fake, session_boundary_log=mirror)  # type: ignore[arg-type]
-    end = _by_name(tools, "msam_end_session")
+    tools = build_saga_tools(fake, session_boundary_log=mirror)  # type: ignore[arg-type]
+    end = _by_name(tools, "saga_end_session")
 
     out = await end.handler({
-        "session_id": "msam-x-1",
+        "session_id": "saga-x-1",
         "summary": "wrap-up",
         "topics_discussed": ["alpha"],
         "decisions_made": [],
@@ -311,7 +311,7 @@ async def test_msam_end_session_appends_to_local_mirror(tmp_path):
 
     body = (tmp_path / ".mimir" / "sb.jsonl").read_text()
     rec = json.loads(body.splitlines()[0])
-    assert rec["msam_session_id"] == "msam-x-1"
+    assert rec["saga_session_id"] == "saga-x-1"
     assert rec["summary"] == "wrap-up"
     assert rec["unfinished"] == ["draft response"]
     assert rec["topics_discussed"] == ["alpha"]
@@ -319,21 +319,21 @@ async def test_msam_end_session_appends_to_local_mirror(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_msam_end_session_no_mirror_when_log_unset():
-    """build_msam_tools without a SessionBoundaryLog must still work —
+async def test_saga_end_session_no_mirror_when_log_unset():
+    """build_saga_tools without a SessionBoundaryLog must still work —
     the mirror is optional; absent means no mirror writes."""
-    fake = FakeMsam()
-    tools = build_msam_tools(fake)  # type: ignore[arg-type]
-    end = _by_name(tools, "msam_end_session")
+    fake = FakeSaga()
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    end = _by_name(tools, "saga_end_session")
     out = await end.handler({"session_id": "x", "summary": "y"})
     assert out.get("is_error") is not True
 
 
 @pytest.mark.asyncio
-async def test_msam_store_passes_through():
-    fake = FakeMsam()
-    tools = build_msam_tools(fake)  # type: ignore[arg-type]
-    store = _by_name(tools, "msam_store")
+async def test_saga_store_passes_through():
+    fake = FakeSaga()
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    store = _by_name(tools, "saga_store")
     out = await store.handler({"content": "x", "stream": "semantic"})
     assert out.get("is_error") is not True
     payload = fake.last("store")
@@ -349,20 +349,20 @@ async def test_subagent_isolation_does_not_leak_atom_ids():
 
     We approximate the subagent boundary with ``asyncio.create_task`` — the
     child task's contextvars are a copy, not a shared reference."""
-    fake = FakeMsam(
+    fake = FakeSaga(
         query_response={"_raw_atoms": [{"id": "child-atom", "content": "x"}]}
     )
-    tools = build_msam_tools(fake)  # type: ignore[arg-type]
-    msam_query = _by_name(tools, "msam_query")
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_query = _by_name(tools, "saga_query")
 
     parent_ctx = _ctx("parent")
     parent_token = _context.set_current_turn(parent_ctx)
     try:
         async def subagent_run():
-            child_ctx = _ctx("child", msam_session_id="msam-child-1")
+            child_ctx = _ctx("child", saga_session_id="saga-child-1")
             child_token = _context.set_current_turn(child_ctx)
             try:
-                await msam_query.handler({"query": "x", "top_k": 1})
+                await saga_query.handler({"query": "x", "top_k": 1})
             finally:
                 _context.reset_current_turn(child_token)
             return child_ctx
@@ -371,8 +371,8 @@ async def test_subagent_isolation_does_not_leak_atom_ids():
     finally:
         _context.reset_current_turn(parent_token)
 
-    assert child.msam_atom_ids == ["child-atom"]
-    assert parent_ctx.msam_atom_ids == []  # parent untouched
+    assert child.saga_atom_ids == ["child-atom"]
+    assert parent_ctx.saga_atom_ids == []  # parent untouched
 
 
 # Late import to keep the file's main imports compact.

@@ -26,7 +26,7 @@ from mimir.session_manager import SessionManager
 from mimir.subagent_inbox import SubagentInbox
 from mimir.turn_logger import TurnLogger
 
-from ._fake_msam import FakeMsam
+from ._fake_saga import FakeSaga
 
 
 def _build_agent(tmp_path: Path) -> tuple[Agent, SubagentInbox]:
@@ -44,7 +44,7 @@ def _build_agent(tmp_path: Path) -> tuple[Agent, SubagentInbox]:
         buf,
         indexes,
         indexer=None,
-        msam_client=FakeMsam(),
+        saga_client=FakeSaga(),
         session_manager=sessions,
         scheduler=None,
         subagent_inbox=inbox,

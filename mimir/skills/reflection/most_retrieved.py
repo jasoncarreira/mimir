@@ -1,4 +1,4 @@
-"""Reflection skill helper: fetch top-N most-retrieved atoms from MSAM.
+"""Reflection skill helper: fetch top-N most-retrieved atoms from SAGA.
 
 Invoked from the reflection skill's SKILL.md via the `mimir reflection
 most-retrieved` CLI subcommand (see ``mimir/cli.py``). Not exposed as
@@ -17,7 +17,7 @@ import json
 import sys
 
 from mimir.config import Config
-from mimir.msam_client import MsamClient
+from mimir.saga_client import SagaClient
 
 
 def add_argparse(p: argparse.ArgumentParser) -> None:
@@ -38,7 +38,7 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
 
 async def run(args: argparse.Namespace) -> int:
     cfg = Config.from_env()
-    client = MsamClient(endpoint=cfg.msam_endpoint, api_key=cfg.msam_api_key or None)
+    client = SagaClient(endpoint=cfg.saga_endpoint, api_key=cfg.saga_api_key or None)
     try:
         atoms = await client.most_retrieved_atoms(
             days=args.days,
@@ -55,7 +55,7 @@ async def run(args: argparse.Namespace) -> int:
 
 async def _amain() -> int:
     p = argparse.ArgumentParser(
-        description="Top-N most-retrieved MSAM atoms over a recent window."
+        description="Top-N most-retrieved SAGA atoms over a recent window."
     )
     add_argparse(p)
     return await run(p.parse_args())

@@ -4,7 +4,7 @@ The spec lists templates under ``mimir/prompts/`` but that path collides with
 ``mimir/prompts.py`` (assembly module) under Python's import system, so the
 bundled defaults live here as constants. ``MIMIR_PROMPTS_DIR`` (SPEC §14)
 still overrides per-deployment — looked up by template name (e.g.
-``<dir>/msam_session_end.md``) and falls back to the default below.
+``<dir>/saga_session_end.md``) and falls back to the default below.
 """
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
-MSAM_SESSION_END_DEFAULT = """\
-The MSAM session for channel {channel_id} has been idle for {idle_minutes}
+SAGA_SESSION_END_DEFAULT = """\
+The SAGA session for channel {channel_id} has been idle for {idle_minutes}
 minutes and is being closed. Below are the turns from this session, filtered
-by msam_session_id. Each turn record carries `msam_atom_ids` — the atoms
-MSAM injected pre-message plus any you queried mid-turn.
+by saga_session_id. Each turn record carries `saga_atom_ids` — the atoms
+SAGA injected pre-message plus any you queried mid-turn.
 
 Do three things, in order:
 
@@ -35,14 +35,14 @@ future sessions — write or edit files under:
 Use bash and the file-op tools. Skip this step entirely if nothing notable
 came up — no need to manufacture content.
 
-### 2. Score MSAM atoms
+### 2. Score SAGA atoms
 
-For each atom_id in the union of `msam_atom_ids` across the turns below,
+For each atom_id in the union of `saga_atom_ids` across the turns below,
 decide whether it actually helped:
 
-  msam_feedback(atom_id, "useful")     # genuinely informed a reply
-  msam_feedback(atom_id, "incorrect")  # was wrong or misleading
-  msam_feedback(atom_id, "stale")      # outdated, should decay
+  saga_feedback(atom_id, "useful")     # genuinely informed a reply
+  saga_feedback(atom_id, "incorrect")  # was wrong or misleading
+  saga_feedback(atom_id, "stale")      # outdated, should decay
 
 Skip atoms that were neutral / not applicable — silence is a valid signal.
 
@@ -50,8 +50,8 @@ Skip atoms that were neutral / not applicable — silence is a valid signal.
 
 Synthesize and call:
 
-  msam_end_session(
-    session_id="{msam_session_id}",
+  saga_end_session(
+    session_id="{saga_session_id}",
     summary="<one-sentence summary>",
     topics_discussed=["..."],         # omit if nothing concrete
     decisions_made=["..."],           # omit if nothing concrete
@@ -80,15 +80,15 @@ def load_template(name: str, default: str, prompts_dir: Path | None) -> str:
     return default
 
 
-def render_msam_session_end(
+def render_saga_session_end(
     *,
     channel_id: str,
-    msam_session_id: str,
+    saga_session_id: str,
     idle_minutes: int,
     turns_window: list[dict],
     prompts_dir: Path | None,
 ) -> str:
-    template = load_template("msam_session_end", MSAM_SESSION_END_DEFAULT, prompts_dir)
+    template = load_template("saga_session_end", SAGA_SESSION_END_DEFAULT, prompts_dir)
     import json as _json
 
     serialized = "\n".join(
@@ -96,7 +96,7 @@ def render_msam_session_end(
     )
     return template.format(
         channel_id=channel_id,
-        msam_session_id=msam_session_id,
+        saga_session_id=saga_session_id,
         idle_minutes=idle_minutes,
         turns_window_jsonl=serialized or "(no turns recorded for this session)",
     )

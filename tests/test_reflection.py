@@ -131,7 +131,7 @@ def test_default_reflection_policy_has_required_sections():
     body = DEFAULT_REFLECTION_POLICY
     assert "## Autonomous" in body
     assert "## Propose-only" in body
-    assert "MSAM atom decay" in body
+    assert "SAGA atom decay" in body
     assert "Persona block edits" in body
 
 
