@@ -1,0 +1,141 @@
+# MSAM config — P41-only variant (triple_augment_v2 ON, subatom OFF).
+# Same as msam_bench.toml (canonical) EXCEPT
+# [retrieval] enable_triple_augment_v2 = true.
+# [triples] enable_extraction = true so consolidation populates triples.
+# Pair config: msam_bench.toml (canonical) for the A/B comparison.
+
+[embedding]
+provider = "openai"
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dimensions = 1536
+max_input_chars = 8000
+timeout_seconds = 30
+batch_size = 256
+api_key_env = "OPENAI_API_KEY"
+
+[storage]
+db_path = "msam.db"
+metrics_db_path = "msam_metrics.db"
+# Disable the storage backpressure: per-question haystacks can push thousands
+# of atoms; MSAM's production budget (40k tokens) would auto-compact/refuse.
+token_budget_ceiling = 100000000
+auto_compact_threshold_pct = 99
+refuse_threshold_pct = 100
+db_busy_timeout_ms = 5000
+
+[retrieval]
+default_top_k = 20
+semantic_weight = 0.7
+fusion = "rrf"
+rrf_k = 60
+rrf_semantic_weight = 1.0
+rrf_keyword_weight = 1.0
+# P9: two-tier retrieval with observation->raw evidence boost.
+two_tier_enabled = true
+observations_top_k = 5
+observation_confidence_min_sim = 0.30
+evidence_boost_cap_multiplier = 3.0
+# P32/P35: graph pathway off — triples-as-byproduct of consolidation
+# regressed -2.6pp on canonical (msam_p35_canon_v1). Code stays for
+# production-graph-feature deployments; bench defaults to off.
+enable_graph_pathway = false
+# Single-tier bonus is redundant in two_tier mode; leave off to avoid double-handling.
+enable_observation_bonus = false
+similarity_threshold = 0.15
+sigmoid_midpoint = 0.35
+sigmoid_steepness = 15.0
+base_activation_cap = 3.0
+quality_threshold = 0.0
+confidence_sim_high = 0.45
+confidence_sim_medium = 0.30
+confidence_sim_low = 0.10
+confidence_score_high = 40.0
+confidence_score_medium = 10.0
+context_quality_floor = 0.0
+mmr_lambda = 0.7
+keyword_top_k = 20
+spreading_activation_enabled = false
+temporal_recency_hours = 24
+outcome_weight = 0.0
+outcome_decay = 1.0
+# P41: cosine-match query embedding to active triple embeddings,
+# surface source atoms via triple.atom_id as a 'triple_augment'
+# RRF pathway. Subatom beam stays OFF for this isolation run.
+enable_triple_augment_v2 = true
+enable_subatom_beam = false
+
+[retrieval_v2]
+enable_rerank = false   # P15 cross-encoder LLM rerank (regressed in msam_rerank_gptoss_v1)
+enabled = false
+# P12 (synonym expansion on the keyword pathway via _expand_query_for_keyword
+# in core.py) — the only positive single lever since P30. Shipped to
+# canonical 2026-04-29. Same flag still gates this even after the
+# triple-graph expand_query removal in the cleanup batch.
+enable_query_expansion = true
+
+[llm]
+# Unified LLM endpoint for every MSAM subsystem (consolidation synthesis,
+# annotation, triple extraction, rerank, subatom synthesis). Bench routes
+# through OpenRouter to test gpt-oss-120b end-to-end (paid tier — free
+# tier daily caps would kill a 500q run).
+url             = "https://openrouter.ai/api/v1/chat/completions"
+model           = "openai/gpt-oss-120b"
+api_key_env     = "OPENROUTER_API_KEY"
+timeout_seconds = 60
+
+[compression]
+enable_subatom = false
+enable_fact_dedup = false
+enable_synthesis = false
+
+[triples]
+# Triples extraction during consolidation needs to be ON for P41
+# to have triples to cosine-match against. Bench's canonical config
+# keeps this off (triples-as-RRF-pathway regressed in P32/P35),
+# but P41 augments via the source atom, not via the graph pathway.
+enable_extraction = true
+
+[annotation]
+# Use heuristic-only annotation (fast, deterministic, free).
+use_llm = false
+
+[prediction]
+enabled = false
+
+[world_model]
+enabled = false
+
+[decay]
+enabled = false
+
+[consolidation]
+enabled = true
+# P9: LLM synthesis using gpt-5.4-nano — fast and cheap, good enough for
+# the "combine N atoms into one observation" task. With the two-tier
+# retrieval design the raws preserve specifics, so observations just need
+# to be passable abstractions.
+enable_llm = true
+llm_url = "https://api.openai.com/v1/chat/completions"
+llm_model = "gpt-5.4-nano"
+timeout_seconds = 30
+api_key_env = "OPENAI_API_KEY"
+min_cluster_size = 3
+max_clusters_per_run = 20
+stability_reduction_factor = 0.5
+
+[atoms]
+# Bench harness runs resolve_contradictions_to_supersedes() once per
+# question post-consolidation; we don't need per-write resolution on top
+# of that (it would just duplicate work and slow ingest).
+auto_resolve_supersedes_on_write = false
+
+[benchmark]
+# P10 wiring (session boundaries + mark_contributions). Disabled while we
+# isolate the P4-bench supersedes effect — the boundary atoms appeared to
+# crowd top-K retrieval and drag single-session subtypes ~5pp in P8 runs.
+enable_session_boundaries = false
+enable_mark_contributions = false
+
+[agents]
+default_agent_id = "longmemeval"

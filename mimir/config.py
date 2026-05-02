@@ -25,7 +25,7 @@ def _env_int(name: str, default: int) -> int:
 # should ship logs to an external store, not raise these knobs.
 #
 # Events cap is 5× the turns cap — measured ~5 events/turn for mimir today
-# (turn_started/finished, event_queued, msam_feedback_sent, send_message),
+# (turn_started/finished, event_queued, saga_feedback_sent, send_message),
 # with headroom for failure-class events (tool_call_denied, retries, loop
 # warnings) when they fire. open-strix's distribution runs ~15 events/turn
 # but is chattier; if mimir's per-turn event count grows toward that, raise
@@ -74,8 +74,8 @@ class Config:
     model: str
     effort: str
     embed_model: str
-    msam_endpoint: str
-    msam_api_key: str
+    saga_endpoint: str
+    saga_api_key: str
     web_port: int
 
     # Concurrency (§4.5)
@@ -97,17 +97,17 @@ class Config:
     # Per-message render cap for Recent activity (chars). 0 = no cap.
     recent_message_chars: int
 
-    # MSAM session (§5.6)
-    msam_session_idle_minutes: int
-    msam_consolidate_cron: str
-    # Per-atom confidence floor (post MSAM per-atom gating) for the
-    # pre-message auto-fetch hook. Empty string (default) defers to MSAM's
+    # SAGA session (§5.6)
+    saga_session_idle_minutes: int
+    saga_consolidate_cron: str
+    # Per-atom confidence floor (post SAGA per-atom gating) for the
+    # pre-message auto-fetch hook. Empty string (default) defers to SAGA's
     # ``[retrieval].default_min_confidence_tier`` config (today: "low").
     # Override with "medium"/"high" only when bench data shows weak hits
-    # are net-negative; "low" is fine post MSAM commit 29efa38 which fixed
+    # are net-negative; "low" is fine post SAGA commit 29efa38 which fixed
     # the bug where keyword-only-pathway atoms had ``_confidence_tier``
     # unset and got dropped at any floor ≥ low.
-    msam_pre_message_min_tier: str
+    saga_pre_message_min_tier: str
 
     # send_message circuit breaker (§7.2.4)
     send_loop_soft_limit: int
@@ -156,7 +156,7 @@ class Config:
     # localhost, but the server binds to 0.0.0.0 so any production
     # deployment should set this. Without it, an attacker who can reach
     # the server can steer the agent into the synthesis path against an
-    # arbitrary session id (and call msam_end_session etc.).
+    # arbitrary session id (and call saga_end_session etc.).
     api_key: str
 
     # Algedonic surfacing (v0.4 §2). Window for the Recent feedback
@@ -228,8 +228,8 @@ class Config:
             model=_env("MIMIR_MODEL", "claude-opus-4-7"),
             effort=_env("MIMIR_EFFORT", "high"),
             embed_model=_env("MIMIR_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
-            msam_endpoint=_env("MSAM_ENDPOINT", "http://localhost:3002"),
-            msam_api_key=_env("MSAM_API_KEY"),
+            saga_endpoint=_env("SAGA_ENDPOINT", "http://localhost:3002"),
+            saga_api_key=_env("SAGA_API_KEY"),
             web_port=_env_int("MIMIR_WEB_PORT", 8080),
 
             max_concurrent_turns=_env_int("MIMIR_MAX_CONCURRENT_TURNS", 10),
@@ -246,9 +246,9 @@ class Config:
             ),
             recent_message_chars=_env_int("MIMIR_RECENT_MESSAGE_CHARS", 4096),
 
-            msam_session_idle_minutes=_env_int("MIMIR_MSAM_SESSION_IDLE_MINUTES", 10),
-            msam_consolidate_cron=_env("MIMIR_MSAM_CONSOLIDATE_CRON", "0 4 * * 0"),
-            msam_pre_message_min_tier=_env("MIMIR_MSAM_PRE_MSG_MIN_TIER", ""),
+            saga_session_idle_minutes=_env_int("MIMIR_SAGA_SESSION_IDLE_MINUTES", 10),
+            saga_consolidate_cron=_env("MIMIR_SAGA_CONSOLIDATE_CRON", "0 4 * * 0"),
+            saga_pre_message_min_tier=_env("MIMIR_SAGA_PRE_MSG_MIN_TIER", ""),
 
             send_loop_soft_limit=_env_int("MIMIR_SEND_LOOP_SOFT_LIMIT", 5),
             send_loop_hard_limit=_env_int("MIMIR_SEND_LOOP_HARD_LIMIT", 10),

@@ -1,16 +1,16 @@
 """Per-turn ``TurnContext`` propagation via ``contextvars`` (SPEC §4.6, §9.3).
 
-The MSAM ``msam_query`` tool needs to auto-append returned ``atom_id``s to the
-parent's ``TurnContext.msam_atom_ids`` so the post-message hook can credit
+The SAGA ``saga_query`` tool needs to auto-append returned ``atom_id``s to the
+parent's ``TurnContext.saga_atom_ids`` so the post-message hook can credit
 mid-turn retrievals without the agent having to remember (SPEC §9.3 "mid-turn
-``msam_query`` tracking"). Tools registered with the SDK are plain functions —
+``saga_query`` tracking"). Tools registered with the SDK are plain functions —
 they need a way to find the active turn.
 
 ``contextvars`` are the right primitive: each ``query()`` call runs in its own
 asyncio task, and we set the ContextVar before invoking ``query()``. Subagent
 calls run in distinct tasks with distinct contexts, so a subagent's
-``msam_query`` does NOT mutate the parent's ``msam_atom_ids`` — matching SPEC
-§9.3 "Subagents do not inherit the parent's ``msam_atom_ids``".
+``saga_query`` does NOT mutate the parent's ``saga_atom_ids`` — matching SPEC
+§9.3 "Subagents do not inherit the parent's ``saga_atom_ids``".
 """
 
 from __future__ import annotations

@@ -183,16 +183,16 @@ Lint passes are slower than ingest; do them deliberately, not constantly.
 
 If a note would benefit from being linked to other notes, it belongs in `wiki/`. If it's a one-off, `memory/` is fine.
 
-## Mirroring to MSAM
+## Mirroring to SAGA
 
 Wiki pages are durable, but searching them depends on knowing the page
-name (or following links from a page you already found). MSAM atoms add
+name (or following links from a page you already found). SAGA atoms add
 fuzzy / paraphrased recall. For pages worth retrieving by paraphrase
 ("who's that engineer who keeps talking about async?"), mirror the
 page's headline as a semantic atom:
 
 ```
-mcp__mimir__msam_store(
+mcp__mimir__saga_store(
     content="Alice Smith — eng team lead, async-first advocate. See state/wiki/entities/alice.md",
     stream="semantic",
 )

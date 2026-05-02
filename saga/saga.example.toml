@@ -1,0 +1,269 @@
+# MSAM Configuration
+# Copy to msam.toml and adjust for your deployment.
+#
+# Caller responsibilities (not config — applied at the API layer):
+# - Mint a session_id (any opaque string, UUID is fine) at conversation
+#   start and pass it on every /v1/query, /v1/store (via metadata),
+#   /v1/feedback, and /v1/session_end call. /v1/feedback uses it to
+#   tag every access_log row from that session, not just the most recent.
+# - When using contextual query rewriting, pass `context` (prior
+#   {role, content} messages, most recent last) on /v1/query.
+
+[embedding]
+provider = "nvidia-nim"                     # nvidia-nim | openai | onnx | local
+url = "https://integrate.api.nvidia.com/v1/embeddings"
+model = "nvidia/nv-embedqa-e5-v5"
+dimensions = 1024
+max_input_chars = 2000                      # truncate input beyond this
+timeout_seconds = 10
+batch_size = 50                                # max texts per API batch request
+# api_key_env = "NVIDIA_NIM_API_KEY"        # env var name for API key (provider-specific default)
+
+# ONNX Runtime (local, no API key, lightweight):
+# [embedding]
+# provider = "onnx"
+# model = "BAAI/bge-small-en-v1.5"         # auto-downloads from HuggingFace
+# dimensions = 384
+
+[storage]
+db_path = "db/msam.db"                      # relative to msam/ directory
+metrics_db_path = "db/msam_metrics.db"
+token_budget_ceiling = 40000                # max tokens across all active atoms
+auto_compact_threshold_pct = 85             # above this: force lightweight profile on new atoms
+refuse_threshold_pct = 95                   # above this: reject new atoms entirely
+db_busy_timeout_ms = 5000                    # SQLite busy timeout in milliseconds
+
+[retrieval]
+default_top_k = 12                          # atoms returned per query
+semantic_weight = 0.7                       # vs keyword (0.3); applies when fusion = "weighted_sum"
+# Contextual query rewriting: when true AND the caller passes a non-empty
+# `context` list on /v1/query, an LLM rewrites the current query into a
+# self-contained form ("yes, look for that" → "What do I know about X?").
+# No-op when context is None/empty regardless of this flag, so it's safe
+# to leave on. Uses the [retrieval_v2] LLM (falls back to [llm]).
+enable_contextual_rewrite = false
+fusion = "rrf"                              # how hybrid_retrieve merges pathways: "rrf" | "weighted_sum"
+rrf_k = 60                                  # RRF damping constant (Cormack default)
+rrf_semantic_weight = 1.0                   # RRF weight for semantic pathway
+rrf_keyword_weight = 1.0                    # RRF weight for keyword pathway
+rrf_graph_weight = 0.7                      # RRF weight for triple-graph pathway
+rrf_temporal_weight = 1.0                   # RRF weight for temporal pathway
+enable_graph_pathway = false                # include triple-graph pathway in RRF (off by default; LongMemEval A/B was neutral/negative)
+enable_temporal_pathway = false             # include temporal pathway in RRF (off by default; see BENCHMARK-RESULTS.md §msam_p3_minimax_v2)
+enable_observation_bonus = true             # boost consolidated observations by evidence_count under RRF (single-tier mode)
+observation_bonus_alpha = 0.3               # multiplier = 1 + alpha * log(evidence_count + 1)
+trend_penalty_weakening = 0.7               # score multiplier when trend = 'weakening'
+trend_penalty_stale = 0.4                   # score multiplier when trend = 'stale'
+# P9: two-tier retrieval (returns {observations, raws}). See HINDSIGHT-IDEAS.md §P9.
+# Recommended ON: P30v3 (the canonical-best LongMemEval stack at 0.784) runs two-tier.
+# Per-request `two_tier=true` on QueryRequest overrides this default.
+two_tier_enabled = true                     # default response shape: {observations, raws} instead of {atoms, triples}
+observations_top_k = 5                      # cap on observations returned in two_tier mode
+observation_confidence_min_sim = 0.30       # similarity floor; observations below this are skipped
+evidence_boost_cap_multiplier = 3.0         # cap evidence boost at (this - 1) × own RRF
+graph_pathway_top_k = 20                    # pre-fusion candidates from triples
+temporal_pathway_top_k = 20                 # pre-fusion atoms in the detected time window
+similarity_threshold = 0.2                  # below this: cosine similarity contributes zero
+sigmoid_midpoint = 0.35                     # similarity sigmoid curve center
+sigmoid_steepness = 15.0                    # similarity sigmoid sharpness
+base_activation_cap = 3.0                   # max base activation (prevents frequency dominance)
+quality_threshold = 2.0                     # minimum activation for hybrid retrieval
+# Per-atom confidence tier thresholds. Recalibrated 2026-04-28 (P33) against
+# the LongMemEval gold/noise distribution. Old 0.45/0.30/0.15 were missing
+# 60% of gold atoms at the high tier and admitting too much noise at the low tier.
+confidence_sim_high = 0.40                  # similarity above this: high confidence tier
+confidence_sim_medium = 0.30                # similarity above this: medium confidence tier
+confidence_sim_low = 0.20                   # similarity above this: low confidence tier
+confidence_score_high = 40.0                # activation above this: high confidence
+confidence_score_medium = 10.0              # activation above this: medium confidence
+context_quality_floor = 0.15                # below this: atom rejected from context injection
+mmr_lambda = 0.7                            # diversity vs relevance tradeoff (1.0 = pure relevance)
+keyword_top_k = 10                          # max FTS5 results
+spreading_activation_enabled = true         # enable co-retrieval spreading activation
+max_spread_hops = 2                         # max hops for spreading activation
+spread_decay_factor = 0.3                   # decay per hop
+temporal_recency_hours = 24                 # hours to consider "recent" for temporal queries
+# Felt Consequence -- outcome-attributed memory scoring
+outcome_weight = 0.15                      # weight of outcome score in activation
+outcome_decay = 0.95                       # exponential decay applied to existing score before new feedback
+min_outcomes_for_effect = 3                # minimum feedback count before outcome affects retrieval
+
+[decay]
+active_to_fading_threshold = 0.3            # retrievability R below this: active -> fading
+fading_to_dormant_threshold = 0.1           # retrievability R below this: fading -> dormant
+confidence_decay_rate = 0.01                # per day, after grace period
+confidence_decay_grace_days = 7             # days before confidence starts decaying
+confidence_floor = 0.1                      # minimum confidence value
+stability_dampen_factor = 0.9               # applied to over-retrieved low-value atoms
+stability_boost_factor = 1.1                # applied to high-contribution atoms
+max_stability = 10.0                         # cap on stability value (prevents runaway)
+protection_days = 7                          # never transition atoms accessed within N days
+compaction_full_min_age_days = 7             # min age before full -> standard compaction
+compaction_full_max_access = 3               # max access count for full -> standard compaction
+compaction_standard_min_age_days = 14        # min age before standard -> lightweight compaction
+compaction_standard_max_access = 2           # max access count for standard -> lightweight
+compaction_trigger_ratio = 1.5               # only compact if content > target * ratio
+profile_target_lightweight_chars = 90        # target chars for lightweight profile (~22 tokens)
+profile_target_standard_chars = 240          # target chars for standard profile (~60 tokens)
+
+[atoms]
+default_profile = "standard"                # lightweight | standard | full
+profile_lightweight_max_words = 20           # word count threshold: below = lightweight
+profile_full_min_words = 80                  # word count threshold: above = full
+default_encoding_confidence = 0.7
+default_arousal = 0.5
+default_valence = 0.0
+
+[merge]
+similarity_threshold = 0.85                 # cosine similarity to suggest merge
+max_candidates = 20
+
+[negative_knowledge]
+default_ttl_hours = 168                     # 7 days
+
+[emotional_context]
+urgency_recency_bonus = 1.0                 # bonus for recent atoms when urgency is high
+negative_valence_support_bonus = 0.5        # bonus for supportive atoms when valence is negative
+low_arousal_depth_bonus = 0.5               # bonus for philosophical atoms when arousal is low
+high_arousal_recent_bonus = 0.3             # bonus for recent atoms when arousal is high
+
+[relations]
+supersedes_demotion = 2.0                   # activation penalty for superseded atoms
+supports_bonus = 0.5                        # activation bonus for supported atoms
+
+[vector_index]
+approx_threshold = 50000                     # switch from exact to approximate FAISS at this atom count
+
+[consolidation]
+similarity_threshold = 0.80                 # cosine similarity to group atoms
+min_cluster_size = 3                        # minimum atoms to form a cluster
+max_clusters_per_run = 50                   # cap clusters per consolidation run
+stability_reduction_factor = 0.5            # stability reduction for merged atoms
+# LLM used to synthesize observation atoms from a cluster. Any
+# OpenAI-compatible /chat/completions endpoint works.
+llm_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+llm_model = "mistralai/mistral-large-3-675b-instruct-2512"
+timeout_seconds = 15
+# api_key_env selects which env var to read for the Bearer token.
+# If unset, falls back to embedding.api_key, then CONSOLIDATION_API_KEY,
+# OPENAI_API_KEY, NVIDIA_API_KEY — in that order.
+# api_key_env = "OPENAI_API_KEY"
+
+[annotation]
+llm_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+llm_model = "mistralai/mistral-large-3-675b-instruct-2512"
+timeout_seconds = 15
+
+[comparison]
+# Flat-file baselines for token savings measurement.
+# Lists of markdown file paths used to compute "tokens saved vs flat files".
+startup_files = []    # Files loaded at session startup (identity, preferences, etc.)
+query_files = []      # Files loaded per query (topic-specific context files)
+
+[triples]
+llm_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+llm_model = "mistralai/mistral-large-3-675b-instruct-2512"
+
+[compression]
+enable_subatom = true                       # sentence-level extraction from atoms
+enable_fact_dedup = true                    # semantic deduplication of sentences
+enable_synthesis = false                    # LLM-based sentence compression (off by default)
+subatom_token_budget = 120                  # max tokens for subatom output
+subatom_section_budget = 30                 # token budget per context section
+sentence_similarity_threshold = 0.25        # min similarity for a sentence vs query
+dedup_similarity_threshold = 0.85           # cosine threshold for near-duplicate removal
+synthesis_max_tokens = 30                   # max tokens for LLM synthesis output
+synthesis_model = "mistralai/mistral-large-3-675b-instruct-2512"
+
+[prediction]
+temporal_weight = 0.4                       # weight for time-of-day patterns
+coretrieval_weight = 0.4                    # weight for co-retrieval patterns
+momentum_weight = 0.2                       # weight for topic momentum
+lookback_days = 30                          # how far back to analyze patterns
+min_confidence = 0.3                        # minimum confidence for predictions
+# Predictive Context Assembly
+enabled = true                             # enable predictive pre-retrieval in context
+temporal_window_hours = 2                  # +/- hours to match temporal patterns
+min_pattern_count = 5                      # minimum retrievals before pattern is trusted
+co_retrieval_threshold = 3                 # minimum co-retrievals to expand predictions
+max_predicted_atoms = 8                    # cap on predicted atoms blended into context
+warmup_sessions = 50                       # sessions before prediction engine activates
+
+[agents]
+default_agent_id = "default"                # agent ID when none specified
+enable_sharing = true                       # allow atom sharing between agents
+
+[retrieval_v2]
+enabled = true
+enable_beam_search = "auto"                 # "auto" | true | false -- auto gates on atom count
+beam_search_atom_threshold = 10000          # beam search activates above this many atoms
+beam_width = 3                              # number of retrieval beams when active
+enable_rewrite = true                       # query rewriting (entity resolution, synonyms)
+enable_query_expansion = true               # synonym expansion
+enable_triple_augment = true                # augment results with triple traversal
+enable_entity_roles = true                  # entity-aware scoring
+enable_quality_filter = true                # filter low-quality results
+enable_temporal = true                      # temporal query detection
+enable_rerank = false                       # LLM rerank (adds ~1s latency, off by default)
+enable_feedback = true                      # contribution-based adjustments
+
+[entity_resolution]
+# Alias mappings: alternate names -> canonical name
+# Remove or replace these with your own entities
+[entity_resolution.aliases]
+# Map alternate names to canonical names for query rewriting
+# "nickname" = "canonical_name"
+# "bob" = "robert"
+# "the boss" = "robert"
+
+[query_expansion]
+# Synonym groups for query rewriting
+# "term" = ["synonym1", "synonym2"]
+[query_expansion.synonyms]
+# Expand query terms with synonyms for better recall
+# "profession" = ["job", "career", "work", "occupation"]
+# "home" = ["hometown", "residence", "where lives"]
+# "schedule" = ["routine", "calendar", "plan"]
+
+[predictive_retrieval]
+# Context keys for predict_needed_atoms()
+# Remove or replace with your own context
+user_active = false                         # whether primary user is present
+
+[context]
+default_token_budget = 500                  # token budget for query/hybrid commands
+default_top_k = 10                          # default atoms for query command
+probe_token_budget = 200                    # token budget for snapshot probe queries
+probe_top_k = 5                             # atoms for snapshot probe queries
+# Snapshot probe queries (keep metrics fresh between sessions)
+probe_queries = ["current situation schedule", "identity personality traits"]
+probe_atom_queries = ["What is the user's profession?", "Who is the agent?"]
+
+[api]
+port = 3001
+host = "127.0.0.1"                          # localhost only by default
+# Restrict CORS to specific origins (default: localhost Grafana only)
+allowed_origins = ["http://127.0.0.1:3000", "http://localhost:3000"]
+# Optional API key for metrics endpoint (default: none/open)
+# api_key = "your-secret-key-here"
+
+[metrics]
+enabled = true
+log_access_events = true
+log_emotional_state = true
+hybrid_probe_on_snapshot = true             # run probe queries during snapshot to keep metrics fresh
+default_emotional_intensity = 0.5           # fallback when emotional state file can't be parsed
+default_emotional_warmth = 0.5
+continuity_history_limit = 100              # rows for system history queries
+retrieval_history_limit = 100               # rows for retrieval history queries
+
+[world_model]
+enabled = true                             # enable temporal world model (query_world, update_world)
+auto_close_on_conflict = true              # auto-expire previous triple when updating same subject+predicate
+temporal_extraction = true                 # enable temporal metadata (valid_from/valid_until) on triples
+default_confidence = 1.0                   # default confidence for world model triples
+
+[sycophancy]
+tracking_enabled = true                    # enable agreement rate tracking
+warning_threshold = 0.85                   # agreement rate above this triggers sycophancy warning
+window_size = 20                           # number of recent signals to compute rate over

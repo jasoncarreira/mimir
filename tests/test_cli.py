@@ -72,7 +72,7 @@ def test_setup_env_template_lists_main_keys(tmp_path: Path):
     home = tmp_path / "agent"
     setup_home(home)
     env_text = (home / ".env").read_text()
-    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "MSAM_ENDPOINT", "DISCORD_TOKEN"):
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "SAGA_ENDPOINT", "DISCORD_TOKEN"):
         assert key in env_text
 
 
@@ -148,7 +148,7 @@ def test_regenerate_api_key_rotates_and_preserves_others(tmp_path: Path):
     )
     assert new_key == after_key
     assert new_key != before
-    for unrelated in ("ANTHROPIC_API_KEY=", "MIMIR_WEB_PORT=", "MSAM_ENDPOINT="):
+    for unrelated in ("ANTHROPIC_API_KEY=", "MIMIR_WEB_PORT=", "SAGA_ENDPOINT="):
         assert unrelated in after
 
 

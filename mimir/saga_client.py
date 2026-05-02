@@ -1,22 +1,22 @@
-"""Async HTTP client for the MSAM REST API (SPEC §4.1, §9.3).
+"""Async HTTP client for the SAGA REST API (SPEC §4.1, §9.3).
 
-MSAM is the Python/FastAPI service at ``/Users/jcarreira/projects/odin/msam/``,
-default port 3001 (config) — Mimir points at ``MSAM_ENDPOINT`` (default
+SAGA is the Python/FastAPI service at ``/Users/jcarreira/projects/odin/saga/``,
+default port 3001 (config) — Mimir points at ``SAGA_ENDPOINT`` (default
 ``http://localhost:3002`` per SPEC §14, override per-deployment).
 
 This client wraps just the endpoints Mimir needs:
 - ``query``               — pre-message hit retrieval
-- ``store``               — explicit atom store (rare; MSAM auto-extracts)
+- ``store``               — explicit atom store (rare; SAGA auto-extracts)
 - ``feedback``            — mark_contributions for response credit
-- ``outcome``             — explicit per-atom feedback (used by msam_feedback)
+- ``outcome``             — explicit per-atom feedback (used by saga_feedback)
 - ``end_session``         — write a session_boundary atom
 - ``consolidate``         — weekly maintenance pass
 
-Errors are surfaced as ``MsamError``; transient HTTP failures don't crash
+Errors are surfaced as ``SagaError``; transient HTTP failures don't crash
 the agent — caller decides how to log/retry. ``ClientSession`` is created
 lazily and reused so we don't pay TCP setup per call.
 
-Long inputs to ``query`` are clamped client-side. MSAM's ``_fts5_query``
+Long inputs to ``query`` are clamped client-side. SAGA's ``_fts5_query``
 constructs an OR-joined FTS5 expression from the input tokens; SQLite's
 FTS5 caps expression depth at 1000, and a probe with several hundred
 distinct tokens (common with Bluesky transcripts) produces a 500 from
@@ -36,17 +36,17 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
-# Hard cap on the keyword-token count we let MSAM build FTS5 expressions from.
+# Hard cap on the keyword-token count we let SAGA build FTS5 expressions from.
 # SQLite FTS5 trees are capped at depth 1000; a token cap of 64 keeps us well
-# under that even with future MSAM internal-nesting changes. The cap is also
+# under that even with future SAGA internal-nesting changes. The cap is also
 # essentially free in retrieval quality — beyond ~20 terms BM25 is dominated
 # by a few salient words.
 _MAX_QUERY_TOKENS = 64
 # Backstop if the input has so few whitespace separators that even after
-# truncation it would still blow up MSAM (e.g. one giant URL).
+# truncation it would still blow up SAGA (e.g. one giant URL).
 _MAX_QUERY_CHARS = 1500
 
-# Retry policy for transient MSAM failures (5xx, ClientError, TimeoutError).
+# Retry policy for transient SAGA failures (5xx, ClientError, TimeoutError).
 # 4xx is permanent and never retried. Total wait: 0.2 + 0.4 + 0.8 = 1.4s
 # across 4 attempts, which covers a typical sidecar restart without hanging
 # the agent. Past that, surface the error and let the caller log+continue.
@@ -54,14 +54,14 @@ _MAX_RETRIES = 3
 _RETRY_DELAYS_S = (0.2, 0.4, 0.8)
 
 
-class MsamError(RuntimeError):
+class SagaError(RuntimeError):
     def __init__(self, message: str, status: int | None = None, body: str | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.body = body
 
 
-class MsamClient:
+class SagaClient:
     """One client per process. ``close()`` releases the underlying session.
     All methods are coroutines and never block the event loop."""
 
@@ -90,8 +90,8 @@ class MsamClient:
             self._session = None
 
     async def health(self) -> bool:
-        """True when MSAM responds 200 to /v1/health. Used by the integration
-        smoke and by callers that want to skip MSAM gracefully when down."""
+        """True when SAGA responds 200 to /v1/health. Used by the integration
+        smoke and by callers that want to skip SAGA gracefully when down."""
         try:
             sess = await self._ensure_session()
             async with sess.get(f"{self._endpoint}/v1/health") as resp:
@@ -108,7 +108,7 @@ class MsamClient:
         responses are retried up to ``_MAX_RETRIES`` times with delays
         ``[0.2s, 0.4s, 0.8s]``. 4xx responses are permanent — no retry.
 
-        The MSAM sidecar restarts in <1s; the backoff window covers a typical
+        The SAGA sidecar restarts in <1s; the backoff window covers a typical
         restart without making the agent wait too long. Past 1.4s of total
         backoff, the failure is surfaced and the caller decides what to do.
         """
@@ -127,33 +127,33 @@ class MsamClient:
                         if attempt < _MAX_RETRIES:
                             await asyncio.sleep(_RETRY_DELAYS_S[attempt])
                             continue
-                        raise MsamError(
-                            f"MSAM {path} returned {resp.status} after {attempt + 1} attempts",
+                        raise SagaError(
+                            f"SAGA {path} returned {resp.status} after {attempt + 1} attempts",
                             status=resp.status,
                             body=text,
                         )
                     if resp.status >= 400:
                         # 4xx is permanent — bad request, auth failure, etc.
-                        raise MsamError(
-                            f"MSAM {path} returned {resp.status}",
+                        raise SagaError(
+                            f"SAGA {path} returned {resp.status}",
                             status=resp.status,
                             body=text,
                         )
                     try:
                         return await _parse_json(text)
                     except ValueError as exc:
-                        raise MsamError(f"MSAM {path} returned non-JSON body: {exc}") from exc
+                        raise SagaError(f"SAGA {path} returned non-JSON body: {exc}") from exc
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 if attempt < _MAX_RETRIES:
                     await asyncio.sleep(_RETRY_DELAYS_S[attempt])
                     continue
-                raise MsamError(
-                    f"MSAM {path} failed after {attempt + 1} attempts: {type(exc).__name__}: {exc}"
+                raise SagaError(
+                    f"SAGA {path} failed after {attempt + 1} attempts: {type(exc).__name__}: {exc}"
                 ) from exc
         # Unreachable — the loop either returns or raises every iteration.
-        raise MsamError(
-            f"MSAM {path} retry loop exhausted",
+        raise SagaError(
+            f"SAGA {path} retry loop exhausted",
             status=last_status,
             body=last_body,
         )
@@ -173,31 +173,31 @@ class MsamClient:
     ) -> dict[str, Any]:
         """POST /v1/query. Returns the full response dict including raw atoms.
 
-        ``session_id`` (any stable string per conversation) lets MSAM scope
+        ``session_id`` (any stable string per conversation) lets SAGA scope
         the access_log rows it writes for this retrieve, so a later
         ``feedback(session_id=...)`` call can credit *every* retrieval in
         the session window — not just the globally-most-recent row per
-        atom (MSAM commit e88d458, schema migration 10).
+        atom (SAGA commit e88d458, schema migration 10).
 
-        ``context`` is the prior conversation, most recent last. When MSAM
+        ``context`` is the prior conversation, most recent last. When SAGA
         has ``[retrieval] enable_contextual_rewrite = true`` and ``context``
-        is non-empty, MSAM rewrites short / referential queries
+        is non-empty, SAGA rewrites short / referential queries
         ("yes, look for that") into self-contained form before retrieval.
         Each entry is ``{"role": "user"|"assistant", "content": str}``;
-        MSAM uses the last 10, truncating each content to 400 chars.
+        SAGA uses the last 10, truncating each content to 400 chars.
         Safe to always pass — flag-off and rewrite failures fall through
         to the original query.
 
         ``min_confidence_tier`` (``"none" | "low" | "medium" | "high"``) is
-        the per-atom floor MSAM applies before returning. ``None`` lets
-        MSAM use its ``[retrieval].default_min_confidence_tier`` config
+        the per-atom floor SAGA applies before returning. ``None`` lets
+        SAGA use its ``[retrieval].default_min_confidence_tier`` config
         (today: ``"low"`` — drops sub-0.15 noise). Pass ``"medium"`` /
         ``"high"`` for high-stakes probes where a wrong answer is worse
         than no answer.
 
         Long inputs are clamped to ``_MAX_QUERY_TOKENS`` whitespace-separated
         tokens (and a backstop char limit) to avoid SQLite FTS5's 1000-deep
-        expression-tree limit on MSAM's keyword path."""
+        expression-tree limit on SAGA's keyword path."""
         body: dict[str, Any] = {
             "query": _clamp_query(query),
             "top_k": top_k,
@@ -222,8 +222,8 @@ class MsamClient:
         use_llm_annotate: bool = False,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """POST /v1/store. ``stream`` maps to MSAM's stream taxonomy
-        (semantic/episodic/observation/...); leaving it None lets MSAM decide."""
+        """POST /v1/store. ``stream`` maps to SAGA's stream taxonomy
+        (semantic/episodic/observation/...); leaving it None lets SAGA decide."""
         body: dict[str, Any] = {
             "content": content,
             "source_type": source_type,
@@ -262,7 +262,7 @@ class MsamClient:
         query: str | None = None,
     ) -> dict[str, Any]:
         """POST /v1/outcome — explicit per-atom feedback. ``feedback`` must be
-        one of MSAM's enum values: positive/negative/neutral/silence."""
+        one of SAGA's enum values: positive/negative/neutral/silence."""
         body: dict[str, Any] = {"atom_ids": atom_ids, "feedback": feedback}
         if session_id:
             body["session_id"] = session_id
@@ -310,13 +310,13 @@ class MsamClient:
         this ranks by recency.
 
         Best-effort: returns ``[]`` on any failure (4xx, 5xx, network)
-        so the prompt-assembly path doesn't crash if MSAM is briefly
+        so the prompt-assembly path doesn't crash if SAGA is briefly
         down. The caller logs at warning."""
         params: dict[str, Any] = {"count": count}
         if channel_id:
             params["channel"] = channel_id
         data = await self._get_or_empty("/v1/sessions/recent", params)
-        # MSAM commit 5545a6e ships {"sessions": [...]}.
+        # SAGA commit 5545a6e ships {"sessions": [...]}.
         return data.get("sessions") or []
 
     async def most_retrieved_atoms(
@@ -363,7 +363,7 @@ class MsamClient:
             async with sess.get(f"{self._endpoint}{path}", params=params) as resp:
                 if resp.status >= 400:
                     log.warning(
-                        "MSAM %s returned %d; degrading to empty",
+                        "SAGA %s returned %d; degrading to empty",
                         path, resp.status,
                     )
                     return {}
@@ -371,10 +371,10 @@ class MsamClient:
                 try:
                     return await _parse_json(text)
                 except ValueError:
-                    log.warning("MSAM %s returned non-JSON; degrading to empty", path)
+                    log.warning("SAGA %s returned non-JSON; degrading to empty", path)
                     return {}
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            log.warning("MSAM %s failed: %s", path, exc)
+            log.warning("SAGA %s failed: %s", path, exc)
             return {}
 
 
@@ -388,7 +388,7 @@ def _clamp_query(text: str) -> str:
     Strategy: keep the first ``_MAX_QUERY_TOKENS`` whitespace-separated
     tokens; if the resulting string is still too long (e.g. one massive
     URL with no whitespace), truncate at ``_MAX_QUERY_CHARS``. The
-    semantic embedder MSAM uses already truncates its own input, so we
+    semantic embedder SAGA uses already truncates its own input, so we
     don't try to be cleverer than the upstream tokenizer here.
     """
     if not text:

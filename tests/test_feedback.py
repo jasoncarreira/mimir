@@ -86,7 +86,7 @@ def test_positive_only_signals_render(tmp_path: Path):
         events=[
             {
                 "timestamp": _ts(0.5),
-                "type": "msam_feedback_sent",
+                "type": "saga_feedback_sent",
                 "n_atoms": 3,
                 "channel_id": "slack-eng",
             }
@@ -96,16 +96,16 @@ def test_positive_only_signals_render(tmp_path: Path):
     assert block is not None
     assert "Positive (last 24h):" in block
     assert "Negative" not in block
-    assert "msam_feedback_sent (3 atoms credited)" in block
+    assert "saga_feedback_sent (3 atoms credited)" in block
 
 
 def test_mixed_polarity_renders_both_subsections_with_blank_separator(tmp_path: Path):
     log = _make_log(
         tmp_path,
         events=[
-            {"timestamp": _ts(0.1), "type": "msam_feedback_sent", "n_atoms": 2,
+            {"timestamp": _ts(0.1), "type": "saga_feedback_sent", "n_atoms": 2,
              "channel_id": "slack-eng"},
-            {"timestamp": _ts(0.2), "type": "tool_call_denied", "tool": "msam_query",
+            {"timestamp": _ts(0.2), "type": "tool_call_denied", "tool": "saga_query",
              "reason": "rate-limited", "channel_id": "discord-99"},
         ],
     )
@@ -217,7 +217,7 @@ def test_feedback_is_global_not_channel_scoped(tmp_path: Path):
         events=[
             {"timestamp": _ts(0.5), "type": "tool_call_denied", "tool": "x",
              "channel_id": "discord-99"},
-            {"timestamp": _ts(0.6), "type": "msam_feedback_sent", "n_atoms": 1,
+            {"timestamp": _ts(0.6), "type": "saga_feedback_sent", "n_atoms": 1,
              "channel_id": "slack-eng"},
         ],
     )

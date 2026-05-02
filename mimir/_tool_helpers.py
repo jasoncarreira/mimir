@@ -1,6 +1,6 @@
 """Small shared helpers for tool handlers (MCP-side error formatting).
 
-Used by msam, search, and schedule MCP tools — kept generic so any future
+Used by saga, search, and schedule MCP tools — kept generic so any future
 in-process tool can wrap arg validation and consistent error responses.
 """
 

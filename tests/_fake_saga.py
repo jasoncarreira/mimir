@@ -1,4 +1,4 @@
-"""In-memory fake MSAM client for tests. Records calls so tests can assert
+"""In-memory fake SAGA client for tests. Records calls so tests can assert
 on the wire payloads without a network round-trip.
 """
 
@@ -8,7 +8,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-from mimir.msam_client import MsamError
+from mimir.saga_client import SagaError
 
 
 @dataclass
@@ -18,8 +18,8 @@ class _Call:
 
 
 @dataclass
-class FakeMsam:
-    """Behaves like ``MsamClient`` enough for the agent + hooks + tools."""
+class FakeSaga:
+    """Behaves like ``SagaClient`` enough for the agent + hooks + tools."""
 
     calls: list[_Call] = field(default_factory=list)
     query_response: dict[str, Any] = field(default_factory=dict)
@@ -46,7 +46,7 @@ class FakeMsam:
                             "context": context})
         )
         if "query" in self.fail_on:
-            raise MsamError("synthetic query failure")
+            raise SagaError("synthetic query failure")
         return self.query_response
 
     async def store(self, content: str, **kwargs: Any) -> dict[str, Any]:
@@ -73,7 +73,7 @@ class FakeMsam:
             )
         )
         if "feedback" in self.fail_on:
-            raise MsamError("synthetic feedback failure")
+            raise SagaError("synthetic feedback failure")
         return {"ok": True}
 
     async def outcome(
