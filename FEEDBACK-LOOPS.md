@@ -345,20 +345,35 @@ fusion alongside semantic / keyword pathways.
 
 ---
 
+### 2.6 Inbound reactions → algedonic surfacing
+
+**Algedonic channel — inbound.** Discord and Slack bridges
+intercept inbound reactions (`on_raw_reaction_add` /
+`reaction_added`), filter to reactions on the bot's own messages,
+classify the emoji into a polarity via `mimir.reactions`
+(positive: 👍 ❤️ ✅ 💯 etc.; negative: 👎 ❌ 💔 etc.; neutral
+otherwise — the neutral case is dropped from the algedonic block,
+not surfaced), and emit a `react_received` event into events.jsonl.
+
+The renderer adds a target-message-age suffix (`on just-sent
+message`, `on message from 3h ago`, `on message from 2d ago`)
+so the agent can tell whether a 👎 is on the response it just
+emitted vs. one from yesterday. The 24h window in `feedback.py`
+gates the reaction signal; older reactions don't appear.
+
+**Frequency:** event-driven by users.
+**Latency:** seconds (bridge → events.jsonl → next-turn prompt).
+**Closes the loop:** next turn for the same channel.
+**Call sites:** `mimir/reactions.py`,
+`mimir/bridges/discord.py:_on_reaction`,
+`mimir/bridges/slack.py:_on_reaction`,
+`mimir/feedback.py` (per-event polarity override).
+
+---
+
 ## 5. Loops that don't currently fire (gaps)
 
-### 5.1 Inbound reaction events
-
-Mimir's bridges (Discord, Slack) capture reactions at the
-protocol level but **don't surface them as agent-visible events
-in events.jsonl** today. The algedonic channel (§2.1) sees
-`saga_feedback` events but not raw reactions. Wiring up
-`react_received` events would close a meaningful operator-→-agent
-feedback loop at no model-call cost.
-
-**Status:** noted in `V0.4.md §2`; ~30 LOC per bridge.
-
-### 5.2 Long-term self-evaluation
+### 5.1 Long-term self-evaluation
 
 The reflection skill (§4.2) drafts proposals; auto-apply is gated
 by HITL. There's no closed loop where the agent observes the
@@ -369,7 +384,7 @@ would close that loop.
 **Status:** open. Needs a separate audit log of which proposals
 landed and a metric the reflection pass can measure against.
 
-### 5.3 Cross-instance / multi-agent feedback
+### 5.2 Cross-instance / multi-agent feedback
 
 If two mimir instances shared a saga (or had cross-saga
 coordination), they could pool semantic memory while keeping
@@ -394,6 +409,8 @@ use case. Saga's `enable_sharing` flag is the seed.
 │  • session boundaries (2.2)                           │
 │  • operator alert channel (2.3)                       │
 │  • resource awareness (2.4)                           │
+│  • most-retrieved (2.5)                               │
+│  • inbound reactions → algedonic (2.6)                │
 │  • mountaineering / climber (3.1)                     │
 └───────────────────────────────────────────────────────┘
 ┌─ minutes → hours ────────────────── cron-fast ────────┐
@@ -423,6 +440,7 @@ use case. Saga's `enable_sharing` flag is the seed.
 | 2.3 operator alert | algedonic (out) | high-priority escape |
 | 2.4 resource awareness | S3 + algedonic | self-state sensing |
 | 2.5 most-retrieved | S3* | candidate identification |
+| 2.6 inbound reactions | algedonic (in) | per-emoji polarity, 24h window |
 | 3.1 mountaineering | S1+S3 (subagent-internal) | local control |
 | 4.1 heartbeat | S4 | foresight time |
 | 4.2 reflection | S3* | cross-session audit (HITL) |
