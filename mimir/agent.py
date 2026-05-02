@@ -370,6 +370,27 @@ class Agent:
             log.exception("_assemble_upcoming_block failed; skipping")
             return None
 
+    def _assemble_skill_block(self) -> str | None:
+        """v0.5+ §12.3: render the system-prompt `## Skills` block —
+        proven / untried / risky buckets ordered by recent success
+        rate. Returns None when no skills are seeded."""
+        try:
+            from .skill_outcomes import (
+                SkillPinConfig, aggregate, render_skill_block,
+            )
+            from .skill_defs import _bundled_skill_names
+            seeded = _bundled_skill_names()
+            if not seeded:
+                return None
+            aggs = aggregate(self._config.turns_log)
+            pin = SkillPinConfig.load(
+                self._config.home / "state" / "skill-pin.yaml"
+            )
+            return render_skill_block(seeded, aggs, pin)
+        except Exception:  # noqa: BLE001
+            log.exception("_assemble_skill_block failed; skipping")
+            return None
+
     async def _assemble_session_summaries(
         self, *, channel_id: str | None
     ) -> str | None:
@@ -614,10 +635,12 @@ class Agent:
 
         core_blocks = load_core(self._config.home)
         memory_index_body = self._indexes.read_memory_index()
+        skill_block = self._assemble_skill_block()
         system_prompt = build_system_prompt(
             core_blocks=core_blocks,
             memory_index_body=memory_index_body,
             operator_alert_channel=self._config.operator_alert_channel,
+            skill_block=skill_block,
         )
 
         await log_event(
