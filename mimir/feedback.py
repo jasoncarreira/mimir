@@ -31,7 +31,7 @@ Polarity = Literal["negative", "positive"]
 class FeedbackSignal:
     ts: str
     polarity: Polarity
-    kind: str  # short tag: "tool_denied", "error", "msam_feedback", ...
+    kind: str  # short tag: "tool_denied", "error", "saga_feedback", ...
     channel_id: str | None
     content: str  # one-line rendered description
 
@@ -46,20 +46,20 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "tool_call_budget_warning": ("negative", "tool_budget"),
     "send_message_loop_hard_stop": ("negative", "loop_stop"),
     "send_message_loop_warning": ("negative", "loop_warn"),
-    "msam_query_error": ("negative", "msam_query_error"),
-    "msam_feedback_error": ("negative", "msam_feedback_error"),
-    "msam_consolidate_error": ("negative", "msam_consolidate_error"),
-    "msam_synthesis_dispatch_failed": ("negative", "synth_dispatch_fail"),
-    "msam_synthesis_empty_window": ("negative", "synth_empty_window"),
+    "saga_query_error": ("negative", "saga_query_error"),
+    "saga_feedback_error": ("negative", "saga_feedback_error"),
+    "saga_consolidate_error": ("negative", "saga_consolidate_error"),
+    "saga_synthesis_dispatch_failed": ("negative", "synth_dispatch_fail"),
+    "saga_synthesis_empty_window": ("negative", "synth_empty_window"),
     "cost_rate_alert": ("negative", "cost_rate"),
     "rate_limit_warning": ("negative", "rate_limit_warn"),
     "rate_limit_rejected": ("negative", "rate_limit_reject"),
     "rate_limit_off_pace": ("negative", "rate_limit_off_pace"),
     "scheduled_tick_dropped": ("negative", "tick_dropped"),
     "send_message_unknown_channel": ("negative", "unknown_channel"),
-    # Positive — agent's own contribution-credit pass to MSAM is the
+    # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
-    "msam_feedback_sent": ("positive", "msam_feedback"),
+    "saga_feedback_sent": ("positive", "saga_feedback"),
     # Plumbed for when bridges emit inbound reactions; harmless when absent.
     "react_received": ("positive", "react"),
 }
@@ -81,18 +81,18 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f"send_message_loop_hard_stop after {ev.get('count', '?')}"
     if rule_kind == "loop_warn":
         return f"send_message_loop_warning at {ev.get('count', '?')}"
-    if rule_kind == "msam_query_error":
-        return f"MSAM query failed: {ev.get('error') or '(no detail)'}"
-    if rule_kind == "msam_feedback_error":
-        return f"MSAM feedback failed: {ev.get('error') or '(no detail)'}"
-    if rule_kind == "msam_consolidate_error":
-        return f"MSAM consolidation failed: {ev.get('error') or '(no detail)'}"
+    if rule_kind == "saga_query_error":
+        return f"SAGA query failed: {ev.get('error') or '(no detail)'}"
+    if rule_kind == "saga_feedback_error":
+        return f"SAGA feedback failed: {ev.get('error') or '(no detail)'}"
+    if rule_kind == "saga_consolidate_error":
+        return f"SAGA consolidation failed: {ev.get('error') or '(no detail)'}"
     if rule_kind == "synth_dispatch_fail":
-        return f"MSAM synthesis dispatch failed: {ev.get('error') or '(no detail)'}"
+        return f"SAGA synthesis dispatch failed: {ev.get('error') or '(no detail)'}"
     if rule_kind == "synth_empty_window":
         return (
-            f"MSAM synthesis ran with empty turn window "
-            f"(session={ev.get('msam_session_id') or '?'}); "
+            f"SAGA synthesis ran with empty turn window "
+            f"(session={ev.get('saga_session_id') or '?'}); "
             f"{ev.get('reason') or 'no detail'}"
         )
     if rule_kind == "cost_rate":
@@ -125,9 +125,9 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f"scheduled_tick dropped: {ev.get('reason') or '(no reason)'}"
     if rule_kind == "unknown_channel":
         return f"send_message to unknown channel {ev.get('channel_id', '?')}"
-    if rule_kind == "msam_feedback":
+    if rule_kind == "saga_feedback":
         n = ev.get("n_atoms")
-        return f"msam_feedback_sent ({n} atoms credited)"
+        return f"saga_feedback_sent ({n} atoms credited)"
     if rule_kind == "react":
         emoji = ev.get("emoji") or "?"
         author = ev.get("author") or "?"

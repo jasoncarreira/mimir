@@ -1,4 +1,4 @@
-"""MSAM HTTP client (SPEC §5.6). Uses an aiohttp test app — no real MSAM."""
+"""SAGA HTTP client (SPEC §5.6). Uses an aiohttp test app — no real SAGA."""
 
 from __future__ import annotations
 
@@ -7,11 +7,11 @@ from typing import Any
 import pytest
 from aiohttp import web
 
-from mimir.msam_client import MsamClient, MsamError
+from mimir.saga_client import SagaClient, SagaError
 
 
 @pytest.fixture
-async def msam_app(aiohttp_server):
+async def saga_app(aiohttp_server):
     received: list[dict[str, Any]] = []
 
     async def health(request: web.Request) -> web.Response:
@@ -49,7 +49,7 @@ async def msam_app(aiohttp_server):
                 "sessions": [
                     {
                         "atom_id": "atom-boundary-1",
-                        "session_id": "msam-slack-eng-1",
+                        "session_id": "saga-slack-eng-1",
                         "channel_id": "slack-eng",
                         "ts": "2026-04-29T14:02:00+00:00",
                         "summary": "Helped Alice debug the deploy migration.",
@@ -90,9 +90,9 @@ async def msam_app(aiohttp_server):
 
 
 @pytest.mark.asyncio
-async def test_health_reports_up(msam_app):
-    server, _ = msam_app
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+async def test_health_reports_up(saga_app):
+    server, _ = saga_app
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
         assert await client.health() is True
     finally:
@@ -100,24 +100,24 @@ async def test_health_reports_up(msam_app):
 
 
 @pytest.mark.asyncio
-async def test_query_passes_session_id(msam_app):
-    server, received = msam_app
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+async def test_query_passes_session_id(saga_app):
+    server, received = saga_app
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
-        out = await client.query("hello", top_k=3, session_id="msam-x-1")
+        out = await client.query("hello", top_k=3, session_id="saga-x-1")
     finally:
         await client.close()
 
     assert "_raw_atoms" in out
     assert received[0]["path"] == "/v1/query"
-    assert received[0]["body"]["session_id"] == "msam-x-1"
+    assert received[0]["body"]["session_id"] == "saga-x-1"
     assert received[0]["body"]["top_k"] == 3
 
 
 @pytest.mark.asyncio
-async def test_api_key_added_as_header(msam_app):
-    server, received = msam_app
-    client = MsamClient(
+async def test_api_key_added_as_header(saga_app):
+    server, received = saga_app
+    client = SagaClient(
         endpoint=str(server.make_url("/")).rstrip("/"),
         api_key="secret-token",
     )
@@ -130,27 +130,27 @@ async def test_api_key_added_as_header(msam_app):
 
 
 @pytest.mark.asyncio
-async def test_feedback_includes_session_id(msam_app):
-    server, received = msam_app
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+async def test_feedback_includes_session_id(saga_app):
+    server, received = saga_app
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
         await client.feedback(
-            ["a1", "a2"], "the response text", session_id="msam-x-1"
+            ["a1", "a2"], "the response text", session_id="saga-x-1"
         )
     finally:
         await client.close()
     body = received[0]["body"]
     assert body["atom_ids"] == ["a1", "a2"]
-    assert body["session_id"] == "msam-x-1"
+    assert body["session_id"] == "saga-x-1"
 
 
 @pytest.mark.asyncio
-async def test_end_session_round_trip(msam_app):
-    server, received = msam_app
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+async def test_end_session_round_trip(saga_app):
+    server, received = saga_app
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
         out = await client.end_session(
-            "msam-x-1",
+            "saga-x-1",
             "we discussed quantum",
             topics_discussed=["quantum"],
             decisions_made=None,
@@ -159,7 +159,7 @@ async def test_end_session_round_trip(msam_app):
         )
     finally:
         await client.close()
-    assert out["session_id"] == "msam-x-1"
+    assert out["session_id"] == "saga-x-1"
     body = received[0]["body"]
     assert body["topics_discussed"] == ["quantum"]
     assert body["unfinished"] == ["follow up on entanglement"]
@@ -167,11 +167,11 @@ async def test_end_session_round_trip(msam_app):
 
 
 @pytest.mark.asyncio
-async def test_500_response_raises_msam_error(msam_app):
-    server, _ = msam_app
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+async def test_500_response_raises_saga_error(saga_app):
+    server, _ = saga_app
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
-        with pytest.raises(MsamError) as exc_info:
+        with pytest.raises(SagaError) as exc_info:
             await client.consolidate()
     finally:
         await client.close()
@@ -180,11 +180,11 @@ async def test_500_response_raises_msam_error(msam_app):
 
 
 @pytest.mark.asyncio
-async def test_query_clamps_long_input(msam_app):
+async def test_query_clamps_long_input(saga_app):
     """SQLite FTS5 caps expression depth at 1000; a probe with several hundred
-    distinct tokens crashes MSAM's keyword path. Client truncates upstream."""
-    server, received = msam_app
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    distinct tokens crashes SAGA's keyword path. Client truncates upstream."""
+    server, received = saga_app
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     big_query = " ".join(f"token{i}" for i in range(500))
     try:
         await client.query(big_query, top_k=5)
@@ -198,14 +198,14 @@ async def test_query_clamps_long_input(msam_app):
 
 
 def test_clamp_query_short_input_unchanged():
-    from mimir.msam_client import _clamp_query
+    from mimir.saga_client import _clamp_query
 
     assert _clamp_query("just a few words") == "just a few words"
     assert _clamp_query("") == ""
 
 
 def test_clamp_query_handles_no_whitespace():
-    from mimir.msam_client import _clamp_query, _MAX_QUERY_CHARS
+    from mimir.saga_client import _clamp_query, _MAX_QUERY_CHARS
 
     huge = "x" * 5000
     out = _clamp_query(huge)
@@ -216,9 +216,9 @@ def test_clamp_query_handles_no_whitespace():
 
 
 @pytest.mark.asyncio
-async def test_recent_session_boundaries_happy_path(msam_app):
-    server, received = msam_app
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+async def test_recent_session_boundaries_happy_path(saga_app):
+    server, received = saga_app
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
         out = await client.recent_session_boundaries(channel_id="slack-eng", count=5)
     finally:
@@ -226,16 +226,16 @@ async def test_recent_session_boundaries_happy_path(msam_app):
 
     assert isinstance(out, list)
     assert len(out) == 1
-    assert out[0]["session_id"] == "msam-slack-eng-1"
+    assert out[0]["session_id"] == "saga-slack-eng-1"
     # Params went through correctly.
     call = next(c for c in received if c["path"] == "/v1/sessions/recent")
     assert call["params"] == {"count": "5", "channel": "slack-eng"}
 
 
 @pytest.mark.asyncio
-async def test_recent_session_boundaries_omits_channel_when_unset(msam_app):
-    server, received = msam_app
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+async def test_recent_session_boundaries_omits_channel_when_unset(saga_app):
+    server, received = saga_app
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
         await client.recent_session_boundaries(count=3)
     finally:
@@ -246,7 +246,7 @@ async def test_recent_session_boundaries_omits_channel_when_unset(msam_app):
 
 @pytest.mark.asyncio
 async def test_recent_session_boundaries_returns_empty_on_5xx(aiohttp_server):
-    """Best-effort surface — must not raise on transient MSAM failures."""
+    """Best-effort surface — must not raise on transient SAGA failures."""
 
     async def boom(request: web.Request) -> web.Response:
         return web.Response(status=503, text="upstream down")
@@ -255,7 +255,7 @@ async def test_recent_session_boundaries_returns_empty_on_5xx(aiohttp_server):
     app.router.add_get("/v1/sessions/recent", boom)
     server = await aiohttp_server(app)
 
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
         out = await client.recent_session_boundaries()
     finally:
@@ -267,7 +267,7 @@ async def test_recent_session_boundaries_returns_empty_on_5xx(aiohttp_server):
 async def test_recent_session_boundaries_returns_empty_on_404(aiohttp_server):
     app = web.Application()  # no routes registered
     server = await aiohttp_server(app)
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
         out = await client.recent_session_boundaries()
     finally:
@@ -278,7 +278,7 @@ async def test_recent_session_boundaries_returns_empty_on_404(aiohttp_server):
 @pytest.mark.asyncio
 async def test_recent_session_boundaries_returns_empty_on_network_failure():
     """No server at all — connection refused must degrade silently."""
-    client = MsamClient(endpoint="http://127.0.0.1:1")  # nothing listening
+    client = SagaClient(endpoint="http://127.0.0.1:1")  # nothing listening
     try:
         out = await client.recent_session_boundaries()
     finally:
@@ -287,9 +287,9 @@ async def test_recent_session_boundaries_returns_empty_on_network_failure():
 
 
 @pytest.mark.asyncio
-async def test_most_retrieved_atoms_passes_all_params(msam_app):
-    server, received = msam_app
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+async def test_most_retrieved_atoms_passes_all_params(saga_app):
+    server, received = saga_app
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
         out = await client.most_retrieved_atoms(
             days=14, count=20, channel_id="slack-eng", contributed_only=True,
@@ -307,9 +307,9 @@ async def test_most_retrieved_atoms_passes_all_params(msam_app):
 
 
 @pytest.mark.asyncio
-async def test_most_retrieved_atoms_serializes_contributed_only_false(msam_app):
-    server, received = msam_app
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+async def test_most_retrieved_atoms_serializes_contributed_only_false(saga_app):
+    server, received = saga_app
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
         await client.most_retrieved_atoms(contributed_only=False)
     finally:
@@ -326,7 +326,7 @@ async def test_most_retrieved_atoms_returns_empty_on_5xx(aiohttp_server):
     app = web.Application()
     app.router.add_get("/v1/atoms/most_retrieved", boom)
     server = await aiohttp_server(app)
-    client = MsamClient(endpoint=str(server.make_url("/")).rstrip("/"))
+    client = SagaClient(endpoint=str(server.make_url("/")).rstrip("/"))
     try:
         out = await client.most_retrieved_atoms()
     finally:

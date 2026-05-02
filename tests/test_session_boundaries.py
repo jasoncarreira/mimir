@@ -1,7 +1,7 @@
 """v0.4 §3a: session boundary surfacing.
 
 Local mirror append/read, render_session_summaries layout, and the
-agent-level fallback path (MSAM empty → mirror)."""
+agent-level fallback path (SAGA empty → mirror)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ async def test_append_creates_file_and_writes_record(tmp_path: Path):
     await log.append(
         {
             "channel_id": "slack-eng",
-            "msam_session_id": "msam-slack-eng-1",
+            "saga_session_id": "saga-slack-eng-1",
             "atom_id": "atom-1",
             "summary": "Helped Alice debug deploy.",
             "unfinished": ["heap config Monday"],

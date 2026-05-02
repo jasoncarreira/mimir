@@ -84,15 +84,15 @@ options when the source is large:
 If a `Write` fails because the content is too long, that's the signal
 to switch strategies — not to retry the same call.
 
-### MSAM atoms — semantic recall
+### SAGA atoms — semantic recall
 
 Mirror durable facts as semantic atoms via
-`mcp__mimir__msam_store(stream="semantic")`. Atoms support fuzzy /
+`mcp__mimir__saga_store(stream="semantic")`. Atoms support fuzzy /
 paraphrased queries via embeddings *and* keyword match on distinctive
 terms — so include in the atom content any anchor that a future query
 might use to find this fact: names, handles, dates, identifiers,
 technical phrases. The pre-message hook injects relevant atoms
-automatically; mid-turn queries via `mcp__mimir__msam_query` work for
+automatically; mid-turn queries via `mcp__mimir__saga_query` work for
 follow-ups.
 
 ## Things to Track
@@ -100,7 +100,7 @@ follow-ups.
 - **People or agents**: contact info, things they've done, interests,
   novelties, preferences → `state/wiki/entities/<slug>.md` (graph-shaped,
   cross-linked with topics they engage in). Mirror the headline as an
-  MSAM atom for fuzzy retrieval.
+  SAGA atom for fuzzy retrieval.
 - **Channel context (private to one conversation)**: `memory/channels/<id>/notes.md`.
   Ids to use in `send_message`, ongoing thread state, channel-specific
   preferences.

@@ -5,7 +5,7 @@ description: Weekly cross-session audit. Run when a turn fires with trigger=sche
 
 # Reflection
 
-A weekly cross-session audit. Different from MSAM's per-session
+A weekly cross-session audit. Different from SAGA's per-session
 synthesis — that runs per channel idle, summarizes one conversation.
 This runs once a week against your *whole* recent history: every
 session on every channel for the last 7 days, plus the state of your
@@ -48,7 +48,7 @@ Before either track, gather inputs:
   `<home>/.mimir/session_boundaries.jsonl` is append-only JSONL —
   `tail -n 50 <home>/.mimir/session_boundaries.jsonl | jq` gives you
   the last 50 boundaries across all channels without needing a tool.
-  (Don't use `mcp__mimir__msam_query` for this — it ranks by
+  (Don't use `mcp__mimir__saga_query` for this — it ranks by
   similarity, not recency, and may not surface boundary-typed atoms
   at all.)
 - **Most-retrieved atoms** — invoke the bundled CLI subcommand via Bash:
@@ -86,7 +86,7 @@ every week — pick the 2-3 that have the strongest signal.
 - **Wiki health** — `state/wiki/log.md` for orphan pages, stale
   claims, raw → wiki promotions that didn't happen. The wiki skill's
   lint pass is your tool here.
-- **MSAM atom hygiene** — Decay candidates (atoms with high
+- **SAGA atom hygiene** — Decay candidates (atoms with high
   `_decay_factor` and low recent retrievals); triples that could be
   linked but aren't. These are typically autonomous-track per the
   policy.
@@ -171,8 +171,8 @@ reviews on their own cadence).
 Conservative defaults the policy ships with:
 
 - **Autonomous** (low-risk, reversible / additive):
-  - MSAM atom decay calls
-  - MSAM triples linking (additive)
+  - SAGA atom decay calls
+  - SAGA triples linking (additive)
   - Append-only edits to `memory/core/40-learned-behaviors.md`
   - Wiki orphan tagging (just flag, don't delete)
 
@@ -198,7 +198,7 @@ message. Output goes to:
 - `state/proposed-changes.md` — proposals (HITL items)
 - `memory/core/40-learned-behaviors.md` — autonomous additions
 - `events.jsonl` — your tool calls and results (automatic)
-- The MSAM atom decay / triples-linking calls land in MSAM
+- The SAGA atom decay / triples-linking calls land in SAGA
 
 If you find something genuinely urgent that the operator should know
 about now (security, data loss, compliance), use the operator alert

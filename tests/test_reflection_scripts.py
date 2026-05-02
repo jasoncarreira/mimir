@@ -2,7 +2,7 @@
 
 The most_retrieved.py script is invoked from the reflection skill's
 SKILL.md via Bash. It needs to (a) parse argv flags correctly and
-(b) call MsamClient.most_retrieved_atoms with the right kwargs."""
+(b) call SagaClient.most_retrieved_atoms with the right kwargs."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from mimir.skills.reflection import most_retrieved as script
 
 class _FakeClient:
     """Records the most_retrieved_atoms call args and returns a stub
-    payload. Matches the MsamClient interface the script depends on."""
+    payload. Matches the SagaClient interface the script depends on."""
 
     def __init__(self, payload: list[dict[str, Any]] | None = None) -> None:
         self.payload = payload or [
@@ -50,13 +50,13 @@ class _FakeClient:
 
 
 def _patch_script(monkeypatch, fake_client: _FakeClient, argv: list[str]) -> None:
-    """Replace the script's MsamClient constructor with one that returns
+    """Replace the script's SagaClient constructor with one that returns
     fake_client, and the script's argv. Config.from_env happens for real
     but only reads env vars (which monkeypatch sets to harmless defaults)."""
-    monkeypatch.setattr(script, "MsamClient", lambda **kw: fake_client)
+    monkeypatch.setattr(script, "SagaClient", lambda **kw: fake_client)
     monkeypatch.setattr("sys.argv", ["most_retrieved", *argv])
     monkeypatch.setenv("MIMIR_HOME", "/tmp/mimir-test")
-    monkeypatch.setenv("MSAM_ENDPOINT", "http://example.invalid")
+    monkeypatch.setenv("SAGA_ENDPOINT", "http://example.invalid")
 
 
 @pytest.mark.asyncio
@@ -112,7 +112,7 @@ async def test_output_is_json_round_trippable(monkeypatch: pytest.MonkeyPatch):
 async def test_client_is_always_closed_even_on_failure(monkeypatch: pytest.MonkeyPatch):
     class _Boom(_FakeClient):
         async def most_retrieved_atoms(self, **kwargs: Any) -> list[dict[str, Any]]:
-            raise RuntimeError("simulated MSAM blow-up")
+            raise RuntimeError("simulated SAGA blow-up")
 
     fake = _Boom()
     _patch_script(monkeypatch, fake, [])
@@ -128,8 +128,8 @@ def test_cli_subcommand_dispatches_to_script(monkeypatch: pytest.MonkeyPatch):
     from mimir import cli
 
     fake = _FakeClient()
-    monkeypatch.setattr(script, "MsamClient", lambda **kw: fake)
-    monkeypatch.setenv("MSAM_ENDPOINT", "http://example.invalid")
+    monkeypatch.setattr(script, "SagaClient", lambda **kw: fake)
+    monkeypatch.setenv("SAGA_ENDPOINT", "http://example.invalid")
 
     # SystemExit is the normal flow when the CLI completes (sys.exit(0)).
     out = io.StringIO()

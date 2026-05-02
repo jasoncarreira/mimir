@@ -16,7 +16,7 @@ from mimir.event_logger import init_logger
 from mimir.loop_detector import LoopDetector
 from mimir.models import TurnContext
 
-from tests._fake_msam import FakeMsam
+from tests._fake_saga import FakeSaga
 
 
 @pytest.fixture(autouse=True)
@@ -240,19 +240,19 @@ async def test_bench_bridge_writes_to_stream(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_send_message_fires_msam_feedback():
-    """When msam_client is wired, every successful send_message should call
-    feedback() with the sent text + ctx.msam_atom_ids and bump
+async def test_send_message_fires_saga_feedback():
+    """When saga_client is wired, every successful send_message should call
+    feedback() with the sent text + ctx.saga_atom_ids and bump
     send_message_count so the agent's post_message_hook becomes a no-op."""
     bridge = _RecordingBridge()
     reg = ChannelRegistry()
     reg.register(bridge)
-    msam = FakeMsam()
-    tools = {t.name: t for t in build_channel_tools(reg, msam_client=msam)}
+    saga = FakeSaga()
+    tools = {t.name: t for t in build_channel_tools(reg, saga_client=saga)}
 
     ctx = _ctx_with(LoopDetector(), channel="c-1")
-    ctx.msam_atom_ids = ["atom-A", "atom-B", "atom-A"]  # de-dup expected
-    ctx.msam_session_id = "msam-c-1-x"
+    ctx.saga_atom_ids = ["atom-A", "atom-B", "atom-A"]  # de-dup expected
+    ctx.saga_session_id = "saga-c-1-x"
     token = _context.set_current_turn(ctx)
     try:
         out = await tools["send_message"].handler({"text": "the reply text"})
@@ -261,12 +261,12 @@ async def test_send_message_fires_msam_feedback():
 
     assert out.get("is_error") is not True
     assert ctx.send_message_count == 1
-    fb_calls = [c for c in msam.calls if c.method == "feedback"]
+    fb_calls = [c for c in saga.calls if c.method == "feedback"]
     assert len(fb_calls) == 1
     payload = fb_calls[0].payload
     assert payload["atom_ids"] == ["atom-A", "atom-B"]  # de-duped, order preserved
     assert payload["response_text"] == "the reply text"
-    assert payload["session_id"] == "msam-c-1-x"
+    assert payload["session_id"] == "saga-c-1-x"
 
 
 @pytest.mark.asyncio
@@ -276,10 +276,10 @@ async def test_send_message_skips_feedback_with_no_atoms():
     bridge = _RecordingBridge()
     reg = ChannelRegistry()
     reg.register(bridge)
-    msam = FakeMsam()
-    tools = {t.name: t for t in build_channel_tools(reg, msam_client=msam)}
+    saga = FakeSaga()
+    tools = {t.name: t for t in build_channel_tools(reg, saga_client=saga)}
 
-    ctx = _ctx_with(LoopDetector(), channel="c-1")  # msam_atom_ids stays []
+    ctx = _ctx_with(LoopDetector(), channel="c-1")  # saga_atom_ids stays []
     token = _context.set_current_turn(ctx)
     try:
         await tools["send_message"].handler({"text": "hi"})
@@ -287,22 +287,22 @@ async def test_send_message_skips_feedback_with_no_atoms():
         _context.reset_current_turn(token)
 
     assert ctx.send_message_count == 1
-    assert [c.method for c in msam.calls] == []  # no feedback call
+    assert [c.method for c in saga.calls] == []  # no feedback call
 
 
 @pytest.mark.asyncio
 async def test_send_message_skips_feedback_on_synthesis_turn():
-    """msam_session_end synthesis turns call msam_feedback per-atom inside
+    """saga_session_end synthesis turns call saga_feedback per-atom inside
     the agent's prompt — send_message must not double-count."""
     bridge = _RecordingBridge()
     reg = ChannelRegistry()
     reg.register(bridge)
-    msam = FakeMsam()
-    tools = {t.name: t for t in build_channel_tools(reg, msam_client=msam)}
+    saga = FakeSaga()
+    tools = {t.name: t for t in build_channel_tools(reg, saga_client=saga)}
 
     ctx = _ctx_with(LoopDetector(), channel="c-1")
-    ctx.trigger = "msam_session_end"
-    ctx.msam_atom_ids = ["atom-A"]
+    ctx.trigger = "saga_session_end"
+    ctx.saga_atom_ids = ["atom-A"]
     token = _context.set_current_turn(ctx)
     try:
         await tools["send_message"].handler({"text": "shouldn't actually send on synth turn but test the gate"})
@@ -310,4 +310,4 @@ async def test_send_message_skips_feedback_on_synthesis_turn():
         _context.reset_current_turn(token)
 
     assert ctx.send_message_count == 1
-    assert [c.method for c in msam.calls] == []
+    assert [c.method for c in saga.calls] == []

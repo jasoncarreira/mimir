@@ -68,7 +68,7 @@ One record per agent turn (invocation). Contains the full event sequence:
 ```
 
 Key fields:
-- `trigger` — what caused this turn. Real values: `user_message`, `scheduled_tick` (cron / heartbeat / reflection), `msam_session_end` (synthesis), `cron_tick` (legacy alias). The bridges and dispatcher are the source of truth — see `mimir/models.py:AgentEvent`.
+- `trigger` — what caused this turn. Real values: `user_message`, `scheduled_tick` (cron / heartbeat / reflection), `saga_session_end` (synthesis), `cron_tick` (legacy alias). The bridges and dispatcher are the source of truth — see `mimir/models.py:AgentEvent`.
 - `events` — ordered sequence of tool calls and results, preserving the exact execution flow
 - `duration_ms` — wall-clock time for the entire turn
 - `error` — set if the turn ended with an exception

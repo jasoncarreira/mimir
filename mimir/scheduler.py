@@ -6,7 +6,7 @@ Responsibilities:
   (atomic add-or-replace by name; serialized through a single asyncio lock).
 - On each cron fire: build an ``AgentEvent`` with ``trigger="scheduled_tick"``
   and enqueue it via the dispatcher (the same path as inbound bridge messages).
-- Run the MSAM weekly consolidation cron (Phase 4) as a non-LLM job.
+- Run the SAGA weekly consolidation cron (Phase 4) as a non-LLM job.
 
 Schedule jobs are persisted as YAML for human readability:
 ::
@@ -36,7 +36,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from .event_logger import log_event
 from .models import AgentEvent
-from .msam_client import MsamClient, MsamError
+from .saga_client import SagaClient, SagaError
 
 log = logging.getLogger(__name__)
 
@@ -159,7 +159,7 @@ def _scheduler_channel_id(job_name: str, channel_id: str | None) -> str:
 
 class Scheduler:
     """One AsyncIOScheduler. Owns LLM-tick jobs (from scheduler.yaml) plus the
-    MSAM weekly consolidation cron from Phase 4."""
+    SAGA weekly consolidation cron from Phase 4."""
 
     def __init__(
         self,
@@ -177,7 +177,7 @@ class Scheduler:
     def reload(self) -> dict[str, int]:
         """Wipe LLM-tick registrations and re-register from scheduler.yaml.
         Returns ``{registered, invalid}`` counts. Caller logs."""
-        # Drop existing scheduler:* jobs; leave non-prefixed (e.g. msam-consolidate).
+        # Drop existing scheduler:* jobs; leave non-prefixed (e.g. saga-consolidate).
         for job in list(self._scheduler.get_jobs()):
             if job.id.startswith("scheduler:"):
                 self._scheduler.remove_job(job.id)
@@ -244,14 +244,14 @@ class Scheduler:
     async def list_jobs(self) -> list[SchedulerJob]:
         return await asyncio.to_thread(load_jobs, self._yaml_path)
 
-    # ---- MSAM consolidation cron -------------------------------------
+    # ---- SAGA consolidation cron -------------------------------------
 
-    def add_msam_consolidate_job(
+    def add_saga_consolidate_job(
         self,
-        msam_client: MsamClient,
+        saga_client: SagaClient,
         cron_expr: str,
         *,
-        job_id: str = "msam-consolidate",
+        job_id: str = "saga-consolidate",
     ) -> bool:
         cron_expr = (cron_expr or "").strip()
         if not cron_expr:
@@ -263,16 +263,16 @@ class Scheduler:
 
         async def _consolidate() -> None:
             try:
-                payload = await msam_client.consolidate(dry_run=False)
+                payload = await saga_client.consolidate(dry_run=False)
                 await log_event(
-                    "msam_consolidate_ok",
+                    "saga_consolidate_ok",
                     dry_run=False,
                     result=_summarize_consolidate(payload),
                 )
-            except MsamError as exc:
-                await log_event("msam_consolidate_error", error=str(exc), status=exc.status)
+            except SagaError as exc:
+                await log_event("saga_consolidate_error", error=str(exc), status=exc.status)
             except Exception as exc:  # noqa: BLE001
-                await log_event("msam_consolidate_error", error=f"{type(exc).__name__}: {exc}")
+                await log_event("saga_consolidate_error", error=f"{type(exc).__name__}: {exc}")
 
         self._scheduler.add_job(
             _consolidate,

@@ -1,17 +1,17 @@
 """Claude Agent SDK driver (SPEC §4.2, §9.3, §5.6).
 
 Run-turn flow:
-1. ``session_manager.touch(channel_id)`` — ensure an active MSAM session,
-   reset its idle timer, attach ``msam_session_id`` to the TurnContext.
+1. ``session_manager.touch(channel_id)`` — ensure an active SAGA session,
+   reset its idle timer, attach ``saga_session_id`` to the TurnContext.
 2. Append inbound to chat_history.jsonl + deques.
 3. Flush any pending INDEX.md rebuilds.
-4. Pre-message MSAM hook (skipped on ``trigger="msam_session_end"``):
-   query MSAM, format hits into the turn prompt, stash atom_ids.
+4. Pre-message SAGA hook (skipped on ``trigger="saga_session_end"``):
+   query SAGA, format hits into the turn prompt, stash atom_ids.
 5. Build system + turn prompts. The synthesis turn uses a special template.
-6. Set the ``contextvars`` TurnContext so MSAM tools can auto-credit.
+6. Set the ``contextvars`` TurnContext so SAGA tools can auto-credit.
 7. Invoke ``query()``, collect messages, extract events.
 8. Append outbound to chat_history.jsonl.
-9. Post-message MSAM hook (skipped on ``trigger="msam_session_end"``):
+9. Post-message SAGA hook (skipped on ``trigger="saga_session_end"``):
    call ``mark_contributions`` with the union of pre-injected and
    mid-turn-queried atom_ids, scoped to the active session.
 10. End-of-turn INDEX.md rebuild (debounced, SPEC §3.4).
@@ -76,14 +76,14 @@ from .index import IndexGenerator
 from .loop_detector import LoopDetector
 from .memory import load_core
 from .models import AgentEvent, TurnContext, TurnRecord, make_turn_id
-from .msam_client import MsamClient, MsamError
-from .msamtools import _atom_ids_from_response, _atoms_in_payload, _format_atoms
+from .saga_client import SagaClient, SagaError
+from .sagatools import _atom_ids_from_response, _atoms_in_payload, _format_atoms
 from .prompts import build_system_prompt, build_turn_prompt
 from .scheduler import Scheduler
 from .search import Indexer
 from .session_manager import SessionManager
 from .subagent_inbox import SubagentInbox, SubagentResult, render_subagent_updates
-from .templates import render_msam_session_end
+from .templates import render_saga_session_end
 from .tools import SDK_PRESET_TOOLS, allowed_tool_names, build_mcp_server
 from .turn_logger import TurnLogger, extract_turn_events, truncate_input
 
@@ -94,8 +94,8 @@ def _utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
-def _filter_session_turns(turns_path, msam_session_id: str) -> list[dict]:
-    """Read turns.jsonl and return all records with the given msam_session_id."""
+def _filter_session_turns(turns_path, saga_session_id: str) -> list[dict]:
+    """Read turns.jsonl and return all records with the given saga_session_id."""
     if not turns_path.is_file():
         return []
     out: list[dict] = []
@@ -109,7 +109,7 @@ def _filter_session_turns(turns_path, msam_session_id: str) -> list[dict]:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if rec.get("msam_session_id") == msam_session_id:
+                if rec.get("saga_session_id") == saga_session_id:
                     out.append(rec)
     except OSError:
         return []
@@ -124,7 +124,7 @@ class Agent:
         message_buffer: MessageBuffer,
         index_generator: IndexGenerator,
         indexer: Indexer | None = None,
-        msam_client: MsamClient | None = None,
+        saga_client: SagaClient | None = None,
         session_manager: SessionManager | None = None,
         scheduler: Scheduler | None = None,
         subagent_inbox: SubagentInbox | None = None,
@@ -135,7 +135,7 @@ class Agent:
         self._buffer = message_buffer
         self._indexes = index_generator
         self._indexer = indexer
-        self._msam = msam_client
+        self._saga = saga_client
         self._sessions = session_manager
         self._scheduler = scheduler
         self._inbox = subagent_inbox or SubagentInbox()
@@ -159,7 +159,7 @@ class Agent:
         self._mcp_server = build_mcp_server(
             config.home,
             indexer=indexer,
-            msam_client=msam_client,
+            saga_client=saga_client,
             scheduler=scheduler,
             channel_registry=channel_registry,
             message_buffer=message_buffer,
@@ -187,7 +187,7 @@ class Agent:
             mcp_servers={"mimir": self._mcp_server},
             allowed_tools=allowed_tool_names(
                 include_search=self._indexer is not None,
-                include_msam=self._msam is not None,
+                include_saga=self._saga is not None,
                 include_scheduler=self._scheduler is not None,
                 include_channels=self._channels is not None,
             ),
@@ -224,7 +224,7 @@ class Agent:
     # ---- chat history --------------------------------------------------
 
     async def _record_inbound(self, event: AgentEvent) -> None:
-        if not event.content or event.trigger == "msam_session_end":
+        if not event.content or event.trigger == "saga_session_end":
             return
         kind = "user_message" if event.trigger == "user_message" else "system_note"
         msg = self._buffer.make_message(
@@ -251,7 +251,7 @@ class Agent:
         )
         await self._buffer.append(msg)
 
-    # ---- MSAM hooks ----------------------------------------------------
+    # ---- SAGA hooks ----------------------------------------------------
 
     def _assemble_usage_block(self) -> str | None:
         """Read turns.jsonl tail-first, aggregate over 1h / 5h / 7d,
@@ -359,7 +359,7 @@ class Agent:
     async def _assemble_session_summaries(
         self, *, channel_id: str | None
     ) -> str | None:
-        """Render the Recent session summaries block. Tries MSAM first
+        """Render the Recent session summaries block. Tries SAGA first
         (chronological recall via /v1/sessions/recent); falls back to
         the local mirror on empty / failure. Returns None when both are
         empty or the section is disabled."""
@@ -367,8 +367,8 @@ class Agent:
         if count <= 0:
             return None
         boundaries: list[dict] = []
-        if self._msam is not None:
-            boundaries = await self._msam.recent_session_boundaries(
+        if self._saga is not None:
+            boundaries = await self._saga.recent_session_boundaries(
                 channel_id=channel_id, count=count,
             )
         if not boundaries:
@@ -378,26 +378,26 @@ class Agent:
         return render_session_summaries(boundaries)
 
     async def _pre_message_hook(self, ctx: TurnContext, event: AgentEvent) -> str | None:
-        """Query MSAM, stash atom_ids on ctx, return a formatted prompt block
+        """Query SAGA, stash atom_ids on ctx, return a formatted prompt block
         (or None if nothing relevant). Skipped on synthesis turns.
 
         Floors the per-atom confidence tier at the configured threshold
         (default "medium") because auto-fetched atoms cost system-prompt
         budget every turn — low-confidence noise here is net-negative.
 
-        Passes the last few same-channel messages as ``context`` so MSAM
+        Passes the last few same-channel messages as ``context`` so SAGA
         can rewrite referential queries ("yes, look for that") into
         self-contained form when its
         ``[retrieval] enable_contextual_rewrite`` flag is on. Filtered by
         the same source allowlist as Recent activity so bench / API /
         scheduler traffic stays out of the rewrite path."""
-        if self._msam is None or ctx.trigger == "msam_session_end":
+        if self._saga is None or ctx.trigger == "saga_session_end":
             return None
         if not event.content:
             return None
-        min_tier = (self._config.msam_pre_message_min_tier or "").strip() or None
+        min_tier = (self._config.saga_pre_message_min_tier or "").strip() or None
         # Pull last 11 same-channel messages and drop the just-recorded
-        # inbound (step 2 of run_turn appended it); MSAM uses up to 10.
+        # inbound (step 2 of run_turn appended it); SAGA uses up to 10.
         recent = self._buffer.recent_for_channel(
             event.channel_id,
             11,
@@ -414,16 +414,16 @@ class Agent:
             if m.kind in ("user_message", "assistant_message")
         ] or None
         try:
-            payload = await self._msam.query(
+            payload = await self._saga.query(
                 event.content,
                 top_k=12,
-                session_id=ctx.msam_session_id,
+                session_id=ctx.saga_session_id,
                 min_confidence_tier=min_tier,
                 context=context,
             )
-        except MsamError as exc:
+        except SagaError as exc:
             await log_event(
-                "msam_query_error",
+                "saga_query_error",
                 where="pre_message_hook",
                 error=str(exc),
                 turn_id=ctx.turn_id,
@@ -432,10 +432,10 @@ class Agent:
         ids = _atom_ids_from_response(payload)
         if not ids:
             return None
-        seen = set(ctx.msam_atom_ids)
+        seen = set(ctx.saga_atom_ids)
         for aid in ids:
             if aid not in seen:
-                ctx.msam_atom_ids.append(aid)
+                ctx.saga_atom_ids.append(aid)
                 seen.add(aid)
         hits = _atoms_in_payload(payload)
         return _format_atoms(hits)
@@ -447,32 +447,32 @@ class Agent:
         carries the actual delivered text — see channeltools.py). This hook
         only fires when the turn produced no send_message (e.g. scheduled
         ticks that wrote to memory but didn't reply, or background work).
-        Skipped on synthesis turns (the agent already called msam_feedback
+        Skipped on synthesis turns (the agent already called saga_feedback
         per atom in step 2 of the synthesis prompt)."""
-        if self._msam is None or ctx.trigger == "msam_session_end":
+        if self._saga is None or ctx.trigger == "saga_session_end":
             return
         if ctx.send_message_count > 0:
             # send_message already credited the atoms with the real reply.
             return
-        if not ctx.msam_atom_ids or not output:
+        if not ctx.saga_atom_ids or not output:
             return
-        atom_ids_for_feedback = list(dict.fromkeys(ctx.msam_atom_ids))
+        atom_ids_for_feedback = list(dict.fromkeys(ctx.saga_atom_ids))
         try:
-            await self._msam.feedback(
+            await self._saga.feedback(
                 atom_ids_for_feedback,  # de-dup, preserve order
                 output,
-                session_id=ctx.msam_session_id,
+                session_id=ctx.saga_session_id,
             )
             await log_event(
-                "msam_feedback_sent",
+                "saga_feedback_sent",
                 where="post_message_hook",
                 turn_id=ctx.turn_id,
                 n_atoms=len(atom_ids_for_feedback),
                 text_len=len(output),
             )
-        except MsamError as exc:
+        except SagaError as exc:
             await log_event(
-                "msam_feedback_error",
+                "saga_feedback_error",
                 where="post_message_hook",
                 error=str(exc),
                 turn_id=ctx.turn_id,
@@ -481,7 +481,7 @@ class Agent:
     # ---- synthesis turn ------------------------------------------------
 
     def _build_synthesis_prompt(self, ctx: TurnContext, event: AgentEvent) -> str:
-        """For trigger='msam_session_end' — load the synthesis template,
+        """For trigger='saga_session_end' — load the synthesis template,
         embed the session's turn window from turns.jsonl.
 
         When the window is empty (turns.jsonl was rotated past the
@@ -491,21 +491,21 @@ class Agent:
         so the algedonic surface and the operator can see it; the turn
         still runs (the agent gets a chance to write a "no record"
         boundary rather than crash)."""
-        msam_session_id = ctx.msam_session_id or event.extra.get("msam_session_id", "")
-        idle_minutes = self._config.msam_session_idle_minutes
-        turns_window = _filter_session_turns(self._config.turns_log, msam_session_id)
+        saga_session_id = ctx.saga_session_id or event.extra.get("saga_session_id", "")
+        idle_minutes = self._config.saga_session_idle_minutes
+        turns_window = _filter_session_turns(self._config.turns_log, saga_session_id)
         if not turns_window:
             asyncio.create_task(
                 log_event(
-                    "msam_synthesis_empty_window",
-                    msam_session_id=msam_session_id,
+                    "saga_synthesis_empty_window",
+                    saga_session_id=saga_session_id,
                     channel_id=event.channel_id,
                     reason="turns.jsonl rotated past this session's records",
                 )
             )
-        return render_msam_session_end(
+        return render_saga_session_end(
             channel_id=event.channel_id,
-            msam_session_id=msam_session_id,
+            saga_session_id=saga_session_id,
             idle_minutes=idle_minutes,
             turns_window=turns_window,
             prompts_dir=self._config.prompts_dir,
@@ -528,13 +528,13 @@ class Agent:
             ),
         )
 
-        # 1. MSAM session attach. Synthesis turns already carry the closed
+        # 1. SAGA session attach. Synthesis turns already carry the closed
         #    session's id; for everything else we touch (creating if needed).
-        if event.trigger == "msam_session_end":
-            ctx.msam_session_id = event.extra.get("msam_session_id")
+        if event.trigger == "saga_session_end":
+            ctx.saga_session_id = event.extra.get("saga_session_id")
         elif self._sessions is not None:
             session = await self._sessions.touch(event.channel_id)
-            ctx.msam_session_id = session.msam_session_id
+            ctx.saga_session_id = session.saga_session_id
             self._sessions.increment_turn_count(event.channel_id)
 
         # 2. Inbound → chat_history (skipped for synthesis turns; their
@@ -544,9 +544,9 @@ class Agent:
         # 3. Flush any out-of-band INDEX changes before reading the index.
         await self._indexes.flush()
 
-        # 4. Pre-message MSAM hook — produces a "Possibly relevant memories"
+        # 4. Pre-message SAGA hook — produces a "Possibly relevant memories"
         #    block to slot into the turn prompt.
-        msam_block = await self._pre_message_hook(ctx, event)
+        saga_block = await self._pre_message_hook(ctx, event)
 
         # 4b. Drain any background-subagent notifications that landed since
         #     the last turn for this channel (SPEC §4.4).
@@ -556,7 +556,7 @@ class Agent:
         )
 
         # 5. Build prompts.
-        if event.trigger == "msam_session_end":
+        if event.trigger == "saga_session_end":
             turn_prompt = self._build_synthesis_prompt(ctx, event)
             recent: list = []
         else:
@@ -580,7 +580,7 @@ class Agent:
             turn_prompt = build_turn_prompt(
                 event,
                 recent_messages=recent,
-                msam_block=msam_block,
+                saga_block=saga_block,
                 subagent_block=subagent_block,
                 recent_message_chars=self._config.recent_message_chars,
                 resolver=self._buffer.resolver,
@@ -602,13 +602,13 @@ class Agent:
             turn_id=ctx.turn_id,
             channel_id=ctx.channel_id,
             trigger=ctx.trigger,
-            msam_session_id=ctx.msam_session_id,
+            saga_session_id=ctx.saga_session_id,
             core_block_count=len(core_blocks),
             recent_message_count=len(recent),
-            msam_atoms_pre_injected=len(ctx.msam_atom_ids),
+            saga_atoms_pre_injected=len(ctx.saga_atom_ids),
         )
 
-        # 6. Set TurnContext on the contextvar so MSAM tools auto-credit.
+        # 6. Set TurnContext on the contextvar so SAGA tools auto-credit.
         token = _context.set_current_turn(ctx)
         messages: list = []
         error: str | None = None
@@ -771,14 +771,14 @@ class Agent:
         # didn't happen.
         if (
             output
-            and event.trigger != "msam_session_end"
+            and event.trigger != "saga_session_end"
             and ctx.send_message_attempts == 0
         ):
             await self._record_outbound(
                 event.channel_id, output, source=event.source
             )
 
-        # 9. Post-message MSAM hook.
+        # 9. Post-message SAGA hook.
         if not error:
             await self._post_message_hook(ctx, output)
 
@@ -790,11 +790,11 @@ class Agent:
             ts=_utc_now_iso(),
             turn_id=ctx.turn_id,
             session_id=ctx.session_id,
-            msam_session_id=ctx.msam_session_id,
+            saga_session_id=ctx.saga_session_id,
             trigger=ctx.trigger,
             channel_id=ctx.channel_id,
             input=truncate_input(turn_prompt),
-            msam_atom_ids=list(dict.fromkeys(ctx.msam_atom_ids)),
+            saga_atom_ids=list(dict.fromkeys(ctx.saga_atom_ids)),
             events=events_list,
             output=output,
             duration_ms=duration_ms,
@@ -820,6 +820,6 @@ class Agent:
             total_cost_usd=result_msg.total_cost_usd if result_msg else None,
             event_count=len(events_list),
             output_chars=len(output),
-            msam_atoms_total=len(record.msam_atom_ids),
+            saga_atoms_total=len(record.saga_atom_ids),
         )
         return record
