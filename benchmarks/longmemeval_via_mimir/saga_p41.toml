@@ -1,0 +1,57 @@
+# Integration bench: P41 — query-intent-gated triple_augment_v2 ON.
+# Same as saga_p30.toml in every other respect — sole delta is
+# [retrieval] enable_triple_augment_v2 = true.
+#
+# Historical saga-direct context: P41 surfaces source atoms via
+# triple cosine-match as a second RRF pathway. Pre-fix saga-direct
+# benches showed P41 regress vs P30 by -3.7pp on multi-session and
+# -2.3pp on temporal probes (the two query types mimir hits most).
+# Re-running through mimir tells us whether the integration hooks
+# (cache, mark_contributions, etc.) change that ordering.
+#
+# Pair config: saga_p30.toml.
+
+[storage]
+db_path = "saga.db"
+metrics_db_path = "saga_metrics.db"
+token_budget_ceiling = 100000000
+auto_compact_threshold_pct = 99
+refuse_threshold_pct = 100
+db_busy_timeout_ms = 5000
+
+[embedding]
+provider = "openai"
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dimensions = 1536
+api_key_env = "OPENAI_API_KEY"
+
+[llm]
+provider = "openai_compat"
+url = "https://api.openai.com/v1/chat/completions"
+model = "gpt-5.4-nano"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 120
+
+[retrieval]
+enable_contextual_rewrite = true
+two_tier_enabled = true
+enable_missing_ref_pivot = true
+enable_confidence_gating = true
+default_min_confidence_tier = "low"
+# THE delta vs saga_p30.toml.
+enable_triple_augment_v2 = true
+enable_subatom_beam = false
+
+[retrieval_v2]
+enable_query_expansion = true
+
+[triples]
+enable_extraction = true
+
+[consolidation]
+enabled = true
+enable_llm = true
+
+[server]
+api_key = ""
