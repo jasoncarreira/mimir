@@ -162,7 +162,23 @@ def build_turn_prompt(
     if subagent_block:
         sections.append("## Subagent updates\n\n" + subagent_block.rstrip())
 
-    ts = datetime.now(tz=timezone.utc).isoformat()
+    # Prompt-header timestamp: defaults to now (the agent's view of "today")
+    # but can be overridden by the inbound event via ``extra.event_ts_iso``.
+    # Used by the integration bench (LongMemEval probes are dated 2023; the
+    # agent computes "weeks ago" / "this year" against the question's
+    # contemporaneous date, not the wall clock). Production agents always
+    # see now() unless a bridge/handler explicitly sets the override.
+    ts_override = (event.extra or {}).get("event_ts_iso")
+    ts = ts_override if ts_override else datetime.now(tz=timezone.utc).isoformat()
+    # When the override is set, also surface "Today's date: YYYY-MM-DD" as
+    # an explicit prompt section. The header's ``ts:`` field alone is
+    # ambiguous to readers — saga's bench reader template makes "today"
+    # explicit because LLMs misread bare ISO strings (haiku read the
+    # 2023-04-01 ts: but still answered against the wall-clock 2026
+    # because nothing told it that ts WAS today).
+    if ts_override:
+        date_only = ts_override.split("T", 1)[0]
+        sections.append(f"## Today's date\n\n{date_only}")
     if event.trigger == "scheduled_tick":
         # Heartbeat / cron-fired tick: header omits author (the scheduler is
         # the implicit caller), body is whatever the schedule.yaml entry

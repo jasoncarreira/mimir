@@ -39,8 +39,20 @@ def test_question_to_event_shape():
     assert body["trigger"] == "user_message"
     assert body["channel_id"] == "bench-qa_30__simple"
     assert body["content"] == "What's my favorite color?"
-    assert body["content_meta"]["question_id"] == "qa_30__simple"
-    assert body["content_meta"]["reference_date_iso"] == "2023/06/01 (Thu) 14:23"
+    assert body["extra"]["question_id"] == "qa_30__simple"
+    # event_ts_iso is parsed from the LongMemEval question_date format and
+    # fed into the prompt header so the agent's "today" matches the haystack.
+    assert body["extra"]["event_ts_iso"] == "2023-06-01T14:23:00+00:00"
+
+
+def test_question_to_event_handles_unparseable_date():
+    """Unknown date format → no event_ts_iso → agent falls back to wall clock."""
+    body = question_to_event({
+        "question_id": "qa_x",
+        "question": "Hi",
+        "question_date": "no idea",
+    })
+    assert body["extra"]["event_ts_iso"] is None
 
 
 def test_channel_id_for_consistent():
