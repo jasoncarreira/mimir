@@ -42,3 +42,16 @@ home/
 *.db-shm
 *.db-wal
 *.tar.gz
+
+# v0.5 §3: saga's bench data + LongMemEval source are symlinks/dirs
+# pointing at large datasets that don't belong in git (msam2's .gitignore
+# had the same exclusions; preserved post-merge).
+/saga/data
+/saga/external
+/saga/results
+# Integration bench output (per-run hypothesis JSONLs + scratch mimir homes).
+/results/
+/benchmarks/longmemeval_via_mimir/results/
+
+# Agent home dotenv (in case a smoke run spits one out at workspace root).
+.env
