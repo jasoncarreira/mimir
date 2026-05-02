@@ -2,11 +2,19 @@
 
 Boots mimir in-process with `_InProcessSaga` and a `BenchBridge` outbound,
 ingests each LongMemEval question's haystack into a per-question saga
-SQLite database, then drives the question through ``POST /event`` so
-mimir's pre-message hook (saga query + contextual rewrite +
-session_boundaries surfacing) and post-message hook (mark_contributions)
-both fire. The agent's reply is captured from the BenchBridge stream
-and written to a hypotheses JSONL the existing saga evaluator scores.
+SQLite database, runs consolidation (so observations exist for the
+two-tier retrieval pathway to surface), then drives the question through
+``POST /event`` so mimir's pre-message hook (saga query +
+session_boundaries surfacing) and post-message hook
+(mark_contributions) both fire. The agent's reply is read from
+``turns.jsonl`` and written to a hypotheses JSONL the existing saga
+evaluator scores.
+
+Note on contextual rewrite: it's enabled in the bench saga.toml but
+won't fire on these probes — mimir's pre-message hook passes
+``context=`` from the channel's chat buffer, which is empty for a
+fresh bench channel. To exercise rewrite end-to-end we'd need
+multi-turn probes (LongMemEval doesn't have those).
 
 Usage:
     cd mimir
@@ -75,6 +83,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--mimir-home", default=None,
         help="MIMIR_HOME for the bench agent (defaults to a per-run "
              "tmpdir under the output dir)",
+    )
+    p.add_argument(
+        "--saga-config", default=None,
+        help="path to a saga.toml to use instead of the bench-mode "
+             "default. Lets two benches run side-by-side with different "
+             "saga configs (mirrors saga's own run_eval --config knob); "
+             "pair with distinct --run-tag and --mimir-home so per-DB / "
+             "per-home / output paths don't collide.",
     )
     return p.parse_args(argv)
 
@@ -233,6 +249,22 @@ async def _run_one_question(
     _switch_saga_db(db_path)
     ingest_question(question)
 
+    # Consolidate. saga's run_eval.py runs this between ingest and
+    # retrieve so the observation-bonus + two-tier observations have
+    # material to surface; without it, the agent only sees raw atoms.
+    # Each cluster fires an LLM call (consolidation synthesis) — under
+    # the bench's claude_code provider that's ~one Claude Code subprocess
+    # spawn per cluster, ~30-50 clusters typical for a LongMemEval
+    # haystack. Skip if consolidation is disabled in the bench saga.toml
+    # so operators who want raw-atom-only runs can opt out.
+    from saga.config import get_config as _saga_get_config
+    if _saga_get_config()('consolidation', 'enabled', False):
+        from saga.consolidation import ConsolidationEngine
+        try:
+            ConsolidationEngine().consolidate()
+        except Exception as exc:  # noqa: BLE001 — don't kill the run
+            print(f"  consolidation failed for {qid}: {exc}", file=sys.stderr)
+
     # Snapshot turn-log size + bench stream position so we can read just
     # the new content after this question's turn finishes.
     turns_pos_before = turns_log.stat().st_size if turns_log.exists() else 0
@@ -346,9 +378,20 @@ async def _amain(argv: list[str] | None = None) -> int:
     # Build the bench app.
     from mimir.cli import setup_home as _setup_home
     _setup_home(home)
-    # Overwrite saga.toml with bench-friendly settings — default mimir
-    # caps storage at 1M tokens (fine for daily, fatal for LongMemEval).
-    _write_bench_saga_toml(home)
+    # Saga config selection:
+    # - If --saga-config given: point SAGA_CONFIG at it (overrides
+    #   the per-home saga.toml mimir/server.py would otherwise pick up).
+    # - Else: overwrite <home>/saga.toml with bench-friendly settings
+    #   (token_budget_ceiling 100M etc.) so haystack ingest doesn't
+    #   refuse atoms.
+    if args.saga_config:
+        custom_path = Path(args.saga_config).resolve()
+        if not custom_path.exists():
+            print(f"--saga-config not found: {custom_path}", file=sys.stderr)
+            return 2
+        os.environ["SAGA_CONFIG"] = str(custom_path)
+    else:
+        _write_bench_saga_toml(home)
     from mimir.config import Config
     cfg = Config.from_env()
     cfg = replace(cfg, home=home)
