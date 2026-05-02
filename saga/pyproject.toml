@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "msam"
+name = "saga"
 version = "2026.02.24"
-description = "Multi-Stream Adaptive Memory -- cognitive memory system for AI agents"
+description = "Saga (formerly MSAM) -- cognitive memory system for AI agents"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
@@ -56,10 +56,10 @@ Documentation = "https://github.com/jadenschwab/msam/blob/main/SPEC.md"
 Issues = "https://github.com/jadenschwab/msam/issues"
 
 [project.scripts]
-msam = "msam.remember:main"
+saga = "saga.remember:main"
 
 [tool.setuptools.packages.find]
-include = ["msam*"]
+include = ["saga*"]
 
 [tool.setuptools.package-data]
-msam = ["scripts/*"]
+saga = ["scripts/*"]
