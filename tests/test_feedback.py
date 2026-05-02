@@ -268,6 +268,69 @@ def test_heartbeat_health_degraded_renders_in_feedback(tmp_path: Path):
     assert "1/4 fired" in block
 
 
+def test_saga_consolidate_ok_renders_as_positive(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.5),
+            "type": "saga_consolidate_ok",
+            "session_id": "s",
+            "dry_run": False,
+            "result": {
+                "clusters_processed": 4,
+                "atoms_merged": 7,
+                "atoms_retired": 2,
+                "duration_s": 12.4,
+            },
+        },
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "Positive" in block
+    assert "saga consolidation ran" in block
+    assert "4 clusters" in block
+    assert "7 merged" in block
+    assert "2 retired" in block
+
+
+def test_introspection_report_ok_surfaces_output_path(tmp_path: Path):
+    """The agent should see the report's file path so it can Read it."""
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.5),
+            "type": "introspection_report_ok",
+            "session_id": "s",
+            "output": "/home/agent/state/reports/introspection-2026-05-02.md",
+            "days": 7,
+            "pipeline_success_rate": 0.92,
+            "fired": 50,
+            "successful": 46,
+            "algedonic_emitted": False,
+        },
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "Positive" in block
+    assert "introspection report ready" in block
+    assert "/home/agent/state/reports/introspection-2026-05-02.md" in block
+    assert "92%" in block
+
+
+def test_introspection_report_error_renders_as_negative(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.5),
+            "type": "introspection_report_error",
+            "session_id": "s",
+            "error": "OSError: events.jsonl missing",
+        },
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "Negative" in block
+    assert "introspection report failed" in block
+    assert "events.jsonl missing" in block
+
+
 def test_scheduled_tick_suppressed_renders_in_feedback(tmp_path: Path):
     log = _make_log(tmp_path, events=[
         {

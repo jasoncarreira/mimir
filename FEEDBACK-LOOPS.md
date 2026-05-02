@@ -120,9 +120,13 @@ in `mimir/feedback.py:_EVENT_RULES`):
   `rate_limit_off_pace`
 - `scheduled_tick_dropped` (dispatcher rejected),
   `scheduled_tick_suppressed` (§12.4 arbiter blocked),
-  `heartbeat_health_degraded` (§4.7 weekly health metric)
+  `heartbeat_health_degraded` (§4.7 weekly health metric),
+  `introspection_report_error`
 - `send_message_unknown_channel`
-- Positive: `saga_feedback_sent`, `react_received`
+- Positive: `saga_feedback_sent`, `react_received`,
+  `saga_consolidate_ok` (cron summary line),
+  `introspection_report_ok` (carries the report file path so the
+  agent can Read it within the 24h algedonic window)
 
 Adding a new signal: one line in `_EVENT_RULES`, one renderer
 clause in `_render_event_line`, plus a test pair in
