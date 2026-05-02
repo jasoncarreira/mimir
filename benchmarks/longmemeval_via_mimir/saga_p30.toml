@@ -1,0 +1,62 @@
+# Integration bench: P30 canonical (post-fix baseline 0.774).
+# Same retrieval config as msam_bench.toml's canonical except triples
+# extraction is ON (P41-comparison configs need triples populated and
+# integration mimir-prod has it on anyway). enable_triple_augment_v2
+# stays OFF — this is the comparison's reference run.
+#
+# Pair config: saga_p41.toml (only enable_triple_augment_v2 differs).
+
+[storage]
+# Relative paths resolve under SAGA_DATA_DIR (set by runner per
+# bench home). Two parallel runs with different MIMIR_HOMEs get
+# distinct data dirs and can't collide.
+db_path = "saga.db"
+metrics_db_path = "saga_metrics.db"
+# Match msam_bench.toml: effectively unlimited.
+token_budget_ceiling = 100000000
+auto_compact_threshold_pct = 99
+refuse_threshold_pct = 100
+db_busy_timeout_ms = 5000
+
+[embedding]
+provider = "openai"
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dimensions = 1536
+api_key_env = "OPENAI_API_KEY"
+
+[llm]
+# Match the historical bench: gpt-5.4-nano via OpenAI. Single model
+# for all saga internals (consolidation, contextual rewrite, triples).
+provider = "openai_compat"
+url = "https://api.openai.com/v1/chat/completions"
+model = "gpt-5.4-nano"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 120
+
+[retrieval]
+enable_contextual_rewrite = true
+two_tier_enabled = true
+enable_missing_ref_pivot = true
+enable_confidence_gating = true
+default_min_confidence_tier = "low"
+# Reference run for the A/B — keep triple_augment_v2 OFF.
+enable_triple_augment_v2 = false
+enable_subatom_beam = false
+
+[retrieval_v2]
+# P12 query expansion (canonical-best post-P30).
+enable_query_expansion = true
+
+[triples]
+# Populate the triples table during consolidation so the P41
+# variant's enable_triple_augment_v2 has cosine-matchable embeddings.
+# Both A/B configs run with extraction ON for fairness.
+enable_extraction = true
+
+[consolidation]
+enabled = true
+enable_llm = true
+
+[server]
+api_key = ""
