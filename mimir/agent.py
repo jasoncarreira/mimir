@@ -356,6 +356,20 @@ class Agent:
             subagent_block=subagent_body,
         )
 
+    def _assemble_upcoming_block(self) -> str | None:
+        """v0.5+ §12.1: feedforward — render the `## Upcoming` block from
+        the scheduler's next-N firings + the plan-window reset times.
+        Returns None when both sources are empty."""
+        try:
+            from .upcoming import render_upcoming_block
+            return render_upcoming_block(
+                scheduler=self._scheduler,
+                rate_limit_store=self._rate_limits,
+            )
+        except Exception:  # noqa: BLE001 — never crash a turn for this
+            log.exception("_assemble_upcoming_block failed; skipping")
+            return None
+
     async def _assemble_session_summaries(
         self, *, channel_id: str | None
     ) -> str | None:
@@ -377,6 +391,10 @@ class Agent:
             )
         return render_session_summaries(boundaries)
 
+    # VSM: S3 — pre-turn retrieval; saga.query feeds likely-relevant
+    #          atoms into the prompt before the agent runs. Precondition
+    #          for the post-turn credit pass (loop 1.1).
+    # loop_id: pre-message
     async def _pre_message_hook(self, ctx: TurnContext, event: AgentEvent) -> str | None:
         """Query SAGA, stash atom_ids on ctx, return a formatted prompt block
         (or None if nothing relevant). Skipped on synthesis turns.
@@ -440,6 +458,9 @@ class Agent:
         hits = _atoms_in_payload(payload)
         return _format_atoms(hits)
 
+    # VSM: S3 — post-turn credit pass; saga's retrieval ranking learns
+    #          which atoms helped (access_log.contributed boost).
+    # loop_id: 1.1
     async def _post_message_hook(self, ctx: TurnContext, output: str) -> None:
         """Credit pre-injected ∪ mid-turn-queried atoms via mark_contributions.
 
@@ -577,6 +598,7 @@ class Agent:
                 channel_id=event.channel_id,
             )
             usage_block = self._assemble_usage_block()
+            upcoming_block = self._assemble_upcoming_block()
             turn_prompt = build_turn_prompt(
                 event,
                 recent_messages=recent,
@@ -587,6 +609,7 @@ class Agent:
                 feedback_block=feedback_block,
                 session_summaries_block=session_summaries_block,
                 usage_block=usage_block,
+                upcoming_block=upcoming_block,
             )
 
         core_blocks = load_core(self._config.home)

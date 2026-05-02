@@ -447,6 +447,9 @@ class SlackBridge(Bridge):
         )
         await self.enqueue(agent_event)
 
+    # VSM: algedonic (in) — see DiscordBridge._on_reaction; identical
+    #                       semantics, different protocol.
+    # loop_id: 2.6
     async def _on_reaction(self, event: dict[str, Any]) -> None:
         """Surface inbound reactions on the bot's messages as
         ``react_received`` events. mimir.feedback's algedonic block

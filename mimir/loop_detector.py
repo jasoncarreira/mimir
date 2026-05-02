@@ -43,6 +43,12 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip()).lower()
 
 
+# VSM: S2 — per-channel anti-oscillation; refuses duplicate-or-near-
+#          duplicate sends past a soft threshold, hard-stops past a
+#          higher one. Runs synchronously inside the send_message tool
+#          wrapper so the agent gets a permission-denied result and
+#          adjusts within-turn.
+# loop_id: 1.3
 @dataclass
 class LoopDetector:
     """One instance per TurnContext. Not async-safe — relies on the per-turn

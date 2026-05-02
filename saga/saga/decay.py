@@ -353,6 +353,12 @@ def budget_check() -> dict:
 
 # ─── Full Decay Cycle ─────────────────────────────────────────────
 
+# VSM: S3 (saga-internal) — atom stability decays over time;
+#      access_count + contributed bumps stability. Below thresholds
+#      atoms transition active → fading → dormant → tombstone.
+#      Retrieval respects state filter so low-value detail naturally
+#      fades out without explicit deletion.
+# loop_id: 4.4
 def run_decay_cycle() -> dict:
     """
     Full decay cycle -- designed to be called by systemd timer.

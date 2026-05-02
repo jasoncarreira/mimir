@@ -997,6 +997,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
 
+    loops_p = sub.add_parser(
+        "loops",
+        help="Show feedback-loop inventory + last-fire status (FUTURE_WORK §12.6b).",
+    )
+    loops_p.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
     refl_p = sub.add_parser(
         "reflection",
         help="Reflection skill helpers (invoked by skills/reflection/SKILL.md).",
@@ -1107,6 +1118,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             file=sys.stderr,
         )
         return
+
+    if args.command == "loops":
+        from .loops_cmd import run_loops_cmd
+        home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+        sys.exit(run_loops_cmd(home))
 
     if args.command == "reflection":
         if args.reflection_action == "most-retrieved":
