@@ -45,6 +45,12 @@ UTC = timezone.utc
 EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
 
 
+# Optional arbiter — when present, the scheduler consults it before
+# firing a tick and may suppress S4 work on plan-window or cost-rate
+# pressure. Typed as ``Any`` to avoid an import cycle with budget.py.
+HomeostaticArbiter = Any
+
+
 # ---------------------------------------------------------------------------
 # Job model + YAML round-trip
 # ---------------------------------------------------------------------------
@@ -165,10 +171,13 @@ class Scheduler:
         self,
         scheduler_yaml: Path,
         enqueue: EnqueueFn,
+        *,
+        arbiter: HomeostaticArbiter | None = None,
     ) -> None:
         self._scheduler = AsyncIOScheduler(timezone="UTC")
         self._yaml_path = scheduler_yaml
         self._enqueue = enqueue
+        self._arbiter = arbiter
         self._mutate_lock = asyncio.Lock()
         self._started = False
 
@@ -214,6 +223,26 @@ class Scheduler:
             content=job.prompt,
             extra={"schedule_name": job.name, "configured_channel_id": job.channel_id},
         )
+
+        # §12.4: ask the homeostat first. If S4 work is suppressed by
+        # plan-window saturation or a cost-rate alert, drop the tick
+        # with a structured reason so operator audit / dashboards can
+        # explain the gap.
+        if self._arbiter is not None:
+            try:
+                decision, reason = self._arbiter.should_fire_heartbeat()
+            except Exception:  # noqa: BLE001
+                log.exception("arbiter.should_fire_heartbeat raised; firing anyway")
+                decision, reason = "fire", "arbiter_error"
+            if str(decision) == "suppress" or getattr(decision, "value", None) == "suppress":
+                await log_event(
+                    "scheduled_tick_suppressed",
+                    schedule_name=job.name,
+                    channel_id=event.channel_id,
+                    reason=reason,
+                )
+                return
+
         await log_event("scheduled_tick", schedule_name=job.name, channel_id=event.channel_id)
         accepted = await self._enqueue(event)
         if not accepted:

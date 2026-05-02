@@ -137,6 +137,56 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_fire_consults_arbiter_and_suppresses(tmp_path: Path):
+    """§12.4: when the homeostat returns SUPPRESS, _fire must skip the
+    enqueue and instead emit a scheduled_tick_suppressed event."""
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    class _SuppressingArbiter:
+        def should_fire_heartbeat(self):
+            from mimir.budget import HeartbeatDecision
+            return HeartbeatDecision.SUPPRESS, "plan_window_saturated:7d_opus@0.92"
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml",
+        enqueue=fake_enqueue,
+        arbiter=_SuppressingArbiter(),
+    )
+    job = SchedulerJob(name="morning", prompt="x", cron="0 8 * * *")
+    await sched._fire(job=job)
+
+    assert enqueued == []  # suppressed, no enqueue
+
+
+@pytest.mark.asyncio
+async def test_fire_consults_arbiter_and_fires(tmp_path: Path):
+    """When arbiter returns FIRE, _fire proceeds normally."""
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    class _FiringArbiter:
+        def should_fire_heartbeat(self):
+            from mimir.budget import HeartbeatDecision
+            return HeartbeatDecision.FIRE, "ok"
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml",
+        enqueue=fake_enqueue,
+        arbiter=_FiringArbiter(),
+    )
+    job = SchedulerJob(name="morning", prompt="x", cron="0 8 * * *")
+    await sched._fire(job=job)
+    assert len(enqueued) == 1
+
+
+@pytest.mark.asyncio
 async def test_reload_registers_yaml_jobs(tmp_path: Path):
     path = tmp_path / "scheduler.yaml"
     write_jobs(

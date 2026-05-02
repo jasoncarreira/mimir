@@ -117,6 +117,7 @@ def build_turn_prompt(
     session_summaries_block: str | None = None,
     usage_block: str | None = None,
     upcoming_block: str | None = None,
+    self_state_block: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, SAGA
     atom hits, subagent completion notifications (from prior turns), event
@@ -173,6 +174,14 @@ def build_turn_prompt(
     # agent reads "what's coming" before "what just happened."
     if upcoming_block:
         sections.append("## Upcoming\n\n" + upcoming_block.rstrip())
+
+    # Self-state (FUTURE_WORK §12.4): the homeostat's interpretation of
+    # the four constraint layers (plan window / cost rate / S3-S4
+    # share / tokens). Sits with the other self-state telemetry; the
+    # agent should know the same constraints the arbiter uses to
+    # suppress S4 work.
+    if self_state_block:
+        sections.append("## Self-state\n\n" + self_state_block.rstrip())
 
     if recent_list:
         rendered = render_recent_activity(
