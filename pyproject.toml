@@ -13,6 +13,9 @@ dependencies = [
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "fastembed>=0.4",
+    # v0.5 §2: saga is the in-process memory backend. Workspace member;
+    # editable-installed via [tool.uv.sources] below.
+    "saga",
 ]
 
 [project.optional-dependencies]
@@ -60,3 +63,9 @@ testpaths = ["tests"]
 # commit; renamed to ``saga`` in V0.5.md §6.
 [tool.uv.workspace]
 members = ["saga"]
+
+# Resolve the ``saga`` dependency declared in [project.dependencies]
+# from the workspace member rather than PyPI. uv installs it editable so
+# saga.core / saga.benchmarks are importable from anywhere in the workspace.
+[tool.uv.sources]
+saga = { workspace = true }

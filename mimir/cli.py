@@ -281,6 +281,31 @@ def _default_saga_toml(home: Path, api_key: str) -> str:
         db_path = "{saga_dir / 'saga.db'}"
         metrics_db_path = "{saga_dir / 'saga_metrics.db'}"
 
+        [embedding]
+        # OpenAI's text-embedding-3-small at 1536 dims is saga's bench
+        # canonical (matches msam_bench.toml; comparable to the post-fix
+        # P30 baseline of 0.774). Operators can switch to provider="onnx"
+        # for fully local embeddings — no API key needed, slower CPU pass.
+        provider = "openai"
+        url = "https://api.openai.com/v1/embeddings"
+        model = "text-embedding-3-small"
+        dimensions = 1536
+        api_key_env = "OPENAI_API_KEY"
+
+        [llm]
+        # Default LLM gateway for saga's chat-completion call sites
+        # (consolidation synthesis, contextual rewrite, triples extraction,
+        # rerank, subatom synthesis). v0.5 §7 ships an anthropic provider;
+        # flip provider = "anthropic" and let api_key_env resolve via
+        # ANTHROPIC_API_KEY for direct Claude access. Default
+        # openai_compat keeps the legacy ``requests.post`` path for
+        # bench parity and OpenAI-compatible gateways (OpenRouter,
+        # Minimax, Step, etc.).
+        provider = "anthropic"
+        model = "claude-haiku-4-5"
+        api_key_env = "ANTHROPIC_API_KEY"
+        timeout_seconds = 60
+
         [retrieval]
         # v0.5 §2: rewrite short referential queries against the prior
         # conversation before retrieval. mimir always passes context=.

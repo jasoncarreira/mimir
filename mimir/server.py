@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import signal
 from typing import Any
 
@@ -139,6 +140,15 @@ def build_app(config: Config) -> web.Application:
     indexes.mark_dirty("all")
 
     indexer = Indexer(config.home)
+    # v0.5 §2: point saga at the per-home saga.toml. saga's config search
+    # checks ``$SAGA_CONFIG`` first (then ``$SAGA_DATA_DIR/saga.toml``,
+    # ``~/.saga/saga.toml``, package-default). mimir setup writes
+    # ``<home>/saga.toml``, which doesn't match any of those defaults, so
+    # set the env var here before the in-process saga adapter does its
+    # first import. No-op if the operator already exported SAGA_CONFIG.
+    home_saga_toml = config.home / "saga.toml"
+    if home_saga_toml.is_file() and not os.environ.get("SAGA_CONFIG"):
+        os.environ["SAGA_CONFIG"] = str(home_saga_toml)
     saga_client = make_saga_client(
         endpoint=config.saga_endpoint,
         api_key=config.saga_api_key or None,
