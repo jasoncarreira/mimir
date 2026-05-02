@@ -58,5 +58,42 @@ enable_extraction = true
 enabled = true
 enable_llm = true
 
+[benchmark]
+# msam_bench.toml's bench-mode "off" flags that we need to mirror or
+# ingest quietly does ~50 extra embedding+store calls per question
+# (one session_boundary per haystack session). Bisected: omitting this
+# section made ingest 41s; adding it brings ingest to 17s. The integration
+# bench's mark_contributions still fires via mimir's post_message_hook;
+# this flag only gates the saga-bench-internal credit pass that's
+# redundant when the agent runs.
+enable_session_boundaries = false
+enable_mark_contributions = false
+
+[compression]
+# Subatom beam compression / dedup / synthesis are off in saga's bench
+# canonical (msam_bench.toml). Defaults differ; pin them off here.
+enable_subatom = false
+enable_fact_dedup = false
+enable_synthesis = false
+
+[annotation]
+# Heuristic-only — no LLM-call-per-atom annotation pass during ingest.
+use_llm = false
+
+[prediction]
+enabled = false
+
+[world_model]
+enabled = false
+
+[decay]
+enabled = false
+
+[atoms]
+# Per-write supersedes resolution adds a FAISS top-K + potential LLM
+# contradiction check per atom. Bench runs ContradictionResolver once
+# post-consolidation if needed; per-write is duplicative.
+auto_resolve_supersedes_on_write = false
+
 [server]
 api_key = ""

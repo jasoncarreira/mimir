@@ -53,5 +53,32 @@ enable_extraction = true
 enabled = true
 enable_llm = true
 
+[benchmark]
+# Same bench-mode off-flags as saga_p30.toml — see that file's comment
+# block for the bisection that traced [benchmark] absence to ~24s of
+# extra ingest per question.
+enable_session_boundaries = false
+enable_mark_contributions = false
+
+[compression]
+enable_subatom = false
+enable_fact_dedup = false
+enable_synthesis = false
+
+[annotation]
+use_llm = false
+
+[prediction]
+enabled = false
+
+[world_model]
+enabled = false
+
+[decay]
+enabled = false
+
+[atoms]
+auto_resolve_supersedes_on_write = false
+
 [server]
 api_key = ""
