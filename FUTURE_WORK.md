@@ -606,6 +606,267 @@ When an item from this doc lands, move it to the `## 11. Recently shipped` secti
 
 ---
 
+## 12. Feedback loops / VSM expansion
+
+Complete inventory of mimir's existing feedback loops lives in
+`FEEDBACK-LOOPS.md`. Five new loops + three pieces of architectural
+support sit on the roadmap, prioritized by leverage-per-LOC.
+
+### 12.1 Feedforward — `## Upcoming` prompt section
+
+**VSM:** S4 (intelligence / "there and then") — currently thin. The
+heartbeat tick is reactive ("pick from backlog"); the rate-limit
+off-pace projection is the only forward-looking signal we have.
+
+**What.** New `mimir/upcoming.py` produces a prompt block surfacing
+near-term predictable events: next-N scheduled-tick / cron firings
+from `scheduler.yaml`, plan-window resets (5h, 7d), recurring
+weekly-reflection / saga-consolidation cadence. Renders alongside
+`## Resource usage` and `## Recent feedback signals`.
+
+**Why this loop matters.** Lets the agent prepare for predictable
+load (cron-driven heartbeats, weekly reflection coming up) instead
+of being surprised by them. Closes the feedforward gap Beer's S4
+exists to fill.
+
+**Out of scope first pass:** calendar / Bluesky-poll / external
+event sources. Hook left for them.
+
+**Files:** `mimir/upcoming.py` (~80 LOC), `mimir/prompts.py` (+15),
+`mimir/agent.py` (+15), `tests/test_upcoming.py` (~120).
+
+**Effort:** ~1 day.
+
+---
+
+### 12.2 Applied-proposals audit — close the double-loop
+
+**VSM:** S5 (policy update). Currently the slowest loop in the
+system is open: reflection drafts, operator merges, mimir never
+sees whether the change worked. Single-loop only.
+
+**What.**
+- `mimir reflection mark-applied <proposal-id>` CLI subcommand:
+  moves a proposal from `## Pending` to `## Applied` in
+  `state/proposed-changes.md` AND appends a record to
+  `state/applied-proposals.jsonl` capturing the proposal's
+  `Predicted effect:` line.
+- Reflection v2: each weekly run reads `applied-proposals.jsonl`,
+  pulls proposals applied 1-4 weeks ago, and runs an audit pass
+  that compares predicted-vs-actual against measurable signals
+  in turns.jsonl + events.jsonl (error-rate delta, tool-frequency
+  delta, react-polarity ratio, retrieval contribution rate).
+- Output: a `## Effects of prior proposals` section in the
+  weekly reflection write-up, alongside the existing
+  `## Pending proposals`.
+
+**Why this is the load-bearing one.** Without it, mimir is
+permanently stuck in single-loop learning. Reflection drafts
+plausible-sounding proposals; nothing measures whether merging
+them helped. Closing this loop is the difference between mimir
+appearing thoughtful and mimir actually getting smarter over time.
+
+**Concrete predicted-effect signals to support first:**
+- "Error rate in <area> would drop" → events.jsonl error count delta
+- "Agent would invoke <skill> more often" → tool_call frequency delta
+- "Positive reactions would increase / negative would decrease" → react_polarity ratio
+- "Atom contribution rate for <topic> would rise" → access_log.contributed delta
+
+Each maps to a one-line query on the existing logs.
+
+**Files:** `mimir/skills/reflection/applied_audit.py` (~150),
+`mimir/cli.py` (mark-applied subcommand, +50),
+`mimir/skills/reflection/SKILL.md` (extended prompt),
+tests (~100).
+
+**Effort:** ~2 days.
+
+---
+
+### 12.3 Skill outcome tracking — positive feedback / amplification
+
+**VSM:** S3 (control), with reinforcement properties. Currently
+every skill seeded by `mimir setup` has equal billing in the
+agent's prompt forever. `mark_contributions` is the only
+amplification loop in the whole system.
+
+**What.**
+- `mimir/skill_outcomes.py` aggregates per-skill success / failure
+  / abandonment rates from turns.jsonl tool-call events.
+- Per-turn post-hook scans tool_call events for skill invocations
+  (`mcp__mimir__skill__<name>__<entry>`), classifies outcome from
+  `is_error` + retry-within-turn signal, appends to
+  `state/skill-outcomes.jsonl`.
+- Rolling-window aggregator (1d / 7d / 30d) feeds the prompt's
+  skills listing: high-success-rate skills sort first, low-rate
+  skills get a quiet ⚠ marker, never-tried skills sit in their own
+  bucket so they don't crowd the proven ones.
+- Operator override via `state/skill-pin.yaml` (force show / hide
+  / pin-to-top).
+
+**Why.** Adds the first real amplification loop beyond saga's atom
+ranking. Skills that genuinely work get amplified; noise gets
+demoted. Same shape as `mark_contributions` but at the skill layer.
+
+**Files:** `mimir/skill_outcomes.py` (~150),
+`mimir/agent.py` (post-turn hook, +20),
+`mimir/prompts.py` (ordering, +15), tests (~120).
+
+**Effort:** ~1.5 days.
+
+---
+
+### 12.4 S3-S4 homeostat — exploration/exploitation budget
+
+**VSM:** the perpetual S3-vs-S4 tension that VSM literally exists
+to mediate. Currently we have many S3 loops (§1.1, §2.4, §4.3-§4.6
+in FEEDBACK-LOOPS.md) and one S4 loop (heartbeat). No arbiter.
+
+**What.**
+- `mimir/budget.py`: per-day tool-call budget split into S3
+  (user-message-driven) and S4 (heartbeat / scheduled-tick-driven).
+  Default 80/20 ratio, configurable.
+- Scheduler consults budget before firing heartbeat ticks: if S3
+  is consuming most of the budget (busy day), heartbeat firings
+  are deferred. If S3 is underutilized (idle period), heartbeat
+  fires more frequently to use the slack on exploration work.
+- Rendering: `## Self-state` prompt block showing
+  `S3 used: 67%, S4 used: 12%` so the agent has the signal
+  in-band — subtle, agent can choose to scale back operations or
+  push more strategic work; doesn't enforce anything by itself.
+
+**Why.** Without an explicit arbiter, organizations under load
+default to pure firefighting and starve foresight. The same
+failure mode applies to mimir: if user_message turns dominate
+the day's budget, heartbeat work never lands. Beer's S5
+mediates this in human orgs; mimir's equivalent is a measurable
+budget split.
+
+**Subtle tuning:** the danger is making the agent dormant during
+busy days. The 80/20 default + monotonic decay (S4 budget can
+borrow from S3 surplus, not vice-versa during peak load) is a
+defensible starting point.
+
+**Files:** `mimir/budget.py` (~200),
+`mimir/scheduler.py` (heartbeat suppression / boost, +50),
+`mimir/prompts.py` (`## Self-state`, +15),
+`mimir/agent.py` (turn-boundary updates, +10),
+tests (~150).
+
+**Effort:** ~2 days. Tuning probably an additional week of
+observation before the defaults stabilize.
+
+---
+
+### 12.5 Subagent recursion — requisite variety on S1 units
+
+**VSM:** Beer's "law of requisite variety" — each level must have
+enough internal complexity to regulate the level below. Subagents
+(climber, researcher, critic) are mimir's S1 units. Today they
+have personas (S5) and tasks (S1) and nothing else. No S2
+(anti-oscillation between iterations), no S3 (per-subagent budget
+enforcement), no S4 (subagent-specific foresight).
+
+**What.** Subagent definition frontmatter gains a `vsm:` block:
+
+```yaml
+---
+name: climber
+description: ...
+vsm:
+  s3_tool_budget: 20            # max tool calls per invocation
+  s2_anti_oscillation:
+    iteration_cap: 5
+    duplicate_change_window: 3  # don't make same change in last N
+  s4_foresight: false           # subagent-specific scanning
+---
+```
+
+- `mimir/subagent_defs.py` parses; defaults preserve current behavior.
+- `mimir/subagent_runtime.py` enforces budget via PreToolUse hook
+  scoped to the subagent's session. Tracks recent edits for
+  anti-oscillation; the climber's iteration is the immediate
+  beneficiary (mountaineering gets "I just did this same change
+  two iterations ago, skip").
+
+**Why.** Climber is the most expensive S1 we run (mountaineering
+iterations call multiple LLMs, run code, edit files). Letting it
+run unbounded by S2/S3 is the kind of place runaway costs and
+oscillation get born. Adding regulation now is cheap; adding it
+after a runaway incident is expensive.
+
+**Files:** `mimir/subagent_defs.py` (frontmatter parser, +80),
+`mimir/subagent_runtime.py` (~150),
+`mimir/.claude/agents/*.md` (extend frontmatter on climber +
+researcher + critic), tests (~120).
+
+**Effort:** ~2 days.
+
+---
+
+### 12.6 Architectural support — VSM as a first-class concept
+
+Three small pieces that make adding new loops easier going forward.
+
+**a. Per-loop VSM-layer tags in code.** Convention: every loop's
+entry point gets a `# VSM: S<N>` comment. `FEEDBACK-LOOPS.md`
+becomes auto-generatable from `grep "# VSM:" -r`. Effort: tag
+existing 16 loops + a lint check, ~1 day.
+
+**b. `mimir loops` CLI subcommand.** Reads recent events.jsonl +
+turns.jsonl, prints a table:
+
+```
+Layer       Loop                       Last fired  Volume (24h)  Status
+S1          tool-result                7s ago      342           healthy
+S3          mark_contributions         12s ago      58           healthy
+S3*         reflection                  4d ago       1           healthy
+S4          heartbeat                  18m ago      42           healthy
+algedonic   inbound reactions          never        0           never-fired
+```
+
+The never-fired rows are the diagnostic: if inbound-reactions never
+fires for a week, either nobody's reacting or the bridge wiring is
+broken. Effort: ~120 LOC + ~80 of test scaffolding, ~1 day.
+
+**c. Loop-test pattern.** Every PR adding a feedback loop should
+include: (a) what triggers it, (b) what it changes, (c) how to
+verify it fires, (d) the time horizon. Codified as a checklist in
+`.github/PULL_REQUEST_TEMPLATE.md` and a fixture pattern in
+`tests/test_loops_smoke.py` that asserts each documented loop's
+events fire under a synthetic scenario. Effort: ~0.5 day.
+
+---
+
+### 12.x Out of scope (for now)
+
+- **Cross-S1 anti-oscillation across channels.** No symptoms yet;
+  build when we see them.
+- **Delayed-feedback oscillation diagnostic** — a tool that
+  grep-scans turns.jsonl for behavior cycles. Build on demand.
+- **Closed-loop S5 policy update.** Letting mimir edit
+  `memory/core/identity.md` directly is a real boundary. Per
+  `FEEDBACK-LOOPS.md` §7's note, kept human-anchored by design
+  until §12.2 (applied-proposals audit) proves the agent can be
+  trusted to know which corrections actually worked.
+
+**Suggested order to build in:**
+
+1. §12.6a (VSM tags) — 1 day, prereq for clean reasoning across
+   the rest
+2. §12.1 (Upcoming section) — 1 day, low-risk feedforward
+3. §12.6b (`mimir loops` CLI) — 1 day, makes #4 verifiable
+4. §12.3 (skill outcomes) — 1.5 days, first real amplification
+5. §12.5 (subagent recursion) — 2 days, before climber gets used at scale
+6. §12.4 (S3-S4 homeostat) — 2 days, real arbiter
+7. §12.2 (applied-proposals audit) — 2 days, the load-bearing
+   double-loop closure; do last so the metrics it audits already
+   exist
+
+Total: ~10.5 days of focused work for the whole §12 stack.
+
+---
+
 ## 11. Recently shipped
 
 ### 2026-05-01 — v0.5 saga merge + in-process integration
