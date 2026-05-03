@@ -406,13 +406,18 @@ class Agent:
     def _assemble_skill_block(self) -> str | None:
         """v0.5+ §12.3: render the system-prompt `## Skills` block —
         proven / untried / risky buckets ordered by recent success
-        rate. Returns None when no skills are seeded."""
+        rate. Returns None when no skills are seeded.
+
+        Skills enumerated via ``installed_skill_names(home)`` so user-
+        installed skills under ``<home>/.claude/skills/`` appear
+        alongside bundled ones — the ranker isn't limited to the
+        package-bundled set."""
         try:
             from .skill_outcomes import (
                 SkillPinConfig, aggregate, render_skill_block,
             )
-            from .skill_defs import _bundled_skill_names
-            seeded = _bundled_skill_names()
+            from .skill_defs import installed_skill_names
+            seeded = installed_skill_names(self._config.home)
             if not seeded:
                 return None
             aggs = aggregate(self._config.turns_log)

@@ -77,10 +77,9 @@ def build_system_prompt(
     *what*).
 
     ``skill_block`` (FUTURE_WORK §12.3) — when set, append a Skills
-    section with success-rate-ordered listing. Sits in the system
-    prompt (not turn prompt) because the bucket assignment is
-    stable across turns; updates land via re-build between sessions
-    or after MIMIR_SKILL_BLOCK_REFRESH_TURNS."""
+    section with success-rate-ordered listing. The block is rebuilt
+    each turn (run_turn calls build_system_prompt every dispatch), so
+    bucket assignment stays current as outcome aggregates evolve."""
     parts: list[str] = [persona or _DEFAULT_PERSONA]
 
     if core_blocks:

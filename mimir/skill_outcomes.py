@@ -59,9 +59,12 @@ class SkillOutcome:
 
     @property
     def success_rate(self) -> float | None:
-        """Rate over success+failure (abandons excluded — they're
-        rare and ambiguous). None when no usable data."""
-        denom = self.success + self.failure
+        """Rate of successful invocations over all completed-or-abandoned
+        ones. Abandoned counts as failure (matches the module docstring:
+        "treated as failure for ranking purposes") since an unmatched
+        tool_call usually means the agent gave up mid-skill — not a
+        positive signal. None when no usable data."""
+        denom = self.success + self.failure + self.abandoned
         if denom == 0:
             return None
         return self.success / denom
@@ -200,7 +203,11 @@ def order_skills(
         if name in hidden:
             continue
         agg = aggregates.get(name)
-        if agg is None or (agg.success + agg.failure) == 0:
+        # "Untried" means no completed/failed/abandoned invocations —
+        # i.e. nothing we can rank against. Skill outcomes that exist
+        # but failed are "risky"; skills missing from aggregates are
+        # untried.
+        if agg is None or agg.total == 0:
             untried.append(name)
             continue
         rate = agg.success_rate or 0.0
@@ -237,7 +244,7 @@ def render_skill_block(
         lines.append("**Proven** (recent success):")
         for name in proven:
             agg = aggregates[name]
-            lines.append(f"- {name}  ({agg.success}/{agg.success + agg.failure} in window)")
+            lines.append(f"- {name}  ({agg.success}/{agg.total} in window)")
     if untried:
         if lines:
             lines.append("")
@@ -250,5 +257,5 @@ def render_skill_block(
         lines.append("**Risky** ⚠ (recent failures > successes):")
         for name in risky:
             agg = aggregates[name]
-            lines.append(f"- {name}  ({agg.success}/{agg.success + agg.failure} in window)")
+            lines.append(f"- {name}  ({agg.success}/{agg.total} in window)")
     return "\n".join(lines)
