@@ -321,6 +321,25 @@ class DiscordBridge(Bridge):
             )
         return SendResult(sent=True, message_id=last_id, chunks=sent_count)
 
+    async def send_typing_indicator(self, channel_id: str) -> None:
+        """Show the Discord typing dots in the channel. Single fire —
+        Discord renders the indicator for ~10s on its own. Failures
+        swallowed; typing is a UX nicety, not load-bearing."""
+        if self._client is None or self._client.is_closed():
+            return
+        cid_int = _channel_id_to_int(channel_id)
+        if cid_int is None:
+            return
+        try:
+            channel = self._client.get_channel(cid_int)
+            if channel is None:
+                channel = await self._client.fetch_channel(cid_int)
+            trigger = getattr(channel, "trigger_typing", None)
+            if callable(trigger):
+                await trigger()
+        except Exception:  # noqa: BLE001
+            pass
+
     async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:
         if self._client is None or self._client.is_closed():
             return False
@@ -410,6 +429,12 @@ class DiscordBridge(Bridge):
                 "channel_name": channel_name,
             },
         )
+        # Fire-and-forget the typing indicator so the user sees the
+        # bot "thinking" while the agent spins up. Discord renders
+        # the dots for ~10s on a single trigger; for longer turns
+        # it'll just expire naturally — that's better than blocking
+        # enqueue on a typing call.
+        asyncio.create_task(self.send_typing_indicator(channel_id))
         await self.enqueue(event)
 
     # VSM: algedonic (in) — inbound reactions on the bot's own messages,

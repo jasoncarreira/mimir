@@ -309,6 +309,15 @@ class SlackBridge(Bridge):
             )
         return SendResult(sent=True, message_id=last_id, chunks=sent_count)
 
+    async def send_typing_indicator(self, channel_id: str) -> None:
+        """No-op. Slack has no public typing API for bots — the
+        ``chat.assistant.threads.setStatus`` call is App Assistant-only,
+        not general chat. If we want a typing stand-in later, the
+        cleanest path is auto-react with 👀 on the user's message and
+        remove it when the response goes out, but that fires reaction
+        events back to the agent and adds its own UX wrinkles."""
+        return None
+
     async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:
         if self._app is None:
             return False
