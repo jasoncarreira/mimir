@@ -1,0 +1,97 @@
+# Integration bench: P30 + P42 (triples in response) + P47 (consolidation-v2)
+#                    + similarity rolled back to 0.80.
+#
+# P47's consolidation-v2 (P17 trend writer + P35 contradictions + P48
+# canonical predicate vocabulary) is now baked into saga unconditionally,
+# so this toml just exercises the default consolidation path with two
+# explicit deltas vs saga_p47.toml:
+#
+#   1. include_triples_in_response = true  → P42 triples block on,
+#      restoring the +1.2pp lift that p42-sonnet showed over p30-sonnet.
+#   2. similarity_threshold = 0.80         → P34 rollback. p47-sonnet
+#      regressed multi-session by ~4.5pp at 0.75; the working theory is
+#      that the looser threshold over-merges cross-session aggregation
+#      atoms, especially counting questions. 0.80 was the canonical
+#      pre-P34 value — putting it back here checks whether multi-session
+#      recovers without giving up the consolidation-v2 gains on the
+#      session-scoped categories.
+#
+# Pair: saga_p42_p40_simhi.toml. Sole flag delta between the two is
+# enable_endorsed_atom_pull_in (default true here; false in the p40 pair).
+# Both runs share consolidation-v2 + P42 + 0.80 similarity, so the
+# overall delta isolates the endorsed-pull-in trade-off cleanly.
+
+[storage]
+db_path = "saga.db"
+metrics_db_path = "saga_metrics.db"
+token_budget_ceiling = 100000000
+auto_compact_threshold_pct = 99
+refuse_threshold_pct = 100
+db_busy_timeout_ms = 5000
+
+[embedding]
+provider = "openai"
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dimensions = 1536
+api_key_env = "OPENAI_API_KEY"
+
+[llm]
+provider = "openai_compat"
+url = "https://api.openai.com/v1/chat/completions"
+model = "gpt-5.4-nano"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 120
+
+[retrieval]
+enable_contextual_rewrite = true
+two_tier_enabled = true
+enable_missing_ref_pivot = true
+enable_confidence_gating = true
+default_min_confidence_tier = "low"
+enable_triple_augment_v2 = false
+enable_subatom_beam = false
+# P42: surface top-N triples as a third response block.
+include_triples_in_response = true
+response_triples_top_k = 5
+
+[retrieval_v2]
+enable_query_expansion = true
+
+[triples]
+enable_extraction = true
+
+[consolidation]
+enabled = true
+enable_llm = true
+# P34 rollback: 0.80 was the canonical pre-P34 value; 0.75 regressed
+# multi-session in p47-sonnet. Revisit if a future bench shows 0.80
+# misses paraphrase-merging opportunities again.
+similarity_threshold = 0.80
+
+[benchmark]
+enable_session_boundaries = false
+enable_mark_contributions = false
+
+[compression]
+enable_subatom = false
+enable_fact_dedup = false
+enable_synthesis = false
+
+[annotation]
+use_llm = false
+
+[prediction]
+enabled = false
+
+[world_model]
+enabled = false
+
+[decay]
+enabled = false
+
+[atoms]
+auto_resolve_supersedes_on_write = false
+
+[server]
+api_key = ""
