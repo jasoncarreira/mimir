@@ -118,5 +118,11 @@ If you're orienting yourself in the codebase:
 
 ## License
 
-[See LICENSE — pending decision.] mimir uses [saga](./saga), MIT-licensed
-(see [saga/LICENSE](./saga/LICENSE)).
+Copyright © 2026 Jason Carreira. License terms TBD — see
+[LICENSE](./LICENSE) for the current posture (all rights reserved
+pending a real open-source license decision).
+
+The [saga](./saga) subdirectory is independently MIT-licensed —
+see [saga/LICENSE](./saga/LICENSE) (combined copyright Jaden Schwab
++ Jason Carreira). Saga's MIT terms are unaffected by mimir's
+top-level posture.
