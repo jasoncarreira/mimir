@@ -50,6 +50,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "saga_feedback_error": ("negative", "saga_feedback_error"),
     "saga_consolidate_error": ("negative", "saga_consolidate_error"),
     "saga_decay_error": ("negative", "saga_decay_error"),
+    "saga_forget_error": ("negative", "saga_forget_error"),
     "saga_synthesis_dispatch_failed": ("negative", "synth_dispatch_fail"),
     "saga_synthesis_empty_window": ("negative", "synth_empty_window"),
     "cost_rate_alert": ("negative", "cost_rate"),
@@ -73,6 +74,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # agent should know about so it can Read it.
     "saga_consolidate_ok": ("positive", "saga_consolidate_ok"),
     "saga_decay_ok": ("positive", "saga_decay_ok"),
+    "saga_forget_ok": ("positive", "saga_forget_ok"),
     "introspection_report_ok": ("positive", "introspection_ok"),
 }
 
@@ -86,6 +88,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
 _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "saga_consolidate_ok",
     "saga_decay_ok",
+    "saga_forget_ok",
     "introspection_ok",
     "introspection_error",
     "heartbeat_health",
@@ -117,6 +120,10 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f"SAGA consolidation failed: {ev.get('error') or '(no detail)'}"
     if rule_kind == "saga_decay_error":
         return f"SAGA decay failed: {ev.get('error') or '(no detail)'}"
+    if rule_kind == "saga_forget_error":
+        dry = ev.get("dry_run")
+        suffix = " (dry_run)" if dry else ""
+        return f"SAGA forget failed{suffix}: {ev.get('error') or '(no detail)'}"
     if rule_kind == "synth_dispatch_fail":
         return f"SAGA synthesis dispatch failed: {ev.get('error') or '(no detail)'}"
     if rule_kind == "synth_empty_window":
@@ -196,13 +203,18 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             return f"saga consolidation ran ({detail})"
         return "saga consolidation ran"
     if rule_kind == "saga_decay_ok":
+        # Note: forget-candidate count is surfaced separately as a
+        # persistent line in the ## Self-state block (see
+        # ``pending_forget_candidates_count``) — it stays visible until
+        # the agent acts (a saga_forget_ok event newer than this decay
+        # event clears it). Keeping it off the per-run line avoids
+        # duplicating the same count adjacent to itself.
         result = ev.get("result") or {}
         if isinstance(result, dict):
             updated = result.get("atoms_retrievability_updated")
             faded = result.get("atoms_faded")
             dormanted = result.get("atoms_dormanted")
             compacted = result.get("atoms_compacted")
-            candidates = result.get("forgetting_candidates")
             duration = result.get("elapsed_seconds")
             parts: list[str] = []
             if isinstance(updated, (int, float)):
@@ -219,14 +231,20 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             if isinstance(duration, (int, float)):
                 parts.append(f"{duration:.1f}s")
             detail = ", ".join(parts) if parts else "no detail"
-            tail = ""
-            if isinstance(candidates, (int, float)) and candidates > 0:
-                tail = (
-                    f" — {int(candidates)} forget candidates ready "
-                    f"(POST /v1/forget with dry_run=true to preview)"
-                )
-            return f"saga decay ran ({detail}){tail}"
+            return f"saga decay ran ({detail})"
         return "saga decay ran"
+    if rule_kind == "saga_forget_ok":
+        dry = ev.get("dry_run")
+        actions = ev.get("actions_taken")
+        total = ev.get("total_candidates")
+        bits: list[str] = []
+        if isinstance(total, (int, float)):
+            bits.append(f"{int(total)} candidates reviewed")
+        if isinstance(actions, (int, float)):
+            bits.append(f"{int(actions)} acted on")
+        detail = ", ".join(bits) if bits else "no detail"
+        suffix = " (dry_run)" if dry else ""
+        return f"saga forget ran{suffix} ({detail})"
     if rule_kind == "introspection_ok":
         # The output file path is the load-bearing detail — the agent
         # should be able to grep this line and Read the report.
@@ -462,3 +480,44 @@ def _short_ts(ts: str) -> str:
 # in this module called ``_iter_jsonl_reverse``; new code should import
 # ``tail_jsonl_records`` directly.
 _iter_jsonl_reverse = tail_jsonl_records
+
+
+def pending_forget_candidates_count(events_path: Path) -> int | None:
+    """Return the count from the most recent ``saga_decay_ok`` event,
+    iff that event flagged >0 candidates AND no ``saga_forget_ok``
+    event has occurred since. Otherwise None — meaning the persistent
+    "forget candidates pending" line should not render.
+
+    The clear rule is intentionally binary on event presence, not on
+    counts: a saga_forget_ok event newer than the latest saga_decay_ok
+    clears the block regardless of how many atoms were actually
+    forgotten or how many fresh candidates exist. The next decay run
+    re-establishes the count if it's still non-zero. Per-call count
+    arithmetic is fragile (forget can be partial, ranges can shift)
+    so we don't try.
+    """
+    latest_decay_ts: str | None = None
+    latest_decay_count: int | None = None
+    latest_forget_ts: str | None = None
+    for ev in tail_jsonl_records(events_path):
+        evtype = ev.get("type")
+        ts = ev.get("timestamp")
+        if not isinstance(ts, str):
+            continue
+        if evtype == "saga_decay_ok" and latest_decay_ts is None:
+            latest_decay_ts = ts
+            result = ev.get("result") or {}
+            if isinstance(result, dict):
+                cands = result.get("forgetting_candidates")
+                if isinstance(cands, (int, float)):
+                    latest_decay_count = int(cands)
+        elif evtype == "saga_forget_ok" and latest_forget_ts is None:
+            latest_forget_ts = ts
+        if latest_decay_ts is not None and latest_forget_ts is not None:
+            break
+
+    if latest_decay_count is None or latest_decay_count <= 0:
+        return None
+    if latest_forget_ts is not None and latest_forget_ts > latest_decay_ts:
+        return None
+    return latest_decay_count

@@ -23,6 +23,7 @@ from claude_agent_sdk import SdkMcpTool, tool
 
 from ._context import get_current_turn
 from ._tool_helpers import _ArgError, _content_block, _need, _safe
+from .event_logger import log_event
 from .saga_client import SagaClient, SagaError
 from .session_boundary_log import SessionBoundaryLog
 
@@ -444,7 +445,75 @@ def build_saga_tools(
             f"saga_end_session ok: session_id={session_id} atom_id={payload.get('atom_id')}"
         )
 
-    return [saga_query, saga_store, saga_feedback, saga_mark_contributions, saga_end_session]
+    @tool(
+        "saga_forget",
+        "Run saga's intentional-forgetting engine — review or remove "
+        "atoms that the last decay cycle flagged as low-value (low "
+        "retrieval, negative contribution, contradicted, or below the "
+        "confidence floor and past grace_days). PREVIEW FIRST: keep "
+        "dry_run=true (the default) to inspect the candidate list "
+        "before acting. Set dry_run=false only after reviewing — "
+        "forgetting is irreversible. Use this when the ## Self-state "
+        "block reports pending forget candidates; a successful "
+        "non-dry-run call clears that line until the next decay cycle.",
+        {
+            "type": "object",
+            "properties": {
+                "dry_run": {"type": "boolean"},
+                "min_retrievals": {"type": "integer"},
+                "contribution_threshold": {"type": "number"},
+                "contradiction_threshold": {"type": "number"},
+                "confidence_floor": {"type": "number"},
+                "grace_days": {"type": "integer"},
+            },
+            "required": [],
+        },
+    )
+    @_safe("saga_forget")
+    async def saga_forget(args: dict[str, Any]) -> dict[str, Any]:
+        # dry_run defaults True both here and on the saga side — being
+        # explicit lets us key the event-emit decision off it cleanly.
+        dry_run = bool(args.get("dry_run", True))
+        kwargs: dict[str, Any] = {"dry_run": dry_run}
+        for key in (
+            "min_retrievals",
+            "contribution_threshold",
+            "contradiction_threshold",
+            "confidence_floor",
+            "grace_days",
+        ):
+            if key in args and args[key] is not None:
+                kwargs[key] = args[key]
+        try:
+            payload = await client.forget(**kwargs)
+        except SagaError as exc:
+            await log_event(
+                "saga_forget_error", error=str(exc), dry_run=dry_run,
+            )
+            return _content_block(f"saga_forget failed: {exc}", is_error=True)
+
+        # Only a non-dry-run call actually transitions atoms. The
+        # ## Self-state pending-line clears on saga_forget_ok presence,
+        # not count — emitting on dry_run would clear the nag without
+        # the agent having acted, which is exactly the bug we're
+        # avoiding. Dry-run results still come back in the tool reply
+        # so the agent can review.
+        if not dry_run:
+            await log_event(
+                "saga_forget_ok",
+                actions_taken=payload.get("actions_taken"),
+                total_candidates=payload.get("total_candidates"),
+                dry_run=False,
+            )
+
+        return _content_block(
+            json.dumps(payload, indent=2, ensure_ascii=False)
+        )
+
+    return [
+        saga_query, saga_store, saga_feedback, saga_mark_contributions,
+        saga_end_session, saga_forget,
+    ]
 
 
 def saga_tool_names() -> list[str]:
@@ -454,4 +523,5 @@ def saga_tool_names() -> list[str]:
         "mcp__mimir__saga_feedback",
         "mcp__mimir__saga_mark_contributions",
         "mcp__mimir__saga_end_session",
+        "mcp__mimir__saga_forget",
     ]
