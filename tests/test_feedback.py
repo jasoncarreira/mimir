@@ -12,6 +12,7 @@ from pathlib import Path
 from mimir.feedback import (
     FeedbackLog,
     FeedbackSignal,
+    pending_forget_candidates_count,
     render_feedback_block,
 )
 
@@ -385,3 +386,65 @@ def test_scheduled_tick_suppressed_renders_in_feedback(tmp_path: Path):
     assert block is not None
     assert "suppressed by arbiter" in block
     assert "plan_window_saturated" in block
+
+
+# ---- pending_forget_candidates_count -------------------------------------
+
+
+def test_pending_forget_returns_none_when_no_decay_event(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    _write_jsonl(events, [
+        {"timestamp": _ts(1), "type": "saga_consolidate_ok",
+         "result": {"clusters_processed": 3}},
+    ])
+    assert pending_forget_candidates_count(events) is None
+
+
+def test_pending_forget_returns_none_when_decay_had_zero_candidates(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    _write_jsonl(events, [
+        {"timestamp": _ts(1), "type": "saga_decay_ok",
+         "result": {"forgetting_candidates": 0}},
+    ])
+    assert pending_forget_candidates_count(events) is None
+
+
+def test_pending_forget_returns_count_from_latest_decay(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    _write_jsonl(events, [
+        {"timestamp": _ts(50), "type": "saga_decay_ok",
+         "result": {"forgetting_candidates": 3}},  # older — ignored
+        {"timestamp": _ts(1), "type": "saga_decay_ok",
+         "result": {"forgetting_candidates": 7}},  # latest — wins
+    ])
+    assert pending_forget_candidates_count(events) == 7
+
+
+def test_pending_forget_clears_when_forget_after_decay(tmp_path: Path):
+    """Block clears on saga_forget_ok presence newer than the latest
+    saga_decay_ok — count arithmetic deliberately not attempted."""
+    events = tmp_path / "events.jsonl"
+    _write_jsonl(events, [
+        {"timestamp": _ts(2), "type": "saga_decay_ok",
+         "result": {"forgetting_candidates": 7}},
+        {"timestamp": _ts(1), "type": "saga_forget_ok",
+         "actions_taken": 4},  # any forget event clears, regardless of count
+    ])
+    assert pending_forget_candidates_count(events) is None
+
+
+def test_pending_forget_persists_when_forget_predates_decay(tmp_path: Path):
+    """A forget from BEFORE the most recent decay doesn't clear the
+    block — the new decay's count is the source of truth."""
+    events = tmp_path / "events.jsonl"
+    _write_jsonl(events, [
+        {"timestamp": _ts(50), "type": "saga_forget_ok",
+         "actions_taken": 4},
+        {"timestamp": _ts(1), "type": "saga_decay_ok",
+         "result": {"forgetting_candidates": 5}},
+    ])
+    assert pending_forget_candidates_count(events) == 5
+
+
+def test_pending_forget_returns_none_when_file_missing(tmp_path: Path):
+    assert pending_forget_candidates_count(tmp_path / "nope.jsonl") is None
