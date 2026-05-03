@@ -74,6 +74,20 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
 }
 
 
+# Kinds where only the most recent occurrence in the window should
+# render. Cron-fired events (weekly maintenance) re-appear on every
+# heartbeat in the 24h algedonic window, otherwise — same line × 24
+# would crowd out genuinely-new positive signals like react_received
+# or saga_feedback_sent. Tail-first iteration means the first-seen
+# event for a kind in this set IS the most recent.
+_FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
+    "saga_consolidate_ok",
+    "introspection_ok",
+    "introspection_error",
+    "heartbeat_health",
+}
+
+
 # Render hooks: per-kind one-liner builders. Defaults to a generic
 # "<kind>: <event-type-specific note>" if no specialized renderer fits.
 def _render_event_line(rule_kind: str, ev: dict) -> str:
@@ -250,6 +264,11 @@ class FeedbackLog:
 
         negatives: list[FeedbackSignal] = []
         positives: list[FeedbackSignal] = []
+        # Kinds whose first occurrence (most recent, since we walk
+        # tail-first) we've already added — subsequent occurrences are
+        # skipped. Stops weekly cron events from re-appearing on every
+        # heartbeat for 24h.
+        seen_first_only: set[str] = set()
 
         # 1) events.jsonl — known event-type rules.
         for ev in _iter_jsonl_reverse(self.events_path):
@@ -277,6 +296,12 @@ class FeedbackLog:
                     polarity = ev_polarity
                 elif ev_polarity == "neutral":
                     continue
+            # First-occurrence-only kinds: skip duplicates. Tail-first
+            # iteration means we keep the most recent.
+            if kind in _FIRST_OCCURRENCE_ONLY_KINDS:
+                if kind in seen_first_only:
+                    continue
+                seen_first_only.add(kind)
             target = negatives if polarity == "negative" else positives
             if len(target) >= limit:
                 continue

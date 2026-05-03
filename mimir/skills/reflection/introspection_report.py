@@ -136,6 +136,38 @@ class Report:
 # ─── Aggregation ───────────────────────────────────────────────────────
 
 
+# Patterns for error-message normalization. Strip volatile tokens so
+# "FileNotFoundError: /tmp/abc" and "FileNotFoundError: /tmp/xyz" land
+# in the same bucket. Order matters — paths before numbers (paths
+# contain numbers) and numbers before short hex (longer hex first).
+import re as _re
+
+_NORMALIZE_PATTERNS: list[tuple["_re.Pattern[str]", str]] = [
+    # Filesystem paths (absolute and home-relative).
+    (_re.compile(r"(?:/[A-Za-z0-9_.-]+)+"), "<path>"),
+    # IPv4 addresses.
+    (_re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?\b"), "<ip>"),
+    # UUIDs (hyphenated, 8-4-4-4-12).
+    (_re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<uuid>"),
+    # Long hex ids (16+ hex chars — includes saga's 16-char tids).
+    (_re.compile(r"\b[0-9a-fA-F]{12,}\b"), "<hex>"),
+    # Bare integers (line numbers, sizes, timeouts).
+    (_re.compile(r"\b\d+\b"), "<n>"),
+]
+
+
+def _normalize_error_for_grouping(text: str) -> str:
+    """Collapse volatile tokens so similar errors group. Used as the
+    dict key in error_recurrence — the rendered preview still shows
+    the raw form."""
+    out = text
+    for pat, repl in _NORMALIZE_PATTERNS:
+        out = pat.sub(repl, out)
+    # Collapse runs of whitespace introduced by the substitutions.
+    out = " ".join(out.split())
+    return out
+
+
 def _parse_ts(raw: object) -> datetime | None:
     if not isinstance(raw, str):
         return None
@@ -173,11 +205,20 @@ def aggregate(
     recent_error_hours: int = 24,
     error_recurrence_top_n: int = 10,
 ) -> Report:
-    """Walk turns.jsonl + events.jsonl once, build a Report."""
+    """Walk turns.jsonl + events.jsonl once, build a Report.
+
+    Drift always uses a 14-day window (current week vs previous week)
+    regardless of ``days`` — otherwise the previous-week bucket is
+    empty and ``drift_stopped`` is always []. The outer scan extends
+    to ``max(days, 14)`` for that reason; non-drift sections still
+    respect the requested ``days`` cutoff."""
     now = now or datetime.now(tz=timezone.utc)
     cutoff = now - timedelta(days=days)
     drift_cur_start = now - timedelta(days=7)
     drift_prev_start = now - timedelta(days=14)
+    # Extend the read horizon so drift's previous-week bucket is
+    # populated when days < 14.
+    scan_cutoff = min(cutoff, drift_prev_start)
     recent_errors_cutoff = now - timedelta(hours=recent_error_hours)
 
     # Pass 1: turns.
@@ -200,24 +241,29 @@ def aggregate(
 
     for rec in _iter_jsonl(turns_log):
         ts = _parse_ts(rec.get("ts"))
-        if ts is None or ts < cutoff:
+        if ts is None or ts < scan_cutoff:
             continue
 
+        # Non-drift sections (tool usage, errors, etc.) still respect
+        # the requested ``days`` window — only drift looks further back.
+        in_window = ts >= cutoff
+
         trigger = str(rec.get("trigger") or "?")
-        stats = by_trigger[trigger]
-        stats.trigger = trigger
-        stats.total_turns += 1
-        if rec.get("error") is None:
-            stats.successful += 1
-        ch = rec.get("channel_id")
-        if isinstance(ch, str):
-            channels_by_trigger[trigger].add(ch)
-        dur_ms = rec.get("duration_ms")
-        if isinstance(dur_ms, (int, float)) and dur_ms > 0:
-            duration_sums[trigger] += float(dur_ms)
-            duration_counts[trigger] += 1
-            day = ts.strftime("%Y-%m-%d")
-            daily_perf[(day, trigger)].append(float(dur_ms) / 1000.0)
+        if in_window:
+            stats = by_trigger[trigger]
+            stats.trigger = trigger
+            stats.total_turns += 1
+            if rec.get("error") is None:
+                stats.successful += 1
+            ch = rec.get("channel_id")
+            if isinstance(ch, str):
+                channels_by_trigger[trigger].add(ch)
+            dur_ms = rec.get("duration_ms")
+            if isinstance(dur_ms, (int, float)) and dur_ms > 0:
+                duration_sums[trigger] += float(dur_ms)
+                duration_counts[trigger] += 1
+                day = ts.strftime("%Y-%m-%d")
+                daily_perf[(day, trigger)].append(float(dur_ms) / 1000.0)
 
         # Pair tool_call ↔ tool_result by id within this turn.
         events = rec.get("events") or []
@@ -230,24 +276,31 @@ def aggregate(
             etype = ev.get("type")
             if etype == "tool_call":
                 tid = ev.get("id")
-                name = ev.get("name") or "?"
+                name = ev.get("name")
+                # Skip nameless tool_calls — they shouldn't normally
+                # exist, but historic schema drift produced a few; the
+                # "?" sentinel poisons drift sets and tool-usage rows.
+                if not isinstance(name, str) or not name:
+                    continue
                 if isinstance(tid, str):
                     pending[tid] = name
-                tool_usage_counts[(trigger, name)][0] += 1
-                # Drift bucketing.
+                if in_window:
+                    tool_usage_counts[(trigger, name)][0] += 1
+                # Drift bucketing — always considered (window is the
+                # full 14-day scan; only this section uses pre-cutoff data).
                 if ts >= drift_cur_start:
                     cur_week_tools.add(name)
                 elif ts >= drift_prev_start:
                     prev_week_tools.add(name)
                 # Skill lifecycle: count Skill tool by skill arg.
-                if name == "Skill":
+                if in_window and name == "Skill":
                     args = ev.get("args") or {}
                     skill_name = (
                         args.get("skill") if isinstance(args, dict) else None
                     )
                     if isinstance(skill_name, str):
                         skill_counts[skill_name] += 1
-            elif etype == "tool_result":
+            elif etype == "tool_result" and in_window:
                 tid = ev.get("id")
                 is_error = bool(ev.get("is_error"))
                 tool_name = (
@@ -259,7 +312,11 @@ def aggregate(
                     if not isinstance(content, str):
                         content = str(content)
                     preview = content[:100].replace("\n", " ")
-                    error_recurrence[(tool_name, preview)].append(ts)
+                    # Normalize for grouping — strip volatile tokens
+                    # (paths, hex ids, line numbers, IPs) so similar
+                    # errors cluster instead of fragmenting per-call.
+                    norm = _normalize_error_for_grouping(preview)
+                    error_recurrence[(tool_name, norm)].append((ts, preview))
                     if ts >= recent_errors_cutoff:
                         recent_errors.append(RecentError(
                             ts=ts, trigger=trigger,
@@ -313,14 +370,20 @@ def aggregate(
             max_sec=round(max(durs), 2),
         ))
 
-    # Error recurrence: occurrences desc, top N.
+    # Error recurrence: occurrences desc, top N. The dict keys on the
+    # *normalized* form so similar errors cluster; the rendered preview
+    # uses the most-recent raw content so the agent sees a real example.
     recurrence_rows = []
-    for (tool, preview), occurrences in error_recurrence.items():
+    for (tool, _norm), entries in error_recurrence.items():
+        # entries: list of (ts, raw_preview) tuples
+        timestamps = [e[0] for e in entries]
+        latest = max(entries, key=lambda e: e[0])
         recurrence_rows.append(ErrorRecurrence(
-            tool_name=tool, preview=preview,
-            occurrences=len(occurrences),
-            first_seen=min(occurrences),
-            last_seen=max(occurrences),
+            tool_name=tool,
+            preview=latest[1],
+            occurrences=len(entries),
+            first_seen=min(timestamps),
+            last_seen=max(timestamps),
         ))
     recurrence_rows.sort(key=lambda r: -r.occurrences)
     recurrence_rows = recurrence_rows[:error_recurrence_top_n]

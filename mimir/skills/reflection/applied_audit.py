@@ -83,10 +83,6 @@ class AuditRow:
 # ─── Parsing proposed-changes.md ────────────────────────────────────────
 
 
-_HEADING_RE = re.compile(r"^##\s+(\d{4}-\d{2}-\d{2}\s+—\s+.+?)\s*$")
-_SECTION_RE = re.compile(r"^##\s+", re.MULTILINE)
-
-
 def _split_md_sections(body: str) -> list[tuple[str, str]]:
     """Return [(heading_text_without_##, section_body), ...] keeping
     everything in document order. Section body excludes the heading."""
@@ -446,8 +442,12 @@ def audit_window(
     proposal applied between ``weeks_back_max`` and ``weeks_back_min``
     weeks ago. Each row carries computed before/after signals."""
     now = now or datetime.now(tz=timezone.utc)
-    cutoff_min = now - timedelta(weeks=weeks_back_min)
-    cutoff_max = now - timedelta(weeks=weeks_back_max)
+    # weeks_back_min is the *newest* age we accept (e.g. 1w ago);
+    # weeks_back_max is the *oldest* (e.g. 4w ago). Naming the actual
+    # time bounds avoids the cutoff_min/cutoff_max trap where "min" of
+    # an age range is the *newer* end of the time range.
+    newest_ts = now - timedelta(weeks=weeks_back_min)
+    oldest_ts = now - timedelta(weeks=weeks_back_max)
     applied = load_applied_proposals(home / "state" / "applied-proposals.jsonl")
     rows: list[AuditRow] = []
     for p in applied:
@@ -455,7 +455,7 @@ def audit_window(
             ts = datetime.fromisoformat(p.applied_at.replace("Z", "+00:00"))
         except ValueError:
             continue
-        if not (cutoff_max <= ts <= cutoff_min):
+        if not (oldest_ts <= ts <= newest_ts):
             continue
         signals = compute_signals(
             p,

@@ -125,6 +125,36 @@ def test_aggregate_recurring_errors_sorted_by_count(tmp_path: Path):
     assert rep.error_recurrence[0].occurrences == 3
 
 
+def test_recurring_errors_group_volatile_paths(tmp_path: Path):
+    """§12.4 review #10: paths/ids/numbers should be normalized so
+    'FileNotFoundError /tmp/abc' and 'FileNotFoundError /tmp/xyz'
+    cluster instead of fragmenting per-call."""
+    turns = tmp_path / "turns.jsonl"
+    events = tmp_path / "events.jsonl"
+    # Five errors with different paths but same shape.
+    for i, p in enumerate(["/tmp/abc", "/var/log/foo", "/Users/jcarreira/x",
+                           "/tmp/zzz", "/etc/y"]):
+        _write_turn(turns, ts=NOW - timedelta(hours=i + 1),
+                    tool_calls=[("Read", True, f"FileNotFoundError: {p}")])
+    rep = aggregate(turns, events, days=7, now=NOW)
+    # All 5 cluster into a single recurrence row.
+    assert len(rep.error_recurrence) == 1
+    assert rep.error_recurrence[0].occurrences == 5
+    # Preview shows a real raw path (not the normalized form).
+    assert "/" in rep.error_recurrence[0].preview
+
+
+def test_recurring_errors_group_volatile_numbers(tmp_path: Path):
+    turns = tmp_path / "turns.jsonl"
+    events = tmp_path / "events.jsonl"
+    for i, n in enumerate([42, 100, 9999]):
+        _write_turn(turns, ts=NOW - timedelta(hours=i + 1),
+                    tool_calls=[("Bash", True, f"exit code {n} after timeout")])
+    rep = aggregate(turns, events, days=7, now=NOW)
+    assert len(rep.error_recurrence) == 1
+    assert rep.error_recurrence[0].occurrences == 3
+
+
 def test_recent_errors_capped_to_24h(tmp_path: Path):
     turns = tmp_path / "turns.jsonl"
     events = tmp_path / "events.jsonl"
@@ -152,6 +182,44 @@ def test_drift_started_and_stopped(tmp_path: Path):
     rep = aggregate(turns, events, days=14, now=NOW)
     assert "Read" in rep.drift_started
     assert "Bash" in rep.drift_stopped
+
+
+def test_drift_works_at_default_days_7(tmp_path: Path):
+    """§12.4 review #1: with the default --days 7 the previous-week
+    bucket was empty (records pre-cutoff were filtered before drift
+    ran). Now drift extends the scan internally to 14 days."""
+    turns = tmp_path / "turns.jsonl"
+    events = tmp_path / "events.jsonl"
+    _write_turn(turns, ts=NOW - timedelta(days=2),
+                tool_calls=[("Read", False, "")])
+    _write_turn(turns, ts=NOW - timedelta(days=10),
+                tool_calls=[("Bash", False, "")])
+    rep = aggregate(turns, events, days=7, now=NOW)
+    assert "Read" in rep.drift_started
+    assert "Bash" in rep.drift_stopped
+
+
+def test_nameless_tool_calls_excluded_from_drift(tmp_path: Path):
+    """§12.4 review #15: tool_calls with missing/empty name shouldn't
+    poison the drift sets with a '?' entry."""
+    turns = tmp_path / "turns.jsonl"
+    events = tmp_path / "events.jsonl"
+    # Write a turn with a manually-crafted nameless tool_call.
+    import json
+    rec = {
+        "ts": (NOW - timedelta(hours=1)).isoformat(),
+        "turn_id": "t1", "session_id": "s", "saga_session_id": None,
+        "trigger": "user_message", "channel_id": "c", "input": "",
+        "events": [{"type": "tool_call", "id": "u1", "name": "", "args": {}}],
+        "duration_ms": 100, "error": None,
+    }
+    turns.parent.mkdir(parents=True, exist_ok=True)
+    with turns.open("w") as f:
+        f.write(json.dumps(rec) + "\n")
+    rep = aggregate(turns, events, days=14, now=NOW)
+    assert "?" not in rep.drift_started
+    assert "?" not in rep.drift_stopped
+    assert all(t.tool_name != "?" for t in rep.tool_usage)
 
 
 # ─── performance trends ────────────────────────────────────────────────

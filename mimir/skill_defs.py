@@ -32,6 +32,24 @@ def _bundled_skill_names() -> list[str]:
     )
 
 
+def installed_skill_names(home: Path) -> list[str]:
+    """Enumerate every skill currently installed under
+    ``<home>/.claude/skills/`` — bundled + user-added. Used by the
+    §12.3 ranker so user-installed skills appear in the prompt's
+    ``## Skills`` block alongside bundled ones."""
+    skills_dir = home / ".claude" / "skills"
+    if not skills_dir.is_dir():
+        return sorted(_bundled_skill_names())
+    on_disk = {
+        entry.name
+        for entry in skills_dir.iterdir()
+        if entry.is_dir() and (entry / "SKILL.md").is_file()
+    }
+    # Union with bundled names so a fresh-install home (skills not yet
+    # seeded) still shows the bundled set rather than nothing.
+    return sorted(on_disk | set(_bundled_skill_names()))
+
+
 def seed_skills(home: Path) -> dict[str, str]:
     """Copy missing skill folders to ``<home>/.claude/skills/<name>/``.
 

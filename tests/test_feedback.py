@@ -315,6 +315,33 @@ def test_introspection_report_ok_surfaces_output_path(tmp_path: Path):
     assert "92%" in block
 
 
+def test_cron_events_dedup_to_most_recent(tmp_path: Path):
+    """§12.4 review #13: hourly heartbeats × 24h algedonic window
+    means saga_consolidate_ok would re-appear in 24 prompts. Only the
+    most recent occurrence should render."""
+    # JSONL is appended chronologically — write oldest first so
+    # tail-first iteration reads most-recent first.
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(5.0), "type": "saga_consolidate_ok",
+         "session_id": "s",
+         "result": {"clusters_processed": 1, "atoms_merged": 1}},
+        {"timestamp": _ts(2.0), "type": "saga_consolidate_ok",
+         "session_id": "s",
+         "result": {"clusters_processed": 99, "atoms_merged": 99}},
+        # Most recent — should win.
+        {"timestamp": _ts(0.5), "type": "saga_consolidate_ok",
+         "session_id": "s",
+         "result": {"clusters_processed": 5, "atoms_merged": 7}},
+    ])
+    block = log.recent_block()
+    assert block is not None
+    # Most-recent (5 clusters / 7 merged) should be the only one rendered.
+    assert "5 clusters" in block
+    assert "7 merged" in block
+    assert "99 clusters" not in block
+    assert "1 clusters" not in block
+
+
 def test_introspection_report_error_renders_as_negative(tmp_path: Path):
     log = _make_log(tmp_path, events=[
         {

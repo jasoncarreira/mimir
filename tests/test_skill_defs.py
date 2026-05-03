@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mimir.skill_defs import _bundled_skill_names, seed_skills
+from mimir.skill_defs import (
+    _bundled_skill_names,
+    installed_skill_names,
+    seed_skills,
+)
 
 
 def test_bundled_skills_include_expected_set():
@@ -136,3 +140,34 @@ def test_seed_skills_cleans_up_tmp_from_prior_crash(tmp_path: Path):
     # Either way it shouldn't survive as ``<name>.tmp``.
     assert not leftover.exists()
     assert (tmp_path / ".claude" / "skills" / "memory" / "SKILL.md").is_file()
+
+
+def test_installed_skill_names_includes_user_added_skills(tmp_path: Path):
+    """§12.4 review #11: skills the user adds under <home>/.claude/skills/
+    should appear in the ranker's input alongside bundled skills."""
+    seed_skills(tmp_path)
+    user_skill = tmp_path / ".claude" / "skills" / "my-custom-skill"
+    user_skill.mkdir(parents=True)
+    (user_skill / "SKILL.md").write_text("---\nname: my-custom-skill\n---\nbody")
+
+    names = installed_skill_names(tmp_path)
+    assert "my-custom-skill" in names
+    # Bundled set still present.
+    assert "memory" in names
+
+
+def test_installed_skill_names_falls_back_to_bundled_for_fresh_home(tmp_path: Path):
+    """No .claude/skills dir yet: fall back to the bundled set so a
+    fresh agent that hasn't run setup still gets a populated ranker."""
+    names = installed_skill_names(tmp_path)
+    assert "memory" in names
+    assert "heartbeat" in names
+
+
+def test_installed_skill_names_skips_dirs_without_skill_md(tmp_path: Path):
+    """A directory without a SKILL.md is not a valid skill — skip it."""
+    skills = tmp_path / ".claude" / "skills"
+    skills.mkdir(parents=True)
+    (skills / "broken").mkdir()  # no SKILL.md
+    names = installed_skill_names(tmp_path)
+    assert "broken" not in names
