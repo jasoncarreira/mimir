@@ -36,6 +36,107 @@ DEFAULT_STABILITY_REDUCTION = _cfg('consolidation', 'stability_reduction_factor'
 
 # ─── P35: structured-output parsing for consolidation ───────────
 
+# P48: canonical-vocabulary seeding for the consolidation prompt.
+# The LLM gets nudged (not forced) to reuse these intent predicates
+# instead of inventing compound domain-specific ones (prefers vs
+# prefers_podcast_length). Detail moves into the OBJECT.
+_CANONICAL_PREDICATE_SEED: list[str] = [
+    # Personal-claim intents (the long tail offender pre-P48).
+    "prefers", "likes", "dislikes", "loves", "hates",
+    "has", "owns", "uses",
+    "works_at", "lives_in", "lived_in",
+    "knows", "discussed", "mentioned", "asked_about",
+    "recommends", "follows",
+    # Domain-action verbs commonly seen organically (kept as
+    # canonical so the seed list looks realistic to the LLM).
+    "offers", "includes", "provides", "supports",
+    "located_in", "has_feature",
+]
+_CANONICAL_SUBJECT_SEED: list[str] = ["User"]
+
+
+def _canonical_vocab_block(
+    conn,
+    *,
+    top_n_predicates: int = 25,
+    top_n_subjects: int = 15,
+) -> str:
+    """Build the canonical-predicate / canonical-subject context block
+    for the consolidation prompt. Surfaces existing high-frequency
+    predicates and subjects from the DB so the LLM can canonicalize
+    against the live vocabulary instead of inventing fresh predicate
+    names per cluster (the 9,997-distinct-predicate problem from the
+    P42 Sonnet bench corpus).
+
+    Falls back to a static seed when the DB has no triples yet
+    (cold start). The static seed is also unioned with whatever the
+    DB returns, so a fresh DB sees the seed and starts canonicalizing
+    immediately rather than re-deriving the canonical set from zero.
+
+    Returns an empty string when the helper can't read the DB —
+    consolidation continues with the bare prompt rather than crashing.
+    """
+    pred_lines: list[str] = []
+    subj_lines: list[str] = []
+    seen_preds: set[str] = set()
+    seen_subjs: set[str] = set()
+    try:
+        rows = conn.execute(
+            "SELECT predicate, COUNT(*) c FROM triples "
+            "WHERE state = 'active' "
+            "GROUP BY predicate ORDER BY c DESC LIMIT ?",
+            (top_n_predicates,),
+        ).fetchall()
+        for r in rows:
+            pred = (r[0] if not isinstance(r, dict) else r["predicate"]) or ""
+            cnt = (r[1] if not isinstance(r, dict) else r["c"]) or 0
+            if pred and pred not in seen_preds:
+                pred_lines.append(f"{pred} ({int(cnt)})")
+                seen_preds.add(pred)
+        rows = conn.execute(
+            "SELECT subject, COUNT(*) c FROM triples "
+            "WHERE state = 'active' "
+            "GROUP BY subject ORDER BY c DESC LIMIT ?",
+            (top_n_subjects,),
+        ).fetchall()
+        for r in rows:
+            subj = (r[0] if not isinstance(r, dict) else r["subject"]) or ""
+            cnt = (r[1] if not isinstance(r, dict) else r["c"]) or 0
+            if subj and subj not in seen_subjs:
+                subj_lines.append(f"{subj} ({int(cnt)})")
+                seen_subjs.add(subj)
+    except Exception:
+        # DB read failed — fall back to seed-only.
+        pass
+
+    # Union with the static seed so a fresh DB still sees the canonical
+    # vocabulary. Seed entries omit counts to keep them visually distinct
+    # from real DB-derived counts.
+    for p in _CANONICAL_PREDICATE_SEED:
+        if p not in seen_preds:
+            pred_lines.append(p)
+            seen_preds.add(p)
+    for s in _CANONICAL_SUBJECT_SEED:
+        if s not in seen_subjs:
+            subj_lines.append(s)
+            seen_subjs.add(s)
+
+    if not pred_lines and not subj_lines:
+        return ""
+
+    parts: list[str] = []
+    parts.append(
+        "Existing canonical vocabulary (PREFER reusing these — counts "
+        "in parens for DB-derived entries; bare names are seed values):"
+    )
+    if pred_lines:
+        parts.append("Predicates: " + ", ".join(pred_lines))
+    if subj_lines:
+        parts.append("Subjects: " + ", ".join(subj_lines))
+    parts.append("")  # trailing newline before the next prompt section
+    return "\n".join(parts) + "\n"
+
+
 def _parse_structured_synthesis(
     text: str,
 ) -> tuple[str | None, list[dict], list[str]]:
@@ -596,6 +697,24 @@ class ConsolidationEngine:
         # output shape, so this is purely a prompt simplification.
         ask_for_triples = bool(_cfg('triples', 'enable_extraction', False))
 
+        # P48: canonical predicate + subject vocabulary block, computed
+        # once per consolidation pass and injected into every cluster's
+        # prompt. Off by default for back-compat / minimum-tokens
+        # bench config; flip on with [consolidation]
+        # enable_canonical_vocab_block = true. When triples extraction
+        # is off the block is irrelevant (no TRIPLES section asked for),
+        # so it's also force-disabled in that mode.
+        vocab_block = ""
+        if ask_for_triples and bool(_cfg(
+            'consolidation', 'enable_canonical_vocab_block', False,
+        )):
+            try:
+                _vb_conn = get_db()
+                vocab_block = _canonical_vocab_block(_vb_conn)
+                _vb_conn.close()
+            except Exception:
+                vocab_block = ""
+
         import re as _re
         _prefix_pat = _re.compile(r"^\[Consolidated from \d+ atoms?\]\s*")
 
@@ -714,9 +833,17 @@ class ConsolidationEngine:
                         f"- Subject must be a NAMED ENTITY (person, system, tool, place), max 30 chars\n"
                         f"- Object must be a SHORT SPECIFIC VALUE, max 30 chars\n"
                         f"- Predicate must be lowercase_snake_case\n"
+                        f"- PREFER reusing canonical intent predicates over inventing\n"
+                        f"  domain-specific compounds. Detail goes in the OBJECT, not the\n"
+                        f"  predicate. Instead of (User, prefers_podcast_length, 20-30_minutes),\n"
+                        f"  emit (User, prefers, podcast_length=20-30_minutes). You MAY\n"
+                        f"  introduce a new predicate when no canonical fits — typically for\n"
+                        f"  domain relations between two non-User entities, e.g.\n"
+                        f"  (CompanyX, manufactures, ProductY).\n"
                         f"- Implicit subject 'User' for user-preference statements\n"
                         f"- Lists become multiple triples (one per item)\n"
                         f"- Skip emotional/philosophical/meta-commentary content (write NONE)\n\n"
+                        f"{vocab_block}"
                         f"Rules for TEMPORAL TAGS (optional valid_from/valid_until):\n"
                         f"- Use ONLY when the atoms show a fact CHANGED over time. Take the\n"
                         f"  ``YYYY-MM-DD`` from the dated atom prefix(es).\n"
