@@ -727,15 +727,15 @@ class ConsolidationEngine:
 
         # P48: canonical predicate + subject vocabulary block, computed
         # once per consolidation pass and injected into every cluster's
-        # prompt. Off by default for back-compat / minimum-tokens
-        # bench config; flip on with [consolidation]
-        # enable_canonical_vocab_block = true. When triples extraction
-        # is off the block is irrelevant (no TRIPLES section asked for),
-        # so it's also force-disabled in that mode.
+        # prompt. Always on when triples extraction is enabled — this
+        # is just a prompt-level vocabulary hint, not enforcement, and
+        # it's the right default for any deployment that produces
+        # triples (the LLM still picks predicates that fit the data;
+        # the canonical list reduces aliasing where possible). When
+        # triples extraction is off the block is irrelevant (no TRIPLES
+        # section asked for), so we skip computing it in that mode.
         vocab_block = ""
-        if ask_for_triples and bool(_cfg(
-            'consolidation', 'enable_canonical_vocab_block', False,
-        )):
+        if ask_for_triples:
             try:
                 _vb_conn = get_db()
                 vocab_block = _canonical_vocab_block(

@@ -2,8 +2,11 @@
 
 Covers:
 - _canonical_vocab_block helper: DB-driven + seed fallback
-- Consolidation prompt integration: block is included only when both
-  triples extraction is on AND enable_canonical_vocab_block is true
+- Consolidation prompt integration: block is included whenever
+  triples extraction is enabled (P48 is always-on in that mode); the
+  block — and the "PREFER reusing" rule that references it — is
+  omitted when triples extraction is off (no TRIPLES section asked
+  for, so the vocab hint would be irrelevant).
 """
 
 import sqlite3
@@ -219,12 +222,12 @@ def test_vocab_block_never_emits_count_for_seed_only_entries():
 # ─── Prompt integration ────────────────────────────────────────────────
 
 
-def test_prompt_omits_vocab_block_when_flag_off(monkeypatch):
-    """Default behavior: ask_for_triples=True but
-    enable_canonical_vocab_block=False → no PREFER reusing line."""
+def test_prompt_omits_vocab_block_when_triples_off(monkeypatch):
+    """When triples extraction is off the vocab block is irrelevant
+    (no TRIPLES section asked for) so it should not be computed or
+    included in the prompt."""
     from saga.config import _DEFAULTS
-    monkeypatch.setitem(_DEFAULTS["consolidation"], "enable_canonical_vocab_block", False)
-    monkeypatch.setitem(_DEFAULTS["triples"], "enable_extraction", True)
+    monkeypatch.setitem(_DEFAULTS["triples"], "enable_extraction", False)
 
     from saga.consolidation import ConsolidationEngine
     from saga.core import store_atom
@@ -266,14 +269,15 @@ def test_prompt_omits_vocab_block_when_flag_off(monkeypatch):
 
     if prompts:
         joined = "\n---\n".join(prompts)
-        assert "PREFER reusing" in joined, "soft-canonical rule should always be present"
-        # But with flag off, no DB-derived vocab block.
+        # Triples extraction is off → no TRIPLES section, no canonical
+        # vocab block, no PREFER-reusing rule (which lives inside the
+        # TRIPLES rules block).
         assert "Existing canonical vocabulary" not in joined
+        assert "PREFER reusing" not in joined
 
 
-def test_prompt_includes_vocab_block_when_flag_on(monkeypatch):
+def test_prompt_includes_vocab_block_when_triples_on(monkeypatch):
     from saga.config import _DEFAULTS
-    monkeypatch.setitem(_DEFAULTS["consolidation"], "enable_canonical_vocab_block", True)
     monkeypatch.setitem(_DEFAULTS["triples"], "enable_extraction", True)
 
     from saga.consolidation import ConsolidationEngine
