@@ -229,6 +229,15 @@ _DEFAULTS = {
         "min_cluster_size": 3,
         "max_clusters_per_run": 50,
         "stability_reduction_factor": 0.5,
+        # P48: when True, the consolidation prompt gets a "canonical
+        # vocabulary" block listing the top-N existing predicates and
+        # subjects from the DB (with counts) plus a static seed. The
+        # LLM is nudged to canonicalize against the live vocabulary
+        # instead of inventing compound predicates per cluster
+        # (the 9,997-distinct-predicate problem from the P42 Sonnet
+        # bench corpus). Off by default for back-compat; flip on in
+        # the saga_p48.toml bench TOML to test.
+        "enable_canonical_vocab_block": False,
     },
     "negative_knowledge": {
         "default_ttl_hours": 168,

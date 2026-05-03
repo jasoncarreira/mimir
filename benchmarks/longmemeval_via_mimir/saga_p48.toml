@@ -1,0 +1,91 @@
+# Integration bench: P30 canonical + P48 (canonical predicate vocabulary
+# in consolidation prompt).
+#
+# Sole delta vs saga_p30.toml = enable_canonical_vocab_block = true.
+# The consolidation prompt now includes a soft-canonical seed list +
+# DB-derived top predicates / subjects, nudging the LLM to canonicalize
+# (prefers / likes / has / ...) instead of inventing compound predicates
+# (prefers_podcast_length / prefers_themes / prefers_necklace_style / ...).
+# Detail moves into the OBJECT.
+#
+# Pre-bench validation: run a 50q preference-only slice first and confirm
+# the predicate-fragmentation drops meaningfully before committing to a
+# full 500q.
+#
+# Pair config: saga_p30.toml.
+
+[storage]
+db_path = "saga.db"
+metrics_db_path = "saga_metrics.db"
+token_budget_ceiling = 100000000
+auto_compact_threshold_pct = 99
+refuse_threshold_pct = 100
+db_busy_timeout_ms = 5000
+
+[embedding]
+provider = "openai"
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dimensions = 1536
+api_key_env = "OPENAI_API_KEY"
+
+[llm]
+provider = "openai_compat"
+url = "https://api.openai.com/v1/chat/completions"
+model = "gpt-5.4-nano"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 120
+
+[retrieval]
+enable_contextual_rewrite = true
+two_tier_enabled = true
+enable_missing_ref_pivot = true
+enable_confidence_gating = true
+default_min_confidence_tier = "low"
+enable_triple_augment_v2 = false
+enable_subatom_beam = false
+# P42: also surface triples to the agent so the canonicalization payoff
+# (more clusterable preference triples → better cosine recall) actually
+# reaches the reader. Without this, the canonical vocabulary improves
+# the DB but the agent never sees the triples directly.
+include_triples_in_response = true
+response_triples_top_k = 5
+
+[retrieval_v2]
+enable_query_expansion = true
+
+[triples]
+enable_extraction = true
+
+[consolidation]
+enabled = true
+enable_llm = true
+# P48: inject canonical predicate vocabulary into the prompt.
+enable_canonical_vocab_block = true
+
+[benchmark]
+enable_session_boundaries = false
+enable_mark_contributions = false
+
+[compression]
+enable_subatom = false
+enable_fact_dedup = false
+enable_synthesis = false
+
+[annotation]
+use_llm = false
+
+[prediction]
+enabled = false
+
+[world_model]
+enabled = false
+
+[decay]
+enabled = false
+
+[atoms]
+auto_resolve_supersedes_on_write = false
+
+[server]
+api_key = ""
