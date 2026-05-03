@@ -116,6 +116,8 @@ class SagaClient(Protocol):
         extra_canonical_subjects: list[str] | None = None,
     ) -> dict[str, Any]: ...
 
+    async def decay(self) -> dict[str, Any]: ...
+
     async def recent_session_boundaries(
         self, *, channel_id: str | None = None, count: int = 3,
     ) -> list[dict[str, Any]]: ...
@@ -407,6 +409,25 @@ class _InProcessSaga:
         except Exception as exc:
             raise SagaError(f"in-process saga consolidate failed: {exc}") from exc
 
+    async def decay(self) -> dict[str, Any]:
+        """Run saga's decay cycle — recompute retrievability, fade/
+        dormant state transitions, profile compaction. Surfaces
+        forgetting candidates as part of the result; doesn't act on
+        them (POST /v1/forget is the explicit removal path)."""
+        await self._ensure_ready()
+
+        def _do() -> dict[str, Any]:
+            from saga.decay import run_decay_cycle
+            result = run_decay_cycle() or {}
+            if not isinstance(result, dict):
+                return {"result": result}
+            return result
+
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as exc:
+            raise SagaError(f"in-process saga decay failed: {exc}") from exc
+
     async def recent_session_boundaries(
         self, *, channel_id: str | None = None, count: int = 3,
     ) -> list[dict[str, Any]]:
@@ -629,6 +650,10 @@ class _HttpSaga:
         if extra_canonical_subjects:
             body["extra_canonical_subjects"] = list(extra_canonical_subjects)
         return await self._post("/v1/consolidate", body)
+
+    async def decay(self) -> dict[str, Any]:
+        """Run saga's decay cycle via /v1/decay."""
+        return await self._post("/v1/decay", {})
 
     async def recent_session_boundaries(
         self, *, channel_id: str | None = None, count: int = 3,

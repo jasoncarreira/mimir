@@ -309,10 +309,37 @@ class Scheduler:
             raise ValueError(f"invalid cron expression {cron_expr!r}: {exc}") from exc
 
         async def _consolidate() -> None:
-            # Load identities.yaml at FIRE TIME so operator edits between
-            # runs propagate without a server restart. Best effort: a
-            # missing / unparseable file just means seed-only behavior
-            # for this run.
+            # Step 1: decay BEFORE consolidation. Decay recomputes
+            # retrievability, runs state transitions (active → fading →
+            # dormant), compacts profiles, and surfaces forgetting
+            # candidates. Running it first means consolidation sees
+            # the fresher stability signal when deciding which atoms
+            # to merge. Forgetting itself stays manual (/v1/forget) so
+            # an operator or the agent reviews candidates first.
+            try:
+                decay_payload = await saga_client.decay()
+                await log_event(
+                    "saga_decay_ok",
+                    result=_summarize_decay(decay_payload),
+                )
+            except SagaError as exc:
+                await log_event(
+                    "saga_decay_error",
+                    error=str(exc),
+                    status=getattr(exc, "status", None),
+                )
+                # Don't bail — consolidation can still run on the
+                # un-decayed state; we just log and continue.
+            except Exception as exc:  # noqa: BLE001
+                await log_event(
+                    "saga_decay_error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+            # Step 2: consolidation. Load identities.yaml at FIRE TIME
+            # so operator edits between runs propagate without a server
+            # restart. Best effort: a missing / unparseable file just
+            # means seed-only behavior for this run.
             extra_canonical_subjects: list[str] | None = None
             if home is not None:
                 try:
@@ -453,3 +480,34 @@ def _summarize_consolidate(payload: Any) -> dict:
         for k in ("clusters_processed", "atoms_merged", "atoms_retired", "duration_s")
         if k in payload
     }
+
+
+def _summarize_decay(payload: Any) -> dict:
+    """Pick the salient fields out of saga.decay.run_decay_cycle's
+    return dict for the saga_decay_ok event payload. Forgetting
+    candidate counts surface here when present so the agent's
+    feedback block can hint at review-worthy items."""
+    if not isinstance(payload, dict):
+        return {"raw": str(payload)[:200]}
+    # Keys come from saga/decay.py:run_decay_cycle's `summary` dict.
+    keys = (
+        "atoms_retrievability_updated",
+        "atoms_faded", "atoms_dormanted", "atoms_protected",
+        "atoms_compacted", "tokens_freed",
+        "budget_before_pct", "budget_after_pct",
+        "total_active", "total_fading", "total_dormant",
+        "forgetting_candidates", "forgetting_actions",
+        "elapsed_seconds",
+    )
+    out: dict = {}
+    for k in keys:
+        if k in payload:
+            v = payload[k]
+            if isinstance(v, list):
+                out[k] = len(v)
+            elif isinstance(v, dict):
+                out[k] = {kk: vv for kk, vv in v.items()
+                          if not isinstance(vv, (list, dict))}
+            else:
+                out[k] = v
+    return out
