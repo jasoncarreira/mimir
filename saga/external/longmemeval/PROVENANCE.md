@@ -27,14 +27,13 @@ runs.
 ## What's NOT here
 
 The **dataset** itself (`longmemeval_s_cleaned.json`, ~277 MB) is too big
-for this repo. It lives outside the working tree at:
+for this repo. Fetch it from upstream's data release and place it
+somewhere on the filesystem; the bench runner accepts an explicit
+`--dataset <path>` argument.
 
-```
-/Users/jcarreira/projects/odin/msam/data/longmemeval/longmemeval_s_cleaned.json
-```
-
-Operators on different machines can fetch it from upstream's data release
-and put it wherever; the bench runner accepts an explicit path.
+Convention used in this repo's bench scripts: the dataset lives at
+`<your-data-root>/longmemeval/longmemeval_s_cleaned.json`. Override
+the path per-run as needed.
 
 ## Sync history
 

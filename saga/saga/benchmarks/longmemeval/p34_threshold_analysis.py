@@ -10,7 +10,7 @@ between every pair of atoms and histogram by threshold band. Surfaces:
   LongMemEval's conversation-style content (vs Mimir's news-feed style)
 
 Usage:
-    set -a; source /Users/jcarreira/projects/odin/msam/.env; set +a
+    set -a; source <repo>/.env; set +a
     PYTHONPATH=. python -m saga.benchmarks.longmemeval.p34_threshold_analysis
         [--sample-size N]   # sample N questions; default 10 (smaller than P33 — pairwise O(n²))
 """
