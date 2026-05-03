@@ -49,6 +49,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "saga_query_error": ("negative", "saga_query_error"),
     "saga_feedback_error": ("negative", "saga_feedback_error"),
     "saga_consolidate_error": ("negative", "saga_consolidate_error"),
+    "saga_decay_error": ("negative", "saga_decay_error"),
     "saga_synthesis_dispatch_failed": ("negative", "synth_dispatch_fail"),
     "saga_synthesis_empty_window": ("negative", "synth_empty_window"),
     "cost_rate_alert": ("negative", "cost_rate"),
@@ -71,6 +72,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # for the introspection report, which produces a markdown file the
     # agent should know about so it can Read it.
     "saga_consolidate_ok": ("positive", "saga_consolidate_ok"),
+    "saga_decay_ok": ("positive", "saga_decay_ok"),
     "introspection_report_ok": ("positive", "introspection_ok"),
 }
 
@@ -83,6 +85,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
 # event for a kind in this set IS the most recent.
 _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "saga_consolidate_ok",
+    "saga_decay_ok",
     "introspection_ok",
     "introspection_error",
     "heartbeat_health",
@@ -112,6 +115,8 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f"SAGA feedback failed: {ev.get('error') or '(no detail)'}"
     if rule_kind == "saga_consolidate_error":
         return f"SAGA consolidation failed: {ev.get('error') or '(no detail)'}"
+    if rule_kind == "saga_decay_error":
+        return f"SAGA decay failed: {ev.get('error') or '(no detail)'}"
     if rule_kind == "synth_dispatch_fail":
         return f"SAGA synthesis dispatch failed: {ev.get('error') or '(no detail)'}"
     if rule_kind == "synth_empty_window":
@@ -190,6 +195,38 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             detail = ", ".join(parts) if parts else "no detail"
             return f"saga consolidation ran ({detail})"
         return "saga consolidation ran"
+    if rule_kind == "saga_decay_ok":
+        result = ev.get("result") or {}
+        if isinstance(result, dict):
+            updated = result.get("atoms_retrievability_updated")
+            faded = result.get("atoms_faded")
+            dormanted = result.get("atoms_dormanted")
+            compacted = result.get("atoms_compacted")
+            candidates = result.get("forgetting_candidates")
+            duration = result.get("elapsed_seconds")
+            parts: list[str] = []
+            if isinstance(updated, (int, float)):
+                parts.append(f"{int(updated)} retrievability updates")
+            transitions_total = 0
+            if isinstance(faded, (int, float)):
+                transitions_total += int(faded)
+            if isinstance(dormanted, (int, float)):
+                transitions_total += int(dormanted)
+            if transitions_total:
+                parts.append(f"{transitions_total} state transitions")
+            if isinstance(compacted, (int, float)) and compacted:
+                parts.append(f"{int(compacted)} compacted")
+            if isinstance(duration, (int, float)):
+                parts.append(f"{duration:.1f}s")
+            detail = ", ".join(parts) if parts else "no detail"
+            tail = ""
+            if isinstance(candidates, (int, float)) and candidates > 0:
+                tail = (
+                    f" — {int(candidates)} forget candidates ready "
+                    f"(POST /v1/forget with dry_run=true to preview)"
+                )
+            return f"saga decay ran ({detail}){tail}"
+        return "saga decay ran"
     if rule_kind == "introspection_ok":
         # The output file path is the load-bearing detail — the agent
         # should be able to grep this line and Read the report.

@@ -183,6 +183,8 @@ async def test_saga_consolidate_threads_canonical_subjects(tmp_path: Path):
     captured: dict = {}
 
     class _FakeSagaClient:
+        async def decay(self):
+            return {"atoms_updated": 0, "transitions": 0}
         async def consolidate(self, **kwargs):
             captured.update(kwargs)
             return {"clusters_processed": 0, "atoms_merged": 0}
@@ -215,6 +217,8 @@ async def test_saga_consolidate_no_identities_yaml_no_subjects(tmp_path: Path):
     captured: dict = {}
 
     class _FakeSagaClient:
+        async def decay(self):
+            return {"atoms_updated": 0, "transitions": 0}
         async def consolidate(self, **kwargs):
             captured.update(kwargs)
             return {}
