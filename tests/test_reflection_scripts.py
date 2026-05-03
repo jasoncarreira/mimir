@@ -34,6 +34,7 @@ class _FakeClient:
         count: int,
         channel_id: str | None,
         contributed_only: bool,
+        trend: str | None = None,
     ) -> list[dict[str, Any]]:
         self.calls.append(
             {
@@ -41,6 +42,7 @@ class _FakeClient:
                 "count": count,
                 "channel_id": channel_id,
                 "contributed_only": contributed_only,
+                "trend": trend,
             }
         )
         return self.payload
@@ -68,7 +70,8 @@ async def test_default_args_pass_expected_kwargs(monkeypatch: pytest.MonkeyPatch
         rc = await script._amain()
     assert rc == 0
     assert fake.calls == [
-        {"days": 7, "count": 10, "channel_id": None, "contributed_only": False}
+        {"days": 7, "count": 10, "channel_id": None, "contributed_only": False,
+         "trend": None}
     ]
     assert fake.closed
 
@@ -87,7 +90,8 @@ async def test_all_flags_threaded_through(monkeypatch: pytest.MonkeyPatch):
         rc = await script._amain()
     assert rc == 0
     assert fake.calls == [
-        {"days": 14, "count": 20, "channel_id": "slack-eng", "contributed_only": True}
+        {"days": 14, "count": 20, "channel_id": "slack-eng",
+         "contributed_only": True, "trend": None}
     ]
 
 
@@ -138,5 +142,6 @@ def test_cli_subcommand_dispatches_to_script(monkeypatch: pytest.MonkeyPatch):
                   "--count", "5", "--contributed-only"])
     assert exc_info.value.code == 0
     assert fake.calls == [
-        {"days": 3, "count": 5, "channel_id": None, "contributed_only": True}
+        {"days": 3, "count": 5, "channel_id": None, "contributed_only": True,
+         "trend": None}
     ]

@@ -34,6 +34,14 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
         help="count only retrievals where access_log.contributed=1 — "
              "atoms that earned their keep, not just got pulled in",
     )
+    p.add_argument(
+        "--trend", default=None,
+        choices=["improving", "stable", "weakening", "stale"],
+        help="P47: filter by the consolidation-written trend bucket. "
+             "Pair with --contributed-only and --trend improving for "
+             "promotion candidates; --trend stale for demotion / "
+             "cleanup candidates.",
+    )
 
 
 # VSM: S3* — top-N atoms by retrieval count over a window; reflection
@@ -50,6 +58,7 @@ async def run(args: argparse.Namespace) -> int:
             count=args.count,
             channel_id=args.channel,
             contributed_only=args.contributed_only,
+            trend=args.trend,
         )
     finally:
         await client.close()

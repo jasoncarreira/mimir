@@ -127,6 +127,13 @@ _DEFAULTS = {
         # unchanged.
         "include_triples_in_response": False,
         "response_triples_top_k": 5,
+        # P40 — observation-endorsed raws that miss the cheap-path
+        # candidate pool currently get pulled in (with a low base
+        # score derived from cosine similarity). Hypothesis: the
+        # pull-in dilutes in-pool ranking. Default True for P30
+        # back-compat; the P40 bench TOML flips this False to
+        # test boost-only behavior.
+        "enable_endorsed_atom_pull_in": True,
         "similarity_threshold": 0.2,
         "sigmoid_midpoint": 0.35,
         "sigmoid_steepness": 15.0,

@@ -738,8 +738,20 @@ class TestMostRetrieved:
         assert rv.status_code == 200
         assert captured == {
             "days": 14, "count": 20, "channel": "alpha",
-            "contributed_only": True,
+            "contributed_only": True, "trend": None,
         }
+
+    def test_passes_trend_filter(self, client, monkeypatch):
+        """P47: ?trend=improving threads through to get_most_retrieved."""
+        import saga.core
+        captured = {}
+        def fake(**kw):
+            captured.update(kw)
+            return []
+        monkeypatch.setattr(saga.core, "get_most_retrieved", fake)
+        rv = client.get("/v1/atoms/most_retrieved?trend=improving")
+        assert rv.status_code == 200
+        assert captured["trend"] == "improving"
 
     def test_defaults(self, client, monkeypatch):
         import saga.core
@@ -751,5 +763,6 @@ class TestMostRetrieved:
         rv = client.get("/v1/atoms/most_retrieved")
         assert rv.status_code == 200
         assert captured == {
-            "days": 7, "count": 10, "channel": None, "contributed_only": False,
+            "days": 7, "count": 10, "channel": None,
+            "contributed_only": False, "trend": None,
         }

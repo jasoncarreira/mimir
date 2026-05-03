@@ -1390,11 +1390,16 @@ def _two_tier_split(
                 cap = max(0.0, base * (boost_cap_multiplier - 1.0))
                 raw_score_map[aid] = base + min(boost_map[aid], cap)
 
-        # Pull in endorsed raws that didn't make the candidate pool.
-        # Their base score is derived from cosine similarity to the query
-        # (scaled to the smallest positive in-pool RRF magnitude so the
-        # numbers are comparable), then boosted the same way.
-        if boost_map:
+        # P40: pull in endorsed raws that didn't make the candidate
+        # pool. Hypothesis (filed 2026-04-30): the pull-in dilutes
+        # in-pool ranking with atoms the cheap path explicitly
+        # rejected. Boost-only (no pull-in) is the cleaner shape
+        # for two-tier when the cheap path is doing its job.
+        # ``[retrieval] enable_endorsed_atom_pull_in`` defaults True
+        # for back-compat with P30 baseline; flip false in the P40
+        # bench TOML to test.
+        _pull_in = bool(_cfg('retrieval', 'enable_endorsed_atom_pull_in', True))
+        if boost_map and _pull_in:
             missing_ids = [aid for aid in boost_map if aid not in raw_score_map]
             if missing_ids:
                 conn = get_db()
@@ -5100,6 +5105,7 @@ def get_most_retrieved(
     count: int = 10,
     channel: str = None,
     contributed_only: bool = False,
+    trend: str = None,
 ) -> list[dict]:
     """Top-N atoms by retrieval count over a recent time window.
 
@@ -5115,9 +5121,16 @@ def get_most_retrieved(
         contributed_only: when True, count only retrievals where
             access_log.contributed = 1. Surfaces "atoms that earned
             their keep" rather than just "atoms that got pulled in often."
+        trend: P47 — filter to atoms whose ``trend`` column matches
+            (improving / stable / weakening / stale). None = no filter
+            (returns all). Useful pairings:
+              - ``trend='improving'`` + ``contributed_only=True`` →
+                promotion candidates for mimir core memory
+              - ``trend='stale'`` → cleanup / demotion candidates
 
     Returns: list of atom dicts with id, content, created_at, topics,
-        session_id, retrieval_count, contributed_count, last_retrieved_at.
+        session_id, retrieval_count, contributed_count, last_retrieved_at,
+        trend.
     """
     conn = get_db()
 
@@ -5127,7 +5140,8 @@ def get_most_retrieved(
         "       COUNT(*) AS retrieval_count, "
         "       SUM(CASE WHEN al.contributed = 1 THEN 1 ELSE 0 END) "
         "           AS contributed_count, "
-        "       MAX(al.accessed_at) AS last_retrieved_at "
+        "       MAX(al.accessed_at) AS last_retrieved_at, "
+        "       a.trend "
         "FROM access_log al "
         "JOIN atoms a ON a.id = al.atom_id "
         "WHERE al.accessed_at >= datetime('now', ?) "
@@ -5139,6 +5153,9 @@ def get_most_retrieved(
     if channel:
         sql += " AND json_extract(a.metadata, '$.channel') = ?"
         params.append(channel)
+    if trend:
+        sql += " AND a.trend = ?"
+        params.append(trend)
     sql += (
         " GROUP BY a.id "
         "ORDER BY retrieval_count DESC, last_retrieved_at DESC "
@@ -5165,6 +5182,7 @@ def get_most_retrieved(
             "retrieval_count": r[6],
             "contributed_count": r[7] or 0,
             "last_retrieved_at": r[8],
+            "trend": r[9],
         })
     return out
 

@@ -593,19 +593,22 @@ async def api_most_retrieved(
     count: int = 10,
     channel: Optional[str] = None,
     contributed_only: bool = False,
+    trend: Optional[str] = None,
 ):
     """Top-N atoms by retrieval count over the last `days` days. Useful
     for "what has the agent been thinking about lately?" pre-message
     context, or for heartbeat-turn candidate seeding when no specific
     query is being asked. ``contributed_only=true`` filters to
     retrievals where the agent's feedback marked the atom as actually
-    used (access_log.contributed = 1).
+    used (access_log.contributed = 1). ``trend=improving|stable|
+    weakening|stale`` (P47) filters by the consolidation-written
+    trend bucket — pair with contributed_only for promotion candidates.
     """
     def _list():
         from .core import get_most_retrieved
         return {"atoms": get_most_retrieved(
             days=days, count=count, channel=channel,
-            contributed_only=contributed_only,
+            contributed_only=contributed_only, trend=trend,
         )}
     return await asyncio.to_thread(_list)
 
