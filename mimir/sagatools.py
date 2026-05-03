@@ -74,6 +74,80 @@ def _format_atoms(hits: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _triples_in_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the triples list from a /v1/query response.
+
+    P42 surfaces triples as a third response block alongside
+    observations/raws. Empty when the saga config has
+    ``[retrieval] include_triples_in_response = false`` (the default)
+    or when there are no matching triples."""
+    if not isinstance(payload, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    for t in payload.get("triples") or []:
+        if isinstance(t, dict):
+            out.append(t)
+    return out
+
+
+def _fmt_iso_date(raw: object) -> str | None:
+    """Render an ISO timestamp as a compact YYYY-MM-DD. Returns None for
+    missing / unparseable values so the caller can omit the field."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    return raw[:10]  # ISO-8601 starts with YYYY-MM-DD
+
+
+def _format_triples(triples: list[dict[str, Any]]) -> str:
+    """Render P42 triples as a compact bullet list with valid-date
+    range and confidence. The agent uses these as structured fact
+    grounding alongside the prose atoms."""
+    if not triples:
+        return ""
+    lines: list[str] = []
+    for t in triples:
+        subj = t.get("subject") or "?"
+        pred = t.get("predicate") or "?"
+        obj = t.get("object") or "?"
+        valid_from = _fmt_iso_date(t.get("valid_from"))
+        valid_until = _fmt_iso_date(t.get("valid_until"))
+        if valid_from and valid_until:
+            date_part = f" [valid {valid_from} → {valid_until}]"
+        elif valid_from:
+            date_part = f" [valid {valid_from} → present]"
+        elif valid_until:
+            date_part = f" [valid → {valid_until}]"
+        else:
+            date_part = ""
+        conf = t.get("confidence")
+        conf_part = ""
+        if isinstance(conf, (int, float)) and conf < 1.0:
+            conf_part = f" (conf {conf:.2f})"
+        lines.append(f"- ({subj}, {pred}, {obj}){date_part}{conf_part}")
+    return "\n".join(lines)
+
+
+def _format_saga_payload(payload: dict[str, Any]) -> str:
+    """Combined renderer: atoms first, then a Triples sub-section if
+    P42 surfaced any. Used by the pre-message hook so the agent
+    reads structured facts alongside prose hits."""
+    atoms = _atoms_in_payload(payload)
+    triples = _triples_in_payload(payload)
+    parts: list[str] = []
+    if atoms:
+        parts.append(_format_atoms(atoms))
+    if triples:
+        triples_block = _format_triples(triples)
+        if triples_block:
+            if parts:
+                parts.append("")
+            parts.append("Triples:")
+            parts.append(triples_block)
+    if not parts:
+        return "(no atoms)"
+    return "\n".join(parts)
+
+
 def _atoms_in_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Return the atoms list from a /v1/query response.
 
