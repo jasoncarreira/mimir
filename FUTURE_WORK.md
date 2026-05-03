@@ -918,25 +918,25 @@ Total: ~10.5 days of focused work for the whole §12 stack.
 ### 2026-05-01 — v0.5 saga merge + in-process integration
 
 Closed the cross-repo coordination tax between mimir and msam. See
-`V0.5.md` for the full plan and commit refs (`92577cc .. 8e269d5`):
+`V0.5.md` for the full plan and commit refs (`b7e368b .. 45837d0`):
 
 - **§1 Workspace monorepo merge** — `msam2` (hindsight-ideas branch)
   merged into mimir at `saga/` via `git filter-repo` with full history
   preservation. uv workspace setup in root `pyproject.toml`. saga stays
   standalone-runnable (no mimir dep); cross-package integration benches
   live OUTSIDE saga at `benchmarks/longmemeval_via_mimir/`.
-- **§6 Rename msam → saga** (commits `d318ed9`, `e85eff2`) — Norse
+- **§6 Rename msam → saga** (commits `7568594`, `fb48295`) — Norse
   poet-goddess of history. Pairs with mimir at the pantheon level;
   "saga" already carries the English meaning "ongoing chronicle" so
   the name self-explains. Single-grep rename across imports, tests,
   config keys, env vars (`MSAM_*` → `SAGA_*`).
-- **§7 Unified LLM transport** (commit `8e269d5`) — saga's 9
+- **§7 Unified LLM transport** (commit `45837d0`) — saga's 9
   chat-completion call sites route through `saga._llm.call_llm_sync`
   which dispatches on `[<section>].provider`: `anthropic` (default,
   uses `anthropic.Anthropic` Messages API) or `openai_compat` (default
   for the bench harness, preserves the `requests.post` path against
   saga_p30_canon_v4 baseline 0.774).
-- **§2 In-process saga adapter** (commit `acdb7da`) — `mimir/saga_client.py`
+- **§2 In-process saga adapter** (commit `3346952`) — `mimir/saga_client.py`
   becomes a Protocol with `_InProcessSaga` (default; saga.core via
   asyncio.to_thread) and `_HttpSaga` (external-saga deployments). HTTP
   hop eliminated for the same-host case. `mimir setup` writes
@@ -959,11 +959,11 @@ Also retired:
 
 ### 2026-05-01 — v0.4 self-awareness loops
 
-Closed several long-standing items. See `V0.4.md` for the full plan and commit refs (`9dd50a2 .. e510178`):
+Closed several long-standing items. See `V0.4.md` for the full plan and commit refs (`bf7e3a4 .. 708647b`):
 
 - **§8.1 Periodic reflection / memory consolidation** → reflection skill + weekly cron entry. Two parallel tracks (behavioral + memory-architecture-review). Propose-only by default per `memory/core/30-reflection-policy.md`. Bundled `mimir reflection most-retrieved` CLI for atom-to-core promotion candidates.
 - **§8.3 Wisdom-keeper reflection loop** → partially. Memory-architecture-review track ships; "claims audit" extension is still future work (re-scoped above).
-- **§6.1 Identity reconciliation** (commits `b6a8f9b`, `685f99a`, `4b535d2`) — resolver primitive, bridge prefix + cross-pull, identity records surfaced in turn prompt.
+- **§6.1 Identity reconciliation** (commits `b6a8f9b`, `c043ff3`, `291e754`) — resolver primitive, bridge prefix + cross-pull, identity records surfaced in turn prompt.
 - **`state/social/` indexer skip** — `search.py` now short-circuits `state/heartbeat-backlog.md`, `state/proposed-changes.md`, `state/identities.yaml`, and the `state/social/` prefix via `INDEX_SKIP_PATHS` / `INDEX_SKIP_PREFIXES`. Resolves the "social-cli artifacts shouldn't be embedded" tail of §10.1.
 
 Also shipped (not previously tracked here, captured for posterity):
