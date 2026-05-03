@@ -90,6 +90,24 @@ def _triples_in_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _source_atom_ids_from_triples(payload: dict[str, Any]) -> list[str]:
+    """Pull each triple's ``source_atom_id`` so the post-message hook
+    can credit those atoms via ``mark_contributions``. When the agent
+    grounds its reply in a triple, the originating atom earned its
+    keep — same contribution-credit logic as for surfaced atoms.
+
+    De-dups and preserves first-seen order. Atoms missing the field
+    (legacy rows or non-P42 responses) are skipped silently."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in _triples_in_payload(payload):
+        atom_id = t.get("source_atom_id")
+        if isinstance(atom_id, str) and atom_id and atom_id not in seen:
+            out.append(atom_id)
+            seen.add(atom_id)
+    return out
+
+
 def _fmt_iso_date(raw: object) -> str | None:
     """Render an ISO timestamp as a compact YYYY-MM-DD. Returns None for
     missing / unparseable values so the caller can omit the field."""
