@@ -1068,6 +1068,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .skills.reflection import introspection_report as _intro_report
     _intro_report.add_argparse(refl_intro_p)
 
+    pred_p = sub.add_parser(
+        "predictions",
+        help="Predictions tracking CLI (skills/predictions/script.py).",
+    )
+    from .skills.predictions import script as _predictions_script
+    _predictions_script.add_argparse(pred_p)
+
     refl_audit_p = refl_sub.add_parser(
         "audit",
         help="Print the '## Effects of prior proposals' block — "
@@ -1192,6 +1199,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         from .loops_cmd import run_loops_cmd
         home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
         sys.exit(run_loops_cmd(home))
+
+    if args.command == "predictions":
+        from .skills.predictions import script as _predictions_script
+        sys.exit(_predictions_script.run(args))
 
     if args.command == "reflection":
         if args.reflection_action == "most-retrieved":

@@ -59,6 +59,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "scheduled_tick_suppressed": ("negative", "tick_suppressed"),
     "heartbeat_health_degraded": ("negative", "heartbeat_health"),
     "introspection_report_error": ("negative", "introspection_error"),
+    "predictions_pending_review": ("negative", "predictions_pending"),
     "send_message_unknown_channel": ("negative", "unknown_channel"),
     # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
@@ -85,6 +86,7 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "introspection_ok",
     "introspection_error",
     "heartbeat_health",
+    "predictions_pending",
 }
 
 
@@ -161,6 +163,13 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "introspection_error":
         return (
             f"introspection report failed: {ev.get('error') or '(no detail)'}"
+        )
+    if rule_kind == "predictions_pending":
+        n = ev.get("count")
+        n_str = str(int(n)) if isinstance(n, (int, float)) else "?"
+        return (
+            f"{n_str} predictions past horizon — run `mimir predictions "
+            f"review` to score them"
         )
     if rule_kind == "saga_consolidate_ok":
         result = ev.get("result") or {}
