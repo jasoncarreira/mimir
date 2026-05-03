@@ -118,6 +118,15 @@ _DEFAULTS = {
         # when off.
         "enable_world_model_pathway": False,
         "rrf_world_model_weight": 1.0,
+        # P42 — surface top-N triples as a third response block on
+        # /v1/query (two-tier path). Cosine-matches query embedding
+        # against triple embeddings, returns the top-K triples with
+        # valid_from / valid_until / confidence / source_atom_id.
+        # Filters out triples whose valid_until has expired. Purely
+        # additive — readers can ignore the new block; ranking is
+        # unchanged.
+        "include_triples_in_response": False,
+        "response_triples_top_k": 5,
         "similarity_threshold": 0.2,
         "sigmoid_midpoint": 0.35,
         "sigmoid_steepness": 15.0,
