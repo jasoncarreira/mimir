@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .feedback import pending_forget_candidates_count
 from .rate_limits import RateLimitSnapshot, RateLimitStore
 from .usage_stats import (
     CostRateAlert,
@@ -207,6 +208,24 @@ class HomeostaticArbiter:
         snap = self.snapshot(now=now)
 
         lines: list[str] = []
+
+        # Pending forget candidates from the most recent decay cycle.
+        # Sticky: stays visible across turns until a saga_forget_ok
+        # event lands (newer than the latest saga_decay_ok). Top of
+        # the block because it's actionable agent-maintenance, not
+        # ambient telemetry.
+        try:
+            pending = pending_forget_candidates_count(
+                self.home / "logs" / "events.jsonl",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("pending_forget_candidates_count failed; skipping")
+            pending = None
+        if pending is not None and pending > 0:
+            lines.append(
+                f"- {pending} forget candidates pending review "
+                f"(saga_forget tool, dry_run=true to preview)"
+            )
 
         if snap.plan_window_max_utilization is not None:
             pct = snap.plan_window_max_utilization * 100

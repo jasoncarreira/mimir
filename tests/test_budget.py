@@ -190,17 +190,22 @@ def test_render_returns_none_with_no_signal(tmp_path: Path):
 
 
 def test_render_includes_plan_window_when_present(tmp_path: Path):
+    # RateLimitStore.current() filters out entries whose ``resets_at``
+    # is before ``time.time()`` (real now, not the ``now`` arg). Anchor
+    # the future timestamp on real-now so this test stays valid as the
+    # calendar advances past the fixed NOW constant.
     arb = _arbiter(tmp_path)
-    future = int((NOW + timedelta(days=2, hours=3)).timestamp())
+    real_now = datetime.now(tz=timezone.utc)
+    future = int((real_now + timedelta(days=2, hours=3)).timestamp())
     arb.rate_limit_store._load = lambda: {  # type: ignore[method-assign]
         "7d_opus": {
             "status": "allowed_warning",
             "utilization": 0.68,
             "resets_at": future,
-            "observed_at": NOW.isoformat(),
+            "observed_at": real_now.isoformat(),
         },
     }
-    body = arb.render_self_state_block(now=NOW)
+    body = arb.render_self_state_block(now=real_now)
     assert body is not None
     assert "7d_opus" in body
     assert "68%" in body

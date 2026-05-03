@@ -118,6 +118,16 @@ class SagaClient(Protocol):
 
     async def decay(self) -> dict[str, Any]: ...
 
+    async def forget(
+        self, *,
+        dry_run: bool = True,
+        min_retrievals: int | None = None,
+        contribution_threshold: float | None = None,
+        contradiction_threshold: float | None = None,
+        confidence_floor: float | None = None,
+        grace_days: int | None = None,
+    ) -> dict[str, Any]: ...
+
     async def recent_session_boundaries(
         self, *, channel_id: str | None = None, count: int = 3,
     ) -> list[dict[str, Any]]: ...
@@ -428,6 +438,40 @@ class _InProcessSaga:
         except Exception as exc:
             raise SagaError(f"in-process saga decay failed: {exc}") from exc
 
+    async def forget(
+        self, *,
+        dry_run: bool = True,
+        min_retrievals: int | None = None,
+        contribution_threshold: float | None = None,
+        contradiction_threshold: float | None = None,
+        confidence_floor: float | None = None,
+        grace_days: int | None = None,
+    ) -> dict[str, Any]:
+        """Run saga's intentional-forgetting engine. ``dry_run=True``
+        (default) only identifies candidates; ``dry_run=False`` will
+        transition atoms when saga's config mode permits. Forgetting
+        is irreversible on the saga side."""
+        await self._ensure_ready()
+
+        def _do() -> dict[str, Any]:
+            from saga.forgetting import identify_forgetting_candidates
+            result = identify_forgetting_candidates(
+                dry_run=dry_run,
+                min_retrievals=min_retrievals,
+                contribution_threshold=contribution_threshold,
+                contradiction_threshold=contradiction_threshold,
+                confidence_floor=confidence_floor,
+                grace_days=grace_days,
+            ) or {}
+            if not isinstance(result, dict):
+                return {"result": result}
+            return result
+
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as exc:
+            raise SagaError(f"in-process saga forget failed: {exc}") from exc
+
     async def recent_session_boundaries(
         self, *, channel_id: str | None = None, count: int = 3,
     ) -> list[dict[str, Any]]:
@@ -654,6 +698,28 @@ class _HttpSaga:
     async def decay(self) -> dict[str, Any]:
         """Run saga's decay cycle via /v1/decay."""
         return await self._post("/v1/decay", {})
+
+    async def forget(
+        self, *,
+        dry_run: bool = True,
+        min_retrievals: int | None = None,
+        contribution_threshold: float | None = None,
+        contradiction_threshold: float | None = None,
+        confidence_floor: float | None = None,
+        grace_days: int | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"dry_run": dry_run}
+        if min_retrievals is not None:
+            body["min_retrievals"] = min_retrievals
+        if contribution_threshold is not None:
+            body["contribution_threshold"] = contribution_threshold
+        if contradiction_threshold is not None:
+            body["contradiction_threshold"] = contradiction_threshold
+        if confidence_floor is not None:
+            body["confidence_floor"] = confidence_floor
+        if grace_days is not None:
+            body["grace_days"] = grace_days
+        return await self._post("/v1/forget", body)
 
     async def recent_session_boundaries(
         self, *, channel_id: str | None = None, count: int = 3,
