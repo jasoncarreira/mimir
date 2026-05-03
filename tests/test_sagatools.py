@@ -460,6 +460,48 @@ def test_format_saga_payload_atoms_only_omits_triples_section():
     assert "Triples:" not in out
 
 
+def test_source_atom_ids_from_triples_dedups_and_orders():
+    """Each triple's source_atom_id flows into ctx.saga_atom_ids so the
+    post-message hook credits the originating atom via
+    mark_contributions. Same path as for surfaced atoms."""
+    from mimir.sagatools import _source_atom_ids_from_triples
+    payload = {
+        "triples": [
+            {"subject": "user", "predicate": "p1", "object": "o1",
+             "source_atom_id": "atom-A"},
+            {"subject": "user", "predicate": "p2", "object": "o2",
+             "source_atom_id": "atom-B"},
+            {"subject": "user", "predicate": "p3", "object": "o3",
+             "source_atom_id": "atom-A"},  # duplicate — dropped
+        ],
+    }
+    out = _source_atom_ids_from_triples(payload)
+    assert out == ["atom-A", "atom-B"]
+
+
+def test_source_atom_ids_skips_missing_field():
+    """Legacy / non-P42 responses without source_atom_id are silently
+    skipped — never crashes the credit pass."""
+    from mimir.sagatools import _source_atom_ids_from_triples
+    payload = {
+        "triples": [
+            {"subject": "user", "predicate": "p", "object": "o"},  # no source_atom_id
+            {"subject": "user", "predicate": "p2", "object": "o2",
+             "source_atom_id": "atom-X"},
+            {"subject": "user", "predicate": "p3", "object": "o3",
+             "source_atom_id": ""},  # empty string — skip
+        ],
+    }
+    out = _source_atom_ids_from_triples(payload)
+    assert out == ["atom-X"]
+
+
+def test_source_atom_ids_empty_when_no_triples():
+    from mimir.sagatools import _source_atom_ids_from_triples
+    assert _source_atom_ids_from_triples({}) == []
+    assert _source_atom_ids_from_triples({"triples": []}) == []
+
+
 def test_format_saga_payload_triples_only_renders():
     """When P42 is on but the atom pathways returned nothing, the
     triples block alone is still surfaced."""

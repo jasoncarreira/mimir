@@ -82,6 +82,7 @@ from .sagatools import (
     _atoms_in_payload,
     _format_atoms,
     _format_saga_payload,
+    _source_atom_ids_from_triples,
 )
 from .prompts import build_system_prompt, build_turn_prompt
 from .scheduler import Scheduler
@@ -501,13 +502,15 @@ class Agent:
             )
             return None
         ids = _atom_ids_from_response(payload)
-        # P42: triples may be present even when no atoms hit. Surface
-        # the combined block when EITHER atoms or triples landed.
-        triples_present = bool(payload.get("triples")) if isinstance(payload, dict) else False
-        if not ids and not triples_present:
+        # P42: also credit the atoms whose triples were surfaced — when
+        # the agent grounds its reply in a triple, the originating atom
+        # earned its keep. Same mark_contributions path as for raw atom
+        # hits; the post-message hook treats both identically.
+        triple_source_ids = _source_atom_ids_from_triples(payload)
+        if not ids and not triple_source_ids:
             return None
         seen = set(ctx.saga_atom_ids)
-        for aid in ids:
+        for aid in list(ids) + triple_source_ids:
             if aid not in seen:
                 ctx.saga_atom_ids.append(aid)
                 seen.add(aid)

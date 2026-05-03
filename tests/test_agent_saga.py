@@ -120,6 +120,52 @@ async def test_pre_message_hook_injects_atoms_and_post_credits_them(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_pre_message_hook_credits_triple_source_atoms(tmp_path: Path):
+    """P42: when saga returns triples in the response, their
+    source_atom_id values should also flow into ctx.saga_atom_ids so
+    the post-message hook credits the originating atoms — same
+    contribution-credit path as for raw atom hits."""
+    saga = FakeSaga(
+        query_response={
+            "_raw_atoms": [
+                {"id": "atom-from-prose", "stream": "semantic",
+                 "content": "alice prefers terse"},
+            ],
+            "triples": [
+                {"subject": "alice", "predicate": "prefers", "object": "terse",
+                 "source_atom_id": "atom-from-triple",
+                 "valid_from": None, "valid_until": None, "confidence": 1.0},
+                {"subject": "alice", "predicate": "lives_in", "object": "Oakland",
+                 "source_atom_id": "atom-from-triple-2",
+                 "valid_from": None, "valid_until": None, "confidence": 1.0},
+            ],
+        }
+    )
+    agent = _build_agent(tmp_path, saga)
+
+    fake_q = _fake_query_yielding("hello")
+    with patch("mimir.agent.query", new=fake_q):
+        record = await agent.run_turn(
+            AgentEvent(
+                trigger="user_message",
+                channel_id="bench-1",
+                content="hi alice",
+                author="alice",
+            )
+        )
+
+    # Both prose-atom and triple-source atoms got credited.
+    fb = saga.last("feedback")
+    assert fb is not None
+    assert set(fb["atom_ids"]) == {
+        "atom-from-prose", "atom-from-triple", "atom-from-triple-2",
+    }
+    assert set(record.saga_atom_ids) == {
+        "atom-from-prose", "atom-from-triple", "atom-from-triple-2",
+    }
+
+
+@pytest.mark.asyncio
 async def test_synthesis_turn_skips_pre_post_hooks_and_uses_extra_session_id(tmp_path: Path):
     saga = FakeSaga(query_response={"_raw_atoms": []})
     agent = _build_agent(tmp_path, saga)
