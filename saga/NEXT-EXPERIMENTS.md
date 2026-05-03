@@ -1852,7 +1852,7 @@ User|prefers|theme=philosophical
 ```
 
 **The data point.** Diagnostic on the 500-question P42 Sonnet
-bench corpus (commit 435699f, 2026-05-03):
+bench corpus (commit 33e52d9, 2026-05-03):
 - **9,997 distinct predicates** across all per-question DBs
 - Bare ``prefers``: 7 occurrences
 - Bare ``likes``: 12 occurrences
