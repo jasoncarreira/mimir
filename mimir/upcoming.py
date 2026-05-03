@@ -74,13 +74,28 @@ def _humanize_delta(d: timedelta) -> str:
     return f"{d_days}d {h}h" if h else f"{d_days}d"
 
 
+# Auto-registered maintenance crons. Always surface in Upcoming
+# (bypass ``limit``) and carry a one-line detail describing what they
+# do — bare ids like ``saga-consolidate`` read terse, so the detail
+# map gives the agent enough context to know what's coming. Keys are
+# the job ids exactly as registered with APScheduler.
+_MAINTENANCE_CRON_DETAILS: dict[str, str] = {
+    "saga-consolidate": "atom merge / synthesis",
+    "introspection-report": "behavioral / health snapshot",
+}
+
+
 def collect_scheduler_jobs(
     scheduler: Any | None, *, limit: int = 5
 ) -> list[UpcomingItem]:
     """Pull the next-N firing times from APScheduler. ``scheduler`` is
     the wrapper from ``mimir.scheduler``; we read its underlying
     ``self._scheduler.get_jobs()``. Empty list if no scheduler or no
-    jobs are due."""
+    jobs are due.
+
+    Maintenance crons in ``_MAINTENANCE_CRON_DETAILS`` always surface
+    regardless of ``limit`` — operators adding many custom ticks
+    shouldn't push weekly maintenance work off the agent's radar."""
     if scheduler is None:
         return []
     try:
@@ -89,7 +104,8 @@ def collect_scheduler_jobs(
     except Exception:  # noqa: BLE001
         return []
 
-    items: list[UpcomingItem] = []
+    maintenance: list[UpcomingItem] = []
+    regular: list[UpcomingItem] = []
     for job in jobs:
         next_run = getattr(job, "next_run_time", None)
         if next_run is None:
@@ -100,13 +116,22 @@ def collect_scheduler_jobs(
         # (e.g. saga-consolidate) pass through.
         jid = str(getattr(job, "id", "") or "?")
         label = jid.split(":", 1)[1] if jid.startswith("scheduler:") else jid
-        items.append(UpcomingItem(
+        item = UpcomingItem(
             when=next_run,
             label=label,
+            detail=_MAINTENANCE_CRON_DETAILS.get(jid, ""),
             source="scheduler",
-        ))
-    items.sort(key=lambda it: it.when)
-    return items[:limit]
+        )
+        if jid in _MAINTENANCE_CRON_DETAILS:
+            maintenance.append(item)
+        else:
+            regular.append(item)
+
+    regular.sort(key=lambda it: it.when)
+    capped = regular[:limit]
+    out = capped + maintenance
+    out.sort(key=lambda it: it.when)
+    return out
 
 
 def collect_plan_window_resets(

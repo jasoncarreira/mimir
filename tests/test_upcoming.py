@@ -76,6 +76,55 @@ def test_collect_scheduler_jobs_respects_limit():
     assert len(items) == 3
 
 
+def test_maintenance_crons_carry_detail_label():
+    """saga-consolidate and introspection-report get a one-line
+    detail so the agent knows what they do."""
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    j1 = SimpleNamespace(id="saga-consolidate",
+                         next_run_time=base + timedelta(days=2))
+    j2 = SimpleNamespace(id="introspection-report",
+                         next_run_time=base + timedelta(days=4))
+    fake_wrapper = SimpleNamespace(
+        _scheduler=SimpleNamespace(get_jobs=lambda: [j1, j2])
+    )
+    items = collect_scheduler_jobs(fake_wrapper)
+    by_label = {it.label: it.detail for it in items}
+    assert by_label["saga-consolidate"] == "atom merge / synthesis"
+    assert by_label["introspection-report"] == "behavioral / health snapshot"
+
+
+def test_maintenance_crons_bypass_limit():
+    """If an operator floods scheduler.yaml with custom ticks, the
+    weekly maintenance crons must still surface — they're load-
+    bearing for the agent's awareness of memory hygiene + health."""
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    # 10 regular jobs, all firing in the next 10 minutes.
+    regular = [
+        SimpleNamespace(id=f"scheduler:job{i}",
+                        next_run_time=base + timedelta(minutes=i))
+        for i in range(10)
+    ]
+    # Maintenance jobs firing days from now.
+    maint = [
+        SimpleNamespace(id="saga-consolidate",
+                        next_run_time=base + timedelta(days=2)),
+        SimpleNamespace(id="introspection-report",
+                        next_run_time=base + timedelta(days=4)),
+    ]
+    fake_wrapper = SimpleNamespace(
+        _scheduler=SimpleNamespace(get_jobs=lambda: regular + maint)
+    )
+    items = collect_scheduler_jobs(fake_wrapper, limit=3)
+    labels = [it.label for it in items]
+    # 3 regular (closest by time) + both maintenance, regardless of limit.
+    assert labels.count("saga-consolidate") == 1
+    assert labels.count("introspection-report") == 1
+    # The 3 closest regular jobs (job0/1/2) make it; later regulars don't.
+    assert "job0" in labels
+    assert "job9" not in labels
+    assert len(items) == 5
+
+
 def test_collect_plan_window_resets():
     """Plan-window snapshots come from rate_limits.RateLimitStore.current()."""
 
