@@ -77,7 +77,12 @@ from .loop_detector import LoopDetector
 from .memory import load_core
 from .models import AgentEvent, TurnContext, TurnRecord, make_turn_id
 from .saga_client import SagaClient, SagaError
-from .sagatools import _atom_ids_from_response, _atoms_in_payload, _format_atoms
+from .sagatools import (
+    _atom_ids_from_response,
+    _atoms_in_payload,
+    _format_atoms,
+    _format_saga_payload,
+)
 from .prompts import build_system_prompt, build_turn_prompt
 from .scheduler import Scheduler
 from .search import Indexer
@@ -496,15 +501,17 @@ class Agent:
             )
             return None
         ids = _atom_ids_from_response(payload)
-        if not ids:
+        # P42: triples may be present even when no atoms hit. Surface
+        # the combined block when EITHER atoms or triples landed.
+        triples_present = bool(payload.get("triples")) if isinstance(payload, dict) else False
+        if not ids and not triples_present:
             return None
         seen = set(ctx.saga_atom_ids)
         for aid in ids:
             if aid not in seen:
                 ctx.saga_atom_ids.append(aid)
                 seen.add(aid)
-        hits = _atoms_in_payload(payload)
-        return _format_atoms(hits)
+        return _format_saga_payload(payload)
 
     # VSM: S3 — post-turn credit pass; saga's retrieval ranking learns
     #          which atoms helped (access_log.contributed boost).

@@ -375,5 +375,106 @@ async def test_subagent_isolation_does_not_leak_atom_ids():
     assert parent_ctx.saga_atom_ids == []  # parent untouched
 
 
+# ─── P42: triples surfacing ────────────────────────────────────────────
+
+
+def test_triples_in_payload_extracts_list():
+    from mimir.sagatools import _triples_in_payload
+    payload = {
+        "triples": [
+            {"subject": "user", "predicate": "lives_in", "object": "Oakland"},
+            {"subject": "user", "predicate": "profession", "object": "engineer"},
+        ],
+    }
+    out = _triples_in_payload(payload)
+    assert len(out) == 2
+
+
+def test_triples_in_payload_returns_empty_when_missing():
+    from mimir.sagatools import _triples_in_payload
+    assert _triples_in_payload({}) == []
+    assert _triples_in_payload({"triples": None}) == []
+    assert _triples_in_payload({"triples": []}) == []
+
+
+def test_format_triples_renders_with_dates_and_confidence():
+    from mimir.sagatools import _format_triples
+    out = _format_triples([
+        {
+            "subject": "user", "predicate": "subscription", "object": "pro",
+            "valid_from": "2024-03-15T12:00:00+00:00",
+            "valid_until": "2025-03-15T12:00:00+00:00",
+            "confidence": 0.92,
+        },
+    ])
+    assert "(user, subscription, pro)" in out
+    assert "valid 2024-03-15 → 2025-03-15" in out
+    assert "conf 0.92" in out
+
+
+def test_format_triples_omits_dates_when_absent():
+    from mimir.sagatools import _format_triples
+    out = _format_triples([
+        {"subject": "user", "predicate": "favorite_color", "object": "blue",
+         "valid_from": None, "valid_until": None, "confidence": 1.0},
+    ])
+    assert "(user, favorite_color, blue)" in out
+    assert "valid" not in out
+    assert "conf" not in out  # confidence==1.0 is the default; omit
+
+
+def test_format_triples_present_when_only_valid_from():
+    from mimir.sagatools import _format_triples
+    out = _format_triples([
+        {"subject": "user", "predicate": "is_at", "object": "office",
+         "valid_from": "2026-05-01T09:00:00+00:00",
+         "valid_until": None, "confidence": 1.0},
+    ])
+    assert "valid 2026-05-01 → present" in out
+
+
+def test_format_saga_payload_combines_atoms_and_triples():
+    from mimir.sagatools import _format_saga_payload
+    payload = {
+        "observations": [{"id": "o1", "content": "User works on saga.",
+                          "memory_type": "observation"}],
+        "raws": [],
+        "triples": [
+            {"subject": "user", "predicate": "project", "object": "saga",
+             "valid_from": None, "valid_until": None, "confidence": 1.0},
+        ],
+    }
+    out = _format_saga_payload(payload)
+    assert "User works on saga." in out
+    assert "Triples:" in out
+    assert "(user, project, saga)" in out
+
+
+def test_format_saga_payload_atoms_only_omits_triples_section():
+    from mimir.sagatools import _format_saga_payload
+    payload = {
+        "atoms": [{"id": "a1", "content": "hello"}],
+    }
+    out = _format_saga_payload(payload)
+    assert "hello" in out
+    assert "Triples:" not in out
+
+
+def test_format_saga_payload_triples_only_renders():
+    """When P42 is on but the atom pathways returned nothing, the
+    triples block alone is still surfaced."""
+    from mimir.sagatools import _format_saga_payload
+    payload = {
+        "observations": [], "raws": [],
+        "triples": [
+            {"subject": "user", "predicate": "lives_in", "object": "Oakland",
+             "valid_from": None, "valid_until": None, "confidence": 1.0},
+        ],
+    }
+    out = _format_saga_payload(payload)
+    assert "Triples:" in out
+    assert "(user, lives_in, Oakland)" in out
+
+
 # Late import to keep the file's main imports compact.
 import asyncio  # noqa: E402
