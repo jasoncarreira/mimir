@@ -639,6 +639,120 @@ def retrieve_triples(query: str, top_k: int = 20) -> list[dict]:
     return results
 
 
+def query_triples_for_response(
+    query: str,
+    top_k: int = 5,
+    *,
+    include_expired: bool = False,
+    now: "datetime | None" = None,
+) -> list[dict]:
+    """P42: cosine-rank active triples against the query, return the
+    top-K formatted for ``/v1/query`` response surfacing.
+
+    Each row carries ``subject / predicate / object / valid_from /
+    valid_until / confidence / _similarity / source_atom_id`` so the
+    agent can read the structured facts directly and backtrack to the
+    source atom if it wants more context.
+
+    Filters out expired triples (``valid_until`` < ``now``) unless
+    ``include_expired=True``. Empty result when:
+      - the triples table is empty
+      - no triple has an embedding populated
+      - the query embedding fails (best-effort: no exception)
+    """
+    if top_k <= 0:
+        return []
+    now = now or datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+
+    try:
+        from .core import embed_query, unpack_embedding
+    except Exception:
+        return []
+
+    try:
+        query_vec = embed_query(query)
+    except Exception:
+        return []
+
+    conn = _get_db()
+    try:
+        # Pull every active triple with an embedding. For the typical
+        # corpus size (low thousands of triples) the brute-force scan
+        # is fine. FAISS path could be added later if hot.
+        if include_expired:
+            rows = conn.execute("""
+                SELECT id, atom_id, subject, predicate, object,
+                       confidence, created_at, valid_from, valid_until,
+                       embedding
+                FROM triples
+                WHERE state = 'active' AND embedding IS NOT NULL
+            """).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT id, atom_id, subject, predicate, object,
+                       confidence, created_at, valid_from, valid_until,
+                       embedding
+                FROM triples
+                WHERE state = 'active'
+                  AND embedding IS NOT NULL
+                  AND (valid_until IS NULL OR valid_until > ?)
+            """, (now_iso,)).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return []
+
+    # Brute-force cosine. Pre-compute query magnitude once; skip rows
+    # whose embedding fails to unpack (corrupt) rather than crashing.
+    mag_q = sum(a * a for a in query_vec) ** 0.5
+    if mag_q == 0:
+        return []
+
+    scored: list[dict] = []
+    for row in rows:
+        r = dict(row)
+        emb = r.pop("embedding", None)
+        if not emb:
+            continue
+        try:
+            t_vec = unpack_embedding(emb)
+        except Exception:
+            continue
+        mag_t = sum(a * a for a in t_vec) ** 0.5
+        if mag_t == 0:
+            continue
+        dot = sum(a * b for a, b in zip(query_vec, t_vec))
+        sim = dot / (mag_q * mag_t)
+        confidence = r.get("confidence") or 1.0
+        scored.append({
+            "subject": r["subject"],
+            "predicate": r["predicate"],
+            "object": r["object"],
+            "valid_from": r.get("valid_from"),
+            "valid_until": r.get("valid_until"),
+            "confidence": float(confidence),
+            "_similarity": round(sim, 4),
+            "source_atom_id": r.get("atom_id"),
+            # Tiebreaker fields (not part of the agent-facing contract,
+            # but used for stable ordering): cosine × confidence is the
+            # primary sort, created_at desc breaks ties so newer wins.
+            "_rank_score": sim * float(confidence),
+            "_created_at": r.get("created_at") or "",
+        })
+
+    scored.sort(
+        key=lambda t: (t["_rank_score"], t["_created_at"]),
+        reverse=True,
+    )
+    out = scored[:top_k]
+    for t in out:
+        t.pop("_rank_score", None)
+        t.pop("_created_at", None)
+    return out
+
+
 def retrieve_by_entity(entity: str, top_k: int = 50) -> list[dict]:
     """Get all triples for a specific entity (as subject or object)."""
     conn = _get_db()

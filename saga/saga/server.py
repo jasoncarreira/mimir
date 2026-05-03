@@ -387,6 +387,25 @@ async def api_query(req: QueryRequest):
                         f"{raws_dropped} raws below threshold"
                     )
 
+            # P42: optionally surface top-N triples as a third response
+            # block. Cosine-matched against query embedding; carries
+            # valid_from / valid_until / confidence / source_atom_id
+            # so the agent can read structured facts directly. Strict
+            # no-op when [retrieval] include_triples_in_response is
+            # False (the canonical default).
+            triples_block: list[dict] = []
+            if _cfg('retrieval', 'include_triples_in_response', False):
+                try:
+                    from .triples import query_triples_for_response
+                    triples_block = query_triples_for_response(
+                        req.query,
+                        top_k=int(_cfg('retrieval', 'response_triples_top_k', 5)),
+                    )
+                except Exception:
+                    # Best effort — surfacing triples is additive, never
+                    # block the query response on it.
+                    triples_block = []
+
             return {
                 "query": req.query,
                 "mode": req.mode,
@@ -395,8 +414,8 @@ async def api_query(req: QueryRequest):
                 "gated_reason": gated_reason,
                 "observations": [_format_atom(o) for o in obs],
                 "raws": [_format_atom(r) for r in raws],
-                "triples": [],
-                "items_returned": len(obs) + len(raws),
+                "triples": triples_block,
+                "items_returned": len(obs) + len(raws) + len(triples_block),
                 "latency_ms": round((time.time() - t0) * 1000, 2),
             }
 
