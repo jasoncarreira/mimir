@@ -14,12 +14,20 @@ copy so their sends use their own (typically inert) detector.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
 from ._context import get_current_turn
 from ._tool_helpers import _content_block, _need, _safe
+from .bridges._attachments import AttachmentPathError, resolve_outbound_path
+from .bridges._directives import (
+    ReactDirective,
+    SendFileDirective,
+    SendMessageDirective,
+    parse_directives,
+)
 from .channel_registry import ChannelRegistry, UnknownChannelError
 from .event_logger import log_event
 from .history import MessageBuffer
@@ -34,10 +42,171 @@ from .saga_client import SagaClient, SagaError
 log = logging.getLogger(__name__)
 
 
+def _format_directive_summary(
+    *,
+    main_sent: bool,
+    main_chunks: int,
+    main_msg_id: str | None,
+    results: list[dict[str, Any]],
+) -> str:
+    """Build the send_message tool reply string. Includes a per-directive
+    bullet list when the call carried ``<actions>`` so the agent sees
+    which directives succeeded vs failed before its next turn."""
+    head = (
+        f"send_message complete (sent={main_sent}, chunks={main_chunks}, "
+        f"message_id={main_msg_id})"
+    )
+    if not results:
+        return head
+    lines = [head, "directives:"]
+    for r in results:
+        kind = r.get("kind", "?")
+        ok = r.get("ok", False)
+        flag = "ok" if ok else "FAIL"
+        detail_bits: list[str] = []
+        for k in ("emoji", "path", "channel_id"):
+            if r.get(k):
+                detail_bits.append(f"{k}={r[k]}")
+        if not ok and r.get("error"):
+            detail_bits.append(f"error={r['error']}")
+        lines.append(f"  - {kind} [{flag}] " + ", ".join(detail_bits))
+    return "\n".join(lines)
+
+
+async def _dispatch_action_directives(
+    registry: ChannelRegistry,
+    *,
+    fallback_channel_id: str,
+    directives: tuple,
+    default_message_id: str | None,
+    outbound_root: Path | None,
+) -> list[dict[str, Any]]:
+    """Dispatch the parsed directives in source order. Returns one summary
+    dict per directive for the audit log; never raises. Per-directive
+    failures (path escape, unknown channel, bridge error) are recorded
+    on the summary as ``ok=False`` with a reason — the agent sees the
+    aggregated outcome on the send_message tool reply.
+    """
+    results: list[dict[str, Any]] = []
+    for d in directives:
+        if isinstance(d, ReactDirective):
+            target_channel = (d.channel_id or fallback_channel_id).strip()
+            target_msg = (d.message_id or default_message_id or "").strip()
+            if not target_msg:
+                results.append({
+                    "kind": "react",
+                    "ok": False,
+                    "error": "no message_id and no recent message",
+                    "emoji": d.emoji,
+                })
+                continue
+            try:
+                ok = await registry.react(target_channel, target_msg, d.emoji)
+            except UnknownChannelError as exc:
+                results.append({
+                    "kind": "react", "ok": False,
+                    "error": str(exc), "emoji": d.emoji,
+                })
+                continue
+            except Exception as exc:  # noqa: BLE001
+                log.exception("directive react failed")
+                results.append({
+                    "kind": "react", "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}", "emoji": d.emoji,
+                })
+                continue
+            results.append({
+                "kind": "react", "ok": bool(ok), "emoji": d.emoji,
+                "channel_id": target_channel, "message_id": target_msg,
+            })
+
+        elif isinstance(d, SendFileDirective):
+            target_channel = (d.channel_id or fallback_channel_id).strip()
+            if outbound_root is None:
+                results.append({
+                    "kind": "send-file", "ok": False,
+                    "error": "outbound attachments dir not configured",
+                    "path": d.path,
+                })
+                continue
+            try:
+                resolved = resolve_outbound_path(outbound_root, d.path)
+            except AttachmentPathError as exc:
+                results.append({
+                    "kind": "send-file", "ok": False,
+                    "error": str(exc), "path": d.path,
+                })
+                continue
+            caption = d.caption or ""
+            try:
+                send_res = await registry.send(
+                    target_channel, caption, attachment_paths=[resolved],
+                )
+            except UnknownChannelError as exc:
+                results.append({
+                    "kind": "send-file", "ok": False,
+                    "error": str(exc), "path": d.path,
+                })
+                continue
+            except Exception as exc:  # noqa: BLE001
+                log.exception("directive send-file failed")
+                results.append({
+                    "kind": "send-file", "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "path": d.path,
+                })
+                continue
+            if d.cleanup and send_res.sent:
+                try:
+                    resolved.unlink(missing_ok=True)
+                except OSError:
+                    log.warning(
+                        "directive send-file: cleanup of %s failed", resolved,
+                    )
+            results.append({
+                "kind": "send-file", "ok": send_res.sent,
+                "path": str(resolved), "channel_id": target_channel,
+                "error": send_res.error,
+            })
+
+        elif isinstance(d, SendMessageDirective):
+            target_channel = d.channel_id.strip()
+            if not target_channel:
+                results.append({
+                    "kind": "send-message", "ok": False,
+                    "error": "missing channel attribute",
+                })
+                continue
+            try:
+                send_res = await registry.send(target_channel, d.text)
+            except UnknownChannelError as exc:
+                results.append({
+                    "kind": "send-message", "ok": False, "error": str(exc),
+                    "channel_id": target_channel,
+                })
+                continue
+            except Exception as exc:  # noqa: BLE001
+                log.exception("directive send-message failed")
+                results.append({
+                    "kind": "send-message", "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "channel_id": target_channel,
+                })
+                continue
+            results.append({
+                "kind": "send-message", "ok": send_res.sent,
+                "channel_id": target_channel,
+                "error": send_res.error,
+            })
+
+    return results
+
+
 def build_channel_tools(
     registry: ChannelRegistry,
     saga_client: SagaClient | None = None,
     message_buffer: MessageBuffer | None = None,
+    home: Path | None = None,
 ) -> list[SdkMcpTool]:
     """Build the channel-aware send_message + react tools, closed over a
     shared ``ChannelRegistry``.
@@ -87,6 +256,22 @@ def build_channel_tools(
         if not text.strip():
             return _content_block("send_message failed: text is empty", is_error=True)
 
+        # Parse <actions>...</actions> directives out of the text. The
+        # remaining clean_text is the user-visible message; directives
+        # (react, send-file, send-message) get dispatched after the
+        # main send. This collapses what would otherwise be 2-3 tool
+        # calls (send_message + react + send_file) into one. If parsing
+        # leaves clean_text empty but directives present, the main
+        # send is skipped and only the directives fire.
+        parsed = parse_directives(text)
+        directives = parsed.directives
+        text = parsed.clean_text
+        if not text.strip() and not directives:
+            return _content_block(
+                "send_message failed: nothing to send (text became empty after stripping <actions> blocks)",
+                is_error=True,
+            )
+
         ctx = get_current_turn()
         channel_id = (args.get("channel_id") or "").strip()
         if not channel_id:
@@ -95,6 +280,40 @@ def build_channel_tools(
             return _content_block(
                 "send_message failed: no channel_id and no current turn channel",
                 is_error=True,
+            )
+
+        # Outbound attachments root for <send-file path="..."> directives.
+        # Computed once per call so AttachmentPathError surfaces as a
+        # per-directive failure (not the whole tool call).
+        outbound_root: Path | None = None
+        if home is not None:
+            outbound_root = home / "attachments" / "outbound"
+
+        # When clean_text is empty, skip the main send + loop detector +
+        # SAGA mark and go straight to directive dispatch. ctx's
+        # last_assistant_message_id is the react-fallback target.
+        if not text.strip():
+            directive_results = await _dispatch_action_directives(
+                registry,
+                fallback_channel_id=channel_id,
+                directives=directives,
+                default_message_id=(ctx.last_assistant_message_id if ctx else None),
+                outbound_root=outbound_root,
+            )
+            await log_event(
+                "send_message",
+                channel_id=channel_id,
+                ok=True,
+                chunks=0,
+                message_id=None,
+                text="",
+                directives=directive_results,
+            )
+            return _content_block(
+                _format_directive_summary(
+                    main_sent=False, main_chunks=0, main_msg_id=None,
+                    results=directive_results,
+                )
             )
 
         # Loop-detection circuit breaker (SPEC §7.2.4).
@@ -233,6 +452,20 @@ def build_channel_tools(
             except Exception:  # noqa: BLE001
                 log.exception("send_message: chat_history append failed")
 
+        # Dispatch any <actions> directives the agent emitted alongside
+        # the text (react / send-file / send-message). Directives run
+        # AFTER the main send so reacts default to the just-sent
+        # message id when no explicit ``message=`` was given. Per-
+        # directive failures are recorded in the audit log; never
+        # raise into the tool reply.
+        directive_results = await _dispatch_action_directives(
+            registry,
+            fallback_channel_id=channel_id,
+            directives=directives,
+            default_message_id=result.message_id,
+            outbound_root=outbound_root,
+        )
+
         # Record the text on the event so adapters / the viewer can read what
         # was actually delivered. Cap to 4KB to keep events.jsonl small.
         text_for_log = text if len(text) <= 4096 else text[:4096] + "…[truncated]"
@@ -243,10 +476,13 @@ def build_channel_tools(
             chunks=result.chunks,
             message_id=result.message_id,
             text=text_for_log,
+            directives=directive_results if directive_results else None,
         )
         return _content_block(
-            f"send_message complete (sent=True, chunks={result.chunks}, "
-            f"message_id={result.message_id})"
+            _format_directive_summary(
+                main_sent=True, main_chunks=result.chunks,
+                main_msg_id=result.message_id, results=directive_results,
+            )
         )
 
     @tool(

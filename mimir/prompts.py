@@ -50,7 +50,38 @@ _DEFAULT_CONVENTIONS = """## Conventions
   the entry with [auto].
 - The INDEX.md files are auto-generated; do not hand-edit them.
 - Edit memory blocks with bash and file-op tools — no dedicated memory-block
-  tools exist."""
+  tools exist.
+
+## send_message directives
+
+Inside the ``send_message`` text body you may embed an ``<actions>`` block
+to bundle reactions and file sends into the same tool call. This is
+faster than calling ``send_message``, then ``react``, then ``send_message``
+again with an attachment — those become one tool call total.
+
+```
+Got it, here's the chart you asked for.
+
+<actions>
+  <react emoji="thumbsup" />
+  <send-file path="charts/q3.png" caption="Q3 numbers" />
+</actions>
+```
+
+- ``<react emoji="..." [message="<id>"] [channel="<id>"] />`` — react
+  with an emoji. Defaults to the message just sent in this call (or the
+  most recent assistant message when this call is directives-only).
+- ``<send-file path="..." [caption="..."] [kind="image|file|audio"]
+  [cleanup="true"] [channel="..."] />`` — attach a file. ``path`` resolves
+  under ``MIMIR_HOME/attachments/outbound/``; absolute paths must
+  already be inside that dir. ``..`` and symlink escapes are rejected.
+  ``cleanup="true"`` deletes the file after a successful send.
+- ``<send-message channel="<id>">cross-channel text</send-message>`` —
+  reply on a different channel than the one that triggered the turn.
+
+Per-directive failures are reported on the tool reply but don't fail
+the main send. The text outside the ``<actions>`` block is the
+user-visible message; the block itself is stripped before delivery."""
 
 
 # VSM: algedonic (out) — operator alert channel. When MIMIR_OPERATOR_ALERT_CHANNEL

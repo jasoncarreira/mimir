@@ -290,6 +290,206 @@ async def test_send_message_skips_feedback_with_no_atoms():
     assert [c.method for c in saga.calls] == []  # no feedback call
 
 
+# ─── <actions> directive integration ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_react_directive(tmp_path: Path):
+    """Text + <actions><react/></actions> dispatches the main send,
+    then reacts on the just-sent message id (no explicit message attr)."""
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg, home=tmp_path)}
+
+    ctx = _ctx_with(LoopDetector(), channel="c-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await tools["send_message"].handler({
+            "text": "Got it.\n<actions><react emoji=\"thumbsup\" /></actions>",
+        })
+    finally:
+        _context.reset_current_turn(token)
+
+    # Main send delivered cleaned text; <actions> stripped.
+    assert bridge.sent == [("c-1", "Got it.")]
+    # Single reaction on the just-sent message id (m1 from _RecordingBridge).
+    assert bridge.reacted == [("c-1", "m1", "thumbsup")]
+    body = out["content"][0]["text"]
+    assert "send_message complete" in body
+    assert "react [ok]" in body
+
+
+@pytest.mark.asyncio
+async def test_send_message_directives_only_no_main_send(tmp_path: Path):
+    """When <actions> is the only content (clean_text empty), the main
+    send is skipped and only directives fire."""
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg, home=tmp_path)}
+
+    ctx = _ctx_with(LoopDetector(), channel="c-1")
+    ctx.last_assistant_message_id = "prev-msg"
+    token = _context.set_current_turn(ctx)
+    try:
+        await tools["send_message"].handler({
+            "text": "<actions><react emoji=\"eyes\" /></actions>",
+        })
+    finally:
+        _context.reset_current_turn(token)
+
+    assert bridge.sent == []  # no main send
+    assert bridge.reacted == [("c-1", "prev-msg", "eyes")]
+
+
+@pytest.mark.asyncio
+async def test_send_message_directives_only_rejects_when_no_recent_msg(tmp_path: Path):
+    """Directives-only with a react that has no message attr AND no
+    last_assistant_message_id → recorded as a per-directive failure."""
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg, home=tmp_path)}
+
+    ctx = _ctx_with(LoopDetector(), channel="c-1")
+    # ctx.last_assistant_message_id stays None
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await tools["send_message"].handler({
+            "text": "<actions><react emoji=\"eyes\" /></actions>",
+        })
+    finally:
+        _context.reset_current_turn(token)
+
+    body = out["content"][0]["text"]
+    assert "react [FAIL]" in body
+    assert "no message_id" in body
+    assert bridge.reacted == []
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_send_file_directive_resolves_under_outbound(
+    tmp_path: Path,
+):
+    """<send-file path="..."> resolves against home/attachments/outbound/
+    and is delivered as an attachment_paths argument to bridge.send."""
+    outbound = tmp_path / "attachments" / "outbound"
+    outbound.mkdir(parents=True)
+    target = outbound / "report.pdf"
+    target.write_bytes(b"%PDF")
+
+    sent_with_attach: list[tuple[str, str, list]] = []
+
+    @dataclass
+    class _AttachBridge(Bridge):
+        name: str = "att"
+        prefixes: tuple = ("c-",)
+        async def connect(self): ...
+        async def disconnect(self): ...
+        async def send(self, channel_id, text, attachment_paths=None):
+            sent_with_attach.append((channel_id, text, list(attachment_paths or [])))
+            return SendResult(sent=True, message_id="m1", chunks=1)
+        async def react(self, channel_id, message_id, emoji):
+            return True
+
+    bridge = _AttachBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg, home=tmp_path)}
+
+    ctx = _ctx_with(LoopDetector(), channel="c-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await tools["send_message"].handler({
+            "text": "Here it is.\n<actions><send-file path=\"report.pdf\" caption=\"Q3\" /></actions>",
+        })
+    finally:
+        _context.reset_current_turn(token)
+
+    # Two sends: main (cleaned text), then send-file (caption + attachment).
+    assert len(sent_with_attach) == 2
+    assert sent_with_attach[0][1] == "Here it is."
+    assert sent_with_attach[0][2] == []
+    assert sent_with_attach[1][1] == "Q3"
+    assert sent_with_attach[1][2] == [target.resolve()]
+    body = out["content"][0]["text"]
+    assert "send-file [ok]" in body
+
+
+@pytest.mark.asyncio
+async def test_send_message_send_file_path_escape_logged_not_raised(tmp_path: Path):
+    """Path escape in <send-file path=".."/> is per-directive failure;
+    the main send still succeeds."""
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg, home=tmp_path)}
+
+    # No outbound dir created — resolve_outbound_path will reject as
+    # non-existent path; either way the directive fails cleanly.
+    ctx = _ctx_with(LoopDetector(), channel="c-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await tools["send_message"].handler({
+            "text": "see\n<actions><send-file path=\"../etc/passwd\" /></actions>",
+        })
+    finally:
+        _context.reset_current_turn(token)
+
+    body = out["content"][0]["text"]
+    assert "send_message complete" in body
+    assert "send-file [FAIL]" in body
+    # Main text still delivered.
+    assert bridge.sent == [("c-1", "see")]
+
+
+@pytest.mark.asyncio
+async def test_send_message_send_file_without_home_is_failure(tmp_path: Path):
+    """If home wasn't passed to build_channel_tools, <send-file>
+    fails with a clear message."""
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg)}  # no home
+
+    ctx = _ctx_with(LoopDetector(), channel="c-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await tools["send_message"].handler({
+            "text": "x\n<actions><send-file path=\"y.pdf\" /></actions>",
+        })
+    finally:
+        _context.reset_current_turn(token)
+
+    body = out["content"][0]["text"]
+    assert "send-file [FAIL]" in body
+    assert "outbound attachments dir not configured" in body
+
+
+@pytest.mark.asyncio
+async def test_send_message_plain_text_unchanged(tmp_path: Path):
+    """No <actions> in text → behavior identical to pre-stage-4 path."""
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg, home=tmp_path)}
+
+    ctx = _ctx_with(LoopDetector(), channel="c-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await tools["send_message"].handler({"text": "hello"})
+    finally:
+        _context.reset_current_turn(token)
+
+    assert bridge.sent == [("c-1", "hello")]
+    assert bridge.reacted == []
+    body = out["content"][0]["text"]
+    assert "send_message complete" in body
+    # No directive bullets when there were no directives.
+    assert "directives:" not in body
+
+
 @pytest.mark.asyncio
 async def test_send_message_skips_feedback_on_synthesis_turn():
     """saga_session_end synthesis turns call saga_feedback per-atom inside
