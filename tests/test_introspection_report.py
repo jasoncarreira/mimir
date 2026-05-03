@@ -132,7 +132,7 @@ def test_recurring_errors_group_volatile_paths(tmp_path: Path):
     turns = tmp_path / "turns.jsonl"
     events = tmp_path / "events.jsonl"
     # Five errors with different paths but same shape.
-    for i, p in enumerate(["/tmp/abc", "/var/log/foo", "/Users/jcarreira/x",
+    for i, p in enumerate(["/tmp/abc", "/var/log/foo", "/home/user/x",
                            "/tmp/zzz", "/etc/y"]):
         _write_turn(turns, ts=NOW - timedelta(hours=i + 1),
                     tool_calls=[("Read", True, f"FileNotFoundError: {p}")])

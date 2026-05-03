@@ -26,7 +26,7 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
 ## 2. Repository layout
 
 ```
-/Users/jcarreira/projects/odin/mimir/
+<repo-root>/
 ├── pyproject.toml
 ├── README.md
 ├── SPEC.md                       # this document
@@ -222,7 +222,7 @@ Exactly one of `cron` or `time_of_day` must be set per job.
 Two processes inside one container, supervised by `supervisord`:
 
 1. **Mimir** — Python service running the Claude Agent SDK loop, plus the indexer thread, plus the channel bridges (§7.2.1) as asyncio tasks, plus a small HTTP control surface (event injection, health check).
-2. **MSAM** — the existing MSAM server (Python / FastAPI + Uvicorn, port 3002, source at `/Users/jcarreira/projects/odin/msam/`), unmodified, configured against the same volume-mounted home.
+2. **MSAM** — the existing MSAM server (Python / FastAPI + Uvicorn, port 3002, source vendored under `saga/saga/`), unmodified, configured against the same volume-mounted home.
 
 Channel bridges (Slack, Discord, Bluesky, Web UI, Bench) are NOT separate processes — they run inside the mimir process as asyncio coroutines, sharing the per-channel dispatcher (§4.5) and the global concurrency cap. Subprocess pollers (§7.2.2) are the only out-of-process channel components, and they're inbound-only.
 
@@ -589,7 +589,7 @@ Two MSAM-side changes; both flagged for the MSAM owner. The `/v1/outcome` and `/
 
 ### 6.1 Storage
 
-Single SQLite database at `<home>/.mimir/index.db`. Indexes everything under `memory/` (excluding `memory/core/` and `memory/INDEX.md`) plus everything under `state/` (excluding `state/INDEX.md`). Two tables, one FTS5 virtual table — port of muninnbot's hybrid state-search recipe (`/Users/jcarreira/projects/odin/muninnbot/scripts/state_search.py`) from PostgreSQL + pgvector to SQLite + FTS5 to keep the benchmark container self-contained (no Postgres dependency):
+Single SQLite database at `<home>/.mimir/index.db`. Indexes everything under `memory/` (excluding `memory/core/` and `memory/INDEX.md`) plus everything under `state/` (excluding `state/INDEX.md`). Two tables, one FTS5 virtual table — port of muninnbot's hybrid state-search recipe (originally `state_search.py` in the muninnbot project) from PostgreSQL + pgvector to SQLite + FTS5 to keep the benchmark container self-contained (no Postgres dependency):
 
 ```sql
 CREATE TABLE files (
@@ -1059,7 +1059,7 @@ Same hook as open-strix's `_archive_and_truncate_turns`: when `MIMIR_TURNS_ARCHI
 
 ## 11. Turn viewer (HTML)
 
-Ported from open-strix's `turn_viewer.html` (`/Users/jcarreira/projects/odin/open-strix/open_strix/turn_viewer.html`) — a single self-contained HTML page (vanilla JS, inline CSS, no framework, no CDN) served by an aiohttp endpoint inside the mimir process.
+Ported from open-strix's `turn_viewer.html` — a single self-contained HTML page (vanilla JS, inline CSS, no framework, no CDN) served by an aiohttp endpoint inside the mimir process.
 
 ### 11.1 Routes
 
@@ -1122,8 +1122,8 @@ Single Python image — MSAM is Python (FastAPI + Uvicorn), so we just `pip inst
 FROM python:3.12-slim
 RUN apt-get update && apt-get install -y supervisor curl git && rm -rf /var/lib/apt/lists/*
 
-# MSAM (Python / FastAPI), copied from /Users/jcarreira/projects/odin/msam/
-COPY msam /opt/msam
+# MSAM (Python / FastAPI), copied from the vendored saga package.
+COPY saga /opt/msam
 RUN pip install /opt/msam
 
 # Mimir

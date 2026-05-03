@@ -15,7 +15,7 @@ Output:
 - Per-subtype breakdown so we can see if the thresholds need to vary.
 
 Usage:
-    set -a; source /Users/jcarreira/projects/odin/msam/.env; set +a
+    set -a; source <repo>/.env; set +a
     PYTHONPATH=. python -m saga.benchmarks.longmemeval.p33_threshold_analysis
         [--sample-size N]   # sample N questions; default 100
 """
