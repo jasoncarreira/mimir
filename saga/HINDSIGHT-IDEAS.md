@@ -71,7 +71,7 @@ Add three columns to `atoms`:
 
 ```sql
 ALTER TABLE atoms ADD COLUMN memory_type TEXT DEFAULT 'raw';
-     -- 'raw' | 'observation' | 'mental_model'
+     -- 'raw' | 'observation'  (mental_model dropped — see P26)
 ALTER TABLE atoms ADD COLUMN evidence_count INTEGER DEFAULT 0;
 ALTER TABLE atoms ADD COLUMN trend TEXT DEFAULT NULL;
      -- NULL | 'stable' | 'strengthening' | 'weakening' | 'stale'

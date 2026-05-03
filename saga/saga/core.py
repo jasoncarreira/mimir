@@ -3547,7 +3547,9 @@ MIGRATIONS = {
         # P1: Observations tier. Promote consolidation output to a
         # first-class memory type so the retriever can prefer distilled
         # beliefs over raw atoms and weigh them by evidence strength.
-        # memory_type: 'raw' | 'observation' | 'mental_model' (mental_model reserved, not used yet)
+        # memory_type: 'raw' | 'observation'  (P26: dropped 'mental_model' from
+        # the documented vocabulary — never written, no clear use beyond what
+        # observations + world-model triples already cover.)
         # evidence_count: number of raw atoms that support an observation
         # trend: NULL | 'stable' | 'strengthening' | 'weakening' | 'stale' (populated by decay cycle)
         "ALTER TABLE atoms ADD COLUMN memory_type TEXT DEFAULT 'raw'",
