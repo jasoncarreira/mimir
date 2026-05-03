@@ -192,6 +192,11 @@ def build_app(config: Config) -> web.Application:
     web_chat = WebChatBridge(enqueue=dispatcher.enqueue, home=config.home)
     channels.register(web_chat)
 
+    # Inbound attachments land here; the agent reads files by path. The
+    # outbound counterpart (<send-file path="..."> directives) resolves
+    # paths under attachments/outbound/ — created lazily on first use.
+    attachments_inbound = config.home / "attachments" / "inbound"
+
     # DiscordBridge — opt-in via DISCORD_TOKEN. Import is deferred so absent
     # discord-py doesn't crash deployments that don't use Discord.
     if config.discord_token:
@@ -199,7 +204,11 @@ def build_app(config: Config) -> web.Application:
             from .bridges.discord import DiscordBridge
 
             channels.register(
-                DiscordBridge(token=config.discord_token, enqueue=dispatcher.enqueue)
+                DiscordBridge(
+                    token=config.discord_token,
+                    enqueue=dispatcher.enqueue,
+                    attachments_dir=attachments_inbound,
+                )
             )
         except ImportError as exc:
             log.warning(
@@ -220,6 +229,7 @@ def build_app(config: Config) -> web.Application:
                     bot_token=config.slack_bot_token,
                     app_token=config.slack_app_token,
                     enqueue=dispatcher.enqueue,
+                    attachments_dir=attachments_inbound,
                 )
             )
         except ImportError as exc:

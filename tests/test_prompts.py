@@ -46,3 +46,46 @@ def test_config_operator_alert_channel_default_empty(monkeypatch: pytest.MonkeyP
     monkeypatch.delenv("MIMIR_OPERATOR_ALERT_CHANNEL", raising=False)
     cfg = Config.from_env()
     assert cfg.operator_alert_channel == ""
+
+
+# ---- Inbound attachments rendering ---------------------------------------
+
+
+def test_turn_prompt_renders_inbound_attachments():
+    """When the event carries attachment_names (set by bridges that
+    download inbound files), the turn prompt body grows an
+    ``Attachments:`` block listing each path so the agent can
+    ``Read`` them."""
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1",
+        content="see attached",
+        author="discord-99",
+        author_display="alice",
+        attachment_names=[
+            "/home/mimir/attachments/inbound/discord/1/2-x-report.pdf",
+            "/home/mimir/attachments/inbound/discord/1/2-y-chart.png",
+        ],
+    )
+    prompt = build_turn_prompt(event)
+    assert "see attached" in prompt
+    assert "Attachments:" in prompt
+    assert "report.pdf" in prompt
+    assert "chart.png" in prompt
+
+
+def test_turn_prompt_omits_attachments_section_when_empty():
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1",
+        content="no files this time",
+        author="discord-99",
+    )
+    prompt = build_turn_prompt(event)
+    assert "Attachments:" not in prompt

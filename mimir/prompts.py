@@ -233,6 +233,12 @@ def build_turn_prompt(
             f"author: {header_author}, ts: {ts}]"
         )
         body = event.content or "(no content)"
+        # Surface inbound attachment paths so the agent can ``Read`` them.
+        # Bridges download files into ``MIMIR_HOME/attachments/inbound/...``
+        # and populate ``attachment_names`` with the local paths.
+        if event.attachment_names:
+            paths = "\n".join(f"- {p}" for p in event.attachment_names)
+            body = f"{body}\n\nAttachments:\n{paths}"
     sections.append(f"{header}\n{body}")
 
     return "\n\n".join(sections)
