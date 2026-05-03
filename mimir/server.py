@@ -298,9 +298,13 @@ def build_app(config: Config) -> web.Application:
         await channels.connect_all()
 
         # Register SAGA weekly consolidation. Bad cron logs and continues.
+        # Pass home so the closure can read identities.yaml at fire time
+        # and thread canonical names into the consolidation prompt's
+        # P48 vocab block (Option A — operator-curated canonical subjects).
         try:
             consolidate_registered = scheduler.add_saga_consolidate_job(
-                saga_client, config.saga_consolidate_cron
+                saga_client, config.saga_consolidate_cron,
+                home=config.home,
             )
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc))

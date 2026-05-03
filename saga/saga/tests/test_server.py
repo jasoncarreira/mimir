@@ -620,7 +620,8 @@ class TestConsolidate:
         monkeypatch.setattr(consolidation, "ConsolidationEngine", type(
             "MockEngine", (), {
                 "__init__": lambda self: None,
-                "consolidate": lambda self, dry_run=False, max_clusters=None: {
+                "consolidate": lambda self, dry_run=False, max_clusters=None,
+                                       extra_canonical_subjects=None: {
                     "clusters_found": 2, "dry_run": dry_run,
                 },
             }
@@ -630,6 +631,30 @@ class TestConsolidate:
         assert rv.status_code == 200
         data = rv.json()
         assert data["dry_run"] is True
+
+    def test_consolidate_threads_extra_canonical_subjects(
+        self, client, monkeypatch,
+    ):
+        """P48 + Option A: ?extra_canonical_subjects= threads through
+        to ConsolidationEngine.consolidate."""
+        from saga import consolidation
+        captured: dict = {}
+        monkeypatch.setattr(consolidation, "ConsolidationEngine", type(
+            "MockEngine", (), {
+                "__init__": lambda self: None,
+                "consolidate": lambda self, dry_run=False, max_clusters=None,
+                                       extra_canonical_subjects=None:
+                    captured.update({
+                        "extra_canonical_subjects": extra_canonical_subjects,
+                    }) or {"clusters_found": 0, "dry_run": dry_run},
+            }
+        ))
+        rv = client.post(
+            "/v1/consolidate",
+            json={"extra_canonical_subjects": ["Tim", "Alice"]},
+        )
+        assert rv.status_code == 200
+        assert captured["extra_canonical_subjects"] == ["Tim", "Alice"]
 
 
 # ─── Replay ──────────────────────────────────────────────────────────────────

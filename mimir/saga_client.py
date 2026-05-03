@@ -113,6 +113,7 @@ class SagaClient(Protocol):
 
     async def consolidate(
         self, *, dry_run: bool = False, max_clusters: int | None = None,
+        extra_canonical_subjects: list[str] | None = None,
     ) -> dict[str, Any]: ...
 
     async def recent_session_boundaries(
@@ -381,6 +382,7 @@ class _InProcessSaga:
 
     async def consolidate(
         self, *, dry_run: bool = False, max_clusters: int | None = None,
+        extra_canonical_subjects: list[str] | None = None,
     ) -> dict[str, Any]:
         await self._ensure_ready()
 
@@ -390,6 +392,8 @@ class _InProcessSaga:
             kwargs: dict[str, Any] = {"dry_run": dry_run}
             if max_clusters is not None:
                 kwargs["max_clusters"] = max_clusters
+            if extra_canonical_subjects:
+                kwargs["extra_canonical_subjects"] = list(extra_canonical_subjects)
             result = engine.consolidate(**kwargs) or {}
             # mimir's scheduler logs the result; defensive flat dict.
             if not isinstance(result, dict):
@@ -617,10 +621,13 @@ class _HttpSaga:
 
     async def consolidate(
         self, *, dry_run: bool = False, max_clusters: int | None = None,
+        extra_canonical_subjects: list[str] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"dry_run": dry_run}
         if max_clusters is not None:
             body["max_clusters"] = max_clusters
+        if extra_canonical_subjects:
+            body["extra_canonical_subjects"] = list(extra_canonical_subjects)
         return await self._post("/v1/consolidate", body)
 
     async def recent_session_boundaries(

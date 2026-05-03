@@ -132,6 +132,75 @@ def test_vocab_block_empty_when_db_unreadable(monkeypatch):
     assert isinstance(block, str)
 
 
+def test_vocab_block_includes_extra_subjects():
+    """P48 + Option A: operator-supplied canonical subjects (e.g. mimir's
+    identities.yaml) appear in the subjects list without counts."""
+    from saga.consolidation import _canonical_vocab_block
+    from saga.core import get_db
+    conn = get_db()
+    try:
+        block = _canonical_vocab_block(
+            conn, extra_subjects=["Tim", "Alice", "Jaden"],
+        )
+    finally:
+        conn.close()
+    assert "Tim" in block
+    assert "Alice" in block
+    assert "Jaden" in block
+    # No counts for extras (they're authoritative-by-fiat).
+    subj_line = next(l for l in block.splitlines() if "Subjects:" in l)
+    # "Tim (" or "Alice (" would mean a stray count attached.
+    assert "Tim (" not in subj_line
+    assert "Alice (" not in subj_line
+
+
+def test_vocab_block_extras_dedup_against_seed_and_db():
+    """Don't duplicate User if it's already in the seed AND extras."""
+    from saga.consolidation import _canonical_vocab_block
+    from saga.core import get_db
+    conn = get_db()
+    try:
+        block = _canonical_vocab_block(
+            conn, extra_subjects=["User", "Tim"],
+        )
+    finally:
+        conn.close()
+    subj_line = next(l for l in block.splitlines() if "Subjects:" in l)
+    # User appears exactly once.
+    assert subj_line.count("User") == 1
+    # Tim appears once.
+    assert subj_line.count("Tim") == 1
+
+
+def test_vocab_block_skips_blank_extras():
+    """Extras list with empty / whitespace-only strings is filtered."""
+    from saga.consolidation import _canonical_vocab_block
+    from saga.core import get_db
+    conn = get_db()
+    try:
+        block = _canonical_vocab_block(
+            conn, extra_subjects=["", "  ", "Tim", None],  # type: ignore[list-item]
+        )
+    finally:
+        conn.close()
+    assert "Tim" in block
+
+
+def test_consolidate_threads_extra_canonical_subjects():
+    """ConsolidationEngine.consolidate(extra_canonical_subjects=...)
+    stores them on self for the prompt-builder to read."""
+    from saga.consolidation import ConsolidationEngine
+    engine = ConsolidationEngine()
+    # Pre-state: attribute may not exist.
+    assert getattr(engine, '_extra_canonical_subjects', None) in (None, [])
+    # Mock cluster phase to avoid needing real atoms.
+    engine._cluster_phase = lambda: []  # type: ignore[method-assign]
+    engine.consolidate(
+        dry_run=True, extra_canonical_subjects=["Tim", "Alice"],
+    )
+    assert engine._extra_canonical_subjects == ["Tim", "Alice"]
+
+
 def test_vocab_block_never_emits_count_for_seed_only_entries():
     """A seed predicate that doesn't appear in the DB must NOT be
     rendered with a (0) count — that would mislead the LLM into

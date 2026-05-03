@@ -173,6 +173,12 @@ class PredictRequest(BaseModel):
 class ConsolidateRequest(BaseModel):
     dry_run: bool = False
     max_clusters: Optional[int] = None
+    # P48 + Option A: operator-supplied canonical subjects (typically
+    # the canonical names from mimir's identities.yaml). Threaded into
+    # the consolidation prompt's vocab block so the LLM uses operator-
+    # curated names instead of whatever surface form source atoms
+    # mention. Optional — empty list / None = seed-only behavior.
+    extra_canonical_subjects: Optional[list[str]] = None
 
 
 class ReplayRequest(BaseModel):
@@ -714,7 +720,11 @@ async def api_consolidate(req: ConsolidateRequest = ConsolidateRequest()):
     def _consolidate():
         from .consolidation import ConsolidationEngine
         engine = ConsolidationEngine()
-        return engine.consolidate(dry_run=req.dry_run, max_clusters=req.max_clusters)
+        return engine.consolidate(
+            dry_run=req.dry_run,
+            max_clusters=req.max_clusters,
+            extra_canonical_subjects=req.extra_canonical_subjects,
+        )
     return await asyncio.to_thread(_consolidate)
 
 

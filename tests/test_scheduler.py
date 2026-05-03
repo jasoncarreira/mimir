@@ -163,6 +163,79 @@ def test_add_introspection_report_job_registers(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_saga_consolidate_threads_canonical_subjects(tmp_path: Path):
+    """P48 + Option A: when home is provided, the consolidate cron
+    reads identities.yaml at fire time and threads canonical names
+    through saga_client.consolidate(extra_canonical_subjects=[...])."""
+    # Seed identities.yaml in the home.
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        "people:\n"
+        "  - canonical: Tim\n"
+        "    aliases: [tim, tcarmody]\n"
+        "  - canonical: Alice\n"
+        "    aliases: [alice]\n",
+        encoding="utf-8",
+    )
+
+    # Capture what the saga_client receives.
+    captured: dict = {}
+
+    class _FakeSagaClient:
+        async def consolidate(self, **kwargs):
+            captured.update(kwargs)
+            return {"clusters_processed": 0, "atoms_merged": 0}
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched.add_saga_consolidate_job(
+        _FakeSagaClient(), "0 4 * * 0", home=tmp_path,
+    )
+    job = sched._scheduler.get_job("saga-consolidate")
+    assert job is not None
+
+    # Initialize the event logger so log_event in the callback doesn't
+    # raise. Use a per-test path to avoid cross-test pollution.
+    from mimir.event_logger import init_logger
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    # Invoke the registered callback directly.
+    await job.func()
+
+    assert "extra_canonical_subjects" in captured
+    assert set(captured["extra_canonical_subjects"]) == {"Tim", "Alice"}
+
+
+@pytest.mark.asyncio
+async def test_saga_consolidate_no_identities_yaml_no_subjects(tmp_path: Path):
+    """When identities.yaml is missing, extra_canonical_subjects stays
+    None — no failure, just seed-only behavior on the saga side."""
+    captured: dict = {}
+
+    class _FakeSagaClient:
+        async def consolidate(self, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched.add_saga_consolidate_job(
+        _FakeSagaClient(), "0 4 * * 0", home=tmp_path,
+    )
+    job = sched._scheduler.get_job("saga-consolidate")
+
+    from mimir.event_logger import init_logger
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    await job.func()
+    # Either absent or None — both mean "didn't pass canonical subjects."
+    assert not captured.get("extra_canonical_subjects")
+
+
+@pytest.mark.asyncio
 async def test_introspection_report_callback_writes_report_and_emits(tmp_path: Path):
     """End-to-end: invoke the registered callback directly and verify it
     produces a state/reports/ file. Uses a degraded-heartbeat scenario
