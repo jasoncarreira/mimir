@@ -1,0 +1,78 @@
+# Integration bench: P30 canonical + P40 (no endorsed-atom pull-in).
+# Sole delta vs saga_p30.toml = enable_endorsed_atom_pull_in = false.
+# Hypothesis: out-of-pool endorsed atoms anchor at the bottom of the
+# score distribution and dilute in-pool ranking; boost-only behavior
+# (keep the in-pool boost, drop the pull-in) is the cleaner shape.
+#
+# Pair config: saga_p30.toml.
+
+[storage]
+db_path = "saga.db"
+metrics_db_path = "saga_metrics.db"
+token_budget_ceiling = 100000000
+auto_compact_threshold_pct = 99
+refuse_threshold_pct = 100
+db_busy_timeout_ms = 5000
+
+[embedding]
+provider = "openai"
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dimensions = 1536
+api_key_env = "OPENAI_API_KEY"
+
+[llm]
+provider = "openai_compat"
+url = "https://api.openai.com/v1/chat/completions"
+model = "gpt-5.4-nano"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 120
+
+[retrieval]
+enable_contextual_rewrite = true
+two_tier_enabled = true
+enable_missing_ref_pivot = true
+enable_confidence_gating = true
+default_min_confidence_tier = "low"
+enable_triple_augment_v2 = false
+enable_subatom_beam = false
+# P40: drop the out-of-pool endorsed-atom pull-in. Boost for in-pool
+# endorsed atoms still applies.
+enable_endorsed_atom_pull_in = false
+
+[retrieval_v2]
+enable_query_expansion = true
+
+[triples]
+enable_extraction = true
+
+[consolidation]
+enabled = true
+enable_llm = true
+
+[benchmark]
+enable_session_boundaries = false
+enable_mark_contributions = false
+
+[compression]
+enable_subatom = false
+enable_fact_dedup = false
+enable_synthesis = false
+
+[annotation]
+use_llm = false
+
+[prediction]
+enabled = false
+
+[world_model]
+enabled = false
+
+[decay]
+enabled = false
+
+[atoms]
+auto_resolve_supersedes_on_write = false
+
+[server]
+api_key = ""

@@ -598,7 +598,7 @@ class TestParseStructuredSynthesis:
             "(User, has_degree, Business_Administration)\n"
             "(User, graduation_year, 2023)\n"
         )
-        obs, triples = _parse_structured_synthesis(text)
+        obs, triples, _contras = _parse_structured_synthesis(text)
         assert obs == "User graduated with a Business Administration degree."
         assert len(triples) == 2
         assert triples[0]["subject"] == "User"
@@ -608,7 +608,7 @@ class TestParseStructuredSynthesis:
     def test_observation_only_no_triples_section(self):
         from saga.consolidation import _parse_structured_synthesis
         text = "OBSERVATION:\nUser likes pizza."
-        obs, triples = _parse_structured_synthesis(text)
+        obs, triples, _contras = _parse_structured_synthesis(text)
         assert obs == "User likes pizza."
         assert triples == []
 
@@ -621,7 +621,7 @@ class TestParseStructuredSynthesis:
             "TRIPLES:\n"
             "NONE\n"
         )
-        obs, triples = _parse_structured_synthesis(text)
+        obs, triples, _contras = _parse_structured_synthesis(text)
         assert obs == "User reflects on whether life has meaning."
         assert triples == []
 
@@ -630,7 +630,7 @@ class TestParseStructuredSynthesis:
         whole text becomes the observation."""
         from saga.consolidation import _parse_structured_synthesis
         text = "User said they prefer dark mode UI."
-        obs, triples = _parse_structured_synthesis(text)
+        obs, triples, _contras = _parse_structured_synthesis(text)
         assert "User said they prefer dark mode UI." in obs
         assert triples == []
 
@@ -645,7 +645,7 @@ class TestParseStructuredSynthesis:
             "**TRIPLES:**\n"
             "(User, lives_in, Boston)\n"
         )
-        obs, triples = _parse_structured_synthesis(text)
+        obs, triples, _contras = _parse_structured_synthesis(text)
         assert obs == "User lives in Boston."
         assert len(triples) == 1
 
@@ -663,7 +663,7 @@ class TestParseStructuredSynthesis:
             "CONTRADICTIONS:\n"
             "atom 1 vs atom 3 disagree on day of week\n"
         )
-        obs, triples = _parse_structured_synthesis(text)
+        obs, triples, _contras = _parse_structured_synthesis(text)
         assert obs == "User likes pizza."
         assert len(triples) == 1
         # CONTRADICTIONS shouldn't end up in the triples list
@@ -671,7 +671,7 @@ class TestParseStructuredSynthesis:
 
     def test_empty_input(self):
         from saga.consolidation import _parse_structured_synthesis
-        obs, triples = _parse_structured_synthesis("")
+        obs, triples, _contras = _parse_structured_synthesis("")
         assert obs is None
         assert triples == []
 
@@ -689,7 +689,7 @@ class TestParseStructuredSynthesis:
             "(A, b, C)\n"  # too short - rejected
             "(SomeReallyLongSubjectThatExceedsTheLimitForSubjects, has, x)\n"  # too long subject
         )
-        obs, triples = _parse_structured_synthesis(text)
+        obs, triples, _contras = _parse_structured_synthesis(text)
         # Only the first valid one survives validation
         assert len(triples) == 1
         assert triples[0]["subject"] == "User"

@@ -1773,6 +1773,60 @@ problem is concrete and the fix is targeted.
 
 ---
 
+### P47 — Trend-driven promotion / demotion of saga atoms [filed 2026-05-03]
+
+**What.** Tie three previously-independent threads into one signal:
+- **P17** activates `atoms.trend` (improving / stable / weakening / stale)
+- **P45** surfaces `most-retrieved` atoms as promotion candidates
+- The retrieval-side trend multipliers (already in `core.py:2510-2514`)
+
+…so that promotion candidates AREN'T just "high cumulative retrieval"
+but "high recent retrieval AND currently growing." This distinguishes
+"atom that was hot 6 weeks ago and is now stale" from "atom that's
+currently growing in usage" — only the latter belongs in mimir's
+in-context core memory.
+
+**Bundle: ship as one consolidation-pass-v2 PR + one bench:**
+
+1. **P17** — write `trend` from access-log decay during consolidation.
+   ratio = retrievals_30d / max(retrievals_30-90d, 1):
+   - > 1.2 → `improving`  (no penalty)
+   - 0.7-1.2 → `stable`   (no penalty)
+   - 0.3-0.7 → `weakening` (×0.7 penalty kicks in)
+   - < 0.3 → `stale`      (×0.4 penalty)
+
+2. **P35-contradictions** — add `CONTRADICTIONS:` output section to
+   the consolidation prompt. Cheap (LLM already has all source atoms
+   in context); pure additive (no retrieval ranking impact); feeds
+   P25's reconciliation work with structured cluster-level signal.
+
+3. **P45 extension** — add `trend` to the `get_most_retrieved`
+   response and a `--trend improving|stable|weakening|stale` filter
+   on the `mimir reflection most-retrieved` CLI.
+
+4. **reflection/SKILL.md track B.3 update** — promote candidates =
+   `--trend improving --contributed-only`; cleanup candidates =
+   `--trend stale`; demote-from-core candidates = core blocks whose
+   content correlates with stale atoms.
+
+**Why bundle.** All three changes touch consolidation (P17 + P35-c
+both modify `_persist_consolidation` / the prompt) plus the
+downstream consumer (P45 + reflection skill) that uses the new
+column. Doing them as one PR + one bench run isolates the delta
+cleanly from other work; doing them separately means three bench
+cycles and harder attribution.
+
+**Effort.** ~50 LOC across saga + mimir + skill + tests. ~1 day code
++ 1 bench cycle.
+
+**Risk.** Low. P17 only writes a previously-unwritten column —
+existing retrieval multipliers were already coded but no-op.
+P35-contradictions adds an output section the post-processor doesn't
+yet read (forward-compat). P45 extension is additive to the response
+shape.
+
+---
+
 ### P15 — Evaluate cross-encoder rerank [decided not to do 2026-05-02]
 
 **Status.** The mimir agent already does its own ranking pass over

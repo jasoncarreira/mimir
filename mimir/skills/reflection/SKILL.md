@@ -155,13 +155,22 @@ edited recently are typically still active.
 Output: cleanup + promotion proposals into
 `state/proposed-changes.md`.
 
-### B.3 — Atom-to-core promotion candidates
+### B.3 — Atom-to-core promotion + demotion candidates (P47)
 
-Run the most-retrieved CLI subcommand with `--contributed-only` (e.g.
-`mimir reflection most-retrieved --days 7 --count 20
---contributed-only`) to get the atoms you actually used over the last
-week. For each:
+Two passes — **promote** the atoms that are growing in usage,
+**flag for cleanup** the atoms that have gone stale.
 
+**Promotion pass.** Atoms whose `trend=improving` AND that have
+`access_log.contributed=1` for recent retrievals. These are the
+atoms the agent is *currently* leaning on more than before — they
+belong in core memory:
+
+```bash
+mimir reflection most-retrieved --days 7 --count 20 \
+    --contributed-only --trend improving
+```
+
+For each candidate:
 - Is this a recurring fact or pattern, not a one-off conversational
   detail?
 - Would it be load-bearing in a turn next month?
@@ -170,6 +179,27 @@ week. For each:
 
 If yes: propose a new core block (or addition) with the atom's
 content, into `state/proposed-changes.md`.
+
+**Demotion / cleanup pass.** Atoms whose `trend=stale` — the
+retrieval-side multiplier (×0.4) is already deprioritizing them, so
+this is mostly housekeeping:
+
+```bash
+mimir reflection most-retrieved --days 30 --count 20 --trend stale
+```
+
+For each:
+- If a core block's content correlates with these stale atoms, the
+  block may also have gone stale — propose a review.
+- Saga's decay cycle handles the atom-level fade automatically; this
+  pass is for noticing when a *cluster* of staleness signals a
+  bigger shift in what the agent should care about.
+
+**No-trend fallback.** When `trend` returns NULL for an atom (no
+access history in the prior 90d, or fresh atoms before
+consolidation has labeled them), fall back to the cumulative-
+retrieval signal — `--contributed-only` without `--trend`. The
+P47 trend filter is additive, not a hard gate.
 
 ### Promotion criteria (heuristic, not rigid)
 

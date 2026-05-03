@@ -106,10 +106,11 @@ def _install_fake_saga(monkeypatch, *, calls: dict, query_result=None,
         )
         return last_sessions or [{"session_id": "s1", "summary": "x"}]
 
-    def get_most_retrieved(*, days, count, channel=None, contributed_only=False):
+    def get_most_retrieved(*, days, count, channel=None, contributed_only=False,
+                            trend=None):
         calls.setdefault("get_most_retrieved", []).append(
             {"days": days, "count": count, "channel": channel,
-             "contributed_only": contributed_only}
+             "contributed_only": contributed_only, "trend": trend}
         )
         return most_retrieved or [{"id": "a1", "retrieval_count": 5}]
 

@@ -36,21 +36,25 @@ DEFAULT_STABILITY_REDUCTION = _cfg('consolidation', 'stability_reduction_factor'
 
 # ─── P35: structured-output parsing for consolidation ───────────
 
-def _parse_structured_synthesis(text: str) -> tuple[str | None, list[dict]]:
-    """Parse the OBSERVATION + TRIPLES dual-output format.
+def _parse_structured_synthesis(
+    text: str,
+) -> tuple[str | None, list[dict], list[str]]:
+    """Parse the OBSERVATION + TRIPLES + CONTRADICTIONS triple-output
+    format.
 
-    Returns (observation_text_or_None, list_of_triple_dicts). On parse
-    failure, returns (None, []) — caller falls back to longest-source-
-    atom representative. If only OBSERVATION parses cleanly, returns
-    (observation, []) — graceful degradation when the LLM omits or
-    malforms the TRIPLES section.
+    Returns ``(observation_text_or_None, list_of_triple_dicts,
+    list_of_contradiction_lines)``. On parse failure returns
+    ``(None, [], [])``. If only OBSERVATION parses cleanly, returns
+    ``(observation, [], [])`` — graceful degradation when the LLM
+    omits or malforms downstream sections.
 
     Triples are returned without atom_id; the caller fills it in once
-    the observation is stored.
-    """
+    the observation is stored. Contradictions are raw single-line
+    strings the LLM produced; consumer (P25 audit) does the further
+    parsing into structured form."""
     import re
     if not text:
-        return None, []
+        return None, [], []
 
     # Find the OBSERVATION section header. Tolerant of leading
     # whitespace and either `OBSERVATION:` or `**OBSERVATION:**`.
@@ -58,7 +62,7 @@ def _parse_structured_synthesis(text: str) -> tuple[str | None, list[dict]]:
     if not obs_match:
         # No header — assume the whole response is the observation
         # (legacy single-output format).
-        return text.strip() or None, []
+        return text.strip() or None, [], []
 
     after_obs = text[obs_match.end():]
 
@@ -66,20 +70,32 @@ def _parse_structured_synthesis(text: str) -> tuple[str | None, list[dict]]:
     tri_match = re.search(r'(?im)^\s*\**\s*TRIPLES\s*:?\s*\**\s*\n?', after_obs)
     if tri_match:
         observation = after_obs[:tri_match.start()].strip()
-        triples_block = after_obs[tri_match.end():].strip()
+        triples_block_full = after_obs[tri_match.end():].strip()
     else:
         observation = after_obs.strip()
-        triples_block = ""
+        triples_block_full = ""
 
     if not observation:
         observation = None
 
-    # Strip any further section headers from the triples block (some
-    # models emit trailing CONTRADICTIONS: or similar that we don't
-    # consume yet).
+    # Split TRIPLES vs CONTRADICTIONS section. Either may be absent;
+    # CONTRADICTIONS, when present, terminates TRIPLES.
+    contra_split = re.split(
+        r'(?im)^\s*\**\s*CONTRADICTIONS\s*:?\s*\**\s*\n',
+        triples_block_full,
+        maxsplit=1,
+    )
+    triples_block = contra_split[0].strip()
+    contradictions_block = contra_split[1].strip() if len(contra_split) > 1 else ""
+
+    # NOTES/EXPLANATION can still trail either; trim them off both.
     triples_block = re.split(
-        r'(?im)^\s*\**\s*(?:CONTRADICTIONS|NOTES|EXPLANATION)\s*:?\s*\**\s*\n',
+        r'(?im)^\s*\**\s*(?:NOTES|EXPLANATION)\s*:?\s*\**\s*\n',
         triples_block,
+    )[0]
+    contradictions_block = re.split(
+        r'(?im)^\s*\**\s*(?:NOTES|EXPLANATION)\s*:?\s*\**\s*\n',
+        contradictions_block,
     )[0]
 
     triples: list[dict] = []
@@ -89,7 +105,14 @@ def _parse_structured_synthesis(text: str) -> tuple[str | None, list[dict]]:
         from .triples import _parse_triples
         triples = _parse_triples(triples_block, atom_id="")
 
-    return observation, triples
+    contradictions: list[str] = []
+    if contradictions_block and "NONE" not in contradictions_block.upper().split("\n")[0]:
+        for line in contradictions_block.splitlines():
+            line = line.strip("- *\t ")
+            if line and not line.upper().startswith("NONE"):
+                contradictions.append(line)
+
+    return observation, triples, contradictions
 
 
 class ConsolidationEngine:
@@ -664,7 +687,7 @@ class ConsolidationEngine:
                 if ask_for_triples:
                     prompt = (
                         f"You are consolidating {len(cluster)} related memory atoms. "
-                        f"Produce TWO outputs in a single response.\n\n"
+                        f"Produce THREE outputs in a single response.\n\n"
                         f"Output format (exactly these section headers, in this order):\n\n"
                         f"OBSERVATION:\n"
                         f"<one or two sentences capturing what the atoms collectively convey>\n\n"
@@ -674,6 +697,11 @@ class ConsolidationEngine:
                         f"(subject, predicate, object, valid_from=YYYY-MM-DD, valid_until=YYYY-MM-DD)\n"
                         f"...\n"
                         f"[OR write: NONE if no clean triples]\n\n"
+                        f"CONTRADICTIONS:\n"
+                        f"<atom_index_a> vs <atom_index_b>: <one-sentence summary "
+                        f"of what they disagree on>\n"
+                        f"...\n"
+                        f"[OR write: NONE if no contradictions]\n\n"
                         f"Rules for the OBSERVATION:\n"
                         f"- Preserve specific dates, times, numbers, names, and direct quotes "
                         f"VERBATIM when they appear in the atoms.\n"
@@ -700,6 +728,15 @@ class ConsolidationEngine:
                         f"- DO NOT add bounds to facts that don't change (genres, languages,\n"
                         f"  ratings, etc.). DO NOT use the consolidation date — use the\n"
                         f"  source atom's own date.\n\n"
+                        f"Rules for CONTRADICTIONS:\n"
+                        f"- Only flag *direct* disagreements where two atoms make\n"
+                        f"  incompatible claims about the same fact (different\n"
+                        f"  objects for the same subject+predicate; opposing\n"
+                        f"  preferences on the same topic; incompatible dates).\n"
+                        f"- Use 1-based atom indices from the list below.\n"
+                        f"- Don't flag temporal evolution (\"used to like X, now likes Y\")\n"
+                        f"  — that's a TRIPLES temporal-tag case, not a contradiction.\n"
+                        f"- Don't flag stylistic / phrasing differences. Substance only.\n\n"
                         f"{prior_block}"
                         f"Atoms:\n- {joined}"
                     )
@@ -770,15 +807,19 @@ class ConsolidationEngine:
 
             synthesis_content = None
             cluster_triples: list[dict] = []
+            cluster_contradictions: list[str] = []
             raw = raw_by_idx.get(idx, "")
             if raw:
-                synthesis_content, cluster_triples = _parse_structured_synthesis(raw)
+                synthesis_content, cluster_triples, cluster_contradictions = (
+                    _parse_structured_synthesis(raw)
+                )
 
             # Fallback: take the longest (already-stripped) content as the
             # representative, then wrap with a single-layer prefix.
             if not synthesis_content:
                 synthesis_content = f"[Consolidated from {len(cluster)} atoms] {max(contents, key=len)}"
                 cluster_triples = []  # no triples without successful LLM output
+                cluster_contradictions = []
             else:
                 # Defensive: in case the LLM echoed a prefix into its output.
                 synthesis_content = _strip_prefix(synthesis_content)
@@ -794,10 +835,78 @@ class ConsolidationEngine:
                 # atom_id pointing at the freshly-stored observation.
                 # If the LLM didn't emit any (NONE block), this is [].
                 "triples": cluster_triples,
+                # P35-c (P47 bundle): contradictions the LLM flagged
+                # within this cluster — raw single-line strings,
+                # surfaced as a structured event in _restructure_phase
+                # so the P25 audit cron can pick them up.
+                "contradictions": cluster_contradictions,
             })
 
         self._last_skipped_existing = skipped_existing
         return syntheses
+
+    def _compute_trend_for_cluster(
+        self, conn, source_ids: list[str], now_iso: str,
+    ) -> str | None:
+        """P17 / P47: label the consolidated observation with a trend
+        bucket based on how the cluster's source atoms have been
+        accessed lately. Pure access-log-driven — no LLM call.
+
+        ratio = retrievals_last_30d / max(retrievals_30_to_90d_ago, 1)
+
+        - ratio > 1.2  → ``improving``  (no penalty, surfaces in P47 promotion)
+        - 0.7 ≤ r ≤ 1.2 → ``stable``    (no penalty)
+        - 0.3 ≤ r < 0.7 → ``weakening`` (×0.7 retrieval multiplier)
+        - ratio < 0.3   → ``stale``     (×0.4 retrieval multiplier;
+                                          surfaces in P47 cleanup)
+
+        Returns ``None`` when the cluster has no access history (fresh
+        atoms with zero retrievals in the prior 90d) — left as NULL so
+        the existing trend multipliers (``saga.core``) treat it as
+        unlabeled / no penalty.
+        """
+        if not source_ids:
+            return None
+        from datetime import datetime, timedelta, timezone
+        try:
+            now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        except ValueError:
+            now = datetime.now(timezone.utc)
+        cutoff_30 = (now - timedelta(days=30)).isoformat()
+        cutoff_90 = (now - timedelta(days=90)).isoformat()
+
+        placeholders = ",".join("?" * len(source_ids))
+        try:
+            recent_row = conn.execute(
+                f"SELECT COUNT(*) FROM access_log "
+                f"WHERE atom_id IN ({placeholders}) AND accessed_at >= ?",
+                tuple(source_ids) + (cutoff_30,),
+            ).fetchone()
+            prior_row = conn.execute(
+                f"SELECT COUNT(*) FROM access_log "
+                f"WHERE atom_id IN ({placeholders}) "
+                f"AND accessed_at >= ? AND accessed_at < ?",
+                tuple(source_ids) + (cutoff_90, cutoff_30),
+            ).fetchone()
+        except Exception:
+            return None
+
+        recent = int(recent_row[0] if recent_row else 0)
+        prior = int(prior_row[0] if prior_row else 0)
+        if recent == 0 and prior == 0:
+            return None  # no signal — leave NULL
+
+        # Use prior=1 as the floor when prior is genuinely zero so a
+        # cold-start cluster with any recent activity reads as
+        # "improving" rather than dividing by zero.
+        ratio = recent / max(prior, 1)
+        if ratio > 1.2:
+            return "improving"
+        if ratio >= 0.7:
+            return "stable"
+        if ratio >= 0.3:
+            return "weakening"
+        return "stale"
 
     def _restructure_phase(self, syntheses: list[dict]) -> dict:
         """Store synthesis atoms, create atom_relations, reduce source stability."""
@@ -898,9 +1007,44 @@ class ConsolidationEngine:
                     except Exception:
                         pass
 
+            # P17 / P47: label each consolidated observation with a
+            # trend bucket based on the cluster's source-atom access
+            # patterns. Activates the previously-no-op trend multipliers
+            # in saga.core retrieval AND feeds P47's promotion /
+            # demotion candidate selection. Writes are best-effort —
+            # NULL trend means "no signal," same as today.
+            trends_labeled = 0
+            trends_breakdown: dict[str, int] = {}
+            for syn_id, source_ids, _ in stored:
+                trend = self._compute_trend_for_cluster(conn, source_ids, now)
+                if trend is None:
+                    continue
+                try:
+                    conn.execute(
+                        "UPDATE atoms SET trend = ? WHERE id = ?",
+                        (trend, syn_id),
+                    )
+                    trends_labeled += 1
+                    trends_breakdown[trend] = trends_breakdown.get(trend, 0) + 1
+                except Exception:
+                    pass
+
             conn.commit()
         finally:
             conn.close()
+
+        # P35-c (P47 bundle): aggregate contradictions across all
+        # clusters and surface as a single structured field on the
+        # consolidate response. The P25 audit cron consumes these to
+        # emit per-cluster algedonic events.
+        contradictions_flagged: list[dict] = []
+        for syn, (syn_id, source_ids, _) in zip(syntheses, stored):
+            for line in syn.get("contradictions") or []:
+                contradictions_flagged.append({
+                    "observation_id": syn_id,
+                    "source_atom_ids": source_ids,
+                    "summary": line,
+                })
 
         return {
             "synthesis_atoms_stored": atoms_stored,
@@ -910,4 +1054,10 @@ class ConsolidationEngine:
             # P35: triples extracted in the consolidation pass and
             # persisted as graph-pathway-eligible facts.
             "triples_persisted": triples_persisted,
+            # P17 / P47: trend buckets written this run. Surfaced so
+            # the cron summary line can include "labeled N trends."
+            "trends_labeled": trends_labeled,
+            "trends_breakdown": trends_breakdown,
+            # P35-c / P47: per-cluster contradictions the LLM flagged.
+            "contradictions_flagged": contradictions_flagged,
         }

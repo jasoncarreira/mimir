@@ -122,6 +122,7 @@ class SagaClient(Protocol):
     async def most_retrieved_atoms(
         self, *, days: int = 7, count: int = 10,
         channel_id: str | None = None, contributed_only: bool = False,
+        trend: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
     async def health(self) -> bool: ...
@@ -420,6 +421,7 @@ class _InProcessSaga:
     async def most_retrieved_atoms(
         self, *, days: int = 7, count: int = 10,
         channel_id: str | None = None, contributed_only: bool = False,
+        trend: str | None = None,
     ) -> list[dict[str, Any]]:
         await self._ensure_ready()
 
@@ -429,6 +431,7 @@ class _InProcessSaga:
                 days=days, count=count,
                 channel=channel_id,
                 contributed_only=contributed_only,
+                trend=trend,
             ) or []
 
         try:
@@ -632,6 +635,7 @@ class _HttpSaga:
     async def most_retrieved_atoms(
         self, *, days: int = 7, count: int = 10,
         channel_id: str | None = None, contributed_only: bool = False,
+        trend: str | None = None,
     ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {
             "days": days, "count": count,
@@ -639,6 +643,8 @@ class _HttpSaga:
         }
         if channel_id:
             params["channel"] = channel_id
+        if trend:
+            params["trend"] = trend
         data = await self._get_or_empty("/v1/atoms/most_retrieved", params)
         return data.get("atoms") or []
 
