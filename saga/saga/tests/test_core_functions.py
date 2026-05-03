@@ -117,13 +117,6 @@ class TestRelations:
         assert len(outgoing) >= 1
         assert len(incoming) >= 1
 
-    def test_retrieve_with_relations(self):
-        from saga.core import retrieve_with_relations
-        _store("Relation retrieval test content")
-        results = retrieve_with_relations("relation retrieval", top_k=3)
-        assert isinstance(results, list)
-
-
 # ─── Advanced Retrieval ───────────────────────────────────────────────────────
 
 

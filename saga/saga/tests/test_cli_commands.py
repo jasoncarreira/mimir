@@ -378,15 +378,6 @@ class TestRelations:
         data = json.loads(capsys.readouterr().out)
         assert isinstance(data, (dict, list))
 
-    def test_relations_retrieve(self, capsys):
-        _store_one("Relations retrieve test")
-        from saga.remember import cmd_relations
-        cmd_relations(["retrieve", "test"])
-        captured = capsys.readouterr().out
-        data = json.loads(captured)
-        assert isinstance(data, list)
-
-
 class TestQuality:
     def test_quality_no_args(self, capsys):
         from saga.remember import cmd_quality

@@ -4868,62 +4868,6 @@ def get_atom_relations(atom_id: str, direction: str = "both") -> list[dict]:
     return results
 
 
-def retrieve_with_relations(query: str, mode: str = "task",
-                            top_k: int = 10, **kwargs) -> list[dict]:
-    """Retrieve atoms, then adjust based on relationships.
-    
-    - If atom A supersedes atom B, prefer A
-    - If atom A contradicts atom B, surface both
-    - If atom A elaborates atom B, boost A if B is retrieved
-    """
-    results = retrieve(query, mode=mode, top_k=top_k * 2, **kwargs)
-    if not results:
-        return results
-    
-    conn = get_db()
-    _ensure_relations_table(conn)
-    
-    result_ids = {r["id"] for r in results}
-    
-    # Check for supersedes relationships among results
-    superseded = set()
-    for atom in results:
-        rows = conn.execute("""
-            SELECT target_id FROM atom_relations
-            WHERE source_id = ? AND relation_type = 'supersedes'
-        """, (atom["id"],)).fetchall()
-        for r in rows:
-            if r[0] in result_ids:
-                superseded.add(r[0])  # demote superseded atom
-    
-    # Check for elaboration relationships
-    elaboration_boost = set()
-    for atom in results:
-        rows = conn.execute("""
-            SELECT source_id FROM atom_relations
-            WHERE target_id = ? AND relation_type = 'elaborates'
-        """, (atom["id"],)).fetchall()
-        for r in rows:
-            if r[0] in result_ids:
-                elaboration_boost.add(r[0])
-    
-    conn.close()
-    
-    # Adjust scores
-    _supersedes_demotion = _cfg('relations', 'supersedes_demotion', 2.0)
-    _supports_bonus = _cfg('relations', 'supports_bonus', 0.5)
-    for atom in results:
-        if atom["id"] in superseded:
-            atom["_activation"] -= _supersedes_demotion  # strong demotion
-            atom["_relation_note"] = "superseded"
-        if atom["id"] in elaboration_boost:
-            atom["_activation"] += _supports_bonus
-            atom["_relation_note"] = "elaborates_retrieved"
-    
-    results.sort(key=lambda x: x["_activation"], reverse=True)
-    return results[:top_k]
-
-
 # ─── Feature: Retrieval Diversity (MMR) ──────────────────────────
 
 def retrieve_diverse(query: str, mode: str = "task", top_k: int = 10,

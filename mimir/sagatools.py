@@ -172,7 +172,7 @@ def _atoms_in_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     Handles multiple wire shapes SAGA has used:
 
     - **Two-tier mode** (``[retrieval].two_tier_enabled = true`` —
-      saga-hindsight-ideas/core.py:_two_tier_split): the response contains
+      saga.core._two_tier_split): the response contains
       ``observations`` and ``raws`` as separate lists. Both contribute
       atoms; observations come first because they're the higher-level
       consolidated inferences and the agent benefits from seeing those
