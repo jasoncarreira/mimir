@@ -15,10 +15,26 @@ This document is the output of a session on 2026-04-26. MSAM head is `591e48a`.
   it. Observation-level supersedes (consolidation writing edges between
   observations whose evidence is a strict superset) is **kept and now
   applied in the obs tier** of two-tier retrieval.
-- **P14 (optimize supersedes resolver)** — deferred. Only relevant if
-  atom-level supersedes is revisited; not currently a planned experiment.
+- **P14 (optimize supersedes resolver)** — **dropped 2026-05-02.** Atom-level
+  supersession is decided dead — no plan to revisit. P14 is moot.
 - **Skip-on-identical and superset-supersedes for observations** shipped
   in `34a4243` and `c6909a2`. Both safe defaults.
+- **2026-05-02 sweep.** Several items closed out via the saga code review
+  + integration-bench sessions. See the per-item status blocks below for
+  details, but the headline:
+  - **Shipped**: P32 (triple extraction in consolidation), P34 (similarity
+    threshold 0.80→0.75), P37(a) (temporal valid_from/valid_until),
+    P42 (triples in /v1/query response), P46 (sentence splitter).
+  - **Tested + neutral/regressed, kept behind flag**: P37(b)
+    (world_model_pathway, -0.8pp), P38 (HyDE, -2.2pp), P41
+    (triple_augment_v2, neutral), P43 (subatom beam, flat), P36
+    (graph weight 0.3, -1.4pp).
+  - **Decided not to do**: P14 (atom supersession dead), P15 (agent
+    handles rerank in its prompt context), P16 (mimir-side cron handles
+    cadence), P26 (mental_model removed from documented vocabulary).
+  - **Decided differently**: P18 (we keep boundaries off in bench;
+    mimir surfaces the previous N session boundary atoms in the turn
+    prompt instead).
 
 The P-series numbering keeps going — P11+ is anything below — but the
 groupings reflect the *kind* of work, not the order they should ship in.
@@ -181,7 +197,15 @@ get dropped). A/B is the only way to know.
 
 ### P32 — Wire triple extraction + graph pathway and measure the lift
 
-**What.** Triple extraction is partially wired:
+**Status.** **Triple extraction shipped 2026-04-30** as part of
+consolidation (`consolidation.py:_parse_consolidation_output` parses
+`OBSERVATION + TRIPLES`; `_persist_consolidation_triples` writes
+embedded triples). The graph-pathway side was tested separately as P36
+(see below) and regressed at `rrf_graph_weight=0.3`. So **extraction is
+done; the graph pathway as a co-equal RRF ranker is not the right
+shape**. Current canonical ships extraction-on, graph-pathway-off.
+
+**What.** (original — kept for context) Triple extraction is partially wired:
 
 1. ~~**The `[triples] enable_extraction` config flag is unread.**~~
    **Fixed in commit forthcoming** — `/v1/store` now reads the flag.
@@ -353,12 +377,21 @@ init" item, not P33. **Update: shipped in `8b326e6`.**
 
 ---
 
-### P34 — Recalibrate consolidation similarity_threshold
+### P34 — Recalibrate consolidation similarity_threshold [shipped 2026-05-02]
 
-**What.** Default `consolidation.similarity_threshold = 0.80` and
-`min_cluster_size = 3` were inherited from early experiments. Cluster
-analysis on Mimir's 90-atom corpus (where the user expected many
-duplicates given the data) shows:
+**Status.** **Shipped 2026-05-02.** Default lowered from 0.80 → 0.75
+in `saga/config.py`. Decision driven by post-bench measurement on
+mimir's atom corpus: 0.80 missed clusters of paraphrased observations
+that should have merged; 0.75 caught them without false-merging
+unrelated atoms in spot-checks. `min_cluster_size = 3` left at the
+default. The bench correctness cross-check rides on the next
+P30-baseline run.
+
+**What.** (original — preserved for context) Default
+`consolidation.similarity_threshold = 0.80` and `min_cluster_size = 3`
+were inherited from early experiments. Cluster analysis on Mimir's
+90-atom corpus (where the user expected many duplicates given the
+data) shows:
 
 | threshold | clusters of size ≥2 | atoms covered |
 |---|---|---|
@@ -421,7 +454,29 @@ domain produces real duplicates that the current threshold misses.
 
 ---
 
-### P35 — Consolidation as the structured-cognition pass
+### P35 — Consolidation as the structured-cognition pass [partially shipped]
+
+**Status (2026-05-02).** Mostly shipped. The consolidation prompt
+already produces:
+
+- ✅ **OBSERVATION** (the synthesis text)
+- ✅ **TRIPLES** (S/P/O extraction with embeddings)
+- ✅ **valid_from / valid_until** temporal tagging (P37(a), shipped)
+- ✅ **supersedes** detection (consolidation writes the
+  `'supersedes'` `atom_relations` row directly)
+- ✅ **trend** labeling — folded into the consolidation pass via
+  access-log-driven heuristic (planned 2026-05-02; see P17 below)
+
+What's **not** in the prompt yet:
+
+- ❌ **CONTRADICTIONS** section — the LLM has all source atoms in
+  context; emitting "atoms X and Y disagree on Z" as a separate
+  output section is pure additive (no retrieval impact). Feeds the
+  P25 reconciliation work. **Recommended: ship next.**
+- ❌ **Quality grading** per observation — deferred until there's a
+  concrete consumer. Triples already carry confidence; observation-
+  level quality would need a clear retrieval-side use before
+  maintaining it earns its keep.
 
 **What.** Fold triple extraction (and eventually contradiction
 surfacing, temporal tagging, quality grading) into the consolidation
@@ -511,7 +566,18 @@ knowledge-update where cross-time facts cluster well), bigger win.
 
 ---
 
-### P36 — Lower `rrf_graph_weight` to test graph pathway as tiebreaker
+### P36 — Lower `rrf_graph_weight` to test graph pathway as tiebreaker [tested, doesn't help]
+
+**Status.** Tested at `rrf_graph_weight = 0.3` (`msam_p36_canon_v1` =
+0.760 vs ~0.774 baseline → **−1.4pp**). The graph pathway as an RRF
+ranker just doesn't earn its keep at any weight tested. Decision:
+leave at 0.7 in code; do **not** spend more bench cycles tuning the
+weight. The graph-pathway-as-ranker shape is wrong; if we revisit,
+it should be a separate experiment that surfaces graph-linked atoms
+as a *supplement* (like P42's triples block) rather than competing
+in RRF.
+
+
 
 **What.** P32 and P35 both regressed ~-2.5pp when the graph pathway
 joined RRF as a fourth ranker. Graph pathway runs at default
@@ -904,7 +970,14 @@ pulled-in atoms rank where the formula predicts.
 
 ---
 
-### P40 — Disable pull-in of endorsed atoms that miss the cheap-path pool; keep boost for in-pool endorsed atoms
+### P40 — Disable pull-in of endorsed atoms that miss the cheap-path pool; keep boost for in-pool endorsed atoms [queued 2026-05-02]
+
+**Status.** Queued 2026-05-02 — recommended next-bench candidate
+after the current P30 vs P42 Sonnet run completes. Hypothesis still
+holds: pulling in endorsed-but-out-of-pool atoms anchors them at the
+bottom of the score distribution and dilutes the in-pool ranking.
+
+
 
 **Status.** Filed 2026-04-30. Not yet implemented. Queued behind
 the P12 v3 solo re-run.
@@ -1090,7 +1163,21 @@ time atoms are handled by the cheap path anyway.
 
 ---
 
-### P42 — Triples as a third response block on `/v1/query`
+### P42 — Triples as a third response block on `/v1/query` [shipped 2026-05-02]
+
+**Status.** Shipped 2026-05-02. `query_triples_for_response()` in
+`triples.py` cosine-matches the query embedding against active
+triples, filters expired (`valid_until < now`), returns top-K with
+**subject / predicate / object / valid_from / valid_until /
+confidence / _similarity / source_atom_id**. Wired into
+`server.py` two-tier path behind `[retrieval]
+include_triples_in_response = false` (canonical default). Mimir's
+pre-message hook reads the new block and renders triples as a
+`Triples:` sub-section beneath atoms; source_atom_ids flow into
+contribution credit. Bench: P30 vs P42 with Sonnet 4.6 reader is
+running as of 2026-05-02 22:34.
+
+
 
 **Status.** Filed 2026-04-30. Not yet implemented.
 
@@ -1201,7 +1288,15 @@ when triples table empty.
 
 ---
 
-### P43 — Beam search always-on; subatom retrieval as third beam
+### P43 — Beam search always-on; subatom retrieval as third beam [re-test queued 2026-05-02]
+
+**Update 2026-05-02.** Last result `msam_p43_canon_v1` was flat at
+0.784. Worth re-running now that P30 baseline has shifted (post-
+consolidation-similarity 0.75, post-P42 wiring) — the original
+neutral-result reading may have been correct only against the old
+baseline. Queued behind P40.
+
+
 
 **Status.** Bench-tested 2026-04-30. **Overall flat (0.784,
 exactly canonical) with a clean shape change: multi-session
@@ -1343,7 +1438,24 @@ results, subatom path no-op when no sentences match.
 
 ---
 
-### P44 — LLM-driven relations maintenance job (elaborates / supports / contextualizes)
+### P44 — LLM-driven relations maintenance job (elaborates / supports / contextualizes) [partially shipped]
+
+**Status (2026-05-02).** **Three relation types are now written
+automatically by consolidation** (`saga/consolidation.py`):
+`'consolidated_into'`, `'evidenced_by'`, `'supersedes'`. These cover
+the basic structural edges (raw → observation, observation → its
+sources, observation → prior observation it replaces).
+
+What's **still open** is the richer semantic-edge set the original
+P44 proposed: `elaborates / supports / contextualizes / depends_on /
+refines / contradicts`. These need an explicit LLM pass over
+candidate atom pairs — different shape from the consolidation-time
+writes (which are derivable from cluster membership + the supersedes
+detector). No consumer for the semantic edges yet; queue behind a
+concrete retrieval-side use case (e.g., a graph-supplement block
+that follows `elaborates` edges from a hit atom).
+
+
 
 **Status.** Filed 2026-04-30. Not yet implemented.
 
@@ -1661,7 +1773,16 @@ problem is concrete and the fix is targeted.
 
 ---
 
-### P15 — Evaluate cross-encoder rerank
+### P15 — Evaluate cross-encoder rerank [decided not to do 2026-05-02]
+
+**Status.** The mimir agent already does its own ranking pass over
+returned atoms inside its response prompt (it's an LLM with full
+context). A saga-side cross-encoder would just duplicate work
+already happening downstream — at the cost of adding a second model
+dependency to saga. `retrieval_v2.rerank_with_llm` stays callable
+for non-agent harness users; not a planned bench experiment.
+
+
 
 **What.** Hindsight uses a cross-encoder reranker as their final stage
 and credits it for some of their 91.4%. We have it in
@@ -1681,7 +1802,16 @@ cost matters in production.
 
 ## B. Lifecycle automation
 
-### P16 — Internal scheduler for decay + consolidation
+### P16 — Internal scheduler for decay + consolidation [decided: skip 2026-05-02]
+
+**Status.** Mimir's `add_saga_consolidate_job` (in `mimir/scheduler.py`)
+already handles cadence saga-side via APScheduler — fires
+`consolidate()` on a configurable cron (default Sun 04:00 UTC).
+Decay would slot in the same way if needed. The only remaining
+argument for moving the scheduler *into* saga is "saga without mimir";
+defer until that's a real use case. No code change planned.
+
+
 
 **What.** Add an optional asyncio-based scheduler that wakes on a
 configured cadence and runs `run_decay_cycle()`, then optionally
@@ -1702,7 +1832,34 @@ scheduler with sensible defaults removes a footgun and matches the
 
 ---
 
-### P17 — Trend column writer (or delete the dead reads)
+### P17 — Trend column writer (or delete the dead reads) [design 2026-05-02]
+
+**Update 2026-05-02.** Decision: **fold into consolidation** rather
+than build a separate cron job. Consolidation already iterates over
+atom clusters and queries `access_log` for stability calculations —
+adding one more field write costs ~0 and reuses the same data path.
+
+**Mechanism.** In `_persist_consolidation`, after computing
+`source_ids` for the cluster, compute trend from access decay:
+
+```python
+# Ratio of retrievals in last 30d vs the 30-90d window before.
+ratio = recent_retrievals / max(prior_retrievals, 1)
+if   ratio > 1.2: trend = None         # improving / stable — no penalty
+elif ratio > 0.7: trend = None         # stable
+elif ratio > 0.3: trend = "weakening"  # 0.7× multiplier (existing)
+else:             trend = "stale"      # 0.4× multiplier (existing)
+```
+
+Pure data-driven — no extra LLM call. Writes to `atoms.trend` for
+the consolidated observation; source raws stay at NULL (default no
+penalty). When the cluster is small / has no access history, leaves
+trend NULL.
+
+**Effort.** ~1 day code + tests. Ship alongside P35's contradiction
+surfacing as one consolidation-pass enhancement.
+
+
 
 **What.** The `atoms.trend` column is read by `hybrid_retrieve`
 (multipliers for `weakening` / `stale`) but **nothing ever writes it**.
@@ -1724,7 +1881,20 @@ data accumulating in real deployments.
 
 ---
 
-### P18 — Re-evaluate P10 with the new boundary-atom filter
+### P18 — Re-evaluate P10 with the new boundary-atom filter [decided differently 2026-05-02]
+
+**Status.** **Not pursuing as a saga-side bench experiment.** The
+benchmark intentionally runs with `enable_session_boundaries = false`
+to keep ingest fast (each haystack session would write a boundary
+atom otherwise — ~50 extra embed+store calls per question). Mimir
+surfaces the prior N session boundary atoms in its turn prompt as
+the `## Recent session summaries` block (loop §2.2 in
+FEEDBACK-LOOPS.md), which provides the cross-session continuity P10
+was reaching for — without crowding retrieval. The boundary-atom
+filter (`source_type != 'session_boundary'`) at `core.py:698` stays
+in place as a defensive guard.
+
+
 
 **What.** P10 (session boundaries + mark_contributions) regressed
 single-session subtypes ~5pp in the P8 runs. We hypothesized boundary
@@ -1979,7 +2149,25 @@ extract topics from returned atoms → seed conversational ideas.
 
 ## D. Architecture / design questions
 
-### P24 — Channels as first-class scoping (option B from prior memo)
+### P24 — Channels as first-class scoping (option B from prior memo) [queued 2026-05-02]
+
+**Status.** Approved 2026-05-02. Promote `channel` from
+`metadata.channel` (JSON-extracted at query time) to a denormalized
+`atoms.channel TEXT` column. Plan:
+
+1. Add column + index, migrate existing rows from
+   `json_extract(metadata, '$.channel')`.
+2. Update `store_atom` to write the column directly.
+3. Replace `json_extract` filters in `core.py` (lines 5071, 5138)
+   with native column comparisons.
+4. Add `channel` as a peer of `agent_id` in `RetrieveRequest` /
+   `QueryRequest`.
+
+Net: ~150 LOC + a one-shot migration. Buys real query-time perf
+(no per-row JSON parse) plus cleaner filter semantics for mimir's
+bench bridge and per-channel scoping in production.
+
+
 
 **What.** Promote `channel` from "metadata field on session boundaries"
 to a peer of `agent_id` — a denormalized column on every atom,
@@ -1998,7 +2186,47 @@ is half-built. Either commit to it or rip it out.
 
 ---
 
-### P25 — Reconcile three contradiction detectors
+### P25 — Reconcile three contradiction detectors [design 2026-05-02]
+
+**Update 2026-05-02.** Reframe: most "contradictions" the system
+sees are actually **temporal closures**, not contradictions.
+P37(a)'s `valid_from`/`valid_until` machinery handles same-(S, P)
+updates by setting `valid_until = now` on the prior row — that's a
+new fact superseding an old one in time, not a conflict. Real
+contradictions (overlapping valid windows + conflicting objects on
+same (S, P, *)) are rare with auto-close working.
+
+**The reconciled shape:**
+
+- **`update_world(auto_close=True)` is the temporal updater.**
+  Renamed-in-spirit: not a contradiction handler but a write-side
+  enforcer of temporal closure. New (S, P, new_obj) → prior
+  (S, P, old_obj) gets `valid_until = now`. This is the common path
+  and it's correct.
+
+- **`detect_contradictions` (triple-based)** runs as a periodic
+  audit (cron / reflection), surfaces overlap-conflicts as
+  algedonic `triple_contradiction_detected` events. **Don't
+  auto-resolve**; let operator/agent decide. Removed from the
+  query hot path.
+
+- **`find_semantic_contradictions` (embedding-based)** runs on
+  the same audit cron, surfaces observation-level dissonance
+  (paraphrase-similar atoms with opposing valence) as
+  `semantic_contradiction_detected` events. Different surface
+  from triple contradictions — observations can dissent without
+  contradicting any specific (S, P, O) tuple.
+
+- **No contradiction detection in the query hot path.** Both
+  detectors become diagnostic / surfacing tools, not retrieval
+  filters.
+
+**Effort.** ~1 day code + tests. Mostly: delete the contradiction
+hooks from query paths, add a `mimir saga audit-contradictions`
+CLI subcommand that runs both detectors and emits algedonic
+events when matches land.
+
+
 
 **What.** `find_semantic_contradictions` (embedding-distance, used by
 P4-bench supersedes), `detect_contradictions` (triple-based, in
@@ -2013,7 +2241,21 @@ probably keep two but explicitly document when each fires.
 
 ---
 
-### P26 — `mental_model` slot — commit or remove
+### P26 — `mental_model` slot — commit or remove [removed 2026-05-02]
+
+**Status.** **Removed 2026-05-02.** Decision: drop `mental_model`
+from the documented `memory_type` vocabulary. No clear job that the
+existing `observation` (multi-source synthesis) and world-model
+triples (per-subject stateful beliefs with temporal scope) don't
+already cover. The committing version would have introduced a third
+category with a fuzzy boundary against `observation` — net
+complexity without net value.
+
+Kept the `memory_type` column as `TEXT` (no CHECK constraint added)
+so any prior data with `mental_model` rows would still load. Updated
+the documentation comment in `core.py:3550` and `HINDSIGHT-IDEAS.md`.
+
+
 
 **What.** `memory_type` enum has `'raw' | 'observation' | 'mental_model'`.
 Only the first two are written. `HINDSIGHT-IDEAS.md` says mental_model

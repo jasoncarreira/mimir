@@ -213,7 +213,12 @@ _DEFAULTS = {
         "approx_threshold": 50000,
     },
     "consolidation": {
-        "similarity_threshold": 0.80,
+        # P34: dropped from 0.80 → 0.75 after measuring mimir's atom
+        # corpus post-bench. 0.80 missed clusters of paraphrased
+        # observations that should have merged; 0.75 captured them
+        # without false-merging unrelated atoms in spot-checks. The
+        # bench correctness check rides on the next P30-baseline run.
+        "similarity_threshold": 0.75,
         "min_cluster_size": 3,
         "max_clusters_per_run": 50,
         "stability_reduction_factor": 0.5,
