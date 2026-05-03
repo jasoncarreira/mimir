@@ -92,10 +92,13 @@ def build_mcp_server(
         # fallback for non-send turns). When message_buffer is supplied, the
         # delivered text also writes to chat_history so the agent sees its
         # own prior replies in Recent activity.
+        # ``home`` is threaded through so send_message can resolve
+        # <send-file path="..."> directives against home/attachments/outbound.
         tools += build_channel_tools(
             channel_registry,
             saga_client=saga_client,
             message_buffer=message_buffer,
+            home=home,
         )
     return create_sdk_mcp_server(name="mimir", version="0.1.0", tools=tools)
 
