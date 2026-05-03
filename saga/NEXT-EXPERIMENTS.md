@@ -1827,6 +1827,126 @@ shape.
 
 ---
 
+### P48 — Canonical predicate vocabulary for entity-relation triples [filed 2026-05-03]
+
+**What.** Reduce predicate fragmentation in consolidation-extracted
+triples. Today the LLM invents ad-hoc predicates that fuse intent
+with qualifier:
+
+```
+User|prefers_podcast_length|20-30_minutes
+User|prefers_podcast_format|solo_episodes
+User|likes_podcast|<show>
+User|prefers_themes|philosophical
+User|prefers_soft_cozy_material|...
+```
+
+These should all reduce to a small set of canonical intents
+(``prefers``, ``likes``) with the qualifier moved into the object:
+
+```
+User|prefers|podcast_length=20-30_minutes
+User|prefers|podcast_format=solo_episodes
+User|likes|podcast:<show>
+User|prefers|theme=philosophical
+```
+
+**The data point.** Diagnostic on the 500-question P42 Sonnet
+bench corpus (commit 435699f, 2026-05-03):
+- **9,997 distinct predicates** across all per-question DBs
+- Bare ``prefers``: 7 occurrences
+- Bare ``likes``: 12 occurrences
+- 30+ ``prefers_*``/``likes_*`` variants in the long tail (most
+  N-of-1 or N-of-few)
+
+This kills cosine match for preference queries: "What kind of
+podcasts do I like?" should hit the cluster of preference triples
+about podcasts, but each variant is in a different embedding
+neighborhood. Single-session-preference category was the only one
+where P42 (triples-direct-to-agent) lost on Sonnet — and this is
+why.
+
+**Mechanism.** Two-part change to the consolidation prompt:
+
+1. **Soft canonical seed.** Instead of "must use one of," prefer
+   reuse and provide a list:
+
+   ```
+   Rules for TRIPLES:
+   - Predicate must be lowercase_snake_case.
+   - PREFER reusing canonical intent predicates over inventing
+     domain-specific compounds. Common canonical predicates:
+       prefers / likes / dislikes / has / owns / works_at /
+       lives_in / discussed / recommends / asked_about /
+       offers / includes / provides / supports / uses
+   - Detail goes in the OBJECT, not the predicate. Instead of
+     (User, prefers_podcast_length, 20-30_minutes), emit
+     (User, prefers, podcast_length=20-30_minutes).
+   - You MAY introduce a new predicate when the canonical set
+     genuinely doesn't fit (a domain-specific relation between
+     two non-User entities, e.g. (CompanyX, manufactures, ProductY)).
+   ```
+
+2. **Surface existing vocabulary.** At the start of each
+   consolidation pass (or per-cluster), query the DB for the
+   top-N existing predicates and top-N existing subjects. Inject
+   into the prompt as context the LLM can canonicalize against:
+
+   ```
+   Existing predicates in this database (prefer reusing when
+   they fit; counts in parens):
+     offers (408), includes (388), provides (310), supports (211),
+     uses (172), located_in (164), has (157), suggests (156),
+     prefers (7), likes (12), ...
+
+   Existing subjects (prefer reusing the canonical capitalization):
+     User (1247), Sony (12), Anthropic (8), ...
+   ```
+
+The DB query is cheap (one COUNT-grouped scan over a small table);
+runs once per consolidation pass, not per cluster. Cold-start
+behavior: empty DB → fall back to the static seed list. After the
+first few clusters in a fresh DB, the surfaced list grows and
+becomes the dominant canonicalization signal.
+
+**Why this matters beyond preferences.**
+- 9,997 unique predicates serving as 9,997 unique buckets is
+  pathological for any cosine-on-triple-embedding mechanism (P41,
+  P42, P47).
+- Subject canonicalization (``User`` vs ``user`` vs ``the_user``)
+  has the same problem at smaller scale.
+- This is a quality fix for the whole structured-side of saga,
+  not just one category. P42, P41, P47 promotion / demotion all
+  benefit.
+
+**Effort.** ~30 LOC: the prompt change + a `_canonical_vocab_block`
+helper that queries existing predicates + subjects from the DB.
+Tests for the prompt rendering + the DB-vocab-injection contract.
+~1 day code + 1 bench cycle.
+
+**Risk.** Low–medium. The "PREFER" softening avoids over-
+constraining the LLM. The seed list is conservative (only intent
+verbs canonicalized; domain action predicates like "manufactures"
+stay free). Worst case: predicate diversity stays high but cosine
+recall on preferences improves anyway because the canonical
+predicates cluster better.
+
+**Pre-bench validation.** Before running a full 500q bench, run a
+50-question slice scoped to single-session-preference questions
+only and compare predicate distributions before/after. If the
+fragmentation drops meaningfully (say >50% reduction in distinct
+predicates among preference triples), the full bench is justified.
+
+**Connection to P25.** Predicate canonicalization makes
+contradiction detection (P25) much sharper — currently
+"(User, prefers_genre, jazz)" and "(User, likes_music_genre, jazz)"
+look like two unrelated facts; canonicalized to
+"(User, prefers, music_genre=jazz)" and
+"(User, likes, music_genre=jazz)" they're recognizable as the
+same claim. Same for temporal closure (P37(a)).
+
+---
+
 ### P15 — Evaluate cross-encoder rerank [decided not to do 2026-05-02]
 
 **Status.** The mimir agent already does its own ranking pass over
