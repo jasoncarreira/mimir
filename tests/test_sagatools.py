@@ -61,7 +61,7 @@ async def test_saga_query_passes_session_id_and_appends_atom_ids():
 
 @pytest.mark.asyncio
 async def test_saga_query_extracts_from_live_atoms_key():
-    """Real SAGA (saga-hindsight-ideas server.py:api_query) returns atoms
+    """Real SAGA (saga.server.api_query) returns atoms
     under the ``atoms`` key, not ``_raw_atoms``. Regression for the bug
     where contributions never marked because the extractor only looked
     at the legacy/never-shipped key."""
@@ -89,7 +89,7 @@ async def test_saga_query_extracts_from_live_atoms_key():
 @pytest.mark.asyncio
 async def test_saga_query_extracts_from_two_tier_observations_and_raws():
     """When two_tier_enabled = true, SAGA returns observations and raws as
-    separate lists (saga-hindsight-ideas core.py:_two_tier_split). Both
+    separate lists (saga.core._two_tier_split). Both
     contribute atom IDs to the contribution-tracking set, with observations
     surfacing first since they're the higher-level consolidated atoms."""
     fake = FakeSaga(

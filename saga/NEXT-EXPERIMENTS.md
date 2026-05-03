@@ -2091,7 +2091,16 @@ regression before declaring P10 dead.
 
 ## C. Dead-code cleanup
 
-### P19 — Delete `retrieve_with_relations`
+### P19 — Delete `retrieve_with_relations` [done 2026-05-03]
+
+**Status.** Deleted 2026-05-03 along with its CLI debug subcommand
+(``cmd_relations`` retrieve branch in ``remember.py``) and its unit
+test. Pure dead-code removal — the supersedes branch was duplicated
+by the multiplicative path in main retrieval, and the elaborates
+branch could never fire because no code writes
+``relation_type='elaborates'`` edges (P44 territory).
+
+
 
 **What.** `core.py:3791` — pre-P4 supersedes demotion via subtractive
 activation penalty. Now duplicates the multiplicative path I shipped in

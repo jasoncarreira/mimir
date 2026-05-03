@@ -1083,23 +1083,17 @@ def cmd_emotion_retrieve(args):
 
 def cmd_relations(args):
     """Manage atom relationships."""
-    from .core import add_atom_relation, get_atom_relations, retrieve_with_relations
+    from .core import add_atom_relation, get_atom_relations
     if not args:
-        print(json.dumps({"error": "Usage: relations add <src> <tgt> <type> | relations get <atom_id> | relations retrieve <query>"}))
+        print(json.dumps({"error": "Usage: relations add <src> <tgt> <type> | relations get <atom_id>"}))
         return
-    
+
     if args[0] == "add" and len(args) >= 4:
         result = add_atom_relation(args[1], args[2], args[3])
         print(json.dumps(result, indent=2))
     elif args[0] == "get" and len(args) >= 2:
         result = get_atom_relations(args[1])
         print(json.dumps(result, indent=2))
-    elif args[0] == "retrieve":
-        results = retrieve_with_relations(" ".join(args[1:]), top_k=5)
-        output = [{"id": r["id"], "content": r["content"][:80],
-                   "activation": round(r["_activation"], 3),
-                   "relation_note": r.get("_relation_note", "")} for r in results]
-        print(json.dumps(output, indent=2))
     else:
         print(json.dumps({"error": "Unknown subcommand"}))
 
