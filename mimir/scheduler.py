@@ -229,13 +229,12 @@ class Scheduler:
         # with a structured reason so operator audit / dashboards can
         # explain the gap.
         if self._arbiter is not None:
-            from .budget import HeartbeatDecision
             try:
-                decision, reason = self._arbiter.should_fire_heartbeat()
+                fire, reason = self._arbiter.should_fire_heartbeat()
             except Exception:  # noqa: BLE001
                 log.exception("arbiter.should_fire_heartbeat raised; firing anyway")
-                decision, reason = HeartbeatDecision.FIRE, "arbiter_error"
-            if decision == HeartbeatDecision.SUPPRESS:
+                fire, reason = True, "arbiter_error"
+            if not fire:
                 await log_event(
                     "scheduled_tick_suppressed",
                     schedule_name=job.name,
