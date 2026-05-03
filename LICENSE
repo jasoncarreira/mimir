@@ -1,0 +1,41 @@
+Copyright (c) 2026 Jason Carreira
+
+This repository contains a copyrighted work-in-progress. License terms
+have not been finalized; see "License posture" below for the current
+state.
+
+The saga/ subdirectory is independently licensed — see saga/LICENSE
+(MIT, combined copyright Jaden Schwab + Jason Carreira). Nothing in
+this top-level statement modifies saga's MIT terms; saga remains
+permissively licensed regardless of what the surrounding mimir code
+ends up under.
+
+----
+
+License posture
+
+All rights reserved. The author is evaluating license terms and has
+not yet granted public permissions to use, modify, or redistribute
+this work outside of viewing the source on GitHub.
+
+Expected outcome: this notice will be replaced with a real
+open-source license (likely MIT, Apache-2.0, or AGPL-3.0) once the
+project's direction is clearer. Until then, please contact
+jasoncarreira on GitHub for use inquiries.
+
+What you may do today:
+- View the source publicly on GitHub.
+- Fork on GitHub for personal inspection (per GitHub's Terms of
+  Service, which grant a limited fork-and-review right separate
+  from the underlying license).
+- Reference the design ideas, file pointers, or mechanisms in your
+  own work — copyright protects the expression, not the underlying
+  ideas.
+
+What you may not do today:
+- Use the code in production.
+- Modify and redistribute it.
+- Build a derivative work and publish it.
+
+If any of those are blocking you, opening an issue or reaching out
+directly is the fastest path to a permission grant.
