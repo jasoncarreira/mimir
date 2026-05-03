@@ -121,7 +121,9 @@ in `mimir/feedback.py:_EVENT_RULES`):
 - `scheduled_tick_dropped` (dispatcher rejected),
   `scheduled_tick_suppressed` (§12.4 arbiter blocked),
   `heartbeat_health_degraded` (§4.7 weekly health metric),
-  `introspection_report_error`
+  `introspection_report_error`,
+  `predictions_pending_review` (predictions skill — past-horizon
+  items piling up; nudges the agent to run `mimir predictions review`)
 - `send_message_unknown_channel`
 - Positive: `saga_feedback_sent`, `react_received`,
   `saga_consolidate_ok` (cron summary line),

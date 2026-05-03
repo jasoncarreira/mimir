@@ -315,6 +315,20 @@ def test_introspection_report_ok_surfaces_output_path(tmp_path: Path):
     assert "92%" in block
 
 
+def test_predictions_pending_review_renders(tmp_path: Path):
+    """The predictions skill emits predictions_pending_review when
+    past-horizon items pile up; algedonic surfacing nudges the agent
+    to run `mimir predictions review`."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(0.5), "type": "predictions_pending_review",
+         "session_id": "s", "count": 3},
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "3 predictions past horizon" in block
+    assert "mimir predictions review" in block
+
+
 def test_cron_events_dedup_to_most_recent(tmp_path: Path):
     """§12.4 review #13: hourly heartbeats × 24h algedonic window
     means saga_consolidate_ok would re-appear in 24 prompts. Only the
