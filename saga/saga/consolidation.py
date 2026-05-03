@@ -60,6 +60,7 @@ def _canonical_vocab_block(
     *,
     top_n_predicates: int = 25,
     top_n_subjects: int = 15,
+    extra_subjects: list[str] | None = None,
 ) -> str:
     """Build the canonical-predicate / canonical-subject context block
     for the consolidation prompt. Surfaces existing high-frequency
@@ -72,6 +73,15 @@ def _canonical_vocab_block(
     (cold start). The static seed is also unioned with whatever the
     DB returns, so a fresh DB sees the seed and starts canonicalizing
     immediately rather than re-deriving the canonical set from zero.
+
+    ``extra_subjects`` (optional) — operator-supplied canonical names
+    that should always appear in the subjects list regardless of DB
+    contents. mimir uses this to inject identities.yaml's canonical
+    forms ("Tim", "Alice", etc.) so the consolidation LLM uses the
+    operator-curated names instead of whatever surface form the
+    source atoms happen to mention. Rendered without counts, like
+    seed entries — they're authoritative-by-fiat, not frequency-
+    derived.
 
     Returns an empty string when the helper can't read the DB —
     consolidation continues with the bare prompt rather than crashing.
@@ -120,6 +130,14 @@ def _canonical_vocab_block(
         if s not in seen_subjs:
             subj_lines.append(s)
             seen_subjs.add(s)
+    # Operator-supplied canonical subjects (mimir's identities.yaml
+    # entries, typically). Rendered without counts — same shape as
+    # the static seed; authoritative-by-fiat.
+    if extra_subjects:
+        for s in extra_subjects:
+            if isinstance(s, str) and s.strip() and s not in seen_subjs:
+                subj_lines.append(s.strip())
+                seen_subjs.add(s.strip())
 
     if not pred_lines and not subj_lines:
         return ""
@@ -238,17 +256,27 @@ class ConsolidationEngine:
     #      reduces source-atom stability. Output feeds the two-tier
     #      retrieval pathway and (P37) the world-model audit.
     # loop_id: 4.3
-    def consolidate(self, dry_run: bool = False, max_clusters: int = None) -> dict:
+    def consolidate(
+        self,
+        dry_run: bool = False,
+        max_clusters: int = None,
+        extra_canonical_subjects: list[str] | None = None,
+    ) -> dict:
         """Main entry: cluster -> synthesize -> restructure.
 
         Args:
             dry_run: If True, detect clusters but don't synthesize or restructure.
             max_clusters: Override max clusters for this run.
+            extra_canonical_subjects: P48 — operator-supplied canonical
+                subject names (e.g. mimir's identities.yaml canonicals)
+                to surface in the consolidation prompt's vocab block.
+                None / empty = seed-only behavior.
 
         Returns:
             Dict with clusters_found, clusters_consolidated, atoms_affected, etc.
         """
         max_clusters = max_clusters or self.max_clusters
+        self._extra_canonical_subjects = list(extra_canonical_subjects or [])
 
         # Phase 1: Cluster
         clusters = self._cluster_phase()
@@ -710,7 +738,12 @@ class ConsolidationEngine:
         )):
             try:
                 _vb_conn = get_db()
-                vocab_block = _canonical_vocab_block(_vb_conn)
+                vocab_block = _canonical_vocab_block(
+                    _vb_conn,
+                    extra_subjects=getattr(
+                        self, '_extra_canonical_subjects', None,
+                    ),
+                )
                 _vb_conn.close()
             except Exception:
                 vocab_block = ""

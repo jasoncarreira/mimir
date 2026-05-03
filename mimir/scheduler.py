@@ -289,8 +289,17 @@ class Scheduler:
         saga_client: SagaClient,
         cron_expr: str,
         *,
+        home: Path | None = None,
         job_id: str = "saga-consolidate",
     ) -> bool:
+        """Register the weekly saga consolidation cron.
+
+        ``home`` (optional) — when set, the cron reads
+        ``<home>/state/identities.yaml`` at fire time and threads the
+        canonical names through ``consolidate(extra_canonical_subjects
+        =[...])`` so saga's P48 vocab block surfaces operator-curated
+        subjects to the consolidation LLM (Option A from the P48
+        identities-injection design)."""
         cron_expr = (cron_expr or "").strip()
         if not cron_expr:
             return False
@@ -300,12 +309,40 @@ class Scheduler:
             raise ValueError(f"invalid cron expression {cron_expr!r}: {exc}") from exc
 
         async def _consolidate() -> None:
+            # Load identities.yaml at FIRE TIME so operator edits between
+            # runs propagate without a server restart. Best effort: a
+            # missing / unparseable file just means seed-only behavior
+            # for this run.
+            extra_canonical_subjects: list[str] | None = None
+            if home is not None:
+                try:
+                    from .identities import IdentityResolver
+                    resolver = IdentityResolver(home)
+                    resolver.reload()
+                    extra_canonical_subjects = [
+                        ident.canonical for ident in resolver.all_identities()
+                        if ident.canonical
+                    ] or None
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "identities.yaml read failed; consolidation "
+                        "will run without extra_canonical_subjects",
+                    )
+                    extra_canonical_subjects = None
+
             try:
-                payload = await saga_client.consolidate(dry_run=False)
+                payload = await saga_client.consolidate(
+                    dry_run=False,
+                    extra_canonical_subjects=extra_canonical_subjects,
+                )
                 await log_event(
                     "saga_consolidate_ok",
                     dry_run=False,
                     result=_summarize_consolidate(payload),
+                    extra_canonical_subjects_count=(
+                        len(extra_canonical_subjects)
+                        if extra_canonical_subjects else 0
+                    ),
                 )
             except SagaError as exc:
                 await log_event("saga_consolidate_error", error=str(exc), status=exc.status)
