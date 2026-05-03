@@ -10,7 +10,6 @@ import pytest
 
 from mimir.budget import (
     BudgetSnapshot,
-    HeartbeatDecision,
     HomeostaticArbiter,
     _partition_turns,
 )
@@ -110,15 +109,13 @@ def test_partition_handles_missing_file(tmp_path: Path):
 
 def test_should_fire_when_no_signal(tmp_path: Path):
     arb = _arbiter(tmp_path)
-    decision, reason = arb.should_fire_heartbeat(now=NOW)
-    assert decision == HeartbeatDecision.FIRE
+    fire, reason = arb.should_fire_heartbeat(now=NOW)
+    assert fire is True
     assert reason == "ok"
 
 
 def test_plan_window_saturation_suppresses(tmp_path: Path):
     arb = _arbiter(tmp_path)
-    # Manually seed a saturated rate-limit entry. Future resets_at so
-    # current() doesn't filter it as stale.
     # Far-future resets_at — RateLimitStore.current() filters stale
     # entries using real time.time(), not our injected NOW. Push the
     # reset out beyond real wall-clock so the entry survives.
@@ -131,17 +128,14 @@ def test_plan_window_saturation_suppresses(tmp_path: Path):
             "observed_at": NOW.isoformat(),
         },
     }
-    decision, reason = arb.should_fire_heartbeat(now=NOW)
-    assert decision == HeartbeatDecision.SUPPRESS
+    fire, reason = arb.should_fire_heartbeat(now=NOW)
+    assert fire is False
     assert "plan_window_saturated" in reason
     assert "7d_opus" in reason
 
 
 def test_plan_window_below_threshold_does_not_suppress(tmp_path: Path):
     arb = _arbiter(tmp_path, plan_window_suppress_threshold=0.80)
-    # Far-future resets_at — RateLimitStore.current() filters stale
-    # entries using real time.time(), not our injected NOW. Push the
-    # reset out beyond real wall-clock so the entry survives.
     future = int((datetime.now(tz=timezone.utc) + timedelta(days=14)).timestamp())
     arb.rate_limit_store._load = lambda: {  # type: ignore[method-assign]
         "7d": {
@@ -151,8 +145,8 @@ def test_plan_window_below_threshold_does_not_suppress(tmp_path: Path):
             "observed_at": NOW.isoformat(),
         },
     }
-    decision, _ = arb.should_fire_heartbeat(now=NOW)
-    assert decision == HeartbeatDecision.FIRE
+    fire, _ = arb.should_fire_heartbeat(now=NOW)
+    assert fire is True
 
 
 def test_cost_rate_alert_suppresses(tmp_path: Path):
@@ -165,48 +159,26 @@ def test_cost_rate_alert_suppresses(tmp_path: Path):
         _write_turn(turns, ts=real_now - timedelta(minutes=10),
                     trigger="user_message", cost=2.0)
     arb = _arbiter(tmp_path, cost_hourly_limit_usd=5.0)
-    decision, reason = arb.should_fire_heartbeat(now=real_now)
-    assert decision == HeartbeatDecision.SUPPRESS
+    fire, reason = arb.should_fire_heartbeat(now=real_now)
+    assert fire is False
     assert "cost_rate_alert" in reason
 
 
-def test_s3_dominance_defers_s4(tmp_path: Path):
+def test_partition_no_longer_suppresses_busy_days(tmp_path: Path):
+    """Review #7: the S3-share partition layer is now informational
+    only — busy days (high S3 share) can no longer starve heartbeats.
+    Only plan-window + cost-rate gate firing."""
     turns = tmp_path / "turns.jsonl"
-    # 10 S3 calls, 1 S4 call → 91% S3 share, total ≥ 10.
+    # 10 S3 calls, 1 S4 call → 91% S3 share, would have suppressed
+    # under the old 0.80 threshold. New behavior: still fires.
     _write_turn(turns, ts=NOW - timedelta(hours=1),
                 trigger="user_message", tool_calls=10)
     _write_turn(turns, ts=NOW - timedelta(hours=2),
                 trigger="scheduled_tick", tool_calls=1)
-    arb = _arbiter(tmp_path, s3_share_max=0.80)
-    decision, reason = arb.should_fire_heartbeat(now=NOW)
-    assert decision == HeartbeatDecision.SUPPRESS
-    assert "s3_dominant" in reason
-
-
-def test_s3_idle_boosts_s4(tmp_path: Path):
-    turns = tmp_path / "turns.jsonl"
-    # 2 S3 calls, 10 S4 calls → 17% S3 share, well below 50% min.
-    _write_turn(turns, ts=NOW - timedelta(hours=1),
-                trigger="user_message", tool_calls=2)
-    _write_turn(turns, ts=NOW - timedelta(hours=2),
-                trigger="scheduled_tick", tool_calls=10)
-    arb = _arbiter(tmp_path, s3_share_min=0.50)
-    decision, reason = arb.should_fire_heartbeat(now=NOW)
-    assert decision == HeartbeatDecision.BOOST
-    assert "s3_idle" in reason
-
-
-def test_low_volume_no_partition_signal(tmp_path: Path):
-    """Below 10 total tool calls, the partition layer goes quiet — too
-    little signal to act on; small-day noise shouldn't trip suppression."""
-    turns = tmp_path / "turns.jsonl"
-    _write_turn(turns, ts=NOW - timedelta(hours=1),
-                trigger="user_message", tool_calls=4)
-    _write_turn(turns, ts=NOW - timedelta(hours=2),
-                trigger="scheduled_tick", tool_calls=1)
-    arb = _arbiter(tmp_path, s3_share_max=0.50)
-    decision, _ = arb.should_fire_heartbeat(now=NOW)
-    assert decision == HeartbeatDecision.FIRE
+    arb = _arbiter(tmp_path)
+    fire, reason = arb.should_fire_heartbeat(now=NOW)
+    assert fire is True
+    assert reason == "ok"
 
 
 # ─── render_self_state_block ────────────────────────────────────────────
@@ -247,6 +219,8 @@ def test_render_includes_cost_rate_with_limit(tmp_path: Path):
 
 
 def test_render_includes_s3_s4_share(tmp_path: Path):
+    """Partition is now informational-only — render still surfaces it
+    so the agent can see how its day skews user-driven vs autonomous."""
     turns = tmp_path / "turns.jsonl"
     _write_turn(turns, ts=NOW - timedelta(hours=1),
                 trigger="user_message", tool_calls=8)
@@ -255,7 +229,7 @@ def test_render_includes_s3_s4_share(tmp_path: Path):
     arb = _arbiter(tmp_path)
     body = arb.render_self_state_block(now=NOW)
     assert body is not None
-    assert "S3/S4 budget today" in body
+    assert "S3/S4 tool-call share" in body
     assert "80%" in body  # 8/(8+2) = 80%
 
 

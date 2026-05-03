@@ -240,8 +240,7 @@ async def test_fire_consults_arbiter_and_suppresses(tmp_path: Path):
 
     class _SuppressingArbiter:
         def should_fire_heartbeat(self):
-            from mimir.budget import HeartbeatDecision
-            return HeartbeatDecision.SUPPRESS, "plan_window_saturated:7d_opus@0.92"
+            return False, "plan_window_saturated:7d_opus@0.92"
 
     sched = Scheduler(
         scheduler_yaml=tmp_path / "s.yaml",
@@ -265,8 +264,7 @@ async def test_fire_consults_arbiter_and_fires(tmp_path: Path):
 
     class _FiringArbiter:
         def should_fire_heartbeat(self):
-            from mimir.budget import HeartbeatDecision
-            return HeartbeatDecision.FIRE, "ok"
+            return True, "ok"
 
     sched = Scheduler(
         scheduler_yaml=tmp_path / "s.yaml",

@@ -1,31 +1,33 @@
 """S3-S4 homeostat (FUTURE_WORK §12.4).
 
-The arbiter that decides whether scheduled-tick (S4) work fires. Reads
-four layered constraints in priority order and returns suppress / fire
-/ boost. The same data is rendered into a ``## Self-state`` prompt
-section so the agent has the same signal as the arbiter.
+The arbiter decides whether scheduled-tick (S4) work fires. Two
+layers can suppress; a third is informational only.
 
-Layered constraints (strictest first):
+**Suppressing layers (in priority order):**
 
-1. **Plan-window utilization** (hardest). From ``RateLimitStore`` —
-   the SDK's ``RateLimitInfo`` 5h / 7d / 7d_opus / 7d_sonnet windows.
-   ≥ ``plan_window_suppress_threshold`` (default 0.80) suppresses S4.
-2. **Cost-rate alert** (dollars). From ``usage_stats.evaluate_cost_rate``.
-   When tripped, suppress S4.
-3. **Tool-call budget** (soft). Per-day count split S3 / S4 from
-   turns.jsonl ``trigger`` field. When S3 share > 80%, defer S4
-   firings (the day is busy with user work). When < 50%, boost.
-4. **Token-count budget** (rolling). Surfaced in the self-state
-   block but not currently a suppression input — the dollar
-   constraint already captures this in practice.
+1. **Plan-window utilization** (hardest wall). From ``RateLimitStore``
+   — the SDK's ``RateLimitInfo`` 5h / 7d / 7d_opus / 7d_sonnet
+   windows. At ≥ ``plan_window_suppress_threshold`` (default 0.80)
+   the next heartbeat is suppressed; Anthropic literally stops
+   responding when the window saturates so spending S4 budget there
+   is wasted.
+2. **Cost-rate alert** (dollars). From
+   ``usage_stats.evaluate_cost_rate``. When tripped, suppress S4.
 
-The order matters: constraint #1 is a hard wall (Anthropic just stops
-responding when the window saturates); cost-rate is dollars; tool-call
-is a soft heuristic. Saturating #1 overrides all others.
+**Informational layer (rendered in self-state, no decision):**
 
-Runtime enforcement lands here (heartbeat-fire decision); the prompt
-self-state block lands in the system/turn prompt assembly so the
-agent sees the same constraints the arbiter does."""
+3. **S3/S4 partition + tokens.** Per-day tool-call counts split by
+   trigger (S3 = user_message, S4 = scheduled_tick) plus 24h/7d
+   token totals. The agent reads these via the ``## Self-state``
+   prompt section but the arbiter doesn't act on them — earlier
+   designs that had this layer suppress on "S3 dominance" risked
+   starving heartbeats on busy days, exactly when reflection /
+   introspection are most valuable. Code review #7 (deferred-then-
+   shipped) removed the partition's decision authority.
+
+Runtime enforcement: ``should_fire_heartbeat()`` returns ``(fire,
+reason)``. Prompt block: ``render_self_state_block()`` always
+includes the partition + tokens for agent awareness."""
 
 from __future__ import annotations
 
@@ -34,7 +36,6 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from enum import Enum
 from pathlib import Path
 
 from .rate_limits import RateLimitSnapshot, RateLimitStore
@@ -46,14 +47,6 @@ from .usage_stats import (
 )
 
 log = logging.getLogger(__name__)
-
-
-class HeartbeatDecision(str, Enum):
-    """Arbiter outcome for an upcoming S4 tick."""
-
-    SUPPRESS = "suppress"
-    FIRE = "fire"
-    BOOST = "boost"
 
 
 @dataclass
@@ -107,8 +100,6 @@ class HomeostaticArbiter:
     rate_limit_store: RateLimitStore
     turns_log: Path
     plan_window_suppress_threshold: float = 0.80
-    s3_share_max: float = 0.80          # > this → S4 deferred
-    s3_share_min: float = 0.50          # < this → S4 boosted
     cost_hourly_limit_usd: float | None = None
     cost_spike_ratio: float | None = None
     fallback_model: str | None = None
@@ -178,10 +169,16 @@ class HomeostaticArbiter:
 
     def should_fire_heartbeat(
         self, *, now: datetime | None = None,
-    ) -> tuple[HeartbeatDecision, str]:
-        """Return (decision, reason). Reason is the constraint that
-        produced the decision — useful for ``scheduled_tick_dropped``
-        events and operator triage."""
+    ) -> tuple[bool, str]:
+        """Return ``(fire, reason)``. ``fire=True`` lets the scheduled
+        tick run; ``fire=False`` suppresses it. Reason is the
+        constraint that produced the decision (useful for the
+        ``scheduled_tick_suppressed`` event and operator triage).
+
+        Only plan-window and cost-rate can suppress. The S3/S4
+        partition is informational (rendered into the prompt block)
+        but doesn't gate firing — busy days shouldn't starve weekly
+        maintenance work."""
         snap = self.snapshot(now=now)
 
         # 1. Plan window — hard wall.
@@ -193,31 +190,13 @@ class HomeostaticArbiter:
                 f"plan_window_saturated:{snap.plan_window_worst_key}"
                 f"@{snap.plan_window_max_utilization:.2f}"
             )
-            return HeartbeatDecision.SUPPRESS, reason
+            return False, reason
 
         # 2. Cost rate — dollars.
         if snap.cost_rate_alert is not None:
-            return (
-                HeartbeatDecision.SUPPRESS,
-                f"cost_rate_alert:{snap.cost_rate_alert.reason}",
-            )
+            return False, f"cost_rate_alert:{snap.cost_rate_alert.reason}"
 
-        # 3. Tool-call partition — S3 dominance defers S4; S3 idle boosts.
-        share = snap.s3_share_today
-        total = snap.s3_tool_calls_today + snap.s4_tool_calls_today
-        if total >= 10:  # avoid noise from tiny days
-            if share > self.s3_share_max:
-                return (
-                    HeartbeatDecision.SUPPRESS,
-                    f"s3_dominant:{share:.2f}>{self.s3_share_max:.2f}",
-                )
-            if share < self.s3_share_min:
-                return (
-                    HeartbeatDecision.BOOST,
-                    f"s3_idle:{share:.2f}<{self.s3_share_min:.2f}",
-                )
-
-        return HeartbeatDecision.FIRE, "ok"
+        return True, "ok"
 
     def render_self_state_block(
         self, *, now: datetime | None = None,
@@ -252,9 +231,11 @@ class HomeostaticArbiter:
         if total > 0:
             s3_pct = snap.s3_share_today * 100
             s4_pct = (1.0 - snap.s3_share_today) * 100
+            # Informational only — the partition layer doesn't suppress
+            # ticks (review #7). Surfaced so the agent can see whether
+            # its day skews toward user-driven or autonomous work.
             lines.append(
-                f"- S3/S4 budget today: {s3_pct:.0f}% / {s4_pct:.0f}% "
-                f"(target {self.s3_share_max * 100:.0f}/{(1 - self.s3_share_max) * 100:.0f})"
+                f"- S3/S4 tool-call share (24h): {s3_pct:.0f}% / {s4_pct:.0f}%"
             )
 
         if snap.tokens_24h > 0 or snap.tokens_7d > 0:
