@@ -208,6 +208,8 @@ class SlackBridge(Bridge):
     app_token: str
     enqueue: Callable[[AgentEvent], Awaitable[bool]]
     respond_to_bots: bool = False
+    attachments_dir: Path | None = None
+    attachments_max_bytes: int | None = None
     _app: Any | None = field(default=None, init=False, repr=False)
     _handler: Any | None = field(default=None, init=False, repr=False)
     _runner: asyncio.Task | None = field(default=None, init=False, repr=False)
@@ -438,6 +440,64 @@ class SlackBridge(Bridge):
             )
             slack_email = info.get("email")
 
+        # Inbound file_share attachments — Slack's ``files`` array on
+        # the event has url_private (Bot-token-auth) which we can stream
+        # to disk. Skipped when attachments_dir isn't configured.
+        attachment_paths: list[str] = []
+        attachment_urls: list[str] = []
+        for f in (event.get("files") or []):
+            if not isinstance(f, dict):
+                continue
+            url = f.get("url_private") or f.get("url_private_download")
+            name = f.get("name") or f.get("id") or "attachment"
+            size = f.get("size")
+            if url:
+                attachment_urls.append(str(url))
+            if not (self.attachments_dir and url):
+                continue
+            if (
+                self.attachments_max_bytes is not None
+                and isinstance(size, int)
+                and size > self.attachments_max_bytes
+            ):
+                log.warning(
+                    "SlackBridge: attachment %s (%d bytes) exceeds "
+                    "max_bytes=%s; skipping download",
+                    name, size, self.attachments_max_bytes,
+                )
+                continue
+            from ._attachments import build_inbound_path, download_to_path
+            target = build_inbound_path(
+                self.attachments_dir,
+                channel="slack",
+                chat_id=str(slack_channel or ""),
+                filename=str(name),
+            )
+            # Slack's url_private requires the bot token in the
+            # Authorization header; download_to_path passes through
+            # custom headers via aiohttp.
+            try:
+                import aiohttp
+                timeout = aiohttp.ClientTimeout(total=15.0)
+                async with aiohttp.ClientSession(
+                    timeout=timeout,
+                    headers={"Authorization": f"Bearer {self.bot_token}"},
+                ) as session:
+                    async with session.get(str(url)) as resp:
+                        if resp.status >= 400:
+                            log.warning(
+                                "SlackBridge: download %s returned %s",
+                                url, resp.status,
+                            )
+                            continue
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with target.open("wb") as fh:
+                            async for chunk in resp.content.iter_chunked(64 * 1024):
+                                fh.write(chunk)
+                attachment_paths.append(str(target))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("SlackBridge: download %s failed: %s", url, exc)
+
         agent_event = AgentEvent(
             trigger="user_message",
             channel_id=channel_id,
@@ -447,11 +507,16 @@ class SlackBridge(Bridge):
             author_id=user_id,
             source_id=event.get("ts"),
             source="slack",
+            attachment_names=attachment_paths,
             extra={
                 "channel_conversation_type": "dm" if is_dm else "multi_user",
                 "channel_visibility": "private" if is_dm else "public",
                 "thread_ts": event.get("thread_ts"),
                 "slack_email": slack_email,
+                **(
+                    {"inbound_attachment_urls": attachment_urls}
+                    if attachment_urls else {}
+                ),
             },
         )
         await self.enqueue(agent_event)
