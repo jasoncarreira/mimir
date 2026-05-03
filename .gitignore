@@ -47,7 +47,10 @@ home/
 # pointing at large datasets that don't belong in git (msam2's .gitignore
 # had the same exclusions; preserved post-merge).
 /saga/data
-/saga/external
+# saga/external is now vendored (the LongMemEval eval harness lives under
+# saga/external/longmemeval/ — see its PROVENANCE.md). Specific subdirs
+# that are too big or transient stay ignored.
+/saga/external/hindsight
 /saga/results
 # Integration bench output (per-run hypothesis JSONLs + scratch mimir homes).
 /results/
