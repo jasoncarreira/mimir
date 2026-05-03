@@ -162,8 +162,11 @@ transformers, fastembed).
 
 `[consolidation]`:
 - `similarity_threshold = 0.75` (P34)
-- `enable_canonical_vocab_block` — opt in for P48 prompt-side
-  canonicalization
+
+P48 (canonical predicate vocabulary in the consolidation prompt) is
+always on whenever `[triples] enable_extraction = true` — the block
+is a vocabulary hint, not enforcement, and reduces predicate aliasing
+across clusters with no measured downside.
 
 ## License
 
