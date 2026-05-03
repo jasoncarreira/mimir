@@ -231,11 +231,21 @@ class DiscordBridge(Bridge):
         enqueue: dispatcher's enqueue coroutine.
         respond_to_bots: if True, on_message accepts bot-authored messages
             (useful for inter-bot collaboration). Default False — humans only.
+        attachments_dir: when set, inbound message attachments are
+            downloaded under
+            ``<dir>/discord/<channel_id>/<msg_id>/<ts>-<uuid>-<name>``
+            and the resulting paths populate ``event.attachment_names``.
+            Default None — attachments arrive on the event with their
+            URLs in ``extra["inbound_attachment_urls"]`` only.
+        attachments_max_bytes: per-file cap; oversized files skip the
+            download. None (default) = no cap.
     """
 
     token: str
     enqueue: Callable[[AgentEvent], Awaitable[bool]]
     respond_to_bots: bool = False
+    attachments_dir: Path | None = None
+    attachments_max_bytes: int | None = None
     _client: _DiscordClient | None = field(default=None, init=False, repr=False)
     _runner: asyncio.Task | None = field(default=None, init=False, repr=False)
 
@@ -396,6 +406,44 @@ class DiscordBridge(Bridge):
         if not content:
             content = "User sent a message with no text."
 
+        # Download inbound attachments to disk so the agent can Read them
+        # by path. URL-only listing is the fallback when attachments_dir
+        # isn't configured (or download fails) — the agent then has the
+        # URL in extra and can fetch_url itself.
+        attachment_paths: list[str] = []
+        attachment_urls: list[str] = []
+        for att in (getattr(message, "attachments", None) or []):
+            url = getattr(att, "url", None)
+            name = getattr(att, "filename", None) or getattr(att, "id", None) or "attachment"
+            size = getattr(att, "size", None)
+            if url:
+                attachment_urls.append(str(url))
+            if not (self.attachments_dir and url):
+                continue
+            if (
+                self.attachments_max_bytes is not None
+                and isinstance(size, int)
+                and size > self.attachments_max_bytes
+            ):
+                log.warning(
+                    "DiscordBridge: attachment %s (%d bytes) exceeds "
+                    "max_bytes=%s; skipping download",
+                    name, size, self.attachments_max_bytes,
+                )
+                continue
+            from ._attachments import build_inbound_path, download_to_path
+            target = build_inbound_path(
+                self.attachments_dir,
+                channel="discord",
+                chat_id=str(getattr(message.channel, "id", "") or ""),
+                filename=str(name),
+            )
+            ok = await download_to_path(
+                str(url), target, max_bytes=self.attachments_max_bytes,
+            )
+            if ok:
+                attachment_paths.append(str(target))
+
         author_id = str(getattr(message.author, "id", "") or "") or None
         # Discord exposes display info directly on the User/Member object —
         # no API round-trip needed (unlike Slack). Preference order:
@@ -423,10 +471,15 @@ class DiscordBridge(Bridge):
             author_id=author_id,
             source_id=str(getattr(message, "id", "") or "") or None,
             source="discord",
+            attachment_names=attachment_paths,
             extra={
                 "channel_conversation_type": conv_type,
                 "channel_visibility": visibility,
                 "channel_name": channel_name,
+                **(
+                    {"inbound_attachment_urls": attachment_urls}
+                    if attachment_urls else {}
+                ),
             },
         )
         # Fire-and-forget the typing indicator so the user sees the

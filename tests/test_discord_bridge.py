@@ -364,6 +364,117 @@ async def test_send_typing_indicator_unconnected_noops(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_on_message_downloads_inbound_attachments(
+    bridge_with_fake_client, tmp_path: Path,
+):
+    """When attachments_dir is set, message attachments are downloaded
+    to the per-channel-per-chat dir and surfaced on the AgentEvent."""
+    import discord
+
+    bridge, enqueued, _ = bridge_with_fake_client
+    bridge.attachments_dir = tmp_path / "att"
+
+    # Patch download_to_path to a fake that writes a marker file.
+    from mimir.bridges import _attachments as att_mod
+
+    async def fake_download(url, target, **kw):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"FAKE-DOWNLOAD")
+        return True
+
+    monkey_orig = att_mod.download_to_path
+    att_mod.download_to_path = fake_download
+    try:
+        channel = SimpleNamespace(
+            id=1, type=getattr(discord.ChannelType, "text", None),
+            name="general", guild=None, permissions_for=None,
+        )
+        author = SimpleNamespace(
+            id=11, bot=False, display_name="A", global_name="A",
+            __str__=lambda self: "a",
+        )
+        # Discord attachment objects expose url, filename, size.
+        attachments = [
+            SimpleNamespace(
+                id="a1", url="https://cdn.example/a.png",
+                filename="report.png", size=1024, content_type="image/png",
+            ),
+        ]
+        msg = SimpleNamespace(
+            id=42, author=author, channel=channel,
+            content="see attached", attachments=attachments, mentions=[],
+        )
+        await bridge._on_message(msg)
+    finally:
+        att_mod.download_to_path = monkey_orig
+
+    assert len(enqueued) == 1
+    ev = enqueued[0]
+    assert len(ev.attachment_names) == 1
+    saved = Path(ev.attachment_names[0])
+    assert saved.exists()
+    assert saved.read_bytes() == b"FAKE-DOWNLOAD"
+    # Layout: <root>/discord/<channel_id>/<ts>-<token>-report.png
+    assert saved.parent.name == "1"
+    assert saved.parent.parent.name == "discord"
+    # Original URL preserved on extra for fallback.
+    assert ev.extra.get("inbound_attachment_urls") == ["https://cdn.example/a.png"]
+
+
+@pytest.mark.asyncio
+async def test_on_message_skips_oversized_attachments(
+    bridge_with_fake_client, tmp_path: Path,
+):
+    """Files over attachments_max_bytes don't get downloaded; the URL
+    still surfaces in extra so the agent can fetch_url manually if it
+    wants to."""
+    import discord
+
+    bridge, enqueued, _ = bridge_with_fake_client
+    bridge.attachments_dir = tmp_path / "att"
+    bridge.attachments_max_bytes = 100
+
+    from mimir.bridges import _attachments as att_mod
+    download_calls: list[str] = []
+
+    async def fake_download(url, target, **kw):
+        download_calls.append(url)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x")
+        return True
+
+    att_mod.download_to_path, prev = fake_download, att_mod.download_to_path
+    try:
+        channel = SimpleNamespace(
+            id=1, type=getattr(discord.ChannelType, "text", None),
+            name="g", guild=None, permissions_for=None,
+        )
+        author = SimpleNamespace(
+            id=22, bot=False, display_name="B", global_name="B",
+            __str__=lambda self: "b",
+        )
+        attachments = [
+            SimpleNamespace(
+                id="a1", url="https://cdn.example/big.bin",
+                filename="big.bin", size=99999, content_type=None,
+            ),
+        ]
+        msg = SimpleNamespace(
+            id=43, author=author, channel=channel,
+            content="big file", attachments=attachments, mentions=[],
+        )
+        await bridge._on_message(msg)
+    finally:
+        att_mod.download_to_path = prev
+
+    assert download_calls == []  # oversized → never called
+    ev = enqueued[0]
+    assert ev.attachment_names == []  # no local copy
+    # URL still listed so the agent has the option to retrieve.
+    assert "https://cdn.example/big.bin" in ev.extra.get("inbound_attachment_urls", [])
+
+
+@pytest.mark.asyncio
 async def test_on_message_fires_typing_before_enqueue(bridge_with_fake_client):
     """Inbound messages should trigger the typing indicator. The bridge
     fires it as a background task so enqueue isn't blocked — verify it
