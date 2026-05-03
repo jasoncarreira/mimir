@@ -62,3 +62,11 @@ class Bridge(ABC):
         """Add a reaction to a prior message. Returns False when the bridge
         has no native reaction support (e.g. Bluesky) — caller logs and
         moves on."""
+
+    async def send_typing_indicator(self, channel_id: str) -> None:
+        """Best-effort typing indicator. Default is no-op — bridges that
+        support it (Discord) override; bridges that don't (Slack — no
+        public typing API for bots — and benchmark/web stubs) inherit
+        the no-op. Failures are swallowed silently; this is a UX nicety,
+        not load-bearing — never raises into the caller."""
+        return None

@@ -328,3 +328,71 @@ async def test_send_reports_disconnected_client(tmp_path: Path):
     result = await bridge.send("discord-1", "hi")
     assert result.sent is False
     assert "not connected" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_send_typing_indicator_calls_trigger_typing(bridge_with_fake_client):
+    """The Discord typing-dots fire fires when the bridge gets a real
+    inbound message — verify trigger_typing is invoked on the channel."""
+    bridge, _, _ = bridge_with_fake_client
+    # Attach trigger_typing to the fake channel so we can observe the call.
+    channel = bridge._client._channels[1]  # type: ignore[attr-defined]
+    channel.trigger_typing = AsyncMock()
+    await bridge.send_typing_indicator("discord-1")
+    channel.trigger_typing.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_typing_indicator_swallows_failures(bridge_with_fake_client):
+    """trigger_typing errors don't propagate — typing is best-effort."""
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels[1]  # type: ignore[attr-defined]
+
+    async def boom():
+        raise RuntimeError("rate-limited")
+
+    channel.trigger_typing = boom
+    # Should not raise.
+    await bridge.send_typing_indicator("discord-1")
+
+
+@pytest.mark.asyncio
+async def test_send_typing_indicator_unconnected_noops(tmp_path: Path):
+    """No client → silent no-op, no exception."""
+    bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))
+    await bridge.send_typing_indicator("discord-1")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_on_message_fires_typing_before_enqueue(bridge_with_fake_client):
+    """Inbound messages should trigger the typing indicator. The bridge
+    fires it as a background task so enqueue isn't blocked — verify it
+    was scheduled."""
+    import asyncio
+
+    import discord
+
+    bridge, enqueued, _ = bridge_with_fake_client
+    channel_obj = bridge._client._channels[1]  # type: ignore[attr-defined]
+    channel_obj.trigger_typing = AsyncMock()
+
+    channel = SimpleNamespace(
+        id=1,
+        type=getattr(discord.ChannelType, "text", None),
+        name="general",
+        guild=None,
+        permissions_for=None,
+    )
+    author = SimpleNamespace(
+        id=77, bot=False, display_name="Bob", global_name="Bob",
+        __str__=lambda self: "bob",
+    )
+    msg = SimpleNamespace(
+        id=99, author=author, channel=channel, content="hello", mentions=[],
+    )
+    await bridge._on_message(msg)
+    # The typing-indicator task is scheduled but may not have run yet —
+    # let the event loop tick once so it gets a chance.
+    await asyncio.sleep(0)
+    channel_obj.trigger_typing.assert_awaited_once()
+    assert len(enqueued) == 1
