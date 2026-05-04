@@ -43,6 +43,62 @@ async def test_pre_hook_passes_through_when_path_inside_home(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_pre_hook_extra_roots_allow_absolute_paths(tmp_path: Path):
+    """When extra_roots is configured, file-op tools accept paths
+    inside any of the roots — mimirbot's case for reading its own
+    source at /workspace/mimir or the bench harness at /benchmark."""
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    target = workspace / "mimir" / "agent.py"
+    target.parent.mkdir()
+    target.write_text("# agent")
+
+    hook = make_pre_tool_use_hook(home, extra_roots=[workspace])
+    out = await hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(target)},
+            "tool_use_id": "tu",
+        },
+        "tu",
+        _ctx(),
+    )
+    # No deny → empty dict means the hook allows the call.
+    assert out == {}
+
+
+@pytest.mark.asyncio
+async def test_pre_hook_extra_roots_still_block_unconfigured_paths(tmp_path: Path):
+    """A path outside both home AND extra_roots is rejected."""
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    elsewhere = tmp_path / "elsewhere"
+    home.mkdir()
+    workspace.mkdir()
+    elsewhere.mkdir()
+    secret = elsewhere / "secret.md"
+    secret.write_text("nope")
+
+    hook = make_pre_tool_use_hook(home, extra_roots=[workspace])
+    out = await hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(secret)},
+            "tool_use_id": "tu",
+        },
+        "tu",
+        _ctx(),
+    )
+    deny = out["hookSpecificOutput"]
+    assert deny["permissionDecision"] == "deny"
+    assert "MIMIR_FILE_OP_ROOTS" in deny["permissionDecisionReason"]
+
+
+@pytest.mark.asyncio
 async def test_pre_hook_denies_absolute_path_outside_home(tmp_path: Path):
     hook = make_pre_tool_use_hook(tmp_path)
     out = await hook(
@@ -57,7 +113,7 @@ async def test_pre_hook_denies_absolute_path_outside_home(tmp_path: Path):
     )
     deny = out["hookSpecificOutput"]
     assert deny["permissionDecision"] == "deny"
-    assert "escapes home" in deny["permissionDecisionReason"]
+    assert "escapes configured roots" in deny["permissionDecisionReason"]
     assert "Read" in deny["permissionDecisionReason"]
 
 
@@ -95,7 +151,7 @@ async def test_pre_hook_denies_dotdot_escape(tmp_path: Path):
     )
     deny = out["hookSpecificOutput"]
     assert deny["permissionDecision"] == "deny"
-    assert "escapes home" in deny["permissionDecisionReason"]
+    assert "escapes configured roots" in deny["permissionDecisionReason"]
 
 
 @pytest.mark.asyncio

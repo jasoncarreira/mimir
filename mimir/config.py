@@ -134,6 +134,15 @@ class Config:
     # 0 disables the cap entirely.
     tool_call_budget: int
 
+    # Additional file-op roots beyond ``home``. File-op tools (Read,
+    # Glob, Grep, Edit, Write, MultiEdit, NotebookEdit) accept paths
+    # inside any of these. Useful for deployments where the agent
+    # operates on sibling mounts: mimirbot reads/edits its own source
+    # at ``/workspace/mimir`` and the bench harness at ``/benchmark``.
+    # Configured via ``MIMIR_FILE_OP_ROOTS`` (colon-separated paths);
+    # empty by default (just ``home``).
+    file_op_extra_roots: list[Path]
+
     # SDK gateway (§14.1)
     anthropic_api_key: str
     anthropic_base_url: str
@@ -282,6 +291,11 @@ class Config:
             send_loop_hard_limit=_env_int("MIMIR_SEND_LOOP_HARD_LIMIT", 10),
             send_loop_similarity=_env_float("MIMIR_SEND_LOOP_SIMILARITY", 0.9),
             tool_call_budget=_env_int("MIMIR_TOOL_CALL_BUDGET", 30),
+            file_op_extra_roots=[
+                Path(p)
+                for p in (_env("MIMIR_FILE_OP_ROOTS", "") or "").split(":")
+                if p.strip()
+            ],
 
             anthropic_api_key=_env("ANTHROPIC_API_KEY"),
             anthropic_base_url=_env("ANTHROPIC_BASE_URL"),
