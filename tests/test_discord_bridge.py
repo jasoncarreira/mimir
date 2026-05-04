@@ -330,28 +330,50 @@ async def test_send_reports_disconnected_client(tmp_path: Path):
     assert "not connected" in (result.error or "")
 
 
+class _FakeTyping:
+    """Stand-in for discord.py's ``Typing`` async context manager.
+    Records aenter/aexit on the fake channel for test assertions."""
+    def __init__(self, channel):
+        self.channel = channel
+    async def __aenter__(self):
+        self.channel.typing_aenter_calls = (
+            getattr(self.channel, "typing_aenter_calls", 0) + 1
+        )
+        return self
+    async def __aexit__(self, *exc):
+        self.channel.typing_aexit_calls = (
+            getattr(self.channel, "typing_aexit_calls", 0) + 1
+        )
+        return None
+
+
 @pytest.mark.asyncio
-async def test_send_typing_indicator_calls_trigger_typing(bridge_with_fake_client):
-    """The Discord typing-dots fire fires when the bridge gets a real
-    inbound message — verify trigger_typing is invoked on the channel."""
+async def test_send_typing_indicator_uses_typing_context_manager(
+    bridge_with_fake_client,
+):
+    """discord.py 2.x exposes typing via ``async with channel.typing():``;
+    the bridge enters and exits the context to fire one POST."""
     bridge, _, _ = bridge_with_fake_client
-    # Attach trigger_typing to the fake channel so we can observe the call.
     channel = bridge._client._channels[1]  # type: ignore[attr-defined]
-    channel.trigger_typing = AsyncMock()
+    channel.typing = lambda: _FakeTyping(channel)
     await bridge.send_typing_indicator("discord-1")
-    channel.trigger_typing.assert_awaited_once()
+    assert getattr(channel, "typing_aenter_calls", 0) == 1
+    assert getattr(channel, "typing_aexit_calls", 0) == 1
 
 
 @pytest.mark.asyncio
 async def test_send_typing_indicator_swallows_failures(bridge_with_fake_client):
-    """trigger_typing errors don't propagate — typing is best-effort."""
+    """Errors during typing don't propagate — best-effort."""
     bridge, _, _ = bridge_with_fake_client
     channel = bridge._client._channels[1]  # type: ignore[attr-defined]
 
-    async def boom():
-        raise RuntimeError("rate-limited")
+    class _BoomTyping:
+        async def __aenter__(self):
+            raise RuntimeError("rate-limited")
+        async def __aexit__(self, *exc):
+            return None
 
-    channel.trigger_typing = boom
+    channel.typing = lambda: _BoomTyping()
     # Should not raise.
     await bridge.send_typing_indicator("discord-1")
 
@@ -477,15 +499,15 @@ async def test_on_message_skips_oversized_attachments(
 @pytest.mark.asyncio
 async def test_on_message_fires_typing_before_enqueue(bridge_with_fake_client):
     """Inbound messages should trigger the typing indicator. The bridge
-    fires it as a background task so enqueue isn't blocked — verify it
-    was scheduled."""
+    fires it as a background task so enqueue isn't blocked — verify the
+    ``channel.typing()`` context manager got entered."""
     import asyncio
 
     import discord
 
     bridge, enqueued, _ = bridge_with_fake_client
     channel_obj = bridge._client._channels[1]  # type: ignore[attr-defined]
-    channel_obj.trigger_typing = AsyncMock()
+    channel_obj.typing = lambda: _FakeTyping(channel_obj)
 
     channel = SimpleNamespace(
         id=1,
@@ -503,9 +525,11 @@ async def test_on_message_fires_typing_before_enqueue(bridge_with_fake_client):
     )
     await bridge._on_message(msg)
     # The typing-indicator task is scheduled but may not have run yet —
-    # let the event loop tick once so it gets a chance.
-    await asyncio.sleep(0)
-    channel_obj.trigger_typing.assert_awaited_once()
+    # let the event loop tick a few times so the asyncio.create_task
+    # gets dispatched and the context manager runs to completion.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert getattr(channel_obj, "typing_aenter_calls", 0) >= 1
     assert len(enqueued) == 1
 
 

@@ -333,9 +333,16 @@ class DiscordBridge(Bridge):
         return SendResult(sent=True, message_id=last_id, chunks=sent_count)
 
     async def send_typing_indicator(self, channel_id: str) -> None:
-        """Show the Discord typing dots in the channel. Single fire —
-        Discord renders the indicator for ~10s on its own. Failures
-        swallowed; typing is a UX nicety, not load-bearing."""
+        """Show the Discord typing dots in the channel. Discord's API
+        renders the indicator for ~10s on a single POST. Failures
+        swallowed; typing is a UX nicety, not load-bearing.
+
+        discord.py 2.x exposes typing as an async context manager —
+        ``Messageable.trigger_typing`` was removed. Entering the
+        context POSTs once (which is what we want for fire-and-
+        forget); exiting immediately just cancels the auto-refresh
+        loop without cancelling the indicator on Discord's side
+        (no such API exists)."""
         if self._client is None or self._client.is_closed():
             return
         cid_int = _channel_id_to_int(channel_id)
@@ -345,9 +352,9 @@ class DiscordBridge(Bridge):
             channel = self._client.get_channel(cid_int)
             if channel is None:
                 channel = await self._client.fetch_channel(cid_int)
-            trigger = getattr(channel, "trigger_typing", None)
-            if callable(trigger):
-                await trigger()
+            if hasattr(channel, "typing"):
+                async with channel.typing():
+                    pass
         except Exception:  # noqa: BLE001
             pass
 
