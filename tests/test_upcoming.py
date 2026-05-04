@@ -150,7 +150,10 @@ def test_collect_plan_window_resets():
     assert "currently 78% used" in items[1].detail
 
 
-def test_render_upcoming_includes_both_groups():
+def test_render_upcoming_only_renders_scheduled_work():
+    """As of 2026-05-04: plan-window resets are surfaced via the
+    Self-state block (with utilization context) instead of duplicated
+    here. The Upcoming block now renders only scheduler jobs."""
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     fake_sched = SimpleNamespace(_scheduler=SimpleNamespace(get_jobs=lambda: [
         SimpleNamespace(id="scheduler:heartbeat",
@@ -173,24 +176,14 @@ def test_render_upcoming_includes_both_groups():
     assert out is not None
     assert "**Scheduled work**" in out
     assert "heartbeat" in out
-    assert "**Plan-window resets**" in out
-    assert "five_hour" in out
-    # Both should render their "in Xm" / "in Xh" relative time.
     assert "in 30m" in out
-    assert "in 2h" in out
-
-
-def test_render_upcoming_handles_one_group_only():
-    """If only the scheduler has items (or only plan-window), render
-    just that group — no empty headers."""
-    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
-    fake_sched = SimpleNamespace(_scheduler=SimpleNamespace(get_jobs=lambda: [
-        SimpleNamespace(id="scheduler:heartbeat",
-                        next_run_time=base + timedelta(minutes=15)),
-    ]))
-    out = render_upcoming_block(
-        scheduler=fake_sched, rate_limit_store=None, now=base,
-    )
-    assert out is not None
-    assert "Scheduled work" in out
+    # Plan-window resets no longer rendered here.
     assert "Plan-window resets" not in out
+    assert "five_hour" not in out
+
+
+def test_render_upcoming_handles_no_scheduler_items():
+    """No scheduled work → return None so the prompt assembler can
+    suppress the section."""
+    out = render_upcoming_block(scheduler=None, rate_limit_store=None)
+    assert out is None
