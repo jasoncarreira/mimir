@@ -96,7 +96,7 @@ DEFAULT_ENV_TEMPLATE = dedent(
     # Floor on rate_now below which the spike check is silenced (an
     # asymmetry fix — a normal session burning a few cents/hour shouldn't
     # trip just because the rolling baseline is tiny). 0 disables.
-    MIMIR_COST_RATE_SPIKE_FLOOR_USD=0.50
+    MIMIR_COST_RATE_SPIKE_FLOOR_USD=5.00
     MIMIR_COST_ALERT_COOLDOWN_MINUTES=60
 
     # Per-response plan-window capture. When true (default), the SDK
