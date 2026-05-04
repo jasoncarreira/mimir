@@ -19,10 +19,11 @@ from .memory import CoreBlock, render_core_section
 from .models import AgentEvent
 
 _DEFAULT_PERSONA = """You are Mimir, a memory-centric agent built on the Claude Agent SDK.
-You communicate through channels (Slack, Discord, Bluesky, web, benchmark
-stdout). You can use bash and file-op tools to organize your own notes
-under memory/, search them via the file_search skill, and call SAGA
-through the saga skill for semantic memory."""
+You communicate through channels (Slack, Discord, web, benchmark stdout).
+You can use bash and file-op tools to organize your own notes under
+memory/, search them via the file_search skill (covers state/ and
+memory/ except memory/core/* — core blocks are already in this prompt),
+and call SAGA through the saga skill for semantic memory."""
 
 # Heartbeat-tick body when the scheduler.yaml job didn't set its own
 # ``prompt:``. Brief — the heartbeat skill carries the full instructions.
@@ -57,7 +58,10 @@ _DEFAULT_CONVENTIONS = """## Conventions
 Inside the ``send_message`` text body you may embed an ``<actions>`` block
 to bundle reactions and file sends into the same tool call. This is
 faster than calling ``send_message``, then ``react``, then ``send_message``
-again with an attachment — those become one tool call total.
+again with an attachment — those become one tool call total. The
+directives target the channel the ``send_message`` call goes to;
+cross-channel sends use a separate ``send_message`` call with an
+explicit ``channel_id``.
 
 ```
 Got it, here's the chart you asked for.
@@ -68,16 +72,14 @@ Got it, here's the chart you asked for.
 </actions>
 ```
 
-- ``<react emoji="..." [message="<id>"] [channel="<id>"] />`` — react
-  with an emoji. Defaults to the message just sent in this call (or the
-  most recent assistant message when this call is directives-only).
+- ``<react emoji="..." [message="<id>"] />`` — react with an emoji.
+  Defaults to the message just sent in this call (or the most recent
+  assistant message when this call is directives-only).
 - ``<send-file path="..." [caption="..."] [kind="image|file|audio"]
-  [cleanup="true"] [channel="..."] />`` — attach a file. ``path`` resolves
-  under ``MIMIR_HOME/attachments/outbound/``; absolute paths must
-  already be inside that dir. ``..`` and symlink escapes are rejected.
+  [cleanup="true"] />`` — attach a file. ``path`` resolves under
+  ``MIMIR_HOME/attachments/outbound/``; absolute paths must already be
+  inside that dir. ``..`` and symlink escapes are rejected.
   ``cleanup="true"`` deletes the file after a successful send.
-- ``<send-message channel="<id>">cross-channel text</send-message>`` —
-  reply on a different channel than the one that triggered the turn.
 
 Per-directive failures are reported on the tool reply but don't fail
 the main send. The text outside the ``<actions>`` block is the
@@ -234,15 +236,13 @@ def build_turn_prompt(
     # see now() unless a bridge/handler explicitly sets the override.
     ts_override = (event.extra or {}).get("event_ts_iso")
     ts = ts_override if ts_override else datetime.now(tz=timezone.utc).isoformat()
-    # When the override is set, also surface "Today's date: YYYY-MM-DD" as
-    # an explicit prompt section. The header's ``ts:`` field alone is
-    # ambiguous to readers — saga's bench reader template makes "today"
-    # explicit because LLMs misread bare ISO strings (haiku read the
-    # 2023-04-01 ts: but still answered against the wall-clock 2026
-    # because nothing told it that ts WAS today).
-    if ts_override:
-        date_only = ts_override.split("T", 1)[0]
-        sections.append(f"## Today's date\n\n{date_only}")
+    # ALWAYS surface "Today's date: YYYY-MM-DD" — bare ISO timestamps in
+    # the event header alone get misread (haiku saw a 2023-04-01 ts: but
+    # answered against the wall-clock 2026 because nothing told it that
+    # ts WAS today). Production turns get current date; bench / replay
+    # turns get the override they passed.
+    date_only = ts.split("T", 1)[0]
+    sections.append(f"## Today's date\n\n{date_only}")
     if event.trigger == "scheduled_tick":
         # Heartbeat / cron-fired tick: header omits author (the scheduler is
         # the implicit caller), body is whatever the schedule.yaml entry
@@ -250,6 +250,7 @@ def build_turn_prompt(
         # when the entry was a bare scheduled tick with no instructions.
         header = f"[scheduled_tick: {event.channel_id}, ts: {ts}]"
         body = event.content or HEARTBEAT_DEFAULT_PROMPT
+        sections.append(f"{header}\n{body}")
     else:
         # Prefer the canonical's display name (or the event's author_display)
         # over the raw matching key in the header — the agent reads "alice",
@@ -259,17 +260,19 @@ def build_turn_prompt(
             header_author = resolver.display_name(event.author)
         if not header_author:
             header_author = event.author or "-"
-        header = (
-            f"[event_kind: {event.trigger}, channel: {event.channel_id}, "
-            f"author: {header_author}, ts: {ts}]"
-        )
+        # Highlight the current message — bordered separator + heading
+        # so the agent reads "this is what I'm responding to" clearly,
+        # vs. ambient context blocks above. Recent activity already
+        # shows the message tail; this block is the *active* one.
         body = event.content or "(no content)"
-        # Surface inbound attachment paths so the agent can ``Read`` them.
-        # Bridges download files into ``MIMIR_HOME/attachments/inbound/...``
-        # and populate ``attachment_names`` with the local paths.
         if event.attachment_names:
             paths = "\n".join(f"- {p}" for p in event.attachment_names)
             body = f"{body}\n\nAttachments:\n{paths}"
-    sections.append(f"{header}\n{body}")
+        sections.append(
+            f"## ▶ Current message — respond to this\n\n"
+            f"[event_kind: {event.trigger}, channel: {event.channel_id}, "
+            f"author: {header_author}, ts: {ts}]\n\n"
+            f"{body}"
+        )
 
     return "\n\n".join(sections)

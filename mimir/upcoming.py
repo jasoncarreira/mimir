@@ -175,32 +175,26 @@ def render_upcoming_block(
     limit_plan_windows: int = 5,
     now: datetime | None = None,
 ) -> str | None:
-    """Assemble the Upcoming block body. Returns None when both
-    sources are empty (so the prompt assembler can suppress the
+    """Assemble the Upcoming block body. Returns None when there's
+    nothing to surface (so the prompt assembler can suppress the
     section entirely instead of rendering an empty header).
 
-    Two source-grouped lists rather than a single sort: cron
-    firings and plan-window resets are different categories and
-    grouping keeps the agent's mental model crisp. Empty groups
-    are dropped; if both are empty, the whole block returns None."""
+    Plan-window resets used to be listed here too, but the
+    Self-state block already surfaces them with utilization
+    context (``7d_opus window: 64% used (resets in 4d 7h)``) —
+    duplicating just the reset time was noise. The
+    ``rate_limit_store`` and ``limit_plan_windows`` parameters
+    are kept for back-compat with callers but no longer affect
+    output.
+    """
     now = now or datetime.now(tz=timezone.utc)
+    del rate_limit_store, limit_plan_windows  # back-compat shims; no-op now.
 
     sched_items = collect_scheduler_jobs(scheduler, limit=limit_scheduler)
-    plan_items = collect_plan_window_resets(rate_limit_store, limit=limit_plan_windows)
-
-    if not sched_items and not plan_items:
+    if not sched_items:
         return None
 
-    lines: list[str] = []
-    if sched_items:
-        lines.append("**Scheduled work**")
-        for it in sched_items:
-            lines.append(it.render(now=now))
-    if plan_items:
-        if lines:
-            lines.append("")
-        lines.append("**Plan-window resets**")
-        for it in plan_items:
-            lines.append(it.render(now=now))
-
+    lines: list[str] = ["**Scheduled work**"]
+    for it in sched_items:
+        lines.append(it.render(now=now))
     return "\n".join(lines)
