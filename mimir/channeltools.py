@@ -532,8 +532,96 @@ def build_channel_tools(
             f"react ok={ok} (message_id={message_id}, emoji={emoji})"
         )
 
-    return [send_message, react]
+    @tool(
+        "fetch_channel_history",
+        "Fetch the last N messages from a channel — useful for catching "
+        "up on a thread the bridge didn't see live (bot was offline, "
+        "restart, mid-conversation join). Returns oldest-first. Pass "
+        "``before`` (a message id from a prior fetch) to paginate further "
+        "back. ``limit`` defaults to 20, capped at 100. Bridges without a "
+        "history API (bench, web stub) return no messages.",
+        {
+            "type": "object",
+            "properties": {
+                "channel_id": {"type": "string"},
+                "limit": {"type": "integer"},
+                "before": {"type": "string"},
+            },
+            "required": [],
+        },
+    )
+    @_safe("fetch_channel_history")
+    async def fetch_channel_history(args: dict[str, Any]) -> dict[str, Any]:
+        ctx = get_current_turn()
+        channel_id = (args.get("channel_id") or "").strip()
+        if not channel_id:
+            channel_id = (ctx.channel_id if ctx else "") or ""
+        if not channel_id:
+            return _content_block(
+                "fetch_channel_history failed: no channel_id and no current turn channel",
+                is_error=True,
+            )
+        try:
+            limit = max(1, min(int(args.get("limit") or 20), 100))
+        except (TypeError, ValueError):
+            limit = 20
+        before = (args.get("before") or "").strip() or None
+
+        try:
+            messages = await registry.fetch_history(
+                channel_id, limit=limit, before=before,
+            )
+        except UnknownChannelError as exc:
+            return _content_block(
+                f"fetch_channel_history failed: {exc}", is_error=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("fetch_channel_history dispatch failed")
+            return _content_block(
+                f"fetch_channel_history failed: {type(exc).__name__}: {exc}",
+                is_error=True,
+            )
+
+        await log_event(
+            "fetch_channel_history",
+            channel_id=channel_id,
+            limit=limit,
+            before=before,
+            returned=len(messages),
+        )
+        return _content_block(_format_history(channel_id, messages))
+
+    return [send_message, react, fetch_channel_history]
+
+
+def _format_history(channel_id: str, messages: list[Any]) -> str:
+    """Render fetched messages as a compact prompt-friendly listing.
+    One line per message: ``[ts msg=<id>] author: text [+N attachments]``.
+    Empty list rendered as a single notice line."""
+    if not messages:
+        return f"fetch_channel_history: no messages returned for {channel_id}"
+    lines = [f"fetch_channel_history: {len(messages)} messages from {channel_id}"]
+    for m in messages:
+        ts = getattr(m, "ts", "") or "?"
+        mid = getattr(m, "id", "") or "?"
+        author = (
+            getattr(m, "author_display", None)
+            or getattr(m, "author_id", None)
+            or "?"
+        )
+        bot_tag = " (bot)" if getattr(m, "is_bot", False) else ""
+        content = (getattr(m, "content", "") or "").replace("\n", " ")
+        if len(content) > 500:
+            content = content[:500] + "…"
+        atts = getattr(m, "attachment_urls", ()) or ()
+        att_tag = f" [+{len(atts)} attachments]" if atts else ""
+        lines.append(f"[{ts} msg={mid}] {author}{bot_tag}: {content}{att_tag}")
+    return "\n".join(lines)
 
 
 def channel_tool_names() -> list[str]:
-    return ["mcp__mimir__send_message", "mcp__mimir__react"]
+    return [
+        "mcp__mimir__send_message",
+        "mcp__mimir__react",
+        "mcp__mimir__fetch_channel_history",
+    ]
