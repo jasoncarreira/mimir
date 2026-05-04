@@ -136,6 +136,127 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
     assert e.extra["schedule_name"] == "morning"
 
 
+@pytest.mark.asyncio
+async def test_fire_reads_prompt_file_when_set(tmp_path: Path):
+    """When the SchedulerJob has prompt_file set, _fire reads the file
+    under <home>/prompts/ and uses its content as the event body."""
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    home = tmp_path / "home"
+    (home / "prompts").mkdir(parents=True)
+    (home / "prompts" / "heartbeat.md").write_text(
+        "Run the heartbeat skill — librarian first, then backlog.\n",
+    )
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=home,
+    )
+    job = SchedulerJob(
+        name="heartbeat",
+        prompt="fallback inline prompt",
+        prompt_file="heartbeat.md",
+        cron="0 * * * *",
+    )
+    await sched._fire(job=job)
+
+    assert len(enqueued) == 1
+    e = enqueued[0]
+    # File body wins over the inline prompt fallback.
+    assert "librarian" in e.content
+    assert "fallback inline" not in e.content
+    assert e.extra["prompt_file"] == "heartbeat.md"
+
+
+@pytest.mark.asyncio
+async def test_fire_falls_back_to_inline_when_prompt_file_missing(tmp_path: Path):
+    """A missing prompt_file logs a warning and falls back to the
+    inline prompt — never crashes the cron firing."""
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    home = tmp_path / "home"
+    (home / "prompts").mkdir(parents=True)
+    # No heartbeat.md file — prompt_file points at a nonexistent path.
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=home,
+    )
+    job = SchedulerJob(
+        name="heartbeat",
+        prompt="inline fallback content",
+        prompt_file="missing.md",
+        cron="0 * * * *",
+    )
+    await sched._fire(job=job)
+
+    assert len(enqueued) == 1
+    assert enqueued[0].content == "inline fallback content"
+
+
+@pytest.mark.asyncio
+async def test_fire_rejects_prompt_file_escape(tmp_path: Path):
+    """prompt_file with .. or absolute-outside-prompts paths are
+    rejected (path-confinement defense). Falls back to the inline
+    prompt."""
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    home = tmp_path / "home"
+    (home / "prompts").mkdir(parents=True)
+    # Plant a file outside <home>/prompts/ that the agent might try
+    # to reference via prompt_file="../secret.md".
+    (tmp_path / "secret.md").write_text("EXFIL: you should not see this")
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=home,
+    )
+    job = SchedulerJob(
+        name="bad",
+        prompt="safe inline prompt",
+        prompt_file="../secret.md",
+        cron="0 * * * *",
+    )
+    await sched._fire(job=job)
+
+    assert len(enqueued) == 1
+    assert enqueued[0].content == "safe inline prompt"
+    assert "EXFIL" not in enqueued[0].content
+
+
+def test_scheduler_job_yaml_round_trip_with_prompt_file():
+    """SchedulerJob with prompt_file survives YAML round-trip cleanly."""
+    job = SchedulerJob(
+        name="reflect",
+        prompt="",
+        prompt_file="reflect.md",
+        cron="0 6 * * 0",
+    )
+    entry = job.to_yaml_entry()
+    assert entry["prompt_file"] == "reflect.md"
+    # No empty inline prompt key when only prompt_file is set.
+    assert "prompt" not in entry
+
+    reloaded = SchedulerJob.from_yaml_entry(entry)
+    assert reloaded.prompt_file == "reflect.md"
+    assert reloaded.prompt == ""
+    assert reloaded.cron == "0 6 * * 0"
+
+
+def test_scheduler_job_requires_one_of_prompt_or_prompt_file():
+    """Neither inline prompt nor prompt_file → ValueError."""
+    with pytest.raises(ValueError, match="prompt"):
+        SchedulerJob.from_yaml_entry({
+            "name": "bad", "cron": "0 * * * *",
+        })
+
+
 def test_add_introspection_report_job_validates_cron(tmp_path: Path):
     async def noop(_e):
         return True

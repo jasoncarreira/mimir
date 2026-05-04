@@ -172,6 +172,7 @@ def build_app(config: Config) -> web.Application:
     scheduler = Scheduler(
         scheduler_yaml=config.home / "scheduler.yaml",
         enqueue=dispatcher.enqueue,
+        home=config.home,
     )
     agent = Agent(
         config,
