@@ -213,6 +213,11 @@ class Config:
     # - cost_rate_spike_ratio: multiplier of the rolling-week per-hour
     #   baseline. Default 3.0; 0 disables. Adapts to your usual spend
     #   so a sleeper agent that wakes up briefly doesn't false-positive.
+    # - cost_rate_spike_floor_usd: rate_now floor below which the spike
+    #   check is silenced regardless of ratio. Default $5.00/hr — a
+    #   second line of defense for "weird shape, not yet at ceiling"
+    #   that lets normal working sessions (a few dollars/hour) pass
+    #   without tripping. 0 disables (revert to baseline-only gating).
     # cost_alert_cooldown_minutes: minimum interval between
     #   ``cost_rate_alert`` events landing in events.jsonl. The
     #   algedonic surfacing keeps showing the most recent alert until
@@ -220,6 +225,7 @@ class Config:
     #   information. Default 60.
     cost_hourly_limit_usd: float
     cost_rate_spike_ratio: float
+    cost_rate_spike_floor_usd: float
     cost_alert_cooldown_minutes: int
 
     # Per-response rate-limit capture (default on). Enabling this turns
@@ -330,6 +336,9 @@ class Config:
 
             cost_hourly_limit_usd=_env_float("MIMIR_COST_HOURLY_LIMIT_USD", 0.0),
             cost_rate_spike_ratio=_env_float("MIMIR_COST_RATE_SPIKE_RATIO", 3.0),
+            cost_rate_spike_floor_usd=_env_float(
+                "MIMIR_COST_RATE_SPIKE_FLOOR_USD", 5.00,
+            ),
             cost_alert_cooldown_minutes=_env_int(
                 "MIMIR_COST_ALERT_COOLDOWN_MINUTES", 60,
             ),
