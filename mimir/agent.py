@@ -173,6 +173,7 @@ class Agent:
             turns_log=config.turns_log,
             cost_hourly_limit_usd=config.cost_hourly_limit_usd or None,
             cost_spike_ratio=config.cost_rate_spike_ratio or None,
+            cost_spike_floor_usd=config.cost_rate_spike_floor_usd or None,
             fallback_model=config.model,
         )
         if scheduler is not None:
@@ -433,6 +434,7 @@ class Agent:
             report,
             hourly_limit_usd=self._config.cost_hourly_limit_usd or None,
             spike_ratio=self._config.cost_rate_spike_ratio or None,
+            spike_floor_usd_per_hour=self._config.cost_rate_spike_floor_usd or None,
         )
         if alert is not None and not event_recently_emitted(
             self._config.events_log,

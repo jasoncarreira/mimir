@@ -93,6 +93,10 @@ DEFAULT_ENV_TEMPLATE = dedent(
     # Cooldown gates re-emission so the firehose doesn't churn.
     MIMIR_COST_HOURLY_LIMIT_USD=
     MIMIR_COST_RATE_SPIKE_RATIO=3.0
+    # Floor on rate_now below which the spike check is silenced (an
+    # asymmetry fix — a normal session burning a few cents/hour shouldn't
+    # trip just because the rolling baseline is tiny). 0 disables.
+    MIMIR_COST_RATE_SPIKE_FLOOR_USD=0.50
     MIMIR_COST_ALERT_COOLDOWN_MINUTES=60
 
     # Per-response plan-window capture. When true (default), the SDK
@@ -1262,6 +1266,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             report,
             hourly_limit_usd=cfg.cost_hourly_limit_usd or None,
             spike_ratio=cfg.cost_rate_spike_ratio or None,
+            spike_floor_usd_per_hour=cfg.cost_rate_spike_floor_usd or None,
         )
         subagent_body = render_subagent_block(
             aggregate_subagents(cfg.events_log),

@@ -139,9 +139,14 @@ class CostRateAlert:
       ``MIMIR_COST_HOURLY_LIMIT_USD``. Operator-set ceiling; useful for
       "never go above $X/hour even if we usually do."
     - **spike_ratio**: ``rate_now_usd_per_hour`` >
-      ``spike_ratio * baseline_usd_per_hour``. Adapts to your usual
-      spend; catches runaway loops (3× the rolling-week average is the
-      default).
+      ``spike_ratio * baseline_usd_per_hour`` AND
+      ``rate_now_usd_per_hour >= spike_floor_usd_per_hour``.
+      Adapts to your usual spend; catches runaway loops (3× the
+      rolling-week average is the default). The floor is the asymmetry
+      fix: a quiet-history agent (low baseline) shouldn't false-positive
+      on a normal working session that's expensive only in *ratio*
+      terms. Below the floor, we're not in spend territory worth
+      suppressing S4 over — the absolute ceiling remains the backstop.
 
     When both fire, the absolute one wins (deterministic; no double-
     counted reasons).
@@ -251,6 +256,7 @@ def evaluate_cost_rate(
     *,
     hourly_limit_usd: float | None = None,
     spike_ratio: float | None = None,
+    spike_floor_usd_per_hour: float | None = 5.0,
     baseline_window_hours: float = 24.0 * 7,
     current_window_hours: float = 1.0,
 ) -> CostRateAlert | None:
@@ -267,6 +273,15 @@ def evaluate_cost_rate(
 
     ``hourly_limit_usd <= 0`` or ``None`` disables the absolute check.
     ``spike_ratio <= 0`` or ``None`` disables the spike check.
+    ``spike_floor_usd_per_hour`` (default $5.0/hr) gates the spike
+    check on rate_now: a 100× ratio over a $0.001/hr baseline is still
+    only a $0.10/hr session — not worth suppressing S4 over. The floor
+    is paired with an absolute ``hourly_limit_usd`` (typical bench
+    setting: $120/hr) which serves as the real brake; the spike check
+    is a second line of defense for "weird shape, not yet at ceiling,"
+    so $5/hr is the neighborhood that catches genuine oddities while
+    ignoring normal working sessions. Set to 0 or None to disable the
+    floor and revert to baseline-only gating.
     """
     cur = _find_window(report, current_window_hours)
     if cur is None:
@@ -284,6 +299,11 @@ def evaluate_cost_rate(
         )
 
     if spike_ratio and spike_ratio > 0:
+        # rate_now floor — see docstring. Asymmetry fix for low-baseline
+        # agents whose normal working sessions register as "spikes."
+        if spike_floor_usd_per_hour and spike_floor_usd_per_hour > 0:
+            if rate_now < spike_floor_usd_per_hour:
+                return None
         baseline_w = _find_window(report, baseline_window_hours)
         if baseline_w is not None and baseline_window_hours > 0:
             baseline_rate = baseline_w.total_cost_usd / baseline_window_hours
