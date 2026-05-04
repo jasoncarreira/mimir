@@ -1,4 +1,4 @@
-"""Stage 1 of CLAUDE_SDK_CLIENT_MIGRATION.md.
+"""Stages 1-2 of CLAUDE_SDK_CLIENT_MIGRATION.md.
 
 The agent loop now routes through ``mimir.agent.query`` — a thin async-
 generator wrapper around a shared ``ClaudeSDKClient`` rather than a
@@ -11,6 +11,9 @@ wrapper's behavior:
   disconnect+reconnect.
 - ``shutdown_sdk_client()`` releases the client cleanly and is
   idempotent.
+- ``session_id`` flows through unchanged so per-turn isolation
+  (``ctx.turn_id``) is preserved by the SDK's session store
+  (stage 2).
 
 Tests patch ``mimir.agent.ClaudeSDKClient`` with a fake recorder rather
 than spinning up the real subprocess. Existing tests under
@@ -93,9 +96,17 @@ def _opts(**overrides) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(**base)
 
 
-async def _drain(prompt: str, options: ClaudeAgentOptions) -> list:
+async def _drain(
+    prompt: str,
+    options: ClaudeAgentOptions,
+    *,
+    session_id: str | None = None,
+) -> list:
     out = []
-    async for msg in agent_mod.query(prompt=prompt, options=options):
+    kwargs: dict[str, Any] = {"prompt": prompt, "options": options}
+    if session_id is not None:
+        kwargs["session_id"] = session_id
+    async for msg in agent_mod.query(**kwargs):
         out.append(msg)
     return out
 
@@ -199,11 +210,97 @@ async def test_shutdown_after_disconnect_failure_still_clears_state():
 
 
 @pytest.mark.asyncio
-async def test_session_id_is_default_for_stage_1():
-    """Stage 1 keeps session_id='default' so history accumulates the
-    same way as the legacy query() path. Stage 2 will switch to
-    per-turn turn_id."""
+async def test_session_id_defaults_when_caller_omits_it():
+    """Callers that don't pass ``session_id`` get the historical
+    ``"default"`` accumulating-session behavior. The agent loop opts
+    in to per-turn isolation by passing ``session_id=ctx.turn_id``;
+    other callers (and existing tests) keep working unchanged."""
     await _drain("a", _opts())
     await _drain("b", _opts())
     client = _FakeClaudeSDKClient.instances[0]
     assert [s for _, s in client.queries] == ["default", "default"]
+
+
+# ─── Stage 2: per-turn session_id ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_session_id_is_forwarded_to_client_query():
+    """The wrapper passes ``session_id`` straight through to
+    ``client.query()``. The SDK's session store keys on this id, so
+    forwarding is the load-bearing invariant for per-turn isolation."""
+    await _drain("hello", _opts(), session_id="turn-abc123")
+    client = _FakeClaudeSDKClient.instances[0]
+    assert client.queries == [("hello", "turn-abc123")]
+
+
+@pytest.mark.asyncio
+async def test_distinct_session_ids_isolate_history_in_shared_client():
+    """Two turns with different ``session_id`` values share the same
+    ``ClaudeSDKClient`` (the persistent wrapper) but the per-call
+    session_id flows through unchanged. The SDK's session store
+    scopes history by session_id, so turn N+1's input does not see
+    turn N's content even though the underlying client / subprocess
+    is the same.
+
+    We verify the wrapper-level invariant: the recorded
+    ``client.query()`` calls carry distinct session_ids in order.
+    The fake's per-session_id history mirrors what the real SDK's
+    ``InMemorySessionStore`` does."""
+
+    # A richer fake that actually keys history per session_id, the
+    # way the SDK's InMemorySessionStore does. Lets us assert that
+    # session-A's prompts never appear in session-B's history.
+    class _SessionAwareFake(_FakeClaudeSDKClient):
+        history: dict[str, list[str]] = {}
+
+        async def query(self, prompt: str, session_id: str = "default") -> None:
+            await super().query(prompt, session_id)
+            type(self).history.setdefault(session_id, []).append(prompt)
+
+    _SessionAwareFake.history = {}
+    agent_mod.ClaudeSDKClient = _SessionAwareFake  # type: ignore[assignment]
+    try:
+        await _drain("apple", _opts(), session_id="turn-1")
+        await _drain("banana", _opts(), session_id="turn-2")
+    finally:
+        agent_mod.ClaudeSDKClient = _FakeClaudeSDKClient  # type: ignore[assignment]
+
+    # Same persistent client served both turns.
+    assert len(_FakeClaudeSDKClient.instances) == 1
+    client = _FakeClaudeSDKClient.instances[0]
+    assert client.connect_count == 1
+    assert client.queries == [("apple", "turn-1"), ("banana", "turn-2")]
+
+    # Per-session histories are disjoint — turn-1's prompt never
+    # appears in turn-2's history and vice versa.
+    assert _SessionAwareFake.history == {
+        "turn-1": ["apple"],
+        "turn-2": ["banana"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_same_session_id_accumulates_history_within_one_turn():
+    """If a single session_id is reused (e.g., a multi-message turn
+    or an explicit ``"default"`` accumulating session), the SDK's
+    session store appends to that session's history. Verifies the
+    wrapper doesn't reset session state between calls with the same
+    id."""
+
+    class _SessionAwareFake(_FakeClaudeSDKClient):
+        history: dict[str, list[str]] = {}
+
+        async def query(self, prompt: str, session_id: str = "default") -> None:
+            await super().query(prompt, session_id)
+            type(self).history.setdefault(session_id, []).append(prompt)
+
+    _SessionAwareFake.history = {}
+    agent_mod.ClaudeSDKClient = _SessionAwareFake  # type: ignore[assignment]
+    try:
+        await _drain("first", _opts(), session_id="turn-X")
+        await _drain("second", _opts(), session_id="turn-X")
+    finally:
+        agent_mod.ClaudeSDKClient = _FakeClaudeSDKClient  # type: ignore[assignment]
+
+    assert _SessionAwareFake.history == {"turn-X": ["first", "second"]}

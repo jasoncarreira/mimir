@@ -38,7 +38,7 @@ from mimir.saga_client import _HttpSaga as SagaClient, SagaError
 # ---- ResultMessage capture in TurnRecord -------------------------------
 
 
-async def _fake_query_with_result(*, prompt, options, transport=None):
+async def _fake_query_with_result(*, prompt, options, session_id="default", transport=None):
     """Fake SDK stream that emits a text reply followed by a ResultMessage."""
     yield AssistantMessage(content=[TextBlock(text="hello back")], model="claude-opus-4-7")
     yield ResultMessage(
@@ -107,7 +107,7 @@ async def test_turn_record_when_no_result_message(tmp_path: Path):
     cfg = Config.from_env()
     cfg = replace(cfg, home=tmp_path, max_concurrent_turns=2, worker_idle_timeout_s=1)
 
-    async def crash_query(*, prompt, options, transport=None):
+    async def crash_query(*, prompt, options, session_id="default", transport=None):
         if False:
             yield None  # make this an async generator
         raise asyncio.TimeoutError("simulated SDK timeout")
@@ -143,7 +143,7 @@ async def test_malformed_tool_use_block_does_not_crash_turn(tmp_path: Path):
     cfg = Config.from_env()
     cfg = replace(cfg, home=tmp_path, max_concurrent_turns=2, worker_idle_timeout_s=1)
 
-    async def malformed_query(*, prompt, options, transport=None):
+    async def malformed_query(*, prompt, options, session_id="default", transport=None):
         # A ToolUseBlock with input={} — Minimax tool-arg drop.
         yield AssistantMessage(
             content=[

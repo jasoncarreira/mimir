@@ -122,14 +122,19 @@ def _filter_session_turns(turns_path, saga_session_id: str) -> list[dict]:
     return out
 
 
-# ─── ClaudeSDKClient wrapper (migration stage 1) ────────────────────
+# ─── ClaudeSDKClient wrapper (migration stages 1-2) ─────────────────
 #
 # Stage 1 of CLAUDE_SDK_CLIENT_MIGRATION.md: route the agent loop through
 # a shared, persistent ``ClaudeSDKClient`` instead of one-shot
 # ``claude_agent_sdk.query()``. The shared client keeps the Claude Code
-# subprocess warm across turns; behavior is identical to ``query()``
-# because we pass ``session_id="default"`` (single accumulating session)
-# for now — per-turn isolation arrives in stage 2.
+# subprocess warm across turns.
+#
+# Stage 2: pass ``session_id=ctx.turn_id`` per call so each turn is
+# scoped to its own session inside the persistent client. Prior-turn
+# history can't leak into the next turn's input — the SDK's session
+# store keys conversation state by ``session_id``. No cleanup yet
+# (Stage 3 wires an explicit store + per-turn delete); session entries
+# accumulate for the lifetime of the client process.
 #
 # The lifecycle:
 #   - First call: instantiate ``ClaudeSDKClient(options=...)`` and
@@ -193,10 +198,27 @@ def _options_fingerprint(options: ClaudeAgentOptions) -> str:
     return h.hexdigest()
 
 
-async def query(*, prompt: str, options: ClaudeAgentOptions, transport=None):
-    """Stage 1 ClaudeSDKClient wrapper. Async-generator API matches the
-    old ``claude_agent_sdk.query()`` shape so call sites and patched
-    tests don't have to change.
+async def query(
+    *,
+    prompt: str,
+    options: ClaudeAgentOptions,
+    session_id: str = "default",
+    transport=None,
+):
+    """Stage 1+2 ClaudeSDKClient wrapper. Async-generator API matches
+    the old ``claude_agent_sdk.query()`` shape so call sites and
+    patched tests don't have to change.
+
+    Stage 2: ``session_id`` is now a per-call parameter. The agent
+    loop passes ``ctx.turn_id`` so each turn gets its own session
+    inside the persistent client — prior-turn history can't bleed
+    into the next turn's input. Defaults to ``"default"`` so other
+    callers (and tests) that don't care keep their stage-1 behavior
+    of a single accumulating session.
+
+    No cleanup yet — the SDK's ``InMemorySessionStore`` keeps each
+    turn's history for the lifetime of the client. Stage 3 wires an
+    explicit store + per-turn delete.
 
     The ``transport`` parameter is accepted but unused — kept for
     signature compatibility with tests that may pass it.
@@ -221,7 +243,7 @@ async def query(*, prompt: str, options: ClaudeAgentOptions, transport=None):
             _sdk_options_fingerprint = fingerprint
         client = _sdk_client
         assert client is not None  # for type-checkers
-        await client.query(prompt, session_id="default")
+        await client.query(prompt, session_id=session_id)
         async for msg in client.receive_response():
             yield msg
 
@@ -957,7 +979,11 @@ class Agent:
         error: str | None = None
         try:
             try:
-                async for msg in query(prompt=turn_prompt, options=self._build_options(system_prompt)):
+                async for msg in query(
+                    prompt=turn_prompt,
+                    options=self._build_options(system_prompt),
+                    session_id=ctx.turn_id,
+                ):
                     messages.append(msg)
             except Exception as exc:  # noqa: BLE001
                 error = f"{type(exc).__name__}: {exc}"
