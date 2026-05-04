@@ -103,6 +103,7 @@ class HomeostaticArbiter:
     plan_window_suppress_threshold: float = 0.80
     cost_hourly_limit_usd: float | None = None
     cost_spike_ratio: float | None = None
+    cost_spike_floor_usd: float | None = 5.0
     fallback_model: str | None = None
 
     def snapshot(self, *, now: datetime | None = None) -> BudgetSnapshot:
@@ -137,6 +138,7 @@ class HomeostaticArbiter:
             report,
             hourly_limit_usd=self.cost_hourly_limit_usd,
             spike_ratio=self.cost_spike_ratio,
+            spike_floor_usd_per_hour=self.cost_spike_floor_usd,
         )
         rate_now = 0.0
         baseline = None
