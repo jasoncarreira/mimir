@@ -1915,6 +1915,24 @@ motivation (from the older P42 sonnet corpus) is now ~1,100, of
 which most plausibly belong to legitimately domain-specific
 relations rather than synonymous compounds.
 
+**Subject canonicalization** (the block injects top-15 DB subjects
++ static seed + identities.yaml extras) also tightened, though less
+dramatically — entity names ("Frida Kahlo", brand names, places)
+are mostly atomic with no obvious canonicalization handle:
+
+| run | distinct subjects | subjects/1k triples | "User" share |
+|---|---:|---:|---:|
+| p47-sonnet (pre-P48) | 11,855 | 116 | 43% |
+| p42p47-simhi (P48 on) | 1,342 | 65 | **65%** |
+
+~9× absolute drop, ~1.8× tighter per-1k-triples (vs 5.3× for
+predicates). The biggest concrete win on the subject side: "User"
+went from 43% → 65% of triples — the canonical-subjects block
+successfully steers the LLM toward consistent User forms instead of
+variants ("the user", proper names, "the human"). The remainder of
+the win is rolling up paraphrased entity references where they
+existed.
+
 **Bench accuracy** is roughly unchanged on the preferences slice
 (p48 pref30 = 24/30 = 80%; p42p47-simhi prefs = 24/30 = 80%; prior
 p47 at 0.75 was 27/30 = 90% — likely variance on n=30). At 0.80
