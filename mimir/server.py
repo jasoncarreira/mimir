@@ -341,6 +341,27 @@ def build_app(config: Config) -> web.Application:
             )
             introspection_registered = False
 
+        # Register periodic quota poll. Calls
+        # ClaudeSDKClient.get_context_usage() to populate Max-plan
+        # window utilization in rate_limits.json — the data the
+        # message-stream RateLimitInfo events deliver as null on
+        # Max OAuth. Stop-gap until agent loop uses ClaudeSDKClient
+        # directly (CLAUDE_SDK_CLIENT_MIGRATION.md).
+        try:
+            quota_poll_registered = scheduler.add_quota_poll_job(
+                config.home,
+                agent._rate_limits,
+                config.quota_poll_cron,
+                model=config.model,
+            )
+        except ValueError as exc:
+            await log_event(
+                "scheduler_invalid_cron",
+                job="quota-poll",
+                error=str(exc),
+            )
+            quota_poll_registered = False
+
         # Load LLM-tick jobs from scheduler.yaml.
         reload_stats = scheduler.reload()
 
