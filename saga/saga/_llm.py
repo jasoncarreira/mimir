@@ -187,16 +187,34 @@ peak context at the high end of each cycle. Adjust via the
 benefits from a different K."""
 
 
-_persistent_runner_singleton: "_PersistentClaudeCode | None" = None
+import threading as _threading
+
+_persistent_runner_local = _threading.local()
 
 
 def _persistent_runner() -> "_PersistentClaudeCode":
-    """Module-level singleton. Lazy because the SDK isn't installed in
-    every saga deployment (e.g., standalone bench infra)."""
-    global _persistent_runner_singleton
-    if _persistent_runner_singleton is None:
-        _persistent_runner_singleton = _PersistentClaudeCode()
-    return _persistent_runner_singleton
+    """Per-thread cached runner. Each calling thread (mimir worker,
+    bench runner, scheduler firing) gets its own warm
+    ``ClaudeSDKClient`` so concurrent saga calls don't serialize on
+    a shared lock.
+
+    Cost: ~50MB RAM per Claude Code subprocess, plus one event-loop
+    thread per calling thread. For mimir's expected concurrency
+    (1-3 dispatcher worker threads) that's manageable. Bench runs
+    use the openai_compat path and never enter this code.
+
+    The cache is keyed by Python thread (``threading.local``) so the
+    instance lifetime tracks the calling thread. The inner Claude
+    Code subprocess and event-loop thread are daemons — they exit
+    when the process exits regardless of how cleanup gets
+    sequenced. Lazy import of the SDK happens inside
+    ``_PersistentClaudeCode``'s call path; standalone saga
+    deployments without the SDK installed never reach this."""
+    runner = getattr(_persistent_runner_local, "runner", None)
+    if runner is None:
+        runner = _PersistentClaudeCode()
+        _persistent_runner_local.runner = runner
+    return runner
 
 
 class _PersistentClaudeCode:
@@ -207,12 +225,13 @@ class _PersistentClaudeCode:
     Recycles the client every ``_RECYCLE_AFTER_CALLS`` calls (or when
     ``model`` changes between calls) to bound conversation bloat.
 
-    Concurrent calls from saga workers serialize on the same client
-    (``ClaudeSDKClient.query`` is single-threaded by design). For
-    parallelism we'd need a pool; saga's existing call sites are
-    sequential within a single bench question, so a single client
-    is enough. Future: bump to a small pool if mimir's pre-message
-    hook starts firing concurrent contextual_rewrite calls."""
+    One instance per *calling* Python thread (see
+    ``_persistent_runner_local``). Each instance owns its own inner
+    event-loop thread, its own Claude Code subprocess, and its own
+    submit lock. Concurrent calls from different calling threads
+    don't serialize because they hit different instances; concurrent
+    calls from the *same* calling thread (re-entrancy through saga
+    helpers) still serialize on the per-instance lock."""
 
     def __init__(self) -> None:
         import asyncio

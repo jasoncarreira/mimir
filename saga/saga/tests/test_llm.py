@@ -329,10 +329,14 @@ def _install_fake_claude_agent_sdk(
 
 
 def _reset_persistent_runner():
-    """Tests should drop the module-level singleton between scenarios so
-    each test gets a fresh persistent client (with a fresh fake SDK)."""
+    """Tests should drop the per-thread cached runner between scenarios
+    so each test gets a fresh persistent client (with a fresh fake SDK).
+    The runner is stored on a ``threading.local`` keyed by the calling
+    thread; pytest runs tests on the main thread, so clearing the main
+    thread's entry is sufficient."""
     import saga._llm as _llm
-    _llm._persistent_runner_singleton = None
+    if hasattr(_llm._persistent_runner_local, "runner"):
+        delattr(_llm._persistent_runner_local, "runner")
 
 
 def test_claude_code_happy_path(monkeypatch):
@@ -516,3 +520,44 @@ def test_anthropic_exception_returns_empty(monkeypatch):
         prompt="x",
     )
     assert out == ""
+
+
+def test_persistent_runner_is_per_thread():
+    """Each calling thread gets its own persistent runner instance.
+    Two threads asking for the runner must receive distinct objects;
+    a single thread asking twice gets the same instance."""
+    import saga._llm as _llm
+    import threading
+
+    _reset_persistent_runner()
+
+    main_runner = _llm._persistent_runner()
+    main_runner_again = _llm._persistent_runner()
+    assert main_runner is main_runner_again, (
+        "same thread must reuse its cached runner"
+    )
+
+    other_runner_holder: dict[str, object] = {}
+    ready = threading.Event()
+
+    def in_other_thread():
+        try:
+            other_runner_holder["runner"] = _llm._persistent_runner()
+            # Confirm the other thread also caches its own across calls.
+            other_runner_holder["runner_again"] = _llm._persistent_runner()
+        finally:
+            ready.set()
+
+    t = threading.Thread(target=in_other_thread, daemon=True)
+    t.start()
+    assert ready.wait(timeout=10), "other thread didn't complete"
+    t.join(timeout=10)
+
+    other_runner = other_runner_holder["runner"]
+    other_runner_again = other_runner_holder["runner_again"]
+    assert other_runner is other_runner_again, (
+        "second thread must also reuse its cached runner"
+    )
+    assert other_runner is not main_runner, (
+        "different threads must get different runners"
+    )
