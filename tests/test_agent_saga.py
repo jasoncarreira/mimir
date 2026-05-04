@@ -54,7 +54,7 @@ def _build_agent(tmp_path: Path, saga, sessions=None) -> Agent:
 
 
 def _fake_query_yielding(text: str):
-    async def fake_query(*, prompt, options, transport=None):
+    async def fake_query(*, prompt, options, session_id="default", transport=None):
         yield AssistantMessage(content=[TextBlock(text=text)], model="claude-opus-4-7")
 
     return fake_query
@@ -63,7 +63,7 @@ def _fake_query_yielding(text: str):
 def _fake_query_calling_saga_query():
     """Simulate the agent calling saga_query mid-turn so the post-hook
     sees both the pre-injected and the mid-turn-queried atoms."""
-    async def fake_query(*, prompt, options, transport=None):
+    async def fake_query(*, prompt, options, session_id="default", transport=None):
         # The contextvar is set by run_turn; emit a tool call referencing the
         # MCP tool name so events.jsonl looks right.
         yield AssistantMessage(
@@ -224,7 +224,7 @@ async def test_synthesis_turn_filters_turns_jsonl_by_session_id(tmp_path: Path):
 
     captured: dict = {}
 
-    async def capture_query(*, prompt, options, transport=None):
+    async def capture_query(*, prompt, options, session_id="default", transport=None):
         captured["prompt"] = prompt
         yield AssistantMessage(content=[TextBlock(text="done")], model="claude-opus-4-7")
 
@@ -244,3 +244,55 @@ async def test_synthesis_turn_filters_turns_jsonl_by_session_id(tmp_path: Path):
     assert '"turn_id": "t1"' in body
     assert '"turn_id": "t3"' in body
     assert '"turn_id": "t2"' not in body
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_passes_turn_id_as_session_id(tmp_path: Path):
+    """Stage 2 of CLAUDE_SDK_CLIENT_MIGRATION.md: each turn drives the
+    shared ClaudeSDKClient with ``session_id=ctx.turn_id`` so per-turn
+    history is isolated. Confirm the call-site forwards it."""
+    captured: dict = {}
+
+    async def capture_session_id(*, prompt, options, session_id="default", transport=None):
+        captured["session_id"] = session_id
+        yield AssistantMessage(content=[TextBlock(text="ack")], model="claude-opus-4-7")
+
+    agent = _build_agent(tmp_path, FakeSaga())
+    with patch("mimir.agent.query", new=capture_session_id):
+        record = await agent.run_turn(
+            AgentEvent(
+                trigger="user_message",
+                channel_id="bench-1",
+                content="hello",
+                author="alice",
+            )
+        )
+
+    # The session_id seen by the wrapper is the same turn_id recorded
+    # on the TurnRecord — every turn gets its own SDK session.
+    assert captured["session_id"] == record.turn_id
+    assert captured["session_id"] != "default"
+
+
+@pytest.mark.asyncio
+async def test_consecutive_turns_get_distinct_session_ids(tmp_path: Path):
+    """Two back-to-back turns must hand the wrapper distinct session
+    ids — without that, prior-turn history would bleed into the next
+    turn via the SDK's session store."""
+    seen: list[str] = []
+
+    async def record_session_id(*, prompt, options, session_id="default", transport=None):
+        seen.append(session_id)
+        yield AssistantMessage(content=[TextBlock(text="ack")], model="claude-opus-4-7")
+
+    agent = _build_agent(tmp_path, FakeSaga())
+    with patch("mimir.agent.query", new=record_session_id):
+        r1 = await agent.run_turn(
+            AgentEvent(trigger="user_message", channel_id="c1", content="a", author="alice")
+        )
+        r2 = await agent.run_turn(
+            AgentEvent(trigger="user_message", channel_id="c1", content="b", author="alice")
+        )
+
+    assert seen == [r1.turn_id, r2.turn_id]
+    assert r1.turn_id != r2.turn_id

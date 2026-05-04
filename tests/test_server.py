@@ -18,7 +18,7 @@ from mimir.config import Config
 
 
 async def _fake_query_factory(reply_text: str):
-    async def _fake_query(*, prompt, options, transport=None):
+    async def _fake_query(*, prompt, options, session_id="default", transport=None):
         yield AssistantMessage(content=[TextBlock(text=reply_text)], model="claude-opus-4-7")
     return _fake_query
 
