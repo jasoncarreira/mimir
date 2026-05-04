@@ -118,6 +118,18 @@ async def test_user_message_auto_dispatches_via_bridge(tmp_path: Path):
     assert bridge.sent == [("discord-987", "Hello, Jason.")]
     assert ctx.last_assistant_message_id == "m1"
 
+    # auto_dispatch_ok event landed in events.jsonl so the audit log
+    # captures successful auto-deliveries (parity with how the
+    # send_message tool logs explicit calls).
+    import json
+    events_log = tmp_path / "logs" / "events.jsonl"
+    events = [json.loads(l) for l in events_log.read_text().splitlines()]
+    ok_events = [e for e in events if e.get("type") == "auto_dispatch_ok"]
+    assert len(ok_events) == 1
+    assert ok_events[0]["channel_id"] == "discord-987"
+    assert ok_events[0]["text"] == "Hello, Jason."
+    assert ok_events[0]["bridge"] == "discord"
+
 
 @pytest.mark.asyncio
 async def test_scheduled_tick_does_not_auto_dispatch(tmp_path: Path):

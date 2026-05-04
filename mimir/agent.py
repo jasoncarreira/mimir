@@ -333,6 +333,21 @@ class Agent:
                             dispatched = True
                             send_msg_id = result.message_id
                             ctx.last_assistant_message_id = send_msg_id
+                            # Cap logged text at 4KB to keep events.jsonl
+                            # tight; same threshold the send_message
+                            # tool uses (channeltools.py).
+                            text_for_log = (
+                                clean_text if len(clean_text) <= 4096
+                                else clean_text[:4096] + "…[truncated]"
+                            )
+                            await log_event(
+                                "auto_dispatch_ok",
+                                channel_id=event.channel_id,
+                                bridge=bridge.name,
+                                message_id=send_msg_id,
+                                chunks=result.chunks,
+                                text=text_for_log,
+                            )
                         else:
                             log.warning(
                                 "auto-dispatch: bridge %r returned sent=False: %s",
@@ -353,7 +368,7 @@ class Agent:
                         )
                 if parsed.directives and (dispatched or not clean_text.strip()):
                     try:
-                        await _dispatch_action_directives(
+                        directive_results = await _dispatch_action_directives(
                             self._channels,
                             fallback_channel_id=event.channel_id,
                             directives=parsed.directives,
@@ -361,6 +376,19 @@ class Agent:
                             or ctx.last_assistant_message_id,
                             outbound_root=outbound_root,
                         )
+                        # Directives-only path (no main text) doesn't
+                        # land an auto_dispatch_ok above — emit one
+                        # here so the audit log captures the activity.
+                        if not dispatched and directive_results:
+                            await log_event(
+                                "auto_dispatch_ok",
+                                channel_id=event.channel_id,
+                                bridge=bridge.name,
+                                message_id=None,
+                                chunks=0,
+                                text="",
+                                directives=directive_results,
+                            )
                     except Exception:  # noqa: BLE001
                         log.exception("auto-dispatch directives failed")
 

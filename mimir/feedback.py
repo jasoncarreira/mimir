@@ -63,6 +63,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "introspection_report_error": ("negative", "introspection_error"),
     "predictions_pending_review": ("negative", "predictions_pending"),
     "send_message_unknown_channel": ("negative", "unknown_channel"),
+    "auto_dispatch_failed": ("negative", "auto_dispatch_failed"),
     # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
     "saga_feedback_sent": ("positive", "saga_feedback"),
@@ -120,6 +121,15 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f"SAGA consolidation failed: {ev.get('error') or '(no detail)'}"
     if rule_kind == "saga_decay_error":
         return f"SAGA decay failed: {ev.get('error') or '(no detail)'}"
+    if rule_kind == "auto_dispatch_failed":
+        bridge = ev.get("bridge") or "?"
+        ch = ev.get("channel_id") or "?"
+        err = ev.get("error") or "(no detail)"
+        return (
+            f"auto-dispatch reply failed via {bridge} on {ch}: {err}. "
+            f"Your text was generated but not delivered. "
+            f"Consider calling send_message explicitly next time."
+        )
     if rule_kind == "saga_forget_error":
         dry = ev.get("dry_run")
         suffix = " (dry_run)" if dry else ""
