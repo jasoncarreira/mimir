@@ -539,6 +539,14 @@ class Scheduler:
         ``RateLimitSnapshot`` entries into the store. The Self-state
         and Upcoming render paths pick up the data automatically.
 
+        Returns False (without registering) when:
+        - ``cron_expr`` is empty (operator opt-out).
+        - The agent appears not to be configured for Claude Max OAuth
+          (``running_on_claude_max()`` returns False) — direct API
+          keys, OpenRouter, Minimax, etc. don't expose a useful
+          plan-window picture, so polling every 10 min would just
+          spawn throwaway daemons for no signal.
+
         Stop-gap until the agent loop migrates to ``ClaudeSDKClient``
         and can query usage from its own persistent client at
         end-of-turn (see ``CLAUDE_SDK_CLIENT_MIGRATION.md``).
@@ -546,6 +554,18 @@ class Scheduler:
         cron_expr = (cron_expr or "").strip()
         if not cron_expr:
             return False
+
+        from .quota_poller import running_on_claude_max
+        if not running_on_claude_max():
+            log.info(
+                "quota_poll: skipping registration — not on Claude Max OAuth "
+                "(CLAUDE_CODE_OAUTH_TOKEN unset or ANTHROPIC_BASE_URL set). "
+                "Plan-window utilization will not appear in the Self-state "
+                "block; cost-rate alerts via MIMIR_COST_HOURLY_LIMIT_USD "
+                "still work."
+            )
+            return False
+
         try:
             trigger = CronTrigger.from_crontab(cron_expr, timezone=UTC)
         except (ValueError, KeyError) as exc:

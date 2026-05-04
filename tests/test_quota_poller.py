@@ -184,6 +184,41 @@ async def test_poll_logs_failed_event_on_exception(tmp_path: Path, monkeypatch):
     assert "daemon refused" in failed[0]["error"]
 
 
+# ─── running_on_claude_max detection ────────────────────────────────
+
+
+def test_running_on_claude_max_true_with_oauth_only(monkeypatch):
+    from mimir.quota_poller import running_on_claude_max
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat...")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    assert running_on_claude_max() is True
+
+
+def test_running_on_claude_max_false_when_oauth_missing(monkeypatch):
+    """Direct ANTHROPIC_API_KEY without OAuth → not Max."""
+    from mimir.quota_poller import running_on_claude_max
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-...")
+    assert running_on_claude_max() is False
+
+
+def test_running_on_claude_max_false_with_base_url_override(monkeypatch):
+    """OAuth set BUT ANTHROPIC_BASE_URL points at OpenRouter / Minimax →
+    agent calls don't go to Anthropic, so Max windows aren't relevant."""
+    from mimir.quota_poller import running_on_claude_max
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat...")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://openrouter.ai/api/v1")
+    assert running_on_claude_max() is False
+
+
+def test_running_on_claude_max_false_when_oauth_blank(monkeypatch):
+    """Empty OAuth token (operator left it blank) doesn't count."""
+    from mimir.quota_poller import running_on_claude_max
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "  ")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    assert running_on_claude_max() is False
+
+
 @pytest.mark.asyncio
 async def test_poll_handles_missing_apiusage(tmp_path: Path, monkeypatch):
     """Fresh OAuth session with no traffic yet: response has no

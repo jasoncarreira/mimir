@@ -20,6 +20,7 @@ ships, this module can be retired.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,30 @@ from .event_logger import log_event
 from .rate_limits import RateLimitSnapshot, RateLimitStore
 
 log = logging.getLogger(__name__)
+
+
+def running_on_claude_max() -> bool:
+    """True iff the agent appears to be configured for Claude Max
+    OAuth — the only config where ``get_context_usage()`` returns
+    useful per-window utilization data.
+
+    Heuristic:
+    - ``CLAUDE_CODE_OAUTH_TOKEN`` set (Max OAuth path).
+    - ``ANTHROPIC_BASE_URL`` empty (no proxy / OpenRouter / Minimax
+      redirect that would route the agent's calls outside Anthropic).
+
+    Either condition flipping means we're in a config where the
+    daemon's ``apiUsage`` will be empty — direct API keys deliver
+    rate-limit headers per-response (already captured by
+    ``RateLimitEvent``) but no plan-window picture; OpenRouter /
+    Minimax don't have a plan-window concept at all.
+
+    The check is environment-only — no network calls, safe to invoke
+    at scheduler-registration time before the agent is up.
+    """
+    has_oauth = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip())
+    has_base_url_override = bool(os.environ.get("ANTHROPIC_BASE_URL", "").strip())
+    return has_oauth and not has_base_url_override
 
 
 # Claude Code's apiUsage shape is undocumented in the SDK type
@@ -192,4 +217,4 @@ async def poll_max_plan_quota(
     await log_event("quota_poll_ok", windows=recorded)
 
 
-__all__ = ["poll_max_plan_quota"]
+__all__ = ["poll_max_plan_quota", "running_on_claude_max"]

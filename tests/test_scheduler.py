@@ -510,3 +510,64 @@ async def test_reload_drops_jobs_no_longer_in_yaml(tmp_path: Path):
     write_jobs(path, [])  # Drop everything from disk
     sched.reload()
     assert "scheduler:going" not in {j.id for j in sched._scheduler.get_jobs()}
+
+
+def test_add_quota_poll_job_skips_when_not_on_claude_max(
+    tmp_path: Path, monkeypatch,
+):
+    """Auto-skip the quota-poll cron when the agent isn't on Claude
+    Max OAuth — direct API keys / OpenRouter / Minimax configs don't
+    have useful plan-window data, so polling every 10 min would just
+    spawn throwaway daemons for no signal."""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-direct-api")  # not Max
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    fake_store = object()  # never touched in the skip path
+    registered = sched.add_quota_poll_job(
+        tmp_path, fake_store, "*/10 * * * *",
+    )
+    assert registered is False
+    assert sched._scheduler.get_job("quota-poll") is None
+
+
+def test_add_quota_poll_job_registers_when_on_claude_max(
+    tmp_path: Path, monkeypatch,
+):
+    """Pure Max OAuth config (CLAUDE_CODE_OAUTH_TOKEN set, no
+    ANTHROPIC_BASE_URL override) → cron registers."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat...")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    fake_store = object()
+    registered = sched.add_quota_poll_job(
+        tmp_path, fake_store, "*/10 * * * *",
+    )
+    assert registered is True
+    assert sched._scheduler.get_job("quota-poll") is not None
+
+
+def test_add_quota_poll_job_skips_with_openrouter_base_url(
+    tmp_path: Path, monkeypatch,
+):
+    """OAuth set but ANTHROPIC_BASE_URL points at OpenRouter — agent's
+    calls aren't going to Anthropic, so Max windows are irrelevant."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat...")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://openrouter.ai/api/v1")
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    fake_store = object()
+    registered = sched.add_quota_poll_job(
+        tmp_path, fake_store, "*/10 * * * *",
+    )
+    assert registered is False
