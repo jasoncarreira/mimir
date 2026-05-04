@@ -237,7 +237,7 @@ class Agent:
             },
             model=self._config.model,
             effort=effort,
-            thinking={"type": "adaptive"},
+            thinking={"type": "adaptive", "display": "summarized"},
             env=self._config.sdk_env_overrides(),
             cwd=str(self._config.home),
             # Streaming chunks needed when capture_rate_limits is on —
