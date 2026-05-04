@@ -28,7 +28,11 @@ from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import HookContext
 
-from ._paths import PathOutsideHomeError, resolve_home_path
+from ._paths import (
+    PathOutsideHomeError,
+    resolve_home_path,
+    resolve_within_roots,
+)
 
 log = logging.getLogger(__name__)
 
@@ -84,14 +88,36 @@ def _to_relative(home: Path, raw: str) -> str:
     return p.as_posix()
 
 
-def make_pre_tool_use_hook(home: Path) -> Callable[..., Awaitable[dict[str, Any]]]:
-    """PreToolUse hook: deny any path arg that escapes ``<home>``.
+def make_pre_tool_use_hook(
+    home: Path,
+    *,
+    extra_roots: list[Path] | None = None,
+) -> Callable[..., Awaitable[dict[str, Any]]]:
+    """PreToolUse hook: deny any file-op path arg that escapes the
+    configured root set.
 
-    Permission rules in ClaudeAgentOptions can also constrain the toolset by
-    directory, but a hook keeps the deny message human-readable and lets us
-    log the rejection to events.jsonl for introspection.
+    ``home`` is the primary root; relative paths resolve against it.
+    ``extra_roots`` (optional) are additional roots for deployments
+    where the agent operates on sibling mounts (mimirbot reading its
+    own source at /workspace/mimir, the bench harness at /benchmark).
+    Absolute paths are accepted if they resolve inside any root.
+
+    Permission rules in ClaudeAgentOptions can also constrain the
+    toolset by directory, but a hook keeps the deny message human-
+    readable and lets us log the rejection to events.jsonl for
+    introspection.
     """
     home_resolved = home.resolve()
+    file_op_roots: list[Path] = [home_resolved]
+    if extra_roots:
+        for r in extra_roots:
+            try:
+                resolved = r.resolve()
+            except OSError:
+                continue
+            if resolved == home_resolved or resolved in file_op_roots:
+                continue
+            file_op_roots.append(resolved)
 
     # VSM: S3 — per-turn tool-call budget cap; denies tool calls past
     #          the per-turn quota and warns at the soft threshold.
@@ -172,7 +198,7 @@ def make_pre_tool_use_hook(home: Path) -> Callable[..., Awaitable[dict[str, Any]
         tool_input = input_data.get("tool_input") or {}
         for path_arg in _extract_target_paths(tool_name, tool_input):
             try:
-                resolve_home_path(home_resolved, path_arg)
+                resolve_within_roots(file_op_roots, path_arg)
             except PathOutsideHomeError as exc:
                 await log_event(
                     "tool_call_denied",
@@ -180,13 +206,17 @@ def make_pre_tool_use_hook(home: Path) -> Callable[..., Awaitable[dict[str, Any]
                     reason="path_outside_home",
                     path=path_arg,
                 )
+                roots_str = ", ".join(str(r) for r in file_op_roots)
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "deny",
                         "permissionDecisionReason": (
-                            f"{tool_name} blocked: {exc}. All paths must be "
-                            f"relative to the agent home ({home_resolved})."
+                            f"{tool_name} blocked: {exc}. Paths must "
+                            f"resolve inside one of the configured roots "
+                            f"({roots_str}). Set MIMIR_FILE_OP_ROOTS to "
+                            f"extend this list when running the agent on "
+                            f"sibling mounts."
                         ),
                     }
                 }

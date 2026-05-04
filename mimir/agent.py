@@ -194,7 +194,10 @@ class Agent:
             if self._indexer is not None:
                 await self._indexer.reindex_path(rel)
 
-        self._pre_tool_hook = make_pre_tool_use_hook(config.home)
+        self._pre_tool_hook = make_pre_tool_use_hook(
+            config.home,
+            extra_roots=list(config.file_op_extra_roots),
+        )
         self._post_tool_hook = make_post_tool_use_hook(
             config.home, _reindex if indexer is not None else None
         )
