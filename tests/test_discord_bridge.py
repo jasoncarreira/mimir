@@ -507,3 +507,103 @@ async def test_on_message_fires_typing_before_enqueue(bridge_with_fake_client):
     await asyncio.sleep(0)
     channel_obj.trigger_typing.assert_awaited_once()
     assert len(enqueued) == 1
+
+
+# ─── fetch_history ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_returns_oldest_first(bridge_with_fake_client):
+    """discord-py's history yields newest-first; our fetch_history
+    reverses to oldest-first so the agent reads in conversational
+    order."""
+    from datetime import datetime, timezone
+
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels[1]  # type: ignore[attr-defined]
+
+    # Newest-first stream — what the discord library produces.
+    base_ts = datetime(2026, 5, 3, 12, 0, tzinfo=timezone.utc)
+    msgs = []
+    for i in range(3):
+        m = SimpleNamespace(
+            id=1000 + i,
+            content=f"msg {i}",
+            created_at=base_ts.replace(minute=i),
+            author=SimpleNamespace(
+                id=42 + i, display_name=f"u{i}", global_name=f"u{i}",
+                bot=False, __str__=lambda self: "u",
+            ),
+            attachments=[],
+        )
+        msgs.append(m)
+
+    async def fake_history(limit, **kw):
+        # Discord returns newest-first; emulate that.
+        for m in reversed(msgs):
+            yield m
+
+    channel.history = fake_history
+    out = await bridge.fetch_history("discord-1", limit=10)
+
+    assert [m.content for m in out] == ["msg 0", "msg 1", "msg 2"]
+    assert out[0].id == "1000"
+    assert out[0].author_display == "u0"
+    assert out[0].is_bot is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_clamps_to_100(bridge_with_fake_client):
+    """Caller-requested limits above Discord's 100-per-call ceiling
+    are clamped silently — caller paginates via ``before`` if they want
+    more."""
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels[1]  # type: ignore[attr-defined]
+
+    captured: dict = {}
+
+    async def fake_history(limit, **kw):
+        captured["limit"] = limit
+        if False:
+            yield  # never executes — empty generator with the right type
+
+    channel.history = fake_history
+    await bridge.fetch_history("discord-1", limit=500)
+    assert captured["limit"] == 100
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_passes_before_cursor(bridge_with_fake_client):
+    """``before`` must be forwarded as a discord.Object id for
+    pagination to work."""
+    import discord
+
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels[1]  # type: ignore[attr-defined]
+
+    captured: dict = {}
+
+    async def fake_history(limit, before=None, **kw):
+        captured["before"] = before
+        if False:
+            yield
+
+    channel.history = fake_history
+    await bridge.fetch_history("discord-1", limit=20, before="1234567890")
+    assert captured["before"] is not None
+    # ``before`` is a discord.Object whose id matches.
+    assert getattr(captured["before"], "id", None) == 1234567890
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_unconnected_returns_empty(tmp_path: Path):
+    bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))
+    out = await bridge.fetch_history("discord-1")
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_bad_channel_id_returns_empty(bridge_with_fake_client):
+    bridge, _, _ = bridge_with_fake_client
+    out = await bridge.fetch_history("not-a-discord-id")
+    assert out == []

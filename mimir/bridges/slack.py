@@ -40,6 +40,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
     ) from _exc
 
 from ..models import AgentEvent
+from ._history import ChannelMessage
 from .base import Bridge, SendResult
 
 log = logging.getLogger(__name__)
@@ -319,6 +320,96 @@ class SlackBridge(Bridge):
         remove it when the response goes out, but that fires reaction
         events back to the agent and adds its own UX wrinkles."""
         return None
+
+    async def fetch_history(
+        self,
+        channel_id: str,
+        *,
+        limit: int = 20,
+        before: str | None = None,
+    ) -> list[ChannelMessage]:
+        """Fetch recent messages from a Slack channel via
+        ``conversations.history``. Returns oldest-first. Slack's API
+        accepts up to 1000 per call but recommends ≤200; we cap at
+        100 to match Discord's behavior and keep the call cheap.
+
+        Requires the bot's OAuth token to have ``channels:history``
+        / ``groups:history`` / ``im:history`` / ``mpim:history``
+        depending on the channel type. Missing scope raises
+        ``SlackApiError`` (``not_in_channel`` / ``missing_scope``)
+        which propagates to the caller.
+        """
+        if self._app is None:
+            return []
+        slack_channel = _channel_id_to_slack(channel_id)
+        if slack_channel is None:
+            return []
+        limit = max(1, min(int(limit), 100))
+
+        params: dict[str, Any] = {"channel": slack_channel, "limit": limit}
+        if before:
+            # Slack's ``latest`` cursor: messages with ts <= latest. We
+            # subtract a microsecond's worth of ts so the cursor message
+            # itself isn't re-included on the next page.
+            params["latest"] = before
+            params["inclusive"] = False
+
+        try:
+            resp = await self._app.client.conversations_history(**params)
+        except SlackApiError as exc:
+            log.warning(
+                "SlackBridge.fetch_history failed for %s: %s",
+                slack_channel, exc,
+            )
+            raise
+
+        messages = resp.get("messages") or []
+        out: list[ChannelMessage] = []
+        # Slack returns newest-first; reverse for oldest-first output.
+        for m in reversed(messages):
+            if not isinstance(m, dict):
+                continue
+            user_id = m.get("user") or m.get("bot_id")
+            ts = m.get("ts") or ""
+            # Slack ts is "<unix-seconds>.<microseconds>" — convert to
+            # ISO-8601 for the uniform shape.
+            iso_ts = ""
+            if ts:
+                try:
+                    iso_ts = datetime.fromtimestamp(
+                        float(ts), tz=timezone.utc,
+                    ).isoformat()
+                except (ValueError, OSError):
+                    iso_ts = ts
+            attachments = m.get("files") or []
+            attachment_urls = tuple(
+                str(a.get("url_private") or a.get("url_private_download") or "")
+                for a in attachments
+                if isinstance(a, dict)
+                and (a.get("url_private") or a.get("url_private_download"))
+            )
+            # Resolve a friendly name for guild-channel messages. DMs
+            # have user ids only; users.info hits a 1-call cache.
+            author_display: str | None = user_id
+            if user_id and not user_id.startswith("B"):  # not a bot id
+                info = await self._user_info_cached(user_id)
+                if info:
+                    author_display = (
+                        info.get("real_name")
+                        or info.get("display_name")
+                        or user_id
+                    )
+            out.append(ChannelMessage(
+                id=str(ts),
+                ts=iso_ts,
+                author_id=user_id,
+                author_display=author_display,
+                is_bot=bool(m.get("bot_id")),
+                content=str(m.get("text", "") or ""),
+                attachment_urls=attachment_urls,
+                extra={"thread_ts": m.get("thread_ts")} if m.get("thread_ts") else {},
+            ))
+        return out
 
     async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:
         if self._app is None:

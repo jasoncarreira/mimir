@@ -509,3 +509,118 @@ async def test_send_reports_disconnected_app(tmp_path: Path):
     result = await bridge.send("slack-C01ABC", "hi")
     assert result.sent is False
     assert "not connected" in (result.error or "")
+
+
+# ─── fetch_history ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_returns_oldest_first(bridge_with_fake_app):
+    """Slack's conversations.history returns newest-first; our
+    fetch_history flips to oldest-first so the agent reads in
+    conversational order."""
+    bridge, _, _ = bridge_with_fake_app
+    # Newest-first stream — what Slack's API returns.
+    payload = {
+        "messages": [
+            {"ts": "1714768922.000300", "user": "U05ALICE", "text": "third"},
+            {"ts": "1714768921.000200", "user": "U05ALICE", "text": "second"},
+            {"ts": "1714768920.000100", "user": "U05ALICE", "text": "first"},
+        ],
+    }
+
+    async def fake_history(**kw):
+        return payload
+
+    bridge._app.client.conversations_history = fake_history  # type: ignore[attr-defined]
+    out = await bridge.fetch_history("slack-C01ABC", limit=10)
+    assert [m.content for m in out] == ["first", "second", "third"]
+    assert out[0].id == "1714768920.000100"
+    # ISO ts derived from Slack ts.
+    assert out[0].ts.startswith("2024-")  # 1714768920 → April 2024
+    assert out[0].author_display == "Alice Smith"
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_passes_before_cursor(bridge_with_fake_app):
+    """``before`` is forwarded as Slack's ``latest`` with inclusive=False."""
+    bridge, _, _ = bridge_with_fake_app
+    captured: dict = {}
+
+    async def fake_history(**kw):
+        captured.update(kw)
+        return {"messages": []}
+
+    bridge._app.client.conversations_history = fake_history  # type: ignore[attr-defined]
+    await bridge.fetch_history(
+        "slack-C01ABC", limit=20, before="1714768920.000100",
+    )
+    assert captured["latest"] == "1714768920.000100"
+    assert captured["inclusive"] is False
+    assert captured["channel"] == "C01ABC"
+    assert captured["limit"] == 20
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_clamps_to_100(bridge_with_fake_app):
+    bridge, _, _ = bridge_with_fake_app
+    captured: dict = {}
+
+    async def fake_history(**kw):
+        captured.update(kw)
+        return {"messages": []}
+
+    bridge._app.client.conversations_history = fake_history  # type: ignore[attr-defined]
+    await bridge.fetch_history("slack-C01ABC", limit=999)
+    assert captured["limit"] == 100
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_unconnected_returns_empty():
+    bridge = SlackBridge(
+        bot_token="x", app_token="x",
+        enqueue=AsyncMock(return_value=True),
+    )
+    out = await bridge.fetch_history("slack-C01ABC")
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_marks_bot_messages(bridge_with_fake_app):
+    """Slack uses ``bot_id`` instead of (or alongside) ``user`` for
+    bot-authored messages; the bridge sets is_bot accordingly."""
+    bridge, _, _ = bridge_with_fake_app
+    payload = {"messages": [
+        {"ts": "1714768925.000100", "bot_id": "B01BOT", "user": "B01BOT",
+         "text": "auto-posted"},
+    ]}
+
+    async def fake_history(**kw):
+        return payload
+
+    bridge._app.client.conversations_history = fake_history  # type: ignore[attr-defined]
+    out = await bridge.fetch_history("slack-C01ABC")
+    assert len(out) == 1
+    assert out[0].is_bot is True
+    assert out[0].content == "auto-posted"
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_files_surface_as_attachment_urls(bridge_with_fake_app):
+    bridge, _, _ = bridge_with_fake_app
+    payload = {"messages": [
+        {
+            "ts": "1714768926.000200", "user": "U05ALICE",
+            "text": "see file",
+            "files": [
+                {"name": "x.png", "url_private": "https://files.slack.com/x.png"},
+            ],
+        },
+    ]}
+
+    async def fake_history(**kw):
+        return payload
+
+    bridge._app.client.conversations_history = fake_history  # type: ignore[attr-defined]
+    out = await bridge.fetch_history("slack-C01ABC")
+    assert out[0].attachment_urls == ("https://files.slack.com/x.png",)
