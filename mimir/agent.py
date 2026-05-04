@@ -39,12 +39,14 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookMatcher,
+    InMemorySessionStore,
     RateLimitEvent,
     ResultMessage,
     StreamEvent,
     TaskNotificationMessage,
     TaskProgressMessage,
     TaskStartedMessage,
+    project_key_for_directory,
 )
 
 from . import _context
@@ -122,7 +124,7 @@ def _filter_session_turns(turns_path, saga_session_id: str) -> list[dict]:
     return out
 
 
-# ─── ClaudeSDKClient wrapper (migration stages 1-2) ─────────────────
+# ─── ClaudeSDKClient wrapper (migration stages 1-3) ─────────────────
 #
 # Stage 1 of CLAUDE_SDK_CLIENT_MIGRATION.md: route the agent loop through
 # a shared, persistent ``ClaudeSDKClient`` instead of one-shot
@@ -132,9 +134,15 @@ def _filter_session_turns(turns_path, saga_session_id: str) -> list[dict]:
 # Stage 2: pass ``session_id=ctx.turn_id`` per call so each turn is
 # scoped to its own session inside the persistent client. Prior-turn
 # history can't leak into the next turn's input — the SDK's session
-# store keys conversation state by ``session_id``. No cleanup yet
-# (Stage 3 wires an explicit store + per-turn delete); session entries
-# accumulate for the lifetime of the client process.
+# store keys conversation state by ``session_id``.
+#
+# Stage 3: an explicit ``InMemorySessionStore`` is attached to
+# ``ClaudeAgentOptions`` and ``Agent`` calls ``store.delete()`` after
+# each turn completes. The store is owned by ``Agent`` (not the
+# wrapper) because it has to survive client recycles — recycling the
+# client when options drift would otherwise reset all in-flight
+# session state. Per-turn delete bounds the store size so memory
+# stays flat across long-lived processes.
 #
 # The lifecycle:
 #   - First call: instantiate ``ClaudeSDKClient(options=...)`` and
@@ -303,6 +311,17 @@ class Agent:
             path=config.home / ".mimir" / "rate_limits.json",
         )
 
+        # Stage 3: explicit SessionStore + per-turn delete. The store
+        # is owned by ``Agent`` (not the SDK-client wrapper) so it
+        # survives options-fingerprint client recycles — otherwise
+        # recycling the client would reset all session state and
+        # break the per-turn delete contract for in-flight turns.
+        # ``project_key`` is derived once from ``config.home`` so
+        # ``run_turn`` can target the right namespace without
+        # re-deriving on every turn.
+        self._session_store = InMemorySessionStore()
+        self._session_project_key = project_key_for_directory(str(config.home))
+
         # §12.4: S3-S4 homeostat. Constructed once so the scheduler
         # consults the same instance the prompt's `## Self-state` block
         # is rendered from. Wire into the scheduler immediately so
@@ -381,6 +400,11 @@ class Agent:
             thinking={"type": "adaptive", "display": "summarized"},
             env=self._config.sdk_env_overrides(),
             cwd=str(self._config.home),
+            # Stage 3: per-turn session_id (Stage 2) writes into this
+            # store; ``run_turn`` deletes by ``ctx.turn_id`` after the
+            # turn completes so memory stays bounded across long-lived
+            # processes.
+            session_store=self._session_store,
             # Streaming chunks needed when capture_rate_limits is on —
             # the message_start event carries the per-response
             # rate_limits block we want. The extra deltas are cheap
@@ -990,6 +1014,25 @@ class Agent:
                 log.exception("query() failed for turn %s", ctx.turn_id)
         finally:
             _context.reset_current_turn(token)
+            # Stage 3: drop this turn's session entries from the store
+            # so memory stays flat across long-lived processes. Runs
+            # in finally so a query() crash still cleans up. Adapter
+            # delete failures are logged but don't propagate — the
+            # turn record + observability path matters more than a
+            # leaked session entry.
+            try:
+                await self._session_store.delete(
+                    {
+                        "project_key": self._session_project_key,
+                        "session_id": ctx.turn_id,
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "session_store.delete failed for turn %s "
+                    "(continuing — entry will be evicted on next process restart)",
+                    ctx.turn_id,
+                )
 
         events_list, output = extract_turn_events(messages)
         duration_ms = int((time.monotonic() - ctx.started_at) * 1000)

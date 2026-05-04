@@ -9,7 +9,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock, UserMessage, ToolResultBlock
+from claude_agent_sdk import (
+    AssistantMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+    project_key_for_directory,
+)
 
 from mimir.agent import Agent
 from mimir.config import Config
@@ -296,3 +303,158 @@ async def test_consecutive_turns_get_distinct_session_ids(tmp_path: Path):
 
     assert seen == [r1.turn_id, r2.turn_id]
     assert r1.turn_id != r2.turn_id
+
+
+# ─── Stage 3: explicit SessionStore + per-turn delete ────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_options_attaches_session_store(tmp_path: Path):
+    """Stage 3: the agent's per-turn options carry the same
+    InMemorySessionStore instance every call. The shared store is
+    what the wrapper hands to ClaudeSDKClient at connect time."""
+    agent = _build_agent(tmp_path, FakeSaga())
+    opts1 = agent._build_options("system prompt v1")
+    opts2 = agent._build_options("system prompt v2")
+    assert opts1.session_store is agent._session_store
+    assert opts2.session_store is agent._session_store
+
+
+@pytest.mark.asyncio
+async def test_run_turn_deletes_session_after_completion(tmp_path: Path):
+    """Stage 3: after a turn completes, run_turn calls
+    ``store.delete()`` for that turn's session so the store doesn't
+    accumulate per-turn entries. We pre-seed the store with an entry
+    keyed to the turn's id (the fake query() path never appends, so
+    seeding is the only way to verify the delete actually fired)."""
+    seeded_ids: list[str] = []
+
+    async def seeding_query(*, prompt, options, session_id="default", transport=None):
+        # Mimic the SDK appending an entry for this session_id, the
+        # way the real client+store integration would.
+        seeded_ids.append(session_id)
+        await options.session_store.append(
+            {
+                "project_key": project_key_for_directory(options.cwd),
+                "session_id": session_id,
+            },
+            [{"type": "user", "uuid": "u1", "timestamp": "2026-05-04T00:00:00Z"}],
+        )
+        yield AssistantMessage(content=[TextBlock(text="ok")], model="claude-opus-4-7")
+
+    agent = _build_agent(tmp_path, FakeSaga())
+    with patch("mimir.agent.query", new=seeding_query):
+        record = await agent.run_turn(
+            AgentEvent(trigger="user_message", channel_id="c1", content="hi", author="alice")
+        )
+
+    assert seeded_ids == [record.turn_id]
+    # After the turn, the entry for turn_id has been deleted.
+    project_key = project_key_for_directory(str(tmp_path))
+    assert agent._session_store.get_entries(
+        {"project_key": project_key, "session_id": record.turn_id}
+    ) == []
+    # And the store reports no main-transcript sessions for our project key.
+    assert agent._session_store.size == 0
+
+
+@pytest.mark.asyncio
+async def test_session_store_size_stays_flat_across_many_turns(tmp_path: Path):
+    """Stage 3 success metric (scaled): the store size doesn't grow
+    over N sequential turns. Spec asks for 1000 turns; we run 50 in
+    unit tests and check that count stays at 0 after each — the
+    invariant is identical and a higher N just costs CI time."""
+
+    async def seeding_query(*, prompt, options, session_id="default", transport=None):
+        await options.session_store.append(
+            {
+                "project_key": project_key_for_directory(options.cwd),
+                "session_id": session_id,
+            },
+            [{"type": "user", "uuid": f"u-{session_id[-6:]}", "timestamp": "2026-05-04T00:00:00Z"}],
+        )
+        yield AssistantMessage(content=[TextBlock(text="ok")], model="claude-opus-4-7")
+
+    agent = _build_agent(tmp_path, FakeSaga())
+    with patch("mimir.agent.query", new=seeding_query):
+        for i in range(50):
+            await agent.run_turn(
+                AgentEvent(
+                    trigger="user_message",
+                    channel_id="c1",
+                    content=f"turn {i}",
+                    author="alice",
+                )
+            )
+            # Per-turn delete fired in finally — store stays empty.
+            assert agent._session_store.size == 0
+
+
+@pytest.mark.asyncio
+async def test_session_store_delete_runs_even_when_query_crashes(tmp_path: Path):
+    """The delete is in a ``finally`` block, so a query() crash mid-
+    turn must still drop that turn's session entries — otherwise a
+    flapping subprocess would leak one session per failure."""
+
+    async def crashing_query(*, prompt, options, session_id="default", transport=None):
+        await options.session_store.append(
+            {
+                "project_key": project_key_for_directory(options.cwd),
+                "session_id": session_id,
+            },
+            [{"type": "user", "uuid": "u1", "timestamp": "2026-05-04T00:00:00Z"}],
+        )
+        raise RuntimeError("simulated SDK crash mid-turn")
+        yield  # pragma: no cover — make this an async generator
+
+    agent = _build_agent(tmp_path, FakeSaga())
+    with patch("mimir.agent.query", new=crashing_query):
+        record = await agent.run_turn(
+            AgentEvent(trigger="user_message", channel_id="c1", content="hi", author="alice")
+        )
+
+    # The TurnRecord captured the error and the store is still empty.
+    assert record.error is not None
+    assert "simulated SDK crash" in record.error
+    assert agent._session_store.size == 0
+
+
+@pytest.mark.asyncio
+async def test_session_store_delete_failure_does_not_break_turn(tmp_path: Path):
+    """If the store's delete() raises (e.g., a backend hiccup), the
+    turn must still complete cleanly. We swap in a store whose
+    delete always raises; the run_turn finally must swallow it."""
+
+    class _ExplodingDeleteStore:
+        # Minimal duck-typed SessionStore — only the methods the
+        # agent path actually uses.
+        def __init__(self):
+            self.deletes: list[dict] = []
+            self.appends: list[tuple] = []
+
+        async def append(self, key, entries):
+            self.appends.append((dict(key), list(entries)))
+
+        async def load(self, key):
+            return None
+
+        async def delete(self, key):
+            self.deletes.append(dict(key))
+            raise RuntimeError("backend down")
+
+    agent = _build_agent(tmp_path, FakeSaga())
+    exploder = _ExplodingDeleteStore()
+    agent._session_store = exploder  # type: ignore[assignment]
+
+    async def fake_q(*, prompt, options, session_id="default", transport=None):
+        yield AssistantMessage(content=[TextBlock(text="ok")], model="claude-opus-4-7")
+
+    with patch("mimir.agent.query", new=fake_q):
+        record = await agent.run_turn(
+            AgentEvent(trigger="user_message", channel_id="c1", content="hi", author="alice")
+        )
+
+    # Turn succeeded, delete was attempted exactly once with the right key.
+    assert record.error is None
+    assert len(exploder.deletes) == 1
+    assert exploder.deletes[0]["session_id"] == record.turn_id
