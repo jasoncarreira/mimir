@@ -116,6 +116,16 @@ class Config:
     introspection_report_days: int
     introspection_report_health_threshold: float
     introspection_report_emit_algedonic: bool
+
+    # Periodic poll of Claude Max plan window utilization. Empty
+    # string disables. ``ClaudeSDKClient.get_context_usage()`` is
+    # the data source. Default ``*/10 * * * *`` (every 10 minutes)
+    # — quota state doesn't shift fast enough to need finer cadence,
+    # and each poll spins up a throwaway Claude Code subprocess.
+    # See CLAUDE_SDK_CLIENT_MIGRATION.md for the long-term plan
+    # to retire this cron once the agent loop uses ClaudeSDKClient
+    # itself.
+    quota_poll_cron: str
     # Per-atom confidence floor (post SAGA per-atom gating) for the
     # pre-message auto-fetch hook. Empty string (default) defers to SAGA's
     # ``[retrieval].default_min_confidence_tier`` config (today: "low").
@@ -282,6 +292,7 @@ class Config:
             introspection_report_cron=_env(
                 "MIMIR_INTROSPECTION_REPORT_CRON", "0 14 * * 5",
             ),
+            quota_poll_cron=_env("MIMIR_QUOTA_POLL_CRON", "*/10 * * * *"),
             introspection_report_days=_env_int(
                 "MIMIR_INTROSPECTION_REPORT_DAYS", 7,
             ),
