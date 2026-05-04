@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     HookMatcher,
     RateLimitEvent,
     ResultMessage,
@@ -44,7 +45,6 @@ from claude_agent_sdk import (
     TaskNotificationMessage,
     TaskProgressMessage,
     TaskStartedMessage,
-    query,
 )
 
 from . import _context
@@ -120,6 +120,125 @@ def _filter_session_turns(turns_path, saga_session_id: str) -> list[dict]:
     except OSError:
         return []
     return out
+
+
+# ─── ClaudeSDKClient wrapper (migration stage 1) ────────────────────
+#
+# Stage 1 of CLAUDE_SDK_CLIENT_MIGRATION.md: route the agent loop through
+# a shared, persistent ``ClaudeSDKClient`` instead of one-shot
+# ``claude_agent_sdk.query()``. The shared client keeps the Claude Code
+# subprocess warm across turns; behavior is identical to ``query()``
+# because we pass ``session_id="default"`` (single accumulating session)
+# for now — per-turn isolation arrives in stage 2.
+#
+# The lifecycle:
+#   - First call: instantiate ``ClaudeSDKClient(options=...)`` and
+#     ``connect()``.
+#   - Subsequent calls with matching options-fingerprint: reuse.
+#   - Options changed (system_prompt drifted, model swapped, etc.):
+#     disconnect + reconnect with the new options. Recycle cost is one
+#     subprocess restart (~1s) per fingerprint flip. In practice the
+#     fingerprint is very stable (system prompt blocks change slowly).
+#   - ``shutdown_sdk_client()`` is called from the server's cleanup
+#     hook to release the subprocess on graceful shutdown.
+#
+# Test shape:
+#   The module-level ``query`` name is preserved so existing tests that
+#   ``patch("mimir.agent.query", new=fake_query)`` keep working
+#   unchanged. Tests that exercise the wrapper itself patch
+#   ``mimir.agent.ClaudeSDKClient``.
+#
+# An ``asyncio.Lock`` serializes calls — ``ClaudeSDKClient`` is
+# single-threaded by design. Stage 4 swaps the singleton for a
+# threading.local cache to lift the serialization.
+
+import hashlib
+
+_sdk_lock: asyncio.Lock | None = None
+_sdk_client: ClaudeSDKClient | None = None
+_sdk_options_fingerprint: str | None = None
+
+
+def _get_sdk_lock() -> asyncio.Lock:
+    """Lazy-create the lock so it binds to the running loop. Module
+    import shouldn't require an event loop."""
+    global _sdk_lock
+    if _sdk_lock is None:
+        _sdk_lock = asyncio.Lock()
+    return _sdk_lock
+
+
+def _options_fingerprint(options: ClaudeAgentOptions) -> str:
+    """Hash the options fields that, if changed, require recycling the
+    underlying ClaudeSDKClient. Things bound to the client at connect
+    time go in here; per-call data (the prompt) does not.
+
+    Hooks/mcp_servers/tools are object references — they don't get
+    hashed (mimir's are stable across an Agent's lifetime). The
+    fingerprint is conservative: false-positive recycles are cheap,
+    false-negatives stale a connected client against new options.
+    """
+    h = hashlib.sha256()
+    h.update((options.system_prompt or "").encode("utf-8"))
+    h.update(b"|")
+    h.update((options.model or "").encode("utf-8"))
+    h.update(b"|")
+    h.update((str(getattr(options, "effort", "")) or "").encode("utf-8"))
+    h.update(b"|")
+    h.update(str(options.permission_mode).encode("utf-8"))
+    h.update(b"|")
+    h.update(str(getattr(options, "include_partial_messages", False)).encode("utf-8"))
+    h.update(b"|")
+    h.update(str(options.cwd or "").encode("utf-8"))
+    return h.hexdigest()
+
+
+async def query(*, prompt: str, options: ClaudeAgentOptions, transport=None):
+    """Stage 1 ClaudeSDKClient wrapper. Async-generator API matches the
+    old ``claude_agent_sdk.query()`` shape so call sites and patched
+    tests don't have to change.
+
+    The ``transport`` parameter is accepted but unused — kept for
+    signature compatibility with tests that may pass it.
+    """
+    global _sdk_client, _sdk_options_fingerprint
+    fingerprint = _options_fingerprint(options)
+    lock = _get_sdk_lock()
+    async with lock:
+        if _sdk_client is None or _sdk_options_fingerprint != fingerprint:
+            if _sdk_client is not None:
+                try:
+                    await _sdk_client.disconnect()
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "ClaudeSDKClient disconnect failed during recycle "
+                        "(continuing — fresh client about to replace it)"
+                    )
+                _sdk_client = None
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            _sdk_client = client
+            _sdk_options_fingerprint = fingerprint
+        client = _sdk_client
+        assert client is not None  # for type-checkers
+        await client.query(prompt, session_id="default")
+        async for msg in client.receive_response():
+            yield msg
+
+
+async def shutdown_sdk_client() -> None:
+    """Disconnect the shared ClaudeSDKClient (called from server cleanup).
+    Idempotent — safe to call when no client was ever connected."""
+    global _sdk_client, _sdk_options_fingerprint
+    lock = _get_sdk_lock()
+    async with lock:
+        if _sdk_client is not None:
+            try:
+                await _sdk_client.disconnect()
+            except Exception:  # noqa: BLE001
+                log.exception("ClaudeSDKClient disconnect failed during shutdown")
+            _sdk_client = None
+            _sdk_options_fingerprint = None
 
 
 class Agent:

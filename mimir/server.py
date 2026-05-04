@@ -396,6 +396,12 @@ def build_app(config: Config) -> web.Application:
         await indexer.stop()
         await saga_client.close()
         await channels.disconnect_all()
+        # Stage 1 of CLAUDE_SDK_CLIENT_MIGRATION.md: release the shared
+        # ClaudeSDKClient subprocess on graceful shutdown. No-op if no
+        # client was ever connected (test shutdowns, query()-failed
+        # bring-up, etc.).
+        from .agent import shutdown_sdk_client
+        await shutdown_sdk_client()
 
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
