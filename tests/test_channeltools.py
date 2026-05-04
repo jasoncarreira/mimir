@@ -490,6 +490,165 @@ async def test_send_message_plain_text_unchanged(tmp_path: Path):
     assert "directives:" not in body
 
 
+# ─── fetch_channel_history ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_history_returns_formatted_listing(tmp_path: Path):
+    """The tool wraps registry.fetch_history and renders a compact
+    one-line-per-message listing for the agent."""
+    from mimir.bridges._history import ChannelMessage
+
+    @dataclass
+    class _HistBridge(Bridge):
+        name: str = "h"
+        prefixes: tuple = ("c-",)
+        async def connect(self): ...
+        async def disconnect(self): ...
+        async def send(self, channel_id, text, attachment_paths=None):
+            return SendResult(sent=True, message_id="m1", chunks=1)
+        async def react(self, channel_id, message_id, emoji):
+            return True
+        async def fetch_history(self, channel_id, *, limit=20, before=None):
+            return [
+                ChannelMessage(
+                    id="100", ts="2026-05-03T12:00:00+00:00",
+                    author_id="u1", author_display="Alice",
+                    is_bot=False, content="hello",
+                ),
+                ChannelMessage(
+                    id="101", ts="2026-05-03T12:01:00+00:00",
+                    author_id="bot", author_display="bot",
+                    is_bot=True, content="hi back",
+                    attachment_urls=("https://cdn.example/x.png",),
+                ),
+            ]
+
+    bridge = _HistBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg)}
+
+    ctx = _ctx_with(channel="c-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await tools["fetch_channel_history"].handler({"limit": 10})
+    finally:
+        _context.reset_current_turn(token)
+
+    body = out["content"][0]["text"]
+    assert "2 messages from c-1" in body
+    assert "Alice: hello" in body
+    assert "bot (bot): hi back" in body
+    assert "[+1 attachments]" in body
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_history_clamps_limit(tmp_path: Path):
+    """Caller-requested limit > 100 is silently clamped before
+    reaching the bridge."""
+    captured: dict = {}
+
+    @dataclass
+    class _HistBridge(Bridge):
+        name: str = "h"
+        prefixes: tuple = ("c-",)
+        async def connect(self): ...
+        async def disconnect(self): ...
+        async def send(self, channel_id, text, attachment_paths=None):
+            return SendResult(sent=True, message_id="m1", chunks=1)
+        async def react(self, channel_id, message_id, emoji):
+            return True
+        async def fetch_history(self, channel_id, *, limit=20, before=None):
+            captured["limit"] = limit
+            captured["before"] = before
+            return []
+
+    bridge = _HistBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg)}
+
+    ctx = _ctx_with(channel="c-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        await tools["fetch_channel_history"].handler({
+            "limit": 500, "before": "abc",
+        })
+    finally:
+        _context.reset_current_turn(token)
+
+    assert captured["limit"] == 100
+    assert captured["before"] == "abc"
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_history_unknown_channel_returns_error(tmp_path: Path):
+    """Channel that doesn't match any registered bridge returns an
+    is_error tool reply instead of raising."""
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg)}
+
+    ctx = _ctx_with(channel="c-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await tools["fetch_channel_history"].handler({
+            "channel_id": "no-such-prefix-1",
+        })
+    finally:
+        _context.reset_current_turn(token)
+
+    body = out["content"][0]["text"]
+    assert "fetch_channel_history failed" in body
+    assert "no bridge registered" in body
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_history_no_channel_id_no_ctx(tmp_path: Path):
+    """No channel_id arg AND no current turn channel → fail cleanly."""
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg)}
+
+    out = await tools["fetch_channel_history"].handler({})
+    body = out["content"][0]["text"]
+    assert "no channel_id" in body
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_history_empty_result(tmp_path: Path):
+    """Empty list from the bridge renders as a clear notice."""
+    @dataclass
+    class _EmptyBridge(Bridge):
+        name: str = "e"
+        prefixes: tuple = ("c-",)
+        async def connect(self): ...
+        async def disconnect(self): ...
+        async def send(self, channel_id, text, attachment_paths=None):
+            return SendResult(sent=True, message_id="m1", chunks=1)
+        async def react(self, channel_id, message_id, emoji):
+            return True
+        # fetch_history inherits the base no-op → returns [].
+
+    bridge = _EmptyBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg)}
+
+    ctx = _ctx_with(channel="c-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await tools["fetch_channel_history"].handler({})
+    finally:
+        _context.reset_current_turn(token)
+
+    body = out["content"][0]["text"]
+    assert "no messages returned for c-1" in body
+
+
 @pytest.mark.asyncio
 async def test_send_message_skips_feedback_on_synthesis_turn():
     """saga_session_end synthesis turns call saga_feedback per-atom inside
