@@ -377,15 +377,25 @@ init" item, not P33. **Update: shipped in `8b326e6`.**
 
 ---
 
-### P34 — Recalibrate consolidation similarity_threshold [shipped 2026-05-02]
+### P34 — Recalibrate consolidation similarity_threshold [reverted 2026-05-03]
 
-**Status.** **Shipped 2026-05-02.** Default lowered from 0.80 → 0.75
-in `saga/config.py`. Decision driven by post-bench measurement on
-mimir's atom corpus: 0.80 missed clusters of paraphrased observations
-that should have merged; 0.75 caught them without false-merging
-unrelated atoms in spot-checks. `min_cluster_size = 3` left at the
-default. The bench correctness cross-check rides on the next
-P30-baseline run.
+**Status.** **Reverted 2026-05-03 — back to 0.80.** P34 shipped
+2026-05-02 lowering the default from 0.80 → 0.75; the simhi sweep
+on 2026-05-03 (P40 + P47 reruns at 0.80, see those entries) showed
+that 0.75 was a net loss:
+
+- multi-session: 67.7% (p47 at 0.75) vs 71.4% (p42+p47 simhi at 0.80) — **+3.7pp recovered**
+- temporal-reasoning: 78.2% at 0.75 vs 81.2% at 0.80 — **+3pp recovered**
+- session-scoped categories barely moved either way
+
+Failure mode at 0.75: counting / aggregation questions across
+sessions undercount their answer items. Atoms that the looser
+clustering collapsed into single observations stop surfacing
+individually at retrieval time. The paraphrase-merge gap P34 was
+chasing is real but smaller than the cross-session penalty it
+introduced. 0.80 is the better default.
+
+**What.** (original — preserved for context) Default
 
 **What.** (original — preserved for context) Default
 `consolidation.similarity_threshold = 0.80` and `min_cluster_size = 3`
@@ -970,14 +980,32 @@ pulled-in atoms rank where the formula predicts.
 
 ---
 
-### P40 — Disable pull-in of endorsed atoms that miss the cheap-path pool; keep boost for in-pool endorsed atoms [queued 2026-05-02]
+### P40 — Disable pull-in of endorsed atoms that miss the cheap-path pool; keep boost for in-pool endorsed atoms [tested 2026-05-03]
 
-**Status.** Queued 2026-05-02 — recommended next-bench candidate
-after the current P30 vs P42 Sonnet run completes. Hypothesis still
-holds: pulling in endorsed-but-out-of-pool atoms anchors them at the
-bottom of the score distribution and dilutes the in-pool ranking.
+**Status.** **Tested 2026-05-03 — flag stays default-on.** Two
+benches:
 
+- p40 sonnet (0.75 sim): pull-in OFF gave 80.6% overall vs p47's
+  81.4% with pull-in default-on. At 0.75 the pull-in trade was
+  category-skewed (+5 assistant, +2 user, +2 preference, +2
+  knowledge, -1 temporal, -6 multi-session) — net +4 to leaving
+  pull-in on, but multi-session paid the price.
+- p42+p40 simhi (0.80 sim, with P42 triples + P47 consolidation):
+  pull-in OFF gave 81.0% vs the paired p42+p47 simhi (pull-in on)
+  at 81.6%. At 0.80 the trade is much milder: pull-in-on gains 3
+  questions (assistant +2, knowledge +1) and multi-session is
+  identical (95/133 in both).
 
+Net read: at the new canonical 0.80 cutoff, the P40 hypothesis
+("pull-in dilutes in-pool ranking") barely holds — most of what we
+saw at 0.75 was the looser clustering compounding with pull-in,
+not pull-in alone. Default `enable_endorsed_atom_pull_in = true`
+stands. Worth revisiting in a future bench cycle when other
+retrieval changes are in flight.
+
+**What.** (original — preserved for context) Pulling in endorsed-
+but-out-of-pool atoms anchors them at the bottom of the score
+distribution and dilutes the in-pool ranking.
 
 **Status.** Filed 2026-04-30. Not yet implemented. Queued behind
 the P12 v3 solo re-run.
@@ -1773,7 +1801,24 @@ problem is concrete and the fix is targeted.
 
 ---
 
-### P47 — Trend-driven promotion / demotion of saga atoms [filed 2026-05-03]
+### P47 — Trend-driven promotion / demotion of saga atoms [shipped 2026-05-03]
+
+**Status.** **Shipped 2026-05-03.** Consolidation-v2 bundle (P17
+trend writer + P35-c contradictions + P45 ext) is now the unconditional
+consolidation behavior — no flags. Two bench cycles validated:
+
+- p47 sonnet (0.75 sim, default config): 81.40% overall — best at
+  the time, but multi-session regressed to 67.7% (-4.5pp vs p42).
+- **p42+p47 simhi (0.80 sim, P42 triples on, current canonical):**
+  **81.6% overall** — new best, with multi-session recovered to
+  71.4% (only -0.8pp vs p42). Strong gains preserved on
+  single-session-assistant (+3.6pp), single-session-user (+0pp
+  net), knowledge-update (+2.6pp); session-preference dropped to
+  80% (n=30, likely variance — was 90% at 0.75 in p47).
+
+Net: P47 + P34 reverted-to-0.80 + P48 always-on is the new
+canonical config. See `saga_p42_p47_simhi.toml` for the full
+bench shape.
 
 **What.** Tie three previously-independent threads into one signal:
 - **P17** activates `atoms.trend` (improving / stable / weakening / stale)
@@ -1827,7 +1872,24 @@ shape.
 
 ---
 
-### P48 — Canonical predicate vocabulary for entity-relation triples [filed 2026-05-03]
+### P48 — Canonical predicate vocabulary for entity-relation triples [shipped 2026-05-03]
+
+**Status.** **Shipped 2026-05-03 — always-on.** Canonical predicate
+vocabulary block injected into the consolidation prompt whenever
+triples extraction is enabled. No config flag — wrong/unknown
+predicates degrade gracefully (the LLM still picks predicates that
+fit the data; the canonical list reduces aliasing where possible).
+
+Bench evidence is mixed: p48 pref30 slice tied p42 (24/30 = 80%
+vs the prior p47 90% at 0.75 sim — likely variance on n=30). At
+0.80 (p42+p47 simhi, P48 baked in) preference is also 80%; multi-
+session and overall both improved over p42, so P48 isn't *hurting*
+where it matters. Shipped as the right default on principle: the
+canonical-vocab hint is a prompt-level recommendation that can
+only help reduce predicate fragmentation across consolidation
+runs. Identities.yaml-canonicals are threaded through via Option
+A (mimir/scheduler.py) so the consolidation pass sees the operator's
+canonical names alongside the DB-derived top-N.
 
 **What.** Reduce predicate fragmentation in consolidation-extracted
 triples. Today the LLM invents ad-hoc predicates that fuse intent
