@@ -300,6 +300,66 @@ def test_evaluate_quiet_baseline_disables_spike_check(tmp_path: Path):
     assert alert is None
 
 
+def test_evaluate_rate_now_floor_silences_spike(tmp_path: Path):
+    """The asymmetry fix: even when both baseline and ratio say 'spike,'
+    a rate_now below the floor means we're not in spend territory worth
+    suppressing S4 over. Models the recurring false-positive shape:
+    chatty session (a few cents/hour) over a tiny rolling baseline."""
+    from mimir.usage_stats import evaluate_cost_rate
+
+    path = tmp_path / "turns.jsonl"
+    # Baseline: $5.04 over 7d → $0.03/hr (above the 1¢/hr noise floor,
+    # so the existing baseline gate doesn't silence). Last hour: $0.19
+    # — that's > 3× baseline, but well below the default $5/hr floor.
+    _write_turns(path, [
+        _turn(hours_ago=24 * 6, cost=5.04),
+        _turn(hours_ago=0.1, cost=0.19),
+    ])
+    rep = aggregate(path)
+
+    # With default floor ($5/hr): silenced.
+    assert evaluate_cost_rate(rep, spike_ratio=3.0) is None
+
+    # Floor disabled (None or 0): the spike fires as before.
+    alert = evaluate_cost_rate(
+        rep, spike_ratio=3.0, spike_floor_usd_per_hour=None,
+    )
+    assert alert is not None
+    assert alert.reason == "spike_ratio"
+    alert = evaluate_cost_rate(
+        rep, spike_ratio=3.0, spike_floor_usd_per_hour=0,
+    )
+    assert alert is not None
+
+    # Floor cleared at $0.10/hr: $0.19/hr clears it, spike still fires.
+    alert = evaluate_cost_rate(
+        rep, spike_ratio=3.0, spike_floor_usd_per_hour=0.10,
+    )
+    assert alert is not None
+    assert alert.reason == "spike_ratio"
+
+
+def test_evaluate_floor_does_not_affect_absolute_limit(tmp_path: Path):
+    """The floor only gates the spike check — the absolute hourly limit
+    is the real backstop and must still fire even when the spike side
+    is silenced."""
+    from mimir.usage_stats import evaluate_cost_rate
+
+    path = tmp_path / "turns.jsonl"
+    _write_turns(path, [_turn(hours_ago=0.1, cost=0.20)])
+    rep = aggregate(path)
+    # Floor at $1/hr would silence a spike on $0.20/hr — but the
+    # absolute limit at $0.10/hr should still trip.
+    alert = evaluate_cost_rate(
+        rep,
+        hourly_limit_usd=0.10,
+        spike_ratio=3.0,
+        spike_floor_usd_per_hour=1.0,
+    )
+    assert alert is not None
+    assert alert.reason == "absolute_hourly_limit"
+
+
 def test_absolute_threshold_takes_precedence_when_both_fire(tmp_path: Path):
     from mimir.usage_stats import evaluate_cost_rate
 
