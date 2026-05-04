@@ -59,13 +59,22 @@ HomeostaticArbiter = Any
 @dataclass
 class SchedulerJob:
     name: str
-    prompt: str
+    # Either ``prompt`` (inline string) OR ``prompt_file`` (path under
+    # ``MIMIR_HOME/prompts/``) provides the cron's instructions. When
+    # both are set, ``prompt_file`` wins at fire time and ``prompt``
+    # is the fallback if the file goes missing.
+    prompt: str = ""
+    prompt_file: str | None = None
     cron: str | None = None
     time_of_day: str | None = None
     channel_id: str | None = None
 
     def to_yaml_entry(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"name": self.name, "prompt": self.prompt}
+        out: dict[str, Any] = {"name": self.name}
+        if self.prompt:
+            out["prompt"] = self.prompt
+        if self.prompt_file:
+            out["prompt_file"] = self.prompt_file
         if self.cron:
             out["cron"] = self.cron
         if self.time_of_day:
@@ -77,6 +86,7 @@ class SchedulerJob:
     def from_yaml_entry(cls, raw: dict[str, Any]) -> "SchedulerJob":
         name = str(raw.get("name", "")).strip()
         prompt = str(raw.get("prompt", "")).strip()
+        prompt_file_raw = str(raw.get("prompt_file", "")).strip() or None
         cron = str(raw.get("cron", "")).strip() or None
         time_of_day = str(raw.get("time_of_day", "")).strip() or None
         channel_id = raw.get("channel_id")
@@ -84,8 +94,10 @@ class SchedulerJob:
             channel_id = None
         if not name:
             raise ValueError("scheduler job missing 'name'")
-        if not prompt:
-            raise ValueError(f"scheduler job {name!r} missing 'prompt'")
+        if not prompt and not prompt_file_raw:
+            raise ValueError(
+                f"scheduler job {name!r}: one of 'prompt' or 'prompt_file' required"
+            )
         if bool(cron) == bool(time_of_day):
             raise ValueError(
                 f"scheduler job {name!r}: exactly one of cron / time_of_day required"
@@ -93,6 +105,7 @@ class SchedulerJob:
         return cls(
             name=name,
             prompt=prompt,
+            prompt_file=prompt_file_raw,
             cron=cron,
             time_of_day=time_of_day,
             channel_id=channel_id,
@@ -135,6 +148,20 @@ def write_jobs(path: Path, jobs: list[SchedulerJob]) -> None:
     tmp.replace(path)
 
 
+def _resolve_prompt_file(home: Path | None, prompt_file: str) -> Path | None:
+    """Resolve ``prompt_file`` against ``<home>/prompts/`` and verify
+    the result stays inside that directory. Returns None on escape,
+    missing home, or empty input. Caller logs and falls back to the
+    inline prompt when None is returned."""
+    if not home or not prompt_file or not prompt_file.strip():
+        return None
+    root = (home / "prompts").resolve()
+    candidate = (root / prompt_file.strip().lstrip("/")).resolve()
+    if root not in candidate.parents and candidate != root:
+        return None
+    return candidate
+
+
 def _build_trigger(job: SchedulerJob) -> CronTrigger:
     """Convert ``cron`` / ``time_of_day`` to an APScheduler trigger.
     Raises ``ValueError`` for malformed expressions."""
@@ -173,6 +200,7 @@ class Scheduler:
         enqueue: EnqueueFn,
         *,
         arbiter: HomeostaticArbiter | None = None,
+        home: Path | None = None,
     ) -> None:
         self._scheduler = AsyncIOScheduler(timezone="UTC")
         self._yaml_path = scheduler_yaml
@@ -180,6 +208,10 @@ class Scheduler:
         self._arbiter = arbiter
         self._mutate_lock = asyncio.Lock()
         self._started = False
+        # Used to resolve ``SchedulerJob.prompt_file`` against
+        # ``<home>/prompts/<file>`` at fire time. Optional for tests
+        # and bench harnesses that construct Scheduler without a home.
+        self._home = home
 
     # ---- LLM-tick jobs ------------------------------------------------
 
@@ -217,11 +249,41 @@ class Scheduler:
     #      which skill the agent should run.
     # loop_id: 4.1
     async def _fire(self, *, job: SchedulerJob) -> None:
+        # Resolve the cron's prompt body. Precedence:
+        #   1. ``prompt_file`` (relative to ``<home>/prompts/`` — escapes
+        #      via ``..`` are rejected so an agent can't reference an
+        #      arbitrary host file by setting prompt_file).
+        #   2. Inline ``prompt`` field.
+        #   3. Empty string (the agent falls back to HEARTBEAT_DEFAULT_PROMPT
+        #      via build_turn_prompt's body fallback).
+        content = job.prompt
+        if job.prompt_file:
+            resolved = _resolve_prompt_file(self._home, job.prompt_file)
+            if resolved is not None and resolved.is_file():
+                try:
+                    content = resolved.read_text(encoding="utf-8").strip()
+                except OSError as exc:
+                    log.warning(
+                        "scheduler %r: prompt_file %s read failed (%s); "
+                        "falling back to inline prompt",
+                        job.name, resolved, exc,
+                    )
+            else:
+                log.warning(
+                    "scheduler %r: prompt_file %r missing or escapes "
+                    "<home>/prompts/; falling back to inline prompt",
+                    job.name, job.prompt_file,
+                )
+
         event = AgentEvent(
             trigger="scheduled_tick",
             channel_id=_scheduler_channel_id(job.name, job.channel_id),
-            content=job.prompt,
-            extra={"schedule_name": job.name, "configured_channel_id": job.channel_id},
+            content=content,
+            extra={
+                "schedule_name": job.name,
+                "configured_channel_id": job.channel_id,
+                **({"prompt_file": job.prompt_file} if job.prompt_file else {}),
+            },
         )
 
         # §12.4: ask the homeostat first. If S4 work is suppressed by

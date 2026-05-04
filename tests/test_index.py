@@ -20,15 +20,21 @@ def _seed_memory(home: Path) -> None:
     (home / "memory" / "topics.md").write_text("# Topics\nthings I know about.")
 
 
-def test_build_memory_index_excludes_core_and_self(tmp_path: Path):
+def test_build_memory_index_includes_core_with_tag(tmp_path: Path):
+    """Core files now appear in the index tagged ``[core]`` so the
+    agent can navigate to them for edits. They're still skipped by
+    file_search (they're already in the system prompt)."""
     _seed_memory(tmp_path)
     body = build_memory_index(tmp_path)
 
     assert "channels/alice.md" in body
     assert "topics.md" in body
-    # Core files must be omitted — they're already in the system prompt.
-    assert "00-persona.md" not in body
-    assert "INDEX.md" not in body
+    # Core files appear, tagged so the agent recognizes them.
+    assert "core/00-persona.md" in body
+    assert "`[core]`" in body
+    # The auto-generated INDEX.md itself is still excluded.
+    assert "memory/INDEX.md" not in body
+    assert "- INDEX.md" not in body
 
 
 def test_files_without_desc_are_marked_auto(tmp_path: Path):

@@ -43,26 +43,42 @@ def build_schedule_tools(scheduler: Scheduler) -> list[SdkMcpTool]:
     @tool(
         "add_schedule",
         "Add or replace a schedule by name. Exactly one of cron (5-field) "
-        "or time_of_day (HH:MM, daily UTC) must be set. channel_id is "
-        "optional — if omitted, the tick fires on a synthetic scheduler:<name> "
-        "channel. Replaces any existing job with the same name.",
+        "or time_of_day (HH:MM, daily UTC) must be set. Provide EITHER "
+        "``prompt`` (inline text) OR ``prompt_file`` (path under "
+        "<home>/prompts/, e.g. ``daily-review.md``). Per-cron prompt "
+        "files are the preferred shape — they keep prompt content out "
+        "of scheduler.yaml so it can grow without cluttering the "
+        "registration. channel_id is optional — if omitted, the tick "
+        "fires on a synthetic scheduler:<name> channel. Replaces any "
+        "existing job with the same name.",
         {
-            "name": str,
-            "prompt": str,
-            "cron": str,
-            "time_of_day": str,
-            "channel_id": str,
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "prompt": {"type": "string"},
+                "prompt_file": {"type": "string"},
+                "cron": {"type": "string"},
+                "time_of_day": {"type": "string"},
+                "channel_id": {"type": "string"},
+            },
+            "required": ["name"],
         },
     )
     @_safe("add_schedule")
     async def add_schedule(args: dict[str, Any]) -> dict[str, Any]:
         name = _need(args, "name")
-        prompt = _need(args, "prompt")
+        prompt = (args.get("prompt") or "").strip()
+        prompt_file = (args.get("prompt_file") or "").strip() or None
         cron = (args.get("cron") or "").strip() or None
         time_of_day = (args.get("time_of_day") or "").strip() or None
         channel_id = args.get("channel_id")
         if isinstance(channel_id, str):
             channel_id = channel_id.strip() or None
+        if not prompt and not prompt_file:
+            return _content_block(
+                "add_schedule failed: one of 'prompt' or 'prompt_file' required",
+                is_error=True,
+            )
         if bool(cron) == bool(time_of_day):
             return _content_block(
                 "add_schedule failed: exactly one of cron or time_of_day required",
@@ -71,6 +87,7 @@ def build_schedule_tools(scheduler: Scheduler) -> list[SdkMcpTool]:
         job = SchedulerJob(
             name=name,
             prompt=prompt,
+            prompt_file=prompt_file,
             cron=cron,
             time_of_day=time_of_day,
             channel_id=channel_id,

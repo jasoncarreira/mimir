@@ -140,23 +140,27 @@ DEFAULT_SCHEDULER_YAML = dedent(
     #     default Fri 14:00).
     #
     # To disable a default tick, comment it out below or remove it.
-    # To add a custom tick:
+    # To add a custom tick, prefer ``prompt_file`` over inline ``prompt``
+    # so the prompt content can grow without cluttering this file:
     #
     #   - name: morning-checkin
     #     cron: "0 9 * * 1-5"
     #     channel_id: web-default
-    #     prompt: "Morning check-in: review yesterday and plan today."
+    #     prompt_file: morning-checkin.md   # under <home>/prompts/
+    #
+    # Each job needs exactly one of ``cron`` (5-field) or ``time_of_day``
+    # (HH:MM, daily UTC), and exactly one of ``prompt`` (inline) or
+    # ``prompt_file`` (path under <home>/prompts/).
 
-    jobs:
-      - name: heartbeat
-        cron: "0 * * * *"
-        channel_id: null   # synthetic scheduler:heartbeat channel
-        prompt: "Run the heartbeat skill: librarian protocol first, then pick one item from state/heartbeat-backlog.md and do it. End silently."
+    - name: heartbeat
+      cron: "0 * * * *"
+      channel_id: null   # synthetic scheduler:heartbeat channel
+      prompt_file: heartbeat.md
 
-      - name: reflect
-        cron: "0 6 * * 0"
-        channel_id: null   # synthetic scheduler:reflect channel
-        prompt: "Run the reflection skill — cross-session audit of the past week. Start with `mimir reflection introspection-report` and `mimir reflection audit`."
+    - name: reflect
+      cron: "0 6 * * 0"
+      channel_id: null   # synthetic scheduler:reflect channel
+      prompt_file: reflect.md
     """
 )
 
@@ -203,6 +207,41 @@ DEFAULT_HEARTBEAT_PATTERNS = dedent(
     tasks that fit well, ones that didn't, time-of-day patterns,
     mistakes worth not repeating. Keep it tight; this block is in core
     memory.
+    """
+)
+
+
+DEFAULT_HEARTBEAT_PROMPT = dedent(
+    """\
+    This is a heartbeat tick — autonomous-work cadence, not a user message.
+
+    Run the heartbeat skill: librarian protocol first (state coherence,
+    drift, re-anchor to current date), then pick ONE item from
+    state/heartbeat-backlog.md and do it. End the turn silently when done.
+
+    If something genuinely needs operator attention, route through the
+    operator alert channel; otherwise no user-visible message.
+    """
+)
+
+
+DEFAULT_REFLECT_PROMPT = dedent(
+    """\
+    This is the weekly reflection tick — autonomous, no user message.
+
+    Run the reflection skill: cross-session audit of the past 7 days
+    across both behavioral analysis (failures, drift, recurring
+    patterns) and memory architecture review (core cleanup, atom
+    promotion candidates, wiki health).
+
+    Start by reading memory/30-reflection-policy.md (the autonomous-vs-
+    propose-only boundary) and the reflection SKILL.md. Output is
+    propose-only by default — write to state/proposed-changes.md for
+    operator review unless the policy explicitly permits autonomous
+    application.
+
+    End the turn silently when done; the introspection-report cron
+    handles the operator-facing summary separately.
     """
 )
 
@@ -682,6 +721,7 @@ def setup_home(home: Path) -> dict[str, object]:
         "memory/core",
         "memory/channels",
         "memory/shared",
+        "prompts",
         "state",
         "state/raw",
         "state/wiki",
@@ -725,6 +765,10 @@ def setup_home(home: Path) -> dict[str, object]:
         files_created.append("saga.toml")
     if _write_if_missing(home / "scheduler.yaml", DEFAULT_SCHEDULER_YAML):
         files_created.append("scheduler.yaml")
+    if _write_if_missing(home / "prompts" / "heartbeat.md", DEFAULT_HEARTBEAT_PROMPT):
+        files_created.append("prompts/heartbeat.md")
+    if _write_if_missing(home / "prompts" / "reflect.md", DEFAULT_REFLECT_PROMPT):
+        files_created.append("prompts/reflect.md")
     if _write_if_missing(home / "memory" / "core" / "identity.md", DEFAULT_IDENTITY_MD):
         files_created.append("memory/core/identity.md")
     if _write_if_missing(home / "state" / "wiki" / "AGENTS.md", DEFAULT_WIKI_AGENTS_MD):
