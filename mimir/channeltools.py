@@ -477,6 +477,12 @@ def build_channel_tools(
             )
 
         message_id = (args.get("message_id") or "").strip()
+        # "latest" / "last" / "recent" are natural-language aliases the
+        # model reaches for when it wants the default — bridges treat
+        # message_id as an opaque ID, so the alias has to be normalized
+        # here before falling through to ctx.last_assistant_message_id.
+        if message_id.lower() in {"latest", "last", "recent"}:
+            message_id = ""
         if not message_id and ctx is not None:
             message_id = ctx.last_assistant_message_id or ""
         if not message_id:

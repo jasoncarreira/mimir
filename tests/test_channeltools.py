@@ -211,6 +211,26 @@ async def test_react_uses_last_assistant_message_id():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ["latest", "last", "recent", "LATEST", "Last"])
+async def test_react_treats_alias_as_default_request(alias: str):
+    """The model often types message_id="latest" expecting it to mean
+    "use the default." Aliases normalize to the empty-string fallback."""
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    tools = {t.name: t for t in build_channel_tools(reg)}
+    ctx = _ctx_with(LoopDetector())
+    ctx.last_assistant_message_id = "msg-prev"
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await tools["react"].handler({"emoji": "👍", "message_id": alias})
+    finally:
+        _context.reset_current_turn(token)
+    assert out.get("is_error") is not True
+    assert bridge.reacted == [("c-1", "msg-prev", "👍")]
+
+
+@pytest.mark.asyncio
 async def test_react_without_message_id_or_recent_fails():
     bridge = _RecordingBridge()
     reg = ChannelRegistry()
