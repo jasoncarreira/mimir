@@ -53,15 +53,38 @@ _DEFAULT_CONVENTIONS = """## Conventions
 - Edit memory blocks with bash and file-op tools — no dedicated memory-block
   tools exist.
 
-## send_message directives
+## Replying to user messages
 
-Inside the ``send_message`` text body you may embed an ``<actions>`` block
-to bundle reactions and file sends into the same tool call. This is
-faster than calling ``send_message``, then ``react``, then ``send_message``
-again with an attachment — those become one tool call total. The
-directives target the channel the ``send_message`` call goes to;
-cross-channel sends use a separate ``send_message`` call with an
-explicit ``channel_id``.
+For chat channels (Discord, Slack, web), your final assistant text is
+**auto-delivered** to the channel that sent the message. Just reply
+naturally — the runtime parses any ``<actions>`` block out, sends the
+remaining text to the user, and dispatches the directives. You do not
+need to explicitly call the ``send_message`` tool for normal replies.
+
+When auto-dispatch applies:
+- ``user_message`` and ``react_received`` triggers on a registered
+  chat bridge → final text is delivered.
+- ``scheduled_tick`` (heartbeats, cron-fired turns) → final text is
+  NOT auto-delivered. Heartbeats are explicitly silent; if you want
+  to surface something to the operator, use the ``send_message`` tool
+  on the operator alert channel.
+- If you call ``send_message`` explicitly during the turn → the
+  auto-dispatch is suppressed (the explicit call is the canonical
+  delivery; auto-dispatch only kicks in when you didn't call it).
+
+When to call ``send_message`` explicitly anyway:
+- Cross-channel sends (different ``channel_id`` than the inbound).
+- You want fine-grained chunking control (multiple separate Discord
+  messages with different reactions).
+- You want to send something *and then* keep working in the same turn
+  without that subsequent work landing in the user's view.
+
+## ``<actions>`` directives
+
+Inside your reply text (auto-dispatch) or inside the ``send_message``
+text body, you may embed an ``<actions>`` block to bundle reactions
+and file sends into the same delivery. The runtime strips the block
+from the user-visible text, then dispatches each directive in order.
 
 ```
 Got it, here's the chart you asked for.
@@ -73,17 +96,19 @@ Got it, here's the chart you asked for.
 ```
 
 - ``<react emoji="..." [message="<id>"] />`` — react with an emoji.
-  Defaults to the message just sent in this call (or the most recent
-  assistant message when this call is directives-only).
+  Defaults to the message just delivered in this turn (or the most
+  recent assistant message when the reply is directives-only).
 - ``<send-file path="..." [caption="..."] [kind="image|file|audio"]
   [cleanup="true"] />`` — attach a file. ``path`` resolves under
   ``MIMIR_HOME/attachments/outbound/``; absolute paths must already be
   inside that dir. ``..`` and symlink escapes are rejected.
   ``cleanup="true"`` deletes the file after a successful send.
 
-Per-directive failures are reported on the tool reply but don't fail
-the main send. The text outside the ``<actions>`` block is the
-user-visible message; the block itself is stripped before delivery."""
+Per-directive failures show up in the next turn's prompt feedback
+block; the main reply still goes out. Discord wants unicode glyphs
+for reactions (``thumbsup`` shortcode does NOT work — use ``👍`` or
+``thumbsup`` resolves via the alias table); Slack accepts the alias
+form (``thumbsup`` without colons)."""
 
 
 # VSM: algedonic (out) — operator alert channel. When MIMIR_OPERATOR_ALERT_CHANNEL

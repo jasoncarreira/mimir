@@ -273,6 +273,107 @@ class Agent:
         )
         await self._buffer.append(msg)
 
+    # VSM: S1 outbound — auto-dispatch the SDK's final assistant text
+    #                    when the agent didn't call send_message. Without
+    #                    this, the natural-text reply is recorded only to
+    #                    chat_history (lettabot/muninnbot pattern: the
+    #                    final text IS the reply).
+    # loop_id: outbound-auto
+    async def _auto_dispatch_or_record(
+        self, ctx: TurnContext, event: AgentEvent, output: str,
+    ) -> None:
+        """When the agent emits final text without calling send_message
+        explicitly, deliver the text via the channel bridge. Parses
+        ``<actions>`` directives the same way ``send_message`` does so
+        the agent can react / send-file via natural-text directives too.
+
+        Only fires for user-visible inbound triggers (``user_message``,
+        ``react_received``, etc.) on bridge-routable chat channels.
+        Heartbeats and other ``scheduled_tick`` events are explicitly
+        "end silently" — those still go through ``_record_outbound``
+        only. Bench / web-stub bridges that don't actually deliver to
+        a third-party service skip auto-dispatch and just record.
+
+        Always writes to chat_history regardless of dispatch outcome —
+        so Recent activity reflects what the agent said even when
+        delivery failed (the agent self-corrects when it sees a stale
+        conversation that doesn't match what it thought it sent)."""
+        # Heartbeat / cron tick / synth turn → never auto-dispatch.
+        # Heartbeats are explicitly silent; scheduler:* channels would
+        # try to dispatch back through the dispatcher to a synthetic
+        # channel that has no bridge, generating noise.
+        auto_eligible = event.trigger in ("user_message", "react_received")
+
+        dispatched = False
+        clean_text = output
+        if auto_eligible and self._channels is not None:
+            bridge = self._channels.find(event.channel_id)
+            # Skip auto-dispatch on benchmark + bench-bridge channels —
+            # the bench harness reads the SDK's final text directly.
+            if bridge is not None and bridge.name not in ("bench",):
+                from .bridges._directives import parse_directives
+                from .channeltools import _dispatch_action_directives
+
+                parsed = parse_directives(output)
+                clean_text = parsed.clean_text or ""
+                outbound_root = (
+                    self._config.home / "attachments" / "outbound"
+                )
+                # Send the cleaned text first so reactions land on the
+                # just-sent message id by default. When clean_text is
+                # empty (the agent emitted an actions-only reply), skip
+                # the main send — directives still fire.
+                send_msg_id: str | None = None
+                if clean_text.strip():
+                    try:
+                        result = await self._channels.send(
+                            event.channel_id, clean_text,
+                        )
+                        if result.sent:
+                            dispatched = True
+                            send_msg_id = result.message_id
+                            ctx.last_assistant_message_id = send_msg_id
+                        else:
+                            log.warning(
+                                "auto-dispatch: bridge %r returned sent=False: %s",
+                                bridge.name, result.error,
+                            )
+                            await log_event(
+                                "auto_dispatch_failed",
+                                channel_id=event.channel_id,
+                                bridge=bridge.name,
+                                error=result.error,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("auto-dispatch send failed")
+                        await log_event(
+                            "auto_dispatch_failed",
+                            channel_id=event.channel_id,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                if parsed.directives and (dispatched or not clean_text.strip()):
+                    try:
+                        await _dispatch_action_directives(
+                            self._channels,
+                            fallback_channel_id=event.channel_id,
+                            directives=parsed.directives,
+                            default_message_id=send_msg_id
+                            or ctx.last_assistant_message_id,
+                            outbound_root=outbound_root,
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception("auto-dispatch directives failed")
+
+        # Always record the cleaned text to chat_history so Recent
+        # activity reflects what was sent (or what would have been
+        # sent on dispatch failure). Empty cleaned text — directive-
+        # only response — still gets a placeholder so the turn
+        # registers in history.
+        record_text = clean_text if clean_text.strip() else output
+        await self._record_outbound(
+            event.channel_id, record_text, source=event.source,
+        )
+
     # ---- SAGA hooks ----------------------------------------------------
 
     def _assemble_usage_block(self) -> str | None:
@@ -864,9 +965,7 @@ class Agent:
             and event.trigger != "saga_session_end"
             and ctx.send_message_attempts == 0
         ):
-            await self._record_outbound(
-                event.channel_id, output, source=event.source
-            )
+            await self._auto_dispatch_or_record(ctx, event, output)
 
         # 9. Post-message SAGA hook.
         if not error:
