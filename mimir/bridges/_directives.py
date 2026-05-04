@@ -39,33 +39,33 @@ from typing import Literal
 
 @dataclass(frozen=True)
 class ReactDirective:
+    """React with an emoji on the channel the parent ``send_message``
+    targets. ``message_id`` defaults to the message just sent in the
+    same call (or, for directives-only sends, the most recent
+    assistant message in the channel)."""
     type: Literal["react"] = field(default="react", init=False)
     emoji: str = ""
     message_id: str | None = None
-    channel_id: str | None = None  # For cross-channel reacts (rare).
 
 
 @dataclass(frozen=True)
 class SendFileDirective:
+    """Attach a file to the parent ``send_message`` channel. ``path``
+    resolves under ``MIMIR_HOME/attachments/outbound/`` (escapes via
+    ``..`` or symlink are rejected)."""
     type: Literal["send-file"] = field(default="send-file", init=False)
     path: str = ""
     caption: str | None = None
     kind: Literal["image", "file", "audio"] | None = None
     cleanup: bool = False  # If True, delete the file after successful send.
-    channel_id: str | None = None  # Cross-channel send.
 
 
-@dataclass(frozen=True)
-class SendMessageDirective:
-    """Cross-channel text send. Used to talk back through a different
-    channel than the one that triggered the turn (e.g., respond on
-    Slack to a message that came in on Discord)."""
-    type: Literal["send-message"] = field(default="send-message", init=False)
-    text: str = ""
-    channel_id: str = ""
+# Cross-channel sends use a separate ``send_message`` tool call with an
+# explicit ``channel_id`` argument, not an in-actions directive. There's
+# no ``<send-message>`` directive — keeping cross-channel routing on the
+# tool surface keeps the behavior obvious and per-call rate-limited.
 
-
-Directive = ReactDirective | SendFileDirective | SendMessageDirective
+Directive = ReactDirective | SendFileDirective
 
 
 @dataclass(frozen=True)
@@ -87,16 +87,10 @@ _ACTIONS_BLOCK_RE = re.compile(
     r"<actions\b[^>]*>([\s\S]*?)</actions>", re.IGNORECASE,
 )
 
-# Matches one of:
-#   1. self-closing <react ... /> or <send-file ... />
-#   2. content-bearing <send-message ...>...</send-message>
-# The whitespace around `/>` is tolerated to be lenient on LLM output.
+# Matches a self-closing <react ... /> or <send-file ... />. The
+# whitespace around `/>` is tolerated to be lenient on LLM output.
 _DIRECTIVE_TOKEN_RE = re.compile(
-    r"""
-    <(react|send-file)\b([^>]*?)/\s*>
-    |
-    <send-message\b([^>]*?)>([\s\S]*?)</send-message>
-    """,
+    r"""<(react|send-file)\b([^>]*?)/\s*>""",
     re.VERBOSE | re.IGNORECASE,
 )
 
@@ -117,17 +111,8 @@ def _parse_attrs(attr_str: str) -> dict[str, str]:
 def _parse_block_children(block: str) -> list[Directive]:
     out: list[Directive] = []
     for m in _DIRECTIVE_TOKEN_RE.finditer(block):
-        sc_tag, sc_attrs, sm_attrs, sm_text = m.group(1), m.group(2), m.group(3), m.group(4)
-        if sm_text is not None:
-            attrs = _parse_attrs(sm_attrs or "")
-            text = sm_text.strip()
-            channel = attrs.get("channel") or attrs.get("channel_id")
-            if text and channel:
-                out.append(SendMessageDirective(text=text, channel_id=channel))
-            continue
-
-        tag = (sc_tag or "").lower()
-        attrs = _parse_attrs(sc_attrs or "")
+        tag = (m.group(1) or "").lower()
+        attrs = _parse_attrs(m.group(2) or "")
         if tag == "react":
             emoji = attrs.get("emoji", "").strip()
             if not emoji:
@@ -135,7 +120,6 @@ def _parse_block_children(block: str) -> list[Directive]:
             out.append(ReactDirective(
                 emoji=emoji,
                 message_id=attrs.get("message") or attrs.get("message_id"),
-                channel_id=attrs.get("channel") or attrs.get("channel_id"),
             ))
         elif tag == "send-file":
             path = (attrs.get("path") or attrs.get("file") or "").strip()
@@ -150,7 +134,6 @@ def _parse_block_children(block: str) -> list[Directive]:
             cleanup = (attrs.get("cleanup") or "").lower() in ("true", "1", "yes")
             out.append(SendFileDirective(
                 path=path, caption=caption, kind=kind, cleanup=cleanup,
-                channel_id=attrs.get("channel") or attrs.get("channel_id"),
             ))
     return out
 
@@ -224,7 +207,6 @@ def strip_actions_blocks(text: str) -> str:
 __all__ = [
     "ReactDirective",
     "SendFileDirective",
-    "SendMessageDirective",
     "Directive",
     "ParseResult",
     "parse_directives",

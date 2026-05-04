@@ -5,7 +5,6 @@ from __future__ import annotations
 from mimir.bridges._directives import (
     ReactDirective,
     SendFileDirective,
-    SendMessageDirective,
     has_incomplete_actions_tag,
     has_unclosed_actions_block,
     parse_directives,
@@ -29,7 +28,6 @@ def test_simple_react_directive():
     assert isinstance(d, ReactDirective)
     assert d.emoji == "thumbsup"
     assert d.message_id is None
-    assert d.channel_id is None
 
 
 def test_react_with_message_id():
@@ -42,14 +40,18 @@ def test_react_with_message_id():
     assert d.message_id == "123456789"
 
 
-def test_react_with_channel_and_message():
+def test_react_channel_attribute_is_ignored():
+    """``channel`` on directives is no longer supported — the parent
+    send_message's channel is the only target. The attribute is
+    silently ignored on parse (no error, no special handling)."""
     result = parse_directives(
         '<actions><react emoji="fire" channel="987" message="123" /></actions>'
     )
     d = result.directives[0]
     assert isinstance(d, ReactDirective)
-    assert d.channel_id == "987"
     assert d.message_id == "123"
+    # ReactDirective no longer has a channel_id field.
+    assert not hasattr(d, "channel_id")
 
 
 def test_send_file_directive():
@@ -75,14 +77,15 @@ def test_send_file_with_kind_and_cleanup():
     assert d.cleanup is True
 
 
-def test_send_message_cross_channel():
+def test_send_message_directive_no_longer_supported():
+    """<send-message> was removed; it produces no directives. The text
+    inside the tag stays in clean_text (the tag itself isn't recognized,
+    so it's left as-is — the agent should just call send_message
+    directly with an explicit channel_id for cross-channel sends)."""
     result = parse_directives(
         '<actions><send-message channel="discord-987">heads up</send-message></actions>'
     )
-    d = result.directives[0]
-    assert isinstance(d, SendMessageDirective)
-    assert d.text == "heads up"
-    assert d.channel_id == "discord-987"
+    assert result.directives == ()
 
 
 def test_multiple_directives_preserve_order():
@@ -137,11 +140,16 @@ def test_send_file_accepts_file_attr_alias():
     assert result.directives[0].path == "x.txt"  # type: ignore[attr-defined]
 
 
-def test_send_message_without_channel_is_skipped():
+def test_send_file_channel_attribute_is_ignored():
+    """``channel`` on send-file is no longer supported — directives
+    target the parent send_message's channel only."""
     result = parse_directives(
-        '<actions><send-message>orphan text</send-message></actions>'
+        '<actions><send-file path="x.txt" channel="other-1" /></actions>'
     )
-    assert result.directives == ()
+    d = result.directives[0]
+    assert isinstance(d, SendFileDirective)
+    assert d.path == "x.txt"
+    assert not hasattr(d, "channel_id")
 
 
 def test_unknown_tags_inside_block_are_ignored():

@@ -25,7 +25,6 @@ from .bridges._attachments import AttachmentPathError, resolve_outbound_path
 from .bridges._directives import (
     ReactDirective,
     SendFileDirective,
-    SendMessageDirective,
     parse_directives,
 )
 from .channel_registry import ChannelRegistry, UnknownChannelError
@@ -87,10 +86,13 @@ async def _dispatch_action_directives(
     on the summary as ``ok=False`` with a reason — the agent sees the
     aggregated outcome on the send_message tool reply.
     """
+    # Directives target the parent send_message's channel — no
+    # cross-channel routing inside <actions>. Cross-channel sends use
+    # a separate send_message tool call with an explicit channel_id.
+    target_channel = fallback_channel_id.strip()
     results: list[dict[str, Any]] = []
     for d in directives:
         if isinstance(d, ReactDirective):
-            target_channel = (d.channel_id or fallback_channel_id).strip()
             target_msg = (d.message_id or default_message_id or "").strip()
             if not target_msg:
                 results.append({
@@ -117,11 +119,10 @@ async def _dispatch_action_directives(
                 continue
             results.append({
                 "kind": "react", "ok": bool(ok), "emoji": d.emoji,
-                "channel_id": target_channel, "message_id": target_msg,
+                "message_id": target_msg,
             })
 
         elif isinstance(d, SendFileDirective):
-            target_channel = (d.channel_id or fallback_channel_id).strip()
             if outbound_root is None:
                 results.append({
                     "kind": "send-file", "ok": False,
@@ -165,37 +166,7 @@ async def _dispatch_action_directives(
                     )
             results.append({
                 "kind": "send-file", "ok": send_res.sent,
-                "path": str(resolved), "channel_id": target_channel,
-                "error": send_res.error,
-            })
-
-        elif isinstance(d, SendMessageDirective):
-            target_channel = d.channel_id.strip()
-            if not target_channel:
-                results.append({
-                    "kind": "send-message", "ok": False,
-                    "error": "missing channel attribute",
-                })
-                continue
-            try:
-                send_res = await registry.send(target_channel, d.text)
-            except UnknownChannelError as exc:
-                results.append({
-                    "kind": "send-message", "ok": False, "error": str(exc),
-                    "channel_id": target_channel,
-                })
-                continue
-            except Exception as exc:  # noqa: BLE001
-                log.exception("directive send-message failed")
-                results.append({
-                    "kind": "send-message", "ok": False,
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "channel_id": target_channel,
-                })
-                continue
-            results.append({
-                "kind": "send-message", "ok": send_res.sent,
-                "channel_id": target_channel,
+                "path": str(resolved),
                 "error": send_res.error,
             })
 
