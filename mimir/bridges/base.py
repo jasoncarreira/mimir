@@ -70,3 +70,24 @@ class Bridge(ABC):
         the no-op. Failures are swallowed silently; this is a UX nicety,
         not load-bearing — never raises into the caller."""
         return None
+
+    async def fetch_history(
+        self,
+        channel_id: str,
+        *,
+        limit: int = 20,
+        before: str | None = None,
+    ) -> list:
+        """Fetch up to ``limit`` recent messages from the channel,
+        oldest-first. ``before`` is a message id from a prior fetch
+        — pass it back to paginate further into the past.
+
+        Returns a list of ``ChannelMessage``. Default is the empty
+        list (bridges without a history API — bench, bluesky stubs).
+        Discord and Slack override.
+
+        Hard caps and rate limits are enforced by the bridge
+        implementation, not the caller. Failures (network, missing
+        scope) propagate as exceptions to the caller.
+        """
+        return []

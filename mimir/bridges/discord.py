@@ -34,6 +34,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
     ) from _exc
 
 from ..models import AgentEvent
+from ._history import ChannelMessage
 from .base import Bridge, SendResult
 
 log = logging.getLogger(__name__)
@@ -349,6 +350,78 @@ class DiscordBridge(Bridge):
                 await trigger()
         except Exception:  # noqa: BLE001
             pass
+
+    async def fetch_history(
+        self,
+        channel_id: str,
+        *,
+        limit: int = 20,
+        before: str | None = None,
+    ) -> list[ChannelMessage]:
+        """Fetch recent messages from a Discord channel via discord-py's
+        ``channel.history`` API. Returns oldest-first so the agent reads
+        in conversational order. Discord caps at 100 per call; we cap
+        at the same regardless of caller-requested ``limit``.
+        """
+        if self._client is None or self._client.is_closed():
+            return []
+        cid_int = _channel_id_to_int(channel_id)
+        if cid_int is None:
+            return []
+        # Clamp to Discord's per-call ceiling. Caller can paginate via
+        # ``before`` if they want more than 100.
+        limit = max(1, min(int(limit), 100))
+
+        channel = self._client.get_channel(cid_int)
+        if channel is None:
+            channel = await self._client.fetch_channel(cid_int)
+        history_fn = getattr(channel, "history", None)
+        if not callable(history_fn):
+            return []
+
+        kwargs: dict[str, Any] = {"limit": limit}
+        if before:
+            try:
+                kwargs["before"] = discord.Object(id=int(before))
+            except ValueError:
+                # Bad cursor — ignore and fetch most-recent.
+                pass
+
+        out: list[ChannelMessage] = []
+        # discord.py's history returns an async iterator newest-first;
+        # we collect then reverse for oldest-first output.
+        async for msg in history_fn(**kwargs):
+            author = getattr(msg, "author", None)
+            author_id = str(getattr(author, "id", "") or "") or None
+            author_display = (
+                getattr(author, "display_name", None)
+                or getattr(author, "global_name", None)
+                or (str(author) if author is not None else None)
+            )
+            attachments = getattr(msg, "attachments", None) or []
+            attachment_urls = tuple(
+                str(getattr(a, "url", "")) for a in attachments
+                if getattr(a, "url", None)
+            )
+            created = getattr(msg, "created_at", None)
+            if created is not None:
+                if created.tzinfo is None:
+                    from datetime import timezone as _tz
+                    created = created.replace(tzinfo=_tz.utc)
+                ts = created.isoformat()
+            else:
+                ts = ""
+            out.append(ChannelMessage(
+                id=str(getattr(msg, "id", "") or ""),
+                ts=ts,
+                author_id=author_id,
+                author_display=author_display,
+                is_bot=bool(getattr(author, "bot", False)),
+                content=str(getattr(msg, "content", "") or ""),
+                attachment_urls=attachment_urls,
+            ))
+        out.reverse()
+        return out
 
     async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:
         if self._client is None or self._client.is_closed():

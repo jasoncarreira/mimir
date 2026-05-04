@@ -71,6 +71,18 @@ class ChannelRegistry:
         bridge = self.find_or_raise(channel_id)
         return await bridge.react(channel_id, message_id, emoji)
 
+    async def fetch_history(
+        self,
+        channel_id: str,
+        *,
+        limit: int = 20,
+        before: str | None = None,
+    ) -> list:
+        bridge = self.find_or_raise(channel_id)
+        return await bridge.fetch_history(
+            channel_id, limit=limit, before=before,
+        )
+
     async def connect_all(self) -> None:
         for bridge in self._bridges:
             try:
