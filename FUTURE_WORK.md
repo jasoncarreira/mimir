@@ -975,3 +975,16 @@ Also shipped (not previously tracked here, captured for posterity):
 - Indexer exclusion list (V0.4 §7) — see §6.1 above.
 - API key auth on POST /event (post-v0.4 review) — `MIMIR_API_KEY`; without it the server's 0.0.0.0 bind exposed an arbitrary-trigger injection surface.
 - JSONL log caps + tail-streaming — `MIMIR_MAX_EVENTS` / `MIMIR_MAX_TURNS` default 1000, hard ceiling 10000, hysteresis trim, tail-streamed reads via `mimir/_jsonl_tail.py`.
+
+---
+
+## Filed specs (separate documents)
+
+- **[CLAUDE_SDK_CLIENT_MIGRATION.md](./CLAUDE_SDK_CLIENT_MIGRATION.md)** —
+  staged plan to replace `claude_agent_sdk.query()` with the long-lived
+  `ClaudeSDKClient` in the agent loop. Unlocks `get_context_usage()` (Max
+  plan window utilization), `interrupt()`, `set_permission_mode()`,
+  `set_model()`, and lets us retire the cron-based quota poller. Filed
+  2026-05-04 alongside the cron poller in `mimir/quota_poller.py` —
+  the cron is the ship-this-week fix; the migration is the long-term
+  shape. ~one focused day of work across five stages.
