@@ -80,7 +80,7 @@ def _notification(task_id: str, status: str, summary: str, output_file: str) -> 
 async def test_task_notification_pushed_to_inbox(tmp_path: Path):
     agent, inbox = _build_agent(tmp_path)
 
-    async def fake_query(*, prompt, options, transport=None):
+    async def fake_query(*, prompt, options, session_id="default", transport=None):
         yield _started("t1", "research X")
         yield _notification("t1", "completed", "found Y", "/tmp/out.md")
         yield AssistantMessage(content=[TextBlock(text="kicked off")], model="claude")
@@ -120,7 +120,7 @@ async def test_inbox_drains_into_next_turn_prompt(tmp_path: Path):
 
     captured: dict = {}
 
-    async def capturing_query(*, prompt, options, transport=None):
+    async def capturing_query(*, prompt, options, session_id="default", transport=None):
         captured["prompt"] = prompt
         yield AssistantMessage(content=[TextBlock(text="ok")], model="claude")
 
@@ -140,7 +140,7 @@ async def test_inbox_drains_into_next_turn_prompt(tmp_path: Path):
 async def test_failed_subagent_still_pushed(tmp_path: Path):
     agent, inbox = _build_agent(tmp_path)
 
-    async def fake_query(*, prompt, options, transport=None):
+    async def fake_query(*, prompt, options, session_id="default", transport=None):
         yield _started("t1", "explore")
         yield _notification("t1", "failed", "kaboom", "/tmp/err.md")
         yield AssistantMessage(content=[TextBlock(text="noted")], model="claude")
