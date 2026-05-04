@@ -29,6 +29,7 @@ class IndexEntry:
     rel_path: str
     description: str
     is_auto: bool
+    is_core: bool = False
 
 
 def _walk_tree(root: Path, exclude_names: set[str]) -> list[Path]:
@@ -56,21 +57,43 @@ def _build_entries(root: Path, files: list[Path]) -> list[IndexEntry]:
             continue
         desc, is_auto = describe_file(text)
         rel = path.relative_to(root).as_posix()
-        entries.append(IndexEntry(rel_path=rel, description=desc, is_auto=is_auto))
+        is_core = rel.startswith("core/")
+        entries.append(IndexEntry(
+            rel_path=rel, description=desc, is_auto=is_auto, is_core=is_core,
+        ))
     return entries
 
 
 def render_memory_index(entries: list[IndexEntry]) -> str:
-    """Render the memory/INDEX.md body."""
+    """Render the memory/INDEX.md body.
+
+    Core blocks are listed with a ``[core]`` tag. They're already
+    inlined in every system prompt under ``## Core memory``, but the
+    index needs to know they exist so the agent can edit them when
+    it wants to (the index is the agent's "where do I edit X?" map)."""
     header = (
         "# Memory Index\n\n"
-        "Files under memory/ that aren't in core/. Read directly with "
-        "`read_file` if you know the path; use `file_search` to find by topic.\n\n"
+        "All files under memory/. Core blocks are tagged ``[core]`` — "
+        "they're inlined in every system prompt under ``## Core memory`` "
+        "but you can ``read_file`` and edit them like any other memory "
+        "file. Read directly with ``read_file`` if you know the path; "
+        "use ``file_search`` to find non-core files by topic (file_search "
+        "skips core because it's already in the prompt).\n\n"
     )
     if not entries:
         return header + "(none)\n"
+    # Core first (numeric prefix order), then non-core. Within each
+    # group preserve the lexicographic order from the walker.
+    core_entries = [e for e in entries if e.is_core]
+    other_entries = [e for e in entries if not e.is_core]
     lines: list[str] = []
-    for e in entries:
+    for e in core_entries:
+        prefix = "[auto] " if e.is_auto else ""
+        body = e.description or "(no description)"
+        lines.append(f"- {e.rel_path} `[core]` — {prefix}{body}")
+    if core_entries and other_entries:
+        lines.append("")
+    for e in other_entries:
         prefix = "[auto] " if e.is_auto else ""
         body = e.description or "(no description)"
         lines.append(f"- {e.rel_path} — {prefix}{body}")
@@ -96,7 +119,10 @@ def render_state_index(entries: list[IndexEntry]) -> str:
 
 def build_memory_index(home: Path) -> str:
     memory_root = home / "memory"
-    files = _walk_tree(memory_root, exclude_names={"core", "INDEX.md"})
+    # Core files ARE included in the memory index now (so the agent
+    # knows where to edit them). They're still skipped by ``file_search``
+    # because they're already inlined in the system prompt.
+    files = _walk_tree(memory_root, exclude_names={"INDEX.md"})
     entries = _build_entries(memory_root, files)
     return render_memory_index(entries)
 
