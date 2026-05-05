@@ -386,7 +386,11 @@ def render_recent_activity(
         content = m.content or ""
         if max_chars > 0 and len(content) > max_chars:
             content = content[:max_chars] + "…[truncated]"
-        lines.append(f"[{ts_short} {m.channel_id}] {author}: {content}")
+        # Surface msg_id when present so the agent can target older
+        # messages with ``<react message="<id>" />``. Skipped when the
+        # record has no id (legacy entries, system_notes).
+        id_part = f" id={m.msg_id}" if m.msg_id else ""
+        lines.append(f"[{ts_short} {m.channel_id}{id_part}] {author}: {content}")
     return "\n".join(lines)
 
 
