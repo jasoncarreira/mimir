@@ -664,6 +664,27 @@ class Agent:
             config.home, _reindex if indexer is not None else None
         )
 
+        # Bounded set for fire-and-forget background tasks (event-log
+        # writes, etc.). CPython warns that the result of asyncio.
+        # create_task() may be GC'd before it has run; without retaining
+        # a reference, short events.jsonl writes can vanish under load
+        # before the task body executes. Adding to the set + a discard
+        # callback is the standard idiom from PEP 458 / asyncio docs.
+        self._bg_tasks: set[asyncio.Task] = set()
+
+    def _spawn_bg_task(self, coro) -> asyncio.Task:
+        """Schedule a fire-and-forget coroutine while keeping a reference.
+
+        The set membership prevents the task from being garbage-collected
+        mid-run; ``add_done_callback`` removes it once the coroutine
+        finishes (success or error) so the set bound stays at the
+        in-flight count.
+        """
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
     def _build_options(self, system_prompt: str) -> ClaudeAgentOptions:
         effort = self._config.effort
         if effort not in ("low", "medium", "high", "max"):
@@ -1016,7 +1037,7 @@ class Agent:
                 event_kind,
                 cooldown_minutes=self._config.cost_alert_cooldown_minutes,
             ):
-                asyncio.create_task(
+                self._spawn_bg_task(
                     log_event(
                         event_kind,
                         reason=alert.reason,
@@ -1051,7 +1072,7 @@ class Agent:
                 cooldown_minutes=self._config.cost_alert_cooldown_minutes,
             ):
                 worst_key, worst_snap, worst_proj = off_pace[0]
-                asyncio.create_task(
+                self._spawn_bg_task(
                     log_event(
                         "rate_limit_off_pace",
                         rate_limit_type=worst_key,
@@ -1386,7 +1407,7 @@ class Agent:
         idle_minutes = self._config.saga_session_idle_minutes
         turns_window = _filter_session_turns(self._config.turns_log, saga_session_id)
         if not turns_window:
-            asyncio.create_task(
+            self._spawn_bg_task(
                 log_event(
                     "saga_synthesis_empty_window",
                     saga_session_id=saga_session_id,
