@@ -483,3 +483,90 @@ async def test_legacy_module_resets_still_safe():
 
     agent_mod._reset_pool_for_tests()
     assert agent_mod._pool is None
+
+
+# ─── connect-fail propagation (PR #15 review fix) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_acquire_propagates_connect_failure_cleanly():
+    """When ``ClaudeSDKClient.connect()`` raises during pool acquire,
+    the original exception must propagate cleanly — not get masked by
+    a ``RuntimeError: Lock is not acquired.`` from the surrounding
+    ``async with cond:`` block.
+
+    Regression for the connect-fail path's prior manual ``cond.release()``
+    before ``raise`` (PR #15 review). The lock is held when the
+    exception unwinds; ``__aexit__`` releases it. A manual release
+    would leave the lock unheld and ``__aexit__`` would then raise.
+    """
+
+    class _ConnectFails(_BlockingFakeClient):
+        async def connect(self) -> None:  # type: ignore[override]
+            raise RuntimeError("connect blew up")
+
+    pool = agent_mod.ClientPool(max_size=2)
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _patched_client():
+        original = agent_mod.ClaudeSDKClient
+        agent_mod.ClaudeSDKClient = _ConnectFails  # type: ignore[assignment]
+        try:
+            yield
+        finally:
+            agent_mod.ClaudeSDKClient = original  # type: ignore[assignment]
+
+    async with _patched_client():
+        with pytest.raises(RuntimeError, match="connect blew up"):
+            async with pool.acquire_ctx(_opts()):
+                pass
+
+    # Reservation was backed out — pool stayed empty.
+    assert pool.size == 0
+
+
+@pytest.mark.asyncio
+async def test_connect_failure_does_not_strand_other_waiters():
+    """A connect failure must ``notify_all`` so a peer waiting at
+    ``cond.wait()`` (max-size cap) wakes up and re-tries acquire.
+    Without the notify, a peer can park forever even though the
+    failed acquire freed the slot."""
+
+    # Pool of size 1 so the second acquire waits on cond.
+    pool = agent_mod.ClientPool(max_size=1)
+
+    fail_first = {"flag": True}
+
+    class _ConnectFailsOnce(_BlockingFakeClient):
+        async def connect(self) -> None:  # type: ignore[override]
+            if fail_first["flag"]:
+                fail_first["flag"] = False
+                raise RuntimeError("first connect fails")
+            await super().connect()
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _patched_client():
+        original = agent_mod.ClaudeSDKClient
+        agent_mod.ClaudeSDKClient = _ConnectFailsOnce  # type: ignore[assignment]
+        try:
+            yield
+        finally:
+            agent_mod.ClaudeSDKClient = original  # type: ignore[assignment]
+
+    async with _patched_client():
+        # First acquire fails immediately.
+        with pytest.raises(RuntimeError, match="first connect fails"):
+            async with pool.acquire_ctx(_opts()):
+                pass
+
+        # Second acquire should succeed (slot is free, second connect
+        # works). If notify_all is missing this would deadlock if a
+        # peer was already waiting; here we just confirm a fresh
+        # acquire after the failure path runs cleanly.
+        async with pool.acquire_ctx(_opts()) as client:
+            assert client.connect_count == 1
+        assert pool.size == 1

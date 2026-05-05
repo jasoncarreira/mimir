@@ -331,11 +331,19 @@ class ClientPool:
                         await client.connect()
                     except BaseException:
                         # Connect failed — back out the reservation,
-                        # then propagate.
+                        # then propagate. We re-acquire the lock so the
+                        # bookkeeping mutation is safe and notify any
+                        # peer waiting at ``cond.wait()`` below that the
+                        # in-flight count went down. Do NOT manually
+                        # release here: the surrounding ``async with
+                        # cond:`` block's ``__aexit__`` releases when
+                        # the exception unwinds. A manual release would
+                        # leave the lock unheld and ``__aexit__`` would
+                        # then raise ``RuntimeError: Lock is not
+                        # acquired`` — masking the real connect failure.
                         await cond.acquire()
                         self._in_flight.discard(entry)
                         cond.notify_all()
-                        cond.release()
                         raise
                     await cond.acquire()
                     # If a fingerprint flip raced our connect, the
