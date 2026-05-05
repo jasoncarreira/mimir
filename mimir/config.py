@@ -307,7 +307,7 @@ class Config:
             send_loop_soft_limit=_env_int("MIMIR_SEND_LOOP_SOFT_LIMIT", 5),
             send_loop_hard_limit=_env_int("MIMIR_SEND_LOOP_HARD_LIMIT", 10),
             send_loop_similarity=_env_float("MIMIR_SEND_LOOP_SIMILARITY", 0.9),
-            tool_call_budget=_env_int("MIMIR_TOOL_CALL_BUDGET", 30),
+            tool_call_budget=_env_int("MIMIR_TOOL_CALL_BUDGET", 120),
             file_op_extra_roots=[
                 Path(p)
                 for p in (_env("MIMIR_FILE_OP_ROOTS", "") or "").split(":")

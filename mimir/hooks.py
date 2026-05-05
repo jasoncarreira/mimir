@@ -135,10 +135,22 @@ def make_pre_tool_use_hook(
         # so it has an exit hatch from the budget. The deny message points
         # the agent at send_message; if send_message itself were denied, the
         # agent would be wedged.
-        from ._context import get_current_turn
+        from ._context import get_current_turn, get_turn_by_session_id
         from .event_logger import log_event
 
-        ctx = get_current_turn()
+        # Hook callbacks fire on the SDK's control-protocol task, which
+        # was forked at first client.connect() and captured contextvar
+        # state from that moment. Subsequent run_turn set_current_turn
+        # calls don't propagate into this task, so contextvar lookup
+        # returns stale ctx (or None on first connect). Look up by
+        # session_id instead — the SDK passes the per-turn session_id
+        # (== ctx.turn_id since stage 2 of the migration) on every hook
+        # call, and _active_turns is keyed by turn_id. The contextvar
+        # fallback handles same-task callers and tests that don't pass
+        # session_id in the hook input fixture.
+        ctx = get_turn_by_session_id(input_data.get("session_id"))
+        if ctx is None:
+            ctx = get_current_turn()
         if (
             ctx is not None
             and ctx.tool_call_budget > 0

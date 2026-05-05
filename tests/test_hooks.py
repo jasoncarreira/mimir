@@ -372,6 +372,89 @@ def _budget_ctx(budget: int = 5) -> TurnContext:
 
 
 @_pytest.mark.asyncio
+async def test_pre_hook_budget_lookup_by_session_id(tmp_path: Path):
+    """Stage-1+ migration regression: hook callbacks fire on a task
+    that the SDK forked at first client.connect(), so contextvar
+    inheritance is broken — every turn after the first sees the
+    fork-time ctx (None or the first turn's), and budget counter
+    accumulates instead of resetting. The fix is session_id-based
+    lookup; this test pins it.
+
+    Simulate the broken-contextvar scenario by NOT setting the
+    contextvar — only registering the ctx via set_current_turn (which
+    populates _active_turns) and then immediately resetting it. The
+    hook receives session_id in input_data, looks up _active_turns,
+    finds the live ctx, and increments its (per-turn) counter."""
+    from mimir._context import _active_turns
+
+    hook = make_pre_tool_use_hook(tmp_path)
+    ctx = _budget_ctx(budget=10)
+    # Manually register without setting contextvar — mirrors what the
+    # real run_turn does, viewed from the hook task's perspective
+    # (where contextvar is not visible).
+    _active_turns[ctx.turn_id] = ctx
+    try:
+        for _i in range(3):
+            out = await hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Grep",
+                    "tool_input": {"pattern": "x"},
+                    "tool_use_id": "tu",
+                    "session_id": ctx.turn_id,
+                },
+                "tu",
+                _ctx(),
+            )
+            assert out == {}
+        assert ctx.tool_call_count == 3
+    finally:
+        _active_turns.pop(ctx.turn_id, None)
+
+
+@_pytest.mark.asyncio
+async def test_pre_hook_budget_resets_per_turn_via_session_id(tmp_path: Path):
+    """Two consecutive turns must each get their own budget counter.
+    Pre-fix bug: hook saw turn 1's ctx for turn 2's calls and
+    accumulated (turn 2 saw 31/30 on its first call). Post-fix:
+    session_id lookup returns turn N's ctx for turn N's hook calls.
+
+    Both turns burn 5 calls; both end with their own ctx at count=5,
+    not count=10."""
+    from mimir._context import _active_turns
+
+    hook = make_pre_tool_use_hook(tmp_path)
+    ctx_a = TurnContext(
+        turn_id="turn-a", session_id="c-1", trigger="user_message",
+        channel_id="c-1", started_at=0.0, tool_call_budget=10,
+    )
+    ctx_b = TurnContext(
+        turn_id="turn-b", session_id="c-1", trigger="user_message",
+        channel_id="c-1", started_at=0.0, tool_call_budget=10,
+    )
+    for ctx in (ctx_a, ctx_b):
+        _active_turns[ctx.turn_id] = ctx
+        try:
+            for _i in range(5):
+                await hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Grep",
+                        "tool_input": {"pattern": "x"},
+                        "tool_use_id": "tu",
+                        "session_id": ctx.turn_id,
+                    },
+                    "tu",
+                    _ctx(),
+                )
+        finally:
+            _active_turns.pop(ctx.turn_id, None)
+    # Each ctx counted only its own 5 calls — no cross-turn bleed.
+    assert ctx_a.tool_call_count == 5
+    assert ctx_b.tool_call_count == 5
+
+
+@_pytest.mark.asyncio
 async def test_pre_hook_budget_passes_under_threshold(tmp_path: Path):
     hook = make_pre_tool_use_hook(tmp_path)
     ctx = _budget_ctx(budget=10)
