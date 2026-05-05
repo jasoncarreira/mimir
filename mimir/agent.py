@@ -394,6 +394,7 @@ class Agent:
             channel_registry=channel_registry,
             message_buffer=message_buffer,
             session_boundary_log=self._session_boundary_log,
+            turns_log=config.turns_log,
         )
 
         # Hooks layer mimir's path confinement + post-write reindex onto the

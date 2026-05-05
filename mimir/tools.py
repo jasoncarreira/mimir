@@ -9,6 +9,7 @@ The model sees a hybrid surface:
   SDK preset:
     * echo (smoke)
     * file_search, rebuild_index
+    * get_turn (synthesis-turn helper — fetch turn output+events)
     * saga_query, saga_store, saga_feedback, saga_mark_contributions, saga_end_session
     * list_schedules, add_schedule, remove_schedule
 """
@@ -30,6 +31,7 @@ from .session_boundary_log import SessionBoundaryLog
 from .scheduletools import build_schedule_tools, schedule_tool_names
 from .search import Indexer
 from .searchtools import build_search_tools, search_tool_names
+from .turntools import build_turn_tools, turn_tool_names
 
 # Built-in SDK preset tools we enable. Hooks (mimir.hooks) layer mimir-specific
 # concerns on top — path confinement, post-write reindex.
@@ -76,11 +78,14 @@ def build_mcp_server(
     channel_registry: ChannelRegistry | None = None,
     message_buffer: MessageBuffer | None = None,
     session_boundary_log: SessionBoundaryLog | None = None,
+    turns_log: Path | None = None,
 ) -> McpSdkServerConfig:
     """Bundle the in-process MCP tools (everything with no SDK preset)."""
     tools = [echo]
     if indexer is not None:
         tools += build_search_tools(indexer)
+    if turns_log is not None:
+        tools += build_turn_tools(turns_log)
     if saga_client is not None:
         tools += build_saga_tools(saga_client, session_boundary_log=session_boundary_log)
     if scheduler is not None:
@@ -108,12 +113,15 @@ def allowed_tool_names(
     include_saga: bool = True,
     include_scheduler: bool = True,
     include_channels: bool = True,
+    include_turns: bool = True,
 ) -> list[str]:
     """Names referenced in ``ClaudeAgentOptions.allowed_tools`` — both SDK
     preset names and ``mcp__mimir__*`` MCP tool names."""
     names = list(SDK_PRESET_TOOLS) + ["mcp__mimir__echo"]
     if include_search:
         names += search_tool_names()
+    if include_turns:
+        names += turn_tool_names()
     if include_saga:
         names += saga_tool_names()
     if include_scheduler:
