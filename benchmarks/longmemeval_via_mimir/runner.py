@@ -134,15 +134,38 @@ model = "{llm_model}"
 timeout_seconds = 120
 
 [retrieval]
-# v0.5 §2 mimir-prod overrides — same as the default saga.toml.
-enable_contextual_rewrite = true
+# v0.5 §2 mimir-prod overrides — same as the default saga.toml, with
+# one bench-specific tweak: contextual_rewrite is OFF. LongMemEval is
+# single-turn so the rewrite gate never fires (channel chat buffer is
+# empty when the bench POSTs /event), but leaving it on misleads
+# anyone reading the bench config; explicit-off documents the intent.
+enable_contextual_rewrite = false
 two_tier_enabled = true
 enable_missing_ref_pivot = true
 enable_confidence_gating = true
 default_min_confidence_tier = "low"
 
 [retrieval_v2]
+# P12 synonym expansion on the FTS5/keyword pathway. The flag is a
+# no-op without a populated [query_expansion.synonyms] block, so the
+# block below ships with the bench config rather than living in a
+# separate operator-managed file.
 enable_query_expansion = true
+
+[query_expansion.synonyms]
+# Starter synonym dict tuned for LongMemEval's question patterns
+# (profession/home/schedule/relationship/preference/transit). The
+# semantic pathway already handles synonyms via embedding similarity,
+# so this only affects the keyword (FTS5) leg of hybrid retrieval.
+# Add entries here, not in operator-managed configs — the bench is
+# meant to be reproducible from this file alone.
+profession = ["job", "career", "work", "occupation", "employed"]
+home = ["hometown", "residence", "lives", "address", "neighborhood"]
+schedule = ["routine", "calendar", "plan", "appointment", "meeting"]
+family = ["spouse", "wife", "husband", "partner", "children", "kids", "parent", "mom", "dad", "sibling"]
+preference = ["like", "favorite", "prefer", "enjoy", "love"]
+commute = ["drive", "travel", "transit", "ride", "route"]
+school = ["college", "university", "graduated", "degree", "studied", "education"]
 
 [triples]
 enable_extraction = true
