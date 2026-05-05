@@ -153,14 +153,19 @@ def build_system_prompt(
 
     parts.append(conventions or _DEFAULT_CONVENTIONS)
 
-    if skill_block:
-        parts.append("## Skills\n\n" + skill_block.rstrip())
-
+    # ``## Operator config`` is install-stable (changes only when the
+    # operator-alert-channel config flips); ``## Skills`` is per-turn-
+    # variable (the success/total counts and bucket assignment update
+    # whenever a skill is invoked). Render the stable block first so
+    # the prompt-cache prefix extends through it. See chainlink #15.
     if operator_alert_channel:
         parts.append(
             "## Operator config\n\n"
             f"Operator alert channel: {operator_alert_channel}"
         )
+
+    if skill_block:
+        parts.append("## Skills\n\n" + skill_block.rstrip())
 
     return "\n\n".join(parts)
 

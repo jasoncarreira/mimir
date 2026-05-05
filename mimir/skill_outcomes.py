@@ -226,36 +226,65 @@ def order_skills(
     return proven_names, sorted(untried), sorted(risky)
 
 
-def render_skill_block(
+def render_skill_catalog(
+    seeded: list[str],
+    pin: SkillPinConfig,
+) -> str | None:
+    """Render the install-stable `## Skills` section for the system
+    prompt — alphabetical list of every seeded skill name, with
+    ``pin.hide``-listed skills filtered out. Pin order is NOT applied
+    here (pinning is a per-turn ranking concern, not a catalog
+    concern); rendered as a plain alphabetic list so the system prompt
+    stays cacheable across turns.
+
+    Volatile bucket assignment + ``(N/M in window)`` counts live in
+    ``render_skill_telemetry`` (rendered into the per-turn
+    ``## Self-state`` block) — keeping them out of the system prompt
+    means a skill invocation no longer perturbs the prompt-cache prefix.
+
+    Returns None when no skills survive the hide filter (don't print an
+    empty header)."""
+    hidden = set(pin.hide or [])
+    visible = sorted(name for name in seeded if name not in hidden)
+    if not visible:
+        return None
+    return "\n".join(f"- {name}" for name in visible)
+
+
+def render_skill_telemetry(
     seeded: list[str],
     aggregates: dict[str, SkillOutcome],
     pin: SkillPinConfig,
     *,
     now: datetime | None = None,
 ) -> str | None:
-    """Render the `## Skills` section body. Returns None when no
-    skills are seeded at all (don't print an empty header)."""
-    proven, untried, risky = order_skills(seeded, aggregates, pin, now=now)
-    if not (proven or untried or risky):
+    """Render per-turn-variable skill bucket telemetry for the
+    ``## Self-state`` block. Emits Proven (success ≥ 50%) and Risky
+    (success < 50%) buckets with ``(N/M in window)`` counts.
+
+    Untried skills (no completed invocations in window) are *not*
+    enumerated here — the install-stable catalog in the system prompt
+    already lists them, and re-listing them here would just bloat the
+    block with names that have no telemetry to share. The model can
+    infer "any skill in the catalog not mentioned in telemetry has no
+    recent activity."
+
+    Returns None when no skill has any in-window activity (don't print
+    an empty header). The returned body has no leading ``## Self-state``
+    header — caller composes it into a larger block."""
+    proven, _untried, risky = order_skills(seeded, aggregates, pin, now=now)
+    if not (proven or risky):
         return None
 
     lines: list[str] = []
     if proven:
-        lines.append("**Proven** (recent success):")
+        lines.append("- skills proven (recent success):")
         for name in proven:
             agg = aggregates[name]
-            lines.append(f"- {name}  ({agg.success}/{agg.total} in window)")
-    if untried:
-        if lines:
-            lines.append("")
-        lines.append("**Untried** (no recent invocations):")
-        for name in untried:
-            lines.append(f"- {name}")
+            lines.append(f"  - {name} ({agg.success}/{agg.total} in window)")
     if risky:
-        if lines:
-            lines.append("")
-        lines.append("**Risky** ⚠ (recent failures > successes):")
+        lines.append("- skills risky ⚠ (recent failures > successes):")
         for name in risky:
             agg = aggregates[name]
-            lines.append(f"- {name}  ({agg.success}/{agg.total} in window)")
+            lines.append(f"  - {name} ({agg.success}/{agg.total} in window)")
     return "\n".join(lines)
