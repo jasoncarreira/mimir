@@ -303,8 +303,8 @@ async def test_dispatcher_callbacks_fire_on_plan_flush():
     bridge = RecordingBridge()
     seen: list[tuple[str, Any]] = []
 
-    async def on_plan(text: str, result: SendResult, dropped: int) -> None:
-        seen.append(("ok", (text, result.message_id, dropped)))
+    async def on_plan(text, result, directives) -> None:
+        seen.append(("ok", (text, result.message_id, len(directives))))
 
     async def on_fail(text: str, error: str) -> None:
         seen.append(("fail", (text, error)))
@@ -320,28 +320,25 @@ async def test_dispatcher_callbacks_fire_on_plan_flush():
     await disp.observe(_assistant(ToolUseBlock(id="t1", name="Read", input={})))
 
     assert len(seen) == 1
-    kind, (text, msg_id, dropped) = seen[0]
+    kind, (text, msg_id, n_directives) = seen[0]
     assert kind == "ok"
     assert text == "plan"
     assert msg_id == "msg-1"
-    assert dropped == 0
+    assert n_directives == 0
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_strips_actions_from_plan_flush():
-    """Acceptance criterion: <actions> only dispatch on the final
-    flush. If the agent puts an actions block in the plan, the
-    streaming flush must strip it (the user sees clean text), and
-    the dropped count must reach the callback for audit logging.
-
-    Defensive case — actions normally land at the END of replies,
-    after the result text. But we don't trust agent discipline.
-    """
+async def test_dispatcher_strips_actions_from_plan_flush_text():
+    """Plan with inline ``<actions>``: the bridge send carries only
+    the cleaned remainder (no raw markup), and the parsed directives
+    flow through to the dispatched callback so the caller can fire
+    them mid-turn alongside the plan."""
     bridge = RecordingBridge()
-    seen: list[tuple[str, int]] = []
+    seen: list[tuple[str, str | None, tuple]] = []
 
-    async def on_plan(text: str, result: SendResult, dropped: int) -> None:
-        seen.append((text, dropped))
+    async def on_plan(text, result, directives) -> None:
+        msg_id = result.message_id if result is not None else None
+        seen.append((text, msg_id, directives))
 
     disp = StreamingAutoDispatcher(
         channel_id="test-ch",
@@ -362,27 +359,69 @@ async def test_dispatcher_strips_actions_from_plan_flush():
     sent_text = bridge.sends[0].text
     assert "<actions>" not in sent_text
     assert "I'll do X then Y" in sent_text
-    assert seen[0][1] == 1  # one dropped directive
+    # Callback got the parsed directive — caller dispatches mid-turn.
+    assert len(seen) == 1
+    text_seen, msg_id, directives = seen[0]
+    assert msg_id == "msg-1"
+    assert len(directives) == 1
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_skips_directives_only_plan():
-    """If the plan turns out to be only an actions block (no real
-    text), suppress the flush entirely — there's nothing user-visible
-    to deliver. Wait for the result flush to handle the actions."""
+async def test_dispatcher_directives_only_plan_dispatches_without_send():
+    """A plan that's *only* an actions block (e.g. an inline ack-react
+    on the inbound user message): no bridge send (nothing user-visible
+    to deliver), but the callback still fires so the directive gets
+    dispatched. Previously these directives were silently dropped."""
     bridge = RecordingBridge()
+    seen: list[tuple[str, object, tuple]] = []
+
+    async def on_plan(text, result, directives) -> None:
+        seen.append((text, result, directives))
+
     disp = StreamingAutoDispatcher(
-        channel_id="test-ch", bridge=bridge, eligible=True,
+        channel_id="test-ch",
+        bridge=bridge,
+        on_plan_dispatched=on_plan,
+        eligible=True,
     )
-    actions_only = '<actions>\n  <react emoji="👍" />\n</actions>'
+    actions_only = (
+        '<actions>\n'
+        '  <react emoji="👍" message="inbound-123" />\n'
+        '</actions>'
+    )
     await disp.observe(_assistant(TextBlock(text=actions_only)))
     await disp.observe(_assistant(ToolUseBlock(id="t1", name="Read", input={})))
+    # No bridge send — the cleaned text was empty.
     assert bridge.sends == []
-    # State machine still recorded the boundary transition though,
-    # so callers see streamed_plan=False (no flush actually happened).
-    assert disp.streamed_plan is True  # state-level flag — buffer was
-    # non-empty after splitting. The dispatcher just chose not to
-    # send because the cleaned text was empty.
+    # But the callback fired with result=None and the directive.
+    assert len(seen) == 1
+    text_seen, result, directives = seen[0]
+    assert text_seen == ""
+    assert result is None
+    assert len(directives) == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_callback_exception_does_not_break_loop():
+    """The dispatched callback can raise (e.g. the directive dispatch
+    itself errors); the dispatcher must swallow it so the main message
+    loop keeps running."""
+    bridge = RecordingBridge()
+
+    async def boom(text, result, directives) -> None:
+        raise RuntimeError("dispatch exploded")
+
+    disp = StreamingAutoDispatcher(
+        channel_id="test-ch",
+        bridge=bridge,
+        on_plan_dispatched=boom,
+        eligible=True,
+    )
+    # Should not raise.
+    await disp.observe(_assistant(TextBlock(text="plan")))
+    await disp.observe(_assistant(ToolUseBlock(id="t1", name="Read", input={})))
+    # Bridge send still happened.
+    assert len(bridge.sends) == 1
 
 
 @pytest.mark.asyncio

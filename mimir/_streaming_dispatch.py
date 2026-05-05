@@ -68,7 +68,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -78,6 +78,7 @@ from claude_agent_sdk import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover
+    from .bridges._directives import Directive
     from .bridges.base import Bridge, SendResult
 
 log = logging.getLogger(__name__)
@@ -210,7 +211,13 @@ class StreamingAutoDispatcher:
         *,
         channel_id: str,
         bridge: "Bridge | None",
-        on_plan_dispatched: Callable[[str, "SendResult"], Awaitable[None]] | None = None,
+        on_plan_dispatched: (
+            Callable[
+                [str, "SendResult | None", "tuple[Directive, ...]"],
+                Awaitable[None],
+            ]
+            | None
+        ) = None,
         on_plan_failed: Callable[[str, str], Awaitable[None]] | None = None,
         eligible: bool = True,
     ) -> None:
@@ -247,7 +254,13 @@ class StreamingAutoDispatcher:
         return self.state.suppressed_text()
 
     async def observe(self, msg: Message) -> None:
-        """Advance the state machine and (if needed) flush the plan."""
+        """Advance the state machine and (if needed) flush the plan.
+
+        On a flush, ``<actions>`` directives present in the plan text
+        are parsed out and forwarded to ``on_plan_dispatched`` so the
+        caller can dispatch them mid-turn (against the just-sent plan
+        message). The plan-flush bridge send carries only the cleaned
+        text; raw ``<actions>`` markup never reaches the channel."""
         plan_text = advance_state(self.state, msg)
         if plan_text is None:
             return
@@ -256,66 +269,75 @@ class StreamingAutoDispatcher:
         if self._bridge is None:
             return
 
-        # Strip any ``<actions>`` blocks from the plan flush. Per
-        # chainlink #5 acceptance criteria: directives only dispatch
-        # on the final flush; intermediate chunks are text only. If
-        # the agent put an actions block inline with the plan text,
-        # we send the cleaned remainder and log a notice — the
-        # directives stay in the underlying ``output`` and will be
-        # parsed at end-of-turn from the result flush. (In practice
-        # actions blocks land at the END of replies, after the
-        # result, so this is a defensive guard.)
-        cleaned_plan, dropped_directives = _strip_directives(plan_text)
-        if not cleaned_plan.strip():
-            # Plan was directives-only; nothing to flush. Treat as
-            # no-plan and wait for the result flush.
-            return
+        # Parse directives out of the plan text. Directives are
+        # dispatched alongside the plan flush (so an inline ack-react
+        # in the plan actually lands on the user's message); the bridge
+        # send carries only the cleaned remainder so raw markup never
+        # reaches the channel.
+        cleaned_plan, directives = _parse_plan_directives(plan_text)
 
-        try:
-            result = await self._bridge.send(
-                self._channel_id, cleaned_plan, final=False,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("streaming plan flush failed")
-            if self._on_plan_failed is not None:
-                try:
-                    await self._on_plan_failed(
-                        cleaned_plan, f"{type(exc).__name__}: {exc}"
-                    )
-                except Exception:  # noqa: BLE001
-                    log.exception("on_plan_failed callback raised")
+        send_result: "SendResult | None" = None
+        if cleaned_plan.strip():
+            try:
+                send_result = await self._bridge.send(
+                    self._channel_id, cleaned_plan, final=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("streaming plan flush failed")
+                if self._on_plan_failed is not None:
+                    try:
+                        await self._on_plan_failed(
+                            cleaned_plan, f"{type(exc).__name__}: {exc}"
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception("on_plan_failed callback raised")
+                return
+            if not send_result.sent:
+                if self._on_plan_failed is not None:
+                    try:
+                        await self._on_plan_failed(
+                            cleaned_plan,
+                            send_result.error or "bridge returned sent=False",
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception("on_plan_failed callback raised")
+                return
+
+        # Notify the dispatched callback when there's something for it
+        # to act on: either a successful bridge send, or directives that
+        # still need dispatching even though the cleaned plan text was
+        # empty (e.g. an actions-only plan ack). When both are absent,
+        # nothing to report.
+        if send_result is None and not directives:
             return
-        if result.sent and self._on_plan_dispatched is not None:
+        if self._on_plan_dispatched is not None:
             try:
                 await self._on_plan_dispatched(
-                    cleaned_plan, result, dropped_directives,
+                    cleaned_plan, send_result, directives,
                 )
             except Exception:  # noqa: BLE001
                 log.exception("on_plan_dispatched callback raised")
-        elif not result.sent and self._on_plan_failed is not None:
-            try:
-                await self._on_plan_failed(
-                    cleaned_plan, result.error or "bridge returned sent=False"
-                )
-            except Exception:  # noqa: BLE001
-                log.exception("on_plan_failed callback raised")
 
 
-def _strip_directives(text: str) -> tuple[str, int]:
-    """Return ``(cleaned_text, dropped_directive_count)``.
+def _parse_plan_directives(
+    text: str,
+) -> tuple[str, "tuple[Directive, ...]"]:
+    """Return ``(cleaned_text, directives_tuple)``.
 
     Wraps the bridges' parse_directives. The plan flush sends the
-    cleaned text only; directives are NOT dispatched mid-turn (the
-    end-of-turn result flush handles them via the standard path).
+    cleaned text only; the parsed directives are forwarded to the
+    on_plan_dispatched callback so the caller can dispatch them
+    against the just-sent plan flush. (Previously these were
+    silently dropped — see chainlink #5 follow-up.)
     """
     try:
         from .bridges._directives import parse_directives
 
         parsed = parse_directives(text)
-        return (parsed.clean_text or "", len(parsed.directives))
+        return (parsed.clean_text or "", tuple(parsed.directives))
     except Exception:  # noqa: BLE001
-        log.exception("parse_directives raised in plan-flush cleaner")
-        return text, 0
+        log.exception("parse_directives raised in plan-flush parser")
+        return text, ()
 
 
 def intermediate_text_segments(messages: list[Message]) -> list[str]:
