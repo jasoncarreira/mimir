@@ -115,6 +115,128 @@ def test_response_bucket_minimal_fields():
     assert snap.resets_at is None
 
 
+# ---- snapshot_from_api_usage_bucket (Stage 5: get_context_usage) -------
+
+
+def test_api_usage_bucket_with_fraction_utilization():
+    from mimir.rate_limits import snapshot_from_api_usage_bucket
+
+    snap = snapshot_from_api_usage_bucket({
+        "status": "allowed",
+        "utilization": 0.42,
+        "resets_at": 9_999_999_999,
+    })
+    assert snap is not None
+    assert snap.status == "allowed"
+    assert snap.utilization == 0.42
+    assert snap.resets_at == 9_999_999_999
+
+
+def test_api_usage_bucket_rescales_percentage():
+    """apiUsage may report 0-100 instead of 0-1. The parser detects
+    via ``v > 1.0`` and divides by 100."""
+    from mimir.rate_limits import snapshot_from_api_usage_bucket
+
+    snap = snapshot_from_api_usage_bucket({"utilization": 75})
+    assert snap is not None
+    assert snap.utilization == 0.75
+
+
+def test_api_usage_bucket_iso_resets_at_string():
+    """``resets_at`` may arrive as an ISO timestamp string; parser
+    converts to unix seconds."""
+    from mimir.rate_limits import snapshot_from_api_usage_bucket
+
+    snap = snapshot_from_api_usage_bucket({
+        "utilization": 0.5,
+        "resets_at": "2026-05-05T12:00:00Z",
+    })
+    assert snap is not None
+    assert snap.resets_at is not None and snap.resets_at > 0
+
+
+def test_api_usage_bucket_returns_none_when_unparseable():
+    """A bucket with neither utilization nor resets_at can't say
+    anything useful — caller should drop it."""
+    from mimir.rate_limits import snapshot_from_api_usage_bucket
+
+    assert snapshot_from_api_usage_bucket({"status": "allowed"}) is None
+
+
+# ---- record_api_usage ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_api_usage_writes_each_window(tmp_path: Path):
+    from mimir.rate_limits import record_api_usage
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    api_usage = {
+        "five_hour": {"utilization": 0.40, "resets_at": 9_999_999_999},
+        "seven_day_opus": {"utilization": 0.65, "resets_at": 9_999_999_999},
+    }
+    recorded = await record_api_usage(store, api_usage)
+    assert set(recorded.keys()) == {"five_hour", "seven_day_opus"}
+    saved = store.current()
+    assert "five_hour" in saved
+    assert saved["five_hour"].utilization == 0.40
+    assert "seven_day_opus" in saved
+
+
+@pytest.mark.asyncio
+async def test_record_api_usage_empty_or_none(tmp_path: Path):
+    """Empty / None apiUsage records nothing and returns an empty
+    summary — the agent's capture method then logs an empty-windows
+    quota_capture_ok event."""
+    from mimir.rate_limits import record_api_usage
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    assert await record_api_usage(store, None) == {}
+    assert await record_api_usage(store, {}) == {}
+    assert store.current() == {}
+
+
+@pytest.mark.asyncio
+async def test_record_api_usage_skips_unparseable_buckets(tmp_path: Path):
+    """One bad bucket shouldn't drop the whole capture."""
+    from mimir.rate_limits import record_api_usage
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    recorded = await record_api_usage(store, {
+        "five_hour": {"utilization": 0.30, "resets_at": 9_999_999_999},
+        "broken": {"status": "allowed"},  # no util, no resets — drop
+        "also_broken": "not a dict",  # type-mismatched — drop
+    })
+    assert set(recorded.keys()) == {"five_hour"}
+
+
+# ---- running_on_claude_max ---------------------------------------------
+
+
+def test_running_on_claude_max_true_with_oauth_only(monkeypatch):
+    from mimir.rate_limits import running_on_claude_max
+
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-...")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    assert running_on_claude_max() is True
+
+
+def test_running_on_claude_max_false_when_oauth_missing(monkeypatch):
+    from mimir.rate_limits import running_on_claude_max
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    assert running_on_claude_max() is False
+
+
+def test_running_on_claude_max_false_with_base_url_override(monkeypatch):
+    from mimir.rate_limits import running_on_claude_max
+
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-...")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://openrouter.ai/api/v1")
+    assert running_on_claude_max() is False
+
+
 # ---- RateLimitStore -----------------------------------------------------
 
 

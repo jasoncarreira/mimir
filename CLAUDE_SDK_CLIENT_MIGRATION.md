@@ -170,7 +170,7 @@ isolation.
 **Success metric:** parallel-turn latency unchanged from a baseline of two
 fire-and-forget queries.
 
-### Stage 5 — wire `get_context_usage()` into the rate-limit store
+### Stage 5 — wire `get_context_usage()` into the rate-limit store ✅
 
 **Goal:** retire the cron-based quota poller.
 
@@ -179,6 +179,17 @@ fire-and-forget queries.
 - Once landed, drop `mimir/quota_poller.py` and the scheduler entry.
 - Self-state and Upcoming blocks render the fresh per-turn data with no
   changes (the renderer already handles non-null utilization).
+
+**Landed:** `agent.get_context_usage()` wrapper reuses the same warm
+ClaudeSDKClient as `query()` (matching options-fingerprint avoids a
+recycle); `Agent._capture_plan_quota_from_client(options)` is called
+from `run_turn` after the message loop, gated on
+`running_on_claude_max()`. apiUsage parsing + `record_api_usage` live
+in `mimir/rate_limits.py`. `mimir/quota_poller.py`,
+`tests/test_quota_poller.py`, `Scheduler.add_quota_poll_job`, the
+`quota_poll_cron` config field, and the server's poll registration
+are removed. New tests in `test_agent_sdk_client.py` and
+`test_rate_limits.py`.
 
 **Success metric:** the RateLimitStore has populated `utilization` for both
 `five_hour` and `seven_day_opus` after one turn. The cron poller is removable.
