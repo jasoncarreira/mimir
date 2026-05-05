@@ -97,7 +97,10 @@ Got it, here's the chart you asked for.
 
 - ``<react emoji="..." [message="<id>"] />`` — react with an emoji.
   Defaults to the message just delivered in this turn (or the most
-  recent assistant message when the reply is directives-only).
+  recent assistant message when the reply is directives-only). To
+  ack the inbound user message instead, pass ``message="<id>"``
+  using the ``msg_id`` from the Current-message header (or the
+  ``id=<...>`` field on Recent-activity lines).
 - ``<send-file path="..." [caption="..."] [kind="image|file|audio"]
   [cleanup="true"] />`` — attach a file. ``path`` resolves under
   ``MIMIR_HOME/attachments/outbound/``; absolute paths must already be
@@ -293,10 +296,15 @@ def build_turn_prompt(
         if event.attachment_names:
             paths = "\n".join(f"- {p}" for p in event.attachment_names)
             body = f"{body}\n\nAttachments:\n{paths}"
+        # Include the inbound message id so the agent can target it with
+        # ``<react message="<id>" />`` (otherwise the directive falls back
+        # to the just-sent assistant reply, which is the wrong target for
+        # an "on it" ack — see memory/core/40-learned-behaviors.md).
+        msg_id_part = f", msg_id: {event.source_id}" if event.source_id else ""
         sections.append(
             f"## ▶ Current message — respond to this\n\n"
             f"[event_kind: {event.trigger}, channel: {event.channel_id}, "
-            f"author: {header_author}, ts: {ts}]\n\n"
+            f"author: {header_author}, ts: {ts}{msg_id_part}]\n\n"
             f"{body}"
         )
 

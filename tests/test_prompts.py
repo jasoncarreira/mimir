@@ -89,3 +89,66 @@ def test_turn_prompt_omits_attachments_section_when_empty():
     )
     prompt = build_turn_prompt(event)
     assert "Attachments:" not in prompt
+
+
+# ---- Inbound msg_id surfacing (so <react message="<id>"/> can target it) ----
+
+
+def test_turn_prompt_includes_inbound_msg_id_in_header():
+    """The Current-message header must surface ``msg_id: <id>`` when the
+    inbound event carries a source_id, so the agent can target that
+    message with ``<react message="<id>"/>`` instead of falling back to
+    the just-sent assistant reply (memory/core/40-learned-behaviors.md).
+    """
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1",
+        content="hi",
+        author="discord-99",
+        author_display="alice",
+        source_id="1234567890",
+    )
+    prompt = build_turn_prompt(event)
+    assert "msg_id: 1234567890" in prompt
+    # And it lives in the Current-message metadata bracket, not floating
+    # somewhere else in the body.
+    header_line = next(
+        line for line in prompt.splitlines() if line.startswith("[event_kind:")
+    )
+    assert "msg_id: 1234567890" in header_line
+
+
+def test_turn_prompt_omits_msg_id_when_source_id_missing():
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1",
+        content="no id",
+        author="discord-99",
+    )
+    prompt = build_turn_prompt(event)
+    header_line = next(
+        line for line in prompt.splitlines() if line.startswith("[event_kind:")
+    )
+    assert "msg_id" not in header_line
+
+
+def test_turn_prompt_scheduled_tick_omits_msg_id():
+    """Scheduled ticks have no inbound message — the synthetic header
+    must not pretend otherwise."""
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        content="",
+        source_id="should-be-ignored",
+    )
+    prompt = build_turn_prompt(event)
+    assert "msg_id" not in prompt
