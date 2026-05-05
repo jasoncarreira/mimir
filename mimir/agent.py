@@ -518,6 +518,12 @@ class Agent:
         bridge,
     ):
         async def _cb(plan_text: str, result, directives: tuple) -> None:
+            # ``plan_text`` is the *cleaned* plan (actions stripped) —
+            # what the user actually saw on the bridge send. Recording
+            # this to chat_history keeps Recent-activity consistent
+            # with delivery; the raw plan_buffer (with <actions>
+            # markup) never makes it into chat_history.
+            #
             # ``result`` is None when the plan was directives-only —
             # there was no cleaned text to send via the bridge, but
             # we still need to dispatch the parsed directives so
@@ -1501,20 +1507,23 @@ class Agent:
                         ctx, event, result_text,
                     )
                 else:
-                    # Plan was streamed but result is empty — record an
-                    # auto_dispatch_ok so the audit log shows the
-                    # streamed plan was the entire reply, not silence.
+                    # Plan was streamed but the result chunk is empty
+                    # (no post-tool text, or the only text was an
+                    # actions-only plan). Audit the case so the log
+                    # shows the streamed plan was the entire reply.
+                    #
+                    # No _record_outbound here: the streaming-plan
+                    # callback already wrote the cleaned plan text to
+                    # chat_history when there was a real bridge send,
+                    # and writing the raw plan_buffer here would
+                    # double-record (and would inject raw <actions>
+                    # markup the user never saw on the directives-only
+                    # plan path). Bridge-failure / directives-only
+                    # cases have nothing user-visible left to record.
                     await log_event(
                         "auto_dispatch_streamed_only_plan",
                         channel_id=event.channel_id,
                         plan_chars=len(streaming_dispatcher.state.plan_text()),
-                    )
-                    # Still record to chat_history so Recent activity
-                    # reflects what the agent said (the plan text).
-                    await self._record_outbound(
-                        event.channel_id,
-                        streaming_dispatcher.state.plan_text(),
-                        source=event.source,
                     )
             else:
                 await self._auto_dispatch_or_record(ctx, event, output)

@@ -344,3 +344,60 @@ async def test_streaming_plan_dispatched_no_directives_only_text(tmp_path: Path)
     ]
     assert len(plan_events) == 1
     assert plan_events[0]["actions_in_plan"] == 0
+
+
+@pytest.mark.asyncio
+async def test_streaming_plan_callback_records_cleaned_text_only(tmp_path: Path):
+    """Regression: chat_history records the cleaned plan (what the
+    user saw on the bridge) — not the raw plan_buffer (which would
+    include <actions> markup). Whatever the dispatcher passes as the
+    first arg to the callback is what lands in chat_history.
+
+    The dispatcher always passes ``cleaned_plan`` (post-actions-strip);
+    the callback faithfully records that string. So the chat_history /
+    Recent-activity view stays consistent with what was delivered."""
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    agent = _make_agent(tmp_path, reg)
+
+    ctx = _ctx()
+    evt = _evt()
+    cb = agent._on_streaming_plan_dispatched(ctx, evt, bridge)
+    plan_send = SendResult(sent=True, message_id="m-plan", chunks=1)
+    cleaned = "On it — checking the logs."
+    await cb(cleaned, plan_send, ())
+
+    history = agent._buffer.recent_for_channel("discord-987", limit=10)
+    outbound = [m for m in history if m.kind == "assistant_message"]
+    assert len(outbound) == 1
+    assert outbound[0].content == cleaned
+    assert "<actions>" not in outbound[0].content
+
+
+@pytest.mark.asyncio
+async def test_streaming_plan_directives_only_does_not_record(tmp_path: Path):
+    """Regression: when the plan was directives-only (cleaned text
+    empty, dispatcher passes ``result=None``), the callback must
+    NOT write anything to chat_history — there was nothing
+    user-visible to record. Previously a fallback in _run_turn
+    recorded the raw plan_buffer (raw <actions> markup); that
+    fallback has been removed."""
+    from mimir.bridges._directives import ReactDirective
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    agent = _make_agent(tmp_path, reg)
+
+    ctx = _ctx()
+    ctx.last_assistant_message_id = "prev-99"
+    evt = _evt()
+    cb = agent._on_streaming_plan_dispatched(ctx, evt, bridge)
+    directives = (ReactDirective(emoji="eyes", message_id=None),)
+    await cb("", None, directives)
+
+    history = agent._buffer.recent_for_channel("discord-987", limit=10)
+    outbound = [m for m in history if m.kind == "assistant_message"]
+    assert outbound == []
+    # Reaction did still fire, against the prior message id.
+    assert bridge.reacted == [("discord-987", "prev-99", "eyes")]
