@@ -45,6 +45,24 @@ def _events_cap() -> int:
     return min(_env_int("MIMIR_MAX_EVENTS", _EVENTS_CAP_DEFAULT), _EVENTS_CAP_MAX)
 
 
+def _oauth_credentials_path() -> Path | None:
+    """Resolve the OAuth credentials path. Empty string explicitly
+    disables (useful in tests / non-OAuth deployments). Unset falls
+    back to ~/.claude/.credentials.json — where ``claude /login``
+    writes the file."""
+    raw = os.environ.get("MIMIR_CLAUDE_OAUTH_CREDENTIALS")
+    if raw is None:
+        # Unset → use the standard Claude Code path.
+        home = os.environ.get("HOME") or ""
+        if not home:
+            return None
+        return Path(home) / ".claude" / ".credentials.json"
+    if not raw.strip():
+        # Explicitly empty → disable.
+        return None
+    return Path(raw).expanduser().resolve()
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     return float(raw) if raw else default
@@ -229,6 +247,22 @@ class Config:
     cost_rate_spike_floor_usd: float
     cost_alert_cooldown_minutes: int
 
+    # OAuth usage poller (mimir/oauth_usage_poller.py): hits Anthropic's
+    # /api/oauth/usage to populate plan-window utilization% in the
+    # RateLimitStore. Requires credentials minted by ``claude /login``
+    # (which grants user:profile scope) — the headless setup-token
+    # flow's user:inference-only scope can't read this endpoint.
+    # ``oauth_credentials_path`` is the path to credentials.json;
+    # default is $HOME/.claude/.credentials.json. Empty string disables
+    # the poller. ``oauth_usage_poll_cron`` is the cron expression;
+    # leave blank to disable. ``oauth_refresh_warn_days`` is the soft
+    # heuristic threshold (days since first observed credentials) at
+    # which we emit ``oauth_refresh_token_age_warn`` so the operator
+    # knows to consider re-/login before the refresh token expires.
+    oauth_credentials_path: Path | None
+    oauth_usage_poll_cron: str
+    oauth_refresh_warn_days: int
+
     # Per-response rate-limit capture (default on). Enabling this turns
     # on the SDK's include_partial_messages so StreamEvent messages
     # carry the raw Anthropic streaming events; we filter for
@@ -346,6 +380,14 @@ class Config:
 
             capture_rate_limits=_env("MIMIR_CAPTURE_RATE_LIMITS", "true").lower()
                 not in {"false", "0", "no", "off"},
+
+            oauth_credentials_path=_oauth_credentials_path(),
+            oauth_usage_poll_cron=_env(
+                "MIMIR_OAUTH_USAGE_POLL_CRON", "*/3 * * * *",
+            ),
+            oauth_refresh_warn_days=_env_int(
+                "MIMIR_OAUTH_REFRESH_WARN_DAYS", 25,
+            ),
 
             max_turns_kept=_turns_cap(),
             max_events_kept=_events_cap(),
