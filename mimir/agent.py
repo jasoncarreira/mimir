@@ -58,7 +58,9 @@ from .history import MessageBuffer
 from .rate_limits import (
     RateLimitStore,
     off_pace_buckets,
+    record_api_usage,
     render_off_pace_warning,
+    running_on_claude_max,
     snapshot_from_response_bucket,
     snapshot_from_sdk_event,
 )
@@ -254,6 +256,51 @@ async def query(
         await client.query(prompt, session_id=session_id)
         async for msg in client.receive_response():
             yield msg
+
+
+async def get_context_usage(options: ClaudeAgentOptions) -> dict | None:
+    """Stage 5: query the shared persistent client for plan-window
+    utilization. Returns the raw response dict (typically containing
+    an ``apiUsage`` key) or None if no client is connected and we
+    couldn't safely connect one for a usage probe.
+
+    Reuses the same fingerprint-keyed singleton as ``query()`` so the
+    probe rides on whatever client the agent loop already warmed.
+    When no client is connected yet (first call before any ``query()``
+    has run), this connects one — same recycle semantics as ``query()``.
+    Failures are caught and logged; never propagate. Plan-window
+    capture is observability, not load-bearing.
+    """
+    global _sdk_client, _sdk_options_fingerprint
+    fingerprint = _options_fingerprint(options)
+    lock = _get_sdk_lock()
+    async with lock:
+        if _sdk_client is None or _sdk_options_fingerprint != fingerprint:
+            if _sdk_client is not None:
+                try:
+                    await _sdk_client.disconnect()
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "ClaudeSDKClient disconnect failed during recycle "
+                        "for get_context_usage (continuing — fresh client "
+                        "about to replace it)"
+                    )
+                _sdk_client = None
+            try:
+                client = ClaudeSDKClient(options=options)
+                await client.connect()
+            except Exception:  # noqa: BLE001
+                log.exception("ClaudeSDKClient connect failed in get_context_usage")
+                return None
+            _sdk_client = client
+            _sdk_options_fingerprint = fingerprint
+        client = _sdk_client
+        assert client is not None  # for type-checkers
+        try:
+            return await client.get_context_usage()
+        except Exception:  # noqa: BLE001
+            log.exception("client.get_context_usage() raised")
+            return None
 
 
 async def shutdown_sdk_client() -> None:
@@ -861,6 +908,65 @@ class Agent:
                 turn_id=ctx.turn_id,
             )
 
+    # ---- plan-window capture (Stage 5) ------------------------------
+
+    async def _capture_plan_quota_from_client(
+        self, options: ClaudeAgentOptions,
+    ) -> None:
+        """Stage 5 of CLAUDE_SDK_CLIENT_MIGRATION.md: query the shared
+        persistent ``ClaudeSDKClient`` for ``apiUsage`` and write each
+        window bucket into ``self._rate_limits``. Replaces the
+        throwaway-subprocess cron poller (mimir/quota_poller.py) with
+        per-turn capture off the warm client we already have.
+
+        ``options`` must be the same options object used for this
+        turn's ``query()`` call so the fingerprint matches and the
+        warm client is reused — passing fresh options would force a
+        disconnect+reconnect, defeating the persistence win.
+
+        No-op when the agent isn't on Claude Max OAuth — direct API
+        keys / OpenRouter / Minimax don't surface useful per-window
+        utilization, so the probe would just waste an IPC roundtrip.
+
+        Best-effort: failures are caught + logged via
+        ``quota_capture_failed`` events and do not propagate. Logs
+        ``quota_capture_ok`` on success so the audit trail is the same
+        shape the cron poller used (``quota_poll_ok`` / ``quota_poll_failed``
+        renamed to ``quota_capture_*`` to mark the new code path).
+        """
+        if not running_on_claude_max():
+            return
+        try:
+            response = await get_context_usage(options)
+        except Exception as exc:  # noqa: BLE001
+            await log_event(
+                "quota_capture_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
+        api_usage: dict | None = None
+        if isinstance(response, dict):
+            api_usage = response.get("apiUsage")
+        if not isinstance(api_usage, dict) or not api_usage:
+            # Daemon doesn't have plan-window data yet (fresh OAuth
+            # session before any messages flow), or the user is on a
+            # non-Max plan that doesn't surface this data.
+            await log_event(
+                "quota_capture_ok",
+                windows={},
+                note="apiUsage empty",
+            )
+            return
+        try:
+            recorded = await record_api_usage(self._rate_limits, api_usage)
+        except Exception as exc:  # noqa: BLE001
+            await log_event(
+                "quota_capture_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
+        await log_event("quota_capture_ok", windows=recorded)
+
     # ---- synthesis turn ------------------------------------------------
 
     def _build_synthesis_prompt(self, ctx: TurnContext, event: AgentEvent) -> str:
@@ -999,13 +1105,18 @@ class Agent:
 
         # 6. Set TurnContext on the contextvar so SAGA tools auto-credit.
         token = _context.set_current_turn(ctx)
+        # Build options once — the same object is passed to query() and
+        # then reused for the post-turn plan-quota capture so the
+        # ClaudeSDKClient fingerprint matches and the warm client is
+        # reused (see _capture_plan_quota_from_client).
+        options = self._build_options(system_prompt)
         messages: list = []
         error: str | None = None
         try:
             try:
                 async for msg in query(
                     prompt=turn_prompt,
-                    options=self._build_options(system_prompt),
+                    options=options,
                     session_id=ctx.turn_id,
                 ):
                     messages.append(msg)
@@ -1101,6 +1212,21 @@ class Agent:
                             "rate_limits.record from response failed for %s",
                             bucket_type,
                         )
+
+        # 7a.c. Plan-window apiUsage capture (Stage 5 of
+        #       CLAUDE_SDK_CLIENT_MIGRATION.md). Query the shared
+        #       persistent client's ``get_context_usage()`` and persist
+        #       each ``apiUsage`` bucket into the same RateLimitStore.
+        #       Replaces the throwaway-subprocess cron poller —
+        #       fresher cadence (every turn vs every 10 min) with no
+        #       extra subprocess cost (the client is already warm
+        #       from the query() above). Skipped when the message
+        #       loop crashed; the next successful turn picks it up.
+        if not error:
+            try:
+                await self._capture_plan_quota_from_client(options)
+            except Exception:  # noqa: BLE001
+                log.exception("_capture_plan_quota_from_client raised")
 
         # 7b. Subagent lifecycle (SPEC §4.4). The SDK yields three messages:
         #

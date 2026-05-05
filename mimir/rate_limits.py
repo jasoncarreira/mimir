@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -41,6 +42,30 @@ from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+
+def running_on_claude_max() -> bool:
+    """True iff the agent appears to be configured for Claude Max
+    OAuth — the only config where ``ClaudeSDKClient.get_context_usage()``
+    returns useful per-window utilization data.
+
+    Heuristic:
+    - ``CLAUDE_CODE_OAUTH_TOKEN`` set (Max OAuth path).
+    - ``ANTHROPIC_BASE_URL`` empty (no proxy / OpenRouter / Minimax
+      redirect that would route the agent's calls outside Anthropic).
+
+    Either condition flipping means we're in a config where the
+    daemon's ``apiUsage`` will be empty — direct API keys deliver
+    rate-limit headers per-response (already captured by
+    ``RateLimitEvent``) but no plan-window picture; OpenRouter /
+    Minimax don't have a plan-window concept at all.
+
+    The check is environment-only — no network calls, safe to invoke
+    at scheduler-registration time before the agent is up.
+    """
+    has_oauth = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip())
+    has_base_url_override = bool(os.environ.get("ANTHROPIC_BASE_URL", "").strip())
+    return has_oauth and not has_base_url_override
 
 
 @dataclass
@@ -347,6 +372,136 @@ def snapshot_from_sdk_event(rate_limit_info: Any) -> RateLimitSnapshot:
             rate_limit_info, "overage_disabled_reason", None,
         ),
     )
+
+
+# ─── apiUsage parsing (ClaudeSDKClient.get_context_usage) ────────────
+#
+# Stage 5 of CLAUDE_SDK_CLIENT_MIGRATION.md: each turn calls the
+# shared persistent client's ``get_context_usage()`` and writes the
+# returned ``apiUsage`` buckets here. This replaces the throwaway-
+# subprocess cron poller (``mimir/quota_poller.py``) — same data,
+# cheaper path, fresher cadence (every turn vs every 10 min).
+#
+# Claude Code's apiUsage shape is undocumented in the SDK type
+# annotations (just ``dict[str, Any] | None``); ``_KNOWN_WINDOW_TYPES``
+# is what we've observed (and what RateLimitInfo's literal types
+# name). Unknown keys still get recorded — the store is a free-form
+# dict.
+
+_KNOWN_WINDOW_TYPES = {
+    "five_hour",
+    "seven_day",
+    "seven_day_opus",
+    "seven_day_sonnet",
+    "overage",
+}
+
+
+def _coerce_utilization(raw: Any) -> float | None:
+    """apiUsage may report utilization as 0-1, 0-100, or as a string.
+    Normalize to 0-1 floats; return None on unparseable."""
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v > 1.0:
+        # Looks like a percentage; rescale.
+        v = v / 100.0
+    if v < 0.0 or v > 1.5:  # >1.5 means we're past 150% — store anyway but
+                            # likely indicates a parse error, log it.
+        log.warning("apiUsage: utilization out of range (%r → %f)", raw, v)
+    return v
+
+
+def _coerce_resets_at(raw: Any) -> int | None:
+    """resets_at may be unix seconds (int/float) or an ISO timestamp.
+    Normalize to unix seconds (int)."""
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    if isinstance(raw, str):
+        try:
+            return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def snapshot_from_api_usage_bucket(bucket: dict[str, Any]) -> RateLimitSnapshot | None:
+    """Best-effort parse of one ``apiUsage[<window_type>]`` bucket from
+    ``ClaudeSDKClient.get_context_usage()``. Returns None if the
+    bucket is too malformed to be useful (no resets_at AND no
+    utilization)."""
+    util = _coerce_utilization(
+        bucket.get("utilization")
+        or bucket.get("usage_pct")
+        or bucket.get("percentage"),
+    )
+    resets = _coerce_resets_at(
+        bucket.get("resets_at")
+        or bucket.get("reset_at")
+        or bucket.get("resetsAt"),
+    )
+    if util is None and resets is None:
+        return None
+    status = str(bucket.get("status") or "allowed")
+    overage_status = bucket.get("overage_status")
+    overage_resets = _coerce_resets_at(
+        bucket.get("overage_resets_at") or bucket.get("overage_reset_at"),
+    )
+    overage_disabled = bucket.get("overage_disabled_reason")
+    return RateLimitSnapshot(
+        status=status,
+        utilization=util,
+        resets_at=resets,
+        observed_at=datetime.now(tz=timezone.utc).isoformat(),
+        overage_status=overage_status if isinstance(overage_status, str) else None,
+        overage_resets_at=overage_resets,
+        overage_disabled_reason=(
+            overage_disabled if isinstance(overage_disabled, str) else None
+        ),
+    )
+
+
+async def record_api_usage(
+    store: "RateLimitStore",
+    api_usage: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """Write each parseable ``apiUsage`` bucket into ``store``.
+    Returns a summary mapping window_type → {utilization, resets_at,
+    status} of what was recorded, so the caller can emit a structured
+    log event without re-loading the store. Empty dict when there's
+    nothing useful to record (apiUsage is None, empty, or all buckets
+    are unparseable)."""
+    recorded: dict[str, dict[str, Any]] = {}
+    if not isinstance(api_usage, dict) or not api_usage:
+        return recorded
+    for window_type, bucket in api_usage.items():
+        if not isinstance(bucket, dict):
+            continue
+        snapshot = snapshot_from_api_usage_bucket(bucket)
+        if snapshot is None:
+            log.debug(
+                "apiUsage: skipping unparseable bucket %r: %r",
+                window_type, bucket,
+            )
+            continue
+        try:
+            await store.record(window_type, snapshot)
+        except Exception:  # noqa: BLE001
+            log.exception("apiUsage: store.record failed for %s", window_type)
+            continue
+        recorded[window_type] = {
+            "utilization": snapshot.utilization,
+            "resets_at": snapshot.resets_at,
+            "status": snapshot.status,
+        }
+        if window_type not in _KNOWN_WINDOW_TYPES:
+            log.info("apiUsage: recorded unknown window type %r", window_type)
+    return recorded
 
 
 def snapshot_from_response_bucket(bucket: dict[str, Any]) -> RateLimitSnapshot:
