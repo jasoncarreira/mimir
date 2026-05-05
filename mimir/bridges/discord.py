@@ -249,9 +249,23 @@ class DiscordBridge(Bridge):
     attachments_max_bytes: int | None = None
     _client: _DiscordClient | None = field(default=None, init=False, repr=False)
     _runner: asyncio.Task | None = field(default=None, init=False, repr=False)
+    # Per-channel "hold typing open" tasks, created on inbound and cancelled
+    # on outbound (or when the agent loop calls ``cancel_typing`` after a
+    # turn finishes). See ``send_typing_indicator``.
+    _typing_tasks: dict[str, asyncio.Task] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     prefixes = ("discord-", "dm-discord-")
     name = "discord"
+
+    # Hard cap on a single typing-hold task. Cancellation normally happens on
+    # ``send()`` or ``cancel_typing()``; the cap protects against turns that
+    # never call either (errored turns, cross-channel-only sends if the
+    # agent loop's ``turn_finished`` cleanup ever regresses). 10 minutes
+    # gives longmemeval / long climbs headroom; the cap only matters when
+    # cancellation never arrives.
+    _TYPING_HOLD_TIMEOUT_SECONDS: float = 600.0
 
     async def connect(self) -> None:
         if self._client is not None:
@@ -264,6 +278,14 @@ class DiscordBridge(Bridge):
         )
 
     async def disconnect(self) -> None:
+        # Cancel any dangling typing-hold tasks first so they don't try to
+        # POST against a closing client. Each task swallows its own
+        # CancelledError on the way out (see ``send_typing_indicator._hold``).
+        for task in list(self._typing_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._typing_tasks.clear()
+
         if self._client is not None and not self._client.is_closed():
             try:
                 await self._client.close()
@@ -284,6 +306,14 @@ class DiscordBridge(Bridge):
         text: str,
         attachment_paths: list[Path] | None = None,
     ) -> SendResult:
+        # Cancel any in-flight typing-hold task on this channel before the
+        # actual reply goes out. Discord drops the indicator within ~10s
+        # of the last refresh, so this gets the dots out of the user's
+        # face right around the time their message arrives. Programmatic
+        # sends to a channel that never had a typing task (scheduled
+        # ticks, alerts) hit the no-op branch — safe.
+        await self.cancel_typing(channel_id)
+
         if self._client is None or self._client.is_closed():
             return SendResult(sent=False, error="discord client not connected")
         cid_int = _channel_id_to_int(channel_id)
@@ -333,30 +363,74 @@ class DiscordBridge(Bridge):
         return SendResult(sent=True, message_id=last_id, chunks=sent_count)
 
     async def send_typing_indicator(self, channel_id: str) -> None:
-        """Show the Discord typing dots in the channel. Discord's API
-        renders the indicator for ~10s on a single POST. Failures
-        swallowed; typing is a UX nicety, not load-bearing.
+        """Hold the Discord typing indicator open until ``send()`` /
+        ``cancel_typing()`` is called for this channel (or the hard
+        cap, whichever first). Replaces the previous fire-and-forget
+        single-POST shape, which dropped the indicator after Discord's
+        ~10s TTL even when the bot was still working.
 
-        discord.py 2.x exposes typing as an async context manager —
-        ``Messageable.trigger_typing`` was removed. Entering the
-        context POSTs once (which is what we want for fire-and-
-        forget); exiting immediately just cancels the auto-refresh
-        loop without cancelling the indicator on Discord's side
-        (no such API exists)."""
+        discord.py 2.x's ``channel.typing()`` is an async context
+        manager that auto-refreshes the typing POST every ~9s while
+        the caller stays inside the ``async with``. We spawn a
+        per-channel asyncio task that enters the context and sleeps
+        until cancelled, then exits cleanly. The next 9s tick is
+        skipped after cancellation, so Discord drops the indicator
+        within ~10s of cancel — i.e. right around when the actual
+        reply lands.
+
+        Failures are swallowed; typing is a UX nicety, not
+        load-bearing. Repeated calls on the same channel cancel any
+        prior task — most-recent-inbound wins."""
+        # Replace any prior typing task on this channel.
+        prior = self._typing_tasks.pop(channel_id, None)
+        if prior is not None and not prior.done():
+            prior.cancel()
+
         if self._client is None or self._client.is_closed():
             return
         cid_int = _channel_id_to_int(channel_id)
         if cid_int is None:
             return
-        try:
-            channel = self._client.get_channel(cid_int)
-            if channel is None:
-                channel = await self._client.fetch_channel(cid_int)
-            if hasattr(channel, "typing"):
-                async with channel.typing():
-                    pass
-        except Exception:  # noqa: BLE001
-            pass
+
+        timeout_seconds = self._TYPING_HOLD_TIMEOUT_SECONDS
+
+        async def _hold() -> None:
+            try:
+                channel = self._client.get_channel(cid_int) if self._client else None
+                if channel is None and self._client is not None:
+                    channel = await self._client.fetch_channel(cid_int)
+                typing_ctx = getattr(channel, "typing", None) if channel else None
+                if typing_ctx is None:
+                    return
+                async with typing_ctx():
+                    # discord.py's ``Typing`` schedules its own auto-refresh
+                    # task on aenter; we just need to stay inside the
+                    # context until cancelled (or the hard cap fires).
+                    await asyncio.sleep(timeout_seconds)
+            except asyncio.CancelledError:
+                # Standard practice — let the cancel propagate so the
+                # ``async with`` exits cleanly (which cancels discord.py's
+                # internal refresh task).
+                raise
+            except Exception:  # noqa: BLE001
+                # Typing is best-effort; never raise into the bridge loop.
+                pass
+
+        task = asyncio.create_task(_hold(), name=f"typing-hold-{channel_id}")
+        self._typing_tasks[channel_id] = task
+
+    async def cancel_typing(self, channel_id: str) -> None:
+        """Cancel the in-flight typing-hold task for ``channel_id``,
+        if any. Safe to call when no task exists (programmatic sends,
+        scheduled ticks). Called from ``send()`` automatically and
+        from the agent loop on ``turn_finished`` (so cross-channel
+        sends and errored turns don't leave the indicator hanging)."""
+        prior = self._typing_tasks.pop(channel_id, None)
+        if prior is not None and not prior.done():
+            prior.cancel()
+            # Don't await — the task's finally/aexit runs on the event
+            # loop without us blocking here. Awaiting would slow down
+            # send() by a tick on the common path.
 
     async def fetch_history(
         self,
