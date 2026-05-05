@@ -83,8 +83,15 @@ class ParseResult:
 # ─── Regex tokens ───────────────────────────────────────────────────
 
 
+# Line-anchored open/close: the agent's convention is one block per line
+# (or multi-line block whose tags sit alone on their lines). Inline prose
+# mentions in code spans (single backticks) or markdown formatting don't
+# start at column 0, so they're skipped — fixes the "agent documents the
+# directive syntax in code-quotes and the parser greedily eats prose
+# between the stray open and the real trailing close" failure mode.
 _ACTIONS_BLOCK_RE = re.compile(
-    r"<actions\b[^>]*>([\s\S]*?)</actions>", re.IGNORECASE,
+    r"^[ \t]*<actions\b[^>]*>([\s\S]*?)</actions>[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # Matches a self-closing <react ... /> or <send-file ... />. The
