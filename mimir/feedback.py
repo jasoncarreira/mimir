@@ -54,6 +54,11 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "saga_synthesis_dispatch_failed": ("negative", "synth_dispatch_fail"),
     "saga_synthesis_empty_window": ("negative", "synth_empty_window"),
     "cost_rate_alert": ("negative", "cost_rate"),
+    # chainlink #13: under billing-mode=quota, cost spikes don't
+    # suppress (the binding constraint is plan-window quota, not
+    # dollars-spent). Emit as positive-bucket "noticed, no action
+    # needed" so the message doesn't read as "scale back".
+    "cost_rate_advisory": ("positive", "cost_rate_advisory"),
     "rate_limit_warning": ("negative", "rate_limit_warn"),
     "rate_limit_rejected": ("negative", "rate_limit_reject"),
     "rate_limit_off_pace": ("negative", "rate_limit_off_pace"),
@@ -102,6 +107,10 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "introspection_error",
     "heartbeat_health",
     "predictions_pending",
+    # chainlink #13: cost_rate_advisory fires with the same cooldown
+    # cadence as cost_rate_alert (60 min default), so multiple within
+    # the 24h window add no information — the latest is the live state.
+    "cost_rate_advisory",
     # OAuth poller fires every few minutes — without dedup the
     # success line would crowd out everything else in the window.
     # Failure / logged-out / age-warn dedup too: re-emitting per-poll
@@ -166,6 +175,25 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         rate_str = f"${rate:.2f}/hr" if isinstance(rate, (int, float)) else "?"
         thr_str = f"${threshold:.2f}/hr" if isinstance(threshold, (int, float)) else "?"
         return f"cost rate alert: {rate_str} exceeds {thr_str} ({reason})"
+    if rule_kind == "cost_rate_advisory":
+        # chainlink #13: quota-mode "FYI" — the spike triggered our
+        # spike_ratio math, but cost isn't the binding constraint, so
+        # the message is informational. NOT phrased as "scale back" —
+        # plan quota will gate independently if it needs to.
+        rate = ev.get("rate_now_usd_per_hour")
+        baseline = ev.get("baseline_usd_per_hour")
+        rate_str = f"${rate:.2f}/hr" if isinstance(rate, (int, float)) else "?"
+        if isinstance(baseline, (int, float)) and baseline > 0 and isinstance(rate, (int, float)):
+            ratio = rate / baseline
+            return (
+                f"cost rate noted: {rate_str} ({ratio:.1f}× weekly baseline). "
+                f"Advisory under quota billing mode — plan-window quota is the "
+                f"binding constraint."
+            )
+        return (
+            f"cost rate noted: {rate_str}. Advisory under quota billing mode — "
+            f"plan-window quota is the binding constraint."
+        )
     if rule_kind in ("rate_limit_warn", "rate_limit_reject"):
         rl_type = ev.get("rate_limit_type") or "?"
         util = ev.get("utilization")
