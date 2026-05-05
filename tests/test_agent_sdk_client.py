@@ -67,12 +67,38 @@ class _FakeClaudeSDKClient:
             model="claude-opus-4-7",
         )
 
+    # Stage 5: ``get_context_usage`` lets the agent loop pull plan-window
+    # utilization off the warm client at end-of-turn. The fake records
+    # call counts so tests can assert reuse vs recycle, and returns a
+    # canned ``apiUsage`` payload by default — override
+    # ``_context_usage_response`` per-test for failure / empty-response
+    # coverage.
+    _context_usage_response: dict | None = None
+    get_context_usage_count: int = 0
+
+    async def get_context_usage(self) -> dict:
+        type(self).get_context_usage_count = (
+            getattr(type(self), "get_context_usage_count", 0) + 1
+        )
+        if self._context_usage_response is not None:
+            return self._context_usage_response
+        return {
+            "apiUsage": {
+                "five_hour": {
+                    "utilization": 0.42,
+                    "resets_at": 9999999999,
+                    "status": "allowed",
+                },
+            }
+        }
+
 
 def _reset_module_state() -> None:
     agent_mod._sdk_client = None
     agent_mod._sdk_options_fingerprint = None
     agent_mod._sdk_lock = None
     _FakeClaudeSDKClient.instances.clear()
+    _FakeClaudeSDKClient.get_context_usage_count = 0
 
 
 @pytest.fixture(autouse=True)
@@ -304,3 +330,90 @@ async def test_same_session_id_accumulates_history_within_one_turn():
         agent_mod.ClaudeSDKClient = _FakeClaudeSDKClient  # type: ignore[assignment]
 
     assert _SessionAwareFake.history == {"turn-X": ["first", "second"]}
+
+
+# ─── Stage 5: get_context_usage off the warm client ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_context_usage_reuses_warm_client():
+    """A turn just queried; calling ``get_context_usage`` after with
+    the same options reuses the warm client (same fingerprint) instead
+    of reconnecting."""
+    opts = _opts()
+    await _drain("hello", opts)
+    assert len(_FakeClaudeSDKClient.instances) == 1
+    client = _FakeClaudeSDKClient.instances[0]
+    assert client.connect_count == 1
+
+    response = await agent_mod.get_context_usage(opts)
+    # Same client served both — no recycle, no extra connect.
+    assert len(_FakeClaudeSDKClient.instances) == 1
+    assert client.connect_count == 1
+    assert client.disconnect_count == 0
+    assert _FakeClaudeSDKClient.get_context_usage_count == 1
+    assert response is not None
+    assert "apiUsage" in response
+
+
+@pytest.mark.asyncio
+async def test_get_context_usage_connects_when_no_warm_client():
+    """No prior query() has run — the wrapper still connects a fresh
+    client to service the usage probe rather than returning None.
+    Plan-window data is observability; first-turn capture is fine."""
+    response = await agent_mod.get_context_usage(_opts())
+    assert response is not None
+    assert len(_FakeClaudeSDKClient.instances) == 1
+    client = _FakeClaudeSDKClient.instances[0]
+    assert client.connect_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_context_usage_recycles_on_options_change():
+    """Different options-fingerprint after the warm client was set up
+    forces a recycle, same as ``query()``. Avoids stale system_prompt
+    bleed if the agent loop's options drifted between query and
+    capture."""
+    await _drain("hi", _opts(system_prompt="prompt-a"))
+    await agent_mod.get_context_usage(_opts(system_prompt="prompt-b"))
+    assert len(_FakeClaudeSDKClient.instances) == 2
+    assert _FakeClaudeSDKClient.instances[0].disconnect_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_context_usage_swallows_get_context_usage_failure():
+    """``get_context_usage`` is best-effort — when the underlying call
+    raises, the wrapper logs and returns None rather than propagating.
+    The agent loop treats None the same as an empty response."""
+
+    class _RaisingFake(_FakeClaudeSDKClient):
+        async def get_context_usage(self) -> dict:
+            raise RuntimeError("daemon disconnected")
+
+    agent_mod.ClaudeSDKClient = _RaisingFake  # type: ignore[assignment]
+    try:
+        response = await agent_mod.get_context_usage(_opts())
+    finally:
+        agent_mod.ClaudeSDKClient = _FakeClaudeSDKClient  # type: ignore[assignment]
+    assert response is None
+
+
+@pytest.mark.asyncio
+async def test_get_context_usage_swallows_connect_failure():
+    """When connect() raises during the on-demand client construction,
+    the wrapper returns None instead of propagating. The next turn's
+    capture attempt is independent."""
+
+    class _ConnectFails(_FakeClaudeSDKClient):
+        async def connect(self) -> None:
+            raise RuntimeError("connect failed")
+
+    agent_mod.ClaudeSDKClient = _ConnectFails  # type: ignore[assignment]
+    try:
+        response = await agent_mod.get_context_usage(_opts())
+    finally:
+        agent_mod.ClaudeSDKClient = _FakeClaudeSDKClient  # type: ignore[assignment]
+    assert response is None
+    # No client should be retained — the connect failure must clear
+    # the singleton so the next call constructs a fresh one.
+    assert agent_mod._sdk_client is None
