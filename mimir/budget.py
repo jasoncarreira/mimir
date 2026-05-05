@@ -34,10 +34,16 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .billing import (
+    BillingMode,
+    QuotaProvider,
+    QuotaSuppressionResult,
+    evaluate_quota,
+)
 from .feedback import pending_forget_candidates_count
 from .rate_limits import RateLimitSnapshot, RateLimitStore
 from .usage_stats import (
@@ -100,6 +106,8 @@ class HomeostaticArbiter:
     home: Path
     rate_limit_store: RateLimitStore
     turns_log: Path
+    billing_mode: BillingMode = BillingMode.PAY_AS_YOU_GO
+    quota_providers: list[QuotaProvider] = field(default_factory=list)
     plan_window_suppress_threshold: float = 0.80
     cost_hourly_limit_usd: float | None = None
     cost_spike_ratio: float | None = None
@@ -178,13 +186,37 @@ class HomeostaticArbiter:
         constraint that produced the decision (useful for the
         ``scheduled_tick_suppressed`` event and operator triage).
 
-        Only plan-window and cost-rate can suppress. The S3/S4
-        partition is informational (rendered into the prompt block)
-        but doesn't gate firing — busy days shouldn't starve weekly
-        maintenance work."""
+        Branches on :class:`BillingMode` (chainlink #13):
+
+        - ``quota`` — plan-window utilization is the binding
+          constraint (zero marginal cost up to the cap). Suppress on
+          on-pace projection or raw saturation across configured
+          :class:`QuotaProvider` instances. Cost-rate spikes are
+          demoted to advisory in this mode (logged elsewhere; not a
+          suppression input).
+        - ``pay-as-you-go`` — every token costs real money, so the
+          cost-rate spike check is the binding constraint. Plan-
+          window data, when present, can still suppress as a
+          sanity wall (matches pre-chainlink-#13 behavior).
+
+        The S3/S4 partition layer is informational (rendered into the
+        prompt block) but doesn't gate firing — busy days shouldn't
+        starve weekly maintenance work."""
         snap = self.snapshot(now=now)
 
-        # 1. Plan window — hard wall.
+        if self.billing_mode is BillingMode.QUOTA:
+            result = evaluate_quota(
+                self.quota_providers,
+                raw_threshold=self.plan_window_suppress_threshold,
+            )
+            if result.suppress:
+                return False, result.reason
+            # Cost rate is advisory under quota mode — never gates.
+            return True, "ok"
+
+        # Pay-as-you-go (and any unrecognized future mode): existing
+        # layered behavior — plan-window first (hard wall when present),
+        # then cost-rate spike.
         if (
             snap.plan_window_max_utilization is not None
             and snap.plan_window_max_utilization >= self.plan_window_suppress_threshold
@@ -195,7 +227,6 @@ class HomeostaticArbiter:
             )
             return False, reason
 
-        # 2. Cost rate — dollars.
         if snap.cost_rate_alert is not None:
             return False, f"cost_rate_alert:{snap.cost_rate_alert.reason}"
 
