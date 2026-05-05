@@ -181,6 +181,33 @@ def test_render_recent_activity_uses_assistant_marker(tmp_path: Path):
     assert "(assistant): hello back" in rendered
 
 
+def test_render_recent_activity_surfaces_msg_id(tmp_path: Path):
+    """Recent activity lines include ``id=<msg_id>`` so the agent can
+    react to older messages with ``<react message="<id>"/>``."""
+    buf = _make_buffer(tmp_path)
+    msgs = [
+        buf.make_message(
+            channel_id="discord-1",
+            kind="user_message",
+            content="hi",
+            author="alice",
+            msg_id="msg-abc",
+        ),
+        buf.make_message(
+            channel_id="discord-1",
+            kind="user_message",
+            content="no id here",
+            author="bob",
+            # msg_id intentionally omitted
+        ),
+    ]
+    rendered = render_recent_activity(msgs)
+    lines = rendered.splitlines()
+    # Line for alice carries the id; bob's line doesn't.
+    assert any("id=msg-abc" in ln and "alice" in ln for ln in lines)
+    assert any("bob" in ln and "id=" not in ln for ln in lines)
+
+
 def test_render_recent_activity_caps_per_message_chars(tmp_path: Path):
     buf = _make_buffer(tmp_path)
     msg = buf.make_message(
