@@ -1396,4 +1396,19 @@ class Agent:
             output_chars=len(output),
             saga_atoms_total=len(record.saga_atom_ids),
         )
+
+        # Cancel any typing indicator the bridge spawned on inbound. send()
+        # already cancels typing on the destination channel for normal
+        # replies; this handles the edge cases where send() never landed
+        # on the inbound channel — cross-channel-only sends, errored
+        # turns, heartbeat-shaped flow that explicitly went silent.
+        if self._channels is not None and ctx.channel_id:
+            bridge = self._channels.find(ctx.channel_id)
+            if bridge is not None:
+                try:
+                    await bridge.cancel_typing(ctx.channel_id)
+                except Exception:  # noqa: BLE001
+                    # Typing is best-effort. Don't let a stray exception
+                    # mask the actual turn record we're about to return.
+                    log.debug("cancel_typing(%s) failed", ctx.channel_id)
         return record
