@@ -341,12 +341,38 @@ def build_app(config: Config) -> web.Application:
             )
             introspection_registered = False
 
-        # Stage 5 of CLAUDE_SDK_CLIENT_MIGRATION.md retired the
-        # quota-poll cron — plan-window utilization is now captured
-        # per-turn off the shared persistent client in
-        # ``Agent._capture_plan_quota_from_client`` (called from
-        # ``run_turn``). Same RateLimitStore keys, fresher cadence,
-        # no throwaway subprocess.
+        # Stage 5 of CLAUDE_SDK_CLIENT_MIGRATION.md retired the original
+        # quota-poll cron because the plan was to use the shared
+        # persistent client's get_context_usage(). That endpoint turned
+        # out to be context-window data; its apiUsage side-channel is
+        # session-scoped and consistently empty on Claude Max OAuth
+        # (chainlink #9). Plan-window utilization% lives at
+        # ``GET /api/oauth/usage`` and requires the user:profile OAuth
+        # scope, which the headless setup-token flow doesn't grant.
+        # The new oauth_usage_poller fills the gap by reading
+        # ``credentials.json`` (operator-minted via ``claude /login``)
+        # and refreshing tokens itself, bypassing Claude Code CLI's
+        # broken auto-refresh on headless / copied-creds boxes.
+        oauth_poll_registered = False
+        if config.oauth_credentials_path is not None:
+            try:
+                # Share the agent's RateLimitStore instance so the
+                # poller's writes coordinate with the per-turn message-
+                # stream capture path through a single asyncio.Lock.
+                # Two stores at the same path would race on read-modify-
+                # write of the JSON file.
+                oauth_poll_registered = scheduler.add_oauth_usage_poll_job(
+                    agent._rate_limits,
+                    config.oauth_usage_poll_cron,
+                    config.oauth_credentials_path,
+                    refresh_warn_days=config.oauth_refresh_warn_days,
+                )
+            except ValueError as exc:
+                await log_event(
+                    "scheduler_invalid_cron",
+                    job="oauth-usage-poll",
+                    error=str(exc),
+                )
 
         # Load LLM-tick jobs from scheduler.yaml.
         reload_stats = scheduler.reload()
@@ -354,6 +380,7 @@ def build_app(config: Config) -> web.Application:
         if (
             consolidate_registered
             or introspection_registered
+            or oauth_poll_registered
             or reload_stats["registered"] > 0
         ):
             scheduler.start()
