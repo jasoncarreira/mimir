@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -41,6 +42,30 @@ from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+
+def running_on_claude_max() -> bool:
+    """True iff the agent appears to be configured for Claude Max
+    OAuth — the only config where ``ClaudeSDKClient.get_context_usage()``
+    returns useful per-window utilization data.
+
+    Heuristic:
+    - ``CLAUDE_CODE_OAUTH_TOKEN`` set (Max OAuth path).
+    - ``ANTHROPIC_BASE_URL`` empty (no proxy / OpenRouter / Minimax
+      redirect that would route the agent's calls outside Anthropic).
+
+    Either condition flipping means we're in a config where the
+    daemon's ``apiUsage`` will be empty — direct API keys deliver
+    rate-limit headers per-response (already captured by
+    ``RateLimitEvent``) but no plan-window picture; OpenRouter /
+    Minimax don't have a plan-window concept at all.
+
+    The check is environment-only — no network calls, safe to invoke
+    at scheduler-registration time before the agent is up.
+    """
+    has_oauth = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip())
+    has_base_url_override = bool(os.environ.get("ANTHROPIC_BASE_URL", "").strip())
+    return has_oauth and not has_base_url_override
 
 
 @dataclass
@@ -345,6 +370,83 @@ def snapshot_from_sdk_event(rate_limit_info: Any) -> RateLimitSnapshot:
         overage_resets_at=getattr(rate_limit_info, "overage_resets_at", None),
         overage_disabled_reason=getattr(
             rate_limit_info, "overage_disabled_reason", None,
+        ),
+    )
+
+
+def _coerce_api_usage_utilization(raw: Any) -> float | None:
+    """apiUsage utilization may be 0-1, 0-100, or a string. Normalize
+    to 0-1 floats; return None on unparseable."""
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v > 1.0:
+        # Looks like a percentage; rescale.
+        v = v / 100.0
+    if v < 0.0 or v > 1.5:
+        log.warning("apiUsage: utilization out of range (%r → %f)", raw, v)
+    return v
+
+
+def _coerce_api_usage_resets_at(raw: Any) -> int | None:
+    """apiUsage may report ``resets_at`` as unix seconds (int/float)
+    or an ISO timestamp string. Normalize to unix seconds (int)."""
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    if isinstance(raw, str):
+        try:
+            return int(
+                datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+            )
+        except ValueError:
+            return None
+    return None
+
+
+def snapshot_from_api_usage_bucket(bucket: dict[str, Any]) -> RateLimitSnapshot | None:
+    """Convert one ``apiUsage[<window_type>]`` bucket from
+    ``ClaudeSDKClient.get_context_usage()`` to our persisted snapshot.
+
+    The shape is undocumented in the SDK type annotations
+    (``dict[str, Any] | None``); observed fields:
+    - ``status``: "allowed" / "allowed_warning" / "rejected"
+    - ``utilization`` (0.0-1.0) | ``usage_pct`` (0-100) | ``percentage``
+    - ``resets_at`` | ``reset_at`` | ``resetsAt`` (unix seconds or ISO)
+    - ``overage_status``, ``overage_resets_at``, ``overage_disabled_reason``
+
+    Returns None when the bucket is too malformed to be useful (no
+    resets_at AND no utilization)."""
+    util = _coerce_api_usage_utilization(
+        bucket.get("utilization")
+        or bucket.get("usage_pct")
+        or bucket.get("percentage"),
+    )
+    resets = _coerce_api_usage_resets_at(
+        bucket.get("resets_at")
+        or bucket.get("reset_at")
+        or bucket.get("resetsAt"),
+    )
+    if util is None and resets is None:
+        return None
+    overage_status = bucket.get("overage_status")
+    overage_resets = _coerce_api_usage_resets_at(
+        bucket.get("overage_resets_at") or bucket.get("overage_reset_at"),
+    )
+    overage_disabled = bucket.get("overage_disabled_reason")
+    return RateLimitSnapshot(
+        status=str(bucket.get("status") or "allowed"),
+        utilization=util,
+        resets_at=resets,
+        observed_at=datetime.now(tz=timezone.utc).isoformat(),
+        overage_status=overage_status if isinstance(overage_status, str) else None,
+        overage_resets_at=overage_resets,
+        overage_disabled_reason=(
+            overage_disabled if isinstance(overage_disabled, str) else None
         ),
     )
 

@@ -59,6 +59,8 @@ from .rate_limits import (
     RateLimitStore,
     off_pace_buckets,
     render_off_pace_warning,
+    running_on_claude_max,
+    snapshot_from_api_usage_bucket,
     snapshot_from_response_bucket,
     snapshot_from_sdk_event,
 )
@@ -254,6 +256,38 @@ async def query(
         await client.query(prompt, session_id=session_id)
         async for msg in client.receive_response():
             yield msg
+
+
+async def get_context_usage() -> dict | None:
+    """Stage 5: per-turn quota capture. Calls
+    ``ClaudeSDKClient.get_context_usage()`` on the shared persistent
+    client and returns the response dict (or None if no client is
+    connected yet / the SDK call failed).
+
+    The shared client is the same one driving ``query()``, so this
+    is a cheap reuse — no throwaway-subprocess cost the cron-based
+    poller paid. Serialized through the same lock as ``query()``
+    because ``ClaudeSDKClient`` is single-threaded by design.
+
+    Caller is responsible for the ``running_on_claude_max()`` guard;
+    this function will happily query a non-Max session and just
+    return an empty / None ``apiUsage`` payload (which the parser
+    treats as a no-op).
+
+    Errors are caught + logged + return None — quota visibility is
+    best-effort observability, never a load-bearing dependency.
+    """
+    lock = _get_sdk_lock()
+    async with lock:
+        client = _sdk_client
+        if client is None:
+            return None
+        try:
+            response = await client.get_context_usage()
+        except Exception:  # noqa: BLE001
+            log.exception("ClaudeSDKClient.get_context_usage() failed")
+            return None
+        return response if isinstance(response, dict) else None
 
 
 async def shutdown_sdk_client() -> None:
@@ -861,6 +895,51 @@ class Agent:
                 turn_id=ctx.turn_id,
             )
 
+    # ---- plan-quota capture (Stage 5) ----------------------------------
+
+    async def _capture_plan_quota_from_client(self) -> None:
+        """Stage 5 of CLAUDE_SDK_CLIENT_MIGRATION.md: each turn calls
+        ``ClaudeSDKClient.get_context_usage()`` on the shared client
+        and writes the per-window ``apiUsage`` buckets into the
+        ``RateLimitStore``. This retires the cron-based quota poller
+        — every turn now refreshes the plan-window picture for free,
+        with no throwaway-subprocess cost.
+
+        Skipped when not on Claude Max OAuth (direct API keys /
+        OpenRouter / Minimax: ``apiUsage`` would come back empty).
+        Errors are caught + logged + swallowed; the prompt's
+        ``Self-state`` block degrades to "no plan data" rather than
+        crashing the turn.
+        """
+        if not running_on_claude_max():
+            return
+        try:
+            response = await get_context_usage()
+        except Exception:  # noqa: BLE001
+            log.exception("get_context_usage failed during run_turn")
+            return
+        if not isinstance(response, dict):
+            return
+        api_usage = response.get("apiUsage")
+        if not isinstance(api_usage, dict) or not api_usage:
+            # Daemon doesn't have plan-window data yet (fresh OAuth
+            # session before the first message), or non-Max plan with
+            # no apiUsage surface. No-op.
+            return
+        for window_type, bucket in api_usage.items():
+            if not isinstance(bucket, dict):
+                continue
+            snapshot = snapshot_from_api_usage_bucket(bucket)
+            if snapshot is None:
+                continue
+            try:
+                await self._rate_limits.record(window_type, snapshot)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "rate_limits.record failed for apiUsage bucket %s",
+                    window_type,
+                )
+
     # ---- synthesis turn ------------------------------------------------
 
     def _build_synthesis_prompt(self, ctx: TurnContext, event: AgentEvent) -> str:
@@ -1101,6 +1180,16 @@ class Agent:
                             "rate_limits.record from response failed for %s",
                             bucket_type,
                         )
+
+        # 7a.c. Stage 5: per-turn plan-window capture from
+        #     ``ClaudeSDKClient.get_context_usage()``. Same data the
+        #     cron-based quota_poller used to fetch on a 10-min cadence
+        #     — now refreshed every turn from the persistent client at
+        #     no extra subprocess cost. Replaces ``mimir/quota_poller.py``.
+        try:
+            await self._capture_plan_quota_from_client()
+        except Exception:  # noqa: BLE001
+            log.exception("plan-quota capture failed (non-fatal)")
 
         # 7b. Subagent lifecycle (SPEC §4.4). The SDK yields three messages:
         #
