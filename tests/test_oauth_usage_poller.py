@@ -78,20 +78,28 @@ def rate_store(tmp_path: Path) -> RateLimitStore:
 
 
 def _usage_response() -> dict:
-    """Match the live shape of /api/oauth/usage."""
+    """Match the live shape of /api/oauth/usage. Reset times are
+    computed relative to ``now`` so the fixture doesn't rot — RateLimitStore
+    filters out windows whose ``resets_at`` is in the past, which would
+    silently make assertions on ``store.current()`` fail once wall-clock
+    crosses a hardcoded timestamp."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    five_hour_reset = (now + timedelta(hours=2)).isoformat()
+    seven_day_reset = (now + timedelta(days=3)).isoformat()
     return {
         "five_hour": {
             "utilization": 5.0,
-            "resets_at": "2026-05-05T13:00:00.000000+00:00",
+            "resets_at": five_hour_reset,
         },
         "seven_day": {
             "utilization": 43.0,
-            "resets_at": "2026-05-06T19:00:00.000000+00:00",
+            "resets_at": seven_day_reset,
         },
         "seven_day_opus": None,
         "seven_day_sonnet": {
             "utilization": 24.0,
-            "resets_at": "2026-05-06T19:00:00.000000+00:00",
+            "resets_at": seven_day_reset,
         },
         "extra_usage": {
             "is_enabled": False,
