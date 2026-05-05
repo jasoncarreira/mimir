@@ -93,23 +93,33 @@ about recycle timing, which adds state-management complexity.
 **Recommended:** Option A. The precision is worth the plumbing for an
 agent-loop change; the control-plane methods need a stable client lifecycle.
 
-## Concurrency: per-thread client cache
+## Concurrency: asyncio-aware client pool
 
-`ClaudeSDKClient.query()` is single-threaded by design. Concurrent turns from
-mimir's dispatcher would serialize on a shared client — a real latency hit
-under multi-channel load.
+`ClaudeSDKClient.query()` is single-threaded by design — really, single-
+async-task: holding `client.query()` then iterating
+`client.receive_response()` is one logical request and the daemon serializes
+two concurrent requests on the same client. Concurrent turns from mimir's
+dispatcher would serialize on a shared client.
 
-The fix is the same `threading.local` pattern saga adopted (commit 54c5618):
-each calling Python thread (each dispatcher worker, plus any scheduler-fired
-turn that runs on its own thread) caches its own `ClaudeSDKClient`. Per-thread
-cleanup happens at thread teardown (daemon thread + OS reaping on process
-exit), so no explicit lifecycle management is needed for the worker pool.
+**Saga uses a `threading.local` (commit 54c5618).** That shape works for
+saga because saga's callers are different OS threads. Mimir's runtime is
+different: every dispatcher worker is an asyncio task on the same event
+loop in the same OS thread. `threading.local` would hand every coroutine
+the same client.
 
-**Resource cost:** ~50MB RAM per worker thread (one Claude Code subprocess
-each). For mimir's 1-3 dispatcher workers under realistic Discord load, that's
-~150MB. The Max plan quota is account-level, not per-subprocess — multiple
-warm clients share one quota pool, so per-thread caching doesn't multiply
-quota burn.
+**Mimir's Stage 4 shape is an `asyncio`-aware pool** (`mimir.agent.ClientPool`):
+each concurrent turn acquires its own warm `ClaudeSDKClient` from the pool;
+the pool grows lazily up to `max_size=10` and waits when saturated. Pool
+members are keyed by options-fingerprint and a fingerprint change drains
+the whole pool gracefully (idle clients disconnect immediately; in-flight
+clients finish their current request, then disconnect on release).
+
+**Resource cost:** ~50MB RAM per warm pool member (one Claude Code
+subprocess each). For mimir's `max_concurrent_turns=10` under realistic
+load that's ~500MB worst-case; in practice the pool only grows to as
+many concurrent turns are actually in flight, which is typically 1-3.
+The Max plan quota is account-level, not per-subprocess — multiple warm
+clients share one quota pool, so pooling doesn't multiply quota burn.
 
 ## Migration plan (staged)
 
@@ -158,14 +168,34 @@ isolation.
 **Success metric:** memory profile flat across a 1000-turn synthetic run
 (matches `query()`'s memory profile within noise).
 
-### Stage 4 — per-thread cache
+### Stage 4 — asyncio-aware ClientPool
 
 **Goal:** eliminate concurrent-turn serialization.
 
-- Replace the singleton client with a `threading.local` (mirroring saga's
-  `_persistent_runner_local` shape).
-- Each calling thread gets its own client + own session_store.
-- Test: two concurrent turns on different channels don't block on each other.
+**Note (2026-05-05, chainlink #11):** the original Stage 4 plan
+prescribed a `threading.local` cache mirroring saga's
+`_persistent_runner_local` shape. That shape was wrong for mimir.
+Mimir runs all turns on a single asyncio event loop in a single OS
+thread (the dispatcher's worker tasks are coroutines, not threads),
+so `threading.local` would hand every coroutine the *same* client —
+the same serialization problem the lock was creating, just without
+the lock to make it visible. The fix that actually unblocks
+parallelism is an **asyncio-aware pool** keyed by options-fingerprint
+rather than by thread identity.
+
+Shipped shape:
+
+- `mimir.agent.ClientPool`: lazy-fill, max size 10, no pre-warming.
+- `acquire(options)` hands out an idle client at the current
+  fingerprint; constructs+connects a fresh one if pool size is below
+  max; awaits a release if at max.
+- Fingerprint flip drains the pool gracefully — idle clients
+  disconnect immediately, in-flight clients finish their current
+  request and disconnect on release rather than re-pooling. New
+  acquires after the flip use the new fingerprint. No mixed-
+  fingerprint clients are ever concurrently in use.
+- `get_context_usage()` rides the pool — no dedicated client.
+- `shutdown_sdk_client()` disconnects every pool member.
 
 **Success metric:** parallel-turn latency unchanged from a baseline of two
 fire-and-forget queries.

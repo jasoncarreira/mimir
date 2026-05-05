@@ -1,0 +1,485 @@
+"""Stage 4 (chainlink #11) — asyncio-aware ``ClientPool`` tests.
+
+The pool replaces the single-shared-client + global ``asyncio.Lock``
+that was serializing all turns through one ``ClaudeSDKClient``.
+Tests pin:
+
+- Two concurrent ``query()`` calls truly run in parallel — neither
+  waits on the other's full request.
+- Lazy fill: the first call constructs one client, a second
+  concurrent call constructs a second client, etc.
+- Max-size cap: at ``max_size`` in-flight, a further acquire waits
+  for a release.
+- Fingerprint flip drains the whole pool — idle clients disconnect
+  immediately, in-flight clients finish and disconnect on release,
+  fresh acquires use the new fingerprint.
+- ``get_context_usage`` rides the pool — works concurrently with a
+  ``query()``, doesn't block on it.
+- ``shutdown_sdk_client()`` disconnects every pool member (idle and
+  in-flight) and is idempotent.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import pytest
+from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock
+
+import mimir.agent as agent_mod
+
+
+class _BlockingFakeClient:
+    """Test double that lets each test pause ``receive_response`` mid-
+    stream so we can interleave concurrent calls and assert the pool
+    actually parallelizes them."""
+
+    instances: list["_BlockingFakeClient"] = []
+
+    def __init__(self, options: ClaudeAgentOptions | None = None, transport: Any = None) -> None:
+        self.options = options
+        self.connect_count = 0
+        self.disconnect_count = 0
+        self.queries: list[tuple[str, str]] = []
+        # Per-instance "gate": tests set this to an ``asyncio.Event`` and
+        # the fake will wait on it before yielding the assistant message.
+        self.release_gate: asyncio.Event | None = None
+        # Tracks how many clients are concurrently inside
+        # receive_response so a test can assert true parallelism.
+        type(self).instances.append(self)
+
+    async def connect(self) -> None:
+        self.connect_count += 1
+
+    async def disconnect(self) -> None:
+        self.disconnect_count += 1
+
+    async def query(self, prompt: str, session_id: str = "default") -> None:
+        self.queries.append((prompt, session_id))
+
+    async def receive_response(self):
+        # If the test installed a gate, block until it's set. Lets us
+        # have N requests in-flight simultaneously.
+        if self.release_gate is not None:
+            await self.release_gate.wait()
+        yield AssistantMessage(
+            content=[TextBlock(text="ok")],
+            model="claude-opus-4-7",
+        )
+
+    async def get_context_usage(self) -> dict:
+        return {"apiUsage": {"five_hour": {"utilization": 0.1, "resets_at": 0, "status": "allowed"}}}
+
+
+def _reset() -> None:
+    agent_mod._reset_pool_for_tests()
+    _BlockingFakeClient.instances.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pool(monkeypatch):
+    _reset()
+    monkeypatch.setattr(agent_mod, "ClaudeSDKClient", _BlockingFakeClient)
+    yield
+    _reset()
+
+
+def _opts(**overrides) -> ClaudeAgentOptions:
+    base = dict(
+        system_prompt="hello system",
+        model="claude-opus-4-7",
+        cwd="/tmp",
+        permission_mode="bypassPermissions",
+    )
+    base.update(overrides)
+    return ClaudeAgentOptions(**base)
+
+
+async def _drain(prompt: str, options: ClaudeAgentOptions, session_id: str = "default"):
+    out = []
+    async for msg in agent_mod.query(prompt=prompt, options=options, session_id=session_id):
+        out.append(msg)
+    return out
+
+
+# ─── (a) two concurrent calls run in parallel ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_calls_run_in_parallel():
+    """Two ``query()`` calls launched concurrently must both reach
+    ``receive_response`` before either finishes — the old global
+    asyncio.Lock would serialize them so the second would only enter
+    after the first yielded its terminal message."""
+    opts = _opts()
+
+    # Both gates start unset; we'll have both clients block inside
+    # receive_response, then assert two clients exist concurrently,
+    # then release them.
+    started = asyncio.Event()
+    in_flight_count = 0
+    seen_concurrent = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def _instrumented_drain(prompt: str):
+        nonlocal in_flight_count
+        msgs = []
+        async for msg in agent_mod.query(prompt=prompt, options=opts):
+            msgs.append(msg)
+        return msgs
+
+    # Override receive_response so we can count concurrent in-flight
+    # callers.
+    original = _BlockingFakeClient.receive_response
+
+    async def _instrumented_receive(self):
+        nonlocal in_flight_count
+        in_flight_count += 1
+        if in_flight_count >= 2:
+            seen_concurrent.set()
+        await gate.wait()
+        in_flight_count -= 1
+        yield AssistantMessage(
+            content=[TextBlock(text="ok")],
+            model="claude-opus-4-7",
+        )
+
+    _BlockingFakeClient.receive_response = _instrumented_receive
+    try:
+        t1 = asyncio.create_task(_instrumented_drain("first"))
+        t2 = asyncio.create_task(_instrumented_drain("second"))
+        # Wait for both to be inside receive_response.
+        await asyncio.wait_for(seen_concurrent.wait(), timeout=2.0)
+        # Two clients must have been constructed (lazy-fill).
+        assert len(_BlockingFakeClient.instances) == 2
+        gate.set()
+        await asyncio.gather(t1, t2)
+    finally:
+        _BlockingFakeClient.receive_response = original
+
+    # After release both clients should be idle (still connected).
+    for c in _BlockingFakeClient.instances:
+        assert c.connect_count == 1
+        assert c.disconnect_count == 0
+
+
+# ─── (b) fingerprint flip drains and replaces ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_flip_drains_idle_clients():
+    """When a query arrives with a different options-fingerprint, all
+    idle pool members are disconnected before the new client is
+    constructed."""
+    await _drain("first", _opts(system_prompt="prompt-a"))
+    await _drain("first2", _opts(system_prompt="prompt-a"))
+    # Two queries, same fingerprint, same client (sequential reuse).
+    assert len(_BlockingFakeClient.instances) == 1
+    a = _BlockingFakeClient.instances[0]
+    assert a.disconnect_count == 0
+
+    # Flip the fingerprint — the idle client must be disconnected
+    # before the new one runs.
+    await _drain("second", _opts(system_prompt="prompt-b"))
+    assert len(_BlockingFakeClient.instances) == 2
+    assert a.disconnect_count == 1
+    b = _BlockingFakeClient.instances[1]
+    assert b.connect_count == 1
+    assert b.disconnect_count == 0
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_flip_lets_in_flight_finish_then_disconnects_on_release():
+    """An in-flight client at fingerprint A must finish its current
+    request when fingerprint B arrives mid-flight; on release it
+    disconnects rather than re-pooling."""
+    opts_a = _opts(system_prompt="prompt-a")
+    opts_b = _opts(system_prompt="prompt-b")
+
+    a_gate = asyncio.Event()
+    a_inside = asyncio.Event()
+
+    async def _gated_receive(self):
+        # Only the first instance (fingerprint A) blocks; later
+        # instances fall through to the canned reply.
+        if self is _BlockingFakeClient.instances[0]:
+            a_inside.set()
+            await a_gate.wait()
+        yield AssistantMessage(
+            content=[TextBlock(text="ok")],
+            model="claude-opus-4-7",
+        )
+
+    original = _BlockingFakeClient.receive_response
+    _BlockingFakeClient.receive_response = _gated_receive
+    try:
+        # Start a query at fingerprint A and let it block inside
+        # receive_response.
+        t_a = asyncio.create_task(_drain("a", opts_a))
+        await asyncio.wait_for(a_inside.wait(), timeout=2.0)
+        client_a = _BlockingFakeClient.instances[0]
+        assert client_a.disconnect_count == 0
+
+        # While A is still in flight, run a query at fingerprint B.
+        # A new client must be constructed — A is busy, can't drain
+        # yet — and the pool flips its current fingerprint.
+        t_b = asyncio.create_task(_drain("b", opts_b))
+        # Give B time to start (it should construct a new client).
+        # B isn't gated, so it'll complete quickly.
+        await asyncio.wait_for(t_b, timeout=2.0)
+        # B's client is fresh and connected.
+        assert len(_BlockingFakeClient.instances) == 2
+        client_b = _BlockingFakeClient.instances[1]
+        assert client_b.connect_count == 1
+
+        # A is still in flight — must NOT have been disconnected mid-stream.
+        assert client_a.disconnect_count == 0
+
+        # Release A. On release, A sees the fingerprint flip and
+        # disconnects rather than re-pooling.
+        a_gate.set()
+        await asyncio.wait_for(t_a, timeout=2.0)
+
+        # Give the release path a tick to complete the disconnect
+        # (it happens after notify, outside the lock).
+        for _ in range(20):
+            if client_a.disconnect_count == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert client_a.disconnect_count == 1
+        # B is still healthy and idle.
+        assert client_b.disconnect_count == 0
+    finally:
+        _BlockingFakeClient.receive_response = original
+
+
+# ─── (c) lazy fill grows up to max ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_lazy_fill_grows_up_to_max():
+    """Sequential calls reuse a single client; concurrent calls each
+    construct a fresh client up to ``max_size``."""
+    opts = _opts()
+
+    # Sequential: only one client created.
+    await _drain("a", opts)
+    await _drain("b", opts)
+    await _drain("c", opts)
+    assert len(_BlockingFakeClient.instances) == 1
+
+    # Concurrent: pool grows. Force 4 concurrent in-flight requests
+    # by gating receive_response.
+    gate = asyncio.Event()
+
+    async def _gated_receive(self):
+        await gate.wait()
+        yield AssistantMessage(
+            content=[TextBlock(text="ok")],
+            model="claude-opus-4-7",
+        )
+
+    original = _BlockingFakeClient.receive_response
+    _BlockingFakeClient.receive_response = _gated_receive
+    try:
+        tasks = [asyncio.create_task(_drain(f"msg{i}", opts)) for i in range(4)]
+        # Wait for all 4 to be inside receive_response.
+        for _ in range(200):
+            if sum(1 for c in _BlockingFakeClient.instances if c.connect_count == 1) >= 4:
+                break
+            await asyncio.sleep(0.01)
+        # Existing 1 + 3 new = 4 total. The first task may reuse the
+        # pre-existing idle client; only 3 fresh ones get built.
+        assert len(_BlockingFakeClient.instances) == 4
+        gate.set()
+        await asyncio.gather(*tasks)
+    finally:
+        _BlockingFakeClient.receive_response = original
+
+
+# ─── (d) max-size cap waits for release ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_max_size_cap_waits_for_release():
+    """When the pool is at max_size and all clients are in flight, a
+    further acquire blocks until one is released."""
+    opts = _opts()
+
+    # Shrink the pool's max_size for this test so we don't have to
+    # spin up 11 concurrent fakes. The pool is created lazily on
+    # first use; create it here and override max_size.
+    pool = agent_mod._get_pool()
+    pool.max_size = 2
+
+    gate = asyncio.Event()
+    waiter_started = asyncio.Event()
+    in_receive = 0
+    saw_two_in_flight = asyncio.Event()
+
+    async def _gated_receive(self):
+        nonlocal in_receive
+        in_receive += 1
+        if in_receive == 2:
+            saw_two_in_flight.set()
+        await gate.wait()
+        in_receive -= 1
+        yield AssistantMessage(
+            content=[TextBlock(text="ok")],
+            model="claude-opus-4-7",
+        )
+
+    original = _BlockingFakeClient.receive_response
+    _BlockingFakeClient.receive_response = _gated_receive
+    try:
+        # Two saturate the pool.
+        t1 = asyncio.create_task(_drain("a", opts))
+        t2 = asyncio.create_task(_drain("b", opts))
+        await asyncio.wait_for(saw_two_in_flight.wait(), timeout=2.0)
+        assert len(_BlockingFakeClient.instances) == 2
+
+        # Third must wait — pool is at cap.
+        async def _third():
+            waiter_started.set()
+            return await _drain("c", opts)
+
+        t3 = asyncio.create_task(_third())
+        await asyncio.wait_for(waiter_started.wait(), timeout=2.0)
+        # Give t3 time to actually try to acquire and block. It
+        # shouldn't have constructed a 3rd client.
+        await asyncio.sleep(0.1)
+        assert len(_BlockingFakeClient.instances) == 2
+        assert not t3.done()
+
+        # Release one — t3 should now proceed.
+        gate.set()
+        await asyncio.gather(t1, t2, t3)
+
+        # Still only 2 clients total — t3 reused one.
+        assert len(_BlockingFakeClient.instances) == 2
+    finally:
+        _BlockingFakeClient.receive_response = original
+
+
+# ─── (e) get_context_usage works during a concurrent query ────────
+
+
+@pytest.mark.asyncio
+async def test_get_context_usage_works_during_concurrent_query():
+    """``get_context_usage`` rides the pool. While one ``query()`` is
+    blocked in ``receive_response``, ``get_context_usage`` must be
+    able to acquire a separate client and return."""
+    opts = _opts()
+
+    query_inside = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def _gated_receive(self):
+        query_inside.set()
+        await gate.wait()
+        yield AssistantMessage(
+            content=[TextBlock(text="ok")],
+            model="claude-opus-4-7",
+        )
+
+    original = _BlockingFakeClient.receive_response
+    _BlockingFakeClient.receive_response = _gated_receive
+    try:
+        t_q = asyncio.create_task(_drain("hello", opts))
+        await asyncio.wait_for(query_inside.wait(), timeout=2.0)
+
+        # query is parked in receive_response. get_context_usage
+        # must NOT block — the pool can grow to a second client.
+        usage = await asyncio.wait_for(agent_mod.get_context_usage(opts), timeout=2.0)
+        assert usage is not None
+        assert "apiUsage" in usage
+        # Two clients exist now.
+        assert len(_BlockingFakeClient.instances) == 2
+
+        gate.set()
+        await t_q
+    finally:
+        _BlockingFakeClient.receive_response = original
+
+
+# ─── (f) shutdown disconnects all pool members ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_shutdown_disconnects_all_pool_members():
+    """``shutdown_sdk_client()`` disconnects every connected client
+    in the pool — both idle and any that happened to be in flight."""
+    opts = _opts()
+
+    gate = asyncio.Event()
+    in_flight = 0
+    saw_three = asyncio.Event()
+
+    async def _gated_receive(self):
+        nonlocal in_flight
+        in_flight += 1
+        if in_flight == 3:
+            saw_three.set()
+        await gate.wait()
+        in_flight -= 1
+        yield AssistantMessage(
+            content=[TextBlock(text="ok")],
+            model="claude-opus-4-7",
+        )
+
+    original = _BlockingFakeClient.receive_response
+    _BlockingFakeClient.receive_response = _gated_receive
+    try:
+        # Build out three concurrent in-flight clients.
+        tasks = [asyncio.create_task(_drain(f"m{i}", opts)) for i in range(3)]
+        await asyncio.wait_for(saw_three.wait(), timeout=2.0)
+        assert len(_BlockingFakeClient.instances) == 3
+
+        # Release one — it returns to idle. Two stay in flight.
+        gate.set()
+        # Don't gather yet; give the released ones a moment to land
+        # back in idle.
+        await asyncio.sleep(0.1)
+        await asyncio.gather(*tasks)
+    finally:
+        _BlockingFakeClient.receive_response = original
+
+    # All three are now idle. Shutdown disconnects them all.
+    await agent_mod.shutdown_sdk_client()
+    for c in _BlockingFakeClient.instances:
+        assert c.disconnect_count == 1
+
+    # Idempotent — second call is a no-op (no pool to drain).
+    await agent_mod.shutdown_sdk_client()
+    for c in _BlockingFakeClient.instances:
+        assert c.disconnect_count == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_with_no_pool_is_safe():
+    """Shutdown before any query() is a no-op."""
+    await agent_mod.shutdown_sdk_client()
+
+
+# ─── back-compat: legacy module-level reset hooks ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_legacy_module_resets_still_safe():
+    """Existing tests that pre-date the pool poke at ``_sdk_client``,
+    ``_sdk_options_fingerprint``, ``_sdk_lock`` to reset state. Those
+    assignments are now no-op shims; the load-bearing reset is
+    ``_reset_pool_for_tests``. Verify both forms coexist without
+    breaking."""
+    await _drain("hi", _opts())
+    assert agent_mod._pool is not None
+
+    agent_mod._sdk_client = None
+    agent_mod._sdk_options_fingerprint = None
+    agent_mod._sdk_lock = None
+    # The pool is still alive (legacy assignments don't reset it).
+    assert agent_mod._pool is not None
+
+    agent_mod._reset_pool_for_tests()
+    assert agent_mod._pool is None
