@@ -521,6 +521,73 @@ class Scheduler:
         )
         return True
 
+    # ---- OAuth usage poller cron -------------------------------------
+
+    # VSM: S3 — non-LLM background poll for plan-window quota.
+    #      Reads ~/.claude/.credentials.json (operator-minted via
+    #      ``claude /login``), GETs Anthropic's /api/oauth/usage, and
+    #      writes per-window snapshots into the shared RateLimitStore.
+    #      Refreshes its own access token via the standard OAuth2
+    #      refresh_token grant (Claude Code CLI's auto-refresh is
+    #      broken on headless / copied-creds boxes — see
+    #      mimir/oauth_usage_poller.py for context).
+    # loop_id: 4.9
+    def add_oauth_usage_poll_job(
+        self,
+        rate_limit_store: Any,
+        cron_expr: str,
+        credentials_path: Path,
+        *,
+        refresh_warn_days: int = 25,
+        job_id: str = "oauth-usage-poll",
+    ) -> bool:
+        """Register the plan-window quota poller. Returns False on
+        empty / unset cron expression so callers can no-op out without
+        an exception."""
+        cron_expr = (cron_expr or "").strip()
+        if not cron_expr:
+            return False
+        try:
+            trigger = CronTrigger.from_crontab(cron_expr, timezone=UTC)
+        except (ValueError, KeyError) as exc:
+            raise ValueError(
+                f"invalid cron expression {cron_expr!r}: {exc}"
+            ) from exc
+
+        from .oauth_usage_poller import PollerConfig, poll_once
+
+        cfg = PollerConfig(
+            credentials_path=credentials_path,
+            refresh_warn_days=refresh_warn_days,
+        )
+
+        async def _run() -> None:
+            try:
+                await poll_once(cfg, rate_limit_store)
+            except Exception as exc:  # noqa: BLE001
+                # poll_once is meant to swallow its own errors via
+                # log_event; this is a defensive belt — if something
+                # leaks (e.g. import-time bug) we still surface it.
+                await log_event(
+                    "oauth_usage_failed",
+                    stage="job_wrapper",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+        self._scheduler.add_job(
+            _run,
+            trigger=trigger,
+            id=job_id,
+            replace_existing=True,
+            # Quota data is best-effort — don't backfill missed runs.
+            misfire_grace_time=60,
+            # If the poller is already mid-run when the next tick fires
+            # (network slow), skip rather than overlap.
+            max_instances=1,
+            coalesce=True,
+        )
+        return True
+
     # ---- lifecycle ---------------------------------------------------
 
     def start(self) -> None:
