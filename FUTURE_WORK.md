@@ -988,3 +988,13 @@ Also shipped (not previously tracked here, captured for posterity):
   2026-05-04 alongside the cron poller in `mimir/quota_poller.py` —
   the cron is the ship-this-week fix; the migration is the long-term
   shape. ~one focused day of work across five stages.
+
+- **[SYNTHESIS_AND_BUDGET_FIXES.md](./SYNTHESIS_AND_BUDGET_FIXES.md)** —
+  two cost/autonomy fixes from the 2026-05-04 self-reflection cycle.
+  (1) Synthesis turn embeds full turn JSON including each turn's
+  `input` (a 30k-token rendered prompt that already contains prior
+  turns' context) — quadratic blowup, $2-3 per session-end at 500k
+  prompt tokens. Fix: pass turn IDs + atom-feedback structure;
+  add `mimir_get_turn(turn_id)` MCP tool for selective fetch during
+  memory capture. (2) `MIMIR_TOOL_CALL_BUDGET` default of 30 is too
+  low for an autonomous engineer; bump to 120. Two independent PRs.
