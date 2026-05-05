@@ -63,9 +63,13 @@ class ChannelRegistry:
         channel_id: str,
         text: str,
         attachment_paths: list | None = None,
+        *,
+        final: bool = True,
     ) -> SendResult:
         bridge = self.find_or_raise(channel_id)
-        return await bridge.send(channel_id, text, attachment_paths)
+        return await bridge.send(
+            channel_id, text, attachment_paths, final=final,
+        )
 
     async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:
         bridge = self.find_or_raise(channel_id)

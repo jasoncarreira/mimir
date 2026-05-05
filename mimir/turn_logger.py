@@ -57,7 +57,11 @@ def _coerce_tool_result_content(content: Any) -> str:
     return str(content)
 
 
-def extract_turn_events(messages: list[Message]) -> tuple[list[dict[str, Any]], str]:
+def extract_turn_events(
+    messages: list[Message],
+    *,
+    streaming_active: bool = False,
+) -> tuple[list[dict[str, Any]], str]:
     """Walk a Claude Agent SDK message stream and produce ``(events, output)``.
 
     Mapping (SPEC §10.3):
@@ -74,12 +78,48 @@ def extract_turn_events(messages: list[Message]) -> tuple[list[dict[str, Any]], 
     Tool-result ``name`` is filled by correlating ``tool_use_id`` against the
     preceding ``tool_call`` events; the SDK's ``ToolResultBlock`` carries only
     the id.
+
+    streaming_active (chainlink #5)
+    -------------------------------
+
+    When True, intermediate text — text-only AssistantMessages strictly
+    between the first and last ``tool_use`` — is demoted from
+    ``output`` to a ``reasoning`` event. This mirrors what the
+    streaming auto-dispatcher delivered to the user: only the "plan"
+    (text before the first tool_use) and the "result" (text after
+    the last tool_use) hit the channel; intermediate narration is
+    suppressed. Without this flag, all text-only AssistantMessages
+    would be joined into ``output``, which would no longer match
+    what the user actually saw.
+
+    Behaves identically to the default for turns with zero or one
+    tool_use AssistantMessage — there's no "intermediate" range
+    when there's at most one boundary.
     """
     events: list[dict[str, Any]] = []
     output_parts: list[str] = []
     tool_name_by_id: dict[str, str] = {}
 
-    for msg in messages:
+    # Pre-compute the "intermediate" range when streaming was active,
+    # so each AssistantMessage knows whether its text-only payload is
+    # post-tool intermediate (→ reasoning) or pre/post boundary (→
+    # output). The set holds indices into ``messages``.
+    intermediate_indices: set[int] = set()
+    if streaming_active:
+        tool_indices: list[int] = []
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, AssistantMessage):
+                continue
+            if getattr(msg, "parent_tool_use_id", None) is not None:
+                continue
+            if any(isinstance(b, ToolUseBlock) for b in msg.content):
+                tool_indices.append(i)
+        if len(tool_indices) >= 2:
+            first_tool, last_tool = tool_indices[0], tool_indices[-1]
+            for i in range(first_tool + 1, last_tool + 1):
+                intermediate_indices.add(i)
+
+    for idx, msg in enumerate(messages):
         # Skip subagent-internal turns. Top-level messages have parent_tool_use_id=None.
         if getattr(msg, "parent_tool_use_id", None) is not None:
             continue
@@ -102,7 +142,16 @@ def extract_turn_events(messages: list[Message]) -> tuple[list[dict[str, Any]], 
                 # Text alongside tool calls reads as reasoning that precedes the call.
                 events.append({"type": "reasoning", "content": "\n".join(text_parts)})
             elif text_parts:
-                output_parts.extend(text_parts)
+                if idx in intermediate_indices:
+                    # chainlink #5: streaming would have suppressed
+                    # this text from the user; record it as reasoning
+                    # so turns.jsonl mirrors what was delivered.
+                    events.append({
+                        "type": "reasoning",
+                        "content": "\n".join(text_parts),
+                    })
+                else:
+                    output_parts.extend(text_parts)
 
             for tu in tool_uses:
                 tool_name_by_id[tu.id] = tu.name

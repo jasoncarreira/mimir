@@ -21,7 +21,7 @@ class _RecordingBridge(Bridge):
     async def connect(self) -> None: ...
     async def disconnect(self) -> None: ...
 
-    async def send(self, channel_id, text, attachment_paths=None):
+    async def send(self, channel_id, text, attachment_paths=None, *, final=True):
         self.sent.append((channel_id, text))
         return SendResult(sent=True, message_id="m1", chunks=1)
 

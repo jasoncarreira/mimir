@@ -305,14 +305,24 @@ class DiscordBridge(Bridge):
         channel_id: str,
         text: str,
         attachment_paths: list[Path] | None = None,
+        *,
+        final: bool = True,
     ) -> SendResult:
-        # Cancel any in-flight typing-hold task on this channel before the
-        # actual reply goes out. Discord drops the indicator within ~10s
-        # of the last refresh, so this gets the dots out of the user's
-        # face right around the time their message arrives. Programmatic
-        # sends to a channel that never had a typing task (scheduled
-        # ticks, alerts) hit the no-op branch — safe.
-        await self.cancel_typing(channel_id)
+        # Cancel any in-flight typing-hold task on this channel before
+        # the actual reply goes out — but only on the FINAL flush.
+        # Discord drops the indicator within ~10s of the last refresh,
+        # so this gets the dots out of the user's face right around
+        # the time their message arrives. Programmatic sends to a
+        # channel that never had a typing task (scheduled ticks,
+        # alerts) hit the no-op branch — safe.
+        #
+        # chainlink #5: when ``final=False`` the bridge is delivering a
+        # mid-turn "plan" chunk with more work still queued — keep
+        # the typing indicator held so the user sees "still working"
+        # rather than "done." The next ``send(final=True)`` (the
+        # result flush) cancels it normally.
+        if final:
+            await self.cancel_typing(channel_id)
 
         if self._client is None or self._client.is_closed():
             return SendResult(sent=False, error="discord client not connected")

@@ -95,6 +95,7 @@ from .session_manager import SessionManager
 from .subagent_inbox import SubagentInbox, SubagentResult, render_subagent_updates
 from .templates import render_saga_session_end
 from .tools import SDK_PRESET_TOOLS, allowed_tool_names, build_mcp_server
+from ._streaming_dispatch import StreamingAutoDispatcher
 from .turn_logger import TurnLogger, extract_turn_events, truncate_input
 
 log = logging.getLogger(__name__)
@@ -499,6 +500,63 @@ class Agent:
             source=source,
         )
         await self._buffer.append(msg)
+
+    # chainlink #5 — streaming auto-dispatch callbacks.
+    #
+    # The streaming dispatcher (mimir._streaming_dispatch) handles the
+    # "plan" flush — text emitted before the first tool_use, sent
+    # mid-turn so the user sees forward progress. The result flush
+    # still goes through _auto_dispatch_or_record at end-of-turn. The
+    # callbacks below glue the dispatcher to the standard observability
+    # surfaces: events.jsonl + last_assistant_message_id tracking on
+    # the TurnContext (so reactions defaulting to "the message I just
+    # delivered" land on the plan flush, not on a stale prior reply).
+    def _on_streaming_plan_dispatched(
+        self,
+        ctx: TurnContext,
+        event: AgentEvent,
+        bridge,
+    ):
+        async def _cb(plan_text: str, result, dropped_directives: int) -> None:
+            ctx.last_assistant_message_id = result.message_id
+            text_for_log = (
+                plan_text if len(plan_text) <= 4096
+                else plan_text[:4096] + "…[truncated]"
+            )
+            await log_event(
+                "auto_dispatch_streamed_plan",
+                channel_id=event.channel_id,
+                bridge=getattr(bridge, "name", None),
+                message_id=result.message_id,
+                chunks=result.chunks,
+                text=text_for_log,
+                # chainlink #5: directives are end-of-turn only. If
+                # the agent put one inline with the plan, log it so
+                # the audit trail shows it happened (dropped from
+                # the plan flush — the result flush will handle any
+                # trailing directives in its own clean_text).
+                dropped_actions_in_plan=dropped_directives,
+            )
+            # Record the plan chunk to chat_history immediately so
+            # Recent activity reflects what was sent. The result chunk
+            # is appended later by _auto_dispatch_or_record.
+            await self._record_outbound(
+                event.channel_id, plan_text, source=event.source,
+            )
+
+        return _cb
+
+    def _on_streaming_plan_failed(self, event: AgentEvent, bridge):
+        async def _cb(plan_text: str, error: str) -> None:
+            await log_event(
+                "auto_dispatch_streamed_plan_failed",
+                channel_id=event.channel_id,
+                bridge=getattr(bridge, "name", None),
+                error=error,
+                plan_chars=len(plan_text),
+            )
+
+        return _cb
 
     # VSM: S1 outbound — auto-dispatch the SDK's final assistant text
     #                    when the agent didn't call send_message. Without
@@ -1133,6 +1191,30 @@ class Agent:
         options = self._build_options(system_prompt)
         messages: list = []
         error: str | None = None
+        # chainlink #5: streaming auto-dispatcher. Eligibility matches
+        # _auto_dispatch_or_record exactly — user-facing inbound on a
+        # registered, non-bench bridge. On heartbeat / scheduler ticks
+        # the dispatcher is created disabled and observe() is a no-op.
+        streaming_eligible = (
+            event.trigger in ("user_message", "react_received")
+            and self._channels is not None
+        )
+        streaming_bridge = (
+            self._channels.find(event.channel_id)
+            if streaming_eligible and self._channels is not None
+            else None
+        )
+        streaming_dispatcher = StreamingAutoDispatcher(
+            channel_id=event.channel_id,
+            bridge=streaming_bridge,
+            on_plan_dispatched=self._on_streaming_plan_dispatched(
+                ctx, event, streaming_bridge,
+            ),
+            on_plan_failed=self._on_streaming_plan_failed(
+                event, streaming_bridge,
+            ),
+            eligible=streaming_eligible,
+        )
         try:
             try:
                 async for msg in query(
@@ -1141,6 +1223,16 @@ class Agent:
                     session_id=ctx.turn_id,
                 ):
                     messages.append(msg)
+                    # observe() is best-effort — failures inside the
+                    # streaming dispatcher must never break the main
+                    # message loop. Logged inside the dispatcher.
+                    try:
+                        await streaming_dispatcher.observe(msg)
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "streaming_dispatcher.observe failed; "
+                            "continuing message loop",
+                        )
             except Exception as exc:  # noqa: BLE001
                 error = f"{type(exc).__name__}: {exc}"
                 log.exception("query() failed for turn %s", ctx.turn_id)
@@ -1166,7 +1258,18 @@ class Agent:
                     ctx.turn_id,
                 )
 
-        events_list, output = extract_turn_events(messages)
+        # chainlink #5: when streaming was active and a plan flush
+        # already went out, pass streaming_active=True so intermediate
+        # text is demoted to reasoning events (turns.jsonl mirrors what
+        # the user actually saw). For all other turns this is a no-op
+        # — same single-flush behavior as before.
+        streaming_active_for_log = (
+            streaming_dispatcher.streamed_plan
+            and not streaming_dispatcher.disabled_by_explicit_send
+        )
+        events_list, output = extract_turn_events(
+            messages, streaming_active=streaming_active_for_log,
+        )
         duration_ms = int((time.monotonic() - ctx.started_at) * 1000)
 
         # 7a. ResultMessage capture (Phase 8 — resume detection + cost).
@@ -1350,7 +1453,35 @@ class Agent:
             and event.trigger != "saga_session_end"
             and ctx.send_message_attempts == 0
         ):
-            await self._auto_dispatch_or_record(ctx, event, output)
+            # chainlink #5: when the streaming dispatcher already
+            # flushed a "plan" chunk, this final call delivers only
+            # the "result" half. The plan part of `output` is the
+            # text BEFORE the first tool_use; pass only the result
+            # text so we don't redeliver the plan.
+            if streaming_active_for_log:
+                result_text = streaming_dispatcher.result_text()
+                if result_text:
+                    await self._auto_dispatch_or_record(
+                        ctx, event, result_text,
+                    )
+                else:
+                    # Plan was streamed but result is empty — record an
+                    # auto_dispatch_ok so the audit log shows the
+                    # streamed plan was the entire reply, not silence.
+                    await log_event(
+                        "auto_dispatch_streamed_only_plan",
+                        channel_id=event.channel_id,
+                        plan_chars=len(streaming_dispatcher.state.plan_text()),
+                    )
+                    # Still record to chat_history so Recent activity
+                    # reflects what the agent said (the plan text).
+                    await self._record_outbound(
+                        event.channel_id,
+                        streaming_dispatcher.state.plan_text(),
+                        source=event.source,
+                    )
+            else:
+                await self._auto_dispatch_or_record(ctx, event, output)
 
         # 9. Post-message SAGA hook.
         if not error:
