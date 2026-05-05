@@ -36,7 +36,7 @@ class _RecordingBridge(Bridge):
     async def connect(self) -> None: ...
     async def disconnect(self) -> None: ...
 
-    async def send(self, channel_id, text, attachment_paths=None):
+    async def send(self, channel_id, text, attachment_paths=None, *, final=True):
         self.sent.append((channel_id, text))
         if self.fail_send:
             return SendResult(sent=False, error="bridge boom")
@@ -407,7 +407,7 @@ async def test_send_message_with_send_file_directive_resolves_under_outbound(
         prefixes: tuple = ("c-",)
         async def connect(self): ...
         async def disconnect(self): ...
-        async def send(self, channel_id, text, attachment_paths=None):
+        async def send(self, channel_id, text, attachment_paths=None, *, final=True):
             sent_with_attach.append((channel_id, text, list(attachment_paths or [])))
             return SendResult(sent=True, message_id="m1", chunks=1)
         async def react(self, channel_id, message_id, emoji):
@@ -525,7 +525,7 @@ async def test_fetch_channel_history_returns_formatted_listing(tmp_path: Path):
         prefixes: tuple = ("c-",)
         async def connect(self): ...
         async def disconnect(self): ...
-        async def send(self, channel_id, text, attachment_paths=None):
+        async def send(self, channel_id, text, attachment_paths=None, *, final=True):
             return SendResult(sent=True, message_id="m1", chunks=1)
         async def react(self, channel_id, message_id, emoji):
             return True
@@ -575,7 +575,7 @@ async def test_fetch_channel_history_clamps_limit(tmp_path: Path):
         prefixes: tuple = ("c-",)
         async def connect(self): ...
         async def disconnect(self): ...
-        async def send(self, channel_id, text, attachment_paths=None):
+        async def send(self, channel_id, text, attachment_paths=None, *, final=True):
             return SendResult(sent=True, message_id="m1", chunks=1)
         async def react(self, channel_id, message_id, emoji):
             return True
@@ -647,7 +647,7 @@ async def test_fetch_channel_history_empty_result(tmp_path: Path):
         prefixes: tuple = ("c-",)
         async def connect(self): ...
         async def disconnect(self): ...
-        async def send(self, channel_id, text, attachment_paths=None):
+        async def send(self, channel_id, text, attachment_paths=None, *, final=True):
             return SendResult(sent=True, message_id="m1", chunks=1)
         async def react(self, channel_id, message_id, emoji):
             return True

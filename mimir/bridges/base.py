@@ -52,10 +52,21 @@ class Bridge(ABC):
         channel_id: str,
         text: str,
         attachment_paths: list[Path] | None = None,
+        *,
+        final: bool = True,
     ) -> SendResult:
         """Emit ``text`` to ``channel_id``. Returns a ``SendResult`` —
         ``sent=False`` plus an ``error`` string for soft failures the model
-        can react to. Hard failures raise."""
+        can react to. Hard failures raise.
+
+        ``final`` (chainlink #5): when False, the caller is mid-turn —
+        a "plan" chunk emitted before tool_use work runs, with more
+        text expected later. Bridges that hold UI affordances tied
+        to "the bot is done" (e.g. Discord typing indicator) should
+        keep them held when ``final=False`` and only release on
+        ``final=True`` (the default; matches the pre-streaming
+        single-flush behavior). Bridges that don't have such
+        affordances ignore the kwarg."""
 
     @abstractmethod
     async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:

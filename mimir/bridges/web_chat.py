@@ -78,7 +78,14 @@ class WebChatBridge(Bridge):
         channel_id: str,
         text: str,
         attachment_paths: list[Path] | None = None,
+        *,
+        final: bool = True,
     ) -> SendResult:
+        # chainlink #5: ``final`` is informational. The web stub fans
+        # each send out as its own SSE payload, so a plan-then-result
+        # turn naturally arrives as two events without further
+        # gating. No typing-indicator affordance to hold.
+        del final
         message_id = uuid.uuid4().hex[:12]
         payload = {
             "channel_id": channel_id,

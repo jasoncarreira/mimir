@@ -56,7 +56,15 @@ class BenchBridge(Bridge):
         channel_id: str,
         text: str,
         attachment_paths: list[Path] | None = None,
+        *,
+        final: bool = True,
     ) -> SendResult:
+        # chainlink #5: bench has no typing-indicator affordance, so
+        # ``final`` is informational only. Streaming auto-dispatch is
+        # disabled on bench channels anyway (the bench harness reads
+        # the SDK's final text directly), so this kwarg should never
+        # arrive with final=False in practice.
+        del final
         message_id = uuid.uuid4().hex[:12]
         line = (
             f"[mimir:bench send_message channel={channel_id} "
