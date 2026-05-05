@@ -94,9 +94,14 @@ class _FakeClaudeSDKClient:
 
 
 def _reset_module_state() -> None:
+    # chainlink #11: the singleton client + global asyncio.Lock were
+    # replaced with a ``ClientPool``. The legacy module-level names
+    # are kept as no-op back-compat (assigning ``None`` is harmless);
+    # the load-bearing reset is ``_reset_pool_for_tests()``.
     agent_mod._sdk_client = None
     agent_mod._sdk_options_fingerprint = None
     agent_mod._sdk_lock = None
+    agent_mod._reset_pool_for_tests()
     _FakeClaudeSDKClient.instances.clear()
     _FakeClaudeSDKClient.get_context_usage_count = 0
 
