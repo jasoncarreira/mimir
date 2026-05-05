@@ -241,3 +241,106 @@ async def test_react_received_trigger_also_auto_dispatches(tmp_path: Path):
     evt = _evt(trigger="react_received")
     await agent._auto_dispatch_or_record(ctx, evt, "Thanks for the 👍.")
     assert bridge.sent == [("discord-987", "Thanks for the 👍.")]
+
+
+# ─── Streaming plan-flush directive dispatch (chainlink #5 follow-up) ──
+
+
+@pytest.mark.asyncio
+async def test_streaming_plan_dispatched_callback_fires_directives(tmp_path: Path):
+    """Plan with text + ``<actions>``: the callback dispatches the
+    directive (against the just-sent plan flush's message_id) so an
+    inline ack-react actually fires. Previously these were dropped."""
+    from mimir.bridges._directives import ReactDirective
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    agent = _make_agent(tmp_path, reg)
+
+    ctx = _ctx()
+    evt = _evt()
+    cb = agent._on_streaming_plan_dispatched(ctx, evt, bridge)
+
+    # Simulate the dispatcher having sent the plan flush at msg-7.
+    plan_send_result = SendResult(sent=True, message_id="m-plan", chunks=1)
+    directives = (ReactDirective(emoji="👍", message_id=None),)
+    await cb("plan body", plan_send_result, directives)
+
+    # React landed on the plan flush message id (default fallback).
+    assert bridge.reacted == [("discord-987", "m-plan", "👍")]
+    assert ctx.last_assistant_message_id == "m-plan"
+
+
+@pytest.mark.asyncio
+async def test_streaming_plan_dispatched_explicit_message_id_wins(tmp_path: Path):
+    """When the directive carries an explicit ``message`` (the
+    inline ack-react pattern: ``<react message="<inbound-id>" />``),
+    the explicit id wins over the plan flush's own message id."""
+    from mimir.bridges._directives import ReactDirective
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    agent = _make_agent(tmp_path, reg)
+
+    ctx = _ctx()
+    evt = _evt()
+    cb = agent._on_streaming_plan_dispatched(ctx, evt, bridge)
+    plan_send = SendResult(sent=True, message_id="m-plan", chunks=1)
+    directives = (
+        ReactDirective(emoji="👍", message_id="inbound-42"),
+    )
+    await cb("On it.", plan_send, directives)
+    assert bridge.reacted == [("discord-987", "inbound-42", "👍")]
+
+
+@pytest.mark.asyncio
+async def test_streaming_plan_dispatched_directives_only(tmp_path: Path):
+    """A plan that's ONLY an actions block: the dispatcher passes
+    ``result=None`` to the callback. The directives still dispatch,
+    using ``ctx.last_assistant_message_id`` as the react fallback."""
+    from mimir.bridges._directives import ReactDirective
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    agent = _make_agent(tmp_path, reg)
+
+    ctx = _ctx()
+    ctx.last_assistant_message_id = "prev-7"
+    evt = _evt()
+    cb = agent._on_streaming_plan_dispatched(ctx, evt, bridge)
+    directives = (ReactDirective(emoji="eyes", message_id=None),)
+    await cb("", None, directives)
+
+    # No message was sent on this callback — no record_outbound call,
+    # no last_assistant_message_id mutation. React used the prev id.
+    assert bridge.sent == []  # callback didn't call bridge.send itself
+    assert bridge.reacted == [("discord-987", "prev-7", "eyes")]
+    assert ctx.last_assistant_message_id == "prev-7"
+
+
+@pytest.mark.asyncio
+async def test_streaming_plan_dispatched_no_directives_only_text(tmp_path: Path):
+    """No directives, plain plan text → callback records outbound and
+    logs the streamed_plan event; no directive dispatch attempted."""
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    agent = _make_agent(tmp_path, reg)
+
+    ctx = _ctx()
+    evt = _evt()
+    cb = agent._on_streaming_plan_dispatched(ctx, evt, bridge)
+    plan_send = SendResult(sent=True, message_id="m-plan", chunks=1)
+    await cb("just plan text", plan_send, ())
+
+    assert bridge.reacted == []
+    assert ctx.last_assistant_message_id == "m-plan"
+    # auto_dispatch_streamed_plan event landed.
+    import json
+    events_log = tmp_path / "logs" / "events.jsonl"
+    events = [json.loads(l) for l in events_log.read_text().splitlines()]
+    plan_events = [
+        e for e in events if e.get("type") == "auto_dispatch_streamed_plan"
+    ]
+    assert len(plan_events) == 1
+    assert plan_events[0]["actions_in_plan"] == 0

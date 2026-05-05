@@ -517,32 +517,68 @@ class Agent:
         event: AgentEvent,
         bridge,
     ):
-        async def _cb(plan_text: str, result, dropped_directives: int) -> None:
-            ctx.last_assistant_message_id = result.message_id
-            text_for_log = (
-                plan_text if len(plan_text) <= 4096
-                else plan_text[:4096] + "…[truncated]"
-            )
-            await log_event(
-                "auto_dispatch_streamed_plan",
-                channel_id=event.channel_id,
-                bridge=getattr(bridge, "name", None),
-                message_id=result.message_id,
-                chunks=result.chunks,
-                text=text_for_log,
-                # chainlink #5: directives are end-of-turn only. If
-                # the agent put one inline with the plan, log it so
-                # the audit trail shows it happened (dropped from
-                # the plan flush — the result flush will handle any
-                # trailing directives in its own clean_text).
-                dropped_actions_in_plan=dropped_directives,
-            )
-            # Record the plan chunk to chat_history immediately so
-            # Recent activity reflects what was sent. The result chunk
-            # is appended later by _auto_dispatch_or_record.
-            await self._record_outbound(
-                event.channel_id, plan_text, source=event.source,
-            )
+        async def _cb(plan_text: str, result, directives: tuple) -> None:
+            # ``result`` is None when the plan was directives-only —
+            # there was no cleaned text to send via the bridge, but
+            # we still need to dispatch the parsed directives so
+            # things like an inline ack-react actually fire.
+            send_msg_id: str | None = None
+            if result is not None:
+                send_msg_id = result.message_id
+                ctx.last_assistant_message_id = send_msg_id
+                text_for_log = (
+                    plan_text if len(plan_text) <= 4096
+                    else plan_text[:4096] + "…[truncated]"
+                )
+                await log_event(
+                    "auto_dispatch_streamed_plan",
+                    channel_id=event.channel_id,
+                    bridge=getattr(bridge, "name", None),
+                    message_id=result.message_id,
+                    chunks=result.chunks,
+                    text=text_for_log,
+                    actions_in_plan=len(directives),
+                )
+                # Record the plan chunk to chat_history immediately so
+                # Recent activity reflects what was sent. The result
+                # chunk is appended later by _auto_dispatch_or_record.
+                await self._record_outbound(
+                    event.channel_id, plan_text, source=event.source,
+                )
+
+            if directives and self._channels is not None:
+                from .channeltools import _dispatch_action_directives
+
+                outbound_root = (
+                    self._config.home / "attachments" / "outbound"
+                )
+                # default_message_id: prefer the just-sent plan flush
+                # so a bare ``<react>`` lands on it; otherwise fall
+                # back to whatever was last delivered on this turn.
+                # When the agent emits the inline ack-react pattern
+                # (``<react message="<inbound-id>" />``) the explicit
+                # message id wins anyway.
+                try:
+                    directive_results = await _dispatch_action_directives(
+                        self._channels,
+                        fallback_channel_id=event.channel_id,
+                        directives=directives,
+                        default_message_id=(
+                            send_msg_id or ctx.last_assistant_message_id
+                        ),
+                        outbound_root=outbound_root,
+                    )
+                    await log_event(
+                        "auto_dispatch_streamed_plan_actions",
+                        channel_id=event.channel_id,
+                        bridge=getattr(bridge, "name", None),
+                        message_id=send_msg_id,
+                        directives=directive_results,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "streaming plan-flush directive dispatch failed",
+                    )
 
         return _cb
 
