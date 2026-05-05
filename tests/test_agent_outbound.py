@@ -39,7 +39,12 @@ class _RecordingBridge(Bridge):
     async def disconnect(self) -> None: ...
 
     async def send(
-        self, channel_id: str, text: str, attachment_paths: list | None = None,
+        self,
+        channel_id: str,
+        text: str,
+        attachment_paths: list | None = None,
+        *,
+        final: bool = True,
     ) -> SendResult:
         self.sent.append((channel_id, text))
         return SendResult(sent=True, message_id=f"m{len(self.sent)}", chunks=1)
@@ -58,7 +63,7 @@ class _BenchBridge(Bridge):
 
     async def connect(self) -> None: ...
     async def disconnect(self) -> None: ...
-    async def send(self, channel_id, text, attachment_paths=None):
+    async def send(self, channel_id, text, attachment_paths=None, *, final=True):
         self.sent.append((channel_id, text))
         return SendResult(sent=True, message_id="m1", chunks=1)
     async def react(self, channel_id, message_id, emoji):

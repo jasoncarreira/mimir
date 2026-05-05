@@ -265,7 +265,14 @@ class SlackBridge(Bridge):
         channel_id: str,
         text: str,
         attachment_paths: list[Path] | None = None,
+        *,
+        final: bool = True,
     ) -> SendResult:
+        # chainlink #5: Slack has no public typing-indicator API for
+        # bots (chat.assistant.threads.setStatus is App Assistant-only),
+        # so ``final`` is informational. Streaming plan + result land
+        # as two separate Slack messages naturally.
+        del final
         if self._app is None:
             return SendResult(sent=False, error="slack app not connected")
         slack_channel = _channel_id_to_slack(channel_id)
