@@ -28,7 +28,17 @@ Two cost/agency frictions surfaced in the 2026-05-04 session:
    valves; the tool-call cap was a proxy for "runaway loop"
    detection that has stricter, cheaper alternatives now.
 
-## Change 1 — synthesis turn: pass IDs, not transcripts
+## Change 1 — synthesis turn: pass IDs, not transcripts ✅
+
+**Landed:** templates.py renders metadata-only summaries (turn_id,
+trigger, cost, tool-call count, output preview, atom IDs) plus an
+atom_id → [turn_ids] feedback section. The synthesis prompt no longer
+embeds full turn dicts (the `input`-field cubic blowup is gone). New
+MCP tool `mimir_get_turn(turn_id)` lives in `mimir/turntools.py` and
+returns `{turn_id, trigger, output, events}` — `input` is stripped
+deliberately. Wired through `tools.build_mcp_server` (gated on
+`turns_log` availability). Tests in `tests/test_synthesis_prompt.py`
+(16 new). Full suite: 802 passed (was 786).
 
 ### Current shape
 
@@ -160,7 +170,11 @@ detail. Existing synthesis behavior survives turns where memory
 capture isn't worth doing (most of them) — agent skips step 1
 entirely without ever calling `mimir_get_turn`.
 
-## Change 2 — tool-call budget default
+## Change 2 — tool-call budget default ✅
+
+**Landed in commit `1d6b2b0`** (alongside the tool-budget counter
+accumulation bug fix). `MIMIR_TOOL_CALL_BUDGET` default is now 120 in
+`mimir/config.py`.
 
 ### Current state
 
