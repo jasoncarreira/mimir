@@ -112,15 +112,68 @@ def test_text_around_block_preserved():
 
 
 def test_multiple_blocks_concatenated():
+    """Multiple action blocks each on their own line are concatenated.
+    Inline (mid-line) blocks are NOT parsed under the line-anchored
+    convention — see ``test_inline_mention_does_not_parse`` for why."""
     result = parse_directives(
-        "one <actions><react emoji=\"a\" /></actions> two "
-        "<actions><react emoji=\"b\" /></actions> three"
+        "one\n<actions><react emoji=\"a\" /></actions>\n two\n"
+        "<actions><react emoji=\"b\" /></actions>\n three"
     )
     assert "one" in result.clean_text and "two" in result.clean_text
     assert "three" in result.clean_text
     assert len(result.directives) == 2
     assert result.directives[0].emoji == "a"  # type: ignore[attr-defined]
     assert result.directives[1].emoji == "b"  # type: ignore[attr-defined]
+
+
+def test_inline_mention_does_not_parse():
+    """Regression: mentions of the directive tag inside prose (e.g. in
+    inline code formatting) must NOT be paired with a real trailing
+    block, because that greedily strips all the prose between them.
+
+    Pre-fix, this text would have its middle section deleted: the parser
+    saw a stray inline-code mention as the open tag, paired it with the
+    real trailing close, and the cleaned text became just the prefix.
+    Post-fix the inline mention is on a non-anchored line and is not
+    matched."""
+    raw = (
+        "Found it: when the agent writes the literal `<actions>` tag in "
+        "code-quoted prose AND then emits a real trailing block on its "
+        "own line, the parser used to greedily eat everything between "
+        "them.\n"
+        "\n"
+        "<actions><react emoji=\"thumbsup\" /></actions>"
+    )
+    result = parse_directives(raw)
+    # Prose body should survive intact (no truncation at the inline mention).
+    assert "Found it" in result.clean_text
+    assert "code-quoted prose" in result.clean_text
+    assert "trailing block" in result.clean_text
+    # Real trailing block parsed exactly once.
+    assert len(result.directives) == 1
+    assert result.directives[0].emoji == "thumbsup"  # type: ignore[attr-defined]
+
+
+def test_block_with_indented_open_tag():
+    """Markdown often indents nested content; the open tag may have
+    leading whitespace (spaces or tabs) and still count as line-anchored."""
+    result = parse_directives(
+        "context:\n"
+        "  <actions>\n"
+        "    <react emoji=\"eyes\" />\n"
+        "  </actions>"
+    )
+    assert len(result.directives) == 1
+    assert result.directives[0].emoji == "eyes"  # type: ignore[attr-defined]
+
+
+def test_inline_mention_without_trailing_block():
+    """A bare inline mention with no trailing block just stays in the
+    cleaned text — same as the no-actions-here passthrough."""
+    raw = "I'd write `<actions>` to react; here's the explanation."
+    result = parse_directives(raw)
+    assert result.directives == ()
+    assert result.clean_text == raw
 
 
 def test_react_without_emoji_is_skipped():
