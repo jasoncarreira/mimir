@@ -68,7 +68,21 @@ class Bridge(ABC):
         support it (Discord) override; bridges that don't (Slack — no
         public typing API for bots — and benchmark/web stubs) inherit
         the no-op. Failures are swallowed silently; this is a UX nicety,
-        not load-bearing — never raises into the caller."""
+        not load-bearing — never raises into the caller.
+
+        Bridges that hold the indicator for longer than the platform's
+        single-trigger TTL (Discord auto-refreshes ~9s) MUST cancel
+        the hold from ``send()`` and ``cancel_typing()`` so the dots
+        stop when work is done — see DiscordBridge."""
+        return None
+
+    async def cancel_typing(self, channel_id: str) -> None:
+        """Stop any in-flight typing indicator for ``channel_id``. The
+        agent loop calls this on ``turn_finished`` so cross-channel
+        sends (turn triggered on A but only sends to B) and errored
+        turns (no send happened) don't leave the indicator hanging
+        until a per-bridge hard cap. Default is a no-op for bridges
+        without a hold-task model. Failures are swallowed silently."""
         return None
 
     async def fetch_history(
