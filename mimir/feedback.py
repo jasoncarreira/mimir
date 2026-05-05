@@ -64,6 +64,14 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "predictions_pending_review": ("negative", "predictions_pending"),
     "send_message_unknown_channel": ("negative", "unknown_channel"),
     "auto_dispatch_failed": ("negative", "auto_dispatch_failed"),
+    # OAuth usage poller — plan-window quota probe runs on a cron and
+    # surfaces refresh / logged-out / age-warn signals algedonically so
+    # the agent can route operator-actionable alerts through.
+    "oauth_usage_failed": ("negative", "oauth_usage_failed"),
+    "oauth_logged_out": ("negative", "oauth_logged_out"),
+    "oauth_refresh_token_age_warn": ("negative", "oauth_refresh_age_warn"),
+    "oauth_usage_ok": ("positive", "oauth_usage_ok"),
+    "oauth_refresh_ok": ("positive", "oauth_refresh_ok"),
     # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
     "saga_feedback_sent": ("positive", "saga_feedback"),
@@ -94,6 +102,15 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "introspection_error",
     "heartbeat_health",
     "predictions_pending",
+    # OAuth poller fires every few minutes — without dedup the
+    # success line would crowd out everything else in the window.
+    # Failure / logged-out / age-warn dedup too: re-emitting per-poll
+    # adds no information, the latest one is what the agent acts on.
+    "oauth_usage_ok",
+    "oauth_usage_failed",
+    "oauth_logged_out",
+    "oauth_refresh_age_warn",
+    "oauth_refresh_ok",
 }
 
 
@@ -265,6 +282,46 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         else:
             tail = ""
         return f"introspection report ready: {out}{tail}"
+    if rule_kind == "oauth_usage_ok":
+        recorded = ev.get("recorded") or {}
+        if isinstance(recorded, dict) and recorded:
+            five = recorded.get("five_hour", {})
+            seven = recorded.get("seven_day", {})
+            parts: list[str] = []
+            five_util = five.get("utilization") if isinstance(five, dict) else None
+            seven_util = seven.get("utilization") if isinstance(seven, dict) else None
+            if isinstance(five_util, (int, float)):
+                parts.append(f"5h {five_util * 100:.0f}%")
+            if isinstance(seven_util, (int, float)):
+                parts.append(f"7d {seven_util * 100:.0f}%")
+            detail = ", ".join(parts) if parts else f"{len(recorded)} windows"
+            return f"oauth usage poll ok ({detail})"
+        return "oauth usage poll ok"
+    if rule_kind == "oauth_usage_failed":
+        stage = ev.get("stage") or "?"
+        err = ev.get("error") or "(no detail)"
+        status = ev.get("status")
+        suffix = f" [HTTP {status}]" if status is not None else ""
+        return f"oauth usage poll failed at {stage}{suffix}: {err}"
+    if rule_kind == "oauth_logged_out":
+        stage = ev.get("stage") or "?"
+        return (
+            f"OAuth logged out (refresh failed at {stage}). "
+            f"Operator action: re-run ``claude /login`` and copy "
+            f"~/.claude/.credentials.json into the mimir homedir."
+        )
+    if rule_kind == "oauth_refresh_age_warn":
+        age = ev.get("age_days")
+        thr = ev.get("warn_threshold_days")
+        age_str = f"{age:.1f}d" if isinstance(age, (int, float)) else "?"
+        thr_str = f"{thr}d" if isinstance(thr, (int, float)) else "?"
+        return (
+            f"OAuth credentials are {age_str} old (warn threshold {thr_str}). "
+            f"Consider re-running ``claude /login`` before the refresh "
+            f"token expires."
+        )
+    if rule_kind == "oauth_refresh_ok":
+        return "oauth access token refreshed"
     if rule_kind == "unknown_channel":
         return f"send_message to unknown channel {ev.get('channel_id', '?')}"
     if rule_kind == "saga_feedback":
