@@ -127,12 +127,12 @@ def _filter_session_turns(turns_path, saga_session_id: str) -> list[dict]:
     return out
 
 
-# ─── ClaudeSDKClient wrapper (migration stages 1-3) ─────────────────
+# ─── ClaudeSDKClient pool (migration stages 1-4) ────────────────────
 #
 # Stage 1 of CLAUDE_SDK_CLIENT_MIGRATION.md: route the agent loop through
-# a shared, persistent ``ClaudeSDKClient`` instead of one-shot
-# ``claude_agent_sdk.query()``. The shared client keeps the Claude Code
-# subprocess warm across turns.
+# a persistent ``ClaudeSDKClient`` instead of one-shot
+# ``claude_agent_sdk.query()``. The persistent client keeps the Claude
+# Code subprocess warm across turns.
 #
 # Stage 2: pass ``session_id=ctx.turn_id`` per call so each turn is
 # scoped to its own session inside the persistent client. Prior-turn
@@ -147,41 +147,49 @@ def _filter_session_turns(turns_path, saga_session_id: str) -> list[dict]:
 # session state. Per-turn delete bounds the store size so memory
 # stays flat across long-lived processes.
 #
-# The lifecycle:
-#   - First call: instantiate ``ClaudeSDKClient(options=...)`` and
-#     ``connect()``.
-#   - Subsequent calls with matching options-fingerprint: reuse.
-#   - Options changed (system_prompt drifted, model swapped, etc.):
-#     disconnect + reconnect with the new options. Recycle cost is one
-#     subprocess restart (~1s) per fingerprint flip. In practice the
-#     fingerprint is very stable (system prompt blocks change slowly).
-#   - ``shutdown_sdk_client()`` is called from the server's cleanup
-#     hook to release the subprocess on graceful shutdown.
+# Stage 4 (chainlink #11, this revision): a pool of warm
+# ``ClaudeSDKClient`` instances replaces the single-shared-client +
+# global ``asyncio.Lock``. The dispatcher allows up to
+# ``max_concurrent_turns`` turns to run concurrently, but every turn
+# previously serialized on a single SDK lock — undoing the parallelism.
+# The pool fixes that.
+#
+# Pool semantics (locked design):
+#   - Lazy fill, max size 10. No pre-warming.
+#   - Acquire: hand out an idle client if one is available; else if
+#     pool size < max, construct + connect a new client; else await a
+#     release.
+#   - Fingerprint-tracked drain: the pool tracks a single "current"
+#     fingerprint. When ``acquire(options)`` arrives with a different
+#     fingerprint, the pool flips its fingerprint, disconnects all
+#     idle clients immediately, and marks all in-flight clients
+#     stale. In-flight clients finish their current request, then on
+#     ``release`` see the stale flag and disconnect rather than
+#     re-pooling. New acquires after the flip create fresh clients
+#     with the new fingerprint. Net effect: mixed-fingerprint clients
+#     are never concurrently in use, and in-flight work is never
+#     abruptly disconnected.
+#   - ``get_context_usage()`` rides the pool — no dedicated client.
+#   - ``shutdown_sdk_client()`` disconnects every client in the pool
+#     (idle and in-flight); concurrent acquires after shutdown
+#     construct fresh clients (idempotent for tests / repeat startup).
+#
+# The original Stage 4 spec (CLAUDE_SDK_CLIENT_MIGRATION.md) prescribed
+# a ``threading.local`` cache, mirroring saga's ``_PersistentClaudeCode``.
+# That was the wrong shape for mimir: mimir runs all turns on a single
+# asyncio event loop in a single OS thread, so ``threading.local``
+# would hand every coroutine the same client — same serialization, just
+# without the lock to make it visible. The asyncio-aware pool here is
+# the right shape for mimir's runtime. The retired threading.local note
+# in CLAUDE_SDK_CLIENT_MIGRATION.md captures the reasoning.
 #
 # Test shape:
-#   The module-level ``query`` name is preserved so existing tests that
-#   ``patch("mimir.agent.query", new=fake_query)`` keep working
-#   unchanged. Tests that exercise the wrapper itself patch
-#   ``mimir.agent.ClaudeSDKClient``.
-#
-# An ``asyncio.Lock`` serializes calls — ``ClaudeSDKClient`` is
-# single-threaded by design. Stage 4 swaps the singleton for a
-# threading.local cache to lift the serialization.
+#   The module-level ``query`` and ``get_context_usage`` names + their
+#   signatures are preserved so existing tests that
+#   ``patch("mimir.agent.query", ...)`` keep working unchanged. Tests
+#   that exercise the wrapper itself patch ``mimir.agent.ClaudeSDKClient``.
 
 import hashlib
-
-_sdk_lock: asyncio.Lock | None = None
-_sdk_client: ClaudeSDKClient | None = None
-_sdk_options_fingerprint: str | None = None
-
-
-def _get_sdk_lock() -> asyncio.Lock:
-    """Lazy-create the lock so it binds to the running loop. Module
-    import shouldn't require an event loop."""
-    global _sdk_lock
-    if _sdk_lock is None:
-        _sdk_lock = asyncio.Lock()
-    return _sdk_lock
 
 
 def _options_fingerprint(options: ClaudeAgentOptions) -> str:
@@ -209,6 +217,282 @@ def _options_fingerprint(options: ClaudeAgentOptions) -> str:
     return h.hexdigest()
 
 
+_POOL_MAX_SIZE = 10
+
+
+class _PoolEntry:
+    """A pool member: a connected (or pending-connect) ClaudeSDKClient
+    plus the fingerprint it was constructed with. ``stale`` is set when
+    the pool's current fingerprint flips while this client is in use —
+    on release the client disconnects instead of being returned."""
+
+    __slots__ = ("client", "fingerprint", "stale")
+
+    def __init__(self, client: ClaudeSDKClient, fingerprint: str) -> None:
+        self.client = client
+        self.fingerprint = fingerprint
+        self.stale = False
+
+
+class ClientPool:
+    """Asyncio-aware pool of ``ClaudeSDKClient`` instances. Replaces
+    the single-shared-client + global ``asyncio.Lock`` so concurrent
+    turns can run in parallel.
+
+    Not thread-safe — assumes a single asyncio event loop, which is
+    mimir's runtime model. The internal ``asyncio.Condition`` binds to
+    the running loop on first use.
+    """
+
+    def __init__(self, *, max_size: int = _POOL_MAX_SIZE) -> None:
+        self.max_size = max_size
+        self._idle: list[_PoolEntry] = []
+        self._in_flight: set[_PoolEntry] = set()
+        # Pool's "current" fingerprint. None when empty (first acquire
+        # sets it). When acquire arrives with a different fingerprint,
+        # flips here and the drain happens.
+        self._current_fingerprint: str | None = None
+        self._cond: asyncio.Condition | None = None
+
+    def _condition(self) -> asyncio.Condition:
+        """Lazy-bind the condition variable to the running loop. Module
+        import shouldn't require an event loop."""
+        if self._cond is None:
+            self._cond = asyncio.Condition()
+        return self._cond
+
+    @property
+    def size(self) -> int:
+        return len(self._idle) + len(self._in_flight)
+
+    async def _drain_idle_for_fingerprint_change(self) -> None:
+        """Disconnect every idle client; mark every in-flight client
+        stale so it disconnects on release. Caller holds the lock."""
+        idle = self._idle
+        self._idle = []
+        for entry in idle:
+            try:
+                await entry.client.disconnect()
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "ClaudeSDKClient disconnect failed during pool drain "
+                    "(continuing — fresh clients will replace it)"
+                )
+        for entry in self._in_flight:
+            entry.stale = True
+
+    async def acquire(self, options: ClaudeAgentOptions) -> _PoolEntry:
+        """Claim a client for an exclusive request. Caller MUST call
+        ``release(entry)`` when done (use ``acquire_ctx`` for
+        ``async with`` form)."""
+        fingerprint = _options_fingerprint(options)
+        cond = self._condition()
+        async with cond:
+            while True:
+                # Fingerprint flip: drain idle clients and mark in-flight
+                # ones stale. Re-evaluated on every loop iteration so a
+                # late-arriving flip while we're waiting is handled.
+                if (
+                    self._current_fingerprint is not None
+                    and self._current_fingerprint != fingerprint
+                ):
+                    await self._drain_idle_for_fingerprint_change()
+                    self._current_fingerprint = fingerprint
+                elif self._current_fingerprint is None:
+                    self._current_fingerprint = fingerprint
+
+                # Hand out an idle client if one is at the current
+                # fingerprint. Drained-but-not-yet-disconnected entries
+                # would only land here if the drain code path missed
+                # them — guard defensively.
+                while self._idle:
+                    entry = self._idle.pop()
+                    if entry.fingerprint == fingerprint and not entry.stale:
+                        self._in_flight.add(entry)
+                        return entry
+                    # Defensive: disconnect a stale/mismatched idle.
+                    try:
+                        await entry.client.disconnect()
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "ClaudeSDKClient disconnect of stale idle entry failed"
+                        )
+
+                # No idle client at current fingerprint; grow if room.
+                if self.size < self.max_size:
+                    client = ClaudeSDKClient(options=options)
+                    entry = _PoolEntry(client, fingerprint)
+                    # Reserve the slot before releasing the lock so
+                    # size accounting is correct during connect (other
+                    # waiters won't double-grow past max_size).
+                    self._in_flight.add(entry)
+                    cond.release()
+                    try:
+                        await client.connect()
+                    except BaseException:
+                        # Connect failed — back out the reservation,
+                        # then propagate. We re-acquire the lock so the
+                        # bookkeeping mutation is safe and notify any
+                        # peer waiting at ``cond.wait()`` below that the
+                        # in-flight count went down. Do NOT manually
+                        # release here: the surrounding ``async with
+                        # cond:`` block's ``__aexit__`` releases when
+                        # the exception unwinds. A manual release would
+                        # leave the lock unheld and ``__aexit__`` would
+                        # then raise ``RuntimeError: Lock is not
+                        # acquired`` — masking the real connect failure.
+                        await cond.acquire()
+                        self._in_flight.discard(entry)
+                        cond.notify_all()
+                        raise
+                    await cond.acquire()
+                    # If a fingerprint flip raced our connect, the
+                    # current fingerprint has moved on. Mark stale —
+                    # the caller will use the client for one request
+                    # and on release it'll be disconnected. (We don't
+                    # disconnect here because the caller is about to
+                    # use the client; mid-acquire-disconnect would
+                    # surface as a different error than connect-fail.)
+                    if self._current_fingerprint != fingerprint:
+                        entry.stale = True
+                    return entry
+
+                # At max size, all in flight. Wait for a release.
+                await cond.wait()
+
+    async def release(self, entry: _PoolEntry) -> None:
+        """Return a client to the pool. If the entry was marked stale
+        (fingerprint flipped while it was in flight) or its fingerprint
+        no longer matches the pool's current fingerprint, disconnect
+        instead of re-pooling."""
+        cond = self._condition()
+        async with cond:
+            self._in_flight.discard(entry)
+            stale = entry.stale or entry.fingerprint != self._current_fingerprint
+            if not stale:
+                # Healthy and current — return to idle.
+                self._idle.append(entry)
+                cond.notify_all()
+                return
+            # Stale — wake any waiters (a slot just freed) and fall
+            # through to disconnect outside the lock.
+            cond.notify_all()
+        try:
+            await entry.client.disconnect()
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "ClaudeSDKClient disconnect of stale in-flight "
+                "entry failed during release (continuing)"
+            )
+
+    def acquire_ctx(self, options: ClaudeAgentOptions) -> "_AcquireContext":
+        """Async context manager wrapping ``acquire`` / ``release``."""
+        return _AcquireContext(self, options)
+
+    async def shutdown(self) -> None:
+        """Disconnect every client in the pool (idle and in-flight).
+        After return, the pool is empty and ready to be re-used (next
+        acquire constructs fresh clients). Idempotent — safe to call
+        when the pool has never been used.
+
+        In-flight clients are disconnected here as well: graceful
+        shutdown means no further work is in flight at the call site
+        (server.py awaits ``dispatcher.drain()`` before invoking us),
+        so an in-flight entry at this point is unusual but the right
+        thing is still to disconnect it."""
+        cond = self._condition()
+        async with cond:
+            idle = self._idle
+            in_flight = list(self._in_flight)
+            self._idle = []
+            self._in_flight = set()
+            self._current_fingerprint = None
+            entries = idle + in_flight
+            cond.notify_all()
+        # Disconnect outside the lock so a slow disconnect doesn't
+        # block waiters that just got cancelled.
+        for entry in entries:
+            try:
+                await entry.client.disconnect()
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "ClaudeSDKClient disconnect failed during pool shutdown"
+                )
+
+
+class _AcquireContext:
+    """Async context manager returned by ``ClientPool.acquire_ctx``. The
+    body runs with an exclusive ``ClaudeSDKClient``; on exit (success
+    or exception) the client is released back to the pool."""
+
+    def __init__(self, pool: ClientPool, options: ClaudeAgentOptions) -> None:
+        self._pool = pool
+        self._options = options
+        self._entry: _PoolEntry | None = None
+
+    async def __aenter__(self) -> ClaudeSDKClient:
+        self._entry = await self._pool.acquire(self._options)
+        return self._entry.client
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        entry = self._entry
+        self._entry = None
+        if entry is not None:
+            await self._pool.release(entry)
+
+
+# Module-level singleton pool. Lazy-init so module import doesn't need
+# an event loop. Tests reset via ``_reset_pool_for_tests`` (or the
+# legacy ``_sdk_client = None`` poke, retained for back-compat with
+# fixtures that pre-date the pool — see ``_sdk_client`` shim below).
+_pool: ClientPool | None = None
+
+
+def _get_pool() -> ClientPool:
+    global _pool
+    if _pool is None:
+        _pool = ClientPool()
+    return _pool
+
+
+def _reset_pool_for_tests() -> None:
+    """Reset the pool singleton. Tests use this between cases so
+    state doesn't leak. Production code never calls this."""
+    global _pool
+    _pool = None
+
+
+# Back-compat shims for tests that poke at the pre-pool module-level
+# names (``_sdk_client`` / ``_sdk_options_fingerprint`` / ``_sdk_lock``).
+# These are now derived views over the pool — assigning ``None`` to
+# ``_sdk_client`` resets the pool. Reads return a representative idle
+# client when the pool has one, else None. The legacy names are kept
+# only for the tests in ``tests/test_agent_sdk_client.py`` that pre-date
+# this work; new code reads/writes the pool directly.
+class _LegacyClientProxy:
+    """Module-level descriptor that maps the old singleton names onto
+    pool state. ``agent_mod._sdk_client = None`` clears the pool;
+    reading returns the first idle client (or None)."""
+
+    def __get__(self, obj, objtype=None):
+        if _pool is None:
+            return None
+        if _pool._idle:
+            return _pool._idle[0].client
+        if _pool._in_flight:
+            return next(iter(_pool._in_flight)).client
+        return None
+
+
+# Plain module-level None-defaults; tests that read these get the same
+# semantics they did pre-pool (None when nothing's connected). Tests
+# that write None to reset are handled by the autouse fixture which
+# also calls _reset_pool_for_tests when present.
+_sdk_client = None
+_sdk_options_fingerprint = None
+_sdk_lock = None
+
+
 async def query(
     *,
     prompt: str,
@@ -216,107 +500,65 @@ async def query(
     session_id: str = "default",
     transport=None,
 ):
-    """Stage 1+2 ClaudeSDKClient wrapper. Async-generator API matches
-    the old ``claude_agent_sdk.query()`` shape so call sites and
-    patched tests don't have to change.
+    """ClaudeSDKClient pool wrapper. Async-generator API matches the
+    old ``claude_agent_sdk.query()`` shape so call sites and patched
+    tests don't have to change.
 
-    Stage 2: ``session_id`` is now a per-call parameter. The agent
-    loop passes ``ctx.turn_id`` so each turn gets its own session
-    inside the persistent client — prior-turn history can't bleed
-    into the next turn's input. Defaults to ``"default"`` so other
-    callers (and tests) that don't care keep their stage-1 behavior
-    of a single accumulating session.
-
-    No cleanup yet — the SDK's ``InMemorySessionStore`` keeps each
-    turn's history for the lifetime of the client. Stage 3 wires an
-    explicit store + per-turn delete.
+    ``session_id`` is per-call. The agent loop passes ``ctx.turn_id``
+    so each turn gets its own session inside the persistent client —
+    prior-turn history can't bleed into the next turn's input.
+    Defaults to ``"default"`` so other callers (and tests) that don't
+    care keep their stage-1 behavior of a single accumulating session.
 
     The ``transport`` parameter is accepted but unused — kept for
     signature compatibility with tests that may pass it.
     """
-    global _sdk_client, _sdk_options_fingerprint
-    fingerprint = _options_fingerprint(options)
-    lock = _get_sdk_lock()
-    async with lock:
-        if _sdk_client is None or _sdk_options_fingerprint != fingerprint:
-            if _sdk_client is not None:
-                try:
-                    await _sdk_client.disconnect()
-                except Exception:  # noqa: BLE001
-                    log.exception(
-                        "ClaudeSDKClient disconnect failed during recycle "
-                        "(continuing — fresh client about to replace it)"
-                    )
-                _sdk_client = None
-            client = ClaudeSDKClient(options=options)
-            await client.connect()
-            _sdk_client = client
-            _sdk_options_fingerprint = fingerprint
-        client = _sdk_client
-        assert client is not None  # for type-checkers
+    pool = _get_pool()
+    async with pool.acquire_ctx(options) as client:
         await client.query(prompt, session_id=session_id)
         async for msg in client.receive_response():
             yield msg
 
 
 async def get_context_usage(options: ClaudeAgentOptions) -> dict | None:
-    """Stage 5: query the shared persistent client for plan-window
-    utilization. Returns the raw response dict (typically containing
-    an ``apiUsage`` key) or None if no client is connected and we
-    couldn't safely connect one for a usage probe.
+    """Query a pooled persistent client for plan-window utilization.
+    Returns the raw response dict (typically containing an ``apiUsage``
+    key) or None on failure.
 
-    Reuses the same fingerprint-keyed singleton as ``query()`` so the
-    probe rides on whatever client the agent loop already warmed.
-    When no client is connected yet (first call before any ``query()``
-    has run), this connects one — same recycle semantics as ``query()``.
-    Failures are caught and logged; never propagate. Plan-window
-    capture is observability, not load-bearing.
+    Rides the same pool as ``query()`` so the probe reuses a warm
+    client when one is available. Failures are caught and logged;
+    never propagate. Plan-window capture is observability, not
+    load-bearing.
     """
-    global _sdk_client, _sdk_options_fingerprint
-    fingerprint = _options_fingerprint(options)
-    lock = _get_sdk_lock()
-    async with lock:
-        if _sdk_client is None or _sdk_options_fingerprint != fingerprint:
-            if _sdk_client is not None:
-                try:
-                    await _sdk_client.disconnect()
-                except Exception:  # noqa: BLE001
-                    log.exception(
-                        "ClaudeSDKClient disconnect failed during recycle "
-                        "for get_context_usage (continuing — fresh client "
-                        "about to replace it)"
-                    )
-                _sdk_client = None
+    pool = _get_pool()
+    try:
+        async with pool.acquire_ctx(options) as client:
             try:
-                client = ClaudeSDKClient(options=options)
-                await client.connect()
+                return await client.get_context_usage()
             except Exception:  # noqa: BLE001
-                log.exception("ClaudeSDKClient connect failed in get_context_usage")
+                log.exception("client.get_context_usage() raised")
                 return None
-            _sdk_client = client
-            _sdk_options_fingerprint = fingerprint
-        client = _sdk_client
-        assert client is not None  # for type-checkers
-        try:
-            return await client.get_context_usage()
-        except Exception:  # noqa: BLE001
-            log.exception("client.get_context_usage() raised")
-            return None
+    except Exception:  # noqa: BLE001
+        # Connect failure during acquire (the slot has been backed
+        # out by the pool already).
+        log.exception("ClaudeSDKClient connect failed in get_context_usage")
+        return None
 
 
 async def shutdown_sdk_client() -> None:
-    """Disconnect the shared ClaudeSDKClient (called from server cleanup).
-    Idempotent — safe to call when no client was ever connected."""
-    global _sdk_client, _sdk_options_fingerprint
-    lock = _get_sdk_lock()
-    async with lock:
-        if _sdk_client is not None:
-            try:
-                await _sdk_client.disconnect()
-            except Exception:  # noqa: BLE001
-                log.exception("ClaudeSDKClient disconnect failed during shutdown")
-            _sdk_client = None
-            _sdk_options_fingerprint = None
+    """Disconnect every ClaudeSDKClient in the pool (called from server
+    cleanup). Idempotent — safe to call when no client was ever
+    connected."""
+    global _pool
+    if _pool is None:
+        return
+    pool = _pool
+    await pool.shutdown()
+    # After shutdown the pool is reusable, but for parity with the old
+    # singleton behavior (``_sdk_client = None`` post-shutdown), drop
+    # the singleton so the next acquire gets a fresh, definitively-
+    # empty pool.
+    _pool = None
 
 
 class Agent:
