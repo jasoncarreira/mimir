@@ -373,11 +373,21 @@ class Agent:
         # consults the same instance the prompt's `## Self-state` block
         # is rendered from. Wire into the scheduler immediately so
         # heartbeats fired before the first turn are still arbitrated.
+        # chainlink #13: billing-mode aware. Quota-mode installs get a
+        # provider list (today: AnthropicQuotaProvider only); pay-as-
+        # you-go gets an empty list and the arbiter routes through the
+        # existing spike_ratio path.
+        from .billing import AnthropicQuotaProvider, BillingMode, QuotaProvider
         from .budget import HomeostaticArbiter
+        quota_providers: list[QuotaProvider] = []
+        if config.billing_mode is BillingMode.QUOTA:
+            quota_providers.append(AnthropicQuotaProvider(self._rate_limits))
         self._arbiter = HomeostaticArbiter(
             home=config.home,
             rate_limit_store=self._rate_limits,
             turns_log=config.turns_log,
+            billing_mode=config.billing_mode,
+            quota_providers=quota_providers,
             cost_hourly_limit_usd=config.cost_hourly_limit_usd or None,
             cost_spike_ratio=config.cost_rate_spike_ratio or None,
             cost_spike_floor_usd=config.cost_rate_spike_floor_usd or None,
@@ -649,24 +659,34 @@ class Agent:
             spike_ratio=self._config.cost_rate_spike_ratio or None,
             spike_floor_usd_per_hour=self._config.cost_rate_spike_floor_usd or None,
         )
-        if alert is not None and not event_recently_emitted(
-            self._config.events_log,
-            "cost_rate_alert",
-            cooldown_minutes=self._config.cost_alert_cooldown_minutes,
-        ):
-            asyncio.create_task(
-                log_event(
-                    "cost_rate_alert",
-                    reason=alert.reason,
-                    rate_now_usd_per_hour=round(alert.rate_now_usd_per_hour, 4),
-                    threshold_usd_per_hour=round(alert.threshold_usd_per_hour, 4),
-                    baseline_usd_per_hour=(
-                        round(alert.baseline_usd_per_hour, 4)
-                        if alert.baseline_usd_per_hour is not None
-                        else None
-                    ),
+        if alert is not None:
+            # chainlink #13: under quota mode, cost-rate spikes are
+            # advisory (logged but not suppressing — the binding
+            # constraint is plan-window utilization, which costs
+            # nothing to respect). Emit a separate ``cost_rate_advisory``
+            # kind so the algedonic feedback renderer can phrase it as
+            # "FYI" rather than "scheduled work suppressed".
+            from .billing import BillingMode
+            advisory = self._config.billing_mode is BillingMode.QUOTA
+            event_kind = "cost_rate_advisory" if advisory else "cost_rate_alert"
+            if not event_recently_emitted(
+                self._config.events_log,
+                event_kind,
+                cooldown_minutes=self._config.cost_alert_cooldown_minutes,
+            ):
+                asyncio.create_task(
+                    log_event(
+                        event_kind,
+                        reason=alert.reason,
+                        rate_now_usd_per_hour=round(alert.rate_now_usd_per_hour, 4),
+                        threshold_usd_per_hour=round(alert.threshold_usd_per_hour, 4),
+                        baseline_usd_per_hour=(
+                            round(alert.baseline_usd_per_hour, 4)
+                            if alert.baseline_usd_per_hour is not None
+                            else None
+                        ),
+                    )
                 )
-            )
 
         # Plan-window state from the SDK's stream. Per-response capture
         # (when capture_rate_limits=True) gives us current state on
