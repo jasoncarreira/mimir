@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .billing import BillingMode, detect_billing_mode
+
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
@@ -258,6 +260,14 @@ class Config:
     cost_rate_spike_floor_usd: float
     cost_alert_cooldown_minutes: int
 
+    # Billing-mode-aware suppression (chainlink #13). ``quota`` mode
+    # treats plan-window on-pace projection as the binding constraint
+    # (zero marginal cost up to the cap) and demotes cost-rate spikes
+    # to advisory; ``pay-as-you-go`` keeps the existing spike_ratio
+    # path. Auto-detected by default — see ``mimir.billing.detect_billing_mode``.
+    # Override via ``MIMIR_BILLING_MODE=quota|pay-as-you-go``.
+    billing_mode: BillingMode
+
     # OAuth usage poller (mimir/oauth_usage_poller.py): hits Anthropic's
     # /api/oauth/usage to populate plan-window utilization% in the
     # RateLimitStore. Requires credentials minted by ``claude /login``
@@ -387,6 +397,11 @@ class Config:
             ),
             cost_alert_cooldown_minutes=_env_int(
                 "MIMIR_COST_ALERT_COOLDOWN_MINUTES", 60,
+            ),
+
+            billing_mode=detect_billing_mode(
+                explicit=_env("MIMIR_BILLING_MODE") or None,
+                oauth_credentials_path=_oauth_credentials_path(),
             ),
 
             capture_rate_limits=_env("MIMIR_CAPTURE_RATE_LIMITS", "true").lower()
