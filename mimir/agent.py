@@ -1171,6 +1171,18 @@ class Agent:
         # In practice the per-response stream-event path is fresher, so
         # it dominates; the transition path is a backstop when
         # capture_rate_limits is disabled.
+        #
+        # **Max OAuth gate:** under Claude Max OAuth, response headers
+        # do NOT carry per-window utilization% (Anthropic only includes
+        # those for direct API key deployments). The OAuth poller
+        # (oauth_usage_poller.py) and the in-process Stage 5 capture
+        # at 7a.c below are the real-value writers in that mode. The
+        # StreamEvent path here would write ``utilization=null`` on
+        # every turn, clobbering the poller's real numbers — so we
+        # skip it. Direct-API-key deployments are the inverse: the
+        # OAuth poller is gated off, and StreamEvent headers carry
+        # the real values.
+        is_max_oauth = running_on_claude_max()
         for msg in messages:
             if isinstance(msg, RateLimitEvent):
                 info = msg.rate_limit_info
@@ -1193,6 +1205,11 @@ class Agent:
                         resets_at=info.resets_at,
                     )
             elif isinstance(msg, StreamEvent):
+                if is_max_oauth:
+                    # See gate explanation above. Response headers
+                    # under Max OAuth carry no utilization% — capturing
+                    # here would null-clobber the OAuth poller.
+                    continue
                 ev = msg.event or {}
                 if ev.get("type") != "message_start":
                     continue
