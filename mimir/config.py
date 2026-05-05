@@ -47,20 +47,31 @@ def _events_cap() -> int:
 
 def _oauth_credentials_path() -> Path | None:
     """Resolve the OAuth credentials path. Empty string explicitly
-    disables (useful in tests / non-OAuth deployments). Unset falls
-    back to ~/.claude/.credentials.json — where ``claude /login``
-    writes the file."""
+    disables (useful in tests / non-OAuth deployments). Unset prefers
+    ``$MIMIR_HOME/.claude/.credentials.json`` — co-located with the
+    rest of mimir's persistent state so the credentials file rides
+    whatever bind mount / volume the operator has set up for the
+    homedir. Falls back to ``$HOME/.claude/.credentials.json`` (where
+    ``claude /login`` writes by default) only if MIMIR_HOME is unset.
+
+    Containerized deployments without bind mounts otherwise see the
+    refresh-token rotation get blown away on every container rebuild,
+    forcing a re-login. Anchoring on MIMIR_HOME removes that footgun
+    while still letting bare-metal operators keep credentials in their
+    user home."""
     raw = os.environ.get("MIMIR_CLAUDE_OAUTH_CREDENTIALS")
-    if raw is None:
-        # Unset → use the standard Claude Code path.
-        home = os.environ.get("HOME") or ""
-        if not home:
-            return None
-        return Path(home) / ".claude" / ".credentials.json"
-    if not raw.strip():
+    if raw is not None and not raw.strip():
         # Explicitly empty → disable.
         return None
-    return Path(raw).expanduser().resolve()
+    if raw is not None:
+        return Path(raw).expanduser().resolve()
+    mimir_home = os.environ.get("MIMIR_HOME")
+    if mimir_home:
+        return Path(mimir_home).expanduser().resolve() / ".claude" / ".credentials.json"
+    home = os.environ.get("HOME") or ""
+    if not home:
+        return None
+    return Path(home) / ".claude" / ".credentials.json"
 
 
 def _env_float(name: str, default: float) -> float:
