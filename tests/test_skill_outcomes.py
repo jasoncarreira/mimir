@@ -14,7 +14,8 @@ from mimir.skill_outcomes import (
     _classify_skill_calls,
     aggregate,
     order_skills,
-    render_skill_block,
+    render_skill_catalog,
+    render_skill_telemetry,
 )
 
 
@@ -145,7 +146,35 @@ def test_order_skills_respects_hide():
     assert "deprecated" not in untried
 
 
-def test_render_block_groups():
+def test_render_skill_catalog_alphabetic_install_stable():
+    """Catalog is alphabetical, contains every seeded skill, no
+    bucket headers, no telemetry — install-stable so the system-prompt
+    cache prefix isn't busted by skill invocations (chainlink #15)."""
+    pin = SkillPinConfig()
+    out = render_skill_catalog(["wiki", "memory", "heartbeat"], pin)
+    assert out is not None
+    # Alphabetical
+    assert out.split("\n") == ["- heartbeat", "- memory", "- wiki"]
+    # No bucket headers / counts in the catalog
+    assert "**" not in out
+    assert "in window" not in out
+
+
+def test_render_skill_catalog_filters_hidden():
+    pin = SkillPinConfig(hide=["legacy"])
+    out = render_skill_catalog(["legacy", "memory"], pin)
+    assert out is not None
+    assert "legacy" not in out
+    assert "memory" in out
+
+
+def test_render_skill_catalog_returns_none_when_empty():
+    assert render_skill_catalog([], SkillPinConfig()) is None
+    # All seeded skills hidden ⇒ None
+    assert render_skill_catalog(["x"], SkillPinConfig(hide=["x"])) is None
+
+
+def test_render_skill_telemetry_emits_proven_and_risky_only():
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     aggs = {
         "memory": SkillOutcome(skill="memory", success=5, failure=1,
@@ -154,18 +183,36 @@ def test_render_block_groups():
                               last_used=base),
     }
     pin = SkillPinConfig()
-    out = render_skill_block(["memory", "wiki", "heartbeat"], aggs, pin, now=base)
+    out = render_skill_telemetry(
+        ["memory", "wiki", "heartbeat"], aggs, pin, now=base,
+    )
     assert out is not None
-    assert "**Proven**" in out
-    assert "memory" in out
-    assert "**Untried**" in out
-    assert "heartbeat" in out
-    assert "**Risky**" in out
-    assert "wiki" in out
+    # Proven and Risky present, with N/M counts
+    assert "skills proven" in out
+    assert "memory (5/6 in window)" in out
+    assert "skills risky" in out
+    assert "wiki (1/5 in window)" in out
+    # Untried skills are NOT enumerated in telemetry — they live in
+    # the install-stable catalog only
+    assert "heartbeat" not in out
 
 
-def test_render_block_returns_none_when_no_seeded():
-    out = render_skill_block([], {}, SkillPinConfig())
+def test_render_skill_telemetry_returns_none_when_no_activity():
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    # All seeded skills untried (no aggregates) ⇒ no telemetry
+    out = render_skill_telemetry(
+        ["memory", "wiki"], {}, SkillPinConfig(), now=base,
+    )
+    assert out is None
+
+
+def test_render_skill_telemetry_returns_none_when_only_untried():
+    """If all skills with aggregates are untried (zero total) the
+    telemetry block is empty — both Proven and Risky are empty."""
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    # Aggregate exists but with zero counts ⇒ untried bucket
+    aggs = {"memory": SkillOutcome(skill="memory", last_used=None)}
+    out = render_skill_telemetry(["memory"], aggs, SkillPinConfig(), now=base)
     assert out is None
 
 

@@ -862,26 +862,65 @@ class Agent:
     def _assemble_self_state_block(self) -> str | None:
         """v0.5+ §12.4: render the `## Self-state` block — homeostat's
         view of the four layered constraints (plan window / cost rate /
-        S3-S4 share / tokens). Returns None when the homeostat has
-        nothing useful to surface yet (fresh agent, no signal)."""
+        S3-S4 share / tokens), plus per-turn skill bucket telemetry
+        (chainlink #15 — moved out of the system prompt's `## Skills`
+        block so a skill invocation doesn't bust the prompt-cache
+        prefix). Returns None when the homeostat has nothing useful to
+        surface yet (fresh agent, no signal) AND no skill telemetry
+        either."""
         try:
-            return self._arbiter.render_self_state_block()
+            arbiter_body = self._arbiter.render_self_state_block()
         except Exception:  # noqa: BLE001
-            log.exception("_assemble_self_state_block failed; skipping")
+            log.exception("_assemble_self_state_block (arbiter) failed; skipping")
+            arbiter_body = None
+        skill_body = self._assemble_skill_telemetry_lines()
+        if not arbiter_body and not skill_body:
             return None
+        if arbiter_body and skill_body:
+            return f"{arbiter_body}\n{skill_body}"
+        return arbiter_body or skill_body
 
     def _assemble_skill_block(self) -> str | None:
         """v0.5+ §12.3: render the system-prompt `## Skills` block —
-        proven / untried / risky buckets ordered by recent success
-        rate. Returns None when no skills are seeded.
+        the **install-stable** catalog of skill names. Volatile
+        success-rate telemetry (Proven/Risky buckets, ``N/M in window``
+        counts) lives in `_assemble_skill_telemetry_lines` and gets
+        composed into the per-turn `## Self-state` block instead, so
+        the system prompt stays cacheable across turns (chainlink #15).
+
+        Returns None when no skills are seeded.
 
         Skills enumerated via ``installed_skill_names(home)`` so user-
         installed skills under ``<home>/.claude/skills/`` appear
-        alongside bundled ones — the ranker isn't limited to the
-        package-bundled set."""
+        alongside bundled ones."""
         try:
             from .skill_outcomes import (
-                SkillPinConfig, aggregate, render_skill_block,
+                SkillPinConfig, render_skill_catalog,
+            )
+            from .skill_defs import installed_skill_names
+            seeded = installed_skill_names(self._config.home)
+            if not seeded:
+                return None
+            pin = SkillPinConfig.load(
+                self._config.home / "state" / "skill-pin.yaml"
+            )
+            return render_skill_catalog(seeded, pin)
+        except Exception:  # noqa: BLE001
+            log.exception("_assemble_skill_block failed; skipping")
+            return None
+
+    def _assemble_skill_telemetry_lines(self) -> str | None:
+        """Per-turn skill bucket telemetry (Proven/Risky with
+        ``N/M in window`` counts) for inclusion in the
+        ``## Self-state`` block. The install-stable skill catalog
+        lives in the system prompt (`_assemble_skill_block`); this
+        is the volatile half — pulled out so a skill invocation
+        doesn't perturb the system-prompt cache prefix.
+
+        Returns None when no skills have in-window activity."""
+        try:
+            from .skill_outcomes import (
+                SkillPinConfig, aggregate, render_skill_telemetry,
             )
             from .skill_defs import installed_skill_names
             seeded = installed_skill_names(self._config.home)
@@ -891,9 +930,9 @@ class Agent:
             pin = SkillPinConfig.load(
                 self._config.home / "state" / "skill-pin.yaml"
             )
-            return render_skill_block(seeded, aggs, pin)
+            return render_skill_telemetry(seeded, aggs, pin)
         except Exception:  # noqa: BLE001
-            log.exception("_assemble_skill_block failed; skipping")
+            log.exception("_assemble_skill_telemetry_lines failed; skipping")
             return None
 
     async def _assemble_session_summaries(
