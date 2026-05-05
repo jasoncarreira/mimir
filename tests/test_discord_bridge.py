@@ -347,23 +347,155 @@ class _FakeTyping:
         return None
 
 
+async def _wait_for(predicate, timeout: float = 1.0, interval: float = 0.01):
+    """Loop until ``predicate()`` is truthy or ``timeout`` elapses. Used
+    to poll the typing-hold task's state without sleep-then-assert
+    races (the task spawns asynchronously)."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return predicate()
+
+
 @pytest.mark.asyncio
-async def test_send_typing_indicator_uses_typing_context_manager(
-    bridge_with_fake_client,
-):
-    """discord.py 2.x exposes typing via ``async with channel.typing():``;
-    the bridge enters and exits the context to fire one POST."""
+async def test_send_typing_indicator_spawns_hold_task(bridge_with_fake_client):
+    """send_typing_indicator now holds the typing context open via a
+    background task, not a one-shot enter/exit. The task aenters the
+    typing context and stays inside until cancelled — discord.py's own
+    auto-refresh keeps the indicator alive while the body runs."""
     bridge, _, _ = bridge_with_fake_client
     channel = bridge._client._channels[1]  # type: ignore[attr-defined]
     channel.typing = lambda: _FakeTyping(channel)
     await bridge.send_typing_indicator("discord-1")
-    assert getattr(channel, "typing_aenter_calls", 0) == 1
-    assert getattr(channel, "typing_aexit_calls", 0) == 1
+
+    # Task is registered and alive.
+    assert "discord-1" in bridge._typing_tasks
+    task = bridge._typing_tasks["discord-1"]
+    assert not task.done()
+    # Wait for the hold body to enter the context.
+    assert await _wait_for(lambda: getattr(channel, "typing_aenter_calls", 0) >= 1)
+    # It hasn't exited yet — that's the whole point.
+    assert getattr(channel, "typing_aexit_calls", 0) == 0
+
+    # Cleanup so the test doesn't leak a task into the loop.
+    await bridge.cancel_typing("discord-1")
+    assert await _wait_for(lambda: task.done())
+
+
+@pytest.mark.asyncio
+async def test_send_cancels_typing_for_destination_channel(
+    bridge_with_fake_client,
+):
+    """send() cancels the typing-hold task for the destination channel
+    before the actual reply lands. The aexit on the typing context
+    runs once cancellation propagates."""
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels[1]  # type: ignore[attr-defined]
+    channel.typing = lambda: _FakeTyping(channel)
+    await bridge.send_typing_indicator("discord-1")
+    assert await _wait_for(lambda: getattr(channel, "typing_aenter_calls", 0) >= 1)
+
+    result = await bridge.send("discord-1", "ok")
+    assert result.sent is True
+    # Task should be removed from the registry on send.
+    assert "discord-1" not in bridge._typing_tasks
+    # Wait for aexit to land — task cancellation runs the context's __aexit__.
+    assert await _wait_for(lambda: getattr(channel, "typing_aexit_calls", 0) >= 1)
+
+
+@pytest.mark.asyncio
+async def test_repeat_send_typing_replaces_prior_task(bridge_with_fake_client):
+    """Two send_typing_indicator calls in a row: first task is
+    cancelled, second is alive. Most-recent-inbound wins."""
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels[1]  # type: ignore[attr-defined]
+    channel.typing = lambda: _FakeTyping(channel)
+
+    await bridge.send_typing_indicator("discord-1")
+    first = bridge._typing_tasks["discord-1"]
+
+    await bridge.send_typing_indicator("discord-1")
+    second = bridge._typing_tasks["discord-1"]
+
+    assert first is not second
+    assert await _wait_for(lambda: first.done())
+    assert not second.done()
+
+    await bridge.cancel_typing("discord-1")
+
+
+@pytest.mark.asyncio
+async def test_send_to_channel_b_does_not_cancel_typing_on_channel_a(
+    bridge_with_fake_client,
+):
+    """Per-channel isolation: a send to channel B must leave channel A's
+    typing-hold task alone. (Without this guard the test would
+    regress the cross-channel edge case the spec calls out.)"""
+    bridge, _, _ = bridge_with_fake_client
+    channel_a = bridge._client._channels[1]  # type: ignore[attr-defined]
+    channel_b = bridge._client._channels[2]  # type: ignore[attr-defined]
+    channel_a.typing = lambda: _FakeTyping(channel_a)
+    channel_b.typing = lambda: _FakeTyping(channel_b)
+
+    await bridge.send_typing_indicator("discord-1")
+    task_a = bridge._typing_tasks["discord-1"]
+    assert await _wait_for(lambda: getattr(channel_a, "typing_aenter_calls", 0) >= 1)
+
+    await bridge.send("discord-2", "hi over here")
+    # Channel A's typing task still alive — only channel B was affected.
+    assert "discord-1" in bridge._typing_tasks
+    assert not task_a.done()
+    assert getattr(channel_a, "typing_aexit_calls", 0) == 0
+
+    await bridge.cancel_typing("discord-1")
+
+
+@pytest.mark.asyncio
+async def test_cancel_typing_when_no_task_is_safe(bridge_with_fake_client):
+    """cancel_typing() on a channel that never had a typing task is a
+    no-op — programmatic sends and scheduled-tick replies hit this
+    path. Must not raise."""
+    bridge, _, _ = bridge_with_fake_client
+    await bridge.cancel_typing("discord-1")  # never had a task
+    assert "discord-1" not in bridge._typing_tasks
+
+
+@pytest.mark.asyncio
+async def test_send_without_prior_typing_task_is_safe(bridge_with_fake_client):
+    """A send() to a channel with no in-flight typing task works
+    normally — the cancel_typing() call inside send() is a no-op."""
+    bridge, _, sent = bridge_with_fake_client
+    result = await bridge.send("discord-2", "scheduled tick reply")
+    assert result.sent is True
+    assert sent  # actually delivered
+
+
+@pytest.mark.asyncio
+async def test_typing_hold_capped_at_timeout(bridge_with_fake_client):
+    """When neither send() nor cancel_typing() arrives, the hold task
+    exits naturally at the hard cap — defense against errored turns
+    that would otherwise leak a typing task forever."""
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels[1]  # type: ignore[attr-defined]
+    channel.typing = lambda: _FakeTyping(channel)
+    # Shrink the cap so the test runs in a sane wall-clock window.
+    bridge._TYPING_HOLD_TIMEOUT_SECONDS = 0.05  # 50ms
+
+    await bridge.send_typing_indicator("discord-1")
+    task = bridge._typing_tasks["discord-1"]
+    # Task should exit on its own once the inner asyncio.sleep wakes.
+    assert await _wait_for(lambda: task.done(), timeout=1.0)
+    # And aexit has run.
+    assert getattr(channel, "typing_aexit_calls", 0) >= 1
 
 
 @pytest.mark.asyncio
 async def test_send_typing_indicator_swallows_failures(bridge_with_fake_client):
-    """Errors during typing don't propagate — best-effort."""
+    """Errors during typing don't propagate — best-effort. Even when
+    the typing context aenter raises, the bridge should not bubble
+    the exception."""
     bridge, _, _ = bridge_with_fake_client
     channel = bridge._client._channels[1]  # type: ignore[attr-defined]
 
@@ -376,13 +508,34 @@ async def test_send_typing_indicator_swallows_failures(bridge_with_fake_client):
     channel.typing = lambda: _BoomTyping()
     # Should not raise.
     await bridge.send_typing_indicator("discord-1")
+    task = bridge._typing_tasks["discord-1"]
+    # Task exits cleanly (the exception is swallowed inside _hold).
+    assert await _wait_for(lambda: task.done())
 
 
 @pytest.mark.asyncio
 async def test_send_typing_indicator_unconnected_noops(tmp_path: Path):
-    """No client → silent no-op, no exception."""
+    """No client → silent no-op, no exception, no dangling task."""
     bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))
     await bridge.send_typing_indicator("discord-1")  # must not raise
+    assert "discord-1" not in bridge._typing_tasks
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_dangling_typing_tasks(bridge_with_fake_client):
+    """Bridge disconnect must cancel any in-flight typing-hold tasks so
+    they don't try to POST against a closing client."""
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels[1]  # type: ignore[attr-defined]
+    channel.typing = lambda: _FakeTyping(channel)
+    await bridge.send_typing_indicator("discord-1")
+    task = bridge._typing_tasks["discord-1"]
+    assert not task.done()
+
+    await bridge.disconnect()
+    # All tasks cancelled and dict cleared.
+    assert bridge._typing_tasks == {}
+    assert await _wait_for(lambda: task.done())
 
 
 @pytest.mark.asyncio
