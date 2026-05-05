@@ -247,10 +247,17 @@ async def test_synthesis_turn_filters_turns_jsonl_by_session_id(tmp_path: Path):
         )
 
     body = captured["prompt"]
-    # Both S1 turns embedded; S2's turn must NOT appear.
-    assert '"turn_id": "t1"' in body
-    assert '"turn_id": "t3"' in body
-    assert '"turn_id": "t2"' not in body
+    # Both S1 turn_ids appear in the metadata-only summary block;
+    # S2's turn_id must NOT (filtering by saga_session_id is what we're
+    # checking — the prompt no longer JSON-dumps full transcripts, but
+    # the summary line still names each included turn by id).
+    assert "turn t1" in body
+    assert "turn t3" in body
+    assert "turn t2" not in body
+    # And the inputs (rendered prompts that fed earlier turns) are
+    # specifically NOT re-embedded — that was the cubic blowup fix.
+    assert "hello" not in body
+    assert "more S1" not in body
 
 
 @pytest.mark.asyncio
