@@ -588,6 +588,78 @@ class Scheduler:
         )
         return True
 
+    # ---- bind-mount health probe cron --------------------------------
+
+    # VSM: S3 — non-LLM safety probe for the VirtioFS bind-mount stale-
+    #      inode failure mode (see BIND_MOUNT_HEALTH_PROBE.md). Spawns a
+    #      ``pwd`` subprocess in MIMIR_HOME; nonzero exit or "deleted"
+    #      in stderr means the bind is broken and the agent should
+    #      self-restart so Docker's restart policy can re-mount.
+    # loop_id: 4.10
+    def add_health_probe_job(
+        self,
+        home: Path,
+        events_log: Path,
+        cron_expr: str,
+        *,
+        max_restarts_per_hour: int = 3,
+        job_id: str = "bind-mount-health-probe",
+    ) -> bool:
+        """Register the bind-mount health probe cron. Returns False on
+        empty / unset cron expression so callers can no-op out without
+        an exception.
+
+        The probe is lightweight (a single subprocess.run) and self-
+        gates on VirtioFS detection, so registering it on a non-
+        VirtioFS host is harmless — every tick will short-circuit on
+        the mountinfo check."""
+        cron_expr = (cron_expr or "").strip()
+        if not cron_expr:
+            return False
+        try:
+            trigger = CronTrigger.from_crontab(cron_expr, timezone=UTC)
+        except (ValueError, KeyError) as exc:
+            raise ValueError(
+                f"invalid cron expression {cron_expr!r}: {exc}"
+            ) from exc
+
+        from .health_probe import HealthProbeConfig, probe_once
+
+        cfg = HealthProbeConfig(
+            home=home,
+            events_log=events_log,
+            max_restarts_per_hour=max_restarts_per_hour,
+        )
+
+        async def _run() -> None:
+            try:
+                await probe_once(cfg)
+            except Exception as exc:  # noqa: BLE001
+                # probe_once is meant to swallow its own errors via
+                # log_event; this is a defensive belt — if something
+                # leaks (e.g. import-time bug) we still surface it
+                # rather than letting the cron job die silently.
+                await log_event(
+                    "bind_mount_probe_failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+        self._scheduler.add_job(
+            _run,
+            trigger=trigger,
+            id=job_id,
+            replace_existing=True,
+            # If the probe takes longer than 30s (kernel hang in the
+            # subprocess.run path itself), let APScheduler skip the
+            # next tick rather than queue them up. We'd rather miss a
+            # probe than pile them up behind a stuck syscall.
+            misfire_grace_time=30,
+            # Same reason — never overlap probes.
+            max_instances=1,
+            coalesce=True,
+        )
+        return True
+
     # ---- lifecycle ---------------------------------------------------
 
     def start(self) -> None:
