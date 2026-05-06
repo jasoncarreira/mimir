@@ -297,6 +297,71 @@ async def test_pre_message_hook_dedup_keeps_distinct_prior(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_synthesis_turn_emits_skipped_boundary_when_step3_missing(
+    tmp_path: Path,
+):
+    """CR#19: a synthesis turn that completes without calling
+    ``saga_end_session`` (step 3 of the synthesis prompt) emits a
+    ``saga_synthesis_skipped_boundary`` algedonic so the silent
+    contract failure is visible. The fake query above just emits text
+    and never calls the tool — exactly the failure shape we're guarding
+    against."""
+    saga = FakeSaga(query_response={"_raw_atoms": []})
+    agent = _build_agent(tmp_path, saga)
+    cfg = agent._config
+
+    fake_q = _fake_query_yielding("did the work but forgot the bookkeeping")
+    with patch("mimir.agent.query", new=fake_q):
+        await agent.run_turn(
+            AgentEvent(
+                trigger="saga_session_end",
+                channel_id="bench-1",
+                content="",
+                extra={"saga_session_id": "saga-c1-skip"},
+            )
+        )
+
+    events = [
+        json.loads(line)
+        for line in cfg.events_log.read_text().splitlines() if line.strip()
+    ]
+    skipped = [
+        e for e in events if e.get("type") == "saga_synthesis_skipped_boundary"
+    ]
+    assert len(skipped) == 1, (
+        f"expected exactly one skipped_boundary event, got {skipped}"
+    )
+    assert skipped[0].get("saga_session_id") == "saga-c1-skip"
+    assert skipped[0].get("channel_id") == "bench-1"
+
+
+@pytest.mark.asyncio
+async def test_non_synthesis_turn_does_not_emit_skipped_boundary(tmp_path: Path):
+    """CR#19: only synthesis turns get the post-check. A normal user
+    turn must not emit ``saga_synthesis_skipped_boundary`` even though
+    it never calls saga_end_session — the check is gated on
+    ``trigger == 'saga_session_end'``."""
+    saga = FakeSaga(query_response={"_raw_atoms": []})
+    agent = _build_agent(tmp_path, saga)
+    cfg = agent._config
+
+    fake_q = _fake_query_yielding("normal reply")
+    with patch("mimir.agent.query", new=fake_q):
+        await agent.run_turn(
+            AgentEvent(trigger="user_message", channel_id="c", content="hi", author="x")
+        )
+
+    events = [
+        json.loads(line)
+        for line in cfg.events_log.read_text().splitlines() if line.strip()
+    ]
+    skipped = [
+        e for e in events if e.get("type") == "saga_synthesis_skipped_boundary"
+    ]
+    assert skipped == []
+
+
+@pytest.mark.asyncio
 async def test_saga_failure_does_not_break_turn(tmp_path: Path):
     saga = FakeSaga(fail_on={"query"})
     agent = _build_agent(tmp_path, saga)
