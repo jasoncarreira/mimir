@@ -2,7 +2,7 @@
 
 <!-- desc: detect VirtioFS bind-mount stale-inode states and recover by killing PID 1 -->
 
-**Status:** filed 2026-05-06. Not started. Single focused PR.
+**Status:** filed 2026-05-06. Implementation in flight (PR pending).
 
 ## Problem
 
