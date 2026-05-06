@@ -224,6 +224,19 @@ are removed. New tests in `test_agent_sdk_client.py` and
 **Success metric:** the RateLimitStore has populated `utilization` for both
 `five_hour` and `seven_day_opus` after one turn. The cron poller is removable.
 
+**Post-landing reality check (2026-05-05):** Stage 5 landed mechanically —
+the wrapper, the per-turn capture, the poller removal — but on Claude Max
+OAuth, `get_context_usage().apiUsage` turns out to be session-scoped (the
+SDK exposes per-session token counts, not the plan-window utilization%
+that gets rendered in self-state). So while the "cron poller retired"
+objective was met for one news cycle, plan-window utilization% only
+resurfaced after PR #8 added a new cron poller (`mimir/oauth_usage_poller.py`)
+that hits Anthropic's `/api/oauth/usage` directly. The Stage 5 plumbing
+stays in place — apiUsage is still useful for non-OAuth deployments and
+for finer-grained per-turn telemetry — but readers should not infer from
+this section that mimir is poller-free; it isn't, the poller just moved
+to a different upstream.
+
 ### Stage 6 — control-plane methods (opportunistic)
 
 **Goal:** unlock features the migration enables.

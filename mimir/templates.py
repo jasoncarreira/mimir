@@ -43,6 +43,18 @@ useful context for future sessions — write or edit files under:
 
   memory/channels/{channel_id}/   # channel-specific notes
   memory/shared/                  # cross-channel facts
+  memory/learnings-pending.md     # candidate learned behaviors (see below)
+
+If the session surfaced something that *might* be a durable behavior
+worth remembering across all future turns — a heuristic that worked, a
+failure mode worth avoiding, an approach that beat the default — append
+it to `memory/learnings-pending.md` in the canonical 4-field shape
+(`What I noticed / What works / Trigger / Source:`). The weekly
+reflection turn promotes durable entries from there to
+`memory/core/40-learned-behaviors.md` and drops one-offs. **Do NOT write
+directly to `memory/core/40-learned-behaviors.md`** — synthesis turns
+have narrow context (one session) and have been observed confabulating
+durable rules from one-off events. The pending buffer is the safe path.
 
 Use bash and the file-op tools. Call `mimir_get_turn` only for turns
 whose summary suggests they're worth a closer look. Skip this step
