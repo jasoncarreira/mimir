@@ -219,6 +219,18 @@ choice rather than leaving it open.
 - **Effort:** S
 - **Severity:** sev:low
 
+### 22. Arbiter trusts OAuth-endpoint utilization at face value; spurious 100% spikes wrongly suppress hours of scheduled work
+
+- **Where:** `mimir/billing.py:AnthropicQuotaProvider.get_windows`, `mimir/billing.py:evaluate_quota`, `mimir/oauth_usage_poller.py:record_usage` (writer side)
+- **What's wrong:** Anthropic's `/api/oauth/usage` endpoint occasionally reports bogus utilization values for the 5-hour window — observed twice now (2026-05-05 14:00 UTC: bounced 0%/100%/3% in three consecutive polls; 2026-05-06 04:03 UTC: jumped 7%→100% in 3 minutes and got stuck for 7+ hours). Each event suppressed all `scheduled_tick` heartbeats for the duration. Cross-checks confirm both were spurious: in the second incident the bot only spent ~$13 across the surrounding hour while the 7-day window moved +1pp — internally inconsistent with 100% of 5h quota actually being burned. The arbiter (`evaluate_quota` in `mimir/billing.py:215-280`) consumes whatever the provider returns without sanity-checking; `record_usage` writes whatever the endpoint sent without comparing against prior readings.
+- **Why it matters:** Hours of S4 (autonomous) work get silently dropped when the endpoint glitches. The current Self-state block surfaces the suppression reason but the operator has to manually cross-reference cost-rate-vs-utilization to spot the data quality issue. This is the third quota-data-quality issue we've hit since the OAuth poller shipped (PR #8); the pattern is going to keep coming back as long as we trust the endpoint blindly.
+- **Approach:** Two layers, additive:
+  - **(a) Anomaly detector at write time.** In `record_usage` (or a new `mimir/billing.py:detect_quota_anomaly`), keep a small in-memory ring of the last N (=10) snapshots per window. When a new reading lands, flag as anomalous if: (i) jump size > 50 percentage points in a single poll interval (3 min) AND (ii) the corresponding longer-window value barely moved (e.g., 5h jumped >50pp but 7d delta was <5pp over the same interval, scaled to the period). Flagged readings get persisted with `anomalous: True` and emit `quota_reading_anomalous` algedonic event but do NOT replace the prior known-good value in `RateLimitStore` for that window. The renderer keeps showing the previous trustworthy value with a warning suffix ("(last verified Xm ago)").
+  - **(b) Cost-rate cross-check estimator** (the back-propagation idea). When a 5h reading is anomalous, the arbiter falls back to an estimate derived from `aggregate_usage` (already exists in `mimir/usage_stats.py`): take the cost spent in the last 5 hours from `turns.jsonl`, divide by the operator's known 7d-quota-in-dollars (back-derived: `7d_dollars_observed / 7d_utilization_observed`), and compute `estimated_5h_util = 5h_dollars_recent * (5h_to_7d_quota_ratio) / 7d_quota_dollars`. We don't know the exact 5h-to-7d quota ratio but `(5h / 168h) * 14` (Anthropic's stated 5h-to-7d ratio is roughly 1.4× what flat scaling would give — confirmed empirically across recent windows) gets us within a factor of 1.5. Round to nearest 5pp; mark the estimate as `derived` so the arbiter can apply a higher suppress threshold (e.g., 90% derived vs 80% direct) to avoid over-aggressive suppression on noisy estimates. **Recommended choice:** ship (a) first as a 1-day item (anomaly detection without estimator); evaluate whether suppression-during-anomaly is rare enough that (b) isn't needed before building the estimator.
+  - The arbiter (`evaluate_quota`) consults the anomaly flag: when a window's snapshot is `anomalous=True` AND a derived estimate exists, use the derived value with the higher threshold; if no derived estimate, treat the window as "no signal" (suppress=False) until the next non-anomalous reading.
+- **Effort:** S for (a) alone, M for (a)+(b)
+- **Severity:** sev:med
+
 ---
 
 ## Recommended sequencing
@@ -232,3 +244,7 @@ If shipping in priority order:
 5. **#16 (saga transactional writes)** — quiet data-integrity bug.
 6. **#14 (saga adapter dedup)** — slow-burning, but only matters when both `_InProcessSaga` and `_HttpSaga` ship in production.
 7. Remaining items in any order.
+
+**Added 2026-05-06 from operational incident:**
+
+8. **#22 (arbiter quota anomaly detection)** — observed twice in 48h; second incident suppressed S4 work for 7+ hours unnecessarily. Ship the anomaly detector (part a) first.
