@@ -82,6 +82,13 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # operator should know the upstream endpoint is glitching, even
     # though the arbiter is now insulated.
     "quota_reading_anomalous": ("negative", "quota_anomaly"),
+    # PR 4a (git_tracking): post-turn commit/push failures. All three
+    # are first-occurrence-only (see ``_FIRST_OCCURRENCE_ONLY_KINDS``)
+    # because once git breaks every subsequent turn re-emits — without
+    # dedup the failure crowds out everything else in the 24h window.
+    "git_commit_failed": ("negative", "git_commit_failed"),
+    "git_push_failed": ("negative", "git_push_failed"),
+    "git_pull_blocked": ("negative", "git_pull_blocked"),
     # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
     "saga_feedback_sent": ("positive", "saga_feedback"),
@@ -129,6 +136,13 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # algedonic block only needs the latest one.
     "quota_anomaly",
     "oauth_refresh_ok",
+    # PR 4a (git_tracking): a stuck network outage / auth issue / dirty
+    # tree will re-emit on every turn until resolved. Dedup so the
+    # operator-visible signal is the *most recent* failure, not 50
+    # copies of the same error in the 24h window.
+    "git_commit_failed",
+    "git_push_failed",
+    "git_pull_blocked",
 }
 
 
@@ -375,6 +389,30 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"(kept previous {kept_str}); arbiter consults the last "
             f"trusted value. Glitch is transient — usually clears within "
             f"a poll cycle or two."
+        )
+    if rule_kind == "git_commit_failed":
+        stage = ev.get("stage") or "?"
+        err = ev.get("error") or "(no detail)"
+        return (
+            f"git commit failed at {stage}: {err}. "
+            f"Tracked-state changes from this turn are NOT staged. "
+            f"Investigate /mimir-home git status; next successful turn re-tries."
+        )
+    if rule_kind == "git_push_failed":
+        reason = ev.get("reason") or "(no detail)"
+        rc = ev.get("returncode")
+        rc_suffix = f" [rc={rc}]" if rc is not None else ""
+        return (
+            f"git push to mimirbot-state failed: {reason}{rc_suffix}. "
+            f"Local commits stand; the next debounced push catches up "
+            f"once connectivity / auth is restored."
+        )
+    if rule_kind == "git_pull_blocked":
+        reason = ev.get("reason") or "(no detail)"
+        return (
+            f"git pull blocked: {reason}. Container's local branch has "
+            f"diverged from remote — operator must reconcile manually "
+            f"(reset local to remote, or push divergent commits)."
         )
     if rule_kind == "unknown_channel":
         return f"send_message to unknown channel {ev.get('channel_id', '?')}"
