@@ -305,6 +305,45 @@ def build_app(config: Config) -> web.Application:
     web_chat.register_routes(app)
 
     async def _on_startup(app: web.Application) -> None:
+        # PR 4b (MIMIR_HOME_GIT_TRACKING): idempotent bootstrap. Runs
+        # before the agent starts processing turns so the post-turn
+        # commit hook lands on a real repo. Sync function dispatched to
+        # a thread because subprocess.run blocks the loop. Bootstrap
+        # failures are logged but never fatal — the agent can still
+        # serve turns; the post-turn hook self-skips when .git is
+        # missing.
+        if config.git_tracking_enabled:
+            try:
+                from .git_bootstrap import bootstrap_git_repo
+
+                async def _bootstrap_log(event_kind: str, **fields: Any) -> None:
+                    await log_event(event_kind, **fields)
+
+                # log_event is async; wrap a sync shim for the bootstrap
+                # callback that schedules the awaitable on the running
+                # loop.
+                running_loop = asyncio.get_running_loop()
+
+                def _sync_log_event(event_kind: str, **fields: Any) -> None:
+                    asyncio.run_coroutine_threadsafe(
+                        _bootstrap_log(event_kind, **fields),
+                        running_loop,
+                    )
+
+                await asyncio.to_thread(
+                    bootstrap_git_repo,
+                    config.home,
+                    state_repo=config.git_state_repo,
+                    github_token=config.git_state_token,
+                    log_event=_sync_log_event,
+                )
+            except Exception as exc:  # noqa: BLE001
+                await log_event(
+                    "git_bootstrap_failed",
+                    home=str(config.home),
+                    error=str(exc)[:500],
+                )
+
         await indexer.start(run_initial_sweep=False, sweep_loop=True)
         await channels.connect_all()
 

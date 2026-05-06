@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# .git/hooks/pre-commit — secret scanner for /mimir-home auto-commits.
+#
+# Refuse the commit (exit 1) if any staged content matches a secret
+# pattern or any staged file has a secret-shaped name. Runs before
+# every auto-commit from mimir/git_tracking.commit_turn_changes.
+#
+# A failed hook surfaces in events.jsonl as a git_commit_failed event
+# (stage=commit). The next turn sees it via the algedonic feedback
+# block and can self-correct.
+#
+# Spec: MIMIR_HOME_GIT_TRACKING.md §"Pre-commit secret-scan hook".
+# Bypassable only by an operator running `git commit --no-verify`
+# manually; mimir's commit path always invokes the hook.
+
+set -euo pipefail
+
+# Content-pattern allowlist. Each is an extended regex matched against
+# the +lines of the staged diff. Tune by editing in place; entries
+# that produce false positives can be tightened or dropped.
+PATTERNS=(
+  'Bearer [A-Za-z0-9_\-]{20,}'
+  'sk-ant-[A-Za-z0-9_\-]{20,}'
+  'sk-[A-Za-z0-9]{40,}'                # OpenAI-shaped
+  'ghp_[A-Za-z0-9]{30,}'               # GitHub PAT (classic)
+  'gho_[A-Za-z0-9]{30,}'               # GitHub OAuth
+  'github_pat_[A-Za-z0-9_]{60,}'       # GitHub fine-grained PAT
+  'AKIA[0-9A-Z]{16}'                   # AWS access key
+  'ASIA[0-9A-Z]{16}'                   # AWS STS temp key
+  '"refresh_token"[[:space:]]*:[[:space:]]*"[^"]{20,}"'
+  '"access_token"[[:space:]]*:[[:space:]]*"[^"]{20,}"'
+  '"client_secret"[[:space:]]*:[[:space:]]*"[^"]{20,}"'
+  'xoxb-[0-9A-Za-z-]{20,}'             # Slack bot token
+  'xoxp-[0-9A-Za-z-]{20,}'             # Slack user token
+)
+
+# Filename heuristics — refuse outright on suspicious names. The
+# allowlist .gitignore should already block these, but this is the
+# last line of defence if a future gitignore edit punches a hole.
+NAME_PATTERNS=(
+  '*token*'
+  '*credential*'
+  '*.key'
+  '*.pem'
+  'oauth_*.json'
+  'rate_limits.json'
+  '.env'
+  '.env.*'
+)
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+if [ -z "$staged" ]; then
+  exit 0
+fi
+
+# Filename pass first — cheaper and a more confident refusal.
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  base=$(basename -- "$f")
+  for np in "${NAME_PATTERNS[@]}"; do
+    # shellcheck disable=SC2254
+    case "$base" in
+      $np)
+        echo "pre-commit: refusing to commit secret-shaped filename: $f" >&2
+        exit 1
+        ;;
+    esac
+  done
+done <<< "$staged"
+
+# Content scan: only the +lines of the staged diff so we don't trip
+# on context lines that happened to match an existing-but-pre-staged
+# secret (a separate problem with a separate workflow).
+diff_added=$(git diff --cached -U0 --no-color | grep -E '^\+' || true)
+if [ -z "$diff_added" ]; then
+  exit 0
+fi
+
+for pat in "${PATTERNS[@]}"; do
+  if echo "$diff_added" | grep -E "$pat" >/dev/null 2>&1; then
+    echo "pre-commit: refusing to commit content matching: $pat" >&2
+    # Re-run with line numbers so the operator can see the offender.
+    echo "$diff_added" | grep -nE "$pat" >&2 || true
+    exit 1
+  fi
+done
+
+exit 0

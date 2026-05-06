@@ -1,0 +1,59 @@
+# mimir-home .gitignore — allowlist pattern.
+#
+# Block-everything-then-unblock. Easier to audit than a long blocklist;
+# new file types fail closed (don't get committed) until an operator
+# decides they should be tracked. See MIMIR_HOME_GIT_TRACKING.md
+# §"Allowlist .gitignore".
+
+# Block everything by default.
+*
+!*/
+
+# Tracked: human-readable curated state.
+!memory/**
+!prompts/**
+!state/wiki/**
+!state/INDEX.md
+!state/heartbeat-backlog.md
+!state/proposed-changes.md
+!state/applied-proposals.jsonl
+!state/identities.yaml
+!state/raw/**
+!state/learnings-pending.md
+
+# Top-level tracked files.
+!.gitignore
+!README.md
+!saga.toml
+!scheduler.yaml
+
+# Re-block any binary/log artifact that slipped past the include rules
+# above (belt-and-suspenders; if a future change drops atoms.db into
+# memory/, the include rule for memory/** would otherwise pick it up).
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+*.log
+*.tmp
+*.swp
+*.pyc
+*.pyo
+*.bak
+__pycache__/
+.DS_Store
+.cache/
+embeddings/
+
+# Re-block credential-shaped filenames as a content-of-last-resort
+# defence (the pre-commit hook is the primary line; this catches the
+# case where the hook is bypassed or absent).
+*token*
+*credential*
+*.key
+*.pem
+oauth_*.json
+rate_limits.json
+
+# Re-allow the few jsonl files we genuinely want tracked.
+!state/applied-proposals.jsonl
