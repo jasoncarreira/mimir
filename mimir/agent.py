@@ -54,6 +54,7 @@ from .channel_registry import ChannelRegistry
 from .config import Config
 from .event_logger import log_event
 from .feedback import FeedbackLog
+from . import git_tracking
 from .history import MessageBuffer
 from .rate_limits import (
     RateLimitStore,
@@ -1844,6 +1845,19 @@ class Agent:
         # 10. End-of-turn INDEX rebuild (debounced).
         self._indexes.mark_dirty("all")
         await self._indexes.flush()
+
+        # 11. PR 4a: post-turn git commit + debounced push (gated on
+        # ``MIMIR_GIT_TRACKING_ENABLED``). Runs after the index flush so
+        # the auto-regenerated INDEX.md files are part of the same
+        # commit as the writes that triggered them. Failures are
+        # swallowed inside ``commit_turn_changes`` and surfaced via
+        # ``git_commit_failed`` / ``git_push_failed`` algedonic events.
+        await git_tracking.commit_turn_changes(
+            turn_id=ctx.turn_id,
+            trigger=ctx.trigger,
+            home=self._config.home,
+            enabled=self._config.git_tracking_enabled,
+        )
 
         record = TurnRecord(
             ts=_utc_now_iso(),
