@@ -159,6 +159,30 @@ def test_synthesis_prompt_under_50k_for_long_session():
     assert len(out) < 50000
 
 
+def test_render_mentions_learnings_pending_buffer():
+    """Synthesis prompt step #1 must point at memory/learnings-pending.md
+    as the capture path for candidate learned behaviors, with an explicit
+    do-not-write-to-core-40 safety note. Reflection (weekly) is the only
+    autonomous writer of memory/core/40-learned-behaviors.md per
+    memory/core/30-reflection-policy.md — synthesis turns capture
+    candidates here for reflection to promote."""
+    out = render_saga_session_end(
+        channel_id="c",
+        saga_session_id="s",
+        idle_minutes=10,
+        turns_window=[_turn("t1")],
+        prompts_dir=None,
+    )
+    assert "memory/learnings-pending.md" in out
+    # Safety: prompt must steer synthesis turns away from direct core writes.
+    # (Match in flattened-whitespace form so the assertion survives template
+    # line wraps around "Do NOT write directly to ...".)
+    assert "40-learned-behaviors.md" in out
+    flat = " ".join(out.split())
+    assert "Do NOT write directly to" in flat
+    assert "memory/core/40-learned-behaviors.md" in flat
+
+
 def test_render_handles_empty_turns_window():
     out = render_saga_session_end(
         channel_id="c",
