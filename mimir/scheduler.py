@@ -292,7 +292,14 @@ class Scheduler:
         # explain the gap.
         if self._arbiter is not None:
             try:
-                fire, reason = self._arbiter.should_fire_heartbeat()
+                # CR#5: should_fire_heartbeat() reads turns.jsonl via
+                # aggregate_usage and _partition_turns. Move off the
+                # event loop so concurrent dispatcher work (other
+                # channel turns, log writers) isn't stalled during the
+                # per-tick scan.
+                fire, reason = await asyncio.to_thread(
+                    self._arbiter.should_fire_heartbeat,
+                )
             except Exception:  # noqa: BLE001
                 log.exception("arbiter.should_fire_heartbeat raised; firing anyway")
                 fire, reason = True, "arbiter_error"

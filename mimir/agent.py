@@ -1524,9 +1524,17 @@ class Agent:
             session_summaries_block = await self._assemble_session_summaries(
                 channel_id=event.channel_id,
             )
-            usage_block = self._assemble_usage_block()
+            # CR#5: _assemble_usage_block walks turns.jsonl via
+            # aggregate_usage; _assemble_self_state_block walks the
+            # same file plus events.jsonl via the homeostat snapshot.
+            # Move both off the event loop so other tasks (saga writes,
+            # message buffering, log_event flushes) aren't blocked
+            # during the per-turn JSONL scans.
+            usage_block = await asyncio.to_thread(self._assemble_usage_block)
             upcoming_block = self._assemble_upcoming_block()
-            self_state_block = self._assemble_self_state_block()
+            self_state_block = await asyncio.to_thread(
+                self._assemble_self_state_block,
+            )
             turn_prompt = build_turn_prompt(
                 event,
                 recent_messages=recent,
