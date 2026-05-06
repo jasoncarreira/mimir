@@ -289,7 +289,7 @@ operator decides; mimir reads the merged result on next turn.
 
 ### 4.3 Saga consolidation — sleep-inspired memory consolidation
 
-**S3 (control) — saga internal.** Default Sunday 04:00 UTC cron
+**S3 (control) — saga internal.** Default nightly 04:00 UTC cron
 (via `MIMIR_SAGA_CONSOLIDATE_CRON`). Saga's
 `ConsolidationEngine.consolidate()` clusters semantically-similar
 active atoms via cosine threshold + min cluster size, runs an LLM
@@ -301,7 +301,7 @@ The observations participate in retrieval as a separate tier
 (two-tier mode); pulling an observation lifts the rank of its
 source atoms via `evidenced_by` edges (P9 evidence boost).
 
-**Frequency:** weekly cron + on-demand `mimir.scheduler
+**Frequency:** nightly cron + on-demand `mimir.scheduler
 .add_saga_consolidate_job`.
 **Closes the loop:** consolidation's output feeds future retrieves;
 source-atom stability decay means low-value detail eventually fades

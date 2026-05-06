@@ -6,7 +6,7 @@ Responsibilities:
   (atomic add-or-replace by name; serialized through a single asyncio lock).
 - On each cron fire: build an ``AgentEvent`` with ``trigger="scheduled_tick"``
   and enqueue it via the dispatcher (the same path as inbound bridge messages).
-- Run the SAGA weekly consolidation cron (Phase 4) as a non-LLM job.
+- Run the SAGA consolidation cron (Phase 4) as a non-LLM job.
 
 Schedule jobs are persisted as YAML for human readability:
 ::
@@ -192,7 +192,7 @@ def _scheduler_channel_id(job_name: str, channel_id: str | None) -> str:
 
 class Scheduler:
     """One AsyncIOScheduler. Owns LLM-tick jobs (from scheduler.yaml) plus the
-    SAGA weekly consolidation cron from Phase 4."""
+    SAGA consolidation cron from Phase 4."""
 
     def __init__(
         self,
@@ -349,7 +349,7 @@ class Scheduler:
 
     # ---- SAGA consolidation cron -------------------------------------
 
-    # VSM: S3 (saga-internal) — weekly cron triggers consolidation.
+    # VSM: S3 (saga-internal) — nightly cron triggers consolidation.
     #      Saga's hot path: clusters similar atoms, LLM-synthesizes
     #      observations, decays source stability.
     # loop_id: 4.3
@@ -361,7 +361,7 @@ class Scheduler:
         home: Path | None = None,
         job_id: str = "saga-consolidate",
     ) -> bool:
-        """Register the weekly saga consolidation cron.
+        """Register the saga consolidation cron.
 
         ``home`` (optional) — when set, the cron reads
         ``<home>/state/identities.yaml`` at fire time and threads the
