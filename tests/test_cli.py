@@ -552,3 +552,98 @@ def test_print_setup_report_omits_credential_helper_lines_when_absent(capsys):
     out = capsys.readouterr().out
     assert "credential helper" not in out
     assert "legacy in-URL token" not in out
+
+
+def test_print_setup_report_surfaces_initial_push(capsys):
+    """PR 4e added initial_push to BootstrapResult. When True, the
+    report should mention that the remote main was created via the
+    initial ``git push -u``."""
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "git_bootstrap": {
+            "initialized": True,
+            "cloned": False,
+            "pulled": False,
+            "pull_blocked": False,
+            "bootstrap_commit": True,
+            "gitignore_written": True,
+            "hook_written": True,
+            "remote_configured": True,
+            "credentials_written": True,
+            "legacy_token_url_migrated": False,
+            "upstream_set": True,
+            "initial_push": True,
+        },
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "initial push" in out
+    assert "created remote main" in out
+    # initial_push subsumes upstream_set — only the more specific
+    # phrase prints.
+    assert "upstream tracking set" not in out
+
+
+def test_print_setup_report_surfaces_upstream_set_without_push(capsys):
+    """When upstream_set is True but initial_push is False (case 2:
+    remote already had main, just set tracking), the report shows the
+    less specific phrase."""
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "git_bootstrap": {
+            "initialized": False,
+            "cloned": False,
+            "pulled": True,
+            "pull_blocked": False,
+            "bootstrap_commit": False,
+            "gitignore_written": False,
+            "hook_written": True,
+            "remote_configured": True,
+            "credentials_written": True,
+            "legacy_token_url_migrated": False,
+            "upstream_set": True,
+            "initial_push": False,
+        },
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "upstream tracking set" in out
+    assert "initial push" not in out
+
+
+def test_print_setup_report_omits_upstream_lines_when_absent(capsys):
+    """When upstream_set / initial_push are both False, neither phrase
+    appears (e.g. tracking already configured by an earlier run)."""
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "git_bootstrap": {
+            "initialized": False,
+            "cloned": False,
+            "pulled": True,
+            "pull_blocked": False,
+            "bootstrap_commit": False,
+            "gitignore_written": False,
+            "hook_written": True,
+            "remote_configured": True,
+            "credentials_written": False,
+            "legacy_token_url_migrated": False,
+            "upstream_set": False,
+            "initial_push": False,
+        },
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "upstream tracking" not in out
+    assert "initial push" not in out
