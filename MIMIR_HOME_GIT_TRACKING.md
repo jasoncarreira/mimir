@@ -4,6 +4,17 @@
 
 **Status:** 2026-05-06 — ready for implementation. Open questions resolved by operator (§"Locked answers"). Companion to `BIND_MOUNT_HEALTH_PROBE.md` (current mitigation, PR #23).
 
+> **Addendum (PR 4d, 2026-05-06):** the in-URL token approach
+> originally specified for `inject_token_into_url` (§"Authentication
+> + token rotation" / §"Skeleton") was replaced with a git
+> credential-helper plumbing in `mimir/git_bootstrap.py`. The PAT
+> now lives in `<home>/.git/credentials` (chmod 600) and the remote
+> URL is stored in `.git/config` in the canonical clean form. `git
+> remote -v` no longer leaks the token. Bootstrap detects and
+> migrates a legacy PR4b-shape in-URL token on existing repos.
+> Sections below describe the original design; the implementation
+> diverges in this one place.
+
 ## Problem
 
 The current container layout bind-mounts a host directory

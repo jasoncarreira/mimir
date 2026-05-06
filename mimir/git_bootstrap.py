@@ -1,8 +1,10 @@
 """Idempotent git-init / clone bootstrap for ``/mimir-home``.
 
-PR 4b of MIMIR_HOME_GIT_TRACKING.md: the post-turn commit module shipped
-in PR 4a, but the working copy needed to become a git repo first. This
-module gets called from two places:
+PR 4b of MIMIR_HOME_GIT_TRACKING.md established the working copy as a
+git repo; PR 4d (this revision) replaces the in-URL token authentication
+with a git credential helper so the PAT is no longer embedded in
+``.git/config`` or visible to ``git remote -v``. The module gets called
+from two places:
 
 - ``mimir setup`` (CLI) — operator-driven scaffold; runs once
   interactively when the operator first wires up the home dir.
@@ -17,10 +19,17 @@ idempotent — safe to invoke any number of times. It performs:
 2. ``git init`` / ``git clone`` based on env (see §"Decision matrix").
 3. Apply mimir's committer identity (``user.name`` + ``user.email``).
 4. Install the pre-commit secret-scan hook (chmod +x).
-5. Bootstrap commit if init'd fresh AND working tree non-empty.
-6. On existing repo: ``git remote set-url`` to refresh embedded token,
-   then ``git pull --ff-only`` (logs ``git_pull_blocked`` on conflict
-   and exits without raising — the agent's local commits stand).
+5. **Install the credential helper** (PR 4d): writes
+   ``<home>/.git/credentials`` (chmod 600) with the
+   ``https://x-access-token:<PAT>@<host>`` line, sets
+   ``credential.helper "store --file=<path>"`` in local git config.
+   The remote URL itself is the clean, token-free form.
+6. Bootstrap commit if init'd fresh AND working tree non-empty.
+7. On existing repo: ``git remote set-url`` to the clean URL
+   (migrates legacy in-URL-token configs from PR 4b), refresh
+   credentials, then ``git pull --ff-only`` (logs ``git_pull_blocked``
+   on conflict and exits without raising — the agent's local commits
+   stand).
 
 Failure modes log algedonic events; the function never raises (callers
 need to be able to call it from startup paths without tripping the
@@ -30,16 +39,25 @@ event loop).
 
 |         | .git missing                       | .git present                |
 |---------|------------------------------------|-----------------------------|
-| repo+token set | ``git clone <token-url>`` to home  | ``git pull --ff-only``     |
+| repo+token set | ``git clone <token-url>`` to home  | refresh creds + ``git pull --ff-only`` |
 | neither set    | ``git init`` + bootstrap commit    | no-op (still ensure hook)   |
 
 ## Token rotation
 
-``bootstrap_git_repo`` always re-runs ``git remote set-url origin <url>``
-on the token-injected URL when both env vars are set, so a container
+``bootstrap_git_repo`` rewrites ``<home>/.git/credentials`` from the
+current ``GITHUB_TOKEN`` env var on every invocation. A container
 restart after a ``GITHUB_TOKEN`` rotation in ``.env`` picks up the new
 token without operator intervention. Mid-container rotation is out of
 scope for v1 (spec §"`mimir setup` flow").
+
+## Why a credential helper rather than in-URL token
+
+Embedding the PAT in the remote URL (the original PR 4b shape) leaks
+it to anyone running ``git remote -v``, anyone reading ``.git/config``,
+and any bash output that captures git invocations. The credential
+helper keeps the token in a single 0600 file at
+``<home>/.git/credentials`` (under ``.git/``, so it's ignored by git
+itself) and the remote URL stays the clean canonical form.
 """
 
 from __future__ import annotations
@@ -47,7 +65,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
+import stat
 import subprocess
 import urllib.parse
 from dataclasses import dataclass
@@ -71,6 +91,20 @@ DEFAULT_USER_EMAIL = "noreply@mimir-agent.local"
 _TEMPLATES_DIR = Path(__file__).parent / "templates" / "git"
 
 
+# Username sent to GitHub alongside the PAT. GitHub accepts any
+# non-empty value for PAT auth; ``x-access-token`` is the canonical
+# form GitHub Apps use and is unambiguous in logs / debugging.
+_PAT_USERNAME = "x-access-token"
+
+
+# Regex for redacting PAT-shaped tokens from log strings. Covers the
+# fine-grained PAT prefix (``github_pat_...``) and the classic prefix
+# (``ghp_...``). Used by ``_redact`` so error messages still scrub
+# tokens in the rare paths where one might transit through (e.g. the
+# transient clone URL on first bootstrap).
+_PAT_REGEX = re.compile(r"(?:github_pat_|ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9_]+")
+
+
 @dataclass
 class BootstrapResult:
     """Summary of what bootstrap_git_repo did. Useful for tests + the
@@ -84,31 +118,12 @@ class BootstrapResult:
     gitignore_written: bool
     hook_written: bool
     remote_configured: bool
+    credentials_written: bool   # PR 4d: credential helper file written / refreshed
+    legacy_token_url_migrated: bool  # PR 4d: stripped a PR4b-style in-URL token
     skipped: bool           # bootstrap was a no-op (e.g. already done)
 
 
 # ─── public API ──────────────────────────────────────────────────────
-
-
-def inject_token_into_url(state_repo_url: str, github_token: str) -> str:
-    """Rewrite an HTTPS git URL to embed the PAT in the netloc.
-
-    Input:  ``https://github.com/jasoncarreira/mimirbot-state.git``
-    Output: ``https://${TOKEN}@github.com/jasoncarreira/mimirbot-state.git``
-
-    Token is URL-encoded so PATs containing reserved chars (``+``, ``/``,
-    ``=``) don't break the netloc parse on the receiving end. Leaves
-    non-https URLs alone (ssh URLs are caller's problem; we only
-    support the HTTPS-token shape per spec §"Locked answers" #2).
-    """
-    parsed = urllib.parse.urlparse(state_repo_url)
-    if parsed.scheme not in {"http", "https"}:
-        return state_repo_url
-    quoted = urllib.parse.quote(github_token, safe="")
-    new_netloc = f"{quoted}@{parsed.hostname}"
-    if parsed.port:
-        new_netloc = f"{new_netloc}:{parsed.port}"
-    return parsed._replace(netloc=new_netloc).geturl()
 
 
 def bootstrap_git_repo(
@@ -139,7 +154,8 @@ def bootstrap_git_repo(
     result = BootstrapResult(
         initialized=False, cloned=False, pulled=False, pull_blocked=False,
         bootstrap_commit=False, gitignore_written=False, hook_written=False,
-        remote_configured=False, skipped=False,
+        remote_configured=False, credentials_written=False,
+        legacy_token_url_migrated=False, skipped=False,
     )
 
     git_dir = home / ".git"
@@ -150,15 +166,29 @@ def bootstrap_git_repo(
     # (clone elsewhere, move .git in). Defer that to the operator.
     if not git_dir.exists():
         if state_repo and github_token:
-            push_url = inject_token_into_url(state_repo, github_token)
+            # Clone is the one place we still inject the token into the
+            # URL: ``.git/`` doesn't exist yet, so ``git config --local``
+            # has nowhere to live, and we can't pre-stage the credential
+            # helper before clone. The injection is transient — we
+            # rewrite the remote to the clean URL immediately on
+            # success. Argv-level exposure is bounded to one subprocess.
+            transient_url = _inject_token_into_url(state_repo, github_token)
             if _is_dir_effectively_empty(home):
-                ok = _clone(home, push_url, log_event=log_event)
+                ok = _clone(home, transient_url, log_event=log_event)
                 if ok:
                     result.cloned = True
+                    # Rewrite remote to the clean URL right away.
+                    _run(
+                        ["git", "remote", "set-url", "origin", state_repo],
+                        cwd=home, check=False,
+                    )
                     result.remote_configured = True
                     _apply_identity(home, user_name, user_email)
                     _ensure_gitignore(home, result)
                     _ensure_hook(home, result)
+                    _install_credential_helper(
+                        home, state_repo, github_token, result,
+                    )
                     log_event(
                         "git_bootstrap_ok",
                         path=str(home),
@@ -174,9 +204,13 @@ def bootstrap_git_repo(
         _ensure_gitignore(home, result)
         _ensure_hook(home, result)
         if state_repo and github_token:
-            push_url = inject_token_into_url(state_repo, github_token)
+            # Install credential helper *before* adding the remote so
+            # subsequent network operations can authenticate.
+            _install_credential_helper(
+                home, state_repo, github_token, result,
+            )
             _run(
-                ["git", "remote", "add", "origin", push_url],
+                ["git", "remote", "add", "origin", state_repo],
                 cwd=home, check=False,
             )
             result.remote_configured = True
@@ -204,25 +238,32 @@ def bootstrap_git_repo(
         return result
 
     # ── path 3: existing repo ────────────────────────────────────────
-    # Idempotent: refresh identity + hook + gitignore + remote URL,
-    # then pull --ff-only.
+    # Idempotent: refresh identity + hook + gitignore + credential
+    # helper + remote URL, then pull --ff-only. Migrates any PR4b-era
+    # in-URL token by rewriting the remote to the clean form.
     _apply_identity(home, user_name, user_email)
     _ensure_gitignore(home, result)
     _ensure_hook(home, result)
     if state_repo and github_token:
-        push_url = inject_token_into_url(state_repo, github_token)
+        _install_credential_helper(
+            home, state_repo, github_token, result,
+        )
+
         existing = _run(
             ["git", "remote", "get-url", "origin"],
             cwd=home, check=False, capture=True,
         )
         if existing.returncode == 0:
+            current_url = (existing.stdout or "").strip()
+            if _url_has_embedded_token(current_url):
+                result.legacy_token_url_migrated = True
             _run(
-                ["git", "remote", "set-url", "origin", push_url],
+                ["git", "remote", "set-url", "origin", state_repo],
                 cwd=home, check=False,
             )
         else:
             _run(
-                ["git", "remote", "add", "origin", push_url],
+                ["git", "remote", "add", "origin", state_repo],
                 cwd=home, check=False,
             )
         result.remote_configured = True
@@ -245,7 +286,9 @@ def bootstrap_git_repo(
                 log_event(
                     "git_pull_blocked",
                     path=str(home),
-                    reason=(pull.stderr or pull.stdout or "non-fast-forward").strip()[:500],
+                    reason=_redact(
+                        (pull.stderr or pull.stdout or "non-fast-forward").strip()[:500]
+                    ),
                 )
         # fetch failure is silent — network outage shouldn't block start.
 
@@ -255,6 +298,7 @@ def bootstrap_git_repo(
         action="reused",
         pulled=result.pulled,
         pull_blocked=result.pull_blocked,
+        legacy_token_url_migrated=result.legacy_token_url_migrated,
     )
     return result
 
@@ -318,6 +362,89 @@ def _ensure_hook(home: Path, result: BootstrapResult) -> None:
     result.hook_written = True
 
 
+def _install_credential_helper(
+    home: Path,
+    state_repo: str,
+    github_token: str,
+    result: BootstrapResult,
+) -> None:
+    """Write ``<home>/.git/credentials`` with the PAT and configure
+    ``credential.helper`` to read from it.
+
+    The helper file lives inside ``.git/`` so it's automatically
+    excluded from working-tree operations. Mode 0600 keeps it readable
+    only by the running user. Sets ``--local`` config to avoid
+    polluting any global ``~/.gitconfig``.
+
+    Idempotent: rewrites the file unconditionally because the token may
+    have rotated since last bootstrap; the file size is tiny so the
+    write cost is negligible. Same-content writes still bump mtime;
+    that's fine — we don't expose mtime anywhere.
+    """
+    parsed = urllib.parse.urlparse(state_repo)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        # We only support HTTPS; ssh URLs need a different auth shape
+        # and aren't covered by spec §"Locked answers" #2.
+        log.warning(
+            "credential helper not installed: state_repo is not https (%s)",
+            parsed.scheme,
+        )
+        return
+
+    host = parsed.hostname
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+
+    # Credentials file format: one URL per line, ``user:pass@host``
+    # encoded as a URL. ``store`` looks for an exact scheme+host match
+    # (path is ignored), so a single line per host works for any number
+    # of repos on that host.
+    creds_path = home / ".git" / "credentials"
+    creds_path.parent.mkdir(parents=True, exist_ok=True)
+    quoted_user = urllib.parse.quote(_PAT_USERNAME, safe="")
+    quoted_token = urllib.parse.quote(github_token, safe="")
+    line = f"{parsed.scheme}://{quoted_user}:{quoted_token}@{host}\n"
+    # Write atomically: tmp + rename, so a half-written file never
+    # exists. Set restrictive mode on the tmp file before rename so
+    # the final inode is born 0600 (rather than created 0644 then
+    # chmod'd, which has a brief window).
+    tmp_path = creds_path.with_suffix(creds_path.suffix + ".tmp")
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(line)
+    except Exception:
+        # Make sure the tmp file is gone if the write blew up.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    os.replace(str(tmp_path), str(creds_path))
+    # Belt-and-suspenders chmod (some filesystems ignore mode in
+    # ``os.open``; better to set it twice than miss it).
+    try:
+        os.chmod(str(creds_path), 0o600)
+    except OSError:
+        pass
+
+    # Tell git to use this file. ``store --file=<abs-path>`` is the
+    # canonical helper-with-arg syntax; git invokes it as
+    # ``git credential-store --file=<path>``.
+    helper_value = f"store --file={creds_path}"
+    _run(
+        ["git", "-C", str(home), "config", "--local",
+         "credential.helper", helper_value],
+        check=False,
+    )
+
+    result.credentials_written = True
+
+
 def _clone(
     home: Path,
     push_url: str,
@@ -340,23 +467,63 @@ def _clone(
             "git_clone_failed",
             path=str(home),
             returncode=exc.returncode,
-            stderr=_redact(exc.stderr or "", push_url)[:500],
+            stderr=_redact(exc.stderr or "")[:500],
         )
         return False
 
 
-def _redact(text: str, push_url: str) -> str:
-    """Strip the token-bearing URL out of error text before logging."""
+def _inject_token_into_url(state_repo_url: str, github_token: str) -> str:
+    """Internal-only: rewrite an HTTPS git URL to embed the PAT in the
+    netloc.
+
+    Used solely for the transient clone subprocess in path 1 (.git/
+    doesn't exist yet, so credential helper can't be staged). Caller
+    rewrites the remote to the clean URL immediately on success. Never
+    persisted anywhere.
+
+    Token is URL-encoded so PATs containing reserved chars (``+``, ``/``,
+    ``=``) don't break the netloc parse on the receiving end.
+    """
+    parsed = urllib.parse.urlparse(state_repo_url)
+    if parsed.scheme not in {"http", "https"}:
+        return state_repo_url
+    quoted = urllib.parse.quote(github_token, safe="")
+    new_netloc = f"{quoted}@{parsed.hostname}"
+    if parsed.port:
+        new_netloc = f"{new_netloc}:{parsed.port}"
+    return parsed._replace(netloc=new_netloc).geturl()
+
+
+def _url_has_embedded_token(url: str) -> bool:
+    """Detect a PR4b-style in-URL token. Used during migration to
+    decide whether to flag legacy_token_url_migrated. Looks for any
+    userinfo component on an https URL — even if it's not a literal
+    PAT, anything before ``@`` in the netloc shouldn't be there in
+    the canonical clean form."""
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    # parsed.username is None when there's no userinfo. Any non-None
+    # value (including empty string from ``://@host``) means there's an
+    # auth component embedded.
+    return parsed.username is not None
+
+
+def _redact(text: str) -> str:
+    """Strip PAT-shaped tokens out of error text before logging.
+
+    PR 4d: now operates on plain text rather than a per-call URL —
+    the credential helper means tokens shouldn't appear in any URL
+    we'd be redacting against, but the regex catches strays from
+    legacy paths or surprising error output."""
     if not text:
         return text
-    parsed = urllib.parse.urlparse(push_url)
-    # Replace the token-bearing form with the canonical form.
-    if parsed.hostname:
-        sanitized_host = parsed.hostname
-        # netloc as it was — token@host[:port]
-        token_netloc = parsed.netloc
-        return text.replace(token_netloc, sanitized_host)
-    return text
+    return _PAT_REGEX.sub("[REDACTED_PAT]", text)
 
 
 def _run(
@@ -384,5 +551,4 @@ __all__: tuple[str, ...] = (
     "DEFAULT_USER_EMAIL",
     "DEFAULT_USER_NAME",
     "bootstrap_git_repo",
-    "inject_token_into_url",
 )
