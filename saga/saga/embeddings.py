@@ -13,6 +13,7 @@ Provider is configured via saga.toml [embedding] section.
 import logging
 import os
 import sys
+import threading
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -242,6 +243,14 @@ _PROVIDERS = {
 }
 
 _provider_instance = None
+# CR#1: lock the singleton init. Saga is called from mimir's
+# ``asyncio.to_thread`` workers — two concurrent first calls both saw
+# ``_provider_instance is None`` and both constructed an
+# ``ONNXProvider`` (which downloads/loads a 33MB model), with the loser
+# leaking after warming the module-global ``cached_embed_query`` LRU
+# against a concurrent re-init. Mirror ``saga/core.py``'s
+# ``_migrations_lock`` double-checked-locking pattern.
+_provider_lock = threading.Lock()
 
 
 def get_provider() -> EmbeddingProvider:
@@ -256,7 +265,14 @@ def get_provider() -> EmbeddingProvider:
     long as their key is in the environment.
     """
     global _provider_instance
-    if _provider_instance is None:
+    # Double-checked locking: avoid acquiring on every call once the
+    # singleton is initialized (the read of a single Python attribute
+    # is atomic under the GIL — no torn read here).
+    if _provider_instance is not None:
+        return _provider_instance
+    with _provider_lock:
+        if _provider_instance is not None:
+            return _provider_instance
         import os
         provider_name = _cfg('embedding', 'provider', 'nvidia-nim')
 
