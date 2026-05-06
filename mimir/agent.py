@@ -995,19 +995,34 @@ class Agent:
 
     # ---- SAGA hooks ----------------------------------------------------
 
-    def _assemble_usage_block(self) -> str | None:
+    def _assemble_usage_block(
+        self,
+    ) -> tuple[str | None, list[tuple[str, dict]]]:
         """Read turns.jsonl tail-first, aggregate over 1h / 5h / 7d,
         evaluate the cost-rate alert, render the Resource usage prompt
-        section. Returns None when disabled via config or when no turns
-        have been recorded yet.
+        section. Returns ``(block_text, deferred_events)`` where
+        ``block_text`` is None when disabled via config or when no
+        turns have been recorded yet, and ``deferred_events`` is a list
+        of ``(event_kind, kwargs)`` pairs the caller should ``log_event``
+        on the running loop.
 
-        Side effect: emits a ``cost_rate_alert`` event when a threshold
-        is currently tripped AND no prior alert lies within the cooldown
-        window. The annotated alert is included in the rendered block
-        regardless of cooldown — the agent should keep seeing the
-        warning while the spike persists."""
+        Side effects (deferred): a ``cost_rate_alert`` /
+        ``cost_rate_advisory`` entry when a threshold is currently
+        tripped AND no prior alert lies within the cooldown window;
+        a ``rate_limit_off_pace`` entry under the same shape. The
+        annotated alert is included in the rendered block regardless
+        of cooldown — the agent should keep seeing the warning while
+        the spike persists.
+
+        Note on deferred-vs-immediate: this method runs inside
+        ``asyncio.to_thread`` (CR#5 — keeps JSONL scans off the event
+        loop). The worker thread has no running loop, so we can't
+        ``asyncio.create_task`` from here. The caller flushes
+        ``deferred_events`` on the dispatcher loop after the
+        to_thread returns."""
+        deferred: list[tuple[str, dict]] = []
         if not self._config.usage_block_enabled:
-            return None
+            return None, deferred
         try:
             report = aggregate_usage(
                 self._config.turns_log,
@@ -1015,7 +1030,7 @@ class Agent:
             )
         except Exception:  # noqa: BLE001
             log.exception("usage_stats.aggregate failed; skipping block")
-            return None
+            return None, deferred
 
         alert = evaluate_cost_rate(
             report,
@@ -1038,17 +1053,19 @@ class Agent:
                 event_kind,
                 cooldown_minutes=self._config.cost_alert_cooldown_minutes,
             ):
-                self._spawn_bg_task(
-                    log_event(
+                deferred.append(
+                    (
                         event_kind,
-                        reason=alert.reason,
-                        rate_now_usd_per_hour=round(alert.rate_now_usd_per_hour, 4),
-                        threshold_usd_per_hour=round(alert.threshold_usd_per_hour, 4),
-                        baseline_usd_per_hour=(
-                            round(alert.baseline_usd_per_hour, 4)
-                            if alert.baseline_usd_per_hour is not None
-                            else None
-                        ),
+                        {
+                            "reason": alert.reason,
+                            "rate_now_usd_per_hour": round(alert.rate_now_usd_per_hour, 4),
+                            "threshold_usd_per_hour": round(alert.threshold_usd_per_hour, 4),
+                            "baseline_usd_per_hour": (
+                                round(alert.baseline_usd_per_hour, 4)
+                                if alert.baseline_usd_per_hour is not None
+                                else None
+                            ),
+                        },
                     )
                 )
 
@@ -1073,14 +1090,16 @@ class Agent:
                 cooldown_minutes=self._config.cost_alert_cooldown_minutes,
             ):
                 worst_key, worst_snap, worst_proj = off_pace[0]
-                self._spawn_bg_task(
-                    log_event(
+                deferred.append(
+                    (
                         "rate_limit_off_pace",
-                        rate_limit_type=worst_key,
-                        utilization=worst_snap.utilization,
-                        on_pace_utilization=round(worst_proj.on_pace_utilization, 4),
-                        hours_until_reset=round(worst_proj.hours_until_reset, 2),
-                        resets_at=worst_snap.resets_at,
+                        {
+                            "rate_limit_type": worst_key,
+                            "utilization": worst_snap.utilization,
+                            "on_pace_utilization": round(worst_proj.on_pace_utilization, 4),
+                            "hours_until_reset": round(worst_proj.hours_until_reset, 2),
+                            "resets_at": worst_snap.resets_at,
+                        },
                     )
                 )
         except Exception:  # noqa: BLE001
@@ -1098,15 +1117,18 @@ class Agent:
         except Exception:  # noqa: BLE001
             log.exception("subagent_stats aggregate failed")
 
-        return render_usage_block(
-            report,
-            fallback_model=self._config.model,
-            budget_5h_usd=self._config.usage_5h_limit_usd or None,
-            budget_weekly_usd=self._config.usage_weekly_limit_usd or None,
-            alert=alert,
-            plan_quota_lines=plan_lines,
-            off_pace_warning=off_pace_lines,
-            subagent_block=subagent_body,
+        return (
+            render_usage_block(
+                report,
+                fallback_model=self._config.model,
+                budget_5h_usd=self._config.usage_5h_limit_usd or None,
+                budget_weekly_usd=self._config.usage_weekly_limit_usd or None,
+                alert=alert,
+                plan_quota_lines=plan_lines,
+                off_pace_warning=off_pace_lines,
+                subagent_block=subagent_body,
+            ),
+            deferred,
         )
 
     def _assemble_upcoming_block(self) -> str | None:
@@ -1530,7 +1552,13 @@ class Agent:
             # Move both off the event loop so other tasks (saga writes,
             # message buffering, log_event flushes) aren't blocked
             # during the per-turn JSONL scans.
-            usage_block = await asyncio.to_thread(self._assemble_usage_block)
+            usage_block, deferred_usage_events = await asyncio.to_thread(
+                self._assemble_usage_block
+            )
+            # Flush deferred events on the running loop. Can't spawn
+            # tasks inside the to_thread worker — it has no loop.
+            for event_kind, event_kwargs in deferred_usage_events:
+                self._spawn_bg_task(log_event(event_kind, **event_kwargs))
             upcoming_block = self._assemble_upcoming_block()
             self_state_block = await asyncio.to_thread(
                 self._assemble_self_state_block,
