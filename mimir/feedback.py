@@ -77,6 +77,11 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "oauth_refresh_token_age_warn": ("negative", "oauth_refresh_age_warn"),
     "oauth_usage_ok": ("positive", "oauth_usage_ok"),
     "oauth_refresh_ok": ("positive", "oauth_refresh_ok"),
+    # CR#22 layer a: OAuth poller rejected an implausible 5h reading
+    # (large jump unmatched by 7d response). Negative because the
+    # operator should know the upstream endpoint is glitching, even
+    # though the arbiter is now insulated.
+    "quota_reading_anomalous": ("negative", "quota_anomaly"),
     # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
     "saga_feedback_sent": ("positive", "saga_feedback"),
@@ -119,6 +124,10 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "oauth_usage_failed",
     "oauth_logged_out",
     "oauth_refresh_age_warn",
+    # CR#22 layer a: an endpoint glitch keeps re-reporting the same
+    # bogus 5h reading every 3-min poll until it self-corrects. The
+    # algedonic block only needs the latest one.
+    "quota_anomaly",
     "oauth_refresh_ok",
 }
 
@@ -350,6 +359,23 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         )
     if rule_kind == "oauth_refresh_ok":
         return "oauth access token refreshed"
+    if rule_kind == "quota_anomaly":
+        # CR#22 layer a: cross-window sanity rejected a 5h spike that
+        # didn't match the 7d trajectory. Surface what got rejected so
+        # the operator can see the suspect reading + know the kept value.
+        kept = ev.get("kept_utilization")
+        rejected = ev.get("rejected_utilization")
+        kept_str = f"{kept * 100:.0f}%" if isinstance(kept, (int, float)) else "?"
+        rejected_str = (
+            f"{rejected * 100:.0f}%"
+            if isinstance(rejected, (int, float)) else "?"
+        )
+        return (
+            f"quota reading anomaly: 5h endpoint reported {rejected_str} "
+            f"(kept previous {kept_str}); arbiter consults the last "
+            f"trusted value. Glitch is transient — usually clears within "
+            f"a poll cycle or two."
+        )
     if rule_kind == "unknown_channel":
         return f"send_message to unknown channel {ev.get('channel_id', '?')}"
     if rule_kind == "saga_feedback":

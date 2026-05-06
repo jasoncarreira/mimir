@@ -406,6 +406,157 @@ async def test_record_usage_writes_known_windows(rate_store: RateLimitStore) -> 
     assert persisted["five_hour"].utilization == pytest.approx(0.05)
 
 
+# ─── CR#22 layer a: cross-window anomaly detection ──────────────────
+
+
+def test_detect_5h_anomaly_flags_jump_with_no_7d_response() -> None:
+    """The classic glitch shape: 5h jumped 7%→100% (+93pp) while 7d
+    barely moved (49% → 49%, ~0pp). Rule should reject the spike."""
+    from mimir.oauth_usage_poller import detect_5h_anomaly
+
+    reason = detect_5h_anomaly(
+        new_5h=1.00, prev_5h=0.07,
+        new_7d=0.49, prev_7d=0.49,
+    )
+    assert reason is not None
+    assert "five_hour jumped +93pp" in reason
+    assert "seven_day only moved 0.0pp" in reason
+
+
+def test_detect_5h_anomaly_passes_real_growth() -> None:
+    """A real saturation event grows gradually AND the 7d climbs in
+    proportion. 5h 7%→60% (+53pp) with 7d 49%→55% (+6pp) is plausible
+    — should NOT be flagged."""
+    from mimir.oauth_usage_poller import detect_5h_anomaly
+
+    reason = detect_5h_anomaly(
+        new_5h=0.60, prev_5h=0.07,
+        new_7d=0.55, prev_7d=0.49,
+    )
+    assert reason is None  # 7d delta of 6pp clears the threshold
+
+
+def test_detect_5h_anomaly_passes_small_jump() -> None:
+    """5h moved only 30pp; cross-check doesn't even apply (below
+    the trigger threshold)."""
+    from mimir.oauth_usage_poller import detect_5h_anomaly
+
+    reason = detect_5h_anomaly(
+        new_5h=0.40, prev_5h=0.10,
+        new_7d=0.49, prev_7d=0.49,
+    )
+    assert reason is None
+
+
+def test_detect_5h_anomaly_no_data_skips_check() -> None:
+    """First poll after restart: prev values are None. Trust the
+    reading — no signal to distrust it on."""
+    from mimir.oauth_usage_poller import detect_5h_anomaly
+
+    assert detect_5h_anomaly(
+        new_5h=1.00, prev_5h=None, new_7d=0.49, prev_7d=None,
+    ) is None
+    # Missing 7d means we can't cross-check; trust the 5h value.
+    assert detect_5h_anomaly(
+        new_5h=1.00, prev_5h=0.07, new_7d=None, prev_7d=None,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_record_usage_rejects_anomalous_5h_spike(
+    rate_store: RateLimitStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: prior store has 5h=7% and 7d=49%; new payload says
+    5h=100% and 7d=49%. The 5h reading should be rejected and the
+    prior 7% kept; 7d updates normally. ``quota_reading_anomalous``
+    event fires."""
+    events: list[tuple[str, dict]] = []
+    async def _cap(t, **kw):
+        events.append((t, kw))
+    monkeypatch.setattr(op, "log_event", _cap)
+    # Seed prior state directly via the store's _load monkey-patch
+    # path (parallels the test fixtures elsewhere in this file).
+    rate_store._load = lambda: {  # type: ignore[method-assign]
+        "five_hour": {
+            "status": "allowed",
+            "utilization": 0.07,
+            "resets_at": int(time.time() + 3600),
+            "observed_at": "2026-05-06T04:00:00+00:00",
+        },
+        "seven_day": {
+            "status": "allowed",
+            "utilization": 0.49,
+            "resets_at": int(time.time() + 86400),
+            "observed_at": "2026-05-06T04:00:00+00:00",
+        },
+    }
+    recorded = await record_usage(rate_store, {
+        "five_hour": {
+            "utilization": 100.0,  # 100% in percent form
+            "resets_at": "2099-01-01T00:00:00Z",
+        },
+        "seven_day": {
+            "utilization": 49.0,
+            "resets_at": "2099-01-01T00:00:00Z",
+        },
+    })
+    # 5h was rejected — recorded shows the anomaly metadata.
+    assert recorded["five_hour"]["anomalous"] is True
+    assert recorded["five_hour"]["rejected_utilization"] == pytest.approx(1.00)
+    assert recorded["five_hour"]["kept_utilization"] == pytest.approx(0.07)
+    # 7d wrote through unchanged.
+    assert recorded["seven_day"]["utilization"] == pytest.approx(0.49)
+    # Algedonic event fired with both values + cross-window context.
+    anomaly_events = [e for e in events if e[0] == "quota_reading_anomalous"]
+    assert len(anomaly_events) == 1
+    payload = anomaly_events[0][1]
+    assert payload["window_type"] == "five_hour"
+    assert payload["rejected_utilization"] == pytest.approx(1.00)
+    assert payload["kept_utilization"] == pytest.approx(0.07)
+
+
+@pytest.mark.asyncio
+async def test_record_usage_passes_real_5h_growth(
+    rate_store: RateLimitStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inverse: a legitimate 5h climb with matching 7d delta writes
+    through normally. Avoids over-aggressive rejection."""
+    events: list[tuple[str, dict]] = []
+    async def _cap(t, **kw):
+        events.append((t, kw))
+    monkeypatch.setattr(op, "log_event", _cap)
+    rate_store._load = lambda: {  # type: ignore[method-assign]
+        "five_hour": {
+            "status": "allowed",
+            "utilization": 0.07,
+            "resets_at": int(time.time() + 3600),
+            "observed_at": "",
+        },
+        "seven_day": {
+            "status": "allowed",
+            "utilization": 0.49,
+            "resets_at": int(time.time() + 86400),
+            "observed_at": "",
+        },
+    }
+    recorded = await record_usage(rate_store, {
+        "five_hour": {
+            "utilization": 60.0,  # +53pp
+            "resets_at": "2099-01-01T00:00:00Z",
+        },
+        "seven_day": {
+            "utilization": 55.0,  # +6pp — proportional
+            "resets_at": "2099-01-01T00:00:00Z",
+        },
+    })
+    assert recorded["five_hour"]["utilization"] == pytest.approx(0.60)
+    assert "anomalous" not in recorded["five_hour"]
+    # No anomaly event.
+    assert not [e for e in events if e[0] == "quota_reading_anomalous"]
+
+
 # ─── poll_once orchestration ──────────────────────────────────────────
 
 
