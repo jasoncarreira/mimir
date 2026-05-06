@@ -1371,7 +1371,7 @@ class Agent:
 
     # ---- synthesis turn ------------------------------------------------
 
-    def _build_synthesis_prompt(self, ctx: TurnContext, event: AgentEvent) -> str:
+    async def _build_synthesis_prompt(self, ctx: TurnContext, event: AgentEvent) -> str:
         """For trigger='saga_session_end' — load the synthesis template,
         embed the session's turn window from turns.jsonl.
 
@@ -1384,7 +1384,14 @@ class Agent:
         boundary rather than crash)."""
         saga_session_id = ctx.saga_session_id or event.extra.get("saga_session_id", "")
         idle_minutes = self._config.saga_session_idle_minutes
-        turns_window = _filter_session_turns(self._config.turns_log, saga_session_id)
+        # CR#4: synchronous read of turns.jsonl off the event loop. The file
+        # can grow to 50MB at MIMIR_MAX_TURNS=1000 with large event lists per
+        # row; reading it on the loop blocked dispatcher workers (typing
+        # indicators, oauth poller cron, scheduled-tick dispatch) for
+        # 100-500ms during synthesis. Same pattern as scheduler.list_jobs.
+        turns_window = await asyncio.to_thread(
+            _filter_session_turns, self._config.turns_log, saga_session_id
+        )
         if not turns_window:
             asyncio.create_task(
                 log_event(
@@ -1448,7 +1455,7 @@ class Agent:
 
         # 5. Build prompts.
         if event.trigger == "saga_session_end":
-            turn_prompt = self._build_synthesis_prompt(ctx, event)
+            turn_prompt = await self._build_synthesis_prompt(ctx, event)
             recent: list = []
         else:
             recent = self._buffer.assemble_recent_activity(
