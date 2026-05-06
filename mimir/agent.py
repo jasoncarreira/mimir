@@ -1302,7 +1302,16 @@ class Agent:
         only fires when the turn produced no send_message (e.g. scheduled
         ticks that wrote to memory but didn't reply, or background work).
         Skipped on synthesis turns (the agent already called saga_feedback
-        per atom in step 2 of the synthesis prompt)."""
+        per atom in step 2 of the synthesis prompt).
+
+        CR#19: synthesis turns get a *different* post-check before the
+        early return — verify step 3 of the synthesis prompt ran (the
+        ``saga_end_session`` tool call). When missing, emit a
+        ``saga_synthesis_skipped_boundary`` algedonic so the operator
+        sees silent contract failures and the next turn's prompt
+        surfaces it as a negative signal."""
+        if ctx.trigger == "saga_session_end":
+            await self._check_synthesis_boundary_called(ctx)
         if self._saga is None or ctx.trigger == "saga_session_end":
             return
         if ctx.send_message_count > 0:
@@ -1331,6 +1340,25 @@ class Agent:
                 error=str(exc),
                 turn_id=ctx.turn_id,
             )
+
+    async def _check_synthesis_boundary_called(self, ctx: TurnContext) -> None:
+        """CR#19: synthesis-turn post-check. The synthesis prompt asks
+        the agent to call ``saga_end_session`` (step 3); the tool
+        handler flips ``ctx.saga_end_session_called`` on success. If
+        the flag is still False at end of turn, the agent skipped step
+        3 and the next session has no boundary atom — a silent
+        contract failure the operator only notices days later via empty
+        ``Recent session summaries`` blocks. Emit an algedonic event so
+        the failure surfaces immediately and the agent's next turn
+        prompt carries it as a negative signal."""
+        if ctx.saga_end_session_called:
+            return
+        await log_event(
+            "saga_synthesis_skipped_boundary",
+            turn_id=ctx.turn_id,
+            saga_session_id=ctx.saga_session_id,
+            channel_id=ctx.channel_id,
+        )
 
     # ---- plan-window capture (Stage 5) ------------------------------
 
@@ -1496,9 +1524,17 @@ class Agent:
             session_summaries_block = await self._assemble_session_summaries(
                 channel_id=event.channel_id,
             )
-            usage_block = self._assemble_usage_block()
+            # CR#5: _assemble_usage_block walks turns.jsonl via
+            # aggregate_usage; _assemble_self_state_block walks the
+            # same file plus events.jsonl via the homeostat snapshot.
+            # Move both off the event loop so other tasks (saga writes,
+            # message buffering, log_event flushes) aren't blocked
+            # during the per-turn JSONL scans.
+            usage_block = await asyncio.to_thread(self._assemble_usage_block)
             upcoming_block = self._assemble_upcoming_block()
-            self_state_block = self._assemble_self_state_block()
+            self_state_block = await asyncio.to_thread(
+                self._assemble_self_state_block,
+            )
             turn_prompt = build_turn_prompt(
                 event,
                 recent_messages=recent,

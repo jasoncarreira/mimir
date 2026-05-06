@@ -79,6 +79,14 @@ class TurnContext:
     # Channel-layer state (Phase 6.3) — populated by the agent at run_turn start.
     loop_detector: object | None = None
     last_assistant_message_id: str | None = None
+    # Synthesis-turn observability (CR#19). The synthesis prompt instructs
+    # the agent to call ``saga_end_session`` (step 3); this flag flips True
+    # in the tool handler on success. The agent's post-message hook checks
+    # it at synthesis-turn end and emits ``saga_synthesis_skipped_boundary``
+    # when False, so silent contract failures (agent didn't follow step 3)
+    # become a visible algedonic signal instead of empty session-summary
+    # blocks for the next session.
+    saga_end_session_called: bool = False
 
 
 @dataclass
