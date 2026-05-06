@@ -484,21 +484,127 @@ def _bucket_to_snapshot(bucket: Any) -> RateLimitSnapshot | None:
     )
 
 
+# Cross-window anomaly thresholds (CR#22 layer a). The 5h window is a
+# *subset* of the 7d window — so a real 50pp jump in 5h must show up
+# as a corresponding 7d delta. When 7d barely moves while 5h spikes
+# (observed live: 7%→100% in 3 minutes with 7d steady at 49%), the
+# endpoint is reporting noise. Skipping the write keeps the prior
+# trusted value in the store so the arbiter doesn't suppress
+# scheduled work on bogus data.
+ANOMALY_5H_JUMP_PP = 0.50   # 5h utilization rise that triggers cross-check
+ANOMALY_7D_DELTA_PP = 0.05  # 7d delta below this confirms the 5h jump is bogus
+
+
+def detect_5h_anomaly(
+    new_5h: float | None,
+    prev_5h: float | None,
+    new_7d: float | None,
+    prev_7d: float | None,
+) -> str | None:
+    """Cross-window sanity check on the 5h reading. Returns a reason
+    string if the new 5h is anomalous (large jump unmatched by 7d
+    response), else None.
+
+    Rule:
+      - 5h rose by >= ANOMALY_5H_JUMP_PP (50pp) since prior reading
+      - AND 7d delta over the same interval is < ANOMALY_7D_DELTA_PP (5pp)
+
+    The 5h window is contained within the 7d window: every dollar that
+    counts toward 5h also counts toward 7d. So a 50pp 5h jump implies
+    spending equal to 50% of the 5h quota, which is some non-trivial
+    fraction of the 7d quota too — 7d should move accordingly. When
+    it doesn't (deltas <5pp), the 5h reading is internally inconsistent
+    with the 7d trajectory and almost certainly an endpoint glitch.
+
+    Skips the check when either side is None — first poll, missing
+    data, or a 7d-less response. "Trust the value" is the right
+    fallback because we have no signal to distrust it.
+    """
+    if new_5h is None or prev_5h is None:
+        return None
+    jump = new_5h - prev_5h
+    if jump < ANOMALY_5H_JUMP_PP:
+        return None
+    if new_7d is None or prev_7d is None:
+        return None
+    sevenday_delta = abs(new_7d - prev_7d)
+    if sevenday_delta >= ANOMALY_7D_DELTA_PP:
+        return None
+    return (
+        f"five_hour jumped +{jump * 100:.0f}pp "
+        f"({prev_5h * 100:.0f}% → {new_5h * 100:.0f}%) "
+        f"but seven_day only moved {sevenday_delta * 100:.1f}pp — "
+        f"endpoint glitch suspected"
+    )
+
+
 async def record_usage(
     store: RateLimitStore, payload: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
     """Walk the ``/api/oauth/usage`` response and persist each parseable
     window bucket. Returns the recorded summary for the structured
-    log event."""
+    log event.
+
+    CR#22 layer a: before writing, the 5h reading is cross-checked
+    against the 7d delta. When the 5h jumps implausibly (a >=50pp
+    rise unmatched by a corresponding 7d move), the new reading is
+    rejected — the prior trustworthy value stays in the store, a
+    ``quota_reading_anomalous`` event fires for the algedonic surface,
+    and the recorded summary marks the rejection. The arbiter then
+    sees the prior (trusted) utilization rather than the bogus spike,
+    avoiding the hours-of-suppression-on-bad-data failure we observed
+    twice in 48h. Other windows (7d, 7d_sonnet, etc.) write through
+    unchanged — only the 5h direction is asymmetric enough to warrant
+    rejection."""
     recorded: dict[str, dict[str, Any]] = {}
+
+    # Build the new snapshots first so the 5h-vs-7d cross-check has
+    # access to both before either is written.
+    prior_snaps = store.current()
+    new_snaps: dict[str, RateLimitSnapshot] = {}
     for window_type, bucket in payload.items():
         if window_type == "extra_usage":
             # Overage bucket has a different shape (monthly_limit /
-            # used_credits / is_enabled). We don't currently render it
-            # — log info and skip.
+            # used_credits / is_enabled). We don't currently render
+            # it — skip.
             continue
         snapshot = _bucket_to_snapshot(bucket)
-        if snapshot is None:
+        if snapshot is not None:
+            new_snaps[window_type] = snapshot
+
+    new_5h = new_snaps.get("five_hour")
+    prior_5h = prior_snaps.get("five_hour")
+    new_7d = new_snaps.get("seven_day")
+    prior_7d = prior_snaps.get("seven_day")
+    anomaly_reason = detect_5h_anomaly(
+        new_5h.utilization if new_5h else None,
+        prior_5h.utilization if prior_5h else None,
+        new_7d.utilization if new_7d else None,
+        prior_7d.utilization if prior_7d else None,
+    )
+
+    for window_type, snapshot in new_snaps.items():
+        if window_type == "five_hour" and anomaly_reason:
+            # Reject the spike. The prior 5h snapshot stays in the
+            # store so the arbiter consults a trusted value. Surface
+            # the rejection so the operator (and the agent's
+            # algedonic block) can investigate.
+            await log_event(
+                "quota_reading_anomalous",
+                window_type=window_type,
+                reason=anomaly_reason,
+                rejected_utilization=snapshot.utilization,
+                kept_utilization=prior_5h.utilization if prior_5h else None,
+                kept_observed_at=prior_5h.observed_at if prior_5h else None,
+                seven_day_prev=prior_7d.utilization if prior_7d else None,
+                seven_day_new=new_7d.utilization if new_7d else None,
+            )
+            recorded[window_type] = {
+                "anomalous": True,
+                "rejected_utilization": snapshot.utilization,
+                "kept_utilization": prior_5h.utilization if prior_5h else None,
+                "reason": anomaly_reason,
+            }
             continue
         try:
             await store.record(window_type, snapshot)
