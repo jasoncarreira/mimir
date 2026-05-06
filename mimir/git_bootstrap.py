@@ -25,11 +25,16 @@ idempotent — safe to invoke any number of times. It performs:
    ``credential.helper "store --file=<path>"`` in local git config.
    The remote URL itself is the clean, token-free form.
 6. Bootstrap commit if init'd fresh AND working tree non-empty.
-7. On existing repo: ``git remote set-url`` to the clean URL
+7. **Ensure upstream tracking** (PR 4e): if ``branch.main`` lacks
+   upstream config, either set it from an existing ``origin/main``
+   or do an initial ``git push -u origin main`` to bootstrap the
+   remote. Without this, a fresh init + empty remote leaves
+   ``git pull`` and ``git push`` both broken until manually fixed.
+8. On existing repo: ``git remote set-url`` to the clean URL
    (migrates legacy in-URL-token configs from PR 4b), refresh
-   credentials, then ``git pull --ff-only`` (logs ``git_pull_blocked``
-   on conflict and exits without raising — the agent's local commits
-   stand).
+   credentials, ensure upstream tracking, then ``git pull --ff-only``
+   (logs ``git_pull_blocked`` on conflict and exits without raising —
+   the agent's local commits stand).
 
 Failure modes log algedonic events; the function never raises (callers
 need to be able to call it from startup paths without tripping the
@@ -120,6 +125,8 @@ class BootstrapResult:
     remote_configured: bool
     credentials_written: bool   # PR 4d: credential helper file written / refreshed
     legacy_token_url_migrated: bool  # PR 4d: stripped a PR4b-style in-URL token
+    upstream_set: bool      # PR 4e: branch.main upstream tracking configured
+    initial_push: bool      # PR 4e: ran ``git push -u`` to create remote main
     skipped: bool           # bootstrap was a no-op (e.g. already done)
 
 
@@ -155,7 +162,8 @@ def bootstrap_git_repo(
         initialized=False, cloned=False, pulled=False, pull_blocked=False,
         bootstrap_commit=False, gitignore_written=False, hook_written=False,
         remote_configured=False, credentials_written=False,
-        legacy_token_url_migrated=False, skipped=False,
+        legacy_token_url_migrated=False, upstream_set=False,
+        initial_push=False, skipped=False,
     )
 
     git_dir = home / ".git"
@@ -230,6 +238,12 @@ def bootstrap_git_repo(
                 result.bootstrap_commit = True
         except subprocess.CalledProcessError as exc:
             log.warning("bootstrap commit failed: %s", exc)
+        # If we have a bootstrap commit and a remote, push -u to create
+        # the remote ``main`` and set local tracking in one shot. This
+        # closes the "init+empty-remote → no-upstream pull/push errors"
+        # loop that bites the very first container start.
+        if (state_repo and github_token and result.bootstrap_commit):
+            _ensure_upstream_tracking(home, log_event, result)
         log_event(
             "git_bootstrap_ok",
             path=str(home),
@@ -268,29 +282,38 @@ def bootstrap_git_repo(
             )
         result.remote_configured = True
 
+        # Ensure upstream tracking is wired up before pull. Handles the
+        # "local main has no upstream" case (existing repo init'd before
+        # remote ``main`` existed) by either setting tracking from an
+        # existing remote ``main`` or by doing the initial ``push -u``.
+        _ensure_upstream_tracking(home, log_event, result)
+
         # Try a fast-forward pull. If it fails, log + continue; the
         # agent's local commits stand and the next turn surfaces it.
-        fetch = _run(
-            ["git", "fetch", "--all", "--tags", "--quiet"],
-            cwd=home, check=False, capture=True,
-        )
-        if fetch.returncode == 0:
-            pull = _run(
-                ["git", "pull", "--ff-only", "--quiet"],
+        # Skip pull if we just did an initial push (nothing to pull —
+        # remote is exactly what we just sent).
+        if not result.initial_push:
+            fetch = _run(
+                ["git", "fetch", "--all", "--tags", "--quiet"],
                 cwd=home, check=False, capture=True,
             )
-            if pull.returncode == 0:
-                result.pulled = True
-            else:
-                result.pull_blocked = True
-                log_event(
-                    "git_pull_blocked",
-                    path=str(home),
-                    reason=_redact(
-                        (pull.stderr or pull.stdout or "non-fast-forward").strip()[:500]
-                    ),
+            if fetch.returncode == 0:
+                pull = _run(
+                    ["git", "pull", "--ff-only", "--quiet"],
+                    cwd=home, check=False, capture=True,
                 )
-        # fetch failure is silent — network outage shouldn't block start.
+                if pull.returncode == 0:
+                    result.pulled = True
+                else:
+                    result.pull_blocked = True
+                    log_event(
+                        "git_pull_blocked",
+                        path=str(home),
+                        reason=_redact(
+                            (pull.stderr or pull.stdout or "non-fast-forward").strip()[:500]
+                        ),
+                    )
+            # fetch failure is silent — network outage shouldn't block start.
 
     log_event(
         "git_bootstrap_ok",
@@ -443,6 +466,102 @@ def _install_credential_helper(
     )
 
     result.credentials_written = True
+
+
+def _ensure_upstream_tracking(
+    home: Path,
+    log_event: callable,
+    result: BootstrapResult,
+) -> None:
+    """Make sure ``main`` has upstream tracking configured.
+
+    Three cases:
+
+    1. Tracking already configured → no-op.
+    2. Remote has ``main`` but local lacks tracking →
+       ``git branch --set-upstream-to=origin/main main`` (after a
+       targeted fetch so ``origin/main`` exists locally as a ref).
+    3. Remote is empty (no ``main`` ref) → ``git push -u origin main``
+       to bootstrap the remote AND set tracking in one operation.
+
+    Without this, a fresh ``init`` + remote pair leaves the local
+    branch untracked: ``git pull`` rejects with "no tracking
+    information for the current branch", and the next debounced push
+    from ``git_tracking`` hits "no upstream branch". Both surface as
+    algedonic negatives until the operator runs ``git push -u``
+    manually. This helper closes the loop autonomously.
+
+    Idempotent: subsequent invocations short-circuit at step 1 once
+    tracking is set. Failures are logged but do not raise — bootstrap
+    must not block startup on a remote write.
+    """
+    # Step 1: does ``main`` already have upstream config?
+    upstream = _run(
+        ["git", "-C", str(home), "rev-parse", "--abbrev-ref",
+         "--symbolic-full-name", "main@{upstream}"],
+        check=False, capture=True,
+    )
+    if upstream.returncode == 0 and (upstream.stdout or "").strip():
+        return  # already tracking — nothing to do
+
+    # Step 2: probe remote for ``main``. If reachable + present we
+    # just set tracking; if reachable + absent we'll push -u.
+    ls = _run(
+        ["git", "-C", str(home), "ls-remote", "--heads", "origin", "main"],
+        check=False, capture=True,
+    )
+    if ls.returncode != 0:
+        # Remote unreachable (network / auth). Don't push, don't fail
+        # — leave tracking unset and let the next bootstrap retry.
+        return
+    remote_has_main = bool((ls.stdout or "").strip())
+
+    if remote_has_main:
+        # Pull origin/main into the local refs cache so
+        # set-upstream-to has something to point at.
+        _run(
+            ["git", "-C", str(home), "fetch", "--quiet", "origin", "main"],
+            check=False, capture=True,
+        )
+        rc = _run(
+            ["git", "-C", str(home), "branch",
+             "--set-upstream-to=origin/main", "main"],
+            check=False, capture=True,
+        )
+        if rc.returncode == 0:
+            result.upstream_set = True
+            log_event(
+                "git_upstream_set",
+                path=str(home),
+                action="tracking_existing_remote",
+            )
+        return
+
+    # Step 3: remote is empty → initial push -u. Bounded to whatever
+    # commits the agent has accumulated locally (typically just the
+    # bootstrap commit on first start).
+    push = _run(
+        ["git", "-C", str(home), "push", "-u", "origin", "main"],
+        check=False, capture=True,
+    )
+    if push.returncode == 0:
+        result.initial_push = True
+        result.upstream_set = True
+        log_event(
+            "git_upstream_set",
+            path=str(home),
+            action="initial_push",
+        )
+    else:
+        # Don't fail bootstrap. The next debounced push from
+        # git_tracking will retry, and the operator can run
+        # ``git push -u origin main`` manually if needed.
+        log_event(
+            "git_initial_push_failed",
+            path=str(home),
+            returncode=push.returncode,
+            stderr=_redact((push.stderr or "")[:500]),
+        )
 
 
 def _clone(

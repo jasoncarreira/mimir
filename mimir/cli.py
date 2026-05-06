@@ -842,6 +842,8 @@ def setup_home(home: Path) -> dict[str, object]:
                 "remote_configured": br.remote_configured,
                 "credentials_written": br.credentials_written,
                 "legacy_token_url_migrated": br.legacy_token_url_migrated,
+                "upstream_set": br.upstream_set,
+                "initial_push": br.initial_push,
             }
         except Exception as exc:  # noqa: BLE001
             # Bootstrap failures shouldn't block ``mimir setup`` — the
@@ -910,6 +912,10 @@ def _print_setup_report(status: dict[str, object]) -> None:
                 actions.append("credential helper installed")
             if git_st.get("legacy_token_url_migrated"):
                 actions.append("legacy in-URL token stripped")
+            if git_st.get("initial_push"):
+                actions.append("initial push (created remote main)")
+            elif git_st.get("upstream_set"):
+                actions.append("upstream tracking set")
             print(f"  git bootstrap:  {' / '.join(actions)}")
     print()
     print("Recurring scheduled tasks (active when `mimir run` starts):")
