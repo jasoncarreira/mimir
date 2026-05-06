@@ -125,6 +125,51 @@ async def test_runner_exception_does_not_wedge_channel(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_runner_exception_logs_traceback(tmp_path: Path):
+    """When run_turn raises, the dispatcher's structured error event must
+    include a ``traceback`` field with the formatted traceback. Without
+    this, a self-diagnosing event log can't tell which line in run_turn
+    raised — the operator has to dig into stderr / app logs to learn
+    anything (regression captured 2026-05-06: a RuntimeError from
+    asyncio.create_task on a non-running loop showed up in events.jsonl
+    as just ``RuntimeError: no running event loop`` with no frames).
+    """
+    import json
+
+    cfg = _make_config(tmp_path)
+
+    async def runner(event: AgentEvent) -> None:
+        # Use a function call so the traceback frame names are informative.
+        def _inner() -> None:
+            raise RuntimeError("synthetic-explode")
+
+        _inner()
+
+    disp = Dispatcher(cfg, runner)
+    await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="0"))
+    await disp.drain()
+
+    events_path = tmp_path / "logs" / "events.jsonl"
+    rows = [
+        json.loads(line)
+        for line in events_path.read_text().splitlines()
+        if line.strip()
+    ]
+    err_rows = [
+        r
+        for r in rows
+        if r.get("type") == "error"
+        and r.get("where") == "dispatcher.worker"
+    ]
+    assert err_rows, "expected a dispatcher.worker error event"
+    err = err_rows[-1]
+    assert "traceback" in err, "error event missing traceback field"
+    tb = err["traceback"]
+    assert "RuntimeError: synthetic-explode" in tb
+    assert "_inner" in tb, "traceback should include the raising frame"
+
+
+@pytest.mark.asyncio
 async def test_is_channel_busy_tracks_in_flight_and_queued(tmp_path: Path):
     """``is_channel_busy`` distinguishes parked-on-get from work-in-flight.
 
