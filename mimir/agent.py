@@ -54,6 +54,7 @@ from .channel_registry import ChannelRegistry
 from .config import Config
 from .event_logger import log_event
 from .feedback import FeedbackLog
+from . import git_tracking
 from .history import MessageBuffer
 from .rate_limits import (
     RateLimitStore,
@@ -664,6 +665,27 @@ class Agent:
             config.home, _reindex if indexer is not None else None
         )
 
+        # Bounded set for fire-and-forget background tasks (event-log
+        # writes, etc.). CPython warns that the result of asyncio.
+        # create_task() may be GC'd before it has run; without retaining
+        # a reference, short events.jsonl writes can vanish under load
+        # before the task body executes. Adding to the set + a discard
+        # callback is the standard idiom from PEP 458 / asyncio docs.
+        self._bg_tasks: set[asyncio.Task] = set()
+
+    def _spawn_bg_task(self, coro) -> asyncio.Task:
+        """Schedule a fire-and-forget coroutine while keeping a reference.
+
+        The set membership prevents the task from being garbage-collected
+        mid-run; ``add_done_callback`` removes it once the coroutine
+        finishes (success or error) so the set bound stays at the
+        in-flight count.
+        """
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
     def _build_options(self, system_prompt: str) -> ClaudeAgentOptions:
         effort = self._config.effort
         if effort not in ("low", "medium", "high", "max"):
@@ -1016,7 +1038,7 @@ class Agent:
                 event_kind,
                 cooldown_minutes=self._config.cost_alert_cooldown_minutes,
             ):
-                asyncio.create_task(
+                self._spawn_bg_task(
                     log_event(
                         event_kind,
                         reason=alert.reason,
@@ -1051,7 +1073,7 @@ class Agent:
                 cooldown_minutes=self._config.cost_alert_cooldown_minutes,
             ):
                 worst_key, worst_snap, worst_proj = off_pace[0]
-                asyncio.create_task(
+                self._spawn_bg_task(
                     log_event(
                         "rate_limit_off_pace",
                         rate_limit_type=worst_key,
@@ -1280,7 +1302,16 @@ class Agent:
         only fires when the turn produced no send_message (e.g. scheduled
         ticks that wrote to memory but didn't reply, or background work).
         Skipped on synthesis turns (the agent already called saga_feedback
-        per atom in step 2 of the synthesis prompt)."""
+        per atom in step 2 of the synthesis prompt).
+
+        CR#19: synthesis turns get a *different* post-check before the
+        early return — verify step 3 of the synthesis prompt ran (the
+        ``saga_end_session`` tool call). When missing, emit a
+        ``saga_synthesis_skipped_boundary`` algedonic so the operator
+        sees silent contract failures and the next turn's prompt
+        surfaces it as a negative signal."""
+        if ctx.trigger == "saga_session_end":
+            await self._check_synthesis_boundary_called(ctx)
         if self._saga is None or ctx.trigger == "saga_session_end":
             return
         if ctx.send_message_count > 0:
@@ -1309,6 +1340,25 @@ class Agent:
                 error=str(exc),
                 turn_id=ctx.turn_id,
             )
+
+    async def _check_synthesis_boundary_called(self, ctx: TurnContext) -> None:
+        """CR#19: synthesis-turn post-check. The synthesis prompt asks
+        the agent to call ``saga_end_session`` (step 3); the tool
+        handler flips ``ctx.saga_end_session_called`` on success. If
+        the flag is still False at end of turn, the agent skipped step
+        3 and the next session has no boundary atom — a silent
+        contract failure the operator only notices days later via empty
+        ``Recent session summaries`` blocks. Emit an algedonic event so
+        the failure surfaces immediately and the agent's next turn
+        prompt carries it as a negative signal."""
+        if ctx.saga_end_session_called:
+            return
+        await log_event(
+            "saga_synthesis_skipped_boundary",
+            turn_id=ctx.turn_id,
+            saga_session_id=ctx.saga_session_id,
+            channel_id=ctx.channel_id,
+        )
 
     # ---- plan-window capture (Stage 5) ------------------------------
 
@@ -1371,7 +1421,7 @@ class Agent:
 
     # ---- synthesis turn ------------------------------------------------
 
-    def _build_synthesis_prompt(self, ctx: TurnContext, event: AgentEvent) -> str:
+    async def _build_synthesis_prompt(self, ctx: TurnContext, event: AgentEvent) -> str:
         """For trigger='saga_session_end' — load the synthesis template,
         embed the session's turn window from turns.jsonl.
 
@@ -1384,9 +1434,16 @@ class Agent:
         boundary rather than crash)."""
         saga_session_id = ctx.saga_session_id or event.extra.get("saga_session_id", "")
         idle_minutes = self._config.saga_session_idle_minutes
-        turns_window = _filter_session_turns(self._config.turns_log, saga_session_id)
+        # CR#4: synchronous read of turns.jsonl off the event loop. The file
+        # can grow to 50MB at MIMIR_MAX_TURNS=1000 with large event lists per
+        # row; reading it on the loop blocked dispatcher workers (typing
+        # indicators, oauth poller cron, scheduled-tick dispatch) for
+        # 100-500ms during synthesis. Same pattern as scheduler.list_jobs.
+        turns_window = await asyncio.to_thread(
+            _filter_session_turns, self._config.turns_log, saga_session_id
+        )
         if not turns_window:
-            asyncio.create_task(
+            self._spawn_bg_task(
                 log_event(
                     "saga_synthesis_empty_window",
                     saga_session_id=saga_session_id,
@@ -1448,7 +1505,7 @@ class Agent:
 
         # 5. Build prompts.
         if event.trigger == "saga_session_end":
-            turn_prompt = self._build_synthesis_prompt(ctx, event)
+            turn_prompt = await self._build_synthesis_prompt(ctx, event)
             recent: list = []
         else:
             recent = self._buffer.assemble_recent_activity(
@@ -1467,9 +1524,17 @@ class Agent:
             session_summaries_block = await self._assemble_session_summaries(
                 channel_id=event.channel_id,
             )
-            usage_block = self._assemble_usage_block()
+            # CR#5: _assemble_usage_block walks turns.jsonl via
+            # aggregate_usage; _assemble_self_state_block walks the
+            # same file plus events.jsonl via the homeostat snapshot.
+            # Move both off the event loop so other tasks (saga writes,
+            # message buffering, log_event flushes) aren't blocked
+            # during the per-turn JSONL scans.
+            usage_block = await asyncio.to_thread(self._assemble_usage_block)
             upcoming_block = self._assemble_upcoming_block()
-            self_state_block = self._assemble_self_state_block()
+            self_state_block = await asyncio.to_thread(
+                self._assemble_self_state_block,
+            )
             turn_prompt = build_turn_prompt(
                 event,
                 recent_messages=recent,
@@ -1816,6 +1881,19 @@ class Agent:
         # 10. End-of-turn INDEX rebuild (debounced).
         self._indexes.mark_dirty("all")
         await self._indexes.flush()
+
+        # 11. PR 4a: post-turn git commit + debounced push (gated on
+        # ``MIMIR_GIT_TRACKING_ENABLED``). Runs after the index flush so
+        # the auto-regenerated INDEX.md files are part of the same
+        # commit as the writes that triggered them. Failures are
+        # swallowed inside ``commit_turn_changes`` and surfaced via
+        # ``git_commit_failed`` / ``git_push_failed`` algedonic events.
+        await git_tracking.commit_turn_changes(
+            turn_id=ctx.turn_id,
+            trigger=ctx.trigger,
+            home=self._config.home,
+            enabled=self._config.git_tracking_enabled,
+        )
 
         record = TurnRecord(
             ts=_utc_now_iso(),

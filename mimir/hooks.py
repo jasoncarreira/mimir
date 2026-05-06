@@ -148,9 +148,16 @@ def make_pre_tool_use_hook(
         # call, and _active_turns is keyed by turn_id. The contextvar
         # fallback handles same-task callers and tests that don't pass
         # session_id in the hook input fixture.
+        # Track which path resolved the ctx so SDK-API drift fails loudly:
+        # if the SDK ever stops passing session_id in hook input_data, the
+        # event stream will show resolution_path flipping to "contextvar"
+        # (or "missing" if the contextvar fallback also fails) instead of
+        # silently breaking budget enforcement. (CR#18)
         ctx = get_turn_by_session_id(input_data.get("session_id"))
+        resolution_path = "session_id" if ctx is not None else None
         if ctx is None:
             ctx = get_current_turn()
+            resolution_path = "contextvar" if ctx is not None else "missing"
         if (
             ctx is not None
             and ctx.tool_call_budget > 0
@@ -166,6 +173,7 @@ def make_pre_tool_use_hook(
                     reason="tool_call_budget_exceeded",
                     count=count,
                     budget=budget,
+                    resolution_path=resolution_path,
                 )
                 return {
                     "hookSpecificOutput": {
@@ -191,6 +199,7 @@ def make_pre_tool_use_hook(
                     tool=tool_name,
                     count=count,
                     budget=budget,
+                    resolution_path=resolution_path,
                 )
                 return {
                     "hookSpecificOutput": {
