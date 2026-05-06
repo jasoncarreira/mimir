@@ -198,6 +198,105 @@ async def test_synthesis_turn_skips_pre_post_hooks_and_uses_extra_session_id(tmp
 
 
 @pytest.mark.asyncio
+async def test_pre_message_hook_dedup_drops_just_recorded_not_prior_identical(
+    tmp_path: Path,
+):
+    """CR#21 boundary case: when two user messages with identical content
+    arrive in quick succession (e.g. a one-word query like "yes" sent
+    twice), the dedup in ``_pre_message_hook`` must drop ``recent[-1]``
+    (the just-recorded inbound for the current event) and keep
+    ``recent[-2]`` (the prior, which is legitimate rewrite context).
+    Otherwise SAGA's contextual rewrite gets fed the wrong context."""
+    saga = FakeSaga(query_response={"_raw_atoms": []})
+    agent = _build_agent(tmp_path, saga)
+
+    # Seed buffer with one "yes" from the same channel/author. This is
+    # the prior identical that must survive the dedup.
+    from mimir.history import Message  # local import to keep test isolated
+    await agent._buffer.append(
+        Message(
+            ts="2026-05-06T17:00:00+00:00",
+            msg_id="m-prior",
+            channel_id="bench-1",
+            author="alice",
+            author_display="alice",
+            kind="user_message",
+            content="yes",
+            source="discord",
+        )
+    )
+
+    fake_q = _fake_query_yielding("acknowledged")
+    with patch("mimir.agent.query", new=fake_q):
+        await agent.run_turn(
+            AgentEvent(
+                trigger="user_message",
+                channel_id="bench-1",
+                content="yes",  # identical to the prior buffer entry
+                author="alice",
+                source="discord",
+            )
+        )
+
+    # SAGA query was called with context containing exactly the prior
+    # "yes" — not the just-recorded inbound (which would duplicate the
+    # current event content into its own rewrite context), and not
+    # both (which would feed the prior twice).
+    q_payload = saga.last("query")
+    assert q_payload is not None
+    ctx = q_payload["context"]
+    assert ctx == [{"role": "user", "content": "yes"}], (
+        "dedup should keep the prior identical message and drop only "
+        f"the just-recorded inbound; got context={ctx!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_message_hook_dedup_keeps_distinct_prior(tmp_path: Path):
+    """CR#21 negative-side: when the prior message has DIFFERENT content,
+    only the just-recorded inbound is dropped. Locks in the
+    content-equality predicate so a later refactor can't broaden it
+    into "drop any user_message at recent[-1]" (which would silently
+    discard real prior context)."""
+    saga = FakeSaga(query_response={"_raw_atoms": []})
+    agent = _build_agent(tmp_path, saga)
+
+    from mimir.history import Message
+    await agent._buffer.append(
+        Message(
+            ts="2026-05-06T17:00:00+00:00",
+            msg_id="m-prior",
+            channel_id="bench-1",
+            author="alice",
+            author_display="alice",
+            kind="user_message",
+            content="what's the weather?",
+            source="discord",
+        )
+    )
+
+    fake_q = _fake_query_yielding("sunny")
+    with patch("mimir.agent.query", new=fake_q):
+        await agent.run_turn(
+            AgentEvent(
+                trigger="user_message",
+                channel_id="bench-1",
+                content="and tomorrow?",  # distinct from prior
+                author="alice",
+                source="discord",
+            )
+        )
+
+    q_payload = saga.last("query")
+    assert q_payload is not None
+    # Prior survives; just-recorded "and tomorrow?" is dropped because
+    # it equals event.content at recent[-1].
+    assert q_payload["context"] == [
+        {"role": "user", "content": "what's the weather?"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_synthesis_turn_emits_skipped_boundary_when_step3_missing(
     tmp_path: Path,
 ):
