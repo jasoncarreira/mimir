@@ -526,9 +526,22 @@ class _HttpSaga:
         self._api_key = api_key
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
         self._session: aiohttp.ClientSession | None = None
+        # CR#9: serialize lazy init. Two concurrent first-call turns
+        # both saw ``self._session is None`` and both constructed a
+        # ``ClientSession``, with the loser's session leaking and
+        # producing aiohttp deprecation warnings in production logs.
+        # Mostly a multi-deployment edge case (default is ``_InProcessSaga``)
+        # but the lock is cheap and the failure mode is silent.
+        self._session_lock = asyncio.Lock()
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
+        # Cheap read first — once the session is up the common path
+        # avoids the lock entirely.
+        if self._session is not None and not self._session.closed:
+            return self._session
+        async with self._session_lock:
+            if self._session is not None and not self._session.closed:
+                return self._session
             headers: dict[str, str] = {}
             if self._api_key:
                 headers["X-API-Key"] = self._api_key
