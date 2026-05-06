@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from mimir.cli import main, setup_home
+from mimir.cli import _print_setup_report, main, setup_home
 
 
 def test_setup_creates_home_layout(tmp_path: Path):
@@ -493,3 +493,62 @@ def test_identities_list_after_adds(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert "Alice Smith" in out
     assert "slack-U05ALICE" in out
     assert "discord-456" in out
+
+
+def test_print_setup_report_surfaces_credential_helper_fields(capsys):
+    """PR 4d added credentials_written + legacy_token_url_migrated to
+    BootstrapResult. The setup report must surface both so the operator
+    can see whether the credential helper was installed and whether a
+    legacy in-URL token was stripped during migration."""
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "git_bootstrap": {
+            "initialized": False,
+            "cloned": False,
+            "pulled": True,
+            "pull_blocked": False,
+            "bootstrap_commit": False,
+            "gitignore_written": False,
+            "hook_written": True,
+            "remote_configured": True,
+            "credentials_written": True,
+            "legacy_token_url_migrated": True,
+        },
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "credential helper installed" in out
+    assert "legacy in-URL token stripped" in out
+
+
+def test_print_setup_report_omits_credential_helper_lines_when_absent(capsys):
+    """When credentials_written / legacy_token_url_migrated are False
+    (existing repo, helper already in place, no migration needed) the
+    report should stay quiet about them — only positive actions print."""
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "git_bootstrap": {
+            "initialized": False,
+            "cloned": False,
+            "pulled": True,
+            "pull_blocked": False,
+            "bootstrap_commit": False,
+            "gitignore_written": False,
+            "hook_written": True,
+            "remote_configured": True,
+            "credentials_written": False,
+            "legacy_token_url_migrated": False,
+        },
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "credential helper" not in out
+    assert "legacy in-URL token" not in out
