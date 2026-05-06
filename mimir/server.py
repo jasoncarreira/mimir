@@ -374,6 +374,27 @@ def build_app(config: Config) -> web.Application:
                     error=str(exc),
                 )
 
+        # Bind-mount health probe (BIND_MOUNT_HEALTH_PROBE.md).
+        # Detects VirtioFS stale-inode failures and self-restarts via
+        # SIGTERM to PID 1. The probe self-gates on
+        # ``/proc/self/mountinfo`` containing a virtiofs entry, so
+        # registering it on bare-metal Linux / OrbStack-without-virtiofs
+        # / CI is harmless — it short-circuits per tick.
+        health_probe_registered = False
+        try:
+            health_probe_registered = scheduler.add_health_probe_job(
+                config.home,
+                config.events_log,
+                config.health_probe_cron,
+                max_restarts_per_hour=config.health_probe_max_restarts_per_hour,
+            )
+        except ValueError as exc:
+            await log_event(
+                "scheduler_invalid_cron",
+                job="bind-mount-health-probe",
+                error=str(exc),
+            )
+
         # Load LLM-tick jobs from scheduler.yaml.
         reload_stats = scheduler.reload()
 
@@ -381,6 +402,7 @@ def build_app(config: Config) -> web.Application:
             consolidate_registered
             or introspection_registered
             or oauth_poll_registered
+            or health_probe_registered
             or reload_stats["registered"] > 0
         ):
             scheduler.start()

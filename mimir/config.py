@@ -284,6 +284,17 @@ class Config:
     oauth_usage_poll_cron: str
     oauth_refresh_warn_days: int
 
+    # Bind-mount health probe (mimir/health_probe.py): detects the
+    # VirtioFS stale-inode failure mode and self-restarts via SIGTERM
+    # to PID 1 so Docker's restart-unless-stopped policy re-mounts
+    # cleanly. ``health_probe_cron`` is the cron expression; default
+    # is every minute. Empty disables. ``health_probe_max_restarts_per_hour``
+    # is the sliding-window guard threshold — past N restarts in 60min
+    # we stop self-restarting and surface ``bind_mount_stale_persistent``
+    # for operator action.
+    health_probe_cron: str
+    health_probe_max_restarts_per_hour: int
+
     # Per-response rate-limit capture (default on). Enabling this turns
     # on the SDK's include_partial_messages so StreamEvent messages
     # carry the raw Anthropic streaming events; we filter for
@@ -421,6 +432,13 @@ class Config:
             ),
             oauth_refresh_warn_days=_env_int(
                 "MIMIR_OAUTH_REFRESH_WARN_DAYS", 25,
+            ),
+
+            health_probe_cron=_env(
+                "MIMIR_HEALTH_PROBE_CRON", "* * * * *",
+            ),
+            health_probe_max_restarts_per_hour=_env_int(
+                "MIMIR_HEALTH_PROBE_MAX_RESTARTS_PER_HOUR", 3,
             ),
 
             git_tracking_enabled=_env_bool("MIMIR_GIT_TRACKING_ENABLED", False),

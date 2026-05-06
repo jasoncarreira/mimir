@@ -420,11 +420,19 @@ def build_saga_tools(
         except SagaError as exc:
             return _content_block(f"saga_end_session failed: {exc}", is_error=True)
 
+        # CR#19: flag the per-turn ctx so the agent's post-message hook
+        # can tell that step 3 of the synthesis prompt actually ran. The
+        # check fires only on synthesis turns (trigger=saga_session_end);
+        # for non-synthesis callers (rare — operator manually closes a
+        # session) it's harmless extra bookkeeping.
+        ctx = get_current_turn()
+        if ctx is not None:
+            ctx.saga_end_session_called = True
+
         # v0.4 §3: append to local mirror so the prompt-time render still
         # has session summaries available if SAGA is briefly down. Best
         # effort — failures don't fail the tool turn.
         if session_boundary_log is not None:
-            ctx = get_current_turn()
             try:
                 await session_boundary_log.append(
                     {

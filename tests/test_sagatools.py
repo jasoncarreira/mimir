@@ -319,6 +319,75 @@ async def test_saga_end_session_appends_to_local_mirror(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_saga_end_session_flips_ctx_flag(tmp_path):
+    """CR#19: a successful end_session call flips
+    ``ctx.saga_end_session_called = True`` so the agent's post-message
+    hook can tell that step 3 of the synthesis prompt actually ran.
+    Without this flag the synthesis-skipped-boundary check has nothing
+    to reference."""
+    from mimir import _context
+    from mimir.models import TurnContext
+
+    ctx = TurnContext(
+        turn_id="t-synth-1",
+        session_id="c-x",
+        trigger="saga_session_end",
+        channel_id="c-x",
+        started_at=0.0,
+    )
+    assert ctx.saga_end_session_called is False  # default
+    token = _context.set_current_turn(ctx)
+    try:
+        fake = FakeSaga()
+        tools = build_saga_tools(fake)  # type: ignore[arg-type]
+        end = _by_name(tools, "saga_end_session")
+        out = await end.handler({
+            "session_id": "saga-x-1",
+            "summary": "ok",
+        })
+        assert out.get("is_error") is not True
+        assert ctx.saga_end_session_called is True
+    finally:
+        _context.reset_current_turn(token)
+
+
+@pytest.mark.asyncio
+async def test_saga_end_session_does_not_flip_ctx_flag_on_failure():
+    """CR#19: when SAGA raises, the flag must stay False so the
+    post-message check reports the real outcome. (Synthesis turn fired
+    the tool but the boundary atom didn't actually land.)"""
+    from mimir import _context
+    from mimir.models import TurnContext
+    from mimir.saga_client import SagaError
+
+    class FailingSaga(FakeSaga):
+        async def end_session(self, **kwargs):  # type: ignore[override]
+            raise SagaError("simulated server error")
+
+    ctx = TurnContext(
+        turn_id="t-synth-2",
+        session_id="c-y",
+        trigger="saga_session_end",
+        channel_id="c-y",
+        started_at=0.0,
+    )
+    token = _context.set_current_turn(ctx)
+    try:
+        tools = build_saga_tools(FailingSaga())  # type: ignore[arg-type]
+        end = _by_name(tools, "saga_end_session")
+        out = await end.handler({
+            "session_id": "saga-y-1",
+            "summary": "ok",
+        })
+        # Tool returns an error block but doesn't raise.
+        assert out.get("is_error") is True
+        # Flag stays False — the check sees the real failure.
+        assert ctx.saga_end_session_called is False
+    finally:
+        _context.reset_current_turn(token)
+
+
+@pytest.mark.asyncio
 async def test_saga_end_session_no_mirror_when_log_unset():
     """build_saga_tools without a SessionBoundaryLog must still work —
     the mirror is optional; absent means no mirror writes."""
