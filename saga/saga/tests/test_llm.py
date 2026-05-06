@@ -329,14 +329,14 @@ def _install_fake_claude_agent_sdk(
 
 
 def _reset_persistent_runner():
-    """Tests should drop the per-thread cached runner between scenarios
-    so each test gets a fresh persistent client (with a fresh fake SDK).
-    The runner is stored on a ``threading.local`` keyed by the calling
-    thread; pytest runs tests on the main thread, so clearing the main
-    thread's entry is sufficient."""
+    """Tests should drop the cached pool between scenarios so each
+    test gets fresh persistent clients (with a fresh fake SDK).
+    Resetting the module-level singleton is sufficient: the next
+    ``call_llm_sync`` will lazily build a new pool, and any in-flight
+    daemon threads from prior tests are harmless (they hold the
+    *previous* test's fake SDK and never see a new submission)."""
     import saga._llm as _llm
-    if hasattr(_llm._persistent_runner_local, "runner"):
-        delattr(_llm._persistent_runner_local, "runner")
+    _llm._persistent_pool = None
 
 
 def test_claude_code_happy_path(monkeypatch):
@@ -522,42 +522,157 @@ def test_anthropic_exception_returns_empty(monkeypatch):
     assert out == ""
 
 
-def test_persistent_runner_is_per_thread():
-    """Each calling thread gets its own persistent runner instance.
-    Two threads asking for the runner must receive distinct objects;
-    a single thread asking twice gets the same instance."""
+def test_persistent_pool_reuses_idle_runner():
+    """A single-threaded sequence of acquire/release should reuse the
+    same runner — that's the whole point of caching the warm SDK
+    client across calls."""
+    import saga._llm as _llm
+
+    _reset_persistent_runner()
+    pool = _llm._PersistentClaudePool(max_size=2)
+
+    r1 = pool.acquire()
+    pool.release(r1)
+    r2 = pool.acquire()
+    try:
+        assert r1 is r2, "released runner must be reused on next acquire"
+    finally:
+        pool.release(r2)
+
+
+def test_persistent_pool_caps_concurrent_instances():
+    """Under concurrent load, the pool must never exceed ``max_size``
+    live ``_PersistentClaudeCode`` instances — that's the leak fix.
+    Many worker threads churning through acquire/release see at most
+    ``max_size`` distinct instances."""
     import saga._llm as _llm
     import threading
 
     _reset_persistent_runner()
+    pool = _llm._PersistentClaudePool(max_size=3)
+    seen: set[int] = set()
+    seen_lock = threading.Lock()
+    barrier = threading.Barrier(8)
 
-    main_runner = _llm._persistent_runner()
-    main_runner_again = _llm._persistent_runner()
-    assert main_runner is main_runner_again, (
-        "same thread must reuse its cached runner"
+    def worker():
+        # Stagger acquires so churn is realistic but the pool is
+        # genuinely under contention (8 workers, cap=3).
+        barrier.wait()
+        for _ in range(3):
+            r = pool.acquire()
+            try:
+                with seen_lock:
+                    seen.add(id(r))
+            finally:
+                pool.release(r)
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+        assert not t.is_alive(), "worker hung — likely a deadlock in pool"
+
+    assert len(seen) <= 3, (
+        f"pool grew past max_size: {len(seen)} distinct runners "
+        f"created, expected <= 3"
     )
+    assert pool.size <= 3
+    # All workers borrowed from the (small) pool; we should have
+    # actually constructed at least 1 and at most 3 instances.
+    assert 1 <= len(seen) <= 3
 
-    other_runner_holder: dict[str, object] = {}
-    ready = threading.Event()
 
-    def in_other_thread():
-        try:
-            other_runner_holder["runner"] = _llm._persistent_runner()
-            # Confirm the other thread also caches its own across calls.
-            other_runner_holder["runner_again"] = _llm._persistent_runner()
-        finally:
-            ready.set()
+def test_persistent_pool_blocks_when_full_until_release():
+    """When ``max_size`` instances are checked out, a new ``acquire``
+    must block until something is released — not silently grow the
+    pool past the cap."""
+    import saga._llm as _llm
+    import threading
 
-    t = threading.Thread(target=in_other_thread, daemon=True)
+    _reset_persistent_runner()
+    pool = _llm._PersistentClaudePool(max_size=1)
+
+    held = pool.acquire()
+    acquired_event = threading.Event()
+    second: dict[str, object] = {}
+
+    def waiter():
+        second["runner"] = pool.acquire()
+        acquired_event.set()
+
+    t = threading.Thread(target=waiter, daemon=True)
     t.start()
-    assert ready.wait(timeout=10), "other thread didn't complete"
-    t.join(timeout=10)
 
-    other_runner = other_runner_holder["runner"]
-    other_runner_again = other_runner_holder["runner_again"]
-    assert other_runner is other_runner_again, (
-        "second thread must also reuse its cached runner"
+    # The waiter should be parked — not yet fired.
+    assert not acquired_event.wait(timeout=0.2), (
+        "waiter acquired before holder released — pool exceeded max_size"
     )
-    assert other_runner is not main_runner, (
-        "different threads must get different runners"
+
+    pool.release(held)
+
+    assert acquired_event.wait(timeout=5), "waiter never woke after release"
+    t.join(timeout=5)
+    pool.release(second["runner"])
+    assert second["runner"] is held, (
+        "post-release acquire should reuse the same instance"
     )
+
+
+def test_persistent_pool_construction_failure_frees_slot():
+    """If ``_PersistentClaudeCode.__init__`` raises, the reserved slot
+    must be returned to the pool — otherwise repeated failures would
+    permanently shrink capacity."""
+    import saga._llm as _llm
+
+    _reset_persistent_runner()
+    pool = _llm._PersistentClaudePool(max_size=1)
+
+    boom_count = {"n": 0}
+    real_init = _llm._PersistentClaudeCode.__init__
+
+    def flaky_init(self, *args, **kwargs):
+        boom_count["n"] += 1
+        if boom_count["n"] == 1:
+            raise RuntimeError("boom")
+        return real_init(self, *args, **kwargs)
+
+    _llm._PersistentClaudeCode.__init__ = flaky_init
+    try:
+        try:
+            pool.acquire()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("flaky_init should have raised")
+
+        # Slot was reserved before the failed construction; without
+        # the back-out, ``size`` would be stuck at 1 with nothing to
+        # check out, and this acquire would block forever.
+        runner = pool.acquire()
+        assert runner is not None
+        pool.release(runner)
+    finally:
+        _llm._PersistentClaudeCode.__init__ = real_init
+
+
+def test_persistent_pool_default_size_from_env(monkeypatch):
+    """``SAGA_PERSISTENT_CLAUDE_POOL_SIZE`` controls the default
+    pool's cap; bogus values fall back to the default rather than
+    raising."""
+    import saga._llm as _llm
+
+    _reset_persistent_runner()
+    monkeypatch.setenv("SAGA_PERSISTENT_CLAUDE_POOL_SIZE", "7")
+    pool = _llm._get_persistent_pool()
+    assert pool.max_size == 7
+
+    _reset_persistent_runner()
+    monkeypatch.setenv("SAGA_PERSISTENT_CLAUDE_POOL_SIZE", "not-a-number")
+    pool = _llm._get_persistent_pool()
+    assert pool.max_size == _llm._DEFAULT_POOL_SIZE
+
+    _reset_persistent_runner()
+    monkeypatch.setenv("SAGA_PERSISTENT_CLAUDE_POOL_SIZE", "0")
+    pool = _llm._get_persistent_pool()
+    assert pool.max_size == _llm._DEFAULT_POOL_SIZE

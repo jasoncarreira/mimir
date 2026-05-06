@@ -165,11 +165,16 @@ def _call_claude_code(
             temperature=temperature, system=system,
         )
 
-    return _persistent_runner().call(
-        prompt=prompt,
-        model=llm.get("model"),
-        system=system,
-    )
+    pool = _get_persistent_pool()
+    runner = pool.acquire()
+    try:
+        return runner.call(
+            prompt=prompt,
+            model=llm.get("model"),
+            system=system,
+        )
+    finally:
+        pool.release(runner)
 
 
 # ─── Persistent ClaudeSDKClient ──────────────────────────────────
@@ -187,34 +192,140 @@ peak context at the high end of each cycle. Adjust via the
 benefits from a different K."""
 
 
+import os as _os
 import threading as _threading
 
-_persistent_runner_local = _threading.local()
+_DEFAULT_POOL_SIZE = 4
+"""Default ceiling on concurrent ``_PersistentClaudeCode`` instances.
+
+4 covers mimir's expected steady-state (~2 chat channels active at
+once + 1 saga consolidation cron) with headroom. Override via
+``SAGA_PERSISTENT_CLAUDE_POOL_SIZE``.
+
+Why bounded vs. the previous ``threading.local`` cache: under
+``asyncio.to_thread`` worker churn (mimir's call path), each fresh
+worker thread that hit ``_persistent_runner()`` allocated a new
+``_PersistentClaudeCode`` — daemon thread + event loop + Claude Code
+subprocess. The default ``ThreadPoolExecutor`` grows up to ``min(32,
+os.cpu_count() + 4)`` workers, so on an 8-core box that meant up to
+12 daemon threads each holding ~50MB of subprocess RSS, never
+shrinking. The pool fixes the leak by capping live instances and
+recycling them across worker threads via FIFO checkout."""
 
 
-def _persistent_runner() -> "_PersistentClaudeCode":
-    """Per-thread cached runner. Each calling thread (mimir worker,
-    bench runner, scheduler firing) gets its own warm
-    ``ClaudeSDKClient`` so concurrent saga calls don't serialize on
-    a shared lock.
+class _PersistentClaudePool:
+    """Bounded thread-safe pool of ``_PersistentClaudeCode`` instances.
 
-    Cost: ~50MB RAM per Claude Code subprocess, plus one event-loop
-    thread per calling thread. For mimir's expected concurrency
-    (1-3 dispatcher worker threads) that's manageable. Bench runs
-    use the openai_compat path and never enter this code.
+    Replaces the per-thread ``threading.local`` cache. Cross-thread
+    parallelism is preserved up to ``max_size`` concurrent callers —
+    important for cross-channel mimir traffic where Discord and
+    Slack turns can both hit saga LLM at the same time. Once
+    ``max_size`` is in flight, additional callers block on
+    ``acquire`` until one is returned.
 
-    The cache is keyed by Python thread (``threading.local``) so the
-    instance lifetime tracks the calling thread. The inner Claude
-    Code subprocess and event-loop thread are daemons — they exit
-    when the process exits regardless of how cleanup gets
-    sequenced. Lazy import of the SDK happens inside
-    ``_PersistentClaudeCode``'s call path; standalone saga
-    deployments without the SDK installed never reach this."""
-    runner = getattr(_persistent_runner_local, "runner", None)
-    if runner is None:
-        runner = _PersistentClaudeCode()
-        _persistent_runner_local.runner = runner
-    return runner
+    Construction is cheap (~5ms — daemon thread + event loop spin-up;
+    the Claude Code SDK client is lazy-connected on first
+    ``runner.call(...)``), so we don't pre-warm the pool. Instances
+    are created on demand up to the cap; once created they live
+    until process exit.
+
+    Not asyncio-aware — saga's contract is sync from any Python
+    thread (``call_llm_sync``). Synchronization is via a
+    ``threading.Condition``; callers may be on any thread. (The
+    inner ``_PersistentClaudeCode`` does its own sync→async bridge
+    via its daemon-thread event loop.)"""
+
+    def __init__(self, max_size: int) -> None:
+        if max_size < 1:
+            raise ValueError(f"max_size must be >= 1, got {max_size}")
+        self._max_size = max_size
+        self._idle: list[_PersistentClaudeCode] = []
+        self._size = 0  # idle + in-flight, never decremented
+        self._cond = _threading.Condition()
+
+    @property
+    def max_size(self) -> int:
+        return self._max_size
+
+    @property
+    def size(self) -> int:
+        with self._cond:
+            return self._size
+
+    def acquire(self) -> "_PersistentClaudeCode":
+        """Block until an instance is available; return it. Caller
+        MUST call ``release`` when done."""
+        with self._cond:
+            while True:
+                if self._idle:
+                    return self._idle.pop()
+                if self._size < self._max_size:
+                    # Reserve the slot before releasing the lock so
+                    # concurrent acquirers don't double-grow past
+                    # ``max_size``. Construction happens outside the
+                    # lock — daemon-thread spin-up + event-loop
+                    # ready-wait is bounded but non-trivial; holding
+                    # the lock would serialize cold-start.
+                    self._size += 1
+                    break
+                self._cond.wait()
+        try:
+            return _PersistentClaudeCode()
+        except BaseException:
+            # Construction failed — back out the reservation and
+            # wake any waiters. The slot is free again.
+            with self._cond:
+                self._size -= 1
+                self._cond.notify()
+            raise
+
+    def release(self, runner: "_PersistentClaudeCode") -> None:
+        """Return an instance to the idle list and wake one waiter."""
+        with self._cond:
+            self._idle.append(runner)
+            self._cond.notify()
+
+
+_persistent_pool: "_PersistentClaudePool | None" = None
+_pool_init_lock = _threading.Lock()
+
+
+def _resolve_pool_size() -> int:
+    raw = _os.environ.get("SAGA_PERSISTENT_CLAUDE_POOL_SIZE", "")
+    if not raw:
+        return _DEFAULT_POOL_SIZE
+    try:
+        n = int(raw)
+    except ValueError:
+        log.warning(
+            "SAGA_PERSISTENT_CLAUDE_POOL_SIZE=%r is not an int; "
+            "falling back to default %d",
+            raw, _DEFAULT_POOL_SIZE,
+        )
+        return _DEFAULT_POOL_SIZE
+    if n < 1:
+        log.warning(
+            "SAGA_PERSISTENT_CLAUDE_POOL_SIZE=%d < 1 is not valid; "
+            "falling back to default %d",
+            n, _DEFAULT_POOL_SIZE,
+        )
+        return _DEFAULT_POOL_SIZE
+    return n
+
+
+def _get_persistent_pool() -> "_PersistentClaudePool":
+    """Lazy module-level singleton. Double-checked under a lock so
+    concurrent first-callers don't construct two pools."""
+    global _persistent_pool
+    pool = _persistent_pool
+    if pool is not None:
+        return pool
+    with _pool_init_lock:
+        if _persistent_pool is None:
+            _persistent_pool = _PersistentClaudePool(
+                max_size=_resolve_pool_size()
+            )
+        return _persistent_pool
 
 
 class _PersistentClaudeCode:
@@ -225,13 +336,16 @@ class _PersistentClaudeCode:
     Recycles the client every ``_RECYCLE_AFTER_CALLS`` calls (or when
     ``model`` changes between calls) to bound conversation bloat.
 
-    One instance per *calling* Python thread (see
-    ``_persistent_runner_local``). Each instance owns its own inner
+    Lifetime is managed by ``_PersistentClaudePool``: the pool caps
+    live instances at ``max_size`` (default 4, override via
+    ``SAGA_PERSISTENT_CLAUDE_POOL_SIZE``) and lets callers borrow via
+    ``acquire``/``release``. Each instance owns its own inner
     event-loop thread, its own Claude Code subprocess, and its own
-    submit lock. Concurrent calls from different calling threads
-    don't serialize because they hit different instances; concurrent
-    calls from the *same* calling thread (re-entrancy through saga
-    helpers) still serialize on the per-instance lock."""
+    submit lock. Concurrent ``call`` invocations on the *same*
+    instance serialize on ``_submit_lock``; the pool ensures distinct
+    callers get distinct instances up to ``max_size``, preserving
+    cross-channel parallelism without leaking instances per worker
+    thread the way the previous ``threading.local`` cache did."""
 
     def __init__(self) -> None:
         import asyncio
