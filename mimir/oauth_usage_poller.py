@@ -117,6 +117,46 @@ class PollerConfig:
 # ─── credentials I/O ───────────────────────────────────────────────────
 
 
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write ``payload`` as pretty JSON to ``path`` durably.
+
+    CR#7: the previous shape used ``Path.write_text(...)`` + ``os.replace``
+    without an ``fsync`` on the temp file, so a crash between rename-commit
+    and content-flush left ``path`` pointing at a zero-length region. The
+    credentials file's refresh token rotates on every refresh — losing a
+    write here forces an operator re-``/login``. Same shape applies to the
+    sidecar (less catastrophic, but corrupting it triggered the CR#8 bug
+    where the age-warn countdown silently reset).
+
+    The standard atomic-write pattern: open tmp, write, ``fsync`` the file,
+    close, ``rename``, then ``fsync`` the parent directory so the rename
+    itself is durable. Mode 0o600 matches the prior chmod-after-write
+    behavior.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    body = json.dumps(payload, indent=2).encode("utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, body)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    # Make the rename durable. Without this, on crash between rename and
+    # parent-dir writeback, the new entry can revert to the pre-rename
+    # state. Parent-dir fsync is cheap (single block usually) and the
+    # only way to actually commit the rename. Best-effort — Windows /
+    # exotic FS may reject O_RDONLY on directories.
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
 def read_credentials(path: Path) -> dict[str, Any]:
     """Load credentials.json. Returns the inner ``claudeAiOauth`` dict
     (the structure ``claude /login`` writes). Raises :class:`OSError`
@@ -148,14 +188,7 @@ def write_credentials(path: Path, oauth_block: dict[str, Any]) -> None:
     except json.JSONDecodeError:
         log.warning("existing credentials.json is corrupt; overwriting")
     existing["claudeAiOauth"] = oauth_block
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        # Best effort — Windows / odd FS don't support 0600 cleanly.
-        pass
-    os.replace(tmp, path)
+    _atomic_write_json(path, existing)
 
 
 def is_access_token_expired(
@@ -200,10 +233,26 @@ def record_first_seen(
         if not isinstance(existing, dict):
             existing = {}
     except OSError:
+        # Fresh / missing sidecar — proceed with empty existing; we'll
+        # populate first_login_at_unix=now below.
         pass
     except json.JSONDecodeError:
-        log.warning("first-seen sidecar is corrupt; resetting")
-        existing = {}
+        # CR#8: a corrupt sidecar must NOT silently reset the first-login
+        # timestamp. The previous code reset existing={} and then wrote a
+        # fresh sidecar with first_login_at_unix=now, restarting the
+        # 30-day refresh-token age-warn countdown without operator
+        # awareness. Treat corruption as a hard error: log + skip the
+        # write entirely. ``days_since_first_login`` already returns None
+        # on the same JSONDecodeError, so the age-warn won't fire — which
+        # is the right behavior (we don't know the age) until the
+        # operator investigates the corruption (re-``/login`` or restore
+        # from backup will write a clean sidecar).
+        log.warning(
+            "first-seen sidecar at %s is corrupt; skipping update to "
+            "preserve unknown-age signal. Operator should investigate.",
+            sidecar,
+        )
+        return {"corrupt": True}
 
     # We care about login-age, not refresh-rotation-age. The "original
     # login" is whatever the operator last did with /login. Heuristic:
@@ -219,13 +268,7 @@ def record_first_seen(
 
     try:
         sidecar.parent.mkdir(parents=True, exist_ok=True)
-        tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
-        tmp.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, sidecar)
+        _atomic_write_json(sidecar, existing)
     except OSError as exc:
         log.warning("first-seen sidecar write failed: %s", exc)
     return existing
@@ -242,11 +285,7 @@ def reset_first_seen(credentials_path: Path, *, now: float | None = None) -> Non
     payload = {"first_login_at_unix": int(now), "last_seen_at_unix": int(now)}
     try:
         sidecar.parent.mkdir(parents=True, exist_ok=True)
-        sidecar.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        try:
-            os.chmod(sidecar, 0o600)
-        except OSError:
-            pass
+        _atomic_write_json(sidecar, payload)
     except OSError as exc:
         log.warning("first-seen sidecar reset failed: %s", exc)
 

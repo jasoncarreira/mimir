@@ -195,6 +195,57 @@ def test_reset_first_seen(tmp_path: Path) -> None:
     assert age == 0.0
 
 
+def test_record_first_seen_does_not_reset_first_login_on_corrupt_sidecar(
+    tmp_path: Path,
+) -> None:
+    """CR#8: a corrupt sidecar must NOT silently reset first_login_at.
+
+    Previously the JSONDecodeError branch reset existing={} and wrote a
+    fresh sidecar with first_login_at_unix=now, restarting the 30-day
+    age-warn countdown. The fix: refuse to write when the sidecar can't
+    be parsed; let the operator notice via days_since_first_login=None.
+    """
+    cred_path = tmp_path / "creds.json"
+    cred_path.write_text("{}", encoding="utf-8")
+    sidecar = tmp_path / op.FIRST_SEEN_SIDECAR_NAME
+
+    # Plant a corrupt sidecar (truncated JSON).
+    corrupt_blob = '{"first_login_at_unix": 17000000'
+    sidecar.write_text(corrupt_blob, encoding="utf-8")
+    sidecar_mtime_before = sidecar.stat().st_mtime
+
+    # record_first_seen against the corrupt sidecar must return without
+    # rewriting it.
+    result = record_first_seen(cred_path, "rt-tail", now=1701000000.0)
+    assert result.get("corrupt") is True
+
+    # Sidecar untouched — same bytes, same mtime (within FS resolution).
+    assert sidecar.read_text(encoding="utf-8") == corrupt_blob
+    assert sidecar.stat().st_mtime == sidecar_mtime_before
+
+    # And days_since_first_login still returns None (its existing
+    # JSONDecodeError handler), so the age-warn correctly does not fire.
+    assert days_since_first_login(cred_path, now=1701000000.0) is None
+
+
+def test_atomic_write_json_fsyncs_and_replaces(tmp_path: Path) -> None:
+    """CR#7: write_credentials must use the atomic helper that fsyncs.
+
+    We can't test actual durability across crashes, but we can verify
+    the helper produces a valid JSON file with mode 0o600 and that the
+    temp file is gone after the call (proving os.replace ran).
+    """
+    target = tmp_path / "out.json"
+    op._atomic_write_json(target, {"a": 1, "b": [2, 3]})
+    assert target.exists()
+    assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1, "b": [2, 3]}
+    # Mode 0o600 (POSIX).
+    mode = target.stat().st_mode & 0o777
+    assert mode == 0o600
+    # Tmp file cleaned up.
+    assert not target.with_suffix(target.suffix + ".tmp").exists()
+
+
 # ─── refresh-grant HTTP ───────────────────────────────────────────────
 
 
