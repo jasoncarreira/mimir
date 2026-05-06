@@ -83,6 +83,13 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "oauth_refresh_token_age_warn": ("negative", "oauth_refresh_age_warn"),
     "oauth_usage_ok": ("positive", "oauth_usage_ok"),
     "oauth_refresh_ok": ("positive", "oauth_refresh_ok"),
+    # Bind-mount health probe — detects VirtioFS stale-inode failures
+    # and self-restarts. Stale + restart-triggered surfaces as a
+    # negative; persistent-after-N-restarts is a louder negative
+    # operator signal; recovery after a self-restart is positive.
+    "bind_mount_stale_detected": ("negative", "bind_mount_stale"),
+    "bind_mount_stale_persistent": ("negative", "bind_mount_persistent"),
+    "bind_mount_recovered": ("positive", "bind_mount_recovered"),
     # CR#22 layer a: OAuth poller rejected an implausible 5h reading
     # (large jump unmatched by 7d response). Negative because the
     # operator should know the upstream endpoint is glitching, even
@@ -142,6 +149,12 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # algedonic block only needs the latest one.
     "quota_anomaly",
     "oauth_refresh_ok",
+    # Health probe runs every minute — without dedup the line would
+    # crowd out everything else in the 24h algedonic window. Tail-first
+    # iteration means the first occurrence in the set IS the most recent.
+    "bind_mount_stale",
+    "bind_mount_persistent",
+    "bind_mount_recovered",
     # PR 4a (git_tracking): a stuck network outage / auth issue / dirty
     # tree will re-emit on every turn until resolved. Dedup so the
     # operator-visible signal is the *most recent* failure, not 50
@@ -379,6 +392,29 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         )
     if rule_kind == "oauth_refresh_ok":
         return "oauth access token refreshed"
+    if rule_kind == "bind_mount_stale":
+        recent = ev.get("recent_restarts")
+        cap = ev.get("max_restarts_per_hour")
+        count_str = (
+            f"count: {int(recent) + 1}/{cap} in last 60min"
+            if isinstance(recent, (int, float)) and isinstance(cap, (int, float))
+            else "auto-restart triggered"
+        )
+        home = ev.get("home") or "/mimir-home"
+        return (
+            f"Bind mount stale-inode detected ({home}); "
+            f"auto-restart triggered ({count_str})"
+        )
+    if rule_kind == "bind_mount_persistent":
+        recent = ev.get("recent_restarts")
+        n_str = f"{int(recent)}" if isinstance(recent, (int, float)) else "?"
+        return (
+            f"Bind mount stale-inode persists despite {n_str} auto-restarts in "
+            f"last 60min; operator action needed (try ``docker compose down "
+            f"&& up``)"
+        )
+    if rule_kind == "bind_mount_recovered":
+        return "Bind mount healthy again after auto-restart"
     if rule_kind == "quota_anomaly":
         # CR#22 layer a: cross-window sanity rejected a 5h spike that
         # didn't match the 7d trajectory. Surface what got rejected so
