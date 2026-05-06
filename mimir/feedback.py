@@ -53,6 +53,12 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "saga_forget_error": ("negative", "saga_forget_error"),
     "saga_synthesis_dispatch_failed": ("negative", "synth_dispatch_fail"),
     "saga_synthesis_empty_window": ("negative", "synth_empty_window"),
+    # CR#19: synthesis-turn post-check; agent ran the synthesis turn
+    # but skipped step 3 (saga_end_session). Without the boundary
+    # atom the next session has no "what were we doing last time?"
+    # record. Negative so the agent's next turn surfaces it and the
+    # behavior self-corrects.
+    "saga_synthesis_skipped_boundary": ("negative", "synth_skip_boundary"),
     "cost_rate_alert": ("negative", "cost_rate"),
     # chainlink #13: under billing-mode=quota, cost spikes don't
     # suppress (the binding constraint is plan-window quota, not
@@ -84,6 +90,18 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "bind_mount_stale_detected": ("negative", "bind_mount_stale"),
     "bind_mount_stale_persistent": ("negative", "bind_mount_persistent"),
     "bind_mount_recovered": ("positive", "bind_mount_recovered"),
+    # CR#22 layer a: OAuth poller rejected an implausible 5h reading
+    # (large jump unmatched by 7d response). Negative because the
+    # operator should know the upstream endpoint is glitching, even
+    # though the arbiter is now insulated.
+    "quota_reading_anomalous": ("negative", "quota_anomaly"),
+    # PR 4a (git_tracking): post-turn commit/push failures. All three
+    # are first-occurrence-only (see ``_FIRST_OCCURRENCE_ONLY_KINDS``)
+    # because once git breaks every subsequent turn re-emits — without
+    # dedup the failure crowds out everything else in the 24h window.
+    "git_commit_failed": ("negative", "git_commit_failed"),
+    "git_push_failed": ("negative", "git_push_failed"),
+    "git_pull_blocked": ("negative", "git_pull_blocked"),
     # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
     "saga_feedback_sent": ("positive", "saga_feedback"),
@@ -126,6 +144,10 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "oauth_usage_failed",
     "oauth_logged_out",
     "oauth_refresh_age_warn",
+    # CR#22 layer a: an endpoint glitch keeps re-reporting the same
+    # bogus 5h reading every 3-min poll until it self-corrects. The
+    # algedonic block only needs the latest one.
+    "quota_anomaly",
     "oauth_refresh_ok",
     # Health probe runs every minute — without dedup the line would
     # crowd out everything else in the 24h algedonic window. Tail-first
@@ -133,6 +155,13 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "bind_mount_stale",
     "bind_mount_persistent",
     "bind_mount_recovered",
+    # PR 4a (git_tracking): a stuck network outage / auth issue / dirty
+    # tree will re-emit on every turn until resolved. Dedup so the
+    # operator-visible signal is the *most recent* failure, not 50
+    # copies of the same error in the 24h window.
+    "git_commit_failed",
+    "git_push_failed",
+    "git_pull_blocked",
 }
 
 
@@ -386,6 +415,47 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         )
     if rule_kind == "bind_mount_recovered":
         return "Bind mount healthy again after auto-restart"
+    if rule_kind == "quota_anomaly":
+        # CR#22 layer a: cross-window sanity rejected a 5h spike that
+        # didn't match the 7d trajectory. Surface what got rejected so
+        # the operator can see the suspect reading + know the kept value.
+        kept = ev.get("kept_utilization")
+        rejected = ev.get("rejected_utilization")
+        kept_str = f"{kept * 100:.0f}%" if isinstance(kept, (int, float)) else "?"
+        rejected_str = (
+            f"{rejected * 100:.0f}%"
+            if isinstance(rejected, (int, float)) else "?"
+        )
+        return (
+            f"quota reading anomaly: 5h endpoint reported {rejected_str} "
+            f"(kept previous {kept_str}); arbiter consults the last "
+            f"trusted value. Glitch is transient — usually clears within "
+            f"a poll cycle or two."
+        )
+    if rule_kind == "git_commit_failed":
+        stage = ev.get("stage") or "?"
+        err = ev.get("error") or "(no detail)"
+        return (
+            f"git commit failed at {stage}: {err}. "
+            f"Tracked-state changes from this turn are NOT staged. "
+            f"Investigate /mimir-home git status; next successful turn re-tries."
+        )
+    if rule_kind == "git_push_failed":
+        reason = ev.get("reason") or "(no detail)"
+        rc = ev.get("returncode")
+        rc_suffix = f" [rc={rc}]" if rc is not None else ""
+        return (
+            f"git push to mimirbot-state failed: {reason}{rc_suffix}. "
+            f"Local commits stand; the next debounced push catches up "
+            f"once connectivity / auth is restored."
+        )
+    if rule_kind == "git_pull_blocked":
+        reason = ev.get("reason") or "(no detail)"
+        return (
+            f"git pull blocked: {reason}. Container's local branch has "
+            f"diverged from remote — operator must reconcile manually "
+            f"(reset local to remote, or push divergent commits)."
+        )
     if rule_kind == "unknown_channel":
         return f"send_message to unknown channel {ev.get('channel_id', '?')}"
     if rule_kind == "saga_feedback":
