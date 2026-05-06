@@ -267,11 +267,21 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
     """Sleep ``DEBOUNCE_SECONDS`` then push. If cancelled (a later
     commit superseded us), exit silently — that turn's task owns the
     push instead. On push failure log ``git_push_failed`` and let the
-    next successful debounce catch up."""
+    next successful debounce catch up.
+
+    PR 4b: skip the push silently when no ``origin`` remote is
+    configured. The bootstrap path can leave the repo with no remote
+    (operator hasn't set ``MIMIR_STATE_REPO`` + ``GITHUB_TOKEN``); we
+    still commit-per-turn (audit trail value), but don't churn
+    ``git_push_failed`` events on every turn for a missing remote
+    that's a configuration choice, not a failure.
+    """
     try:
         await asyncio.sleep(DEBOUNCE_SECONDS)
     except asyncio.CancelledError:
         return  # superseded; the new task owns the push.
+    if not await _has_origin_remote(home):
+        return
     try:
         await _git("push", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
@@ -301,6 +311,20 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
 
 
 # ─── helpers ─────────────────────────────────────────────────────────
+
+
+async def _has_origin_remote(home: Path) -> bool:
+    """Return True iff ``git remote get-url origin`` succeeds.
+
+    Used by ``_debounced_push`` to skip pushes when the operator hasn't
+    configured a remote — keeps the offline / init-only path quiet
+    (no ``git_push_failed`` per turn for an absent-by-design remote).
+    """
+    try:
+        await _git("remote", "get-url", "origin", cwd=home)
+        return True
+    except (GitError, asyncio.TimeoutError, OSError):
+        return False
 
 
 def _short_err(exc: BaseException) -> str:

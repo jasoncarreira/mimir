@@ -113,7 +113,25 @@ def git_status_summary(
     return (count, head)
 
 
+def render_git_status_line(home: Path, *, top_n: int = DEFAULT_TOP_N) -> str | None:
+    """PR 4b: format the ``- uncommitted in <home>: N file(s) — paths``
+    line for the Self-state block. Returns None when the tree is clean
+    (count == 0) or when ``git_status_summary`` reported a failure.
+
+    Pure-ish wrapper over ``git_status_summary``; lives in health.py
+    rather than agent.py so it's testable without spinning up an Agent
+    fixture, and so other surfaces (CLI ``mimir stats``, web UI) can
+    reuse the exact same rendering."""
+    count, top_paths = git_status_summary(home, top_n=top_n)
+    if count <= 0:
+        return None
+    paths_text = ", ".join(top_paths) if top_paths else "(no paths)"
+    noun = "file" if count == 1 else "files"
+    return f"- uncommitted in {home}: {count} {noun} — {paths_text}"
+
+
 __all__: tuple[str, ...] = (
     "DEFAULT_TOP_N",
     "git_status_summary",
+    "render_git_status_line",
 )

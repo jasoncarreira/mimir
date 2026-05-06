@@ -815,6 +815,38 @@ def setup_home(home: Path) -> dict[str, object]:
     seeded_subagents = seed_subagent_defs(home)
     seeded_skills = seed_skills(home)
 
+    # PR 4b: bootstrap the home dir as a git repo (idempotent). Reads
+    # ``MIMIR_STATE_REPO`` + ``GITHUB_TOKEN`` from the environment so a
+    # fresh clone-on-init works when the operator's wired the .env
+    # before running setup. Skipped when MIMIR_GIT_TRACKING_ENABLED is
+    # set explicitly to a falsy value — otherwise bootstrap is the
+    # default once 4b lands.
+    git_bootstrap_status: dict[str, object] | None = None
+    if (os.environ.get("MIMIR_GIT_TRACKING_ENABLED", "true").lower()
+            not in {"false", "0", "no", "off"}):
+        try:
+            from .git_bootstrap import bootstrap_git_repo
+            br = bootstrap_git_repo(
+                home,
+                state_repo=os.environ.get("MIMIR_STATE_REPO"),
+                github_token=os.environ.get("GITHUB_TOKEN"),
+            )
+            git_bootstrap_status = {
+                "initialized": br.initialized,
+                "cloned": br.cloned,
+                "pulled": br.pulled,
+                "pull_blocked": br.pull_blocked,
+                "bootstrap_commit": br.bootstrap_commit,
+                "gitignore_written": br.gitignore_written,
+                "hook_written": br.hook_written,
+                "remote_configured": br.remote_configured,
+            }
+        except Exception as exc:  # noqa: BLE001
+            # Bootstrap failures shouldn't block ``mimir setup`` — the
+            # operator can re-run after fixing the env. Surface the
+            # error in the printed report.
+            git_bootstrap_status = {"error": str(exc)}
+
     return {
         "home": str(home),
         "dirs_created": created_dirs,
@@ -823,6 +855,7 @@ def setup_home(home: Path) -> dict[str, object]:
         "skills": seeded_skills,
         "api_key_action": api_key_action,
         "saga_api_key_action": saga_api_key_action,
+        "git_bootstrap": git_bootstrap_status,
     }
 
 
@@ -847,6 +880,31 @@ def _print_setup_report(status: dict[str, object]) -> None:
         print("  MIMIR_API_KEY:  generated (see .env; rotate via `mimir regenerate-api-key`)")
     if status.get("saga_api_key_action") == "generated":
         print("  SAGA_API_KEY:   generated (unused in in-process mode; preserved for external-saga use)")
+    git_st = status.get("git_bootstrap")
+    if isinstance(git_st, dict):
+        if "error" in git_st:
+            print(f"  git bootstrap:  FAILED — {git_st['error']}")
+        else:
+            actions: list[str] = []
+            if git_st.get("cloned"):
+                actions.append("cloned remote")
+            elif git_st.get("initialized"):
+                actions.append("init'd repo")
+                if git_st.get("bootstrap_commit"):
+                    actions.append("seeded commit")
+            else:
+                actions.append("repo present")
+            if git_st.get("pulled"):
+                actions.append("pulled --ff-only")
+            elif git_st.get("pull_blocked"):
+                actions.append("pull BLOCKED (operator review needed)")
+            if git_st.get("remote_configured"):
+                actions.append("remote=origin")
+            if git_st.get("gitignore_written"):
+                actions.append(".gitignore installed")
+            if git_st.get("hook_written"):
+                actions.append("pre-commit hook installed")
+            print(f"  git bootstrap:  {' / '.join(actions)}")
     print()
     print("Recurring scheduled tasks (active when `mimir run` starts):")
     print("  LLM ticks (scheduler.yaml):")
