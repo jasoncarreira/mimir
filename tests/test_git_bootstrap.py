@@ -558,3 +558,214 @@ def test_clone_failure_event_does_not_leak_token(
     for _, payload in events:
         rendered = json.dumps(payload)
         assert "ghp_SUPER_SECRET_PAT_VALUE_xxx" not in rendered
+
+
+# ─── upstream tracking (PR 4e) ───────────────────────────────────────
+
+
+def test_init_path_pushes_to_empty_remote(
+    tmp_path: Path,
+    upstream_repo: Path,
+    captured_events: tuple[list, Any],
+) -> None:
+    """Fresh init + a bare empty remote → bootstrap must do ``git push
+    -u origin main`` so the remote ``main`` exists and local has
+    upstream tracking from the very first start.
+
+    This reproduces the production bug: container starts with a
+    non-empty ``/mimir-home`` (memory/, state/ already exist) but no
+    ``.git`` and an empty remote repo. Clone is skipped (home not
+    empty), init runs, bootstrap commit lands — but without PR 4e the
+    remote ``main`` is never created and local has no upstream config.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    # Put a file in home so the dir isn't empty → clone path skipped
+    # → falls through to init path.
+    (home / "memory").mkdir()
+    (home / "memory" / "seed.md").write_text("seed\n")
+    events, cb = captured_events
+
+    res = git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo=upstream_repo.as_uri(),
+        github_token="abc",  # local file:// URLs don't auth-check
+        log_event=cb,
+    )
+
+    assert res.initialized is True
+    assert res.cloned is False, "non-empty home → clone path must be skipped"
+    assert res.bootstrap_commit is True
+    assert res.upstream_set is True, "upstream tracking must be set"
+    assert res.initial_push is True, "initial push must run on empty remote"
+
+    # branch.main now has upstream config.
+    upstream = _git(
+        "rev-parse", "--abbrev-ref", "--symbolic-full-name",
+        "main@{upstream}", cwd=home,
+    ).stdout.strip()
+    assert upstream == "origin/main"
+
+    # The bootstrap commit landed on the remote.
+    remote_log = subprocess.run(
+        ["git", "--git-dir", str(upstream_repo), "log", "--oneline"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "initial mimir-home bootstrap" in remote_log
+
+    # And we logged a git_upstream_set event with action=initial_push.
+    upstream_events = [
+        (k, p) for k, p in events
+        if k == "git_upstream_set" and p.get("action") == "initial_push"
+    ]
+    assert len(upstream_events) == 1
+
+
+def test_existing_repo_no_tracking_remote_has_main(
+    tmp_path: Path,
+    seeded_remote: Path,
+    captured_events: tuple[list, Any],
+) -> None:
+    """Existing repo on disk (not freshly init'd this run) with a
+    remote that already has ``main`` but local lacks tracking → set
+    upstream from origin/main, no initial push."""
+    home = tmp_path / "home"
+    home.mkdir()
+    events, cb = captured_events
+
+    # First bootstrap (no remote yet) — yields the init shape.
+    git_bootstrap.bootstrap_git_repo(home)
+    # Manually add the remote without setting tracking (simulates
+    # the "PR4b-era init happened, now the remote has commits but
+    # local main was never pushed -u" state).
+    _git("remote", "add", "origin", seeded_remote.as_uri(), cwd=home)
+    # Confirm no tracking yet.
+    no_upstream = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref",
+         "--symbolic-full-name", "main@{upstream}"],
+        cwd=home, capture_output=True, text=True,
+    )
+    assert no_upstream.returncode != 0  # main@{upstream} unresolvable
+
+    # Second bootstrap → existing repo path, should set tracking
+    # without needing to push.
+    res = git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo=seeded_remote.as_uri(),
+        github_token="abc",
+        log_event=cb,
+    )
+
+    assert res.upstream_set is True
+    assert res.initial_push is False, (
+        "remote already has main; should not push -u"
+    )
+
+    upstream = _git(
+        "rev-parse", "--abbrev-ref", "--symbolic-full-name",
+        "main@{upstream}", cwd=home,
+    ).stdout.strip()
+    assert upstream == "origin/main"
+
+    upstream_events = [
+        (k, p) for k, p in events
+        if k == "git_upstream_set"
+        and p.get("action") == "tracking_existing_remote"
+    ]
+    assert len(upstream_events) == 1
+
+
+def test_existing_repo_already_tracking_is_noop(
+    tmp_path: Path,
+    upstream_repo: Path,
+    captured_events: tuple[list, Any],
+) -> None:
+    """Second bootstrap on the same home — tracking already configured
+    by the first run, helper short-circuits."""
+    home = tmp_path / "home"
+    home.mkdir()
+    # Non-empty home → init path (matches the production shape).
+    (home / "memory").mkdir()
+    (home / "memory" / "seed.md").write_text("seed\n")
+
+    # First run: init + initial push, sets tracking.
+    first = git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo=upstream_repo.as_uri(),
+        github_token="abc",
+    )
+    assert first.upstream_set is True
+    assert first.initial_push is True
+
+    # Second run: existing repo path. Tracking already set, helper
+    # returns early; upstream_set stays False on this BootstrapResult
+    # (it's a fresh result for this invocation, not cumulative).
+    events, cb = captured_events
+    second = git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo=upstream_repo.as_uri(),
+        github_token="abc",
+        log_event=cb,
+    )
+
+    assert second.upstream_set is False
+    assert second.initial_push is False
+    # No git_upstream_set event this time — it short-circuited.
+    assert not any(k == "git_upstream_set" for k, _ in events)
+
+
+def test_no_state_repo_skips_upstream_setup(
+    tmp_path: Path,
+    captured_events: tuple[list, Any],
+) -> None:
+    """Bootstrap without a state_repo / token → helper not invoked,
+    no upstream/initial_push attempts (no remote to push to)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    events, cb = captured_events
+
+    res = git_bootstrap.bootstrap_git_repo(home, log_event=cb)
+
+    assert res.initialized is True
+    assert res.upstream_set is False
+    assert res.initial_push is False
+    # No upstream-related events.
+    assert not any(k == "git_upstream_set" for k, _ in events)
+    assert not any(k == "git_initial_push_failed" for k, _ in events)
+
+
+def test_unreachable_remote_does_not_raise(
+    tmp_path: Path,
+    captured_events: tuple[list, Any],
+) -> None:
+    """If the remote is unreachable (network outage, bad path),
+    bootstrap returns normally — never raises. Local commits stand;
+    the next bootstrap retries the upstream-tracking probe.
+
+    Specifically: ``ls-remote`` fails before we even try to push, so
+    the helper short-circuits. ``upstream_set`` stays False.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    # Non-empty home so we go through init path, not clone.
+    (home / "memory").mkdir()
+    (home / "memory" / "seed.md").write_text("seed\n")
+    events, cb = captured_events
+
+    # Point at a nonexistent local path → ls-remote fails.
+    nonexistent = tmp_path / "does-not-exist.git"
+    res = git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo=nonexistent.as_uri(),
+        github_token="abc",
+        log_event=cb,
+    )
+
+    # Init succeeded; remote configured; just no upstream wired.
+    assert res.initialized is True
+    assert res.bootstrap_commit is True
+    assert res.remote_configured is True
+    assert res.upstream_set is False
+    assert res.initial_push is False
+    # No upstream events at all — helper bailed before trying to push.
+    assert not any(k == "git_upstream_set" for k, _ in events)
