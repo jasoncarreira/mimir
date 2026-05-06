@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import traceback
 from typing import Awaitable, Callable
 
 from .config import Config
@@ -128,6 +129,7 @@ class Dispatcher:
                             where="dispatcher.worker",
                             channel_id=channel_id,
                             message=f"{type(exc).__name__}: {exc}",
+                            traceback=traceback.format_exc(),
                         )
                     finally:
                         self._in_flight.discard(channel_id)
