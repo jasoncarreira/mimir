@@ -65,12 +65,16 @@ def _arbiter(tmp_path: Path, **kwargs) -> HomeostaticArbiter:
 
 def test_partition_splits_s3_and_s4(tmp_path: Path):
     turns = tmp_path / "turns.jsonl"
-    _write_turn(turns, ts=NOW - timedelta(hours=1),
-                trigger="user_message", tool_calls=5)
-    _write_turn(turns, ts=NOW - timedelta(hours=2),
-                trigger="scheduled_tick", tool_calls=3)
+    # JSONL is append-chronological — oldest first, newest last. CR#5
+    # switched _partition_turns to tail-first reading with an early
+    # break on `ts < cutoff_7d`, which requires the on-disk order to
+    # be chronological-ascending (matching real mimir writes).
     _write_turn(turns, ts=NOW - timedelta(hours=3),
                 trigger="user_message", tool_calls=2)
+    _write_turn(turns, ts=NOW - timedelta(hours=2),
+                trigger="scheduled_tick", tool_calls=3)
+    _write_turn(turns, ts=NOW - timedelta(hours=1),
+                trigger="user_message", tool_calls=5)
     s3, s4, _, _ = _partition_turns(turns, now=NOW)
     assert s3 == 7
     assert s4 == 3
@@ -78,22 +82,22 @@ def test_partition_splits_s3_and_s4(tmp_path: Path):
 
 def test_partition_drops_old_turns(tmp_path: Path):
     turns = tmp_path / "turns.jsonl"
-    _write_turn(turns, ts=NOW - timedelta(hours=1),
-                trigger="user_message", tool_calls=5)
     _write_turn(turns, ts=NOW - timedelta(hours=48),  # > 24h, dropped
                 trigger="user_message", tool_calls=99)
+    _write_turn(turns, ts=NOW - timedelta(hours=1),
+                trigger="user_message", tool_calls=5)
     s3, _, _, _ = _partition_turns(turns, now=NOW)
     assert s3 == 5
 
 
 def test_partition_aggregates_tokens_24h_and_7d(tmp_path: Path):
     turns = tmp_path / "turns.jsonl"
-    _write_turn(turns, ts=NOW - timedelta(hours=1),
-                trigger="user_message", tokens=1000)
-    _write_turn(turns, ts=NOW - timedelta(hours=48),
-                trigger="user_message", tokens=2000)
     _write_turn(turns, ts=NOW - timedelta(days=10),  # > 7d, dropped
                 trigger="user_message", tokens=99999)
+    _write_turn(turns, ts=NOW - timedelta(hours=48),
+                trigger="user_message", tokens=2000)
+    _write_turn(turns, ts=NOW - timedelta(hours=1),
+                trigger="user_message", tokens=1000)
     _, _, t24, t7d = _partition_turns(turns, now=NOW)
     assert t24 == 1000
     assert t7d == 3000
@@ -102,6 +106,25 @@ def test_partition_aggregates_tokens_24h_and_7d(tmp_path: Path):
 def test_partition_handles_missing_file(tmp_path: Path):
     s3, s4, t24, t7d = _partition_turns(tmp_path / "missing.jsonl", now=NOW)
     assert (s3, s4, t24, t7d) == (0, 0, 0, 0)
+
+
+def test_partition_early_break_on_7d_cutoff(tmp_path: Path):
+    """CR#5 regression: with a chronological file, the tail-first walk
+    must stop as soon as it encounters a record older than 7d. The 99K
+    poison-token record at the head of the file would inflate the 7d
+    total if the early break weren't in place."""
+    turns = tmp_path / "turns.jsonl"
+    # Way-old record at the start. If the early break works correctly,
+    # the tail walk encounters the recent record first, then hits this
+    # one and stops; this record's tokens never accrue.
+    _write_turn(turns, ts=NOW - timedelta(days=30),
+                trigger="user_message", tokens=99999, tool_calls=99)
+    _write_turn(turns, ts=NOW - timedelta(hours=1),
+                trigger="user_message", tokens=500, tool_calls=2)
+    s3, _, t24, t7d = _partition_turns(turns, now=NOW)
+    assert s3 == 2
+    assert t24 == 500
+    assert t7d == 500  # 99999 from the 30d-old record was excluded
 
 
 # ─── should_fire_heartbeat: layered constraints ─────────────────────────
@@ -171,10 +194,10 @@ def test_partition_no_longer_suppresses_busy_days(tmp_path: Path):
     turns = tmp_path / "turns.jsonl"
     # 10 S3 calls, 1 S4 call → 91% S3 share, would have suppressed
     # under the old 0.80 threshold. New behavior: still fires.
-    _write_turn(turns, ts=NOW - timedelta(hours=1),
-                trigger="user_message", tool_calls=10)
     _write_turn(turns, ts=NOW - timedelta(hours=2),
                 trigger="scheduled_tick", tool_calls=1)
+    _write_turn(turns, ts=NOW - timedelta(hours=1),
+                trigger="user_message", tool_calls=10)
     arb = _arbiter(tmp_path)
     fire, reason = arb.should_fire_heartbeat(now=NOW)
     assert fire is True
@@ -227,10 +250,10 @@ def test_render_includes_s3_s4_share(tmp_path: Path):
     """Partition is now informational-only — render still surfaces it
     so the agent can see how its day skews user-driven vs autonomous."""
     turns = tmp_path / "turns.jsonl"
-    _write_turn(turns, ts=NOW - timedelta(hours=1),
-                trigger="user_message", tool_calls=8)
     _write_turn(turns, ts=NOW - timedelta(hours=2),
                 trigger="scheduled_tick", tool_calls=2)
+    _write_turn(turns, ts=NOW - timedelta(hours=1),
+                trigger="user_message", tool_calls=8)
     arb = _arbiter(tmp_path)
     body = arb.render_self_state_block(now=NOW)
     assert body is not None

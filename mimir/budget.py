@@ -31,13 +31,13 @@ includes the partition + tokens for agent awareness."""
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from ._jsonl_tail import tail_jsonl_records
 from .billing import (
     BillingMode,
     QuotaProvider,
@@ -304,9 +304,17 @@ class HomeostaticArbiter:
 def _partition_turns(
     path: Path, *, now: datetime,
 ) -> tuple[int, int, int, int]:
-    """Walk turns.jsonl, return (s3_tool_calls_24h, s4_tool_calls_24h,
-    tokens_24h, tokens_7d). S3 = user_message; S4 = scheduled_tick.
-    Other triggers (subagent_completion, etc.) don't count toward either.
+    """Walk turns.jsonl tail-first, return (s3_tool_calls_24h,
+    s4_tool_calls_24h, tokens_24h, tokens_7d). S3 = user_message;
+    S4 = scheduled_tick. Other triggers (subagent_completion, etc.)
+    don't count toward either.
+
+    JSONL is append-chronological — oldest record on disk first,
+    newest last. ``tail_jsonl_records`` reads chunks from the end so
+    we see newest-first; once we hit a record older than the 7d
+    cutoff, everything still in the file is also older and we stop.
+    Avoids the O(file_size) memory spike of the prior
+    ``path.read_text()``-based walk. CR#5.
     """
     s3_calls = 0
     s4_calls = 0
@@ -318,19 +326,7 @@ def _partition_turns(
     cutoff_24h = now - timedelta(hours=24)
     cutoff_7d = now - timedelta(days=7)
 
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return 0, 0, 0, 0
-
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for rec in tail_jsonl_records(path):
         ts_raw = rec.get("ts")
         if not isinstance(ts_raw, str):
             continue
@@ -338,8 +334,13 @@ def _partition_turns(
             ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
         except ValueError:
             continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
         if ts < cutoff_7d:
-            continue
+            # Tail-first iteration over a chronological file: every
+            # remaining record is also older than the 7d cutoff. Stop.
+            break
 
         usage = rec.get("usage") or {}
         if isinstance(usage, dict):
