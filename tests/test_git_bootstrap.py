@@ -1,8 +1,7 @@
-"""Tests for ``mimir.git_bootstrap`` (PR 4b of MIMIR_HOME_GIT_TRACKING).
+"""Tests for ``mimir.git_bootstrap`` (PR 4b/4d of MIMIR_HOME_GIT_TRACKING).
 
 Covers the idempotent bootstrap flow:
 
-- ``inject_token_into_url`` URL-encodes the PAT and rewrites the netloc.
 - Bootstrap on an empty home with no env → ``git init`` + bootstrap
   commit + identity + .gitignore + pre-commit hook.
 - Bootstrap on an existing repo → no re-init, identity + hook + gitignore
@@ -12,8 +11,14 @@ Covers the idempotent bootstrap flow:
 - Pre-commit hook is executable and refuses secret-shaped content.
 - Allowlist .gitignore: a binary file under ``memory/`` (e.g.
   ``memory/atoms.db``) is NOT staged by ``git add -A``.
-- Token-bearing URL never leaks into events.jsonl (sanitized via
+- Token never leaks into events.jsonl (PAT-regex redaction in
   ``_redact``).
+- **PR 4d** — credential-helper plumbing: ``<home>/.git/credentials``
+  is written 0600 with the canonical
+  ``https://x-access-token:<PAT>@<host>`` line, ``credential.helper``
+  is set to ``store --file=<abs-path>``, the remote URL stays clean
+  (no embedded token), and a legacy in-URL token from a PR4b-era
+  config gets migrated to the clean form on next bootstrap.
 
 Tests use real ``git`` against ``tmp_path``. The "remote" for clone +
 pull paths is a second tmp directory so we don't need network.
@@ -86,38 +91,175 @@ def seeded_remote(tmp_path: Path, upstream_repo: Path) -> Path:
     return upstream_repo
 
 
-# ─── inject_token_into_url ───────────────────────────────────────────
+# ─── credential helper installation (PR 4d) ──────────────────────────
 
 
-def test_inject_token_into_url_basic() -> None:
-    url = git_bootstrap.inject_token_into_url(
-        "https://github.com/jasoncarreira/mimirbot-state.git",
-        "ghp_AbCdEf123",
+def _read_creds(home: Path) -> str:
+    """Helper for the credential-file assertions."""
+    return (home / ".git" / "credentials").read_text()
+
+
+def test_credential_helper_writes_canonical_line(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    res = git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo="https://github.com/jasoncarreira/mimirbot-state.git",
+        github_token="ghp_AbCdEf123",
     )
-    assert url == "https://ghp_AbCdEf123@github.com/jasoncarreira/mimirbot-state.git"
+    assert res.credentials_written is True
+    line = _read_creds(home).rstrip("\n")
+    assert line == "https://x-access-token:ghp_AbCdEf123@github.com"
 
 
-def test_inject_token_into_url_url_encodes_special_chars() -> None:
-    # PATs occasionally contain ``+`` / ``/`` / ``=``; without
-    # encoding these break the netloc parse on the receiving end.
-    url = git_bootstrap.inject_token_into_url(
-        "https://github.com/foo/bar.git",
-        "tok+en/with=specials",
+def test_credential_helper_url_encodes_token_with_specials(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo="https://github.com/foo/bar.git",
+        github_token="tok+en/with=specials",
     )
-    assert "tok%2Ben%2Fwith%3Dspecials@github.com" in url
+    creds = _read_creds(home)
+    assert "tok%2Ben%2Fwith%3Dspecials" in creds
 
 
-def test_inject_token_into_url_preserves_port() -> None:
-    url = git_bootstrap.inject_token_into_url(
-        "https://example.com:8443/x/y.git", "abc",
+def test_credential_helper_file_is_mode_600(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo="https://github.com/foo/bar.git",
+        github_token="abc",
     )
-    assert url == "https://abc@example.com:8443/x/y.git"
+    creds_path = home / ".git" / "credentials"
+    mode = creds_path.stat().st_mode & 0o777
+    # Group + other must have no bits; owner read+write only.
+    assert mode == 0o600, f"expected 0o600, got 0o{mode:o}"
 
 
-def test_inject_token_into_url_passthrough_for_ssh() -> None:
-    # ssh URLs are caller's problem — leave them alone.
-    url = "git@github.com:foo/bar.git"
-    assert git_bootstrap.inject_token_into_url(url, "abc") == url
+def test_credential_helper_local_config_set(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo="https://github.com/foo/bar.git",
+        github_token="abc",
+    )
+    helper = _git("config", "--local", "credential.helper", cwd=home).stdout.strip()
+    expected_path = (home / ".git" / "credentials").resolve()
+    assert helper == f"store --file={expected_path}"
+
+
+def test_credential_helper_preserves_port(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo="https://gh.example.com:8443/x/y.git",
+        github_token="abc",
+    )
+    line = _read_creds(home).rstrip("\n")
+    assert line == "https://x-access-token:abc@gh.example.com:8443"
+
+
+def test_credential_helper_idempotent_token_rotation(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo="https://github.com/foo/bar.git",
+        github_token="old-token",
+    )
+    assert "old-token" in _read_creds(home)
+
+    # Second bootstrap with rotated token — file rewritten, mode kept.
+    git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo="https://github.com/foo/bar.git",
+        github_token="new-token-xyz",
+    )
+    creds = _read_creds(home)
+    assert "new-token-xyz" in creds
+    assert "old-token" not in creds
+    mode = (home / ".git" / "credentials").stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_credential_helper_skipped_for_non_https(
+    tmp_path: Path, captured_events: tuple[list, Any],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    events, cb = captured_events
+    res = git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo="git@github.com:foo/bar.git",
+        github_token="abc",
+        log_event=cb,
+    )
+    # ssh URLs aren't supported — credential helper not installed.
+    assert res.credentials_written is False
+    assert not (home / ".git" / "credentials").exists()
+
+
+def test_remote_url_has_no_embedded_token_after_init(
+    tmp_path: Path,
+) -> None:
+    """After init+bootstrap, ``git remote get-url origin`` must return
+    the clean URL — no token in the netloc."""
+    home = tmp_path / "home"
+    home.mkdir()
+    git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo="https://github.com/foo/bar.git",
+        github_token="ghp_secret_token",
+    )
+    url = _git("remote", "get-url", "origin", cwd=home).stdout.strip()
+    assert url == "https://github.com/foo/bar.git"
+    assert "ghp_secret_token" not in url
+    # And it shouldn't be in the raw .git/config either.
+    raw_config = (home / ".git" / "config").read_text()
+    assert "ghp_secret_token" not in raw_config
+
+
+def test_legacy_in_url_token_migrated_on_existing_repo(
+    tmp_path: Path,
+) -> None:
+    """If an existing repo has a PR4b-style token-in-URL remote (user
+    upgrading from PR 4b → PR 4d), bootstrap must rewrite the remote
+    to the clean URL and flag ``legacy_token_url_migrated``."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    # First bootstrap with PR4b-shape: manually plant a token-in-URL.
+    git_bootstrap.bootstrap_git_repo(home)  # init only, no remote
+    legacy_url = "https://OLD_PAT_VALUE@github.com/foo/bar.git"
+    _git("remote", "add", "origin", legacy_url, cwd=home)
+
+    # PR4d-shape bootstrap: should detect + strip.
+    res = git_bootstrap.bootstrap_git_repo(
+        home,
+        state_repo="https://github.com/foo/bar.git",
+        github_token="new-token",
+    )
+    assert res.legacy_token_url_migrated is True
+    url_after = _git("remote", "get-url", "origin", cwd=home).stdout.strip()
+    assert url_after == "https://github.com/foo/bar.git"
+    assert "OLD_PAT_VALUE" not in (home / ".git" / "config").read_text()
+
+
+def test_url_has_embedded_token_helper() -> None:
+    # Direct cover of the migration-detection helper.
+    has = git_bootstrap._url_has_embedded_token
+    assert has("https://tok@github.com/foo/bar.git") is True
+    assert has("https://github.com/foo/bar.git") is False
+    assert has("git@github.com:foo/bar.git") is False  # ssh — not our problem
+    assert has("") is False
 
 
 # ─── bootstrap on empty home, no env → init path ─────────────────────
