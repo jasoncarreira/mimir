@@ -298,6 +298,75 @@ async def test_search_returns_empty_for_blank(tmp_path: Path):
     assert await idx.search("", scope="all", k=5) == []
 
 
+# ---- query-embedding LRU cache (CR#12) -----------------------------------
+
+
+class _CountingEmbedder(HashEmbedder):
+    """HashEmbedder that records every embed() call so we can verify the
+    LRU short-circuits the call path on repeats."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts):  # type: ignore[override]
+        self.calls.append(list(texts))
+        return super().embed(texts)
+
+
+@pytest.mark.asyncio
+async def test_search_caches_query_embedding_within_indexer(tmp_path: Path):
+    _seed(tmp_path)
+    counting = _CountingEmbedder()
+    idx = Indexer(tmp_path, embedder=counting)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    # ``start`` issued passage-embedding calls during the sweep — clear them so
+    # the assertions below isolate the query-side cache behavior.
+    counting.calls.clear()
+
+    await idx.search("quantum", scope="all", k=5)
+    await idx.search("quantum", scope="all", k=5)
+    await idx.search("quantum", scope="memory", k=5)  # same query, diff scope
+    await idx.search("flocking", scope="all", k=5)
+
+    query_calls = [c for c in counting.calls if c == ["quantum"] or c == ["flocking"]]
+    assert query_calls == [["quantum"], ["flocking"]]
+    info = idx._embed_query.cache_info()
+    assert info.hits == 2  # two repeats of "quantum"
+    assert info.misses == 2  # one each for "quantum" and "flocking"
+
+
+@pytest.mark.asyncio
+async def test_query_embedding_cache_is_per_instance(tmp_path: Path):
+    """Two indexers share no cache — important for tests that reuse tmp_path
+    or for any future code that holds multiple Indexers."""
+    _seed(tmp_path)
+    a = Indexer(tmp_path, embedder=HashEmbedder())
+    b = Indexer(tmp_path, embedder=HashEmbedder())
+    await a.start(run_initial_sweep=True, sweep_loop=False)
+    await b.start(run_initial_sweep=True, sweep_loop=False)
+
+    await a.search("quantum", scope="all", k=5)
+    await a.search("quantum", scope="all", k=5)
+
+    a_info = a._embed_query.cache_info()
+    b_info = b._embed_query.cache_info()
+    assert a_info.hits == 1 and a_info.misses == 1
+    assert b_info.hits == 0 and b_info.misses == 0
+
+
+def test_query_embedding_cache_returns_immutable_tuple(tmp_path: Path):
+    """The cached value is a tuple so callers can't mutate the cached entry
+    and corrupt later searches. Mirrors saga's ``cached_embed_query``."""
+    (tmp_path / "memory").mkdir()
+    (tmp_path / "state").mkdir()
+    idx = Indexer(tmp_path, embedder=HashEmbedder())
+    vec = idx._embed_query("hello")
+    assert isinstance(vec, tuple)
+    with pytest.raises(TypeError):
+        vec[0] = 0.0  # type: ignore[index]
+
+
 # ---- file_search tool wrapper --------------------------------------------
 
 
