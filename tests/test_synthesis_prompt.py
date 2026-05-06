@@ -259,3 +259,59 @@ async def test_get_turn_skips_malformed_lines(tmp_path: Path):
     assert "is_error" not in result
     text = result["content"][0]["text"]
     assert "found" in text
+
+
+# ── _filter_session_turns (CR#4) ─────────────────────────────────────
+
+
+def test_filter_session_turns_returns_matching_rows(tmp_path: Path):
+    from mimir.agent import _filter_session_turns
+
+    path = tmp_path / "turns.jsonl"
+    path.write_text(
+        json.dumps({"turn_id": "a", "saga_session_id": "S1", "output": "x"}) + "\n"
+        + json.dumps({"turn_id": "b", "saga_session_id": "S2", "output": "y"}) + "\n"
+        + json.dumps({"turn_id": "c", "saga_session_id": "S1", "output": "z"}) + "\n",
+        encoding="utf-8",
+    )
+
+    rows = _filter_session_turns(path, "S1")
+    assert [r["turn_id"] for r in rows] == ["a", "c"]
+
+
+def test_filter_session_turns_handles_missing_file(tmp_path: Path):
+    from mimir.agent import _filter_session_turns
+
+    assert _filter_session_turns(tmp_path / "nope.jsonl", "S1") == []
+
+
+def test_filter_session_turns_skips_malformed_lines(tmp_path: Path):
+    """Defensive: bad JSON lines are skipped, not crashed on."""
+    from mimir.agent import _filter_session_turns
+
+    path = tmp_path / "turns.jsonl"
+    path.write_text(
+        "not json\n"
+        + json.dumps({"turn_id": "a", "saga_session_id": "S1"}) + "\n"
+        + "{bad\n"
+        + json.dumps({"turn_id": "b", "saga_session_id": "S1"}) + "\n",
+        encoding="utf-8",
+    )
+
+    rows = _filter_session_turns(path, "S1")
+    assert [r["turn_id"] for r in rows] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_build_synthesis_prompt_is_async():
+    """CR#4: ``_build_synthesis_prompt`` must be a coroutine function so
+    the synchronous turns.jsonl read inside it can be awaited via
+    ``asyncio.to_thread`` — keeping the event loop unblocked during
+    session-end synthesis under MIMIR_MAX_TURNS=1000 / 50MB worst case."""
+    import inspect
+    from mimir.agent import Agent
+
+    assert inspect.iscoroutinefunction(Agent._build_synthesis_prompt), (
+        "_build_synthesis_prompt must be async so its turns.jsonl read "
+        "runs off the event loop (CR#4)."
+    )
