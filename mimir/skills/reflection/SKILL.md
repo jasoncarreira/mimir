@@ -77,6 +77,9 @@ Before either track, gather inputs:
   - `mimir` is on PATH wherever the operator launched the server from,
     so this works regardless of cwd
 - All `memory/core/*.md` files
+- `memory/learnings-pending.md` — candidate behaviors captured by
+  `saga_session_end` synthesis turns since last reflection. Promote /
+  drop / keep per §B.4.
 - File-count and mtime distribution under `memory/<anywhere>/` and
   `state/wiki/` (Glob + `os.stat`; cheap)
 - **Applied-proposals audit** — invoke the bundled CLI subcommand:
@@ -201,6 +204,25 @@ consolidation has labeled them), fall back to the cumulative-
 retrieval signal — `--contributed-only` without `--trend`. The
 P47 trend filter is additive, not a hard gate.
 
+### B.4 — Pending-learnings buffer review
+
+Walk `memory/learnings-pending.md` entry-by-entry. For each:
+
+- **Promote** — the pattern recurred this week or holds up on broader
+  review (cross-check against session boundaries, recent failures,
+  similar entries in `40-learned-behaviors.md`). Move (cut) the entry
+  to `memory/core/40-learned-behaviors.md`, drop the `Source:` line
+  (or rewrite as `Confirmed: <date>`), and append to the core block.
+- **Drop** — was a one-off, contradicted by other evidence, no longer
+  applies, or has sat ≥3 reflection cycles unpromoted (the file's
+  Lifecycle section sets the default-drop after 3 cycles).
+- **Keep pending** — promising but not yet enough evidence; leave for
+  the next reflection cycle.
+
+This pass is autonomous per `30-reflection-policy.md`. The append-only
+`40-learned-behaviors.md` write you may do here is the promotion case,
+not arbitrary new content.
+
 ### Promotion criteria (heuristic, not rigid)
 
 Use these to triage cleanup vs. promotion vs. leave-alone. They're
@@ -230,6 +252,9 @@ Conservative defaults the policy ships with:
   - SAGA atom decay calls
   - SAGA triples linking (additive)
   - Append-only edits to `memory/core/40-learned-behaviors.md`
+    (typically by promoting from `memory/learnings-pending.md`)
+  - Promote/drop entries in `memory/learnings-pending.md` (the
+    weekly review pass — see §B.4 below)
   - Wiki orphan tagging (just flag, don't delete)
 
 - **Propose-only** (HITL — write to `state/proposed-changes.md`):
