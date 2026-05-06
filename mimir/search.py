@@ -21,6 +21,7 @@ without paying the fastembed cold-start (model download + ONNX load).
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import math
@@ -43,6 +44,10 @@ RECENCY_HALF_LIFE_DAYS = 30.0
 W_COSINE = 0.5
 W_BM25 = 0.2
 W_RECENCY = 0.3
+# Mirrors saga's ``cached_embed_query`` LRU (saga/saga/embeddings.py:340).
+# A single turn issues a handful of ``file_search`` calls and benchmarks
+# replay the same queries; 64 is plenty without bloating worker memory.
+EMBED_QUERY_CACHE_SIZE = 64
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +289,13 @@ class Indexer:
         self._db_lock = threading.Lock()
         self._sweep_task: asyncio.Task | None = None
         self._closed = False
+        # Per-instance LRU for query embeddings — file_search call patterns
+        # repeat the same query string several times per turn (mirror of
+        # saga's ``cached_embed_query``). Wrapping the bound method here
+        # gives each Indexer its own cache without leaking across tests.
+        self._embed_query = functools.lru_cache(maxsize=EMBED_QUERY_CACHE_SIZE)(
+            self._embed_query_uncached
+        )
 
     # ---- lifecycle ----
 
@@ -344,10 +356,17 @@ class Indexer:
     ) -> list[SearchResult]:
         if not query.strip():
             return []
-        query_vec = await asyncio.to_thread(lambda: self._embedder.embed([query])[0])
+        # Cached embedding lookup — repeats within a turn (semantic +
+        # keyword + variations) skip the ONNX call.
+        query_vec_t = await asyncio.to_thread(self._embed_query, query)
         return await asyncio.to_thread(
-            self._search_sync, query, query_vec, scope, k, candidate_pool
+            self._search_sync, query, list(query_vec_t), scope, k, candidate_pool
         )
+
+    def _embed_query_uncached(self, text: str) -> tuple[float, ...]:
+        """Single-query embed; tuple return is hashable + immutable so the
+        LRU value can't be mutated by callers."""
+        return tuple(self._embedder.embed([text])[0])
 
     async def stats(self) -> IndexerStats:
         return await asyncio.to_thread(self._stats_sync)
