@@ -77,6 +77,13 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "oauth_refresh_token_age_warn": ("negative", "oauth_refresh_age_warn"),
     "oauth_usage_ok": ("positive", "oauth_usage_ok"),
     "oauth_refresh_ok": ("positive", "oauth_refresh_ok"),
+    # Bind-mount health probe — detects VirtioFS stale-inode failures
+    # and self-restarts. Stale + restart-triggered surfaces as a
+    # negative; persistent-after-N-restarts is a louder negative
+    # operator signal; recovery after a self-restart is positive.
+    "bind_mount_stale_detected": ("negative", "bind_mount_stale"),
+    "bind_mount_stale_persistent": ("negative", "bind_mount_persistent"),
+    "bind_mount_recovered": ("positive", "bind_mount_recovered"),
     # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
     "saga_feedback_sent": ("positive", "saga_feedback"),
@@ -120,6 +127,12 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "oauth_logged_out",
     "oauth_refresh_age_warn",
     "oauth_refresh_ok",
+    # Health probe runs every minute — without dedup the line would
+    # crowd out everything else in the 24h algedonic window. Tail-first
+    # iteration means the first occurrence in the set IS the most recent.
+    "bind_mount_stale",
+    "bind_mount_persistent",
+    "bind_mount_recovered",
 }
 
 
@@ -350,6 +363,29 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         )
     if rule_kind == "oauth_refresh_ok":
         return "oauth access token refreshed"
+    if rule_kind == "bind_mount_stale":
+        recent = ev.get("recent_restarts")
+        cap = ev.get("max_restarts_per_hour")
+        count_str = (
+            f"count: {int(recent) + 1}/{cap} in last 60min"
+            if isinstance(recent, (int, float)) and isinstance(cap, (int, float))
+            else "auto-restart triggered"
+        )
+        home = ev.get("home") or "/mimir-home"
+        return (
+            f"Bind mount stale-inode detected ({home}); "
+            f"auto-restart triggered ({count_str})"
+        )
+    if rule_kind == "bind_mount_persistent":
+        recent = ev.get("recent_restarts")
+        n_str = f"{int(recent)}" if isinstance(recent, (int, float)) else "?"
+        return (
+            f"Bind mount stale-inode persists despite {n_str} auto-restarts in "
+            f"last 60min; operator action needed (try ``docker compose down "
+            f"&& up``)"
+        )
+    if rule_kind == "bind_mount_recovered":
+        return "Bind mount healthy again after auto-restart"
     if rule_kind == "unknown_channel":
         return f"send_message to unknown channel {ev.get('channel_id', '?')}"
     if rule_kind == "saga_feedback":
