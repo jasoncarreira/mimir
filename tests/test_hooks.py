@@ -589,6 +589,105 @@ async def test_pre_hook_budget_exempts_send_message_and_react(tmp_path: Path):
         _context.reset_current_turn(token)
 
 
+def _read_events(tmp_path: Path) -> list[dict]:
+    """Read events.jsonl back into a list of dicts. The autouse _logger
+    fixture writes here; tests that emit events can inspect them."""
+    import json
+
+    path = tmp_path / "logs" / "events.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+@_pytest.mark.asyncio
+async def test_pre_hook_budget_events_record_resolution_path_session_id(
+    tmp_path: Path,
+):
+    """CR#18: tool_call_denied / tool_call_budget_warning events must
+    carry a resolution_path field that distinguishes the by-session-id
+    lookup (production path under the SDK harness, where the hook task's
+    contextvars are stale) from the contextvar fallback (same-task
+    callers and tests). If the SDK ever stops passing session_id in
+    hook input, this counter flips and the operator notices instead of
+    budget enforcement silently breaking."""
+    from mimir._context import _active_turns
+
+    hook = make_pre_tool_use_hook(tmp_path)
+    ctx = _budget_ctx(budget=2)  # soft threshold = 1
+    # Mirror the SDK-harness scenario: ctx registered for session_id
+    # lookup, contextvar NOT set.
+    _active_turns[ctx.turn_id] = ctx
+    try:
+        # Call 1 hits soft threshold (count=1, budget=2 → 70% = 1) → warning event.
+        # Call 2 fills budget. Call 3 exceeds → deny event.
+        for _i in range(3):
+            await hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Grep",
+                    "tool_input": {"pattern": "x"},
+                    "tool_use_id": "tu",
+                    "session_id": ctx.turn_id,
+                },
+                "tu",
+                _ctx(),
+            )
+    finally:
+        _active_turns.pop(ctx.turn_id, None)
+
+    events = _read_events(tmp_path)
+    warns = [e for e in events if e.get("type") == "tool_call_budget_warning"]
+    denies = [
+        e
+        for e in events
+        if e.get("type") == "tool_call_denied"
+        and e.get("reason") == "tool_call_budget_exceeded"
+    ]
+    assert warns, "expected a tool_call_budget_warning event"
+    assert denies, "expected a tool_call_denied event"
+    assert all(e.get("resolution_path") == "session_id" for e in warns)
+    assert all(e.get("resolution_path") == "session_id" for e in denies)
+
+
+@_pytest.mark.asyncio
+async def test_pre_hook_budget_events_record_resolution_path_contextvar(
+    tmp_path: Path,
+):
+    """CR#18: when only the contextvar is set (same-task fallback path
+    used by direct invocations and many tests), events tag
+    resolution_path='contextvar'. session_id is not present in the
+    input_data, so by-session-id lookup misses and we fall through."""
+    hook = make_pre_tool_use_hook(tmp_path)
+    ctx = _budget_ctx(budget=1)  # any over-budget call denies immediately
+    token = _context.set_current_turn(ctx)
+    try:
+        for _i in range(2):
+            await hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "memory/x.md"},
+                    "tool_use_id": "tu",
+                    # No session_id — forces contextvar fallback.
+                },
+                "tu",
+                _ctx(),
+            )
+    finally:
+        _context.reset_current_turn(token)
+
+    events = _read_events(tmp_path)
+    denies = [
+        e
+        for e in events
+        if e.get("type") == "tool_call_denied"
+        and e.get("reason") == "tool_call_budget_exceeded"
+    ]
+    assert denies, "expected a tool_call_denied event"
+    assert all(e.get("resolution_path") == "contextvar" for e in denies)
+
+
 @_pytest.mark.asyncio
 async def test_pre_hook_budget_zero_disables_check(tmp_path: Path):
     hook = make_pre_tool_use_hook(tmp_path)
