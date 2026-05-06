@@ -353,7 +353,7 @@ class Config:
             recent_message_chars=_env_int("MIMIR_RECENT_MESSAGE_CHARS", 4096),
 
             saga_session_idle_minutes=_env_int("MIMIR_SAGA_SESSION_IDLE_MINUTES", 10),
-            saga_consolidate_cron=_env("MIMIR_SAGA_CONSOLIDATE_CRON", "0 4 * * 0"),
+            saga_consolidate_cron=_env("MIMIR_SAGA_CONSOLIDATE_CRON", "0 4 * * *"),
             introspection_report_cron=_env(
                 "MIMIR_INTROSPECTION_REPORT_CRON", "0 14 * * 5",
             ),

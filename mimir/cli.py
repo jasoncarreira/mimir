@@ -136,8 +136,8 @@ DEFAULT_SCHEDULER_YAML = dedent(
     # Two non-LLM crons are auto-installed by the runtime (no entry
     # needed here):
     #
-    #   - saga-consolidate: weekly atom merge / synthesis pass
-    #     (MIMIR_SAGA_CONSOLIDATE_CRON, default Sun 04:00).
+    #   - saga-consolidate: nightly atom merge / synthesis pass
+    #     (MIMIR_SAGA_CONSOLIDATE_CRON, default 04:00 daily).
     #   - introspection-report: weekly behavioral / health snapshot
     #     written to state/reports/ with algedonic emit on degraded
     #     heartbeat success rate (MIMIR_INTROSPECTION_REPORT_CRON,
