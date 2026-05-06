@@ -76,7 +76,7 @@ storage) and is served by the worst-fit transport for either.
 Container layout (proposed):
 
   /mimir-home/                   ← Docker volume (overlay2, no bind-mount)
-    .git/                        ← git repo init'd here; remote = jasoncarreira/mimirbot (private)
+    .git/                        ← git repo init'd here; remote = jasoncarreira/mimirbot-state (private)
     memory/                      ← tracked
     prompts/                     ← tracked
     state/
@@ -378,9 +378,12 @@ First-container-start:
 set -euo pipefail
 
 apply_git_identity() {
-  # Locked answer #3: both fields = jcarreira@gmail.com.
-  git -C /mimir-home config user.name  "jcarreira@gmail.com"
-  git -C /mimir-home config user.email "jcarreira@gmail.com"
+  # Locked answer #3 (revised 2026-05-06 msg 1501603018377007295):
+  # mimir@muninnai.ai with no GitHub-account association — commits will
+  # show in log without avatar attribution, which is the desired shape
+  # for a non-human committer identity.
+  git -C /mimir-home config user.name  "mimir"
+  git -C /mimir-home config user.email "mimir@muninnai.ai"
 }
 
 inject_token_into_url() {
@@ -461,11 +464,13 @@ volume."
 Pre-migration state (after 4a + 4b):
 - `<mimirbot>/state/home/.git/` exists, has the bootstrap commit and
   whatever per-turn commits accumulated.
-- `MIMIR_STATE_REPO=https://github.com/jasoncarreira/mimirbot.git`
+- `MIMIR_STATE_REPO=https://github.com/jasoncarreira/mimirbot-state.git`
   set in `.env`.
-- `GITHUB_TOKEN` already in `.env`.
-- The repo `jasoncarreira/mimirbot` exists on GitHub (private,
-  pre-created by operator).
+- `GITHUB_TOKEN` already in `.env`, scoped to both
+  `jasoncarreira/mimirbot` and `jasoncarreira/mimirbot-state`.
+- Both repos exist on GitHub (private, pre-created by operator).
+  `mimirbot-state` is mimir's push target; `mimirbot` is the
+  operator-side compose/README repo.
 
 One-shot operator script:
 
@@ -517,21 +522,32 @@ One-shot operator script:
 
 ## Locked answers
 
-Operator decisions (2026-05-06, msg 1501603003994476787) on the six
-open questions from the v1 draft. Carried through into the rest of
-this spec.
+Operator decisions on the six open questions from the v1 draft.
+Initial answers in msg 1501603003994476787; revisions to #1, #2, #3
+in msg 1501603018377007295. Carried through into the rest of this
+spec.
 
-1. **GitHub repo:** `jasoncarreira/mimirbot` (private). Operator will
-   create the repo before PR 4c lands. **Distinct from the host-side
-   `~/projects/odin/mimirbot/` directory** — different thing, do not
-   conflate. Container env: `MIMIR_STATE_REPO=https://github.com/jasoncarreira/mimirbot.git`.
-2. **Auth:** HTTPS + the existing `GITHUB_TOKEN` from `.env`. Reuse
-   what's already wired into the container; no new secret to manage.
-   Push URL embeds the token at clone-time:
-   `https://${GITHUB_TOKEN}@github.com/jasoncarreira/mimirbot.git`.
-3. **Committer identity:** `user.name = jcarreira@gmail.com` and
-   `user.email = jcarreira@gmail.com` (both fields). Commits attribute
-   to operator's GitHub account, not a bot identity.
+1. **GitHub repos — two of them, separate concerns:**
+   - `jasoncarreira/mimirbot` — operator-side repo for the
+     `docker-compose.yml`, README, host-side scripts, the
+     `.env.example`. Operator-curated; mimir does not push here.
+     Distinct from the host-side `~/projects/odin/mimirbot/`
+     directory — different thing, don't conflate.
+   - `jasoncarreira/mimirbot-state` — **mimir's push target.** The
+     remote for `/mimir-home`'s `.git/`. Container env:
+     `MIMIR_STATE_REPO=https://github.com/jasoncarreira/mimirbot-state.git`.
+   Both private. Operator creates both before PR 4c lands.
+2. **Auth:** existing PAT (`GITHUB_TOKEN` in `.env`), expanded by
+   operator to cover both new repos. Reuse what's already wired into
+   the container; no new secret to manage. Mimir's auto-push only
+   targets `mimirbot-state`, but the same token grants access to
+   `mimirbot` for whatever operator-side workflows need it. Push URL
+   embeds the token at clone-time:
+   `https://${GITHUB_TOKEN}@github.com/jasoncarreira/mimirbot-state.git`.
+3. **Committer identity:** `user.name = "mimir"`, `user.email =
+   "mimir@muninnai.ai"`. The email has no associated GitHub account
+   — that's intentional; commits will show in the log without avatar
+   attribution, which is the desired shape for a non-human committer.
 4. **state/INDEX.md:** tracked. Diff value > regen noise.
 5. **Push cadence:** debounce-then-push at 60s, **not** per-turn-push.
    Skip both the commit and the push when `git status --porcelain` is
@@ -568,7 +584,7 @@ Unit tests (new `tests/test_git_tracking.py`):
 - Allowlist `.gitignore`: verify `atoms.db` placed under tracked dirs
   is still excluded from `git add -A`.
 - `inject_token_into_url`: `MIMIR_STATE_REPO` + `GITHUB_TOKEN`
-  produces `https://${TOKEN}@github.com/jasoncarreira/mimirbot.git`
+  produces `https://${TOKEN}@github.com/jasoncarreira/mimirbot-state.git`
   (token is URL-encoded if it contains special chars).
 - `mimir.health.git_status_summary()` returns `(count, paths[:3])`,
   with truncation suffix when `count > 3`.
