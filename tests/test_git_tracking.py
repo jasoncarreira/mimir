@@ -172,9 +172,14 @@ async def test_commit_and_schedule_push(
     home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _short_debounce(monkeypatch, 0.05)
-    # No remote configured → push will fail, but that's the point of
-    # this assertion: we want to see the push *attempt*, captured as
-    # git_push_failed in events.
+    # PR 4b: ``_debounced_push`` skips silently when no remote is
+    # configured. We want to see the push *attempt* fail here, so add
+    # a remote pointing to a nonexistent path — push will then attempt
+    # the dial and surface a GitError → git_push_failed event.
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
     (home_repo / "memory").mkdir()
     (home_repo / "memory" / "x.md").write_text("hello\n")
 
@@ -213,6 +218,10 @@ async def test_debounce_coalesces_burst_to_single_push(
     exactly 1 push (the prior 4 push tasks are cancelled before
     firing)."""
     _short_debounce(monkeypatch, 0.10)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
 
     (home_repo / "memory").mkdir()
     push_calls = []
@@ -345,6 +354,10 @@ async def test_push_timeout_logs_git_push_failed(
     — verify we surface ``git_push_failed`` with reason='timeout'."""
     _short_debounce(monkeypatch, 0.02)
 
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
     real_git = git_tracking._git
 
     async def flaky_git(*args: str, **kwargs: Any) -> Any:
@@ -396,6 +409,52 @@ async def test_status_failure_emits_git_commit_failed(
     assert len(failures) == 1
     assert failures[0]["stage"] == "status"
     assert "git binary missing" in failures[0]["error"]
+
+
+# ─── PR 4b: no-remote skips push silently ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_no_remote_skips_push_silently(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR 4b: when no ``origin`` remote is configured, the debounced
+    push must skip silently — no ``git push`` invocation, no
+    ``git_push_failed`` event spam every turn for what is actually a
+    deliberate "init-only, no push target" configuration."""
+    _short_debounce(monkeypatch, 0.05)
+    push_calls = []
+    real_git = git_tracking._git
+
+    async def counting_git(*args: str, **kwargs: Any) -> Any:
+        if args and args[0] == "push":
+            push_calls.append(args)
+        return await real_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_git", counting_git)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("hello\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home_repo, enabled=True,
+    )
+
+    # The commit landed even without a remote.
+    log = subprocess.run(
+        ["git", "log", "--oneline"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout
+    assert log.count("\n") == 2
+
+    # Wait past debounce.
+    assert git_tracking._pending_push_task is not None
+    await asyncio.wait_for(git_tracking._pending_push_task, timeout=2.0)
+
+    # Push was NOT invoked, and no failure event surfaced.
+    assert push_calls == []
+    events = _read_events(tmp_path)
+    push_failures = [e for e in events if e["type"] == "git_push_failed"]
+    assert push_failures == []
 
 
 # ─── porcelain summary helper ───────────────────────────────────────
@@ -460,3 +519,41 @@ def test_git_status_summary_dirty_under_topn(home_repo: Path) -> None:
     count, paths = health.git_status_summary(home_repo, top_n=3)
     assert count == 2
     assert paths == ["memory/a.md", "memory/b.md"]
+
+
+# ─── PR 4b: render_git_status_line ──────────────────────────────────
+
+
+def test_render_git_status_line_clean_returns_none(home_repo: Path) -> None:
+    assert health.render_git_status_line(home_repo) is None
+
+
+def test_render_git_status_line_uninit_returns_none(tmp_path: Path) -> None:
+    home = tmp_path / "no-git"
+    home.mkdir()
+    assert health.render_git_status_line(home) is None
+
+
+def test_render_git_status_line_singular_file(home_repo: Path) -> None:
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("x\n")
+    line = health.render_git_status_line(home_repo)
+    assert line is not None
+    # Singular noun, count 1, the path, and the home prefix all present.
+    assert ": 1 file —" in line
+    assert "memory/x.md" in line
+    assert str(home_repo) in line
+
+
+def test_render_git_status_line_plural_with_truncation(home_repo: Path) -> None:
+    (home_repo / "memory").mkdir()
+    for c in "abcdef":
+        (home_repo / "memory" / f"{c}.md").write_text(f"{c}\n")
+    line = health.render_git_status_line(home_repo, top_n=3)
+    assert line is not None
+    assert ": 6 files —" in line
+    assert "memory/a.md" in line
+    assert "memory/c.md" in line
+    assert "…+3" in line
+    # Truncated paths should NOT appear in the rendered text.
+    assert "memory/f.md" not in line
