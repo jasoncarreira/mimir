@@ -308,12 +308,21 @@ class Config:
     capture_rate_limits: bool
 
     # PR 4a (MIMIR_HOME_GIT_TRACKING): post-turn git commit + debounced
-    # push for /mimir-home. Default off so PR 4a lands inert ahead of
-    # the gitignore + secret-scan hook (PR 4b). When True, the agent's
-    # post-message phase calls ``git_tracking.commit_turn_changes``.
-    # Set ``MIMIR_GIT_TRACKING_ENABLED=true`` once PR 4b's gitignore +
-    # ``mimir setup`` flow lands.
+    # push for /mimir-home. PR 4b ships the allowlist gitignore +
+    # pre-commit secret-scan hook + ``git_bootstrap.bootstrap_git_repo``
+    # called from ``mimir setup`` and from ``server._on_startup``, and
+    # flips this default to True. Operators that want to opt out (e.g.
+    # standalone CI runs, transient containers) can still set
+    # ``MIMIR_GIT_TRACKING_ENABLED=false`` in the env.
     git_tracking_enabled: bool
+    # PR 4b: optional remote-bootstrap inputs. When both are set, the
+    # bootstrap function clones the remote into an empty home (or
+    # configures origin + pulls --ff-only on an existing repo). When
+    # either is missing, the bootstrap falls back to ``git init`` +
+    # bootstrap commit (no remote, no auto-push). Token is URL-encoded
+    # into the embedded HTTPS URL — never logged in cleartext.
+    git_state_repo: str | None
+    git_state_token: str | None
 
     # Logging — JSONL caps clamped to [1, _LOG_CAP_MAX]. Default 1000.
     # Both files are tail-streamed at read time, so the cap is mostly
@@ -441,7 +450,9 @@ class Config:
                 "MIMIR_HEALTH_PROBE_MAX_RESTARTS_PER_HOUR", 3,
             ),
 
-            git_tracking_enabled=_env_bool("MIMIR_GIT_TRACKING_ENABLED", False),
+            git_tracking_enabled=_env_bool("MIMIR_GIT_TRACKING_ENABLED", True),
+            git_state_repo=_env("MIMIR_STATE_REPO"),
+            git_state_token=_env("GITHUB_TOKEN"),
 
             max_turns_kept=_turns_cap(),
             max_events_kept=_events_cap(),

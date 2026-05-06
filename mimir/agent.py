@@ -55,6 +55,7 @@ from .config import Config
 from .event_logger import log_event
 from .feedback import FeedbackLog
 from . import git_tracking
+from . import health
 from .history import MessageBuffer
 from .rate_limits import (
     RateLimitStore,
@@ -1148,7 +1149,8 @@ class Agent:
     def _assemble_self_state_block(self) -> str | None:
         """v0.5+ §12.4: render the `## Self-state` block — homeostat's
         view of the four layered constraints (plan window / cost rate /
-        S3-S4 share / tokens), plus per-turn skill bucket telemetry
+        S3-S4 share / tokens), plus the PR 4b ``uncommitted in
+        /mimir-home`` line and per-turn skill bucket telemetry
         (chainlink #15 — moved out of the system prompt's `## Skills`
         block so a skill invocation doesn't bust the prompt-cache
         prefix). Returns None when the homeostat has nothing useful to
@@ -1159,12 +1161,35 @@ class Agent:
         except Exception:  # noqa: BLE001
             log.exception("_assemble_self_state_block (arbiter) failed; skipping")
             arbiter_body = None
+        git_line = self._assemble_git_status_line()
         skill_body = self._assemble_skill_telemetry_lines()
-        if not arbiter_body and not skill_body:
+        parts = [s for s in (arbiter_body, git_line, skill_body) if s]
+        if not parts:
             return None
-        if arbiter_body and skill_body:
-            return f"{arbiter_body}\n{skill_body}"
-        return arbiter_body or skill_body
+        return "\n".join(parts)
+
+    def _assemble_git_status_line(self) -> str | None:
+        """PR 4b: ``- uncommitted in /mimir-home: <count> file(s) — <topN>``
+        line for the Self-state block. Catches the case where commits
+        failed (secret-scan refused, push outage during operator
+        intervention, manual edits left the tree dirty). Suppressed when:
+
+        - ``MIMIR_GIT_TRACKING_ENABLED`` is False (tracking off entirely)
+        - count == 0 (the common case — clean tree)
+        - ``health.git_status_summary`` errored (returns (0, []))
+
+        Synchronous: runs on the prompt-render path, which is itself
+        synchronous. ``git_status_summary`` blocks the caller for ~5-10ms.
+        Rendering lives in ``health.render_git_status_line`` so other
+        surfaces (CLI, web UI) can reuse the exact same output.
+        """
+        if not self._config.git_tracking_enabled:
+            return None
+        try:
+            return health.render_git_status_line(self._config.home)
+        except Exception:  # noqa: BLE001
+            log.exception("_assemble_git_status_line failed; skipping")
+            return None
 
     def _assemble_skill_block(self) -> str | None:
         """v0.5+ §12.3: render the system-prompt `## Skills` block —

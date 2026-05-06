@@ -50,6 +50,7 @@ include = [
     "mimir/skills/**/*.md",
     "mimir/skills/**/*.json",
     "mimir/skills/**/*.py",
+    "mimir/templates/**/*",
     "mimir/turn_viewer.html",
 ]
 
