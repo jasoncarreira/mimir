@@ -296,6 +296,14 @@ class Config:
     # streaming overhead at the cost of less-current plan-window data.
     capture_rate_limits: bool
 
+    # PR 4a (MIMIR_HOME_GIT_TRACKING): post-turn git commit + debounced
+    # push for /mimir-home. Default off so PR 4a lands inert ahead of
+    # the gitignore + secret-scan hook (PR 4b). When True, the agent's
+    # post-message phase calls ``git_tracking.commit_turn_changes``.
+    # Set ``MIMIR_GIT_TRACKING_ENABLED=true`` once PR 4b's gitignore +
+    # ``mimir setup`` flow lands.
+    git_tracking_enabled: bool
+
     # Logging — JSONL caps clamped to [1, _LOG_CAP_MAX]. Default 1000.
     # Both files are tail-streamed at read time, so the cap is mostly
     # about cumulative on-disk size; the trim logic uses 10% hysteresis
@@ -414,6 +422,8 @@ class Config:
             oauth_refresh_warn_days=_env_int(
                 "MIMIR_OAUTH_REFRESH_WARN_DAYS", 25,
             ),
+
+            git_tracking_enabled=_env_bool("MIMIR_GIT_TRACKING_ENABLED", False),
 
             max_turns_kept=_turns_cap(),
             max_events_kept=_events_cap(),
