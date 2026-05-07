@@ -129,9 +129,10 @@ DEFAULT_SCHEDULER_YAML = dedent(
     #     state/heartbeat-backlog.md and does it. The §12.4 homeostat
     #     suppresses fires when the plan window saturates or cost rate
     #     trips, so this default is safe even at hourly cadence.
-    #   - reflect: weekly cross-session audit (Sunday 06:00 UTC, two
-    #     hours after the SAGA consolidation cron at 04:00 so the
-    #     reflection turn reads post-consolidation state).
+    #   - reflect: weekly cross-session audit (Sunday 06:00 UTC). The
+    #     SAGA consolidation cron runs nightly at 04:00 UTC, so by the
+    #     time reflection fires Sunday morning the most recent
+    #     consolidation pass is two hours old.
     #
     # Two non-LLM crons are auto-installed by the runtime (no entry
     # needed here):
