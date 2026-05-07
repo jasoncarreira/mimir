@@ -180,6 +180,98 @@ async def test_idle_timer_defers_when_dispatcher_reports_busy():
 
 
 @pytest.mark.asyncio
+async def test_touch_cancels_in_flight_fire_idle_task_after_timer_fired():
+    """CR#3 regression: once the timer has fired, ``idle_handle`` is the
+    spawned ``_fire_idle`` task — not the (now-spent) TimerHandle. ``touch``
+    must cancel that inner task so a delayed ``_fire_idle`` can't end the
+    just-touched session.
+
+    Without this fix, the ``TimerHandle.cancel()`` in ``touch`` was a no-op
+    once the timer had already fired, and only the saga-session-id bail
+    check inside ``_fire_idle`` saved us under bursty churn.
+    """
+    fired: list[ChannelSession] = []
+
+    async def on_idle(session: ChannelSession) -> None:
+        fired.append(session)
+
+    mgr = SessionManager(idle_minutes=60, on_idle=on_idle)
+    s = await mgr.touch("c1")
+    saga_id = s.saga_session_id
+
+    # Force the timer to fire immediately. The scheduled callback
+    # synchronously spawns the _fire_idle task and swaps idle_handle from
+    # TimerHandle → Task; the task itself hasn't started executing yet
+    # (asyncio.create_task only schedules it).
+    timer_handle = s.idle_handle
+    assert isinstance(timer_handle, asyncio.TimerHandle)
+    timer_handle._run()  # run the call_later callback synchronously
+    timer_handle.cancel()  # don't let the loop run it again
+
+    assert isinstance(s.idle_handle, asyncio.Task), (
+        "fire callback must replace idle_handle with the spawned task"
+    )
+    in_flight_task = s.idle_handle
+
+    # touch() before the in-flight task gets a chance to run.
+    s2 = await mgr.touch("c1")
+    assert s2 is s
+    assert s2.saga_session_id == saga_id
+
+    # Yield so the cancelled task gets a chance to surface its cancellation.
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert in_flight_task.cancelled() or in_flight_task.done(), (
+        "touch() must cancel the in-flight _fire_idle task"
+    )
+    # Synthesis must not have fired — the session is alive and just touched.
+    assert fired == []
+    assert "c1" in mgr._sessions
+    assert mgr._sessions["c1"].ended is False
+    # And idle_handle is back to a fresh TimerHandle armed by touch().
+    assert isinstance(mgr._sessions["c1"].idle_handle, asyncio.TimerHandle)
+
+
+@pytest.mark.asyncio
+async def test_fire_callback_is_no_op_for_replaced_session():
+    """If the session has been replaced (or ``end_now`` ran) between the
+    timer being scheduled and it firing, the timer callback must not spawn
+    a stale ``_fire_idle`` task against the new session."""
+    fired: list[ChannelSession] = []
+
+    async def on_idle(session: ChannelSession) -> None:
+        fired.append(session)
+
+    mgr = SessionManager(idle_minutes=60, on_idle=on_idle)
+    s_old = await mgr.touch("c1")
+    timer_handle = s_old.idle_handle
+    assert isinstance(timer_handle, asyncio.TimerHandle)
+
+    # Simulate a race: the session got force-ended (end_now) before the
+    # timer's callback ran. The callback must notice and bail rather than
+    # spawning a task that would re-end the (now ended) session, or worse,
+    # interfere with whatever fresh session a subsequent touch() created.
+    await mgr.end_now("c1")
+    assert len(fired) == 1  # end_now itself triggers the synthesis callback
+    fired.clear()
+
+    s_new = await mgr.touch("c1")
+    assert s_new.saga_session_id != s_old.saga_session_id
+
+    # Now run the *old* timer's callback synchronously — the session it was
+    # bound to is gone; the callback must not spawn a stale task.
+    timer_handle._run()
+    timer_handle.cancel()
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert fired == [], "stale timer callback should not have synthesized"
+    assert mgr._sessions["c1"] is s_new
+    assert s_new.ended is False
+
+
+@pytest.mark.asyncio
 async def test_set_is_busy_can_be_wired_after_construction():
     """``set_is_busy`` lets the server wire the dispatcher's predicate after
     both objects exist (same pattern as ``set_on_idle``)."""

@@ -45,7 +45,15 @@ class ChannelSession:
     started_at: float
     last_message_at: float
     turn_count: int = 0
-    idle_handle: asyncio.TimerHandle | None = field(default=None, repr=False)
+    # Either the not-yet-fired ``TimerHandle`` (between ``_schedule_idle`` and
+    # the timer firing) or the ``_fire_idle`` ``asyncio.Task`` (after the
+    # timer fires and before the task completes). Tracking the task — not
+    # just the timer — is what makes ``touch()`` cancellation reliable: a
+    # plain ``TimerHandle.cancel()`` after the timer has already fired is a
+    # no-op, leaving an in-flight ``_fire_idle`` task behind. See CR#3.
+    idle_handle: asyncio.TimerHandle | asyncio.Task | None = field(
+        default=None, repr=False
+    )
     ended: bool = False
 
 
@@ -156,10 +164,23 @@ class SessionManager:
 
     def _schedule_idle(self, session: ChannelSession) -> asyncio.TimerHandle:
         loop = asyncio.get_running_loop()
-        return loop.call_later(
-            self._idle_seconds,
-            lambda: asyncio.create_task(self._fire_idle(session.saga_session_id, session.channel_id)),
-        )
+
+        def _on_timer_fired() -> None:
+            # Synchronously (on the event loop) spawn the _fire_idle task and
+            # swap the session's idle_handle from the now-fired TimerHandle to
+            # the task. Subsequent ``touch()``/``end_now()``/``shutdown()``
+            # calls will cancel the task (cancelling a fired TimerHandle is a
+            # no-op). Guarded so a session that's already been replaced or
+            # ended between scheduling and firing doesn't spawn a stale task.
+            current = self._sessions.get(session.channel_id)
+            if current is not session or session.ended:
+                return
+            task = asyncio.create_task(
+                self._fire_idle(session.saga_session_id, session.channel_id)
+            )
+            session.idle_handle = task
+
+        return loop.call_later(self._idle_seconds, _on_timer_fired)
 
     async def _fire_idle(self, saga_session_id: str, channel_id: str) -> None:
         # Defer if the dispatcher reports the channel is busy (queued events
