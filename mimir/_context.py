@@ -21,6 +21,36 @@ registers the turn under its ``turn_id``, hooks pass their incoming
 ``session_id`` (which is ``ctx.turn_id`` since stage 2 of the ClaudeSDKClient
 migration) to ``get_turn_by_session_id`` for a reliable lookup that doesn't
 depend on task-fork inheritance.
+
+**MCP tool dispatch hits the same pattern (chainlink #23).** Every MCP
+``tools/call`` control request lands in
+``Query._spawn_control_request_handler`` (SDK internals,
+``claude_agent_sdk/_internal/query.py:232``), which calls
+``spawn_detached`` to run the handler on a fresh asyncio task. That task
+captures contextvars from the SDK's read-loop task — forked at connect
+time, where ``_current_turn`` was ``None``. So the same staleness affects
+MCP-dispatched tools (``saga_query``, ``saga_store``, ``saga_feedback``,
+``saga_end_session``) as PreToolUse / PostToolUse hooks.
+
+The hook fix uses ``input_data["session_id"]`` which the SDK forwards on
+every hook callback. The MCP path is **asymmetric** — the SDK only
+forwards ``(server_name, mcp_message)`` to the MCP handler; per-call
+session_id is dropped at the boundary. So MCP tools can't use the same
+fix shape as hooks.
+
+The two helpers below cover the lookups available to MCP tool handlers:
+
+- ``get_turn_by_saga_session_id(saga_session_id)`` — for tools whose args
+  carry the saga_session_id (currently just ``saga_end_session``). Iterates
+  ``_active_turns`` matching ``ctx.saga_session_id``.
+- ``get_only_active_turn()`` — best-effort heuristic for tools whose args
+  don't carry any per-turn key. Returns the single active turn if exactly
+  one is registered, else ``None``. Works in single-channel deployments;
+  multi-active cases must be surfaced via observability events rather than
+  silently picking one.
+
+See ``state/spec/chainlink-23-saga-mcp-context-resolution.md`` for the
+full design and the per-tool migration sequence.
 """
 
 from __future__ import annotations
@@ -65,3 +95,41 @@ def get_turn_by_session_id(session_id: str | None) -> "TurnContext | None":
     if not session_id:
         return None
     return _active_turns.get(session_id)
+
+
+def get_turn_by_saga_session_id(saga_session_id: str | None) -> "TurnContext | None":
+    """Look up an active turn by its ``saga_session_id``. Used by MCP
+    tool handlers whose args carry a ``saga_session_id`` (currently
+    ``saga_end_session``) where the SDK's task-fork dispatch breaks
+    contextvar inheritance (chainlink #23).
+
+    Iterates ``_active_turns.values()`` rather than maintaining a parallel
+    registry — active_turns is bounded by the dispatcher's per-channel
+    queue size (typically 1-3 in production), so the linear scan is cheap.
+
+    Returns ``None`` when ``saga_session_id`` is empty / None, or when no
+    active turn matches. Caller should fall back to ``get_current_turn``
+    (which works for direct-handler-call paths, e.g. unit tests) or
+    treat as "no active turn" and skip per-turn bookkeeping."""
+    if not saga_session_id:
+        return None
+    for ctx in _active_turns.values():
+        if ctx.saga_session_id == saga_session_id:
+            return ctx
+    return None
+
+
+def get_only_active_turn() -> "TurnContext | None":
+    """Return the unique active turn if exactly one is registered, else
+    ``None``. Best-effort heuristic for MCP tool handlers whose args
+    don't carry any per-turn lookup key (``saga_query``, ``saga_store``,
+    ``saga_feedback``) — works in single-channel deployments where
+    concurrent turns are serialized by the dispatcher.
+
+    Multi-active cases (multiple channels with concurrent in-flight
+    turns) return ``None`` rather than guessing — callers should emit a
+    ``resolution_path`` observability event so the rate at which the
+    heuristic punts is visible. See chainlink #23 design doc."""
+    if len(_active_turns) == 1:
+        return next(iter(_active_turns.values()))
+    return None
