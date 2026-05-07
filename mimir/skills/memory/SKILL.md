@@ -40,8 +40,13 @@ Organize however helps you. Common shapes:
 - `memory/channels/<channel_id>/<slug>.md` — channel-scoped notes (no
   cross-channel race; only that channel's worker writes here). Things
   that only matter inside one conversation belong here.
-- `memory/shared/<slug>.md` — cross-channel facts that don't need a
-  graph: one-off observations, durable facts that stand alone.
+- `memory/issues/<slug>.md` — operational gotchas. Fingerprint-shaped
+  runbooks for issues mimir might hit again (infra failure modes,
+  config tripwires, surprising tool behaviors). Each entry surfaces in
+  `memory/INDEX.md` (every-turn prompt) so the description line acts
+  as a hash-lookup against a future symptom. **Filing question:** "is
+  this an operational issue I might hit and want flagged in the
+  every-turn INDEX?" Yes → here.
 
 For people, recurring topics, concepts, and anything else that benefits
 from cross-references (a graph of who-relates-to-whom, which-concept-
@@ -107,8 +112,13 @@ follow-ups.
 - **Topics, projects, concepts that recur**: `state/wiki/topics/` for
   concrete subjects, `state/wiki/concepts/` for abstract ideas. Use
   wikilinks `[[name]]` to connect to related entities and other topics.
-- **One-off cross-channel facts**: `memory/shared/<slug>.md`. Standalone,
-  no graph needed.
+- **Operational gotchas / fingerprint runbooks** (issues mimir might
+  hit again): `memory/issues/<slug>.md`. Surfaces in the every-turn
+  `memory/INDEX.md` description list — the WHY for paying that prompt
+  cost is right there in the directory name.
+- **One-off cross-channel facts** (concept/topic shape, doesn't fit
+  the operational-gotcha mould): `state/wiki/concepts/` or
+  `state/wiki/topics/` — see wiki skill.
 - **Schedules**: `scheduler.yaml` for cron-driven prompts, plus a pinned core
   block when the schedule is core to your identity.
 - **Environment**: the agent home you run in is your body. Keep careful watch

@@ -1626,8 +1626,8 @@ class Agent:
                 # on saga_query / saga_store / saga_feedback /
                 # saga_mark_contributions tool calls. Required because the
                 # SDK's MCP dispatch path runs handlers on a fresh task that
-                # can't see ``_current_turn`` (memory/shared/mcp-tool-
-                # contextvar-stale.md).
+                # can't see ``_current_turn``
+                # (state/wiki/concepts/mcp-tool-contextvar-stale.md).
                 saga_session_id=ctx.saga_session_id,
             )
 

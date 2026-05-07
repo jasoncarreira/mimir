@@ -42,7 +42,9 @@ Skim the turn summaries below. If anything is worth remembering long-term
 useful context for future sessions — write or edit files under:
 
   memory/channels/{channel_id}/   # channel-specific notes
-  memory/shared/                  # cross-channel facts
+  memory/issues/                  # operational gotchas (every-turn-INDEX surfacing)
+  state/wiki/concepts/            # cross-channel patterns / frameworks
+  state/wiki/topics/              # cross-channel long-form synthesis
   memory/learnings-pending.md     # candidate learned behaviors (see below)
 
 If the session surfaced something that *might* be a durable behavior
