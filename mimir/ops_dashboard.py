@@ -157,18 +157,23 @@ def compute_stats(events: list[dict[str, Any]], days: int) -> dict[str, Any]:
 
         if _is_failure_kind(kind):
             failures_by_kind[kind] += 1
-            if len(recent_failures) < _RECENT_FAILURES_CAP * 2:
-                # Collect more than we'll ultimately surface so the
-                # tail-trim below picks the most-recent N.
-                recent_failures.append({
-                    "t": ts.isoformat(),
-                    "kind": kind,
-                    "channel_id": record.get("channel_id"),
-                    "trigger": record.get("trigger"),
-                    "detail": _failure_detail(record),
-                })
+            # Collect every failure in the window. ``_load_events``
+            # iterates the file in append order (oldest first), so an
+            # earlier "stop after N" cap during this loop would keep
+            # the OLDEST N — exactly the wrong end for a "recent
+            # failures" surface. Memory is bounded by failures-in-
+            # window × ~200 chars per entry; even pathological cases
+            # (10k failures over 7d) stay under a few MB.
+            recent_failures.append({
+                "t": ts.isoformat(),
+                "kind": kind,
+                "channel_id": record.get("channel_id"),
+                "trigger": record.get("trigger"),
+                "detail": _failure_detail(record),
+            })
 
-    # Sort recent failures most-recent-first and cap.
+    # Sort most-recent-first across the full set, then trim to the
+    # cap so the rendered table stays scannable.
     recent_failures.sort(key=lambda x: x["t"], reverse=True)
     recent_failures = recent_failures[:_RECENT_FAILURES_CAP]
 

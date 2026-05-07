@@ -240,6 +240,58 @@ def test_compute_stats_recent_failures_capped_and_sorted(tmp_path: Path):
     assert "failure-" in rf[0]["detail"]
 
 
+def test_compute_stats_recent_failures_keeps_newest_when_over_cap(tmp_path: Path):
+    """Regression for Mimir's PR review catch: the prior implementation
+    capped during accumulation, keeping the OLDEST 60 failures encountered
+    (since _load_events walks oldest-first), then sort-descending picked
+    the latest 30 of those 60 — silently dropping anything past position
+    60. With >60 failures in the window, the dashboard would have shown
+    the 30-most-recent-of-the-oldest-60, not the 30-most-recent-overall.
+
+    This generates 80 failures spread across 7 days where the *latest 10*
+    carry distinct ``signature-N`` strings; the assertion pins that those
+    latest signatures appear in the rendered output. With the prior bug
+    they never even made it into the recent_failures list."""
+    log = tmp_path / "events.jsonl"
+    records = []
+    # 70 "old" failures, oldest first, all with the same noise string.
+    # Land within the window but well past the latest-10 below.
+    for i in range(70):
+        records.append({
+            "timestamp": _ts(6.0 - i * 0.05),  # day 6 down to ~day 2.5
+            "type": "git_push_failed",
+            "error": "old-noise",
+        })
+    # Latest 10 — distinct signatures, very recent.
+    for i in range(10):
+        records.append({
+            "timestamp": _ts(0.5 - i * 0.01),
+            "type": "oauth_quota_anomalous",
+            "detail": f"signature-{i}",
+        })
+    _write_events(log, records)
+
+    payload = build_dashboard_payload(log, days=7)
+    rf = payload["recent_failures"]
+    assert len(rf) == 30
+
+    # Each of the latest 10 ``signature-N`` strings must appear in the
+    # rendered list. With the prior cap-during-append bug they're
+    # absent (the cap kept the oldest 60 from ``records``, none of
+    # which carried these signatures).
+    rendered_details = {entry["detail"] for entry in rf}
+    for i in range(10):
+        assert f"signature-{i}" in rendered_details, (
+            f"signature-{i} missing — recent_failures cap is dropping "
+            f"newest entries. Rendered details: {sorted(rendered_details)}"
+        )
+
+    # And the rendered kinds should include the newer
+    # ``oauth_quota_anomalous`` events, not just ``git_push_failed``.
+    rendered_kinds = {entry["kind"] for entry in rf}
+    assert "oauth_quota_anomalous" in rendered_kinds
+
+
 def test_compute_stats_recent_failures_pulls_from_alt_fields(tmp_path: Path):
     """``_failure_detail`` walks a few candidate fields — error /
     reason / stderr / message / detail / stage."""
