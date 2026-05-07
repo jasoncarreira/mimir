@@ -17,7 +17,7 @@ def test_setup_creates_home_layout(tmp_path: Path):
     assert (home / "logs").is_dir()
     assert (home / "memory" / "core").is_dir()
     assert (home / "memory" / "channels").is_dir()
-    assert (home / "memory" / "shared").is_dir()
+    assert (home / "memory" / "issues").is_dir()
     assert (home / "state").is_dir()
     # Wiki layer + raw source store (Karpathy's LLM Wiki pattern).
     assert (home / "state" / "raw").is_dir()
