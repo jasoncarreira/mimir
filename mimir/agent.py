@@ -1621,6 +1621,14 @@ class Agent:
                 usage_block=usage_block,
                 upcoming_block=upcoming_block,
                 self_state_block=self_state_block,
+                # chainlink #23 #26 Option P: surface this turn's
+                # saga_session_id so the model can pass it as ``session_id``
+                # on saga_query / saga_store / saga_feedback /
+                # saga_mark_contributions tool calls. Required because the
+                # SDK's MCP dispatch path runs handlers on a fresh task that
+                # can't see ``_current_turn`` (memory/shared/mcp-tool-
+                # contextvar-stale.md).
+                saga_session_id=ctx.saga_session_id,
             )
 
         core_blocks = load_core(self._config.home)

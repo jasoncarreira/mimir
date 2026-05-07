@@ -152,3 +152,66 @@ def test_turn_prompt_scheduled_tick_omits_msg_id():
     )
     prompt = build_turn_prompt(event)
     assert "msg_id" not in prompt
+
+
+# ---- saga_session_id surfacing for chainlink #23 #26 (Option P) ----
+
+
+def test_turn_prompt_includes_saga_session_id_in_user_message_header():
+    """chainlink #23 #26 Option P: the Current-message header must
+    surface ``saga_session_id: <id>`` so the model can pass it as the
+    ``session_id`` arg on saga_query / saga_store / saga_feedback /
+    saga_mark_contributions tool calls. Without it the MCP handler's
+    ctx-resolution chain can only fall through to single_active or
+    missing — fragile under multi-channel concurrency."""
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1",
+        content="hi",
+        author="discord-99",
+        source_id="msg-1",
+    )
+    prompt = build_turn_prompt(event, saga_session_id="saga-discord-1-abc123")
+    header_line = next(
+        line for line in prompt.splitlines() if line.startswith("[event_kind:")
+    )
+    assert "saga_session_id: saga-discord-1-abc123" in header_line
+
+
+def test_turn_prompt_includes_saga_session_id_in_scheduled_tick_header():
+    """Heartbeats and crons fire saga_query / saga_store too — the
+    saga_session_id needs to surface for ticks not just user messages
+    so heartbeat-driven tool calls can scope correctly."""
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        content="",
+    )
+    prompt = build_turn_prompt(event, saga_session_id="saga-scheduler-xyz")
+    header_line = next(
+        line for line in prompt.splitlines() if line.startswith("[scheduled_tick:")
+    )
+    assert "saga_session_id: saga-scheduler-xyz" in header_line
+
+
+def test_turn_prompt_omits_saga_session_id_when_unset():
+    """If no saga_session_id is passed (e.g. early bootstrap before
+    SAGA registration), the header omits the field rather than
+    rendering an empty/None value the model would echo verbatim."""
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1",
+        content="hi",
+        author="discord-99",
+    )
+    prompt = build_turn_prompt(event)  # no saga_session_id kwarg
+    assert "saga_session_id" not in prompt
