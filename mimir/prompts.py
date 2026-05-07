@@ -183,6 +183,7 @@ def build_turn_prompt(
     usage_block: str | None = None,
     upcoming_block: str | None = None,
     self_state_block: str | None = None,
+    saga_session_id: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, SAGA
     atom hits, subagent completion notifications (from prior turns), event
@@ -281,7 +282,13 @@ def build_turn_prompt(
         # the implicit caller), body is whatever the schedule.yaml entry
         # provided as ``prompt:``, falling back to HEARTBEAT_DEFAULT_PROMPT
         # when the entry was a bare scheduled tick with no instructions.
-        header = f"[scheduled_tick: {event.channel_id}, ts: {ts}]"
+        # saga_session_id surfaced for parity with user_message turns —
+        # heartbeat-driven saga_query / saga_store calls need it too
+        # (chainlink #23 #26 Option P).
+        saga_part = (
+            f", saga_session_id: {saga_session_id}" if saga_session_id else ""
+        )
+        header = f"[scheduled_tick: {event.channel_id}, ts: {ts}{saga_part}]"
         body = event.content or HEARTBEAT_DEFAULT_PROMPT
         sections.append(f"{header}\n{body}")
     else:
@@ -306,10 +313,20 @@ def build_turn_prompt(
         # to the just-sent assistant reply, which is the wrong target for
         # an "on it" ack — see memory/core/40-learned-behaviors.md).
         msg_id_part = f", msg_id: {event.source_id}" if event.source_id else ""
+        # Include the turn's saga_session_id so the agent can pass it as
+        # ``session_id`` on saga_query / saga_store / saga_feedback /
+        # saga_mark_contributions (chainlink #23 #26 — Option P). MCP tool
+        # dispatch runs on a fresh asyncio task forked from the SDK's
+        # read-loop; ``_current_turn`` is invisible inside that task. The
+        # model passing the session_id at tool-call construction time is
+        # the structural fit (skill-as-method-call pattern).
+        saga_part = (
+            f", saga_session_id: {saga_session_id}" if saga_session_id else ""
+        )
         sections.append(
             f"## ▶ Current message — respond to this\n\n"
             f"[event_kind: {event.trigger}, channel: {event.channel_id}, "
-            f"author: {header_author}, ts: {ts}{msg_id_part}]\n\n"
+            f"author: {header_author}, ts: {ts}{msg_id_part}{saga_part}]\n\n"
             f"{body}"
         )
 
