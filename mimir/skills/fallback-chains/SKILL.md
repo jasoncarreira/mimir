@@ -19,8 +19,8 @@ gone, the cookie expired). Each rung of the chain assumes the previous rung is b
 Three things make a chain useful rather than ceremonial:
 
 1. **Each layer covers a *different* failure mode.** Slack → Slack-via-different-bot
-   is not a chain; it's superstition. Slack → email → osascript dialog → ntfy.sh is a
-   chain — each rung survives the previous rung's typical failures.
+   is not a chain; it's superstition. Discord → email → ntfy.sh push → state-file
+   marker is a chain — each rung survives the previous rung's typical failures.
 2. **Detection has to be cheap.** If checking whether a layer succeeded costs as much
    as the layer itself, the chain is more expensive than the failures it prevents.
 3. **The terminal rung is loud.** When the whole chain falls through, *somebody* needs
@@ -34,9 +34,8 @@ Three things make a chain useful rather than ceremonial:
 ```
 1. Discord/Slack DM (fastest if they're at a device)
 2. Email (survives chat-platform outage, archived)
-3. osascript display dialog (only if they're at the Mac — see `async-tasks`)
-4. ntfy.sh push to phone (works anywhere)
-5. write state/operator-needs-attention.md (terminal — picked up next session)
+3. ntfy.sh push to phone (works anywhere with internet)
+4. write state/operator-needs-attention.md (terminal — picked up next session)
 ```
 
 The agent should not iterate this in real-time on every send. Pick the right *initial*
@@ -130,8 +129,6 @@ Three layers tops, unless the cost of total failure is genuinely catastrophic.
 
 * **`world-scanning`** — pull/push fallback for change detection. The pollers menu is
   full of "primary push, fall back to pull" shapes.
-* **`async-tasks`** — when the terminal "loud failure" rung is `display dialog
-  "Everything failed, please intervene"`, that's an async-block waiting for the human.
 * **`circuit-breaker`** — falling through every rung repeatedly is itself a pattern
   to break on. If the chain has fired three times in an hour, stop and investigate
   the structural problem rather than draining the chain again.
