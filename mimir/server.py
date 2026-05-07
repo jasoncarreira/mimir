@@ -301,7 +301,12 @@ def build_app(config: Config) -> web.Application:
     app.router.add_post("/event", _handle_event)
     app.router.add_get("/health", _handle_health)
     # Turn viewer + log API (SPEC §11).
-    web_ui.register_routes(app, turns_log=config.turns_log, events_log=config.events_log)
+    web_ui.register_routes(
+        app,
+        turns_log=config.turns_log,
+        events_log=config.events_log,
+        home=config.home,
+    )
     # Web chat bridge — POST /chat + GET /chat/stream for the local UI.
     web_chat.register_routes(app)
 

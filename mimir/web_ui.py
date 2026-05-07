@@ -1,4 +1,4 @@
-"""Turn-viewer + log API routes (SPEC §11).
+"""Turn-viewer + ops dashboard + log API routes (SPEC §11).
 
 Mounts onto the same aiohttp app that serves ``/event`` + ``/health`` and
 hosts the WebUI bridge's ``/chat``. Routes:
@@ -8,9 +8,12 @@ hosts the WebUI bridge's ``/chat``. Routes:
   GET /api/events       — events.jsonl as JSON (optional ``?since=<ts>``,
                           ``?type=<kind>``, ``?limit=<n>``); type may be
                           repeated to combine filters
+  GET /ops              — live ops dashboard (HTML, Chart.js)
+  GET /api/ops          — JSON twin of /ops for ad-hoc scripting
 
 The HTML page polls ``/api/turns`` every 5s for live updates. ``/api/events``
-is exposed for the (deferred) Events tab + ad-hoc scripting.
+is exposed for the (deferred) Events tab + ad-hoc scripting. ``/ops``
+recomputes from events.jsonl on every request — no caching.
 """
 
 from __future__ import annotations
@@ -21,6 +24,12 @@ from pathlib import Path
 from typing import Any
 
 from aiohttp import web
+
+from .ops_dashboard import (
+    build_dashboard_payload_async,
+    parse_days_param,
+    render_dashboard_html,
+)
 
 log = logging.getLogger(__name__)
 
@@ -61,11 +70,17 @@ def register_routes(
     *,
     turns_log: Path,
     events_log: Path,
+    home: Path | None = None,
 ) -> None:
     """Add viewer + API routes to an existing aiohttp app.
 
     Idempotent — skips routes that already exist (so calling this twice in a
-    rebuild is harmless)."""
+    rebuild is harmless).
+
+    ``home`` is passed to ``build_dashboard_payload`` so the /ops
+    dashboard's Chainlink tab can run ``chainlink issue list --json``
+    against the right repo. None disables the Chainlink tab gracefully
+    (renders an "unavailable" message)."""
 
     existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
 
@@ -113,9 +128,34 @@ def register_routes(
             out = out[-limit:]
         return web.json_response({"events": out})
 
+    async def ops_page(request: web.Request) -> web.Response:
+        try:
+            days = parse_days_param(request.query.get("days"))
+        except ValueError as exc:
+            return web.Response(text=str(exc), status=400)
+        stats = await build_dashboard_payload_async(
+            events_log, days, home=home,
+        )
+        return web.Response(
+            text=render_dashboard_html(stats), content_type="text/html",
+        )
+
+    async def ops_data(request: web.Request) -> web.Response:
+        try:
+            days = parse_days_param(request.query.get("days"))
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(
+            await build_dashboard_payload_async(events_log, days, home=home),
+        )
+
     if ("GET", "/turns") not in existing:
         app.router.add_get("/turns", turns_page)
     if ("GET", "/api/turns") not in existing:
         app.router.add_get("/api/turns", turns_data)
     if ("GET", "/api/events") not in existing:
         app.router.add_get("/api/events", events_data)
+    if ("GET", "/ops") not in existing:
+        app.router.add_get("/ops", ops_page)
+    if ("GET", "/api/ops") not in existing:
+        app.router.add_get("/api/ops", ops_data)
