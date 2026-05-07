@@ -991,7 +991,7 @@ def _print_setup_report(status: dict[str, object]) -> None:
     print("    - heartbeat:           hourly (autonomous-work cadence)")
     print("    - reflect:             Sun 06:00 UTC (cross-session audit)")
     print("  Non-LLM crons (auto-registered by the runtime):")
-    print("    - saga-consolidate:    Sun 04:00 UTC (atom merge / synthesis)")
+    print("    - saga-consolidate:    nightly 04:00 UTC (atom merge / synthesis)")
     print("    - introspection-report: Fri 14:00 UTC (behavioral / health snapshot)")
     print("  Override any cadence via env vars or scheduler.yaml.")
     print()
