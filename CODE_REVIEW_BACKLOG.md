@@ -176,6 +176,7 @@ choice rather than leaving it open.
 
 ### 17. `MessageBuffer.append` writes to disk inside the asyncio.Lock, blocking the event loop on slow filesystem
 
+- **Status:** ✅ Landed 2026-05-07. Lock removed from `MessageBuffer.append` — the in-memory deque mutation is single-threaded under asyncio and the disk write through `asyncio.to_thread` is per-line atomic at the kernel level (POSIX `O_APPEND`), so concurrent appends now fan out to separate threads instead of serializing through one. Kept the `await` to preserve caller-visible flush ordering (tests and graceful-shutdown depend on it); the more aggressive fire-and-forget option (a) variant is deferred. One regression test pins two concurrent appends reaching `_append_disk` in distinct threads simultaneously.
 - **Where:** `mimir/history.py:144-158`
 - **What's wrong:** `append` does `async with self._write_lock: ... await asyncio.to_thread(self._append_disk, msg)`. The lock is held *across* the to_thread — meaning every concurrent `append` serializes through one thread, defeating the to_thread parallelism. For a chatty deployment with 5 channels each appending at 10 msg/min, this is fine; for a Bluesky-firehose-like deployment, throughput tops out at 1/I-O-latency.
 - **Why it matters:** Real bottleneck if any deployment ever drives high inbound throughput. Discord-only deployments won't notice; Slack workspace-wide subscribe + cross-channel pull might.
