@@ -215,3 +215,65 @@ def test_turn_prompt_omits_saga_session_id_when_unset():
     )
     prompt = build_turn_prompt(event)  # no saga_session_id kwarg
     assert "saga_session_id" not in prompt
+
+
+# ---- shell_job_complete trigger rendering ----
+
+
+def test_turn_prompt_renders_shell_job_complete_header():
+    """The shell_job_complete branch must surface the job_id and
+    exit_code in the header so the agent grep'ing events.jsonl can
+    pivot from prompt → job-specific events without ambiguity."""
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="shell_job_complete",
+        channel_id="discord-1",
+        content="Shell job j_abcd1234 complete (status=exited_ok, exit_code=0).",
+        extra={"job_id": "j_abcd1234", "exit_code": 0},
+    )
+    prompt = build_turn_prompt(event)
+    header_line = next(
+        line for line in prompt.splitlines() if line.startswith("[shell_job_complete:")
+    )
+    assert "job_id: j_abcd1234" in header_line
+    assert "exit_code: 0" in header_line
+    assert "discord-1" in header_line
+
+
+def test_turn_prompt_shell_job_complete_renders_body_payload():
+    """Body of the rendered prompt must contain the job-summary content
+    set by Agent._on_shell_job_complete (status + tails)."""
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    body = "Shell job j_xyz complete.\n--- stdout tail ---\nhello\n--- stderr tail ---\n(empty)"
+    event = AgentEvent(
+        trigger="shell_job_complete",
+        channel_id="discord-1",
+        content=body,
+        extra={"job_id": "j_xyz", "exit_code": 0},
+    )
+    prompt = build_turn_prompt(event)
+    assert "stdout tail" in prompt
+    assert "hello" in prompt
+
+
+def test_turn_prompt_shell_job_complete_handles_missing_extra():
+    """If extra is empty (legacy events?), the header still renders
+    cleanly with placeholders rather than crashing."""
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="shell_job_complete",
+        channel_id="discord-1",
+        content="(no payload)",
+    )
+    prompt = build_turn_prompt(event)
+    header_line = next(
+        line for line in prompt.splitlines() if line.startswith("[shell_job_complete:")
+    )
+    assert "job_id: ?" in header_line  # placeholder when extra is absent
+    assert "exit_code: None" in header_line
