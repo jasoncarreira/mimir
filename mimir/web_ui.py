@@ -26,7 +26,7 @@ from typing import Any
 from aiohttp import web
 
 from .ops_dashboard import (
-    build_dashboard_payload,
+    build_dashboard_payload_async,
     parse_days_param,
     render_dashboard_html,
 )
@@ -70,11 +70,17 @@ def register_routes(
     *,
     turns_log: Path,
     events_log: Path,
+    home: Path | None = None,
 ) -> None:
     """Add viewer + API routes to an existing aiohttp app.
 
     Idempotent — skips routes that already exist (so calling this twice in a
-    rebuild is harmless)."""
+    rebuild is harmless).
+
+    ``home`` is passed to ``build_dashboard_payload`` so the /ops
+    dashboard's Chainlink tab can run ``chainlink issue list --json``
+    against the right repo. None disables the Chainlink tab gracefully
+    (renders an "unavailable" message)."""
 
     existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
 
@@ -127,7 +133,9 @@ def register_routes(
             days = parse_days_param(request.query.get("days"))
         except ValueError as exc:
             return web.Response(text=str(exc), status=400)
-        stats = build_dashboard_payload(events_log, days)
+        stats = await build_dashboard_payload_async(
+            events_log, days, home=home,
+        )
         return web.Response(
             text=render_dashboard_html(stats), content_type="text/html",
         )
@@ -137,7 +145,9 @@ def register_routes(
             days = parse_days_param(request.query.get("days"))
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
-        return web.json_response(build_dashboard_payload(events_log, days))
+        return web.json_response(
+            await build_dashboard_payload_async(events_log, days, home=home),
+        )
 
     if ("GET", "/turns") not in existing:
         app.router.add_get("/turns", turns_page)

@@ -22,11 +22,16 @@ scripting.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import subprocess
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 _MAX_DAYS = 365
@@ -321,17 +326,119 @@ def parse_days_param(raw: str | None, default: int = _DEFAULT_DAYS) -> int:
     return value
 
 
+_CHAINLINK_TIMEOUT_SECONDS = 5.0
+_CHAINLINK_MAX_ISSUES = 200
+
+
+async def _load_chainlink_issues(home: Path) -> dict[str, Any]:
+    """Run ``chainlink issue list --json`` against ``home`` and return
+    a structured envelope.
+
+    Returns ``{"available": bool, "issues": list, "error": str | None}``
+    so the frontend can distinguish "chainlink not initialized here"
+    from "real failure" without crashing the whole dashboard. Bounded
+    to ``_CHAINLINK_MAX_ISSUES`` so a deployment with thousands of
+    closed issues doesn't blow the prompt budget — the dashboard is
+    a triage surface, not an exhaustive issue browser.
+
+    Soft-fails on every error path: chainlink not on PATH, repo not
+    initialized, JSON garbled, subprocess hangs. The dashboard's own
+    Backlog tab handles the "chainlink unavailable" message.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "chainlink", "issue", "list", "--json",
+            cwd=str(home),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return {"available": False, "issues": [], "error": "chainlink CLI not on PATH"}
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "issues": [], "error": str(exc)[:500]}
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=_CHAINLINK_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        return {
+            "available": False,
+            "issues": [],
+            "error": f"chainlink timed out after {_CHAINLINK_TIMEOUT_SECONDS}s",
+        }
+
+    if proc.returncode != 0:
+        err_text = (stderr or b"").decode("utf-8", errors="replace").strip()
+        return {
+            "available": False,
+            "issues": [],
+            "error": err_text[:500] or f"chainlink exit code {proc.returncode}",
+        }
+
+    try:
+        issues = json.loads(stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        return {"available": False, "issues": [], "error": f"chainlink output: {exc}"}
+
+    if not isinstance(issues, list):
+        return {"available": False, "issues": [], "error": "chainlink returned non-list payload"}
+
+    return {
+        "available": True,
+        "issues": issues[:_CHAINLINK_MAX_ISSUES],
+        "error": None,
+        "truncated": len(issues) > _CHAINLINK_MAX_ISSUES,
+        "total_count": len(issues),
+    }
+
+
 def build_dashboard_payload(events_log: Path, days: int) -> dict[str, Any]:
-    """Top-level entry: load events, compute stats."""
+    """Sync top-level entry: load events, compute stats. Adds an
+    empty ``chainlink_issues`` envelope so the frontend's tab renders
+    consistently. For the chainlink-populated variant used by the
+    live route handler, see ``build_dashboard_payload_async``."""
     events = _load_events(events_log, days)
-    return compute_stats(events, days)
+    stats = compute_stats(events, days)
+    stats["chainlink_issues"] = {
+        "available": False, "issues": [], "error": None,
+    }
+    return stats
+
+
+async def build_dashboard_payload_async(
+    events_log: Path,
+    days: int,
+    *,
+    home: Path | None = None,
+) -> dict[str, Any]:
+    """Async variant: same as ``build_dashboard_payload`` plus the
+    chainlink subprocess call when ``home`` is given. The route
+    handler uses this; tests that don't exercise chainlink can stick
+    with the sync version."""
+    stats = build_dashboard_payload(events_log, days)
+    if home is not None:
+        stats["chainlink_issues"] = await _load_chainlink_issues(home)
+    return stats
 
 
 def render_dashboard_html(stats: dict[str, Any]) -> str:
     """Inject the stats payload into the HTML template via a JSON
     script tag. The frontend reads it once on load — no XHR back to
-    /api/ops needed."""
-    return _DASHBOARD_HTML.replace("__DATA__", json.dumps(stats))
+    /api/ops needed.
+
+    Replaces ``</`` with ``<\\/`` after ``json.dumps`` so a string in
+    the payload (e.g. a failure detail or a chainlink issue title) that
+    happens to contain ``</script>`` can't break out of the
+    ``<script type="application/json">`` tag. ``\\/`` is a legal
+    JSON-string alternate for ``/``, so the JSON parser accepts it
+    unchanged."""
+    payload = json.dumps(stats).replace("</", "<\\/")
+    return _DASHBOARD_HTML.replace("__DATA__", payload)
 
 
 _DASHBOARD_HTML = """<!doctype html>
@@ -488,6 +595,7 @@ _DASHBOARD_HTML = """<!doctype html>
         <button class="tab" data-panel="invocations">Invocations</button>
         <button class="tab" data-panel="resolution">Resolution paths</button>
         <button class="tab" data-panel="shell">Shell jobs</button>
+        <button class="tab" data-panel="chainlink">Chainlink</button>
         <button class="tab" data-panel="failures">Failures</button>
         <button class="tab" data-panel="backlog">Backlog</button>
         <button class="tab" data-panel="raw">Raw</button>
@@ -515,6 +623,17 @@ _DASHBOARD_HTML = """<!doctype html>
         <div class="summary-grid" id="shell-summary"></div>
         <h3>Spawned by channel (top 20)</h3>
         <table id="shell-channel-table"><thead><tr><th>Channel</th><th class="num">Spawned</th></tr></thead><tbody></tbody></table>
+      </section>
+
+      <section id="chainlink" class="panel">
+        <p class="hint">Open chainlink issues in this home. Live read of <code>chainlink issue list --json</code> on every dashboard request. Sorted by priority (high → low), then most-recently-updated first.</p>
+        <div id="chainlink-meta" class="meta" style="margin-bottom: 0.6rem;"></div>
+        <table id="chainlink-table">
+          <thead><tr>
+            <th>#</th><th>Title</th><th>Status</th><th>Priority</th><th>Parent</th><th>Updated</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
       </section>
 
       <section id="failures" class="panel">
@@ -661,6 +780,48 @@ _DASHBOARD_HTML = """<!doctype html>
           '<div class="status">' + item.status + '</div>' +
           '<div class="blocker">' + item.blocker + '</div>';
         backlogEl.appendChild(div);
+      }
+
+      // Chainlink tab. Tables filled via .textContent / setAttribute
+      // (not innerHTML) so issue titles or descriptions containing
+      // markup render as inert text.
+      const chainlinkMeta = document.getElementById('chainlink-meta');
+      const chainlinkTbody = document.querySelector('#chainlink-table tbody');
+      const cl = D.chainlink_issues || {available: false, issues: [], error: null};
+      if (!cl.available) {
+        const errMsg = cl.error || 'chainlink not available for this home';
+        chainlinkMeta.textContent = '(unavailable: ' + errMsg + ')';
+      } else if (cl.issues.length === 0) {
+        chainlinkMeta.textContent = '(no open issues)';
+      } else {
+        const truncatedSuffix = cl.truncated
+          ? ' (showing first ' + cl.issues.length + ' of ' + cl.total_count + ')'
+          : '';
+        chainlinkMeta.textContent = cl.issues.length + ' open' + truncatedSuffix;
+        const priorityRank = (p) => ({high: 0, medium: 1, low: 2}[p] ?? 3);
+        const sorted = [...cl.issues].sort((a, b) => {
+          const dp = priorityRank(a.priority) - priorityRank(b.priority);
+          if (dp !== 0) return dp;
+          return (b.updated_at || '').localeCompare(a.updated_at || '');
+        });
+        for (const issue of sorted) {
+          const tr = document.createElement('tr');
+          // Use td.textContent so titles can't inject markup.
+          const cells = [
+            String(issue.id ?? ''),
+            String(issue.title ?? ''),
+            String(issue.status ?? ''),
+            String(issue.priority ?? ''),
+            issue.parent_id ? '#' + issue.parent_id : '',
+            (issue.updated_at || '').slice(0, 19).replace('T', ' '),
+          ];
+          for (const v of cells) {
+            const td = document.createElement('td');
+            td.textContent = v;
+            tr.appendChild(td);
+          }
+          chainlinkTbody.appendChild(tr);
+        }
       }
 
       const accent = '#0d766e';

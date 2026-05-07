@@ -439,3 +439,271 @@ async def test_route_ops_days_param_filters_window(web_app, aiohttp_client):
     resp = await client.get("/api/ops?days=1")
     body = await resp.json()
     assert body["summary"]["events_queued"] == 1
+
+
+# ─── XSS hardening: </ → <\/ in injected JSON ────────────────────────
+
+
+def test_render_dashboard_html_escapes_close_script_tag(tmp_path: Path):
+    """If a string in the payload contains ``</script>`` the HTML
+    template's ``<script type=\"application/json\">__DATA__</script>``
+    tag could be broken out of, allowing arbitrary JS injection. The
+    render must escape ``</`` to ``<\\/`` so the JSON string survives
+    the HTML parser (``\\/`` is a legal alternate for ``/`` in JSON
+    strings; consumers parse it identically to ``/``)."""
+    log = tmp_path / "events.jsonl"
+    _write_events(log, [
+        {
+            "timestamp": _ts(0.1),
+            "type": "git_push_failed",
+            "error": "</script><script>alert('xss')</script>"
+        },
+    ])
+    payload = build_dashboard_payload(log, days=1)
+    html = render_dashboard_html(payload)
+    # The literal closing-tag sequence must NOT appear inside the
+    # data block — if it did, the browser would terminate the script
+    # tag early and execute the rest as JS.
+    # Find the data script and verify what's between the opening tag
+    # and the next </script>.
+    data_open = html.find('<script id="data" type="application/json">')
+    assert data_open >= 0
+    data_close = html.find('</script>', data_open)
+    assert data_close >= 0
+    data_body = html[data_open + len('<script id="data" type="application/json">'):data_close]
+    # The escaped form survives.
+    assert "<\\/script>" in data_body
+    # The naked closing tag (which would break out) is absent.
+    assert "</script>" not in data_body
+    # And the JSON is still parseable — \/ is a valid alternate for /.
+    parsed = json.loads(data_body)
+    assert parsed["recent_failures"][0]["detail"] == "</script><script>alert('xss')</script>"
+
+
+def test_render_dashboard_html_escapes_close_anchor_tag(tmp_path: Path):
+    """Be defensive about other ``</`` sequences too — operators have
+    every right to put HTML in their channel names or descriptions
+    and the dashboard shouldn't render any of it."""
+    log = tmp_path / "events.jsonl"
+    _write_events(log, [
+        {
+            "timestamp": _ts(0.1),
+            "type": "event_queued",
+            "trigger": "user_message",
+            "channel_id": "<a href=javascript:alert(1)>click</a>",
+        },
+    ])
+    payload = build_dashboard_payload(log, days=1)
+    html = render_dashboard_html(payload)
+    data_open = html.find('<script id="data" type="application/json">')
+    data_close = html.find('</script>', data_open)
+    data_body = html[data_open + len('<script id="data" type="application/json">'):data_close]
+    assert "<\\/a>" in data_body
+    assert "</a>" not in data_body
+
+
+# ─── _load_chainlink_issues — graceful failure paths ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_chainlink_helper_handles_missing_cli(tmp_path: Path, monkeypatch):
+    """When chainlink isn't on PATH, the helper returns an unavailable
+    envelope rather than raising. Simulated by monkeypatching
+    asyncio.create_subprocess_exec to raise FileNotFoundError."""
+    from mimir import ops_dashboard
+    import asyncio
+
+    async def raise_fnf(*args, **kwargs):
+        raise FileNotFoundError("chainlink: command not found")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", raise_fnf)
+    result = await ops_dashboard._load_chainlink_issues(tmp_path)
+    assert result["available"] is False
+    assert "chainlink CLI not on PATH" in result["error"]
+    assert result["issues"] == []
+
+
+@pytest.mark.asyncio
+async def test_chainlink_helper_handles_nonzero_exit(tmp_path: Path, monkeypatch):
+    """A non-zero exit code (e.g. 'not a chainlink repository') yields
+    an unavailable envelope with stderr captured."""
+    from mimir import ops_dashboard
+    import asyncio
+
+    class _FakeProc:
+        returncode = 1
+        async def communicate(self):
+            return (b"", b"Error: Not a chainlink repository (or any parent).\n")
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    result = await ops_dashboard._load_chainlink_issues(tmp_path)
+    assert result["available"] is False
+    assert "Not a chainlink repository" in result["error"]
+    assert result["issues"] == []
+
+
+@pytest.mark.asyncio
+async def test_chainlink_helper_handles_garbled_json(tmp_path: Path, monkeypatch):
+    """If chainlink succeeds but emits invalid JSON the helper still
+    soft-fails. Defensive: spec drift in the CLI output shouldn't
+    break the dashboard."""
+    from mimir import ops_dashboard
+    import asyncio
+
+    class _FakeProc:
+        returncode = 0
+        async def communicate(self):
+            return (b"this is not json", b"")
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    result = await ops_dashboard._load_chainlink_issues(tmp_path)
+    assert result["available"] is False
+    assert "chainlink output" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_chainlink_helper_success_path(tmp_path: Path, monkeypatch):
+    """Happy path: returncode 0, valid JSON list of issues — wrapped
+    in an envelope with available=True and the issues passed through."""
+    from mimir import ops_dashboard
+    import asyncio
+
+    issues_payload = [
+        {
+            "id": 23,
+            "title": "chainlink #23 — saga MCP context resolution",
+            "description": "...",
+            "status": "open",
+            "priority": "high",
+            "parent_id": None,
+            "created_at": "2026-05-06T12:00:00Z",
+            "updated_at": "2026-05-07T18:00:00Z",
+            "closed_at": None,
+        },
+        {
+            "id": 24,
+            "title": "subissue #24 — context lookups",
+            "status": "open",
+            "priority": "medium",
+            "parent_id": 23,
+            "created_at": "2026-05-06T13:00:00Z",
+            "updated_at": "2026-05-07T15:00:00Z",
+            "closed_at": None,
+        },
+    ]
+
+    class _FakeProc:
+        returncode = 0
+        async def communicate(self):
+            return (json.dumps(issues_payload).encode("utf-8"), b"")
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    result = await ops_dashboard._load_chainlink_issues(tmp_path)
+    assert result["available"] is True
+    assert result["error"] is None
+    assert len(result["issues"]) == 2
+    assert result["issues"][0]["id"] == 23
+    assert result["truncated"] is False
+    assert result["total_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_chainlink_helper_caps_at_max(tmp_path: Path, monkeypatch):
+    """A deployment with thousands of issues should not blow the
+    payload — cap at _CHAINLINK_MAX_ISSUES (200) and mark truncated."""
+    from mimir import ops_dashboard
+    import asyncio
+
+    big_payload = [
+        {"id": i, "title": f"issue {i}", "status": "open", "priority": "low"}
+        for i in range(500)
+    ]
+
+    class _FakeProc:
+        returncode = 0
+        async def communicate(self):
+            return (json.dumps(big_payload).encode("utf-8"), b"")
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    result = await ops_dashboard._load_chainlink_issues(tmp_path)
+    assert result["available"] is True
+    assert len(result["issues"]) == 200
+    assert result["truncated"] is True
+    assert result["total_count"] == 500
+
+
+# ─── async wrapper integration ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_dashboard_payload_async_includes_chainlink(tmp_path: Path, monkeypatch):
+    """The async wrapper attaches chainlink_issues when home is given."""
+    from mimir import ops_dashboard
+    import asyncio
+
+    log = tmp_path / "events.jsonl"
+    _write_events(log, [
+        {"timestamp": _ts(0.1), "type": "event_queued", "trigger": "user_message"},
+    ])
+
+    class _FakeProc:
+        returncode = 0
+        async def communicate(self):
+            return (b'[{"id": 1, "title": "test", "status": "open"}]', b"")
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    payload = await ops_dashboard.build_dashboard_payload_async(
+        log, days=7, home=tmp_path,
+    )
+    assert payload["summary"]["events_queued"] == 1
+    assert payload["chainlink_issues"]["available"] is True
+    assert payload["chainlink_issues"]["issues"][0]["id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_dashboard_payload_async_home_none_skips_chainlink(tmp_path: Path):
+    """When home is None the async wrapper still runs (sync work +
+    an empty chainlink envelope). Used by callers that don't want
+    the subprocess overhead (e.g. tests, future flag-off path)."""
+    from mimir import ops_dashboard
+    log = tmp_path / "events.jsonl"
+    _write_events(log, [
+        {"timestamp": _ts(0.1), "type": "event_queued", "trigger": "user_message"},
+    ])
+    payload = await ops_dashboard.build_dashboard_payload_async(log, days=7, home=None)
+    assert payload["summary"]["events_queued"] == 1
+    assert payload["chainlink_issues"]["available"] is False
+
+
+# ─── /ops route renders chainlink data ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_route_ops_renders_chainlink_unavailable_when_home_unset(tmp_path: Path, aiohttp_client):
+    """When home is None on register_routes (e.g. unit-test setup),
+    the dashboard renders successfully with chainlink unavailable."""
+    app = web.Application()
+    register_routes(
+        app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl",
+        # home omitted → None
+    )
+    client = await aiohttp_client(app)
+    resp = await client.get("/api/ops")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["chainlink_issues"]["available"] is False
