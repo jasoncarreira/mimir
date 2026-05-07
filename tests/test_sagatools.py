@@ -17,12 +17,25 @@ from ._fake_saga import FakeSaga
 
 @pytest.fixture(autouse=True)
 def _ensure_event_logger(tmp_path):
-    """saga_end_session emits ``saga_synthesis_ctx_resolution`` events
-    (chainlink #23 subissue #25) which require the event_logger to be
+    """saga_* tools emit ``saga_<tool>_ctx_resolution`` events (chainlink
+    #23 subissues #25 + #26) which require the event_logger to be
     initialized. Tests that monkeypatch ``mimir.sagatools.log_event``
     bypass this; tests that don't get a real logger pointed at a temp
     file."""
     init_logger(tmp_path / "test-events.jsonl", session_id="test-sagatools")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_active_turns():
+    """``_active_turns`` is a module-global registry. Tests that register
+    a turn but don't reset_current_turn (e.g. a test failure interrupts
+    cleanup) can leak state into subsequent tests. Snapshot + restore
+    around each test keeps the lookup-chain tests honest about the
+    multi-active vs single-active vs no-active cases."""
+    snapshot = dict(_context._active_turns)
+    yield
+    _context._active_turns.clear()
+    _context._active_turns.update(snapshot)
 
 
 def _by_name(tools, name):
@@ -738,6 +751,275 @@ def test_format_saga_payload_triples_only_renders():
     out = _format_saga_payload(payload)
     assert "Triples:" in out
     assert "(user, lives_in, Oakland)" in out
+
+
+# ---- chainlink #23 subissue #26: saga_query / saga_store / saga_feedback /
+# ---- saga_mark_contributions resolution-path tests under SDK task fork.
+# ---- Same shape as the saga_end_session tests above (subissue #25), one
+# ---- per tool × resolution path. These are the regression net for
+# ---- the Option P fix.
+
+
+@pytest.mark.asyncio
+async def test_saga_query_resolves_via_saga_session_id_under_sdk_fork(
+    monkeypatch,
+):
+    """chainlink #23 #26: saga_query under fresh-context fork must still
+    auto-credit retrieved atom_ids to the calling turn's saga_atom_ids
+    list (SPEC §9.3 mid-turn tracking). The fix passes session_id as a
+    tool arg; the handler resolves it via _resolve_ctx and finds the
+    matching ctx in _active_turns."""
+    from tests._mcp_dispatch import dispatch_via_sdk_task_fork
+
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(kind: str, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.sagatools.log_event", fake_log_event)
+
+    fake = FakeSaga(
+        query_response={
+            "atoms": [
+                {"id": "fork-a1", "stream": "semantic", "content": "x"},
+                {"id": "fork-a2", "stream": "semantic", "content": "y"},
+            ]
+        }
+    )
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_query = _by_name(tools, "saga_query")
+
+    ctx = _ctx(channel_id="c-fork-q", saga_session_id="saga-fork-q-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await dispatch_via_sdk_task_fork(
+            saga_query.handler,
+            {"query": "hi", "session_id": "saga-fork-q-1"},
+        )
+        assert out.get("is_error") is not True
+        # The atom-credit invariant: ctx.saga_atom_ids populated even
+        # though the handler ran in a fresh-context fork.
+        assert ctx.saga_atom_ids == ["fork-a1", "fork-a2"]
+    finally:
+        _context.reset_current_turn(token)
+
+    payload = fake.last("query")
+    # session_id propagated to the saga client call.
+    assert payload["session_id"] == "saga-fork-q-1"
+
+    res_events = [f for k, f in captured if k == "saga_query_ctx_resolution"]
+    assert len(res_events) == 1
+    assert res_events[0]["resolution_path"] == "saga_session_id"
+    assert res_events[0]["turn_id"] == ctx.turn_id
+
+
+@pytest.mark.asyncio
+async def test_saga_query_falls_back_to_single_active_when_session_id_omitted(
+    monkeypatch,
+):
+    """If the model omits session_id (legacy callers, prompt-tax slip),
+    the lookup chain falls through to ``get_only_active_turn()``. Works
+    in single-channel deployments where exactly one turn is in flight."""
+    from tests._mcp_dispatch import dispatch_via_sdk_task_fork
+
+    captured: list[tuple[str, dict]] = []
+
+    async def _record(kind, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.sagatools.log_event", _record)
+
+    fake = FakeSaga(
+        query_response={"atoms": [{"id": "single-1", "stream": "semantic", "content": "z"}]}
+    )
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_query = _by_name(tools, "saga_query")
+
+    ctx = _ctx(channel_id="c-single", saga_session_id="saga-single-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await dispatch_via_sdk_task_fork(
+            saga_query.handler, {"query": "hi"}  # no session_id
+        )
+        assert out.get("is_error") is not True
+        assert ctx.saga_atom_ids == ["single-1"]
+    finally:
+        _context.reset_current_turn(token)
+
+    res_events = [f for k, f in captured if k == "saga_query_ctx_resolution"]
+    assert len(res_events) == 1
+    assert res_events[0]["resolution_path"] == "single_active"
+
+
+@pytest.mark.asyncio
+async def test_saga_query_returns_missing_when_multi_active_and_no_session_id(
+    monkeypatch,
+):
+    """Multi-channel concurrent turns + no session_id arg = the lookup
+    chain has nothing to disambiguate. Returns ``missing``; handler
+    runs but atom auto-credit silently no-ops. The observability event
+    surfaces the rate of this case in production."""
+    from tests._mcp_dispatch import dispatch_via_sdk_task_fork
+
+    captured: list[tuple[str, dict]] = []
+
+    async def _record(kind, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.sagatools.log_event", _record)
+
+    fake = FakeSaga(query_response={"atoms": [{"id": "x", "stream": "s", "content": "y"}]})
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_query = _by_name(tools, "saga_query")
+
+    # Two concurrent turns registered → get_only_active_turn returns None.
+    ctx_a = _ctx(channel_id="c-multi-a", saga_session_id="saga-multi-a")
+    ctx_b = _ctx(channel_id="c-multi-b", saga_session_id="saga-multi-b")
+    tok_a = _context.set_current_turn(ctx_a)
+    # set_current_turn replaces _current_turn; manually inject ctx_b
+    # into the registry so both are "active" without disturbing the
+    # contextvar (the test's whole point is that contextvar is one
+    # turn while two are in _active_turns).
+    _context._active_turns[ctx_b.turn_id] = ctx_b
+    try:
+        out = await dispatch_via_sdk_task_fork(
+            saga_query.handler, {"query": "hi"}  # no session_id
+        )
+        # Handler still succeeds — the fix is about ctx resolution, not
+        # blocking the call. Atom auto-credit silently no-ops; the
+        # missing-resolution-path event tells operators this is happening.
+        assert out.get("is_error") is not True
+        assert ctx_a.saga_atom_ids == []  # not credited (resolution=missing)
+        assert ctx_b.saga_atom_ids == []  # not credited
+    finally:
+        _context._active_turns.pop(ctx_b.turn_id, None)
+        _context.reset_current_turn(tok_a)
+
+    res_events = [f for k, f in captured if k == "saga_query_ctx_resolution"]
+    assert len(res_events) == 1
+    assert res_events[0]["resolution_path"] == "missing"
+    assert res_events[0]["turn_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_saga_feedback_resolves_via_saga_session_id_under_sdk_fork(
+    monkeypatch,
+):
+    """saga_feedback under SDK fork must scope outcome by the calling
+    turn's saga_session_id (otherwise SAGA records the outcome with no
+    session attribution). Same lookup chain as saga_query."""
+    from tests._mcp_dispatch import dispatch_via_sdk_task_fork
+
+    captured: list[tuple[str, dict]] = []
+
+    async def _record(kind, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.sagatools.log_event", _record)
+
+    fake = FakeSaga()
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_feedback = _by_name(tools, "saga_feedback")
+
+    ctx = _ctx(channel_id="c-fb", saga_session_id="saga-fb-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await dispatch_via_sdk_task_fork(
+            saga_feedback.handler,
+            {"atom_id": "a-1", "signal": "useful", "session_id": "saga-fb-1"},
+        )
+        assert out.get("is_error") is not True
+    finally:
+        _context.reset_current_turn(token)
+
+    payload = fake.last("outcome")
+    assert payload["session_id"] == "saga-fb-1"
+
+    res_events = [f for k, f in captured if k == "saga_feedback_ctx_resolution"]
+    assert len(res_events) == 1
+    assert res_events[0]["resolution_path"] == "saga_session_id"
+
+
+@pytest.mark.asyncio
+async def test_saga_mark_contributions_resolves_via_saga_session_id_under_sdk_fork(
+    monkeypatch,
+):
+    """saga_mark_contributions under SDK fork must scope by the calling
+    turn's saga_session_id (otherwise the credit is recorded against
+    no session). Same lookup chain as saga_query."""
+    from tests._mcp_dispatch import dispatch_via_sdk_task_fork
+
+    captured: list[tuple[str, dict]] = []
+
+    async def _record(kind, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.sagatools.log_event", _record)
+
+    fake = FakeSaga()
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_mc = _by_name(tools, "saga_mark_contributions")
+
+    ctx = _ctx(channel_id="c-mc", saga_session_id="saga-mc-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await dispatch_via_sdk_task_fork(
+            saga_mc.handler,
+            {
+                "atom_ids": ["a", "b"],
+                "response_text": "thanks",
+                "session_id": "saga-mc-1",
+            },
+        )
+        assert out.get("is_error") is not True
+    finally:
+        _context.reset_current_turn(token)
+
+    payload = fake.last("feedback")
+    assert payload["session_id"] == "saga-mc-1"
+
+    res_events = [
+        f for k, f in captured if k == "saga_mark_contributions_ctx_resolution"
+    ]
+    assert len(res_events) == 1
+    assert res_events[0]["resolution_path"] == "saga_session_id"
+
+
+@pytest.mark.asyncio
+async def test_saga_store_logs_resolution_path_for_observability_parity(
+    monkeypatch,
+):
+    """saga_store doesn't currently scope storage by session (the saga
+    client interface doesn't accept session_id), but the handler logs
+    saga_store_ctx_resolution for observability parity with the other
+    tools. This way the introspection-report's resolution-path
+    histogram covers all four saga tools uniformly, and a future
+    wire-up of session-scoped storage doesn't need a separate event
+    rollout."""
+    captured: list[tuple[str, dict]] = []
+
+    async def _record(kind, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.sagatools.log_event", _record)
+
+    fake = FakeSaga()
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    saga_store = _by_name(tools, "saga_store")
+
+    ctx = _ctx(channel_id="c-st", saga_session_id="saga-st-1")
+    token = _context.set_current_turn(ctx)
+    try:
+        out = await saga_store.handler(
+            {"content": "remember", "stream": "semantic", "session_id": "saga-st-1"}
+        )
+        assert out.get("is_error") is not True
+    finally:
+        _context.reset_current_turn(token)
+
+    res_events = [f for k, f in captured if k == "saga_store_ctx_resolution"]
+    assert len(res_events) == 1
+    assert res_events[0]["resolution_path"] == "saga_session_id"
 
 
 # Late import to keep the file's main imports compact.
