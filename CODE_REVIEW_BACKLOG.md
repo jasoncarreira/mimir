@@ -208,6 +208,7 @@ choice rather than leaving it open.
 
 ### 20. ClientPool's fingerprint-flip drain has no observability — silent client churn under config edits
 
+- **Status:** ✅ Landed 2026-05-07. `_drain_idle_for_fingerprint_change` now takes `(old_fingerprint, new_fingerprint)`, captures `idle_disconnected` and `in_flight_marked_stale` counts before mutating the pool, and emits a `client_pool_drained` event with all four fields (fingerprints truncated to first 8 chars). One regression test asserts the event lands after a fingerprint flip with the right counts and prefix shape. Aggregation in introspection-report cron is followup work.
 - **Where:** `mimir/agent.py:268-301` (`_drain_idle_for_fingerprint_change`, `acquire`)
 - **What's wrong:** When `_options_fingerprint` changes (system prompt edit, model swap, mid-run config reload), the pool drains all idle clients and marks in-flight ones stale. No event is emitted. No metric tracks how often this happens. If a deployment has flapping config (e.g. a memory file that contains the current timestamp and ends up in the system prompt), the pool churns continuously — every turn pays the cold-start tax (~5-9s) — and the operator sees only "mimir is slow" with no signal.
 - **Why it matters:** This is exactly the kind of silent performance footgun the SPEC §16 prompt-cache audit was designed to catch but lacks a shipping mechanism for. The pool drains are the proximate cause; the fingerprint change is the effect of an unstable system prompt.
