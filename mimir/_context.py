@@ -56,7 +56,7 @@ full design and the per-tool migration sequence.
 from __future__ import annotations
 
 from contextvars import ContextVar, Token
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .models import TurnContext
@@ -133,3 +133,39 @@ def get_only_active_turn() -> "TurnContext | None":
     if len(_active_turns) == 1:
         return next(iter(_active_turns.values()))
     return None
+
+
+def resolve_active_ctx(args: dict[str, Any]) -> tuple["TurnContext | None", str]:
+    """Standard three-level lookup chain for MCP tool handlers running
+    on a forked task that can't see ``_current_turn``.
+
+    Tries:
+
+    1. ``args["session_id"]`` (model-passed via Option P) → match against
+       ``ctx.saga_session_id`` in ``_active_turns``. Multi-channel safe.
+    2. ``get_only_active_turn()`` heuristic — the unique active turn if
+       exactly one is registered. Works in single-channel deployments;
+       returns None when 0 or >1 turns are active.
+    3. ``get_current_turn()`` contextvar — works for the direct-handler-
+       call test path. Won't fire under SDK dispatch.
+
+    Returns ``(ctx, resolution_path)`` where resolution_path is one of
+    ``"saga_session_id" | "single_active" | "contextvar" | "missing"``.
+    The path is logged via per-tool ``<tool>_ctx_resolution`` events so
+    the rate of each path is visible in events.jsonl.
+
+    Mirrors the chainlink #23 sagatools resolution chain; lifted here
+    so any new MCP-dispatched tool (currently the bash_async family)
+    can use the same shape without duplicating the logic.
+    """
+    sid = args.get("session_id") if args else None
+    ctx = get_turn_by_saga_session_id(sid) if sid else None
+    if ctx is not None:
+        return ctx, "saga_session_id"
+    ctx = get_only_active_turn()
+    if ctx is not None:
+        return ctx, "single_active"
+    ctx = get_current_turn()
+    if ctx is not None:
+        return ctx, "contextvar"
+    return None, "missing"

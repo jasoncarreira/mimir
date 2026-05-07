@@ -31,6 +31,8 @@ from .session_boundary_log import SessionBoundaryLog
 from .scheduletools import build_schedule_tools, schedule_tool_names
 from .search import Indexer
 from .searchtools import build_search_tools, search_tool_names
+from .shell_jobs import ShellJob, ShellJobRegistry
+from .shelltools import build_shell_tools, shell_tool_names
 from .turntools import build_turn_tools, turn_tool_names
 
 # Built-in SDK preset tools we enable. Hooks (mimir.hooks) layer mimir-specific
@@ -79,6 +81,8 @@ def build_mcp_server(
     message_buffer: MessageBuffer | None = None,
     session_boundary_log: SessionBoundaryLog | None = None,
     turns_log: Path | None = None,
+    shell_jobs: ShellJobRegistry | None = None,
+    on_shell_job_complete: Any | None = None,
 ) -> McpSdkServerConfig:
     """Bundle the in-process MCP tools (everything with no SDK preset)."""
     tools = [echo]
@@ -90,6 +94,8 @@ def build_mcp_server(
         tools += build_saga_tools(saga_client, session_boundary_log=session_boundary_log)
     if scheduler is not None:
         tools += build_schedule_tools(scheduler)
+    if shell_jobs is not None:
+        tools += build_shell_tools(shell_jobs, on_complete=on_shell_job_complete)
     if channel_registry is not None:
         # send_message fires SAGA mark_contributions when saga_client is
         # available; handles the credit pass at the actual reply boundary
@@ -114,6 +120,7 @@ def allowed_tool_names(
     include_scheduler: bool = True,
     include_channels: bool = True,
     include_turns: bool = True,
+    include_shell: bool = True,
 ) -> list[str]:
     """Names referenced in ``ClaudeAgentOptions.allowed_tools`` — both SDK
     preset names and ``mcp__mimir__*`` MCP tool names."""
@@ -128,4 +135,6 @@ def allowed_tool_names(
         names += schedule_tool_names()
     if include_channels:
         names += channel_tool_names()
+    if include_shell:
+        names += shell_tool_names()
     return names

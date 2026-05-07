@@ -291,6 +291,23 @@ def build_turn_prompt(
         header = f"[scheduled_tick: {event.channel_id}, ts: {ts}{saga_part}]"
         body = event.content or HEARTBEAT_DEFAULT_PROMPT
         sections.append(f"{header}\n{body}")
+    elif event.trigger == "shell_job_complete":
+        # Async shell job completion wake-up. The agent body already
+        # contains the rendered summary (status, exit_code, command,
+        # stdout/stderr tails) built by ``Agent._on_shell_job_complete``.
+        # Header gives the routing context — channel + the completion
+        # signature so the agent can grep events.jsonl if it needs more.
+        job_id = (event.extra or {}).get("job_id", "?")
+        exit_code = (event.extra or {}).get("exit_code")
+        saga_part = (
+            f", saga_session_id: {saga_session_id}" if saga_session_id else ""
+        )
+        header = (
+            f"[shell_job_complete: {event.channel_id}, job_id: {job_id}, "
+            f"exit_code: {exit_code}, ts: {ts}{saga_part}]"
+        )
+        body = event.content or "(no payload)"
+        sections.append(f"{header}\n{body}")
     else:
         # Prefer the canonical's display name (or the event's author_display)
         # over the raw matching key in the header — the agent reads "alice",
