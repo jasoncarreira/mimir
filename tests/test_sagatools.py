@@ -474,16 +474,19 @@ async def test_saga_end_session_resolves_via_saga_session_id_under_sdk_fork(
 
 
 @pytest.mark.asyncio
-async def test_saga_end_session_resolution_path_contextvar_in_direct_call(
+async def test_saga_end_session_resolution_path_single_active_in_direct_call(
     monkeypatch,
 ):
-    """The pre-fix tests (above) call the handler directly without going
-    through the SDK fork. With the fix, those tests still pass because
-    the lookup falls back to ``get_current_turn()`` when no active turn
-    matches the ``session_id`` arg. The resolution_path event records
-    ``contextvar`` for that path so the rate of direct-call vs fork-path
-    is visible in events.jsonl. (In production, fork is the dominant
-    path; direct-call mostly happens in unit tests.)"""
+    """When the session_id arg doesn't match any registered turn but
+    exactly one turn is active, the resolution chain falls through to
+    ``single_active`` (the unique-active heuristic from the lifted
+    ``resolve_active_ctx`` shared with saga_query/store/feedback).
+
+    Pre-migration this hit the bare ``get_current_turn()`` contextvar
+    fallback and recorded ``contextvar``. Post-migration ``single_active``
+    catches it first since the test setup leaves exactly one turn
+    registered. ``contextvar`` is now the path only when zero turns are
+    registered — that scenario is the orphan-call test below."""
     captured: list[tuple[str, dict]] = []
 
     async def fake_log_event(kind: str, **fields):
@@ -492,7 +495,8 @@ async def test_saga_end_session_resolution_path_contextvar_in_direct_call(
     monkeypatch.setattr("mimir.sagatools.log_event", fake_log_event)
 
     # ctx with NO saga_session_id set (default None) — so the
-    # saga_session_id lookup misses and we fall through to contextvar.
+    # saga_session_id lookup misses; with one active turn, single_active
+    # picks it up.
     ctx = TurnContext(
         turn_id="t-direct-1",
         session_id="c-direct",
@@ -518,7 +522,7 @@ async def test_saga_end_session_resolution_path_contextvar_in_direct_call(
         f for k, f in captured if k == "saga_synthesis_ctx_resolution"
     ]
     assert len(resolution_events) == 1
-    assert resolution_events[0]["resolution_path"] == "contextvar"
+    assert resolution_events[0]["resolution_path"] == "single_active"
 
 
 @pytest.mark.asyncio

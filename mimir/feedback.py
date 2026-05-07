@@ -102,6 +102,11 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "git_commit_failed": ("negative", "git_commit_failed"),
     "git_push_failed": ("negative", "git_push_failed"),
     "git_pull_blocked": ("negative", "git_pull_blocked"),
+    # PR 56 (shell-jobs): the cross-thread bridge from waiter thread
+    # back to the dispatcher raised. Means a finished async shell job
+    # never woke the spawning channel — the operator sees a missing
+    # wake-up before they'd notice without surfacing here.
+    "shell_job_complete_enqueue_failed": ("negative", "shell_job_complete_enqueue_failed"),
     # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
     "saga_feedback_sent": ("positive", "saga_feedback"),
@@ -162,6 +167,10 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "git_commit_failed",
     "git_push_failed",
     "git_pull_blocked",
+    # PR 56: a broken bridge fires on every async shell job that
+    # completes. Same shape as git_*_failed — dedup so the operator
+    # sees the latest failure, not N stale copies.
+    "shell_job_complete_enqueue_failed",
 }
 
 
@@ -455,6 +464,15 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"git pull blocked: {reason}. Container's local branch has "
             f"diverged from remote — operator must reconcile manually "
             f"(reset local to remote, or push divergent commits)."
+        )
+    if rule_kind == "shell_job_complete_enqueue_failed":
+        job_id = ev.get("job_id") or "?"
+        err = ev.get("error") or "(no detail)"
+        return (
+            f"shell job {job_id} finished but the wake-up event "
+            f"failed to enqueue: {err}. The job's exit + output are on "
+            f"disk under logs/bash-jobs/; the spawning channel did NOT "
+            f"resume. Investigate dispatcher state."
         )
     if rule_kind == "unknown_channel":
         return f"send_message to unknown channel {ev.get('channel_id', '?')}"

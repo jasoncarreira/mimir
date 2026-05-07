@@ -19,6 +19,9 @@
 body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
 .header{padding:12px 20px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-shrink:0}
 .header h1{font-size:16px;font-weight:600}
+.header-links{margin-left:auto;display:flex;gap:14px;font-size:13px}
+.header-links a{color:var(--accent);text-decoration:none}
+.header-links a:hover{text-decoration:underline}
 .turn-count{font-size:12px;color:var(--text2);margin-left:auto}
 .status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0}
 .status-dot.live{animation:pulse 2s infinite}
@@ -98,6 +101,9 @@ tr:hover td{background:var(--surface2);cursor:pointer}
   <h1>Turn Viewer</h1>
   <span class="turn-count" id="turnCount"></span>
   <div class="status-dot stale" id="statusDot" title="Connecting&hellip;"></div>
+  <nav class="header-links">
+    <a href="/ops" title="Live ops dashboard">Ops</a>
+  </nav>
 </div>
 
 <div class="filters">
