@@ -1713,42 +1713,46 @@ class Agent:
         )
         duration_ms = int((time.monotonic() - ctx.started_at) * 1000)
 
-        # 7a. ResultMessage capture (Phase 8 — resume detection + cost).
-        #     The SDK emits one ResultMessage per turn at end-of-stream. We
-        #     keep the last one in case retries land more than one. None
-        #     when query() crashed before emitting any.
+        # 7a. Single dispatch walk over ``messages`` (CR#13). Replaces
+        # four separate type-specific walks that each read the full
+        # 100-500-element list. Handles, in this order per message:
+        #   - ResultMessage (Phase 8 — last-wins; resume detection + cost)
+        #   - RateLimitEvent (state-transition capture; SPEC §10.x)
+        #   - StreamEvent(message_start) (per-response rate-limit headers,
+        #     gated off under Max OAuth — see comment block below)
+        #   - TaskStartedMessage (subagent_started log + description)
+        #   - TaskProgressMessage (subagent_progress log)
+        #   - TaskNotificationMessage (inbox push + subagent_notification log)
+        #
+        # **Subagent ordering invariant.** TaskNotificationMessage's
+        # description field comes from ``task_descriptions[task_id]``,
+        # which is populated by the Started branch. The SDK emits
+        # TaskStartedMessage before any TaskProgress/TaskNotification
+        # for the same task_id (it has to — the task can't have status
+        # before it starts). Mid-walk lookup is safe under that
+        # invariant; if the SDK ever violates it, the description on
+        # the first notification of a stream-reordered task degrades
+        # to None rather than corrupting state.
+        #
+        # **Max OAuth gate** (preserved verbatim from the prior 4-walk
+        # form). Under Claude Max OAuth, response headers do NOT carry
+        # per-window utilization% (Anthropic only includes those for
+        # direct API key deployments). The OAuth poller and the
+        # in-process Stage 5 capture at 7a.c below are the real-value
+        # writers in that mode. The StreamEvent path here would write
+        # ``utilization=null`` on every turn, clobbering the poller's
+        # real numbers — so we skip it. Direct-API-key deployments are
+        # the inverse: the OAuth poller is gated off and StreamEvent
+        # headers carry the real values.
         result_msg: ResultMessage | None = None
+        is_max_oauth = running_on_claude_max()
+        task_descriptions: dict[str, str] = {}
         for msg in messages:
             if isinstance(msg, ResultMessage):
+                # Last-wins — keep iterating in case retries land more
+                # than one ResultMessage in the same turn.
                 result_msg = msg
-
-        # 7a.b. Rate-limit capture from two sources:
-        #   - RateLimitEvent: emitted on state transitions (allowed →
-        #     allowed_warning → rejected). Sparse but authoritative.
-        #   - StreamEvent(message_start): when capture_rate_limits is on
-        #     (include_partial_messages=True), every API response's
-        #     ``message_start`` carries a ``rate_limits`` block for
-        #     Claude.ai subscribers. Captured per-response — we get
-        #     current state on every turn, not only on transitions.
-        #
-        # Both write to the same per-type store; the last update wins.
-        # In practice the per-response stream-event path is fresher, so
-        # it dominates; the transition path is a backstop when
-        # capture_rate_limits is disabled.
-        #
-        # **Max OAuth gate:** under Claude Max OAuth, response headers
-        # do NOT carry per-window utilization% (Anthropic only includes
-        # those for direct API key deployments). The OAuth poller
-        # (oauth_usage_poller.py) and the in-process Stage 5 capture
-        # at 7a.c below are the real-value writers in that mode. The
-        # StreamEvent path here would write ``utilization=null`` on
-        # every turn, clobbering the poller's real numbers — so we
-        # skip it. Direct-API-key deployments are the inverse: the
-        # OAuth poller is gated off, and StreamEvent headers carry
-        # the real values.
-        is_max_oauth = running_on_claude_max()
-        for msg in messages:
-            if isinstance(msg, RateLimitEvent):
+            elif isinstance(msg, RateLimitEvent):
                 info = msg.rate_limit_info
                 rl_type = getattr(info, "rate_limit_type", None)
                 if not rl_type:
@@ -1770,9 +1774,6 @@ class Agent:
                     )
             elif isinstance(msg, StreamEvent):
                 if is_max_oauth:
-                    # See gate explanation above. Response headers
-                    # under Max OAuth carry no utilization% — capturing
-                    # here would null-clobber the OAuth poller.
                     continue
                 ev = msg.event or {}
                 if ev.get("type") != "message_start":
@@ -1794,38 +1795,10 @@ class Agent:
                             "rate_limits.record from response failed for %s",
                             bucket_type,
                         )
-
-        # 7a.c. Plan-window apiUsage capture (Stage 5 of
-        #       CLAUDE_SDK_CLIENT_MIGRATION.md). Query the shared
-        #       persistent client's ``get_context_usage()`` and persist
-        #       each ``apiUsage`` bucket into the same RateLimitStore.
-        #       Replaces the throwaway-subprocess cron poller —
-        #       fresher cadence (every turn vs every 10 min) with no
-        #       extra subprocess cost (the client is already warm
-        #       from the query() above). Skipped when the message
-        #       loop crashed; the next successful turn picks it up.
-        if not error:
-            try:
-                await self._capture_plan_quota_from_client(options)
-            except Exception:  # noqa: BLE001
-                log.exception("_capture_plan_quota_from_client raised")
-
-        # 7b. Subagent lifecycle (SPEC §4.4). The SDK yields three messages:
-        #
-        #   - TaskStartedMessage: task begins; carries description + task_type
-        #   - TaskProgressMessage: periodic during long-running tasks; carries
-        #     cumulative TaskUsage (total_tokens, tool_uses, duration_ms)
-        #   - TaskNotificationMessage: terminal (completed/failed/stopped);
-        #     carries final TaskUsage
-        #
-        # All three log to events.jsonl with task_id + usage fields so
-        # subagent_stats.py can aggregate token spend over time. Climber
-        # subagents in particular can run for hours and burn most of the
-        # parent's plan budget — surfacing this lets the agent see "where
-        # the budget is going."
-        task_descriptions: dict[str, str] = {}
-        for msg in messages:
-            if isinstance(msg, TaskStartedMessage):
+            elif isinstance(msg, TaskStartedMessage):
+                # SPEC §4.4 subagent lifecycle — task begins; record
+                # description for the eventual TaskNotification's inbox
+                # push, then emit subagent_started.
                 task_descriptions[msg.task_id] = msg.description
                 await log_event(
                     "subagent_started",
@@ -1835,8 +1808,7 @@ class Agent:
                     description=msg.description,
                     task_type=getattr(msg, "task_type", None),
                 )
-        for msg in messages:
-            if isinstance(msg, TaskProgressMessage):
+            elif isinstance(msg, TaskProgressMessage):
                 u = msg.usage or {}
                 await log_event(
                     "subagent_progress",
@@ -1873,6 +1845,27 @@ class Agent:
                     tool_uses=u.get("tool_uses"),
                     duration_ms=u.get("duration_ms"),
                 )
+
+        # 7b. Plan-window apiUsage capture (Stage 5 of
+        #     CLAUDE_SDK_CLIENT_MIGRATION.md). Query the shared
+        #     persistent client's ``get_context_usage()`` and persist
+        #     each ``apiUsage`` bucket into the same RateLimitStore.
+        #     Replaces the throwaway-subprocess cron poller — fresher
+        #     cadence (every turn vs every 10 min) with no extra
+        #     subprocess cost (the client is already warm from the
+        #     query() above). Skipped when the message loop crashed;
+        #     the next successful turn picks it up.
+        #
+        # Note: this used to sit between the rate-limit capture walk
+        # and the subagent-lifecycle walks. With the dispatch
+        # consolidation it moves after them — neither subagent logging
+        # nor rate-limit recording depends on plan-quota state, and
+        # vice versa.
+        if not error:
+            try:
+                await self._capture_plan_quota_from_client(options)
+            except Exception:  # noqa: BLE001
+                log.exception("_capture_plan_quota_from_client raised")
 
         # 8. Outbound → chat_history (skip for synthesis turn — there's no
         #    user-facing message; the prompt instructs the agent not to send).
