@@ -724,7 +724,7 @@ def setup_home(home: Path) -> dict[str, object]:
         "logs",
         "memory/core",
         "memory/channels",
-        "memory/shared",
+        "memory/issues",
         "prompts",
         "state",
         "state/raw",
