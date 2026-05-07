@@ -267,11 +267,23 @@ class ClientPool:
     def size(self) -> int:
         return len(self._idle) + len(self._in_flight)
 
-    async def _drain_idle_for_fingerprint_change(self) -> None:
+    async def _drain_idle_for_fingerprint_change(
+        self,
+        old_fingerprint: str,
+        new_fingerprint: str,
+    ) -> None:
         """Disconnect every idle client; mark every in-flight client
-        stale so it disconnects on release. Caller holds the lock."""
+        stale so it disconnects on release. Caller holds the lock.
+
+        Emits a ``client_pool_drained`` event with both fingerprints
+        (truncated to the first 8 chars for readability) and the counts
+        of clients affected so an unstable system prompt — the most
+        common cause of repeated fingerprint flips — surfaces in
+        events.jsonl rather than only as latency drift. See CR#20."""
         idle = self._idle
         self._idle = []
+        idle_disconnected = len(idle)
+        in_flight_marked_stale = len(self._in_flight)
         for entry in idle:
             try:
                 await entry.client.disconnect()
@@ -282,6 +294,13 @@ class ClientPool:
                 )
         for entry in self._in_flight:
             entry.stale = True
+        await log_event(
+            "client_pool_drained",
+            old_fingerprint_8=old_fingerprint[:8],
+            new_fingerprint_8=new_fingerprint[:8],
+            idle_disconnected=idle_disconnected,
+            in_flight_marked_stale=in_flight_marked_stale,
+        )
 
     async def acquire(self, options: ClaudeAgentOptions) -> _PoolEntry:
         """Claim a client for an exclusive request. Caller MUST call
@@ -298,7 +317,9 @@ class ClientPool:
                     self._current_fingerprint is not None
                     and self._current_fingerprint != fingerprint
                 ):
-                    await self._drain_idle_for_fingerprint_change()
+                    await self._drain_idle_for_fingerprint_change(
+                        self._current_fingerprint, fingerprint
+                    )
                     self._current_fingerprint = fingerprint
                 elif self._current_fingerprint is None:
                     self._current_fingerprint = fingerprint

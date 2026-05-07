@@ -22,12 +22,15 @@ Tests pin:
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock
 
 import mimir.agent as agent_mod
+from mimir.event_logger import init_logger
 
 
 class _BlockingFakeClient:
@@ -78,8 +81,13 @@ def _reset() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_pool(monkeypatch):
+def _isolate_pool(monkeypatch, tmp_path: Path):
     _reset()
+    # The pool now emits ``client_pool_drained`` events on fingerprint
+    # flips (CR#20), so the event logger must be initialized for these
+    # tests to exercise the drain path.
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    init_logger(tmp_path / "logs" / "events.jsonl", session_id="test-pool")
     monkeypatch.setattr(agent_mod, "ClaudeSDKClient", _BlockingFakeClient)
     yield
     _reset()
@@ -187,6 +195,36 @@ async def test_fingerprint_flip_drains_idle_clients():
     b = _BlockingFakeClient.instances[1]
     assert b.connect_count == 1
     assert b.disconnect_count == 0
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_flip_emits_client_pool_drained_event(tmp_path: Path):
+    """CR#20 regression: a fingerprint flip drains the pool — that's
+    silent today (only visible as latency drift). Assert
+    ``client_pool_drained`` lands in events.jsonl with both fingerprint
+    prefixes and the affected counts so an unstable system prompt
+    surfaces immediately."""
+    events_path = tmp_path / "logs" / "events.jsonl"
+
+    # Two queries at fingerprint A → 1 idle client at fingerprint A.
+    await _drain("first", _opts(system_prompt="prompt-a"))
+    await _drain("first2", _opts(system_prompt="prompt-a"))
+
+    # Flip to fingerprint B → drain fires.
+    await _drain("second", _opts(system_prompt="prompt-b"))
+
+    drained = [
+        json.loads(line)
+        for line in events_path.read_text().splitlines()
+        if line and json.loads(line).get("type") == "client_pool_drained"
+    ]
+    assert len(drained) == 1, f"expected exactly one drain event; got {drained}"
+    ev = drained[0]
+    assert ev["idle_disconnected"] == 1
+    assert ev["in_flight_marked_stale"] == 0
+    assert isinstance(ev["old_fingerprint_8"], str) and len(ev["old_fingerprint_8"]) == 8
+    assert isinstance(ev["new_fingerprint_8"], str) and len(ev["new_fingerprint_8"]) == 8
+    assert ev["old_fingerprint_8"] != ev["new_fingerprint_8"]
 
 
 @pytest.mark.asyncio
