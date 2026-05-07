@@ -207,10 +207,35 @@ DEFAULT_HEARTBEAT_PATTERNS = dedent(
     <!-- desc: what works (and what doesn't) during heartbeat ticks -->
     # Heartbeat Patterns
 
-    Empty starter. Append observations from your heartbeat experience —
-    tasks that fit well, ones that didn't, time-of-day patterns,
-    mistakes worth not repeating. Keep it tight; this block is in core
-    memory.
+    Append observations from your heartbeat experience — tasks that
+    fit well, ones that didn't, time-of-day patterns, mistakes worth
+    not repeating. Keep it tight; this block is in core memory.
+
+    ## Multi-item ticks (when one finishes fast)
+
+    Default is "pick ONE item per tick" — but that produces an
+    artificial ceiling on ticks where the picked item happened to be
+    tightly bounded (a quick audit, a one-edit doc reconciliation).
+    The prompt cost is sunk regardless; exiting early wastes capacity.
+
+    Relaxation: **when the first item finishes in <10 min and the
+    next ready item is a natural successor, pick a second item rather
+    than exiting.** Cap at 2 items per tick; cap at 30 min wall-clock
+    so the next tick doesn't get behind. Skip the second pick if the
+    first item produced something that needs operator review before
+    continuing (e.g. a propose-only doc whose recommendations the
+    next phase would consume).
+
+    "Natural successor" examples:
+    - next subissue in the same chainlink chain (when it's unblocked
+      and bounded)
+    - another single-edit backlog item from
+      `state/heartbeat-backlog.md`
+    - a propose-only draft that pairs with the just-completed work
+
+    Not natural successors: anything operator-gated, anything that
+    needs a stakeholder review of the first item's output, anything
+    that would push wall-clock past 30 min.
     """
 )
 
