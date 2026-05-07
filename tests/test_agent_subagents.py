@@ -137,6 +137,44 @@ async def test_inbox_drains_into_next_turn_prompt(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_walk_handles_interleaved_task_streams(tmp_path: Path):
+    """CR#13 regression: consolidated dispatch walk must preserve the
+    task_descriptions invariant when two subagents are running
+    concurrently and their TaskStarted/TaskNotification messages are
+    interleaved in the SDK stream.
+
+    Order in the test:
+      Started(A) → Started(B) → Notification(A) → Notification(B)
+
+    Both inbox pushes must carry the right `description` from
+    task_descriptions, demonstrating that the dispatch loop's
+    mid-walk lookup works for any task_id whose Started came
+    earlier in the stream — including cross-pollination across
+    interleaved tasks."""
+    agent, inbox = _build_agent(tmp_path)
+
+    async def fake_query(*, prompt, options, session_id="default", transport=None):
+        yield _started("ta", "research A")
+        yield _started("tb", "research B")
+        yield _notification("ta", "completed", "result A", "/tmp/a.md")
+        yield _notification("tb", "completed", "result B", "/tmp/b.md")
+        yield AssistantMessage(content=[TextBlock(text="kicked off")], model="claude")
+
+    with patch("mimir.agent.query", new=fake_query):
+        await agent.run_turn(
+            AgentEvent(trigger="user_message", channel_id="c1", content="go", author="alice")
+        )
+
+    pending = inbox.peek("c1")
+    assert len(pending) == 2
+    by_id = {p.task_id: p for p in pending}
+    assert by_id["ta"].description == "research A"
+    assert by_id["tb"].description == "research B"
+    assert by_id["ta"].summary == "result A"
+    assert by_id["tb"].summary == "result B"
+
+
+@pytest.mark.asyncio
 async def test_failed_subagent_still_pushed(tmp_path: Path):
     agent, inbox = _build_agent(tmp_path)
 
