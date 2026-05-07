@@ -21,7 +21,11 @@ from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
-from ._context import get_current_turn, get_turn_by_saga_session_id
+from ._context import (
+    get_current_turn,
+    get_only_active_turn,
+    get_turn_by_saga_session_id,
+)
 from ._tool_helpers import _ArgError, _content_block, _need, _safe
 from .event_logger import log_event
 from .saga_client import SagaClient, SagaError
@@ -216,6 +220,42 @@ def _atom_ids_from_response(payload: dict[str, Any]) -> list[str]:
     return out
 
 
+def _resolve_ctx(args: dict[str, Any]) -> tuple[Any, str]:
+    """Resolve the active TurnContext for an MCP tool handler running on
+    a forked task that can't see ``_current_turn`` (chainlink #23).
+
+    Tries three lookups in order:
+
+    1. ``args["session_id"]`` (model-passed via Option P) → match against
+       ``ctx.saga_session_id`` in ``_active_turns``. The model has the
+       value via the system prompt's per-turn context block. Multi-channel
+       safe.
+    2. ``get_only_active_turn()`` heuristic — the unique active turn if
+       exactly one is registered. Works in single-channel deployments;
+       returns None when 0 or >1 turns are active.
+    3. ``get_current_turn()`` contextvar — works for the direct-handler-
+       call test path (where the contextvar IS set). Won't fire under
+       SDK dispatch.
+
+    Returns ``(ctx, resolution_path)`` where resolution_path is one of
+    ``"saga_session_id" | "single_active" | "contextvar" | "missing"``.
+    Mirrors CR#18's pattern; the path is logged via a per-tool
+    ``<tool>_ctx_resolution`` event so the rate of each path is visible
+    in events.jsonl.
+    """
+    sid = args.get("session_id")
+    ctx = get_turn_by_saga_session_id(sid) if sid else None
+    if ctx is not None:
+        return ctx, "saga_session_id"
+    ctx = get_only_active_turn()
+    if ctx is not None:
+        return ctx, "single_active"
+    ctx = get_current_turn()
+    if ctx is not None:
+        return ctx, "contextvar"
+    return None, "missing"
+
+
 def _hits_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Slim hits list for tool result text. Mirrors the pre-message hook shape.
 
@@ -260,15 +300,21 @@ def build_saga_tools(
         "are auto-tracked on the current turn so they get credited at "
         "post-message — you do not need to call saga_mark_contributions "
         "for these. Pass min_confidence_tier in {none|low|medium|high} to "
-        "raise the per-atom floor; default is SAGA's server-side setting.",
-        # Explicit JSON schema so top_k + min_confidence_tier are optional.
-        # Without this, the SDK marks every dict-style key as required.
+        "raise the per-atom floor; default is SAGA's server-side setting. "
+        "Pass ``session_id`` (your current saga_session_id from the "
+        "Current-message header) so the handler can scope retrieval and "
+        "credit retrieved atoms back to your turn — without it, mid-turn "
+        "atom auto-credit may silently fail under multi-channel concurrency.",
+        # Explicit JSON schema so top_k + min_confidence_tier + session_id
+        # are optional. Without this, the SDK marks every dict-style key as
+        # required.
         {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
                 "top_k": {"type": "integer"},
                 "min_confidence_tier": {"type": "string"},
+                "session_id": {"type": "string"},
             },
             "required": ["query"],
         },
@@ -281,8 +327,16 @@ def build_saga_tools(
         except (TypeError, ValueError):
             top_k = 12
         min_tier = (args.get("min_confidence_tier") or "").strip() or None
-        ctx = get_current_turn()
+        # chainlink #23 #26: lookup chain replaces bare get_current_turn().
+        # See _resolve_ctx docstring for the three-level fallback order.
+        ctx, resolution_path = _resolve_ctx(args)
         sid = ctx.saga_session_id if ctx else None
+        await log_event(
+            "saga_query_ctx_resolution",
+            resolution_path=resolution_path,
+            saga_session_id=sid,
+            turn_id=ctx.turn_id if ctx is not None else None,
+        )
         try:
             payload = await client.query(
                 q, top_k=top_k, session_id=sid, min_confidence_tier=min_tier
@@ -306,13 +360,37 @@ def build_saga_tools(
         "saga_store",
         "Explicitly store a memory atom. SAGA auto-extracts atoms from message "
         "content, so you rarely need this — only call it for facts you want "
-        "stored verbatim that wouldn't otherwise be picked up.",
-        {"content": str, "stream": str},
+        "stored verbatim that wouldn't otherwise be picked up. Pass "
+        "``session_id`` (your current saga_session_id from the Current-message "
+        "header) so the stored atom is scoped to your turn.",
+        {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "stream": {"type": "string"},
+                "session_id": {"type": "string"},
+            },
+            "required": ["content", "stream"],
+        },
     )
     @_safe("saga_store")
     async def saga_store(args: dict[str, Any]) -> dict[str, Any]:
         content = _need(args, "content")
         stream = (args.get("stream") or "").strip() or None
+        # chainlink #23 #26: log ctx resolution for observability parity
+        # with the other saga tools. SagaClient.store doesn't currently
+        # accept session_id (storage is un-scoped at the client interface);
+        # tracking resolution_path here keeps the event stream uniform so
+        # future wire-up of session-scoped storage doesn't need a separate
+        # observability rollout.
+        ctx, resolution_path = _resolve_ctx(args)
+        sid = ctx.saga_session_id if ctx else None
+        await log_event(
+            "saga_store_ctx_resolution",
+            resolution_path=resolution_path,
+            saga_session_id=sid,
+            turn_id=ctx.turn_id if ctx is not None else None,
+        )
         try:
             payload = await client.store(content=content, stream=stream)
         except SagaError as exc:
@@ -322,8 +400,18 @@ def build_saga_tools(
     @tool(
         "saga_feedback",
         "Mark a single atom as useful/incorrect/stale. Maps internally to "
-        "SAGA's /v1/outcome (useful→positive, incorrect→negative, stale→negative).",
-        {"atom_id": str, "signal": str},
+        "SAGA's /v1/outcome (useful→positive, incorrect→negative, stale→negative). "
+        "Pass ``session_id`` (your current saga_session_id from the Current-message "
+        "header) so the outcome is recorded against your turn.",
+        {
+            "type": "object",
+            "properties": {
+                "atom_id": {"type": "string"},
+                "signal": {"type": "string"},
+                "session_id": {"type": "string"},
+            },
+            "required": ["atom_id", "signal"],
+        },
     )
     @_safe("saga_feedback")
     async def saga_feedback(args: dict[str, Any]) -> dict[str, Any]:
@@ -335,8 +423,14 @@ def build_saga_tools(
                 f"saga_feedback failed: signal must be useful|incorrect|stale (got {signal!r})",
                 is_error=True,
             )
-        ctx = get_current_turn()
+        ctx, resolution_path = _resolve_ctx(args)
         sid = ctx.saga_session_id if ctx else None
+        await log_event(
+            "saga_feedback_ctx_resolution",
+            resolution_path=resolution_path,
+            saga_session_id=sid,
+            turn_id=ctx.turn_id if ctx is not None else None,
+        )
         try:
             await client.outcome([atom_id], feedback=wire, session_id=sid)
         except SagaError as exc:
@@ -348,8 +442,18 @@ def build_saga_tools(
         "Manually credit a list of atom_ids against the response text. Normally "
         "the post-message hook handles this automatically with the union of "
         "pre-injected and mid-turn-queried atoms. Use this only if you want to "
-        "credit atoms outside the standard flow.",
-        {"atom_ids": list[str], "response_text": str},
+        "credit atoms outside the standard flow. Pass ``session_id`` (your "
+        "current saga_session_id from the Current-message header) so the credit "
+        "is recorded against your turn.",
+        {
+            "type": "object",
+            "properties": {
+                "atom_ids": {"type": "array", "items": {"type": "string"}},
+                "response_text": {"type": "string"},
+                "session_id": {"type": "string"},
+            },
+            "required": ["atom_ids", "response_text"],
+        },
     )
     @_safe("saga_mark_contributions")
     async def saga_mark_contributions(args: dict[str, Any]) -> dict[str, Any]:
@@ -365,8 +469,14 @@ def build_saga_tools(
                 "saga_mark_contributions failed: response_text must be a string",
                 is_error=True,
             )
-        ctx = get_current_turn()
+        ctx, resolution_path = _resolve_ctx(args)
         sid = ctx.saga_session_id if ctx else None
+        await log_event(
+            "saga_mark_contributions_ctx_resolution",
+            resolution_path=resolution_path,
+            saga_session_id=sid,
+            turn_id=ctx.turn_id if ctx is not None else None,
+        )
         try:
             await client.feedback(atom_ids, response_text, session_id=sid)
         except SagaError as exc:
