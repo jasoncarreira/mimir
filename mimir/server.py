@@ -185,6 +185,7 @@ def build_app(config: Config) -> web.Application:
         scheduler=scheduler,
         subagent_inbox=inbox,
         channel_registry=channels,
+        dispatcher=dispatcher,
     )
     dispatcher.set_run_turn(agent.run_turn)
 

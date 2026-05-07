@@ -33,6 +33,10 @@ import asyncio
 import json
 import logging
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .dispatcher import Dispatcher
 from datetime import datetime, timezone
 
 from claude_agent_sdk import (
@@ -94,6 +98,7 @@ from .prompts import build_system_prompt, build_turn_prompt
 from .scheduler import Scheduler
 from .search import Indexer
 from .session_manager import SessionManager
+from .shell_jobs import ShellJob, ShellJobRegistry
 from .subagent_inbox import SubagentInbox, SubagentResult, render_subagent_updates
 from .templates import render_saga_session_end
 from .tools import SDK_PRESET_TOOLS, allowed_tool_names, build_mcp_server
@@ -597,6 +602,7 @@ class Agent:
         scheduler: Scheduler | None = None,
         subagent_inbox: SubagentInbox | None = None,
         channel_registry: ChannelRegistry | None = None,
+        dispatcher: "Dispatcher | None" = None,
     ) -> None:
         self._config = config
         self._turn_logger = turn_logger
@@ -608,6 +614,16 @@ class Agent:
         self._scheduler = scheduler
         self._inbox = subagent_inbox or SubagentInbox()
         self._channels = channel_registry
+        # Used by the shell-job completion bridge to enqueue
+        # ``shell_job_complete`` events from the waiter thread back into
+        # the originating channel's queue. Optional — tests construct an
+        # Agent without a dispatcher and shell jobs simply complete
+        # silently in that case.
+        self._dispatcher = dispatcher
+        # Captured at first turn (when we know we're on the asyncio
+        # loop). Worker threads use this to schedule coroutines back
+        # onto the loop via ``run_coroutine_threadsafe``.
+        self._loop: "asyncio.AbstractEventLoop | None" = None
         self._feedback = FeedbackLog(
             events_path=config.events_log,
             turns_path=config.turns_log,
@@ -662,6 +678,14 @@ class Agent:
         if scheduler is not None:
             scheduler._arbiter = self._arbiter
 
+        # Async shell-job registry — backs the bash_async / bash_jobs_list /
+        # bash_job_output MCP tools. Constructed once; threads spawned by
+        # ``spawn()`` live for the duration of the subprocess they wrap.
+        # Files land in ``<home>/logs/bash-jobs/<job_id>.{out,err}``.
+        self._shell_jobs = ShellJobRegistry(
+            jobs_dir=config.home / "logs" / "bash-jobs",
+        )
+
         self._mcp_server = build_mcp_server(
             config.home,
             indexer=indexer,
@@ -671,6 +695,8 @@ class Agent:
             message_buffer=message_buffer,
             session_boundary_log=self._session_boundary_log,
             turns_log=config.turns_log,
+            shell_jobs=self._shell_jobs,
+            on_shell_job_complete=self._handle_shell_job_complete,
         )
 
         # Hooks layer mimir's path confinement + post-write reindex onto the
@@ -707,6 +733,101 @@ class Agent:
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
         return task
+
+    # ─── Async shell-job completion bridge ──────────────────────────────
+
+    def _handle_shell_job_complete(self, job: ShellJob) -> None:
+        """Thread-safe bridge: a shell-job waiter thread invokes this when
+        the subprocess exits. Schedules the async handler onto the
+        captured asyncio loop so we can enqueue a ``shell_job_complete``
+        AgentEvent without crossing thread boundaries unsafely.
+
+        Silently no-ops when no loop has been captured yet (e.g. a job
+        completed before the first turn ran — shouldn't happen in
+        practice but the guard is cheap) or when the dispatcher isn't
+        wired (unit tests). Never raises — the registry guards against
+        callback errors but a pre-callback raise here would still
+        crash the daemon thread.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        if self._dispatcher is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._on_shell_job_complete(job),
+                loop,
+            )
+        except Exception:
+            # Last-resort guard. Never let a daemon-thread invocation
+            # crash the registry.
+            log.exception("schedule of shell-job-complete handler failed")
+
+    async def _on_shell_job_complete(self, job: ShellJob) -> None:
+        """Async handler that runs on the asyncio loop. Builds a turn
+        prompt summarizing the job's exit state + output tails and
+        enqueues a ``shell_job_complete`` AgentEvent into the dispatcher.
+
+        Routes back to the channel that spawned the job. When channel_id
+        is None (job spawned from a bare scheduled tick that lacked a
+        channel reference), the event is silently dropped — there's no
+        sensible default routing target.
+        """
+        if job.channel_id is None:
+            await log_event(
+                "shell_job_complete_no_channel",
+                job_id=job.job_id,
+                exit_code=job.exit_code,
+            )
+            return
+
+        try:
+            data = self._shell_jobs.read_output(
+                job.job_id, tail_lines=100, stream="both",
+            )
+        except Exception:
+            data = {"stdout_tail": "", "stderr_tail": ""}
+
+        stdout_tail = (data.get("stdout_tail") or "").strip()
+        stderr_tail = (data.get("stderr_tail") or "").strip()
+        # Bound each stream so a runaway job doesn't blow the prompt budget.
+        max_chars = 4000
+        if len(stdout_tail) > max_chars:
+            stdout_tail = stdout_tail[-max_chars:]
+        if len(stderr_tail) > max_chars:
+            stderr_tail = stderr_tail[-max_chars:]
+
+        elapsed = round(job.elapsed_seconds, 1)
+        body_lines = [
+            f"Shell job {job.job_id} complete (status={job.status}, "
+            f"exit_code={job.exit_code}, elapsed={elapsed}s).",
+            f"Command: {job.command}",
+            "",
+            "--- stdout tail ---",
+            stdout_tail or "(empty)",
+            "",
+            "--- stderr tail ---",
+            stderr_tail or "(empty)",
+        ]
+        body = "\n".join(body_lines)
+
+        event = AgentEvent(
+            trigger="shell_job_complete",
+            channel_id=job.channel_id,
+            content=body,
+            source_id=f"shell_job:{job.job_id}",
+            source="system",
+            extra={"job_id": job.job_id, "exit_code": job.exit_code},
+        )
+        try:
+            await self._dispatcher.enqueue(event)
+        except Exception as exc:  # noqa: BLE001
+            await log_event(
+                "shell_job_complete_enqueue_failed",
+                job_id=job.job_id,
+                error=str(exc)[:500],
+            )
 
     def _build_options(self, system_prompt: str) -> ClaudeAgentOptions:
         effort = self._config.effort
@@ -761,6 +882,13 @@ class Agent:
 
     async def _record_inbound(self, event: AgentEvent) -> None:
         if not event.content or event.trigger == "saga_session_end":
+            return
+        # Shell-job completion wake-ups are payload-shaped (multi-line
+        # status + tails), not message-shaped. Skip recording them in
+        # chat_history so the recent-activity block doesn't fill with
+        # shell dumps; the wake-up turn still sees them in its prompt
+        # via build_turn_prompt's shell_job_complete branch.
+        if event.trigger == "shell_job_complete":
             return
         kind = "user_message" if event.trigger == "user_message" else "system_note"
         msg = self._buffer.make_message(
@@ -1530,6 +1658,16 @@ class Agent:
     # ---- run_turn ------------------------------------------------------
 
     async def run_turn(self, event: AgentEvent) -> TurnRecord:
+        # Capture the running loop on first turn — worker threads (shell
+        # job waiters, etc.) use this to schedule coroutines back onto
+        # the loop via run_coroutine_threadsafe. Idempotent: subsequent
+        # calls re-bind to the same loop, which is fine.
+        if self._loop is None:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass  # not on a loop (shouldn't happen, but the guard is cheap)
+
         ctx = TurnContext(
             turn_id=make_turn_id(),
             session_id=event.channel_id,
