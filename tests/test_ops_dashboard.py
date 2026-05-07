@@ -546,6 +546,79 @@ async def test_chainlink_helper_handles_nonzero_exit(tmp_path: Path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_chainlink_helper_passes_status_open_filter(tmp_path: Path, monkeypatch):
+    """Defensive against CLI default drift: the helper must always
+    invoke chainlink with ``--status open`` so closed / archived
+    issues never bleed into the dashboard even if a future CLI
+    release flips its default."""
+    from mimir import ops_dashboard
+    import asyncio
+
+    captured_args: list[tuple[str, ...]] = []
+
+    class _FakeProc:
+        returncode = 0
+        async def communicate(self):
+            return (b"[]", b"")
+
+    async def fake_exec(*args, **kwargs):
+        captured_args.append(args)
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await ops_dashboard._load_chainlink_issues(tmp_path)
+    assert len(captured_args) == 1
+    assert "--status" in captured_args[0]
+    status_idx = captured_args[0].index("--status")
+    assert captured_args[0][status_idx + 1] == "open"
+
+
+@pytest.mark.asyncio
+async def test_chainlink_helper_drains_pipes_after_timeout_kill(tmp_path: Path, monkeypatch):
+    """Mimir review item on PR #62: after a timeout the helper kills
+    the subprocess but must also drain stdout/stderr so file
+    descriptors release immediately. Without the drain, a hung
+    chainlink CLI under heavy /ops traffic could accumulate FDs.
+
+    Verified by counting communicate() calls — once for the
+    initial wait_for that times out, once for the post-kill drain."""
+    from mimir import ops_dashboard
+    import asyncio
+
+    communicate_calls = 0
+    kill_called = False
+
+    class _FakeProc:
+        returncode = None
+
+        async def communicate(self):
+            nonlocal communicate_calls
+            communicate_calls += 1
+            # First call: hang past the timeout.
+            # Second call (post-kill): return empty and complete fast.
+            if communicate_calls == 1:
+                await asyncio.sleep(60)
+            return (b"", b"")
+
+        def kill(self):
+            nonlocal kill_called
+            kill_called = True
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(ops_dashboard, "_CHAINLINK_TIMEOUT_SECONDS", 0.05)
+
+    result = await ops_dashboard._load_chainlink_issues(tmp_path)
+    assert result["available"] is False
+    assert "timed out" in result["error"]
+    # Both the timed-out wait_for and the post-kill drain ran.
+    assert communicate_calls == 2
+    assert kill_called is True
+
+
+@pytest.mark.asyncio
 async def test_chainlink_helper_handles_garbled_json(tmp_path: Path, monkeypatch):
     """If chainlink succeeds but emits invalid JSON the helper still
     soft-fails. Defensive: spec drift in the CLI output shouldn't

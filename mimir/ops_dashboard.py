@@ -346,8 +346,12 @@ async def _load_chainlink_issues(home: Path) -> dict[str, Any]:
     Backlog tab handles the "chainlink unavailable" message.
     """
     try:
+        # ``--status open`` is defensive — chainlink's current default
+        # is ``open`` but pinning it at the call site means a future
+        # CLI default change can't silently start filling the dashboard
+        # tab with closed/archived issues.
         proc = await asyncio.create_subprocess_exec(
-            "chainlink", "issue", "list", "--json",
+            "chainlink", "issue", "list", "--status", "open", "--json",
             cwd=str(home),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -365,6 +369,15 @@ async def _load_chainlink_issues(home: Path) -> dict[str, Any]:
         try:
             proc.kill()
         except ProcessLookupError:
+            pass
+        # Drain the stdout/stderr pipes after kill so file descriptors
+        # release immediately rather than lingering until GC. Under
+        # heavy /ops traffic with a hung chainlink CLI the FD count
+        # could otherwise climb. Swallow exceptions — the kill already
+        # happened; we're just cleaning up.
+        try:
+            await proc.communicate()
+        except Exception:  # noqa: BLE001
             pass
         return {
             "available": False,
