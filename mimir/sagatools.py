@@ -21,11 +21,7 @@ from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
-from ._context import (
-    get_current_turn,
-    get_only_active_turn,
-    get_turn_by_saga_session_id,
-)
+from ._context import resolve_active_ctx
 from ._tool_helpers import _ArgError, _content_block, _need, _safe
 from .event_logger import log_event
 from .saga_client import SagaClient, SagaError
@@ -220,42 +216,6 @@ def _atom_ids_from_response(payload: dict[str, Any]) -> list[str]:
     return out
 
 
-def _resolve_ctx(args: dict[str, Any]) -> tuple[Any, str]:
-    """Resolve the active TurnContext for an MCP tool handler running on
-    a forked task that can't see ``_current_turn`` (chainlink #23).
-
-    Tries three lookups in order:
-
-    1. ``args["session_id"]`` (model-passed via Option P) → match against
-       ``ctx.saga_session_id`` in ``_active_turns``. The model has the
-       value via the system prompt's per-turn context block. Multi-channel
-       safe.
-    2. ``get_only_active_turn()`` heuristic — the unique active turn if
-       exactly one is registered. Works in single-channel deployments;
-       returns None when 0 or >1 turns are active.
-    3. ``get_current_turn()`` contextvar — works for the direct-handler-
-       call test path (where the contextvar IS set). Won't fire under
-       SDK dispatch.
-
-    Returns ``(ctx, resolution_path)`` where resolution_path is one of
-    ``"saga_session_id" | "single_active" | "contextvar" | "missing"``.
-    Mirrors CR#18's pattern; the path is logged via a per-tool
-    ``<tool>_ctx_resolution`` event so the rate of each path is visible
-    in events.jsonl.
-    """
-    sid = args.get("session_id")
-    ctx = get_turn_by_saga_session_id(sid) if sid else None
-    if ctx is not None:
-        return ctx, "saga_session_id"
-    ctx = get_only_active_turn()
-    if ctx is not None:
-        return ctx, "single_active"
-    ctx = get_current_turn()
-    if ctx is not None:
-        return ctx, "contextvar"
-    return None, "missing"
-
-
 def _hits_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Slim hits list for tool result text. Mirrors the pre-message hook shape.
 
@@ -328,8 +288,8 @@ def build_saga_tools(
             top_k = 12
         min_tier = (args.get("min_confidence_tier") or "").strip() or None
         # chainlink #23 #26: lookup chain replaces bare get_current_turn().
-        # See _resolve_ctx docstring for the three-level fallback order.
-        ctx, resolution_path = _resolve_ctx(args)
+        # See resolve_active_ctx docstring for the three-level fallback order.
+        ctx, resolution_path = resolve_active_ctx(args)
         sid = ctx.saga_session_id if ctx else None
         await log_event(
             "saga_query_ctx_resolution",
@@ -383,7 +343,7 @@ def build_saga_tools(
         # tracking resolution_path here keeps the event stream uniform so
         # future wire-up of session-scoped storage doesn't need a separate
         # observability rollout.
-        ctx, resolution_path = _resolve_ctx(args)
+        ctx, resolution_path = resolve_active_ctx(args)
         sid = ctx.saga_session_id if ctx else None
         await log_event(
             "saga_store_ctx_resolution",
@@ -423,7 +383,7 @@ def build_saga_tools(
                 f"saga_feedback failed: signal must be useful|incorrect|stale (got {signal!r})",
                 is_error=True,
             )
-        ctx, resolution_path = _resolve_ctx(args)
+        ctx, resolution_path = resolve_active_ctx(args)
         sid = ctx.saga_session_id if ctx else None
         await log_event(
             "saga_feedback_ctx_resolution",
@@ -469,7 +429,7 @@ def build_saga_tools(
                 "saga_mark_contributions failed: response_text must be a string",
                 is_error=True,
             )
-        ctx, resolution_path = _resolve_ctx(args)
+        ctx, resolution_path = resolve_active_ctx(args)
         sid = ctx.saga_session_id if ctx else None
         await log_event(
             "saga_mark_contributions_ctx_resolution",
@@ -539,17 +499,15 @@ def build_saga_tools(
         # chainlink #23 subissue #25: the SDK dispatches MCP tool handlers
         # on a fresh asyncio task forked at first connect. ``_current_turn``
         # is invisible inside that task even when ``run_turn`` set it on
-        # its own task — same pattern as hooks (CR#18). Look up the turn
-        # by the ``session_id`` arg the model already passes
-        # (= ctx.saga_session_id); fall back to the contextvar for the
-        # direct-handler-call test path. ``resolution_path`` mirrors
-        # CR#18's pattern so the rate of each path is visible in
-        # events.jsonl.
-        ctx = get_turn_by_saga_session_id(session_id)
-        resolution_path = "saga_session_id"
-        if ctx is None:
-            ctx = get_current_turn()
-            resolution_path = "contextvar" if ctx is not None else "missing"
+        # its own task — same pattern as hooks (CR#18). Use the shared
+        # three-level lookup (saga_session_id → single_active → contextvar
+        # → missing). ``saga_session_id`` is the load-bearing path here;
+        # the middle step is harmless extra coverage when the model
+        # forgets to pass session_id (synthesis turns are serialized so
+        # single_active typically resolves to the right ctx).
+        # ``resolution_path`` mirrors CR#18's pattern so the rate of each
+        # path is visible in events.jsonl.
+        ctx, resolution_path = resolve_active_ctx({"session_id": session_id})
         if ctx is not None:
             ctx.saga_end_session_called = True
         await log_event(
