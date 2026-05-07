@@ -21,7 +21,7 @@ from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
-from ._context import get_current_turn
+from ._context import get_current_turn, get_turn_by_saga_session_id
 from ._tool_helpers import _ArgError, _content_block, _need, _safe
 from .event_logger import log_event
 from .saga_client import SagaClient, SagaError
@@ -425,9 +425,30 @@ def build_saga_tools(
         # check fires only on synthesis turns (trigger=saga_session_end);
         # for non-synthesis callers (rare — operator manually closes a
         # session) it's harmless extra bookkeeping.
-        ctx = get_current_turn()
+        #
+        # chainlink #23 subissue #25: the SDK dispatches MCP tool handlers
+        # on a fresh asyncio task forked at first connect. ``_current_turn``
+        # is invisible inside that task even when ``run_turn`` set it on
+        # its own task — same pattern as hooks (CR#18). Look up the turn
+        # by the ``session_id`` arg the model already passes
+        # (= ctx.saga_session_id); fall back to the contextvar for the
+        # direct-handler-call test path. ``resolution_path`` mirrors
+        # CR#18's pattern so the rate of each path is visible in
+        # events.jsonl.
+        ctx = get_turn_by_saga_session_id(session_id)
+        resolution_path = "saga_session_id"
+        if ctx is None:
+            ctx = get_current_turn()
+            resolution_path = "contextvar" if ctx is not None else "missing"
         if ctx is not None:
             ctx.saga_end_session_called = True
+        await log_event(
+            "saga_synthesis_ctx_resolution",
+            saga_session_id=session_id,
+            resolution_path=resolution_path,
+            turn_id=ctx.turn_id if ctx is not None else None,
+            channel_id=ctx.channel_id if ctx is not None else None,
+        )
 
         # v0.4 §3: append to local mirror so the prompt-time render still
         # has session summaries available if SAGA is briefly down. Best

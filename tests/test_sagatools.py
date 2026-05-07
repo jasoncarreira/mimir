@@ -8,10 +8,21 @@ from pathlib import Path
 import pytest
 
 from mimir import _context
+from mimir.event_logger import init_logger
 from mimir.models import TurnContext, make_turn_id
 from mimir.sagatools import build_saga_tools
 
 from ._fake_saga import FakeSaga
+
+
+@pytest.fixture(autouse=True)
+def _ensure_event_logger(tmp_path):
+    """saga_end_session emits ``saga_synthesis_ctx_resolution`` events
+    (chainlink #23 subissue #25) which require the event_logger to be
+    initialized. Tests that monkeypatch ``mimir.sagatools.log_event``
+    bypass this; tests that don't get a real logger pointed at a temp
+    file."""
+    init_logger(tmp_path / "test-events.jsonl", session_id="test-sagatools")
 
 
 def _by_name(tools, name):
@@ -385,6 +396,148 @@ async def test_saga_end_session_does_not_flip_ctx_flag_on_failure():
         assert ctx.saga_end_session_called is False
     finally:
         _context.reset_current_turn(token)
+
+
+@pytest.mark.asyncio
+async def test_saga_end_session_resolves_via_saga_session_id_under_sdk_fork(
+    monkeypatch,
+):
+    """chainlink #23 subissue #25: when the MCP handler is dispatched on
+    a fresh-context asyncio task (the SDK's production path), the
+    ``_current_turn`` ContextVar is invisible inside the handler — but
+    the turn is still registered in ``_active_turns`` keyed by turn_id.
+
+    The fix in ``saga_end_session`` is to look up the turn by the
+    ``session_id`` arg the model already passes (= ``ctx.saga_session_id``)
+    rather than relying on contextvar inheritance. This regression test
+    drives the handler through ``dispatch_via_sdk_task_fork`` to prove
+    the fix: ``ctx.saga_end_session_called`` flips True even though the
+    contextvar is invisible inside the forked handler. Without the fix
+    the assertion fails (the handler can't see the ctx and the flag
+    stays False — which is the production false-positive
+    ``synth_skip_boundary`` algedonic at the heart of chainlink #23)."""
+    from tests._mcp_dispatch import dispatch_via_sdk_task_fork
+
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(kind: str, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.sagatools.log_event", fake_log_event)
+
+    ctx = TurnContext(
+        turn_id="t-fork-1",
+        session_id="c-fork",
+        trigger="saga_session_end",
+        channel_id="c-fork",
+        started_at=0.0,
+        saga_session_id="saga-fork-1",
+    )
+    token = _context.set_current_turn(ctx)
+    try:
+        fake = FakeSaga()
+        tools = build_saga_tools(fake)  # type: ignore[arg-type]
+        end = _by_name(tools, "saga_end_session")
+        out = await dispatch_via_sdk_task_fork(
+            end.handler,
+            {"session_id": "saga-fork-1", "summary": "done"},
+        )
+        assert out.get("is_error") is not True
+        # The flag must flip even though the handler ran in a
+        # fresh-context fork that can't see the contextvar.
+        assert ctx.saga_end_session_called is True
+    finally:
+        _context.reset_current_turn(token)
+
+    # Resolution path observability: this dispatch hit the
+    # saga_session_id-based lookup, not the contextvar fallback.
+    resolution_events = [
+        f for k, f in captured if k == "saga_synthesis_ctx_resolution"
+    ]
+    assert len(resolution_events) == 1
+    assert resolution_events[0]["resolution_path"] == "saga_session_id"
+    assert resolution_events[0]["saga_session_id"] == "saga-fork-1"
+    assert resolution_events[0]["turn_id"] == "t-fork-1"
+
+
+@pytest.mark.asyncio
+async def test_saga_end_session_resolution_path_contextvar_in_direct_call(
+    monkeypatch,
+):
+    """The pre-fix tests (above) call the handler directly without going
+    through the SDK fork. With the fix, those tests still pass because
+    the lookup falls back to ``get_current_turn()`` when no active turn
+    matches the ``session_id`` arg. The resolution_path event records
+    ``contextvar`` for that path so the rate of direct-call vs fork-path
+    is visible in events.jsonl. (In production, fork is the dominant
+    path; direct-call mostly happens in unit tests.)"""
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(kind: str, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.sagatools.log_event", fake_log_event)
+
+    # ctx with NO saga_session_id set (default None) — so the
+    # saga_session_id lookup misses and we fall through to contextvar.
+    ctx = TurnContext(
+        turn_id="t-direct-1",
+        session_id="c-direct",
+        trigger="saga_session_end",
+        channel_id="c-direct",
+        started_at=0.0,
+    )
+    token = _context.set_current_turn(ctx)
+    try:
+        fake = FakeSaga()
+        tools = build_saga_tools(fake)  # type: ignore[arg-type]
+        end = _by_name(tools, "saga_end_session")
+        out = await end.handler({
+            "session_id": "saga-direct-1",
+            "summary": "ok",
+        })
+        assert out.get("is_error") is not True
+        assert ctx.saga_end_session_called is True
+    finally:
+        _context.reset_current_turn(token)
+
+    resolution_events = [
+        f for k, f in captured if k == "saga_synthesis_ctx_resolution"
+    ]
+    assert len(resolution_events) == 1
+    assert resolution_events[0]["resolution_path"] == "contextvar"
+
+
+@pytest.mark.asyncio
+async def test_saga_end_session_resolution_path_missing_when_no_ctx(
+    monkeypatch,
+):
+    """No turn registered + contextvar not set: the handler still
+    succeeds at the SAGA level (the call doesn't depend on ctx) but
+    the flag-flip is a no-op. resolution_path=missing surfaces the
+    rate of orphaned-call cases for monitoring."""
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(kind: str, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.sagatools.log_event", fake_log_event)
+
+    fake = FakeSaga()
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    end = _by_name(tools, "saga_end_session")
+    out = await end.handler({
+        "session_id": "saga-orphan-1",
+        "summary": "ok",
+    })
+    assert out.get("is_error") is not True
+
+    resolution_events = [
+        f for k, f in captured if k == "saga_synthesis_ctx_resolution"
+    ]
+    assert len(resolution_events) == 1
+    assert resolution_events[0]["resolution_path"] == "missing"
+    assert resolution_events[0]["turn_id"] is None
 
 
 @pytest.mark.asyncio
