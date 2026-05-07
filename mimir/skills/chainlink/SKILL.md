@@ -127,6 +127,95 @@ Don't create one when:
   `saga_store`, not chainlink.
 - The user is just venting and didn't ask you to track anything.
 
+## Writing interest items future-you will actually use
+
+Heartbeat picks up interest items by reading their descriptions cold. An
+item written as prose ("look into the rate-limit thing later") is
+unanchored: a future heartbeat reads it, shrugs, and moves on. An item
+with **handles** ("investigate why `oauth_quota_anomalous` has fired
+5×/day on `discord-100000000000000002` since 2026-05-03") is actionable
+on first read.
+
+A good interest item answers four questions:
+
+1. **What's the trigger, named with handles?** Not "saga thing went
+   wrong" — "`saga_synthesis_skipped_boundary` fired 5×/24h on synthesis
+   turns since PR #32 (2026-05-06)." Specific event names, file paths,
+   commit hashes, dollar thresholds, dedupe-key shapes. Anything a
+   future heartbeat can grep for.
+2. **Why does this matter?** The reason it crossed the bar from noise
+   to signal. "Atoms aren't landing → silent memory loss" is a reason;
+   "felt off" is not.
+3. **What's the success path?** The concrete next step if the
+   investigation finds something. "If the cause is the new dedup
+   window, the fix is bumping the floor in `_pre_message_hook`."
+4. **What's the failure path?** Likely modes if the cause isn't what
+   you expect. "If it's not the dedup window, check the consolidator —
+   PR #32 also touched `_partition_turns`."
+
+The handles matter most. With handles, future-you can grep
+`events.jsonl`, query saga, or `git log` and find every record tied to
+the item. Without handles, the item is unanchored and gets deferred
+forever.
+
+## Idempotency: design for the boundary firing twice
+
+Chainlink interest items can be picked up by overlapping heartbeats.
+Pollers can emit duplicate events when a cursor wasn't saved before a
+crash. Subagent completion notifications can arrive after a retry.
+Synthesis turns can fire twice on the same session boundary. **Design
+actions so they're safe to run twice.**
+
+The agent's instinct is "I just got here, I should do the thing." The
+right instinct is: "I just got here, has the thing already been done?"
+
+Concrete tactics:
+
+- **Tag durable artifacts with a unique key.** "Posted draft #abc123
+  to channel" — if you wake up and see #abc123 already exists, skip
+  rather than duplicate. PR titles, commit messages, and chainlink
+  issue titles are all good unique keys you can grep for before
+  acting.
+- **Update cursors atomically and *after* the side effect.** Save
+  the poller cursor only once the events have been emitted; never
+  save-then-emit (a crash between saves the cursor but loses the
+  event). See `pollers/SKILL.md` for the cursor pattern.
+- **Use mkdir / O_CREAT-style claims for cross-process work.** If a
+  marker file or directory exists, another instance is already
+  working — back off rather than collide.
+- **Treat send_message and similar with care.** A duplicate message
+  annoys the operator. The harness already circuit-breaks
+  near-duplicate sends within a turn — but design as if it won't.
+  The breaker is a safety net, not a correctness guarantee.
+
+### Mimir-specific idempotency surfaces
+
+Several mimir primitives have built-in idempotency you can lean on,
+plus a couple that look idempotent but aren't:
+
+- **Saga atom IDs are unique-key idempotency for free.** `saga_store`
+  returns an `atom_id`; if the same content lands twice, saga
+  deduplicates at the atom layer. Synth turns firing twice on the
+  same boundary don't create two atoms.
+- **`applied_proposals.jsonl` is the proposal-replay guard.** Before
+  re-applying a proposal from `state/proposed-changes.md`, check
+  whether its id is already in `state/applied_proposals.jsonl` — if
+  so, it landed already and re-applying is a foot-gun.
+- **`chainlink issue create` is *append-only*, not idempotent.**
+  Re-running `issue create "Same title"` produces a *new* issue with
+  a fresh id every time. Before creating an interest item, query
+  for an existing issue with the same title or a distinctive label
+  (`chainlink issue list --label interest --json | jq ...`). This
+  is the most common chainlink foot-gun.
+- **`send_message` has harness-level dedup within a turn.** The
+  dispatcher circuit-breaks near-duplicate sends — but only within
+  the same turn. Across turns, the breaker doesn't help; rely on
+  unique keys in the message itself if the same content might be
+  generated twice.
+- **PR creation is *not* idempotent.** `gh pr create` against the
+  same branch happily makes a second PR. Always `gh pr list --head
+  <branch>` first.
+
 ## Querying open work
 
 End-of-heartbeat or end-of-session is a good time to surface what's open:

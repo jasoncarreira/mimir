@@ -114,6 +114,26 @@ mimir predictions stats --days 30
 Shows accuracy by kind, by author (agent/operator), and a
 calibration curve when there are enough samples.
 
+## What NOT to predict
+
+- **Shield-tic predictions.** Predictions whose options all have
+  similar probabilities and similar shapes — `Meta-1
+  silence-correct 0.95, Meta-2 logging-correct 0.95, Meta-3
+  verification-correct 0.95` — are calibration noise that drowns
+  real signal. The test: would the resolution of this prediction
+  *change* what you'd do next? If no, it's filler — drop it.
+  "Calibrated at 95%" inflated by shield-tics is worse than no
+  calibration data because it lies to the reflection pass.
+- **Re-narrating the structured field as prose.** If you wrote
+  `predictions: a 0.45, b 0.30, c 0.25` in the structured field,
+  don't then say in the body "I think a is most likely." Pick one
+  surface — the structured field is what review reads.
+- **Predictions you'd have made without thinking.** "The build
+  will probably pass" without a specific reason isn't a
+  calibration data point; it's reflex. A real prediction names
+  *why* you expect the outcome, so a wrong call traces back to a
+  broken assumption.
+
 ## Self-reminders
 
 - **Be specific.** "Things will be better" is unverifiable. "Read

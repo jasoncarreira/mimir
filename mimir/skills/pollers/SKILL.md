@@ -129,6 +129,19 @@ See [design-patterns.md](design-patterns.md) for detailed guidance on:
 - **Error handling** — fail silently (exit non-zero), never emit on error
 - **Anti-patterns** — common mistakes and how to avoid them
 
+## Idempotency: design for the boundary firing twice
+
+Pollers are a duplicate-events surface by construction: a crash between
+"emit event" and "save cursor" replays the event on the next tick.
+Design poller-driven actions so they're safe to run twice — tag
+artifacts with unique keys, update cursors *after* the side effect, and
+treat the agent-side response as if any given event could land twice.
+
+See `chainlink/SKILL.md` §"Idempotency: design for the boundary firing
+twice" for the full discipline (the same rules apply to chainlink
+interest items, synth turns, and subagent notifications — pollers are
+one surface among several).
+
 ## Security & Privacy
 
 See [security.md](security.md) for guidance on:
