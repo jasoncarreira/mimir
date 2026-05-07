@@ -536,7 +536,6 @@ DEFAULT_FILING_RULES = dedent(
     | Session-scoped note in `memory/core/` | `memory/learnings-pending.md` or discard | **system-breaking** |
     | Candidate learning written directly to `memory/core/40-learned-behaviors.md` (not by reflection) | `memory/learnings-pending.md` | drift-amplifier |
     | Verbatim source under `state/wiki/` (no provenance header) | `state/raw/<YYYY-MM-DD>-<source>.md` (with synthesis at the wiki layer) | cosmetic |
-    | Wiki page added but `state/wiki/index.md` not updated | update index | drift-amplifier |
     | Stub-shaped seed file persists alongside lived-in successor | retire the seed | drift-amplifier |
 
     ## Lifecycle pointers
@@ -547,8 +546,8 @@ DEFAULT_FILING_RULES = dedent(
       writes only).
     - **Edit-in-place**: most other layers — channels, issues, wiki
       concepts/topics/entities, spec docs in flight.
-    - **Auto-managed**: `memory/INDEX.md`, `state/INDEX.md`. Hand-edits are
-      overwritten on the next file-write or 60s mtime sweep.
+    - **Auto-managed**: `memory/INDEX.md`, `state/INDEX.md`,
+      `state/wiki/index.md`. Hand-edits are overwritten end-of-turn.
     """
 )
 
