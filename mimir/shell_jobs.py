@@ -302,6 +302,14 @@ class ShellJobRegistry:
             return {"error": f"unknown job_id: {job_id}"}
 
         def _tail(path: Path, n: int) -> str:
+            # TODO(perf): seek-from-end streaming tail. Today we
+            # ``read_bytes()`` then ``splitlines()`` — a 1GB runaway
+            # log spikes memory on the event loop. Bounded in practice
+            # by the async-tasks skill's "wrap in ``timeout 1h``"
+            # discipline; if a job ever produces hundreds of MB
+            # legitimately, the safer shape is read backward in
+            # ~64KB chunks until N newlines are seen, then decode.
+            # See chainlink #56 follow-up if it ever bites.
             try:
                 data = path.read_bytes()
             except FileNotFoundError:

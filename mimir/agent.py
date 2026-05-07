@@ -33,11 +33,11 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .dispatcher import Dispatcher
-from datetime import datetime, timezone
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -821,13 +821,26 @@ class Agent:
             extra={"job_id": job.job_id, "exit_code": job.exit_code},
         )
         try:
-            await self._dispatcher.enqueue(event)
+            accepted = await self._dispatcher.enqueue(event)
         except Exception as exc:  # noqa: BLE001
             await log_event(
                 "shell_job_complete_enqueue_failed",
                 job_id=job.job_id,
                 error=str(exc)[:500],
             )
+            return
+        # Success path observability: closes the loop for "did the
+        # wake-up actually go out?" without making the operator
+        # cross-reference the next turn's prompt against the
+        # _spawned event. ``accepted=False`` means the dispatcher
+        # rejected (queue full / closed) — distinct from a raise.
+        await log_event(
+            "shell_job_complete_routed",
+            job_id=job.job_id,
+            channel_id=job.channel_id,
+            exit_code=job.exit_code,
+            accepted=accepted,
+        )
 
     def _build_options(self, system_prompt: str) -> ClaudeAgentOptions:
         effort = self._config.effort

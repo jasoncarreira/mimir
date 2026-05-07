@@ -74,6 +74,12 @@ async def test_on_complete_enqueues_event_with_summary(tmp_path: Path):
     loop = asyncio.get_running_loop()
     bridge = _AgentBridgeStub(dispatcher, registry, loop)
 
+    # Initialize logger so the routed-event emission has somewhere to
+    # write (added by Mimir-review observation: success path now logs
+    # shell_job_complete_routed).
+    from mimir.event_logger import init_logger
+    init_logger(tmp_path / "events.jsonl", session_id="test")
+
     # Synthesize a finished job that read_output knows about. spawn() is
     # cleaner than fabricating a ShellJob — we then await its completion.
     job = registry.spawn("echo hi", argv=["bash", "-c", "echo hi"], channel_id="c1")
@@ -96,6 +102,77 @@ async def test_on_complete_enqueues_event_with_summary(tmp_path: Path):
     assert ev.extra["job_id"] == job.job_id
     assert ev.extra["exit_code"] == 0
     assert ev.source == "system"
+
+
+@pytest.mark.asyncio
+async def test_on_complete_logs_routed_event_on_success(tmp_path: Path):
+    """Wake-up success path observability — the dispatcher accepted
+    the event, so a ``shell_job_complete_routed`` event lands in
+    events.jsonl with job_id, channel_id, exit_code, accepted=True.
+    Closes the loop for "did the wake-up actually go out?" debugging
+    without making the operator cross-reference next-turn prompts."""
+    registry = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
+    dispatcher = _FakeDispatcher()
+    loop = asyncio.get_running_loop()
+    bridge = _AgentBridgeStub(dispatcher, registry, loop)
+
+    from mimir.event_logger import init_logger
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="test")
+
+    job = registry.spawn("true", argv=["bash", "-c", "true"], channel_id="c-routed")
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if job.exit_code is not None:
+            break
+        await asyncio.sleep(0.05)
+
+    await bridge._on_shell_job_complete(job)
+
+    # Read events file; find the routed event we just emitted.
+    import json as _json
+    lines = events_path.read_text().splitlines()
+    routed = [
+        _json.loads(line)
+        for line in lines
+        if line and _json.loads(line).get("type") == "shell_job_complete_routed"
+    ]
+    assert len(routed) == 1
+    assert routed[0]["job_id"] == job.job_id
+    assert routed[0]["channel_id"] == "c-routed"
+    assert routed[0]["exit_code"] == 0
+    assert routed[0]["accepted"] is True
+
+
+@pytest.mark.asyncio
+async def test_on_complete_no_routed_event_when_dispatcher_raises(tmp_path: Path):
+    """When enqueue raises, ``_enqueue_failed`` fires but
+    ``_routed`` does NOT — the wake-up didn't reach the queue, and
+    success-path observability shouldn't lie about it."""
+    registry = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
+    dispatcher = _FakeDispatcher()
+    dispatcher.raise_on_enqueue = RuntimeError("dispatcher down")
+    loop = asyncio.get_running_loop()
+    bridge = _AgentBridgeStub(dispatcher, registry, loop)
+
+    from mimir.event_logger import init_logger
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="test")
+
+    job = registry.spawn("true", argv=["bash", "-c", "true"], channel_id="c1")
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if job.exit_code is not None:
+            break
+        await asyncio.sleep(0.05)
+
+    await bridge._on_shell_job_complete(job)
+
+    import json as _json
+    lines = events_path.read_text().splitlines()
+    types = [_json.loads(line).get("type") for line in lines if line]
+    assert "shell_job_complete_enqueue_failed" in types
+    assert "shell_job_complete_routed" not in types
 
 
 @pytest.mark.asyncio
