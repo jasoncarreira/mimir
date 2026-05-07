@@ -99,7 +99,6 @@ class MessageBuffer:
     cross_platform_pull: bool = True
     _all: deque[Message] = field(default_factory=deque)
     _by_channel: dict[str, deque[Message]] = field(default_factory=dict)
-    _write_lock: asyncio.Lock | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self._all = deque(maxlen=self.global_max)
@@ -142,12 +141,31 @@ class MessageBuffer:
         ch.append(msg)
 
     async def append(self, msg: Message) -> None:
-        """Append to disk + both deques. Lock-serialized writes."""
-        if self._write_lock is None:
-            self._write_lock = asyncio.Lock()
-        async with self._write_lock:
-            self._append_in_memory(msg)
-            await asyncio.to_thread(self._append_disk, msg)
+        """Append to disk + both deques.
+
+        No lock: the in-memory deque mutation is single-threaded under
+        asyncio (synchronous, no awaits inside ``_append_in_memory``),
+        and the disk write goes through ``asyncio.to_thread``. Each
+        ``_append_disk`` call opens the file with ``"a"`` and writes one
+        JSON line — POSIX guarantees ``O_APPEND`` writes are atomic at
+        the kernel level for a single ``write(2)`` syscall, so concurrent
+        appends from different threads can't corrupt or interleave at the
+        byte level. They may land out of call order on disk (whichever
+        thread wins the inode-lock race), but each line is whole.
+
+        Removing the lock — which previously held *across* the
+        ``await asyncio.to_thread(...)`` — lets concurrent callers
+        actually fan out to separate threads instead of serializing
+        through one. See CR#17.
+
+        Note: caller-visible flush ordering is preserved by keeping the
+        ``await``; on return, this message's disk write has completed.
+        Tests and graceful-shutdown paths depend on that. A more
+        aggressive fix would make the write fire-and-forget with a
+        bounded queue — deferred (would need bg-task tracking on the
+        buffer instance plus test-side flush hooks)."""
+        self._append_in_memory(msg)
+        await asyncio.to_thread(self._append_disk, msg)
 
     def _append_disk(self, msg: Message) -> None:
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
