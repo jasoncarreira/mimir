@@ -743,6 +743,149 @@ async def test_pre_hook_budget_punts_on_stale_contextvar(tmp_path: Path):
 
 
 @_pytest.mark.asyncio
+async def test_pre_hook_budget_per_client_cell_correct_under_concurrency(
+    tmp_path: Path,
+):
+    """Multi-channel concurrent: two pooled clients, each with its own
+    ``_TurnCell`` captured by its own SDK hook task. Two turns in
+    flight at the same time; tool calls coming from client A's hook
+    must increment ctx_A's counter, not ctx_B's.
+
+    The ``_current_client_cell`` ContextVar simulates the per-task
+    capture the SDK does at connect: we set it to cell_A, fire client
+    A's hook, set it to cell_B, fire client B's hook. Each hook fire
+    sees the cell it captured; mutations to ``cell.turn_id`` (done by
+    ``acquire_ctx``) are visible. This is the property the contextvar
+    fallback FAILED to guarantee — see
+    test_pre_hook_budget_punts_on_stale_contextvar for the failure
+    mode this design fixes."""
+    from mimir._context import _TurnCell, _active_turns, _current_client_cell
+
+    hook = make_pre_tool_use_hook(tmp_path)
+    ctx_a = TurnContext(
+        turn_id="ta", session_id="ca", trigger="user_message",
+        channel_id="ca", started_at=0.0, tool_call_budget=10,
+    )
+    ctx_b = TurnContext(
+        turn_id="tb", session_id="cb", trigger="user_message",
+        channel_id="cb", started_at=0.0, tool_call_budget=10,
+    )
+    _active_turns[ctx_a.turn_id] = ctx_a
+    _active_turns[ctx_b.turn_id] = ctx_b
+
+    cell_a = _TurnCell()
+    cell_a.turn_id = ctx_a.turn_id
+    cell_b = _TurnCell()
+    cell_b.turn_id = ctx_b.turn_id
+
+    try:
+        # Three tool calls on client A, two on client B, interleaved.
+        # Each must hit only its own ctx's counter.
+        sequence = [cell_a, cell_b, cell_a, cell_a, cell_b]
+        for cell in sequence:
+            token = _current_client_cell.set(cell)
+            try:
+                await hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Grep",
+                        "tool_input": {"pattern": "x"},
+                        "tool_use_id": "tu",
+                    },
+                    "tu",
+                    _ctx(),
+                )
+            finally:
+                _current_client_cell.reset(token)
+
+        assert ctx_a.tool_call_count == 3
+        assert ctx_b.tool_call_count == 2
+
+        events = _read_events(tmp_path)
+        # No denies, no warnings (under budget), no punts.
+        punts = [e for e in events if e.get("type") == "tool_call_budget_punted"]
+        assert punts == []
+        # All resolution_path tags should be client_cell — the per-client
+        # path is the primary one when the cell is set.
+        denies = [e for e in events if e.get("type") == "tool_call_denied"]
+        warns = [e for e in events if e.get("type") == "tool_call_budget_warning"]
+        for e in denies + warns:
+            assert e.get("resolution_path") == "client_cell"
+    finally:
+        _active_turns.pop(ctx_a.turn_id, None)
+        _active_turns.pop(ctx_b.turn_id, None)
+
+
+@_pytest.mark.asyncio
+async def test_pre_hook_budget_per_client_cell_isolates_budget_breaches(
+    tmp_path: Path,
+):
+    """Even when one channel exhausts its budget, a concurrent channel
+    with budget remaining must keep working. Pins the multi-channel
+    isolation property."""
+    from mimir._context import _TurnCell, _active_turns, _current_client_cell
+
+    hook = make_pre_tool_use_hook(tmp_path)
+    ctx_busy = TurnContext(
+        turn_id="t-busy", session_id="c-busy", trigger="user_message",
+        channel_id="c-busy", started_at=0.0,
+        tool_call_budget=2, tool_call_count=2,  # already at limit
+    )
+    ctx_fresh = TurnContext(
+        turn_id="t-fresh", session_id="c-fresh", trigger="user_message",
+        channel_id="c-fresh", started_at=0.0, tool_call_budget=10,
+    )
+    _active_turns[ctx_busy.turn_id] = ctx_busy
+    _active_turns[ctx_fresh.turn_id] = ctx_fresh
+
+    cell_busy = _TurnCell()
+    cell_busy.turn_id = ctx_busy.turn_id
+    cell_fresh = _TurnCell()
+    cell_fresh.turn_id = ctx_fresh.turn_id
+
+    try:
+        # Tool call on the busy channel — denies.
+        token = _current_client_cell.set(cell_busy)
+        try:
+            out = await hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "memory/x.md"},
+                    "tool_use_id": "tu1",
+                },
+                "tu1",
+                _ctx(),
+            )
+        finally:
+            _current_client_cell.reset(token)
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+        # Tool call on the fresh channel — passes.
+        token = _current_client_cell.set(cell_fresh)
+        try:
+            out = await hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Grep",
+                    "tool_input": {"pattern": "x"},
+                    "tool_use_id": "tu2",
+                },
+                "tu2",
+                _ctx(),
+            )
+        finally:
+            _current_client_cell.reset(token)
+        assert out == {}
+        assert ctx_fresh.tool_call_count == 1
+        # Busy ctx wasn't bumped further by the second call.
+        assert ctx_busy.tool_call_count == 3  # was 2, deny incremented to 3
+    finally:
+        _active_turns.pop(ctx_busy.turn_id, None)
+        _active_turns.pop(ctx_fresh.turn_id, None)
+
+
+@_pytest.mark.asyncio
 async def test_pre_hook_budget_zero_disables_check(tmp_path: Path):
     hook = make_pre_tool_use_hook(tmp_path)
     ctx = _budget_ctx(budget=0)

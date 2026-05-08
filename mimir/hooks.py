@@ -137,6 +137,7 @@ def make_pre_tool_use_hook(
         # agent would be wedged.
         from ._context import (
             _active_turns,
+            _current_client_cell,
             get_current_turn,
             get_only_active_turn,
             get_turn_by_session_id,
@@ -145,36 +146,44 @@ def make_pre_tool_use_hook(
 
         # Hook callbacks fire on the SDK's control-protocol task, which
         # was forked at first client.connect() and captured contextvar
-        # state from that moment. Subsequent run_turn set_current_turn
-        # calls don't propagate into this task, so contextvar lookup
-        # returns stale ctx (or None on first connect).
+        # state from that moment. Per-channel correctness:
         #
-        # Originally this matched ``input_data["session_id"]`` against
-        # ``_active_turns`` keyed by ``ctx.turn_id``. SDK 0.1.x emits a
-        # CLI-internal session_id (UUID-with-dashes) in hook input rather
-        # than the per-call ``client.query(session_id=...)`` we pass —
-        # 100% of recent tool_call_denied / tool_call_budget_warning
-        # events surfaced ``resolution_path: "contextvar"`` (the path
-        # CR#18 wired in to make this drift visible). The contextvar
-        # fallback then returns the FIRST turn's ctx (whatever was set
-        # when the persistent client first connected), which lives
-        # forever in the hook task — its ``tool_call_count`` accumulates
-        # across every turn until it crosses budget, and from then on
-        # every tool call in every turn is permanently denied.
+        # The pool sets ``_current_client_cell`` to a fresh ``_TurnCell``
+        # *before* each new client's ``connect()``. The hook task forks
+        # at that connect and captures the cell *reference* — and the
+        # cell's ``turn_id`` attribute is mutable, so later
+        # ``acquire_ctx(turn_id=X)`` writes are live-readable from the
+        # hook task even though the contextvar value itself is frozen.
+        # Each pooled client has its own cell, so two clients running
+        # turns on different channels can't corrupt each other's hook
+        # bookkeeping.
         #
-        # Resolution chain:
-        #   1. ``input_data["session_id"]`` against ``_active_turns`` —
-        #      kept for backward compat / tests; production rarely hits.
-        #   2. ``get_only_active_turn()`` — single in-flight turn (the
-        #      common production shape with one channel at a time).
-        #   3. ``get_current_turn()`` contextvar — same-task callers /
-        #      tests that drove the hook directly. Verify the resolved
-        #      ctx is still in ``_active_turns`` before trusting it; a
-        #      stale ctx (turn_id absent from the registry) means we
-        #      captured a long-ended turn at fork time and budget
-        #      enforcement against it is meaningless. Treat as missing.
-        ctx = get_turn_by_session_id(input_data.get("session_id"))
-        resolution_path = "session_id" if ctx is not None else None
+        # Fallbacks below cover the legacy paths:
+        #   1. ``client_cell.turn_id`` — primary production path
+        #   2. ``input_data["session_id"]`` against ``_active_turns`` —
+        #      historic SDK contract (currently broken in 0.1.x — the
+        #      SDK passes the CLI-internal session_id, not what mimir
+        #      sets via ``client.query(session_id=...)``). Kept so the
+        #      hook works again automatically if SDK behavior changes.
+        #   3. ``get_only_active_turn()`` — single-active heuristic for
+        #      tests / direct invocations bypassing the pool.
+        #   4. ``get_current_turn()`` contextvar — same-task callers
+        #      AND tests that set ``_current_turn`` directly. Stale-ctx
+        #      guarded: a ctx whose turn_id is no longer in
+        #      ``_active_turns`` is a frozen-contextvar leak; punt.
+        ctx = None
+        resolution_path: str | None = None
+
+        cell = _current_client_cell.get()
+        if cell is not None and cell.turn_id is not None:
+            ctx = _active_turns.get(cell.turn_id)
+            if ctx is not None:
+                resolution_path = "client_cell"
+
+        if ctx is None:
+            ctx = get_turn_by_session_id(input_data.get("session_id"))
+            if ctx is not None:
+                resolution_path = "session_id"
         if ctx is None:
             ctx = get_only_active_turn()
             if ctx is not None:
