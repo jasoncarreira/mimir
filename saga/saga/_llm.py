@@ -23,6 +23,21 @@ The returned text follows the OpenAI-compatible "single best
 candidate" shape: a single string. Anthropic's response can have
 multiple content blocks (text + tool_use); we collapse to text only
 (saga's calls don't request tools).
+
+Two public entry points:
+
+- ``call_llm_sync(...)`` — synchronous; saga's existing internal call
+  sites use this. claude_code path goes through the legacy
+  daemon-thread ``_PersistentClaudePool`` bridge.
+- ``async def call_llm(...)`` — async-native; new in chainlink #45
+  (Phase 1 of #20). claude_code path goes through ``_AsyncClaudePool``
+  on the caller's event loop, no daemon thread spawned. anthropic and
+  openai_compat are sync HTTP libraries — the async wrapper offloads
+  via ``asyncio.to_thread`` for now (Phase 3 may async-ify them
+  properly).
+
+Both APIs coexist during the chainlink-20 migration. ``call_llm_sync``
+and ``_PersistentClaudePool`` delete in Phase 3.
 """
 
 from __future__ import annotations
@@ -523,3 +538,333 @@ def _call_openai_compat(
     except Exception as exc:  # noqa: BLE001
         log.warning("openai_compat call failed: %s", exc)
         return ""
+
+
+# ─── Async-native call_llm (chainlink #45 / Phase 1 of #20) ──────────
+#
+# The async path runs entirely on the caller's event loop — no daemon
+# thread, no run_coroutine_threadsafe bridge. Mimir (already async),
+# saga's bench harness (post Phase 3 conversion), and any future async
+# saga internals all use this.
+#
+# Existing ``call_llm_sync`` and the threading ``_PersistentClaudePool``
+# stay live alongside this during the migration. Both delete in
+# chainlink #47 (Phase 3) once saga internals are converted.
+
+
+async def call_llm(
+    llm: dict[str, Any],
+    *,
+    prompt: str,
+    max_tokens: int = 1500,
+    temperature: float = 0.3,
+    system: str | None = None,
+) -> str:
+    """Async-native LLM call. Saga's eventual replacement for
+    ``call_llm_sync``; callers on an event loop ``await`` this directly.
+
+    Provider dispatch:
+    - ``claude_code`` runs on the caller's event loop via
+      ``_AsyncClaudePool`` — bounded pool of ``ClaudeSDKClient``
+      instances connected on the running loop, recycle-after-N-calls.
+    - ``anthropic`` and ``openai_compat`` are sync HTTP libraries
+      (``anthropic.Anthropic.messages.create`` and ``requests.post``);
+      we offload them to a thread via ``asyncio.to_thread`` so the
+      caller's loop stays responsive. Phase 3 may async-ify these
+      properly with ``anthropic.AsyncAnthropic`` + ``aiohttp``, but the
+      to_thread wrap is correct semantically and unblocks Phase 1.
+
+    Returns the assistant's reply text. Empty string on transport
+    failure (matches ``call_llm_sync`` semantics — every existing
+    caller already handles empty gracefully)."""
+    import asyncio
+
+    provider = (llm.get("provider") or "openai_compat").lower()
+    if provider == "claude_code":
+        return await _call_claude_code_async(
+            llm, prompt=prompt, max_tokens=max_tokens,
+            temperature=temperature, system=system,
+        )
+    if provider == "anthropic":
+        return await asyncio.to_thread(
+            _call_anthropic, llm,
+            prompt=prompt, max_tokens=max_tokens,
+            temperature=temperature, system=system,
+        )
+    return await asyncio.to_thread(
+        _call_openai_compat, llm,
+        prompt=prompt, max_tokens=max_tokens,
+        temperature=temperature, system=system,
+    )
+
+
+async def _call_claude_code_async(
+    llm: dict[str, Any], *,
+    prompt: str, max_tokens: int, temperature: float,
+    system: str | None,
+) -> str:
+    """Async claude_code path. Acquires an ``_AsyncClaudeRunner`` from
+    the per-loop pool, calls it, releases on completion. ``max_tokens``
+    and ``temperature`` are accepted but unused — the Claude Code CLI
+    doesn't expose them (matches the sync claude_code path)."""
+    try:
+        from claude_agent_sdk import (  # noqa: F401 — used by _AsyncClaudeRunner
+            ClaudeAgentOptions,
+            ClaudeSDKClient,
+        )
+    except ImportError:
+        log.warning("claude-agent-sdk not installed; falling back to openai_compat")
+        import asyncio
+        return await asyncio.to_thread(
+            _call_openai_compat, llm,
+            prompt=prompt, max_tokens=max_tokens,
+            temperature=temperature, system=system,
+        )
+
+    pool = _get_async_claude_pool()
+    runner = await pool.acquire()
+    try:
+        return await runner.call(
+            prompt=prompt,
+            model=llm.get("model"),
+            system=system,
+        )
+    finally:
+        await pool.release(runner)
+
+
+class _AsyncClaudeRunner:
+    """Owns one ``ClaudeSDKClient`` connected on the running event
+    loop. ``call`` runs on the caller's loop; no daemon thread, no
+    cross-thread bridge.
+
+    Recycles the client every ``recycle_after`` calls (or when
+    ``model`` changes between calls) to bound conversation bloat —
+    same policy as the sync ``_PersistentClaudeCode``.
+
+    Lifetime is managed by ``_AsyncClaudePool``: the pool caps live
+    instances at its ``max_size`` and lets callers borrow via
+    ``acquire``/``release``."""
+
+    def __init__(self, recycle_after: int) -> None:
+        self._recycle_after = recycle_after
+        self._client = None  # type: ignore[assignment]
+        self._client_model: str | None = None
+        self._call_count = 0
+
+    @property
+    def call_count(self) -> int:
+        return self._call_count
+
+    async def call(self, *, prompt: str, model: str | None, system: str | None) -> str:
+        """Submit a prompt to the warm client and return the flattened
+        reply text. Empty string on transport failure (matches
+        sync-path semantics so saga's existing call sites swallow
+        gracefully)."""
+        try:
+            from claude_agent_sdk import AssistantMessage
+        except ImportError:
+            log.warning("claude-agent-sdk not installed; returning empty")
+            return ""
+
+        if (
+            self._client is None
+            or self._client_model != model
+            or self._call_count >= self._recycle_after
+        ):
+            await self._reset_client(model=model, system=system)
+
+        assert self._client is not None
+        try:
+            await self._client.query(prompt)
+            pieces: list[str] = []
+            async for msg in self._client.receive_response():
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content or []:
+                        text = getattr(block, "text", None)
+                        if text:
+                            pieces.append(text)
+            self._call_count += 1
+            return "".join(pieces).strip()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("async claude-code call failed: %s", exc)
+            return ""
+
+    async def _reset_client(self, *, model: str | None, system: str | None) -> None:
+        """Disconnect any current client + spin up a fresh one connected
+        on the running loop."""
+        from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("async claude-code disconnect failed: %s", exc)
+            self._client = None
+
+        options_kwargs: dict[str, Any] = {}
+        if model:
+            options_kwargs["model"] = model
+        if system:
+            options_kwargs["system_prompt"] = system
+
+        client = ClaudeSDKClient(options=ClaudeAgentOptions(**options_kwargs))
+        await client.connect()
+        self._client = client
+        self._client_model = model
+        self._call_count = 0
+
+    async def aclose(self) -> None:
+        """Disconnect the underlying client. Called when the pool is
+        torn down (e.g., between tests with isolated event loops)."""
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("async claude-code aclose disconnect failed: %s", exc)
+            self._client = None
+
+
+class _AsyncClaudePool:
+    """Bounded asyncio-native pool of ``_AsyncClaudeRunner`` instances.
+
+    Tied to a single event loop — the ``asyncio.Condition`` binds to
+    the running loop on first ``acquire``/``release``. Different loops
+    (e.g., test isolation) need different pool instances; see
+    ``_get_async_claude_pool`` for the per-loop registry that
+    enforces this.
+
+    Cross-task parallelism is preserved up to ``max_size`` concurrent
+    callers — important for cross-channel mimir traffic where Discord
+    and Slack turns can both hit saga LLM at the same time. Once
+    ``max_size`` is in flight, additional callers ``await`` until one
+    is returned.
+
+    Recycle policy is per-runner (the runner tracks its own call count
+    and reconnects every N calls). The pool itself doesn't churn
+    runners — once created they live until the pool is closed."""
+
+    def __init__(self, max_size: int, recycle_after: int) -> None:
+        if max_size < 1:
+            raise ValueError(f"max_size must be >= 1, got {max_size}")
+        self._max_size = max_size
+        self._recycle_after = recycle_after
+        self._idle: list[_AsyncClaudeRunner] = []
+        self._size = 0  # idle + in-flight, never decremented
+        self._cond: "Any | None" = None  # asyncio.Condition; lazy-bound to running loop
+
+    @property
+    def max_size(self) -> int:
+        return self._max_size
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def _condition(self) -> Any:
+        """Lazy-bind the condition to the running loop. Module import
+        shouldn't require an event loop."""
+        if self._cond is None:
+            import asyncio
+            self._cond = asyncio.Condition()
+        return self._cond
+
+    async def acquire(self) -> "_AsyncClaudeRunner":
+        """Block (await) until an instance is available; return it.
+        Caller MUST call ``release`` when done."""
+        cond = self._condition()
+        async with cond:
+            while True:
+                if self._idle:
+                    return self._idle.pop()
+                if self._size < self._max_size:
+                    # Reserve the slot before constructing so concurrent
+                    # acquirers don't double-grow past max_size.
+                    self._size += 1
+                    try:
+                        return _AsyncClaudeRunner(recycle_after=self._recycle_after)
+                    except BaseException:
+                        # Construction failed — back out and re-raise.
+                        self._size -= 1
+                        cond.notify()
+                        raise
+                await cond.wait()
+
+    async def release(self, runner: "_AsyncClaudeRunner") -> None:
+        """Return an instance to the idle list and wake one waiter."""
+        cond = self._condition()
+        async with cond:
+            self._idle.append(runner)
+            cond.notify()
+
+    async def aclose(self) -> None:
+        """Disconnect all idle runners and reset state. Used by tests
+        to tear down between event loops, and would be called at saga
+        shutdown if saga grew an explicit shutdown hook (it doesn't
+        today — daemon-thread reaping by the OS is the production
+        teardown path, and that goes away in Phase 3)."""
+        cond = self._condition()
+        async with cond:
+            idle = self._idle
+            self._idle = []
+            self._size = 0
+        for runner in idle:
+            await runner.aclose()
+
+
+# Per-loop async-pool registry. Different event loops (production,
+# tests with isolated loops) need their own pool. Keyed on ``id(loop)``;
+# entries are pruned implicitly when a loop is garbage-collected (we
+# don't hold a strong ref to the loop). For test isolation in
+# pytest-asyncio, callers can use ``_reset_async_pool()`` to drop the
+# registry between tests.
+
+_async_pools: dict[int, _AsyncClaudePool] = {}
+
+
+def _resolve_recycle_after() -> int:
+    raw = _os.environ.get("SAGA_PERSISTENT_CLAUDE_RECYCLE", "")
+    if not raw:
+        return _RECYCLE_AFTER_CALLS
+    try:
+        n = int(raw)
+    except ValueError:
+        log.warning(
+            "SAGA_PERSISTENT_CLAUDE_RECYCLE=%r is not an int; falling back to %d",
+            raw, _RECYCLE_AFTER_CALLS,
+        )
+        return _RECYCLE_AFTER_CALLS
+    if n < 1:
+        log.warning(
+            "SAGA_PERSISTENT_CLAUDE_RECYCLE=%d < 1 is not valid; falling back to %d",
+            n, _RECYCLE_AFTER_CALLS,
+        )
+        return _RECYCLE_AFTER_CALLS
+    return n
+
+
+def _get_async_claude_pool() -> _AsyncClaudePool:
+    """Lazy per-running-loop singleton. Caller must already be on an
+    event loop."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    pool = _async_pools.get(key)
+    if pool is None:
+        pool = _AsyncClaudePool(
+            max_size=_resolve_pool_size(),
+            recycle_after=_resolve_recycle_after(),
+        )
+        _async_pools[key] = pool
+    return pool
+
+
+def _reset_async_pools() -> None:
+    """Drop the per-loop pool registry without disconnecting clients.
+    Used by tests to rebuild state between isolated event loops; in
+    production this is never called.
+
+    The previous loop's pool entries are left to be garbage-collected
+    along with their loop. If a test wants a clean disconnect, it
+    should ``await pool.aclose()`` first."""
+    _async_pools.clear()
