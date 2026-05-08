@@ -43,7 +43,7 @@ def _switch_db(db_path: Path):
     init_triples_schema()
 
 
-def run(max_tokens: int, run_tag: str) -> Path:
+async def run(max_tokens: int, run_tag: str) -> Path:
     _prepare_environment()
 
     from saga.config import reload_config
@@ -77,7 +77,7 @@ def run(max_tokens: int, run_tag: str) -> Path:
             t_ing = time.time() - t0
 
             t0 = time.time()
-            atoms = hybrid_retrieve(q["question"], mode="task", top_k=RETRIEVAL_TOP_K)
+            atoms = await hybrid_retrieve(q["question"], mode="task", top_k=RETRIEVAL_TOP_K)
             t_ret = time.time() - t0
 
             t0 = time.time()
@@ -111,11 +111,12 @@ def run(max_tokens: int, run_tag: str) -> Path:
 
 
 def main():
+    import asyncio
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--run-tag", default="max1024")
     args = ap.parse_args()
-    run(args.max_tokens, args.run_tag)
+    asyncio.run(run(args.max_tokens, args.run_tag))
 
 
 if __name__ == "__main__":
