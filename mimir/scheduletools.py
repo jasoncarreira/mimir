@@ -44,19 +44,24 @@ def build_schedule_tools(scheduler: Scheduler) -> list[SdkMcpTool]:
         "add_schedule",
         "Add or replace a schedule by name. Exactly one of cron (5-field) "
         "or time_of_day (HH:MM, daily UTC) must be set. Provide EITHER "
-        "``prompt`` (inline text) OR ``prompt_file`` (path under "
-        "<home>/prompts/, e.g. ``daily-review.md``). Per-cron prompt "
-        "files are the preferred shape — they keep prompt content out "
-        "of scheduler.yaml so it can grow without cluttering the "
-        "registration. channel_id is optional — if omitted, the tick "
-        "fires on a synthetic scheduler:<name> channel. Replaces any "
-        "existing job with the same name.",
+        "``prompt`` (inline text), ``prompt_file`` (path under "
+        "<home>/prompts/, e.g. ``daily-review.md``), OR ``callable`` "
+        "(name of a code-side-registered non-LLM cron callable like "
+        "``saga-consolidate`` or ``identities-populate``). Per-cron "
+        "prompt files are the preferred shape for LLM ticks. The "
+        "``callable`` field overrides the env-var-default cron of a "
+        "registered callable; pass an empty cron to disable a callable "
+        "for this deployment. channel_id is optional — if omitted, the "
+        "tick fires on a synthetic scheduler:<name> channel "
+        "(LLM-tick entries only; callable entries don't carry "
+        "channel_id). Replaces any existing job with the same name.",
         {
             "type": "object",
             "properties": {
                 "name": {"type": "string"},
                 "prompt": {"type": "string"},
                 "prompt_file": {"type": "string"},
+                "callable": {"type": "string"},
                 "cron": {"type": "string"},
                 "time_of_day": {"type": "string"},
                 "channel_id": {"type": "string"},
@@ -69,25 +74,55 @@ def build_schedule_tools(scheduler: Scheduler) -> list[SdkMcpTool]:
         name = _need(args, "name")
         prompt = (args.get("prompt") or "").strip()
         prompt_file = (args.get("prompt_file") or "").strip() or None
+        callable_name = (args.get("callable") or "").strip() or None
         cron = (args.get("cron") or "").strip() or None
         time_of_day = (args.get("time_of_day") or "").strip() or None
         channel_id = args.get("channel_id")
         if isinstance(channel_id, str):
             channel_id = channel_id.strip() or None
-        if not prompt and not prompt_file:
+        kind_count = sum(bool(x) for x in (prompt, prompt_file, callable_name))
+        if kind_count == 0:
             return _content_block(
-                "add_schedule failed: one of 'prompt' or 'prompt_file' required",
+                "add_schedule failed: one of 'prompt', 'prompt_file', "
+                "or 'callable' required",
                 is_error=True,
             )
-        if bool(cron) == bool(time_of_day):
+        if kind_count > 1:
             return _content_block(
-                "add_schedule failed: exactly one of cron or time_of_day required",
+                "add_schedule failed: 'prompt', 'prompt_file', and "
+                "'callable' are mutually exclusive — exactly one",
                 is_error=True,
             )
+        if callable_name is not None:
+            # Callable entries: cron only (time_of_day is for LLM ticks).
+            # Empty cron is the explicit-disable signal — allowed.
+            if time_of_day:
+                return _content_block(
+                    "add_schedule failed: callable entries use 'cron' "
+                    "only; 'time_of_day' is for prompt entries",
+                    is_error=True,
+                )
+            # Validate against the registry early so a bad name fails
+            # with a clear list of options rather than a generic
+            # 'not registered' message after writing yaml.
+            registered = scheduler.registered_callables()
+            if callable_name not in registered:
+                return _content_block(
+                    f"add_schedule failed: callable {callable_name!r} "
+                    f"is not registered. Available: {registered!r}",
+                    is_error=True,
+                )
+        else:
+            if bool(cron) == bool(time_of_day):
+                return _content_block(
+                    "add_schedule failed: exactly one of cron or time_of_day required",
+                    is_error=True,
+                )
         job = SchedulerJob(
             name=name,
             prompt=prompt,
             prompt_file=prompt_file,
+            callable_name=callable_name,
             cron=cron,
             time_of_day=time_of_day,
             channel_id=channel_id,
