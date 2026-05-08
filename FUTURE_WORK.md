@@ -974,7 +974,7 @@ Also shipped (not previously tracked here, captured for posterity):
 - Operator alert channel (V0.4 §6) — `MIMIR_OPERATOR_ALERT_CHANNEL` + alert skill teaching when/how to escalate.
 - Indexer exclusion list (V0.4 §7) — see §6.1 above.
 - API key auth on POST /event (post-v0.4 review) — `MIMIR_API_KEY`; without it the server's 0.0.0.0 bind exposed an arbitrary-trigger injection surface.
-- JSONL log caps + tail-streaming — `MIMIR_MAX_EVENTS` / `MIMIR_MAX_TURNS` default 1000, hard ceiling 10000, hysteresis trim, tail-streamed reads via `mimir/_jsonl_tail.py`.
+- JSONL log caps + tail-streaming — `MIMIR_MAX_TURNS` default 5000 (hard ceiling 50000), `MIMIR_MAX_EVENTS` default 75000 (hard ceiling 750000, 15× turns to match observed events/turn rate), hysteresis trim, tail-streamed reads via `mimir/_jsonl_tail.py`.
 
 ---
 
