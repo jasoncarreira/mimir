@@ -309,6 +309,16 @@ class Config:
     # streaming overhead at the cost of less-current plan-window data.
     capture_rate_limits: bool
 
+    # Opt into Anthropic's 1M-context-window beta for Claude 4.x
+    # Opus / Sonnet (header ``context-1m-2025-08-07``). Default on:
+    # mimir's typical prompt size (300-600k tokens with full memory +
+    # session summaries + recent activity + SAGA hits) is well past
+    # the 200k bare-model cap, so without this the API silently
+    # truncates or rejects oversize prompts. Set
+    # ``MIMIR_CONTEXT_1M=false`` to disable (e.g. when running against
+    # an account / model variant that doesn't support the beta).
+    context_1m: bool
+
     # PR 4a (MIMIR_HOME_GIT_TRACKING): post-turn git commit + debounced
     # push for /mimir-home. PR 4b ships the allowlist gitignore +
     # pre-commit secret-scan hook + ``git_bootstrap.bootstrap_git_repo``
@@ -435,6 +445,9 @@ class Config:
             ),
 
             capture_rate_limits=_env("MIMIR_CAPTURE_RATE_LIMITS", "true").lower()
+                not in {"false", "0", "no", "off"},
+
+            context_1m=_env("MIMIR_CONTEXT_1M", "true").lower()
                 not in {"false", "0", "no", "off"},
 
             oauth_credentials_path=_oauth_credentials_path(),
