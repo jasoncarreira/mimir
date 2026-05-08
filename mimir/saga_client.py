@@ -215,60 +215,60 @@ class _InProcessSaga:
 
         await self._ensure_ready()
         clamped = _clamp_query(query)
-        cfg = get_config()
-        t0 = time.time()
+        # Wrap the entire body — including get_config(), the retrieve
+        # call, gating, and per-atom formatting — so any failure surfaces
+        # as SagaError. The agent's pre-message hook catches SagaError
+        # and degrades gracefully (logs + skips auto-fetch); RuntimeError
+        # from missing embedding API key, SQLite OperationalError,
+        # unexpected atom shape, etc. all fold into this path.
         try:
+            cfg = get_config()
+            t0 = time.time()
             result = await hybrid_retrieve(
                 clamped, mode=mode, top_k=top_k,
                 two_tier=True, context=context, session_id=session_id,
             )
+            obs = result.get("observations", []) or []
+            raws = result.get("raws", []) or []
+
+            gated_reason = None
+            if cfg('retrieval', 'enable_confidence_gating', True):
+                floor = (
+                    min_confidence_tier
+                    or cfg('retrieval', 'default_min_confidence_tier', 'low')
+                )
+                tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
+                floor_rank = tier_rank.get(floor, 1)
+
+                def _passes(a: dict) -> bool:
+                    t = a.get("_confidence_tier", "none")
+                    return tier_rank.get(t, 0) >= floor_rank
+
+                obs_before, raws_before = len(obs), len(raws)
+                obs = [o for o in obs if _passes(o)]
+                raws = [r for r in raws if _passes(r)]
+                obs_dropped = obs_before - len(obs)
+                raws_dropped = raws_before - len(raws)
+                if obs_dropped or raws_dropped:
+                    gated_reason = (
+                        f"floor={floor}: dropped {obs_dropped} obs and "
+                        f"{raws_dropped} raws below threshold"
+                    )
+
+            return {
+                "query": clamped, "mode": mode, "two_tier": True,
+                "gated": gated_reason is not None,
+                "gated_reason": gated_reason,
+                "observations": [_format_atom(o) for o in obs],
+                "raws": [_format_atom(r) for r in raws],
+                "triples": [],
+                "items_returned": len(obs) + len(raws),
+                "latency_ms": round((time.time() - t0) * 1000, 2),
+            }
         except SagaError:
             raise
         except Exception as exc:
-            # Preserve the HTTP client's contract: transport-layer or
-            # backend failures surface as SagaError. The agent's pre-message
-            # hook catches SagaError and degrades gracefully (logs + skips
-            # auto-fetch). RuntimeError from missing embedding API key,
-            # SQLite OperationalError, etc. all fold into this path.
             raise SagaError(f"in-process saga query failed: {exc}") from exc
-
-        obs = result.get("observations", []) or []
-        raws = result.get("raws", []) or []
-
-        gated_reason = None
-        if cfg('retrieval', 'enable_confidence_gating', True):
-            floor = (
-                min_confidence_tier
-                or cfg('retrieval', 'default_min_confidence_tier', 'low')
-            )
-            tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
-            floor_rank = tier_rank.get(floor, 1)
-
-            def _passes(a: dict) -> bool:
-                t = a.get("_confidence_tier", "none")
-                return tier_rank.get(t, 0) >= floor_rank
-
-            obs_before, raws_before = len(obs), len(raws)
-            obs = [o for o in obs if _passes(o)]
-            raws = [r for r in raws if _passes(r)]
-            obs_dropped = obs_before - len(obs)
-            raws_dropped = raws_before - len(raws)
-            if obs_dropped or raws_dropped:
-                gated_reason = (
-                    f"floor={floor}: dropped {obs_dropped} obs and "
-                    f"{raws_dropped} raws below threshold"
-                )
-
-        return {
-            "query": clamped, "mode": mode, "two_tier": True,
-            "gated": gated_reason is not None,
-            "gated_reason": gated_reason,
-            "observations": [_format_atom(o) for o in obs],
-            "raws": [_format_atom(r) for r in raws],
-            "triples": [],
-            "items_returned": len(obs) + len(raws),
-            "latency_ms": round((time.time() - t0) * 1000, 2),
-        }
 
     async def store(
         self, content: str, *, stream: str | None = None,
@@ -280,9 +280,9 @@ class _InProcessSaga:
         from saga.core import store_atom
 
         await self._ensure_ready()
-        actual_stream = stream or classify_stream(content)
-        actual_profile = profile or classify_profile(content)
         try:
+            actual_stream = stream or classify_stream(content)
+            actual_profile = profile or classify_profile(content)
             # smart_annotate is async-native (LLM path optionally awaits
             # call_llm); the heuristic short-circuit also returns via the
             # async signature.
@@ -295,30 +295,30 @@ class _InProcessSaga:
                 content=content, stream=actual_stream, profile=actual_profile,
                 source_type=source_type, metadata=metadata, **annotations,
             )
+
+            if isinstance(result, tuple):
+                atom_id, reason = result
+            else:
+                atom_id = result
+                reason = "duplicate content" if result is None else None
+
+            if atom_id is None:
+                return {
+                    "stored": False, "atom_id": None,
+                    "stream": actual_stream, "profile": actual_profile,
+                    "annotations": annotations,
+                    "triples_extracted": 0, "reason": reason,
+                }
+            return {
+                "stored": True, "atom_id": atom_id,
+                "stream": actual_stream, "profile": actual_profile,
+                "annotations": annotations,
+                "triples_extracted": 0,
+            }
         except SagaError:
             raise
         except Exception as exc:
             raise SagaError(f"in-process saga store failed: {exc}") from exc
-
-        if isinstance(result, tuple):
-            atom_id, reason = result
-        else:
-            atom_id = result
-            reason = "duplicate content" if result is None else None
-
-        if atom_id is None:
-            return {
-                "stored": False, "atom_id": None,
-                "stream": actual_stream, "profile": actual_profile,
-                "annotations": annotations,
-                "triples_extracted": 0, "reason": reason,
-            }
-        return {
-            "stored": True, "atom_id": atom_id,
-            "stream": actual_stream, "profile": actual_profile,
-            "annotations": annotations,
-            "triples_extracted": 0,
-        }
 
     async def feedback(
         self, atom_ids: list[str], response_text: str, *,
@@ -388,21 +388,21 @@ class _InProcessSaga:
         from saga.consolidation import ConsolidationEngine
 
         await self._ensure_ready()
-        kwargs: dict[str, Any] = {"dry_run": dry_run}
-        if max_clusters is not None:
-            kwargs["max_clusters"] = max_clusters
-        if extra_canonical_subjects:
-            kwargs["extra_canonical_subjects"] = list(extra_canonical_subjects)
         try:
+            kwargs: dict[str, Any] = {"dry_run": dry_run}
+            if max_clusters is not None:
+                kwargs["max_clusters"] = max_clusters
+            if extra_canonical_subjects:
+                kwargs["extra_canonical_subjects"] = list(extra_canonical_subjects)
             result = await ConsolidationEngine().consolidate(**kwargs) or {}
+            # mimir's scheduler logs the result; defensive flat dict.
+            if not isinstance(result, dict):
+                return {"result": result}
+            return result
         except SagaError:
             raise
         except Exception as exc:
             raise SagaError(f"in-process saga consolidate failed: {exc}") from exc
-        # mimir's scheduler logs the result; defensive flat dict.
-        if not isinstance(result, dict):
-            return {"result": result}
-        return result
 
     async def decay(self) -> dict[str, Any]:
         """Run saga's decay cycle — recompute retrievability, fade/

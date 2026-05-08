@@ -182,13 +182,16 @@ def _filter_session_turns(turns_path, saga_session_id: str) -> list[dict]:
 #     construct fresh clients (idempotent for tests / repeat startup).
 #
 # The original Stage 4 spec (CLAUDE_SDK_CLIENT_MIGRATION.md) prescribed
-# a ``threading.local`` cache, mirroring saga's ``_PersistentClaudeCode``.
-# That was the wrong shape for mimir: mimir runs all turns on a single
-# asyncio event loop in a single OS thread, so ``threading.local``
-# would hand every coroutine the same client — same serialization, just
-# without the lock to make it visible. The asyncio-aware pool here is
-# the right shape for mimir's runtime. The retired threading.local note
-# in CLAUDE_SDK_CLIENT_MIGRATION.md captures the reasoning.
+# a ``threading.local`` cache, mirroring saga's old ``_PersistentClaudeCode``
+# (a daemon-thread + run_coroutine_threadsafe bridge — itself retired
+# in chainlink #47 / Phase 3 of #20 in favor of saga's async-native
+# ``_AsyncClaudeRunner``). ``threading.local`` was the wrong shape for
+# mimir regardless: mimir runs all turns on a single asyncio event loop
+# in a single OS thread, so ``threading.local`` would hand every coroutine
+# the same client — same serialization, just without the lock to make
+# it visible. The asyncio-aware pool here is the right shape for mimir's
+# runtime. The retired threading.local note in CLAUDE_SDK_CLIENT_MIGRATION.md
+# captures the reasoning.
 #
 # Test shape:
 #   The module-level ``query`` and ``get_context_usage`` names + their
