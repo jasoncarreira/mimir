@@ -212,15 +212,18 @@ class TestOutcomesCmd:
 
 
 class TestHybrid:
-    def test_hybrid_retrieval(self, capsys, monkeypatch):
-        monkeypatch.setattr("saga.remember.hybrid_retrieve_with_triples", lambda q, mode="task", token_budget=500: {
-            "triples": [{"subject": "user", "predicate": "likes", "object": "dark mode"}],
-            "atoms": [{"id": "a1", "content": "User likes dark mode", "_combined_score": 0.9}],
-            "triple_tokens": 5, "atom_tokens": 10, "total_tokens": 15,
-            "items_returned": 2, "latency_ms": 5.0,
-        })
+    @pytest.mark.asyncio
+    async def test_hybrid_retrieval(self, capsys, monkeypatch):
+        async def _hybrid(q, mode="task", token_budget=500):
+            return {
+                "triples": [{"subject": "user", "predicate": "likes", "object": "dark mode"}],
+                "atoms": [{"id": "a1", "content": "User likes dark mode", "_combined_score": 0.9}],
+                "triple_tokens": 5, "atom_tokens": 10, "total_tokens": 15,
+                "items_returned": 2, "latency_ms": 5.0,
+            }
+        monkeypatch.setattr("saga.remember.hybrid_retrieve_with_triples", _hybrid)
         from saga.remember import cmd_hybrid
-        cmd_hybrid(["user", "preferences"])
+        await cmd_hybrid(["user", "preferences"])
         data = json.loads(capsys.readouterr().out)
         assert data["query"] == "user preferences"
         assert data["triple_count"] == 1
@@ -379,16 +382,18 @@ class TestRelations:
         assert isinstance(data, (dict, list))
 
 class TestQuality:
-    def test_quality_no_args(self, capsys):
+    @pytest.mark.asyncio
+    async def test_quality_no_args(self, capsys):
         from saga.remember import cmd_quality
-        cmd_quality([])
+        await cmd_quality([])
         data = json.loads(capsys.readouterr().out)
         assert "error" in data
 
-    def test_quality_with_query(self, capsys):
+    @pytest.mark.asyncio
+    async def test_quality_with_query(self, capsys):
         _store_one("Quality scoring test content")
         from saga.remember import cmd_quality
-        cmd_quality(["quality", "test"])
+        await cmd_quality(["quality", "test"])
         data = json.loads(capsys.readouterr().out)
         assert "query" in data
         assert "total" in data
@@ -627,21 +632,23 @@ class TestSummarize:
 
 
 class TestSnapshot:
-    def test_snapshot_runs(self, capsys, monkeypatch, metrics_db):
+    @pytest.mark.asyncio
+    async def test_snapshot_runs(self, capsys, monkeypatch, metrics_db):
         # Mock out external calls that snapshot makes
         monkeypatch.setattr("saga.remember.log_system_snapshot", lambda: None)
         monkeypatch.setattr("saga.remember.log_access_event",
                             lambda **kw: None)
         monkeypatch.setattr("saga.remember.log_comparison",
                             lambda **kw: None)
-        monkeypatch.setattr("saga.remember.hybrid_retrieve_with_triples",
-                            lambda q, mode="task", token_budget=200: {
-                                "triples": [], "atoms": [], "triple_tokens": 0,
-                                "atom_tokens": 0, "total_tokens": 0,
-                                "items_returned": 0, "latency_ms": 0,
-                            })
+        async def _hybrid_triples(q, mode="task", token_budget=200):
+            return {
+                "triples": [], "atoms": [], "triple_tokens": 0,
+                "atom_tokens": 0, "total_tokens": 0,
+                "items_returned": 0, "latency_ms": 0,
+            }
+        monkeypatch.setattr("saga.remember.hybrid_retrieve_with_triples", _hybrid_triples)
         from saga.remember import cmd_snapshot
-        cmd_snapshot()
+        await cmd_snapshot()
         data = json.loads(capsys.readouterr().out)
         assert data["snapshot"] == "ok"
         assert "stats" in data

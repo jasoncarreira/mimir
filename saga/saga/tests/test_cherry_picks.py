@@ -80,25 +80,28 @@ class TestContextualRewrite:
     nothing).
     """
 
-    def test_no_context_is_noop(self, cfg_override):
+    @pytest.mark.asyncio
+    async def test_no_context_is_noop(self, cfg_override):
         from saga.core import _resolve_contextual_query
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
-        assert _resolve_contextual_query("yes, look for that", None) == \
+        assert await _resolve_contextual_query("yes, look for that", None) == \
             "yes, look for that"
-        assert _resolve_contextual_query("yes, look for that", []) == \
+        assert await _resolve_contextual_query("yes, look for that", []) == \
             "yes, look for that"
 
-    def test_flag_off_is_noop(self, cfg_override):
+    @pytest.mark.asyncio
+    async def test_flag_off_is_noop(self, cfg_override):
         from saga.core import _resolve_contextual_query
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = False
         ctx = [
             {"role": "user", "content": "Tell me about my Sony headphones"},
             {"role": "assistant", "content": "You bought WH-1000XM5 in Boston."},
         ]
-        assert _resolve_contextual_query("yes, look for that", ctx) == \
+        assert await _resolve_contextual_query("yes, look for that", ctx) == \
             "yes, look for that"
 
-    def test_no_api_key_is_noop(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_api_key_is_noop(self, cfg_override, monkeypatch):
         from saga.core import _resolve_contextual_query
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
         monkeypatch.setattr(
@@ -106,9 +109,10 @@ class TestContextualRewrite:
             lambda subsystem: {"url": "u", "model": "m", "api_key": "", "timeout": 5},
         )
         ctx = [{"role": "user", "content": "Tell me about my headphones"}]
-        assert _resolve_contextual_query("yes, that one", ctx) == "yes, that one"
+        assert await _resolve_contextual_query("yes, that one", ctx) == "yes, that one"
 
-    def test_llm_rewrite_replaces_query(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_llm_rewrite_replaces_query(self, cfg_override, monkeypatch):
         from saga.core import _resolve_contextual_query
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
         monkeypatch.setattr(
@@ -128,10 +132,11 @@ class TestContextualRewrite:
             {"role": "user", "content": "Tell me about my Sony WH-1000XM5"},
             {"role": "assistant", "content": "You bought them in Boston for $399."},
         ]
-        out = _resolve_contextual_query("yes, look for that", ctx)
+        out = await _resolve_contextual_query("yes, look for that", ctx)
         assert "Sony WH-1000XM5" in out
 
-    def test_llm_failure_returns_original(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_llm_failure_returns_original(self, cfg_override, monkeypatch):
         from saga.core import _resolve_contextual_query
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
         monkeypatch.setattr(
@@ -141,9 +146,10 @@ class TestContextualRewrite:
         def _boom(*a, **kw): raise RuntimeError("network down")
         monkeypatch.setattr("requests.post", _boom)
         ctx = [{"role": "user", "content": "anything"}]
-        assert _resolve_contextual_query("yes, that", ctx) == "yes, that"
+        assert await _resolve_contextual_query("yes, that", ctx) == "yes, that"
 
-    def test_strips_wrapping_quotes(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_strips_wrapping_quotes(self, cfg_override, monkeypatch):
         from saga.core import _resolve_contextual_query
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
         monkeypatch.setattr(
@@ -158,10 +164,11 @@ class TestContextualRewrite:
                 }}]}
         monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
         ctx = [{"role": "user", "content": "my headphones"}]
-        out = _resolve_contextual_query("yes, that", ctx)
+        out = await _resolve_contextual_query("yes, that", ctx)
         assert out == "What is my headphone model?"
 
-    def test_empty_response_returns_original(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_empty_response_returns_original(self, cfg_override, monkeypatch):
         from saga.core import _resolve_contextual_query
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
         monkeypatch.setattr(
@@ -174,7 +181,7 @@ class TestContextualRewrite:
                 return {"choices": [{"message": {"content": "   "}}]}
         monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
         ctx = [{"role": "user", "content": "context"}]
-        assert _resolve_contextual_query("yes, that", ctx) == "yes, that"
+        assert await _resolve_contextual_query("yes, that", ctx) == "yes, that"
 
 
 # ─── P38: confidence-gated HyDE ──────────────────────────────────────────
@@ -182,21 +189,24 @@ class TestContextualRewrite:
 class TestHydeHelper:
     """The _hyde_query helper itself: gating + LLM mock + failure modes."""
 
-    def test_disabled_returns_none(self, cfg_override):
+    @pytest.mark.asyncio
+    async def test_disabled_returns_none(self, cfg_override):
         from saga.core import _hyde_query
         cfg_override.setdefault("retrieval", {})["enable_hyde"] = False
-        assert _hyde_query("What is my profession?") is None
+        assert await _hyde_query("What is my profession?") is None
 
-    def test_no_api_key_returns_none(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_api_key_returns_none(self, cfg_override, monkeypatch):
         from saga.core import _hyde_query
         cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
         monkeypatch.setattr(
             "saga.config.resolve_llm_config",
             lambda subsystem: {"url": "u", "model": "m", "api_key": "", "timeout": 5},
         )
-        assert _hyde_query("What is my profession?") is None
+        assert await _hyde_query("What is my profession?") is None
 
-    def test_returns_hypothetical_when_enabled(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_returns_hypothetical_when_enabled(self, cfg_override, monkeypatch):
         from saga.core import _hyde_query
         cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
         monkeypatch.setattr(
@@ -211,10 +221,11 @@ class TestHydeHelper:
                     "content": "I work as a software engineer at TechCorp."
                 }}]}
         monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
-        out = _hyde_query("What is my profession?")
+        out = await _hyde_query("What is my profession?")
         assert out == "I work as a software engineer at TechCorp."
 
-    def test_llm_failure_returns_none(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_llm_failure_returns_none(self, cfg_override, monkeypatch):
         from saga.core import _hyde_query
         cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
         monkeypatch.setattr(
@@ -223,9 +234,10 @@ class TestHydeHelper:
         )
         def _boom(*a, **kw): raise RuntimeError("network down")
         monkeypatch.setattr("requests.post", _boom)
-        assert _hyde_query("anything?") is None
+        assert await _hyde_query("anything?") is None
 
-    def test_strips_wrapping_quotes(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_strips_wrapping_quotes(self, cfg_override, monkeypatch):
         from saga.core import _hyde_query
         cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
         monkeypatch.setattr(
@@ -239,9 +251,10 @@ class TestHydeHelper:
                     "content": '"I prefer dark mode."'
                 }}]}
         monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
-        assert _hyde_query("dark mode?") == "I prefer dark mode."
+        assert await _hyde_query("dark mode?") == "I prefer dark mode."
 
-    def test_empty_response_returns_none(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_empty_response_returns_none(self, cfg_override, monkeypatch):
         from saga.core import _hyde_query
         cfg_override.setdefault("retrieval", {})["enable_hyde"] = True
         monkeypatch.setattr(
@@ -253,7 +266,7 @@ class TestHydeHelper:
             def json(self):
                 return {"choices": [{"message": {"content": "   "}}]}
         monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
-        assert _hyde_query("anything?") is None
+        assert await _hyde_query("anything?") is None
 
 
 class TestHydeGating:
@@ -266,23 +279,25 @@ class TestHydeGating:
         from saga.core import store_atom
         return store_atom(content)
 
-    def test_gate_does_not_fire_when_disabled(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gate_does_not_fire_when_disabled(self, cfg_override, monkeypatch):
         """enable_hyde=False → never call _hyde_query, even on weak first pass."""
         from saga.core import hybrid_retrieve
         cfg_override.setdefault("retrieval", {})["enable_hyde"] = False
         cfg_override["retrieval"]["fusion"] = "rrf"
 
         called = {"n": 0}
-        def _spy(q):
+        async def _spy(q):
             called["n"] += 1
             return None
         monkeypatch.setattr("saga.core._hyde_query", _spy)
 
         self._seed_atom()
-        hybrid_retrieve("what is my profession?", top_k=3)
+        await hybrid_retrieve("what is my profession?", top_k=3)
         assert called["n"] == 0
 
-    def test_gate_fires_on_weak_first_pass(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gate_fires_on_weak_first_pass(self, cfg_override, monkeypatch):
         """When max similarity in first-pass < trigger AND enable_hyde=True,
         _hyde_query must be called. The fixture's randomized embeddings
         produce low cosine similarity, so the gate naturally trips here.
@@ -295,18 +310,19 @@ class TestHydeGating:
         cfg_override["retrieval"]["fusion"] = "rrf"
 
         called = {"n": 0, "q": None}
-        def _spy(q):
+        async def _spy(q):
             called["n"] += 1
             called["q"] = q
             return None  # simulate LLM returning nothing — gate fires but no rerun
         monkeypatch.setattr("saga.core._hyde_query", _spy)
 
         self._seed_atom()
-        hybrid_retrieve("what is my profession?", top_k=3)
+        await hybrid_retrieve("what is my profession?", top_k=3)
         assert called["n"] == 1
         assert called["q"] == "what is my profession?"
 
-    def test_gate_skips_when_first_pass_is_confident(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gate_skips_when_first_pass_is_confident(self, cfg_override, monkeypatch):
         """When the first pass already has a confident match, HyDE should
         be skipped — that's the whole point of the gate.
         """
@@ -316,16 +332,17 @@ class TestHydeGating:
         cfg_override["retrieval"]["fusion"] = "rrf"
 
         called = {"n": 0}
-        def _spy(q):
+        async def _spy(q):
             called["n"] += 1
             return None
         monkeypatch.setattr("saga.core._hyde_query", _spy)
 
         self._seed_atom()
-        hybrid_retrieve("what is my profession?", top_k=3)
+        await hybrid_retrieve("what is my profession?", top_k=3)
         assert called["n"] == 0
 
-    def test_gate_skips_in_weighted_sum_mode(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gate_skips_in_weighted_sum_mode(self, cfg_override, monkeypatch):
         """HyDE is a fusion-only feature. weighted_sum mode is the legacy
         path; we don't bolt new pathways onto it."""
         from saga.core import hybrid_retrieve
@@ -334,13 +351,17 @@ class TestHydeGating:
         cfg_override["retrieval"]["fusion"] = "weighted_sum"
 
         called = {"n": 0}
-        monkeypatch.setattr("saga.core._hyde_query", lambda q: called.__setitem__("n", called["n"] + 1) or None)
+        async def _spy(q):
+            called["n"] += 1
+            return None
+        monkeypatch.setattr("saga.core._hyde_query", _spy)
 
         self._seed_atom()
-        hybrid_retrieve("what is my profession?", top_k=3)
+        await hybrid_retrieve("what is my profession?", top_k=3)
         assert called["n"] == 0
 
-    def test_gate_skips_for_non_question_queries(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gate_skips_for_non_question_queries(self, cfg_override, monkeypatch):
         """HyDE generates a hypothetical *answer* — that only makes sense
         for a query asking something. Statements and commands shouldn't
         trip the gate even when first-pass confidence is weak."""
@@ -350,12 +371,15 @@ class TestHydeGating:
         cfg_override["retrieval"]["fusion"] = "rrf"
 
         called = {"n": 0}
-        monkeypatch.setattr("saga.core._hyde_query", lambda q: called.__setitem__("n", called["n"] + 1) or None)
+        async def _spy(q):
+            called["n"] += 1
+            return None
+        monkeypatch.setattr("saga.core._hyde_query", _spy)
 
         self._seed_atom()
-        hybrid_retrieve("save this for later", top_k=3)
-        hybrid_retrieve("Yes, please do that", top_k=3)
-        hybrid_retrieve("That sounds good", top_k=3)
+        await hybrid_retrieve("save this for later", top_k=3)
+        await hybrid_retrieve("Yes, please do that", top_k=3)
+        await hybrid_retrieve("That sounds good", top_k=3)
         assert called["n"] == 0
 
 
@@ -433,28 +457,31 @@ class TestCombinedRewriteHyde:
                 return {"choices": [{"message": {"content": body}}]}
         monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
 
-    def test_parses_two_section_output(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_parses_two_section_output(self, cfg_override, monkeypatch):
         from saga.core import _resolve_query_and_hypothetical
         self._llm_returns(monkeypatch,
             "REWRITTEN: What do I know about my Sony WH-1000XM5?\n"
             "HYPOTHETICAL: I bought Sony WH-1000XM5 in Boston for $399."
         )
         ctx = [{"role": "user", "content": "Tell me about my headphones"}]
-        rewritten, hyp = _resolve_query_and_hypothetical("yes, look for that", ctx)
+        rewritten, hyp = await _resolve_query_and_hypothetical("yes, look for that", ctx)
         assert rewritten == "What do I know about my Sony WH-1000XM5?"
         assert hyp == "I bought Sony WH-1000XM5 in Boston for $399."
 
-    def test_no_context_returns_passthrough(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_context_returns_passthrough(self, cfg_override, monkeypatch):
         from saga.core import _resolve_query_and_hypothetical
         # No LLM should be hit when there's no context to resolve against.
         called = {"n": 0}
         monkeypatch.setattr("requests.post", lambda *a, **kw: called.__setitem__("n", called["n"] + 1) or None)
-        rewritten, hyp = _resolve_query_and_hypothetical("anything", None)
+        rewritten, hyp = await _resolve_query_and_hypothetical("anything", None)
         assert rewritten == "anything"
         assert hyp is None
         assert called["n"] == 0
 
-    def test_llm_failure_returns_originals(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_llm_failure_returns_originals(self, cfg_override, monkeypatch):
         from saga.core import _resolve_query_and_hypothetical
         monkeypatch.setattr(
             "saga.config.resolve_llm_config",
@@ -463,11 +490,12 @@ class TestCombinedRewriteHyde:
         def _boom(*a, **kw): raise RuntimeError("network down")
         monkeypatch.setattr("requests.post", _boom)
         ctx = [{"role": "user", "content": "context here"}]
-        rewritten, hyp = _resolve_query_and_hypothetical("yes that", ctx)
+        rewritten, hyp = await _resolve_query_and_hypothetical("yes that", ctx)
         assert rewritten == "yes that"
         assert hyp is None
 
-    def test_partial_response_keeps_what_parsed(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_partial_response_keeps_what_parsed(self, cfg_override, monkeypatch):
         """If only REWRITTEN parses cleanly (no HYPOTHETICAL section),
         return rewritten + None for the hypothetical."""
         from saga.core import _resolve_query_and_hypothetical
@@ -475,7 +503,7 @@ class TestCombinedRewriteHyde:
             "REWRITTEN: What about Italy?"
         )
         ctx = [{"role": "user", "content": "Tell me about Italy"}]
-        rewritten, hyp = _resolve_query_and_hypothetical("tell me more", ctx)
+        rewritten, hyp = await _resolve_query_and_hypothetical("tell me more", ctx)
         assert rewritten == "What about Italy?"
         assert hyp is None
 
@@ -495,15 +523,15 @@ class TestRewriteHydeDispatch:
         """Monkeypatch the three LLM helpers and return a counter dict."""
         n = {"combined": 0, "rewrite": 0, "hyde": 0}
 
-        def _combined(q, c):
+        async def _combined(q, c):
             n["combined"] += 1
             return ("rewritten", "hypothetical")
 
-        def _rewrite(q, c):
+        async def _rewrite(q, c):
             n["rewrite"] += 1
             return q
 
-        def _hyde(q):
+        async def _hyde(q):
             n["hyde"] += 1
             return None
 
@@ -512,7 +540,8 @@ class TestRewriteHydeDispatch:
         monkeypatch.setattr("saga.core._hyde_query", _hyde)
         return n
 
-    def test_combined_path_when_both_apply(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_combined_path_when_both_apply(self, cfg_override, monkeypatch):
         """Both flags on + context + question → one combined call. No
         standalone rewrite call. No standalone HyDE call (we already
         have the hypothetical from the combined call).
@@ -525,12 +554,13 @@ class TestRewriteHydeDispatch:
 
         self._seed_atom()
         ctx = [{"role": "user", "content": "Tell me about my headphones"}]
-        hybrid_retrieve("what about that?", top_k=3, context=ctx)
+        await hybrid_retrieve("what about that?", top_k=3, context=ctx)
         assert n["combined"] == 1
         assert n["rewrite"] == 0
         assert n["hyde"] == 0
 
-    def test_rewrite_only_when_not_a_question(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_rewrite_only_when_not_a_question(self, cfg_override, monkeypatch):
         """Both flags on + context, but query is a statement → standalone
         rewrite (no HyDE because non-question)."""
         from saga.core import hybrid_retrieve
@@ -541,12 +571,13 @@ class TestRewriteHydeDispatch:
 
         self._seed_atom()
         ctx = [{"role": "user", "content": "About a meeting"}]
-        hybrid_retrieve("yes, please save that", top_k=3, context=ctx)
+        await hybrid_retrieve("yes, please save that", top_k=3, context=ctx)
         assert n["combined"] == 0
         assert n["rewrite"] == 1
         assert n["hyde"] == 0  # statement → HyDE skipped post-retrieval too
 
-    def test_rewrite_only_when_hyde_disabled(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_rewrite_only_when_hyde_disabled(self, cfg_override, monkeypatch):
         from saga.core import hybrid_retrieve
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
         cfg_override["retrieval"]["enable_hyde"] = False
@@ -555,12 +586,13 @@ class TestRewriteHydeDispatch:
 
         self._seed_atom()
         ctx = [{"role": "user", "content": "About headphones"}]
-        hybrid_retrieve("what about that?", top_k=3, context=ctx)
+        await hybrid_retrieve("what about that?", top_k=3, context=ctx)
         assert n["combined"] == 0
         assert n["rewrite"] == 1
         assert n["hyde"] == 0
 
-    def test_hyde_only_when_no_context(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_hyde_only_when_no_context(self, cfg_override, monkeypatch):
         """HyDE flag on + question, no context → standalone HyDE
         post-retrieval, no combined call, no rewrite call."""
         from saga.core import hybrid_retrieve
@@ -571,12 +603,13 @@ class TestRewriteHydeDispatch:
         n = self._track(monkeypatch)
 
         self._seed_atom()
-        hybrid_retrieve("what is my profession?", top_k=3, context=None)
+        await hybrid_retrieve("what is my profession?", top_k=3, context=None)
         assert n["combined"] == 0
         assert n["rewrite"] == 0
         assert n["hyde"] == 1
 
-    def test_hyde_only_when_rewrite_disabled(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_hyde_only_when_rewrite_disabled(self, cfg_override, monkeypatch):
         from saga.core import hybrid_retrieve
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = False
         cfg_override["retrieval"]["enable_hyde"] = True
@@ -586,12 +619,13 @@ class TestRewriteHydeDispatch:
 
         self._seed_atom()
         ctx = [{"role": "user", "content": "About headphones"}]
-        hybrid_retrieve("what is my profession?", top_k=3, context=ctx)
+        await hybrid_retrieve("what is my profession?", top_k=3, context=ctx)
         assert n["combined"] == 0
         assert n["rewrite"] == 0
         assert n["hyde"] == 1
 
-    def test_neither_when_both_off(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_neither_when_both_off(self, cfg_override, monkeypatch):
         from saga.core import hybrid_retrieve
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = False
         cfg_override["retrieval"]["enable_hyde"] = False
@@ -599,7 +633,7 @@ class TestRewriteHydeDispatch:
         n = self._track(monkeypatch)
 
         self._seed_atom()
-        hybrid_retrieve("what is my profession?", top_k=3)
+        await hybrid_retrieve("what is my profession?", top_k=3)
         assert n == {"combined": 0, "rewrite": 0, "hyde": 0}
 
 
@@ -615,17 +649,18 @@ class TestRetrievalPathLogging:
     def _stub_helpers(self, monkeypatch):
         """Stub the rewrite + HyDE helpers so we exercise the dispatch
         without real LLM calls."""
-        monkeypatch.setattr(
-            "saga.core._resolve_query_and_hypothetical",
-            lambda q, c: ("rewritten q?", "hypothetical answer"),
-        )
-        monkeypatch.setattr(
-            "saga.core._resolve_contextual_query",
-            lambda q, c: "rewritten q",
-        )
-        monkeypatch.setattr("saga.core._hyde_query", lambda q: "hypothetical answer")
+        async def _combined(q, c):
+            return ("rewritten q?", "hypothetical answer")
+        async def _rewrite(q, c):
+            return "rewritten q"
+        async def _hyde(q):
+            return "hypothetical answer"
+        monkeypatch.setattr("saga.core._resolve_query_and_hypothetical", _combined)
+        monkeypatch.setattr("saga.core._resolve_contextual_query", _rewrite)
+        monkeypatch.setattr("saga.core._hyde_query", _hyde)
 
-    def test_combined_path_logged(self, cfg_override, monkeypatch, caplog):
+    @pytest.mark.asyncio
+    async def test_combined_path_logged(self, cfg_override, monkeypatch, caplog):
         from saga.core import hybrid_retrieve
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
         cfg_override["retrieval"]["enable_hyde"] = True
@@ -635,14 +670,15 @@ class TestRetrievalPathLogging:
 
         with caplog.at_level("INFO", logger="saga.retrieval"):
             ctx = [{"role": "user", "content": "headphones"}]
-            hybrid_retrieve("what about that?", top_k=3, context=ctx)
+            await hybrid_retrieve("what about that?", top_k=3, context=ctx)
 
         msgs = [r.getMessage() for r in caplog.records if r.name == "saga.retrieval"]
         assert any(m.startswith("path=combined") for m in msgs), msgs
         # Combined path also logs the post-retrieval HyDE-pathway source.
         # Stays at DEBUG so it doesn't appear at INFO.
 
-    def test_rewrite_only_path_logged(self, cfg_override, monkeypatch, caplog):
+    @pytest.mark.asyncio
+    async def test_rewrite_only_path_logged(self, cfg_override, monkeypatch, caplog):
         from saga.core import hybrid_retrieve
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
         cfg_override["retrieval"]["enable_hyde"] = False
@@ -652,12 +688,13 @@ class TestRetrievalPathLogging:
 
         with caplog.at_level("INFO", logger="saga.retrieval"):
             ctx = [{"role": "user", "content": "context"}]
-            hybrid_retrieve("statement here", top_k=3, context=ctx)
+            await hybrid_retrieve("statement here", top_k=3, context=ctx)
 
         msgs = [r.getMessage() for r in caplog.records if r.name == "saga.retrieval"]
         assert any(m == "path=rewrite_only" for m in msgs), msgs
 
-    def test_hyde_gated_fired_logged(self, cfg_override, monkeypatch, caplog):
+    @pytest.mark.asyncio
+    async def test_hyde_gated_fired_logged(self, cfg_override, monkeypatch, caplog):
         from saga.core import hybrid_retrieve
         cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = False
         cfg_override["retrieval"]["enable_hyde"] = True
@@ -667,13 +704,14 @@ class TestRetrievalPathLogging:
         self._seed_atom()
 
         with caplog.at_level("INFO", logger="saga.retrieval"):
-            hybrid_retrieve("what is my profession?", top_k=3)
+            await hybrid_retrieve("what is my profession?", top_k=3)
 
         msgs = [r.getMessage() for r in caplog.records if r.name == "saga.retrieval"]
         # Includes 'fired=yes' since the stubbed _hyde_query returns text.
         assert any(m.startswith("path=hyde_gated fired=yes") for m in msgs), msgs
 
-    def test_no_log_when_no_llm_path(self, cfg_override, monkeypatch, caplog):
+    @pytest.mark.asyncio
+    async def test_no_log_when_no_llm_path(self, cfg_override, monkeypatch, caplog):
         """The common bench/CLI case: no flags on, no context. Nothing
         should be logged at INFO — keeps high-volume retrieval quiet."""
         from saga.core import hybrid_retrieve
@@ -683,7 +721,7 @@ class TestRetrievalPathLogging:
         self._seed_atom()
 
         with caplog.at_level("INFO", logger="saga.retrieval"):
-            hybrid_retrieve("what is my profession?", top_k=3)
+            await hybrid_retrieve("what is my profession?", top_k=3)
 
         msgs = [r.getMessage() for r in caplog.records if r.name == "saga.retrieval"]
         assert msgs == [], f"unexpected INFO logs: {msgs}"
@@ -788,20 +826,22 @@ class TestSubatomBeam:
     as the atom's beam-2 score. Strict no-op when [retrieval]
     enable_subatom_beam is False."""
 
-    def test_disabled_is_noop(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_disabled_is_noop(self, cfg_override, monkeypatch):
         from saga.core import _subatom_beam_atoms
         cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = False
         # Even mocking compressed_retrieve to return data — flag-off must
         # short-circuit before calling.
         called = {"n": 0}
-        def _spy(*args, **kw):
+        async def _spy(*args, **kw):
             called["n"] += 1
             return {"sentences": [{"atom_id": "x", "score": 0.9}]}
         monkeypatch.setattr("saga.subatom.compressed_retrieve", _spy)
-        assert _subatom_beam_atoms("anything", top_k=3, mode="task") == []
+        assert await _subatom_beam_atoms("anything", top_k=3, mode="task") == []
         assert called["n"] == 0
 
-    def test_enabled_collapses_sentences_to_atoms(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_enabled_collapses_sentences_to_atoms(self, cfg_override, monkeypatch):
         from saga.core import _subatom_beam_atoms, store_atom
         cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = True
         # Seed two atoms so the helper has something to load.
@@ -810,7 +850,7 @@ class TestSubatomBeam:
 
         # Mock compressed_retrieve to return four sentences spread across
         # two atoms with varying scores.
-        def fake(*args, **kw):
+        async def fake(*args, **kw):
             return {"sentences": [
                 {"atom_id": a, "sentence": "...", "score": 0.5},
                 {"atom_id": a, "sentence": "...", "score": 0.8},
@@ -819,7 +859,7 @@ class TestSubatomBeam:
             ]}
         monkeypatch.setattr("saga.subatom.compressed_retrieve", fake)
 
-        out = _subatom_beam_atoms("dark mode", top_k=5, mode="task")
+        out = await _subatom_beam_atoms("dark mode", top_k=5, mode="task")
         assert len(out) == 2
         # Atom a has the higher max-sentence-score (0.8 > 0.4) so it ranks first.
         assert out[0]["id"] == a
@@ -828,23 +868,27 @@ class TestSubatomBeam:
         assert out[0]["_subatom_score"] == pytest.approx(0.8)
         assert out[1]["_subatom_score"] == pytest.approx(0.4)
 
-    def test_no_sentences_is_noop(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_sentences_is_noop(self, cfg_override, monkeypatch):
         from saga.core import _subatom_beam_atoms
         cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = True
-        monkeypatch.setattr("saga.subatom.compressed_retrieve",
-                            lambda *a, **kw: {"sentences": []})
-        assert _subatom_beam_atoms("anything", top_k=3, mode="task") == []
+        async def _no_sentences(*a, **kw):
+            return {"sentences": []}
+        monkeypatch.setattr("saga.subatom.compressed_retrieve", _no_sentences)
+        assert await _subatom_beam_atoms("anything", top_k=3, mode="task") == []
 
-    def test_compressed_retrieve_failure_is_noop(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_compressed_retrieve_failure_is_noop(self, cfg_override, monkeypatch):
         """A crash inside compressed_retrieve must drop the beam silently —
         same resilience pattern as graph/HyDE pathways."""
         from saga.core import _subatom_beam_atoms
         cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = True
-        def _boom(*a, **kw): raise RuntimeError("subatom blew up")
+        async def _boom(*a, **kw): raise RuntimeError("subatom blew up")
         monkeypatch.setattr("saga.subatom.compressed_retrieve", _boom)
-        assert _subatom_beam_atoms("anything", top_k=3, mode="task") == []
+        assert await _subatom_beam_atoms("anything", top_k=3, mode="task") == []
 
-    def test_recursion_guard_prevents_infinite_loop(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_recursion_guard_prevents_infinite_loop(self, cfg_override, monkeypatch):
         """compressed_retrieve internally calls hybrid_retrieve, which
         calls _subatom_beam_atoms. Without a guard, that loops forever.
         Simulate the recursion: a fake compressed_retrieve calls back
@@ -855,18 +899,18 @@ class TestSubatomBeam:
 
         inner_calls = {"n": 0}
 
-        def fake_compressed(*a, **kw):
+        async def fake_compressed(*a, **kw):
             # Simulate compressed_retrieve → hybrid_retrieve →
             # _subatom_beam_atoms re-entry. The guard should make this
             # inner call return [] instead of recursing.
             from saga.core import _subatom_beam_atoms as inner
             inner_calls["n"] += 1
-            inner_result = inner("inner", top_k=2, mode="task")
+            inner_result = await inner("inner", top_k=2, mode="task")
             assert inner_result == [], "guard failed — inner call recursed"
             return {"sentences": [{"atom_id": "x", "score": 0.5}]}
 
         monkeypatch.setattr("saga.subatom.compressed_retrieve", fake_compressed)
-        _subatom_beam_atoms("outer", top_k=2, mode="task")
+        await _subatom_beam_atoms("outer", top_k=2, mode="task")
         assert inner_calls["n"] == 1
 
 
@@ -875,7 +919,8 @@ class TestBeamPathwaysInHybridRetrieve:
     when the flags are off, no extra DB calls happen; when on, the
     pathways join the ranked_lists alongside semantic+keyword."""
 
-    def test_both_flags_off_no_extra_helpers_called(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_both_flags_off_no_extra_helpers_called(self, cfg_override, monkeypatch):
         from saga.core import hybrid_retrieve, store_atom
         cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = False
         cfg_override["retrieval"]["enable_triple_augment_v2"] = False
@@ -885,39 +930,42 @@ class TestBeamPathwaysInHybridRetrieve:
         # Replace the helpers so we can confirm they're early-returned by
         # the flag check inside hybrid_retrieve, not just by their own
         # internal flag check.
-        monkeypatch.setattr("saga.core._subatom_beam_atoms",
-                            lambda *a, **kw: called.__setitem__("sub", called["sub"] + 1) or [])
+        async def _sub(*a, **kw):
+            called["sub"] += 1
+            return []
+        monkeypatch.setattr("saga.core._subatom_beam_atoms", _sub)
         monkeypatch.setattr("saga.core._triple_augment_v2",
                             lambda *a, **kw: called.__setitem__("trip", called["trip"] + 1) or [])
 
         store_atom("anything for the cheap path to find")
-        hybrid_retrieve("anything", top_k=3)
+        await hybrid_retrieve("anything", top_k=3)
         # Helpers ARE called (hybrid_retrieve always invokes them; their
         # internal flag-check is the gate). They must return [] which
         # contributes nothing to RRF.
         assert called["sub"] == 1
         assert called["trip"] == 1
 
-    def test_subatom_beam_joins_rrf_when_enabled(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_subatom_beam_joins_rrf_when_enabled(self, cfg_override, monkeypatch):
         from saga.core import hybrid_retrieve, store_atom
         cfg_override.setdefault("retrieval", {})["enable_subatom_beam"] = True
         cfg_override["retrieval"]["fusion"] = "rrf"
 
         seed_id = store_atom("dark mode preference content")
         # Stub the helper to return our seeded atom as the only beam result.
-        monkeypatch.setattr(
-            "saga.core._subatom_beam_atoms",
-            lambda q, top_k, mode: [{"id": seed_id, "content": "x",
-                                     "_subatom_score": 0.9, "_subatom_beam": True}],
-        )
+        async def _beam(q, top_k, mode):
+            return [{"id": seed_id, "content": "x",
+                     "_subatom_score": 0.9, "_subatom_beam": True}]
+        monkeypatch.setattr("saga.core._subatom_beam_atoms", _beam)
 
-        results = hybrid_retrieve("anything", top_k=3)
+        results = await hybrid_retrieve("anything", top_k=3)
         # The seeded atom should appear in results (it could come from
         # cheap path AND subatom; RRF dedupes by id).
         ids = [r["id"] for r in results]
         assert seed_id in ids
 
-    def test_triple_augment_joins_rrf_when_enabled(self, cfg_override, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_triple_augment_joins_rrf_when_enabled(self, cfg_override, monkeypatch):
         from saga.core import hybrid_retrieve, store_atom
         cfg_override.setdefault("retrieval", {})["enable_triple_augment_v2"] = True
         cfg_override["retrieval"]["fusion"] = "rrf"
@@ -930,6 +978,6 @@ class TestBeamPathwaysInHybridRetrieve:
                                   "_triple_augmented_v2": True}],
         )
 
-        results = hybrid_retrieve("user profession", top_k=3)
+        results = await hybrid_retrieve("user profession", top_k=3)
         ids = [r["id"] for r in results]
         assert seed_id in ids

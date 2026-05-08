@@ -36,8 +36,9 @@ class _FakeResp:
         return self._payload
 
 
-def test_openai_compat_happy_path(monkeypatch):
-    from saga._llm import call_llm_sync
+@pytest.mark.asyncio
+async def test_openai_compat_happy_path(monkeypatch):
+    from saga._llm import call_llm
 
     captured = {}
 
@@ -50,7 +51,7 @@ def test_openai_compat_happy_path(monkeypatch):
 
     monkeypatch.setattr("requests.post", fake_post)
 
-    out = call_llm_sync(
+    out = await call_llm(
         {"provider": "openai_compat", "url": "https://x/v1/chat", "api_key": "k", "model": "m"},
         prompt="hi", max_tokens=42, temperature=0.5, system="you are helpful",
     )
@@ -66,37 +67,40 @@ def test_openai_compat_happy_path(monkeypatch):
     assert captured["body"]["messages"][1] == {"role": "user", "content": "hi"}
 
 
-def test_openai_compat_uses_reasoning_when_content_none(monkeypatch):
-    from saga._llm import call_llm_sync
+@pytest.mark.asyncio
+async def test_openai_compat_uses_reasoning_when_content_none(monkeypatch):
+    from saga._llm import call_llm
 
     def fake_post(url, headers=None, json=None, timeout=None):
         return _FakeResp({"choices": [{"message": {"content": None, "reasoning": "thought"}}]})
 
     monkeypatch.setattr("requests.post", fake_post)
-    out = call_llm_sync(
+    out = await call_llm(
         {"provider": "openai_compat", "url": "u", "api_key": "k"},
         prompt="x",
     )
     assert out == "thought"
 
 
-def test_openai_compat_exception_returns_empty(monkeypatch):
-    from saga._llm import call_llm_sync
+@pytest.mark.asyncio
+async def test_openai_compat_exception_returns_empty(monkeypatch):
+    from saga._llm import call_llm
 
     def boom(url, headers=None, json=None, timeout=None):
         raise RuntimeError("network down")
 
     monkeypatch.setattr("requests.post", boom)
-    out = call_llm_sync(
+    out = await call_llm(
         {"provider": "openai_compat", "url": "u", "api_key": "k"},
         prompt="x",
     )
     assert out == ""
 
 
-def test_default_provider_is_openai_compat(monkeypatch):
+@pytest.mark.asyncio
+async def test_default_provider_is_openai_compat(monkeypatch):
     """No provider field → openai_compat path."""
-    from saga._llm import call_llm_sync
+    from saga._llm import call_llm
 
     called = {"hit": False}
 
@@ -105,7 +109,7 @@ def test_default_provider_is_openai_compat(monkeypatch):
         return _FakeResp({"choices": [{"message": {"content": "ok"}}]})
 
     monkeypatch.setattr("requests.post", fake_post)
-    out = call_llm_sync({"url": "u", "api_key": "k"}, prompt="x")
+    out = await call_llm({"url": "u", "api_key": "k"}, prompt="x")
     assert out == "ok"
     assert called["hit"]
 
@@ -148,8 +152,9 @@ def _install_fake_anthropic(monkeypatch, blocks, captured):
     monkeypatch.setitem(sys.modules, "anthropic", fake_mod)
 
 
-def test_anthropic_happy_path(monkeypatch):
-    from saga._llm import call_llm_sync
+@pytest.mark.asyncio
+async def test_anthropic_happy_path(monkeypatch):
+    from saga._llm import call_llm
 
     captured = {}
     _install_fake_anthropic(
@@ -158,7 +163,7 @@ def test_anthropic_happy_path(monkeypatch):
         captured,
     )
 
-    out = call_llm_sync(
+    out = await call_llm(
         {"provider": "anthropic", "api_key": "ak", "model": "claude-x", "timeout": 17},
         prompt="hi", max_tokens=99, temperature=0.2, system="be brief",
     )
@@ -171,23 +176,25 @@ def test_anthropic_happy_path(monkeypatch):
     assert captured["messages"] == [{"role": "user", "content": "hi"}]
 
 
-def test_anthropic_default_model(monkeypatch):
+@pytest.mark.asyncio
+async def test_anthropic_default_model(monkeypatch):
     """Empty/missing model field → claude-haiku-4-5 default."""
-    from saga._llm import call_llm_sync
+    from saga._llm import call_llm
 
     captured = {}
     _install_fake_anthropic(monkeypatch, [_FakeBlock("ok")], captured)
 
-    call_llm_sync(
+    await call_llm(
         {"provider": "anthropic", "api_key": "ak"},
         prompt="hi",
     )
     assert captured["model"] == "claude-haiku-4-5"
 
 
-def test_anthropic_skips_blocks_without_text(monkeypatch):
+@pytest.mark.asyncio
+async def test_anthropic_skips_blocks_without_text(monkeypatch):
     """Tool_use / thinking blocks lack a .text attr — should be skipped."""
-    from saga._llm import call_llm_sync
+    from saga._llm import call_llm
 
     class _NonText:
         # No .text attribute.
@@ -199,26 +206,28 @@ def test_anthropic_skips_blocks_without_text(monkeypatch):
         [_FakeBlock("a"), _NonText(), _FakeBlock("b")],
         captured,
     )
-    out = call_llm_sync(
+    out = await call_llm(
         {"provider": "anthropic", "api_key": "ak"},
         prompt="hi",
     )
     assert out == "ab"
 
 
-def test_anthropic_missing_api_key_returns_empty(monkeypatch):
-    from saga._llm import call_llm_sync
+@pytest.mark.asyncio
+async def test_anthropic_missing_api_key_returns_empty(monkeypatch):
+    from saga._llm import call_llm
 
     # Ensure anthropic isn't even imported by clearing the slot.
     monkeypatch.setitem(sys.modules, "anthropic", types.ModuleType("anthropic"))
-    out = call_llm_sync(
+    out = await call_llm(
         {"provider": "anthropic", "api_key": ""},
         prompt="x",
     )
     assert out == ""
 
 
-def test_anthropic_import_error_falls_back_to_openai_compat(monkeypatch):
+@pytest.mark.asyncio
+async def test_anthropic_import_error_falls_back_to_openai_compat(monkeypatch):
     """If `anthropic` SDK isn't installed, _call_anthropic falls through
     to _call_openai_compat — keeps bench infra runnable on minimal envs."""
     from saga import _llm
@@ -234,7 +243,7 @@ def test_anthropic_import_error_falls_back_to_openai_compat(monkeypatch):
 
     monkeypatch.setattr("requests.post", fake_post)
 
-    out = _llm.call_llm_sync(
+    out = await _llm.call_llm(
         {"provider": "anthropic", "api_key": "ak", "url": "u"},
         prompt="x",
     )
@@ -328,43 +337,10 @@ def _install_fake_claude_agent_sdk(
     monkeypatch.setitem(_sys.modules, "claude_agent_sdk", fake_mod)
 
 
-def _reset_persistent_runner():
-    """Tests should drop the cached pool between scenarios so each
-    test gets fresh persistent clients (with a fresh fake SDK).
-    Resetting the module-level singleton is sufficient: the next
-    ``call_llm_sync`` will lazily build a new pool, and any in-flight
-    daemon threads from prior tests are harmless (they hold the
-    *previous* test's fake SDK and never see a new submission)."""
-    import saga._llm as _llm
-    _llm._persistent_pool = None
-
-
-def test_claude_code_happy_path(monkeypatch):
-    _reset_persistent_runner()
-    from saga._llm import call_llm_sync
-
-    captured: dict[str, Any] = {}
-    _install_fake_claude_agent_sdk(
-        monkeypatch,
-        scripted_responses=[[_FakeContent("hello "), _FakeContent("world")]],
-        captured=captured,
-    )
-
-    out = call_llm_sync(
-        {"provider": "claude_code", "model": "claude-haiku-4-5"},
-        prompt="hi", system="be brief",
-    )
-    assert out == "hello world"
-    assert captured["prompts"] == ["hi"]
-    # First call connects; first connect uses the model + system prompt.
-    assert captured["options"]["model"] == "claude-haiku-4-5"
-    assert captured["options"]["system_prompt"] == "be brief"
-    assert captured["connect_count"] == 1
-
-
-def test_claude_code_omits_unset_options(monkeypatch):
-    _reset_persistent_runner()
-    from saga._llm import call_llm_sync
+@pytest.mark.asyncio
+async def test_claude_code_omits_unset_options(monkeypatch):
+    _reset_async_pools()
+    from saga._llm import call_llm
 
     captured: dict[str, Any] = {}
     _install_fake_claude_agent_sdk(
@@ -373,14 +349,15 @@ def test_claude_code_omits_unset_options(monkeypatch):
         captured=captured,
     )
 
-    call_llm_sync({"provider": "claude_code"}, prompt="x")
+    await call_llm({"provider": "claude_code"}, prompt="x")
     assert "model" not in captured["options"]
     assert "system_prompt" not in captured["options"]
 
 
-def test_claude_code_skips_blocks_without_text(monkeypatch):
-    _reset_persistent_runner()
-    from saga._llm import call_llm_sync
+@pytest.mark.asyncio
+async def test_claude_code_skips_blocks_without_text(monkeypatch):
+    _reset_async_pools()
+    from saga._llm import call_llm
 
     class _NonText:
         pass  # no .text
@@ -390,122 +367,27 @@ def test_claude_code_skips_blocks_without_text(monkeypatch):
         scripted_responses=[[_FakeContent("a"), _NonText(), _FakeContent("b")]],
     )
 
-    out = call_llm_sync({"provider": "claude_code"}, prompt="x")
+    out = await call_llm({"provider": "claude_code"}, prompt="x")
     assert out == "ab"
 
 
-def test_claude_code_query_exception_returns_empty(monkeypatch):
-    _reset_persistent_runner()
-    from saga._llm import call_llm_sync
+@pytest.mark.asyncio
+async def test_claude_code_query_exception_returns_empty(monkeypatch):
+    _reset_async_pools()
+    from saga._llm import call_llm
 
     _install_fake_claude_agent_sdk(
         monkeypatch,
         raise_on_query=RuntimeError("CLI not authenticated"),
     )
 
-    out = call_llm_sync({"provider": "claude_code"}, prompt="x")
+    out = await call_llm({"provider": "claude_code"}, prompt="x")
     assert out == ""
 
 
-def test_claude_code_reuses_client_across_calls(monkeypatch):
-    """Two consecutive calls with the same model should share one
-    connect()/disconnect() pair — that's the whole point of the
-    persistent client (avoids subprocess spawn per call)."""
-    _reset_persistent_runner()
-    from saga._llm import call_llm_sync
-
-    captured: dict[str, Any] = {}
-    _install_fake_claude_agent_sdk(
-        monkeypatch,
-        scripted_responses=[
-            [_FakeContent("one")],
-            [_FakeContent("two")],
-            [_FakeContent("three")],
-        ],
-        captured=captured,
-    )
-
-    cfg = {"provider": "claude_code", "model": "claude-haiku-4-5"}
-    assert call_llm_sync(cfg, prompt="p1") == "one"
-    assert call_llm_sync(cfg, prompt="p2") == "two"
-    assert call_llm_sync(cfg, prompt="p3") == "three"
-    # One connect at boot, no recycle yet (3 < default 10).
-    assert captured["connect_count"] == 1
-    assert captured.get("disconnect_count", 0) == 0
-
-
-def test_claude_code_recycles_after_threshold(monkeypatch):
-    """Past SAGA_PERSISTENT_CLAUDE_RECYCLE calls, the client is torn
-    down and a fresh one connected — bounds context bloat."""
-    _reset_persistent_runner()
-    monkeypatch.setenv("SAGA_PERSISTENT_CLAUDE_RECYCLE", "2")
-    from saga._llm import call_llm_sync
-
-    captured: dict[str, Any] = {}
-    _install_fake_claude_agent_sdk(
-        monkeypatch,
-        scripted_responses=[
-            [_FakeContent(f"r{i}")] for i in range(5)
-        ],
-        captured=captured,
-    )
-
-    cfg = {"provider": "claude_code", "model": "claude-haiku-4-5"}
-    for i in range(5):
-        call_llm_sync(cfg, prompt=f"p{i}")
-    # K=2: calls 0,1 on client A. Call 2 triggers recycle → client B
-    # handles 2,3. Call 4 triggers another recycle → client C handles 4.
-    # That's 3 connects, 2 disconnects.
-    assert captured["connect_count"] == 3
-    assert captured["disconnect_count"] == 2
-
-
-def test_claude_code_recycles_on_model_change(monkeypatch):
-    """Switching ``model`` between calls forces a recycle so the new
-    options take effect."""
-    _reset_persistent_runner()
-    from saga._llm import call_llm_sync
-
-    captured: dict[str, Any] = {}
-    _install_fake_claude_agent_sdk(
-        monkeypatch,
-        scripted_responses=[[_FakeContent("a")], [_FakeContent("b")]],
-        captured=captured,
-    )
-
-    call_llm_sync({"provider": "claude_code", "model": "claude-haiku-4-5"}, prompt="p1")
-    call_llm_sync({"provider": "claude_code", "model": "claude-opus-4-7"},  prompt="p2")
-    assert captured["connect_count"] == 2
-    assert captured["disconnect_count"] == 1
-
-
-def test_claude_code_import_error_falls_back_to_openai_compat(monkeypatch):
-    """If claude-agent-sdk isn't installed, fall through to openai_compat —
-    keeps standalone saga environments runnable."""
-    from saga import _llm
-
-    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
-
-    called = {"hit": False}
-
-    def fake_post(url, headers=None, json=None, timeout=None):
-        called["hit"] = True
-        return _FakeResp({"choices": [{"message": {"content": "fallback"}}]})
-
-    monkeypatch.setattr("requests.post", fake_post)
-
-    out = _llm.call_llm_sync(
-        {"provider": "claude_code", "url": "u", "api_key": "k"},
-        prompt="x",
-    )
-    assert out == "fallback"
-    assert called["hit"]
-
-
-def test_anthropic_exception_returns_empty(monkeypatch):
-    from saga._llm import call_llm_sync
-
-    captured = {}
+@pytest.mark.asyncio
+async def test_anthropic_exception_returns_empty(monkeypatch):
+    from saga._llm import call_llm
 
     class _BoomMessages:
         def create(self, **kwargs):
@@ -515,167 +397,11 @@ def test_anthropic_exception_returns_empty(monkeypatch):
     fake_mod.Anthropic = lambda **kw: types.SimpleNamespace(messages=_BoomMessages())
     monkeypatch.setitem(sys.modules, "anthropic", fake_mod)
 
-    out = call_llm_sync(
+    out = await call_llm(
         {"provider": "anthropic", "api_key": "ak"},
         prompt="x",
     )
     assert out == ""
-
-
-def test_persistent_pool_reuses_idle_runner():
-    """A single-threaded sequence of acquire/release should reuse the
-    same runner — that's the whole point of caching the warm SDK
-    client across calls."""
-    import saga._llm as _llm
-
-    _reset_persistent_runner()
-    pool = _llm._PersistentClaudePool(max_size=2)
-
-    r1 = pool.acquire()
-    pool.release(r1)
-    r2 = pool.acquire()
-    try:
-        assert r1 is r2, "released runner must be reused on next acquire"
-    finally:
-        pool.release(r2)
-
-
-def test_persistent_pool_caps_concurrent_instances():
-    """Under concurrent load, the pool must never exceed ``max_size``
-    live ``_PersistentClaudeCode`` instances — that's the leak fix.
-    Many worker threads churning through acquire/release see at most
-    ``max_size`` distinct instances."""
-    import saga._llm as _llm
-    import threading
-
-    _reset_persistent_runner()
-    pool = _llm._PersistentClaudePool(max_size=3)
-    seen: set[int] = set()
-    seen_lock = threading.Lock()
-    barrier = threading.Barrier(8)
-
-    def worker():
-        # Stagger acquires so churn is realistic but the pool is
-        # genuinely under contention (8 workers, cap=3).
-        barrier.wait()
-        for _ in range(3):
-            r = pool.acquire()
-            try:
-                with seen_lock:
-                    seen.add(id(r))
-            finally:
-                pool.release(r)
-
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=10)
-        assert not t.is_alive(), "worker hung — likely a deadlock in pool"
-
-    assert len(seen) <= 3, (
-        f"pool grew past max_size: {len(seen)} distinct runners "
-        f"created, expected <= 3"
-    )
-    assert pool.size <= 3
-    # All workers borrowed from the (small) pool; we should have
-    # actually constructed at least 1 and at most 3 instances.
-    assert 1 <= len(seen) <= 3
-
-
-def test_persistent_pool_blocks_when_full_until_release():
-    """When ``max_size`` instances are checked out, a new ``acquire``
-    must block until something is released — not silently grow the
-    pool past the cap."""
-    import saga._llm as _llm
-    import threading
-
-    _reset_persistent_runner()
-    pool = _llm._PersistentClaudePool(max_size=1)
-
-    held = pool.acquire()
-    acquired_event = threading.Event()
-    second: dict[str, object] = {}
-
-    def waiter():
-        second["runner"] = pool.acquire()
-        acquired_event.set()
-
-    t = threading.Thread(target=waiter, daemon=True)
-    t.start()
-
-    # The waiter should be parked — not yet fired.
-    assert not acquired_event.wait(timeout=0.2), (
-        "waiter acquired before holder released — pool exceeded max_size"
-    )
-
-    pool.release(held)
-
-    assert acquired_event.wait(timeout=5), "waiter never woke after release"
-    t.join(timeout=5)
-    pool.release(second["runner"])
-    assert second["runner"] is held, (
-        "post-release acquire should reuse the same instance"
-    )
-
-
-def test_persistent_pool_construction_failure_frees_slot():
-    """If ``_PersistentClaudeCode.__init__`` raises, the reserved slot
-    must be returned to the pool — otherwise repeated failures would
-    permanently shrink capacity."""
-    import saga._llm as _llm
-
-    _reset_persistent_runner()
-    pool = _llm._PersistentClaudePool(max_size=1)
-
-    boom_count = {"n": 0}
-    real_init = _llm._PersistentClaudeCode.__init__
-
-    def flaky_init(self, *args, **kwargs):
-        boom_count["n"] += 1
-        if boom_count["n"] == 1:
-            raise RuntimeError("boom")
-        return real_init(self, *args, **kwargs)
-
-    _llm._PersistentClaudeCode.__init__ = flaky_init
-    try:
-        try:
-            pool.acquire()
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("flaky_init should have raised")
-
-        # Slot was reserved before the failed construction; without
-        # the back-out, ``size`` would be stuck at 1 with nothing to
-        # check out, and this acquire would block forever.
-        runner = pool.acquire()
-        assert runner is not None
-        pool.release(runner)
-    finally:
-        _llm._PersistentClaudeCode.__init__ = real_init
-
-
-def test_persistent_pool_default_size_from_env(monkeypatch):
-    """``SAGA_PERSISTENT_CLAUDE_POOL_SIZE`` controls the default
-    pool's cap; bogus values fall back to the default rather than
-    raising."""
-    import saga._llm as _llm
-
-    _reset_persistent_runner()
-    monkeypatch.setenv("SAGA_PERSISTENT_CLAUDE_POOL_SIZE", "7")
-    pool = _llm._get_persistent_pool()
-    assert pool.max_size == 7
-
-    _reset_persistent_runner()
-    monkeypatch.setenv("SAGA_PERSISTENT_CLAUDE_POOL_SIZE", "not-a-number")
-    pool = _llm._get_persistent_pool()
-    assert pool.max_size == _llm._DEFAULT_POOL_SIZE
-
-    _reset_persistent_runner()
-    monkeypatch.setenv("SAGA_PERSISTENT_CLAUDE_POOL_SIZE", "0")
-    pool = _llm._get_persistent_pool()
-    assert pool.max_size == _llm._DEFAULT_POOL_SIZE
 
 
 # ─── Async-native call_llm (chainlink #45 / Phase 1 of #20) ─────────

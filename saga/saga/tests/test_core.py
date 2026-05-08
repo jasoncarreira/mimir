@@ -108,11 +108,12 @@ class TestBatchCosine:
 
 
 class TestConfidenceTiers:
-    def test_tier_thresholds(self):
+    @pytest.mark.asyncio
+    async def test_tier_thresholds(self):
         """Verify tier classification matches documented thresholds."""
         from saga.core import hybrid_retrieve, store_atom
         # Just verify the function runs without error on empty db
-        results = hybrid_retrieve("nonexistent query", top_k=5)
+        results = await hybrid_retrieve("nonexistent query", top_k=5)
         assert results == []
 
     def test_stats(self):

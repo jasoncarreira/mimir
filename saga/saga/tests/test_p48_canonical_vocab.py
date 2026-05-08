@@ -189,7 +189,8 @@ def test_vocab_block_skips_blank_extras():
     assert "Tim" in block
 
 
-def test_consolidate_threads_extra_canonical_subjects():
+@pytest.mark.asyncio
+async def test_consolidate_threads_extra_canonical_subjects():
     """ConsolidationEngine.consolidate(extra_canonical_subjects=...)
     stores them on self for the prompt-builder to read."""
     from saga.consolidation import ConsolidationEngine
@@ -198,7 +199,7 @@ def test_consolidate_threads_extra_canonical_subjects():
     assert getattr(engine, '_extra_canonical_subjects', None) in (None, [])
     # Mock cluster phase to avoid needing real atoms.
     engine._cluster_phase = lambda: []  # type: ignore[method-assign]
-    engine.consolidate(
+    await engine.consolidate(
         dry_run=True, extra_canonical_subjects=["Tim", "Alice"],
     )
     assert engine._extra_canonical_subjects == ["Tim", "Alice"]
@@ -222,7 +223,8 @@ def test_vocab_block_never_emits_count_for_seed_only_entries():
 # ─── Prompt integration ────────────────────────────────────────────────
 
 
-def test_prompt_omits_vocab_block_when_triples_off(monkeypatch):
+@pytest.mark.asyncio
+async def test_prompt_omits_vocab_block_when_triples_off(monkeypatch):
     """When triples extraction is off the vocab block is irrelevant
     (no TRIPLES section asked for) so it should not be computed or
     included in the prompt."""
@@ -265,7 +267,7 @@ def test_prompt_omits_vocab_block_when_triples_off(monkeypatch):
         return _Resp()
 
     monkeypatch.setattr("requests.post", fake_post)
-    engine.consolidate()
+    await engine.consolidate()
 
     if prompts:
         joined = "\n---\n".join(prompts)
@@ -276,7 +278,8 @@ def test_prompt_omits_vocab_block_when_triples_off(monkeypatch):
         assert "PREFER reusing" not in joined
 
 
-def test_prompt_includes_vocab_block_when_triples_on(monkeypatch):
+@pytest.mark.asyncio
+async def test_prompt_includes_vocab_block_when_triples_on(monkeypatch):
     from saga.config import _DEFAULTS
     monkeypatch.setitem(_DEFAULTS["triples"], "enable_extraction", True)
 
@@ -308,7 +311,7 @@ def test_prompt_includes_vocab_block_when_triples_on(monkeypatch):
         return _Resp()
 
     monkeypatch.setattr("requests.post", fake_post)
-    engine.consolidate()
+    await engine.consolidate()
 
     if prompts:
         joined = "\n---\n".join(prompts)

@@ -182,13 +182,16 @@ def _filter_session_turns(turns_path, saga_session_id: str) -> list[dict]:
 #     construct fresh clients (idempotent for tests / repeat startup).
 #
 # The original Stage 4 spec (CLAUDE_SDK_CLIENT_MIGRATION.md) prescribed
-# a ``threading.local`` cache, mirroring saga's ``_PersistentClaudeCode``.
-# That was the wrong shape for mimir: mimir runs all turns on a single
-# asyncio event loop in a single OS thread, so ``threading.local``
-# would hand every coroutine the same client — same serialization, just
-# without the lock to make it visible. The asyncio-aware pool here is
-# the right shape for mimir's runtime. The retired threading.local note
-# in CLAUDE_SDK_CLIENT_MIGRATION.md captures the reasoning.
+# a ``threading.local`` cache, mirroring saga's old ``_PersistentClaudeCode``
+# (a daemon-thread + run_coroutine_threadsafe bridge — itself retired
+# in chainlink #47 / Phase 3 of #20 in favor of saga's async-native
+# ``_AsyncClaudeRunner``). ``threading.local`` was the wrong shape for
+# mimir regardless: mimir runs all turns on a single asyncio event loop
+# in a single OS thread, so ``threading.local`` would hand every coroutine
+# the same client — same serialization, just without the lock to make
+# it visible. The asyncio-aware pool here is the right shape for mimir's
+# runtime. The retired threading.local note in CLAUDE_SDK_CLIENT_MIGRATION.md
+# captures the reasoning.
 #
 # Test shape:
 #   The module-level ``query`` and ``get_context_usage`` names + their
@@ -231,14 +234,22 @@ class _PoolEntry:
     """A pool member: a connected (or pending-connect) ClaudeSDKClient
     plus the fingerprint it was constructed with. ``stale`` is set when
     the pool's current fingerprint flips while this client is in use —
-    on release the client disconnects instead of being returned."""
+    on release the client disconnects instead of being returned.
 
-    __slots__ = ("client", "fingerprint", "stale")
+    ``cell`` is a ``_TurnCell`` whose reference is captured by the
+    SDK's forked hook task at first connect. Mutating ``cell.turn_id``
+    is how the budget hook learns which turn is currently using THIS
+    client (as opposed to some other client serving a different
+    channel concurrently)."""
+
+    __slots__ = ("client", "fingerprint", "stale", "cell")
 
     def __init__(self, client: ClaudeSDKClient, fingerprint: str) -> None:
         self.client = client
         self.fingerprint = fingerprint
         self.stale = False
+        from ._context import _TurnCell
+        self.cell = _TurnCell()
 
 
 from saga.async_pool import BoundedAsyncPool
@@ -356,6 +367,18 @@ class ClientPool(BoundedAsyncPool[_PoolEntry]):
                     # waiters won't double-grow past max_size).
                     self._in_flight.add(entry)
                     cond.release()
+                    # Bind THIS client's ``_TurnCell`` to the contextvar
+                    # before connect. The SDK forks the hook control
+                    # task during ``connect()`` and that task captures
+                    # the contextvar value at fork time — capturing the
+                    # cell reference means later mutations of
+                    # ``entry.cell.turn_id`` (on each acquire/release)
+                    # remain visible to the hook task. No reset of the
+                    # token afterwards: each new client's connect should
+                    # see *its own* cell on the contextvar, and we always
+                    # set a fresh one before the next construct above.
+                    from ._context import _current_client_cell
+                    _current_client_cell.set(entry.cell)
                     try:
                         await client.connect()
                     except BaseException:
@@ -414,9 +437,21 @@ class ClientPool(BoundedAsyncPool[_PoolEntry]):
                 "entry failed during release (continuing)"
             )
 
-    def acquire_ctx(self, options: ClaudeAgentOptions) -> "_AcquireContext":
-        """Async context manager wrapping ``acquire`` / ``release``."""
-        return _AcquireContext(self, options)
+    def acquire_ctx(
+        self,
+        options: ClaudeAgentOptions,
+        *,
+        turn_id: str | None = None,
+    ) -> "_AcquireContext":
+        """Async context manager wrapping ``acquire`` / ``release``.
+
+        ``turn_id`` (optional) is stamped onto the entry's
+        ``_TurnCell.turn_id`` while the client is checked out and
+        cleared on release. The budget hook reads this to identify
+        which turn the calling client belongs to in multi-channel
+        concurrent setups (where ``get_only_active_turn`` returns None
+        because >1 turn is in flight)."""
+        return _AcquireContext(self, options, turn_id=turn_id)
 
     async def shutdown(self) -> None:
         """Disconnect every client in the pool (idle and in-flight).
@@ -454,19 +489,32 @@ class _AcquireContext:
     body runs with an exclusive ``ClaudeSDKClient``; on exit (success
     or exception) the client is released back to the pool."""
 
-    def __init__(self, pool: ClientPool, options: ClaudeAgentOptions) -> None:
+    def __init__(
+        self,
+        pool: ClientPool,
+        options: ClaudeAgentOptions,
+        *,
+        turn_id: str | None = None,
+    ) -> None:
         self._pool = pool
         self._options = options
+        self._turn_id = turn_id
         self._entry: _PoolEntry | None = None
 
     async def __aenter__(self) -> ClaudeSDKClient:
         self._entry = await self._pool.acquire(self._options)
+        # Stamp the cell so the budget hook can correlate this client's
+        # tool calls to the current turn. ``cell`` is a per-client
+        # holder captured by the SDK's hook task at first connect; live
+        # mutations remain visible across the task boundary.
+        self._entry.cell.turn_id = self._turn_id
         return self._entry.client
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         entry = self._entry
         self._entry = None
         if entry is not None:
+            entry.cell.turn_id = None
             await self._pool.release(entry)
 
 
@@ -543,7 +591,10 @@ async def query(
     signature compatibility with tests that may pass it.
     """
     pool = _get_pool()
-    async with pool.acquire_ctx(options) as client:
+    # ``session_id`` here is ``ctx.turn_id`` (the agent loop passes it),
+    # so it doubles as the cell-stamp value the budget hook uses to
+    # find the right TurnContext under concurrent multi-channel use.
+    async with pool.acquire_ctx(options, turn_id=session_id) as client:
         await client.query(prompt, session_id=session_id)
         async for msg in client.receive_response():
             yield msg

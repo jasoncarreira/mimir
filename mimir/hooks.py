@@ -135,29 +135,83 @@ def make_pre_tool_use_hook(
         # so it has an exit hatch from the budget. The deny message points
         # the agent at send_message; if send_message itself were denied, the
         # agent would be wedged.
-        from ._context import get_current_turn, get_turn_by_session_id
+        from ._context import (
+            _active_turns,
+            _current_client_cell,
+            get_current_turn,
+            get_only_active_turn,
+            get_turn_by_session_id,
+        )
         from .event_logger import log_event
 
         # Hook callbacks fire on the SDK's control-protocol task, which
         # was forked at first client.connect() and captured contextvar
-        # state from that moment. Subsequent run_turn set_current_turn
-        # calls don't propagate into this task, so contextvar lookup
-        # returns stale ctx (or None on first connect). Look up by
-        # session_id instead — the SDK passes the per-turn session_id
-        # (== ctx.turn_id since stage 2 of the migration) on every hook
-        # call, and _active_turns is keyed by turn_id. The contextvar
-        # fallback handles same-task callers and tests that don't pass
-        # session_id in the hook input fixture.
-        # Track which path resolved the ctx so SDK-API drift fails loudly:
-        # if the SDK ever stops passing session_id in hook input_data, the
-        # event stream will show resolution_path flipping to "contextvar"
-        # (or "missing" if the contextvar fallback also fails) instead of
-        # silently breaking budget enforcement. (CR#18)
-        ctx = get_turn_by_session_id(input_data.get("session_id"))
-        resolution_path = "session_id" if ctx is not None else None
+        # state from that moment. Per-channel correctness:
+        #
+        # The pool sets ``_current_client_cell`` to a fresh ``_TurnCell``
+        # *before* each new client's ``connect()``. The hook task forks
+        # at that connect and captures the cell *reference* — and the
+        # cell's ``turn_id`` attribute is mutable, so later
+        # ``acquire_ctx(turn_id=X)`` writes are live-readable from the
+        # hook task even though the contextvar value itself is frozen.
+        # Each pooled client has its own cell, so two clients running
+        # turns on different channels can't corrupt each other's hook
+        # bookkeeping.
+        #
+        # Fallbacks below cover the legacy paths:
+        #   1. ``client_cell.turn_id`` — primary production path
+        #   2. ``input_data["session_id"]`` against ``_active_turns`` —
+        #      historic SDK contract (currently broken in 0.1.x — the
+        #      SDK passes the CLI-internal session_id, not what mimir
+        #      sets via ``client.query(session_id=...)``). Kept so the
+        #      hook works again automatically if SDK behavior changes.
+        #   3. ``get_only_active_turn()`` — single-active heuristic for
+        #      tests / direct invocations bypassing the pool.
+        #   4. ``get_current_turn()`` contextvar — same-task callers
+        #      AND tests that set ``_current_turn`` directly. Stale-ctx
+        #      guarded: a ctx whose turn_id is no longer in
+        #      ``_active_turns`` is a frozen-contextvar leak; punt.
+        ctx = None
+        resolution_path: str | None = None
+
+        cell = _current_client_cell.get()
+        if cell is not None and cell.turn_id is not None:
+            ctx = _active_turns.get(cell.turn_id)
+            if ctx is not None:
+                resolution_path = "client_cell"
+
+        if ctx is None:
+            ctx = get_turn_by_session_id(input_data.get("session_id"))
+            if ctx is not None:
+                resolution_path = "session_id"
+        if ctx is None:
+            ctx = get_only_active_turn()
+            if ctx is not None:
+                resolution_path = "single_active"
         if ctx is None:
             ctx = get_current_turn()
-            resolution_path = "contextvar" if ctx is not None else "missing"
+            if ctx is not None:
+                # Stale-ctx guard: if the contextvar handed us a turn
+                # that's no longer registered, the hook task is reading
+                # a contextvar frozen at fork time. Don't enforce.
+                if ctx.turn_id in _active_turns:
+                    resolution_path = "contextvar"
+                else:
+                    await log_event(
+                        "tool_call_budget_punted",
+                        tool=tool_name,
+                        reason="stale_contextvar",
+                        stale_turn_id=ctx.turn_id,
+                    )
+                    ctx = None
+                    resolution_path = "stale_contextvar"
+            else:
+                await log_event(
+                    "tool_call_budget_punted",
+                    tool=tool_name,
+                    reason="missing",
+                )
+                resolution_path = "missing"
         if (
             ctx is not None
             and ctx.tool_call_budget > 0

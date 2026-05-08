@@ -90,7 +90,7 @@ def _format_atom_for_reader(atom: dict) -> dict:
     }
 
 
-def run(
+async def run(
     limit: int | None,
     run_tag: str,
     resume: bool,
@@ -154,7 +154,7 @@ def run(
                 from saga.consolidation import ConsolidationEngine
                 t0 = time.time()
                 try:
-                    cresult = ConsolidationEngine().consolidate()
+                    cresult = await ConsolidationEngine().consolidate()
                     clusters_consolidated = cresult.get("clusters_consolidated", 0)
                 except Exception as ce:
                     import traceback as _tb
@@ -169,7 +169,7 @@ def run(
             except (ValueError, KeyError):
                 ref_date = None
             two_tier = bool(_c('retrieval', 'two_tier_enabled', False))
-            retrieved = hybrid_retrieve(
+            retrieved = await hybrid_retrieve(
                 q["question"],
                 mode="task",
                 top_k=RETRIEVAL_TOP_K,
@@ -275,6 +275,7 @@ def run(
 
 
 def main():
+    import asyncio
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None, help="cap number of questions")
     ap.add_argument("--run-tag", default="msam_baseline_v0", help="tag for output files")
@@ -290,10 +291,10 @@ def main():
         help="override per-question DB work dir (parallel runs need separate dirs)",
     )
     args = ap.parse_args()
-    run(
+    asyncio.run(run(
         args.limit, args.run_tag, args.resume, args.keep_dbs,
         config_path=args.config, work_dir=args.work_dir,
-    )
+    ))
 
 
 if __name__ == "__main__":

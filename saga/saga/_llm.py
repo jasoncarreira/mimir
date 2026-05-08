@@ -24,20 +24,16 @@ candidate" shape: a single string. Anthropic's response can have
 multiple content blocks (text + tool_use); we collapse to text only
 (saga's calls don't request tools).
 
-Two public entry points:
+Single async entry point:
 
-- ``call_llm_sync(...)`` — synchronous; saga's existing internal call
-  sites use this. claude_code path goes through the legacy
-  daemon-thread ``_PersistentClaudePool`` bridge.
-- ``async def call_llm(...)`` — async-native; new in chainlink #45
-  (Phase 1 of #20). claude_code path goes through ``_AsyncClaudePool``
-  on the caller's event loop, no daemon thread spawned. anthropic and
-  openai_compat are sync HTTP libraries — the async wrapper offloads
-  via ``asyncio.to_thread`` for now (Phase 3 may async-ify them
-  properly).
+- ``async def call_llm(...)`` — async-native (chainlink #20). The
+  claude_code path runs on the caller's event loop via
+  ``_AsyncClaudePool`` (no daemon thread). ``anthropic`` and
+  ``openai_compat`` are sync HTTP libraries; the wrapper offloads
+  them via ``asyncio.to_thread`` so the loop stays responsive.
 
-Both APIs coexist during the chainlink-20 migration. ``call_llm_sync``
-and ``_PersistentClaudePool`` delete in Phase 3.
+The legacy ``call_llm_sync`` + ``_PersistentClaudePool`` daemon-thread
+bridge was deleted in Phase 3 — saga's internals are now async-native.
 """
 
 from __future__ import annotations
@@ -46,41 +42,6 @@ import logging
 from typing import Any
 
 log = logging.getLogger(__name__)
-
-
-def call_llm_sync(
-    llm: dict[str, Any],
-    *,
-    prompt: str,
-    max_tokens: int = 1500,
-    temperature: float = 0.3,
-    system: str | None = None,
-) -> str:
-    """Synchronous LLM call. saga's hot paths are sync (def, not async
-    def); they call this directly. The async wrapping for mimir's
-    event-loop responsiveness happens at mimir's boundary
-    (``_InProcessSaga.<method>`` wraps with ``asyncio.to_thread``).
-
-    Returns the assistant's reply text. Empty string on transport
-    failure — callers handle gracefully (every existing site already
-    does, since the old ``requests.post`` path raised exceptions that
-    were caught).
-    """
-    provider = (llm.get("provider") or "openai_compat").lower()
-    if provider == "anthropic":
-        return _call_anthropic(
-            llm, prompt=prompt, max_tokens=max_tokens,
-            temperature=temperature, system=system,
-        )
-    if provider == "claude_code":
-        return _call_claude_code(
-            llm, prompt=prompt, max_tokens=max_tokens,
-            temperature=temperature, system=system,
-        )
-    return _call_openai_compat(
-        llm, prompt=prompt, max_tokens=max_tokens,
-        temperature=temperature, system=system,
-    )
 
 
 def _call_anthropic(
@@ -127,72 +88,7 @@ def _call_anthropic(
     return "".join(pieces).strip()
 
 
-def _call_claude_code(
-    llm: dict[str, Any], *,
-    prompt: str, max_tokens: int, temperature: float,
-    system: str | None,
-) -> str:
-    """Route through claude-agent-sdk against a long-lived
-    ``ClaudeSDKClient`` so the Claude Code subprocess stays warm
-    across saga's many small LLM calls. Inherits OAuth from
-    ``claude login`` (Max plan).
-
-    Why the persistent client matters:
-      Measured one-shot ``query()`` startup: ~5-9s/call (most of it
-      subprocess spawn).
-      Measured warm ``ClaudeSDKClient.query()``: ~1.5-2s/call.
-      For a 500-question integration bench with ~30 consolidation
-      clusters per question, that's the difference between ~30 hours
-      and ~8 hours of consolidation wall-clock.
-
-    Caveat: ``ClaudeSDKClient`` accumulates conversation history
-    across ``query()`` calls — call 2 remembers what call 1 said.
-    saga's prompts are independent (one consolidation cluster has
-    nothing to do with the next), so the carry-over is pure waste.
-    We recycle the client every ``RECYCLE_AFTER`` calls
-    (``disconnect`` + new ``connect``) to bound the context bloat.
-    Recycle cost is one cold-start (~1s) every K calls; net win is
-    still ~3-4x.
-
-    Other tradeoffs vs. ``anthropic`` / ``openai_compat``:
-    - **Auth**: free under Max — no API credit needed.
-    - **Quota**: counts against your 5h / 7d Max windows. Daily
-      mimir use is fine; a 500-question bench can eat through.
-    - **Reproducibility**: Max plan throttles via wait, not 429.
-      Bench numbers may drift more than direct-API runs.
-
-    ``temperature`` and ``max_tokens`` aren't honored — the Claude
-    Code CLI doesn't expose them. ``model`` from the llm dict picks
-    the model; otherwise ``CLAUDE_MODEL`` env or CLI default wins.
-    """
-    try:
-        # Lazy import: claude-agent-sdk lives in mimir's deps but saga
-        # doesn't depend on mimir, and standalone saga environments may
-        # not have it installed.
-        from claude_agent_sdk import (  # noqa: F401 — used by _PersistentClaudeCode
-            ClaudeAgentOptions,
-            ClaudeSDKClient,
-        )
-    except ImportError:
-        log.warning("claude-agent-sdk not installed; falling back to openai_compat")
-        return _call_openai_compat(
-            llm, prompt=prompt, max_tokens=max_tokens,
-            temperature=temperature, system=system,
-        )
-
-    pool = _get_persistent_pool()
-    runner = pool.acquire()
-    try:
-        return runner.call(
-            prompt=prompt,
-            model=llm.get("model"),
-            system=system,
-        )
-    finally:
-        pool.release(runner)
-
-
-# ─── Persistent ClaudeSDKClient ──────────────────────────────────
+# ─── ClaudeSDKClient pool tunables ───────────────────────────────
 
 
 _RECYCLE_AFTER_CALLS = 10
@@ -208,101 +104,14 @@ benefits from a different K."""
 
 
 import os as _os
-import threading as _threading
 
 _DEFAULT_POOL_SIZE = 4
-"""Default ceiling on concurrent ``_PersistentClaudeCode`` instances.
+"""Default ceiling on concurrent ``_AsyncClaudeRunner`` instances.
 
 4 covers mimir's expected steady-state (~2 chat channels active at
 once + 1 saga consolidation cron) with headroom. Override via
-``SAGA_PERSISTENT_CLAUDE_POOL_SIZE``.
-
-Why bounded vs. the previous ``threading.local`` cache: under
-``asyncio.to_thread`` worker churn (mimir's call path), each fresh
-worker thread that hit ``_persistent_runner()`` allocated a new
-``_PersistentClaudeCode`` — daemon thread + event loop + Claude Code
-subprocess. The default ``ThreadPoolExecutor`` grows up to ``min(32,
-os.cpu_count() + 4)`` workers, so on an 8-core box that meant up to
-12 daemon threads each holding ~50MB of subprocess RSS, never
-shrinking. The pool fixes the leak by capping live instances and
-recycling them across worker threads via FIFO checkout."""
-
-
-class _PersistentClaudePool:
-    """Bounded thread-safe pool of ``_PersistentClaudeCode`` instances.
-
-    Replaces the per-thread ``threading.local`` cache. Cross-thread
-    parallelism is preserved up to ``max_size`` concurrent callers —
-    important for cross-channel mimir traffic where Discord and
-    Slack turns can both hit saga LLM at the same time. Once
-    ``max_size`` is in flight, additional callers block on
-    ``acquire`` until one is returned.
-
-    Construction is cheap (~5ms — daemon thread + event loop spin-up;
-    the Claude Code SDK client is lazy-connected on first
-    ``runner.call(...)``), so we don't pre-warm the pool. Instances
-    are created on demand up to the cap; once created they live
-    until process exit.
-
-    Not asyncio-aware — saga's contract is sync from any Python
-    thread (``call_llm_sync``). Synchronization is via a
-    ``threading.Condition``; callers may be on any thread. (The
-    inner ``_PersistentClaudeCode`` does its own sync→async bridge
-    via its daemon-thread event loop.)"""
-
-    def __init__(self, max_size: int) -> None:
-        if max_size < 1:
-            raise ValueError(f"max_size must be >= 1, got {max_size}")
-        self._max_size = max_size
-        self._idle: list[_PersistentClaudeCode] = []
-        self._size = 0  # idle + in-flight, never decremented
-        self._cond = _threading.Condition()
-
-    @property
-    def max_size(self) -> int:
-        return self._max_size
-
-    @property
-    def size(self) -> int:
-        with self._cond:
-            return self._size
-
-    def acquire(self) -> "_PersistentClaudeCode":
-        """Block until an instance is available; return it. Caller
-        MUST call ``release`` when done."""
-        with self._cond:
-            while True:
-                if self._idle:
-                    return self._idle.pop()
-                if self._size < self._max_size:
-                    # Reserve the slot before releasing the lock so
-                    # concurrent acquirers don't double-grow past
-                    # ``max_size``. Construction happens outside the
-                    # lock — daemon-thread spin-up + event-loop
-                    # ready-wait is bounded but non-trivial; holding
-                    # the lock would serialize cold-start.
-                    self._size += 1
-                    break
-                self._cond.wait()
-        try:
-            return _PersistentClaudeCode()
-        except BaseException:
-            # Construction failed — back out the reservation and
-            # wake any waiters. The slot is free again.
-            with self._cond:
-                self._size -= 1
-                self._cond.notify()
-            raise
-
-    def release(self, runner: "_PersistentClaudeCode") -> None:
-        """Return an instance to the idle list and wake one waiter."""
-        with self._cond:
-            self._idle.append(runner)
-            self._cond.notify()
-
-
-_persistent_pool: "_PersistentClaudePool | None" = None
-_pool_init_lock = _threading.Lock()
+``SAGA_PERSISTENT_CLAUDE_POOL_SIZE`` (env name kept for backward
+compatibility with operator-set values from the sync-pool era)."""
 
 
 def _resolve_pool_size() -> int:
@@ -326,153 +135,6 @@ def _resolve_pool_size() -> int:
         )
         return _DEFAULT_POOL_SIZE
     return n
-
-
-def _get_persistent_pool() -> "_PersistentClaudePool":
-    """Lazy module-level singleton. Double-checked under a lock so
-    concurrent first-callers don't construct two pools."""
-    global _persistent_pool
-    pool = _persistent_pool
-    if pool is not None:
-        return pool
-    with _pool_init_lock:
-        if _persistent_pool is None:
-            _persistent_pool = _PersistentClaudePool(
-                max_size=_resolve_pool_size()
-            )
-        return _persistent_pool
-
-
-class _PersistentClaudeCode:
-    """A daemon thread running an asyncio event loop with one warm
-    ``ClaudeSDKClient``. saga's sync ``call_llm_sync`` submits prompts
-    via ``run_coroutine_threadsafe`` and blocks on the result.
-
-    Recycles the client every ``_RECYCLE_AFTER_CALLS`` calls (or when
-    ``model`` changes between calls) to bound conversation bloat.
-
-    Lifetime is managed by ``_PersistentClaudePool``: the pool caps
-    live instances at ``max_size`` (default 4, override via
-    ``SAGA_PERSISTENT_CLAUDE_POOL_SIZE``) and lets callers borrow via
-    ``acquire``/``release``. Each instance owns its own inner
-    event-loop thread, its own Claude Code subprocess, and its own
-    submit lock. Concurrent ``call`` invocations on the *same*
-    instance serialize on ``_submit_lock``; the pool ensures distinct
-    callers get distinct instances up to ``max_size``, preserving
-    cross-channel parallelism without leaking instances per worker
-    thread the way the previous ``threading.local`` cache did."""
-
-    def __init__(self) -> None:
-        import asyncio
-        import os
-        import threading
-        from concurrent.futures import Future
-
-        self._asyncio = asyncio
-        self._Future = Future
-        recycle_env = os.environ.get("SAGA_PERSISTENT_CLAUDE_RECYCLE", "")
-        try:
-            self._recycle_after = max(1, int(recycle_env)) if recycle_env else _RECYCLE_AFTER_CALLS
-        except ValueError:
-            self._recycle_after = _RECYCLE_AFTER_CALLS
-
-        # Daemon thread runs the event loop. Daemon=True so the bench
-        # runner's process exits without us hanging on close cleanup
-        # — the OS reaps the Claude Code subprocess on parent exit.
-        self._loop_ready = threading.Event()
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="saga-claude-code")
-        self._thread.start()
-        self._loop_ready.wait(timeout=5)
-        if self._loop is None:
-            raise RuntimeError("persistent claude-code thread failed to start")
-
-        self._client = None  # type: ignore[assignment]
-        self._client_model: str | None = None
-        self._call_count = 0
-        # Submission lock: ClaudeSDKClient is single-threaded; saga
-        # call_llm_sync usages are sequential per-thread but we lock
-        # to make this safe under unexpected concurrency too.
-        self._submit_lock = threading.Lock()
-
-    def _run_loop(self) -> None:
-        loop = self._asyncio.new_event_loop()
-        self._asyncio.set_event_loop(loop)
-        self._loop = loop
-        self._loop_ready.set()
-        try:
-            loop.run_forever()
-        finally:
-            loop.close()
-
-    def call(self, *, prompt: str, model: str | None, system: str | None) -> str:
-        """Submit a prompt to the warm client. Blocks the caller until
-        the assistant's reply is fully received, then returns the
-        flattened text."""
-        with self._submit_lock:
-            future = self._asyncio.run_coroutine_threadsafe(
-                self._do_call(prompt=prompt, model=model, system=system),
-                self._loop,  # type: ignore[arg-type]
-            )
-            try:
-                return future.result(timeout=600)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("persistent claude-code call failed: %s", exc)
-                return ""
-
-    async def _do_call(
-        self, *, prompt: str, model: str | None, system: str | None
-    ) -> str:
-        from claude_agent_sdk import (
-            AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient,
-        )
-
-        # Recycle conditions: model changed (different options needed)
-        # OR call count hit the recycle threshold.
-        if (
-            self._client is None
-            or self._client_model != model
-            or self._call_count >= self._recycle_after
-        ):
-            await self._reset_client(model=model, system=system)
-
-        assert self._client is not None
-        await self._client.query(prompt)
-
-        pieces: list[str] = []
-        async for msg in self._client.receive_response():
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content or []:
-                    text = getattr(block, "text", None)
-                    if text:
-                        pieces.append(text)
-        self._call_count += 1
-        return "".join(pieces).strip()
-
-    async def _reset_client(self, *, model: str | None, system: str | None) -> None:
-        """Disconnect any current client + spin up a fresh one. Cheap
-        relative to one-shot ``query()`` startup because most of the
-        connect cost amortizes over the next K calls."""
-        from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
-
-        if self._client is not None:
-            try:
-                await self._client.disconnect()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("persistent claude-code disconnect failed: %s", exc)
-            self._client = None
-
-        options_kwargs: dict[str, Any] = {}
-        if model:
-            options_kwargs["model"] = model
-        if system:
-            options_kwargs["system_prompt"] = system
-
-        client = ClaudeSDKClient(options=ClaudeAgentOptions(**options_kwargs))
-        await client.connect()
-        self._client = client
-        self._client_model = model
-        self._call_count = 0
 
 
 def _call_openai_compat(
@@ -540,16 +202,7 @@ def _call_openai_compat(
         return ""
 
 
-# ─── Async-native call_llm (chainlink #45 / Phase 1 of #20) ──────────
-#
-# The async path runs entirely on the caller's event loop — no daemon
-# thread, no run_coroutine_threadsafe bridge. Mimir (already async),
-# saga's bench harness (post Phase 3 conversion), and any future async
-# saga internals all use this.
-#
-# Existing ``call_llm_sync`` and the threading ``_PersistentClaudePool``
-# stay live alongside this during the migration. Both delete in
-# chainlink #47 (Phase 3) once saga internals are converted.
+# ─── Async-native call_llm (chainlink #20) ──────────
 
 
 async def call_llm(
@@ -560,8 +213,8 @@ async def call_llm(
     temperature: float = 0.3,
     system: str | None = None,
 ) -> str:
-    """Async-native LLM call. Saga's eventual replacement for
-    ``call_llm_sync``; callers on an event loop ``await`` this directly.
+    """Async-native LLM call. Saga's sole entry point — callers on an
+    event loop ``await`` this directly.
 
     Provider dispatch:
     - ``claude_code`` runs on the caller's event loop via
@@ -570,13 +223,10 @@ async def call_llm(
     - ``anthropic`` and ``openai_compat`` are sync HTTP libraries
       (``anthropic.Anthropic.messages.create`` and ``requests.post``);
       we offload them to a thread via ``asyncio.to_thread`` so the
-      caller's loop stays responsive. Phase 3 may async-ify these
-      properly with ``anthropic.AsyncAnthropic`` + ``aiohttp``, but the
-      to_thread wrap is correct semantically and unblocks Phase 1.
+      caller's loop stays responsive.
 
     Returns the assistant's reply text. Empty string on transport
-    failure (matches ``call_llm_sync`` semantics — every existing
-    caller already handles empty gracefully)."""
+    failure — every existing caller already handles empty gracefully."""
     import asyncio
 
     provider = (llm.get("provider") or "openai_compat").lower()
@@ -639,8 +289,7 @@ class _AsyncClaudeRunner:
     cross-thread bridge.
 
     Recycles the client every ``recycle_after`` calls (or when
-    ``model`` changes between calls) to bound conversation bloat —
-    same policy as the sync ``_PersistentClaudeCode``.
+    ``model`` changes between calls) to bound conversation bloat.
 
     Lifetime is managed by ``_AsyncClaudePool``: the pool caps live
     instances at its ``max_size`` and lets callers borrow via
@@ -800,13 +449,16 @@ class _AsyncClaudePool(BoundedAsyncPool["_AsyncClaudeRunner"]):
 
 
 # Per-loop async-pool registry. Different event loops (production,
-# tests with isolated loops) need their own pool. Keyed on ``id(loop)``;
-# entries are pruned implicitly when a loop is garbage-collected (we
-# don't hold a strong ref to the loop). For test isolation in
-# pytest-asyncio, callers can use ``_reset_async_pool()`` to drop the
-# registry between tests.
+# tests with isolated loops) need their own pool. ``WeakKeyDictionary``
+# keys on the loop object; when the loop is garbage-collected, its
+# entry vanishes automatically, so a long-lived process with churning
+# loops (long pytest-asyncio runs) doesn't accumulate stale pools.
+# For deterministic cleanup, callers can use ``_reset_async_pools()``
+# to drop the registry without waiting for GC.
 
-_async_pools: dict[int, _AsyncClaudePool] = {}
+import weakref as _weakref
+
+_async_pools: "_weakref.WeakKeyDictionary[Any, _AsyncClaudePool]" = _weakref.WeakKeyDictionary()
 
 
 def _resolve_recycle_after() -> int:
@@ -835,14 +487,13 @@ def _get_async_claude_pool() -> _AsyncClaudePool:
     event loop."""
     import asyncio
     loop = asyncio.get_running_loop()
-    key = id(loop)
-    pool = _async_pools.get(key)
+    pool = _async_pools.get(loop)
     if pool is None:
         pool = _AsyncClaudePool(
             max_size=_resolve_pool_size(),
             recycle_after=_resolve_recycle_after(),
         )
-        _async_pools[key] = pool
+        _async_pools[loop] = pool
     return pool
 
 

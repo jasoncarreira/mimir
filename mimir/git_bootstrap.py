@@ -458,9 +458,25 @@ def _install_credential_helper(
     # Tell git to use this file. ``store --file=<abs-path>`` is the
     # canonical helper-with-arg syntax; git invokes it as
     # ``git credential-store --file=<path>``.
+    #
+    # Reset the helper chain first. git resolves ``credential.helper`` by
+    # CONCATENATING values from system → global → local (a list, not a
+    # single value). If the operator's global git config has a helper
+    # like ``!gh auth git-credential``, mimir's ``--local`` setting
+    # appends to that chain rather than replacing it — git would still
+    # consult the global helper, and on a successful clone would write
+    # *its* credentials to our store file too. Setting an empty value
+    # at the head of the local chain clears the inherited entries
+    # (documented behavior; see ``git-config(1)`` under
+    # ``credential.helper``).
     helper_value = f"store --file={creds_path}"
     _run(
         ["git", "-C", str(home), "config", "--local",
+         "credential.helper", ""],
+        check=False,
+    )
+    _run(
+        ["git", "-C", str(home), "config", "--local", "--add",
          "credential.helper", helper_value],
         check=False,
     )
