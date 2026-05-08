@@ -419,6 +419,27 @@ def build_app(config: Config) -> web.Application:
                     error=str(exc),
                 )
 
+        # Identities populator (chainlink #44). Daily scrape of
+        # connected bridges into state/identities.yaml. Default cron
+        # is empty (disabled) — operator opt-in via
+        # MIMIR_IDENTITIES_POPULATE_CRON so bridge API hits don't
+        # surprise environments. Channel registry is passed in (not
+        # the bridges themselves) so reconnects mid-day still get
+        # picked up on the next tick.
+        identities_populate_registered = False
+        try:
+            identities_populate_registered = scheduler.add_identities_populate_job(
+                config.home,
+                config.identities_populate_cron,
+                channels,
+            )
+        except ValueError as exc:
+            await log_event(
+                "scheduler_invalid_cron",
+                job="identities-populate",
+                error=str(exc),
+            )
+
         # Bind-mount health probe (BIND_MOUNT_HEALTH_PROBE.md).
         # Detects VirtioFS stale-inode failures and self-restarts via
         # SIGTERM to PID 1. The probe self-gates on
@@ -448,6 +469,7 @@ def build_app(config: Config) -> web.Application:
             or introspection_registered
             or oauth_poll_registered
             or health_probe_registered
+            or identities_populate_registered
             or reload_stats["registered"] > 0
         ):
             scheduler.start()
