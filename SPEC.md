@@ -1195,6 +1195,7 @@ def reset(self) -> None:
 |---|---|---|
 | `MIMIR_HOME` | `/home` | Agent home dir |
 | `MIMIR_MODEL` | `claude-opus-4-7` | Model for the main loop |
+| `MIMIR_CONTEXT_1M` | `true` | Pass Anthropic's `context-1m-2025-08-07` beta to the SDK (lifts Claude 4.x Opus / Sonnet from 200k → 1M context cap). Set `false` if your account/model doesn't accept the beta. |
 | `MIMIR_EFFORT` | `high` | Effort param |
 | `MIMIR_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed model |
 | `MIMIR_INDEX_DB` | `$MIMIR_HOME/.mimir/index.db` | SQLite path |
