@@ -45,6 +45,39 @@ from .base import Bridge, SendResult
 
 log = logging.getLogger(__name__)
 
+
+def _should_emit_retry_algedonic(attempt: int) -> bool:
+    """Throttle ``slack_bridge_retry`` events during sustained outages.
+
+    Mirrors the Discord supervisor's helper — fires every attempt from
+    3-9 inclusive (early-warning), then every 10th thereafter
+    (throttled during multi-hour outages so events.jsonl doesn't fill
+    with retry rows). Kept per-bridge rather than lifted to a shared
+    module so each bridge stays importable in isolation."""
+    if attempt < 3:
+        return False
+    if attempt < 10:
+        return True
+    return attempt % 10 == 0
+
+
+async def _safe_log_event(event_kind: str, **fields: Any) -> None:
+    """Best-effort wrapper around ``mimir.event_logger.log_event`` for use
+    from the bridge supervisor — swallows any logger-side error so a
+    misbehaving event sink can never wedge the reconnect loop.
+
+    Mirrors the helper in ``mimir/bridges/discord.py``. Kept per-bridge
+    rather than lifted to a shared module so each bridge stays
+    importable in isolation (e.g. when one of slack-bolt / discord-py
+    is missing in a slim deployment).
+    """
+    try:
+        from ..event_logger import log_event
+        await log_event(event_kind, **fields)
+    except Exception:  # noqa: BLE001
+        log.exception("SlackBridge: log_event(%r) failed", event_kind)
+
+
 # Slack mrkdwn doesn't have a hard char cap on chat.postMessage like Discord's
 # 2000, but the Slack API's text field is capped at 40k. Realistic ergonomics
 # (mobile clients, search) prefer ~3-4k per message. Match Discord's chunk
@@ -226,23 +259,194 @@ class SlackBridge(Bridge):
     prefixes = ("slack-", "dm-slack-")
     name = "slack"
 
+    # Reconnect backoff schedule for the supervisor wrapping
+    # ``handler.start_async()``. Mirrors DiscordBridge — Slack 5xx
+    # incidents and Socket-Mode WebSocket disconnects typically recover
+    # in minutes; 5-minute cap keeps retry cadence reasonable without
+    # spamming during a sustained outage.
+    _RECONNECT_BACKOFF_INITIAL_SECONDS: float = 5.0
+    _RECONNECT_BACKOFF_CAP_SECONDS: float = 300.0
+
     async def connect(self) -> None:
         if self._app is not None:
             return
         self._app = AsyncApp(token=self.bot_token)
         self._register_handlers(self._app)
         self._handler = AsyncSocketModeHandler(self._app, self.app_token)
-        # ``handler.start_async`` is a long-running coroutine — run it as a
-        # task so connect() returns once the WebSocket is up.
+        # Wrap ``handler.start_async`` in a supervisor that retries on
+        # transient failure (Slack 5xx, network blip, Socket-Mode
+        # WebSocket disconnect). Operator-actionable errors —
+        # ``invalid_auth`` (rotated bot token), ``missing_scope`` (app
+        # config gap), ``token_revoked`` — propagate up so retrying
+        # doesn't mask a config issue. Same shape as DiscordBridge's
+        # supervisor.
         self._runner = asyncio.create_task(
-            self._handler.start_async(), name="mimir-slack-runner"
+            self._supervised_run(), name="mimir-slack-runner"
         )
-        # Best-effort lookup of the bot's own user id, used to skip self-messages.
+        # ``_bot_user_id`` is filled by the supervisor (see
+        # ``_refresh_bot_user_id``) on each retry iteration where it's
+        # still None. That way a Slack-side outage that 503s ``auth_test``
+        # at startup self-heals once Slack recovers — without it, the
+        # one-shot lookup at connect-time would leave ``_bot_user_id``
+        # None for the rest of the container's life and self-messages
+        # wouldn't get filtered.
+
+    async def _refresh_bot_user_id(self) -> None:
+        """Best-effort lookup of the bot's own user_id via ``auth_test``.
+        Called from the supervisor at the top of each iteration when
+        ``_bot_user_id`` is still None. Swallows all exceptions —
+        failures here are common during a Slack outage and shouldn't
+        prevent the supervisor from attempting the WebSocket handshake."""
+        if self._bot_user_id is not None:
+            return
+        if self._app is None:
+            return
         try:
             auth = await self._app.client.auth_test()
-            self._bot_user_id = auth.get("user_id")
-        except SlackApiError as exc:
-            log.warning("SlackBridge auth_test failed: %s", exc)
+            user_id = auth.get("user_id") if isinstance(auth, dict) else None
+            if not user_id:
+                # ``slack_sdk`` returns a SlackResponse; treat .get() the
+                # same way (it implements __getitem__/get).
+                user_id = getattr(auth, "get", lambda _k: None)("user_id")
+            if user_id:
+                self._bot_user_id = user_id
+                log.info("SlackBridge: bot_user_id resolved to %s", user_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("SlackBridge auth_test (supervisor) failed: %s", exc)
+
+    async def _supervised_run(self) -> None:
+        """Retry-with-exponential-backoff wrapper around
+        ``self._handler.start_async()``.
+
+        Mirrors ``DiscordBridge._supervised_run`` shape. Socket-Mode's
+        long-lived WebSocket has its own internal reconnect logic
+        (``slack_sdk`` retries the SOCKET-mode connection automatically);
+        this supervisor only matters when ``start_async`` itself
+        terminates — which happens on persistent auth failure, on
+        Socket-Mode rejection, or on unexpected exceptions during
+        handshake.
+
+        Retryable: ``SlackApiError`` whose Slack-side ``error`` code is
+        a transient (5xx-shape, ``service_unavailable``, ``timeout``);
+        generic network/connection errors. Backoff: 5s → 10s → 20s →
+        40s → 80s, capped at ``_RECONNECT_BACKOFF_CAP_SECONDS``.
+
+        Non-retryable (raise out, runner ends, operator-actionable):
+        - ``SlackApiError`` with ``error in {invalid_auth, token_revoked,
+          account_inactive}`` — token rotation needed
+        - ``SlackApiError`` with ``error == missing_scope`` — Slack app
+          config gap, scope must be added in dashboard
+        - ``CancelledError`` — clean shutdown via ``disconnect()``
+
+        Fires ``slack_bridge_retry`` (algedonic-negative) on attempts
+        3-9 inclusive, then every 10th attempt thereafter — see
+        ``_should_emit_retry_algedonic``. Surfaces the early "is this
+        real?" signal fast, then throttles during sustained outages.
+        ``slack_bridge_auth_failure`` / ``_scope_failure`` fire once on
+        terminal failure.
+
+        Also refreshes ``_bot_user_id`` via ``auth_test`` at the top of
+        each iteration when it's still None — so a Slack-side outage
+        that 503s the initial lookup heals on the next iteration where
+        Slack accepts the call.
+        """
+        attempt = 0
+        backoff = self._RECONNECT_BACKOFF_INITIAL_SECONDS
+        while True:
+            # Best-effort refresh of the bot user id. Self-message
+            # filtering depends on this; if the initial lookup at
+            # connect-time 503'd, this re-runs every retry until it
+            # succeeds.
+            await self._refresh_bot_user_id()
+            try:
+                assert self._handler is not None
+                await self._handler.start_async()
+                # Clean exit (e.g. operator-initiated close_async).
+                log.info(
+                    "SlackBridge supervisor: handler.start_async() "
+                    "returned cleanly; exiting"
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except SlackApiError as exc:
+                err_code = ""
+                resp = getattr(exc, "response", None)
+                if resp is not None:
+                    try:
+                        err_code = (
+                            resp.get("error") if isinstance(resp, dict)
+                            else getattr(resp, "data", {}).get("error", "")
+                        ) or ""
+                    except Exception:  # noqa: BLE001
+                        err_code = ""
+                # Operator-actionable failure modes: don't retry.
+                fatal_codes = {
+                    "invalid_auth", "token_revoked", "account_inactive",
+                    "missing_scope", "not_authed",
+                }
+                if err_code in fatal_codes:
+                    log.error(
+                        "SlackBridge: terminal auth failure (%s); supervisor exiting",
+                        err_code,
+                    )
+                    event_kind = (
+                        "slack_bridge_scope_failure"
+                        if err_code == "missing_scope"
+                        else "slack_bridge_auth_failure"
+                    )
+                    asyncio.create_task(_safe_log_event(
+                        event_kind,
+                        slack_error=err_code,
+                        error=str(exc)[:300],
+                    ))
+                    raise
+                attempt += 1
+                log.warning(
+                    "SlackBridge: transient SlackApiError (%s) on attempt %d; "
+                    "retrying in %.1fs",
+                    err_code or exc, attempt, backoff,
+                )
+                if _should_emit_retry_algedonic(attempt):
+                    asyncio.create_task(_safe_log_event(
+                        "slack_bridge_retry",
+                        attempt=attempt,
+                        backoff_seconds=round(backoff, 1),
+                        slack_error=err_code,
+                        error=f"SlackApiError: {str(exc)[:200]}",
+                    ))
+            except Exception as exc:  # noqa: BLE001
+                # Unexpected exception (network errors from aiohttp,
+                # WebSocket disconnect storms, slack_sdk internals).
+                # Treat as transient — same posture as Discord supervisor.
+                attempt += 1
+                log.warning(
+                    "SlackBridge: unexpected exception (%s) on attempt %d; "
+                    "retrying in %.1fs",
+                    exc, attempt, backoff,
+                )
+                if _should_emit_retry_algedonic(attempt):
+                    asyncio.create_task(_safe_log_event(
+                        "slack_bridge_retry",
+                        attempt=attempt,
+                        backoff_seconds=round(backoff, 1),
+                        error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                    ))
+
+            await asyncio.sleep(backoff)
+            backoff = min(
+                backoff * 2.0, self._RECONNECT_BACKOFF_CAP_SECONDS,
+            )
+
+            # Build a fresh handler. The previous one may be in a
+            # half-open state after a failed handshake.
+            try:
+                if self._handler is not None:
+                    await self._handler.close_async()
+            except Exception:  # noqa: BLE001
+                pass
+            assert self._app is not None
+            self._handler = AsyncSocketModeHandler(self._app, self.app_token)
 
     async def disconnect(self) -> None:
         if self._handler is not None:
