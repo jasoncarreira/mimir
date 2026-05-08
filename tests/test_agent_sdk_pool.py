@@ -347,9 +347,12 @@ async def test_max_size_cap_waits_for_release():
 
     # Shrink the pool's max_size for this test so we don't have to
     # spin up 11 concurrent fakes. The pool is created lazily on
-    # first use; create it here and override max_size.
+    # first use; create it here and override the cap. Mutating
+    # ``_max_size`` directly (rather than ``max_size``, which is a
+    # read-only property inherited from ``saga.async_pool.BoundedAsyncPool``)
+    # preserves the test's "reach in and tweak the singleton" intent.
     pool = agent_mod._get_pool()
-    pool.max_size = 2
+    pool._max_size = 2
 
     gate = asyncio.Event()
     waiter_started = asyncio.Event()
