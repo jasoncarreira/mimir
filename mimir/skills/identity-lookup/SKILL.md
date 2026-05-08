@@ -40,11 +40,16 @@ The skill is a thin pattern over reading + parsing the YAML file. Use
 Python (or `yq` if available) to query — `grep` works for quick checks
 but YAML structure trips up greps for multi-line entries.
 
+The bare-YAML examples below come first because they're portable
+(no need to be inside `/workspace/mimir`); the typed
+`IdentityResolver` path further down is the cleaner alternative when
+you're already in-tree.
+
 ### Resolve an alias to its canonical + record
 
 ```bash
 uv run --extra dev python <<'PY'
-import yaml, sys, os
+import yaml, os
 from pathlib import Path
 
 home = Path(os.environ.get("MIMIR_HOME", os.environ["HOME"]))
@@ -58,8 +63,9 @@ for person in doc.get("people") or []:
         print(f"aliases:   {', '.join(person.get('aliases') or [])}")
         if person.get("notes"):
             print(f"notes:     {person['notes']}")
-        sys.exit(0)
-print(f"not found: {alias}")
+        break
+else:
+    print(f"not found: {alias}")
 PY
 ```
 
@@ -146,13 +152,15 @@ in-process consumer — it normalizes the YAML into typed dataclasses
 If the alias / canonical isn't in `identities.yaml`:
 
 1. **Tell the operator the id isn't registered.** Don't pretend to know.
-2. **Check whether the populator has run recently.** If the file's
-   mtime is more than 24h old, suggest re-running the daily populator
-   (`mimir.identities_populator.populate_all`) — it pulls from
-   connected bridges and fills missing entries.
-3. **For a one-off operator question:** the operator can manually add
-   the entry to `identities.yaml` if they know the answer. The agent
-   does NOT edit this file directly.
+2. **Operator can add the entry manually** if they know the answer.
+   The agent does NOT edit this file directly.
+3. **If a daily populator is running** (chainlink #44 /
+   `mimir.identities_populator`, opt-in via
+   `MIMIR_IDENTITIES_POPULATE_CRON`) and the file's mtime is more
+   than 24h old, suggest the operator re-run it — it scrapes
+   connected Discord guilds + Slack workspaces and fills missing
+   entries. Skip this step if the populator isn't wired up in the
+   current deployment.
 
 Live API fallback (Discord `fetch_member` / Slack `users.info`) is
 *not* in the read path today. If a real recurring need surfaces,
