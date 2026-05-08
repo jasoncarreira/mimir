@@ -1049,7 +1049,7 @@ Subagent results (returned by the `Agent` tool) appear as a `tool_result` event 
 
 ### 10.4 Retention
 
-Same as open-strix: `DEFAULT_MAX_TURNS = 1000` for turns.jsonl. When the line count exceeds the cap, the file is trimmed in-place to keep the most recent N records under a write lock. events.jsonl has no retention cap by default — it's the diagnostic backbone — but a `MIMIR_MAX_EVENTS` env var enables similar trimming if needed.
+`DEFAULT_MAX_TURNS = 5000` for turns.jsonl, `DEFAULT_MAX_EVENTS = 75000` for events.jsonl (15× the turns cap, sized to the observed ~14 events/turn rate so both files span roughly the same time window). When the line count exceeds the cap, the file is trimmed in-place to keep the most recent N records under a write lock with 10% hysteresis. Hard ceilings: `MIMIR_MAX_TURNS` clamps at 50000, `MIMIR_MAX_EVENTS` at 750000 — beyond that, on-disk weight (~300 MB at the events ceiling) starts to matter and operators should ship to an external log store instead.
 
 ### 10.5 Archive-and-truncate (benchmark resume support)
 
@@ -1203,8 +1203,8 @@ def reset(self) -> None:
 | `MIMIR_MSAM_CONSOLIDATE_CRON` | `0 4 * * 0` | Cron expression for periodic `POST /v1/consolidate`; empty string disables (§5.6) |
 | `MIMIR_PROMPTS_DIR` | `mimir/prompts/` (bundled) | Override path for prompt templates; mimir falls back to bundled defaults if a file isn't found (§5.6) |
 | `MIMIR_TURNS_ARCHIVE_DIR` | (unset) | If set, `reset()` archives turns.jsonl + events.jsonl here before truncate |
-| `MIMIR_MAX_TURNS` | `1000` | Retention cap for turns.jsonl |
-| `MIMIR_MAX_EVENTS` | (unset) | Optional retention cap for events.jsonl |
+| `MIMIR_MAX_TURNS` | `5000` | Retention cap for turns.jsonl (hard ceiling 50000) |
+| `MIMIR_MAX_EVENTS` | `75000` | Retention cap for events.jsonl (hard ceiling 750000) |
 | `MIMIR_WEB_PORT` | `8080` | aiohttp port for `/turns` and `/api/*` |
 | `MIMIR_MAX_CONCURRENT_TURNS` | `10` | Global cap on in-flight `query()` calls across all channels |
 | `MIMIR_MAX_CHANNEL_QUEUE` | `100` | Per-channel queue depth before admission-rejecting events |
