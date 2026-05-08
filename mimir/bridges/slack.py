@@ -46,6 +46,21 @@ from .base import Bridge, SendResult
 log = logging.getLogger(__name__)
 
 
+def _should_emit_retry_algedonic(attempt: int) -> bool:
+    """Throttle ``slack_bridge_retry`` events during sustained outages.
+
+    Mirrors the Discord supervisor's helper — fires every attempt from
+    3-9 inclusive (early-warning), then every 10th thereafter
+    (throttled during multi-hour outages so events.jsonl doesn't fill
+    with retry rows). Kept per-bridge rather than lifted to a shared
+    module so each bridge stays importable in isolation."""
+    if attempt < 3:
+        return False
+    if attempt < 10:
+        return True
+    return attempt % 10 == 0
+
+
 async def _safe_log_event(event_kind: str, **fields: Any) -> None:
     """Best-effort wrapper around ``mimir.event_logger.log_event`` for use
     from the bridge supervisor — swallows any logger-side error so a
@@ -268,19 +283,36 @@ class SlackBridge(Bridge):
         self._runner = asyncio.create_task(
             self._supervised_run(), name="mimir-slack-runner"
         )
-        # Best-effort lookup of the bot's own user id, used to skip self-messages.
-        # If the supervisor is still in initial-handshake retry, this also
-        # 5xxs — that's fine, the bridge stays usable for outbound and
-        # the auth_test will succeed on a future restart.
+        # ``_bot_user_id`` is filled by the supervisor (see
+        # ``_refresh_bot_user_id``) on each retry iteration where it's
+        # still None. That way a Slack-side outage that 503s ``auth_test``
+        # at startup self-heals once Slack recovers — without it, the
+        # one-shot lookup at connect-time would leave ``_bot_user_id``
+        # None for the rest of the container's life and self-messages
+        # wouldn't get filtered.
+
+    async def _refresh_bot_user_id(self) -> None:
+        """Best-effort lookup of the bot's own user_id via ``auth_test``.
+        Called from the supervisor at the top of each iteration when
+        ``_bot_user_id`` is still None. Swallows all exceptions —
+        failures here are common during a Slack outage and shouldn't
+        prevent the supervisor from attempting the WebSocket handshake."""
+        if self._bot_user_id is not None:
+            return
+        if self._app is None:
+            return
         try:
             auth = await self._app.client.auth_test()
-            self._bot_user_id = auth.get("user_id")
-        except SlackApiError as exc:
-            log.warning("SlackBridge auth_test failed: %s", exc)
+            user_id = auth.get("user_id") if isinstance(auth, dict) else None
+            if not user_id:
+                # ``slack_sdk`` returns a SlackResponse; treat .get() the
+                # same way (it implements __getitem__/get).
+                user_id = getattr(auth, "get", lambda _k: None)("user_id")
+            if user_id:
+                self._bot_user_id = user_id
+                log.info("SlackBridge: bot_user_id resolved to %s", user_id)
         except Exception as exc:  # noqa: BLE001
-            # Network errors during initial auth_test are transient;
-            # don't block connect on them.
-            log.warning("SlackBridge auth_test transient failure: %s", exc)
+            log.warning("SlackBridge auth_test (supervisor) failed: %s", exc)
 
     async def _supervised_run(self) -> None:
         """Retry-with-exponential-backoff wrapper around
@@ -306,14 +338,26 @@ class SlackBridge(Bridge):
           config gap, scope must be added in dashboard
         - ``CancelledError`` — clean shutdown via ``disconnect()``
 
-        Fires ``slack_bridge_retry`` after 3 consecutive attempts so
-        the operator sees sustained outages without reading container
-        logs. ``slack_bridge_auth_failure`` / ``_scope_failure`` fire
-        once on terminal failure.
+        Fires ``slack_bridge_retry`` (algedonic-negative) on attempts
+        3-9 inclusive, then every 10th attempt thereafter — see
+        ``_should_emit_retry_algedonic``. Surfaces the early "is this
+        real?" signal fast, then throttles during sustained outages.
+        ``slack_bridge_auth_failure`` / ``_scope_failure`` fire once on
+        terminal failure.
+
+        Also refreshes ``_bot_user_id`` via ``auth_test`` at the top of
+        each iteration when it's still None — so a Slack-side outage
+        that 503s the initial lookup heals on the next iteration where
+        Slack accepts the call.
         """
         attempt = 0
         backoff = self._RECONNECT_BACKOFF_INITIAL_SECONDS
         while True:
+            # Best-effort refresh of the bot user id. Self-message
+            # filtering depends on this; if the initial lookup at
+            # connect-time 503'd, this re-runs every retry until it
+            # succeeds.
+            await self._refresh_bot_user_id()
             try:
                 assert self._handler is not None
                 await self._handler.start_async()
@@ -363,7 +407,7 @@ class SlackBridge(Bridge):
                     "retrying in %.1fs",
                     err_code or exc, attempt, backoff,
                 )
-                if attempt >= 3:
+                if _should_emit_retry_algedonic(attempt):
                     asyncio.create_task(_safe_log_event(
                         "slack_bridge_retry",
                         attempt=attempt,
@@ -381,7 +425,7 @@ class SlackBridge(Bridge):
                     "retrying in %.1fs",
                     exc, attempt, backoff,
                 )
-                if attempt >= 3:
+                if _should_emit_retry_algedonic(attempt):
                     asyncio.create_task(_safe_log_event(
                         "slack_bridge_retry",
                         attempt=attempt,
