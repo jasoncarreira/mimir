@@ -6,7 +6,32 @@ from pathlib import Path
 
 import pytest
 
-from mimir.index import IndexGenerator, build_memory_index, build_state_index
+from mimir.index import (
+    IndexGenerator,
+    build_memory_index,
+    build_state_index,
+    build_wiki_index,
+)
+
+
+def _seed_wiki(home: Path) -> None:
+    wiki = home / "state" / "wiki"
+    (wiki / "entities").mkdir(parents=True)
+    (wiki / "concepts").mkdir(parents=True)
+    (wiki / "topics").mkdir(parents=True)
+
+    (wiki / "entities" / "alice.md").write_text(
+        "<!-- desc: Alice the operator -->\n# Alice\nbody.\n"
+    )
+    (wiki / "concepts" / "actor-model.md").write_text(
+        "<!-- desc: Hewitt's actor model -->\n# Actors\nbody.\n"
+    )
+    (wiki / "concepts" / "no-desc-page.md").write_text(
+        "# Untagged\nbody without desc-comment.\n"
+    )
+    (wiki / "topics" / "bench-map.md").write_text(
+        "<!-- desc: bench layout -->\n# Bench Map\nbody.\n"
+    )
 
 
 def _seed_memory(home: Path) -> None:
@@ -106,3 +131,116 @@ async def test_generator_flushes_only_dirty_scope(tmp_path: Path):
     assert (tmp_path / "memory" / "INDEX.md").exists()
     # state index wasn't dirty, so it shouldn't have been written.
     assert not (tmp_path / "state" / "INDEX.md").exists()
+    # wiki index also untouched.
+    assert not (tmp_path / "state" / "wiki" / "index.md").exists()
+
+
+def test_build_wiki_index_section_grouped(tmp_path: Path):
+    """chainlink #31 #38: wiki/index.md is auto-regen'd from page
+    desc-comments, grouped by Entities/Concepts/Topics."""
+    _seed_wiki(tmp_path)
+    body = build_wiki_index(tmp_path)
+
+    # Section headers present (only when populated).
+    assert "## Entities" in body
+    assert "## Concepts" in body
+    assert "## Topics" in body
+
+    # Wiki-style link + rel-path + desc, one per line.
+    assert "[[alice]] — `entities/alice.md` — Alice the operator" in body
+    assert "[[actor-model]] — `concepts/actor-model.md` — Hewitt's actor model" in body
+    assert "[[bench-map]] — `topics/bench-map.md` — bench layout" in body
+
+    # Page without desc-comment renders with [auto] prefix.
+    assert "[[no-desc-page]]" in body
+    assert "[auto]" in body
+
+
+def test_build_wiki_index_skips_meta_files(tmp_path: Path):
+    """AGENTS.md, log.md, and an existing index.md at wiki root are
+    documentation about the wiki, not catalog entries — must not show
+    up in the auto-regen output."""
+    wiki = tmp_path / "state" / "wiki"
+    wiki.mkdir(parents=True)
+    (wiki / "AGENTS.md").write_text("<!-- desc: ingest conventions -->\nbody")
+    (wiki / "log.md").write_text("<!-- desc: ingest log -->\nbody")
+    (wiki / "index.md").write_text("# stale hand-curated\n")
+    body = build_wiki_index(tmp_path)
+
+    assert "AGENTS.md" not in body
+    assert "log.md" not in body
+    # The previously hand-curated index.md doesn't list itself.
+    assert "[[index]]" not in body
+
+
+def test_build_wiki_index_omits_empty_sections(tmp_path: Path):
+    """A fresh agent with only entities seeded shouldn't see empty
+    Concepts/Topics headers cluttering the file."""
+    wiki = tmp_path / "state" / "wiki"
+    (wiki / "entities").mkdir(parents=True)
+    (wiki / "concepts").mkdir(parents=True)
+    (wiki / "topics").mkdir(parents=True)
+    (wiki / "entities" / "only.md").write_text("<!-- desc: lone entity -->\n")
+
+    body = build_wiki_index(tmp_path)
+    assert "## Entities" in body
+    assert "## Concepts" not in body
+    assert "## Topics" not in body
+
+
+def test_build_wiki_index_handles_no_pages(tmp_path: Path):
+    """Empty wiki tree renders the header with the no-pages marker
+    instead of a bare blank index."""
+    body = build_wiki_index(tmp_path)
+    assert "Wiki Index" in body
+    assert "(no pages yet)" in body
+
+
+@pytest.mark.asyncio
+async def test_generator_writes_wiki_index_on_flush(tmp_path: Path):
+    _seed_memory(tmp_path)
+    _seed_wiki(tmp_path)
+
+    gen = IndexGenerator(tmp_path)
+    gen.mark_dirty("all")
+    await gen.flush()
+
+    wiki_idx = (tmp_path / "state" / "wiki" / "index.md").read_text()
+    assert "## Entities" in wiki_idx
+    assert "[[alice]]" in wiki_idx
+
+
+@pytest.mark.asyncio
+async def test_generator_wiki_scope_isolated(tmp_path: Path):
+    """mark_dirty('wiki') writes only the wiki index — memory and
+    state indexes stay untouched. Mirrors the per-scope-isolation
+    contract the existing memory/state scopes already enforce."""
+    _seed_memory(tmp_path)
+    _seed_wiki(tmp_path)
+    (tmp_path / "state" / "doc.md").write_text("# doc")
+
+    gen = IndexGenerator(tmp_path)
+    gen.mark_dirty("wiki")
+    await gen.flush()
+
+    assert (tmp_path / "state" / "wiki" / "index.md").exists()
+    assert not (tmp_path / "memory" / "INDEX.md").exists()
+    assert not (tmp_path / "state" / "INDEX.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_generator_wiki_overwrites_hand_edits(tmp_path: Path):
+    """Hand-edits to wiki/index.md get overwritten on next flush —
+    same contract as memory/INDEX.md and state/INDEX.md. Resolves
+    the drift-amplifier flagged in Phase 1 audit finding #4."""
+    _seed_wiki(tmp_path)
+    wiki_idx = tmp_path / "state" / "wiki" / "index.md"
+    wiki_idx.write_text("# Hand-curated content that should be wiped.\n")
+
+    gen = IndexGenerator(tmp_path)
+    gen.mark_dirty("wiki")
+    await gen.flush()
+
+    body = wiki_idx.read_text()
+    assert "Hand-curated" not in body
+    assert "Wiki Index" in body  # auto-regen header replaces it
