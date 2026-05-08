@@ -98,6 +98,20 @@ from .prompts import build_system_prompt, build_turn_prompt
 from .scheduler import Scheduler
 from .search import Indexer
 from .session_manager import SessionManager
+from .turn_hooks import (
+    CancelTypingHook,
+    GitCommitHook,
+    IndexRebuildHook,
+    PlanQuotaCaptureHook,
+    PostMessageSagaHook,
+    RateLimitObserverHook,
+    SubagentLifecycleHook,
+    TurnLifecycleHook,
+    fire_finalize,
+    fire_on_message,
+    fire_post_query,
+    fire_pre_query,
+)
 from .shell_jobs import ShellJob, ShellJobRegistry
 from .subagent_inbox import SubagentInbox, SubagentResult, render_subagent_updates
 from .templates import render_saga_session_end
@@ -764,6 +778,31 @@ class Agent:
         self._post_tool_hook = make_post_tool_use_hook(
             config.home, _reindex if indexer is not None else None
         )
+
+        # Per-turn lifecycle hooks (CR#15). Each fires at one of four
+        # seams in run_turn: pre_query / on_message / post_query /
+        # finalize. Order matters — finalize hooks run sequentially, so
+        # IndexRebuild must precede GitCommit (the commit needs the
+        # regenerated INDEX.md files in the working tree). New
+        # extensible behaviors register here rather than editing
+        # run_turn directly.
+        self._turn_hooks: list[TurnLifecycleHook] = [
+            RateLimitObserverHook(
+                rate_limits=self._rate_limits,
+                is_max_oauth=running_on_claude_max,
+            ),
+            SubagentLifecycleHook(inbox=self._inbox),
+            PlanQuotaCaptureHook(
+                capture_fn=self._capture_plan_quota_from_client,
+            ),
+            PostMessageSagaHook(hook_fn=self._post_message_hook),
+            IndexRebuildHook(indexes=self._indexes),
+            GitCommitHook(
+                home=self._config.home,
+                enabled=self._config.git_tracking_enabled,
+            ),
+            CancelTypingHook(channels=self._channels),
+        ]
 
         # Bounded set for fire-and-forget background tasks (event-log
         # writes, etc.). CPython warns that the result of asyncio.
@@ -1740,6 +1779,245 @@ class Agent:
 
     # ---- run_turn ------------------------------------------------------
 
+    async def _build_turn_prompt(
+        self,
+        ctx: TurnContext,
+        event: AgentEvent,
+        saga_block: str | None,
+        subagent_block: str | None,
+    ) -> tuple[str, list]:
+        """Assemble the per-turn user-side prompt + the recent-message
+        list. Synthesis turns get a dedicated synthesis prompt; everything
+        else builds the standard turn prompt with the algedonic /
+        session-summary / usage / upcoming / self-state blocks.
+
+        Returns ``(turn_prompt, recent)`` — recent is needed for the
+        ``turn_started`` event's ``recent_message_count``.
+        """
+        if event.trigger == "saga_session_end":
+            return await self._build_synthesis_prompt(ctx, event), []
+
+        recent = self._buffer.assemble_recent_activity(
+            channel_id=event.channel_id,
+            author=event.author,
+            recent_per_channel=self._config.recent_per_channel,
+            recent_author_cross=self._config.recent_author_cross,
+            cross_hours=self._config.recent_cross_hours,
+            source_allowlist=self._config.recent_sources,
+        )
+        feedback_block = (
+            self._feedback.recent_block()
+            if self._config.feedback_limit_per_polarity > 0
+            else None
+        )
+        session_summaries_block = await self._assemble_session_summaries(
+            channel_id=event.channel_id,
+        )
+        # CR#5: _assemble_usage_block walks turns.jsonl via aggregate_usage;
+        # _assemble_self_state_block walks the same file plus events.jsonl
+        # via the homeostat snapshot. Move both off the event loop so other
+        # tasks (saga writes, message buffering, log_event flushes) aren't
+        # blocked during the per-turn JSONL scans.
+        usage_block, deferred_usage_events = await asyncio.to_thread(
+            self._assemble_usage_block
+        )
+        # Flush deferred events on the running loop. Can't spawn tasks
+        # inside the to_thread worker — it has no loop.
+        for event_kind, event_kwargs in deferred_usage_events:
+            self._spawn_bg_task(log_event(event_kind, **event_kwargs))
+        upcoming_block = self._assemble_upcoming_block()
+        self_state_block = await asyncio.to_thread(
+            self._assemble_self_state_block,
+        )
+        turn_prompt = build_turn_prompt(
+            event,
+            recent_messages=recent,
+            saga_block=saga_block,
+            subagent_block=subagent_block,
+            recent_message_chars=self._config.recent_message_chars,
+            resolver=self._buffer.resolver,
+            feedback_block=feedback_block,
+            session_summaries_block=session_summaries_block,
+            usage_block=usage_block,
+            upcoming_block=upcoming_block,
+            self_state_block=self_state_block,
+            # chainlink #23 #26 Option P: surface this turn's
+            # saga_session_id so the model can pass it as ``session_id``
+            # on saga_query / saga_store / saga_feedback /
+            # saga_mark_contributions tool calls. Required because the
+            # SDK's MCP dispatch path runs handlers on a fresh task that
+            # can't see ``_current_turn``
+            # (state/wiki/concepts/mcp-tool-contextvar-stale.md).
+            saga_session_id=ctx.saga_session_id,
+        )
+        return turn_prompt, recent
+
+    def _build_system_prompt(self) -> tuple[str, int]:
+        """Assemble the system prompt. Returns ``(prompt, core_block_count)``
+        — core_block_count goes into the turn_started event."""
+        core_blocks = load_core(self._config.home)
+        memory_index_body = self._indexes.read_memory_index()
+        skill_block = self._assemble_skill_block()
+        return (
+            build_system_prompt(
+                core_blocks=core_blocks,
+                memory_index_body=memory_index_body,
+                operator_alert_channel=self._config.operator_alert_channel,
+                skill_block=skill_block,
+            ),
+            len(core_blocks),
+        )
+
+    def _make_streaming_dispatcher(
+        self, ctx: TurnContext, event: AgentEvent,
+    ) -> StreamingAutoDispatcher:
+        """chainlink #5: streaming auto-dispatcher. Eligibility matches
+        ``_auto_dispatch_or_record`` exactly — user-facing inbound on a
+        registered, non-bench bridge. On heartbeat / scheduler ticks
+        the dispatcher is created disabled and ``observe()`` is a no-op."""
+        streaming_eligible = (
+            event.trigger in ("user_message", "react_received")
+            and self._channels is not None
+        )
+        streaming_bridge = (
+            self._channels.find(event.channel_id)
+            if streaming_eligible and self._channels is not None
+            else None
+        )
+        return StreamingAutoDispatcher(
+            channel_id=event.channel_id,
+            bridge=streaming_bridge,
+            on_plan_dispatched=self._on_streaming_plan_dispatched(
+                ctx, event, streaming_bridge,
+            ),
+            on_plan_failed=self._on_streaming_plan_failed(
+                event, streaming_bridge,
+            ),
+            eligible=streaming_eligible,
+        )
+
+    async def _run_query_loop(
+        self,
+        ctx: TurnContext,
+        event: AgentEvent,
+        *,
+        prompt: str,
+        options: ClaudeAgentOptions,
+        streaming_dispatcher: StreamingAutoDispatcher,
+    ) -> tuple[list, str | None]:
+        """Drive the SDK ``query()`` async-generator. Manages the
+        ``_current_turn`` contextvar binding, fires per-message hooks +
+        the streaming dispatcher, and ensures the per-turn
+        SessionStore entry is dropped on exit (success OR crash).
+
+        Returns ``(messages, error)``. ``error`` is non-None when the
+        query loop raised; downstream phases (post_query, finalize) can
+        still run on a None ctx but generally short-circuit on error.
+        """
+        token = _context.set_current_turn(ctx)
+        messages: list = []
+        error: str | None = None
+        try:
+            try:
+                async for msg in query(
+                    prompt=prompt,
+                    options=options,
+                    session_id=ctx.turn_id,
+                ):
+                    messages.append(msg)
+                    # observe() is best-effort — failures inside the
+                    # streaming dispatcher must never break the main
+                    # message loop. Logged inside the dispatcher.
+                    try:
+                        await streaming_dispatcher.observe(msg)
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "streaming_dispatcher.observe failed; "
+                            "continuing message loop",
+                        )
+                    # Per-message turn-lifecycle hooks (rate-limit
+                    # observer, subagent lifecycle). These are
+                    # exception-isolated by ``fire_on_message``; a
+                    # broken hook can't sink the loop.
+                    await fire_on_message(
+                        self._turn_hooks, ctx, event, msg,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}: {exc}"
+                log.exception("query() failed for turn %s", ctx.turn_id)
+        finally:
+            _context.reset_current_turn(token)
+            # Stage 3: drop this turn's session entries from the store
+            # so memory stays flat across long-lived processes. Runs
+            # in finally so a query() crash still cleans up. Adapter
+            # delete failures are logged but don't propagate — the
+            # turn record + observability path matters more than a
+            # leaked session entry.
+            try:
+                await self._session_store.delete(
+                    {
+                        "project_key": self._session_project_key,
+                        "session_id": ctx.turn_id,
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "session_store.delete failed for turn %s "
+                    "(continuing — entry will be evicted on next process restart)",
+                    ctx.turn_id,
+                )
+        return messages, error
+
+    async def _record_turn_outbound(
+        self,
+        ctx: TurnContext,
+        event: AgentEvent,
+        output: str,
+        streaming_dispatcher: StreamingAutoDispatcher,
+        streaming_active_for_log: bool,
+    ) -> None:
+        """Outbound chat_history write. Skipped on synthesis turns
+        (no user-facing reply) and when send_message already attempted
+        a dispatch (success OR failure — failure stays in events.jsonl
+        rather than being claimed in chat_history).
+
+        chainlink #5: when the streaming dispatcher already flushed a
+        "plan" chunk, this delivers only the "result" half (text after
+        the first tool_use). Plan-only replies emit a diagnostic event
+        instead of double-recording.
+        """
+        if not (
+            output
+            and event.trigger != "saga_session_end"
+            and ctx.send_message_attempts == 0
+        ):
+            return
+        if streaming_active_for_log:
+            result_text = streaming_dispatcher.result_text()
+            if result_text:
+                await self._auto_dispatch_or_record(ctx, event, result_text)
+            else:
+                # Plan was streamed but the result chunk is empty
+                # (no post-tool text, or the only text was an
+                # actions-only plan). Audit the case so the log
+                # shows the streamed plan was the entire reply.
+                #
+                # No _record_outbound here: the streaming-plan
+                # callback already wrote the cleaned plan text to
+                # chat_history when there was a real bridge send,
+                # and writing the raw plan_buffer here would
+                # double-record (and would inject raw <actions>
+                # markup the user never saw on the directives-only
+                # plan path). Bridge-failure / directives-only
+                # cases have nothing user-visible left to record.
+                await log_event(
+                    "auto_dispatch_streamed_only_plan",
+                    channel_id=event.channel_id,
+                    plan_chars=len(streaming_dispatcher.state.plan_text()),
+                )
+            return
+        await self._auto_dispatch_or_record(ctx, event, output)
+
     async def run_turn(self, event: AgentEvent) -> TurnRecord:
         # Capture the running loop on first turn — worker threads (shell
         # job waiters, etc.) use this to schedule coroutines back onto
@@ -1765,8 +2043,8 @@ class Agent:
             ),
         )
 
-        # 1. SAGA session attach. Synthesis turns already carry the closed
-        #    session's id; for everything else we touch (creating if needed).
+        # SAGA session attach. Synthesis turns already carry the closed
+        # session's id; for everything else we touch (creating if needed).
         if event.trigger == "saga_session_end":
             ctx.saga_session_id = event.extra.get("saga_session_id")
         elif self._sessions is not None:
@@ -1774,93 +2052,27 @@ class Agent:
             ctx.saga_session_id = session.saga_session_id
             self._sessions.increment_turn_count(event.channel_id)
 
-        # 2. Inbound → chat_history (skipped for synthesis turns; their
-        #    "input" is the turn-window block, not a real user message).
+        # Inbound → chat_history (skipped for synthesis turns; their
+        # "input" is the turn-window block, not a real user message).
         await self._record_inbound(event)
 
-        # 3. Flush any out-of-band INDEX changes before reading the index.
+        # Flush any out-of-band INDEX changes before reading the index.
         await self._indexes.flush()
 
-        # 4. Pre-message SAGA hook — produces a "Possibly relevant memories"
-        #    block to slot into the turn prompt.
+        # Pre-message SAGA hook — produces a "Possibly relevant memories"
+        # block to slot into the turn prompt — and drain any background-
+        # subagent notifications (SPEC §4.4).
         saga_block = await self._pre_message_hook(ctx, event)
-
-        # 4b. Drain any background-subagent notifications that landed since
-        #     the last turn for this channel (SPEC §4.4).
         pending_subagents = await self._inbox.drain(event.channel_id)
         subagent_block = (
-            render_subagent_updates(pending_subagents) if pending_subagents else None
+            render_subagent_updates(pending_subagents)
+            if pending_subagents else None
         )
 
-        # 5. Build prompts.
-        if event.trigger == "saga_session_end":
-            turn_prompt = await self._build_synthesis_prompt(ctx, event)
-            recent: list = []
-        else:
-            recent = self._buffer.assemble_recent_activity(
-                channel_id=event.channel_id,
-                author=event.author,
-                recent_per_channel=self._config.recent_per_channel,
-                recent_author_cross=self._config.recent_author_cross,
-                cross_hours=self._config.recent_cross_hours,
-                source_allowlist=self._config.recent_sources,
-            )
-            feedback_block = (
-                self._feedback.recent_block()
-                if self._config.feedback_limit_per_polarity > 0
-                else None
-            )
-            session_summaries_block = await self._assemble_session_summaries(
-                channel_id=event.channel_id,
-            )
-            # CR#5: _assemble_usage_block walks turns.jsonl via
-            # aggregate_usage; _assemble_self_state_block walks the
-            # same file plus events.jsonl via the homeostat snapshot.
-            # Move both off the event loop so other tasks (saga writes,
-            # message buffering, log_event flushes) aren't blocked
-            # during the per-turn JSONL scans.
-            usage_block, deferred_usage_events = await asyncio.to_thread(
-                self._assemble_usage_block
-            )
-            # Flush deferred events on the running loop. Can't spawn
-            # tasks inside the to_thread worker — it has no loop.
-            for event_kind, event_kwargs in deferred_usage_events:
-                self._spawn_bg_task(log_event(event_kind, **event_kwargs))
-            upcoming_block = self._assemble_upcoming_block()
-            self_state_block = await asyncio.to_thread(
-                self._assemble_self_state_block,
-            )
-            turn_prompt = build_turn_prompt(
-                event,
-                recent_messages=recent,
-                saga_block=saga_block,
-                subagent_block=subagent_block,
-                recent_message_chars=self._config.recent_message_chars,
-                resolver=self._buffer.resolver,
-                feedback_block=feedback_block,
-                session_summaries_block=session_summaries_block,
-                usage_block=usage_block,
-                upcoming_block=upcoming_block,
-                self_state_block=self_state_block,
-                # chainlink #23 #26 Option P: surface this turn's
-                # saga_session_id so the model can pass it as ``session_id``
-                # on saga_query / saga_store / saga_feedback /
-                # saga_mark_contributions tool calls. Required because the
-                # SDK's MCP dispatch path runs handlers on a fresh task that
-                # can't see ``_current_turn``
-                # (state/wiki/concepts/mcp-tool-contextvar-stale.md).
-                saga_session_id=ctx.saga_session_id,
-            )
-
-        core_blocks = load_core(self._config.home)
-        memory_index_body = self._indexes.read_memory_index()
-        skill_block = self._assemble_skill_block()
-        system_prompt = build_system_prompt(
-            core_blocks=core_blocks,
-            memory_index_body=memory_index_body,
-            operator_alert_channel=self._config.operator_alert_channel,
-            skill_block=skill_block,
+        turn_prompt, recent = await self._build_turn_prompt(
+            ctx, event, saga_block, subagent_block,
         )
+        system_prompt, core_block_count = self._build_system_prompt()
 
         await log_event(
             "turn_started",
@@ -1868,86 +2080,26 @@ class Agent:
             channel_id=ctx.channel_id,
             trigger=ctx.trigger,
             saga_session_id=ctx.saga_session_id,
-            core_block_count=len(core_blocks),
+            core_block_count=core_block_count,
             recent_message_count=len(recent),
             saga_atoms_pre_injected=len(ctx.saga_atom_ids),
         )
 
-        # 6. Set TurnContext on the contextvar so SAGA tools auto-credit.
-        token = _context.set_current_turn(ctx)
         # Build options once — the same object is passed to query() and
         # then reused for the post-turn plan-quota capture so the
         # ClaudeSDKClient fingerprint matches and the warm client is
         # reused (see _capture_plan_quota_from_client).
         options = self._build_options(system_prompt)
-        messages: list = []
-        error: str | None = None
-        # chainlink #5: streaming auto-dispatcher. Eligibility matches
-        # _auto_dispatch_or_record exactly — user-facing inbound on a
-        # registered, non-bench bridge. On heartbeat / scheduler ticks
-        # the dispatcher is created disabled and observe() is a no-op.
-        streaming_eligible = (
-            event.trigger in ("user_message", "react_received")
-            and self._channels is not None
+        streaming_dispatcher = self._make_streaming_dispatcher(ctx, event)
+
+        await fire_pre_query(self._turn_hooks, ctx, event)
+
+        messages, error = await self._run_query_loop(
+            ctx, event,
+            prompt=turn_prompt,
+            options=options,
+            streaming_dispatcher=streaming_dispatcher,
         )
-        streaming_bridge = (
-            self._channels.find(event.channel_id)
-            if streaming_eligible and self._channels is not None
-            else None
-        )
-        streaming_dispatcher = StreamingAutoDispatcher(
-            channel_id=event.channel_id,
-            bridge=streaming_bridge,
-            on_plan_dispatched=self._on_streaming_plan_dispatched(
-                ctx, event, streaming_bridge,
-            ),
-            on_plan_failed=self._on_streaming_plan_failed(
-                event, streaming_bridge,
-            ),
-            eligible=streaming_eligible,
-        )
-        try:
-            try:
-                async for msg in query(
-                    prompt=turn_prompt,
-                    options=options,
-                    session_id=ctx.turn_id,
-                ):
-                    messages.append(msg)
-                    # observe() is best-effort — failures inside the
-                    # streaming dispatcher must never break the main
-                    # message loop. Logged inside the dispatcher.
-                    try:
-                        await streaming_dispatcher.observe(msg)
-                    except Exception:  # noqa: BLE001
-                        log.exception(
-                            "streaming_dispatcher.observe failed; "
-                            "continuing message loop",
-                        )
-            except Exception as exc:  # noqa: BLE001
-                error = f"{type(exc).__name__}: {exc}"
-                log.exception("query() failed for turn %s", ctx.turn_id)
-        finally:
-            _context.reset_current_turn(token)
-            # Stage 3: drop this turn's session entries from the store
-            # so memory stays flat across long-lived processes. Runs
-            # in finally so a query() crash still cleans up. Adapter
-            # delete failures are logged but don't propagate — the
-            # turn record + observability path matters more than a
-            # leaked session entry.
-            try:
-                await self._session_store.delete(
-                    {
-                        "project_key": self._session_project_key,
-                        "session_id": ctx.turn_id,
-                    }
-                )
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "session_store.delete failed for turn %s "
-                    "(continuing — entry will be evicted on next process restart)",
-                    ctx.turn_id,
-                )
 
         # chainlink #5: when streaming was active and a plan flush
         # already went out, pass streaming_active=True so intermediate
@@ -1963,232 +2115,30 @@ class Agent:
         )
         duration_ms = int((time.monotonic() - ctx.started_at) * 1000)
 
-        # 7a. Single dispatch walk over ``messages`` (CR#13). Replaces
-        # four separate type-specific walks that each read the full
-        # 100-500-element list. Handles, in this order per message:
-        #   - ResultMessage (Phase 8 — last-wins; resume detection + cost)
-        #   - RateLimitEvent (state-transition capture; SPEC §10.x)
-        #   - StreamEvent(message_start) (per-response rate-limit headers,
-        #     gated off under Max OAuth — see comment block below)
-        #   - TaskStartedMessage (subagent_started log + description)
-        #   - TaskProgressMessage (subagent_progress log)
-        #   - TaskNotificationMessage (inbox push + subagent_notification log)
-        #
-        # **Subagent ordering invariant.** TaskNotificationMessage's
-        # description field comes from ``task_descriptions[task_id]``,
-        # which is populated by the Started branch. The SDK emits
-        # TaskStartedMessage before any TaskProgress/TaskNotification
-        # for the same task_id (it has to — the task can't have status
-        # before it starts). Mid-walk lookup is safe under that
-        # invariant; if the SDK ever violates it, the description on
-        # the first notification of a stream-reordered task degrades
-        # to None rather than corrupting state.
-        #
-        # **Max OAuth gate** (preserved verbatim from the prior 4-walk
-        # form). Under Claude Max OAuth, response headers do NOT carry
-        # per-window utilization% (Anthropic only includes those for
-        # direct API key deployments). The OAuth poller and the
-        # in-process Stage 5 capture at 7a.c below are the real-value
-        # writers in that mode. The StreamEvent path here would write
-        # ``utilization=null`` on every turn, clobbering the poller's
-        # real numbers — so we skip it. Direct-API-key deployments are
-        # the inverse: the OAuth poller is gated off and StreamEvent
-        # headers carry the real values.
+        # ResultMessage extraction — last-wins so retries that emit more
+        # than one ResultMessage in the same turn keep the final value.
         result_msg: ResultMessage | None = None
-        is_max_oauth = running_on_claude_max()
-        task_descriptions: dict[str, str] = {}
         for msg in messages:
             if isinstance(msg, ResultMessage):
-                # Last-wins — keep iterating in case retries land more
-                # than one ResultMessage in the same turn.
                 result_msg = msg
-            elif isinstance(msg, RateLimitEvent):
-                info = msg.rate_limit_info
-                rl_type = getattr(info, "rate_limit_type", None)
-                if not rl_type:
-                    continue
-                try:
-                    await self._rate_limits.record(
-                        rl_type, snapshot_from_sdk_event(info),
-                    )
-                except Exception:  # noqa: BLE001
-                    log.exception("rate_limits.record failed for %s", rl_type)
-                if info.status in ("allowed_warning", "rejected"):
-                    await log_event(
-                        "rate_limit_warning"
-                        if info.status == "allowed_warning"
-                        else "rate_limit_rejected",
-                        rate_limit_type=rl_type,
-                        utilization=info.utilization,
-                        resets_at=info.resets_at,
-                    )
-            elif isinstance(msg, StreamEvent):
-                if is_max_oauth:
-                    continue
-                ev = msg.event or {}
-                if ev.get("type") != "message_start":
-                    continue
-                api_message = ev.get("message") or {}
-                rate_limits = api_message.get("rate_limits")
-                if not isinstance(rate_limits, dict):
-                    continue
-                for bucket_type, bucket in rate_limits.items():
-                    if not isinstance(bucket, dict):
-                        continue
-                    try:
-                        await self._rate_limits.record(
-                            bucket_type,
-                            snapshot_from_response_bucket(bucket),
-                        )
-                    except Exception:  # noqa: BLE001
-                        log.exception(
-                            "rate_limits.record from response failed for %s",
-                            bucket_type,
-                        )
-            elif isinstance(msg, TaskStartedMessage):
-                # SPEC §4.4 subagent lifecycle — task begins; record
-                # description for the eventual TaskNotification's inbox
-                # push, then emit subagent_started.
-                task_descriptions[msg.task_id] = msg.description
-                await log_event(
-                    "subagent_started",
-                    turn_id=ctx.turn_id,
-                    channel_id=event.channel_id,
-                    task_id=msg.task_id,
-                    description=msg.description,
-                    task_type=getattr(msg, "task_type", None),
-                )
-            elif isinstance(msg, TaskProgressMessage):
-                u = msg.usage or {}
-                await log_event(
-                    "subagent_progress",
-                    turn_id=ctx.turn_id,
-                    channel_id=event.channel_id,
-                    task_id=msg.task_id,
-                    description=msg.description,
-                    last_tool_name=getattr(msg, "last_tool_name", None),
-                    total_tokens=u.get("total_tokens"),
-                    tool_uses=u.get("tool_uses"),
-                    duration_ms=u.get("duration_ms"),
-                )
-            elif isinstance(msg, TaskNotificationMessage):
-                await self._inbox.push(
-                    event.channel_id,
-                    SubagentResult(
-                        task_id=msg.task_id,
-                        status=msg.status,
-                        summary=msg.summary,
-                        output_file=msg.output_file,
-                        description=task_descriptions.get(msg.task_id),
-                        usage=msg.usage,
-                        received_ts=_utc_now_iso(),
-                    ),
-                )
-                u = msg.usage or {}
-                await log_event(
-                    "subagent_notification",
-                    turn_id=ctx.turn_id,
-                    channel_id=event.channel_id,
-                    task_id=msg.task_id,
-                    status=msg.status,
-                    total_tokens=u.get("total_tokens"),
-                    tool_uses=u.get("tool_uses"),
-                    duration_ms=u.get("duration_ms"),
-                )
 
-        # 7b. Plan-window apiUsage capture (Stage 5 of
-        #     CLAUDE_SDK_CLIENT_MIGRATION.md). Query the shared
-        #     persistent client's ``get_context_usage()`` and persist
-        #     each ``apiUsage`` bucket into the same RateLimitStore.
-        #     Replaces the throwaway-subprocess cron poller — fresher
-        #     cadence (every turn vs every 10 min) with no extra
-        #     subprocess cost (the client is already warm from the
-        #     query() above). Skipped when the message loop crashed;
-        #     the next successful turn picks it up.
-        #
-        # Note: this used to sit between the rate-limit capture walk
-        # and the subagent-lifecycle walks. With the dispatch
-        # consolidation it moves after them — neither subagent logging
-        # nor rate-limit recording depends on plan-quota state, and
-        # vice versa.
-        if not error:
-            try:
-                await self._capture_plan_quota_from_client(options)
-            except Exception:  # noqa: BLE001
-                log.exception("_capture_plan_quota_from_client raised")
+        # Post-query lifecycle hooks: plan-quota capture, post-message
+        # saga hook, and any §12-shaped follow-ons that read the
+        # completed message stream.
+        await fire_post_query(
+            self._turn_hooks, ctx, event,
+            messages=messages, output=output, error=error, options=options,
+        )
 
-        # 8. Outbound → chat_history (skip for synthesis turn — there's no
-        #    user-facing message; the prompt instructs the agent not to send).
-        #    Outbound inherits the inbound's source so the assistant reply
-        #    participates in Recent activity rendering on the same allowlist
-        #    as the human turn (open-strix-style).
-        #
-        #    Skip when send_message already wrote the delivered text to the
-        #    buffer. The SDK's `output` is final-assistant-text — when the
-        #    agent answered via mcp__mimir__send_message it's typically a
-        #    short narration ("Sent.") and persisting it would shadow the
-        #    real reply in Recent activity.
-        # Gate on attempts (not successes) — if the agent tried to send
-        # via send_message and the dispatch failed, the failure is in
-        # events.jsonl; chat_history shouldn't claim a delivery that
-        # didn't happen.
-        if (
-            output
-            and event.trigger != "saga_session_end"
-            and ctx.send_message_attempts == 0
-        ):
-            # chainlink #5: when the streaming dispatcher already
-            # flushed a "plan" chunk, this final call delivers only
-            # the "result" half. The plan part of `output` is the
-            # text BEFORE the first tool_use; pass only the result
-            # text so we don't redeliver the plan.
-            if streaming_active_for_log:
-                result_text = streaming_dispatcher.result_text()
-                if result_text:
-                    await self._auto_dispatch_or_record(
-                        ctx, event, result_text,
-                    )
-                else:
-                    # Plan was streamed but the result chunk is empty
-                    # (no post-tool text, or the only text was an
-                    # actions-only plan). Audit the case so the log
-                    # shows the streamed plan was the entire reply.
-                    #
-                    # No _record_outbound here: the streaming-plan
-                    # callback already wrote the cleaned plan text to
-                    # chat_history when there was a real bridge send,
-                    # and writing the raw plan_buffer here would
-                    # double-record (and would inject raw <actions>
-                    # markup the user never saw on the directives-only
-                    # plan path). Bridge-failure / directives-only
-                    # cases have nothing user-visible left to record.
-                    await log_event(
-                        "auto_dispatch_streamed_only_plan",
-                        channel_id=event.channel_id,
-                        plan_chars=len(streaming_dispatcher.state.plan_text()),
-                    )
-            else:
-                await self._auto_dispatch_or_record(ctx, event, output)
-
-        # 9. Post-message SAGA hook.
-        if not error:
-            await self._post_message_hook(ctx, output)
-
-        # 10. End-of-turn INDEX rebuild (debounced).
-        self._indexes.mark_dirty("all")
-        await self._indexes.flush()
-
-        # 11. PR 4a: post-turn git commit + debounced push (gated on
-        # ``MIMIR_GIT_TRACKING_ENABLED``). Runs after the index flush so
-        # the auto-regenerated INDEX.md files are part of the same
-        # commit as the writes that triggered them. Failures are
-        # swallowed inside ``commit_turn_changes`` and surfaced via
-        # ``git_commit_failed`` / ``git_push_failed`` algedonic events.
-        await git_tracking.commit_turn_changes(
-            turn_id=ctx.turn_id,
-            trigger=ctx.trigger,
-            home=self._config.home,
-            enabled=self._config.git_tracking_enabled,
+        # Outbound chat_history write — happens here (between
+        # post_query hooks and finalize) because the post-message saga
+        # hook may consume the output text without persisting it.
+        # ``_record_turn_outbound`` short-circuits on synthesis turns
+        # and on any prior send_message attempt.
+        await self._record_turn_outbound(
+            ctx, event, output,
+            streaming_dispatcher=streaming_dispatcher,
+            streaming_active_for_log=streaming_active_for_log,
         )
 
         record = TurnRecord(
@@ -2228,18 +2178,9 @@ class Agent:
             saga_atoms_total=len(record.saga_atom_ids),
         )
 
-        # Cancel any typing indicator the bridge spawned on inbound. send()
-        # already cancels typing on the destination channel for normal
-        # replies; this handles the edge cases where send() never landed
-        # on the inbound channel — cross-channel-only sends, errored
-        # turns, heartbeat-shaped flow that explicitly went silent.
-        if self._channels is not None and ctx.channel_id:
-            bridge = self._channels.find(ctx.channel_id)
-            if bridge is not None:
-                try:
-                    await bridge.cancel_typing(ctx.channel_id)
-                except Exception:  # noqa: BLE001
-                    # Typing is best-effort. Don't let a stray exception
-                    # mask the actual turn record we're about to return.
-                    log.debug("cancel_typing(%s) failed", ctx.channel_id)
+        # Finalize lifecycle hooks: index rebuild, git commit,
+        # cancel-typing. Order matters — IndexRebuild precedes
+        # GitCommit so auto-regenerated INDEX.md files are part of the
+        # same commit as the writes that triggered them.
+        await fire_finalize(self._turn_hooks, ctx, event, record)
         return record
