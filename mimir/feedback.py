@@ -107,6 +107,21 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # never woke the spawning channel — the operator sees a missing
     # wake-up before they'd notice without surfacing here.
     "shell_job_complete_enqueue_failed": ("negative", "shell_job_complete_enqueue_failed"),
+    # Discord bridge supervisor — surfaces sustained Discord-side
+    # degradation (5xx at token-auth, gateway disconnect storms) that
+    # would otherwise live only in container logs. ``discord_bridge_retry``
+    # fires after 3 consecutive retry attempts; the login/intents
+    # failures are operator-actionable (token rotation / intent enable
+    # in dev portal) and surface immediately on first occurrence.
+    "discord_bridge_retry": ("negative", "discord_bridge_retry"),
+    "discord_bridge_login_failure": ("negative", "discord_bridge_login_failure"),
+    "discord_bridge_intents_failure": ("negative", "discord_bridge_intents_failure"),
+    # Slack bridge supervisor — same shape as Discord. Retry fires on
+    # sustained transient outages; auth/scope failures are
+    # operator-actionable and surface immediately.
+    "slack_bridge_retry": ("negative", "slack_bridge_retry"),
+    "slack_bridge_auth_failure": ("negative", "slack_bridge_auth_failure"),
+    "slack_bridge_scope_failure": ("negative", "slack_bridge_scope_failure"),
     # Positive — agent's own contribution-credit pass to SAGA is the
     # one signal currently emitted regardless of bridge reaction wiring.
     "saga_feedback_sent": ("positive", "saga_feedback"),
@@ -171,6 +186,14 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # completes. Same shape as git_*_failed — dedup so the operator
     # sees the latest failure, not N stale copies.
     "shell_job_complete_enqueue_failed",
+    # Discord bridge supervisor: a sustained outage fires
+    # ``discord_bridge_retry`` every backoff tick (5s → 5min cap).
+    # Without dedup the algedonic block would fill with retry lines
+    # for the duration of the outage. Latest-only surfaces "still
+    # retrying after N attempts" — the most recent attempt count is
+    # the operator-actionable signal.
+    "discord_bridge_retry",
+    "slack_bridge_retry",
 }
 
 
@@ -473,6 +496,66 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"failed to enqueue: {err}. The job's exit + output are on "
             f"disk under logs/bash-jobs/; the spawning channel did NOT "
             f"resume. Investigate dispatcher state."
+        )
+    if rule_kind == "discord_bridge_retry":
+        attempt = ev.get("attempt", "?")
+        backoff = ev.get("backoff_seconds")
+        err = ev.get("error") or "(no detail)"
+        backoff_str = f" (next retry in {backoff}s)" if backoff else ""
+        return (
+            f"Discord bridge supervisor: {attempt} consecutive retry "
+            f"attempts on connect — {err}{backoff_str}. Most likely "
+            f"Discord-side gateway / API outage; the supervisor is "
+            f"still retrying with exponential backoff. Inbound + "
+            f"outbound Discord traffic is paused until reconnect."
+        )
+    if rule_kind == "discord_bridge_login_failure":
+        err = ev.get("error") or "(no detail)"
+        return (
+            f"Discord bridge: token auth permanently rejected ({err}). "
+            f"Operator must rotate the bot token in `.env` "
+            f"(DISCORD_TOKEN) and restart the container — the bridge "
+            f"supervisor has stopped retrying and Discord traffic is "
+            f"down for the rest of this container's lifetime."
+        )
+    if rule_kind == "discord_bridge_intents_failure":
+        err = ev.get("error") or "(no detail)"
+        return (
+            f"Discord bridge: privileged intents required ({err}). "
+            f"Operator must enable members + message_content intents "
+            f"in the Discord developer portal for this bot, then "
+            f"restart the container."
+        )
+    if rule_kind == "slack_bridge_retry":
+        attempt = ev.get("attempt", "?")
+        backoff = ev.get("backoff_seconds")
+        slack_err = ev.get("slack_error") or ""
+        err = ev.get("error") or "(no detail)"
+        backoff_str = f" (next retry in {backoff}s)" if backoff else ""
+        slack_err_str = f" slack-error={slack_err}" if slack_err else ""
+        return (
+            f"Slack bridge supervisor: {attempt} consecutive retry "
+            f"attempts on connect — {err}{slack_err_str}{backoff_str}. "
+            f"Most likely Slack-side Socket Mode / API outage; the "
+            f"supervisor is still retrying with exponential backoff. "
+            f"Inbound + outbound Slack traffic is paused until reconnect."
+        )
+    if rule_kind == "slack_bridge_auth_failure":
+        slack_err = ev.get("slack_error") or "(unknown)"
+        return (
+            f"Slack bridge: terminal auth failure ({slack_err}). "
+            f"Operator must rotate the Slack bot/app tokens in `.env` "
+            f"(SLACK_BOT_TOKEN / SLACK_APP_TOKEN) and restart the "
+            f"container — the bridge supervisor has stopped retrying "
+            f"and Slack traffic is down for the rest of this "
+            f"container's lifetime."
+        )
+    if rule_kind == "slack_bridge_scope_failure":
+        return (
+            f"Slack bridge: missing OAuth scope. Operator must add the "
+            f"required scope in the Slack app dashboard (api.slack.com → "
+            f"OAuth & Permissions), reinstall the app to refresh the "
+            f"token, then restart the container."
         )
     if rule_kind == "unknown_channel":
         return f"send_message to unknown channel {ev.get('channel_id', '?')}"

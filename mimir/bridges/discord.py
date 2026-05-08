@@ -42,6 +42,57 @@ log = logging.getLogger(__name__)
 DISCORD_MESSAGE_CHAR_LIMIT = 2000
 
 
+# Fatal-exception map: classes that mean "operator must intervene"
+# (token rotation, intent enable in dev portal). Built from
+# ``getattr`` lookups at module load so a discord-py version that
+# doesn't expose one of these classes drops it from the tuple cleanly —
+# without the ``except`` clause silently degrading to ``except
+# Exception:`` and blocking the retryable handlers below it.
+_FATAL_DISCORD_EXCEPTION_INFO: dict[type[BaseException], tuple[str, str]] = {
+    cls: (event_kind, log_msg)
+    for cls, event_kind, log_msg in (
+        (getattr(discord, "LoginFailure", None),
+         "discord_bridge_login_failure",
+         "token auth permanently rejected"),
+        (getattr(discord, "PrivilegedIntentsRequired", None),
+         "discord_bridge_intents_failure",
+         "privileged intents required — enable members + message_content "
+         "in the Discord developer portal"),
+    )
+    if cls is not None
+}
+_FATAL_DISCORD_EXCEPTIONS: tuple[type[BaseException], ...] = tuple(
+    _FATAL_DISCORD_EXCEPTION_INFO
+)
+
+
+def _should_emit_retry_algedonic(attempt: int) -> bool:
+    """Throttle ``*_bridge_retry`` events during sustained outages.
+
+    Fires every attempt from 3-9 inclusive (so the operator sees the
+    early "is this real?" signal fast), then every 10th attempt
+    thereafter (10, 20, 30...). A multi-hour outage at the 5-min
+    backoff cap would otherwise produce ~12 retry events/hour;
+    throttling drops that to ~1.2/hour for the sustained case while
+    keeping the early-warning shape."""
+    if attempt < 3:
+        return False
+    if attempt < 10:
+        return True
+    return attempt % 10 == 0
+
+
+async def _safe_log_event(event_kind: str, **fields: Any) -> None:
+    """Best-effort wrapper around ``mimir.event_logger.log_event`` for use
+    from the bridge supervisor — swallows any logger-side error so a
+    misbehaving event sink can never wedge the reconnect loop."""
+    try:
+        from ..event_logger import log_event
+        await log_event(event_kind, **fields)
+    except Exception:  # noqa: BLE001
+        log.exception("DiscordBridge: log_event(%r) failed", event_kind)
+
+
 # ---------------------------------------------------------------------------
 # Helpers (ported verbatim from open-strix)
 # ---------------------------------------------------------------------------
@@ -267,15 +318,150 @@ class DiscordBridge(Bridge):
     # cancellation never arrives.
     _TYPING_HOLD_TIMEOUT_SECONDS: float = 600.0
 
+    # Reconnect backoff schedule for the supervisor wrapping
+    # ``client.start()``. Discord 5xx incidents typically recover in
+    # minutes-to-hours; a 5-minute cap keeps retry cadence reasonable
+    # without spamming the bridge during a sustained outage. Initial
+    # delay is short so a one-off transient resolves fast; doublings
+    # ramp the back-pressure as the outage persists.
+    _RECONNECT_BACKOFF_INITIAL_SECONDS: float = 5.0
+    _RECONNECT_BACKOFF_CAP_SECONDS: float = 300.0
+
     async def connect(self) -> None:
         if self._client is not None:
             return
         self._client = _DiscordClient(self)
-        # ``client.start`` is a long-running coroutine — run it as a task so
-        # connect() returns once the login handshake is in flight.
+        # ``client.start`` is a long-running coroutine. Wrap it in a
+        # supervisor that retries on transient failure (Discord 5xx at
+        # token-auth, network errors during initial handshake) so a
+        # gateway outage at restart-time doesn't permanently kill the
+        # bridge for the rest of the container's life. Operator-actionable
+        # errors (LoginFailure = bad token, PrivilegedIntentsRequired =
+        # missing intent) propagate up — retrying those just spams.
         self._runner = asyncio.create_task(
-            self._client.start(self.token), name="mimir-discord-runner"
+            self._supervised_run(), name="mimir-discord-runner"
         )
+
+    async def _supervised_run(self) -> None:
+        """Retry-with-exponential-backoff wrapper around
+        ``self._client.start(self.token)``.
+
+        Retryable: 5xx server errors, generic connection / network errors
+        from discord.py and aiohttp. Backoff: 5s → 10s → 20s → 40s → 80s,
+        capped at ``_RECONNECT_BACKOFF_CAP_SECONDS``. Retries
+        indefinitely — Discord's longest documented outage is hours, and
+        a wedged-bridge-for-the-rest-of-the-container's-life is worse
+        than a noisy retry log.
+
+        Non-retryable (raise out, runner task ends):
+        - ``LoginFailure`` (bad token) — operator must rotate
+        - ``PrivilegedIntentsRequired`` — config gap, operator must enable
+          in Discord developer portal
+        - ``CancelledError`` — clean shutdown via ``disconnect()``
+
+        Fires ``discord_bridge_retry`` (algedonic-negative) on attempts
+        3-9 inclusive, then every 10th attempt thereafter — see
+        ``_should_emit_retry_algedonic``. Surfaces the early "is this
+        real?" signal fast, then throttles during sustained outages so
+        events.jsonl doesn't fill with retry rows during a 24h
+        Discord-side incident.
+        """
+        attempt = 0
+        backoff = self._RECONNECT_BACKOFF_INITIAL_SECONDS
+        while True:
+            try:
+                # ``client.start`` returns when the gateway disconnects
+                # cleanly OR raises on transient/fatal failure. discord.py
+                # handles intra-session WebSocket reconnects internally
+                # via the resume protocol; this loop only matters when
+                # ``start`` itself returns/raises (initial handshake
+                # failure or unrecoverable disconnect).
+                assert self._client is not None
+                await self._client.start(self.token)
+                # Clean exit (e.g. operator-initiated disconnect via
+                # ``client.close()``). Don't loop — exit the supervisor.
+                log.info(
+                    "DiscordBridge supervisor: client.start() returned cleanly; exiting"
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except _FATAL_DISCORD_EXCEPTIONS as exc:
+                # Operator-actionable: token rotation needed (LoginFailure)
+                # or intents must be enabled in the dev portal
+                # (PrivilegedIntentsRequired). Map back to the per-class
+                # event kind + log message via the module-level info dict.
+                event_kind = "discord_bridge_unknown_fatal"
+                log_msg = "fatal exception"
+                for cls, (kind, msg) in _FATAL_DISCORD_EXCEPTION_INFO.items():
+                    if isinstance(exc, cls):
+                        event_kind = kind
+                        log_msg = msg
+                        break
+                log.error(
+                    "DiscordBridge: %s (%s); supervisor exiting",
+                    log_msg, exc,
+                )
+                # Fire-and-forget so we don't block the supervisor on a
+                # logger that might itself be backing off.
+                asyncio.create_task(_safe_log_event(
+                    event_kind, error=str(exc)[:300],
+                ))
+                raise
+            except (discord.HTTPException, discord.ConnectionClosed) as exc:
+                # ``HTTPException`` is the parent of ``DiscordServerError``
+                # so the 5xx-at-token-auth case (the production failure
+                # mode that motivated this) lands here. ``ConnectionClosed``
+                # covers post-handshake gateway disconnects that
+                # discord.py's resume protocol couldn't fix.
+                attempt += 1
+                log.warning(
+                    "DiscordBridge: transient failure (%s) on attempt %d; "
+                    "retrying in %.1fs",
+                    exc, attempt, backoff,
+                )
+                if _should_emit_retry_algedonic(attempt):
+                    asyncio.create_task(_safe_log_event(
+                        "discord_bridge_retry",
+                        attempt=attempt,
+                        backoff_seconds=round(backoff, 1),
+                        error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                    ))
+            except Exception as exc:  # noqa: BLE001
+                # Catch-all for unexpected exception types (network errors
+                # from aiohttp surface as multiple class hierarchies). Treat
+                # as transient — Discord-down looks the same to the bot
+                # whether it's a discord-py exception or a deeper aiohttp
+                # one. Surface but retry.
+                attempt += 1
+                log.warning(
+                    "DiscordBridge: unexpected exception (%s) on attempt %d; "
+                    "retrying in %.1fs",
+                    exc, attempt, backoff,
+                )
+                if _should_emit_retry_algedonic(attempt):
+                    asyncio.create_task(_safe_log_event(
+                        "discord_bridge_retry",
+                        attempt=attempt,
+                        backoff_seconds=round(backoff, 1),
+                        error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                    ))
+
+            # Sleep before retry. ``CancelledError`` here aborts the loop
+            # cleanly via the outer except clause.
+            await asyncio.sleep(backoff)
+            backoff = min(
+                backoff * 2.0, self._RECONNECT_BACKOFF_CAP_SECONDS,
+            )
+
+            # The previous client may be in a half-closed state after a
+            # failed login. Construct a fresh one for the next attempt.
+            try:
+                if not self._client.is_closed():
+                    await self._client.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._client = _DiscordClient(self)
 
     async def disconnect(self) -> None:
         # Cancel any dangling typing-hold tasks first so they don't try to
