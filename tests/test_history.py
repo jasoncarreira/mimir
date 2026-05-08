@@ -76,24 +76,111 @@ def test_deque_evicts_at_maxlen(tmp_path: Path):
         )
         # Sync in-memory append for the eviction test.
         buf._append_in_memory(msg)
+    # Per-channel cap of 2 still applies to the per-channel deque…
     assert buf.total_count() == 3
     assert buf.channel_count("c1") == 2
+    # …but Phase C (chainlink #40 / #43) made ``recent_for_channel`` pull
+    # from the global pool unconditionally — the per-channel deque is no
+    # longer privileged. So a public-target lookup returns the global tail
+    # (which honors the global_max=3 cap), not just the per-channel slice.
     contents = [m.content for m in buf.recent_for_channel("c1", 10)]
-    assert contents == ["3", "4"]
+    assert contents == ["2", "3", "4"]
 
 
 @pytest.mark.asyncio
-async def test_recent_for_channel_falls_back_to_global_when_empty(tmp_path: Path):
+async def test_recent_for_channel_pulls_global_public_pool(tmp_path: Path):
+    """Phase C (chainlink #40 / #43): ``recent_for_channel`` pulls from
+    the global public-channel pool, not just the target channel's queue.
+    This previously only happened when the target channel was empty;
+    Phase C made it the default."""
     buf = _make_buffer(tmp_path)
-    # Seed a different channel; query an empty channel should fall back.
     msg = buf.make_message(
         channel_id="c1", kind="user_message", content="x", author="alice"
     )
     await buf.append(msg)
     out = buf.recent_for_channel("c2-empty", limit=5)
-    # Falls back to global tail.
     assert len(out) == 1
     assert out[0].content == "x"
+
+
+@pytest.mark.asyncio
+async def test_recent_for_channel_pulls_cross_channel_when_local_has_messages(
+    tmp_path: Path,
+):
+    """Phase C: even when the target channel has its own messages, the
+    pool now spans all public channels — quieter peers contribute when
+    their messages are recent enough to fall in the global tail."""
+    buf = _make_buffer(tmp_path)
+    # Local channel has its own message …
+    await buf.append(
+        buf.make_message(
+            channel_id="eng", kind="user_message", content="local",
+            author="alice", ts=_now_iso(offset_minutes=-2),
+        )
+    )
+    # … and a peer public channel posted right after.
+    await buf.append(
+        buf.make_message(
+            channel_id="ops", kind="user_message", content="peer",
+            author="bob", ts=_now_iso(offset_minutes=-1),
+        )
+    )
+    out = buf.recent_for_channel("eng", limit=10)
+    contents = {m.content for m in out}
+    # Both surface — local no longer monopolises.
+    assert contents == {"local", "peer"}
+
+
+@pytest.mark.asyncio
+async def test_recent_for_channel_excludes_dms_for_public_target(
+    tmp_path: Path,
+):
+    """Phase C privacy guarantee: a DM channel's messages must never
+    surface in a public target's recent-activity, even when the public
+    target has no local messages of its own."""
+    buf = _make_buffer(tmp_path)
+    # Public peer message + a DM message.
+    await buf.append(
+        buf.make_message(
+            channel_id="eng", kind="user_message", content="public-msg",
+            author="alice", ts=_now_iso(offset_minutes=-2),
+        )
+    )
+    await buf.append(
+        buf.make_message(
+            channel_id="dm-slack-bob", kind="user_message",
+            content="private-msg", author="bob",
+            ts=_now_iso(offset_minutes=-1),
+        )
+    )
+    out = buf.recent_for_channel("ops", limit=10)
+    contents = {m.content for m in out}
+    assert contents == {"public-msg"}
+    # The DM message is gone, even though its ts is more recent.
+
+
+@pytest.mark.asyncio
+async def test_recent_for_channel_dm_target_keeps_global_pool(tmp_path: Path):
+    """Phase C does not change DM-target behavior: the pool stays
+    ``self._all`` for a DM target. Per-message DM gating remains the
+    runtime layer's responsibility upstream of the render."""
+    buf = _make_buffer(tmp_path)
+    await buf.append(
+        buf.make_message(
+            channel_id="dm-slack-alice", kind="user_message",
+            content="dm-content", author="alice",
+        )
+    )
+    await buf.append(
+        buf.make_message(
+            channel_id="eng", kind="user_message",
+            content="public-content", author="bob",
+        )
+    )
+    out = buf.recent_for_channel("dm-slack-alice", limit=10)
+    contents = {m.content for m in out}
+    # DM target sees both — caller gates per-message before render.
+    assert contents == {"dm-content", "public-content"}
 
 
 @pytest.mark.asyncio
@@ -355,3 +442,88 @@ def test_recent_for_channel_limit_zero_returns_empty(tmp_path: Path):
         buf.make_message(channel_id="c1", kind="user_message", content="a", source="slack")
     )
     assert buf.recent_for_channel("c1", limit=0) == []
+
+
+# ---------------------------------------------------------------------------
+# render_recent_activity channel-side resolution (chainlink #40 / #43).
+# ---------------------------------------------------------------------------
+
+
+def test_render_recent_activity_uses_channel_display_name(tmp_path: Path):
+    """Phase C: when a resolver knows the channel id, the line renders
+    ``<display_name> (<channel_id>)`` so the agent reads a friendly
+    label without losing the canonical id (still needed for routing)."""
+    from textwrap import dedent
+    from mimir.identities import IdentityResolver
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        dedent(
+            """\
+            channels:
+              - canonical: discord-1500
+                display_name: jason-mimir
+                kind: public
+            """
+        ),
+        encoding="utf-8",
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+
+    buf = _make_buffer(tmp_path)
+    msgs = [
+        buf.make_message(
+            channel_id="discord-1500", kind="user_message",
+            content="hi", author="alice",
+        ),
+        buf.make_message(
+            channel_id="discord-9999",  # unknown to resolver
+            kind="user_message", content="hey", author="bob",
+        ),
+    ]
+    rendered = render_recent_activity(msgs, resolver=resolver)
+    # Known channel renders with display name + id in parens.
+    assert "jason-mimir (discord-1500)" in rendered
+    # Unknown channel falls through to bare id.
+    assert "[" in rendered and "discord-9999" in rendered
+    assert "jason-mimir (discord-9999)" not in rendered
+
+
+def test_render_recent_activity_no_resolver_uses_bare_channel_id(tmp_path: Path):
+    """Without a resolver, channel renders bare (existing format)."""
+    buf = _make_buffer(tmp_path)
+    msgs = [
+        buf.make_message(
+            channel_id="discord-1500", kind="user_message",
+            content="hi", author="alice",
+        ),
+    ]
+    rendered = render_recent_activity(msgs)
+    # Bare channel id, no display-name prefix.
+    assert "discord-1500" in rendered
+    assert "(" not in rendered.split("] ")[0]
+
+
+def test_render_recent_activity_legacy_resolver_without_channel_api(tmp_path: Path):
+    """A legacy resolver lacking ``channel_display_name`` still works
+    on the author side — the channel side falls through gracefully."""
+
+    class LegacyPeopleOnlyResolver:
+        def display_name(self, author: str | None) -> str | None:
+            if author == "alice":
+                return "Alice S."
+            return None
+
+    buf = _make_buffer(tmp_path)
+    msgs = [
+        buf.make_message(
+            channel_id="discord-1500", kind="user_message",
+            content="hi", author="alice",
+        ),
+    ]
+    rendered = render_recent_activity(msgs, resolver=LegacyPeopleOnlyResolver())
+    # Author display rendered; channel falls through to bare id.
+    assert "Alice S." in rendered
+    assert "discord-1500" in rendered
