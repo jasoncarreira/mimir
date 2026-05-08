@@ -624,3 +624,186 @@ async def test_fetch_history_files_surface_as_attachment_urls(bridge_with_fake_a
     bridge._app.client.conversations_history = fake_history  # type: ignore[attr-defined]
     out = await bridge.fetch_history("slack-C01ABC")
     assert out[0].attachment_urls == ("https://files.slack.com/x.png",)
+
+
+# ---- supervisor: retry-with-backoff around handler.start_async() ---------
+
+
+@pytest.mark.asyncio
+async def test_slack_supervisor_retries_on_transient(monkeypatch, tmp_path: Path):
+    """A transient SlackApiError (5xx-shape, not in fatal_codes set) gets
+    retried with exponential backoff. First attempt fails; second
+    succeeds; supervisor exits cleanly."""
+    import asyncio
+    from slack_sdk.errors import SlackApiError
+    bridge = SlackBridge(bot_token="xoxb-x", app_token="xapp-x", enqueue=AsyncMock(return_value=True))
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.01
+    bridge._RECONNECT_BACKOFF_CAP_SECONDS = 0.05
+
+    attempts = {"n": 0}
+
+    async def fake_start_async():
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise SlackApiError(
+                message="503", response={"ok": False, "error": "service_unavailable"},
+            )
+        return None  # second attempt: clean exit
+
+    fake_handler = SimpleNamespace(
+        start_async=fake_start_async,
+        close_async=AsyncMock(),
+    )
+    fake_app = SimpleNamespace(
+        client=SimpleNamespace(auth_test=AsyncMock(return_value={"user_id": "U_BOT"})),
+    )
+
+    bridge._app = fake_app
+    bridge._handler = fake_handler
+
+    # Force a fresh handler on each retry — mimic the real init.
+    monkeypatch.setattr(
+        "mimir.bridges.slack.AsyncSocketModeHandler",
+        lambda app, app_token: fake_handler,
+    )
+
+    bridge._runner = asyncio.create_task(bridge._supervised_run())
+    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    assert attempts["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_slack_supervisor_does_not_retry_on_invalid_auth(monkeypatch, tmp_path: Path):
+    """``invalid_auth`` is operator-actionable (rotated bot token).
+    Retrying just spams. The supervisor must propagate."""
+    import asyncio
+    from slack_sdk.errors import SlackApiError
+    bridge = SlackBridge(bot_token="xoxb-x", app_token="xapp-x", enqueue=AsyncMock(return_value=True))
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.01
+
+    attempts = {"n": 0}
+
+    async def fake_start_async():
+        attempts["n"] += 1
+        raise SlackApiError(
+            message="bad token", response={"ok": False, "error": "invalid_auth"},
+        )
+
+    fake_handler = SimpleNamespace(start_async=fake_start_async, close_async=AsyncMock())
+    fake_app = SimpleNamespace(client=SimpleNamespace(auth_test=AsyncMock()))
+    bridge._app = fake_app
+    bridge._handler = fake_handler
+    monkeypatch.setattr(
+        "mimir.bridges.slack.AsyncSocketModeHandler",
+        lambda app, app_token: fake_handler,
+    )
+
+    bridge._runner = asyncio.create_task(bridge._supervised_run())
+    with pytest.raises(SlackApiError):
+        await asyncio.wait_for(bridge._runner, timeout=1.0)
+    assert attempts["n"] == 1  # no retries on operator-actionable errors
+
+
+@pytest.mark.asyncio
+async def test_slack_supervisor_does_not_retry_on_missing_scope(monkeypatch, tmp_path: Path):
+    """``missing_scope`` requires Slack app dashboard config change.
+    Same fail-fast posture as invalid_auth."""
+    import asyncio
+    from slack_sdk.errors import SlackApiError
+    bridge = SlackBridge(bot_token="xoxb-x", app_token="xapp-x", enqueue=AsyncMock(return_value=True))
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.01
+
+    attempts = {"n": 0}
+
+    async def fake_start_async():
+        attempts["n"] += 1
+        raise SlackApiError(
+            message="missing scope", response={"ok": False, "error": "missing_scope"},
+        )
+
+    fake_handler = SimpleNamespace(start_async=fake_start_async, close_async=AsyncMock())
+    bridge._app = SimpleNamespace(client=SimpleNamespace(auth_test=AsyncMock()))
+    bridge._handler = fake_handler
+    monkeypatch.setattr(
+        "mimir.bridges.slack.AsyncSocketModeHandler",
+        lambda app, app_token: fake_handler,
+    )
+
+    bridge._runner = asyncio.create_task(bridge._supervised_run())
+    with pytest.raises(SlackApiError):
+        await asyncio.wait_for(bridge._runner, timeout=1.0)
+    assert attempts["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_slack_supervisor_fires_algedonic_after_three_attempts(monkeypatch, tmp_path: Path):
+    """``slack_bridge_retry`` event should fire only after attempts >= 3
+    so a one-off transient doesn't spam the algedonic block."""
+    import asyncio
+    from slack_sdk.errors import SlackApiError
+
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(kind: str, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.bridges.slack._safe_log_event", fake_log_event)
+
+    bridge = SlackBridge(bot_token="xoxb-x", app_token="xapp-x", enqueue=AsyncMock(return_value=True))
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.001
+    bridge._RECONNECT_BACKOFF_CAP_SECONDS = 0.01
+
+    attempts = {"n": 0}
+
+    async def fake_start_async():
+        attempts["n"] += 1
+        if attempts["n"] >= 5:
+            return None
+        raise SlackApiError(
+            message="503", response={"ok": False, "error": "service_unavailable"},
+        )
+
+    fake_handler = SimpleNamespace(start_async=fake_start_async, close_async=AsyncMock())
+    bridge._app = SimpleNamespace(client=SimpleNamespace(auth_test=AsyncMock()))
+    bridge._handler = fake_handler
+    monkeypatch.setattr(
+        "mimir.bridges.slack.AsyncSocketModeHandler",
+        lambda app, app_token: fake_handler,
+    )
+
+    bridge._runner = asyncio.create_task(bridge._supervised_run())
+    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+    retry_events = [(k, f) for k, f in captured if k == "slack_bridge_retry"]
+    assert len(retry_events) == 2  # attempts 3, 4 (5th succeeded)
+    assert retry_events[0][1]["attempt"] == 3
+    assert retry_events[0][1]["slack_error"] == "service_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_slack_supervisor_clean_exit_when_handler_returns(monkeypatch, tmp_path: Path):
+    """If ``handler.start_async()`` returns cleanly the supervisor exits
+    rather than retrying."""
+    import asyncio
+    bridge = SlackBridge(bot_token="xoxb-x", app_token="xapp-x", enqueue=AsyncMock(return_value=True))
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.01
+
+    attempts = {"n": 0}
+
+    async def fake_start_async():
+        attempts["n"] += 1
+        return None
+
+    fake_handler = SimpleNamespace(start_async=fake_start_async, close_async=AsyncMock())
+    bridge._app = SimpleNamespace(client=SimpleNamespace(auth_test=AsyncMock()))
+    bridge._handler = fake_handler
+    monkeypatch.setattr(
+        "mimir.bridges.slack.AsyncSocketModeHandler",
+        lambda app, app_token: fake_handler,
+    )
+
+    bridge._runner = asyncio.create_task(bridge._supervised_run())
+    await asyncio.wait_for(bridge._runner, timeout=1.0)
+    assert attempts["n"] == 1
