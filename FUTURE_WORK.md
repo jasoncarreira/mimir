@@ -254,7 +254,16 @@ Subagent invocations land as a single `tool_result` event in turns.jsonl with `n
 
 ### 6.1 Identity reconciliation (cross-platform context)
 
-**Status:** designed (this doc); SPEC §16, item 11.
+**Status:** v1 shipped (commits `b6a8f9b`, `c043ff3`, `291e754` — see also v0.4 shipped log below); chainlink #40 expansion shipped 2026-05-08:
+
+- **#41 (PR #69)** — schema extension: parallel `channels:` section in `state/identities.yaml`, with `IdentityResolver` gaining a channel-side API (`resolve_channel`, `channel_display_name`, `channel`, `all_channels`).
+- **#43 (PR #70)** — cross-channel content surfacing: `recent_for_channel` pulls the global public-channel pool unconditionally; `render_recent_activity` learns channel-side resolver support so known channels render `<display_name> (<channel_id>)`.
+- **#42 (PR #72)** — `identity-lookup` skill bundled at `mimir/skills/identity-lookup/` (auto-installed by `seed_skills` on `mimir setup`).
+- **#44 (PR #71)** — daily bridge populators (`mimir/identities_populator.py`): scrapes connected Discord guilds + Slack workspaces into `state/identities.yaml`. Idempotent (rerun → zero deltas, operator-set fields preserved, atomic writeback). Top-of-file YAML comment headers preserved across writes. Runtime auto-installed via `Scheduler.add_identities_populate_job`; opt-in via `MIMIR_IDENTITIES_POPULATE_CRON` (default empty; recommended `0 6 * * *`).
+
+The auto-discovery patterns called out below (display-name observation; agent-driven `propose_identity_merge`) remain future work — chainlink #44 covers the steady-state populator, not reactive merge proposals.
+
+**Original design notes (preserved for reference):**
 
 Today `Message.author` is a raw platform ID — Slack `U123ABC`, Discord numeric, Bluesky handle. Cross-channel pull (`MessageBuffer.cross_author_messages`) does strict equality, so Alice on Slack and Alice on Discord look like different people to the bot. A turn for Alice on Slack does NOT pull her Discord public history. The original SPEC framing was workspace migration ("Alice's Slack ID changed"); the bigger use case is cross-platform — the bot should treat one human as one human regardless of which bridge their inbound landed on.
 

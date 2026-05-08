@@ -116,3 +116,102 @@ async def test_list_when_empty(tmp_path: Path):
     tools = {t.name: t for t in build_schedule_tools(sched)}
     out = await tools["list_schedules"].handler({})
     assert "no schedules" in out["content"][0]["text"]
+
+
+# ---- callable-param path (chainlink #44 follow-up) -----
+
+
+@pytest.mark.asyncio
+async def test_add_schedule_with_callable_validates_registry(tmp_path: Path):
+    """add_schedule with callable= for an unregistered name returns
+    a clear error listing what IS registered."""
+    sched = _make_scheduler(tmp_path)
+    tools = {t.name: t for t in build_schedule_tools(sched)}
+
+    out = await tools["add_schedule"].handler({
+        "name": "x", "callable": "no-such-callable", "cron": "0 4 * * *",
+    })
+    assert out.get("is_error") is True
+    assert "not registered" in out["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_add_schedule_with_callable_writes_yaml_and_reloads(tmp_path: Path):
+    """add_schedule with callable= for a registered callable writes
+    the yaml entry and the scheduler picks up the new cron."""
+    sched = _make_scheduler(tmp_path)
+
+    async def _fn():
+        return None
+    sched.register_callable("demo", _fn, default_cron="0 4 * * *")
+
+    tools = {t.name: t for t in build_schedule_tools(sched)}
+    out = await tools["add_schedule"].handler({
+        "name": "demo-shifted", "callable": "demo", "cron": "0 6 * * *",
+    })
+    assert out.get("is_error") is not True
+
+    listed = await tools["list_schedules"].handler({})
+    parsed = yaml.safe_load(listed["content"][0]["text"])
+    assert parsed[0]["name"] == "demo-shifted"
+    assert parsed[0]["callable"] == "demo"
+    assert parsed[0]["cron"] == "0 6 * * *"
+
+    # APScheduler picked up the override.
+    apjob = sched._scheduler.get_job("demo")
+    assert "hour='6'" in str(apjob.trigger)
+
+
+@pytest.mark.asyncio
+async def test_add_schedule_callable_empty_cron_disables(tmp_path: Path):
+    """callable + empty cron is the explicit-disable path; yaml gets
+    the entry and the APScheduler job is dropped."""
+    sched = _make_scheduler(tmp_path)
+
+    async def _fn():
+        return None
+    sched.register_callable("demo", _fn, default_cron="0 4 * * *")
+    assert sched._scheduler.get_job("demo") is not None
+
+    tools = {t.name: t for t in build_schedule_tools(sched)}
+    out = await tools["add_schedule"].handler({
+        "name": "disable-demo", "callable": "demo",
+    })
+    # Note: no cron AND no time_of_day — for callable entries this is
+    # the explicit-disable signal, NOT an error.
+    assert out.get("is_error") is not True
+    assert sched._scheduler.get_job("demo") is None
+
+
+@pytest.mark.asyncio
+async def test_add_schedule_callable_rejects_time_of_day(tmp_path: Path):
+    """callable entries don't accept time_of_day."""
+    sched = _make_scheduler(tmp_path)
+
+    async def _fn():
+        return None
+    sched.register_callable("demo", _fn, default_cron="0 4 * * *")
+
+    tools = {t.name: t for t in build_schedule_tools(sched)}
+    out = await tools["add_schedule"].handler({
+        "name": "x", "callable": "demo", "time_of_day": "08:00",
+    })
+    assert out.get("is_error") is True
+    assert "time_of_day" in out["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_add_schedule_rejects_prompt_and_callable_together(tmp_path: Path):
+    """prompt + callable simultaneously is the mutex-violation path."""
+    sched = _make_scheduler(tmp_path)
+
+    async def _fn():
+        return None
+    sched.register_callable("demo", _fn, default_cron="0 4 * * *")
+
+    tools = {t.name: t for t in build_schedule_tools(sched)}
+    out = await tools["add_schedule"].handler({
+        "name": "x", "prompt": "hi", "callable": "demo", "cron": "0 4 * * *",
+    })
+    assert out.get("is_error") is True
+    assert "mutually exclusive" in out["content"][0]["text"]
