@@ -72,33 +72,36 @@ class TestHybridRetrieveFusionConfig:
             return real_cfg(section, key, default)
         monkeypatch.setattr(saga.core, "_cfg", fake_cfg)
 
-    def test_default_runs(self, fake_embeddings):
+    @pytest.mark.asyncio
+    async def test_default_runs(self, fake_embeddings):
         import saga.core
         saga.core.get_db().close()
         saga.core.run_migrations()
         saga.core.store_atom("The user prefers Sony cameras over Canon")
         saga.core.store_atom("User's favorite hobby is landscape photography")
-        results = saga.core.hybrid_retrieve("camera preferences", top_k=5)
+        results = await saga.core.hybrid_retrieve("camera preferences", top_k=5)
         assert isinstance(results, list)
 
-    def test_weighted_sum_runs(self, fake_embeddings, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_weighted_sum_runs(self, fake_embeddings, monkeypatch):
         import saga.core
         self._force_fusion(monkeypatch, "weighted_sum")
         saga.core.get_db().close()
         saga.core.run_migrations()
         saga.core.store_atom("The user prefers Sony cameras over Canon")
         saga.core.store_atom("User's favorite hobby is landscape photography")
-        results = saga.core.hybrid_retrieve("camera preferences", top_k=5)
+        results = await saga.core.hybrid_retrieve("camera preferences", top_k=5)
         assert isinstance(results, list)
 
-    def test_rrf_fusion_runs(self, fake_embeddings, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_rrf_fusion_runs(self, fake_embeddings, monkeypatch):
         import saga.core
         self._force_fusion(monkeypatch, "rrf")
         saga.core.get_db().close()
         saga.core.run_migrations()
         saga.core.store_atom("The user prefers Sony cameras over Canon")
         saga.core.store_atom("User's favorite hobby is landscape photography")
-        results = saga.core.hybrid_retrieve("camera preferences", top_k=5)
+        results = await saga.core.hybrid_retrieve("camera preferences", top_k=5)
         assert isinstance(results, list)
         for r in results:
             assert "_combined_score" in r

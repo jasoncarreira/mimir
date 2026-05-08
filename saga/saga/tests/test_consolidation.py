@@ -91,7 +91,8 @@ class TestClusterBruteForce:
 
 
 class TestConsolidate:
-    def test_dry_run(self):
+    @pytest.mark.asyncio
+    async def test_dry_run(self):
         from saga.core import get_db, run_migrations
         from saga.consolidation import ConsolidationEngine
 
@@ -108,12 +109,13 @@ class TestConsolidate:
         conn.close()
 
         engine = ConsolidationEngine(similarity_threshold=0.5, min_cluster_size=3)
-        result = engine.consolidate(dry_run=True)
+        result = await engine.consolidate(dry_run=True)
         assert result["dry_run"] is True
         assert "clusters_found" in result
         assert "clusters" in result
 
-    def test_observations_created_field(self):
+    @pytest.mark.asyncio
+    async def test_observations_created_field(self):
         """Live (non-dry) runs surface `observations_created` so callers
         don't have to know about the cluster_consolidated /
         synthesis_atoms_stored distinction."""
@@ -122,11 +124,12 @@ class TestConsolidate:
         run_migrations(get_db())
         # Empty DB - 0 clusters. The field should still exist with value 0.
         engine = ConsolidationEngine()
-        result = engine.consolidate(dry_run=False)
+        result = await engine.consolidate(dry_run=False)
         assert "observations_created" in result
         assert result["observations_created"] == 0
 
-    def test_skips_pinned(self):
+    @pytest.mark.asyncio
+    async def test_skips_pinned(self):
         from saga.core import get_db, run_migrations
         from saga.consolidation import ConsolidationEngine
 
@@ -149,10 +152,11 @@ class TestConsolidate:
         conn.close()
 
         engine = ConsolidationEngine(similarity_threshold=0.5, min_cluster_size=3)
-        result = engine.consolidate(dry_run=True)
+        result = await engine.consolidate(dry_run=True)
         assert result["clusters_found"] == 0
 
-    def test_empty_db(self):
+    @pytest.mark.asyncio
+    async def test_empty_db(self):
         from saga.core import get_db, run_migrations
         from saga.consolidation import ConsolidationEngine
 
@@ -161,7 +165,7 @@ class TestConsolidate:
         conn.close()
 
         engine = ConsolidationEngine()
-        result = engine.consolidate(dry_run=True)
+        result = await engine.consolidate(dry_run=True)
         assert result["clusters_found"] == 0
 
 
@@ -268,7 +272,8 @@ class TestSkipExistingObservation:
         # Single-atom new cluster → guarded out.
         assert engine._subset_observations_for_cluster(["raw_a"]) == []
 
-    def test_consolidate_writes_supersedes_for_strict_superset(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_consolidate_writes_supersedes_for_strict_superset(self, monkeypatch):
         """End-to-end: a cluster that covers a strict superset of an
         existing observation's evidence creates a new observation AND
         writes a supersedes edge from new → old."""
@@ -319,7 +324,7 @@ class TestSkipExistingObservation:
         monkeypatch.setattr(requests, "post", fake_post)
 
         engine = ConsolidationEngine(similarity_threshold=0.5, min_cluster_size=3)
-        result = engine.consolidate()
+        result = await engine.consolidate()
         assert result["clusters_skipped_existing"] == 0
         assert result["observations_superseded"] >= 1
 
@@ -335,7 +340,8 @@ class TestSkipExistingObservation:
         new_obs_id = rows[0][0]
         assert new_obs_id != obs_id
 
-    def test_consolidate_skips_existing(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_consolidate_skips_existing(self, monkeypatch):
         """End-to-end: clusters_skipped_existing reports the count and the
         LLM is not called for an already-consolidated cluster."""
         from saga.core import get_db, run_migrations, add_atom_relation
@@ -387,7 +393,7 @@ class TestSkipExistingObservation:
         monkeypatch.setattr(requests, "post", fake_post)
 
         engine = ConsolidationEngine(similarity_threshold=0.5, min_cluster_size=3)
-        result = engine.consolidate()
+        result = await engine.consolidate()
         assert result["clusters_found"] >= 1
         assert result["clusters_skipped_existing"] >= 1
         # No LLM calls — synthesis was skipped because the observation already exists.
@@ -700,7 +706,8 @@ class TestPromptBranching:
     [triples] enable_extraction so we don't waste tokens asking for a
     TRIPLES section we'd discard."""
 
-    def test_prompt_includes_triples_when_extraction_on(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_prompt_includes_triples_when_extraction_on(self, monkeypatch):
         """When triples.enable_extraction = True, the prompt must
         include the TRIPLES section header and rules."""
         import copy
@@ -732,14 +739,15 @@ class TestPromptBranching:
         # Seed enough atoms to form a cluster (LLM will be called).
         for i in range(3):
             store_atom(f"Atom {i} about the user enjoying jazz music")
-        ConsolidationEngine().consolidate()
+        await ConsolidationEngine().consolidate()
 
         assert "TRIPLES:" in captured.get("prompt", ""), (
             f"prompt missing TRIPLES section: {captured.get('prompt', '')[:500]}"
         )
         assert "Rules for TRIPLES" in captured["prompt"]
 
-    def test_prompt_omits_triples_when_extraction_off(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_prompt_omits_triples_when_extraction_off(self, monkeypatch):
         """When triples.enable_extraction = False (default), the
         prompt must NOT include the TRIPLES section — saves tokens
         and matches what the bench was doing implicitly with the
@@ -771,7 +779,7 @@ class TestPromptBranching:
 
         for i in range(3):
             store_atom(f"Atom {i} about the user enjoying jazz music")
-        ConsolidationEngine().consolidate()
+        await ConsolidationEngine().consolidate()
 
         prompt = captured.get("prompt", "")
         assert "TRIPLES:" not in prompt, (
