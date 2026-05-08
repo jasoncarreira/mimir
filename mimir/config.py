@@ -297,6 +297,18 @@ class Config:
     health_probe_cron: str
     health_probe_max_restarts_per_hour: int
 
+    # Identities populator (mimir/identities_populator.py): scrapes
+    # connected Discord guilds + Slack workspaces into
+    # ``state/identities.yaml`` so the registry stays current without
+    # operator hand-curation. ``identities_populate_cron`` is the cron
+    # expression; default empty (disabled) — operator opt-in via
+    # ``MIMIR_IDENTITIES_POPULATE_CRON`` because bridge scrapes are
+    # platform-API hits that shouldn't fire by default in environments
+    # where it'd be surprising. Recommended value: ``0 6 * * *`` (daily
+    # at 06:00 UTC). The populator is idempotent — rerun → zero deltas,
+    # operator-set fields preserved, atomic writeback.
+    identities_populate_cron: str
+
     # Per-response rate-limit capture (default on). Enabling this turns
     # on the SDK's include_partial_messages so StreamEvent messages
     # carry the raw Anthropic streaming events; we filter for
@@ -463,6 +475,10 @@ class Config:
             ),
             health_probe_max_restarts_per_hour=_env_int(
                 "MIMIR_HEALTH_PROBE_MAX_RESTARTS_PER_HOUR", 3,
+            ),
+
+            identities_populate_cron=_env(
+                "MIMIR_IDENTITIES_POPULATE_CRON", "",
             ),
 
             git_tracking_enabled=_env_bool("MIMIR_GIT_TRACKING_ENABLED", True),
