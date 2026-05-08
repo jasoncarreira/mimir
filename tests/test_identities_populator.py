@@ -341,6 +341,77 @@ def test_merge_preserves_existing_unrelated_entries(tmp_path: Path):
     assert canonicals == {"alice", "bob", "slack-C"}
 
 
+def test_merge_preserves_top_of_file_comment_header(tmp_path: Path):
+    """Operator's schema doc header at the top of identities.yaml
+    survives a populator write — important because the canonical file
+    in /mimir-home carries multi-line schema documentation that an
+    operator (or future-me reading the file) relies on."""
+    header = (
+        "# Operator-managed identity reconciliation.\n"
+        "#\n"
+        "# Two parallel registries: people (alias → canonical) and\n"
+        "# channels (canonical → display_name + kind).\n"
+        "#\n"
+        "# DO NOT edit while the daily populator is running.\n"
+        "\n"
+    )
+    body = dedent(
+        """\
+        people:
+          - canonical: alice
+            aliases: [slack-A]
+        """
+    )
+    p = _state_yaml(tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(header + body, encoding="utf-8")
+
+    # Run the populator with content that triggers a write (new alias
+    # on existing canonical → updated count > 0).
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[{"canonical": "alice", "aliases": ["slack-A", "discord-1"]}],
+        channels=[],
+    )
+    assert counts["people_updated"] == 1
+
+    after = _state_yaml(tmp_path).read_text(encoding="utf-8")
+    # Header survives verbatim, in original position.
+    assert after.startswith(header), (
+        f"header dropped on write\n--- expected prefix ---\n{header}\n"
+        f"--- got ---\n{after[: len(header) + 80]}"
+    )
+    # Document body still parses + carries the merge.
+    assert yaml.safe_load(after)["people"][0]["aliases"] == ["slack-A", "discord-1"]
+
+
+def test_merge_idempotent_rerun_with_header_does_not_drop_it(tmp_path: Path):
+    """Second run is a no-op (no write), but if a third run *does*
+    write, the header from the first round-trip is still there. Guards
+    against subtle regression where the header gets dropped on the
+    first write but the no-op shortcut hides it from idempotency tests."""
+    header = "# load-bearing header line\n\n"
+    p = _state_yaml(tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(header, encoding="utf-8")
+
+    # First run: writes (people_added=1).
+    merge_into_yaml(
+        tmp_path,
+        people=[{"canonical": "alice", "aliases": ["slack-A"]}],
+        channels=[],
+    )
+    assert _state_yaml(tmp_path).read_text().startswith(header)
+
+    # Second run with new alias on the same canonical: writes again.
+    merge_into_yaml(
+        tmp_path,
+        people=[{"canonical": "alice", "aliases": ["slack-A", "discord-1"]}],
+        channels=[],
+    )
+    assert _state_yaml(tmp_path).read_text().startswith(header)
+
+
 def test_merge_round_trips_through_identity_resolver(tmp_path: Path):
     """End-to-end: merger output is a valid identities.yaml that the
     IdentityResolver can load. Confirms the YAML shape matches the

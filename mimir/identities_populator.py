@@ -49,22 +49,62 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _load_yaml(path: Path) -> dict[str, Any]:
-    """Read identities.yaml as a plain dict; treat missing/unparseable as
-    empty so a fresh deployment starts clean.
+def _extract_header(text: str) -> str:
+    """Return the leading comment block of a YAML file, verbatim.
 
-    Differs from ``IdentityResolver.reload`` only in shape: we want the
-    raw YAML structure for round-tripping, not the loader's normalized
-    dataclasses. Comments are not preserved (PyYAML limitation); the
-    operator's comment header is re-added on write below if absent.
+    "Leading comment block" = every line from the start of the file up
+    to (but not including) the first non-blank, non-comment line. Blank
+    lines that precede or sit between comment lines are kept; the
+    trailing blank that conventionally separates a header from the
+    document body is also kept (so the round-tripped file has the same
+    visual shape).
+
+    This is the closest PyYAML-only round-trip we can do: top-of-file
+    comments — which is where ``identities.yaml``'s schema doc lives —
+    survive a populator write. Comments *inside* document entries
+    (``aliases:`` lists, per-record ``# DO NOT remove`` annotations)
+    do NOT survive — see ``_load_yaml`` docstring.
+    """
+    header_lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("#") or stripped == "" or stripped == "\n":
+            header_lines.append(line)
+            continue
+        break
+    return "".join(header_lines)
+
+
+def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
+    """Read identities.yaml; return ``(doc, header_text)``.
+
+    ``doc`` is the parsed YAML mapping (empty dict for missing /
+    non-mapping files). ``header_text`` is the leading comment block —
+    every line from the start of the file through the last consecutive
+    comment / blank line before the first document content. The header
+    is preserved verbatim and prepended on write back, so the
+    operator's schema documentation at the top of ``identities.yaml``
+    survives a populator run.
+
+    Limitations (PyYAML only does so much):
+
+    - Top-of-file comments survive. Operators editing the schema header
+      can rely on it.
+    - Comments *inside* document entries (e.g. an inline
+      ``# DO NOT remove`` next to a specific alias) are dropped on
+      write. If that ever becomes load-bearing, the right escalation
+      is ``ruamel.yaml`` round-trip mode (carries inline comments) —
+      a new dependency, deferred until a real use case shows up.
+    - Treats missing / unparseable / non-mapping files as empty so a
+      fresh deployment starts clean.
     """
     if not path.is_file():
-        return {}
+        return {}, ""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         log.warning("identities.yaml read failed: %s — treating as empty", exc)
-        return {}
+        return {}, ""
     try:
         doc = yaml.safe_load(text) or {}
     except yaml.YAMLError as exc:
@@ -72,9 +112,10 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         # Returning a sentinel telling the caller to abort (preserve the
         # operator's broken-but-recoverable file rather than nuke it).
         raise
+    header = _extract_header(text)
     if not isinstance(doc, dict):
-        return {}
-    return doc
+        return {}, header
+    return doc, header
 
 
 def _strip_value(v: Any) -> Any:
@@ -112,7 +153,7 @@ def merge_into_yaml(
     ``_added == 0`` and ``_updated == 0`` after the first run.
     """
     yaml_path = home / "state" / "identities.yaml"
-    doc = _load_yaml(yaml_path)
+    doc, header = _load_yaml(yaml_path)
 
     # ---- people ---------------------------------------------------------
     existing_people = doc.get("people")
@@ -284,12 +325,14 @@ def merge_into_yaml(
             # crashes mid-write while the runtime IdentityResolver is
             # reloading.
             tmp = yaml_path.with_suffix(yaml_path.suffix + ".tmp")
-            tmp.write_text(
-                yaml.safe_dump(
-                    doc, sort_keys=False, allow_unicode=True, width=1_000
-                ),
-                encoding="utf-8",
+            body = yaml.safe_dump(
+                doc, sort_keys=False, allow_unicode=True, width=1_000
             )
+            # Prepend the operator's leading comment block (schema doc
+            # header on the canonical identities.yaml) so it survives
+            # populator writes. Inline / mid-document comments are NOT
+            # preserved — see _load_yaml docstring.
+            tmp.write_text(header + body, encoding="utf-8")
             tmp.replace(yaml_path)
 
     return {

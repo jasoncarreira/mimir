@@ -667,6 +667,85 @@ class Scheduler:
         )
         return True
 
+    # ---- identities-populate cron -----------------------------------
+
+    # VSM: S3 — non-LLM background scrape of connected bridges into
+    #      ``state/identities.yaml``. Fires daily; the populator is
+    #      idempotent (rerun → zero deltas, operator-set fields
+    #      preserved). Optional per chainlink #44; default empty cron
+    #      means "operator opt-in via MIMIR_IDENTITIES_POPULATE_CRON".
+    # loop_id: 4.11
+    def add_identities_populate_job(
+        self,
+        home: Path,
+        cron_expr: str,
+        channel_registry: Any,
+        *,
+        job_id: str = "identities-populate",
+    ) -> bool:
+        """Register the identities-populator cron. Returns False on
+        empty / unset cron expression so callers can no-op out without
+        an exception.
+
+        ``channel_registry`` is consulted at fire time (not registration
+        time) so bridges that reconnect mid-day still get scraped on
+        the next run. Bridges are looked up by ``bridge.name`` —
+        ``"discord"`` and ``"slack"`` today; absent ones contribute
+        nothing.
+        """
+        cron_expr = (cron_expr or "").strip()
+        if not cron_expr:
+            return False
+        try:
+            trigger = CronTrigger.from_crontab(cron_expr, timezone=UTC)
+        except (ValueError, KeyError) as exc:
+            raise ValueError(
+                f"invalid cron expression {cron_expr!r}: {exc}"
+            ) from exc
+
+        async def _run() -> None:
+            try:
+                from .identities_populator import populate_all
+                discord_bridge = None
+                slack_bridge = None
+                for bridge in channel_registry.bridges():
+                    name = getattr(bridge, "name", None)
+                    if name == "discord":
+                        discord_bridge = bridge
+                    elif name == "slack":
+                        slack_bridge = bridge
+                result = await populate_all(
+                    home,
+                    discord_bridge=discord_bridge,
+                    slack_bridge=slack_bridge,
+                    dry_run=False,
+                )
+                await log_event(
+                    "identities_populate_ok",
+                    discord=discord_bridge is not None,
+                    slack=slack_bridge is not None,
+                    result=result,
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort scheduled job
+                await log_event(
+                    "identities_populate_error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+        self._scheduler.add_job(
+            _run,
+            trigger=trigger,
+            id=job_id,
+            replace_existing=True,
+            # Bridge scrapes can take a minute or two on large
+            # workspaces — give them room but don't backfill missed
+            # runs (next day's tick gets the same data).
+            misfire_grace_time=300,
+            max_instances=1,
+            coalesce=True,
+        )
+        return True
+
     # ---- lifecycle ---------------------------------------------------
 
     def start(self) -> None:

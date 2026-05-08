@@ -510,3 +510,151 @@ async def test_reload_drops_jobs_no_longer_in_yaml(tmp_path: Path):
     write_jobs(path, [])  # Drop everything from disk
     sched.reload()
     assert "scheduler:going" not in {j.id for j in sched._scheduler.get_jobs()}
+
+
+# ---- identities-populate cron ----------------------------------------
+
+
+class _FakeRegistry:
+    """Minimal stand-in for ChannelRegistry — only exposes ``bridges()``."""
+
+    def __init__(self, bridges: list[object]) -> None:
+        self._bridges = bridges
+
+    def bridges(self) -> list[object]:
+        return list(self._bridges)
+
+
+class _FakeBridge:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+def test_add_identities_populate_job_validates_cron(tmp_path: Path):
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    with pytest.raises(ValueError):
+        sched.add_identities_populate_job(
+            tmp_path, "this is not cron", _FakeRegistry([]),
+        )
+
+
+def test_add_identities_populate_job_disabled_when_blank(tmp_path: Path):
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched.add_identities_populate_job(
+        tmp_path, "", _FakeRegistry([]),
+    ) is False
+    assert sched.add_identities_populate_job(
+        tmp_path, "   ", _FakeRegistry([]),
+    ) is False
+
+
+def test_add_identities_populate_job_registers(tmp_path: Path):
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched.add_identities_populate_job(
+        tmp_path, "0 6 * * *", _FakeRegistry([]),
+    ) is True
+    job = sched._scheduler.get_job("identities-populate")
+    assert job is not None
+
+
+@pytest.mark.asyncio
+async def test_identities_populate_callback_resolves_bridges_by_name(
+    tmp_path: Path, monkeypatch
+):
+    """Callback finds discord + slack bridges by ``bridge.name`` and
+    threads them into populate_all."""
+    captured: dict = {}
+
+    async def _fake_populate_all(
+        home, *, discord_bridge=None, slack_bridge=None, dry_run=False,
+    ):
+        captured["home"] = home
+        captured["discord_bridge"] = discord_bridge
+        captured["slack_bridge"] = slack_bridge
+        captured["dry_run"] = dry_run
+        return {"people_added": 0, "channels_added": 0}
+
+    monkeypatch.setattr(
+        "mimir.identities_populator.populate_all", _fake_populate_all,
+    )
+
+    discord = _FakeBridge("discord")
+    slack = _FakeBridge("slack")
+    web = _FakeBridge("web")  # ignored
+    registry = _FakeRegistry([discord, web, slack])
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched.add_identities_populate_job(tmp_path, "0 6 * * *", registry)
+    job = sched._scheduler.get_job("identities-populate")
+    assert job is not None
+
+    await job.func()
+
+    assert captured["home"] == tmp_path
+    assert captured["discord_bridge"] is discord
+    assert captured["slack_bridge"] is slack
+    assert captured["dry_run"] is False
+
+
+@pytest.mark.asyncio
+async def test_identities_populate_callback_handles_no_bridges(
+    tmp_path: Path, monkeypatch
+):
+    """No connected bridges → populate_all called with both None and the
+    callback completes cleanly. Populator's own contract handles the
+    empty case as a no-op."""
+    captured: dict = {}
+
+    async def _fake_populate_all(
+        home, *, discord_bridge=None, slack_bridge=None, dry_run=False,
+    ):
+        captured["discord_bridge"] = discord_bridge
+        captured["slack_bridge"] = slack_bridge
+        return {"people_added": 0, "channels_added": 0}
+
+    monkeypatch.setattr(
+        "mimir.identities_populator.populate_all", _fake_populate_all,
+    )
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched.add_identities_populate_job(tmp_path, "0 6 * * *", _FakeRegistry([]))
+    job = sched._scheduler.get_job("identities-populate")
+    await job.func()
+
+    assert captured["discord_bridge"] is None
+    assert captured["slack_bridge"] is None
+
+
+@pytest.mark.asyncio
+async def test_identities_populate_callback_swallows_populator_errors(
+    tmp_path: Path, monkeypatch
+):
+    """Best-effort scheduled job: a populator exception is logged via
+    log_event but doesn't propagate (so APScheduler doesn't disable
+    the job)."""
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("simulated bridge failure")
+
+    monkeypatch.setattr(
+        "mimir.identities_populator.populate_all", _boom,
+    )
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched.add_identities_populate_job(tmp_path, "0 6 * * *", _FakeRegistry([]))
+    job = sched._scheduler.get_job("identities-populate")
+
+    # Should not raise.
+    await job.func()
