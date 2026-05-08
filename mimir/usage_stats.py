@@ -43,7 +43,10 @@ log = logging.getLogger(__name__)
 #
 # Sources: Anthropic API docs as of the cutoff. The 1M variant of
 # Opus 4.7 reports its own model id (``claude-opus-4-7[1m]``) in the
-# Claude Code surface; bare ``claude-opus-4-7`` is the 200k variant.
+# Claude Code surface; bare ``claude-opus-4-7`` is the 200k variant
+# unless the request opts into the 1M context window via the
+# ``context-1m-2025-08-07`` beta header (see ``CONTEXT_1M_BETA``
+# below). Pass ``betas=`` to ``context_window_for`` to reflect that.
 _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # Opus 4.x
     "claude-opus-4-7": 200_000,
@@ -59,6 +62,16 @@ _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 }
 
 _DEFAULT_CONTEXT_WINDOW = 200_000
+
+# Anthropic beta header that lifts Claude 4.x Opus / Sonnet from the
+# 200k context cap to a 1M cap. Same shape as the OAuth beta header in
+# ``mimir/oauth_usage_poller.py`` — a single string passed via the
+# claude_agent_sdk's ``betas=`` option.
+CONTEXT_1M_BETA = "context-1m-2025-08-07"
+
+# Model-id prefixes for which the 1M-context beta lifts the cap. Haiku
+# is excluded — the beta is documented for Sonnet 4 / Opus 4 only.
+_CONTEXT_1M_MODEL_PREFIXES = ("claude-opus-4-", "claude-sonnet-4-")
 
 
 @dataclass
@@ -158,8 +171,21 @@ class CostRateAlert:
     baseline_usd_per_hour: float | None  # populated only for spike_ratio
 
 
-def context_window_for(model: str | None) -> int:
-    """Look up the model's max input context. Unknown / None → default."""
+def context_window_for(
+    model: str | None,
+    *,
+    betas: Iterable[str] | None = None,
+) -> int:
+    """Look up the model's max input context. Unknown / None → default.
+
+    ``betas`` reflects Anthropic beta headers active on the request.
+    When ``CONTEXT_1M_BETA`` is present and the model is a Claude 4.x
+    Opus or Sonnet, the 1M window applies — the per-model dict's bare
+    ``claude-opus-4-7`` entry would otherwise return the 200k default.
+    """
+    if betas and CONTEXT_1M_BETA in betas and model:
+        if any(model.startswith(p) for p in _CONTEXT_1M_MODEL_PREFIXES):
+            return 1_000_000
     if not model:
         return _DEFAULT_CONTEXT_WINDOW
     return _MODEL_CONTEXT_WINDOWS.get(model, _DEFAULT_CONTEXT_WINDOW)
@@ -378,6 +404,7 @@ def render_usage_block(
     plan_quota_lines: list[str] | None = None,
     off_pace_warning: list[str] | None = None,
     subagent_block: str | None = None,
+    betas: Iterable[str] | None = None,
 ) -> str | None:
     """Format the usage report as a markdown body for the
     "## Resource usage" prompt section. Returns None when there's
@@ -401,7 +428,7 @@ def render_usage_block(
     if report.last_turn.ts is not None:
         lt = report.last_turn
         model = lt.model or fallback_model or "?"
-        ctx_max = context_window_for(model)
+        ctx_max = context_window_for(model, betas=betas)
         ctx_pct = (lt.total_prompt_tokens / ctx_max * 100) if ctx_max else 0.0
         hit_pct = lt.cache_hit_rate * 100
         lines.append(
