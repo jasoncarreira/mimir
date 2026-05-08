@@ -182,6 +182,23 @@ def test_context_window_unknown_model_falls_back():
     assert context_window_for(None) == 200_000
 
 
+def test_context_window_1m_beta_lifts_opus_4_and_sonnet_4():
+    """When the request opts into ``context-1m-2025-08-07``, Claude 4.x
+    Opus and Sonnet jump to a 1M context cap. Bare-model defaults are
+    unchanged when the beta isn't set."""
+    from mimir.usage_stats import CONTEXT_1M_BETA
+    assert context_window_for("claude-opus-4-7", betas=[CONTEXT_1M_BETA]) == 1_000_000
+    assert context_window_for("claude-opus-4-5", betas=[CONTEXT_1M_BETA]) == 1_000_000
+    assert context_window_for("claude-sonnet-4-6", betas=[CONTEXT_1M_BETA]) == 1_000_000
+    # Haiku is excluded from the beta — stays at its bare-model cap.
+    assert context_window_for("claude-haiku-4-5", betas=[CONTEXT_1M_BETA]) == 200_000
+    # No beta, same model → bare-cap.
+    assert context_window_for("claude-opus-4-7", betas=[]) == 200_000
+    assert context_window_for("claude-opus-4-7") == 200_000
+    # Unknown model name + beta → bare default (no prefix match).
+    assert context_window_for("some-future-model", betas=[CONTEXT_1M_BETA]) == 200_000
+
+
 # ---- rendering ---------------------------------------------------------
 
 
