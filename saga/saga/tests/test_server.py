@@ -52,16 +52,20 @@ class TestStore:
         import saga.annotate
         monkeypatch.setattr(saga.annotate, "classify_stream", lambda c: "semantic")
         monkeypatch.setattr(saga.annotate, "classify_profile", lambda c: "standard")
-        monkeypatch.setattr(saga.annotate, "smart_annotate", lambda c, use_llm=False: {
-            "arousal": 0.5, "valence": 0.0,
-            "topics": ["test"], "encoding_confidence": 0.7,
-        })
+        async def _smart_annotate(c, use_llm=False):
+            return {
+                "arousal": 0.5, "valence": 0.0,
+                "topics": ["test"], "encoding_confidence": 0.7,
+            }
+        monkeypatch.setattr(saga.annotate, "smart_annotate", _smart_annotate)
 
         import saga.core
         monkeypatch.setattr(saga.core, "store_atom", lambda **kwargs: "abc123def456")
 
         import saga.triples
-        monkeypatch.setattr(saga.triples, "extract_and_store", lambda aid, c: 2)
+        async def _extract_and_store(aid, c):
+            return 2
+        monkeypatch.setattr(saga.triples, "extract_and_store", _extract_and_store)
 
         rv = client.post("/v1/store", json={"content": "User prefers dark mode"})
         assert rv.status_code == 200
@@ -83,20 +87,22 @@ class TestStore:
         import saga.annotate
         monkeypatch.setattr(saga.annotate, "classify_stream", lambda c: "semantic")
         monkeypatch.setattr(saga.annotate, "classify_profile", lambda c: "standard")
-        monkeypatch.setattr(saga.annotate, "smart_annotate", lambda c, use_llm=False: {
-            "arousal": 0.5, "valence": 0.0,
-            "topics": ["test"], "encoding_confidence": 0.7,
-        })
+        async def _smart_annotate(c, use_llm=False):
+            return {
+                "arousal": 0.5, "valence": 0.0,
+                "topics": ["test"], "encoding_confidence": 0.7,
+            }
+        monkeypatch.setattr(saga.annotate, "smart_annotate", _smart_annotate)
 
         import saga.core
         monkeypatch.setattr(saga.core, "store_atom", lambda **kwargs: "abc")
 
         called = []
         import saga.triples
-        monkeypatch.setattr(
-            saga.triples, "extract_and_store",
-            lambda aid, c: (called.append((aid, c)), 3)[1],
-        )
+        async def _extract_and_store(aid, c):
+            called.append((aid, c))
+            return 3
+        monkeypatch.setattr(saga.triples, "extract_and_store", _extract_and_store)
 
         rv = client.post("/v1/store", json={"content": "user prefers dark mode"})
         assert rv.status_code == 200
@@ -119,20 +125,22 @@ class TestQuery:
         through the two-tier path by default (cleanup batch flipped
         two_tier_enabled to True)."""
         import saga.core
-        monkeypatch.setattr(saga.core, "hybrid_retrieve", lambda q, **kw: {
-            "observations": [],
-            "raws": [
-                {
-                    "id": "abc123",
-                    "content": "User prefers dark mode",
-                    "stream": "semantic",
-                    "_similarity": 0.85,
-                    "_combined_score": 0.9,
-                    "_confidence_tier": "high",
-                    "topics": '["preferences"]',
-                },
-            ],
-        })
+        async def _hybrid(q, **kw):
+            return {
+                "observations": [],
+                "raws": [
+                    {
+                        "id": "abc123",
+                        "content": "User prefers dark mode",
+                        "stream": "semantic",
+                        "_similarity": 0.85,
+                        "_combined_score": 0.9,
+                        "_confidence_tier": "high",
+                        "topics": '["preferences"]',
+                    },
+                ],
+            }
+        monkeypatch.setattr(saga.core, "hybrid_retrieve", _hybrid)
 
         rv = client.post("/v1/query", json={"query": "user preferences"})
         assert rv.status_code == 200
@@ -158,7 +166,7 @@ class TestQuery:
         import saga.core
         captured = {}
 
-        def fake_hybrid_retrieve(query, **kw):
+        async def fake_hybrid_retrieve(query, **kw):
             captured.update(kw)
             return {
                 "observations": [{
@@ -203,28 +211,30 @@ class TestQuery:
         """Default floor is "low" — atoms classified "none" (sim below
         confidence_sim_low) get dropped. Higher tiers stay."""
         import saga.core
-        monkeypatch.setattr(saga.core, "hybrid_retrieve", lambda q, **kw: {
-            "observations": [
-                {"id": "obs_high", "content": "strong",
-                 "stream": "semantic", "memory_type": "observation",
-                 "_similarity": 0.7, "_combined_score": 0.05,
-                 "_confidence_tier": "high", "evidence_count": 5},
-                {"id": "obs_none", "content": "weak",
-                 "stream": "semantic", "memory_type": "observation",
-                 "_similarity": 0.05, "_combined_score": 0.01,
-                 "_confidence_tier": "none", "evidence_count": 1},
-            ],
-            "raws": [
-                {"id": "raw_low", "content": "borderline",
-                 "stream": "semantic", "memory_type": "raw",
-                 "_similarity": 0.18, "_combined_score": 0.03,
-                 "_confidence_tier": "low"},
-                {"id": "raw_none", "content": "irrelevant",
-                 "stream": "semantic", "memory_type": "raw",
-                 "_similarity": 0.05, "_combined_score": 0.01,
-                 "_confidence_tier": "none"},
-            ],
-        })
+        async def _hybrid(q, **kw):
+            return {
+                "observations": [
+                    {"id": "obs_high", "content": "strong",
+                     "stream": "semantic", "memory_type": "observation",
+                     "_similarity": 0.7, "_combined_score": 0.05,
+                     "_confidence_tier": "high", "evidence_count": 5},
+                    {"id": "obs_none", "content": "weak",
+                     "stream": "semantic", "memory_type": "observation",
+                     "_similarity": 0.05, "_combined_score": 0.01,
+                     "_confidence_tier": "none", "evidence_count": 1},
+                ],
+                "raws": [
+                    {"id": "raw_low", "content": "borderline",
+                     "stream": "semantic", "memory_type": "raw",
+                     "_similarity": 0.18, "_combined_score": 0.03,
+                     "_confidence_tier": "low"},
+                    {"id": "raw_none", "content": "irrelevant",
+                     "stream": "semantic", "memory_type": "raw",
+                     "_similarity": 0.05, "_combined_score": 0.01,
+                     "_confidence_tier": "none"},
+                ],
+            }
+        monkeypatch.setattr(saga.core, "hybrid_retrieve", _hybrid)
         rv = client.post("/v1/query", json={"query": "x", "two_tier": True})
         assert rv.status_code == 200
         data = rv.json()
@@ -241,24 +251,26 @@ class TestQuery:
         """min_confidence_tier in the request body overrides the config
         default. Setting "medium" drops everything below medium."""
         import saga.core
-        monkeypatch.setattr(saga.core, "hybrid_retrieve", lambda q, **kw: {
-            "observations": [
-                {"id": "obs_high", "content": "strong",
-                 "stream": "semantic", "memory_type": "observation",
-                 "_similarity": 0.7, "_combined_score": 0.05,
-                 "_confidence_tier": "high", "evidence_count": 5},
-            ],
-            "raws": [
-                {"id": "raw_medium", "content": "ok",
-                 "stream": "semantic", "memory_type": "raw",
-                 "_similarity": 0.32, "_combined_score": 0.04,
-                 "_confidence_tier": "medium"},
-                {"id": "raw_low", "content": "borderline",
-                 "stream": "semantic", "memory_type": "raw",
-                 "_similarity": 0.18, "_combined_score": 0.03,
-                 "_confidence_tier": "low"},
-            ],
-        })
+        async def _hybrid(q, **kw):
+            return {
+                "observations": [
+                    {"id": "obs_high", "content": "strong",
+                     "stream": "semantic", "memory_type": "observation",
+                     "_similarity": 0.7, "_combined_score": 0.05,
+                     "_confidence_tier": "high", "evidence_count": 5},
+                ],
+                "raws": [
+                    {"id": "raw_medium", "content": "ok",
+                     "stream": "semantic", "memory_type": "raw",
+                     "_similarity": 0.32, "_combined_score": 0.04,
+                     "_confidence_tier": "medium"},
+                    {"id": "raw_low", "content": "borderline",
+                     "stream": "semantic", "memory_type": "raw",
+                     "_similarity": 0.18, "_combined_score": 0.03,
+                     "_confidence_tier": "low"},
+                ],
+            }
+        monkeypatch.setattr(saga.core, "hybrid_retrieve", _hybrid)
         rv = client.post("/v1/query", json={
             "query": "x", "two_tier": True, "min_confidence_tier": "medium",
         })
@@ -272,20 +284,22 @@ class TestQuery:
     def test_query_two_tier_floor_none_keeps_everything(self, client, monkeypatch):
         """min_confidence_tier="none" disables filtering entirely."""
         import saga.core
-        monkeypatch.setattr(saga.core, "hybrid_retrieve", lambda q, **kw: {
-            "observations": [
-                {"id": "obs_none", "content": "weak",
-                 "stream": "semantic", "memory_type": "observation",
-                 "_similarity": 0.05, "_combined_score": 0.01,
-                 "_confidence_tier": "none", "evidence_count": 1},
-            ],
-            "raws": [
-                {"id": "raw_none", "content": "irrelevant",
-                 "stream": "semantic", "memory_type": "raw",
-                 "_similarity": 0.05, "_combined_score": 0.01,
-                 "_confidence_tier": "none"},
-            ],
-        })
+        async def _hybrid(q, **kw):
+            return {
+                "observations": [
+                    {"id": "obs_none", "content": "weak",
+                     "stream": "semantic", "memory_type": "observation",
+                     "_similarity": 0.05, "_combined_score": 0.01,
+                     "_confidence_tier": "none", "evidence_count": 1},
+                ],
+                "raws": [
+                    {"id": "raw_none", "content": "irrelevant",
+                     "stream": "semantic", "memory_type": "raw",
+                     "_similarity": 0.05, "_combined_score": 0.01,
+                     "_confidence_tier": "none"},
+                ],
+            }
+        monkeypatch.setattr(saga.core, "hybrid_retrieve", _hybrid)
         rv = client.post("/v1/query", json={
             "query": "x", "two_tier": True, "min_confidence_tier": "none",
         })
@@ -309,9 +323,9 @@ class TestQuery:
             return real_cfg(section, key, default)
         monkeypatch.setattr(saga.server, "_cfg", fake_cfg)
 
-        monkeypatch.setattr(saga.core, "hybrid_retrieve", lambda q, **kw: {
-            "observations": [], "raws": [],
-        })
+        async def _hybrid(q, **kw):
+            return {"observations": [], "raws": []}
+        monkeypatch.setattr(saga.core, "hybrid_retrieve", _hybrid)
 
         rv = client.post("/v1/query", json={"query": "anything"})
         assert rv.status_code == 200
@@ -331,13 +345,14 @@ class TestQuery:
             return real_cfg(section, key, default)
         monkeypatch.setattr(saga.server, "_cfg", fake_cfg)
 
-        monkeypatch.setattr(saga.triples, "hybrid_retrieve_with_triples",
-                            lambda q, mode="task", token_budget=500, **kw: {
-            "triples": [], "atoms": [], "_raw_atoms": [],
-            "triple_tokens": 0, "atom_tokens": 0, "total_tokens": 0,
-            "items_returned": 0, "query_type": "mixed", "triple_ratio": 0,
-            "latency_ms": 0,
-        })
+        async def _hybrid_triples(q, mode="task", token_budget=500, **kw):
+            return {
+                "triples": [], "atoms": [], "_raw_atoms": [],
+                "triple_tokens": 0, "atom_tokens": 0, "total_tokens": 0,
+                "items_returned": 0, "query_type": "mixed", "triple_ratio": 0,
+                "latency_ms": 0,
+            }
+        monkeypatch.setattr(saga.triples, "hybrid_retrieve_with_triples", _hybrid_triples)
 
         rv = client.post("/v1/query", json={"query": "x", "two_tier": False})
         assert rv.status_code == 200
@@ -534,7 +549,9 @@ class TestTriples:
 
     def test_extract_success(self, client, monkeypatch):
         import saga.triples
-        monkeypatch.setattr(saga.triples, "extract_and_store", lambda aid, c: 3)
+        async def _extract_and_store(aid, c):
+            return 3
+        monkeypatch.setattr(saga.triples, "extract_and_store", _extract_and_store)
 
         rv = client.post("/v1/triples/extract", json={
             "atom_id": "abc123", "content": "The sky is blue",
@@ -617,13 +634,13 @@ class TestPredict:
 class TestConsolidate:
     def test_consolidate_dry_run(self, client, monkeypatch):
         from saga import consolidation
+        async def _consolidate(self, dry_run=False, max_clusters=None,
+                               extra_canonical_subjects=None):
+            return {"clusters_found": 2, "dry_run": dry_run}
         monkeypatch.setattr(consolidation, "ConsolidationEngine", type(
             "MockEngine", (), {
                 "__init__": lambda self: None,
-                "consolidate": lambda self, dry_run=False, max_clusters=None,
-                                       extra_canonical_subjects=None: {
-                    "clusters_found": 2, "dry_run": dry_run,
-                },
+                "consolidate": _consolidate,
             }
         ))
 
@@ -639,14 +656,14 @@ class TestConsolidate:
         to ConsolidationEngine.consolidate."""
         from saga import consolidation
         captured: dict = {}
+        async def _consolidate(self, dry_run=False, max_clusters=None,
+                               extra_canonical_subjects=None):
+            captured["extra_canonical_subjects"] = extra_canonical_subjects
+            return {"clusters_found": 0, "dry_run": dry_run}
         monkeypatch.setattr(consolidation, "ConsolidationEngine", type(
             "MockEngine", (), {
                 "__init__": lambda self: None,
-                "consolidate": lambda self, dry_run=False, max_clusters=None,
-                                       extra_canonical_subjects=None:
-                    captured.update({
-                        "extra_canonical_subjects": extra_canonical_subjects,
-                    }) or {"clusters_found": 0, "dry_run": dry_run},
+                "consolidate": _consolidate,
             }
         ))
         rv = client.post(

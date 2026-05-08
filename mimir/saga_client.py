@@ -146,13 +146,15 @@ class SagaClient(Protocol):
 
 
 class _InProcessSaga:
-    """Direct calls into saga.core via ``asyncio.to_thread``.
+    """Direct calls into saga.core.
 
-    saga's hot-path functions are sync (def, not async def) — embeddings,
-    FTS5, vector ops are CPU-bound and hold the GIL while running. We wrap
-    each call in ``to_thread`` so mimir's event loop stays responsive while
-    saga does the heavy work. saga's FastAPI server does the same thing
-    via uvicorn's executor; we make it explicit at the boundary.
+    Saga's retrieval / consolidation entry points are async-native as of
+    chainlink #20 Phase 3: ``hybrid_retrieve``, ``ConsolidationEngine.consolidate``,
+    and the LLM-using annotate paths are awaited directly here. The remaining
+    sync entry points (``store_atom``, ``mark_contributions``, ``record_outcome``,
+    ``run_decay_cycle``, etc.) are CPU-bound — embeddings, FTS5, vector ops
+    that hold the GIL — so they stay wrapped in ``asyncio.to_thread`` to keep
+    mimir's event loop responsive.
 
     The response shape mirrors what saga's ``/v1/<endpoint>`` route handlers
     return, so mimir's call sites don't care which client they're using.
@@ -204,79 +206,69 @@ class _InProcessSaga:
         min_confidence_tier: str | None = None,
         context: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
-        await self._ensure_ready()
-        clamped = _clamp_query(query)
-        try:
-            return await asyncio.to_thread(
-                self._sync_query,
-                clamped, top_k, mode, token_budget,
-                session_id, min_confidence_tier, context,
-            )
-        except SagaError:
-            raise
-        except Exception as exc:
-            # Preserve the HTTP client's contract: transport-layer or
-            # backend failures surface as SagaError. The agent's pre-message
-            # hook catches SagaError and degrades gracefully (logs + skips
-            # auto-fetch). RuntimeError from missing embedding API key,
-            # SQLite OperationalError, etc. all fold into this path.
-            raise SagaError(f"in-process saga query failed: {exc}") from exc
-
-    @staticmethod
-    def _sync_query(
-        query: str, top_k: int, mode: str, token_budget: int,
-        session_id: str | None, min_confidence_tier: str | None,
-        context: list[dict[str, str]] | None,
-    ) -> dict[str, Any]:
         # Mirrors saga/saga/server.py::api_query (two-tier branch — the
         # default since [retrieval].two_tier_enabled = true is the v0.5
         # canonical setting).
         import time
         from saga.core import hybrid_retrieve
         from saga.config import get_config
-        cfg = get_config()
-        t0 = time.time()
-        result = hybrid_retrieve(
-            query, mode=mode, top_k=top_k,
-            two_tier=True, context=context, session_id=session_id,
-        )
-        obs = result.get("observations", []) or []
-        raws = result.get("raws", []) or []
 
-        gated_reason = None
-        if cfg('retrieval', 'enable_confidence_gating', True):
-            floor = (
-                min_confidence_tier
-                or cfg('retrieval', 'default_min_confidence_tier', 'low')
+        await self._ensure_ready()
+        clamped = _clamp_query(query)
+        # Wrap the entire body — including get_config(), the retrieve
+        # call, gating, and per-atom formatting — so any failure surfaces
+        # as SagaError. The agent's pre-message hook catches SagaError
+        # and degrades gracefully (logs + skips auto-fetch); RuntimeError
+        # from missing embedding API key, SQLite OperationalError,
+        # unexpected atom shape, etc. all fold into this path.
+        try:
+            cfg = get_config()
+            t0 = time.time()
+            result = await hybrid_retrieve(
+                clamped, mode=mode, top_k=top_k,
+                two_tier=True, context=context, session_id=session_id,
             )
-            tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
-            floor_rank = tier_rank.get(floor, 1)
+            obs = result.get("observations", []) or []
+            raws = result.get("raws", []) or []
 
-            def _passes(a: dict) -> bool:
-                t = a.get("_confidence_tier", "none")
-                return tier_rank.get(t, 0) >= floor_rank
-
-            obs_before, raws_before = len(obs), len(raws)
-            obs = [o for o in obs if _passes(o)]
-            raws = [r for r in raws if _passes(r)]
-            obs_dropped = obs_before - len(obs)
-            raws_dropped = raws_before - len(raws)
-            if obs_dropped or raws_dropped:
-                gated_reason = (
-                    f"floor={floor}: dropped {obs_dropped} obs and "
-                    f"{raws_dropped} raws below threshold"
+            gated_reason = None
+            if cfg('retrieval', 'enable_confidence_gating', True):
+                floor = (
+                    min_confidence_tier
+                    or cfg('retrieval', 'default_min_confidence_tier', 'low')
                 )
+                tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
+                floor_rank = tier_rank.get(floor, 1)
 
-        return {
-            "query": query, "mode": mode, "two_tier": True,
-            "gated": gated_reason is not None,
-            "gated_reason": gated_reason,
-            "observations": [_format_atom(o) for o in obs],
-            "raws": [_format_atom(r) for r in raws],
-            "triples": [],
-            "items_returned": len(obs) + len(raws),
-            "latency_ms": round((time.time() - t0) * 1000, 2),
-        }
+                def _passes(a: dict) -> bool:
+                    t = a.get("_confidence_tier", "none")
+                    return tier_rank.get(t, 0) >= floor_rank
+
+                obs_before, raws_before = len(obs), len(raws)
+                obs = [o for o in obs if _passes(o)]
+                raws = [r for r in raws if _passes(r)]
+                obs_dropped = obs_before - len(obs)
+                raws_dropped = raws_before - len(raws)
+                if obs_dropped or raws_dropped:
+                    gated_reason = (
+                        f"floor={floor}: dropped {obs_dropped} obs and "
+                        f"{raws_dropped} raws below threshold"
+                    )
+
+            return {
+                "query": clamped, "mode": mode, "two_tier": True,
+                "gated": gated_reason is not None,
+                "gated_reason": gated_reason,
+                "observations": [_format_atom(o) for o in obs],
+                "raws": [_format_atom(r) for r in raws],
+                "triples": [],
+                "items_returned": len(obs) + len(raws),
+                "latency_ms": round((time.time() - t0) * 1000, 2),
+            }
+        except SagaError:
+            raise
+        except Exception as exc:
+            raise SagaError(f"in-process saga query failed: {exc}") from exc
 
     async def store(
         self, content: str, *, stream: str | None = None,
@@ -284,52 +276,49 @@ class _InProcessSaga:
         use_llm_annotate: bool = False,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        from saga.annotate import smart_annotate, classify_stream, classify_profile
+        from saga.core import store_atom
+
         await self._ensure_ready()
         try:
-            return await asyncio.to_thread(
-                self._sync_store, content, stream, profile,
-                source_type, use_llm_annotate, metadata,
+            actual_stream = stream or classify_stream(content)
+            actual_profile = profile or classify_profile(content)
+            # smart_annotate is async-native (LLM path optionally awaits
+            # call_llm); the heuristic short-circuit also returns via the
+            # async signature.
+            annotations = await smart_annotate(content, use_llm=use_llm_annotate)
+            # store_atom remains sync (FTS5 + embedding write is CPU-bound
+            # and holds the GIL); offload to a thread so the event loop
+            # stays responsive during the SQLite writes.
+            result = await asyncio.to_thread(
+                store_atom,
+                content=content, stream=actual_stream, profile=actual_profile,
+                source_type=source_type, metadata=metadata, **annotations,
             )
+
+            if isinstance(result, tuple):
+                atom_id, reason = result
+            else:
+                atom_id = result
+                reason = "duplicate content" if result is None else None
+
+            if atom_id is None:
+                return {
+                    "stored": False, "atom_id": None,
+                    "stream": actual_stream, "profile": actual_profile,
+                    "annotations": annotations,
+                    "triples_extracted": 0, "reason": reason,
+                }
+            return {
+                "stored": True, "atom_id": atom_id,
+                "stream": actual_stream, "profile": actual_profile,
+                "annotations": annotations,
+                "triples_extracted": 0,
+            }
         except SagaError:
             raise
         except Exception as exc:
             raise SagaError(f"in-process saga store failed: {exc}") from exc
-
-    @staticmethod
-    def _sync_store(
-        content: str, stream: str | None, profile: str | None,
-        source_type: str, use_llm_annotate: bool,
-        metadata: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        from saga.annotate import smart_annotate, classify_stream, classify_profile
-        from saga.core import store_atom
-
-        actual_stream = stream or classify_stream(content)
-        actual_profile = profile or classify_profile(content)
-        annotations = smart_annotate(content, use_llm=use_llm_annotate)
-        result = store_atom(
-            content=content, stream=actual_stream, profile=actual_profile,
-            **annotations, source_type=source_type, metadata=metadata,
-        )
-        if isinstance(result, tuple):
-            atom_id, reason = result
-        else:
-            atom_id = result
-            reason = "duplicate content" if result is None else None
-
-        if atom_id is None:
-            return {
-                "stored": False, "atom_id": None,
-                "stream": actual_stream, "profile": actual_profile,
-                "annotations": annotations,
-                "triples_extracted": 0, "reason": reason,
-            }
-        return {
-            "stored": True, "atom_id": atom_id,
-            "stream": actual_stream, "profile": actual_profile,
-            "annotations": annotations,
-            "triples_extracted": 0,
-        }
 
     async def feedback(
         self, atom_ids: list[str], response_text: str, *,
@@ -396,24 +385,20 @@ class _InProcessSaga:
         self, *, dry_run: bool = False, max_clusters: int | None = None,
         extra_canonical_subjects: list[str] | None = None,
     ) -> dict[str, Any]:
-        await self._ensure_ready()
+        from saga.consolidation import ConsolidationEngine
 
-        def _do() -> dict[str, Any]:
-            from saga.consolidation import ConsolidationEngine
-            engine = ConsolidationEngine()
+        await self._ensure_ready()
+        try:
             kwargs: dict[str, Any] = {"dry_run": dry_run}
             if max_clusters is not None:
                 kwargs["max_clusters"] = max_clusters
             if extra_canonical_subjects:
                 kwargs["extra_canonical_subjects"] = list(extra_canonical_subjects)
-            result = engine.consolidate(**kwargs) or {}
+            result = await ConsolidationEngine().consolidate(**kwargs) or {}
             # mimir's scheduler logs the result; defensive flat dict.
             if not isinstance(result, dict):
                 return {"result": result}
             return result
-
-        try:
-            return await asyncio.to_thread(_do)
         except SagaError:
             raise
         except Exception as exc:

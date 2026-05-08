@@ -40,7 +40,8 @@ def _insert_edge(conn, src, tgt, kind):
 
 
 class TestTwoTierReturn:
-    def test_returns_dict_shape(self, env, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_returns_dict_shape(self, env, monkeypatch):
         import saga.core
         obs_id = saga.core.store_atom(
             "user prefers Sony cameras", memory_type="observation", evidence_count=5
@@ -64,13 +65,14 @@ class TestTwoTierReturn:
         monkeypatch.setattr(saga.core, "retrieve", fake_retrieve)
         monkeypatch.setattr(saga.core, "keyword_search", lambda q, top_k=10, memory_type=None, include_session_boundaries=False: fake_retrieve(q, memory_type=memory_type))
 
-        result = saga.core.hybrid_retrieve("cameras", top_k=5, two_tier=True)
+        result = await saga.core.hybrid_retrieve("cameras", top_k=5, two_tier=True)
         assert isinstance(result, dict)
         assert set(result.keys()) == {"observations", "raws"}
         assert any(a["id"] == obs_id for a in result["observations"])
         assert any(a["id"] == raw_id for a in result["raws"])
 
-    def test_observation_below_confidence_floor_dropped(self, env, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_observation_below_confidence_floor_dropped(self, env, monkeypatch):
         import saga.core
         obs_id = saga.core.store_atom(
             "weak belief", memory_type="observation", evidence_count=5
@@ -95,11 +97,12 @@ class TestTwoTierReturn:
         monkeypatch.setattr(saga.core, "retrieve", fake_retrieve)
         monkeypatch.setattr(saga.core, "keyword_search", lambda q, top_k=10, memory_type=None, include_session_boundaries=False: fake_retrieve(q, memory_type=memory_type))
 
-        result = saga.core.hybrid_retrieve("anything", top_k=5, two_tier=True)
+        result = await saga.core.hybrid_retrieve("anything", top_k=5, two_tier=True)
         assert result["observations"] == []  # gated out
         assert any(a["id"] == raw_id for a in result["raws"])
 
-    def test_observations_top_k_cap(self, env, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_observations_top_k_cap(self, env, monkeypatch):
         import saga.core
         ids = [
             saga.core.store_atom(
@@ -128,12 +131,13 @@ class TestTwoTierReturn:
         real_cfg = saga.core._cfg
         monkeypatch.setattr(saga.core, "_cfg", lambda s, k, d=None: 3 if (s, k) == ("retrieval", "observations_top_k") else real_cfg(s, k, d))
 
-        result = saga.core.hybrid_retrieve("q", top_k=20, two_tier=True)
+        result = await saga.core.hybrid_retrieve("q", top_k=20, two_tier=True)
         assert len(result["observations"]) == 3
 
 
 class TestEvidenceBoost:
-    def test_evidenced_by_lifts_raw_atom(self, env, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_evidenced_by_lifts_raw_atom(self, env, monkeypatch):
         import saga.core
         # An observation and two raw atoms. Only the "evidence" raw is
         # linked to the observation by an evidenced_by edge.
@@ -169,7 +173,7 @@ class TestEvidenceBoost:
         monkeypatch.setattr(saga.core, "retrieve", fake_retrieve)
         monkeypatch.setattr(saga.core, "keyword_search", lambda q, top_k=10, memory_type=None, include_session_boundaries=False: fake_retrieve(q, memory_type=memory_type))
 
-        result = saga.core.hybrid_retrieve("photography", top_k=3, two_tier=True)
+        result = await saga.core.hybrid_retrieve("photography", top_k=3, two_tier=True)
 
         raw_ids_in_order = [r["id"] for r in result["raws"]]
         # The evidence atom should rank AT OR ABOVE the noise atom thanks to
@@ -184,7 +188,8 @@ class TestMissingEvidenceBaseScore:
     could outrank in-top-K peers with the same observation backing.
     """
 
-    def test_missing_atom_with_zero_similarity_lands_at_or_below_in_pool_peer(
+    @pytest.mark.asyncio
+    async def test_missing_atom_with_zero_similarity_lands_at_or_below_in_pool_peer(
         self, env, monkeypatch
     ):
         import saga.core
@@ -233,7 +238,7 @@ class TestMissingEvidenceBaseScore:
             lambda q, top_k=10, memory_type=None, include_session_boundaries=False: fake_retrieve(q, memory_type=memory_type),
         )
 
-        result = saga.core.hybrid_retrieve("photography", top_k=5, two_tier=True)
+        result = await saga.core.hybrid_retrieve("photography", top_k=5, two_tier=True)
         raws = result["raws"]
         ids = [r["id"] for r in raws]
 
@@ -321,16 +326,17 @@ class TestMissingRefScorePivot:
                 fake_retrieve(q, memory_type=memory_type),
         )
 
-    def _run(self, missing_id):
+    async def _run(self, missing_id):
         import saga.core
-        result = saga.core.hybrid_retrieve("vintage cameras", top_k=10, two_tier=True)
+        result = await saga.core.hybrid_retrieve("vintage cameras", top_k=10, two_tier=True)
         # Find the missing atom's score in the raws output.
         for r in result["raws"]:
             if r["id"] == missing_id:
                 return r["_combined_score"]
         return None
 
-    def test_min_pivot_is_default_and_back_compat(self, env, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_min_pivot_is_default_and_back_compat(self, env, monkeypatch):
         """Default pivot is 'min' — preserves P30v1/v3 scoring exactly."""
         import copy
         from saga import config as cfg_mod
@@ -342,10 +348,11 @@ class TestMissingRefScorePivot:
 
         obs_id, in_pool, missing_id = self._setup_three_raws_one_obs(env, monkeypatch)
         self._wire_retrieve(monkeypatch, obs_id, in_pool, missing_id)
-        score_min = self._run(missing_id)
+        score_min = await self._run(missing_id)
         assert score_min is not None and score_min > 0
 
-    def test_median_pivot_raises_missing_atom_score(self, env, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_median_pivot_raises_missing_atom_score(self, env, monkeypatch):
         """Switching the pivot to 'median' produces a strictly higher
         score for the missing atom (same boost, larger base, larger cap).
         """
@@ -360,11 +367,11 @@ class TestMissingRefScorePivot:
         snapshot.setdefault("retrieval", {})["missing_ref_score_pivot"] = "min"
         obs_id, in_pool, missing_id = self._setup_three_raws_one_obs(env, monkeypatch)
         self._wire_retrieve(monkeypatch, obs_id, in_pool, missing_id)
-        score_min = self._run(missing_id)
+        score_min = await self._run(missing_id)
 
         # Run again with 'median'.
         snapshot["retrieval"]["missing_ref_score_pivot"] = "median"
-        score_median = self._run(missing_id)
+        score_median = await self._run(missing_id)
 
         assert score_min is not None and score_median is not None
         assert score_median > score_min, (
@@ -381,7 +388,8 @@ class TestKeywordOnlyTierBackfill:
     floor ≥ "low". Fix: _two_tier_split backfills both fields by
     re-fetching embeddings for atoms missing _similarity."""
 
-    def test_keyword_only_atom_gets_classified(self, env, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_keyword_only_atom_gets_classified(self, env, monkeypatch):
         import saga.core
 
         # Two raws stored. The fake retrieve() returns only one (semantic
@@ -431,7 +439,7 @@ class TestKeywordOnlyTierBackfill:
         monkeypatch.setattr(saga.core, "retrieve", fake_retrieve)
         monkeypatch.setattr(saga.core, "keyword_search", fake_keyword_search)
 
-        result = saga.core.hybrid_retrieve("test query", top_k=5, two_tier=True)
+        result = await saga.core.hybrid_retrieve("test query", top_k=5, two_tier=True)
         raws = result["raws"]
 
         # Both atoms should surface

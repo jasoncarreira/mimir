@@ -110,7 +110,8 @@ class TestFeedbackPipeline:
 
 
 class TestRetrieveV2:
-    def test_returns_results(self):
+    @pytest.mark.asyncio
+    async def test_returns_results(self):
         from saga.core import get_db, run_migrations, store_atom
         from saga.retrieval_v2 import retrieve_v2
         from saga.triples import init_triples_schema
@@ -124,7 +125,7 @@ class TestRetrieveV2:
         store_atom("Agent Identity: curious and analytical personality")
         store_atom("User Profession: software engineer at tech company")
 
-        results = retrieve_v2("Who is the agent?", top_k=5)
+        results = await retrieve_v2("Who is the agent?", top_k=5)
         assert isinstance(results, list)
         # Should have pipeline metadata
         if results:

@@ -185,7 +185,7 @@ Return ONLY valid JSON, no explanation.
 Text: {content}"""
 
 
-def llm_annotate(content: str) -> dict:
+async def llm_annotate(content: str) -> dict:
     """
     Slow-path annotation using an LLM endpoint.
     Falls back to heuristic_annotate on any failure.
@@ -197,8 +197,8 @@ def llm_annotate(content: str) -> dict:
 
     prompt = _LLM_ANNOTATION_PROMPT.format(content=content[:2000])
 
-    from ._llm import call_llm_sync
-    response_text = call_llm_sync(
+    from ._llm import call_llm
+    response_text = await call_llm(
         llm, prompt=prompt, temperature=0.1, max_tokens=500,
     )
     if not response_text:
@@ -241,16 +241,20 @@ def llm_annotate(content: str) -> dict:
         return heuristic_annotate(content)  # fallback
 
 
-def smart_annotate(content: str, use_llm: bool = False) -> dict:
+async def smart_annotate(content: str, use_llm: bool = False) -> dict:
     """
     Unified annotation entry point.
     If use_llm is True, attempts LLM annotation first, falling back to heuristic.
     If use_llm is False, uses heuristic annotation directly.
     Always returns a valid annotation dict.
+
+    Async unconditionally — even when use_llm=False this returns immediately
+    without awaiting, but the function signature stays async so callers
+    don't have to branch on the flag.
     """
     if use_llm:
         try:
-            return llm_annotate(content)
+            return await llm_annotate(content)
         except Exception:
             return heuristic_annotate(content)
     return heuristic_annotate(content)

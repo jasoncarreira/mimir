@@ -256,7 +256,7 @@ class ConsolidationEngine:
     #      reduces source-atom stability. Output feeds the two-tier
     #      retrieval pathway and (P37) the world-model audit.
     # loop_id: 4.3
-    def consolidate(
+    async def consolidate(
         self,
         dry_run: bool = False,
         max_clusters: int = None,
@@ -312,7 +312,7 @@ class ConsolidationEngine:
             }
 
         # Phase 2: Synthesize
-        syntheses = self._synthesize_phase(clusters)
+        syntheses = await self._synthesize_phase(clusters)
 
         # Phase 3: Restructure
         result = self._restructure_phase(syntheses)
@@ -696,7 +696,7 @@ class ConsolidationEngine:
             for r in rows
         ]
 
-    def _synthesize_phase(self, clusters: list[list[dict]]) -> list[dict]:
+    async def _synthesize_phase(self, clusters: list[list[dict]]) -> list[dict]:
         """Call LLM to generate a synthesis atom per cluster.
 
         Reads [consolidation] LLM config; falls back to [annotation]
@@ -930,30 +930,49 @@ class ConsolidationEngine:
                 "prompt": prompt,
             })
 
-        # LLM phase: fan out the synthesis calls. ThreadPoolExecutor of size
-        # parallel_workers; submit only the entries with prompts (others
-        # land in the fallback path during finalize). Results land in
-        # raw_by_idx for the in-order finalize that follows.
-        from ._llm import call_llm_sync as _call_llm
+        # LLM phase: fan out the synthesis calls. asyncio.Semaphore-bounded
+        # gather of size parallel_workers; submit only the entries with
+        # prompts (others land in the fallback path during finalize).
+        # Results land in raw_by_idx for the in-order finalize that follows.
+        #
+        # Async-native after chainlink #47 (Phase 3 of #20). The semaphore
+        # caps in-flight LLM calls so we stay under per-account
+        # concurrent-request limits; the underlying ``_AsyncClaudePool``
+        # adds its own per-runner cap on top of this for the claude_code
+        # provider.
+        import asyncio
+        from ._llm import call_llm as _call_llm
         raw_by_idx: dict[int, str] = {}
 
-        def _do_call(idx: int, prompt_text: str) -> tuple[int, str]:
-            try:
-                return idx, _call_llm(llm, prompt=prompt_text, max_tokens=1500, temperature=0.3)
-            except Exception as e:
-                logger.warning(f"LLM synthesis failed (cluster {idx}): {e}")
-                return idx, ""
+        sem = asyncio.Semaphore(parallel_workers)
+
+        async def _do_call(idx: int, prompt_text: str) -> tuple[int, str]:
+            async with sem:
+                try:
+                    text = await _call_llm(
+                        llm, prompt=prompt_text,
+                        max_tokens=1500, temperature=0.3,
+                    )
+                    return idx, text
+                except Exception as e:
+                    logger.warning(f"LLM synthesis failed (cluster {idx}): {e}")
+                    return idx, ""
 
         prompts_to_run = [(i, p["prompt"]) for i, p in enumerate(prep) if p["prompt"]]
         if prompts_to_run:
-            from concurrent.futures import ThreadPoolExecutor
-            workers = min(parallel_workers, len(prompts_to_run))
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futures = [ex.submit(_do_call, idx, prompt_text)
-                           for idx, prompt_text in prompts_to_run]
-                for fut in futures:
-                    i, raw = fut.result()
-                    raw_by_idx[i] = raw
+            tasks = [_do_call(idx, prompt_text)
+                     for idx, prompt_text in prompts_to_run]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                # Per-task try/except already swallowed call errors and
+                # returned (idx, ""); a True exception here would mean
+                # something inside _do_call escaped — preserve the
+                # cluster-skip behavior the threading version had.
+                if isinstance(r, BaseException):
+                    logger.warning(f"LLM synthesis task crashed: {r}")
+                    continue
+                i, raw = r
+                raw_by_idx[i] = raw
 
         # Finalize phase: parse, fall back, build synthesis records in
         # cluster order so _restructure_phase processes them deterministically.

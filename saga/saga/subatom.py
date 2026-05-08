@@ -529,7 +529,7 @@ def _fallback_whole_atoms(atoms: list[dict], token_budget: int) -> list[dict]:
 
 # ─── Phase 3: Synthesis ──────────────────────────────────────────
 
-def synthesize_sentences(
+async def synthesize_sentences(
     sentences: list[dict],
     max_tokens: int = None,
     model: str = None,
@@ -576,13 +576,13 @@ def synthesize_sentences(
     t0 = time.time()
     latency_ms = 0
     try:
-        from ._llm import call_llm_sync
+        from ._llm import call_llm
         # subatom passes a per-call ``model`` distinct from the one in
         # ``llm`` (lighter compression model). Override into a copy of the
         # llm dict.
         llm_for_call = dict(llm)
         llm_for_call["model"] = model
-        output = call_llm_sync(
+        output = await call_llm(
             llm_for_call,
             prompt=input_text,
             system="Compress these facts into the shortest possible text. Merge related. Fragments OK. No filler. Preserve all unique information.",
@@ -616,7 +616,7 @@ def synthesize_sentences(
 
 # ─── Compressed Retrieval (Full Pipeline) ────────────────────────
 
-def compressed_retrieve(
+async def compressed_retrieve(
     query: str,
     mode: str = "task",
     top_k: int = 12,
@@ -659,7 +659,7 @@ def compressed_retrieve(
         token_budget = _cfg('compression', 'subatom_token_budget', 120)
     
     # Step 1: Retrieval (v2 handles rewriting/expansion internally)
-    atoms = hybrid_retrieve(query, mode=mode, top_k=top_k)
+    atoms = await hybrid_retrieve(query, mode=mode, top_k=top_k)
     
     # Sentence extraction operates on the original query — embeddings
     # already match well across phrasings, and the rewrite/expand utilities
@@ -699,7 +699,7 @@ def compressed_retrieve(
     # Step 4: Synthesis (Phase 3)
     synthesis_result = None
     if enable_synthesis and sentences:
-        synthesis_result = synthesize_sentences(sentences)
+        synthesis_result = await synthesize_sentences(sentences)
         if synthesis_result['model'] != 'fallback':
             total_tokens = synthesis_result['tokens']
     
@@ -723,7 +723,7 @@ def compressed_retrieve(
 
 # ─── Benchmarking ────────────────────────────────────────────────
 
-def benchmark_subatom(queries: list[str] = None):
+async def benchmark_subatom(queries: list[str] = None):
     """Compare whole-atom vs sub-atom retrieval."""
     from .core import hybrid_retrieve
     
@@ -752,11 +752,11 @@ def benchmark_subatom(queries: list[str] = None):
     
     for q in queries:
         # Whole atom
-        whole = compressed_retrieve(q, enable_subatom=False, enable_dedup=False, token_budget=300)
+        whole = await compressed_retrieve(q, enable_subatom=False, enable_dedup=False, token_budget=300)
         # Phase 1 only (sub-atom, no dedup)
-        p1 = compressed_retrieve(q, enable_subatom=True, enable_dedup=False, token_budget=120)
+        p1 = await compressed_retrieve(q, enable_subatom=True, enable_dedup=False, token_budget=120)
         # Phase 1 + Phase 2 (sub-atom + dedup)
-        p2 = compressed_retrieve(q, enable_subatom=True, enable_dedup=True, token_budget=120)
+        p2 = await compressed_retrieve(q, enable_subatom=True, enable_dedup=True, token_budget=120)
         
         total_whole += whole['total_tokens']
         total_p1 += p1['total_tokens']
@@ -818,11 +818,13 @@ if __name__ == "__main__":
         print(json.dumps(result, indent=2))
     
     elif cmd == "benchmark":
-        benchmark_subatom()
-    
+        import asyncio
+        asyncio.run(benchmark_subatom())
+
     elif cmd == "query":
+        import asyncio
         query = " ".join(sys.argv[2:])
-        result = compressed_retrieve(query, token_budget=120)
+        result = asyncio.run(compressed_retrieve(query, token_budget=120))
         print(f"\nQuery: {query}")
         print(f"Method: {result['method']}")
         print(f"Atoms retrieved: {result['atoms_retrieved']}")

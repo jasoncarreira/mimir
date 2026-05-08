@@ -33,7 +33,7 @@ _cfg = get_config()
 # 1. TRIPLE-AUGMENTED RETRIEVAL
 # ═══════════════════════════════════════════════════════════════════
 
-def triple_augmented_retrieve(query: str, mode: str = "task", top_k: int = 12) -> list[dict]:
+async def triple_augmented_retrieve(query: str, mode: str = "task", top_k: int = 12) -> list[dict]:
     """
     Use triples as a bridge: query → entities → triples → source atoms.
     
@@ -51,7 +51,7 @@ def triple_augmented_retrieve(query: str, mode: str = "task", top_k: int = 12) -
     entities = extract_query_entities(query)
     
     if not entities:
-        return hybrid_retrieve(query, mode=mode, top_k=top_k)
+        return await hybrid_retrieve(query, mode=mode, top_k=top_k)
     
     # Find triples matching any entity
     triple_atom_ids = set()
@@ -77,7 +77,7 @@ def triple_augmented_retrieve(query: str, mode: str = "task", top_k: int = 12) -
             })
     
     # Get standard retrieval results
-    standard_results = hybrid_retrieve(query, mode=mode, top_k=top_k)
+    standard_results = await hybrid_retrieve(query, mode=mode, top_k=top_k)
     standard_ids = {a.get('id', '') for a in standard_results}
     
     # Fetch triple-linked atoms that standard retrieval missed
@@ -275,7 +275,7 @@ def get_atom_usefulness(atom_id: str) -> float:
 # 6. CROSS-ENCODER RE-RANKING (NIM API)
 # ═══════════════════════════════════════════════════════════════════
 
-def rerank_with_llm(query: str, atoms: list[dict], top_k: int = 5) -> list[dict]:
+async def rerank_with_llm(query: str, atoms: list[dict], top_k: int = 5) -> list[dict]:
     """
     Re-rank retrieved atoms using LLM-as-judge.
     The LLM understands semantic roles (who is described vs who is describing)
@@ -310,8 +310,8 @@ Passages:
 Ranking:"""
 
     try:
-        from ._llm import call_llm_sync
-        ranking_text = call_llm_sync(
+        from ._llm import call_llm
+        ranking_text = await call_llm(
             llm, prompt=prompt, temperature=0, max_tokens=30,
         )
         if ranking_text:
@@ -434,7 +434,7 @@ def migrate_embeddings(new_model: str, batch_size: int = 10):
 # 9. BEAM SEARCH RETRIEVAL
 # ═══════════════════════════════════════════════════════════════════
 
-def beam_search_retrieve(
+async def beam_search_retrieve(
     query: str,
     mode: str = "task",
     top_k: int = 12,
@@ -445,14 +445,14 @@ def beam_search_retrieve(
     a multi-beam shape with subatom as beam 2.
     """
     from .core import hybrid_retrieve
-    return hybrid_retrieve(query, mode=mode, top_k=top_k)
+    return await hybrid_retrieve(query, mode=mode, top_k=top_k)
 
 
 # ═══════════════════════════════════════════════════════════════════
 # UNIFIED RETRIEVAL PIPELINE
 # ═══════════════════════════════════════════════════════════════════
 
-def retrieve_v2(
+async def retrieve_v2(
     query: str,
     mode: str = "task",
     top_k: int = 12,
@@ -488,10 +488,10 @@ def retrieve_v2(
 
     if use_beam:
         beam_width = _cfg('retrieval_v2', 'beam_width', 3)
-        atoms = beam_search_retrieve(query, mode=mode, top_k=top_k * 2, beam_width=beam_width)
+        atoms = await beam_search_retrieve(query, mode=mode, top_k=top_k * 2, beam_width=beam_width)
     else:
         from .core import hybrid_retrieve
-        atoms = hybrid_retrieve(query, mode=mode, top_k=top_k * 2)
+        atoms = await hybrid_retrieve(query, mode=mode, top_k=top_k * 2)
     
     # Step 4: Triple augmentation (1)
     if _cfg('retrieval_v2', 'enable_triple_augment', True):
@@ -532,7 +532,7 @@ def retrieve_v2(
     
     # Step 7: LLM re-ranking (6)
     if _cfg('retrieval_v2', 'enable_rerank', False):  # Off by default (latency)
-        atoms = rerank_with_llm(original_query, atoms, top_k=top_k)
+        atoms = await rerank_with_llm(original_query, atoms, top_k=top_k)
     
     # Step 8: Log feedback for future learning (5)
     if _cfg('retrieval_v2', 'enable_feedback', True):
@@ -555,10 +555,10 @@ def retrieve_v2(
 # BENCHMARK
 # ═══════════════════════════════════════════════════════════════════
 
-def benchmark_v2():
+async def benchmark_v2():
     """Compare v1 (hybrid_retrieve) vs v2 (retrieve_v2) on quality."""
     from .core import hybrid_retrieve
-    
+
     queries = [
         ("Who is the user?", "companion"),
         ("What is MSAM?", "task"),
@@ -571,14 +571,14 @@ def benchmark_v2():
         ("What is the agent's personality?", "task"),
         ("Recent conversations and events", "task"),
     ]
-    
+
     print("=" * 80)
     print("RETRIEVAL V2 BENCHMARK: v1 vs v2")
     print("=" * 80)
-    
+
     for query, mode in queries:
-        v1 = hybrid_retrieve(query, mode=mode, top_k=5)
-        v2 = retrieve_v2(query, mode=mode, top_k=5)
+        v1 = await hybrid_retrieve(query, mode=mode, top_k=5)
+        v2 = await retrieve_v2(query, mode=mode, top_k=5)
         
         v1_ids = [a.get('id', '')[:8] for a in v1]
         v2_ids = [a.get('id', '')[:8] for a in v2]
@@ -618,11 +618,12 @@ if __name__ == "__main__":
     
     cmd = sys.argv[1]
     
+    import asyncio
     if cmd == "benchmark":
-        benchmark_v2()
+        asyncio.run(benchmark_v2())
     elif cmd == "query":
         query = " ".join(sys.argv[2:])
-        results = retrieve_v2(query, top_k=5)
+        results = asyncio.run(retrieve_v2(query, top_k=5))
         print(f"Query: {query}")
         for a in results:
             score = a.get('_combined_score', 0)
