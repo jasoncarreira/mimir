@@ -18,23 +18,25 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
-# Hard ceilings on the JSONL log caps. Beyond these the cumulative on-disk
-# weight isn't worth the benefit — the reflection skill already filters to
-# the last 7 days, the algedonic prompt block bounds itself by
-# hours+limit, and a 10k-turn / 50k-event log is already several MB. The
-# cost of letting it grow further is paid on every prompt assembly that
-# tail-scans the file. Operators with genuine "I need full history" needs
-# should ship logs to an external store, not raise these knobs.
+# Hard ceilings on the JSONL log caps. The reflection skill filters to the
+# last 7 days, the algedonic prompt block bounds itself by hours+limit, and
+# tail-streamed reads keep prompt-assembly cost O(window) regardless of
+# total log size — so the practical limit is on-disk weight, not prompt
+# cost. At ~400 bytes/event observed, 750k events ≈ 300 MB; that's the
+# upper bound an operator should ever set without shipping logs to an
+# external store.
 #
-# Events cap is 5× the turns cap — measured ~5 events/turn for mimir today
-# (turn_started/finished, event_queued, saga_feedback_sent, send_message),
-# with headroom for failure-class events (tool_call_denied, retries, loop
-# warnings) when they fire. open-strix's distribution runs ~15 events/turn
-# but is chattier; if mimir's per-turn event count grows toward that, raise
-# the multiplier.
-_TURNS_CAP_DEFAULT = 1_000
-_TURNS_CAP_MAX = 10_000
-_EVENTS_PER_TURN_RATIO = 5
+# Events cap is 15× the turns cap — measured ~14 events/turn on mimir as
+# of 2026-05 (turn_started/finished, event_queued bursts, saga_feedback_sent
+# per batch, async-bash start/done pairs, tool_call_denied/retry events).
+# Up from the original 5× target as tool-call density grew through 2026
+# Q2; if events.jsonl outpaces turns.jsonl on retention again, raise again.
+#
+# Defaults at 5k turns / 75k events give roughly 30+ days of retention at
+# current rates, which is the window most behavioral audits assume.
+_TURNS_CAP_DEFAULT = 5_000
+_TURNS_CAP_MAX = 50_000
+_EVENTS_PER_TURN_RATIO = 15
 _EVENTS_CAP_DEFAULT = _TURNS_CAP_DEFAULT * _EVENTS_PER_TURN_RATIO
 _EVENTS_CAP_MAX = _TURNS_CAP_MAX * _EVENTS_PER_TURN_RATIO
 

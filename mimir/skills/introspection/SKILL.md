@@ -73,7 +73,7 @@ Key fields:
 - `duration_ms` — wall-clock time for the entire turn
 - `error` — set if the turn ended with an exception
 
-Capped at 1000 most recent turns by default; configurable via `MIMIR_MAX_TURNS` env var (hard ceiling 10000). Both `events.jsonl` and `turns.jsonl` use a 10% hysteresis on trim so rewrites amortize cost.
+Capped at 5000 most recent turns by default; configurable via `MIMIR_MAX_TURNS` env var (hard ceiling 50000). `events.jsonl` is similarly capped at 75000 events by default (`MIMIR_MAX_EVENTS`, hard ceiling 750000) — 15× the turns cap to match the observed ~14 events/turn rate. Both files use a 10% hysteresis on trim so rewrites amortize cost.
 
 ### scheduler.yaml
 
