@@ -553,6 +553,41 @@ DEFAULT_FILING_RULES = dedent(
 )
 
 
+DEFAULT_ISSUES_README = dedent(
+    """\
+    <!-- desc: what goes in memory/issues/ — operational-gotcha layer -->
+    # memory/issues/
+
+    Every-turn-discoverable operational gotchas. Each file is a
+    fingerprint-shaped runbook for a failure mode mimir might hit
+    again — the kind of note where the value is in the future-mimir
+    matching a fresh symptom against a stored entry.
+
+    Each entry's first-line `<!-- desc: ... -->` surfaces in the
+    every-turn `memory/INDEX.md` description list, so the title +
+    one-line desc need to make hash-lookup against a future symptom
+    obvious. Body covers what triggered it, what the failure looked
+    like, and the runbook fix.
+
+    ## What goes elsewhere
+
+    - **Concept-level synthesis** (pattern frameworks, theoretical
+      models, named patterns from external sources) →
+      `state/wiki/concepts/`. Concepts answer "how do I think about
+      X?"; issues answer "what do I do when X happens again?"
+    - **Long-form synthesis** (>5 KB writeups, baseline analyses,
+      runner architectures) → `state/wiki/topics/`. Issues stay
+      tight enough for fingerprint-matching at a glance.
+    - **Channel-scoped facts** (operator preferences, channel-specific
+      patterns) → `memory/channels/<id>/`. If a gotcha is specific to
+      one channel, it's a channel fact, not a global issue.
+
+    See `memory/core/60-filing-rules.md` for the full rubric and the
+    misfiling table.
+    """
+)
+
+
 def _default_saga_toml(home: Path, api_key: str) -> str:
     """v0.5 §2: saga.toml the in-process saga reads at boot.
 
@@ -1006,6 +1041,11 @@ def setup_home(home: Path) -> dict[str, object]:
         DEFAULT_FILING_RULES,
     ):
         files_created.append("memory/core/60-filing-rules.md")
+    if _write_if_missing(
+        home / "memory" / "issues" / "README.md",
+        DEFAULT_ISSUES_README,
+    ):
+        files_created.append("memory/issues/README.md")
     if _write_if_missing(
         home / "state" / "proposed-changes.md", DEFAULT_PROPOSED_CHANGES
     ):
