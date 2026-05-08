@@ -200,8 +200,6 @@ def build_wiki_index(home: Path) -> str:
                 text = path.read_text(encoding="utf-8")
             except OSError:
                 continue
-            from .memory import describe_file
-
             desc, is_auto = describe_file(text)
             rel = f"{subdir}/{path.relative_to(section_root).as_posix()}"
             entries.append(IndexEntry(
