@@ -216,32 +216,51 @@ class MessageBuffer:
         *,
         source_allowlist: frozenset[str] | None = None,
     ) -> list[Message]:
-        """Last ``limit`` messages on ``channel_id``. Falls back to global if
-        the channel queue is empty (open-strix's exact rule, SPEC §5.4).
+        """Last ``limit`` recent messages, scoped per the Phase C
+        cross-channel-content rule (chainlink #40 / #43):
+
+        - **Public-channel target.** Pool is *all public channels'*
+          most-recent activity, ranked by recency. The current channel
+          contributes naturally; quiet channels are still represented
+          by their tail. Diverges from the prior "current-channel queue
+          with global fallback when empty" rule — operator-confirmed
+          dumb-recency global pool.
+        - **DM target.** Pool stays the global ``self._all`` window,
+          which the runtime still gates per-message via
+          ``_is_private_channel(msg.channel_id)`` upstream of any
+          cross-channel render. Behaviorally unchanged from before.
+
+        Privacy: ``_is_private_channel(msg.channel_id)`` excludes any
+        message whose channel id is a DM when the target channel is
+        public — so a bot replying in ``#eng`` can never see its own DM
+        transcripts as "Recent activity," regardless of whether
+        ``#eng`` itself has prior history. The DM-into-public leak path
+        is closed at the source the same way it was before Phase C.
+
         ``limit=0`` returns nothing (used to disable Recent activity in
-        benchmarks; bare slicing with ``[-0:]`` would return the full list).
+        benchmarks; bare slicing with ``[-0:]`` would return the full
+        list).
 
-        ``source_allowlist`` filters the candidate pool by ``Message.source``.
-        ``None`` means no filter; a frozenset means "only these sources".
-        Messages with ``source=None`` are excluded when an allowlist is set.
-
-        Privacy: when we fall back to global, DM channels are filtered out so
-        a bot replying in ``#eng`` (with empty ``#eng`` history) can never see
-        its own DM transcripts as "Recent activity". This diverges from
-        open-strix-base, which predates the cross-channel pull and doesn't
-        face this leak.
+        ``source_allowlist`` filters the candidate pool by
+        ``Message.source``. ``None`` means no filter; a frozenset means
+        "only these sources". Messages with ``source=None`` are
+        excluded when an allowlist is set.
         """
         if limit <= 0:
             return []
-        ch = self._by_channel.get(channel_id)
-        if ch is not None and len(ch) > 0:
-            pool = list(ch)
+        if _is_private_channel(channel_id):
+            # DM target — pool is everything (its own DM + public). The
+            # runtime's outbound-render layer is responsible for any
+            # further DM-vs-public scoping.
+            pool = list(self._all)
         else:
-            # Global fallback — but never surface DMs into a non-DM channel.
-            if _is_private_channel(channel_id):
-                pool = list(self._all)
-            else:
-                pool = [m for m in self._all if not _is_private_channel(m.channel_id)]
+            # Public target — pool is all public-channel messages, no
+            # per-channel preference. The current channel's tail will
+            # naturally dominate when it's busy; quieter peers
+            # contribute when they have recent activity.
+            pool = [
+                m for m in self._all if not _is_private_channel(m.channel_id)
+            ]
         if source_allowlist is not None:
             pool = [m for m in pool if m.source in source_allowlist]
         return pool[-limit:]
@@ -382,12 +401,25 @@ def render_recent_activity(
     inbound (e.g. a 500-post bluesky seed transcript) blowing the model's
     context when prior messages are included via the SPEC §5.4 deque pull.
 
-    ``resolver`` (FUTURE_WORK §6.1) — when present and the message's author
-    has an identity record, the rendered author uses the record's
-    ``display_name`` instead of the per-message ``author_display``. So Alice
-    on Slack and Alice on Discord render with the same name. The "Known
-    identities" preamble (built separately by ``render_identity_context``)
-    surfaces the canonical + aliases so the agent connects the dots.
+    ``resolver`` (FUTURE_WORK §6.1) — when present, lookups happen on
+    both axes:
+
+    - **Author side.** If the message's author has an identity record,
+      render the record's ``display_name`` instead of the per-message
+      ``author_display``. Alice on Slack and Alice on Discord render
+      with the same name.
+    - **Channel side** (chainlink #40 Phase C). If the message's
+      ``channel_id`` is registered, render
+      ``<display_name> (<channel_id>)`` so the agent reads
+      ``[ts jason-mimir (discord-1500…)]`` instead of bare opaque ids.
+      The id stays in the line so the agent can still target the
+      channel by id when needed. Channels not registered fall through
+      to the bare id (existing format).
+
+    The "Known identities" preamble (built separately by
+    ``render_identity_context``) surfaces canonicals + aliases so the
+    agent connects the dots between the rendered name and the platform
+    ids.
     """
     lines: list[str] = []
     for m in messages:
@@ -408,7 +440,17 @@ def render_recent_activity(
         # messages with ``<react message="<id>" />``. Skipped when the
         # record has no id (legacy entries, system_notes).
         id_part = f" id={m.msg_id}" if m.msg_id else ""
-        lines.append(f"[{ts_short} {m.channel_id}{id_part}] {author}: {content}")
+        # Phase C channel-side resolution: if the resolver knows this
+        # channel, prefix its display_name. ``getattr`` guards against
+        # legacy resolvers without the channel API.
+        channel_field = m.channel_id
+        if resolver is not None:
+            channel_lookup = getattr(resolver, "channel_display_name", None)
+            if callable(channel_lookup):
+                display = channel_lookup(m.channel_id)
+                if display:
+                    channel_field = f"{display} ({m.channel_id})"
+        lines.append(f"[{ts_short} {channel_field}{id_part}] {author}: {content}")
     return "\n".join(lines)
 
 
