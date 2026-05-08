@@ -270,3 +270,270 @@ def test_email_works_as_alias(tmp_path: Path):
     )
     assert r2.resolve("email:alice@work.example.com") == "alice"
     assert r2.resolve("email:alice@personal.example.com") == "alice"
+
+
+# ---------------------------------------------------------------------------
+# Channels (chainlink #40 Phase A) — the channels: section is parallel to
+# people: with ``kind`` added. Backwards-compat: missing channels: = empty.
+# ---------------------------------------------------------------------------
+
+
+def test_no_channels_section_is_empty(tmp_path: Path):
+    """A people-only file (existing operator config) loads identically:
+    people side works, channel side is empty."""
+    r = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: alice
+            aliases: [slack-U123]
+        """,
+    )
+    assert r.resolve("slack-U123") == "alice"
+    assert r.channel_count() == 0
+    assert r.all_channels() == []
+    assert r.resolve_channel("discord-1500") == "discord-1500"  # passthrough
+    assert r.channel_display_name("discord-1500") is None
+    assert r.channel("discord-1500") is None
+
+
+def test_channels_only_file_loads(tmp_path: Path):
+    """A channels-only file (no people:) is valid — channels-only
+    operator configs are explicitly supported."""
+    r = _write_identities(
+        tmp_path,
+        """\
+        channels:
+          - canonical: discord-1500
+            display_name: jason-mimir
+            kind: public
+        """,
+    )
+    # People side empty.
+    assert r.alias_count() == 0
+    # Channel side loaded.
+    assert r.channel_count() == 1
+    assert r.channel_display_name("discord-1500") == "jason-mimir"
+    ch = r.channel("discord-1500")
+    assert ch is not None
+    assert ch.canonical == "discord-1500"
+    assert ch.kind == "public"
+
+
+def test_loads_channel_with_full_fields(tmp_path: Path):
+    r = _write_identities(
+        tmp_path,
+        """\
+        channels:
+          - canonical: discord-1500
+            display_name: jason-mimir
+            kind: public
+            aliases: ["#general", mimir-main]
+            notes: Primary operator channel
+        """,
+    )
+    assert r.channel_count() == 1
+    assert r.resolve_channel("discord-1500") == "discord-1500"
+    assert r.resolve_channel("#general") == "discord-1500"
+    assert r.resolve_channel("mimir-main") == "discord-1500"
+    assert r.channel_display_name("#general") == "jason-mimir"
+    ch = r.channel("mimir-main")
+    assert ch is not None
+    assert ch.notes == "Primary operator channel"
+    assert ch.kind == "public"
+    assert "#general" in ch.aliases
+
+
+def test_resolve_channel_falls_through_unknown(tmp_path: Path):
+    r = _write_identities(
+        tmp_path,
+        """\
+        channels:
+          - canonical: discord-known
+            kind: public
+        """,
+    )
+    assert r.resolve_channel("discord-known") == "discord-known"
+    assert r.resolve_channel("discord-NOPE") == "discord-NOPE"
+    assert r.resolve_channel(None) is None
+
+
+def test_channel_kind_unknown_value_passes_through(tmp_path: Path):
+    """Unknown ``kind`` strings are stored verbatim — new bridge kinds
+    don't require a code change."""
+    r = _write_identities(
+        tmp_path,
+        """\
+        channels:
+          - canonical: bsky-feed-1
+            kind: bluesky-firehose
+        """,
+    )
+    ch = r.channel("bsky-feed-1")
+    assert ch is not None
+    assert ch.kind == "bluesky-firehose"
+
+
+def test_channel_kind_non_string_ignored(tmp_path: Path):
+    """A non-string ``kind`` is dropped (None) but the channel still
+    loads — same liberal-on-read posture as people."""
+    r = _write_identities(
+        tmp_path,
+        """\
+        channels:
+          - canonical: ch-1
+            kind: 42
+        """,
+    )
+    ch = r.channel("ch-1")
+    assert ch is not None
+    assert ch.kind is None
+
+
+def test_malformed_channel_skipped_others_load(tmp_path: Path):
+    r = _write_identities(
+        tmp_path,
+        """\
+        channels:
+          - canonical: ch-good
+            kind: public
+          - kind: public                  # missing canonical, skip
+          - canonical: ""                 # empty canonical, skip
+            kind: public
+          - "not a dict"                  # not a dict, skip
+          - canonical: ch-also-good
+            kind: dm
+        """,
+    )
+    assert r.channel_count() == 2
+    assert r.channel("ch-good") is not None
+    assert r.channel("ch-also-good") is not None
+
+
+def test_duplicate_channel_alias_last_wins(tmp_path: Path):
+    r = _write_identities(
+        tmp_path,
+        """\
+        channels:
+          - canonical: ch-a
+            aliases: [shared]
+            kind: public
+          - canonical: ch-b
+            aliases: [shared]
+            kind: public
+        """,
+    )
+    assert r.resolve_channel("shared") == "ch-b"
+
+
+def test_people_and_channels_coexist(tmp_path: Path):
+    """The two registries are independent — same alias key can mean
+    different things on the people vs channel side without conflict."""
+    r = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: alice
+            aliases: [slack-U123]
+        channels:
+          - canonical: discord-1500
+            display_name: jason-mimir
+            kind: public
+        """,
+    )
+    assert r.resolve("slack-U123") == "alice"
+    assert r.channel_display_name("discord-1500") == "jason-mimir"
+    # People side returns nothing for a channel id, channel side returns
+    # nothing for a person alias.
+    assert r.display_name("discord-1500") is None
+    assert r.channel("slack-U123") is None
+
+
+def test_channels_field_must_be_list(tmp_path: Path):
+    """A non-list channels: value is treated as empty (warned), people
+    side still loads."""
+    r = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: alice
+            aliases: [slack-U123]
+        channels: "should be a list"
+        """,
+    )
+    assert r.resolve("slack-U123") == "alice"
+    assert r.channel_count() == 0
+
+
+def test_strips_whitespace_on_channel_canonical_and_aliases(tmp_path: Path):
+    r = _write_identities(
+        tmp_path,
+        """\
+        channels:
+          - canonical: "  ch-1  "
+            aliases:
+              - "  alias-1  "
+            kind: public
+        """,
+    )
+    assert r.resolve_channel("ch-1") == "ch-1"
+    assert r.resolve_channel("alias-1") == "ch-1"
+
+
+def test_reload_picks_up_channel_changes(tmp_path: Path):
+    state = tmp_path / "state"
+    state.mkdir()
+    yaml_path = state / "identities.yaml"
+    yaml_path.write_text(
+        dedent(
+            """\
+            channels:
+              - canonical: ch-1
+                kind: public
+            """
+        )
+    )
+    r = IdentityResolver(home=tmp_path)
+    r.reload()
+    assert r.channel_count() == 1
+    assert r.channel("ch-2") is None
+
+    yaml_path.write_text(
+        dedent(
+            """\
+            channels:
+              - canonical: ch-1
+                kind: public
+              - canonical: ch-2
+                kind: dm
+            """
+        )
+    )
+    r.reload()
+    assert r.channel_count() == 2
+    assert r.channel("ch-2") is not None
+
+
+def test_missing_file_clears_channel_state(tmp_path: Path):
+    """If the file disappears, both registries clear (matches existing
+    people-side behavior — missing file = empty resolver)."""
+    state = tmp_path / "state"
+    state.mkdir()
+    yaml_path = state / "identities.yaml"
+    yaml_path.write_text(
+        dedent(
+            """\
+            channels:
+              - canonical: ch-1
+                kind: public
+            """
+        )
+    )
+    r = IdentityResolver(home=tmp_path)
+    r.reload()
+    assert r.channel_count() == 1
+
+    yaml_path.unlink()
+    r.reload()
+    assert r.channel_count() == 0
+    assert r.channel("ch-1") is None
