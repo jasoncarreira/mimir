@@ -651,16 +651,19 @@ async def test_pre_hook_budget_events_record_resolution_path_session_id(
 
 
 @_pytest.mark.asyncio
-async def test_pre_hook_budget_events_record_resolution_path_contextvar(
+async def test_pre_hook_budget_events_record_resolution_path_single_active(
     tmp_path: Path,
 ):
-    """CR#18: when only the contextvar is set (same-task fallback path
-    used by direct invocations and many tests), events tag
-    resolution_path='contextvar'. session_id is not present in the
-    input_data, so by-session-id lookup misses and we fall through."""
+    """When the SDK doesn't pass a matching session_id but exactly one
+    turn is registered in ``_active_turns``, the resolution chain picks
+    it via ``get_only_active_turn()`` (resolution_path='single_active').
+    This is the primary production path: SDK 0.1.x emits a CLI-internal
+    session_id that doesn't match our turn_id keys, so the chain falls
+    through to the single-active heuristic — which is what we want, the
+    one in-flight turn IS the one we should be enforcing against."""
     hook = make_pre_tool_use_hook(tmp_path)
     ctx = _budget_ctx(budget=1)  # any over-budget call denies immediately
-    token = _context.set_current_turn(ctx)
+    token = _context.set_current_turn(ctx)  # registers in _active_turns
     try:
         for _i in range(2):
             await hook(
@@ -669,7 +672,7 @@ async def test_pre_hook_budget_events_record_resolution_path_contextvar(
                     "tool_name": "Read",
                     "tool_input": {"file_path": "memory/x.md"},
                     "tool_use_id": "tu",
-                    # No session_id — forces contextvar fallback.
+                    # No session_id — forces single_active resolution.
                 },
                 "tu",
                 _ctx(),
@@ -685,7 +688,58 @@ async def test_pre_hook_budget_events_record_resolution_path_contextvar(
         and e.get("reason") == "tool_call_budget_exceeded"
     ]
     assert denies, "expected a tool_call_denied event"
-    assert all(e.get("resolution_path") == "contextvar" for e in denies)
+    assert all(e.get("resolution_path") == "single_active" for e in denies)
+
+
+@_pytest.mark.asyncio
+async def test_pre_hook_budget_punts_on_stale_contextvar(tmp_path: Path):
+    """The SDK's hook task is forked at first ``client.connect()`` and
+    captures whatever ``_current_turn`` was at that moment. If that
+    turn ends but the hook task's contextvar still points at it, the
+    hook would otherwise mutate the dead ctx forever — its
+    ``tool_call_count`` accumulates across every subsequent turn until
+    it exceeds budget, and from then on every tool call is denied.
+
+    Guard: when the contextvar fallback resolves to a ctx whose
+    turn_id is no longer in ``_active_turns``, we DON'T enforce. A
+    ``tool_call_budget_punted`` event surfaces the punt for ops."""
+    from mimir._context import _active_turns
+
+    hook = make_pre_tool_use_hook(tmp_path)
+    # Build a ctx that's set on the contextvar but explicitly NOT in
+    # _active_turns — simulates the post-turn-end state where the hook
+    # task is still pointing at a deregistered ctx.
+    ctx = _budget_ctx(budget=1)
+    ctx.tool_call_count = 999  # would otherwise deny immediately
+    _context._current_turn.set(ctx)
+    assert ctx.turn_id not in _active_turns
+
+    out = await hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "memory/x.md"},
+            "tool_use_id": "tu",
+        },
+        "tu",
+        _ctx(),
+    )
+    # No deny — the stale ctx is treated as "no active turn".
+    assert out == {} or "permissionDecision" not in out.get(
+        "hookSpecificOutput", {}
+    )
+    # Stale ctx's count must NOT have been incremented.
+    assert ctx.tool_call_count == 999
+
+    events = _read_events(tmp_path)
+    punts = [
+        e
+        for e in events
+        if e.get("type") == "tool_call_budget_punted"
+        and e.get("reason") == "stale_contextvar"
+    ]
+    assert punts, "expected a tool_call_budget_punted event"
+    assert punts[0].get("stale_turn_id") == ctx.turn_id
 
 
 @_pytest.mark.asyncio
