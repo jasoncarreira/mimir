@@ -725,14 +725,17 @@ class _AsyncClaudeRunner:
             self._client = None
 
 
-class _AsyncClaudePool:
+from .async_pool import BoundedAsyncPool
+
+
+class _AsyncClaudePool(BoundedAsyncPool["_AsyncClaudeRunner"]):
     """Bounded asyncio-native pool of ``_AsyncClaudeRunner`` instances.
 
-    Tied to a single event loop — the ``asyncio.Condition`` binds to
-    the running loop on first ``acquire``/``release``. Different loops
-    (e.g., test isolation) need different pool instances; see
-    ``_get_async_claude_pool`` for the per-loop registry that
-    enforces this.
+    Tied to a single event loop — the ``asyncio.Condition`` (inherited
+    via ``BoundedAsyncPool``) binds to the running loop on first
+    ``acquire``/``release``. Different loops (e.g., test isolation)
+    need different pool instances; see ``_get_async_claude_pool`` for
+    the per-loop registry that enforces this.
 
     Cross-task parallelism is preserved up to ``max_size`` concurrent
     callers — important for cross-channel mimir traffic where Discord
@@ -745,29 +748,13 @@ class _AsyncClaudePool:
     runners — once created they live until the pool is closed."""
 
     def __init__(self, max_size: int, recycle_after: int) -> None:
-        if max_size < 1:
-            raise ValueError(f"max_size must be >= 1, got {max_size}")
-        self._max_size = max_size
+        super().__init__(max_size)
         self._recycle_after = recycle_after
-        self._idle: list[_AsyncClaudeRunner] = []
         self._size = 0  # idle + in-flight, never decremented
-        self._cond: "Any | None" = None  # asyncio.Condition; lazy-bound to running loop
-
-    @property
-    def max_size(self) -> int:
-        return self._max_size
 
     @property
     def size(self) -> int:
         return self._size
-
-    def _condition(self) -> Any:
-        """Lazy-bind the condition to the running loop. Module import
-        shouldn't require an event loop."""
-        if self._cond is None:
-            import asyncio
-            self._cond = asyncio.Condition()
-        return self._cond
 
     async def acquire(self) -> "_AsyncClaudeRunner":
         """Block (await) until an instance is available; return it.
