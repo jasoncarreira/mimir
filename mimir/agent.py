@@ -241,10 +241,20 @@ class _PoolEntry:
         self.stale = False
 
 
-class ClientPool:
+from saga.async_pool import BoundedAsyncPool
+
+
+class ClientPool(BoundedAsyncPool[_PoolEntry]):
     """Asyncio-aware pool of ``ClaudeSDKClient`` instances. Replaces
     the single-shared-client + global ``asyncio.Lock`` so concurrent
     turns can run in parallel.
+
+    Inherits the bookkeeping skeleton (max-size validation, lazy
+    condition binding, idle stack) from ``saga.async_pool.BoundedAsyncPool``;
+    adds mimir-specific policy: fingerprint-keyed drain-on-flip, an
+    ``_in_flight`` set for size accounting (so ``size`` reflects both
+    idle and in-flight clients), and the release-during-connect lock
+    dance for async cold-start.
 
     Not thread-safe — assumes a single asyncio event loop, which is
     mimir's runtime model. The internal ``asyncio.Condition`` binds to
@@ -252,21 +262,12 @@ class ClientPool:
     """
 
     def __init__(self, *, max_size: int = _POOL_MAX_SIZE) -> None:
-        self.max_size = max_size
-        self._idle: list[_PoolEntry] = []
+        super().__init__(max_size)
         self._in_flight: set[_PoolEntry] = set()
         # Pool's "current" fingerprint. None when empty (first acquire
         # sets it). When acquire arrives with a different fingerprint,
         # flips here and the drain happens.
         self._current_fingerprint: str | None = None
-        self._cond: asyncio.Condition | None = None
-
-    def _condition(self) -> asyncio.Condition:
-        """Lazy-bind the condition variable to the running loop. Module
-        import shouldn't require an event loop."""
-        if self._cond is None:
-            self._cond = asyncio.Condition()
-        return self._cond
 
     @property
     def size(self) -> int:
