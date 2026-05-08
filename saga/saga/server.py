@@ -274,14 +274,14 @@ async def api_health():
 
 @app.post("/v1/store", dependencies=[Depends(verify_api_key)])
 async def api_store(req: StoreRequest):
-    def _store():
-        from .annotate import smart_annotate, classify_stream, classify_profile
-        from .core import store_atom
+    from .annotate import smart_annotate, classify_stream, classify_profile
+    from .core import store_atom
 
-        stream = req.stream or classify_stream(req.content)
-        profile = req.profile or classify_profile(req.content)
-        annotations = smart_annotate(req.content, use_llm=req.use_llm_annotate)
+    stream = req.stream or classify_stream(req.content)
+    profile = req.profile or classify_profile(req.content)
+    annotations = await smart_annotate(req.content, use_llm=req.use_llm_annotate)
 
+    def _store_sync():
         result = store_atom(
             content=req.content, stream=stream, profile=profile,
             **annotations, source_type=req.source_type, metadata=req.metadata,
@@ -322,223 +322,223 @@ async def api_store(req: StoreRequest):
                 "profile": profile, "annotations": annotations,
                 "triples_extracted": 0}
 
-    return await asyncio.to_thread(_store)
+    return await asyncio.to_thread(_store_sync)
 
 
 # ─── POST /v1/query ───────────────────────────────────────────────────────────
 
 @app.post("/v1/query", dependencies=[Depends(verify_api_key)])
 async def api_query(req: QueryRequest):
-    def _query():
-        t0 = time.time()
+    t0 = time.time()
 
-        # Determine whether the caller wants the two-tier
-        # {observations, raws} shape. Per-call request field wins; falls back
-        # to [retrieval] two_tier_enabled config; final default True (the
-        # canonical-best mechanism on bench).
-        two_tier = req.two_tier
-        if two_tier is None:
-            two_tier = bool(_cfg('retrieval', 'two_tier_enabled', True))
+    # Determine whether the caller wants the two-tier
+    # {observations, raws} shape. Per-call request field wins; falls back
+    # to [retrieval] two_tier_enabled config; final default True (the
+    # canonical-best mechanism on bench).
+    two_tier = req.two_tier
+    if two_tier is None:
+        two_tier = bool(_cfg('retrieval', 'two_tier_enabled', True))
 
-        if two_tier:
-            from datetime import datetime
-            from .core import hybrid_retrieve
+    if two_tier:
+        from datetime import datetime
+        from .core import hybrid_retrieve
 
-            ref_date = None
-            if req.reference_date:
-                try:
-                    iso = req.reference_date.replace('Z', '+00:00')
-                    ref_date = datetime.fromisoformat(iso)
-                except (ValueError, AttributeError):
-                    ref_date = None
+        ref_date = None
+        if req.reference_date:
+            try:
+                iso = req.reference_date.replace('Z', '+00:00')
+                ref_date = datetime.fromisoformat(iso)
+            except (ValueError, AttributeError):
+                ref_date = None
 
-            result = hybrid_retrieve(
-                req.query,
-                mode=req.mode,
-                top_k=req.top_k,
-                reference_date=ref_date,
-                two_tier=True,
-                context=req.context,
-                session_id=req.session_id,
-            )
-            obs = result.get("observations", []) or []
-            raws = result.get("raws", []) or []
-
-            # Per-atom confidence filtering. Each atom carries its own
-            # _confidence_tier (set in retrieve() for in-pool atoms; in
-            # _two_tier_split for pulled-in missing atoms). Atoms whose
-            # tier ranks below the floor are dropped before the response
-            # is returned.
-            gated_reason = None
-            if _cfg('retrieval', 'enable_confidence_gating', True):
-                floor = req.min_confidence_tier or _cfg(
-                    'retrieval', 'default_min_confidence_tier', 'low'
-                )
-                _tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
-                floor_rank = _tier_rank.get(floor, 1)  # default to "low"
-
-                def _passes(a: dict) -> bool:
-                    t = a.get("_confidence_tier", "none")
-                    return _tier_rank.get(t, 0) >= floor_rank
-
-                obs_before = len(obs)
-                raws_before = len(raws)
-                obs = [o for o in obs if _passes(o)]
-                raws = [r for r in raws if _passes(r)]
-                obs_dropped = obs_before - len(obs)
-                raws_dropped = raws_before - len(raws)
-                if obs_dropped or raws_dropped:
-                    gated_reason = (
-                        f"floor={floor}: dropped {obs_dropped} obs and "
-                        f"{raws_dropped} raws below threshold"
-                    )
-
-            # P42: optionally surface top-N triples as a third response
-            # block. Cosine-matched against query embedding; carries
-            # valid_from / valid_until / confidence / source_atom_id
-            # so the agent can read structured facts directly. Strict
-            # no-op when [retrieval] include_triples_in_response is
-            # False (the canonical default).
-            triples_block: list[dict] = []
-            if _cfg('retrieval', 'include_triples_in_response', False):
-                try:
-                    from .triples import query_triples_for_response
-                    triples_block = query_triples_for_response(
-                        req.query,
-                        top_k=int(_cfg('retrieval', 'response_triples_top_k', 5)),
-                    )
-                except Exception:
-                    # Best effort — surfacing triples is additive, never
-                    # block the query response on it.
-                    triples_block = []
-
-            return {
-                "query": req.query,
-                "mode": req.mode,
-                "two_tier": True,
-                "gated": gated_reason is not None,
-                "gated_reason": gated_reason,
-                "observations": [_format_atom(o) for o in obs],
-                "raws": [_format_atom(r) for r in raws],
-                "triples": triples_block,
-                "items_returned": len(obs) + len(raws) + len(triples_block),
-                "latency_ms": round((time.time() - t0) * 1000, 2),
-            }
-
-        from .triples import hybrid_retrieve_with_triples
-
-        result = hybrid_retrieve_with_triples(req.query, mode=req.mode,
-                                               token_budget=req.token_budget,
-                                               context=req.context,
-                                               session_id=req.session_id)
-        latency_ms = (time.time() - t0) * 1000
-
-        # Determine confidence tier
-        raw_atoms = result.get("_raw_atoms", [])
-        atom_results = list(raw_atoms)
-        _tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
-
-        if not raw_atoms and not result["triples"]:
-            confidence_tier = "none"
-        elif raw_atoms:
-            best_tier = "none"
-            for a in raw_atoms:
-                t = a.get("_confidence_tier", "low")
-                if _tier_rank.get(t, 0) > _tier_rank.get(best_tier, 0):
-                    best_tier = t
-            top_tier = raw_atoms[0].get("_retrieval_confidence_tier", best_tier)
-            confidence_tier = best_tier if _tier_rank.get(best_tier, 0) >= _tier_rank.get(top_tier, 0) else top_tier
-        elif result["triples"]:
-            _temporal_markers = {'right now', 'today', 'currently', 'this session',
-                                 'just now', 'this morning', 'tonight', 'earlier today'}
-            is_temporal = any(m in req.query.lower() for m in _temporal_markers)
-            confidence_tier = "low" if is_temporal or len(result["triples"]) < 10 else "medium"
-        else:
-            confidence_tier = "none"
-
-        # Confidence-gated output volume
-        gated = True
-        gated_reason = None
-        if confidence_tier == "none":
-            result["triples"] = []
-            atom_results = []
-            gated_reason = "no data -- output suppressed"
-        elif confidence_tier == "low":
-            atom_results = atom_results[:1] if atom_results else []
-            result["triples"] = []
-            gated_reason = "low confidence -- output minimized (1 atom, no triples)"
-        elif confidence_tier == "medium":
-            _sim_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
-            atom_results = [a for a in atom_results if a.get("_similarity", 0) > _sim_low] or atom_results[:2]
-            atom_results = atom_results[:3]
-            result["triples"] = result["triples"][:8]
-            gated_reason = "medium confidence -- pruned zero-sim atoms, capped triples at 8"
-        elif confidence_tier == "high":
-            good_atoms = [a for a in atom_results if a.get("_similarity", 0) > 0.10]
-            if good_atoms:
-                atom_results = good_atoms
-            result["triples"] = result["triples"][:12]
-            gated_reason = "high confidence -- pruned zero-sim atoms, capped triples at 12"
-
-        output_triples = [
-            {"subject": t["subject"], "predicate": t["predicate"], "object": t["object"]}
-            for t in result["triples"]
-        ]
-
-        output_atoms = []
-        for a in atom_results:
-            topics = a.get("topics", [])
-            if isinstance(topics, str):
-                try:
-                    topics = json.loads(topics)
-                except (json.JSONDecodeError, TypeError):
-                    topics = []
-
-            # Parse metadata if it's a JSON string
-            metadata = a.get("metadata", {})
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except (json.JSONDecodeError, TypeError):
-                    metadata = {}
-            output_atoms.append({
-                "id": a["id"], "content": a["content"],
-                "stream": a.get("stream", "semantic"),
-                "similarity": round(a.get("_similarity", 0), 3),
-                "score": round(a.get("_combined_score", a.get("_activation", 0)), 3),
-                "confidence_tier": a.get("_confidence_tier", "unknown"),
-                "topics": topics,
-                "metadata": metadata,
-                "source_type": a.get("source_type", "unknown"),
-            })
-
-        total_tokens = sum(len(a["content"]) // 4 for a in output_atoms)
-        total_tokens += sum(
-            len(f'{t["subject"]} {t["predicate"]} {t["object"]}') // 4
-            for t in output_triples
+        result = await hybrid_retrieve(
+            req.query,
+            mode=req.mode,
+            top_k=req.top_k,
+            reference_date=ref_date,
+            two_tier=True,
+            context=req.context,
+            session_id=req.session_id,
         )
+        obs = result.get("observations", []) or []
+        raws = result.get("raws", []) or []
 
-        response = {
-            "query": req.query, "mode": req.mode,
-            "confidence_tier": confidence_tier,
-            "triples": output_triples, "atoms": output_atoms,
-            "total_tokens": total_tokens,
-            "items_returned": len(output_atoms) + len(output_triples),
-            "query_type": result.get("query_type", "mixed"),
-            "latency_ms": round(latency_ms, 2),
-            "gated": gated, "gated_reason": gated_reason,
+        # Per-atom confidence filtering. Each atom carries its own
+        # _confidence_tier (set in retrieve() for in-pool atoms; in
+        # _two_tier_split for pulled-in missing atoms). Atoms whose
+        # tier ranks below the floor are dropped before the response
+        # is returned.
+        gated_reason = None
+        if _cfg('retrieval', 'enable_confidence_gating', True):
+            floor = req.min_confidence_tier or _cfg(
+                'retrieval', 'default_min_confidence_tier', 'low'
+            )
+            _tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
+            floor_rank = _tier_rank.get(floor, 1)  # default to "low"
+
+            def _passes(a: dict) -> bool:
+                t = a.get("_confidence_tier", "none")
+                return _tier_rank.get(t, 0) >= floor_rank
+
+            obs_before = len(obs)
+            raws_before = len(raws)
+            obs = [o for o in obs if _passes(o)]
+            raws = [r for r in raws if _passes(r)]
+            obs_dropped = obs_before - len(obs)
+            raws_dropped = raws_before - len(raws)
+            if obs_dropped or raws_dropped:
+                gated_reason = (
+                    f"floor={floor}: dropped {obs_dropped} obs and "
+                    f"{raws_dropped} raws below threshold"
+                )
+
+        # P42: optionally surface top-N triples as a third response
+        # block. Cosine-matched against query embedding; carries
+        # valid_from / valid_until / confidence / source_atom_id
+        # so the agent can read structured facts directly. Strict
+        # no-op when [retrieval] include_triples_in_response is
+        # False (the canonical default).
+        triples_block: list[dict] = []
+        if _cfg('retrieval', 'include_triples_in_response', False):
+            try:
+                from .triples import query_triples_for_response
+                triples_block = query_triples_for_response(
+                    req.query,
+                    top_k=int(_cfg('retrieval', 'response_triples_top_k', 5)),
+                )
+            except Exception:
+                # Best effort — surfacing triples is additive, never
+                # block the query response on it.
+                triples_block = []
+
+        return {
+            "query": req.query,
+            "mode": req.mode,
+            "two_tier": True,
+            "gated": gated_reason is not None,
+            "gated_reason": gated_reason,
+            "observations": [_format_atom(o) for o in obs],
+            "raws": [_format_atom(r) for r in raws],
+            "triples": triples_block,
+            "items_returned": len(obs) + len(raws) + len(triples_block),
+            "latency_ms": round((time.time() - t0) * 1000, 2),
         }
 
-        if confidence_tier == "none":
-            response["confidence_advisory"] = "[NO_DATA] No reliable memory on this topic."
-        elif confidence_tier == "low":
-            response["confidence_advisory"] = (
-                "[LOW_CONFIDENCE] Results exist but confidence is below threshold. "
-                "Treat with caution."
-            )
-        return response
+    # Single-tier branch.
+    from .triples import hybrid_retrieve_with_triples
 
-    return await asyncio.to_thread(_query)
+    result = await hybrid_retrieve_with_triples(
+        req.query, mode=req.mode,
+        token_budget=req.token_budget,
+        context=req.context,
+        session_id=req.session_id,
+    )
+    latency_ms = (time.time() - t0) * 1000
+
+    # Determine confidence tier
+    raw_atoms = result.get("_raw_atoms", [])
+    atom_results = list(raw_atoms)
+    _tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
+
+    if not raw_atoms and not result["triples"]:
+        confidence_tier = "none"
+    elif raw_atoms:
+        best_tier = "none"
+        for a in raw_atoms:
+            t = a.get("_confidence_tier", "low")
+            if _tier_rank.get(t, 0) > _tier_rank.get(best_tier, 0):
+                best_tier = t
+        top_tier = raw_atoms[0].get("_retrieval_confidence_tier", best_tier)
+        confidence_tier = best_tier if _tier_rank.get(best_tier, 0) >= _tier_rank.get(top_tier, 0) else top_tier
+    elif result["triples"]:
+        _temporal_markers = {'right now', 'today', 'currently', 'this session',
+                             'just now', 'this morning', 'tonight', 'earlier today'}
+        is_temporal = any(m in req.query.lower() for m in _temporal_markers)
+        confidence_tier = "low" if is_temporal or len(result["triples"]) < 10 else "medium"
+    else:
+        confidence_tier = "none"
+
+    # Confidence-gated output volume
+    gated = True
+    gated_reason = None
+    if confidence_tier == "none":
+        result["triples"] = []
+        atom_results = []
+        gated_reason = "no data -- output suppressed"
+    elif confidence_tier == "low":
+        atom_results = atom_results[:1] if atom_results else []
+        result["triples"] = []
+        gated_reason = "low confidence -- output minimized (1 atom, no triples)"
+    elif confidence_tier == "medium":
+        _sim_low = _cfg('retrieval', 'confidence_sim_low', 0.15)
+        atom_results = [a for a in atom_results if a.get("_similarity", 0) > _sim_low] or atom_results[:2]
+        atom_results = atom_results[:3]
+        result["triples"] = result["triples"][:8]
+        gated_reason = "medium confidence -- pruned zero-sim atoms, capped triples at 8"
+    elif confidence_tier == "high":
+        good_atoms = [a for a in atom_results if a.get("_similarity", 0) > 0.10]
+        if good_atoms:
+            atom_results = good_atoms
+        result["triples"] = result["triples"][:12]
+        gated_reason = "high confidence -- pruned zero-sim atoms, capped triples at 12"
+
+    output_triples = [
+        {"subject": t["subject"], "predicate": t["predicate"], "object": t["object"]}
+        for t in result["triples"]
+    ]
+
+    output_atoms = []
+    for a in atom_results:
+        topics = a.get("topics", [])
+        if isinstance(topics, str):
+            try:
+                topics = json.loads(topics)
+            except (json.JSONDecodeError, TypeError):
+                topics = []
+
+        # Parse metadata if it's a JSON string
+        metadata = a.get("metadata", {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+        output_atoms.append({
+            "id": a["id"], "content": a["content"],
+            "stream": a.get("stream", "semantic"),
+            "similarity": round(a.get("_similarity", 0), 3),
+            "score": round(a.get("_combined_score", a.get("_activation", 0)), 3),
+            "confidence_tier": a.get("_confidence_tier", "unknown"),
+            "topics": topics,
+            "metadata": metadata,
+            "source_type": a.get("source_type", "unknown"),
+        })
+
+    total_tokens = sum(len(a["content"]) // 4 for a in output_atoms)
+    total_tokens += sum(
+        len(f'{t["subject"]} {t["predicate"]} {t["object"]}') // 4
+        for t in output_triples
+    )
+
+    response = {
+        "query": req.query, "mode": req.mode,
+        "confidence_tier": confidence_tier,
+        "triples": output_triples, "atoms": output_atoms,
+        "total_tokens": total_tokens,
+        "items_returned": len(output_atoms) + len(output_triples),
+        "query_type": result.get("query_type", "mixed"),
+        "latency_ms": round(latency_ms, 2),
+        "gated": gated, "gated_reason": gated_reason,
+    }
+
+    if confidence_tier == "none":
+        response["confidence_advisory"] = "[NO_DATA] No reliable memory on this topic."
+    elif confidence_tier == "low":
+        response["confidence_advisory"] = (
+            "[LOW_CONFIDENCE] Results exist but confidence is below threshold. "
+            "Treat with caution."
+        )
+    return response
 
 
 # ─── POST /v1/feedback ────────────────────────────────────────────────────────
@@ -663,11 +663,9 @@ async def api_stats():
 
 @app.post("/v1/triples/extract", dependencies=[Depends(verify_api_key)])
 async def api_triples_extract(req: TriplesExtractRequest):
-    def _extract():
-        from .triples import extract_and_store
-        count = extract_and_store(req.atom_id, req.content)
-        return {"atom_id": req.atom_id, "triples_extracted": count}
-    return await asyncio.to_thread(_extract)
+    from .triples import extract_and_store
+    count = await extract_and_store(req.atom_id, req.content)
+    return {"atom_id": req.atom_id, "triples_extracted": count}
 
 
 # ─── GET /v1/triples/graph/{entity} ───────────────────────────────────────────
@@ -717,15 +715,13 @@ async def api_predict(req: PredictRequest = PredictRequest()):
 
 @app.post("/v1/consolidate", dependencies=[Depends(verify_api_key)])
 async def api_consolidate(req: ConsolidateRequest = ConsolidateRequest()):
-    def _consolidate():
-        from .consolidation import ConsolidationEngine
-        engine = ConsolidationEngine()
-        return engine.consolidate(
-            dry_run=req.dry_run,
-            max_clusters=req.max_clusters,
-            extra_canonical_subjects=req.extra_canonical_subjects,
-        )
-    return await asyncio.to_thread(_consolidate)
+    from .consolidation import ConsolidationEngine
+    engine = ConsolidationEngine()
+    return await engine.consolidate(
+        dry_run=req.dry_run,
+        max_clusters=req.max_clusters,
+        extra_canonical_subjects=req.extra_canonical_subjects,
+    )
 
 
 # ─── POST /v1/replay ──────────────────────────────────────────────────────────

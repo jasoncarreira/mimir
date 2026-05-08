@@ -70,6 +70,41 @@ _current_turn: ContextVar["TurnContext | None"] = ContextVar(
 _active_turns: dict[str, "TurnContext"] = {}
 
 
+class _TurnCell:
+    """Per-client mutable holder for the currently-acquired turn id.
+
+    The SDK's hook control task is forked at first ``client.connect()``
+    and captures the surrounding ``ContextVar`` values at that instant.
+    A plain ``_current_turn`` value frozen at fork time is useless —
+    later turns can't update what the hook task sees.
+
+    A ``_TurnCell`` flips that property: the contextvar holds a *cell
+    reference*, which the hook task captures. The cell's ``turn_id``
+    attribute is mutable. Mimir stamps it on ``acquire`` and clears it
+    on ``release``; the hook reads ``cell.turn_id`` lazily and gets the
+    live value.
+
+    One cell per pooled client (created when the client is constructed),
+    so multi-channel concurrent turns each have their own cell — the
+    hook task on client A only sees writes from acquires of client A.
+    Cell reads/writes are bare attribute accesses (atomic under the GIL);
+    no lock needed because each cell has at most one acquire-stamping
+    task at a time (the pool serializes acquire of a given entry)."""
+
+    __slots__ = ("turn_id",)
+
+    def __init__(self) -> None:
+        self.turn_id: str | None = None
+
+
+# ContextVar set by the pool before each new client's ``connect()`` so
+# the SDK's forked hook task captures *this client's* cell. The cell
+# stays None outside of a per-client connect.
+_current_client_cell: ContextVar["_TurnCell | None"] = ContextVar(
+    "mimir_current_client_cell", default=None
+)
+
+
 def set_current_turn(ctx: "TurnContext") -> Token:
     _active_turns[ctx.turn_id] = ctx
     return _current_turn.set(ctx)

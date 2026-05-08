@@ -344,7 +344,8 @@ class TestResolveContradictions:
 
 
 class TestExtractAndStore:
-    def test_extract_and_store_no_api_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_extract_and_store_no_api_key(self, monkeypatch):
         """Without NVIDIA_NIM_API_KEY, extract_and_store returns 0."""
         monkeypatch.delenv("NVIDIA_NIM_API_KEY", raising=False)
         conn = _setup_db()
@@ -359,10 +360,11 @@ class TestExtractAndStore:
         conn.close()
 
         from saga.triples import extract_and_store
-        count = extract_and_store("ext1", "The sky is blue")
+        count = await extract_and_store("ext1", "The sky is blue")
         assert count == 0
 
-    def test_extract_and_store_with_mock_llm(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_extract_and_store_with_mock_llm(self, monkeypatch):
         """With mocked LLM, extract_and_store stores triples."""
         conn = _setup_db()
         emb = struct.pack('1024f', *np.random.randn(1024).astype(np.float32))
@@ -375,25 +377,29 @@ class TestExtractAndStore:
         conn.commit()
         conn.close()
 
-        # Mock extract_triples_llm to return triples directly
-        monkeypatch.setattr("saga.triples.extract_triples_llm", lambda c, aid="": [
-            {"atom_id": aid, "subject": "Jaden", "predicate": "lives_in", "object": "Oakland"},
-        ])
+        # Mock extract_triples_llm (now async) to return triples directly
+        async def _mock_extract(c, aid=""):
+            return [
+                {"atom_id": aid, "subject": "Jaden", "predicate": "lives_in", "object": "Oakland"},
+            ]
+        monkeypatch.setattr("saga.triples.extract_triples_llm", _mock_extract)
 
         from saga.triples import extract_and_store
-        count = extract_and_store("ext2", "Jaden lives in Oakland")
+        count = await extract_and_store("ext2", "Jaden lives in Oakland")
         assert count == 1
 
 
 class TestExtractTriplesLlm:
-    def test_no_api_key_returns_empty(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_api_key_returns_empty(self, monkeypatch):
         """Without API key, returns empty list."""
         monkeypatch.delenv("NVIDIA_NIM_API_KEY", raising=False)
         from saga.triples import extract_triples_llm
-        result = extract_triples_llm("The sky is blue")
+        result = await extract_triples_llm("The sky is blue")
         assert result == []
 
-    def test_with_mocked_api(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_with_mocked_api(self, monkeypatch):
         """With mocked API response, extracts triples."""
         monkeypatch.setenv("NVIDIA_NIM_API_KEY", "test-key")
 
@@ -407,7 +413,7 @@ class TestExtractTriplesLlm:
 
         monkeypatch.setattr(requests, "post", lambda *a, **kw: MockResponse())
         from saga.triples import extract_triples_llm
-        result = extract_triples_llm("Jaden lives in Oakland", atom_id="test1")
+        result = await extract_triples_llm("Jaden lives in Oakland", atom_id="test1")
         assert len(result) >= 1
         assert result[0]["subject"] == "Jaden"
 
@@ -415,21 +421,24 @@ class TestExtractTriplesLlm:
 class TestBatchExtractTriples:
     """P7 batch extraction — single LLM call returns triples for many atoms."""
 
-    def test_no_api_key_returns_empty_per_atom(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_api_key_returns_empty_per_atom(self, monkeypatch):
         monkeypatch.delenv("NVIDIA_NIM_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
         from saga.triples import batch_extract_triples_llm
         items = [("a1", "User likes sushi"), ("a2", "Movie 9/10")]
-        result = batch_extract_triples_llm(items)
+        result = await batch_extract_triples_llm(items)
         assert result == {"a1": [], "a2": []}
 
-    def test_empty_items_returns_empty(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_empty_items_returns_empty(self, monkeypatch):
         from saga.triples import batch_extract_triples_llm
-        assert batch_extract_triples_llm([]) == {}
+        assert await batch_extract_triples_llm([]) == {}
 
-    def test_parses_per_atom_blocks(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_parses_per_atom_blocks(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
         import requests
@@ -461,7 +470,7 @@ class TestBatchExtractTriples:
             ("aid_2", "User feels reflective today"),
             ("aid_3", "Code Geass R2 9/10"),
         ]
-        result = batch_extract_triples_llm(items)
+        result = await batch_extract_triples_llm(items)
         assert set(result.keys()) == {"aid_1", "aid_2", "aid_3"}
         assert len(result["aid_1"]) == 2
         # Map atom_id back through to the parsed triples
@@ -471,7 +480,8 @@ class TestBatchExtractTriples:
         assert len(result["aid_3"]) == 1
         assert result["aid_3"][0]["subject"] == "Code_Geass"
 
-    def test_batch_size_chunks(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_batch_size_chunks(self, monkeypatch):
         """With batch_size=2 over 3 items, the function should make 2
         LLM calls and merge results."""
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
@@ -499,14 +509,15 @@ class TestBatchExtractTriples:
         monkeypatch.setattr(requests, "post", mock_post)
         from saga.triples import batch_extract_triples_llm
         items = [("a1", "1"), ("a2", "2"), ("a3", "3")]
-        result = batch_extract_triples_llm(items, batch_size=2)
+        result = await batch_extract_triples_llm(items, batch_size=2)
         assert call_count["n"] == 2
         assert len(result["a1"]) == 1
         assert len(result["a2"]) == 1
         assert len(result["a3"]) == 1
         assert result["a3"][0]["object"] == "CCC"
 
-    def test_batch_failure_returns_empty_for_that_batch(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_batch_failure_returns_empty_for_that_batch(self, monkeypatch):
         """If a batch's LLM call raises, atoms in that batch get empty
         triple lists but other batches still succeed."""
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
@@ -529,7 +540,7 @@ class TestBatchExtractTriples:
         monkeypatch.setattr(requests, "post", mock_post)
         from saga.triples import batch_extract_triples_llm
         items = [("a1", "1"), ("a2", "2"), ("a3", "3"), ("a4", "4")]
-        result = batch_extract_triples_llm(items, batch_size=2)
+        result = await batch_extract_triples_llm(items, batch_size=2)
         # First batch failed: a1, a2 get empty.
         assert result["a1"] == []
         assert result["a2"] == []
@@ -537,7 +548,8 @@ class TestBatchExtractTriples:
         # (mock only emitted ATOM_1).
         assert len(result["a3"]) == 1
 
-    def test_falls_back_to_reasoning_field(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_falls_back_to_reasoning_field(self, monkeypatch):
         """Reasoning models put output in message.reasoning when content is None."""
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
@@ -554,13 +566,14 @@ class TestBatchExtractTriples:
 
         monkeypatch.setattr(requests, "post", lambda *a, **kw: MockResponse())
         from saga.triples import batch_extract_triples_llm
-        result = batch_extract_triples_llm([("aid", "User lives in Boston")])
+        result = await batch_extract_triples_llm([("aid", "User lives in Boston")])
         assert len(result["aid"]) == 1
         assert result["aid"][0]["object"] == "Boston"
 
 
 class TestBatchExtractAndStore:
-    def test_stores_via_existing_path(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_stores_via_existing_path(self, monkeypatch):
         """batch_extract_and_store should write triples through
         store_triples_batch and return the count."""
         _setup_db()
@@ -583,7 +596,7 @@ class TestBatchExtractAndStore:
         from saga.core import store_atom
         a1 = store_atom("user lives in boston")
         a2 = store_atom("user likes sushi")
-        count = batch_extract_and_store([(a1, "User lives in Boston"), (a2, "User likes sushi")])
+        count = await batch_extract_and_store([(a1, "User lives in Boston"), (a2, "User likes sushi")])
         assert count == 2
 
 

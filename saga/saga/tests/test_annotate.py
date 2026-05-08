@@ -83,16 +83,18 @@ class TestClassifyStream:
 
 
 class TestSmartAnnotate:
-    def test_heuristic_path(self):
-        result = smart_annotate("A simple test.", use_llm=False)
+    @pytest.mark.asyncio
+    async def test_heuristic_path(self):
+        result = await smart_annotate("A simple test.", use_llm=False)
         assert "arousal" in result
         assert "valence" in result
         assert "topics" in result
         assert "encoding_confidence" in result
 
-    def test_llm_path_fallback_no_api_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_llm_path_fallback_no_api_key(self, monkeypatch):
         monkeypatch.delenv("NVIDIA_NIM_API_KEY", raising=False)
-        result = smart_annotate("A simple test.", use_llm=True)
+        result = await smart_annotate("A simple test.", use_llm=True)
         # Should fall back to heuristic when no API key is set
         assert "arousal" in result
         assert "valence" in result
@@ -102,9 +104,10 @@ class TestSmartAnnotate:
 
 
 class TestLlmAnnotate:
-    def test_fallback_when_no_api_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_fallback_when_no_api_key(self, monkeypatch):
         monkeypatch.delenv("NVIDIA_NIM_API_KEY", raising=False)
-        result = llm_annotate("Testing fallback behavior.")
+        result = await llm_annotate("Testing fallback behavior.")
         # Should return heuristic result
         assert "arousal" in result
         assert "valence" in result

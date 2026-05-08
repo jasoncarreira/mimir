@@ -170,7 +170,8 @@ class TestAdvancedRetrieval:
         for r in results:
             assert "query" in r
 
-    def test_batch_query(self):
+    @pytest.mark.asyncio
+    async def test_batch_query(self):
         from saga.core import batch_query
         from saga.triples import init_triples_schema
         from saga.core import get_db
@@ -181,7 +182,7 @@ class TestAdvancedRetrieval:
         queries = [
             {"query": "batch query test", "mode": "task", "budget": 200},
         ]
-        results = batch_query(queries)
+        results = await batch_query(queries)
         assert len(results) == 1
 
 

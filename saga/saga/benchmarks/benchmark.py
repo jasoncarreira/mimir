@@ -210,7 +210,7 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def benchmark_efficiency(ground_truth: dict) -> dict:
+async def benchmark_efficiency(ground_truth: dict) -> dict:
     """Measure token savings: MSAM context vs loading all relevant atoms as flat text."""
     print("\n=== Benchmark 2: Token Efficiency ===")
 
@@ -253,7 +253,7 @@ def benchmark_efficiency(ground_truth: dict) -> dict:
             continue
 
         # MSAM retrieval with token budget
-        hybrid = hybrid_retrieve_with_triples(query, mode="task", token_budget=300)
+        hybrid = await hybrid_retrieve_with_triples(query, mode="task", token_budget=300)
         msam_tokens = hybrid.get("total_tokens", 0)
         # Use _raw_atoms (pre-triple) for coverage, as hybrid may swap atoms for triples
         raw_atoms = hybrid.get("_raw_atoms", hybrid.get("atoms", []))
@@ -536,7 +536,7 @@ def print_summary(results: dict):
     print("\n" + "=" * 60)
 
 
-def main():
+async def _async_main():
     # Load ground truth
     gt_path = os.path.join(os.path.dirname(__file__), "ground_truth.json")
     if os.path.exists(gt_path):
@@ -570,7 +570,7 @@ def main():
         results["retrieval"] = benchmark_retrieval(ground_truth)
 
     if "efficiency" in run_targets:
-        results["efficiency"] = benchmark_efficiency(ground_truth)
+        results["efficiency"] = await benchmark_efficiency(ground_truth)
 
     if "cognitive" in run_targets:
         results["cognitive"] = benchmark_cognitive(ground_truth)
@@ -584,6 +584,11 @@ def main():
     print(f"\nResults saved to: {out_path}")
 
     print_summary(results)
+
+
+def main():
+    import asyncio
+    asyncio.run(_async_main())
 
 
 if __name__ == "__main__":

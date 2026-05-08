@@ -45,7 +45,7 @@ def _setattr(module_path, value):
     setattr(mod, parts[1], value)
 
 
-def main():
+async def main():
     # ─── Setup: temp DB + mocked embeddings ──────────────────────
     tmp_dir = tempfile.mkdtemp(prefix="msam_demo_")
     db_path = os.path.join(tmp_dir, "demo.db")
@@ -211,7 +211,7 @@ def main():
     ]
 
     for query, label in queries:
-        results = hybrid_retrieve(query, top_k=3)
+        results = await hybrid_retrieve(query, top_k=3)
         print(f"\n  Query: \"{query}\" ({label})")
         for r in results[:3]:
             score = r.get('_combined_score', r.get('_activation', 0))
