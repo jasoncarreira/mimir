@@ -371,6 +371,12 @@ async def populate_from_discord(
     list) rather than ``fetch_members()`` (paginated API call) to keep
     the populator fast on large guilds; gaps backfill on the next run
     once the cache catches up.
+
+    Best-effort error handling matches the Slack side: if a guild's
+    member or channel iteration raises mid-loop (cache miss, transient
+    discord.py exception), the failure is logged + skipped at the
+    guild level so the rest of the guilds still contribute. Populator
+    runs shouldn't fail-loud and block the next scheduled tick.
     """
     client = getattr(bridge, "_client", None)
     if client is None or getattr(client, "is_closed", lambda: False)():
@@ -380,47 +386,73 @@ async def populate_from_discord(
     channels: list[dict[str, Any]] = []
 
     # Guilds are an iterable of ``discord.Guild`` (or test doubles).
-    for guild in getattr(client, "guilds", []) or []:
+    try:
+        guilds = list(getattr(client, "guilds", []) or [])
+    except Exception as exc:  # noqa: BLE001 — best-effort scheduled job
+        log.warning("populate_from_discord guilds enumeration failed: %s", exc)
+        return [], []
+
+    for guild in guilds:
         guild_name = getattr(guild, "name", None)
-        # Members.
-        for member in getattr(guild, "members", []) or []:
-            mid = getattr(member, "id", None)
-            if mid is None:
-                continue
-            alias = f"discord-{mid}"
-            display = (
-                getattr(member, "global_name", None)
-                or getattr(member, "display_name", None)
-                or getattr(member, "name", None)
+        # Members. Wrap the per-guild iteration so a single bad guild
+        # doesn't take down the orchestrator.
+        try:
+            for member in getattr(guild, "members", []) or []:
+                mid = getattr(member, "id", None)
+                if mid is None:
+                    continue
+                alias = f"discord-{mid}"
+                display = (
+                    getattr(member, "global_name", None)
+                    or getattr(member, "display_name", None)
+                    or getattr(member, "name", None)
+                )
+                entry: dict[str, Any] = {
+                    "canonical": alias,
+                    "aliases": [alias],
+                }
+                if display:
+                    entry["display_name"] = str(display)
+                # Mirror the Slack populator's bot annotation so
+                # downstream consumers can spot bot accounts without
+                # re-querying the bridge.
+                if getattr(member, "bot", False):
+                    entry["notes"] = "Discord bot account"
+                people.append(entry)
+        except Exception as exc:  # noqa: BLE001 — best-effort scheduled job
+            log.warning(
+                "populate_from_discord members iteration failed for guild "
+                "%r: %s",
+                guild_name, exc,
             )
-            entry: dict[str, Any] = {
-                "canonical": alias,
-                "aliases": [alias],
-            }
-            if display:
-                entry["display_name"] = str(display)
-            people.append(entry)
 
         # Text channels (skip voice / stage / forum — those don't carry
         # user-readable message streams that mimir surfaces). Threads
         # are intentionally omitted — they're transient and would bloat
         # the registry.
-        for channel in getattr(guild, "text_channels", []) or []:
-            cid = getattr(channel, "id", None)
-            if cid is None:
-                continue
-            cname = getattr(channel, "name", None)
-            entry = {
-                "canonical": f"discord-{cid}",
-                "kind": "public",
-            }
-            if cname:
-                entry["display_name"] = (
-                    f"#{cname}" if guild_name is None else f"#{cname}"
-                )
-            if guild_name:
-                entry["notes"] = f"Discord guild: {guild_name}"
-            channels.append(entry)
+        try:
+            for channel in getattr(guild, "text_channels", []) or []:
+                cid = getattr(channel, "id", None)
+                if cid is None:
+                    continue
+                cname = getattr(channel, "name", None)
+                entry = {
+                    "canonical": f"discord-{cid}",
+                    "kind": "public",
+                }
+                if cname:
+                    entry["display_name"] = (
+                        f"#{cname}" if guild_name is None else f"#{cname}"
+                    )
+                if guild_name:
+                    entry["notes"] = f"Discord guild: {guild_name}"
+                channels.append(entry)
+        except Exception as exc:  # noqa: BLE001 — best-effort scheduled job
+            log.warning(
+                "populate_from_discord text_channels iteration failed for "
+                "guild %r: %s",
+                guild_name, exc,
+            )
 
     return people, channels
 

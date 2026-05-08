@@ -496,6 +496,115 @@ async def test_populate_from_discord_prefers_global_name():
     assert people[0]["display_name"] == "Alice Smith"
 
 
+@pytest.mark.asyncio
+async def test_populate_from_discord_marks_bot_accounts():
+    """Mirror Slack populator's bot annotation: when ``member.bot`` is
+    True, the entry gets ``notes: 'Discord bot account'``."""
+    human = SimpleNamespace(
+        id=1, global_name="Alice", display_name=None, name="alice", bot=False
+    )
+    bot = SimpleNamespace(
+        id=2, global_name="MimirBot", display_name=None, name="mimirbot",
+        bot=True,
+    )
+    guild = SimpleNamespace(
+        name="g", members=[human, bot], text_channels=[],
+    )
+    bridge = SimpleNamespace(
+        _client=SimpleNamespace(guilds=[guild], is_closed=lambda: False),
+    )
+    people, _ = await populate_from_discord(bridge)
+    assert len(people) == 2
+    by_canonical = {p["canonical"]: p for p in people}
+    assert "notes" not in by_canonical["discord-1"]
+    assert by_canonical["discord-2"]["notes"] == "Discord bot account"
+
+
+class _BoomMembers:
+    """Iterable that raises mid-iteration to simulate a discord.py
+    cache hiccup or transient error during member enumeration."""
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise RuntimeError("simulated discord cache miss")
+
+
+@pytest.mark.asyncio
+async def test_populate_from_discord_swallows_per_guild_member_failure():
+    """A guild whose ``members`` raises mid-loop is logged and skipped;
+    other guilds in the list still contribute. Matches the Slack
+    populator's best-effort shape so half-failures don't block the
+    other half."""
+    bad_guild = SimpleNamespace(
+        name="bad", members=_BoomMembers(), text_channels=[],
+    )
+    good_member = SimpleNamespace(
+        id=99, global_name="Bob", display_name=None, name="bob",
+    )
+    good_channel = SimpleNamespace(id=200, name="general")
+    good_guild = SimpleNamespace(
+        name="good", members=[good_member], text_channels=[good_channel],
+    )
+    client = SimpleNamespace(
+        guilds=[bad_guild, good_guild], is_closed=lambda: False,
+    )
+    bridge = SimpleNamespace(_client=client)
+
+    # Should NOT raise — best-effort.
+    people, channels = await populate_from_discord(bridge)
+    # bad_guild contributed nothing; good_guild's member + channel landed.
+    assert len(people) == 1
+    assert people[0]["canonical"] == "discord-99"
+    assert len(channels) == 1
+    assert channels[0]["canonical"] == "discord-200"
+
+
+@pytest.mark.asyncio
+async def test_populate_from_discord_swallows_per_guild_channel_failure():
+    """Per-guild text_channels iteration failure is logged + skipped;
+    members on the same guild still contribute."""
+    member = SimpleNamespace(
+        id=1, global_name="Alice", display_name=None, name="alice",
+    )
+
+    class _BadChannels:
+        def __iter__(self):
+            return self
+        def __next__(self):
+            raise RuntimeError("simulated channel-fetch failure")
+
+    guild = SimpleNamespace(
+        name="g", members=[member], text_channels=_BadChannels(),
+    )
+    bridge = SimpleNamespace(
+        _client=SimpleNamespace(guilds=[guild], is_closed=lambda: False),
+    )
+    people, channels = await populate_from_discord(bridge)
+    # Member iteration succeeded.
+    assert len(people) == 1
+    # Channel iteration failed mid-loop → no channels recorded.
+    assert channels == []
+
+
+@pytest.mark.asyncio
+async def test_populate_from_discord_swallows_guilds_enumeration_failure():
+    """Top-level ``client.guilds`` raising returns empty rather than
+    propagating to the orchestrator."""
+    class _BadClient:
+        @property
+        def guilds(self):
+            raise RuntimeError("simulated client.guilds failure")
+        def is_closed(self):
+            return False
+
+    bridge = SimpleNamespace(_client=_BadClient())
+    people, channels = await populate_from_discord(bridge)
+    assert people == []
+    assert channels == []
+
+
 # ---------------------------------------------------------------------------
 # populate_from_slack — duck-typed Slack AsyncWebClient.
 # ---------------------------------------------------------------------------
