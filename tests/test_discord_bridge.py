@@ -784,3 +784,326 @@ async def test_fetch_history_bad_channel_id_returns_empty(bridge_with_fake_clien
     bridge, _, _ = bridge_with_fake_client
     out = await bridge.fetch_history("not-a-discord-id")
     assert out == []
+
+
+# ---- supervisor: retry-with-backoff around client.start() ---------------
+
+
+@pytest.mark.asyncio
+async def test_supervisor_retries_on_transient_5xx(monkeypatch, tmp_path: Path):
+    """A 503 at token-auth (the actual production failure mode that
+    motivated this) gets retried with backoff, not a one-shot kill.
+    First attempt 503s; second succeeds; supervisor exits cleanly."""
+    import discord
+    bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))
+    # Tighten backoffs for the test so it doesn't hang the suite.
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.01
+    bridge._RECONNECT_BACKOFF_CAP_SECONDS = 0.05
+
+    attempts = {"n": 0}
+
+    async def fake_start(token):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            # Fake DiscordServerError shape — discord.py wraps a response
+            # object, but for the supervisor we only care about the type.
+            raise discord.DiscordServerError(
+                _FakeResp(status=503), {"code": 0, "message": "no healthy upstream"}
+            )
+        # Second attempt: clean exit.
+        return None
+
+    async def fake_close():
+        pass
+
+    async def fake_is_closed():
+        return False
+
+    # Patch BEFORE connect so the first ``_DiscordClient`` we build has
+    # the fake start. The supervisor builds a fresh client between
+    # attempts; both need the same patched class.
+    monkeypatch.setattr(
+        "mimir.bridges.discord._DiscordClient",
+        lambda owner: SimpleNamespace(
+            start=fake_start, close=fake_close, is_closed=lambda: False,
+        ),
+    )
+
+    await bridge.connect()
+    # Wait for the supervisor task to finish — the second attempt
+    # should return cleanly.
+    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    assert attempts["n"] == 2  # one failure, one success
+
+
+@pytest.mark.asyncio
+async def test_supervisor_does_not_retry_on_login_failure(monkeypatch, tmp_path: Path):
+    """``LoginFailure`` is operator-actionable (bad token). Retrying
+    just spams. The supervisor must propagate it and the task must die."""
+    import discord
+    bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.01
+
+    attempts = {"n": 0}
+
+    async def fake_start(token):
+        attempts["n"] += 1
+        raise discord.LoginFailure("invalid token")
+
+    monkeypatch.setattr(
+        "mimir.bridges.discord._DiscordClient",
+        lambda owner: SimpleNamespace(
+            start=fake_start, close=AsyncMock(), is_closed=lambda: False,
+        ),
+    )
+
+    await bridge.connect()
+    # The runner task should fail with LoginFailure.
+    with pytest.raises(discord.LoginFailure):
+        await asyncio.wait_for(bridge._runner, timeout=1.0)
+    # Only one attempt — no retries on operator-actionable errors.
+    assert attempts["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_supervisor_caps_backoff(monkeypatch, tmp_path: Path):
+    """Backoff doubles per attempt but caps at the configured ceiling.
+    Pin behavior so a regression doesn't introduce unbounded growth."""
+    import discord
+    bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.01
+    bridge._RECONNECT_BACKOFF_CAP_SECONDS = 0.04
+
+    sleeps: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def capturing_sleep(delay, *a, **kw):
+        sleeps.append(delay)
+        await real_sleep(0)  # yield without actually sleeping
+
+    monkeypatch.setattr(asyncio, "sleep", capturing_sleep)
+
+    attempts = {"n": 0}
+
+    async def fake_start(token):
+        attempts["n"] += 1
+        if attempts["n"] >= 5:
+            return None  # let supervisor exit after a few retries
+        raise discord.DiscordServerError(
+            _FakeResp(status=503), {"code": 0, "message": "boom"},
+        )
+
+    monkeypatch.setattr(
+        "mimir.bridges.discord._DiscordClient",
+        lambda owner: SimpleNamespace(
+            start=fake_start, close=AsyncMock(), is_closed=lambda: False,
+        ),
+    )
+
+    await bridge.connect()
+    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    # First sleep is the initial 0.01; subsequent doublings 0.02, 0.04 (cap), 0.04.
+    assert sleeps[0] == pytest.approx(0.01)
+    # After 4 retries (5th attempt succeeds), the last sleep we recorded
+    # before that should be ≤ cap. None should exceed cap.
+    assert all(s <= 0.04 + 1e-9 for s in sleeps)
+
+
+class _FakeResp:
+    """Minimal aiohttp-Response stand-in for discord.DiscordServerError
+    construction. The real class only reads ``.status`` from the response
+    on init."""
+    def __init__(self, status: int) -> None:
+        self.status = status
+        self.reason = "Service Unavailable"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_fires_algedonic_after_three_attempts(monkeypatch, tmp_path: Path):
+    """``discord_bridge_retry`` event should fire only after attempts >= 3
+    so a one-off transient doesn't spam the algedonic block. Pinned via
+    a captured event log."""
+    import discord
+    from mimir import event_logger
+
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(kind: str, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.bridges.discord._safe_log_event", fake_log_event)
+
+    bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.001
+    bridge._RECONNECT_BACKOFF_CAP_SECONDS = 0.01
+
+    attempts = {"n": 0}
+
+    async def fake_start(token):
+        attempts["n"] += 1
+        if attempts["n"] >= 5:
+            return None
+        raise discord.DiscordServerError(
+            _FakeResp(status=503), {"code": 0, "message": "boom"},
+        )
+
+    monkeypatch.setattr(
+        "mimir.bridges.discord._DiscordClient",
+        lambda owner: SimpleNamespace(
+            start=fake_start, close=AsyncMock(), is_closed=lambda: False,
+        ),
+    )
+
+    await bridge.connect()
+    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    # Wait briefly for any pending log-event tasks to drain.
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+    retry_events = [(k, f) for k, f in captured if k == "discord_bridge_retry"]
+    # 4 failed attempts before success (5th); algedonic fires on attempts 3, 4.
+    assert len(retry_events) == 2
+    assert retry_events[0][1]["attempt"] == 3
+    assert retry_events[1][1]["attempt"] == 4
+
+
+@pytest.mark.asyncio
+async def test_supervisor_clean_exit_when_client_returns(monkeypatch, tmp_path: Path):
+    """If ``client.start()`` returns cleanly (operator initiated
+    disconnect via ``client.close()``), the supervisor exits the loop
+    rather than retrying. Otherwise normal shutdown would re-spawn."""
+    bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.01
+
+    attempts = {"n": 0}
+
+    async def fake_start(token):
+        attempts["n"] += 1
+        return None  # immediate clean exit
+
+    monkeypatch.setattr(
+        "mimir.bridges.discord._DiscordClient",
+        lambda owner: SimpleNamespace(
+            start=fake_start, close=AsyncMock(), is_closed=lambda: False,
+        ),
+    )
+
+    await bridge.connect()
+    await asyncio.wait_for(bridge._runner, timeout=1.0)
+    assert attempts["n"] == 1  # no retries on clean exit
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_supervisor_cleanly(monkeypatch, tmp_path: Path):
+    """``disconnect()`` during a backoff sleep must cancel the supervisor
+    cleanly without re-raising CancelledError into the caller."""
+    import discord
+    bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 5.0  # long enough to interrupt mid-sleep
+
+    async def fake_start(token):
+        raise discord.DiscordServerError(
+            _FakeResp(status=503), {"code": 0, "message": "boom"},
+        )
+
+    monkeypatch.setattr(
+        "mimir.bridges.discord._DiscordClient",
+        lambda owner: SimpleNamespace(
+            start=fake_start, close=AsyncMock(), is_closed=lambda: False,
+        ),
+    )
+
+    await bridge.connect()
+    # Let the supervisor hit its first failure + start the backoff sleep.
+    await asyncio.sleep(0.05)
+    # Now disconnect — should cancel the supervisor task, not raise.
+    await bridge.disconnect()
+    assert bridge._runner is None
+
+
+@pytest.mark.asyncio
+async def test_supervisor_closes_old_client_before_constructing_new(monkeypatch, tmp_path: Path):
+    """Between retry attempts, the previous client is closed before the
+    next one is constructed. Without this the previous client could leak
+    file descriptors / WebSocket sessions on a long-running outage."""
+    import discord
+    bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))
+    bridge._RECONNECT_BACKOFF_INITIAL_SECONDS = 0.001
+    bridge._RECONNECT_BACKOFF_CAP_SECONDS = 0.01
+
+    construct_calls: list[int] = []
+    close_calls: list[int] = []
+
+    def make_fake_client(owner):
+        instance_id = len(construct_calls)
+        construct_calls.append(instance_id)
+
+        async def fake_close():
+            close_calls.append(instance_id)
+
+        async def fake_start(token):
+            if instance_id < 2:
+                raise discord.DiscordServerError(
+                    _FakeResp(status=503), {"code": 0, "message": "x"},
+                )
+            return None
+
+        return SimpleNamespace(
+            start=fake_start, close=fake_close, is_closed=lambda: False,
+        )
+
+    monkeypatch.setattr(
+        "mimir.bridges.discord._DiscordClient", make_fake_client,
+    )
+
+    await bridge.connect()
+    await asyncio.wait_for(bridge._runner, timeout=2.0)
+
+    # Three constructions: initial + 2 retries (2 failures + 1 success).
+    assert construct_calls == [0, 1, 2]
+    # Two closes: between 0→1 and 1→2 (no close after the successful
+    # start exits the loop).
+    assert close_calls == [0, 1]
+
+
+def test_should_emit_retry_algedonic_throttling():
+    """The throttle helper fires every attempt 3-9 (early-warning),
+    then every 10th thereafter (sustained-outage cap)."""
+    from mimir.bridges.discord import _should_emit_retry_algedonic
+    # Pre-threshold: silent.
+    assert _should_emit_retry_algedonic(1) is False
+    assert _should_emit_retry_algedonic(2) is False
+    # Early-warning band: every attempt fires.
+    for n in range(3, 10):
+        assert _should_emit_retry_algedonic(n) is True, n
+    # Sustained-outage band: every 10th only.
+    assert _should_emit_retry_algedonic(10) is True
+    assert _should_emit_retry_algedonic(11) is False
+    assert _should_emit_retry_algedonic(15) is False
+    assert _should_emit_retry_algedonic(19) is False
+    assert _should_emit_retry_algedonic(20) is True
+    assert _should_emit_retry_algedonic(100) is True
+    assert _should_emit_retry_algedonic(101) is False
+
+
+def test_fatal_discord_exceptions_built_correctly():
+    """Module-level fatal-exception map should include LoginFailure and
+    PrivilegedIntentsRequired. Validates the ``getattr`` defensiveness
+    didn't accidentally include ``Exception`` (the prior bug)."""
+    import discord
+    from mimir.bridges.discord import (
+        _FATAL_DISCORD_EXCEPTIONS,
+        _FATAL_DISCORD_EXCEPTION_INFO,
+    )
+    # Both classes should be present in current discord-py.
+    assert discord.LoginFailure in _FATAL_DISCORD_EXCEPTIONS
+    assert discord.PrivilegedIntentsRequired in _FATAL_DISCORD_EXCEPTIONS
+    # And — critically — the catch-all ``Exception`` is NOT in the
+    # tuple. If it were, the supervisor would propagate every
+    # transient as if it were operator-actionable.
+    assert Exception not in _FATAL_DISCORD_EXCEPTIONS
+    assert BaseException not in _FATAL_DISCORD_EXCEPTIONS
+    # The info map should have a (event_kind, log_msg) tuple per class.
+    assert _FATAL_DISCORD_EXCEPTION_INFO[discord.LoginFailure][0] == "discord_bridge_login_failure"
+    assert _FATAL_DISCORD_EXCEPTION_INFO[discord.PrivilegedIntentsRequired][0] == "discord_bridge_intents_failure"
