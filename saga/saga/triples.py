@@ -251,19 +251,19 @@ Output format (one per line, or SKIP):
 (subject, predicate, object)"""
 
 
-def extract_triples_llm(content: str, atom_id: str = "") -> list[dict]:
+async def extract_triples_llm(content: str, atom_id: str = "") -> list[dict]:
     """Extract triples from atom content using LLM.
     Returns list of {subject, predicate, object} dicts.
     Returns empty list if atom is skipped or extraction fails."""
     from .config import resolve_llm_config
-    from ._llm import call_llm_sync
+    from ._llm import call_llm
 
     llm = resolve_llm_config('triples')
     if not llm['api_key']:
         return []
 
     prompt = EXTRACTION_PROMPT.format(content=content)
-    response_text = call_llm_sync(
+    response_text = await call_llm(
         llm, prompt=prompt, temperature=0.1, max_tokens=500,
     )
     if not response_text:
@@ -329,10 +329,10 @@ def _parse_triples(text: str, atom_id: str = "") -> list[dict]:
     return triples
 
 
-def extract_and_store(atom_id: str, content: str) -> int:
+async def extract_and_store(atom_id: str, content: str) -> int:
     """Extract triples from an atom and store them. Returns count stored."""
     start = time.time()
-    triples = extract_triples_llm(content, atom_id)
+    triples = await extract_triples_llm(content, atom_id)
 
     if not triples:
         _log_extraction_metric(atom_id, 0, 0, (time.time() - start) * 1000, skipped=True)
@@ -410,7 +410,7 @@ def _parse_batch_response(text: str, items: list[tuple[str, str]]) -> dict[str, 
     return out
 
 
-def batch_extract_triples_llm(
+async def batch_extract_triples_llm(
     items: list[tuple[str, str]],
     batch_size: int = 20,
 ) -> dict[str, list[dict]]:
@@ -442,11 +442,11 @@ def batch_extract_triples_llm(
         atoms_block = _format_atoms_for_batch(batch)
         prompt = BATCH_EXTRACTION_PROMPT.format(atoms_block=atoms_block)
 
-        from ._llm import call_llm_sync
+        from ._llm import call_llm
         # Generous budget: ~10 lines per atom * 20 atoms = 200 lines plus
         # headers. Reasoning models burn tokens on CoT before emitting
         # content, so we err high.
-        response_text = call_llm_sync(
+        response_text = await call_llm(
             llm, prompt=prompt, temperature=0.1, max_tokens=4000,
         )
         if not response_text:
@@ -460,7 +460,7 @@ def batch_extract_triples_llm(
     return out
 
 
-def batch_extract_and_store(
+async def batch_extract_and_store(
     items: list[tuple[str, str]],
     batch_size: int = 20,
 ) -> int:
@@ -472,7 +472,7 @@ def batch_extract_and_store(
     if not items:
         return 0
     start = time.time()
-    by_atom = batch_extract_triples_llm(items, batch_size=batch_size)
+    by_atom = await batch_extract_triples_llm(items, batch_size=batch_size)
     elapsed_ms = (time.time() - start) * 1000
 
     all_triples: list[dict] = []
@@ -787,7 +787,7 @@ def estimate_triple_tokens(triples: list[dict]) -> int:
 
 # ─── Hybrid Retrieval (Triples + Atoms) ──────────────────────────
 
-def hybrid_retrieve_with_triples(
+async def hybrid_retrieve_with_triples(
     query: str,
     mode: str = "task",
     token_budget: int = 500,
@@ -842,9 +842,9 @@ def hybrid_retrieve_with_triples(
     _c = _gc()
     if _c('retrieval_v2', 'enabled', True):
         from .retrieval_v2 import retrieve_v2
-        atoms = retrieve_v2(query, mode=mode, top_k=atom_top_k)
+        atoms = await retrieve_v2(query, mode=mode, top_k=atom_top_k)
     else:
-        atoms = hybrid_retrieve(
+        atoms = await hybrid_retrieve(
             query, mode=mode, top_k=atom_top_k, context=context, session_id=session_id,
         )
 

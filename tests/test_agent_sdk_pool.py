@@ -111,6 +111,78 @@ async def _drain(prompt: str, options: ClaudeAgentOptions, session_id: str = "de
     return out
 
 
+# ─── _TurnCell stamping (multi-channel budget correlation) ─────────
+
+
+@pytest.mark.asyncio
+async def test_acquire_ctx_stamps_and_clears_cell_turn_id():
+    """The pool's ``acquire_ctx(turn_id=X)`` stamps ``entry.cell.turn_id``
+    on enter and clears on exit. The budget hook reads this cell to
+    correlate hook fires to the active turn under multi-channel use.
+    Pins the contract that ``query()`` relies on."""
+    pool = agent_mod.ClientPool()
+    opts = _opts()
+
+    captured: list[str | None] = []
+
+    async with pool.acquire_ctx(opts, turn_id="turn-XYZ") as client:
+        # Cell stamped while client is in flight.
+        # Reach into the entry to verify (test only — production reads
+        # via the contextvar that the SDK's hook task captured).
+        # We can find the entry via the in_flight set.
+        entries = list(pool._in_flight)
+        assert len(entries) == 1
+        captured.append(entries[0].cell.turn_id)
+        assert client is entries[0].client
+
+    # On exit, the cell is cleared and the entry returns to idle.
+    assert pool._idle, "expected the released client to land in idle"
+    assert pool._idle[0].cell.turn_id is None, "cell.turn_id must clear on release"
+
+    assert captured == ["turn-XYZ"]
+    await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_acquire_ctx_sets_contextvar_to_entry_cell_before_connect():
+    """The SDK's hook control task is forked during ``client.connect()``
+    and captures the ``_current_client_cell`` contextvar at that moment.
+    For per-channel budget correlation to work, the pool MUST set the
+    contextvar to the new entry's cell BEFORE connect returns. Pins it
+    by snapshotting the contextvar value during the fake client's
+    connect callback."""
+    from mimir._context import _current_client_cell, _TurnCell
+
+    captured_during_connect: list[_TurnCell | None] = []
+
+    class _ConnectSnapshotClient(_BlockingFakeClient):
+        async def connect(self) -> None:
+            captured_during_connect.append(_current_client_cell.get())
+            await super().connect()
+
+    import mimir.agent as ag
+    ag.ClaudeSDKClient = _ConnectSnapshotClient  # type: ignore[assignment]
+
+    try:
+        pool = agent_mod.ClientPool()
+        async with pool.acquire_ctx(_opts(), turn_id="turn-A") as _:
+            pass
+        # The contextvar MUST be a fresh _TurnCell (not None) at
+        # connect time — that's the cell the SDK's hook task captures.
+        assert len(captured_during_connect) == 1
+        cell = captured_during_connect[0]
+        assert isinstance(cell, _TurnCell), (
+            "contextvar must be set to a _TurnCell before connect, "
+            f"got {type(cell).__name__}"
+        )
+        # The cell is the entry's cell — same instance.
+        assert pool._idle, "expected the released client to land in idle"
+        assert pool._idle[0].cell is cell
+        await pool.shutdown()
+    finally:
+        ag.ClaudeSDKClient = _BlockingFakeClient  # type: ignore[assignment]
+
+
 # ─── (a) two concurrent calls run in parallel ──────────────────────
 
 

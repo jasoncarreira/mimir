@@ -19,7 +19,7 @@ from .triples import extract_and_store
 from .annotate import heuristic_annotate
 
 
-def migrate_markdown_file(filepath: Path, entity: str, stream: str = "semantic"):
+async def migrate_markdown_file(filepath: Path, entity: str, stream: str = "semantic"):
     """Migrate a single markdown file into atoms.
     
     Splits on headers (## or ###) and stores each section as an atom.
@@ -53,7 +53,7 @@ def migrate_markdown_file(filepath: Path, entity: str, stream: str = "semantic")
         if atom_id:
             # Extract triples
             try:
-                extract_and_store(atom_id, section)
+                await extract_and_store(atom_id, section)
             except Exception:
                 pass
             stored += 1
@@ -62,7 +62,7 @@ def migrate_markdown_file(filepath: Path, entity: str, stream: str = "semantic")
     return stored
 
 
-def run_migration():
+async def run_migration():
     """Run full migration. Customize these paths for your deployment."""
     # Example file list -- replace with your actual memory files
     files = [
@@ -71,23 +71,24 @@ def run_migration():
         # ("memory/projects/project.md", "Project", "semantic"),
         # ("memory/context/opinions.md", "Agent", "semantic"),
     ]
-    
+
     if not files:
         print("No files configured for migration.")
         print("Edit msam/migrate.py and add your file paths to the 'files' list.")
         return
-    
+
     total = 0
     for filepath, entity, *rest in files:
         stream = rest[0] if rest else "semantic"
-        total += migrate_markdown_file(Path(filepath), entity, stream)
-    
+        total += await migrate_markdown_file(Path(filepath), entity, stream)
+
     print(f"\nMigration complete: {total} atoms stored.")
 
 
 if __name__ == "__main__":
+    import asyncio
     dry_run = "--dry-run" in sys.argv
     if dry_run:
         print("DRY RUN -- no atoms will be stored")
     else:
-        run_migration()
+        asyncio.run(run_migration())

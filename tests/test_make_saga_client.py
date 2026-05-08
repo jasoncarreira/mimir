@@ -68,7 +68,7 @@ def _install_fake_saga(monkeypatch, *, calls: dict, query_result=None,
             raise RuntimeError("DB unreachable")
         return stats or {"est_active_tokens": 100}
 
-    def hybrid_retrieve(query, **kw):
+    async def hybrid_retrieve(query, **kw):
         calls.setdefault("hybrid_retrieve", []).append({"query": query, "kwargs": kw})
         return query_result or {
             "observations": [{"id": "o1", "content": "obs", "_confidence_tier": "high",
@@ -136,10 +136,12 @@ def _install_fake_saga(monkeypatch, *, calls: dict, query_result=None,
 
     # saga.annotate
     saga_annotate = types.ModuleType("saga.annotate")
-    saga_annotate.smart_annotate = lambda content, use_llm=False: {
-        "arousal": 0.5, "valence": 0.0, "topics": [],
-        "encoding_confidence": 0.7,
-    }
+    async def _smart_annotate(content, use_llm=False):
+        return {
+            "arousal": 0.5, "valence": 0.0, "topics": [],
+            "encoding_confidence": 0.7,
+        }
+    saga_annotate.smart_annotate = _smart_annotate
     saga_annotate.classify_stream = lambda content, source="conversation": "semantic"
     saga_annotate.classify_profile = lambda content: "standard"
     monkeypatch.setitem(sys.modules, "saga.annotate", saga_annotate)
@@ -148,7 +150,7 @@ def _install_fake_saga(monkeypatch, *, calls: dict, query_result=None,
     saga_consol = types.ModuleType("saga.consolidation")
 
     class ConsolidationEngine:
-        def consolidate(self, dry_run=False, max_clusters=None):
+        async def consolidate(self, dry_run=False, max_clusters=None):
             calls.setdefault("consolidate", []).append(
                 {"dry_run": dry_run, "max_clusters": max_clusters}
             )

@@ -247,10 +247,10 @@ def _install_saga_bench_overrides() -> None:
     if not getattr(_saga_core, "_bench_patched", False):
         _orig_retrieve = _saga_core.hybrid_retrieve
 
-        def _patched_retrieve(*args, reference_date=None, **kwargs):
+        async def _patched_retrieve(*args, reference_date=None, **kwargs):
             if reference_date is None and _BENCH_REFERENCE_DATE is not None:
                 reference_date = _BENCH_REFERENCE_DATE
-            return _orig_retrieve(*args, reference_date=reference_date, **kwargs)
+            return await _orig_retrieve(*args, reference_date=reference_date, **kwargs)
 
         _saga_core.hybrid_retrieve = _patched_retrieve
         _saga_core._bench_patched = True
@@ -366,7 +366,7 @@ async def _run_one_question(
         from saga.consolidation import ConsolidationEngine
         t_phase = _time.time()
         try:
-            cresult = ConsolidationEngine().consolidate() or {}
+            cresult = await ConsolidationEngine().consolidate() or {}
             n_clusters = cresult.get("clusters_consolidated", 0) if isinstance(cresult, dict) else 0
         except Exception as exc:  # noqa: BLE001 — don't kill the run
             print(f"  consolidation failed for {qid}: {exc}", file=sys.stderr)

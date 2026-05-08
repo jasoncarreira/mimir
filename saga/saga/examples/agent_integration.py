@@ -24,13 +24,13 @@ from saga.decay import run_decay_cycle
 
 # ─── 1. Session Startup ──────────────────────────────────────────
 
-def on_session_start():
+async def on_session_start():
     """Load context at the beginning of each agent session."""
 
     context = {"atoms": [], "triples": [], "total_tokens": 0}
     mm = metamemory_query("user preferences")
     if mm['recommendation'] == 'retrieve':
-        context = hybrid_retrieve_with_triples(
+        context = await hybrid_retrieve_with_triples(
             "user preferences and current situation",
             mode="companion",
             token_budget=500,
@@ -56,10 +56,10 @@ def on_session_start():
 
 # ─── 2. During Conversation ──────────────────────────────────────
 
-def on_user_message(message: str):
+async def on_user_message(message: str):
     """Process a user message: retrieve context, store new facts."""
 
-    results = hybrid_retrieve_with_triples(message, mode="task", token_budget=300)
+    results = await hybrid_retrieve_with_triples(message, mode="task", token_budget=300)
 
     atoms = results.get('_raw_atoms', results.get('atoms', []))
     scored = score_context_quality(atoms, query=message)
@@ -100,12 +100,12 @@ def on_session_end(session_id: str, topics: list, decisions: list):
 
 # ─── Demo ─────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+async def _demo():
     print("=== Session Start ===")
-    ctx = on_session_start()
+    ctx = await on_session_start()
 
     print("\n=== User Message ===")
-    atoms = on_user_message("What's my schedule for today?")
+    atoms = await on_user_message("What's my schedule for today?")
 
     print("\n=== Session End ===")
     on_session_end(
@@ -113,3 +113,8 @@ if __name__ == "__main__":
         topics=["schedule", "planning"],
         decisions=["Moved standup to 10am"],
     )
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(_demo())

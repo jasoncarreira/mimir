@@ -97,7 +97,7 @@ def _extract_caller(args):
     return caller, list(args)
 
 
-def cmd_query(args):
+async def cmd_query(args):
     """Retrieve via hybrid pipeline (triples + atoms). Default path for all queries."""
     caller, args = _extract_caller(args)
 
@@ -132,7 +132,7 @@ def cmd_query(args):
     t0 = time.time()
 
     # Single hybrid retrieval: triples for facts, atoms for context
-    result = hybrid_retrieve_with_triples(query, mode=mode, token_budget=budget)
+    result = await hybrid_retrieve_with_triples(query, mode=mode, token_budget=budget)
     latency_ms = (time.time() - t0) * 1000
 
     _snapshot_safe()
@@ -333,7 +333,7 @@ def cmd_query(args):
     print(json.dumps(output, indent=2))
 
 
-def cmd_store(args):
+async def cmd_store(args):
     """Store a new memory atom from conversation."""
     caller, args = _extract_caller(args)
 
@@ -351,7 +351,7 @@ def cmd_store(args):
     t0 = time.time()
     stream = classify_stream(content)
     profile = classify_profile(content)
-    annotations = smart_annotate(content, use_llm=use_llm)
+    annotations = await smart_annotate(content, use_llm=use_llm)
     
     atom_id = store_atom(
         content=content,
@@ -401,7 +401,7 @@ def cmd_store(args):
 
 
 
-def cmd_snapshot(args=None):
+async def cmd_snapshot(args=None):
     """Take a system metrics snapshot."""
     if args is None:
         args = []
@@ -465,7 +465,7 @@ def cmd_snapshot(args=None):
         probe_queries = _cfg('context', 'probe_queries', ["agent current situation", "identity personality traits"])
         import random
         probe_q = random.choice(probe_queries)
-        hybrid_retrieve_with_triples(probe_q, mode="task", token_budget=_cfg('context', 'probe_token_budget', 200))
+        await hybrid_retrieve_with_triples(probe_q, mode="task", token_budget=_cfg('context', 'probe_token_budget', 200))
     except Exception:
         pass
 
@@ -480,7 +480,7 @@ def cmd_snapshot(args=None):
     try:
         probe_atom_queries = _cfg('context', 'probe_atom_queries', ["What is the user's profession?", "Who is the agent?"])
         probe_q2 = random.choice(probe_atom_queries)
-        probe_atoms = hybrid_retrieve(probe_q2, mode="task", top_k=_cfg('context', 'probe_top_k', 5))
+        probe_atoms = await hybrid_retrieve(probe_q2, mode="task", top_k=_cfg('context', 'probe_top_k', 5))
         probe_tokens = sum(len(a.get("content", "")) // 4 for a in probe_atoms)
         md_tokens = _measure_markdown_startup_tokens()
         log_comparison(
@@ -498,7 +498,7 @@ def cmd_snapshot(args=None):
     print(json.dumps({"snapshot": "ok", "stats": stats}, indent=2))
 
 
-def cmd_hybrid(args):
+async def cmd_hybrid(args):
     """Hybrid retrieval using triples + atoms (polymorphic memory)."""
     caller, args = _extract_caller(args)
 
@@ -518,7 +518,7 @@ def cmd_hybrid(args):
         args = args[:idx] + args[idx+2:]
         query = " ".join(args)
 
-    result = hybrid_retrieve_with_triples(query, mode=mode, token_budget=budget)
+    result = await hybrid_retrieve_with_triples(query, mode=mode, token_budget=budget)
 
     output = {
         "query": query,
@@ -786,14 +786,14 @@ def cmd_associations(args):
         print(json.dumps({"error": "Usage: associations <atom_id> [min_co_count] | associations clusters [min_co_count]"}))
 
 
-def cmd_quality(args):
+async def cmd_quality(args):
     """Score context quality for retrieved atoms."""
     from .core import hybrid_retrieve, score_context_quality
     if not args:
         print(json.dumps({"error": "Usage: quality <query>"}))
         return
     query = " ".join(args)
-    atoms = hybrid_retrieve(query, mode="task", top_k=10)
+    atoms = await hybrid_retrieve(query, mode="task", top_k=10)
     scored = score_context_quality(atoms, query)
     output = []
     for a in scored:
@@ -1280,7 +1280,7 @@ def cmd_predict(args):
                        "atoms": predictions[:10]}, indent=2))
 
 
-def cmd_consolidate(args):
+async def cmd_consolidate(args):
     """Run sleep-based memory consolidation."""
     from .consolidation import ConsolidationEngine
 
@@ -1292,7 +1292,7 @@ def cmd_consolidate(args):
             max_clusters = int(args[idx + 1])
 
     engine = ConsolidationEngine()
-    result = engine.consolidate(dry_run=dry_run, max_clusters=max_clusters)
+    result = await engine.consolidate(dry_run=dry_run, max_clusters=max_clusters)
     print(json.dumps(result, indent=2))
 
 
@@ -1708,7 +1708,13 @@ def main():
     
     if command in commands:
         try:
-            commands[command](args)
+            import inspect as _inspect
+            handler = commands[command]
+            if _inspect.iscoroutinefunction(handler):
+                import asyncio as _asyncio
+                _asyncio.run(handler(args))
+            else:
+                handler(args)
         except RuntimeError as e:
             print(json.dumps({"error": str(e)}), file=sys.stderr)
             sys.exit(1)

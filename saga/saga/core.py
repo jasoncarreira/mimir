@@ -1489,7 +1489,7 @@ def _two_tier_split(
 # pathway, each gated by its own [retrieval_v2] config flag. Defaults
 # are False in prod; the bench config flips them on.
 
-def _resolve_contextual_query(
+async def _resolve_contextual_query(
     query: str,
     context: list[dict] | None,
 ) -> str:
@@ -1571,8 +1571,8 @@ def _resolve_contextual_query(
         "Rewritten:"
     )
 
-    from ._llm import call_llm_sync
-    rewritten = call_llm_sync(
+    from ._llm import call_llm
+    rewritten = await call_llm(
         llm, prompt=prompt, temperature=0.0, max_tokens=200,
     )
 
@@ -1618,7 +1618,7 @@ def _looks_like_question(text: str) -> bool:
     return first in _QUESTION_WORDS
 
 
-def _hyde_query(query: str) -> str | None:
+async def _hyde_query(query: str) -> str | None:
     """P38 — generate a hypothetical answer to use as a retrieval probe.
 
     Standard HyDE: replace the query embedding with the embedding of an
@@ -1661,15 +1661,15 @@ def _hyde_query(query: str) -> str | None:
         "Hypothetical answer:"
     )
 
-    from ._llm import call_llm_sync
-    text = call_llm_sync(
+    from ._llm import call_llm
+    text = await call_llm(
         llm, prompt=prompt, temperature=0.0, max_tokens=200,
     )
     text = text.strip().strip('"').strip("'").strip()
     return text or None
 
 
-def _resolve_query_and_hypothetical(
+async def _resolve_query_and_hypothetical(
     query: str,
     context: list[dict] | None,
 ) -> tuple[str, str | None]:
@@ -1743,8 +1743,8 @@ def _resolve_query_and_hypothetical(
         f"Current message: {query}"
     )
 
-    from ._llm import call_llm_sync
-    text = call_llm_sync(
+    from ._llm import call_llm
+    text = await call_llm(
         llm, prompt=prompt, temperature=0.0, max_tokens=400,
     )
     if not text:
@@ -2058,7 +2058,7 @@ def _world_model_pathway(query: str, top_k: int = 20,
     return [atom for atom, _ in scored[:top_k]]
 
 
-def _subatom_beam_atoms(query: str, top_k: int, mode: str) -> list[dict]:
+async def _subatom_beam_atoms(query: str, top_k: int, mode: str) -> list[dict]:
     """P43 beam 2 — sentence-level retrieval via compressed_retrieve,
     folded back to parent atoms with the strongest sentence's score.
 
@@ -2084,7 +2084,7 @@ def _subatom_beam_atoms(query: str, top_k: int, mode: str) -> list[dict]:
 
     _subatom_recursion_guard.active = True
     try:
-        result = compressed_retrieve(
+        result = await compressed_retrieve(
             query, mode=mode,
             top_k=max(top_k * 2, 8),
             enable_subatom=True,
@@ -2135,7 +2135,7 @@ def _subatom_beam_atoms(query: str, top_k: int, mode: str) -> list[dict]:
     return out
 
 
-def hybrid_retrieve(
+async def hybrid_retrieve(
     query: str,
     mode: str = "task",
     top_k: int = 12,
@@ -2190,12 +2190,12 @@ def hybrid_retrieve(
         and _looks_like_question(query)
     )
     if _want_rewrite and _want_hyde:
-        query, pre_hypothetical = _resolve_query_and_hypothetical(query, context)
+        query, pre_hypothetical = await _resolve_query_and_hypothetical(query, context)
         _retrieval_log.info(
             "path=combined hypothetical=%s", "yes" if pre_hypothetical else "no"
         )
     elif _want_rewrite:
-        query = _resolve_contextual_query(query, context)
+        query = await _resolve_contextual_query(query, context)
         _retrieval_log.info("path=rewrite_only")
     # else: no pre-retrieval LLM. HyDE may still fire post-retrieval
     # under the confidence gate — that path's logging lives below.
@@ -2294,7 +2294,7 @@ def hybrid_retrieve(
             gate_max = max(first_pass_max_sim, first_pass_max_sim_obs)
             trigger_thr = _cfg('retrieval', 'hyde_trigger_confidence', 0.45)
             if gate_max < trigger_thr:
-                hyp = _hyde_query(query)
+                hyp = await _hyde_query(query)
                 _retrieval_log.info(
                     "path=hyde_gated fired=%s max_sim=%.3f trigger=%.3f",
                     "yes" if hyp else "no",
@@ -2345,7 +2345,7 @@ def hybrid_retrieve(
     subatom_beam: list = []
     if _fusion == 'rrf':
         try:
-            subatom_beam = _subatom_beam_atoms(query, top_k=top_k, mode=mode)
+            subatom_beam = await _subatom_beam_atoms(query, top_k=top_k, mode=mode)
         except Exception:
             subatom_beam = []
         if subatom_beam:
@@ -3066,17 +3066,17 @@ def batch_retrieve(queries: list[dict]) -> list[dict]:
     return results
 
 
-def batch_query(queries: list[dict]) -> list[dict]:
+async def batch_query(queries: list[dict]) -> list[dict]:
     """Execute multiple hybrid queries (triples + atoms) in one call.
-    
+
     Each query dict: {"query": str, "mode": str, "budget": int}
     Returns list of hybrid results.
     """
     from .triples import hybrid_retrieve_with_triples
-    
+
     results = []
     for q in queries:
-        r = hybrid_retrieve_with_triples(
+        r = await hybrid_retrieve_with_triples(
             query=q.get("query", ""),
             mode=q.get("mode", "task"),
             token_budget=q.get("budget", 500),
