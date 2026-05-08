@@ -146,13 +146,15 @@ class SagaClient(Protocol):
 
 
 class _InProcessSaga:
-    """Direct calls into saga.core via ``asyncio.to_thread``.
+    """Direct calls into saga.core.
 
-    saga's hot-path functions are sync (def, not async def) — embeddings,
-    FTS5, vector ops are CPU-bound and hold the GIL while running. We wrap
-    each call in ``to_thread`` so mimir's event loop stays responsive while
-    saga does the heavy work. saga's FastAPI server does the same thing
-    via uvicorn's executor; we make it explicit at the boundary.
+    Saga's retrieval / consolidation entry points are async-native as of
+    chainlink #20 Phase 3: ``hybrid_retrieve``, ``ConsolidationEngine.consolidate``,
+    and the LLM-using annotate paths are awaited directly here. The remaining
+    sync entry points (``store_atom``, ``mark_contributions``, ``record_outcome``,
+    ``run_decay_cycle``, etc.) are CPU-bound — embeddings, FTS5, vector ops
+    that hold the GIL — so they stay wrapped in ``asyncio.to_thread`` to keep
+    mimir's event loop responsive.
 
     The response shape mirrors what saga's ``/v1/<endpoint>`` route handlers
     return, so mimir's call sites don't care which client they're using.
@@ -204,13 +206,21 @@ class _InProcessSaga:
         min_confidence_tier: str | None = None,
         context: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
+        # Mirrors saga/saga/server.py::api_query (two-tier branch — the
+        # default since [retrieval].two_tier_enabled = true is the v0.5
+        # canonical setting).
+        import time
+        from saga.core import hybrid_retrieve
+        from saga.config import get_config
+
         await self._ensure_ready()
         clamped = _clamp_query(query)
+        cfg = get_config()
+        t0 = time.time()
         try:
-            return await asyncio.to_thread(
-                self._sync_query,
-                clamped, top_k, mode, token_budget,
-                session_id, min_confidence_tier, context,
+            result = await hybrid_retrieve(
+                clamped, mode=mode, top_k=top_k,
+                two_tier=True, context=context, session_id=session_id,
             )
         except SagaError:
             raise
@@ -222,24 +232,6 @@ class _InProcessSaga:
             # SQLite OperationalError, etc. all fold into this path.
             raise SagaError(f"in-process saga query failed: {exc}") from exc
 
-    @staticmethod
-    def _sync_query(
-        query: str, top_k: int, mode: str, token_budget: int,
-        session_id: str | None, min_confidence_tier: str | None,
-        context: list[dict[str, str]] | None,
-    ) -> dict[str, Any]:
-        # Mirrors saga/saga/server.py::api_query (two-tier branch — the
-        # default since [retrieval].two_tier_enabled = true is the v0.5
-        # canonical setting).
-        import time
-        from saga.core import hybrid_retrieve
-        from saga.config import get_config
-        cfg = get_config()
-        t0 = time.time()
-        result = hybrid_retrieve(
-            query, mode=mode, top_k=top_k,
-            two_tier=True, context=context, session_id=session_id,
-        )
         obs = result.get("observations", []) or []
         raws = result.get("raws", []) or []
 
@@ -268,7 +260,7 @@ class _InProcessSaga:
                 )
 
         return {
-            "query": query, "mode": mode, "two_tier": True,
+            "query": clamped, "mode": mode, "two_tier": True,
             "gated": gated_reason is not None,
             "gated_reason": gated_reason,
             "observations": [_format_atom(o) for o in obs],
@@ -284,33 +276,30 @@ class _InProcessSaga:
         use_llm_annotate: bool = False,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        from saga.annotate import smart_annotate, classify_stream, classify_profile
+        from saga.core import store_atom
+
         await self._ensure_ready()
+        actual_stream = stream or classify_stream(content)
+        actual_profile = profile or classify_profile(content)
         try:
-            return await asyncio.to_thread(
-                self._sync_store, content, stream, profile,
-                source_type, use_llm_annotate, metadata,
+            # smart_annotate is async-native (LLM path optionally awaits
+            # call_llm); the heuristic short-circuit also returns via the
+            # async signature.
+            annotations = await smart_annotate(content, use_llm=use_llm_annotate)
+            # store_atom remains sync (FTS5 + embedding write is CPU-bound
+            # and holds the GIL); offload to a thread so the event loop
+            # stays responsive during the SQLite writes.
+            result = await asyncio.to_thread(
+                store_atom,
+                content=content, stream=actual_stream, profile=actual_profile,
+                source_type=source_type, metadata=metadata, **annotations,
             )
         except SagaError:
             raise
         except Exception as exc:
             raise SagaError(f"in-process saga store failed: {exc}") from exc
 
-    @staticmethod
-    def _sync_store(
-        content: str, stream: str | None, profile: str | None,
-        source_type: str, use_llm_annotate: bool,
-        metadata: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        from saga.annotate import smart_annotate, classify_stream, classify_profile
-        from saga.core import store_atom
-
-        actual_stream = stream or classify_stream(content)
-        actual_profile = profile or classify_profile(content)
-        annotations = smart_annotate(content, use_llm=use_llm_annotate)
-        result = store_atom(
-            content=content, stream=actual_stream, profile=actual_profile,
-            **annotations, source_type=source_type, metadata=metadata,
-        )
         if isinstance(result, tuple):
             atom_id, reason = result
         else:
@@ -396,28 +385,24 @@ class _InProcessSaga:
         self, *, dry_run: bool = False, max_clusters: int | None = None,
         extra_canonical_subjects: list[str] | None = None,
     ) -> dict[str, Any]:
+        from saga.consolidation import ConsolidationEngine
+
         await self._ensure_ready()
-
-        def _do() -> dict[str, Any]:
-            from saga.consolidation import ConsolidationEngine
-            engine = ConsolidationEngine()
-            kwargs: dict[str, Any] = {"dry_run": dry_run}
-            if max_clusters is not None:
-                kwargs["max_clusters"] = max_clusters
-            if extra_canonical_subjects:
-                kwargs["extra_canonical_subjects"] = list(extra_canonical_subjects)
-            result = engine.consolidate(**kwargs) or {}
-            # mimir's scheduler logs the result; defensive flat dict.
-            if not isinstance(result, dict):
-                return {"result": result}
-            return result
-
+        kwargs: dict[str, Any] = {"dry_run": dry_run}
+        if max_clusters is not None:
+            kwargs["max_clusters"] = max_clusters
+        if extra_canonical_subjects:
+            kwargs["extra_canonical_subjects"] = list(extra_canonical_subjects)
         try:
-            return await asyncio.to_thread(_do)
+            result = await ConsolidationEngine().consolidate(**kwargs) or {}
         except SagaError:
             raise
         except Exception as exc:
             raise SagaError(f"in-process saga consolidate failed: {exc}") from exc
+        # mimir's scheduler logs the result; defensive flat dict.
+        if not isinstance(result, dict):
+            return {"result": result}
+        return result
 
     async def decay(self) -> dict[str, Any]:
         """Run saga's decay cycle — recompute retrievability, fade/
