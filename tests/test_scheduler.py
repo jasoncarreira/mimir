@@ -658,3 +658,297 @@ async def test_identities_populate_callback_swallows_populator_errors(
 
     # Should not raise.
     await job.func()
+
+
+# ---- Named-callable registry (chainlink #44 follow-up: scheduler.yaml
+# unification for non-LLM crons; see state/spec/scheduler-callable-jobs.md) ----
+
+
+def test_callable_yaml_field_round_trips(tmp_path: Path):
+    """SchedulerJob.from_yaml_entry accepts ``callable: <name>`` and
+    to_yaml_entry serializes it back."""
+    raw = {"name": "saga-consolidate", "cron": "0 4 * * *",
+           "callable": "saga-consolidate"}
+    job = SchedulerJob.from_yaml_entry(raw)
+    assert job.callable_name == "saga-consolidate"
+    assert job.cron == "0 4 * * *"
+    assert job.prompt == ""
+    assert job.prompt_file is None
+    serialized = job.to_yaml_entry()
+    assert serialized["callable"] == "saga-consolidate"
+    assert "channel_id" not in serialized  # callable entries don't carry channel_id
+
+
+def test_callable_mutually_exclusive_with_prompt():
+    """prompt + callable, prompt_file + callable, all three: rejected."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SchedulerJob.from_yaml_entry({
+            "name": "bad", "cron": "0 * * * *",
+            "prompt": "x", "callable": "y",
+        })
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SchedulerJob.from_yaml_entry({
+            "name": "bad", "cron": "0 * * * *",
+            "prompt_file": "x.md", "callable": "y",
+        })
+
+
+def test_callable_entry_rejects_time_of_day():
+    """Callable entries take cron only — time_of_day is for prompt entries."""
+    with pytest.raises(ValueError, match="time_of_day"):
+        SchedulerJob.from_yaml_entry({
+            "name": "bad", "time_of_day": "08:00", "callable": "y",
+        })
+
+
+def test_callable_entry_with_empty_cron_is_valid():
+    """Empty cron on a callable entry is the operator's explicit
+    'disable this callable for this deployment' signal — must parse."""
+    job = SchedulerJob.from_yaml_entry({
+        "name": "saga-consolidate", "callable": "saga-consolidate",
+    })
+    assert job.callable_name == "saga-consolidate"
+    assert job.cron is None
+
+
+def test_register_callable_installs_at_default_cron(tmp_path: Path):
+    """No yaml override → APScheduler job installed at default_cron."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    async def _fn():
+        return None
+    assert sched.register_callable(
+        "demo", _fn, default_cron="0 4 * * *",
+    ) is True
+    job = sched._scheduler.get_job("demo")
+    assert job is not None
+    assert "demo" in sched.registered_callables()
+
+
+def test_register_callable_skips_install_when_cron_empty(tmp_path: Path):
+    """Empty default cron + no yaml override → no APScheduler job
+    installed; registration still recorded (so a yaml entry can later
+    activate it)."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    async def _fn():
+        return None
+    assert sched.register_callable(
+        "demo", _fn, default_cron="",
+    ) is False
+    assert sched._scheduler.get_job("demo") is None
+    # Registration kept so future yaml override can install.
+    assert "demo" in sched.registered_callables()
+
+
+def test_register_callable_yaml_override_wins(tmp_path: Path):
+    """yaml entry naming the callable beats default_cron."""
+    yaml_path = tmp_path / "s.yaml"
+    yaml_path.write_text(
+        "- name: saga-nightly\n"
+        "  callable: demo\n"
+        "  cron: \"30 3 * * *\"\n",
+        encoding="utf-8",
+    )
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=yaml_path, enqueue=noop)
+
+    async def _fn():
+        return None
+    assert sched.register_callable(
+        "demo", _fn, default_cron="0 4 * * *",
+    ) is True
+    job = sched._scheduler.get_job("demo")
+    assert job is not None
+    # APScheduler stringifies the trigger with the cron fields.
+    trigger_str = str(job.trigger)
+    assert "minute='30'" in trigger_str
+    assert "hour='3'" in trigger_str
+
+
+def test_register_callable_yaml_explicit_disable(tmp_path: Path):
+    """yaml entry with empty cron disables the callable, beating a
+    non-empty default."""
+    yaml_path = tmp_path / "s.yaml"
+    yaml_path.write_text(
+        "- name: disable-me\n"
+        "  callable: demo\n",
+        encoding="utf-8",
+    )
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=yaml_path, enqueue=noop)
+
+    async def _fn():
+        return None
+    assert sched.register_callable(
+        "demo", _fn, default_cron="0 4 * * *",
+    ) is False
+    assert sched._scheduler.get_job("demo") is None
+    assert "demo" in sched.registered_callables()
+
+
+def test_register_callable_invalid_cron_raises(tmp_path: Path):
+    """Invalid effective cron (default or yaml) raises ValueError."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    async def _fn():
+        return None
+    with pytest.raises(ValueError, match="invalid cron"):
+        sched.register_callable(
+            "demo", _fn, default_cron="not a cron",
+        )
+
+
+def test_reload_re_resolves_registered_callables(tmp_path: Path):
+    """Adding a yaml entry post-startup + reload() updates the
+    callable's cron in APScheduler."""
+    yaml_path = tmp_path / "s.yaml"
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=yaml_path, enqueue=noop)
+
+    async def _fn():
+        return None
+    sched.register_callable("demo", _fn, default_cron="0 4 * * *")
+    job_before = sched._scheduler.get_job("demo")
+    assert "hour='4'" in str(job_before.trigger)
+
+    # Mutate yaml externally (simulating an add_schedule MCP call).
+    yaml_path.write_text(
+        "- name: saga-shifted\n"
+        "  callable: demo\n"
+        "  cron: \"0 6 * * *\"\n",
+        encoding="utf-8",
+    )
+
+    sched.reload()
+    job_after = sched._scheduler.get_job("demo")
+    assert job_after is not None
+    assert "hour='6'" in str(job_after.trigger)
+
+
+def test_reload_warns_on_unregistered_callable(tmp_path: Path, caplog):
+    """A yaml entry naming an unregistered callable is warn-skipped,
+    not an error."""
+    yaml_path = tmp_path / "s.yaml"
+    yaml_path.write_text(
+        "- name: stale\n"
+        "  callable: never-registered\n"
+        "  cron: \"0 4 * * *\"\n",
+        encoding="utf-8",
+    )
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=yaml_path, enqueue=noop)
+    import logging
+    with caplog.at_level(logging.WARNING):
+        result = sched.reload()
+    assert result == {"registered": 0, "invalid": 0}
+    # The log should mention the unregistered callable.
+    assert any("never-registered" in r.message for r in caplog.records)
+
+
+def test_reload_skips_callable_yaml_entries_for_prompt_dispatch(tmp_path: Path):
+    """Callable-typed yaml entries don't end up as scheduler:* prompt
+    jobs in APScheduler — they're handled by the registry path only."""
+    yaml_path = tmp_path / "s.yaml"
+    yaml_path.write_text(
+        "- name: saga-nightly\n"
+        "  callable: demo\n"
+        "  cron: \"0 4 * * *\"\n"
+        "- name: morning-review\n"
+        "  prompt: \"Review notes.\"\n"
+        "  cron: \"0 8 * * *\"\n",
+        encoding="utf-8",
+    )
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=yaml_path, enqueue=noop)
+
+    async def _fn():
+        return None
+    sched.register_callable("demo", _fn, default_cron="")
+
+    result = sched.reload()
+    # Only the prompt entry is counted as 'registered' (registered=1).
+    assert result == {"registered": 1, "invalid": 0}
+
+    # Prompt-style yaml entry → scheduler:morning-review.
+    assert sched._scheduler.get_job("scheduler:morning-review") is not None
+    # Callable-style yaml entry → demo (no scheduler: prefix).
+    assert sched._scheduler.get_job("demo") is not None
+    # No scheduler:saga-nightly should exist (it's a callable entry).
+    assert sched._scheduler.get_job("scheduler:saga-nightly") is None
+
+
+@pytest.mark.asyncio
+async def test_add_job_validates_callable_is_registered(tmp_path: Path):
+    """add_job MCP tool refuses to write a yaml entry for an
+    unregistered callable — would be dead-on-arrival."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    job = SchedulerJob(
+        name="bogus", callable_name="never-registered",
+        cron="0 4 * * *",
+    )
+    with pytest.raises(ValueError, match="not registered"):
+        await sched.add_job(job)
+
+
+@pytest.mark.asyncio
+async def test_add_job_with_registered_callable_persists(tmp_path: Path):
+    """add_job for a registered callable writes yaml + reload picks
+    up the new cron."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    async def _fn():
+        return None
+    sched.register_callable("demo", _fn, default_cron="0 4 * * *")
+
+    job = SchedulerJob(
+        name="demo-shifted", callable_name="demo",
+        cron="0 6 * * *",
+    )
+    await sched.add_job(job)
+    # yaml mutation triggered reload; callable picked up new cron.
+    apjob = sched._scheduler.get_job("demo")
+    assert "hour='6'" in str(apjob.trigger)
+
+
+@pytest.mark.asyncio
+async def test_add_job_callable_with_empty_cron_disables(tmp_path: Path):
+    """add_job with callable + empty cron is the explicit-disable
+    path; yaml gets the entry, APScheduler drops the job."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    async def _fn():
+        return None
+    sched.register_callable("demo", _fn, default_cron="0 4 * * *")
+    assert sched._scheduler.get_job("demo") is not None
+
+    job = SchedulerJob(
+        name="disable-demo", callable_name="demo", cron=None,
+    )
+    await sched.add_job(job)
+    assert sched._scheduler.get_job("demo") is None
+    # Registration still in place — operator can re-enable later.
+    assert "demo" in sched.registered_callables()

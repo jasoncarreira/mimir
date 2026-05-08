@@ -59,12 +59,24 @@ HomeostaticArbiter = Any
 @dataclass
 class SchedulerJob:
     name: str
-    # Either ``prompt`` (inline string) OR ``prompt_file`` (path under
-    # ``MIMIR_HOME/prompts/``) provides the cron's instructions. When
-    # both are set, ``prompt_file`` wins at fire time and ``prompt``
-    # is the fallback if the file goes missing.
+    # An entry is one of three kinds:
+    #
+    # 1. **Prompt LLM-tick** — ``prompt`` (inline string) OR
+    #    ``prompt_file`` (path under ``MIMIR_HOME/prompts/``). When both
+    #    are set, ``prompt_file`` wins at fire time and ``prompt`` is the
+    #    fallback if the file goes missing.
+    # 2. **Named callable** — ``callable_name`` references a
+    #    code-side-registered callable on the Scheduler (saga-consolidate,
+    #    identities-populate, etc.). The yaml entry exists to override
+    #    the env-var-default cron or disable the callable entirely.
+    #
+    # Exactly one of ``prompt`` / ``prompt_file`` / ``callable_name``
+    # must be set per entry. ``callable`` is the on-disk yaml field
+    # name; ``callable_name`` is the dataclass attribute (avoiding
+    # the ``callable`` builtin shadow).
     prompt: str = ""
     prompt_file: str | None = None
+    callable_name: str | None = None
     cron: str | None = None
     time_of_day: str | None = None
     channel_id: str | None = None
@@ -75,11 +87,17 @@ class SchedulerJob:
             out["prompt"] = self.prompt
         if self.prompt_file:
             out["prompt_file"] = self.prompt_file
+        if self.callable_name:
+            out["callable"] = self.callable_name
         if self.cron:
             out["cron"] = self.cron
         if self.time_of_day:
             out["time_of_day"] = self.time_of_day
-        out["channel_id"] = self.channel_id
+        # Callable entries don't carry a channel_id (they're not
+        # dispatched as AgentEvents); only emit it for prompt entries
+        # to keep yaml uncluttered.
+        if not self.callable_name:
+            out["channel_id"] = self.channel_id
         return out
 
     @classmethod
@@ -87,6 +105,7 @@ class SchedulerJob:
         name = str(raw.get("name", "")).strip()
         prompt = str(raw.get("prompt", "")).strip()
         prompt_file_raw = str(raw.get("prompt_file", "")).strip() or None
+        callable_name_raw = str(raw.get("callable", "")).strip() or None
         cron = str(raw.get("cron", "")).strip() or None
         time_of_day = str(raw.get("time_of_day", "")).strip() or None
         channel_id = raw.get("channel_id")
@@ -94,18 +113,44 @@ class SchedulerJob:
             channel_id = None
         if not name:
             raise ValueError("scheduler job missing 'name'")
-        if not prompt and not prompt_file_raw:
+        # Exactly one of prompt / prompt_file / callable must be set.
+        # The three are mutually exclusive — prompt+callable would
+        # be ambiguous (do we run the callable or render the prompt?)
+        # and silent precedence rules accumulate confusion over time.
+        kind_count = sum(bool(x) for x in (prompt, prompt_file_raw, callable_name_raw))
+        if kind_count == 0:
             raise ValueError(
-                f"scheduler job {name!r}: one of 'prompt' or 'prompt_file' required"
+                f"scheduler job {name!r}: one of 'prompt', 'prompt_file', "
+                f"or 'callable' required"
             )
-        if bool(cron) == bool(time_of_day):
+        if kind_count > 1:
             raise ValueError(
-                f"scheduler job {name!r}: exactly one of cron / time_of_day required"
+                f"scheduler job {name!r}: 'prompt', 'prompt_file', and "
+                f"'callable' are mutually exclusive — exactly one"
             )
+        # cron OR time_of_day required for prompt/prompt_file entries.
+        # Callable entries with empty cron mean "explicitly disabled
+        # for this deployment, regardless of env-var default" — we
+        # still allow that as a deliberate operator action.
+        if callable_name_raw is None:
+            if bool(cron) == bool(time_of_day):
+                raise ValueError(
+                    f"scheduler job {name!r}: exactly one of cron / time_of_day required"
+                )
+        else:
+            # Callable entry: time_of_day not supported (callables get
+            # cron expressions only — they're typically internal
+            # cadence, not user-facing schedules).
+            if time_of_day:
+                raise ValueError(
+                    f"scheduler job {name!r}: callable entries use 'cron' "
+                    f"only; 'time_of_day' is for prompt entries"
+                )
         return cls(
             name=name,
             prompt=prompt,
             prompt_file=prompt_file_raw,
+            callable_name=callable_name_raw,
             cron=cron,
             time_of_day=time_of_day,
             channel_id=channel_id,
@@ -186,6 +231,57 @@ def _scheduler_channel_id(job_name: str, channel_id: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Named-callable registry
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CallableDef:
+    """One registered non-LLM cron callable. The closure ``fn`` captures
+    the binding context (SagaClient, channel registry, etc.) so the
+    yaml side never needs to know about runtime handles. ``default_cron``
+    is the env-var-derived fallback used when no yaml entry overrides;
+    ``job_id`` is the APScheduler id (typically equal to ``name``)."""
+    name: str
+    fn: Callable[[], Awaitable[None]]
+    default_cron: str
+    job_id: str
+    # Misfire grace + max-instance config varies per callable
+    # (saga-consolidate tolerates 1h misfires; oauth poll wants 60s).
+    # Captured here so reload() can re-install with the right knobs.
+    misfire_grace_time: int = 3600
+    max_instances: int = 1
+    coalesce: bool = True
+
+
+def _resolve_callable_cron(
+    yaml_jobs: list[SchedulerJob],
+    callable_name: str,
+    default_cron: str,
+) -> tuple[str, str]:
+    """Resolve the effective cron for a registered callable.
+
+    Returns ``(effective_cron, source)`` where ``source`` is one of
+    ``"yaml"``, ``"env"``, or ``"yaml-disabled"``. ``yaml-disabled``
+    means the yaml has an entry naming this callable but with empty
+    cron — the operator's explicit "off" signal, which beats the
+    env-var default.
+
+    The yaml's match is by ``callable_name`` (the registered name),
+    not by the entry's ``name`` field. Operator can give the yaml
+    entry any human-readable name; the binding is via ``callable:``.
+    """
+    for job in yaml_jobs:
+        if job.callable_name == callable_name:
+            cron = (job.cron or "").strip()
+            if cron:
+                return cron, "yaml"
+            # Empty cron + matching callable = explicit disable.
+            return "", "yaml-disabled"
+    return (default_cron or "").strip(), "env"
+
+
+# ---------------------------------------------------------------------------
 # Scheduler service
 # ---------------------------------------------------------------------------
 
@@ -212,20 +308,60 @@ class Scheduler:
         # ``<home>/prompts/<file>`` at fire time. Optional for tests
         # and bench harnesses that construct Scheduler without a home.
         self._home = home
+        # Named-callable registry. Populated by ``register_callable``
+        # at startup (server.py wires each non-LLM cron). The yaml
+        # is the override surface — entries naming a registered
+        # callable change its cron without a restart; missing yaml
+        # entry → env-var-default-cron is used. See
+        # ``SCHEDULER_CALLABLE_JOBS.md`` for the design.
+        self._callables: dict[str, _CallableDef] = {}
 
     # ---- LLM-tick jobs ------------------------------------------------
 
     def reload(self) -> dict[str, int]:
         """Wipe LLM-tick registrations and re-register from scheduler.yaml.
-        Returns ``{registered, invalid}`` counts. Caller logs."""
+        Re-resolves registered callables against the (potentially mutated)
+        yaml so runtime cron overrides take effect on the next tick.
+        Returns ``{registered, invalid}`` counts. Caller logs.
+
+        ``registered`` and ``invalid`` only count prompt-style entries.
+        Callable entries are tracked separately via the registry."""
         # Drop existing scheduler:* jobs; leave non-prefixed (e.g. saga-consolidate).
         for job in list(self._scheduler.get_jobs()):
             if job.id.startswith("scheduler:"):
                 self._scheduler.remove_job(job.id)
 
+        yaml_jobs = load_jobs(self._yaml_path)
+
+        # Re-resolve registered callables against the new yaml. A yaml
+        # mutation that adds / removes / changes a ``callable:`` entry
+        # propagates to APScheduler here.
+        for cdef in list(self._callables.values()):
+            try:
+                self._install_callable(cdef)
+            except ValueError as exc:
+                log.warning(
+                    "reload: callable %r install failed: %s",
+                    cdef.name, exc,
+                )
+
+        # Warn-skip yaml entries naming an unregistered callable.
+        # Don't crash startup — could be a stale yaml after a refactor
+        # removed the callable code-side.
+        registered_names = set(self._callables.keys())
+
         registered = 0
         invalid = 0
-        for job in load_jobs(self._yaml_path):
+        for job in yaml_jobs:
+            # Skip callable-typed entries — they're handled above.
+            if job.callable_name is not None:
+                if job.callable_name not in registered_names:
+                    log.warning(
+                        "scheduler.yaml entry %r references unregistered "
+                        "callable %r; skipping",
+                        job.name, job.callable_name,
+                    )
+                continue
             try:
                 trigger = _build_trigger(job)
             except ValueError:
@@ -324,8 +460,27 @@ class Scheduler:
 
     async def add_job(self, job: SchedulerJob) -> SchedulerJob:
         """Atomic add-or-replace by name. Validates the trigger before
-        persisting; raises ``ValueError`` on bad cron/time_of_day."""
-        _build_trigger(job)  # validate up front
+        persisting; raises ``ValueError`` on bad cron/time_of_day or
+        unregistered callable references."""
+        if job.callable_name is not None:
+            # Callable entries: validate against the registry. Unknown
+            # callable would write to yaml as a dead-on-arrival entry.
+            if job.callable_name not in self._callables:
+                raise ValueError(
+                    f"callable {job.callable_name!r} is not registered "
+                    f"(registered: {sorted(self._callables.keys())!r})"
+                )
+            # Cron may be empty (explicit-disable signal); only validate
+            # if non-empty.
+            if job.cron:
+                try:
+                    CronTrigger.from_crontab(job.cron, timezone=UTC)
+                except (ValueError, KeyError) as exc:
+                    raise ValueError(
+                        f"invalid cron expression {job.cron!r}: {exc}"
+                    ) from exc
+        else:
+            _build_trigger(job)  # validate up front
         async with self._mutate_lock:
             current = await asyncio.to_thread(load_jobs, self._yaml_path)
             current = [j for j in current if j.name != job.name]
@@ -346,6 +501,111 @@ class Scheduler:
 
     async def list_jobs(self) -> list[SchedulerJob]:
         return await asyncio.to_thread(load_jobs, self._yaml_path)
+
+    # ---- Named-callable registry -------------------------------------
+
+    def register_callable(
+        self,
+        name: str,
+        fn: Callable[[], Awaitable[None]],
+        default_cron: str,
+        *,
+        job_id: str | None = None,
+        misfire_grace_time: int = 3600,
+        max_instances: int = 1,
+        coalesce: bool = True,
+    ) -> bool:
+        """Register a non-LLM cron callable + install it.
+
+        Effective cron resolution:
+          1. yaml entry with matching ``callable: <name>`` → yaml's cron
+          2. else ``default_cron`` (typically from a ``MIMIR_*_CRON``
+             env var)
+          3. empty effective cron → no APScheduler job is installed
+
+        Yaml mutation via ``add_job`` / ``remove_job`` triggers a
+        ``reload()`` which re-resolves all registered callables, so
+        runtime cron overrides via the ``add_schedule`` MCP tool take
+        effect immediately.
+
+        Returns True if a job was installed (cron was non-empty),
+        False otherwise (empty default + no yaml override; or yaml
+        explicit-disable). The boolean preserves the existing
+        ``add_*_job`` return contract.
+
+        Raises ``ValueError`` for invalid cron expressions (caller
+        logs and continues; doesn't propagate to startup).
+        """
+        cdef = _CallableDef(
+            name=name,
+            fn=fn,
+            default_cron=default_cron or "",
+            job_id=job_id or name,
+            misfire_grace_time=misfire_grace_time,
+            max_instances=max_instances,
+            coalesce=coalesce,
+        )
+        # Replace any prior registration under this name so re-calls
+        # during tests / hot-reload-style server restarts don't leak
+        # stale closures.
+        self._callables[name] = cdef
+        return self._install_callable(cdef)
+
+    def _install_callable(self, cdef: _CallableDef) -> bool:
+        """Resolve the effective cron for ``cdef`` and (re-)add the
+        APScheduler job. Returns True if a job was installed."""
+        # Drop any existing APScheduler job under this id. This makes
+        # reload() idempotent — it can re-register without leaking
+        # the prior job.
+        try:
+            self._scheduler.remove_job(cdef.job_id)
+        except Exception:  # noqa: BLE001 — JobLookupError or other; both fine
+            pass
+
+        yaml_jobs: list[SchedulerJob]
+        try:
+            yaml_jobs = load_jobs(self._yaml_path)
+        except Exception:  # noqa: BLE001 — already logged inside load_jobs
+            yaml_jobs = []
+
+        effective_cron, source = _resolve_callable_cron(
+            yaml_jobs, cdef.name, cdef.default_cron,
+        )
+        if not effective_cron:
+            log.info(
+                "callable %r: no effective cron (source=%s); "
+                "not installing",
+                cdef.name, source,
+            )
+            return False
+
+        try:
+            trigger = CronTrigger.from_crontab(effective_cron, timezone=UTC)
+        except (ValueError, KeyError) as exc:
+            raise ValueError(
+                f"invalid cron expression {effective_cron!r} for "
+                f"callable {cdef.name!r} (source={source}): {exc}"
+            ) from exc
+
+        self._scheduler.add_job(
+            cdef.fn,
+            trigger=trigger,
+            id=cdef.job_id,
+            replace_existing=True,
+            misfire_grace_time=cdef.misfire_grace_time,
+            max_instances=cdef.max_instances,
+            coalesce=cdef.coalesce,
+        )
+        log.info(
+            "callable %r installed at cron %r (source=%s)",
+            cdef.name, effective_cron, source,
+        )
+        return True
+
+    def registered_callables(self) -> list[str]:
+        """Names of all registered callables. Used by add_schedule MCP
+        tool validation and by the test harness."""
+        return sorted(self._callables.keys())
 
     # ---- SAGA consolidation cron -------------------------------------
 
@@ -368,15 +628,12 @@ class Scheduler:
         canonical names through ``consolidate(extra_canonical_subjects
         =[...])`` so saga's P48 vocab block surfaces operator-curated
         subjects to the consolidation LLM (Option A from the P48
-        identities-injection design)."""
-        cron_expr = (cron_expr or "").strip()
-        if not cron_expr:
-            return False
-        try:
-            trigger = CronTrigger.from_crontab(cron_expr, timezone=UTC)
-        except (ValueError, KeyError) as exc:
-            raise ValueError(f"invalid cron expression {cron_expr!r}: {exc}") from exc
+        identities-injection design).
 
+        Migrated to the named-callable registry (see
+        ``SCHEDULER_CALLABLE_JOBS.md``). The yaml side may
+        override ``cron_expr`` via a ``callable: saga-consolidate``
+        entry; ``cron_expr`` here is the env-var-derived default."""
         async def _consolidate() -> None:
             # Step 1: decay BEFORE consolidation. Decay recomputes
             # retrievability, runs state transitions (active → fading →
@@ -445,14 +702,19 @@ class Scheduler:
             except Exception as exc:  # noqa: BLE001
                 await log_event("saga_consolidate_error", error=f"{type(exc).__name__}: {exc}")
 
-        self._scheduler.add_job(
-            _consolidate,
-            trigger=trigger,
-            id=job_id,
-            replace_existing=True,
+        return self.register_callable(
+            name=job_id,
+            fn=_consolidate,
+            default_cron=cron_expr,
+            job_id=job_id,
             misfire_grace_time=3600,
+            # Existing behavior: APScheduler defaults (max_instances=1
+            # is APScheduler default, but the consolidate job didn't
+            # set coalesce explicitly — APScheduler default coalesce is
+            # False. Preserve that.)
+            max_instances=1,
+            coalesce=False,
         )
-        return True
 
     # ---- Introspection-report cron -----------------------------------
 
@@ -471,16 +733,6 @@ class Scheduler:
         health_threshold: float = 0.80,
         job_id: str = "introspection-report",
     ) -> bool:
-        cron_expr = (cron_expr or "").strip()
-        if not cron_expr:
-            return False
-        try:
-            trigger = CronTrigger.from_crontab(cron_expr, timezone=UTC)
-        except (ValueError, KeyError) as exc:
-            raise ValueError(
-                f"invalid cron expression {cron_expr!r}: {exc}"
-            ) from exc
-
         async def _run() -> None:
             try:
                 from datetime import datetime, timezone as _tz
@@ -519,14 +771,15 @@ class Scheduler:
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-        self._scheduler.add_job(
-            _run,
-            trigger=trigger,
-            id=job_id,
-            replace_existing=True,
+        return self.register_callable(
+            name=job_id,
+            fn=_run,
+            default_cron=cron_expr,
+            job_id=job_id,
             misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=False,
         )
-        return True
 
     # ---- OAuth usage poller cron -------------------------------------
 
@@ -549,18 +802,8 @@ class Scheduler:
         job_id: str = "oauth-usage-poll",
     ) -> bool:
         """Register the plan-window quota poller. Returns False on
-        empty / unset cron expression so callers can no-op out without
-        an exception."""
-        cron_expr = (cron_expr or "").strip()
-        if not cron_expr:
-            return False
-        try:
-            trigger = CronTrigger.from_crontab(cron_expr, timezone=UTC)
-        except (ValueError, KeyError) as exc:
-            raise ValueError(
-                f"invalid cron expression {cron_expr!r}: {exc}"
-            ) from exc
-
+        empty effective cron (env-var default empty AND no yaml override).
+        Migrated to the named-callable registry."""
         from .oauth_usage_poller import PollerConfig, poll_once
 
         cfg = PollerConfig(
@@ -581,11 +824,11 @@ class Scheduler:
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-        self._scheduler.add_job(
-            _run,
-            trigger=trigger,
-            id=job_id,
-            replace_existing=True,
+        return self.register_callable(
+            name=job_id,
+            fn=_run,
+            default_cron=cron_expr,
+            job_id=job_id,
             # Quota data is best-effort — don't backfill missed runs.
             misfire_grace_time=60,
             # If the poller is already mid-run when the next tick fires
@@ -593,7 +836,6 @@ class Scheduler:
             max_instances=1,
             coalesce=True,
         )
-        return True
 
     # ---- bind-mount health probe cron --------------------------------
 
@@ -619,17 +861,9 @@ class Scheduler:
         The probe is lightweight (a single subprocess.run) and self-
         gates on VirtioFS detection, so registering it on a non-
         VirtioFS host is harmless — every tick will short-circuit on
-        the mountinfo check."""
-        cron_expr = (cron_expr or "").strip()
-        if not cron_expr:
-            return False
-        try:
-            trigger = CronTrigger.from_crontab(cron_expr, timezone=UTC)
-        except (ValueError, KeyError) as exc:
-            raise ValueError(
-                f"invalid cron expression {cron_expr!r}: {exc}"
-            ) from exc
+        the mountinfo check.
 
+        Migrated to the named-callable registry."""
         from .health_probe import HealthProbeConfig, probe_once
 
         cfg = HealthProbeConfig(
@@ -651,21 +885,19 @@ class Scheduler:
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-        self._scheduler.add_job(
-            _run,
-            trigger=trigger,
-            id=job_id,
-            replace_existing=True,
+        return self.register_callable(
+            name=job_id,
+            fn=_run,
+            default_cron=cron_expr,
+            job_id=job_id,
             # If the probe takes longer than 30s (kernel hang in the
             # subprocess.run path itself), let APScheduler skip the
-            # next tick rather than queue them up. We'd rather miss a
-            # probe than pile them up behind a stuck syscall.
+            # next tick rather than queue them up.
             misfire_grace_time=30,
-            # Same reason — never overlap probes.
+            # Never overlap probes.
             max_instances=1,
             coalesce=True,
         )
-        return True
 
     # ---- identities-populate cron -----------------------------------
 
@@ -692,17 +924,8 @@ class Scheduler:
         the next run. Bridges are looked up by ``bridge.name`` —
         ``"discord"`` and ``"slack"`` today; absent ones contribute
         nothing.
-        """
-        cron_expr = (cron_expr or "").strip()
-        if not cron_expr:
-            return False
-        try:
-            trigger = CronTrigger.from_crontab(cron_expr, timezone=UTC)
-        except (ValueError, KeyError) as exc:
-            raise ValueError(
-                f"invalid cron expression {cron_expr!r}: {exc}"
-            ) from exc
 
+        Migrated to the named-callable registry."""
         async def _run() -> None:
             try:
                 from .identities_populator import populate_all
@@ -732,19 +955,17 @@ class Scheduler:
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-        self._scheduler.add_job(
-            _run,
-            trigger=trigger,
-            id=job_id,
-            replace_existing=True,
+        return self.register_callable(
+            name=job_id,
+            fn=_run,
+            default_cron=cron_expr,
+            job_id=job_id,
             # Bridge scrapes can take a minute or two on large
-            # workspaces — give them room but don't backfill missed
-            # runs (next day's tick gets the same data).
+            # workspaces — give them room but don't backfill missed runs.
             misfire_grace_time=300,
             max_instances=1,
             coalesce=True,
         )
-        return True
 
     # ---- lifecycle ---------------------------------------------------
 
