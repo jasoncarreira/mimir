@@ -846,10 +846,18 @@ class Agent:
         effort = self._config.effort
         if effort not in ("low", "medium", "high", "max"):
             effort = "high"
+        # ``betas``: Anthropic beta headers passed through the SDK to
+        # the API. Currently a list of one — the 1M-context flag — when
+        # the operator hasn't opted out via MIMIR_CONTEXT_1M=false.
+        betas: list = []
+        if self._config.context_1m:
+            from .usage_stats import CONTEXT_1M_BETA
+            betas.append(CONTEXT_1M_BETA)
         return ClaudeAgentOptions(
             system_prompt=system_prompt,
             tools=list(SDK_PRESET_TOOLS),
             mcp_servers={"mimir": self._mcp_server},
+            betas=betas,
             allowed_tools=allowed_tool_names(
                 include_search=self._indexer is not None,
                 include_saga=self._saga is not None,
@@ -1280,6 +1288,14 @@ class Agent:
         except Exception:  # noqa: BLE001
             log.exception("subagent_stats aggregate failed")
 
+        # Reflect the active 1M-context beta in the renderer's
+        # context-window arithmetic — the `% of` denominator should
+        # match the cap actually in effect on the wire.
+        active_betas: list[str] = []
+        if self._config.context_1m:
+            from .usage_stats import CONTEXT_1M_BETA
+            active_betas.append(CONTEXT_1M_BETA)
+
         return (
             render_usage_block(
                 report,
@@ -1290,6 +1306,7 @@ class Agent:
                 plan_quota_lines=plan_lines,
                 off_pace_warning=off_pace_lines,
                 subagent_block=subagent_body,
+                betas=active_betas or None,
             ),
             deferred,
         )
