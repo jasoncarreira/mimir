@@ -411,6 +411,13 @@ def build_app(config: Config) -> web.Application:
                     config.oauth_usage_poll_cron,
                     config.oauth_credentials_path,
                     refresh_warn_days=config.oauth_refresh_warn_days,
+                    # chainlink #17: enable the cost-rate-back-derived
+                    # 5h estimator so endpoint glitches don't leave the
+                    # arbiter blind to actual usage during a long
+                    # outage. Falls back to "keep prior trusted value"
+                    # when derive math can't run (no observable cost,
+                    # no prior 7d util).
+                    turns_log_path=config.turns_log,
                 )
             except ValueError as exc:
                 await log_event(
