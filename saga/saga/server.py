@@ -150,6 +150,10 @@ class SessionEndRequest(BaseModel):
     unfinished: Optional[list[str]] = None
     emotional_state: Optional[str] = None
     channel: Optional[str] = None
+    # chainlink #63: corrective overrides — refs of items from prior
+    # boundaries' Unfinished lists that have been resolved during this
+    # session. Empty / None → no corrections from this boundary.
+    closed_since: Optional[list[str]] = None
 
 
 class TriplesExtractRequest(BaseModel):
@@ -550,6 +554,7 @@ async def api_session_end(req: SessionEndRequest):
             unfinished=req.unfinished,
             emotional_state=req.emotional_state,
             channel=req.channel,
+            closed_since=req.closed_since,
         )
         return {"atom_id": atom_id, "session_id": req.session_id, "channel": req.channel}
     return await asyncio.to_thread(_end)

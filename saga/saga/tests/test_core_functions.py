@@ -306,6 +306,55 @@ class TestSessionWorkingMemory:
         assert len(only_s1) == 1
         assert only_s1[0]["session_id"] == "s1"
 
+    def test_get_last_sessions_returns_canonical_render_shape(self):
+        """chainlink #63: structured fields (summary, unfinished,
+        topics_discussed, decisions_made, emotional_state, closed_since)
+        round-trip through metadata so the prompt-render path doesn't
+        need to parse the markdown content blob. Aliases (``ts``,
+        ``channel_id``) match the local-mirror shape."""
+        from saga.core import store_session_boundary, get_last_sessions
+        store_session_boundary(
+            session_id="canon-1",
+            summary="Wrapped chainlink #63 follow-up.",
+            topics_discussed=["session-boundary staleness"],
+            decisions_made=["land closed_since corrective overrides"],
+            unfinished=["#X awaiting CI"],
+            emotional_state="focused",
+            channel="discord-1",
+            closed_since=["#71", "#72"],
+        )
+        out = get_last_sessions(count=1, session_id="canon-1")
+        assert len(out) == 1
+        rec = out[0]
+        # Canonical render-shape keys present.
+        assert rec["ts"] is not None
+        assert rec["channel_id"] == "discord-1"
+        assert rec["summary"] == "Wrapped chainlink #63 follow-up."
+        assert rec["unfinished"] == ["#X awaiting CI"]
+        assert rec["topics_discussed"] == ["session-boundary staleness"]
+        assert rec["decisions_made"] == ["land closed_since corrective overrides"]
+        assert rec["emotional_state"] == "focused"
+        assert rec["closed_since"] == ["#71", "#72"]
+        # Legacy keys retained for back-compat.
+        assert rec["channel"] == "discord-1"
+        assert rec["timestamp"] is not None
+
+    def test_get_last_sessions_empty_lists_when_no_metadata(self):
+        """Backwards-compat: a session_boundary written without the
+        new metadata fields (older atoms, or a caller passing only
+        the required summary) must not raise — empty lists are the
+        renderer-friendly default."""
+        from saga.core import store_session_boundary, get_last_sessions
+        store_session_boundary(session_id="bare-1", summary="No metadata.")
+        out = get_last_sessions(count=1, session_id="bare-1")
+        assert len(out) == 1
+        rec = out[0]
+        assert rec["unfinished"] == []
+        assert rec["topics_discussed"] == []
+        assert rec["closed_since"] == []
+        # summary IS persisted to metadata now, so it round-trips.
+        assert rec["summary"] == "No metadata."
+
     def test_session_boundary_excluded_from_retrieve(self):
         """Continuity beacons must not pollute generic semantic retrieval."""
         from saga.core import store_session_boundary, store_atom, retrieve

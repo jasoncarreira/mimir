@@ -343,6 +343,67 @@ async def test_saga_end_session_appends_to_local_mirror(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_saga_end_session_passes_closed_since_through(tmp_path):
+    """chainlink #63: closed_since flows from the tool args through
+    to BOTH the SAGA client call AND the local mirror record.
+    Synthesis turns use this to record items resolved during the
+    just-ended session — refs like ``#71``, ``chainlink #29 G17``, etc."""
+    import json
+
+    from mimir.session_boundary_log import SessionBoundaryLog
+
+    fake = FakeSaga()
+    mirror = SessionBoundaryLog(path=tmp_path / ".mimir" / "sb.jsonl")
+    tools = build_saga_tools(fake, session_boundary_log=mirror)  # type: ignore[arg-type]
+    end = _by_name(tools, "saga_end_session")
+
+    out = await end.handler({
+        "session_id": "saga-x-1",
+        "summary": "wrap-up",
+        "unfinished": ["PR #99 still pending"],
+        "closed_since": ["#71", "chainlink #29 G17"],
+    })
+    assert out.get("is_error") is not True
+
+    # SAGA client was called with closed_since.
+    end_calls = [c for c in fake.calls if c.method == "end_session"]
+    assert len(end_calls) == 1
+    assert end_calls[0].payload["closed_since"] == ["#71", "chainlink #29 G17"]
+
+    # Local mirror record carries closed_since.
+    body = (tmp_path / ".mimir" / "sb.jsonl").read_text()
+    rec = json.loads(body.splitlines()[0])
+    assert rec["closed_since"] == ["#71", "chainlink #29 G17"]
+
+
+@pytest.mark.asyncio
+async def test_saga_end_session_closed_since_must_be_list_of_strings():
+    """Mirror the existing _opt_list validation for the new arg —
+    a stray dict / non-list raises an _ArgError surfaced as is_error."""
+    fake = FakeSaga()
+    tools = build_saga_tools(fake)  # type: ignore[arg-type]
+    end = _by_name(tools, "saga_end_session")
+
+    out = await end.handler({
+        "session_id": "saga-x-1",
+        "summary": "wrap-up",
+        "closed_since": "not a list",  # wrong shape
+    })
+    assert out.get("is_error") is True
+    assert "closed_since" in out["content"][0]["text"]
+    # Empty list / None drops cleanly without erroring.
+    out2 = await end.handler({
+        "session_id": "saga-x-1",
+        "summary": "wrap-up",
+        "closed_since": [],
+    })
+    assert out2.get("is_error") is not True
+    end_calls = [c for c in fake.calls if c.method == "end_session"]
+    # Empty list collapses to None (consistent with _opt_list semantics).
+    assert end_calls[-1].payload["closed_since"] is None
+
+
+@pytest.mark.asyncio
 async def test_saga_end_session_flips_ctx_flag(tmp_path):
     """CR#19: a successful end_session call flips
     ``ctx.saga_end_session_called = True`` so the agent's post-message
