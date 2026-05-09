@@ -19,6 +19,15 @@ Differences from the open-strix port this is based on:
   resolves to ``<home>/state/pollers/<poller_name>/`` (persistent
   across container rebuilds, separate from the skill dir).
 
+The cursor advances after every successful run regardless of per-repo
+or per-resource ``gh api`` failures: a transient rate-limit / 5xx /
+network error on one repo's endpoint silently drops events in that
+cursor window. The alternative — pinning the cursor on partial
+failure — wedges polling indefinitely if one repo is persistently
+broken, so this is the deliberate tradeoff. Persistent failures
+surface as ``poller_stderr`` events for the affected endpoints, so
+operator audit can grep for them.
+
 Environment variables:
     STATE_DIR                  - Persistent state dir (set by framework)
     POLLER_NAME                - This poller's name
@@ -272,11 +281,14 @@ def _check_pr_review_comments(repo: str, since: str, token: str, me: str) -> int
 
 def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
     """New PR reviews (approve / changes-requested / commented).
-    No ``since=`` query on reviews, so we walk the most-recent open
-    PRs + filter by ``submitted_at``."""
+    No ``since=`` query on reviews endpoint — walk open PRs + filter
+    by ``submitted_at``. ``_gh_api`` passes ``--paginate``, so all
+    open PRs are walked regardless of page size (verified
+    empirically: ``per_page=3 --paginate`` returns every PR, not 3).
+    Letting GitHub's default page size (30) apply means fewer
+    round-trips on repos with many open PRs."""
     prs = _gh_api(
-        f"repos/{repo}/pulls?state=open&sort=updated"
-        f"&direction=desc&per_page=10",
+        f"repos/{repo}/pulls?state=open&sort=updated&direction=desc",
         token,
     )
     if not isinstance(prs, list):
