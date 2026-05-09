@@ -136,6 +136,13 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "saga_decay_ok": ("positive", "saga_decay_ok"),
     "saga_forget_ok": ("positive", "saga_forget_ok"),
     "introspection_report_ok": ("positive", "introspection_ok"),
+    # Wiki health — emitted by `mimir wiki backlinks` when the wiki has
+    # orphan pages or dangling links. Clean wikis emit nothing (no spam
+    # for the no-action-needed case). First-occurrence-only: a chronic
+    # orphan count would otherwise re-render every turn and crowd out
+    # acute signals; the agent sees it once per 24h window and clears
+    # the orphans on a lint pass.
+    "wiki_backlinks_unhealthy": ("negative", "wiki_health"),
 }
 
 
@@ -195,6 +202,11 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # the operator-actionable signal.
     "discord_bridge_retry",
     "slack_bridge_retry",
+    # Wiki health: chronic orphan/dangling counts would re-render every
+    # turn the bot runs `mimir wiki backlinks`. Latest-only is right —
+    # the agent sees "wiki has N orphans" once per 24h window and
+    # decides whether to do a lint pass.
+    "wiki_health",
 }
 
 
@@ -312,6 +324,21 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return (
             f"{n_str} predictions past horizon — run `mimir predictions "
             f"review` to score them"
+        )
+    if rule_kind == "wiki_health":
+        orphans = ev.get("orphan_count")
+        dangling = ev.get("dangling_count")
+        parts: list[str] = []
+        if isinstance(orphans, (int, float)) and orphans > 0:
+            parts.append(f"{int(orphans)} orphan{'' if orphans == 1 else 's'}")
+        if isinstance(dangling, (int, float)) and dangling > 0:
+            parts.append(
+                f"{int(dangling)} dangling link{'' if dangling == 1 else 's'}"
+            )
+        summary = " / ".join(parts) if parts else "issues detected"
+        return (
+            f"wiki health: {summary} — "
+            f"see state/wiki/orphans.md, state/wiki/dangling-links.md"
         )
     if rule_kind == "saga_consolidate_ok":
         result = ev.get("result") or {}
