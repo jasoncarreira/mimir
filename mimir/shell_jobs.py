@@ -132,6 +132,8 @@ class ShellJobRegistry:
         argv: list[str],
         channel_id: Optional[str] = None,
         on_complete: Optional[Callable[["ShellJob"], None]] = None,
+        env_overlay: Optional[dict[str, Optional[str]]] = None,
+        cwd: Optional[os.PathLike] = None,
     ) -> ShellJob:
         """Spawn argv as a subprocess and register it.
 
@@ -146,6 +148,14 @@ class ShellJobRegistry:
         subprocess exits and ``exit_code`` / ``finished_at`` are set.
         Exceptions raised by the callback are caught and dropped so
         the registry stays intact even if the bridge breaks.
+
+        ``env_overlay`` merges into the inherited env after defaults
+        are applied; keys map to None to *unset* an inherited var.
+        ``cwd`` overrides the working directory the subprocess starts
+        in. Both used by ``spawn_claude_code`` to run the bundled CLI
+        with ``HOME=/mimir-home`` (so OAuth credentials resolve) and
+        without ``CLAUDECODE`` (so the spawn doesn't think it's
+        nested in a Claude Code session).
         """
         job_id = self._make_job_id()
         stdout_path = self.jobs_dir / f"{job_id}.out"
@@ -161,12 +171,20 @@ class ShellJobRegistry:
             # still running (otherwise bash_job_output sees nothing
             # until the process ends).
             env.setdefault("PYTHONUNBUFFERED", "1")
+            if env_overlay:
+                for k, v in env_overlay.items():
+                    if v is None:
+                        env.pop(k, None)
+                    else:
+                        env[k] = v
             popen_kwargs: dict = {
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
                 "bufsize": 0,
                 "env": env,
             }
+            if cwd is not None:
+                popen_kwargs["cwd"] = os.fspath(cwd)
             # Put child in its own session so the agent can send signals
             # to it (via the regular Bash tool) without affecting the
             # parent harness. Linux/macOS only; the container always

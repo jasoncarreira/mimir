@@ -143,6 +143,14 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # acute signals; the agent sees it once per 24h window and clears
     # the orphans on a lint pass.
     "wiki_backlinks_unhealthy": ("negative", "wiki_health"),
+    # chainlink #60: spawn_claude_code completion signals. ``_completed``
+    # fires on a clean spawn exit; ``_auth_failed`` on 4xx + is_error
+    # (token revoked, refresh failed, server-side quota exhausted);
+    # ``_work_failed`` on the spawned agent loop ending badly
+    # (max-turns / max-budget / errored / unparseable JSON).
+    "claude_code_spawn_completed": ("positive", "spawn_ok"),
+    "claude_code_spawn_auth_failed": ("negative", "spawn_auth_fail"),
+    "claude_code_spawn_work_failed": ("negative", "spawn_work_fail"),
 }
 
 
@@ -207,6 +215,12 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # the agent sees "wiki has N orphans" once per 24h window and
     # decides whether to do a lint pass.
     "wiki_health",
+    # chainlink #60: a busy spawn day can fire ``spawn_ok`` many times.
+    # Latest-only on the success side keeps positive signals from
+    # crowding out other shapes (saga_feedback, react_received, etc.).
+    # Failures stay un-deduped — each spawn_auth_fail / spawn_work_fail
+    # is a distinct incident with a distinct job_id worth seeing.
+    "spawn_ok",
 }
 
 
@@ -584,6 +598,37 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"required scope in the Slack app dashboard (api.slack.com → "
             f"OAuth & Permissions), reinstall the app to refresh the "
             f"token, then restart the container."
+        )
+    if rule_kind in ("spawn_ok", "spawn_auth_fail", "spawn_work_fail"):
+        job_id = ev.get("job_id") or "?"
+        agent_name = ev.get("agent") or "?"
+        cost = ev.get("cost_usd")
+        cost_str = f" cost=${cost:.2f}" if isinstance(cost, (int, float)) else ""
+        duration = ev.get("duration_ms")
+        if isinstance(duration, (int, float)):
+            secs = duration / 1000.0
+            duration_str = f" {secs:.0f}s" if secs >= 1 else f" {secs:.2f}s"
+        else:
+            duration_str = ""
+        if rule_kind == "spawn_ok":
+            return (
+                f"claude_code spawn {job_id} ({agent_name}){duration_str}{cost_str} "
+                f"completed cleanly"
+            )
+        terminal = ev.get("terminal_reason") or "?"
+        if rule_kind == "spawn_auth_fail":
+            status = ev.get("api_error_status")
+            status_str = f" [HTTP {status}]" if status is not None else ""
+            return (
+                f"claude_code spawn {job_id} ({agent_name}){duration_str} "
+                f"auth-failed{status_str} terminal={terminal}. "
+                f"Token revoked / refresh-failed / quota-exhausted server-side."
+            )
+        # spawn_work_fail
+        return (
+            f"claude_code spawn {job_id} ({agent_name}){duration_str}{cost_str} "
+            f"work-failed terminal={terminal}. "
+            f"Spawn loop ended without a clean PR — see logs/bash-jobs/{job_id}.out."
         )
     if rule_kind == "unknown_channel":
         return f"send_message to unknown channel {ev.get('channel_id', '?')}"
