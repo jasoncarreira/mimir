@@ -1,6 +1,6 @@
 ---
 name: pollers
-description: Create and manage pollers — lightweight monitoring scripts that check external services on a schedule. Use when the user wants to monitor something (Bluesky, GitHub, RSS, APIs), create a new poller, debug why a poller isn't firing, or manage pollers.json files in skills.
+description: Mechanics for building and managing pollers — subprocess scripts that check external services on a schedule and emit events when something has changed. Use when authoring a new poller (a `pollers.json` manifest plus a script in any language), debugging why a poller isn't firing, or extending an existing one. Pollers run on cron, emit JSONL events when there's something to report, and stay silent otherwise (silence-as-filter). The framework discovers `<home>/.claude/skills/<name>/pollers.json` files at startup and via `reload_pollers`; each emitted event becomes a fresh turn on a `poller:<name>` synthetic channel. Companion to the `world-scanning` skill, which catalogs *what's worth polling*. Distinct from `async-tasks` (one-shot wake-up via bash_async, not recurring) and from in-process scheduler callables (saga-consolidate, oauth-usage-poll — those mutate mimir-internal state and aren't subprocess-isolated).
 ---
 
 # Pollers — Event-Driven Monitoring
@@ -29,9 +29,9 @@ The script runs in the skill directory. It receives these environment variables 
 Plus any custom env vars from the `env` field, plus the agent's existing environment.
 
 **Output contract:**
-- **stdout:** JSONL (one JSON object per line). Each line must have `poller` (string) and `prompt` (string) fields.
-- **stderr:** Free-form logging. Not forwarded to the agent.
-- **Exit 0:** Success. **Non-zero:** Error, this cycle is skipped.
+- **stdout:** JSONL (one JSON object per line). Each line must have `prompt` (string); `poller` (string) is informational. Other keys flow into the resulting `AgentEvent.extra` so platform metadata (URLs, IDs, `source_platform`) carries through to your prompt rendering.
+- **stderr:** Free-form diagnostic logging. Captured and emitted as a `poller_stderr` event in `events.jsonl` for observability — not forwarded as a turn-prompt, but greppable from `mimir introspection` / log scraping.
+- **Exit 0:** Success. **Non-zero:** Error — any events emitted by this run are *dropped* (protects against half-failed runs sending partial event streams). The next cron tick retries.
 
 Example poller script:
 
@@ -100,14 +100,14 @@ if __name__ == "__main__":
 
 ### 3. Register the pollers
 
-After creating or updating `pollers.json`, call the `reload_pollers` tool. This re-scans all skill directories and registers any new pollers with the scheduler.
+After creating or updating `pollers.json`, call the `reload_pollers` tool. This re-scans `<home>/.claude/skills/**/pollers.json` and registers any new pollers with the scheduler. Removed pollers (skill uninstalled, manifest deleted) get dropped on the same call.
 
 ```
 reload_pollers()
-# → "Reloaded. 2 poller(s) registered: bluesky-mentions, github-issues"
+# → "reload_pollers ok: 2 poller(s) registered — github-activity, bluesky-mentions"
 ```
 
-Pollers are also loaded automatically at startup.
+Pollers are also loaded automatically at startup, so a fresh container restart picks up any new skills without an explicit reload call.
 
 ## File Layout
 
@@ -129,19 +129,6 @@ See [design-patterns.md](design-patterns.md) for detailed guidance on:
 - **Error handling** — fail silently (exit non-zero), never emit on error
 - **Anti-patterns** — common mistakes and how to avoid them
 
-## Idempotency: design for the boundary firing twice
-
-Pollers are a duplicate-events surface by construction: a crash between
-"emit event" and "save cursor" replays the event on the next tick.
-Design poller-driven actions so they're safe to run twice — tag
-artifacts with unique keys, update cursors *after* the side effect, and
-treat the agent-side response as if any given event could land twice.
-
-See `chainlink/SKILL.md` §"Idempotency: design for the boundary firing
-twice" for the full discipline (the same rules apply to chainlink
-interest items, synth turns, and subagent notifications — pollers are
-one surface among several).
-
 ## Security & Privacy
 
 See [security.md](security.md) for guidance on:
@@ -155,7 +142,7 @@ See [security.md](security.md) for guidance on:
 - **60-second timeout.** If a poller doesn't finish in 60s, it's killed and the cycle is skipped.
 - **Silence means nothing to report.** Only output lines when there's something actionable.
 - **One JSON object per line.** Each line must parse independently.
-- **`poller` and `prompt` are required fields.** Lines missing either are dropped.
+- **`prompt` is the only required field.** Lines missing it are silently dropped (a poller can emit metadata-only diagnostic lines without firing turns). Other keys flow into the AgentEvent's `extra` for prompt rendering.
 - **Pollers are dumb.** No LLM calls. Check a service, output what changed, exit. Keep them fast and pure.
 - **State management is the poller's job.** Use `STATE_DIR` to store cursors, history, or any persistent state. The scheduler doesn't track state for you.
 
@@ -167,10 +154,10 @@ If a poller isn't working:
 2. **Run it manually:** `cd skills/my-monitor && STATE_DIR=. POLLER_NAME=test python poller.py`
 3. **Check stderr:** Poller stderr is logged as `poller_stderr` events
 4. **Check exit code:** Non-zero exits are logged as `poller_nonzero_exit`
-5. **Check JSON format:** Each stdout line must be valid JSON with `poller` and `prompt` keys
+5. **Check JSON format:** Each stdout line must be valid JSON with at least a `prompt` key
 
 ## Available Tool
 
 | Tool | Description |
 |------|-------------|
-| `reload_pollers` | Re-scan all `skills/*/pollers.json` and register pollers. Call after installing/updating skills. |
+| `reload_pollers` | Re-scan `<home>/.claude/skills/**/pollers.json` and register pollers. Call after installing or updating a skill. Also picks up skills with their `pollers.json` deleted (drops the corresponding cron jobs). |
