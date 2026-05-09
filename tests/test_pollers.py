@@ -477,3 +477,282 @@ def test_poller_timeout_constant_reasonable():
     """Locks the contract: the framework's hard-cap is 60s. Skill
     authors who need longer-running pollers must restructure."""
     assert POLLER_TIMEOUT_SECONDS == 60
+
+
+# ─── Back-pressure observability (PR #88 review nits 5+6) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_run_poller_does_not_count_rejected_enqueues(
+    tmp_path: Path, home: Path,
+) -> None:
+    """When the dispatcher refuses an event (returns False), the
+    poller framework MUST NOT count it toward events_emitted — that's
+    the back-pressure signal. Both events still pass through to the
+    dispatcher (so the test fake sees them); only the count differs."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "prompt": "first"}))
+print(json.dumps({"poller": "x", "prompt": "second"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue(accept=False)
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 0
+    # Dispatcher saw both attempts.
+    assert len(enq.events) == 2
+    events = _read_events(home)
+    completes = [e for e in events if e["type"] == "poller_complete"]
+    assert len(completes) == 1
+    assert completes[0]["events_emitted"] == 0
+    assert completes[0]["events_rejected"] == 2
+
+
+@pytest.mark.asyncio
+async def test_run_poller_emits_rejection_events_for_back_pressure(
+    tmp_path: Path, home: Path,
+) -> None:
+    """Each rejected event lands as a ``poller_event_rejected`` event
+    in events.jsonl with a truncated prompt preview, so the operator
+    can audit which payloads got back-pressured."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "prompt": "rejected payload"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue(accept=False)
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    rejections = [
+        e for e in events if e["type"] == "poller_event_rejected"
+    ]
+    assert len(rejections) == 1
+    assert rejections[0]["poller"] == "x"
+    assert "rejected payload" in rejections[0]["prompt_preview"]
+
+
+@pytest.mark.asyncio
+async def test_run_poller_complete_carries_both_counts_on_silence(
+    tmp_path: Path, home: Path,
+) -> None:
+    """A silent poller still emits poller_complete with both
+    events_emitted=0 AND events_rejected=0 — distinguishes "genuine
+    silence" from "back-pressure rejected everything"."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", "pass")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    completes = [e for e in events if e["type"] == "poller_complete"]
+    assert len(completes) == 1
+    assert completes[0]["events_emitted"] == 0
+    assert completes[0]["events_rejected"] == 0
+
+
+# ─── Prompt cap (PR #88 review nit 4) ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_poller_caps_huge_prompt_with_truncation_marker(
+    tmp_path: Path, home: Path,
+) -> None:
+    """A poller emitting a 50 KB prompt gets capped at
+    POLLER_PROMPT_CHARS (16 KB) with a truncation suffix. Protects
+    against chatty / buggy pollers blowing the prompt-build cache."""
+    from mimir.pollers import POLLER_PROMPT_CHARS
+    skill_dir = tmp_path / "skill"
+    huge_chars = POLLER_PROMPT_CHARS + 10_000
+    _install_script(skill_dir, "poller.py", f"""
+import json
+print(json.dumps({{"poller": "x", "prompt": "A" * {huge_chars}}}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    assert len(enq.events) == 1
+    content = enq.events[0].content
+    assert len(content) <= POLLER_PROMPT_CHARS + 100
+    assert "truncated by poller framework" in content
+    events = _read_events(home)
+    truncs = [e for e in events if e["type"] == "poller_prompt_truncated"]
+    assert len(truncs) == 1
+    assert truncs[0]["original_chars"] == huge_chars
+
+
+@pytest.mark.asyncio
+async def test_run_poller_under_cap_passes_through_unchanged(
+    tmp_path: Path, home: Path,
+) -> None:
+    """Below the cap, prompts pass through verbatim (no truncation
+    suffix added). Locks the inclusive boundary."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "prompt": "small payload"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    assert enq.events[0].content == "small payload"
+    events = _read_events(home)
+    assert not any(e["type"] == "poller_prompt_truncated" for e in events)
+
+
+# ─── persist_dir / STATE_DIR redirect (PR #88 review nit 3) ───────────
+
+
+@pytest.mark.asyncio
+async def test_run_poller_state_dir_points_at_persist_dir(
+    tmp_path: Path, home: Path,
+) -> None:
+    """``STATE_DIR`` is the poller's persistent state location — when
+    set, the framework injects ``persist_dir`` (NOT ``skill_dir``)
+    so cursor files survive container rebuilds even when the skill
+    itself ships in the image."""
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({"poller": "x", "prompt": os.environ["STATE_DIR"]}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    assert enq.events[0].content == str(persist_dir)
+    # Persist dir was lazy-created.
+    assert persist_dir.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_run_poller_persist_dir_falls_back_to_skill_dir(
+    tmp_path: Path, home: Path,
+) -> None:
+    """When ``persist_dir`` isn't set on the PollerConfig (tests +
+    niche callers), STATE_DIR falls back to the skill_dir for
+    backward compatibility."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({"poller": "x", "prompt": os.environ["STATE_DIR"]}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        # persist_dir omitted → falls back
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    assert enq.events[0].content == str(skill_dir)
+
+
+def test_discover_pollers_sets_persist_dir_when_state_root_supplied(
+    tmp_path: Path,
+) -> None:
+    """``Scheduler.add_poller_jobs`` passes
+    ``state_root=<home>/state/pollers``; each discovered poller's
+    persist_dir resolves to ``<state_root>/<poller_name>/``."""
+    skills = tmp_path / "skills"
+    state_root = tmp_path / "state" / "pollers"
+    skill = skills / "ghp"
+    skill.mkdir(parents=True)
+    (skill / "pollers.json").write_text(json.dumps({
+        "pollers": [{"name": "ghp", "command": "x", "cron": "* * * * *"}],
+    }), encoding="utf-8")
+    out = discover_pollers(skills, state_root=state_root)
+    assert len(out) == 1
+    assert out[0].persist_dir == state_root / "ghp"
+    # Skill dir is unchanged from the manifest's location.
+    assert out[0].skill_dir == skill
+
+
+def test_discover_pollers_state_root_none_leaves_persist_dir_unset(
+    tmp_path: Path,
+) -> None:
+    """Default ``state_root=None`` leaves ``persist_dir=None`` so
+    ``resolved_persist_dir()`` falls back to skill_dir. Back-compat
+    for tests + setups where the skill dir is itself persistent."""
+    skills = tmp_path / "skills"
+    skill = skills / "ghp"
+    skill.mkdir(parents=True)
+    (skill / "pollers.json").write_text(json.dumps({
+        "pollers": [{"name": "ghp", "command": "x", "cron": "* * * * *"}],
+    }), encoding="utf-8")
+    out = discover_pollers(skills)
+    assert out[0].persist_dir is None
+    assert out[0].resolved_persist_dir() == skill
+
+
+# ─── Subprocess hygiene: kill+reap on every exit path (Nit 1) ─────────
+
+
+@pytest.mark.asyncio
+async def test_run_poller_reaps_subprocess_on_timeout(
+    tmp_path: Path, home: Path,
+) -> None:
+    """After a timeout, the framework calls ``proc.wait()`` so the
+    kernel-side process record is reaped — no zombies left for the
+    long-lived mimir process to accumulate."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import time
+time.sleep(120)
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq, timeout=1.0)
+    assert n == 0
+    # The poller_timeout event landed AND the subprocess was reaped
+    # (no warning at end-of-run; tested implicitly by the absence of
+    # ``RuntimeError: Event loop is closed`` from the asyncio
+    # finalizer when the test's loop tears down).
+    events = _read_events(home)
+    assert any(e["type"] == "poller_timeout" for e in events)
+
+
+# ─── Shell-vs-exec command parsing (PR #88 review nit 7) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_run_poller_command_supports_shell_features(
+    tmp_path: Path, home: Path,
+) -> None:
+    """``command`` is parsed by ``/bin/sh -c`` — env-var expansion
+    works, pipes work, redirection works. Documented in run_poller's
+    docstring; this test pins the contract."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    cfg = PollerConfig(
+        name="x",
+        # Shell expansion: $POLLER_NAME comes from the env injection.
+        command='echo "{\\"poller\\": \\"x\\", \\"prompt\\": \\"name=$POLLER_NAME\\"}"',
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 1
+    assert enq.events[0].content == "name=x"

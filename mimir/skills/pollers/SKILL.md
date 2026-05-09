@@ -19,14 +19,18 @@ Pollers are lightweight scripts that check external services on a schedule and r
 
 ### 1. Write the poller script
 
-The script runs in the skill directory. It receives these environment variables automatically:
+The script runs with the skill directory as its **cwd**. It receives these environment variables automatically:
 
 | Variable | Description |
 |----------|-------------|
-| `STATE_DIR` | The skill directory (writable, for cursors/state) |
-| `POLLER_NAME` | The poller's name from pollers.json |
+| `STATE_DIR` | Persistent cursor/state directory at `<home>/state/pollers/<poller_name>/` — created lazily on first run, on the home volume so cursor files survive container rebuilds even when the skill itself ships in the image. |
+| `POLLER_NAME` | The poller's name from pollers.json (matches the `STATE_DIR` subpath). |
 
 Plus any custom env vars from the `env` field, plus the agent's existing environment.
+
+**Why STATE_DIR is separate from the skill dir**: skills are deployable artifacts (resettable via `seed_skills`, image-shippable, optionally reset on container rebuild). Cursor files are persistent runtime data — losing them means re-emitting the entire backlog of "events since cursor=0" on next run, which for a github-poller would be every PR comment in every watched repo. Mimir's filing rules separate these — skills under `.claude/skills/`, runtime state under `state/`.
+
+**Command parsing (`pollers.json` `command` field)**: parsed by `/bin/sh -c` via `asyncio.create_subprocess_shell`. Shell features (env-var expansion `$FOO`, pipes, redirection) are available — and you're responsible for quoting args containing whitespace or shell metacharacters: `"python poller.py 'arg with spaces'"` not `"python poller.py arg with spaces"`.
 
 **Output contract:**
 - **stdout:** JSONL (one JSON object per line). Each line must have `prompt` (string); `poller` (string) is informational. Other keys flow into the resulting `AgentEvent.extra` so platform metadata (URLs, IDs, `source_platform`) carries through to your prompt rendering.
@@ -109,6 +113,24 @@ reload_pollers()
 
 Pollers are also loaded automatically at startup, so a fresh container restart picks up any new skills without an explicit reload call.
 
+## Ready-built poller skills
+
+Mimir ships ready-built poller skills under ``mimir/optional-skills/`` — opt-in, NOT auto-installed (most installs don't need them). Each is a standalone skill directory with its own ``SKILL.md`` documenting the env vars and what it watches:
+
+| Skill | Watches |
+|---|---|
+| `github-poller` | New issues, PRs, comments, PR reviews, and inline diff comments on configured GitHub repos |
+
+To install one:
+
+```
+cp -r mimir/optional-skills/<name> <home>/.claude/skills/
+# (set the skill's required env vars — see its SKILL.md)
+reload_pollers
+```
+
+Removing a skill: delete the directory under `<home>/.claude/skills/` and call `reload_pollers` to drop the cron job.
+
 ## File Layout
 
 ```
@@ -139,12 +161,14 @@ See [security.md](security.md) for guidance on:
 
 ## Key Constraints
 
-- **60-second timeout.** If a poller doesn't finish in 60s, it's killed and the cycle is skipped.
+- **60-second timeout.** If a poller doesn't finish in 60s, it's killed and the cycle is skipped. The framework reaps the subprocess on every exit path so long-lived mimir processes don't accumulate zombies.
 - **Silence means nothing to report.** Only output lines when there's something actionable.
 - **One JSON object per line.** Each line must parse independently.
 - **`prompt` is the only required field.** Lines missing it are silently dropped (a poller can emit metadata-only diagnostic lines without firing turns). Other keys flow into the AgentEvent's `extra` for prompt rendering.
 - **Pollers are dumb.** No LLM calls. Check a service, output what changed, exit. Keep them fast and pure.
-- **State management is the poller's job.** Use `STATE_DIR` to store cursors, history, or any persistent state. The scheduler doesn't track state for you.
+- **State management is the poller's job.** Use `STATE_DIR` to store cursors, history, or any persistent state. The scheduler doesn't track state for you, but it does provide a persistent path under `<home>/state/pollers/<name>/` (see above).
+- **16 KB prompt cap.** Each emitted event's `prompt` is capped at ~16 KB. Larger payloads get truncated with a marker — emit multiple events or stash to a file + send a path reference instead. Protects against chatty pollers blowing the prompt-build cache.
+- **Back-pressure surfaces in events.jsonl.** When the dispatcher refuses an event (queue cap hit, channel saturated), it lands as a `poller_event_rejected` event; the run's `poller_complete` carries both `events_emitted` and `events_rejected` counts so a mismatch is grep-able.
 
 ## Debugging
 

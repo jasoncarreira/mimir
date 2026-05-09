@@ -625,8 +625,13 @@ class Scheduler:
         (``reload_pollers``) wipe + re-discover.
 
         Pollers fire as subprocesses; their stdout JSONL becomes
-        ``AgentEvent`` enqueues. See ``mimir/pollers.py`` for the
-        contract."""
+        ``AgentEvent`` enqueues. The framework injects
+        ``STATE_DIR=<home>/state/pollers/<poller_name>/`` so cursor
+        files survive container rebuilds (filing-rules-aligned: skills
+        are deployable artifacts, ``state/`` is persistent runtime).
+        Falls back to the skill_dir when ``self._home`` isn't set
+        (tests / niche call sites). See ``mimir/pollers.py`` for the
+        full contract."""
         self._pollers_dir = skills_dir
         return self._reinstall_pollers()
 
@@ -654,7 +659,16 @@ class Scheduler:
         self._pollers = {}
 
         installed = 0
-        for poller in discover_pollers(self._pollers_dir):
+        # Filing-rules-aligned: cursor files live under
+        # ``<home>/state/pollers/<name>/``, NOT inside the skill dir.
+        # Skill dir is the deployable artifact (resettable via
+        # seed_skills); state/pollers/ is the persistent runtime data.
+        # When ``self._home`` is None (tests), fall back to skill_dir.
+        state_root = (
+            self._home / "state" / "pollers"
+            if self._home is not None else None
+        )
+        for poller in discover_pollers(self._pollers_dir, state_root=state_root):
             try:
                 trigger = CronTrigger.from_crontab(poller.cron, timezone=UTC)
             except (ValueError, KeyError) as exc:
