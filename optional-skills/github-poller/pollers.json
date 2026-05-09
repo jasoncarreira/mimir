@@ -1,0 +1,9 @@
+{
+  "pollers": [
+    {
+      "name": "github-activity",
+      "command": "python3 poller.py",
+      "cron": "*/15 * * * *"
+    }
+  ]
+}

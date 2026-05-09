@@ -147,7 +147,31 @@ def build_schedule_tools(scheduler: Scheduler) -> list[SdkMcpTool]:
             return _content_block(f"remove_schedule: no job named {name!r}")
         return _content_block(f"remove_schedule ok: {name}")
 
-    return [list_schedules, add_schedule, remove_schedule]
+    @tool(
+        "reload_pollers",
+        "Re-scan ``<home>/.claude/skills/**/pollers.json`` and "
+        "(re-)register any pollers found. Use after installing a new "
+        "skill that drops a ``pollers.json`` file, so its pollers go "
+        "live without a container restart. Returns the count of "
+        "pollers registered.",
+        {},
+    )
+    @_safe("reload_pollers")
+    async def reload_pollers(args: dict[str, Any]) -> dict[str, Any]:
+        count = await scheduler.reload_pollers()
+        names = scheduler.registered_pollers()
+        if count == 0:
+            return _content_block(
+                "reload_pollers: 0 pollers registered (no "
+                "<home>/.claude/skills/**/pollers.json files found, "
+                "or skills_dir not wired)."
+            )
+        return _content_block(
+            f"reload_pollers ok: {count} poller(s) registered — "
+            f"{', '.join(names)}"
+        )
+
+    return [list_schedules, add_schedule, remove_schedule, reload_pollers]
 
 
 def schedule_tool_names() -> list[str]:
@@ -155,4 +179,5 @@ def schedule_tool_names() -> list[str]:
         "mcp__mimir__list_schedules",
         "mcp__mimir__add_schedule",
         "mcp__mimir__remove_schedule",
+        "mcp__mimir__reload_pollers",
     ]
