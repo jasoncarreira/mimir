@@ -749,3 +749,393 @@ async def test_poll_once_401_then_refresh_then_retry(
     # Both refresh and usage_ok logged.
     assert "oauth_refresh_ok" in types
     assert "oauth_usage_ok" in types
+
+
+# ── chainlink #17 (CR#22 layer b): derive_5h_from_cost ───────────────
+
+
+import json as _json
+from datetime import datetime, timezone
+from datetime import timedelta as _timedelta
+
+
+def _seed_turns(path: Path, *, recent_costs: list[float], older_costs: list[float]) -> None:
+    """Drop a turns.jsonl with cost rows. ``recent_costs`` go inside
+    the 5h window; ``older_costs`` outside the 5h but inside the 7d
+    window (so they count toward 7d total, not 5h)."""
+    now = datetime.now(timezone.utc)
+    rows = []
+    for i, c in enumerate(recent_costs):
+        rows.append({
+            "ts": (now - _timedelta(minutes=i + 1)).isoformat(),
+            "turn_id": f"r{i}", "session_id": "s",
+            "saga_session_id": None, "trigger": "user_message",
+            "channel_id": "c", "input": "x",
+            "total_cost_usd": c,
+        })
+    for i, c in enumerate(older_costs):
+        rows.append({
+            "ts": (now - _timedelta(hours=6 + i)).isoformat(),
+            "turn_id": f"o{i}", "session_id": "s",
+            "saga_session_id": None, "trigger": "user_message",
+            "channel_id": "c", "input": "x",
+            "total_cost_usd": c,
+        })
+    path.write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
+
+
+def test_derive_5h_basic_math(tmp_path: Path):
+    """Math-shape test, factor pinned explicitly so test math is
+    decoupled from the production default. 5h_cost=$20, 7d_cost=$500,
+    prior_7d=0.50, factor=10 → back_derived_quota=$1000 →
+    estimated = 20×10/1000 = 0.20 (no rounding)."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[20.0], older_costs=[480.0])
+    out = derive_5h_from_cost(
+        path, prior_7d_utilization=0.50, backderive_factor=10.0,
+    )
+    assert out == pytest.approx(0.20, abs=1e-6)
+
+
+def test_derive_5h_rounds_to_5pp(tmp_path: Path):
+    """Round-to-5pp shape, factor=10. 5h_cost=$20, 7d_cost=$500.
+    prior_7d=0.40 → 0.16 → 0.15;  prior_7d=0.80 → 0.32 → 0.30."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[20.0], older_costs=[480.0])
+    assert derive_5h_from_cost(
+        path, prior_7d_utilization=0.40, backderive_factor=10.0,
+    ) == pytest.approx(0.15)
+    assert derive_5h_from_cost(
+        path, prior_7d_utilization=0.80, backderive_factor=10.0,
+    ) == pytest.approx(0.30)
+
+
+def test_derive_5h_uses_env_default_factor(tmp_path: Path, monkeypatch):
+    """When ``backderive_factor=None``, the function reads the env or
+    falls back to ``QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT`` (=10.0)."""
+    from mimir.oauth_usage_poller import (
+        derive_5h_from_cost, QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT,
+    )
+    assert QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT == 10.0
+    monkeypatch.delenv("MIMIR_QUOTA_5H_BACKDERIVE_FACTOR", raising=False)
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[20.0], older_costs=[480.0])
+    assert derive_5h_from_cost(
+        path, prior_7d_utilization=0.50,
+    ) == pytest.approx(0.20)
+
+
+def test_derive_5h_env_override_factor(tmp_path: Path, monkeypatch):
+    """``MIMIR_QUOTA_5H_BACKDERIVE_FACTOR`` env var overrides the
+    default factor — operators on different plan tiers can re-calibrate
+    without a code change."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    monkeypatch.setenv("MIMIR_QUOTA_5H_BACKDERIVE_FACTOR", "5.0")
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[20.0], older_costs=[480.0])
+    # factor=5 instead of 10 → estimated halves: 0.20 → 0.10
+    assert derive_5h_from_cost(
+        path, prior_7d_utilization=0.50,
+    ) == pytest.approx(0.10)
+
+
+def test_derive_5h_invalid_env_falls_back_to_default(
+    tmp_path: Path, monkeypatch,
+):
+    """Garbage env values warn + fall back to the default. Protects
+    against typos silently killing the estimator (e.g. operator
+    sets ``MIMIR_QUOTA_5H_BACKDERIVE_FACTOR=ten``)."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    monkeypatch.setenv("MIMIR_QUOTA_5H_BACKDERIVE_FACTOR", "not-a-number")
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[20.0], older_costs=[480.0])
+    # Falls back to default 10.0 → 0.20
+    assert derive_5h_from_cost(
+        path, prior_7d_utilization=0.50,
+    ) == pytest.approx(0.20)
+
+
+def test_derive_5h_clamps_to_one(tmp_path: Path):
+    """Pathological case: 5h spend dominates the 7d window AND
+    prior_7d_util is near saturation → math overshoots 100%, must
+    clamp. With factor=10, 5h=$200, 7d=$210, prior_7d=0.99 →
+    back_derived=$212 → estimated=200×10/212=9.4 → clamp 1.0.
+    (Bounded by the math: estimated > 1 requires 5h_cost × FACTOR
+    × prior_7d_util > 7d_cost.)"""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[200.0], older_costs=[10.0])
+    assert derive_5h_from_cost(
+        path, prior_7d_utilization=0.99, backderive_factor=10.0,
+    ) == pytest.approx(1.0)
+
+
+def test_derive_5h_returns_none_on_zero_prior_7d(tmp_path: Path):
+    """prior_7d_util == 0 means no observable usage to back-derive
+    the 7d quota dollar amount from. Return None — caller falls
+    back to prior trusted value."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[50.0], older_costs=[150.0])
+    assert derive_5h_from_cost(path, prior_7d_utilization=0.0) is None
+    assert derive_5h_from_cost(path, prior_7d_utilization=-0.1) is None
+
+
+def test_derive_5h_returns_none_on_out_of_range_prior(tmp_path: Path):
+    """Bogus utilization >1 means the input is broken. Return None
+    rather than producing a wildly-scaled estimate."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[50.0], older_costs=[150.0])
+    assert derive_5h_from_cost(path, prior_7d_utilization=1.5) is None
+
+
+def test_derive_5h_returns_none_on_zero_7d_cost(tmp_path: Path):
+    """Empty turns.jsonl (or all turns >7d old) → no observable 7d cost
+    → can't back-derive quota → None."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    path = tmp_path / "turns.jsonl"
+    path.write_text("")  # empty file
+    assert derive_5h_from_cost(path, prior_7d_utilization=0.50) is None
+
+
+def test_derive_5h_returns_none_on_missing_file(tmp_path: Path):
+    """Missing turns.jsonl shouldn't raise — caller treats None as
+    'no signal' and keeps the prior trusted value."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    out = derive_5h_from_cost(
+        tmp_path / "nope.jsonl", prior_7d_utilization=0.50,
+    )
+    assert out is None
+
+
+# ── record_usage with derive enabled ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_record_usage_writes_derived_5h_on_anomaly(tmp_path: Path):
+    """End-to-end: anomaly fires + cfg has turns_log + prior_7d
+    available → derived 5h snapshot lands in store with derived=True."""
+    from mimir.oauth_usage_poller import (
+        PollerConfig, record_usage,
+    )
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op
+
+    # Seed turns.jsonl: 5h=$20, 7d=$500. With the production
+    # back-derive factor (10×) and the new_7d=0.51 used after Mimir's
+    # PR #89 nit #2 fix, derived = 20 × 10 × 0.51 / 500 = 0.204 → 0.20.
+    turns_path = tmp_path / "turns.jsonl"
+    _seed_turns(turns_path, recent_costs=[20.0], older_costs=[480.0])
+
+    store_path = tmp_path / "rate_limits.json"
+    store = RateLimitStore(path=store_path)
+    # Seed the store with prior 5h (10%) + prior 7d (50%) — the
+    # cross-check needs a prior 5h to compute the jump.
+    await store.record("five_hour", RateLimitSnapshot(
+        status="allowed", utilization=0.10, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+
+    # New payload: 5h jumps to 70% (60pp jump > 50pp threshold) but 7d
+    # only moves to 51% (1pp delta < 5pp threshold) → anomaly.
+    payload = {
+        "five_hour": {"status": "allowed", "utilization": 0.70,
+                      "resets_at": 9999999999},
+        "seven_day": {"status": "allowed", "utilization": 0.51,
+                      "resets_at": 9999999999},
+    }
+
+    cfg = PollerConfig(
+        credentials_path=tmp_path / "creds.json",
+        turns_log_path=turns_path,
+    )
+
+    events: list[tuple[str, dict]] = []
+
+    async def _cap(et, **kw):
+        events.append((et, kw))
+
+    monkeypatch_target = op
+    orig = monkeypatch_target.log_event
+    monkeypatch_target.log_event = _cap
+    try:
+        recorded = await record_usage(store, payload, cfg=cfg)
+    finally:
+        monkeypatch_target.log_event = orig
+
+    # Anomaly fired AND derive succeeded.
+    assert recorded["five_hour"]["derived"] is True
+    assert recorded["five_hour"]["utilization"] == pytest.approx(0.20, abs=1e-6)
+    # quota_5h_derived event landed.
+    types = [t for t, _ in events]
+    assert "quota_reading_anomalous" in types
+    assert "quota_5h_derived" in types
+
+    # Store now has the derived snapshot, NOT the prior trusted 0.10.
+    snap = store.current().get("five_hour")
+    assert snap is not None
+    assert snap.utilization == pytest.approx(0.20, abs=1e-6)
+    assert snap.derived is True
+
+
+@pytest.mark.asyncio
+async def test_record_usage_falls_back_when_no_turns_log(tmp_path: Path):
+    """No cfg → no turns_log_path → derive can't run → prior
+    trusted value persists (current layer-(a) behavior preserved)."""
+    from mimir.oauth_usage_poller import record_usage
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op
+
+    store_path = tmp_path / "rate_limits.json"
+    store = RateLimitStore(path=store_path)
+    await store.record("five_hour", RateLimitSnapshot(
+        status="allowed", utilization=0.10, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+
+    payload = {
+        "five_hour": {"status": "allowed", "utilization": 0.70,
+                      "resets_at": 9999999999},
+        "seven_day": {"status": "allowed", "utilization": 0.51,
+                      "resets_at": 9999999999},
+    }
+
+    async def _cap(et, **kw):
+        pass
+
+    orig = op.log_event
+    op.log_event = _cap
+    try:
+        # No cfg arg → falls back to layer-(a) behavior.
+        recorded = await record_usage(store, payload)
+    finally:
+        op.log_event = orig
+
+    assert recorded["five_hour"]["anomalous"] is True
+    assert recorded["five_hour"]["kept_utilization"] == pytest.approx(0.10)
+    assert "derived" not in recorded["five_hour"]
+    # Store retains the prior trusted value.
+    snap = store.current().get("five_hour")
+    assert snap.utilization == pytest.approx(0.10)
+    assert snap.derived is False
+
+
+@pytest.mark.asyncio
+async def test_record_usage_falls_back_when_derive_fails(tmp_path: Path):
+    """cfg has turns_log_path but turns.jsonl is empty → derive
+    returns None → prior trusted value persists."""
+    from mimir.oauth_usage_poller import PollerConfig, record_usage
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op
+
+    turns_path = tmp_path / "turns.jsonl"
+    turns_path.write_text("")  # empty → no observable cost
+
+    store_path = tmp_path / "rate_limits.json"
+    store = RateLimitStore(path=store_path)
+    await store.record("five_hour", RateLimitSnapshot(
+        status="allowed", utilization=0.10,
+    ))
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+    ))
+
+    payload = {
+        "five_hour": {"status": "allowed", "utilization": 0.70,
+                      "resets_at": 9999999999},
+        "seven_day": {"status": "allowed", "utilization": 0.51,
+                      "resets_at": 9999999999},
+    }
+
+    cfg = PollerConfig(
+        credentials_path=tmp_path / "creds.json",
+        turns_log_path=turns_path,
+    )
+
+    async def _cap(et, **kw):
+        pass
+
+    orig = op.log_event
+    op.log_event = _cap
+    try:
+        recorded = await record_usage(store, payload, cfg=cfg)
+    finally:
+        op.log_event = orig
+
+    assert recorded["five_hour"]["anomalous"] is True
+    assert "derived" not in recorded["five_hour"]
+    snap = store.current().get("five_hour")
+    assert snap.utilization == pytest.approx(0.10)
+    assert snap.derived is False
+
+
+@pytest.mark.asyncio
+async def test_derived_snapshot_has_resets_at_none(tmp_path: Path):
+    """Self-review fix: derived snapshots unconditionally use
+    resets_at=None. Two reasons documented inline in the producer:
+    (1) we don't actually know when the window resets (no successful
+    endpoint reading this poll), and (2) inheriting a value that
+    later goes stale (long glitch crosses a window boundary) would
+    cause RateLimitStore.current() to filter the derived snapshot
+    out — silently evicting our derived signal. None survives the
+    filter unconditionally and the arbiter handles missing window-
+    timing as "no time signal" (on-pace projection is already
+    skipped for derived in AnthropicQuotaProvider)."""
+    from mimir.oauth_usage_poller import PollerConfig, record_usage
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op
+    import time as _time
+
+    turns_path = tmp_path / "turns.jsonl"
+    _seed_turns(turns_path, recent_costs=[20.0], older_costs=[480.0])
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    # Prior 5h has a future resets_at — even when "just inheriting"
+    # would work for this poll, the producer must NOT, because doing
+    # so creates a multi-poll bug class on long glitches.
+    future_reset = int(_time.time()) + 3 * 3600
+    await store.record("five_hour", RateLimitSnapshot(
+        status="allowed",
+        utilization=0.10,
+        resets_at=future_reset,
+        observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+    ))
+
+    payload = {
+        "five_hour": {"status": "allowed", "utilization": 0.70,
+                      "resets_at": 9999999999},
+        "seven_day": {"status": "allowed", "utilization": 0.51,
+                      "resets_at": 9999999999},
+    }
+    cfg = PollerConfig(
+        credentials_path=tmp_path / "creds.json",
+        turns_log_path=turns_path,
+    )
+
+    async def _cap(et, **kw):
+        pass
+    orig = op.log_event
+    op.log_event = _cap
+    try:
+        await record_usage(store, payload, cfg=cfg)
+    finally:
+        op.log_event = orig
+
+    snap = store.current().get("five_hour")
+    assert snap is not None
+    assert snap.derived is True
+    assert snap.resets_at is None, (
+        "derived snapshots must always have resets_at=None — "
+        f"inheritance would create a multi-poll bug class. Got "
+        f"{snap.resets_at!r}"
+    )

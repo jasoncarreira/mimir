@@ -909,16 +909,25 @@ class Scheduler:
         credentials_path: Path,
         *,
         refresh_warn_days: int = 25,
+        turns_log_path: Path | None = None,
         job_id: str = "oauth-usage-poll",
     ) -> bool:
         """Register the plan-window quota poller. Returns False on
         empty effective cron (env-var default empty AND no yaml override).
-        Migrated to the named-callable registry."""
+        Migrated to the named-callable registry.
+
+        ``turns_log_path`` (chainlink #17): when set, enables the
+        cost-rate-back-derived 5h estimator that fires when the
+        layer-(a) anomaly detector rejects an endpoint reading.
+        Without it (None), the layer-(a) fallback persists the prior
+        trusted 5h value indefinitely on long endpoint glitches —
+        same as before chainlink #17."""
         from .oauth_usage_poller import PollerConfig, poll_once
 
         cfg = PollerConfig(
             credentials_path=credentials_path,
             refresh_warn_days=refresh_warn_days,
+            turns_log_path=turns_log_path,
         )
 
         async def _run() -> None:
