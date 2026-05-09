@@ -357,6 +357,89 @@ def test_cron_events_dedup_to_most_recent(tmp_path: Path):
     assert "1 clusters" not in block
 
 
+def test_content_dedup_collapses_identical_negative_lines(tmp_path: Path):
+    """Three tool_denied events with identical (tool, reason) collapse
+    to the most recent. This handles the "tool_denied Read:
+    path_outside_home × 3" case visible in the operator's prompt
+    when the agent repeatedly hits the same path-confinement boundary."""
+    log = _make_log(tmp_path, events=[
+        # Oldest first (jsonl is appended chronologically; tail-first
+        # iteration means the LAST one written is what the dedup keeps).
+        {"timestamp": _ts(5.0), "type": "tool_call_denied",
+         "tool": "Read", "reason": "path_outside_home", "channel_id": "c"},
+        {"timestamp": _ts(3.0), "type": "tool_call_denied",
+         "tool": "Read", "reason": "path_outside_home", "channel_id": "c"},
+        {"timestamp": _ts(0.5), "type": "tool_call_denied",
+         "tool": "Read", "reason": "path_outside_home", "channel_id": "c"},
+    ])
+    block = log.recent_block()
+    assert block is not None
+    # Exactly one rendered line with this content.
+    assert block.count("tool_denied Read: path_outside_home") == 1
+
+
+def test_content_dedup_keeps_distinct_tool_denied_variants(tmp_path: Path):
+    """Different (tool, reason) tuples render as distinct content
+    strings → both surface. Validates that dedup is per-content,
+    not over-collapsing on rule_kind."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(2.0), "type": "tool_call_denied",
+         "tool": "Read", "reason": "path_outside_home", "channel_id": "c"},
+        {"timestamp": _ts(1.0), "type": "tool_call_denied",
+         "tool": "Write", "reason": "path_outside_home", "channel_id": "c"},
+        {"timestamp": _ts(0.5), "type": "tool_call_denied",
+         "tool": "Read", "reason": "tool_call_budget_exceeded",
+         "channel_id": "c"},
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "tool_denied Read: path_outside_home" in block
+    assert "tool_denied Write: path_outside_home" in block
+    assert "tool_denied Read: tool_call_budget_exceeded" in block
+
+
+def test_content_dedup_keeps_distinct_spawn_failures(tmp_path: Path):
+    """Each spawn failure has a distinct job_id baked into the
+    rendered content, so multiple spawn_work_failed events surface
+    distinctly. Regression guard against over-collapsing per-incident
+    negative signals."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(2.0), "type": "claude_code_spawn_work_failed",
+         "job_id": "j_aaa", "agent": "code-implementer", "elapsed_s": 30,
+         "terminal_reason": "max_turns", "channel_id": "c"},
+        {"timestamp": _ts(0.5), "type": "claude_code_spawn_work_failed",
+         "job_id": "j_bbb", "agent": "code-implementer", "elapsed_s": 15,
+         "terminal_reason": "parse_failed", "channel_id": "c"},
+    ])
+    negatives, _ = log.recent()
+    # Both incidents surface — distinct job_ids → distinct rendered lines.
+    assert len(negatives) == 2
+    contents = [s.content for s in negatives]
+    assert any("j_aaa" in c for c in contents)
+    assert any("j_bbb" in c for c in contents)
+
+
+def test_content_dedup_independent_across_polarities(tmp_path: Path):
+    """A line with the same text appearing as both positive and
+    negative (hypothetical) wouldn't collide — dedup is per-polarity.
+    Practical case: ensures positive saga_feedback_sent dedup doesn't
+    interact with negative lines that happen to share content shape."""
+    log = _make_log(tmp_path, events=[
+        # Two negatives that collapse, two positives that collapse.
+        {"timestamp": _ts(3.0), "type": "tool_call_denied",
+         "tool": "Read", "reason": "path_outside_home", "channel_id": "c"},
+        {"timestamp": _ts(2.0), "type": "tool_call_denied",
+         "tool": "Read", "reason": "path_outside_home", "channel_id": "c"},
+        {"timestamp": _ts(1.0), "type": "saga_feedback_sent", "n_atoms": 5,
+         "channel_id": "c"},
+        {"timestamp": _ts(0.5), "type": "saga_feedback_sent", "n_atoms": 5,
+         "channel_id": "c"},
+    ])
+    negatives, positives = log.recent()
+    assert len(negatives) == 1
+    assert len(positives) == 1
+
+
 def test_introspection_report_error_renders_as_negative(tmp_path: Path):
     log = _make_log(tmp_path, events=[
         {

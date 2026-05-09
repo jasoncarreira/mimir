@@ -715,6 +715,18 @@ class FeedbackLog:
         # skipped. Stops weekly cron events from re-appearing on every
         # heartbeat for 24h.
         seen_first_only: set[str] = set()
+        # Per-polarity content-level dedup: if two distinct events
+        # would render to the same line text within the same polarity
+        # bucket, keep only the first (= most recent under tail-first
+        # iteration) and skip subsequent identical content. Catches
+        # the "tool_denied Read: path_outside_home × 3" case where
+        # kind-level dedup would over-collapse (Read and Write share
+        # rule_kind ``tool_denied`` but different rendered content);
+        # also handles any future event family where the (kind, args)
+        # tuple naturally produces colliding lines. Distinct payloads
+        # under the same kind (e.g. spawn job_ids, tool_denied with
+        # different reasons) keep their separate lines.
+        seen_content: dict[str, set[str]] = {"negative": set(), "positive": set()}
 
         # 1) events.jsonl — known event-type rules.
         for ev in iter_snapshot_or_tail(self.events_snapshot, self.events_path):
@@ -751,13 +763,23 @@ class FeedbackLog:
             target = negatives if polarity == "negative" else positives
             if len(target) >= limit:
                 continue
+            content = _render_event_line(kind, ev)
+            # Content-level dedup: if a prior (more recent) event
+            # already produced this exact line text in this polarity
+            # bucket, skip — see ``seen_content`` comment above for
+            # rationale. Render cost is low and we're in tail-first
+            # iteration, so the *kept* item is always the most recent.
+            polarity_bucket = seen_content[polarity]
+            if content in polarity_bucket:
+                continue
+            polarity_bucket.add(content)
             target.append(
                 FeedbackSignal(
                     ts=ts,
                     polarity=polarity,
                     kind=kind,
                     channel_id=ev.get("channel_id"),
-                    content=_render_event_line(kind, ev),
+                    content=content,
                 )
             )
             # Early exit when both sides full.
@@ -778,13 +800,20 @@ class FeedbackLog:
                     continue
                 if len(negatives) >= limit:
                     break
+                content = _render_turn_error(rec)
+                # Same content-level dedup as the events loop above:
+                # skip turn-error signals whose rendered line text
+                # already appeared in the negative bucket.
+                if content in seen_content["negative"]:
+                    continue
+                seen_content["negative"].add(content)
                 negatives.append(
                     FeedbackSignal(
                         ts=ts,
                         polarity="negative",
                         kind="turn_error",
                         channel_id=rec.get("channel_id"),
-                        content=_render_turn_error(rec),
+                        content=content,
                     )
                 )
 
