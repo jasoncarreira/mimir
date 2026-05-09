@@ -138,13 +138,102 @@ _migrations_done: set[str] = set()
 _migrations_lock = threading.Lock()
 
 
-def get_db() -> sqlite3.Connection:
-    """Get database connection, creating schema if needed.
+# ─── Connection pool (CR#11) ──────────────────────────────────────
+#
+# Each saga function used to do ``conn = get_db()`` → … → ``conn.close()``,
+# spawning a fresh ``sqlite3.connect`` + ``PRAGMA journal_mode=WAL`` +
+# ``PRAGMA busy_timeout=`` + ``executescript(SCHEMA_SQL)`` (~12 CREATE
+# TABLE IF NOT EXISTS statements) per call. Cheap individually but at
+# the typical mimir turn cadence (1 retrieval + N feedback + 1 store +
+# cluster ops = 5–10 calls/turn) it added up to ~20–100 ms/turn purely
+# on SQLite handshake + schema reaffirmation.
+#
+# The pool is thread-local: each Python thread gets one cached
+# connection per DB path. The ``saga.core`` API is sync and most
+# callers run inside ``asyncio.to_thread`` workers; thread-local
+# scoping lets the default ``ThreadPoolExecutor`` share its
+# ~min(32, os.cpu_count()+4) workers' connections without
+# cross-thread sqlite errors. SQLite WAL supports many readers + one
+# writer, so the worker fan-out is fine.
+#
+# ``close()`` on a pooled connection is a no-op for the caller — the
+# real lifecycle is owned by the pool, released at thread exit (or
+# explicit ``_close_thread_local_db`` for tests). Existing code that
+# calls ``conn.close()`` keeps working unchanged; the savings come
+# from skipping the open-and-PRAGMA dance on the SECOND through Nth
+# call within the same thread.
 
-    On first call per DB path within a process, runs pending migrations
-    so callers that skip `python -m saga.init_db` still get the full
-    schema (atom_relations, FTS, etc.).
+
+class _PooledConnection:
+    """Thin no-op-close wrapper around ``sqlite3.Connection``.
+
+    Existing saga code does ``conn = get_db()`` … ``conn.close()`` at
+    every call site. With pooling, the real connection should live
+    longer than one call. ``close()`` here is a no-op; everything else
+    delegates via ``__getattr__``. The actual close happens in
+    ``_close_thread_local_db`` (tests) or at thread exit.
+
+    ``with conn:`` for transactional use still works — sqlite3's
+    Connection ``__enter__`` / ``__exit__`` does commit/rollback (NOT
+    close), so we proxy them through to the real connection.
     """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def close(self) -> None:
+        # Caller-visible no-op. Pool owns the lifecycle.
+        return None
+
+    def __getattr__(self, name: str):
+        # Delegate every other method/attribute to the real connection.
+        # ``__slots__`` excludes ``_conn`` from triggering __getattr__
+        # recursion (``self._conn`` is a real attribute).
+        return getattr(self._conn, name)
+
+    def __enter__(self):
+        return self._conn.__enter__()
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._conn.__exit__(exc_type, exc, tb)
+
+
+_thread_local_db = threading.local()
+
+
+def get_db() -> sqlite3.Connection:
+    """Get a saga DB connection (CR#11: thread-local pooled).
+
+    Returns a ``_PooledConnection`` wrapper whose ``.close()`` is a
+    no-op. The real connection lives in thread-local storage and is
+    reused across calls within the same thread, skipping the
+    ``sqlite3.connect`` + ``PRAGMA`` + ``executescript(SCHEMA_SQL)``
+    re-handshake on every call.
+
+    On first call per DB path per thread, runs pending migrations so
+    callers that skip ``python -m saga.init_db`` still get the full
+    schema (atom_relations, FTS, etc.). ``_migrations_done`` is
+    process-global, so migrations apply exactly once per process even
+    across threads.
+    """
+    db_key = str(DB_PATH)
+
+    cached = getattr(_thread_local_db, "wrapper", None)
+    cached_key = getattr(_thread_local_db, "db_key", None)
+    if cached is not None and cached_key == db_key:
+        return cached
+
+    # Different DB_PATH or first call on this thread — drop any prior
+    # cached connection (e.g. test harness flipped DB_PATH) and open
+    # a fresh one.
+    if cached is not None:
+        try:
+            cached._conn.close()
+        except Exception:
+            pass
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -153,14 +242,32 @@ def get_db() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA_SQL)
 
-    db_key = str(DB_PATH)
     if db_key not in _migrations_done:
         with _migrations_lock:
             if db_key not in _migrations_done:
                 run_migrations(conn)
                 _migrations_done.add(db_key)
 
-    return conn
+    wrapper = _PooledConnection(conn)
+    _thread_local_db.wrapper = wrapper
+    _thread_local_db.db_key = db_key
+    return wrapper
+
+
+def _close_thread_local_db() -> None:
+    """Close + drop the cached connection on this thread.
+
+    Tests use this between cases to avoid stale-DB-path connections
+    leaking across tmp_path fixtures. Production never calls it
+    (workers terminate, the connection goes with them)."""
+    cached = getattr(_thread_local_db, "wrapper", None)
+    if cached is not None:
+        try:
+            cached._conn.close()
+        except Exception:
+            pass
+        _thread_local_db.wrapper = None
+        _thread_local_db.db_key = None
 
 
 # ─── Embedding ────────────────────────────────────────────────────
