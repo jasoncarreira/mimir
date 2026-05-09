@@ -1492,6 +1492,27 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .skills.predictions import script as _predictions_script
     _predictions_script.add_argparse(pred_p)
 
+    # `mimir wiki <action>` — wiki maintenance CLI. The agent invokes
+    # these from lint passes via Bash; operators run them ad hoc.
+    # First (only) action: ``backlinks``. Future: ``lint`` could
+    # combine multiple checks; ``promote`` could move pages between
+    # categories. Same parent group lets all of them share the home
+    # resolution / event-logger init pattern.
+    wiki_p = sub.add_parser(
+        "wiki",
+        help="Wiki maintenance helpers (backlinks, future lint passes).",
+    )
+    wiki_sub = wiki_p.add_subparsers(dest="wiki_action")
+
+    wiki_bl_p = wiki_sub.add_parser(
+        "backlinks",
+        help="Walk state/wiki/, write orphans.md / dangling-links.md / "
+             "backlinks-index.md. Emits wiki_backlinks_unhealthy event "
+             "when the wiki has orphans or dangling links.",
+    )
+    from . import wiki_backlinks as _wiki_backlinks
+    _wiki_backlinks.add_argparse(wiki_bl_p)
+
     refl_audit_p = refl_sub.add_parser(
         "audit",
         help="Print the '## Effects of prior proposals' block — "
@@ -1621,6 +1642,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "predictions":
         from .skills.predictions import script as _predictions_script
         sys.exit(_predictions_script.run(args))
+
+    if args.command == "wiki":
+        if args.wiki_action == "backlinks":
+            from . import wiki_backlinks as _wiki_backlinks
+            sys.exit(_wiki_backlinks.cmd_backlinks(args))
+        wiki_p.print_help()
+        sys.exit(1)
 
     if args.command == "reflection":
         if args.reflection_action == "most-retrieved":
