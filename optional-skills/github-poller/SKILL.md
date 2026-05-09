@@ -59,6 +59,10 @@ GitHub's API events expose `user.login` for issues, PRs, comments, and reviews â
 
 Polling 1 repo every 15 min @ 4 endpoints = ~16 calls/hr/repo. For a 5-repo watch that's ~80/hr â€” well under GitHub's 5000/hr per-PAT rate limit. The `since=` query param keeps each call's payload small.
 
+## Batching
+
+`pollers.json` sets `batch_size=5`: GitHub items emitted in a single cron tick get coalesced into AgentEvents of up to 5 items each. A typical 1-3-event tick collapses to 1 turn; a 12-event backfill (e.g. after a cursor sync past a busy PR-review hour) splits into 3 turns (5 + 5 + 2) instead of firing 12 separate turns. Each batched turn renders as a numbered list with a `<poller> reported N items (batch X of Y)` header so the agent can scan the batch + react per-item, and `extra.items[]` carries per-item metadata (URLs, refs) for programmatic access. Tune via `batch_size` in `pollers.json` if your repos generate different event volumes.
+
 ## Cursor file
 
 Persists at `<home>/state/pollers/github-activity/cursor.json` (the framework-injected `STATE_DIR`). Survives container rebuilds. First run looks back 1 hour to bound the backfill burst.

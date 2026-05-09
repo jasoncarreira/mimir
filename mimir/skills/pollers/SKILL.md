@@ -101,6 +101,9 @@ if __name__ == "__main__":
 | `command` | yes | Shell command, relative to the skill directory. |
 | `cron` | yes | Cron expression (5-field, UTC). |
 | `env` | no | Additional environment variables for the script. |
+| `batch_size` | no | Coalesce up to N items per emitted AgentEvent (= per turn the agent sees). Default `1` (per-item-per-turn, matches open-strix). Use `>1` for bursty pollers (github-poller, RSS) so the agent sees one turn per cron tick instead of one per item. Items beyond `batch_size` overflow into additional batches with `batch_index` / `batch_count` set in `extra` so the agent can tell it's seeing part of a multi-batch fire. |
+
+**On `batch_size`**: the poller script always emits per-item JSONL lines (clean contract). The framework collects all items, then emits `ceil(N/batch_size)` AgentEvents, each carrying a rendered prompt summarizing up to `batch_size` items + per-item metadata in `extra.items`. Single-item batches (default) render the prompt verbatim — no header. Multi-item batches render with a header (`<poller-name> reported N items` plus a `(batch X of Y)` suffix on multi-batch fires) and a numbered list of per-item prompts.
 
 ### 3. Register the pollers
 
