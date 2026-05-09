@@ -84,8 +84,28 @@ Synthesize and call:
     topics_discussed=["..."],         # omit if nothing concrete
     decisions_made=["..."],           # omit if nothing concrete
     unfinished=["..."],               # omit if nothing was left dangling
+    closed_since=["..."],             # see below
     emotional_state="<one phrase>",   # omit if neutral / unclear
   )
+
+`closed_since` is the corrective-overrides list. Look at the "Recent
+session summaries" block in your system prompt and check each prior
+boundary's Unfinished items: did any get resolved during *this*
+session? If so, list the specific identifiers — PR refs like `#71`,
+chainlink IDs like `chainlink #29 G17`, file paths, etc. The prompt
+builder substring-matches these against earlier Unfinished items and
+drops any that contain one of these refs, so future prompts won't
+keep showing them as live work.
+
+If a prior Unfinished item like "PRs #71 + #72 awaiting" is partially
+resolved (#71 merged but #72 still open), put the resolved ref in
+`closed_since=["#71"]` AND re-list the still-open piece in this
+boundary's `unfinished=["PR #72 still awaiting"]`. The older item
+gets dropped via substring match; your new item carries the live
+state forward.
+
+Omit `closed_since` entirely if nothing from prior summaries was
+resolved during this session.
 
 After step 3, do not send any user-facing message — this is a bookkeeping turn.
 
