@@ -952,3 +952,125 @@ async def test_add_job_callable_with_empty_cron_disables(tmp_path: Path):
     assert sched._scheduler.get_job("demo") is None
     # Registration still in place — operator can re-enable later.
     assert "demo" in sched.registered_callables()
+
+
+# ---- pollers framework integration (chainlink #3) ----------------------
+
+
+import json as _json
+
+
+def _drop_pollers_skill(skills_dir: Path, name: str, cron: str = "* * * * *") -> Path:
+    """Helper: build a minimal valid skill dir with a no-op poller."""
+    skill = skills_dir / name
+    skill.mkdir(parents=True, exist_ok=True)
+    (skill / "pollers.json").write_text(_json.dumps({
+        "pollers": [{"name": name, "command": "true", "cron": cron}],
+    }), encoding="utf-8")
+    return skill
+
+
+@pytest.mark.asyncio
+async def test_add_poller_jobs_returns_zero_when_skills_dir_missing(tmp_path: Path):
+    """No skills directory → no pollers, no error. Most installs."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    n = sched.add_poller_jobs(tmp_path / "no-such-dir")
+    assert n == 0
+    assert sched.registered_pollers() == []
+
+
+@pytest.mark.asyncio
+async def test_add_poller_jobs_registers_apscheduler_jobs(tmp_path: Path):
+    """Each discovered poller becomes an APScheduler job with a
+    ``poller:<name>`` id — visible to APScheduler's get_job()."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    _drop_pollers_skill(skills, "p2")
+
+    n = sched.add_poller_jobs(skills)
+    assert n == 2
+    assert sched.registered_pollers() == ["p1", "p2"]
+    assert sched._scheduler.get_job("poller:p1") is not None
+    assert sched._scheduler.get_job("poller:p2") is not None
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_picks_up_new_skill(tmp_path: Path):
+    """The MCP-tool path: agent installs a new skill, calls
+    reload_pollers, the new skill goes live without a container
+    restart."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "first")
+    n = sched.add_poller_jobs(skills)
+    assert n == 1
+    assert sched.registered_pollers() == ["first"]
+
+    # Drop a second skill and reload.
+    _drop_pollers_skill(skills, "second")
+    n2 = await sched.reload_pollers()
+    assert n2 == 2
+    assert sched.registered_pollers() == ["first", "second"]
+    assert sched._scheduler.get_job("poller:second") is not None
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_drops_removed_skills(tmp_path: Path):
+    """Removing a skill's pollers.json (or the whole skill) and
+    reloading must drop the corresponding APScheduler job — otherwise
+    a removed skill keeps firing forever."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "to-keep")
+    skill_to_drop = _drop_pollers_skill(skills, "to-drop")
+    sched.add_poller_jobs(skills)
+    assert "to-drop" in sched.registered_pollers()
+
+    # Delete the skill's pollers.json (simulating an uninstall).
+    (skill_to_drop / "pollers.json").unlink()
+    n = await sched.reload_pollers()
+    assert n == 1
+    assert sched.registered_pollers() == ["to-keep"]
+    assert sched._scheduler.get_job("poller:to-drop") is None
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_no_op_when_never_added(tmp_path: Path):
+    """reload_pollers before add_poller_jobs is a no-op (returns 0).
+    Protects the MCP tool from being called too early or in tests
+    that didn't wire the framework."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    n = await sched.reload_pollers()
+    assert n == 0
+
+
+@pytest.mark.asyncio
+async def test_add_poller_jobs_skips_invalid_cron(tmp_path: Path):
+    """A poller with a malformed cron logs a warning and gets dropped;
+    other pollers in the same dir still register."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    bad = skills / "bad"
+    bad.mkdir(parents=True)
+    (bad / "pollers.json").write_text(_json.dumps({
+        "pollers": [
+            {"name": "bad", "command": "x", "cron": "not a cron"},
+        ],
+    }), encoding="utf-8")
+    _drop_pollers_skill(skills, "good")
+    n = sched.add_poller_jobs(skills)
+    assert n == 1
+    assert sched.registered_pollers() == ["good"]

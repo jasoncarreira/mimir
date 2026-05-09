@@ -464,6 +464,14 @@ def build_app(config: Config) -> web.Application:
         # Load LLM-tick jobs from scheduler.yaml.
         reload_stats = scheduler.reload()
 
+        # Pollers framework (chainlink #3). Discovers any
+        # ``<home>/.claude/skills/**/pollers.json`` and registers each
+        # as a cron-fired subprocess. Most installs have no pollers
+        # and ``installed_pollers`` is 0 (no-ops cleanly).
+        installed_pollers = scheduler.add_poller_jobs(
+            config.home / ".claude" / "skills",
+        )
+
         if (
             consolidate_registered
             or introspection_registered
@@ -471,6 +479,7 @@ def build_app(config: Config) -> web.Application:
             or health_probe_registered
             or identities_populate_registered
             or reload_stats["registered"] > 0
+            or installed_pollers > 0
         ):
             scheduler.start()
 
