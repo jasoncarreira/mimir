@@ -135,50 +135,49 @@ def _embed_triple_safe(subject: str, predicate: str, obj: str) -> bytes:
 def store_triple(atom_id: str, subject: str, predicate: str, obj: str,
                  confidence: float = 1.0, conn=None, embed: bool = True) -> str:
     """Store a single triple with optional embedding. Returns triple ID."""
-    close = False
-    if conn is None:
-        conn = _get_db()
-        close = True
+    from .core import transactional
 
     # Normalize for dedup: lowercase subject+predicate+object hash (atom-independent)
     norm_key = f"{subject.lower().strip()}:{predicate.lower().strip()}:{obj.lower().strip()}"
     triple_id = hashlib.sha256(norm_key.encode()).hexdigest()[:16]
     now = datetime.now(timezone.utc).isoformat()
 
-    # Check if already exists (content-level dedup, not atom-level)
-    existing = conn.execute("SELECT id FROM triples WHERE id = ?", (triple_id,)).fetchone()
+    # Dedup probe runs without holding a write lock. If the triple
+    # already exists we return early before opening the txn.
+    if conn is None:
+        probe = _get_db()
+        try:
+            existing = probe.execute("SELECT id FROM triples WHERE id = ?", (triple_id,)).fetchone()
+        finally:
+            probe.close()
+    else:
+        existing = conn.execute("SELECT id FROM triples WHERE id = ?", (triple_id,)).fetchone()
     if existing:
-        if close:
-            conn.close()
         return triple_id
 
     embedding = _embed_triple_safe(subject, predicate, obj) if embed else None
 
-    try:
-        conn.execute("""
+    # CR#16: triples row + triples_fts row must commit or roll back
+    # together. The pre-fix code wrapped the FTS5 INSERT in
+    # try/except: pass — same shape as the atoms_fts bug — so a real
+    # FTS5 failure (disk full, corruption) silently dropped the FTS
+    # row while the triples row was committed. ``triples_fts`` is
+    # probed via sqlite_master so pre-migration runs don't roll back.
+    with transactional(conn=conn) as txn:
+        txn.execute("""
             INSERT OR IGNORE INTO triples (id, atom_id, subject, predicate, object, confidence, embedding, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (triple_id, atom_id, subject, predicate, obj, confidence, embedding, now))
 
-        # Update FTS5 index
-        try:
-            conn.execute(
+        fts_exists = txn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='triples_fts'"
+        ).fetchone()
+        if fts_exists:
+            txn.execute(
                 "INSERT INTO triples_fts(rowid, subject, predicate, object) "
                 "SELECT rowid, subject, predicate, object FROM triples WHERE id = ?",
                 (triple_id,)
             )
-        except Exception:
-            pass  # FTS5 table may not exist yet (pre-migration)
-
-        if close:
-            conn.commit()
-    except Exception as e:
-        if close:
-            conn.close()
-        raise
-
-    if close:
-        conn.close()
 
     return triple_id
 
@@ -187,37 +186,34 @@ def store_triples_batch(triples: list[dict], conn=None, embed: bool = False) -> 
     """Store multiple triples with content-level dedup.
     Each dict needs: atom_id, subject, predicate, object.
     Returns count of NEW triples stored (skips duplicates)."""
-    close = False
-    if conn is None:
-        conn = _get_db()
-        close = True
+    from .core import transactional
 
     count = 0
     now = datetime.now(timezone.utc).isoformat()
-    for t in triples:
-        # Content-level dedup hash
-        norm_key = f"{t['subject'].lower().strip()}:{t['predicate'].lower().strip()}:{t['object'].lower().strip()}"
-        triple_id = hashlib.sha256(norm_key.encode()).hexdigest()[:16]
 
-        existing = conn.execute("SELECT id FROM triples WHERE id = ?", (triple_id,)).fetchone()
-        if existing:
-            continue
+    # CR#16: each loop iteration was its own implicit autocommit, and
+    # the per-INSERT try/except: pass meant a single bad row silently
+    # skipped while the rest of the batch committed — caller saw a
+    # count smaller than expected and could not tell which rows
+    # didn't make it. One transaction makes the batch all-or-nothing.
+    with transactional(conn=conn) as txn:
+        for t in triples:
+            # Content-level dedup hash
+            norm_key = f"{t['subject'].lower().strip()}:{t['predicate'].lower().strip()}:{t['object'].lower().strip()}"
+            triple_id = hashlib.sha256(norm_key.encode()).hexdigest()[:16]
 
-        embedding = _embed_triple_safe(t['subject'], t['predicate'], t['object']) if embed else None
+            existing = txn.execute("SELECT id FROM triples WHERE id = ?", (triple_id,)).fetchone()
+            if existing:
+                continue
 
-        try:
-            conn.execute("""
+            embedding = _embed_triple_safe(t['subject'], t['predicate'], t['object']) if embed else None
+
+            txn.execute("""
                 INSERT OR IGNORE INTO triples (id, atom_id, subject, predicate, object, confidence, embedding, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (triple_id, t['atom_id'], t['subject'], t['predicate'],
                   t['object'], t.get('confidence', 1.0), embedding, now))
             count += 1
-        except Exception:
-            pass
-
-    if close:
-        conn.commit()
-        conn.close()
 
     return count
 
@@ -1127,27 +1123,31 @@ def detect_contradictions(subject: str = None, predicate: str = None,
 
 def resolve_contradictions(contradictions: list[dict], strategy: str = "newest") -> int:
     """Resolve detected contradictions by tombstoning old values.
-    
+
     Strategies:
     - newest: keep the most recent triple, tombstone older ones
     - manual: return without changes (for human review)
     """
     if strategy == "manual":
         return 0
-    
-    conn = _get_db()
+
+    from .core import transactional
+
     resolved = 0
-    
-    for c in contradictions:
-        if c['type'] == 'multi_value_on_unique_pred' and strategy == 'newest':
-            values = sorted(c['values'], key=lambda v: v['date'], reverse=True)
-            # Keep first (newest), tombstone rest
-            for old in values[1:]:
-                conn.execute("UPDATE triples SET state = 'tombstone' WHERE id = ?", (old['id'],))
-                resolved += 1
-    
-    conn.commit()
-    conn.close()
+
+    # CR#16: each contradiction tombstones N-1 older triples; partial
+    # commit could leave some "older" triples still active alongside
+    # the newest one, which is exactly the bug this function exists
+    # to fix.
+    with transactional() as conn:
+        for c in contradictions:
+            if c['type'] == 'multi_value_on_unique_pred' and strategy == 'newest':
+                values = sorted(c['values'], key=lambda v: v['date'], reverse=True)
+                # Keep first (newest), tombstone rest
+                for old in values[1:]:
+                    conn.execute("UPDATE triples SET state = 'tombstone' WHERE id = ?", (old['id'],))
+                    resolved += 1
+
     return resolved
 
 
@@ -1459,9 +1459,8 @@ def update_world(subject, predicate, object_val, valid_from=None, valid_until=No
     if confidence is None:
         confidence = _cfg('world_model', 'default_confidence', 1.0)
 
-    conn = _get_db()
-    # Disable FK checks for world updates that may not reference real atoms
-    conn.execute("PRAGMA foreign_keys=OFF")
+    from .core import transactional
+
     now = datetime.now(timezone.utc).isoformat()
 
     # When temporal_extraction is disabled, strip temporal metadata
@@ -1471,28 +1470,11 @@ def update_world(subject, predicate, object_val, valid_from=None, valid_until=No
     elif valid_from is None:
         valid_from = now
 
-    closed_ids = []
-
-    # Auto-close existing active triples with same subject+predicate
-    # (only when temporal_extraction is enabled — otherwise just overwrite)
-    if auto_close and temporal_extraction:
-        existing = conn.execute(
-            """SELECT id FROM triples
-               WHERE LOWER(subject) = LOWER(?) AND LOWER(predicate) = LOWER(?)
-               AND state = 'active' AND (valid_until IS NULL OR valid_until > datetime('now'))""",
-            (subject, predicate),
-        ).fetchall()
-        for row in existing:
-            conn.execute(
-                "UPDATE triples SET valid_until = ? WHERE id = ?",
-                (now, row["id"]),
-            )
-            closed_ids.append(row["id"])
-
-    # Insert new triple
+    # Embed the triple text outside the transaction — it's a network
+    # call and we don't want it holding the write lock. Failure here
+    # is non-fatal (we just store without embedding) — same behavior
+    # as pre-CR#16.
     triple_id = generate_triple_id(source_atom_id or "world", subject, predicate, object_val)
-
-    # Embed the triple text
     from .core import embed_text, pack_embedding
     triple_text = _triple_text(subject, predicate, object_val)
     try:
@@ -1502,18 +1484,43 @@ def update_world(subject, predicate, object_val, valid_from=None, valid_until=No
         emb_blob = None
 
     atom_id_val = source_atom_id or "world_update"
-    conn.execute(
-        """INSERT OR REPLACE INTO triples
-           (id, atom_id, subject, predicate, object, confidence, state, embedding, created_at,
-            valid_from, valid_until, source_atom_id)
-           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)""",
-        (triple_id, atom_id_val, subject, predicate, object_val,
-         confidence, emb_blob, now, valid_from, valid_until, source_atom_id),
-    )
+    closed_ids = []
 
-    conn.commit()
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.close()
+    # CR#16: auto-close UPDATEs + new-triple INSERT must commit
+    # together. Previously a failure mid-batch could leave one of the
+    # old triples already closed (valid_until set) plus a new triple
+    # half-committed depending on which statement raised. PRAGMA
+    # foreign_keys must be set OUTSIDE the transaction (SQLite ignores
+    # it inside an active txn) so we toggle it before BEGIN IMMEDIATE.
+    conn = _get_db()
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        with transactional(conn=conn) as txn:
+            if auto_close and temporal_extraction:
+                existing = txn.execute(
+                    """SELECT id FROM triples
+                       WHERE LOWER(subject) = LOWER(?) AND LOWER(predicate) = LOWER(?)
+                       AND state = 'active' AND (valid_until IS NULL OR valid_until > datetime('now'))""",
+                    (subject, predicate),
+                ).fetchall()
+                for row in existing:
+                    txn.execute(
+                        "UPDATE triples SET valid_until = ? WHERE id = ?",
+                        (now, row["id"]),
+                    )
+                    closed_ids.append(row["id"])
+
+            txn.execute(
+                """INSERT OR REPLACE INTO triples
+                   (id, atom_id, subject, predicate, object, confidence, state, embedding, created_at,
+                    valid_from, valid_until, source_atom_id)
+                   VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)""",
+                (triple_id, atom_id_val, subject, predicate, object_val,
+                 confidence, emb_blob, now, valid_from, valid_until, source_atom_id),
+            )
+        conn.execute("PRAGMA foreign_keys=ON")
+    finally:
+        conn.close()
 
     return {
         "triple_id": triple_id,

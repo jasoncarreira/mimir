@@ -15,6 +15,7 @@ import os
 import struct
 import sys
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -333,6 +334,53 @@ def apply_confidence_gating(
     return filtered_obs, filtered_raws, gated_reason
 
 
+@contextmanager
+def transactional(conn: "sqlite3.Connection | None" = None):
+    """Run a saga write batch as one atomic transaction (CR#16).
+
+    Without this, multi-statement saga writes (atom row + atom_topics
+    + atoms_fts + ...) ran as separate auto-commit DML in serial. A
+    failure on the FTS5 INSERT — caught by ``try/except: pass`` — left
+    the atom row committed but the FTS row missing, so keyword
+    retrieval silently lost the atom while embedding retrieval still
+    found it. Same shape in 30+ other write paths (merge_atoms,
+    pin_atom, store_session_boundary, etc.).
+
+    Wrapping the whole batch in ``BEGIN IMMEDIATE`` ... ``COMMIT`` /
+    ``ROLLBACK`` collapses that to one fate: every write in the block
+    sticks together, or all of them roll back. ``BEGIN IMMEDIATE``
+    (vs the deferred default) takes the write lock immediately so a
+    concurrent writer hits ``busy_timeout`` deterministically rather
+    than partway through; mimir's WAL mode keeps reads non-blocking.
+
+    Usage:
+
+        with transactional() as conn:
+            conn.execute("INSERT INTO atoms ...")
+            conn.execute("INSERT INTO atom_topics ...")
+            conn.execute("INSERT INTO atoms_fts ...")
+        # commits on normal exit; rolls back on exception.
+
+    Pass ``conn`` to share a connection (rare — most call sites open
+    their own); omit to let the helper open + close one. The opened
+    connection is closed on exit regardless of commit/rollback.
+    """
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        if owns_conn:
+            conn.close()
+
+
 # ─── Embedding ────────────────────────────────────────────────────
 # Embedding functions are provided by embeddings.py (pluggable provider).
 # Re-exported here for backward compatibility.
@@ -420,6 +468,14 @@ def generate_atom_id(content: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+class _DuplicateAtom(Exception):
+    """Sentinel raised inside ``store_atom``'s transactional block when
+    INSERT OR IGNORE returns rowcount=0 — content_hash already exists.
+    Caught at the top of the function so the caller sees the
+    (None, reason) tuple shape it always has, while letting the
+    transactional helper roll back cleanly. Module-private."""
+
+
 def store_atom(
     content: str,
     stream: str = "semantic",
@@ -463,21 +519,19 @@ def store_atom(
         )
         profile = 'lightweight'
 
-    conn = get_db()
-    
     atom_id = generate_atom_id(content)
     content_hash = hashlib.sha256(content.encode()).hexdigest()[:32]
     now = datetime.now(timezone.utc).isoformat()
-    
+
     # Content deduplication: atomic INSERT OR IGNORE to avoid TOCTOU race
     # We attempt the insert directly; if a duplicate exists, rowcount == 0.
-    
+
     # Get embedding if not provided
     if embedding is None:
         embedding = embed_text(content)
-    
+
     emb_blob = pack_embedding(embedding)
-    
+
     # Compute denormalized columns
     meta = metadata or {}
     _is_pinned = 1 if meta.get("pinned", False) else 0
@@ -485,46 +539,56 @@ def store_atom(
 
     _embedding_provider = _cfg('embedding', 'provider', 'nvidia-nim')
 
-    cursor = conn.execute("""
-        INSERT OR IGNORE INTO atoms (
-            id, profile, stream, content, content_hash, created_at,
-            arousal, valence, topics, encoding_confidence, provisional,
-            source_type, embedding, metadata, agent_id,
-            embedding_provider, is_pinned, session_id,
-            memory_type, evidence_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        atom_id, profile, stream, content, content_hash, now,
-        arousal, valence, json.dumps(topics or []),
-        encoding_confidence, int(provisional), source_type,
-        emb_blob, json.dumps(meta), agent_id,
-        _embedding_provider, _is_pinned, _session_id,
-        memory_type, evidence_count
-    ))
-
-    if cursor.rowcount == 0:
-        # Duplicate content_hash in active/fading state -- dedup triggered
-        conn.close()
-        return (None, "duplicate content")
-
-    # Populate atom_topics junction table
-    if topics:
-        conn.executemany(
-            "INSERT OR IGNORE INTO atom_topics (atom_id, topic) VALUES (?, ?)",
-            [(atom_id, t) for t in topics]
-        )
-
-    # Update FTS5 index
+    # CR#16: atoms + atom_topics + atoms_fts must commit or roll back
+    # together. The pre-fix code committed atoms first then tried FTS;
+    # an FTS failure (caught by try/except: pass) left a row that
+    # keyword retrieval silently couldn't find.
     try:
-        conn.execute(
-            "INSERT INTO atoms_fts(rowid, content) SELECT rowid, content FROM atoms WHERE id = ?",
-            (atom_id,)
-        )
-    except Exception:
-        pass  # FTS5 table may not exist yet (pre-migration)
+        with transactional() as conn:
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO atoms (
+                    id, profile, stream, content, content_hash, created_at,
+                    arousal, valence, topics, encoding_confidence, provisional,
+                    source_type, embedding, metadata, agent_id,
+                    embedding_provider, is_pinned, session_id,
+                    memory_type, evidence_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                atom_id, profile, stream, content, content_hash, now,
+                arousal, valence, json.dumps(topics or []),
+                encoding_confidence, int(provisional), source_type,
+                emb_blob, json.dumps(meta), agent_id,
+                _embedding_provider, _is_pinned, _session_id,
+                memory_type, evidence_count
+            ))
 
-    conn.commit()
-    conn.close()
+            if cursor.rowcount == 0:
+                # Duplicate content_hash in active/fading state — dedup triggered.
+                # Roll back the empty INSERT-OR-IGNORE noop by raising
+                # explicitly; the caller sees (None, "duplicate content").
+                #
+                # Plain ``return`` from inside ``with transactional()`` would
+                # commit the empty txn — harmless but noisy in WAL — so we
+                # raise a sentinel to roll back cleanly and convert outside.
+                raise _DuplicateAtom
+
+            # Populate atom_topics junction table
+            if topics:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO atom_topics (atom_id, topic) VALUES (?, ?)",
+                    [(atom_id, t) for t in topics]
+                )
+
+            # Update FTS5 index. No try/except: pre-migration FTS5-missing is
+            # a setup bug (``run_migrations`` should have run); a runtime
+            # FTS5 failure (disk full, etc.) MUST roll the atoms INSERT
+            # back so we don't end up with an atom unsearchable by keyword.
+            conn.execute(
+                "INSERT INTO atoms_fts(rowid, content) SELECT rowid, content FROM atoms WHERE id = ?",
+                (atom_id,)
+            )
+    except _DuplicateAtom:
+        return (None, "duplicate content")
 
     # Invalidate stats cache since atom count changed
     global _stats_cache
@@ -1074,24 +1138,25 @@ def _log_access(atoms: list[dict], mode: str, session_id: str | None = None):
     rows from this session — without it, bulk end-of-session feedback can
     only tag the globally most-recent retrieval per atom.
     """
-    conn = get_db()
     now = datetime.now(timezone.utc).isoformat()
+    _access_boost = _cfg('decay', 'stability_boost_factor', 1.1)
+    _max_stability = _cfg('decay', 'max_stability', 10.0)
 
-    for atom in atoms:
-        conn.execute(
-            "INSERT INTO access_log (atom_id, accessed_at, activation_score, retrieval_mode, session_id) VALUES (?, ?, ?, ?, ?)",
-            (atom["id"], now, atom.get("_activation", 0), mode, session_id)
-        )
-        # Update access count and last_accessed (cap stability to prevent runaway)
-        _access_boost = _cfg('decay', 'stability_boost_factor', 1.1)
-        _max_stability = _cfg('decay', 'max_stability', 10.0)
-        conn.execute(
-            "UPDATE atoms SET access_count = access_count + 1, last_accessed_at = ?, stability = MIN(stability * ?, ?) WHERE id = ?",
-            (now, _access_boost, _max_stability, atom["id"])
-        )
-    
-    conn.commit()
-    conn.close()
+    # CR#16: every retrieved atom gets one access_log row + one atoms
+    # UPDATE — partial commits would either log access without
+    # incrementing the counter or vice versa, drifting the two views
+    # of "how often was this atom used."
+    with transactional() as conn:
+        for atom in atoms:
+            conn.execute(
+                "INSERT INTO access_log (atom_id, accessed_at, activation_score, retrieval_mode, session_id) VALUES (?, ?, ?, ?, ?)",
+                (atom["id"], now, atom.get("_activation", 0), mode, session_id)
+            )
+            # Update access count and last_accessed (cap stability to prevent runaway)
+            conn.execute(
+                "UPDATE atoms SET access_count = access_count + 1, last_accessed_at = ?, stability = MIN(stability * ?, ?) WHERE id = ?",
+                (now, _access_boost, _max_stability, atom["id"])
+            )
 
 
 # ─── Keyword Search (BM25-lite) ──────────────────────────────────
@@ -3134,71 +3199,66 @@ def emotional_drift(entity_or_topic: str, window_days: int = 7) -> dict:
 
 def update_confidence_from_evidence(conn=None) -> dict:
     """Update triple confidence based on evidence accumulation.
-    
+
     A fact confirmed by multiple atoms has higher confidence.
     A fact from a single atom retains its source confidence.
-    
+
     Evidence sources:
     1. Same triple extracted from multiple atoms -> confidence boost
     2. Triple's source atom has high access_count -> slightly higher
     3. Triple's source atom is 'correction' type -> highest confidence
-    
+
     Called during decay cycle or on-demand.
     """
-    close = False
-    if conn is None:
-        conn = get_db()
-        close = True
-    
-    # Get all active triples with their source atom info
-    rows = conn.execute("""
-        SELECT t.id, t.subject, t.predicate, t.object, t.confidence, t.atom_id,
-               a.access_count, a.source_type, a.encoding_confidence
-        FROM triples t
-        JOIN atoms a ON t.atom_id = a.id
-        WHERE t.state = 'active'
-    """).fetchall()
-    
-    # Group by normalized content (same fact from different atoms)
-    from collections import defaultdict
-    fact_groups = defaultdict(list)
-    for row in rows:
-        norm_key = f"{row[1].lower()}:{row[2].lower()}:{row[3].lower()}"
-        fact_groups[norm_key].append(dict(row))
-    
-    updated = 0
-    for norm_key, triples in fact_groups.items():
-        # Evidence count: how many distinct atoms support this fact
-        unique_atoms = len(set(t['atom_id'] for t in triples))
-        
-        # Base confidence from source atoms
-        avg_encoding_conf = sum(t['encoding_confidence'] for t in triples) / len(triples)
-        
-        # Evidence multiplier: more sources = higher confidence (diminishing returns)
-        evidence_mult = min(1.5, 0.7 + 0.2 * unique_atoms)
-        
-        # Correction boost: if any source is a correction, boost
-        correction_boost = 0.1 if any(t['source_type'] == 'correction' for t in triples) else 0
-        
-        # Access boost: frequently accessed atoms suggest confirmed knowledge
-        max_access = max(t['access_count'] for t in triples)
-        access_boost = min(0.1, max_access * 0.005)
-        
-        new_confidence = min(1.0, avg_encoding_conf * evidence_mult + correction_boost + access_boost)
-        
-        # Update all triples in this group
-        for t in triples:
-            if abs(t['confidence'] - new_confidence) > 0.01:
-                conn.execute("UPDATE triples SET confidence = ? WHERE id = ?",
-                           (round(new_confidence, 3), t['id']))
-                updated += 1
-    
-    if close:
-        conn.commit()
-        conn.close()
-    else:
-        conn.commit()
-    
+    # CR#16: confidence rebalance issues many UPDATEs across triples;
+    # a partial commit would leave fact-groups half-rebalanced and
+    # downstream retrieval scoring would mix old and new confidences.
+    # When called with a caller-managed conn (e.g. from the decay
+    # cycle that wraps a larger batch), we share its transaction.
+    with transactional(conn=conn) as conn:
+        # Get all active triples with their source atom info
+        rows = conn.execute("""
+            SELECT t.id, t.subject, t.predicate, t.object, t.confidence, t.atom_id,
+                   a.access_count, a.source_type, a.encoding_confidence
+            FROM triples t
+            JOIN atoms a ON t.atom_id = a.id
+            WHERE t.state = 'active'
+        """).fetchall()
+
+        # Group by normalized content (same fact from different atoms)
+        from collections import defaultdict
+        fact_groups = defaultdict(list)
+        for row in rows:
+            norm_key = f"{row[1].lower()}:{row[2].lower()}:{row[3].lower()}"
+            fact_groups[norm_key].append(dict(row))
+
+        updated = 0
+        for norm_key, triples in fact_groups.items():
+            # Evidence count: how many distinct atoms support this fact
+            unique_atoms = len(set(t['atom_id'] for t in triples))
+
+            # Base confidence from source atoms
+            avg_encoding_conf = sum(t['encoding_confidence'] for t in triples) / len(triples)
+
+            # Evidence multiplier: more sources = higher confidence (diminishing returns)
+            evidence_mult = min(1.5, 0.7 + 0.2 * unique_atoms)
+
+            # Correction boost: if any source is a correction, boost
+            correction_boost = 0.1 if any(t['source_type'] == 'correction' for t in triples) else 0
+
+            # Access boost: frequently accessed atoms suggest confirmed knowledge
+            max_access = max(t['access_count'] for t in triples)
+            access_boost = min(0.1, max_access * 0.005)
+
+            new_confidence = min(1.0, avg_encoding_conf * evidence_mult + correction_boost + access_boost)
+
+            # Update all triples in this group
+            for t in triples:
+                if abs(t['confidence'] - new_confidence) > 0.01:
+                    conn.execute("UPDATE triples SET confidence = ? WHERE id = ?",
+                               (round(new_confidence, 3), t['id']))
+                    updated += 1
+
     return {
         "triples_updated": updated,
         "fact_groups": len(fact_groups),
@@ -3528,70 +3588,105 @@ def find_merge_candidates(similarity_threshold: float = None, top_k: int = None)
 
 def merge_atoms(atom_id_keep: str, atom_id_remove: str, merged_content: str = None) -> dict:
     """Merge two atoms. Keeps one, tombstones the other.
-    
+
     The kept atom gets:
     - Combined access count
     - Higher confidence
     - Merged content (if provided) or keeps its own content
     - Re-embedded if content changed
-    
+
     The removed atom is tombstoned (not deleted).
     Triples from the removed atom are reassigned to the kept atom.
     """
     conn = get_db()
-    
-    keep = conn.execute("SELECT * FROM atoms WHERE id = ?", (atom_id_keep,)).fetchone()
-    remove = conn.execute("SELECT * FROM atoms WHERE id = ?", (atom_id_remove,)).fetchone()
-    
-    if not keep or not remove:
+    try:
+        keep = conn.execute("SELECT * FROM atoms WHERE id = ?", (atom_id_keep,)).fetchone()
+        remove = conn.execute("SELECT * FROM atoms WHERE id = ?", (atom_id_remove,)).fetchone()
+    finally:
         conn.close()
+
+    if not keep or not remove:
         return {"error": "One or both atoms not found"}
-    
+
     keep = dict(keep)
     remove = dict(remove)
-    
+
     # Merge access counts
     new_access = keep['access_count'] + remove['access_count']
     new_confidence = max(keep['encoding_confidence'], remove['encoding_confidence'])
-    
+
     # Merge content if provided
     new_content = merged_content or keep['content']
-    
-    # Re-embed if content changed
+
+    # Re-embed if content changed. Embedding lives outside the
+    # transaction — it's a network call that can take seconds, and we
+    # don't want to hold the write lock that long. If it fails, we
+    # still merge (without re-embedding) just like the pre-CR#16 code.
     new_embedding = None
     if merged_content:
         try:
             new_embedding = pack_embedding(embed_text(new_content))
         except Exception:
             pass
-    
+
     # Update kept atom
     update_sql = """UPDATE atoms SET access_count = ?, encoding_confidence = ?"""
     params = [new_access, new_confidence]
-    
+
     if merged_content:
         update_sql += ", content = ?, content_hash = ?"
         params.extend([new_content, hashlib.sha256(new_content.encode()).hexdigest()[:32]])
     if new_embedding:
         update_sql += ", embedding = ?"
         params.append(new_embedding)
-    
+
     update_sql += " WHERE id = ?"
     params.append(atom_id_keep)
-    conn.execute(update_sql, params)
-    
-    # Tombstone removed atom
-    conn.execute("UPDATE atoms SET state = 'tombstone' WHERE id = ?", (atom_id_remove,))
-    
-    # Reassign triples
-    try:
-        conn.execute("UPDATE triples SET atom_id = ? WHERE atom_id = ?", 
-                    (atom_id_keep, atom_id_remove))
-    except Exception:
-        pass
-    
-    conn.commit()
-    conn.close()
+
+    # CR#16: kept-atom UPDATE + atoms_fts resync + tombstone UPDATE +
+    # triples reassign must commit together. Pre-fix code wrapped the
+    # triples UPDATE in try/except: pass — a real FK / lock failure
+    # there left the keep-side updated and the remove-side tombstoned
+    # but the triples still pointing at the (now-tombstoned) remove
+    # atom.
+    #
+    # Reviewer (cr16-review #80) flagged a second divergence shape on
+    # this path: when ``merged_content`` is provided, ``atoms.content``
+    # is updated in-place but ``atoms_fts`` (an external-content FTS5
+    # over ``atoms``, no auto-update triggers) was left pointing at the
+    # OLD content — so keyword search returned the pre-merge text
+    # forever. We DELETE+INSERT the FTS row inside the same txn so the
+    # text in atoms and atoms_fts can never disagree post-merge.
+    #
+    # We probe sqlite_master for the triples table instead of try/except:
+    # in test envs that haven't called init_triples_schema the table
+    # genuinely doesn't exist (lazy init), and that's not a
+    # rollback-worthy failure — but a real error during the UPDATE is.
+    with transactional() as conn:
+        conn.execute(update_sql, params)
+        if merged_content:
+            # Re-sync the FTS5 row so keyword search returns the new
+            # content. External-content FTS5 (``content='atoms'``) has
+            # no auto-update trigger; we re-INSERT after a DELETE.
+            row = conn.execute(
+                "SELECT rowid FROM atoms WHERE id = ?", (atom_id_keep,)
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    "DELETE FROM atoms_fts WHERE rowid = ?", (row["rowid"],),
+                )
+                conn.execute(
+                    "INSERT INTO atoms_fts(rowid, content) "
+                    "SELECT rowid, content FROM atoms WHERE id = ?",
+                    (atom_id_keep,),
+                )
+        conn.execute("UPDATE atoms SET state = 'tombstone' WHERE id = ?", (atom_id_remove,))
+        triples_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='triples'"
+        ).fetchone()
+        if triples_exists:
+            conn.execute("UPDATE triples SET atom_id = ? WHERE atom_id = ?",
+                         (atom_id_keep, atom_id_remove))
     
     # Log provenance
     log_provenance("atom", atom_id_keep, "merged", 
@@ -3828,70 +3923,71 @@ def mark_contributions(retrieved_atom_ids: list[str], response_text: str,
     
     Called by the agent after generating a response.
     """
-    conn = get_db()
     response_lower = response_text.lower()
     response_words = set(response_lower.split())
-    
+
     contributed_ids = []
     not_contributed_ids = []
-    
-    for atom_id in retrieved_atom_ids:
-        row = conn.execute("SELECT content FROM atoms WHERE id = ?", (atom_id,)).fetchone()
-        if not row:
-            continue
-        
-        content = row['content']
-        content_lower = content.lower()
-        
-        # Signal 1: Phrase overlap (3+ word sequences from atom found in response)
-        atom_words = content_lower.split()
-        phrase_hits = 0
-        for i in range(len(atom_words) - 2):
-            trigram = f"{atom_words[i]} {atom_words[i+1]} {atom_words[i+2]}"
-            if trigram in response_lower:
-                phrase_hits += 1
-        
-        # Signal 2: Key term overlap (significant words, not stopwords)
-        stopwords = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
-                     'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
-                     'could', 'should', 'may', 'might', 'can', 'shall', 'to', 'of',
-                     'in', 'for', 'on', 'with', 'at', 'by', 'from', 'this', 'that',
-                     'it', 'its', 'not', 'but', 'and', 'or', 'if', 'as', 'no', 'so'}
-        atom_key_words = {w for w in atom_words if len(w) > 3 and w not in stopwords}
-        overlap = atom_key_words & response_words
-        overlap_ratio = len(overlap) / max(len(atom_key_words), 1)
-        
-        # Classify: contributed if phrase hit OR >30% key word overlap
-        contributed = phrase_hits >= 1 or overlap_ratio > 0.3
-        
-        if contributed:
-            contributed_ids.append(atom_id)
-        else:
-            not_contributed_ids.append(atom_id)
 
-        # Tag every retrieval of this atom in the session window. Without
-        # session_id we fall back to the legacy "most recent globally"
-        # behavior, which only tags one row even when bulk feedback covers
-        # many retrievals — preserved for callers that don't pass it.
-        if session_id is not None:
-            conn.execute("""
-                UPDATE access_log SET contributed = ?
-                WHERE atom_id = ? AND session_id = ?
-            """, (1 if contributed else 0, atom_id, session_id))
-        else:
-            conn.execute("""
-                UPDATE access_log SET contributed = ?
-                WHERE atom_id = ? AND id = (
-                    SELECT id FROM access_log WHERE atom_id = ? ORDER BY accessed_at DESC LIMIT 1
-                )
-            """, (1 if contributed else 0, atom_id, atom_id))
-    
-    # Store co-retrieval record for association chains
-    if len(contributed_ids) > 1:
-        _log_co_retrieval(conn, contributed_ids, session_id)
-    
-    conn.commit()
-    conn.close()
+    # CR#16: per-atom access_log UPDATEs + co_retrieval INSERT must
+    # commit together. Partial commit would label some retrievals as
+    # contributed and skip the co-retrieval graph update — the
+    # association-chain analytics would silently undercount.
+    with transactional() as conn:
+        for atom_id in retrieved_atom_ids:
+            row = conn.execute("SELECT content FROM atoms WHERE id = ?", (atom_id,)).fetchone()
+            if not row:
+                continue
+
+            content = row['content']
+            content_lower = content.lower()
+
+            # Signal 1: Phrase overlap (3+ word sequences from atom found in response)
+            atom_words = content_lower.split()
+            phrase_hits = 0
+            for i in range(len(atom_words) - 2):
+                trigram = f"{atom_words[i]} {atom_words[i+1]} {atom_words[i+2]}"
+                if trigram in response_lower:
+                    phrase_hits += 1
+
+            # Signal 2: Key term overlap (significant words, not stopwords)
+            stopwords = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+                         'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+                         'could', 'should', 'may', 'might', 'can', 'shall', 'to', 'of',
+                         'in', 'for', 'on', 'with', 'at', 'by', 'from', 'this', 'that',
+                         'it', 'its', 'not', 'but', 'and', 'or', 'if', 'as', 'no', 'so'}
+            atom_key_words = {w for w in atom_words if len(w) > 3 and w not in stopwords}
+            overlap = atom_key_words & response_words
+            overlap_ratio = len(overlap) / max(len(atom_key_words), 1)
+
+            # Classify: contributed if phrase hit OR >30% key word overlap
+            contributed = phrase_hits >= 1 or overlap_ratio > 0.3
+
+            if contributed:
+                contributed_ids.append(atom_id)
+            else:
+                not_contributed_ids.append(atom_id)
+
+            # Tag every retrieval of this atom in the session window. Without
+            # session_id we fall back to the legacy "most recent globally"
+            # behavior, which only tags one row even when bulk feedback covers
+            # many retrievals — preserved for callers that don't pass it.
+            if session_id is not None:
+                conn.execute("""
+                    UPDATE access_log SET contributed = ?
+                    WHERE atom_id = ? AND session_id = ?
+                """, (1 if contributed else 0, atom_id, session_id))
+            else:
+                conn.execute("""
+                    UPDATE access_log SET contributed = ?
+                    WHERE atom_id = ? AND id = (
+                        SELECT id FROM access_log WHERE atom_id = ? ORDER BY accessed_at DESC LIMIT 1
+                    )
+                """, (1 if contributed else 0, atom_id, atom_id))
+
+        # Store co-retrieval record for association chains
+        if len(contributed_ids) > 1:
+            _log_co_retrieval(conn, contributed_ids, session_id)
     
     return {
         "total_retrieved": len(retrieved_atom_ids),
@@ -3924,43 +4020,45 @@ def record_outcome(atom_ids, feedback, session_id=None, query=None):
     decay = _cfg('retrieval', 'outcome_decay', 0.95)
     now = datetime.now(timezone.utc).isoformat()
 
-    conn = get_db()
-    updated = 0
-
     if isinstance(atom_ids, str):
         atom_ids = [atom_ids]
 
-    for atom_id in atom_ids:
-        row = conn.execute(
-            "SELECT outcome_score, outcome_count FROM atoms WHERE id = ?",
-            (atom_id,),
-        ).fetchone()
-        if not row:
-            continue
+    updated = 0
 
-        old_score = row["outcome_score"] if row["outcome_score"] is not None else 0.0
-        old_count = row["outcome_count"] if row["outcome_count"] is not None else 0
+    # CR#16: per-atom outcome_score UPDATEs + the retrieval_outcomes
+    # INSERT must commit together. The pre-fix code could update some
+    # atoms' outcome_score, fail mid-batch, and still leave a partial
+    # commit; the retrieval_outcomes audit row could disagree with the
+    # atoms it claims to cover.
+    with transactional() as conn:
+        for atom_id in atom_ids:
+            row = conn.execute(
+                "SELECT outcome_score, outcome_count FROM atoms WHERE id = ?",
+                (atom_id,),
+            ).fetchone()
+            if not row:
+                continue
 
-        # Decay existing score, then add new delta
-        new_score = old_score * decay + delta
-        new_score = max(-5.0, min(5.0, new_score))
-        new_count = old_count + 1
+            old_score = row["outcome_score"] if row["outcome_score"] is not None else 0.0
+            old_count = row["outcome_count"] if row["outcome_count"] is not None else 0
 
+            # Decay existing score, then add new delta
+            new_score = old_score * decay + delta
+            new_score = max(-5.0, min(5.0, new_score))
+            new_count = old_count + 1
+
+            conn.execute(
+                "UPDATE atoms SET outcome_score = ?, outcome_count = ?, last_outcome_at = ? WHERE id = ?",
+                (new_score, new_count, now, atom_id),
+            )
+            updated += 1
+
+        # Log to retrieval_outcomes table
         conn.execute(
-            "UPDATE atoms SET outcome_score = ?, outcome_count = ?, last_outcome_at = ? WHERE id = ?",
-            (new_score, new_count, now, atom_id),
+            """INSERT INTO retrieval_outcomes (session_id, atom_ids, query, feedback, feedback_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (session_id, json.dumps(atom_ids), query, feedback, now),
         )
-        updated += 1
-
-    # Log to retrieval_outcomes table
-    conn.execute(
-        """INSERT INTO retrieval_outcomes (session_id, atom_ids, query, feedback, feedback_at)
-           VALUES (?, ?, ?, ?, ?)""",
-        (session_id, json.dumps(atom_ids), query, feedback, now),
-    )
-
-    conn.commit()
-    conn.close()
 
     return {"updated": updated, "feedback": feedback, "atom_ids": atom_ids}
 
@@ -4237,68 +4335,69 @@ def compute_retrieval_adjustments() -> dict:
     
     Called during decay cycle.
     """
-    conn = get_db()
-    
-    # Get per-atom contribution stats
-    rows = conn.execute("""
-        SELECT atom_id, 
-               COUNT(*) as total_retrievals,
-               SUM(CASE WHEN contributed = 1 THEN 1 ELSE 0 END) as contributed_count,
-               SUM(CASE WHEN contributed = 0 THEN 1 ELSE 0 END) as not_contributed_count,
-               SUM(CASE WHEN contributed = -1 THEN 1 ELSE 0 END) as unknown_count
-        FROM access_log
-        GROUP BY atom_id
-        HAVING total_retrievals >= 3
-    """).fetchall()
-    
     over_retrieved = []  # frequently retrieved, rarely contributes
     high_value = []      # always contributes
     adjustments_made = 0
     _dampen_factor = _cfg('decay', 'stability_dampen_factor', 0.9)
     _boost_factor = _cfg('decay', 'stability_boost_factor', 1.1)
-    
-    for row in rows:
-        atom_id = row[0]
-        total = row[1]
-        contributed = row[2]
-        not_contributed = row[3]
-        
-        known = contributed + not_contributed
-        if known == 0:
-            continue
-        
-        rate = contributed / known
-        
-        if rate < 0.2 and known >= 5:
-            # Over-retrieved: dampen by reducing stability slightly
-            over_retrieved.append({
-                "atom_id": atom_id,
-                "retrievals": total,
-                "contribution_rate": round(rate, 3),
-            })
-            # Apply dampening
-            conn.execute(
-                "UPDATE atoms SET stability = MAX(0.5, stability * ?) WHERE id = ?",
-                (_dampen_factor, atom_id,)
-            )
-            adjustments_made += 1
-            
-        elif rate > 0.8 and known >= 3:
-            # High-value: boost stability
-            high_value.append({
-                "atom_id": atom_id,
-                "retrievals": total,
-                "contribution_rate": round(rate, 3),
-            })
-            # Apply boost
-            conn.execute(
-                "UPDATE atoms SET stability = MIN(stability * ?, ?) WHERE id = ?",
-                (_boost_factor, _cfg('decay', 'max_stability', 10.0), atom_id,)
-            )
-            adjustments_made += 1
-    
-    conn.commit()
-    conn.close()
+    _max_stability = _cfg('decay', 'max_stability', 10.0)
+
+    # CR#16: stability dampen + boost UPDATEs span many atoms in the
+    # same call. Without one transaction, a mid-batch failure leaves
+    # the analytics view (the returned dict) claiming adjustments
+    # that the DB only partially applied.
+    with transactional() as conn:
+        # Get per-atom contribution stats
+        rows = conn.execute("""
+            SELECT atom_id,
+                   COUNT(*) as total_retrievals,
+                   SUM(CASE WHEN contributed = 1 THEN 1 ELSE 0 END) as contributed_count,
+                   SUM(CASE WHEN contributed = 0 THEN 1 ELSE 0 END) as not_contributed_count,
+                   SUM(CASE WHEN contributed = -1 THEN 1 ELSE 0 END) as unknown_count
+            FROM access_log
+            GROUP BY atom_id
+            HAVING total_retrievals >= 3
+        """).fetchall()
+
+        for row in rows:
+            atom_id = row[0]
+            total = row[1]
+            contributed = row[2]
+            not_contributed = row[3]
+
+            known = contributed + not_contributed
+            if known == 0:
+                continue
+
+            rate = contributed / known
+
+            if rate < 0.2 and known >= 5:
+                # Over-retrieved: dampen by reducing stability slightly
+                over_retrieved.append({
+                    "atom_id": atom_id,
+                    "retrievals": total,
+                    "contribution_rate": round(rate, 3),
+                })
+                # Apply dampening
+                conn.execute(
+                    "UPDATE atoms SET stability = MAX(0.5, stability * ?) WHERE id = ?",
+                    (_dampen_factor, atom_id,)
+                )
+                adjustments_made += 1
+
+            elif rate > 0.8 and known >= 3:
+                # High-value: boost stability
+                high_value.append({
+                    "atom_id": atom_id,
+                    "retrievals": total,
+                    "contribution_rate": round(rate, 3),
+                })
+                # Apply boost
+                conn.execute(
+                    "UPDATE atoms SET stability = MIN(stability * ?, ?) WHERE id = ?",
+                    (_boost_factor, _max_stability, atom_id,)
+                )
+                adjustments_made += 1
     
     return {
         "atoms_analyzed": len(rows),
@@ -5830,52 +5929,53 @@ def decay_confidence(max_age_days: int = 90, decay_rate: float = None) -> dict:
         decay_rate = _cfg('decay', 'confidence_decay_rate', 0.01)
     _grace_days = _cfg('decay', 'confidence_decay_grace_days', 7)
     _conf_floor = _cfg('decay', 'confidence_floor', 0.1)
-    conn = get_db()
     now = datetime.now(timezone.utc)
-    
-    rows = conn.execute("""
-        SELECT id, encoding_confidence, last_accessed_at, created_at, is_pinned
-        FROM atoms WHERE state = 'active'
-    """).fetchall()
 
     decayed = 0
     exempt_pinned = 0
     exempt_recent = 0
 
-    for row in rows:
-        atom_id = row[0]
-        confidence = row[1]
-        last_access = row[2] or row[3]
+    # CR#16: the decay sweep updates many atoms' confidence in one
+    # pass. Partial commit here would mean the next decay call
+    # over-decays already-decayed rows (since it can't tell the prior
+    # batch was incomplete) — biasing confidence downward over time.
+    with transactional() as conn:
+        rows = conn.execute("""
+            SELECT id, encoding_confidence, last_accessed_at, created_at, is_pinned
+            FROM atoms WHERE state = 'active'
+        """).fetchall()
 
-        # Skip pinned -- use denormalized is_pinned column
-        if row[4]:
-            exempt_pinned += 1
-            continue
-        
-        # Calculate days since last access/confirmation
-        try:
-            last_dt = datetime.fromisoformat(last_access)
-            days_since = (now - last_dt).total_seconds() / 86400
-        except (ValueError, TypeError):
-            days_since = 30  # default if timestamp is bad
-        
-        # Exempt if accessed within grace period
-        if days_since < _grace_days:
-            exempt_recent += 1
-            continue
-        
-        # Decay: confidence -= decay_rate * (days_since - grace_days)
-        # Only decay the days BEYOND the grace period
-        decay_amount = decay_rate * (days_since - _grace_days)
-        new_confidence = max(_conf_floor, confidence - decay_amount)
-        
-        if new_confidence < confidence:
-            conn.execute("UPDATE atoms SET encoding_confidence = ? WHERE id = ?",
-                        (round(new_confidence, 4), atom_id))
-            decayed += 1
-    
-    conn.commit()
-    conn.close()
+        for row in rows:
+            atom_id = row[0]
+            confidence = row[1]
+            last_access = row[2] or row[3]
+
+            # Skip pinned -- use denormalized is_pinned column
+            if row[4]:
+                exempt_pinned += 1
+                continue
+
+            # Calculate days since last access/confirmation
+            try:
+                last_dt = datetime.fromisoformat(last_access)
+                days_since = (now - last_dt).total_seconds() / 86400
+            except (ValueError, TypeError):
+                days_since = 30  # default if timestamp is bad
+
+            # Exempt if accessed within grace period
+            if days_since < _grace_days:
+                exempt_recent += 1
+                continue
+
+            # Decay: confidence -= decay_rate * (days_since - grace_days)
+            # Only decay the days BEYOND the grace period
+            decay_amount = decay_rate * (days_since - _grace_days)
+            new_confidence = max(_conf_floor, confidence - decay_amount)
+
+            if new_confidence < confidence:
+                conn.execute("UPDATE atoms SET encoding_confidence = ? WHERE id = ?",
+                            (round(new_confidence, 4), atom_id))
+                decayed += 1
     
     return {
         "atoms_checked": len(rows),
