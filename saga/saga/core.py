@@ -270,6 +270,69 @@ def _close_thread_local_db() -> None:
         _thread_local_db.db_key = None
 
 
+# ─── Response shaping helpers ───────────────────────────────────
+
+
+_TIER_RANK: dict[str, int] = {"none": 0, "low": 1, "medium": 2, "high": 3}
+"""Per-atom confidence tier ordering used by ``apply_confidence_gating``.
+
+Mirrors the ranks documented at ``[retrieval] default_min_confidence_tier``
+in the saga config schema. Atoms missing the tier field rank as ``"none"``
+(0) — the most permissive default tier still rejects them when the floor
+is anything stricter than ``"none"``."""
+
+
+def apply_confidence_gating(
+    observations: list[dict],
+    raws: list[dict],
+    *,
+    floor: str = "low",
+    gating_enabled: bool = True,
+) -> "tuple[list[dict], list[dict], str | None]":
+    """Drop atoms below the per-atom confidence floor (CR#14).
+
+    Two-tier ``hybrid_retrieve`` returns ``{"observations": [...], "raws": [...]}``
+    where each atom carries a ``_confidence_tier`` set in retrieve() /
+    _two_tier_split. This helper filters out atoms whose tier ranks
+    below ``floor`` and returns ``(filtered_obs, filtered_raws,
+    gated_reason)`` where ``gated_reason`` is ``None`` when nothing
+    was dropped, else a human-readable description suitable for the
+    response's ``gated_reason`` field.
+
+    The same filter shape was duplicated between ``saga/server.py::api_query``
+    (HTTP path) and ``mimir/saga_client.py::_InProcessSaga.query``
+    (in-process path). Two implementations of the same gating logic
+    drift slowly — the integration bench catches regressions, but only
+    after a full 500-question run. Calling one helper from both sides
+    keeps them in lockstep.
+
+    Pure function: no side effects, no I/O, deterministic given inputs.
+    """
+    if not gating_enabled:
+        return observations, raws, None
+
+    floor_rank = _TIER_RANK.get(floor, 1)  # default to "low" rank
+
+    def _passes(a: dict) -> bool:
+        t = a.get("_confidence_tier", "none")
+        return _TIER_RANK.get(t, 0) >= floor_rank
+
+    obs_before = len(observations)
+    raws_before = len(raws)
+    filtered_obs = [o for o in observations if _passes(o)]
+    filtered_raws = [r for r in raws if _passes(r)]
+    obs_dropped = obs_before - len(filtered_obs)
+    raws_dropped = raws_before - len(filtered_raws)
+
+    gated_reason: "str | None" = None
+    if obs_dropped or raws_dropped:
+        gated_reason = (
+            f"floor={floor}: dropped {obs_dropped} obs and "
+            f"{raws_dropped} raws below threshold"
+        )
+    return filtered_obs, filtered_raws, gated_reason
+
+
 # ─── Embedding ────────────────────────────────────────────────────
 # Embedding functions are provided by embeddings.py (pluggable provider).
 # Re-exported here for backward compatibility.
