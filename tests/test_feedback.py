@@ -440,6 +440,36 @@ def test_content_dedup_independent_across_polarities(tmp_path: Path):
     assert len(positives) == 1
 
 
+def test_saga_feedback_sent_dedups_to_most_recent(tmp_path: Path):
+    """Poller-heavy windows fire saga_feedback_sent once per wakeup;
+    without dedup the algedonic block fills with 5+ identical-shape
+    "N atoms credited" lines that crowd out actually-actionable
+    positive signals. Only the most recent should render.
+
+    Stacks with the content-level dedup above: kind-level
+    (``saga_feedback`` in ``_FIRST_OCCURRENCE_ONLY_KINDS``) catches
+    different-content saga_feedback_sent firings (different
+    ``n_atoms``); content-level catches identical strings under any
+    kind."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(5.0), "type": "saga_feedback_sent",
+         "n_atoms": 99, "channel_id": "poller:github-activity"},
+        {"timestamp": _ts(3.0), "type": "saga_feedback_sent",
+         "n_atoms": 88, "channel_id": "poller:github-activity"},
+        # Most recent — only this one should render.
+        {"timestamp": _ts(0.5), "type": "saga_feedback_sent",
+         "n_atoms": 7, "channel_id": "discord-1"},
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "7 atoms credited" in block
+    assert "99 atoms credited" not in block
+    assert "88 atoms credited" not in block
+    # And the algedonic block should contain exactly one
+    # saga_feedback_sent line (no double-render).
+    assert block.count("saga_feedback_sent") == 1
+
+
 def test_introspection_report_error_renders_as_negative(tmp_path: Path):
     log = _make_log(tmp_path, events=[
         {
