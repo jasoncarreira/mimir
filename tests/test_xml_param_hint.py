@@ -81,6 +81,15 @@ def test_xml_param_re_compiles():
     assert _XML_PARAM_RE.search("</summary>") is None  # closing-only doesn't trip
 
 
+def test_xml_param_re_matches_single_quoted_variant():
+    """PR #87 review nit 1: regex broadened to ``['"]`` so a single-
+    quoted variant (``<parameter name='topics'>``) trips the hint.
+    Anthropic's format is consistently double-quoted, but agents
+    sometimes transcribe the single-quoted variant — this catches it."""
+    assert _XML_PARAM_RE.search("<parameter name='topics'>") is not None
+    assert _detect_embedded_xml({"x": "<parameter name='t'>v</parameter>"}) is True
+
+
 # ─── Wrapper integration ─────────────────────────────────────────────
 
 

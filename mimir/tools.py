@@ -16,9 +16,12 @@ The model sees a hybrid surface:
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 from claude_agent_sdk import McpSdkServerConfig, create_sdk_mcp_server, tool
 
@@ -94,8 +97,11 @@ SDK_PRESET_TOOLS = [
 # load-bearing signal that this is a malformed XML-style tool call
 # specifically (not just prose with angle brackets) is the
 # ``<parameter name="...">`` opening, which is unique to the
-# Anthropic XML tool-call format.
-_XML_PARAM_RE = re.compile(r'<parameter\s+name="')
+# Anthropic XML tool-call format. Quote class accepts both ``"`` and
+# ``'`` so a single-quoted variant (rare in practice — Anthropic's
+# format is consistently double-quoted, but agents sometimes
+# transcribe it that way) still trips the hint.
+_XML_PARAM_RE = re.compile(r"""<parameter\s+name=['"]""")
 
 _XML_HINT = (
     "\n\nHint: one of the string args contains embedded XML parameter "
@@ -103,7 +109,11 @@ _XML_HINT = (
     "separate JSON field in ``args`` — not as XML tags inside another "
     "string. The XML tool-call format and the JSON args format are "
     "different surfaces; mixing them silently drops the embedded params "
-    "and leaves them as literal text in the surrounding string."
+    "and leaves them as literal text in the surrounding string.\n\n"
+    "Right shape: ``args = {\"summary\": \"...\", "
+    "\"topics_discussed\": [\"a\", \"b\"]}``\n"
+    "Wrong shape: ``args = {\"summary\": \"...<parameter "
+    "name=\\\"topics_discussed\\\">[\\\"a\\\",\\\"b\\\"]</parameter>\"}``"
 )
 
 
@@ -136,17 +146,30 @@ def _install_xml_hint_wrapper(server: Any) -> None:
 
     No-op (logs only) if the mcp library's internal shapes shift —
     the wrapper is observability/DX, not load-bearing, so it must
-    never break tool dispatch."""
+    never break tool dispatch. Each early-return path emits a
+    ``log.warning`` so an operator can grep ``xml-hint wrapper`` to
+    confirm install state."""
     try:
         from mcp import types as mcp_types
     except Exception:  # noqa: BLE001 - tolerate any import-shape drift
+        log.warning("chainlink #21: xml-hint wrapper skipped — mcp.types import failed")
         return
 
     handlers = getattr(server, "request_handlers", None)
     if not isinstance(handlers, dict):
+        log.warning(
+            "chainlink #21: xml-hint wrapper skipped — request_handlers is %s",
+            type(handlers).__name__,
+        )
         return
     original = handlers.get(mcp_types.CallToolRequest)
-    if original is None or getattr(original, "_mimir_xml_hint", False):
+    if original is None:
+        log.warning(
+            "chainlink #21: xml-hint wrapper skipped — no CallToolRequest handler"
+        )
+        return
+    if getattr(original, "_mimir_xml_hint", False):
+        # Idempotent re-install — silent (don't spam logs on rebuilds).
         return
 
     async def wrapped(req: Any) -> Any:
@@ -174,10 +197,11 @@ def _install_xml_hint_wrapper(server: Any) -> None:
                 first.text = text + _XML_HINT
             except Exception:  # noqa: BLE001
                 # Pydantic v2 model mutation can be blocked by
-                # frozen=True; rebuild the content block instead.
-                from mcp.types import TextContent as _TC
-
-                content[0] = _TC(type="text", text=text + _XML_HINT)
+                # frozen=True; rebuild the content block instead
+                # using the already-imported ``mcp_types`` module.
+                content[0] = mcp_types.TextContent(
+                    type="text", text=text + _XML_HINT,
+                )
                 cr.content = content
         except Exception:  # noqa: BLE001
             # Any unexpected shape — return the original result
@@ -187,6 +211,7 @@ def _install_xml_hint_wrapper(server: Any) -> None:
 
     wrapped._mimir_xml_hint = True  # type: ignore[attr-defined]
     handlers[mcp_types.CallToolRequest] = wrapped
+    log.info("chainlink #21: xml-hint wrapper installed")
 
 
 @tool("echo", "Echo a string back. Useful for smoke tests.", {"text": str})
