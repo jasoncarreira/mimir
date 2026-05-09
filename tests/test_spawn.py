@@ -767,3 +767,234 @@ def test_profile_defaults_contract_matches_spec():
         "bench-runner":     {"max_budget_usd": 10.0},
         "doc-writer":       {"max_budget_usd": 5.0},
     }
+
+
+# ─── Brief shell-substitution literal rejection (Shape 1 fix) ─────────
+
+
+@pytest.mark.parametrize("bogus_brief", [
+    "$(cat /tmp/sub_a_brief.md)",
+    "  $(cat /tmp/foo.md)  ",                          # whitespace tolerated
+    "`cat /tmp/foo.md`",
+    "${BRIEF_VAR}",
+    "$(generate-brief --target ntfy)",
+])
+@pytest.mark.asyncio
+async def test_brief_pure_shell_substitution_literal_rejected(
+    home: Path, bogus_brief: str,
+):
+    """A brief whose entire content is a literal shell-substitution
+    token (``$(...)``, backticks, or ``${...}``) is the canonical
+    caller anti-pattern: tool args are passed verbatim to ``claude
+    -p`` (no shell), the spawn receives ~30 bytes of unparseable
+    text, and parse-fails after ~15s. Detect pre-spawn and reject
+    with an actionable error pointing at the actual fix (inline the
+    file content into the brief argument). Lock down with multiple
+    canonical shapes so future contributors can't accidentally
+    narrow the regex."""
+    from mimir.spawn import MAX_BRIEF_BYTES  # noqa: F401  (sanity-check exported)
+    registry = _FakeRegistry()
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=lambda coro: coro.close(),
+        chain_on_complete=None,
+    )
+    out = await tool_def.handler({
+        "brief": bogus_brief, "working_dir": "/tmp",
+    })
+    assert out.get("is_error") is True
+    text = out["content"][0]["text"]
+    assert "shell-substitution" in text
+    assert "verbatim" in text or "no shell" in text.lower()
+    # No spawn happened — caller-side caps protect spawn slot.
+    assert registry.spawned == []
+    events = _read_events(home)
+    spawn_failed = [
+        e for e in events if e["type"] == "claude_code_spawn_spawn_failed"
+    ]
+    assert len(spawn_failed) == 1
+    assert spawn_failed[0].get("reason") == "brief_shell_substitution_literal"
+
+
+@pytest.mark.asyncio
+async def test_brief_containing_shell_sub_mid_text_accepted(home: Path):
+    """A real brief that mentions ``$(foo)`` somewhere in its body
+    (e.g. as a code sample or shell snippet for the spawn to run) is
+    NOT rejected — only the pure-token shape (the entire stripped
+    brief is a single substitution) is the anti-pattern. Locks the
+    regex against future broadening that would false-positive on
+    legitimate briefs."""
+    registry = _FakeRegistry()
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=lambda coro: coro.close(),
+        chain_on_complete=None,
+    )
+    legit_brief = (
+        "Implement a helper that uses $(date -u +%FT%TZ) to stamp the "
+        "log header, and verify with `git log --oneline -3`.\n\n"
+        "Acceptance criteria:\n- helper writes to mimir/_ntfy.py\n"
+        "- tests cover the dedup branch\n"
+    )
+    out = await tool_def.handler({
+        "brief": legit_brief, "working_dir": "/tmp",
+    })
+    # Did not error on the brief shape; spawn was attempted.
+    assert out.get("is_error") is not True
+    assert len(registry.spawned) == 1
+
+
+@pytest.mark.asyncio
+async def test_brief_pure_shell_sub_above_detect_cap_passes_through(
+    home: Path,
+):
+    """The shell-sub detector is length-bounded (4 KB) so a huge
+    brief that *coincidentally* starts with ``$(`` and ends with
+    ``)`` doesn't hit the rejection path. Real briefs are larger
+    than the size at which the bug occurs (the bug is "I tried
+    inline a file"; the substitution token is by definition tiny).
+    The bound matters because at large sizes the regex would scan
+    the whole content unnecessarily."""
+    registry = _FakeRegistry()
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=lambda coro: coro.close(),
+        chain_on_complete=None,
+    )
+    # 5 KB body, framed by parens — past the 4 KB detect cap.
+    big_brief = "$(" + ("X" * 5000) + ")"
+    out = await tool_def.handler({
+        "brief": big_brief, "working_dir": "/tmp",
+    })
+    assert out.get("is_error") is not True
+    assert len(registry.spawned) == 1
+
+
+# ─── permission_mode arg + argv flag (Shape 2 fix) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_permission_mode_default_is_bypass(home: Path):
+    """Default ``permission_mode`` is ``bypassPermissions`` — without
+    it, ``claude -p`` blocks on interactive prompts that no human can
+    answer (the live failure shape on 2026-05-09: spawn ran 7m,
+    burned $1.95, exited 0 with zero files written because every
+    Write/git-checkout asked for permission and got nothing).
+
+    Lock the default + lock the flag landing in argv — a future
+    contributor flipping the default to a stricter mode would
+    silently regress the autonomous-spawn use case. Operators can
+    still override per-spawn via the ``permission_mode`` arg."""
+    from mimir.spawn import DEFAULT_PERMISSION_MODE
+    assert DEFAULT_PERMISSION_MODE == "bypassPermissions"
+    registry = _FakeRegistry()
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=lambda coro: coro.close(),
+        chain_on_complete=None,
+    )
+    out = await tool_def.handler({
+        "brief": "implement a small helper", "working_dir": "/tmp",
+    })
+    assert out.get("is_error") is not True
+    assert len(registry.spawned) == 1
+    argv = registry.spawned[0]["argv"]
+    # Flag + value land contiguously in argv.
+    assert "--permission-mode" in argv
+    idx = argv.index("--permission-mode")
+    assert argv[idx + 1] == "bypassPermissions"
+
+
+@pytest.mark.asyncio
+async def test_permission_mode_explicit_override(home: Path):
+    """Operator-supplied ``permission_mode`` overrides the default —
+    e.g. ``acceptEdits`` for a less-trusted brief where Bash should
+    still ask. Lock the override path so the default never silently
+    overrides an explicit caller choice."""
+    registry = _FakeRegistry()
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=lambda coro: coro.close(),
+        chain_on_complete=None,
+    )
+    out = await tool_def.handler({
+        "brief": "implement a small helper",
+        "working_dir": "/tmp",
+        "permission_mode": "acceptEdits",
+    })
+    assert out.get("is_error") is not True
+    argv = registry.spawned[0]["argv"]
+    idx = argv.index("--permission-mode")
+    assert argv[idx + 1] == "acceptEdits"
+
+
+@pytest.mark.asyncio
+async def test_permission_mode_invalid_rejected(home: Path):
+    """An invalid permission_mode (typo, made-up value) is rejected
+    pre-spawn with an actionable error listing the allowed set —
+    not silently passed through to ``claude -p`` which would error
+    less helpfully ~15s in."""
+    registry = _FakeRegistry()
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=lambda coro: coro.close(),
+        chain_on_complete=None,
+    )
+    out = await tool_def.handler({
+        "brief": "ok", "working_dir": "/tmp",
+        "permission_mode": "yolo-mode",
+    })
+    assert out.get("is_error") is True
+    text = out["content"][0]["text"]
+    assert "permission_mode" in text
+    assert "yolo-mode" in text
+    assert "bypassPermissions" in text  # the default surfaces in the error
+    assert registry.spawned == []
+    events = _read_events(home)
+    assert any(
+        e.get("reason") == "invalid_permission_mode"
+        for e in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_permission_mode_lands_in_started_event(home: Path):
+    """The resolved permission_mode is recorded on the
+    claude_code_spawn_started event so post-mortem ``which mode did
+    this spawn run under?`` is one grep away — same shape as
+    resolved_model and resolved_max_turns."""
+    registry = _FakeRegistry()
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=lambda coro: coro.close(),
+        chain_on_complete=None,
+    )
+    await tool_def.handler({
+        "brief": "ok", "working_dir": "/tmp",
+        "permission_mode": "acceptEdits",
+    })
+    events = _read_events(home)
+    started = [e for e in events if e["type"] == "claude_code_spawn_started"]
+    assert len(started) == 1
+    assert started[0]["resolved_permission_mode"] == "acceptEdits"
