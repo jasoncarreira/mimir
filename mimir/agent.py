@@ -796,9 +796,23 @@ class Agent:
             if self._indexer is not None:
                 await self._indexer.reindex_path(rel)
 
+        # Auto-include Claude Code's persisted-output dir in the
+        # file-op roots when it exists. The CLI writes overflow
+        # bash output (>~32KB) to ``~/.claude/projects/.../tool-results/``
+        # and instructs the agent to ``Read`` it; without this root
+        # the Read is denied and the agent loses access to its own
+        # tool output. See ``_paths.claude_code_persisted_output_root``
+        # for the full rationale.
+        from ._paths import claude_code_persisted_output_root
+
+        extra_roots = list(config.file_op_extra_roots)
+        cc_overflow = claude_code_persisted_output_root()
+        if cc_overflow not in extra_roots:
+            extra_roots.append(cc_overflow)
+
         self._pre_tool_hook = make_pre_tool_use_hook(
             config.home,
-            extra_roots=list(config.file_op_extra_roots),
+            extra_roots=extra_roots,
         )
         self._post_tool_hook = make_post_tool_use_hook(
             config.home, _reindex if indexer is not None else None

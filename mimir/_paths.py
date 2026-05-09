@@ -20,6 +20,7 @@ outside every root are caught by the same check.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -78,3 +79,35 @@ def resolve_within_roots(roots: list[Path], raw_path: str) -> Path:
     raise PathOutsideHomeError(
         f"path escapes configured roots ({roots_str}): {raw_path!r} → {full}"
     )
+
+
+def claude_code_persisted_output_root() -> Path:
+    """Return Claude Code's persisted-output parent dir.
+
+    Claude Code's CLI (the bundled ``claude`` binary that the SDK
+    spawns) persists any tool result exceeding ~32KB to a file under
+    ``~/.claude/projects/<encoded-cwd>/<session-uuid>/tool-results/<id>.txt``
+    and embeds that path in the tool result as a "<persisted-output>"
+    block, expecting the agent to ``Read`` it for the rest of the
+    output. Without this dir included in the file-op roots, the agent
+    sees a ``path escapes configured roots`` denial on every overflow
+    Read — which silently breaks any workflow involving large bash
+    output (build logs, pytest -v, large grep, etc.).
+
+    Returned eagerly (no on-disk presence check) so the root is
+    included in file-op roots even when the dir hasn't been created
+    yet — Claude Code creates it lazily on first overflow. Without
+    eager inclusion, fresh containers (or any environment where the
+    dir hasn't yet appeared at ``Agent.__init__`` time) hit the same
+    denial this function exists to prevent on the very first
+    overflow Read. ``resolve_within_roots`` is a string-prefix check
+    on resolved paths, so an absent root is harmless until something
+    inside it is referenced — at which point the file's parents do
+    exist and the check passes.
+
+    Honors ``CLAUDE_CONFIG_DIR`` if set (the SDK uses this to relocate
+    the project state); otherwise falls back to ``~/.claude``.
+    """
+    base_env = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    base = Path(base_env) if base_env else Path.home() / ".claude"
+    return base / "projects"
