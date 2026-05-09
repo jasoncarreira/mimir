@@ -32,7 +32,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
-from ._jsonl_tail import tail_jsonl_records
+from ._jsonl_tail import tail_jsonl_records  # noqa: F401 — kept for back-compat re-exports
+from .jsonl_snapshot import JsonlSnapshot, iter_snapshot_or_tail
 
 log = logging.getLogger(__name__)
 
@@ -197,6 +198,7 @@ def aggregate(
     window_hours: Iterable[float] = (1.0, 5.0, 24.0 * 7),
     window_labels: Iterable[str] | None = None,
     fallback_model: str | None = None,
+    snapshot: "JsonlSnapshot | None" = None,
 ) -> UsageReport:
     """Walk turns.jsonl tail-first; bucket each turn's usage into the
     matching windows. Single pass — stops once the oldest window's
@@ -206,6 +208,11 @@ def aggregate(
     record itself doesn't carry a model field (mimir's TurnRecord
     didn't capture it pre-this-commit; the operator's configured model
     is the right fallback).
+
+    ``snapshot`` (CR#10) — when provided, iterate from the cached
+    JsonlSnapshot instead of streaming the file. Falls back to direct
+    tail when None for back-compat with module-level callers that don't
+    construct an Agent.
     """
     windows = [float(h) for h in window_hours]
     if window_labels is None:
@@ -225,7 +232,7 @@ def aggregate(
     last_turn = LastTurnSnapshot()
     saw_first = False
 
-    for rec in tail_jsonl_records(turns_path):
+    for rec in iter_snapshot_or_tail(snapshot, turns_path):
         ts_str = rec.get("ts")
         if not isinstance(ts_str, str):
             continue
@@ -359,17 +366,21 @@ def _find_window(report: UsageReport, hours: float) -> UsageWindow | None:
 
 def event_recently_emitted(
     events_path: Path, event_type: str, *, cooldown_minutes: int,
+    snapshot: "JsonlSnapshot | None" = None,
 ) -> bool:
     """True if any event with ``type == event_type`` lies within the
     cooldown window. Used to gate spike-style alert emissions
     (cost_rate_alert, rate_limit_off_pace, etc.) so the firehose
     doesn't churn on a sustained condition — the algedonic block
-    surfaces the most recent occurrence anyway."""
+    surfaces the most recent occurrence anyway.
+
+    ``snapshot`` (CR#10) — when provided, iterate the cached snapshot
+    instead of streaming events.jsonl from disk."""
     if cooldown_minutes <= 0:
         return False
     cutoff = datetime.now(tz=timezone.utc) - timedelta(minutes=cooldown_minutes)
     cutoff_iso = cutoff.isoformat()
-    for ev in tail_jsonl_records(events_path):
+    for ev in iter_snapshot_or_tail(snapshot, events_path):
         ts = ev.get("timestamp")
         if not isinstance(ts, str):
             continue
@@ -383,9 +394,11 @@ def event_recently_emitted(
 # Backwards-compatible alias for callers built before the rename.
 def cost_rate_alert_recently_emitted(
     events_path: Path, *, cooldown_minutes: int,
+    snapshot: "JsonlSnapshot | None" = None,
 ) -> bool:
     return event_recently_emitted(
         events_path, "cost_rate_alert", cooldown_minutes=cooldown_minutes,
+        snapshot=snapshot,
     )
 
 
