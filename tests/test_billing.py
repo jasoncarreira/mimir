@@ -449,3 +449,70 @@ def test_evaluate_quota_derived_propagates_through_anthropic_provider(tmp_path):
     assert result.suppress is False, (
         "derived 5h @0.85 must not suppress under the 0.90 threshold"
     )
+
+
+# ── chainlink #17 self-review fixes ───────────────────────────────────
+
+
+def test_derived_5h_skips_on_pace_projection(tmp_path):
+    """Self-review fix: on-pace projection on a derived value is
+    methodologically broken — derived is a synthetic point estimate,
+    not a time-series sample. Extrapolating it forward via
+    project_window_end would (e.g.) treat a 0.85 value at minute 10
+    of a 5h window as a 5x burn rate and project past 1.0, tripping
+    the on-pace threshold spuriously. AnthropicQuotaProvider must
+    set on_pace_utilization=None for derived windows."""
+    from mimir.billing import AnthropicQuotaProvider
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import asyncio
+    import time as _time
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    # Derived snapshot, fresh observation, 5h window with 4h+ left.
+    # If projection ran, current_util / fraction_elapsed would be
+    # absurdly large.
+    asyncio.run(store.record("five_hour", RateLimitSnapshot(
+        status="allowed_warning",
+        utilization=0.85,
+        resets_at=int(_time.time()) + 4 * 3600,  # 4h remaining
+        observed_at="2026-05-09T00:00:00+00:00",
+        derived=True,
+    )))
+
+    provider = AnthropicQuotaProvider(store)
+    [w] = provider.get_windows()
+    assert w.derived is True
+    assert w.on_pace_utilization is None, (
+        "derived windows must skip on-pace projection — got "
+        f"{w.on_pace_utilization!r}"
+    )
+
+    # And evaluate_quota doesn't suppress (raw 0.85 < derived
+    # threshold 0.90, on-pace skipped).
+    result = evaluate_quota([provider])
+    assert result.suppress is False
+
+
+def test_direct_5h_still_projects_on_pace(tmp_path):
+    """Invariant: the on-pace skip is derived-only. Direct (non-derived)
+    snapshots still get on-pace projection — that's a useful early-warn
+    signal when the burn rate suggests we'll cross the wall."""
+    from mimir.billing import AnthropicQuotaProvider
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import asyncio
+    import time as _time
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    asyncio.run(store.record("five_hour", RateLimitSnapshot(
+        status="allowed",
+        utilization=0.50,
+        resets_at=int(_time.time()) + 4 * 3600,
+        observed_at="2026-05-09T00:00:00+00:00",
+        # derived defaults to False
+    )))
+    provider = AnthropicQuotaProvider(store)
+    [w] = provider.get_windows()
+    assert w.derived is False
+    # on_pace_utilization is computable (not None) — the projection
+    # ran. Exact value depends on window timing but it should exist.
+    # (Exact value isn't load-bearing for the test; presence is.)

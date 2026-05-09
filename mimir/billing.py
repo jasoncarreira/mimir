@@ -182,17 +182,33 @@ class AnthropicQuotaProvider(QuotaProvider):
             snap = snaps.get(key)
             if snap is None:
                 continue
-            proj = project_window_end(snap, hours)
+            is_derived = getattr(snap, "derived", False)
+            # chainlink #17: on-pace projection on a derived utilization
+            # is methodologically broken — derived is a synthetic
+            # point estimate (cost-rate-back-derived during endpoint
+            # glitches), not a time-series sample. Extrapolating it
+            # forward via ``project_window_end`` would treat a 0.85
+            # derived value at minute 10 of a 5h window as a 5x rate
+            # and project well past 1.0, tripping the on-pace
+            # threshold spuriously. Skip on-pace for derived windows;
+            # the looser raw threshold (0.90 vs 0.80, see
+            # ``_raw_threshold_for``) is the only suppression signal
+            # we trust on derived values.
+            if is_derived:
+                on_pace = None
+            else:
+                proj = project_window_end(snap, hours)
+                on_pace = (
+                    proj.on_pace_utilization if proj is not None else None
+                )
             out.append(
                 QuotaWindow(
                     key=key,
                     window_hours=hours,
                     utilization=snap.utilization,
-                    on_pace_utilization=(
-                        proj.on_pace_utilization if proj is not None else None
-                    ),
+                    on_pace_utilization=on_pace,
                     resets_at=snap.resets_at,
-                    derived=getattr(snap, "derived", False),
+                    derived=is_derived,
                 )
             )
         return out

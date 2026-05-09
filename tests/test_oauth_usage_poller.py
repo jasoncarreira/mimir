@@ -1017,3 +1017,68 @@ async def test_record_usage_falls_back_when_derive_fails(tmp_path: Path):
     snap = store.current().get("five_hour")
     assert snap.utilization == pytest.approx(0.10)
     assert snap.derived is False
+
+
+@pytest.mark.asyncio
+async def test_derived_snapshot_has_resets_at_none(tmp_path: Path):
+    """Self-review fix: derived snapshots unconditionally use
+    resets_at=None. Two reasons documented inline in the producer:
+    (1) we don't actually know when the window resets (no successful
+    endpoint reading this poll), and (2) inheriting a value that
+    later goes stale (long glitch crosses a window boundary) would
+    cause RateLimitStore.current() to filter the derived snapshot
+    out — silently evicting our derived signal. None survives the
+    filter unconditionally and the arbiter handles missing window-
+    timing as "no time signal" (on-pace projection is already
+    skipped for derived in AnthropicQuotaProvider)."""
+    from mimir.oauth_usage_poller import PollerConfig, record_usage
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op
+    import time as _time
+
+    turns_path = tmp_path / "turns.jsonl"
+    _seed_turns(turns_path, recent_costs=[50.0], older_costs=[150.0])
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    # Prior 5h has a future resets_at — even when "just inheriting"
+    # would work for this poll, the producer must NOT, because doing
+    # so creates a multi-poll bug class on long glitches.
+    future_reset = int(_time.time()) + 3 * 3600
+    await store.record("five_hour", RateLimitSnapshot(
+        status="allowed",
+        utilization=0.10,
+        resets_at=future_reset,
+        observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+    ))
+
+    payload = {
+        "five_hour": {"status": "allowed", "utilization": 0.70,
+                      "resets_at": 9999999999},
+        "seven_day": {"status": "allowed", "utilization": 0.51,
+                      "resets_at": 9999999999},
+    }
+    cfg = PollerConfig(
+        credentials_path=tmp_path / "creds.json",
+        turns_log_path=turns_path,
+    )
+
+    async def _cap(et, **kw):
+        pass
+    orig = op.log_event
+    op.log_event = _cap
+    try:
+        await record_usage(store, payload, cfg=cfg)
+    finally:
+        op.log_event = orig
+
+    snap = store.current().get("five_hour")
+    assert snap is not None
+    assert snap.derived is True
+    assert snap.resets_at is None, (
+        "derived snapshots must always have resets_at=None — "
+        f"inheritance would create a multi-poll bug class. Got "
+        f"{snap.resets_at!r}"
+    )

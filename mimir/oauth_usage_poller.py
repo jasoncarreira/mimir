@@ -728,10 +728,26 @@ async def record_usage(
                     prior_7d_utilization=prior_7d.utilization,
                 )
             if derived_util is not None:
+                # ``resets_at=None`` is unconditional for derived
+                # snapshots. Two reasons: (1) we don't actually know
+                # when the real 5h window resets — we never got a
+                # successful endpoint reading this poll, so any
+                # inherited value would be a guess based on the
+                # glitch-pre-existing read. (2) Inheriting a
+                # window-resets-at value that later goes stale would
+                # cause ``RateLimitStore.current()`` to filter the
+                # derived snapshot out (it drops entries with
+                # ``resets_at < now``), silently evicting our derived
+                # signal during long glitches that cross a window
+                # boundary. ``None`` survives that filter
+                # unconditionally and the arbiter handles missing
+                # window-timing as "no time signal" (on-pace
+                # projection is already skipped for derived in
+                # AnthropicQuotaProvider).
                 derived_snap = RateLimitSnapshot(
                     status="allowed_warning",
                     utilization=derived_util,
-                    resets_at=prior_5h.resets_at if prior_5h else None,
+                    resets_at=None,
                     observed_at=datetime.now(tz=timezone.utc).isoformat(),
                     derived=True,
                 )
