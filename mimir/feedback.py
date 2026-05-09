@@ -221,6 +221,19 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # Failures stay un-deduped — each spawn_auth_fail / spawn_work_fail
     # is a distinct incident with a distinct job_id worth seeing.
     "spawn_ok",
+    # 2026-05-09: ``saga_feedback_sent`` fires once per turn that
+    # retrieves SAGA atoms (the post-message contribution-credit pass).
+    # During poller-heavy windows (github-poller fires ~5/min, each
+    # wakeup runs a turn, each turn credits atoms) this floods the 24h
+    # algedonic window with 5+ identical-shape lines that say nothing
+    # the operator can act on — "yes the credit pass ran again" isn't
+    # information. Same shape as ``oauth_usage_ok`` (every-3-min poll)
+    # which is already deduped. Latest-only surfaces "the credit pass
+    # is alive" without crowding out genuinely-new positive signals
+    # like react_received or PR-merged events. Note: dedup keys on
+    # rule_kind (line 128 maps event ``saga_feedback_sent`` → kind
+    # ``saga_feedback``), not the raw event type.
+    "saga_feedback",
 }
 
 
