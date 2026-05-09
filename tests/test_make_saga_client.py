@@ -122,6 +122,15 @@ def _install_fake_saga(monkeypatch, *, calls: dict, query_result=None,
     saga_core.store_session_boundary = store_session_boundary
     saga_core.get_last_sessions = get_last_sessions
     saga_core.get_most_retrieved = get_most_retrieved
+
+    # CR#14: saga_client.query imports apply_confidence_gating from
+    # saga.core. Real helper is a pure function; install a passthrough
+    # mirror in the fake module so existing tests (which don't care
+    # about gating specifics) keep working.
+    def _passthrough_gating(observations, raws, *, floor="low", gating_enabled=True):
+        return observations, raws, None
+    saga_core.apply_confidence_gating = _passthrough_gating
+
     monkeypatch.setitem(sys.modules, "saga.core", saga_core)
 
     # saga.config — get_config returns a callable that returns config values.
