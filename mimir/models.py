@@ -87,6 +87,12 @@ class TurnContext:
     # become a visible algedonic signal instead of empty session-summary
     # blocks for the next session.
     saga_end_session_called: bool = False
+    # Subagent task descriptions captured during the SDK message loop
+    # (CR#15). ``TaskStartedMessage`` writes here; ``TaskNotificationMessage``
+    # reads to populate the inbox push's ``description`` field. Lives on
+    # the ctx (not on the SubagentLifecycleHook) so concurrent turns on
+    # different channels don't share state.
+    task_descriptions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
