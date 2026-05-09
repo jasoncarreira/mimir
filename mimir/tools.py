@@ -16,8 +16,12 @@ The model sees a hybrid surface:
 
 from __future__ import annotations
 
+import logging
+import re
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 from claude_agent_sdk import McpSdkServerConfig, create_sdk_mcp_server, tool
 
@@ -67,6 +71,147 @@ SDK_PRESET_TOOLS = [
     "WebFetch",
     "Task",
 ]
+
+
+# ─── Embedded-XML-parameter detection (chainlink #21) ────────────────
+#
+# When the model malforms an MCP tool call by smuggling XML-style
+# `<parameter name="...">` syntax inside a JSON string field, the
+# underlying mcp library's input-schema validator returns a misleading
+# "Input validation error: 'X' is a required property" error — the
+# real bug (XML in a string) is invisible, and the model often burns
+# retries on the same shape (turn 9c8921ea286c on 2026-05-06 retried
+# 6 times before giving up and skipping synthesis).
+#
+# Fix: wrap the CallToolRequest handler after create_sdk_mcp_server
+# returns. When the handler emits an "Input validation error", scan
+# the request's string-typed args for the giveaway pattern; if found,
+# append a hint pointing at the actual cause. Cheap (regex over a
+# typically-small args dict), only fires on the validation-error
+# branch, no false positives on successful calls or non-validation
+# tool errors.
+
+# Match the tool-call XML's parameter-opening pattern. Closing tags
+# alone (``</summary>``, ``</topics_discussed>``) were considered but
+# false-positive on generic HTML (``</a>``, ``</span>``) — the
+# load-bearing signal that this is a malformed XML-style tool call
+# specifically (not just prose with angle brackets) is the
+# ``<parameter name="...">`` opening, which is unique to the
+# Anthropic XML tool-call format. Quote class accepts both ``"`` and
+# ``'`` so a single-quoted variant (rare in practice — Anthropic's
+# format is consistently double-quoted, but agents sometimes
+# transcribe it that way) still trips the hint.
+_XML_PARAM_RE = re.compile(r"""<parameter\s+name=['"]""")
+
+_XML_HINT = (
+    "\n\nHint: one of the string args contains embedded XML parameter "
+    "syntax (``<parameter name=\"...\">``). Pass each parameter as a "
+    "separate JSON field in ``args`` — not as XML tags inside another "
+    "string. The XML tool-call format and the JSON args format are "
+    "different surfaces; mixing them silently drops the embedded params "
+    "and leaves them as literal text in the surrounding string.\n\n"
+    "Right shape: ``args = {\"summary\": \"...\", "
+    "\"topics_discussed\": [\"a\", \"b\"]}``\n"
+    "Wrong shape: ``args = {\"summary\": \"...<parameter "
+    "name=\\\"topics_discussed\\\">[\\\"a\\\",\\\"b\\\"]</parameter>\"}``"
+)
+
+
+def _detect_embedded_xml(arguments: dict[str, Any]) -> bool:
+    """True when any string-typed value in ``arguments`` (or in a
+    nested list/dict of strings) contains the embedded-XML param
+    pattern. Conservative: only matches the param-tag shape, not
+    generic angle-bracket text."""
+    if not isinstance(arguments, dict):
+        return False
+
+    def _scan(value: Any) -> bool:
+        if isinstance(value, str):
+            return bool(_XML_PARAM_RE.search(value))
+        if isinstance(value, list):
+            return any(_scan(v) for v in value)
+        if isinstance(value, dict):
+            return any(_scan(v) for v in value.values())
+        return False
+
+    return any(_scan(v) for v in arguments.values())
+
+
+def _install_xml_hint_wrapper(server: Any) -> None:
+    """Wrap the in-process MCP server's CallToolRequest handler so
+    that ``Input validation error: ...`` results get an embedded-XML
+    hint appended when the original arguments contained the giveaway
+    pattern. Idempotent against re-installation: tags the wrapper
+    so we don't double-wrap on repeated calls.
+
+    No-op (logs only) if the mcp library's internal shapes shift —
+    the wrapper is observability/DX, not load-bearing, so it must
+    never break tool dispatch. Each early-return path emits a
+    ``log.warning`` so an operator can grep ``xml-hint wrapper`` to
+    confirm install state."""
+    try:
+        from mcp import types as mcp_types
+    except Exception:  # noqa: BLE001 - tolerate any import-shape drift
+        log.warning("chainlink #21: xml-hint wrapper skipped — mcp.types import failed")
+        return
+
+    handlers = getattr(server, "request_handlers", None)
+    if not isinstance(handlers, dict):
+        log.warning(
+            "chainlink #21: xml-hint wrapper skipped — request_handlers is %s",
+            type(handlers).__name__,
+        )
+        return
+    original = handlers.get(mcp_types.CallToolRequest)
+    if original is None:
+        log.warning(
+            "chainlink #21: xml-hint wrapper skipped — no CallToolRequest handler"
+        )
+        return
+    if getattr(original, "_mimir_xml_hint", False):
+        # Idempotent re-install — silent (don't spam logs on rebuilds).
+        return
+
+    async def wrapped(req: Any) -> Any:
+        result = await original(req)
+        try:
+            cr = getattr(result, "root", None)
+            if cr is None or not getattr(cr, "isError", False):
+                return result
+            content = list(getattr(cr, "content", []) or [])
+            if not content:
+                return result
+            first = content[0]
+            text = getattr(first, "text", None)
+            if not isinstance(text, str) or not text.startswith(
+                "Input validation error:"
+            ):
+                return result
+            args = (getattr(req.params, "arguments", None) or {})
+            if not _detect_embedded_xml(args):
+                return result
+            # Mutate the existing TextContent's text so the rest of
+            # the result (other content blocks, isError, structured)
+            # is preserved verbatim.
+            try:
+                first.text = text + _XML_HINT
+            except Exception:  # noqa: BLE001
+                # Pydantic v2 model mutation can be blocked by
+                # frozen=True; rebuild the content block instead
+                # using the already-imported ``mcp_types`` module.
+                content[0] = mcp_types.TextContent(
+                    type="text", text=text + _XML_HINT,
+                )
+                cr.content = content
+        except Exception:  # noqa: BLE001
+            # Any unexpected shape — return the original result
+            # unchanged. DX polish must never break tool dispatch.
+            return result
+        return result
+
+    wrapped._mimir_xml_hint = True  # type: ignore[attr-defined]
+    handlers[mcp_types.CallToolRequest] = wrapped
+    log.info("chainlink #21: xml-hint wrapper installed")
 
 
 @tool("echo", "Echo a string back. Useful for smoke tests.", {"text": str})
@@ -134,7 +279,18 @@ def build_mcp_server(
             message_buffer=message_buffer,
             home=home,
         )
-    return create_sdk_mcp_server(name="mimir", version="0.1.0", tools=tools)
+    config = create_sdk_mcp_server(name="mimir", version="0.1.0", tools=tools)
+    # chainlink #21: append embedded-XML-parameter hint to validation
+    # errors. Wrap after create_sdk_mcp_server returns so we don't
+    # touch the SDK's bookkeeping. McpSdkServerConfig is a TypedDict;
+    # the live server lives under the ``instance`` key.
+    instance: Any = None
+    if isinstance(config, dict):
+        instance = config.get("instance")
+    else:  # pragma: no cover - guards against future dataclass migration
+        instance = getattr(config, "instance", None)
+    _install_xml_hint_wrapper(instance)
+    return config
 
 
 def allowed_tool_names(
