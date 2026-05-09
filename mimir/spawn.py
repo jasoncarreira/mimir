@@ -325,7 +325,15 @@ def build_spawn_tool(
         "wake-up on this channel. The spawn's cost lands in turns.jsonl "
         "as a ``kind=claude_code_spawn`` record so the homeostat sees "
         "its plan-window spend. Pass ``session_id`` (your "
-        "saga_session_id) so the wake-up routes here.",
+        "saga_session_id) so the wake-up routes here. "
+        "**Trust envelope**: spawned sessions run with "
+        "``bypassPermissions`` by default (no human is here to answer "
+        "interactive prompts). Trust is bounded by ``max_budget_usd`` "
+        "(hard $ cap), ``max_turns`` (loop cap), ``working_dir`` "
+        "(file-op scope via ``--add-dir``), and the agent profile's "
+        "``tools:`` allowlist (e.g. ``doc-writer`` has no Bash). "
+        "Tighten via ``permission_mode='acceptEdits'`` for less-trusted "
+        "briefs where Bash should still ask.",
         {
             "type": "object",
             "properties": {
@@ -480,6 +488,11 @@ def build_spawn_tool(
             max_budget_usd = float(budget_arg)
         max_turns_arg = args.get("max_turns")
         model_arg = args.get("model")
+        # ``or`` (not ``if .. is None``) is intentional: an empty
+        # string from the caller is treated the same as not-supplied
+        # → fall back to the default. Avoids a "permission_mode='' is
+        # invalid" failure when a templated caller emits an empty
+        # field for "I don't care, use default."
         permission_mode_arg = args.get("permission_mode") or DEFAULT_PERMISSION_MODE
         if permission_mode_arg not in ALLOWED_PERMISSION_MODES:
             await log_event(
