@@ -36,6 +36,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -81,6 +82,34 @@ GLOBAL_BUDGET_FALLBACK_USD = 10.0
 # bigger brief, switch the spawn to read from a file via stdin or a
 # brief-path flag.
 MAX_BRIEF_BYTES = 64 * 1024
+
+# Permission mode for the spawn. ``bypassPermissions`` skips interactive
+# permission prompts that ``claude -p`` otherwise blocks on (no human
+# is here to answer them). The trust envelope is provided by other
+# bounds: ``--max-budget-usd`` (hard $ cap), ``--max-turns`` (loop
+# cap), ``--add-dir`` (file-op scope), and the agent profile's
+# ``tools:`` allowlist (e.g. code-implementer can't use unrestricted
+# system tools). Operators can override per-spawn via the
+# ``permission_mode`` arg (e.g. tighten to ``acceptEdits`` for
+# user-supplied briefs where Bash should ask).
+DEFAULT_PERMISSION_MODE = "bypassPermissions"
+ALLOWED_PERMISSION_MODES = frozenset({
+    "acceptEdits", "auto", "bypassPermissions",
+    "default", "dontAsk", "plan",
+})
+
+# Caller anti-pattern: passing a literal shell-substitution token as
+# the brief (``$(cat /tmp/brief.md)`` or ``\`cat /tmp/brief.md\```).
+# Tool args are passed verbatim to ``claude -p`` — there's no shell
+# in the dispatch path, so the substitution never expands and the
+# spawn sees ~30 bytes of literal ``$(...)`` and parse-fails after
+# wasting ~15s. Detect it pre-spawn and reject with an actionable
+# error. Length-bounded so we never false-positive a real brief that
+# happens to contain ``$(foo)`` somewhere mid-text.
+_PURE_SHELL_SUB_RE = re.compile(
+    r"\A\s*(?:\$\([^)]+\)|`[^`]+`|\$\{[^}]+\})\s*\Z"
+)
+_SHELL_SUB_DETECT_MAX_BYTES = 4 * 1024
 
 
 def _parse_spawn_result_json(stdout_text: str) -> Optional[dict[str, Any]]:
@@ -296,7 +325,15 @@ def build_spawn_tool(
         "wake-up on this channel. The spawn's cost lands in turns.jsonl "
         "as a ``kind=claude_code_spawn`` record so the homeostat sees "
         "its plan-window spend. Pass ``session_id`` (your "
-        "saga_session_id) so the wake-up routes here.",
+        "saga_session_id) so the wake-up routes here. "
+        "**Trust envelope**: spawned sessions run with "
+        "``bypassPermissions`` by default (no human is here to answer "
+        "interactive prompts). Trust is bounded by ``max_budget_usd`` "
+        "(hard $ cap), ``max_turns`` (loop cap), ``working_dir`` "
+        "(file-op scope via ``--add-dir``), and the agent profile's "
+        "``tools:`` allowlist (e.g. ``doc-writer`` has no Bash). "
+        "Tighten via ``permission_mode='acceptEdits'`` for less-trusted "
+        "briefs where Bash should still ask.",
         {
             "type": "object",
             "properties": {
@@ -367,6 +404,20 @@ def build_spawn_tool(
                         "event routes back here."
                     ),
                 },
+                "permission_mode": {
+                    "type": "string",
+                    "description": (
+                        "Permission mode for the spawned session. "
+                        "Defaults to 'bypassPermissions' so the spawn "
+                        "doesn't deadlock on interactive prompts (no "
+                        "human here to answer them). Tighten to "
+                        "'acceptEdits' for less-trusted briefs (still "
+                        "auto-accepts edits but Bash asks); 'default' "
+                        "blocks any work in -p mode. Choices: "
+                        "acceptEdits, auto, bypassPermissions, default, "
+                        "dontAsk, plan."
+                    ),
+                },
             },
             "required": ["brief", "working_dir"],
         },
@@ -399,6 +450,33 @@ def build_spawn_tool(
                 f"plus follow-up work.",
                 is_error=True,
             )
+        # Caller anti-pattern: brief is just ``$(cat /path)`` or
+        # backticks. Tool args don't go through a shell; the spawn
+        # would receive ~30 bytes of literal token and parse-fail
+        # after ~15s. Reject early with a pointer at the actual fix.
+        if (
+            brief_bytes <= _SHELL_SUB_DETECT_MAX_BYTES
+            and _PURE_SHELL_SUB_RE.match(brief)
+        ):
+            await log_event(
+                "claude_code_spawn_spawn_failed",
+                agent=agent_name,
+                working_dir=working_dir,
+                error="brief is a literal shell-substitution token",
+                reason="brief_shell_substitution_literal",
+                brief_bytes=brief_bytes,
+            )
+            return _content_block(
+                f"spawn_claude_code failed to launch: brief looks like "
+                f"a literal shell-substitution token ({brief.strip()[:80]!r}). "
+                f"Tool arguments don't go through a shell — the spawn "
+                f"would receive that string verbatim and parse-fail. "
+                f"Inline the file's contents into the ``brief`` field "
+                f"directly (read it on your side first, then pass the "
+                f"text), or write the brief inline as a multi-line "
+                f"string in this tool call.",
+                is_error=True,
+            )
         timeout_sec = int(args.get("timeout_sec") or DEFAULT_TIMEOUT_SEC)
         defaults = PROFILE_DEFAULTS.get(agent_name, {})
         budget_arg = args.get("max_budget_usd")
@@ -410,6 +488,27 @@ def build_spawn_tool(
             max_budget_usd = float(budget_arg)
         max_turns_arg = args.get("max_turns")
         model_arg = args.get("model")
+        # ``or`` (not ``if .. is None``) is intentional: an empty
+        # string from the caller is treated the same as not-supplied
+        # → fall back to the default. Avoids a "permission_mode='' is
+        # invalid" failure when a templated caller emits an empty
+        # field for "I don't care, use default."
+        permission_mode_arg = args.get("permission_mode") or DEFAULT_PERMISSION_MODE
+        if permission_mode_arg not in ALLOWED_PERMISSION_MODES:
+            await log_event(
+                "claude_code_spawn_spawn_failed",
+                agent=agent_name,
+                working_dir=working_dir,
+                error=f"invalid permission_mode: {permission_mode_arg!r}",
+                reason="invalid_permission_mode",
+            )
+            return _content_block(
+                f"spawn_claude_code failed to launch: permission_mode "
+                f"{permission_mode_arg!r} not in "
+                f"{sorted(ALLOWED_PERMISSION_MODES)}. Defaults to "
+                f"{DEFAULT_PERMISSION_MODE!r} when omitted.",
+                is_error=True,
+            )
 
         ctx, _resolution = resolve_active_ctx(args)
         channel_id = ctx.channel_id if ctx is not None else None
@@ -432,6 +531,7 @@ def build_spawn_tool(
             "--output-format", "json",
             "--add-dir", working_dir,
             "--setting-sources", "user,project",
+            "--permission-mode", permission_mode_arg,
             "--max-budget-usd", f"{max_budget_usd}",
         ]
         if max_turns_arg is not None:
@@ -566,6 +666,7 @@ def build_spawn_tool(
             cmd_argv=cmd_argv_redacted,
             resolved_model=str(model_arg) if model_arg else None,
             resolved_max_turns=int(max_turns_arg) if max_turns_arg is not None else None,
+            resolved_permission_mode=permission_mode_arg,
         )
 
         return _content_block(
@@ -586,4 +687,7 @@ __all__: tuple[str, ...] = (
     "PROFILE_DEFAULTS",
     "DEFAULT_AGENT",
     "DEFAULT_TIMEOUT_SEC",
+    "DEFAULT_PERMISSION_MODE",
+    "ALLOWED_PERMISSION_MODES",
+    "MAX_BRIEF_BYTES",
 )
