@@ -373,3 +373,79 @@ def test_arbiter_pay_as_you_go_default_when_unspecified(tmp_path):
         turns_log=tmp_path / "turns.jsonl",
     )
     assert arb.billing_mode is BillingMode.PAY_AS_YOU_GO
+
+
+# ── chainlink #17: derived 5h gets a higher suppress threshold ──────
+
+
+def _w_derived(key: str, util: float | None) -> QuotaWindow:
+    """Variant of _w that flags the window derived=True. Locks the
+    chainlink #17 contract: derived windows skip the direct
+    raw-suppress threshold (0.80) for a looser one (0.90)."""
+    hours = 5.0 if key == "five_hour" else 168.0
+    return QuotaWindow(
+        key=key,
+        window_hours=hours,
+        utilization=util,
+        on_pace_utilization=None,
+        resets_at=None,
+        derived=True,
+    )
+
+
+def test_evaluate_quota_derived_5h_under_90_does_not_suppress():
+    """Derived 5h at 0.85 — would suppress under the direct 0.80
+    threshold, must NOT suppress under the derived 0.90 threshold."""
+    provider = _FakeProvider("anthropic", [_w_derived("five_hour", 0.85)])
+    result = evaluate_quota([provider])
+    assert result.suppress is False, (
+        f"derived 5h @0.85 should be under the 0.90 threshold, "
+        f"got: {result.reason}"
+    )
+
+
+def test_evaluate_quota_derived_5h_at_90_suppresses():
+    """Derived 5h at 0.90 — at the looser threshold, suppresses."""
+    provider = _FakeProvider("anthropic", [_w_derived("five_hour", 0.92)])
+    result = evaluate_quota([provider])
+    assert result.suppress is True
+    assert "five_hour@0.92" in result.reason
+
+
+def test_evaluate_quota_direct_5h_at_85_still_suppresses():
+    """Invariant: chainlink #17 doesn't loosen direct 5h thresholds.
+    Direct 5h at 0.85 still trips the 0.80 wall."""
+    provider = _FakeProvider("anthropic", [_w("five_hour", 0.85, None)])
+    result = evaluate_quota([provider])
+    assert result.suppress is True
+    assert "five_hour@0.85" in result.reason
+
+
+def test_evaluate_quota_derived_propagates_through_anthropic_provider(tmp_path):
+    """End-to-end: a RateLimitSnapshot flagged derived=True flows
+    through AnthropicQuotaProvider.get_windows to a QuotaWindow
+    flagged derived=True, which then takes the looser threshold."""
+    from mimir.billing import AnthropicQuotaProvider
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import asyncio
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    snap = RateLimitSnapshot(
+        status="allowed_warning",
+        utilization=0.85,
+        observed_at="2026-05-09T00:00:00+00:00",
+        derived=True,
+    )
+    asyncio.run(store.record("five_hour", snap))
+
+    provider = AnthropicQuotaProvider(store)
+    windows = provider.get_windows()
+    five_hour_w = next(w for w in windows if w.key == "five_hour")
+    assert five_hour_w.derived is True
+    assert five_hour_w.utilization == pytest.approx(0.85)
+
+    # And evaluate_quota uses the looser threshold.
+    result = evaluate_quota([provider])
+    assert result.suppress is False, (
+        "derived 5h @0.85 must not suppress under the 0.90 threshold"
+    )

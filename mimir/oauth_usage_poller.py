@@ -105,13 +105,22 @@ FIRST_SEEN_SIDECAR_NAME = ".oauth_first_seen.json"
 @dataclass(frozen=True)
 class PollerConfig:
     """Subset of mimir's :class:`Config` the poller needs. Kept narrow
-    so tests can construct it without a full Config."""
+    so tests can construct it without a full Config.
+
+    ``turns_log_path`` (chainlink #17): when set, the cost-rate-back-
+    derived 5h estimator runs on layer-(a) anomaly rejection — instead
+    of just keeping the prior trusted 5h reading, the poller computes
+    a fresh estimate from the last 5h of cost in turns.jsonl divided
+    by a 7d quota back-derived from the prior 7d reading. None
+    disables the derive path (current behavior: prior trusted value
+    persists indefinitely on long endpoint glitches)."""
 
     credentials_path: Path
     refresh_warn_days: int = DEFAULT_REFRESH_WARN_DAYS
     client_id: str = DEFAULT_CLIENT_ID
     token_endpoint: str = TOKEN_ENDPOINT
     usage_endpoint: str = USAGE_ENDPOINT
+    turns_log_path: Path | None = None
 
 
 # ─── credentials I/O ───────────────────────────────────────────────────
@@ -494,6 +503,19 @@ def _bucket_to_snapshot(bucket: Any) -> RateLimitSnapshot | None:
 ANOMALY_5H_JUMP_PP = 0.50   # 5h utilization rise that triggers cross-check
 ANOMALY_7D_DELTA_PP = 0.05  # 7d delta below this confirms the 5h jump is bogus
 
+# chainlink #17 (CR#22 layer b): cost-rate-back-derived 5h estimator.
+# Anthropic's stated 5h-to-7d quota ratio for the Max plan is roughly
+# 1.4x — i.e., the 5h quota dollar-budget is 1.4x what 5h's pro-rata
+# (5/168) share of the 7d quota would predict. Confirmed empirically
+# from observed reset timings on the Max-20x plan. This is a flat
+# scaling constant; the 5h:7d ratio doesn't vary with utilization.
+QUOTA_RATIO_5H_TO_7D = 1.4
+# Round derived utilization to nearest 5pp. Acknowledges the math is
+# approximate (back-derived 7d quota dollars + flat 1.4x assumption +
+# turns.jsonl cost aggregation slop) without being so coarse that
+# 0.78→0.82 transitions get smeared into the same bucket.
+DERIVE_ROUND_STEP = 0.05
+
 
 def detect_5h_anomaly(
     new_5h: float | None,
@@ -538,8 +560,86 @@ def detect_5h_anomaly(
     )
 
 
+def derive_5h_from_cost(
+    turns_log_path: Path,
+    *,
+    prior_7d_utilization: float,
+    ratio_5h_to_7d_quota: float = QUOTA_RATIO_5H_TO_7D,
+) -> float | None:
+    """Estimate 5h utilization from observed cost when the endpoint
+    reading is unavailable / anomalous (chainlink #17 CR#22 layer b).
+
+    Math::
+
+        back_derived_7d_quota_dollars  = observed_7d_cost / prior_7d_util
+        estimated_5h_util              = (observed_5h_cost * 1.4)
+                                       / back_derived_7d_quota_dollars
+
+    The flat 1.4x ratio is Anthropic's published 5h:7d quota scaling
+    on the Max plan (and confirmed empirically). Output is clamped to
+    ``[0, 1]`` and rounded to the nearest 5pp so it's a stable signal
+    rather than jitter.
+
+    Returns ``None`` when the math can't run:
+      - ``prior_7d_utilization`` outside ``(0, 1]`` (zero / negative /
+        impossibly-large; without it, back-deriving the 7d quota
+        dollar-budget is impossible)
+      - turns.jsonl missing or zero observed 7d cost (back-derived
+        quota would be 0 or undefined)
+      - aggregate raises (turns.jsonl corrupt / partial)
+
+    None is the right "no signal" fallback — the caller (record_usage)
+    keeps the prior trusted 5h value rather than synthesizing a
+    plausible-but-wrong estimate.
+    """
+    if not (0.0 < prior_7d_utilization <= 1.0):
+        return None
+    try:
+        # Avoid the import cycle: aggregate_usage is mimir-internal
+        # and importing at module top would pull turns_log_path
+        # through the poller's startup. Late-bind keeps the poller's
+        # cold-start unchanged.
+        from .usage_stats import aggregate
+        report = aggregate(
+            turns_log_path,
+            window_hours=(5.0, 24.0 * 7),
+            window_labels=("5h_cost", "7d_cost"),
+        )
+    except Exception:  # noqa: BLE001 — never crash the poll cycle
+        log.exception("derive_5h_from_cost: aggregate failed")
+        return None
+
+    if len(report.windows) < 2:
+        return None
+    last_5h_cost = report.windows[0].total_cost_usd
+    last_7d_cost = report.windows[1].total_cost_usd
+    if last_7d_cost <= 0:
+        return None
+    back_derived_7d_quota = last_7d_cost / prior_7d_utilization
+    if back_derived_7d_quota <= 0:
+        return None
+    estimated = (last_5h_cost * ratio_5h_to_7d_quota) / back_derived_7d_quota
+    estimated = max(0.0, min(1.0, estimated))
+    # Round to nearest DERIVE_ROUND_STEP, half-up. Two issues with the
+    # naive ``round(x / step) * step``: (1) Python's banker's rounding
+    # (``round(3.5) == 4`` but ``round(2.5) == 2``), and (2) float
+    # precision — ``0.175 / 0.05 == 3.4999...`` so plain ``round``
+    # returns 3 (→ 0.15) instead of 4 (→ 0.20). Decimal with the
+    # input as a string sidesteps both quirks: exact arithmetic +
+    # explicit ROUND_HALF_UP semantics.
+    from decimal import Decimal, ROUND_HALF_UP
+    steps_per_unit = int(round(1.0 / DERIVE_ROUND_STEP))  # 0.05 → 20
+    scaled = (Decimal(str(estimated)) * steps_per_unit).quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP,
+    )
+    return float(scaled / steps_per_unit)
+
+
 async def record_usage(
-    store: RateLimitStore, payload: dict[str, Any],
+    store: RateLimitStore,
+    payload: dict[str, Any],
+    *,
+    cfg: PollerConfig | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Walk the ``/api/oauth/usage`` response and persist each parseable
     window bucket. Returns the recorded summary for the structured
@@ -555,7 +655,18 @@ async def record_usage(
     avoiding the hours-of-suppression-on-bad-data failure we observed
     twice in 48h. Other windows (7d, 7d_sonnet, etc.) write through
     unchanged — only the 5h direction is asymmetric enough to warrant
-    rejection."""
+    rejection.
+
+    chainlink #17 (CR#22 layer b): when ``cfg.turns_log_path`` is set
+    and the layer-(a) detector rejects a 5h reading, the framework
+    additionally tries to compute a cost-rate-back-derived 5h
+    utilization estimate. On success, the derived value lands in the
+    store with ``derived=True``, a ``quota_5h_derived`` event fires,
+    and the arbiter (mimir/billing.py) applies a 90% suppress
+    threshold (vs 80% for direct readings) to absorb the estimate's
+    slop. On derive failure, the prior trusted 5h value persists
+    (current layer-a behavior).
+    """
     recorded: dict[str, dict[str, Any]] = {}
 
     # Build the new snapshots first so the 5h-vs-7d cross-check has
@@ -585,10 +696,8 @@ async def record_usage(
 
     for window_type, snapshot in new_snaps.items():
         if window_type == "five_hour" and anomaly_reason:
-            # Reject the spike. The prior 5h snapshot stays in the
-            # store so the arbiter consults a trusted value. Surface
-            # the rejection so the operator (and the agent's
-            # algedonic block) can investigate.
+            # Reject the spike. Surface the rejection so the operator
+            # (and the agent's algedonic block) can investigate.
             await log_event(
                 "quota_reading_anomalous",
                 window_type=window_type,
@@ -599,6 +708,55 @@ async def record_usage(
                 seven_day_prev=prior_7d.utilization if prior_7d else None,
                 seven_day_new=new_7d.utilization if new_7d else None,
             )
+            # chainlink #17: try the cost-rate-back-derived estimator
+            # before falling back to the prior trusted value. The
+            # derived snapshot lives in the same slot but is flagged
+            # ``derived=True`` so the arbiter applies a 90% suppress
+            # threshold instead of the direct 80%. If derive fails
+            # (no turns_log wired, no observable 7d cost, no prior 7d
+            # utilization), the prior trusted value persists — current
+            # layer-(a) behavior.
+            derived_util = None
+            if (
+                cfg is not None
+                and cfg.turns_log_path is not None
+                and prior_7d is not None
+                and prior_7d.utilization is not None
+            ):
+                derived_util = derive_5h_from_cost(
+                    cfg.turns_log_path,
+                    prior_7d_utilization=prior_7d.utilization,
+                )
+            if derived_util is not None:
+                derived_snap = RateLimitSnapshot(
+                    status="allowed_warning",
+                    utilization=derived_util,
+                    resets_at=prior_5h.resets_at if prior_5h else None,
+                    observed_at=datetime.now(tz=timezone.utc).isoformat(),
+                    derived=True,
+                )
+                try:
+                    await store.record(window_type, derived_snap)
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "oauth_usage: store.record failed for derived %s",
+                        window_type,
+                    )
+                else:
+                    await log_event(
+                        "quota_5h_derived",
+                        utilization=derived_util,
+                        prior_7d_utilization=prior_7d.utilization,
+                        anomaly_reason=anomaly_reason,
+                    )
+                    recorded[window_type] = {
+                        "derived": True,
+                        "utilization": derived_util,
+                        "rejected_utilization": snapshot.utilization,
+                        "reason": anomaly_reason,
+                    }
+                    continue
+            # Derive unavailable — prior trusted value persists.
             recorded[window_type] = {
                 "anomalous": True,
                 "rejected_utilization": snapshot.utilization,
@@ -747,7 +905,7 @@ async def poll_once(
                 )
                 return {"ok": False, "stage": "fetch"}
 
-        recorded = await record_usage(store, payload)
+        recorded = await record_usage(store, payload, cfg=cfg)
         await log_event("oauth_usage_ok", recorded=recorded)
         return {"ok": True, "recorded": recorded}
     finally:

@@ -749,3 +749,271 @@ async def test_poll_once_401_then_refresh_then_retry(
     # Both refresh and usage_ok logged.
     assert "oauth_refresh_ok" in types
     assert "oauth_usage_ok" in types
+
+
+# ── chainlink #17 (CR#22 layer b): derive_5h_from_cost ───────────────
+
+
+import json as _json
+from datetime import datetime, timezone
+from datetime import timedelta as _timedelta
+
+
+def _seed_turns(path: Path, *, recent_costs: list[float], older_costs: list[float]) -> None:
+    """Drop a turns.jsonl with cost rows. ``recent_costs`` go inside
+    the 5h window; ``older_costs`` outside the 5h but inside the 7d
+    window (so they count toward 7d total, not 5h)."""
+    now = datetime.now(timezone.utc)
+    rows = []
+    for i, c in enumerate(recent_costs):
+        rows.append({
+            "ts": (now - _timedelta(minutes=i + 1)).isoformat(),
+            "turn_id": f"r{i}", "session_id": "s",
+            "saga_session_id": None, "trigger": "user_message",
+            "channel_id": "c", "input": "x",
+            "total_cost_usd": c,
+        })
+    for i, c in enumerate(older_costs):
+        rows.append({
+            "ts": (now - _timedelta(hours=6 + i)).isoformat(),
+            "turn_id": f"o{i}", "session_id": "s",
+            "saga_session_id": None, "trigger": "user_message",
+            "channel_id": "c", "input": "x",
+            "total_cost_usd": c,
+        })
+    path.write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
+
+
+def test_derive_5h_basic_math(tmp_path: Path):
+    """5h cost $50, 7d cost $200, prior_7d=0.50 →
+    back_derived_quota=$400 → estimated=(50*1.4)/400=0.175 → round to 0.20."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[50.0], older_costs=[150.0])
+    out = derive_5h_from_cost(path, prior_7d_utilization=0.50)
+    assert out == pytest.approx(0.20, abs=1e-6)
+
+
+def test_derive_5h_rounds_to_5pp(tmp_path: Path):
+    """0.14 (= (50*1.4)/(200/0.4)) → round to 0.15. 0.28 → 0.30."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[50.0], older_costs=[150.0])
+    assert derive_5h_from_cost(path, prior_7d_utilization=0.40) == pytest.approx(0.15)
+    assert derive_5h_from_cost(path, prior_7d_utilization=0.80) == pytest.approx(0.30)
+
+
+def test_derive_5h_clamps_to_one(tmp_path: Path):
+    """Pathological case: 5h spend dominates the 7d window AND
+    prior_7d_util is near saturation → math overshoots 100%, must
+    clamp. Construction: 5h=$1000, 7d=$1100, prior_7d=0.99 →
+    back_derived=$1111 → estimated=1000*1.4/1111=1.26 → clamp 1.0.
+    (Bounded by the math: estimated > 1 requires
+    5h_cost * 1.4 * prior_7d_util > 7d_cost, which means we need a
+    near-saturated 7d AND most of the 7d spend in the last 5h.)"""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[1000.0], older_costs=[100.0])
+    assert derive_5h_from_cost(path, prior_7d_utilization=0.99) == pytest.approx(1.0)
+
+
+def test_derive_5h_returns_none_on_zero_prior_7d(tmp_path: Path):
+    """prior_7d_util == 0 means no observable usage to back-derive
+    the 7d quota dollar amount from. Return None — caller falls
+    back to prior trusted value."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[50.0], older_costs=[150.0])
+    assert derive_5h_from_cost(path, prior_7d_utilization=0.0) is None
+    assert derive_5h_from_cost(path, prior_7d_utilization=-0.1) is None
+
+
+def test_derive_5h_returns_none_on_out_of_range_prior(tmp_path: Path):
+    """Bogus utilization >1 means the input is broken. Return None
+    rather than producing a wildly-scaled estimate."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[50.0], older_costs=[150.0])
+    assert derive_5h_from_cost(path, prior_7d_utilization=1.5) is None
+
+
+def test_derive_5h_returns_none_on_zero_7d_cost(tmp_path: Path):
+    """Empty turns.jsonl (or all turns >7d old) → no observable 7d cost
+    → can't back-derive quota → None."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    path = tmp_path / "turns.jsonl"
+    path.write_text("")  # empty file
+    assert derive_5h_from_cost(path, prior_7d_utilization=0.50) is None
+
+
+def test_derive_5h_returns_none_on_missing_file(tmp_path: Path):
+    """Missing turns.jsonl shouldn't raise — caller treats None as
+    'no signal' and keeps the prior trusted value."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    out = derive_5h_from_cost(
+        tmp_path / "nope.jsonl", prior_7d_utilization=0.50,
+    )
+    assert out is None
+
+
+# ── record_usage with derive enabled ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_record_usage_writes_derived_5h_on_anomaly(tmp_path: Path):
+    """End-to-end: anomaly fires + cfg has turns_log + prior_7d
+    available → derived 5h snapshot lands in store with derived=True."""
+    from mimir.oauth_usage_poller import (
+        PollerConfig, record_usage,
+    )
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op
+
+    # Seed turns.jsonl: 5h=$50, 7d=$200, prior_7d=0.50 → 0.20 derived.
+    turns_path = tmp_path / "turns.jsonl"
+    _seed_turns(turns_path, recent_costs=[50.0], older_costs=[150.0])
+
+    store_path = tmp_path / "rate_limits.json"
+    store = RateLimitStore(path=store_path)
+    # Seed the store with prior 5h (10%) + prior 7d (50%) — the
+    # cross-check needs a prior 5h to compute the jump.
+    await store.record("five_hour", RateLimitSnapshot(
+        status="allowed", utilization=0.10, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+
+    # New payload: 5h jumps to 70% (60pp jump > 50pp threshold) but 7d
+    # only moves to 51% (1pp delta < 5pp threshold) → anomaly.
+    payload = {
+        "five_hour": {"status": "allowed", "utilization": 0.70,
+                      "resets_at": 9999999999},
+        "seven_day": {"status": "allowed", "utilization": 0.51,
+                      "resets_at": 9999999999},
+    }
+
+    cfg = PollerConfig(
+        credentials_path=tmp_path / "creds.json",
+        turns_log_path=turns_path,
+    )
+
+    events: list[tuple[str, dict]] = []
+
+    async def _cap(et, **kw):
+        events.append((et, kw))
+
+    monkeypatch_target = op
+    orig = monkeypatch_target.log_event
+    monkeypatch_target.log_event = _cap
+    try:
+        recorded = await record_usage(store, payload, cfg=cfg)
+    finally:
+        monkeypatch_target.log_event = orig
+
+    # Anomaly fired AND derive succeeded.
+    assert recorded["five_hour"]["derived"] is True
+    assert recorded["five_hour"]["utilization"] == pytest.approx(0.20, abs=1e-6)
+    # quota_5h_derived event landed.
+    types = [t for t, _ in events]
+    assert "quota_reading_anomalous" in types
+    assert "quota_5h_derived" in types
+
+    # Store now has the derived snapshot, NOT the prior trusted 0.10.
+    snap = store.current().get("five_hour")
+    assert snap is not None
+    assert snap.utilization == pytest.approx(0.20, abs=1e-6)
+    assert snap.derived is True
+
+
+@pytest.mark.asyncio
+async def test_record_usage_falls_back_when_no_turns_log(tmp_path: Path):
+    """No cfg → no turns_log_path → derive can't run → prior
+    trusted value persists (current layer-(a) behavior preserved)."""
+    from mimir.oauth_usage_poller import record_usage
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op
+
+    store_path = tmp_path / "rate_limits.json"
+    store = RateLimitStore(path=store_path)
+    await store.record("five_hour", RateLimitSnapshot(
+        status="allowed", utilization=0.10, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+
+    payload = {
+        "five_hour": {"status": "allowed", "utilization": 0.70,
+                      "resets_at": 9999999999},
+        "seven_day": {"status": "allowed", "utilization": 0.51,
+                      "resets_at": 9999999999},
+    }
+
+    async def _cap(et, **kw):
+        pass
+
+    orig = op.log_event
+    op.log_event = _cap
+    try:
+        # No cfg arg → falls back to layer-(a) behavior.
+        recorded = await record_usage(store, payload)
+    finally:
+        op.log_event = orig
+
+    assert recorded["five_hour"]["anomalous"] is True
+    assert recorded["five_hour"]["kept_utilization"] == pytest.approx(0.10)
+    assert "derived" not in recorded["five_hour"]
+    # Store retains the prior trusted value.
+    snap = store.current().get("five_hour")
+    assert snap.utilization == pytest.approx(0.10)
+    assert snap.derived is False
+
+
+@pytest.mark.asyncio
+async def test_record_usage_falls_back_when_derive_fails(tmp_path: Path):
+    """cfg has turns_log_path but turns.jsonl is empty → derive
+    returns None → prior trusted value persists."""
+    from mimir.oauth_usage_poller import PollerConfig, record_usage
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op
+
+    turns_path = tmp_path / "turns.jsonl"
+    turns_path.write_text("")  # empty → no observable cost
+
+    store_path = tmp_path / "rate_limits.json"
+    store = RateLimitStore(path=store_path)
+    await store.record("five_hour", RateLimitSnapshot(
+        status="allowed", utilization=0.10,
+    ))
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+    ))
+
+    payload = {
+        "five_hour": {"status": "allowed", "utilization": 0.70,
+                      "resets_at": 9999999999},
+        "seven_day": {"status": "allowed", "utilization": 0.51,
+                      "resets_at": 9999999999},
+    }
+
+    cfg = PollerConfig(
+        credentials_path=tmp_path / "creds.json",
+        turns_log_path=turns_path,
+    )
+
+    async def _cap(et, **kw):
+        pass
+
+    orig = op.log_event
+    op.log_event = _cap
+    try:
+        recorded = await record_usage(store, payload, cfg=cfg)
+    finally:
+        op.log_event = orig
+
+    assert recorded["five_hour"]["anomalous"] is True
+    assert "derived" not in recorded["five_hour"]
+    snap = store.current().get("five_hour")
+    assert snap.utilization == pytest.approx(0.10)
+    assert snap.derived is False

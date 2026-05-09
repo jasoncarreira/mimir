@@ -12,6 +12,7 @@ import pytest
 from mimir.templates import (
     _atom_feedback_lines,
     _output_preview,
+    _session_has_atoms,
     _turn_summary_lines,
     render_saga_session_end,
 )
@@ -184,6 +185,9 @@ def test_render_mentions_learnings_pending_buffer():
 
 
 def test_render_handles_empty_turns_window():
+    """Empty turns → no atoms cited → chainlink #7 lean template wins.
+    The lean template doesn't have the atoms-cited section at all
+    (that's the cost-saving point), so we assert on the lean shape."""
     out = render_saga_session_end(
         channel_id="c",
         saga_session_id="s",
@@ -192,7 +196,12 @@ def test_render_handles_empty_turns_window():
         prompts_dir=None,
     )
     assert "(no turns recorded for this session)" in out
-    assert "(no atoms cited in this session)" in out
+    # Lean template: no Atoms-cited section.
+    assert "Atoms cited across the session" not in out
+    # Lean template: step 2 is the boundary record (renumbered from 3).
+    assert "Score SAGA atoms" not in out
+    assert "Record the session boundary" in out
+    assert "Do two things" in out
 
 
 # ── mimir_get_turn ───────────────────────────────────────────────────
@@ -339,3 +348,103 @@ async def test_build_synthesis_prompt_is_async():
         "_build_synthesis_prompt must be async so its turns.jsonl read "
         "runs off the event loop (CR#4)."
     )
+
+
+# ── chainlink #7: lean vs full template selection ────────────────────
+
+
+def test_session_has_atoms_detects_any_cite():
+    assert _session_has_atoms([_turn("a", saga_atom_ids=["atom-1"])]) is True
+    # Mixed: some atoms, some none → True (any).
+    assert _session_has_atoms([
+        _turn("a", saga_atom_ids=[]),
+        _turn("b", saga_atom_ids=["atom-1"]),
+    ]) is True
+    # All empty.
+    assert _session_has_atoms([_turn("a", saga_atom_ids=[])]) is False
+    # Missing field entirely (treat as empty).
+    assert _session_has_atoms([{"turn_id": "a"}]) is False
+    # Empty window.
+    assert _session_has_atoms([]) is False
+
+
+def test_render_uses_lean_template_when_no_atoms_cited():
+    """Sessions with zero atom citations across all turns → lean
+    template (drops step 2 + the trailing atoms-cited block) per
+    chainlink #7. Saves $1-3 per bookkeeping turn."""
+    turns = [
+        _turn("t1", saga_atom_ids=[]),
+        _turn("t2", saga_atom_ids=[]),
+    ]
+    out = render_saga_session_end(
+        channel_id="c", saga_session_id="s", idle_minutes=10,
+        turns_window=turns, prompts_dir=None,
+    )
+    # Lean shape: 2 steps total (memory capture + boundary record).
+    assert "Do two things" in out
+    assert "Score SAGA atoms" not in out
+    assert "Atoms cited across the session" not in out
+    # Memory capture (step 1) still present — the valuable part.
+    assert "Capture memories worth keeping" in out
+    # Boundary record (step 2) still present.
+    assert "Record the session boundary" in out
+    assert "saga_end_session" in out
+
+
+def test_render_uses_full_template_when_any_atoms_cited():
+    """Even one atom citation across the session keeps the full
+    template — the contribution-credit pass is valuable when there's
+    something to credit."""
+    turns = [
+        _turn("t1", saga_atom_ids=[]),
+        _turn("t2", saga_atom_ids=["atom-1"]),
+    ]
+    out = render_saga_session_end(
+        channel_id="c", saga_session_id="s", idle_minutes=10,
+        turns_window=turns, prompts_dir=None,
+    )
+    assert "Do three things" in out
+    assert "Score SAGA atoms" in out
+    assert "Atoms cited across the session" in out
+
+
+def test_render_lean_template_overridable_via_prompts_dir(tmp_path: Path):
+    """An operator override at ``<prompts_dir>/saga_session_end_lean.md``
+    is respected. Confirms the lean template uses ``saga_session_end_lean``
+    as its load_template name (parallel to ``saga_session_end``)."""
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "saga_session_end_lean.md").write_text(
+        "lean override for {channel_id}: {saga_session_id} "
+        "({idle_minutes}m)\n{turn_summary_block}",
+        encoding="utf-8",
+    )
+    turns = [_turn("t1", saga_atom_ids=[])]
+    out = render_saga_session_end(
+        channel_id="c", saga_session_id="s", idle_minutes=10,
+        turns_window=turns, prompts_dir=prompts,
+    )
+    assert out.startswith("lean override for c: s (10m)")
+    # Confirm: the override doesn't have the lean-default's "Do two
+    # things" header — proves we're rendering the override.
+    assert "Do two things" not in out
+
+
+def test_render_full_template_override_preserved_when_atoms_present(tmp_path: Path):
+    """Existing ``<prompts_dir>/saga_session_end.md`` overrides
+    behavior is unchanged when atoms ARE present — chainlink #7 is
+    purely additive (a new lean code path), not a rename of the
+    full path."""
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "saga_session_end.md").write_text(
+        "full override for {channel_id}: {saga_session_id} "
+        "({idle_minutes}m)\n{turn_summary_block}\n{atom_feedback_block}",
+        encoding="utf-8",
+    )
+    turns = [_turn("t1", saga_atom_ids=["atom-1"])]
+    out = render_saga_session_end(
+        channel_id="c", saga_session_id="s", idle_minutes=10,
+        turns_window=turns, prompts_dir=prompts,
+    )
+    assert out.startswith("full override for c: s (10m)")

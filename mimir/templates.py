@@ -119,6 +119,106 @@ After step 3, do not send any user-facing message — this is a bookkeeping turn
 """
 
 
+# chainlink #7: lean synthesis prompt for sessions where no SAGA atoms
+# were created or touched. The full template above pays $1-3 per
+# bookkeeping turn for the contribution-credit + atom-scoring
+# scaffolding; when the session genuinely has zero atoms cited there's
+# nothing to credit and the scaffolding is pure cost. The lean
+# variant keeps memory capture (step 1) and the boundary record
+# (step 2 — renumbered from step 3) and drops:
+#   - step 2 (Score SAGA atoms)
+#   - the trailing ``## Atoms cited across the session`` block
+# The session summary is still the valuable artifact (it feeds the
+# Recent session summaries block in every subsequent prompt) — we
+# just stop paying for the parts of synthesis that have no input.
+SAGA_SESSION_END_LEAN_DEFAULT = """\
+The SAGA session for channel {channel_id} has been idle for {idle_minutes}
+minutes and is being closed. No SAGA atoms were created or cited
+during this session, so the contribution-credit scoring is skipped —
+this is a leaner bookkeeping turn focused on memory capture and the
+session boundary record. Each turn line below carries cost,
+tool-call count, and output preview.
+
+If you do need the full content of a specific turn (its tool sequence,
+reasoning, or full output) for memory capture, call:
+
+  mimir_get_turn(turn_id="<id>")
+
+It returns the turn's `output` and `events` (no `input` — the prompt
+that fed that turn isn't useful for synthesis and re-embedding it is
+exactly the cost path we're avoiding). Be surgical — most turns won't
+be worth re-reading.
+
+Do two things, in order:
+
+### 1. Capture memories worth keeping
+
+Skim the turn summaries below. If anything is worth remembering long-term
+— facts about people in this channel, decisions, recurring patterns,
+useful context for future sessions — write or edit files under:
+
+  memory/channels/{channel_id}/   # channel-specific notes
+  memory/issues/                  # operational gotchas (every-turn-INDEX surfacing)
+  state/wiki/concepts/            # cross-channel patterns / frameworks
+  state/wiki/topics/              # cross-channel long-form synthesis
+  memory/learnings-pending.md     # candidate learned behaviors (see below)
+
+If the session surfaced something that *might* be a durable behavior
+worth remembering across all future turns — a heuristic that worked, a
+failure mode worth avoiding, an approach that beat the default — append
+it to `memory/learnings-pending.md` in the canonical 4-field shape
+(`What I noticed / What works / Trigger / Source:`). The weekly
+reflection turn promotes durable entries from there to
+`memory/core/40-learned-behaviors.md` and drops one-offs. **Do NOT write
+directly to `memory/core/40-learned-behaviors.md`** — synthesis turns
+have narrow context (one session) and have been observed confabulating
+durable rules from one-off events. The pending buffer is the safe path.
+
+Use bash and the file-op tools. Call `mimir_get_turn` only for turns
+whose summary suggests they're worth a closer look. Skip this step
+entirely if nothing notable came up — no need to manufacture content.
+
+### 2. Record the session boundary
+
+Synthesize and call:
+
+  saga_end_session(
+    session_id="{saga_session_id}",
+    summary="<one-sentence summary>",
+    topics_discussed=["..."],         # omit if nothing concrete
+    decisions_made=["..."],           # omit if nothing concrete
+    unfinished=["..."],               # omit if nothing was left dangling
+    closed_since=["..."],             # see below
+    emotional_state="<one phrase>",   # omit if neutral / unclear
+  )
+
+`closed_since` is the corrective-overrides list. Look at the "Recent
+session summaries" block in your system prompt and check each prior
+boundary's Unfinished items: did any get resolved during *this*
+session? If so, list the specific identifiers — PR refs like `#71`,
+chainlink IDs like `chainlink #29 G17`, file paths, etc. The prompt
+builder substring-matches these against earlier Unfinished items and
+drops any that contain one of these refs, so future prompts won't
+keep showing them as live work.
+
+If a prior Unfinished item like "PRs #71 + #72 awaiting" is partially
+resolved (#71 merged but #72 still open), put the resolved ref in
+`closed_since=["#71"]` AND re-list the still-open piece in this
+boundary's `unfinished=["PR #72 still awaiting"]`. The older item
+gets dropped via substring match; your new item carries the live
+state forward.
+
+Omit `closed_since` entirely if nothing from prior summaries was
+resolved during this session.
+
+After step 2, do not send any user-facing message — this is a bookkeeping turn.
+
+## Turns in this session
+
+{turn_summary_block}
+"""
+
+
 def load_template(name: str, default: str, prompts_dir: Path | None) -> str:
     """Read ``<prompts_dir>/<name>.md`` if set and present, else return default."""
     if prompts_dir is None:
@@ -216,6 +316,18 @@ def _atom_feedback_lines(turns_window: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _session_has_atoms(turns_window: list[dict]) -> bool:
+    """True iff at least one turn in the session cited a SAGA atom.
+    Drives the lean-vs-full synthesis-prompt selection (chainlink #7):
+    when False, the synthesis turn doesn't need the contribution-credit
+    scaffolding because there's nothing to credit."""
+    for t in turns_window:
+        atoms = t.get("saga_atom_ids") or []
+        if atoms:
+            return True
+    return False
+
+
 def render_saga_session_end(
     *,
     channel_id: str,
@@ -224,11 +336,36 @@ def render_saga_session_end(
     turns_window: list[dict],
     prompts_dir: Path | None,
 ) -> str:
-    template = load_template("saga_session_end", SAGA_SESSION_END_DEFAULT, prompts_dir)
+    """Render the synthesis-turn prompt. When the session cited zero
+    SAGA atoms across all turns, the lean variant is used — drops the
+    atom-scoring step + the trailing atoms-cited block to save the
+    bookkeeping cost on no-atom sessions (chainlink #7).
+
+    The selection is content-driven, not config-driven: an operator
+    override at ``<prompts_dir>/saga_session_end.md`` always wins
+    (full template), and ``<prompts_dir>/saga_session_end_lean.md``
+    overrides the lean default. Both share the same set of placeholders
+    EXCEPT the lean variant has no ``{atom_feedback_block}`` slot —
+    rendering passes only the placeholders the active template actually
+    uses, so an operator's full-template override still works after
+    this change."""
+    if _session_has_atoms(turns_window):
+        template = load_template(
+            "saga_session_end", SAGA_SESSION_END_DEFAULT, prompts_dir,
+        )
+        return template.format(
+            channel_id=channel_id,
+            saga_session_id=saga_session_id,
+            idle_minutes=idle_minutes,
+            turn_summary_block=_turn_summary_lines(turns_window),
+            atom_feedback_block=_atom_feedback_lines(turns_window),
+        )
+    template = load_template(
+        "saga_session_end_lean", SAGA_SESSION_END_LEAN_DEFAULT, prompts_dir,
+    )
     return template.format(
         channel_id=channel_id,
         saga_session_id=saga_session_id,
         idle_minutes=idle_minutes,
         turn_summary_block=_turn_summary_lines(turns_window),
-        atom_feedback_block=_atom_feedback_lines(turns_window),
     )

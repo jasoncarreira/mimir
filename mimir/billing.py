@@ -104,13 +104,22 @@ class QuotaWindow:
     ``on_pace_utilization`` is the projected end-of-window value (None
     when the projection isn't trustworthy — too early in window, no
     ``resets_at``, etc.). The arbiter treats missing data as "no
-    signal" — does NOT suppress on absent values."""
+    signal" — does NOT suppress on absent values.
+
+    ``derived`` (chainlink #17): true when this window's utilization
+    was estimated from cost data (the cost-rate-back-derived 5h
+    estimator that fires when the endpoint reading is rejected as
+    anomalous by layer (a)). Causes :func:`evaluate_quota` to apply
+    a looser raw-suppress threshold for this window — derived values
+    are approximations and shouldn't trip the wall threshold as
+    aggressively as direct readings."""
 
     key: str
     window_hours: float
     utilization: Optional[float]
     on_pace_utilization: Optional[float]
     resets_at: Optional[int]
+    derived: bool = False
 
 
 class QuotaProvider(ABC):
@@ -183,6 +192,7 @@ class AnthropicQuotaProvider(QuotaProvider):
                         proj.on_pace_utilization if proj is not None else None
                     ),
                     resets_at=snap.resets_at,
+                    derived=getattr(snap, "derived", False),
                 )
             )
         return out
@@ -201,6 +211,12 @@ class AnthropicQuotaProvider(QuotaProvider):
 DEFAULT_RAW_SUPPRESS_THRESHOLD = 0.80
 DEFAULT_ON_PACE_SUPPRESS_5H = 0.90
 DEFAULT_ON_PACE_SUPPRESS_7D = 0.95
+# chainlink #17: derived 5h utilization (cost-rate-back-derived during
+# endpoint glitches) gets a looser raw-suppress threshold than direct
+# readings. The estimator rounds to 5pp and assumes a flat 1.4x
+# 5h:7d quota ratio — both approximations. 90% accommodates the slop
+# without giving up the suppression signal entirely on long glitches.
+DEFAULT_RAW_SUPPRESS_DERIVED = 0.90
 
 
 def _on_pace_threshold(window_key: str) -> float:
@@ -210,6 +226,16 @@ def _on_pace_threshold(window_key: str) -> float:
     if window_key == "five_hour":
         return DEFAULT_ON_PACE_SUPPRESS_5H
     return DEFAULT_ON_PACE_SUPPRESS_7D
+
+
+def _raw_threshold_for(window: "QuotaWindow", direct_threshold: float) -> float:
+    """Pick the raw-utilization suppress threshold for a window.
+    Derived windows (chainlink #17) get a looser cap — the estimator
+    is approximate, so don't suppress as aggressively on it as on a
+    direct endpoint reading."""
+    if window.derived:
+        return DEFAULT_RAW_SUPPRESS_DERIVED
+    return direct_threshold
 
 
 @dataclass(frozen=True)
@@ -261,8 +287,10 @@ def evaluate_quota(
             )
             continue
         for w in windows:
-            if w.utilization is not None and w.utilization >= raw_threshold:
-                raw_hits.append((provider.provider_name, w.key, w.utilization))
+            if w.utilization is not None:
+                w_threshold = _raw_threshold_for(w, raw_threshold)
+                if w.utilization >= w_threshold:
+                    raw_hits.append((provider.provider_name, w.key, w.utilization))
             if w.on_pace_utilization is not None:
                 threshold = _on_pace_threshold(w.key)
                 if w.on_pace_utilization >= threshold:
