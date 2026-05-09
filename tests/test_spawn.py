@@ -457,6 +457,109 @@ async def test_spawn_failure_returns_is_error_block(home: Path):
     assert any(e["type"] == "claude_code_spawn_spawn_failed" for e in events)
 
 
+@pytest.mark.asyncio
+async def test_brief_above_size_cap_rejected_before_spawn(home: Path):
+    """A brief above MAX_BRIEF_BYTES gets a clear is_error block before
+    registry.spawn — surfaces actionably instead of letting execve fail
+    with the opaque ``argument list too long``."""
+    from mimir.spawn import MAX_BRIEF_BYTES
+    registry = _FakeRegistry()
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=lambda coro: coro.close(),
+        chain_on_complete=None,
+    )
+    huge_brief = "A" * (MAX_BRIEF_BYTES + 1)
+    out = await tool_def.handler({
+        "brief": huge_brief, "working_dir": "/tmp",
+    })
+    assert out.get("is_error") is True
+    text = out["content"][0]["text"]
+    assert "spawn_claude_code failed to launch" in text
+    assert "brief is" in text
+    assert str(MAX_BRIEF_BYTES) in text
+    # Registry never accepted the spawn — caller's caps protect execve.
+    assert registry.spawned == []
+    events = _read_events(home)
+    spawn_failed = [
+        e for e in events if e["type"] == "claude_code_spawn_spawn_failed"
+    ]
+    assert len(spawn_failed) == 1
+    assert spawn_failed[0].get("reason") == "brief_too_large"
+
+
+@pytest.mark.asyncio
+async def test_brief_at_size_cap_accepted(home: Path):
+    """Boundary case: brief exactly at MAX_BRIEF_BYTES should still
+    spawn (the cap is `>`, not `>=`). Locks the inclusive/exclusive
+    semantics so a future tightening doesn't silently break it."""
+    from mimir.spawn import MAX_BRIEF_BYTES
+    registry = _FakeRegistry()
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=lambda coro: coro.close(),
+        chain_on_complete=None,
+    )
+    at_cap_brief = "A" * MAX_BRIEF_BYTES
+    out = await tool_def.handler({
+        "brief": at_cap_brief, "working_dir": "/tmp",
+    })
+    assert out.get("is_error") is not True
+    assert len(registry.spawned) == 1
+
+
+# ─── claude_code_spawn_started event payload ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_started_event_carries_redacted_argv_for_postmortem(home: Path):
+    """The spawn_started event records the resolved cmd argv (with the
+    brief redacted to a brief_path pointer) so post-mortem ``what
+    flags did this spawn use?`` doesn't require greppin' the registry."""
+    registry = _FakeRegistry()
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=lambda coro: coro.close(),
+        chain_on_complete=None,
+    )
+    await tool_def.handler({
+        "brief": "secret-task-content-here",
+        "working_dir": "/tmp",
+        "agent": "code-implementer",
+        "max_turns": 50,
+        "model": "sonnet",
+    })
+    events = _read_events(home)
+    started = [e for e in events if e["type"] == "claude_code_spawn_started"]
+    assert len(started) == 1
+    payload = started[0]
+    assert "cmd_argv" in payload
+    cmd_argv = payload["cmd_argv"]
+    # All the resolved flags are present...
+    assert "--agent" in cmd_argv
+    assert cmd_argv[cmd_argv.index("--agent") + 1] == "code-implementer"
+    assert "--max-turns" in cmd_argv
+    assert cmd_argv[cmd_argv.index("--max-turns") + 1] == "50"
+    assert "--model" in cmd_argv
+    assert cmd_argv[cmd_argv.index("--model") + 1] == "sonnet"
+    # ...but the brief content is NOT — only a pointer to brief_path.
+    assert "secret-task-content-here" not in str(cmd_argv)
+    assert any("<brief at " in s for s in cmd_argv if isinstance(s, str))
+    # Resolved knobs surfaced as discrete fields too (lets log queries
+    # filter by them without parsing argv).
+    assert payload.get("resolved_max_turns") == 50
+    assert payload.get("resolved_model") == "sonnet"
+
+
 # ─── Completion path: 4 flavors ───────────────────────────────────────
 
 

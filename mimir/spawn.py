@@ -72,6 +72,16 @@ DEFAULT_AGENT = "code-implementer"
 DEFAULT_TIMEOUT_SEC = 3600
 GLOBAL_BUDGET_FALLBACK_USD = 10.0
 
+# Brief is passed as a single argv element to ``claude -p``. Linux's
+# per-element ``MAX_ARG_STRLEN`` is 128 KB on most kernels (32 *
+# PAGE_SIZE); a brief above that fails at ``execve`` with ``E2BIG`` and
+# a not-very-actionable error from Popen. Cap at 64 KB to leave headroom
+# for kernels with smaller PAGE_SIZE and to surface the failure with a
+# clear, actionable message before launch. If a future caller needs a
+# bigger brief, switch the spawn to read from a file via stdin or a
+# brief-path flag.
+MAX_BRIEF_BYTES = 64 * 1024
+
 
 def _parse_spawn_result_json(stdout_text: str) -> Optional[dict[str, Any]]:
     """Recover the final JSON object from a ``claude -p --output-format json``
@@ -367,6 +377,28 @@ def build_spawn_tool(
         working_dir = _need(args, "working_dir")
         agent_name = args.get("agent") or DEFAULT_AGENT
         branch = args.get("branch")
+        # Reject huge briefs before spawn so the caller sees an
+        # actionable error, not an opaque ``[Errno 7] argument list
+        # too long`` from execve. See MAX_BRIEF_BYTES note above.
+        brief_bytes = len(brief.encode("utf-8"))
+        if brief_bytes > MAX_BRIEF_BYTES:
+            await log_event(
+                "claude_code_spawn_spawn_failed",
+                agent=agent_name,
+                working_dir=working_dir,
+                error=f"brief too large: {brief_bytes} bytes > {MAX_BRIEF_BYTES}",
+                reason="brief_too_large",
+                brief_bytes=brief_bytes,
+            )
+            return _content_block(
+                f"spawn_claude_code failed to launch: brief is "
+                f"{brief_bytes} bytes (max {MAX_BRIEF_BYTES}). "
+                f"Briefs are passed as a single argv element to "
+                f"``claude -p`` and would exceed Linux's per-element "
+                f"limit. Trim the brief, or split into a setup brief "
+                f"plus follow-up work.",
+                is_error=True,
+            )
         timeout_sec = int(args.get("timeout_sec") or DEFAULT_TIMEOUT_SEC)
         defaults = PROFILE_DEFAULTS.get(agent_name, {})
         budget_arg = args.get("max_budget_usd")
@@ -511,6 +543,17 @@ def build_spawn_tool(
                 is_error=True,
             )
 
+        # Redact the brief out of the argv before logging — the brief
+        # itself can be tens of KB and lives at brief_path. Replace the
+        # element with a pointer so post-mortem grep sees the flag set
+        # ("--agent foo --max-budget-usd 25 ...") without bloating
+        # events.jsonl.
+        cmd_argv_redacted = list(argv)
+        try:
+            brief_idx = cmd_argv_redacted.index(brief_text)
+            cmd_argv_redacted[brief_idx] = f"<brief at {brief_path}>"
+        except ValueError:
+            pass
         await log_event(
             "claude_code_spawn_started",
             job_id=job.job_id,
@@ -520,6 +563,9 @@ def build_spawn_tool(
             max_budget_usd=max_budget_usd,
             timeout_sec=timeout_sec,
             channel_id=channel_id,
+            cmd_argv=cmd_argv_redacted,
+            resolved_model=str(model_arg) if model_arg else None,
+            resolved_max_turns=int(max_turns_arg) if max_turns_arg is not None else None,
         )
 
         return _content_block(
