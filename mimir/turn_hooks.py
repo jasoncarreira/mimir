@@ -326,6 +326,73 @@ class IndexRebuildHook(TurnLifecycleHook):
         await self._indexes.flush()
 
 
+_WIKI_GENERATED_OUTPUTS = frozenset({
+    "orphans.md",
+    "dangling-links.md",
+    "backlinks-index.md",
+})
+
+
+class WikiBacklinksHook(TurnLifecycleHook):
+    """Regenerate ``state/wiki/{orphans,dangling-links,backlinks-index}.md``
+    when any *content* page under ``state/wiki/`` was modified during this
+    turn. Runs the same code as ``mimir wiki backlinks``, so the algedonic
+    ``wiki_backlinks_unhealthy`` event surfaces orphan/dangling regressions
+    on the turn that introduced them — no operator-discipline dependency,
+    no periodic-cron latency.
+
+    Edit-triggered, not periodic: the failure modes (orphans, dangling
+    links) are caused by wiki *writes*, not by the passage of time.
+    Running on a schedule would lag the failure by up to the schedule
+    interval; running on every turn unconditionally would write the 3
+    generated outputs every turn (diff churn). The mtime check threads
+    that needle — only run when at least one non-generated wiki page
+    is newer than the turn's start time.
+
+    Sits between ``IndexRebuildHook`` and ``GitCommitHook`` so the 3
+    regenerated outputs are part of the same git commit as the writes
+    that triggered them.
+    """
+
+    name = "wiki_backlinks"
+
+    def __init__(self, home) -> None:
+        self._home = home
+
+    async def finalize(self, ctx, event, record):
+        wiki = self._home / "state" / "wiki"
+        if not wiki.is_dir():
+            return
+        # Did any content page get touched this turn? Iterate generously
+        # — typical wiki has 30-60 small markdown files; stat() is fast
+        # and we exit on the first hit.
+        touched = False
+        for page in wiki.rglob("*.md"):
+            if page.name in _WIKI_GENERATED_OUTPUTS:
+                # Skip our own outputs — without this, regenerating
+                # them on turn N would trigger another regen on turn
+                # N+1 ad infinitum even on turns that didn't touch
+                # any other wiki content.
+                continue
+            try:
+                mtime = page.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > ctx.started_at:
+                touched = True
+                break
+        if not touched:
+            return
+        from . import wiki_backlinks
+
+        try:
+            await wiki_backlinks.run(self._home)
+        except FileNotFoundError:
+            # Wiki dir disappeared between the rglob and run() —
+            # benign race; nothing to regenerate.
+            return
+
+
 class GitCommitHook(TurnLifecycleHook):
     """PR 4a: post-turn git commit + debounced push (gated on
     ``MIMIR_GIT_TRACKING_ENABLED``). Runs after the index rebuild so

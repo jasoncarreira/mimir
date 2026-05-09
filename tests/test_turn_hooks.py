@@ -325,3 +325,90 @@ async def test_plan_quota_capture_hook_swallows_capture_exception():
         _make_ctx(), _make_event(),
         messages=[], output="", error=None, options=object(),
     )
+
+
+# ─── WikiBacklinksHook ───────────────────────────────────────────────
+
+
+def _wiki_ctx_at(t: float) -> TurnContext:
+    """TurnContext with ``started_at`` set to a specific epoch — so a
+    page mtime can be deterministically before/after."""
+    return TurnContext(
+        turn_id="t1",
+        session_id="c-1",
+        trigger="user_message",
+        channel_id="c-1",
+        started_at=t,
+    )
+
+
+@pytest.mark.asyncio
+async def test_wiki_backlinks_hook_regenerates_on_wiki_edit(tmp_path: Path):
+    """When a content page under state/wiki/ was modified after
+    ``ctx.started_at``, the hook regenerates the 3 derived outputs."""
+    from mimir.turn_hooks import WikiBacklinksHook
+
+    wiki = tmp_path / "state" / "wiki"
+    (wiki / "concepts").mkdir(parents=True)
+    page = wiki / "concepts" / "foo.md"
+    page.write_text("# Foo with [[ghost]] dangling link\n", encoding="utf-8")
+
+    # Turn started 60s before the page was last touched — page mtime
+    # is current wall-clock; started_at is wall-clock - 60s.
+    import time as _time
+    ctx = _wiki_ctx_at(_time.time() - 60)
+
+    hook = WikiBacklinksHook(home=tmp_path)
+    await hook.finalize(ctx, _make_event(), _make_record())
+
+    assert (wiki / "orphans.md").exists()
+    assert (wiki / "dangling-links.md").exists()
+    assert (wiki / "backlinks-index.md").exists()
+    # foo.md is orphaned (no inbound) and references a ghost page.
+    assert "foo" in (wiki / "orphans.md").read_text()
+    assert "ghost" in (wiki / "dangling-links.md").read_text()
+
+
+@pytest.mark.asyncio
+async def test_wiki_backlinks_hook_skips_when_only_outputs_changed(tmp_path: Path):
+    """If the only mtime-after-started_at files are the 3 generated
+    outputs themselves, the hook must NOT re-fire — else every turn
+    after the first wiki edit would regenerate forever."""
+    from mimir.turn_hooks import WikiBacklinksHook
+
+    wiki = tmp_path / "state" / "wiki"
+    (wiki / "concepts").mkdir(parents=True)
+    # Stable content page, mtime in the past.
+    page = wiki / "concepts" / "foo.md"
+    page.write_text("# Foo\n", encoding="utf-8")
+    import os as _os
+    import time as _time
+    past = _time.time() - 3600
+    _os.utime(page, (past, past))
+
+    # Generated outputs touched "now" — simulating a prior turn just
+    # regenerated them.
+    for name in ("orphans.md", "dangling-links.md", "backlinks-index.md"):
+        (wiki / name).write_text("stale\n", encoding="utf-8")
+
+    # Turn started 30 minutes ago — outputs are newer, content isn't.
+    ctx = _wiki_ctx_at(_time.time() - 1800)
+
+    hook = WikiBacklinksHook(home=tmp_path)
+    await hook.finalize(ctx, _make_event(), _make_record())
+
+    # Outputs were NOT overwritten — stale content survives because
+    # the hook skipped the regen entirely.
+    assert (wiki / "orphans.md").read_text() == "stale\n"
+    assert (wiki / "dangling-links.md").read_text() == "stale\n"
+    assert (wiki / "backlinks-index.md").read_text() == "stale\n"
+
+
+@pytest.mark.asyncio
+async def test_wiki_backlinks_hook_no_op_when_no_wiki_dir(tmp_path: Path):
+    """A home with no state/wiki/ at all → no error, no work."""
+    from mimir.turn_hooks import WikiBacklinksHook
+
+    hook = WikiBacklinksHook(home=tmp_path)
+    # No raise.
+    await hook.finalize(_wiki_ctx_at(0.0), _make_event(), _make_record())

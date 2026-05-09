@@ -108,6 +108,7 @@ from .turn_hooks import (
     RateLimitObserverHook,
     SubagentLifecycleHook,
     TurnLifecycleHook,
+    WikiBacklinksHook,
     fire_finalize,
     fire_on_message,
     fire_post_query,
@@ -818,6 +819,7 @@ class Agent:
             ),
             PostMessageSagaHook(hook_fn=self._post_message_hook),
             IndexRebuildHook(indexes=self._indexes),
+            WikiBacklinksHook(home=self._config.home),
             GitCommitHook(
                 home=self._config.home,
                 enabled=self._config.git_tracking_enabled,
