@@ -404,12 +404,24 @@ def test_evaluate_quota_derived_5h_under_90_does_not_suppress():
     )
 
 
-def test_evaluate_quota_derived_5h_at_90_suppresses():
-    """Derived 5h at 0.90 — at the looser threshold, suppresses."""
+def test_evaluate_quota_derived_5h_above_90_suppresses():
+    """Derived 5h above the 0.90 threshold suppresses. Tests with
+    0.92 (>= threshold by 2pp) to leave room for any future tightening
+    of the threshold and to keep the test from flapping on a `>` vs
+    `>=` boundary edit."""
     provider = _FakeProvider("anthropic", [_w_derived("five_hour", 0.92)])
     result = evaluate_quota([provider])
     assert result.suppress is True
     assert "five_hour@0.92" in result.reason
+
+
+def test_evaluate_quota_derived_5h_at_threshold_boundary_suppresses():
+    """Locks the inclusive boundary: 0.90 (== threshold) trips. If the
+    `>=` semantics ever flip to `>`, this test catches it."""
+    provider = _FakeProvider("anthropic", [_w_derived("five_hour", 0.90)])
+    result = evaluate_quota([provider])
+    assert result.suppress is True
+    assert "five_hour@0.90" in result.reason
 
 
 def test_evaluate_quota_direct_5h_at_85_still_suppresses():

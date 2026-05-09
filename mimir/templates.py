@@ -320,7 +320,19 @@ def _session_has_atoms(turns_window: list[dict]) -> bool:
     """True iff at least one turn in the session cited a SAGA atom.
     Drives the lean-vs-full synthesis-prompt selection (chainlink #7):
     when False, the synthesis turn doesn't need the contribution-credit
-    scaffolding because there's nothing to credit."""
+    scaffolding because there's nothing to credit.
+
+    Note: ``saga_atom_ids`` is the union of pre-injected (S3 retrieval
+    via the pre-message hook) and mid-turn-queried (saga_query) atoms.
+    Storage-only turns — turns that called ``saga_store`` to create
+    new atoms but never queried/cited any — register as zero atoms
+    here, so the lean path fires for them. This is intentional:
+    the contribution-credit scoring is about marking RETRIEVALS as
+    useful/incorrect/stale (atom utility for future surfacing); a turn
+    that only stored has nothing to score, so the lean prompt is
+    correct. New atoms are the agent's own writes — saga's own
+    pipelines (consolidation, decay) handle their lifecycle, not
+    the synthesis pass."""
     for t in turns_window:
         atoms = t.get("saga_atom_ids") or []
         if atoms:

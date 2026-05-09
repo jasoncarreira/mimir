@@ -229,9 +229,16 @@ DEFAULT_ON_PACE_SUPPRESS_5H = 0.90
 DEFAULT_ON_PACE_SUPPRESS_7D = 0.95
 # chainlink #17: derived 5h utilization (cost-rate-back-derived during
 # endpoint glitches) gets a looser raw-suppress threshold than direct
-# readings. The estimator rounds to 5pp and assumes a flat 1.4x
-# 5h:7d quota ratio — both approximations. 90% accommodates the slop
-# without giving up the suppression signal entirely on long glitches.
+# readings. The estimator rounds to 5pp + uses an empirical ~10× 5h:7d
+# back-derive factor (``QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT`` in
+# mimir/oauth_usage_poller.py). 90% accommodates the slop without
+# giving up the suppression signal entirely on long glitches.
+#
+# Coupling note: this threshold and the back-derive factor both encode
+# the trust we extend to derived values. If the factor changes
+# (different plan tier, telemetry-confirmed re-calibration via
+# ``MIMIR_QUOTA_5H_BACKDERIVE_FACTOR``), the variance band of the
+# derived estimate shifts and this threshold may need to move with it.
 DEFAULT_RAW_SUPPRESS_DERIVED = 0.90
 
 

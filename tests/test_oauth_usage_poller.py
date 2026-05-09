@@ -785,36 +785,91 @@ def _seed_turns(path: Path, *, recent_costs: list[float], older_costs: list[floa
 
 
 def test_derive_5h_basic_math(tmp_path: Path):
-    """5h cost $50, 7d cost $200, prior_7d=0.50 →
-    back_derived_quota=$400 → estimated=(50*1.4)/400=0.175 → round to 0.20."""
+    """Math-shape test, factor pinned explicitly so test math is
+    decoupled from the production default. 5h_cost=$20, 7d_cost=$500,
+    prior_7d=0.50, factor=10 → back_derived_quota=$1000 →
+    estimated = 20×10/1000 = 0.20 (no rounding)."""
     from mimir.oauth_usage_poller import derive_5h_from_cost
     path = tmp_path / "turns.jsonl"
-    _seed_turns(path, recent_costs=[50.0], older_costs=[150.0])
-    out = derive_5h_from_cost(path, prior_7d_utilization=0.50)
+    _seed_turns(path, recent_costs=[20.0], older_costs=[480.0])
+    out = derive_5h_from_cost(
+        path, prior_7d_utilization=0.50, backderive_factor=10.0,
+    )
     assert out == pytest.approx(0.20, abs=1e-6)
 
 
 def test_derive_5h_rounds_to_5pp(tmp_path: Path):
-    """0.14 (= (50*1.4)/(200/0.4)) → round to 0.15. 0.28 → 0.30."""
+    """Round-to-5pp shape, factor=10. 5h_cost=$20, 7d_cost=$500.
+    prior_7d=0.40 → 0.16 → 0.15;  prior_7d=0.80 → 0.32 → 0.30."""
     from mimir.oauth_usage_poller import derive_5h_from_cost
     path = tmp_path / "turns.jsonl"
-    _seed_turns(path, recent_costs=[50.0], older_costs=[150.0])
-    assert derive_5h_from_cost(path, prior_7d_utilization=0.40) == pytest.approx(0.15)
-    assert derive_5h_from_cost(path, prior_7d_utilization=0.80) == pytest.approx(0.30)
+    _seed_turns(path, recent_costs=[20.0], older_costs=[480.0])
+    assert derive_5h_from_cost(
+        path, prior_7d_utilization=0.40, backderive_factor=10.0,
+    ) == pytest.approx(0.15)
+    assert derive_5h_from_cost(
+        path, prior_7d_utilization=0.80, backderive_factor=10.0,
+    ) == pytest.approx(0.30)
+
+
+def test_derive_5h_uses_env_default_factor(tmp_path: Path, monkeypatch):
+    """When ``backderive_factor=None``, the function reads the env or
+    falls back to ``QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT`` (=10.0)."""
+    from mimir.oauth_usage_poller import (
+        derive_5h_from_cost, QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT,
+    )
+    assert QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT == 10.0
+    monkeypatch.delenv("MIMIR_QUOTA_5H_BACKDERIVE_FACTOR", raising=False)
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[20.0], older_costs=[480.0])
+    assert derive_5h_from_cost(
+        path, prior_7d_utilization=0.50,
+    ) == pytest.approx(0.20)
+
+
+def test_derive_5h_env_override_factor(tmp_path: Path, monkeypatch):
+    """``MIMIR_QUOTA_5H_BACKDERIVE_FACTOR`` env var overrides the
+    default factor — operators on different plan tiers can re-calibrate
+    without a code change."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    monkeypatch.setenv("MIMIR_QUOTA_5H_BACKDERIVE_FACTOR", "5.0")
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[20.0], older_costs=[480.0])
+    # factor=5 instead of 10 → estimated halves: 0.20 → 0.10
+    assert derive_5h_from_cost(
+        path, prior_7d_utilization=0.50,
+    ) == pytest.approx(0.10)
+
+
+def test_derive_5h_invalid_env_falls_back_to_default(
+    tmp_path: Path, monkeypatch,
+):
+    """Garbage env values warn + fall back to the default. Protects
+    against typos silently killing the estimator (e.g. operator
+    sets ``MIMIR_QUOTA_5H_BACKDERIVE_FACTOR=ten``)."""
+    from mimir.oauth_usage_poller import derive_5h_from_cost
+    monkeypatch.setenv("MIMIR_QUOTA_5H_BACKDERIVE_FACTOR", "not-a-number")
+    path = tmp_path / "turns.jsonl"
+    _seed_turns(path, recent_costs=[20.0], older_costs=[480.0])
+    # Falls back to default 10.0 → 0.20
+    assert derive_5h_from_cost(
+        path, prior_7d_utilization=0.50,
+    ) == pytest.approx(0.20)
 
 
 def test_derive_5h_clamps_to_one(tmp_path: Path):
     """Pathological case: 5h spend dominates the 7d window AND
     prior_7d_util is near saturation → math overshoots 100%, must
-    clamp. Construction: 5h=$1000, 7d=$1100, prior_7d=0.99 →
-    back_derived=$1111 → estimated=1000*1.4/1111=1.26 → clamp 1.0.
-    (Bounded by the math: estimated > 1 requires
-    5h_cost * 1.4 * prior_7d_util > 7d_cost, which means we need a
-    near-saturated 7d AND most of the 7d spend in the last 5h.)"""
+    clamp. With factor=10, 5h=$200, 7d=$210, prior_7d=0.99 →
+    back_derived=$212 → estimated=200×10/212=9.4 → clamp 1.0.
+    (Bounded by the math: estimated > 1 requires 5h_cost × FACTOR
+    × prior_7d_util > 7d_cost.)"""
     from mimir.oauth_usage_poller import derive_5h_from_cost
     path = tmp_path / "turns.jsonl"
-    _seed_turns(path, recent_costs=[1000.0], older_costs=[100.0])
-    assert derive_5h_from_cost(path, prior_7d_utilization=0.99) == pytest.approx(1.0)
+    _seed_turns(path, recent_costs=[200.0], older_costs=[10.0])
+    assert derive_5h_from_cost(
+        path, prior_7d_utilization=0.99, backderive_factor=10.0,
+    ) == pytest.approx(1.0)
 
 
 def test_derive_5h_returns_none_on_zero_prior_7d(tmp_path: Path):
@@ -869,9 +924,11 @@ async def test_record_usage_writes_derived_5h_on_anomaly(tmp_path: Path):
     from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
     import mimir.oauth_usage_poller as op
 
-    # Seed turns.jsonl: 5h=$50, 7d=$200, prior_7d=0.50 → 0.20 derived.
+    # Seed turns.jsonl: 5h=$20, 7d=$500. With the production
+    # back-derive factor (10×) and the new_7d=0.51 used after Mimir's
+    # PR #89 nit #2 fix, derived = 20 × 10 × 0.51 / 500 = 0.204 → 0.20.
     turns_path = tmp_path / "turns.jsonl"
-    _seed_turns(turns_path, recent_costs=[50.0], older_costs=[150.0])
+    _seed_turns(turns_path, recent_costs=[20.0], older_costs=[480.0])
 
     store_path = tmp_path / "rate_limits.json"
     store = RateLimitStore(path=store_path)
@@ -1037,7 +1094,7 @@ async def test_derived_snapshot_has_resets_at_none(tmp_path: Path):
     import time as _time
 
     turns_path = tmp_path / "turns.jsonl"
-    _seed_turns(turns_path, recent_costs=[50.0], older_costs=[150.0])
+    _seed_turns(turns_path, recent_costs=[20.0], older_costs=[480.0])
 
     store = RateLimitStore(path=tmp_path / "rl.json")
     # Prior 5h has a future resets_at — even when "just inheriting"

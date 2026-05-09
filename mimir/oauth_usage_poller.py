@@ -504,17 +504,65 @@ ANOMALY_5H_JUMP_PP = 0.50   # 5h utilization rise that triggers cross-check
 ANOMALY_7D_DELTA_PP = 0.05  # 7d delta below this confirms the 5h jump is bogus
 
 # chainlink #17 (CR#22 layer b): cost-rate-back-derived 5h estimator.
-# Anthropic's stated 5h-to-7d quota ratio for the Max plan is roughly
-# 1.4x — i.e., the 5h quota dollar-budget is 1.4x what 5h's pro-rata
-# (5/168) share of the 7d quota would predict. Confirmed empirically
-# from observed reset timings on the Max-20x plan. This is a flat
-# scaling constant; the 5h:7d ratio doesn't vary with utilization.
-QUOTA_RATIO_5H_TO_7D = 1.4
+#
+# The factor encodes how much smaller the 5h dollar-budget is than the
+# 7d budget on a Max-20x plan. Two empirical samples (2026-05-09):
+#
+#   sample 1 (21:54Z): 5h_util=0.20, 5h_cost=$247.70,
+#       7d_util=0.23, 7d_cost=$2608.21
+#       → factor = 0.20 × (2608.21/0.23) / 247.70 ≈ 9.18
+#
+#   sample 2 (22:03Z): 5h_util=0.23, 5h_cost=$263.14,
+#       7d_util=0.23, 7d_cost=$2623.65
+#       → factor = 0.23 × (2623.65/0.23) / 263.14 ≈ 9.97
+#
+# Both bracket ~10×, consistent with Anthropic's published shape on
+# the Max-20x plan ("5h cap fits ~5h of Sonnet 4 nonstop; 7d cap fits
+# ~50-70h" → 7d/5h_quota ≈ 10-14×). The earlier "1.4× pro-rata"
+# claim from chainlink #17's spec was wrong — Mimir's PR #89 review
+# (2026-05-09) caught the formula/docstring divergence + did the
+# empirical back-derivation that led to this corrected constant.
+#
+# Equivalent interpretation: 5h_quota_$ ≈ 7d_quota_$ / FACTOR. The
+# formula in derive_5h_from_cost uses this directly:
+# ``estimated_5h_util = (5h_cost × FACTOR) / 7d_quota_$`` is just
+# ``5h_cost / 5h_quota_$`` rewritten.
+#
+# Operator override: ``MIMIR_QUOTA_5H_BACKDERIVE_FACTOR`` env var.
+# Re-derive against fresh telemetry on plan-tier changes. The constant
+# couples directly to ``DEFAULT_RAW_SUPPRESS_DERIVED`` in
+# mimir/billing.py — both encode trust in derived values; if the
+# factor's accuracy band shifts (different plan, different
+# telemetry-confirmed value), the suppress threshold may need to
+# move with it.
+QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT = 10.0
 # Round derived utilization to nearest 5pp. Acknowledges the math is
-# approximate (back-derived 7d quota dollars + flat 1.4x assumption +
-# turns.jsonl cost aggregation slop) without being so coarse that
-# 0.78→0.82 transitions get smeared into the same bucket.
+# approximate (back-derived 7d quota dollars + flat factor + turns.jsonl
+# cost aggregation slop) without being so coarse that 0.78→0.82
+# transitions get smeared into the same bucket.
 DERIVE_ROUND_STEP = 0.05
+
+
+def _resolve_backderive_factor() -> float:
+    """Resolve ``MIMIR_QUOTA_5H_BACKDERIVE_FACTOR`` env override or
+    fall back to the empirical default. Empty / non-positive / non-
+    numeric values fall back with a warning so a typo doesn't silently
+    kill the estimator."""
+    raw = os.environ.get("MIMIR_QUOTA_5H_BACKDERIVE_FACTOR", "").strip()
+    if not raw:
+        return QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT
+    try:
+        v = float(raw)
+        if v > 0:
+            return v
+    except ValueError:
+        pass
+    log.warning(
+        "MIMIR_QUOTA_5H_BACKDERIVE_FACTOR=%r invalid (expected positive "
+        "float); falling back to default %s",
+        raw, QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT,
+    )
+    return QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT
 
 
 def detect_5h_anomaly(
@@ -564,25 +612,31 @@ def derive_5h_from_cost(
     turns_log_path: Path,
     *,
     prior_7d_utilization: float,
-    ratio_5h_to_7d_quota: float = QUOTA_RATIO_5H_TO_7D,
+    backderive_factor: float | None = None,
 ) -> float | None:
     """Estimate 5h utilization from observed cost when the endpoint
     reading is unavailable / anomalous (chainlink #17 CR#22 layer b).
 
     Math::
 
-        back_derived_7d_quota_dollars  = observed_7d_cost / prior_7d_util
-        estimated_5h_util              = (observed_5h_cost * 1.4)
-                                       / back_derived_7d_quota_dollars
+        back_derived_7d_quota_$ = observed_7d_cost / observed_7d_util
+        estimated_5h_util       = (observed_5h_cost × FACTOR)
+                                / back_derived_7d_quota_$
 
-    The flat 1.4x ratio is Anthropic's published 5h:7d quota scaling
-    on the Max plan (and confirmed empirically). Output is clamped to
-    ``[0, 1]`` and rounded to the nearest 5pp so it's a stable signal
-    rather than jitter.
+    Where ``FACTOR ≈ 10`` (= ``QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT``)
+    encodes the empirical 5h:7d dollar-budget ratio on the Max-20x
+    plan: 5h_quota_$ ≈ 7d_quota_$ / 10. See the constant's block
+    comment for empirical derivation + override env var.
+
+    ``backderive_factor=None`` reads the env-resolved value; tests
+    pass an explicit value to pin the math.
+
+    Output is clamped to ``[0, 1]`` and rounded to the nearest 5pp
+    so it's a stable signal rather than jitter.
 
     Returns ``None`` when the math can't run:
-      - ``prior_7d_utilization`` outside ``(0, 1]`` (zero / negative /
-        impossibly-large; without it, back-deriving the 7d quota
+      - ``prior_7d_utilization`` outside ``(0, 1]`` (zero / negative
+        / impossibly-large; without it, back-deriving the 7d quota
         dollar-budget is impossible)
       - turns.jsonl missing or zero observed 7d cost (back-derived
         quota would be 0 or undefined)
@@ -594,11 +648,17 @@ def derive_5h_from_cost(
     """
     if not (0.0 < prior_7d_utilization <= 1.0):
         return None
+    factor = (
+        backderive_factor if backderive_factor is not None
+        else _resolve_backderive_factor()
+    )
+    if factor <= 0:
+        return None
     try:
-        # Avoid the import cycle: aggregate_usage is mimir-internal
-        # and importing at module top would pull turns_log_path
-        # through the poller's startup. Late-bind keeps the poller's
-        # cold-start unchanged.
+        # Lazy import: defers the (cheap but non-zero) module load
+        # off the poller's cold-start path. ``usage_stats`` doesn't
+        # import this module so there's no cycle to avoid; the late
+        # bind is purely about startup-time hygiene.
         from .usage_stats import aggregate
         report = aggregate(
             turns_log_path,
@@ -618,7 +678,7 @@ def derive_5h_from_cost(
     back_derived_7d_quota = last_7d_cost / prior_7d_utilization
     if back_derived_7d_quota <= 0:
         return None
-    estimated = (last_5h_cost * ratio_5h_to_7d_quota) / back_derived_7d_quota
+    estimated = (last_5h_cost * factor) / back_derived_7d_quota
     estimated = max(0.0, min(1.0, estimated))
     # Round to nearest DERIVE_ROUND_STEP, half-up. Two issues with the
     # naive ``round(x / step) * step``: (1) Python's banker's rounding
@@ -716,16 +776,29 @@ async def record_usage(
             # (no turns_log wired, no observable 7d cost, no prior 7d
             # utilization), the prior trusted value persists — current
             # layer-(a) behavior.
+            # Prefer the just-arrived 7d reading (Mimir's PR #89 nit
+            # #2): the layer-(a) cross-check above only fires when the
+            # 7d half moved <5pp, which means the 7d side of THIS
+            # poll's payload is presumed trustworthy — anomaly is
+            # specifically the 5h jump unmatched by 7d. Using the
+            # fresher reading gives a sharper back-derived quota.
+            # Fall back to prior_7d when new_7d is missing (rare —
+            # 7d-less response).
+            seven_day_for_derive = (
+                new_7d if (new_7d is not None
+                           and new_7d.utilization is not None)
+                else prior_7d
+            )
             derived_util = None
             if (
                 cfg is not None
                 and cfg.turns_log_path is not None
-                and prior_7d is not None
-                and prior_7d.utilization is not None
+                and seven_day_for_derive is not None
+                and seven_day_for_derive.utilization is not None
             ):
                 derived_util = derive_5h_from_cost(
                     cfg.turns_log_path,
-                    prior_7d_utilization=prior_7d.utilization,
+                    prior_7d_utilization=seven_day_for_derive.utilization,
                 )
             if derived_util is not None:
                 # ``resets_at=None`` is unconditional for derived
@@ -744,8 +817,18 @@ async def record_usage(
                 # window-timing as "no time signal" (on-pace
                 # projection is already skipped for derived in
                 # AnthropicQuotaProvider).
+                # Status reflects the derived value rather than a
+                # fixed string (Mimir's PR #89 nit #3): "allowed" when
+                # below the warn threshold, "allowed_warning" once the
+                # value crosses it. Mirrors what an endpoint reading
+                # would carry; prevents downstream consumers that key
+                # off ``status`` from being misled when the derived
+                # value is low.
+                derived_status = (
+                    "allowed_warning" if derived_util >= 0.50 else "allowed"
+                )
                 derived_snap = RateLimitSnapshot(
-                    status="allowed_warning",
+                    status=derived_status,
                     utilization=derived_util,
                     resets_at=None,
                     observed_at=datetime.now(tz=timezone.utc).isoformat(),
@@ -762,7 +845,14 @@ async def record_usage(
                     await log_event(
                         "quota_5h_derived",
                         utilization=derived_util,
-                        prior_7d_utilization=prior_7d.utilization,
+                        seven_day_utilization=(
+                            seven_day_for_derive.utilization
+                            if seven_day_for_derive is not None else None
+                        ),
+                        seven_day_source=(
+                            "new" if seven_day_for_derive is new_7d
+                            else "prior"
+                        ),
                         anomaly_reason=anomaly_reason,
                     )
                     recorded[window_type] = {
