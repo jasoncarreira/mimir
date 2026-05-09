@@ -326,6 +326,116 @@ class IndexRebuildHook(TurnLifecycleHook):
         await self._indexes.flush()
 
 
+_WIKI_GENERATED_OUTPUTS = frozenset({
+    "orphans.md",
+    "dangling-links.md",
+    "backlinks-index.md",
+})
+
+
+class WikiBacklinksHook(TurnLifecycleHook):
+    """Regenerate ``state/wiki/{orphans,dangling-links,backlinks-index}.md``
+    when any *content* page under ``state/wiki/`` was modified during this
+    turn. Runs the same code as ``mimir wiki backlinks``, so the algedonic
+    ``wiki_backlinks_unhealthy`` event surfaces orphan/dangling regressions
+    on the turn that introduced them — no operator-discipline dependency,
+    no periodic-cron latency.
+
+    Edit-triggered, not periodic: the failure modes (orphans, dangling
+    links) are caused by wiki *writes*, not by the passage of time.
+    Running on a schedule would lag the failure by up to the schedule
+    interval; running on every turn unconditionally would write the 3
+    generated outputs every turn (constant diff churn). The mtime
+    snapshot threads that needle — only run when at least one
+    non-generated wiki page changed mtime relative to the snapshot.
+
+    Detection works via a pre_query → finalize mtime diff: pre_query
+    records ``{path: mtime}`` for every wiki page; finalize re-stats
+    and looks for any page whose mtime moved (or any new/removed
+    page). Both reads are wall-clock ``st_mtime``, so no clock-domain
+    mismatch (``ctx.started_at`` is ``time.monotonic()`` and is NOT
+    safe to compare against ``st_mtime`` directly — that comparison
+    would always return True on a process running for more than the
+    Unix epoch in monotonic seconds, which is "always" in practice).
+
+    Runs **before** ``IndexRebuildHook`` so ``state/INDEX.md`` reflects
+    the freshly-regenerated outputs on the same turn (rather than
+    lagging by one turn). Runs **before** ``GitCommitHook`` so the 3
+    regenerated outputs are part of the same git commit as the writes
+    that triggered them.
+
+    Loop-safety: the 3 generated outputs land at the wiki *root*
+    (``state/wiki/orphans.md`` etc.); IndexRebuildHook's outputs
+    (``memory/INDEX.md``, ``state/INDEX.md``, ``state/wiki/index.md``)
+    are either outside ``state/wiki/`` or in the wiki backlinks
+    ``_META_FILENAMES`` exclusion set, so neither writes back into
+    files this hook tracks.
+    """
+
+    name = "wiki_backlinks"
+
+    def __init__(self, home) -> None:
+        self._home = home
+
+    def _snapshot_mtimes(self) -> dict[str, float]:
+        """Walk the wiki, return ``{absolute_path_str: st_mtime}`` for
+        every non-generated content page. Uses absolute path as the
+        key so finalize's lookup matches even if cwd shifts.
+        Empty dict when the wiki dir doesn't exist."""
+        wiki = self._home / "state" / "wiki"
+        snapshot: dict[str, float] = {}
+        if not wiki.is_dir():
+            return snapshot
+        for page in wiki.rglob("*.md"):
+            if page.name in _WIKI_GENERATED_OUTPUTS:
+                continue
+            try:
+                snapshot[str(page)] = page.stat().st_mtime
+            except OSError:
+                continue
+        return snapshot
+
+    async def pre_query(self, ctx, event):
+        # Snapshot mtimes BEFORE the SDK loop runs. Stored on ctx (NOT
+        # on self) so concurrent turns on different channels don't
+        # share state — the multi-channel-correctness invariant from
+        # CR#15.
+        ctx.wiki_mtime_snapshot = self._snapshot_mtimes()
+
+    async def finalize(self, ctx, event, record):
+        wiki = self._home / "state" / "wiki"
+        if not wiki.is_dir():
+            return
+        before: dict[str, float] = getattr(ctx, "wiki_mtime_snapshot", {})
+        after = self._snapshot_mtimes()
+
+        # Touched if any of:
+        #   - new page added (in `after` but not `before`)
+        #   - existing page mtime changed
+        #   - page removed (in `before` but not `after`)
+        # Iteration short-circuits on first hit.
+        touched = False
+        for path_str, mtime in after.items():
+            if before.get(path_str) != mtime:
+                touched = True
+                break
+        if not touched:
+            for path_str in before:
+                if path_str not in after:
+                    touched = True
+                    break
+        if not touched:
+            return
+
+        from . import wiki_backlinks
+        try:
+            await wiki_backlinks.run(self._home)
+        except FileNotFoundError:
+            # Wiki dir disappeared between the snapshot and run() —
+            # benign race; nothing to regenerate.
+            return
+
+
 class GitCommitHook(TurnLifecycleHook):
     """PR 4a: post-turn git commit + debounced push (gated on
     ``MIMIR_GIT_TRACKING_ENABLED``). Runs after the index rebuild so
