@@ -8,6 +8,7 @@ import pytest
 
 from mimir._paths import (
     PathOutsideHomeError,
+    claude_code_persisted_output_root,
     resolve_home_path,
     resolve_within_roots,
 )
@@ -126,3 +127,74 @@ def test_multi_root_dotdot_escape_caught_via_resolve(tmp_path: Path):
     # ``../../etc/passwd`` walks past every root → rejected.
     with pytest.raises(PathOutsideHomeError):
         resolve_within_roots([home, workspace], "../../etc/passwd")
+
+
+# ─── claude_code_persisted_output_root — overflow Read auto-allow ────
+
+
+def test_persisted_output_root_returns_dir_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """When Claude Code's projects dir exists, return it."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    cc_projects = fake_home / ".claude" / "projects"
+    cc_projects.mkdir(parents=True)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    out = claude_code_persisted_output_root()
+    assert out == cc_projects
+
+
+def test_persisted_output_root_returns_path_eagerly_when_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """When the projects dir doesn't exist yet (fresh container, no
+    overflow yet), still return the expected path — caller adds it
+    to ``extra_roots`` unconditionally so the very first overflow
+    Read after startup resolves rather than being denied. Claude
+    Code lazy-creates the dir on first overflow; pre-creation by us
+    isn't needed (``resolve_within_roots`` is a prefix check)."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    out = claude_code_persisted_output_root()
+    assert out == fake_home / ".claude" / "projects"
+    assert not out.exists()  # confirms eager-return — caller still gets a usable root
+
+
+def test_persisted_output_root_honors_claude_config_dir_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """``CLAUDE_CONFIG_DIR`` overrides the ``~/.claude`` default —
+    the SDK uses this to relocate session state, and the projects
+    dir lives under the override too."""
+    custom = tmp_path / "custom-claude"
+    cc_projects = custom / "projects"
+    cc_projects.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+
+    out = claude_code_persisted_output_root()
+    assert out == cc_projects
+
+
+def test_persisted_output_root_works_with_real_pre_tool_hook(
+    tmp_path: Path,
+):
+    """Once added to the file-op roots, a Read of a path inside
+    Claude Code's projects dir resolves rather than raising. This
+    covers the end-to-end contract: hook receives the overflow
+    path the runtime reports, and lets it through."""
+    home = tmp_path / "home"
+    cc = tmp_path / "cc-projects"
+    home.mkdir()
+    cc.mkdir()
+    overflow = cc / "session-uuid" / "tool-results" / "abc123.txt"
+    overflow.parent.mkdir(parents=True)
+    overflow.write_text("the overflow content")
+
+    out = resolve_within_roots([home, cc], str(overflow))
+    assert out == overflow.resolve()
