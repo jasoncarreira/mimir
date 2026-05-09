@@ -373,3 +373,158 @@ def test_arbiter_pay_as_you_go_default_when_unspecified(tmp_path):
         turns_log=tmp_path / "turns.jsonl",
     )
     assert arb.billing_mode is BillingMode.PAY_AS_YOU_GO
+
+
+# ── chainlink #17: derived 5h gets a higher suppress threshold ──────
+
+
+def _w_derived(key: str, util: float | None) -> QuotaWindow:
+    """Variant of _w that flags the window derived=True. Locks the
+    chainlink #17 contract: derived windows skip the direct
+    raw-suppress threshold (0.80) for a looser one (0.90)."""
+    hours = 5.0 if key == "five_hour" else 168.0
+    return QuotaWindow(
+        key=key,
+        window_hours=hours,
+        utilization=util,
+        on_pace_utilization=None,
+        resets_at=None,
+        derived=True,
+    )
+
+
+def test_evaluate_quota_derived_5h_under_90_does_not_suppress():
+    """Derived 5h at 0.85 — would suppress under the direct 0.80
+    threshold, must NOT suppress under the derived 0.90 threshold."""
+    provider = _FakeProvider("anthropic", [_w_derived("five_hour", 0.85)])
+    result = evaluate_quota([provider])
+    assert result.suppress is False, (
+        f"derived 5h @0.85 should be under the 0.90 threshold, "
+        f"got: {result.reason}"
+    )
+
+
+def test_evaluate_quota_derived_5h_above_90_suppresses():
+    """Derived 5h above the 0.90 threshold suppresses. Tests with
+    0.92 (>= threshold by 2pp) to leave room for any future tightening
+    of the threshold and to keep the test from flapping on a `>` vs
+    `>=` boundary edit."""
+    provider = _FakeProvider("anthropic", [_w_derived("five_hour", 0.92)])
+    result = evaluate_quota([provider])
+    assert result.suppress is True
+    assert "five_hour@0.92" in result.reason
+
+
+def test_evaluate_quota_derived_5h_at_threshold_boundary_suppresses():
+    """Locks the inclusive boundary: 0.90 (== threshold) trips. If the
+    `>=` semantics ever flip to `>`, this test catches it."""
+    provider = _FakeProvider("anthropic", [_w_derived("five_hour", 0.90)])
+    result = evaluate_quota([provider])
+    assert result.suppress is True
+    assert "five_hour@0.90" in result.reason
+
+
+def test_evaluate_quota_direct_5h_at_85_still_suppresses():
+    """Invariant: chainlink #17 doesn't loosen direct 5h thresholds.
+    Direct 5h at 0.85 still trips the 0.80 wall."""
+    provider = _FakeProvider("anthropic", [_w("five_hour", 0.85, None)])
+    result = evaluate_quota([provider])
+    assert result.suppress is True
+    assert "five_hour@0.85" in result.reason
+
+
+def test_evaluate_quota_derived_propagates_through_anthropic_provider(tmp_path):
+    """End-to-end: a RateLimitSnapshot flagged derived=True flows
+    through AnthropicQuotaProvider.get_windows to a QuotaWindow
+    flagged derived=True, which then takes the looser threshold."""
+    from mimir.billing import AnthropicQuotaProvider
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import asyncio
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    snap = RateLimitSnapshot(
+        status="allowed_warning",
+        utilization=0.85,
+        observed_at="2026-05-09T00:00:00+00:00",
+        derived=True,
+    )
+    asyncio.run(store.record("five_hour", snap))
+
+    provider = AnthropicQuotaProvider(store)
+    windows = provider.get_windows()
+    five_hour_w = next(w for w in windows if w.key == "five_hour")
+    assert five_hour_w.derived is True
+    assert five_hour_w.utilization == pytest.approx(0.85)
+
+    # And evaluate_quota uses the looser threshold.
+    result = evaluate_quota([provider])
+    assert result.suppress is False, (
+        "derived 5h @0.85 must not suppress under the 0.90 threshold"
+    )
+
+
+# ── chainlink #17 self-review fixes ───────────────────────────────────
+
+
+def test_derived_5h_skips_on_pace_projection(tmp_path):
+    """Self-review fix: on-pace projection on a derived value is
+    methodologically broken — derived is a synthetic point estimate,
+    not a time-series sample. Extrapolating it forward via
+    project_window_end would (e.g.) treat a 0.85 value at minute 10
+    of a 5h window as a 5x burn rate and project past 1.0, tripping
+    the on-pace threshold spuriously. AnthropicQuotaProvider must
+    set on_pace_utilization=None for derived windows."""
+    from mimir.billing import AnthropicQuotaProvider
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import asyncio
+    import time as _time
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    # Derived snapshot, fresh observation, 5h window with 4h+ left.
+    # If projection ran, current_util / fraction_elapsed would be
+    # absurdly large.
+    asyncio.run(store.record("five_hour", RateLimitSnapshot(
+        status="allowed_warning",
+        utilization=0.85,
+        resets_at=int(_time.time()) + 4 * 3600,  # 4h remaining
+        observed_at="2026-05-09T00:00:00+00:00",
+        derived=True,
+    )))
+
+    provider = AnthropicQuotaProvider(store)
+    [w] = provider.get_windows()
+    assert w.derived is True
+    assert w.on_pace_utilization is None, (
+        "derived windows must skip on-pace projection — got "
+        f"{w.on_pace_utilization!r}"
+    )
+
+    # And evaluate_quota doesn't suppress (raw 0.85 < derived
+    # threshold 0.90, on-pace skipped).
+    result = evaluate_quota([provider])
+    assert result.suppress is False
+
+
+def test_direct_5h_still_projects_on_pace(tmp_path):
+    """Invariant: the on-pace skip is derived-only. Direct (non-derived)
+    snapshots still get on-pace projection — that's a useful early-warn
+    signal when the burn rate suggests we'll cross the wall."""
+    from mimir.billing import AnthropicQuotaProvider
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import asyncio
+    import time as _time
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    asyncio.run(store.record("five_hour", RateLimitSnapshot(
+        status="allowed",
+        utilization=0.50,
+        resets_at=int(_time.time()) + 4 * 3600,
+        observed_at="2026-05-09T00:00:00+00:00",
+        # derived defaults to False
+    )))
+    provider = AnthropicQuotaProvider(store)
+    [w] = provider.get_windows()
+    assert w.derived is False
+    # on_pace_utilization is computable (not None) — the projection
+    # ran. Exact value depends on window timing but it should exist.
+    # (Exact value isn't load-bearing for the test; presence is.)
