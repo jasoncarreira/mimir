@@ -36,6 +36,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from .event_logger import log_event
 from .models import AgentEvent
+from .pollers import PollerConfig, discover_pollers, run_poller
 from .saga_client import SagaClient, SagaError
 
 log = logging.getLogger(__name__)
@@ -315,6 +316,14 @@ class Scheduler:
         # entry → env-var-default-cron is used. See
         # ``SCHEDULER_CALLABLE_JOBS.md`` for the design.
         self._callables: dict[str, _CallableDef] = {}
+        # Pollers framework (chainlink #3). Discovered from
+        # ``<home>/.claude/skills/**/pollers.json`` at startup +
+        # on ``reload_pollers`` MCP tool. Skill directory drop is
+        # the only install path; no mimir release required to add
+        # a new poller. ``_pollers_dir`` is None until
+        # ``add_poller_jobs`` runs (most installs no-op cleanly).
+        self._pollers_dir: Path | None = None
+        self._pollers: dict[str, PollerConfig] = {}
 
     # ---- LLM-tick jobs ------------------------------------------------
 
@@ -606,6 +615,93 @@ class Scheduler:
         """Names of all registered callables. Used by add_schedule MCP
         tool validation and by the test harness."""
         return sorted(self._callables.keys())
+
+    # ---- Pollers framework (chainlink #3) ----------------------------
+
+    def add_poller_jobs(self, skills_dir: Path) -> int:
+        """Discover all pollers under ``skills_dir/**/pollers.json`` and
+        register each as an APScheduler cron job. Returns the number
+        of pollers successfully installed. Subsequent calls
+        (``reload_pollers``) wipe + re-discover.
+
+        Pollers fire as subprocesses; their stdout JSONL becomes
+        ``AgentEvent`` enqueues. See ``mimir/pollers.py`` for the
+        contract."""
+        self._pollers_dir = skills_dir
+        return self._reinstall_pollers()
+
+    async def reload_pollers(self) -> int:
+        """Re-scan the pollers directory and re-install. Called by the
+        ``mcp__mimir__reload_pollers`` MCP tool after the agent installs
+        a new skill. No-op (returns 0) when ``add_poller_jobs`` was
+        never called (no skills_dir wired)."""
+        if self._pollers_dir is None:
+            return 0
+        return await asyncio.to_thread(self._reinstall_pollers)
+
+    def _reinstall_pollers(self) -> int:
+        """Wipe + re-discover + re-register. Sync — runs on the
+        APScheduler thread or via ``to_thread`` from async callers."""
+        if self._pollers_dir is None:
+            return 0
+        # Drop existing poller jobs by id-prefix.
+        for job in list(self._scheduler.get_jobs()):
+            if job.id.startswith("poller:"):
+                try:
+                    self._scheduler.remove_job(job.id)
+                except Exception:  # noqa: BLE001 — JobLookupError, fine
+                    pass
+        self._pollers = {}
+
+        installed = 0
+        for poller in discover_pollers(self._pollers_dir):
+            try:
+                trigger = CronTrigger.from_crontab(poller.cron, timezone=UTC)
+            except (ValueError, KeyError) as exc:
+                log.warning(
+                    "poller_invalid_cron: %s — cron=%r error=%s",
+                    poller.name, poller.cron, exc,
+                )
+                continue
+            self._scheduler.add_job(
+                self._fire_poller,
+                trigger=trigger,
+                kwargs={"poller_name": poller.name},
+                id=f"poller:{poller.name}",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                # A poller that takes 65s and fires every minute would
+                # otherwise stack up; with max_instances=1+coalesce the
+                # next tick is dropped instead of overlapping. Same
+                # shape as our oauth-usage-poll registration.
+                misfire_grace_time=60,
+            )
+            self._pollers[poller.name] = poller
+            installed += 1
+        log.info("pollers reloaded: %d installed from %s", installed, self._pollers_dir)
+        return installed
+
+    async def _fire_poller(self, *, poller_name: str) -> None:
+        """APScheduler-side cron callback. Looks up the live PollerConfig
+        (re-fetched on each fire to reflect any reloads) and runs it.
+        Always logs a ``poller_fire_dropped`` event when the lookup
+        misses — should never happen but it's the diagnosable case."""
+        poller = self._pollers.get(poller_name)
+        if poller is None:
+            await log_event(
+                "poller_fire_dropped",
+                poller=poller_name,
+                reason="poller_not_in_registry",
+            )
+            return
+        await run_poller(poller, enqueue=self._enqueue)
+
+    def registered_pollers(self) -> list[str]:
+        """Names of all currently-registered pollers. Used by the
+        ``reload_pollers`` MCP tool to render the post-reload count
+        and by tests."""
+        return sorted(self._pollers.keys())
 
     # ---- SAGA consolidation cron -------------------------------------
 
