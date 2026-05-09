@@ -783,8 +783,11 @@ class Agent:
             message_buffer=message_buffer,
             session_boundary_log=self._session_boundary_log,
             turns_log=config.turns_log,
+            turn_logger=self._turn_logger,
             shell_jobs=self._shell_jobs,
             on_shell_job_complete=self._handle_shell_job_complete,
+            schedule_from_thread=self._schedule_from_thread,
+            mimir_home=config.home,
         )
 
         # Hooks layer mimir's path confinement + post-write reindex onto the
@@ -849,6 +852,25 @@ class Agent:
         return task
 
     # ─── Async shell-job completion bridge ──────────────────────────────
+
+    def _schedule_from_thread(self, coro) -> None:
+        """Late-bound bridge for code running in non-loop threads.
+
+        ``spawn_claude_code``'s completion handler runs on the registry's
+        waiter thread and needs to ``log_event`` / ``turn_logger.write``
+        from there. Mirrors ``_handle_shell_job_complete`` — silently
+        no-ops when no loop has been captured yet (e.g. waiter thread
+        fires before the first turn) or when the loop has closed.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception:
+            log.exception(
+                "schedule_from_thread failed to dispatch coroutine"
+            )
 
     def _handle_shell_job_complete(self, job: ShellJob) -> None:
         """Thread-safe bridge: a shell-job waiter thread invokes this when

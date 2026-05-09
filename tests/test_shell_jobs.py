@@ -141,6 +141,78 @@ def test_spawn_captures_channel_id(tmp_path: Path):
     assert job.snapshot()["channel_id"] == "discord-99"
 
 
+# ─── env_overlay + cwd (chainlink #60: spawn_claude_code uses these) ──
+
+
+def test_env_overlay_sets_value_visible_to_child(tmp_path: Path):
+    """``env_overlay={"FOO": "bar"}`` → child sees ``FOO=bar``."""
+    registry = _make_registry(tmp_path)
+    job = registry.spawn(
+        "echo $SHELL_JOB_TEST_VAR",
+        argv=["bash", "-c", "echo $SHELL_JOB_TEST_VAR"],
+        env_overlay={"SHELL_JOB_TEST_VAR": "from-overlay"},
+    )
+    _wait_until_done(registry, job.job_id)
+    out = registry.read_output(job.job_id)["stdout_tail"]
+    assert "from-overlay" in out
+
+
+def test_env_overlay_none_unsets_inherited_var(tmp_path: Path, monkeypatch):
+    """``env_overlay={"FOO": None}`` → child does NOT see ``FOO`` even
+    when the parent inherited one. The None-means-unset semantic is
+    load-bearing for ``spawn_claude_code``: ``CLAUDECODE`` is set in
+    mimir's container and must be stripped so the spawn doesn't think
+    it's nested in a parent Claude Code session."""
+    registry = _make_registry(tmp_path)
+    monkeypatch.setenv("SHELL_JOB_INHERIT_ME", "should-be-stripped")
+    job = registry.spawn(
+        "probe",
+        argv=[
+            "bash", "-c",
+            'if [ -n "${SHELL_JOB_INHERIT_ME+x}" ]; then echo SET; '
+            'else echo UNSET; fi',
+        ],
+        env_overlay={"SHELL_JOB_INHERIT_ME": None},
+    )
+    _wait_until_done(registry, job.job_id)
+    out = registry.read_output(job.job_id)["stdout_tail"]
+    assert "UNSET" in out
+    assert "SET" not in out.replace("UNSET", "")
+
+
+def test_env_overlay_default_inherits_parent_env(tmp_path: Path, monkeypatch):
+    """No ``env_overlay`` argument → parent env passed through. Inverse
+    of the above; protects against silently dropping the inherited env
+    when the param is None vs an empty dict."""
+    registry = _make_registry(tmp_path)
+    monkeypatch.setenv("SHELL_JOB_INHERIT_PASSTHRU", "kept")
+    job = registry.spawn(
+        "probe",
+        argv=["bash", "-c", "echo $SHELL_JOB_INHERIT_PASSTHRU"],
+    )
+    _wait_until_done(registry, job.job_id)
+    out = registry.read_output(job.job_id)["stdout_tail"]
+    assert "kept" in out
+
+
+def test_cwd_kwarg_honored_by_subprocess(tmp_path: Path):
+    """``cwd=path`` makes the child's working directory ``path``."""
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = _make_registry(tmp_path)
+    job = registry.spawn(
+        "pwd",
+        argv=["bash", "-c", "pwd"],
+        cwd=work,
+    )
+    _wait_until_done(registry, job.job_id)
+    out = registry.read_output(job.job_id)["stdout_tail"].strip()
+    # macOS resolves /var → /private/var; compare via realpath so the
+    # test passes on both Linux and macOS dev environments.
+    import os as _os
+    assert _os.path.realpath(out) == _os.path.realpath(str(work))
+
+
 # ─── visibility threshold ─────────────────────────────────────────────
 
 
