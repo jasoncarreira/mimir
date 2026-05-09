@@ -45,25 +45,47 @@ def _wait_for_exit(registry: ShellJobRegistry, job_id: str, timeout: float = 10.
     raise AssertionError(f"job {job_id} did not exit within {timeout}s")
 
 
-def _pid_alive(pid: int) -> bool:
-    """True if ``kill -0`` reaches the pid, False if it's gone.
+_HAS_PROC = Path("/proc").is_dir()
 
-    Cross-platform via ``os.kill(pid, 0)`` — works on Linux + macOS dev
-    environments. The earlier shape augmented this with a
-    ``/proc/<pid>/status`` zombie check; that path doesn't exist on
-    Darwin, so the function returned False for any process and broke
-    the SIGTERM/SIGKILL tests on macOS dev hosts. The tests give 5s
-    after the kill for the kernel to deliver + init to reap, which
-    closes the zombie window enough that plain ``kill(0)`` raises
-    ``ProcessLookupError`` by the time the assertion runs.
+
+def _pid_alive(pid: int) -> bool:
+    """True if ``kill -0`` reaches the pid AND the pid isn't a zombie.
+
+    Cross-platform; the gotcha is that a SIGTERM'd grandchild whose parent
+    is also dead becomes a zombie reparented to PID 1, and ``kill(0)``
+    succeeds for zombies. Linux containers (mimir's runtime) often have a
+    PID 1 that doesn't aggressively reap orphans, so the zombie can persist
+    well past the test's 5s wait window. Path:
+
+    1. ``os.kill(pid, 0)`` — fast cross-platform liveness probe.
+       ``ProcessLookupError`` → definitely dead.
+    2. On Linux (``/proc`` present), additionally read
+       ``/proc/<pid>/status`` and reject ``State: Z`` (zombie). A
+       ``FileNotFoundError`` here means we raced with the reaper —
+       count as dead.
+    3. On macOS (``/proc`` absent), there's no portable zombie
+       filter — trust ``kill(0)``. Tests on macOS need the wait
+       window to outlast init's reap latency; on Darwin's launchd
+       this is generally <100ms so the existing 5s window is plenty.
     """
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:  # exists but we don't own it — counts as alive
         return True
+    if not _HAS_PROC:
+        # macOS: kill(0) succeeded; we cannot filter zombies. Trust it.
+        return True
+    # Linux: filter zombies via /proc.
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+    except FileNotFoundError:
+        return False  # raced with reap; pid is gone
+    for line in status.splitlines():
+        if line.startswith("State:"):
+            return "Z" not in line.split(maxsplit=1)[1]
+    return True
 
 
 # ─── tests ────────────────────────────────────────────────────────────
