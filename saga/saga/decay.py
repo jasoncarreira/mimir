@@ -120,7 +120,8 @@ def transition_states() -> dict:
     
     Returns dict with counts of transitions made.
     """
-    conn = get_db()
+    from .core import transactional, log_forgetting, _fire_hook
+
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
 
@@ -129,66 +130,75 @@ def transition_states() -> dict:
     protection_cutoff = now - timedelta(days=PROTECTION_DAYS)
     protection_cutoff_iso = protection_cutoff.isoformat()
 
-    # Single UNION query for all protected IDs (replaces 3 separate queries)
-    protected_rows = conn.execute("""
-        SELECT DISTINCT id FROM (
-            SELECT DISTINCT atom_id AS id FROM access_log WHERE accessed_at >= ?
-            UNION SELECT id FROM atoms WHERE last_accessed_at >= ?
-            UNION SELECT id FROM atoms WHERE is_pinned = 1
-        )
-    """, (protection_cutoff_iso, protection_cutoff_iso)).fetchall()
-    protected_ids = {r["id"] for r in protected_rows}
-
     faded = 0
     dormanted = 0
     log_entries = []
+    protected_ids: set[str] = set()
+    fired_hooks: list[tuple[str, str, str]] = []
 
-    # active -> fading
-    active_rows = conn.execute(
-        "SELECT id, retrievability FROM atoms WHERE state = 'active' AND retrievability < ?",
-        (THRESHOLD_ACTIVE_TO_FADING,)
-    ).fetchall()
+    # CR#16: each transition is two writes (UPDATE atoms +
+    # forgetting_log INSERT via log_forgetting). Without one txn a
+    # mid-batch failure leaves rows in the new state but with no
+    # forgetting_log audit row, or the audit row but not the state
+    # change — the decay history view would silently disagree with
+    # the atoms table. Hooks fire after commit so listeners only see
+    # transitions that actually persisted.
+    with transactional() as conn:
+        # Single UNION query for all protected IDs (replaces 3 separate queries)
+        protected_rows = conn.execute("""
+            SELECT DISTINCT id FROM (
+                SELECT DISTINCT atom_id AS id FROM access_log WHERE accessed_at >= ?
+                UNION SELECT id FROM atoms WHERE last_accessed_at >= ?
+                UNION SELECT id FROM atoms WHERE is_pinned = 1
+            )
+        """, (protection_cutoff_iso, protection_cutoff_iso)).fetchall()
+        protected_ids = {r["id"] for r in protected_rows}
 
-    for row in active_rows:
-        if row["id"] in protected_ids:
-            logger.debug(f"  Protected from fading: {row['id'][:8]} (recently accessed)")
-            continue
-        conn.execute(
-            "UPDATE atoms SET state = 'fading' WHERE id = ?",
-            (row["id"],)
-        )
-        from .core import log_forgetting, _fire_hook
-        log_forgetting(conn, row["id"], "active", "fading",
-                      f"retrievability {row['retrievability']:.4f} below threshold {THRESHOLD_ACTIVE_TO_FADING}",
-                      {"retrievability": round(row['retrievability'], 4), "threshold": THRESHOLD_ACTIVE_TO_FADING})
-        _fire_hook('on_decay', atom_id=row["id"], previous_state="active", new_state="fading")
-        log_entries.append(f"active->fading: {row['id'][:8]} R={row['retrievability']:.4f}")
-        faded += 1
+        # active -> fading
+        active_rows = conn.execute(
+            "SELECT id, retrievability FROM atoms WHERE state = 'active' AND retrievability < ?",
+            (THRESHOLD_ACTIVE_TO_FADING,)
+        ).fetchall()
 
-    # fading -> dormant
-    fading_rows = conn.execute(
-        "SELECT id, retrievability FROM atoms WHERE state = 'fading' AND retrievability < ?",
-        (THRESHOLD_FADING_TO_DORMANT,)
-    ).fetchall()
+        for row in active_rows:
+            if row["id"] in protected_ids:
+                logger.debug(f"  Protected from fading: {row['id'][:8]} (recently accessed)")
+                continue
+            conn.execute(
+                "UPDATE atoms SET state = 'fading' WHERE id = ?",
+                (row["id"],)
+            )
+            log_forgetting(conn, row["id"], "active", "fading",
+                          f"retrievability {row['retrievability']:.4f} below threshold {THRESHOLD_ACTIVE_TO_FADING}",
+                          {"retrievability": round(row['retrievability'], 4), "threshold": THRESHOLD_ACTIVE_TO_FADING})
+            fired_hooks.append((row["id"], "active", "fading"))
+            log_entries.append(f"active->fading: {row['id'][:8]} R={row['retrievability']:.4f}")
+            faded += 1
 
-    for row in fading_rows:
-        if row["id"] in protected_ids:
-            logger.debug(f"  Protected from dormant: {row['id'][:8]} (recently accessed)")
-            continue
-        conn.execute(
-            "UPDATE atoms SET state = 'dormant' WHERE id = ?",
-            (row["id"],)
-        )
-        from .core import log_forgetting, _fire_hook
-        log_forgetting(conn, row["id"], "fading", "dormant",
-                      f"retrievability {row['retrievability']:.4f} below threshold {THRESHOLD_FADING_TO_DORMANT}",
-                      {"retrievability": round(row['retrievability'], 4), "threshold": THRESHOLD_FADING_TO_DORMANT})
-        _fire_hook('on_decay', atom_id=row["id"], previous_state="fading", new_state="dormant")
-        log_entries.append(f"fading->dormant: {row['id'][:8]} R={row['retrievability']:.4f}")
-        dormanted += 1
+        # fading -> dormant
+        fading_rows = conn.execute(
+            "SELECT id, retrievability FROM atoms WHERE state = 'fading' AND retrievability < ?",
+            (THRESHOLD_FADING_TO_DORMANT,)
+        ).fetchall()
 
-    conn.commit()
-    conn.close()
+        for row in fading_rows:
+            if row["id"] in protected_ids:
+                logger.debug(f"  Protected from dormant: {row['id'][:8]} (recently accessed)")
+                continue
+            conn.execute(
+                "UPDATE atoms SET state = 'dormant' WHERE id = ?",
+                (row["id"],)
+            )
+            log_forgetting(conn, row["id"], "fading", "dormant",
+                          f"retrievability {row['retrievability']:.4f} below threshold {THRESHOLD_FADING_TO_DORMANT}",
+                          {"retrievability": round(row['retrievability'], 4), "threshold": THRESHOLD_FADING_TO_DORMANT})
+            fired_hooks.append((row["id"], "fading", "dormant"))
+            log_entries.append(f"fading->dormant: {row['id'][:8]} R={row['retrievability']:.4f}")
+            dormanted += 1
+
+    # Fire hooks after commit so listeners only see persisted transitions.
+    for atom_id, prev_state, new_state in fired_hooks:
+        _fire_hook('on_decay', atom_id=atom_id, previous_state=prev_state, new_state=new_state)
 
     if log_entries:
         for entry in log_entries:
@@ -216,7 +226,8 @@ def compact_profiles() -> dict:
     
     Returns dict with compaction counts and tokens freed.
     """
-    conn = get_db()
+    from .core import transactional
+
     now = datetime.now(timezone.utc)
 
     compacted_to_standard = 0
@@ -224,80 +235,83 @@ def compact_profiles() -> dict:
     tokens_freed = 0
     log_entries = []
 
-    # full -> standard
-    full_rows = conn.execute(
-        """SELECT id, content, access_count, created_at FROM atoms
-           WHERE profile = 'full' AND state IN ('active', 'fading', 'dormant')"""
-    ).fetchall()
+    # CR#16: profile-compaction is N UPDATE atoms in a sweep. A
+    # partial commit would leave some atoms compacted and the
+    # tokens_freed accounting (returned to the caller) overstate the
+    # actual freed bytes — the next decay run would re-evaluate the
+    # un-committed atoms with old content.
+    with transactional() as conn:
+        # full -> standard
+        full_rows = conn.execute(
+            """SELECT id, content, access_count, created_at FROM atoms
+               WHERE profile = 'full' AND state IN ('active', 'fading', 'dormant')"""
+        ).fetchall()
 
-    for row in full_rows:
-        created = datetime.fromisoformat(row["created_at"])
-        age_days = (now - created).total_seconds() / 86400
+        for row in full_rows:
+            created = datetime.fromisoformat(row["created_at"])
+            age_days = (now - created).total_seconds() / 86400
 
-        if age_days < COMPACTION_FULL_TO_STANDARD_MIN_AGE_DAYS:
-            continue
-        if row["access_count"] >= COMPACTION_FULL_TO_STANDARD_MAX_ACCESS:
-            continue
+            if age_days < COMPACTION_FULL_TO_STANDARD_MIN_AGE_DAYS:
+                continue
+            if row["access_count"] >= COMPACTION_FULL_TO_STANDARD_MAX_ACCESS:
+                continue
 
-        content = row["content"]
-        target = PROFILE_TARGET_CHARS["standard"]
+            content = row["content"]
+            target = PROFILE_TARGET_CHARS["standard"]
 
-        if len(content) <= target * COMPACTION_TRIGGER_RATIO:
-            continue  # not worth compacting
+            if len(content) <= target * COMPACTION_TRIGGER_RATIO:
+                continue  # not worth compacting
 
-        old_len = len(content)
-        new_content = content[:target]
-        freed = (old_len - len(new_content)) // 4  # rough token estimate
+            old_len = len(content)
+            new_content = content[:target]
+            freed = (old_len - len(new_content)) // 4  # rough token estimate
 
-        conn.execute(
-            "UPDATE atoms SET profile = 'standard', content = ? WHERE id = ?",
-            (new_content, row["id"])
-        )
-        tokens_freed += freed
-        compacted_to_standard += 1
-        log_entries.append(
-            f"full->standard: {row['id'][:8]} age={age_days:.1f}d access={row['access_count']} "
-            f"chars={old_len}->{len(new_content)} freed~{freed}tok"
-        )
+            conn.execute(
+                "UPDATE atoms SET profile = 'standard', content = ? WHERE id = ?",
+                (new_content, row["id"])
+            )
+            tokens_freed += freed
+            compacted_to_standard += 1
+            log_entries.append(
+                f"full->standard: {row['id'][:8]} age={age_days:.1f}d access={row['access_count']} "
+                f"chars={old_len}->{len(new_content)} freed~{freed}tok"
+            )
 
-    # standard -> lightweight
-    std_rows = conn.execute(
-        """SELECT id, content, access_count, created_at FROM atoms
-           WHERE profile = 'standard' AND state IN ('active', 'fading', 'dormant')"""
-    ).fetchall()
+        # standard -> lightweight
+        std_rows = conn.execute(
+            """SELECT id, content, access_count, created_at FROM atoms
+               WHERE profile = 'standard' AND state IN ('active', 'fading', 'dormant')"""
+        ).fetchall()
 
-    for row in std_rows:
-        created = datetime.fromisoformat(row["created_at"])
-        age_days = (now - created).total_seconds() / 86400
+        for row in std_rows:
+            created = datetime.fromisoformat(row["created_at"])
+            age_days = (now - created).total_seconds() / 86400
 
-        if age_days < COMPACTION_STANDARD_TO_LIGHTWEIGHT_MIN_AGE_DAYS:
-            continue
-        if row["access_count"] >= COMPACTION_STANDARD_TO_LIGHTWEIGHT_MAX_ACCESS:
-            continue
+            if age_days < COMPACTION_STANDARD_TO_LIGHTWEIGHT_MIN_AGE_DAYS:
+                continue
+            if row["access_count"] >= COMPACTION_STANDARD_TO_LIGHTWEIGHT_MAX_ACCESS:
+                continue
 
-        content = row["content"]
-        target = PROFILE_TARGET_CHARS["lightweight"]
+            content = row["content"]
+            target = PROFILE_TARGET_CHARS["lightweight"]
 
-        if len(content) <= target * COMPACTION_TRIGGER_RATIO:
-            continue
+            if len(content) <= target * COMPACTION_TRIGGER_RATIO:
+                continue
 
-        old_len = len(content)
-        new_content = content[:target]
-        freed = (old_len - len(new_content)) // 4
+            old_len = len(content)
+            new_content = content[:target]
+            freed = (old_len - len(new_content)) // 4
 
-        conn.execute(
-            "UPDATE atoms SET profile = 'lightweight', content = ? WHERE id = ?",
-            (new_content, row["id"])
-        )
-        tokens_freed += freed
-        compacted_to_lightweight += 1
-        log_entries.append(
-            f"std->lightweight: {row['id'][:8]} age={age_days:.1f}d access={row['access_count']} "
-            f"chars={old_len}->{len(new_content)} freed~{freed}tok"
-        )
-
-    conn.commit()
-    conn.close()
+            conn.execute(
+                "UPDATE atoms SET profile = 'lightweight', content = ? WHERE id = ?",
+                (new_content, row["id"])
+            )
+            tokens_freed += freed
+            compacted_to_lightweight += 1
+            log_entries.append(
+                f"std->lightweight: {row['id'][:8]} age={age_days:.1f}d access={row['access_count']} "
+                f"chars={old_len}->{len(new_content)} freed~{freed}tok"
+            )
 
     if log_entries:
         for entry in log_entries:
