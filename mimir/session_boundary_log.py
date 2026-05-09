@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -137,20 +138,19 @@ def render_session_summaries(
     """
     if not boundaries:
         return None
-    # Aggregate every boundary's closed_since for cross-boundary drop.
-    # Note: we collect refs across ALL passed boundaries (caller is
-    # responsible for already filtering by channel via
-    # ``recent_session_boundaries``). Aggregating here means
-    # boundaries[0]'s Unfinished can be filtered by closed_since on
-    # boundaries[1+] — i.e. later closures resolve earlier unfinished.
-    all_closed_since: list[str] = []
-    for b in boundaries:
-        for ref in b.get("closed_since") or []:
-            ref_str = str(ref).strip()
-            if len(ref_str) >= _MIN_CLOSED_SINCE_REF_LEN:
-                all_closed_since.append(ref_str)
+    # Per-boundary closed_since application is **asymmetric**: only refs
+    # from chronologically-LATER boundaries get applied. Otherwise a
+    # T1 closure of "#71" would also drop T2's "#71 reverted, reopened"
+    # — collapsing a revert/reopen cycle into invisibility (Mimir's
+    # PR #86 review nit). When timestamps are unparseable we apply
+    # conservatively (treat all other boundaries as later) — preserves
+    # behavior for the rare badly-formed-ts case.
+    parsed_timestamps: list[Optional[datetime]] = [
+        _parse_iso_ts(str(b.get("ts") or b.get("timestamp") or ""))
+        for b in boundaries
+    ]
     lines: list[str] = []
-    for b in boundaries:
+    for i, b in enumerate(boundaries):
         # Both shapes accepted: local mirror writes ``ts`` /
         # ``channel_id``; SAGA's get_last_sessions returns
         # ``timestamp`` / ``channel`` (chainlink #63 latent fix). The
@@ -189,9 +189,26 @@ def render_session_summaries(
         else:
             lines.append(f"- {header_meta} — {summary}")
 
-        # Apply closed_since drops to this boundary's unfinished.
+        # Apply closed_since drops from chronologically-later boundaries
+        # (Mimir's PR #86 nit: avoid collapsing revert/reopen cycles).
         unfinished = b.get("unfinished") or []
-        kept = _apply_closed_since(unfinished, all_closed_since)
+        later_refs: list[str] = []
+        self_ts = parsed_timestamps[i]
+        for j, other in enumerate(boundaries):
+            if j == i:
+                continue
+            other_ts = parsed_timestamps[j]
+            # If either side's timestamp is unparseable, apply
+            # conservatively — preserves the older symmetric behavior
+            # for malformed records, which was the only available
+            # signal in that case.
+            if self_ts is not None and other_ts is not None and other_ts <= self_ts:
+                continue
+            for ref in other.get("closed_since") or []:
+                ref_str = str(ref).strip()
+                if len(ref_str) >= _MIN_CLOSED_SINCE_REF_LEN:
+                    later_refs.append(ref_str)
+        kept = _apply_closed_since(unfinished, later_refs)
         if kept:
             joined = "; ".join(str(x).strip() for x in kept if str(x).strip())
             if joined:
@@ -280,22 +297,42 @@ def _format_turn_count(n: int) -> str:
 def _apply_closed_since(
     unfinished: Iterable[Any], closed_since_refs: list[str],
 ) -> list[str]:
-    """Drop unfinished items containing any closed_since ref as a
-    substring (case-insensitive). Refs shorter than
-    ``_MIN_CLOSED_SINCE_REF_LEN`` are ignored to avoid over-matching.
+    """Drop unfinished items where any closed_since ref appears with
+    digit-aware word boundaries (case-insensitive). Refs shorter than
+    ``_MIN_CLOSED_SINCE_REF_LEN`` are filtered out.
+
+    The boundary check is digit-only — ``(?<!\\d)<ref>(?!\\d)`` —
+    rather than ``\\b...\\b`` because ``#`` and other ref characters
+    aren't word-class. Practical effect: ``#1`` matches in
+    ``"chainlink #1 something"`` but does NOT match in ``"#10"``,
+    ``"#100"``, etc., closing the bug class Mimir flagged on PR #86.
+    Letters / spaces / punctuation around a ref are still permitted.
+
+    Drops are logged at DEBUG level so future-mimir debugging
+    "why didn't this Unfinished item show up?" has an audit trail.
 
     Returns a fresh list — does NOT mutate the input."""
     if not closed_since_refs:
         return [str(u) for u in unfinished if str(u).strip()]
-    refs_lower = [r.lower() for r in closed_since_refs]
+    patterns = [
+        re.compile(rf"(?<!\d){re.escape(r)}(?!\d)", re.IGNORECASE)
+        for r in closed_since_refs
+    ]
     kept: list[str] = []
     for item in unfinished:
         text = str(item).strip()
         if not text:
             continue
-        text_lower = text.lower()
-        if any(ref in text_lower for ref in refs_lower):
-            continue  # dropped: a closed_since ref appears in this item
+        match = next(
+            (p for p in patterns if p.search(text)), None,
+        )
+        if match is not None:
+            log.debug(
+                "session_summary_unfinished_filtered: dropped %r "
+                "(matched closed_since ref %r)",
+                text, match.pattern,
+            )
+            continue
         kept.append(text)
     return kept
 

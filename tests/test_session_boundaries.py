@@ -264,6 +264,149 @@ def test_apply_closed_since_strips_blank_items():
     assert out == ["real item"]
 
 
+# ---- _apply_closed_since: digit-aware word boundary (PR #86 nit) -------
+
+
+def test_apply_closed_since_digit_boundary_short_ref_no_collision():
+    """Mimir's PR #86 nit: ``#1`` must NOT substring-match ``#10`` /
+    ``#100``. Digit-aware lookahead/lookbehind closes the collision
+    while keeping ``#1`` matching when it stands alone."""
+    out = _apply_closed_since(
+        ["chainlink #1 awaiting", "PR #10 still pending", "PR #100 in flight"],
+        ["#1"],
+    )
+    # "chainlink #1 awaiting" → #1 followed by space (not digit) → match → drop.
+    # "#10 still pending" → #1 followed by 0 (digit) → no match → keep.
+    # "#100 in flight" → #1 followed by 0 (digit) → no match → keep.
+    assert out == ["PR #10 still pending", "PR #100 in flight"]
+
+
+def test_apply_closed_since_digit_boundary_left_side():
+    """Symmetric guard: ``#1`` shouldn't match a longer ref where #1
+    sits at the right edge of digits (e.g. ``#11`` contains ``11``,
+    where ``1`` could be confused with the second digit)."""
+    out = _apply_closed_since(
+        ["#11 still pending"],
+        ["#1"],
+    )
+    # In "#11", the "#1" position is at chars 0-1, followed by digit '1' →
+    # lookahead fails → no match → "#11" kept.
+    assert out == ["#11 still pending"]
+
+
+def test_apply_closed_since_multi_digit_refs_still_match():
+    """Sanity: the digit-boundary rule doesn't break legitimate
+    multi-digit refs. ``#71`` still matches ``"PR #71 awaiting"``."""
+    out = _apply_closed_since(
+        ["PR #71 awaiting", "PR #72 still open"],
+        ["#71"],
+    )
+    assert out == ["PR #72 still open"]
+
+
+def test_apply_closed_since_chainlink_id_with_subref():
+    """Refs with internal whitespace + non-digit chars (e.g. chainlink
+    sub-question IDs like ``chainlink #29 G17``) still match end-to-end
+    when present verbatim."""
+    out = _apply_closed_since(
+        ["chainlink #29 G17 awaiting", "chainlink #29 G18 awaiting"],
+        ["chainlink #29 G17"],
+    )
+    # G17 matches; G18 does not (different sub-id).
+    assert out == ["chainlink #29 G18 awaiting"]
+
+
+def test_apply_closed_since_logs_drops_at_debug(caplog):
+    """Mimir's PR #86 observability nit: dropped items log at DEBUG so
+    future-mimir debugging "why didn't this show up?" has an audit
+    trail. Caller is expected to enable DEBUG logging when needed."""
+    import logging
+    with caplog.at_level(logging.DEBUG, logger="mimir.session_boundary_log"):
+        _apply_closed_since(["PR #71 awaiting"], ["#71"])
+    # caplog captures the ``log.debug(...)`` call inside the applier.
+    drops = [
+        r for r in caplog.records
+        if "session_summary_unfinished_filtered" in r.getMessage()
+    ]
+    assert len(drops) == 1
+    assert "PR #71 awaiting" in drops[0].getMessage()
+
+
+# ---- closed_since asymmetry: later resolves earlier (PR #86 nit) -------
+
+
+def test_closed_since_does_not_apply_to_later_boundaries():
+    """Mimir's PR #86 correctness nit: T1 closes #71, T2 (later)
+    re-lists ``"#71 reverted, reopened"`` as unfinished. T2's item
+    must NOT be dropped — closed_since is asymmetric (later resolves
+    earlier, not the other way around). Pre-fix this test would
+    fail because the global aggregation was time-blind."""
+    boundaries = [
+        # T2 (newest first per recent() ordering) — re-lists #71 as
+        # unfinished after a revert.
+        {
+            "ts": "2026-05-09T17:00:00+00:00",
+            "channel_id": "c",
+            "summary": "Revert landed.",
+            "unfinished": ["#71 reverted, reopened"],
+        },
+        # T1 — earlier closure.
+        {
+            "ts": "2026-05-09T13:00:00+00:00",
+            "channel_id": "c",
+            "summary": "Initial #71 merge.",
+            "unfinished": [],
+            "closed_since": ["#71"],
+        },
+    ]
+    out = render_session_summaries(boundaries, now=_NOW)
+    # T2's "#71 reverted, reopened" must survive — it's the live state.
+    assert "#71 reverted, reopened" in out
+
+
+def test_closed_since_self_does_not_drop_self_unfinished():
+    """A boundary's own closed_since records what the synthesis-turn
+    resolved during the just-ended session. The boundary's own
+    ``unfinished`` is the curated list of what's still open AFTER
+    those closures — self-closed_since shouldn't filter
+    self-unfinished. The asymmetric rule (later only) handles this
+    naturally because the boundary isn't "later than" itself."""
+    boundaries = [{
+        "ts": "2026-05-09T17:00:00+00:00",
+        "channel_id": "c",
+        "summary": "s",
+        "unfinished": ["#71 still has a follow-up to do"],
+        "closed_since": ["#71"],  # initial #71 merge happened mid-session
+    }]
+    out = render_session_summaries(boundaries, now=_NOW)
+    # The agent's intentional re-listing must survive its own
+    # closed_since.
+    assert "#71 still has a follow-up to do" in out
+
+
+def test_closed_since_unparseable_timestamps_apply_conservatively():
+    """When timestamps can't be parsed, comparison is impossible;
+    fall back to applying all closed_since (preserves the older
+    symmetric behavior). Documented edge case — production traffic
+    has parseable ISO timestamps."""
+    boundaries = [
+        {
+            "ts": "garbage-ts-1",
+            "channel_id": "c",
+            "summary": "s",
+            "unfinished": ["#71 awaiting"],
+        },
+        {
+            "ts": "garbage-ts-2",
+            "channel_id": "c",
+            "summary": "s",
+            "closed_since": ["#71"],
+        },
+    ]
+    out = render_session_summaries(boundaries, now=_NOW)
+    assert "#71 awaiting" not in out
+
+
 # ---- render_session_summaries: header markers ---------------------------
 
 
