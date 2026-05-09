@@ -33,6 +33,8 @@ from .search import Indexer
 from .searchtools import build_search_tools, search_tool_names
 from .shell_jobs import ShellJob, ShellJobRegistry
 from .shelltools import build_shell_tools, shell_tool_names
+from .spawn import build_spawn_tool, spawn_tool_names
+from .turn_logger import TurnLogger
 from .turntools import build_turn_tools, turn_tool_names
 
 # Built-in SDK preset tools we enable. Hooks (mimir.hooks) layer mimir-specific
@@ -81,8 +83,11 @@ def build_mcp_server(
     message_buffer: MessageBuffer | None = None,
     session_boundary_log: SessionBoundaryLog | None = None,
     turns_log: Path | None = None,
+    turn_logger: TurnLogger | None = None,
     shell_jobs: ShellJobRegistry | None = None,
     on_shell_job_complete: Any | None = None,
+    schedule_from_thread: Any | None = None,
+    mimir_home: Path | None = None,
 ) -> McpSdkServerConfig:
     """Bundle the in-process MCP tools (everything with no SDK preset)."""
     tools = [echo]
@@ -96,6 +101,24 @@ def build_mcp_server(
         tools += build_schedule_tools(scheduler)
     if shell_jobs is not None:
         tools += build_shell_tools(shell_jobs, on_complete=on_shell_job_complete)
+    # spawn_claude_code (chainlink #60): registered when both shell_jobs
+    # and the cross-thread schedule bridge are available. The spawn tool
+    # uses the same registry as bash_async (so the spawn appears in
+    # bash_jobs_list), but its completion path does extra accounting
+    # before chaining to ``on_shell_job_complete`` for the wake-up.
+    if (
+        shell_jobs is not None
+        and schedule_from_thread is not None
+        and mimir_home is not None
+    ):
+        tools += build_spawn_tool(
+            registry=shell_jobs,
+            turn_logger=turn_logger,
+            mimir_home=mimir_home,
+            spawns_dir=mimir_home / "state" / "spawns",
+            schedule_from_thread=schedule_from_thread,
+            chain_on_complete=on_shell_job_complete,
+        )
     if channel_registry is not None:
         # send_message fires SAGA mark_contributions when saga_client is
         # available; handles the credit pass at the actual reply boundary
@@ -121,6 +144,7 @@ def allowed_tool_names(
     include_channels: bool = True,
     include_turns: bool = True,
     include_shell: bool = True,
+    include_spawn: bool = True,
 ) -> list[str]:
     """Names referenced in ``ClaudeAgentOptions.allowed_tools`` — both SDK
     preset names and ``mcp__mimir__*`` MCP tool names."""
@@ -137,4 +161,6 @@ def allowed_tool_names(
         names += channel_tool_names()
     if include_shell:
         names += shell_tool_names()
+    if include_spawn:
+        names += spawn_tool_names()
     return names
