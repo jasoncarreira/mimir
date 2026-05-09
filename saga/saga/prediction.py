@@ -88,32 +88,31 @@ def track_temporal_pattern(atom_ids, conn=None):
     """
     if not atom_ids:
         return
-    close = False
-    if conn is None:
-        conn = get_db()
-        close = True
+
+    from .core import transactional
 
     now = datetime.now(timezone.utc)
     hour = now.hour
     dow = now.weekday()
 
-    for atom_id in atom_ids:
-        try:
-            conn.execute(
+    # CR#16: per-row try/except: pass was a silent-failure trap that
+    # double-counted as defense against pre-migration-8 schemas. The
+    # cleaner shape is one sqlite_master probe outside the loop, then
+    # one transaction covering all the INSERT/UPSERTs.
+    with transactional(conn=conn) as txn:
+        table_exists = txn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='temporal_patterns'"
+        ).fetchone()
+        if not table_exists:
+            return
+        for atom_id in atom_ids:
+            txn.execute(
                 """INSERT INTO temporal_patterns (atom_id, hour_of_day, day_of_week, retrieval_count, last_retrieved_at)
                    VALUES (?, ?, ?, 1, ?)
                    ON CONFLICT(atom_id, hour_of_day, day_of_week)
                    DO UPDATE SET retrieval_count = retrieval_count + 1, last_retrieved_at = ?""",
                 (atom_id, hour, dow, now.isoformat(), now.isoformat()),
             )
-        except Exception:
-            pass  # table may not exist yet (pre-migration 8)
-    try:
-        conn.commit()
-    except Exception:
-        pass
-    if close:
-        conn.close()
 
 
 def track_co_retrievals(atom_ids, conn=None):

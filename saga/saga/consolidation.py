@@ -580,34 +580,43 @@ class ConsolidationEngine:
         now = datetime.now(timezone.utc).isoformat()
         superseded_set = set(superseded_obs_ids or [])
 
-        conn = get_db()
+        from .core import transactional
+
+        # Embeddings live outside the transaction — they can be slow
+        # network calls. The pre-existing-id probe also runs without
+        # the write lock so we can size the embedding batch correctly.
+        probe = get_db()
         try:
-            # Pre-pass: which prepared tids are not yet in the DB? Those
-            # are the ones that need fresh embeddings. Batching the
-            # embedding calls turns N sequential ~500ms API roundtrips
-            # into one ~600ms batch — observed ~4.6s/cluster overhead
-            # on the P41-only bench was dominated by this.
             placeholders = ",".join("?" * len(prepared))
-            existing_rows = conn.execute(
+            existing_rows = probe.execute(
                 f"SELECT id FROM triples WHERE id IN ({placeholders})",
                 tuple(tid for tid, _ in prepared),
             ).fetchall()
-            existing_ids = {r[0] for r in existing_rows}
+        finally:
+            probe.close()
+        existing_ids = {r[0] for r in existing_rows}
 
-            new_triples = [(tid, t) for tid, t in prepared if tid not in existing_ids]
-            embeddings_by_tid: dict[str, bytes | None] = {}
-            if new_triples:
-                texts = [
-                    _triple_text(t["subject"], t["predicate"], t["object"])
-                    for _, t in new_triples
-                ]
-                try:
-                    vecs = batch_embed_texts(texts)
-                except Exception:
-                    vecs = [None] * len(texts)
-                for (tid, _), vec in zip(new_triples, vecs):
-                    embeddings_by_tid[tid] = pack_embedding(vec) if vec else None
+        new_triples = [(tid, t) for tid, t in prepared if tid not in existing_ids]
+        embeddings_by_tid: dict[str, bytes | None] = {}
+        if new_triples:
+            texts = [
+                _triple_text(t["subject"], t["predicate"], t["object"])
+                for _, t in new_triples
+            ]
+            try:
+                vecs = batch_embed_texts(texts)
+            except Exception:
+                vecs = [None] * len(texts)
+            for (tid, _), vec in zip(new_triples, vecs):
+                embeddings_by_tid[tid] = pack_embedding(vec) if vec else None
 
+        # CR#16: per-triple INSERTs and ownership-transfer UPDATEs
+        # ran in autocommit with try/except: pass around each write.
+        # A real conflict (e.g., FK violation) silently dropped
+        # individual triples while the rest of the cluster persisted —
+        # the cluster's "we synthesized N triples" claim could be off
+        # by half. Wrap the whole batch.
+        with transactional() as conn:
             for tid, t in prepared:
                 row = conn.execute(
                     "SELECT atom_id FROM triples WHERE id = ?", (tid,)
@@ -621,20 +630,17 @@ class ConsolidationEngine:
                     # "always valid" per query_world's filter logic.
                     valid_from = t.get("valid_from")
                     valid_until = t.get("valid_until")
-                    try:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO triples "
-                            "(id, atom_id, subject, predicate, object, "
-                            " confidence, embedding, created_at, "
-                            " valid_from, valid_until) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (tid, new_obs_id, t["subject"], t["predicate"],
-                             t["object"], float(t.get("confidence", 1.0)),
-                             embedding, now, valid_from, valid_until),
-                        )
-                        persisted += 1
-                    except Exception:
-                        pass
+                    conn.execute(
+                        "INSERT OR IGNORE INTO triples "
+                        "(id, atom_id, subject, predicate, object, "
+                        " confidence, embedding, created_at, "
+                        " valid_from, valid_until) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (tid, new_obs_id, t["subject"], t["predicate"],
+                         t["object"], float(t.get("confidence", 1.0)),
+                         embedding, now, valid_from, valid_until),
+                    )
+                    persisted += 1
                     continue
 
                 existing_atom_id = row[0]
@@ -646,21 +652,14 @@ class ConsolidationEngine:
                     # (superseding) observation. The LLM saw this
                     # prior triple in context and chose to restate it,
                     # which means it survives the merger.
-                    try:
-                        conn.execute(
-                            "UPDATE triples SET atom_id = ?, created_at = ? WHERE id = ?",
-                            (new_obs_id, now, tid),
-                        )
-                        persisted += 1
-                    except Exception:
-                        pass
+                    conn.execute(
+                        "UPDATE triples SET atom_id = ?, created_at = ? WHERE id = ?",
+                        (new_obs_id, now, tid),
+                    )
+                    persisted += 1
                 # else: triple is attested by some other unrelated
                 # observation. Leave it alone — content-level dedup is
                 # the right default outside the supersedes window.
-
-            conn.commit()
-        finally:
-            conn.close()
 
         return persisted
 
@@ -1132,85 +1131,75 @@ class ConsolidationEngine:
                         cluster_triples, syn_id, superseded_obs_ids
                     )
 
-        # Phase B: create relations and reduce stability in a single connection.
+        # Phase B: create relations and reduce stability in a single transaction.
         # Two edge directions:
         #   raw -> observation  (consolidated_into)  — legacy, used by spread activation
         #   observation -> raw  (evidenced_by)       — new, used by P9 evidence boost
-        conn = get_db()
-        try:
+        #
+        # CR#16: every per-edge / per-stability / per-trend write was
+        # wrapped in try/except: pass. A real failure mid-batch left
+        # the consolidation half-recorded — some sources demoted, some
+        # not; some edges present, some missing — without ever
+        # surfacing the error. One transaction makes the whole Phase B
+        # batch atomic; any error rolls the entire phase back so the
+        # caller sees the failure and can retry cleanly.
+        from .core import transactional
+
+        trends_labeled = 0
+        trends_breakdown: dict[str, int] = {}
+        with transactional() as conn:
             for syn_id, source_ids, supersedes_obs in stored:
                 for source_id in source_ids:
-                    try:
-                        conn.execute("""
-                            INSERT OR IGNORE INTO atom_relations
-                                (source_id, target_id, relation_type, confidence, created_at)
-                            VALUES (?, ?, 'consolidated_into', 1.0, ?)
-                        """, (source_id, syn_id, now))
-                        relations_created += 1
-                    except Exception:
-                        pass
-                    try:
-                        conn.execute("""
-                            INSERT OR IGNORE INTO atom_relations
-                                (source_id, target_id, relation_type, confidence, created_at)
-                            VALUES (?, ?, 'evidenced_by', 1.0, ?)
-                        """, (syn_id, source_id, now))
-                        relations_created += 1
-                    except Exception:
-                        pass
+                    conn.execute("""
+                        INSERT OR IGNORE INTO atom_relations
+                            (source_id, target_id, relation_type, confidence, created_at)
+                        VALUES (?, ?, 'consolidated_into', 1.0, ?)
+                    """, (source_id, syn_id, now))
+                    relations_created += 1
+                    conn.execute("""
+                        INSERT OR IGNORE INTO atom_relations
+                            (source_id, target_id, relation_type, confidence, created_at)
+                        VALUES (?, ?, 'evidenced_by', 1.0, ?)
+                    """, (syn_id, source_id, now))
+                    relations_created += 1
 
                 for source_id in source_ids:
-                    try:
-                        conn.execute(
-                            "UPDATE atoms SET stability = stability * ? WHERE id = ?",
-                            (self.stability_reduction, source_id)
-                        )
-                        sources_reduced += 1
-                    except Exception:
-                        pass
+                    conn.execute(
+                        "UPDATE atoms SET stability = stability * ? WHERE id = ?",
+                        (self.stability_reduction, source_id)
+                    )
+                    sources_reduced += 1
 
                 # The new observation supersedes any prior observation whose
                 # evidence set is a strict subset. The retrieval-side
                 # demotion (saga.core._apply_supersedes_demotion) handles
                 # the score penalty.
                 for old_obs_id in supersedes_obs:
-                    try:
-                        conn.execute("""
-                            INSERT OR IGNORE INTO atom_relations
-                                (source_id, target_id, relation_type, confidence, created_at, metadata)
-                            VALUES (?, ?, 'supersedes', 1.0, ?, ?)
-                        """, (syn_id, old_obs_id, now,
-                              json.dumps({"trigger": "consolidation"})))
-                        observations_superseded += 1
-                        relations_created += 1
-                    except Exception:
-                        pass
+                    conn.execute("""
+                        INSERT OR IGNORE INTO atom_relations
+                            (source_id, target_id, relation_type, confidence, created_at, metadata)
+                        VALUES (?, ?, 'supersedes', 1.0, ?, ?)
+                    """, (syn_id, old_obs_id, now,
+                          json.dumps({"trigger": "consolidation"})))
+                    observations_superseded += 1
+                    relations_created += 1
 
             # P17 / P47: label each consolidated observation with a
             # trend bucket based on the cluster's source-atom access
             # patterns. Activates the previously-no-op trend multipliers
             # in saga.core retrieval AND feeds P47's promotion /
-            # demotion candidate selection. Writes are best-effort —
-            # NULL trend means "no signal," same as today.
-            trends_labeled = 0
-            trends_breakdown: dict[str, int] = {}
+            # demotion candidate selection. NULL trend means
+            # "no signal," same as today.
             for syn_id, source_ids, _ in stored:
                 trend = self._compute_trend_for_cluster(conn, source_ids, now)
                 if trend is None:
                     continue
-                try:
-                    conn.execute(
-                        "UPDATE atoms SET trend = ? WHERE id = ?",
-                        (trend, syn_id),
-                    )
-                    trends_labeled += 1
-                    trends_breakdown[trend] = trends_breakdown.get(trend, 0) + 1
-                except Exception:
-                    pass
-
-            conn.commit()
-        finally:
-            conn.close()
+                conn.execute(
+                    "UPDATE atoms SET trend = ? WHERE id = ?",
+                    (trend, syn_id),
+                )
+                trends_labeled += 1
+                trends_breakdown[trend] = trends_breakdown.get(trend, 0) + 1
 
         # P35-c (P47 bundle): aggregate contradictions across all
         # clusters and surface as a single structured field on the
