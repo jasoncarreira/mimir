@@ -363,34 +363,18 @@ async def api_query(req: QueryRequest):
         obs = result.get("observations", []) or []
         raws = result.get("raws", []) or []
 
-        # Per-atom confidence filtering. Each atom carries its own
-        # _confidence_tier (set in retrieve() for in-pool atoms; in
-        # _two_tier_split for pulled-in missing atoms). Atoms whose
-        # tier ranks below the floor are dropped before the response
-        # is returned.
-        gated_reason = None
-        if _cfg('retrieval', 'enable_confidence_gating', True):
-            floor = req.min_confidence_tier or _cfg(
-                'retrieval', 'default_min_confidence_tier', 'low'
-            )
-            _tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
-            floor_rank = _tier_rank.get(floor, 1)  # default to "low"
-
-            def _passes(a: dict) -> bool:
-                t = a.get("_confidence_tier", "none")
-                return _tier_rank.get(t, 0) >= floor_rank
-
-            obs_before = len(obs)
-            raws_before = len(raws)
-            obs = [o for o in obs if _passes(o)]
-            raws = [r for r in raws if _passes(r)]
-            obs_dropped = obs_before - len(obs)
-            raws_dropped = raws_before - len(raws)
-            if obs_dropped or raws_dropped:
-                gated_reason = (
-                    f"floor={floor}: dropped {obs_dropped} obs and "
-                    f"{raws_dropped} raws below threshold"
-                )
+        # Per-atom confidence filtering (CR#14). Shared with
+        # ``mimir/saga_client.py::_InProcessSaga.query`` via the
+        # ``apply_confidence_gating`` helper so the two implementations
+        # of the same filter can't drift.
+        gating_enabled = _cfg('retrieval', 'enable_confidence_gating', True)
+        floor = req.min_confidence_tier or _cfg(
+            'retrieval', 'default_min_confidence_tier', 'low'
+        )
+        from .core import apply_confidence_gating
+        obs, raws, gated_reason = apply_confidence_gating(
+            obs, raws, floor=floor, gating_enabled=gating_enabled,
+        )
 
         # P42: optionally surface top-N triples as a third response
         # block. Cosine-matched against query embedding; carries

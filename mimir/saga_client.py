@@ -231,29 +231,18 @@ class _InProcessSaga:
             obs = result.get("observations", []) or []
             raws = result.get("raws", []) or []
 
-            gated_reason = None
-            if cfg('retrieval', 'enable_confidence_gating', True):
-                floor = (
-                    min_confidence_tier
-                    or cfg('retrieval', 'default_min_confidence_tier', 'low')
-                )
-                tier_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
-                floor_rank = tier_rank.get(floor, 1)
-
-                def _passes(a: dict) -> bool:
-                    t = a.get("_confidence_tier", "none")
-                    return tier_rank.get(t, 0) >= floor_rank
-
-                obs_before, raws_before = len(obs), len(raws)
-                obs = [o for o in obs if _passes(o)]
-                raws = [r for r in raws if _passes(r)]
-                obs_dropped = obs_before - len(obs)
-                raws_dropped = raws_before - len(raws)
-                if obs_dropped or raws_dropped:
-                    gated_reason = (
-                        f"floor={floor}: dropped {obs_dropped} obs and "
-                        f"{raws_dropped} raws below threshold"
-                    )
+            # CR#14: apply_confidence_gating is the shared helper —
+            # same logic on both sides of the in-process / HTTP saga
+            # boundary, so the two paths can't drift.
+            from saga.core import apply_confidence_gating
+            gating_enabled = cfg('retrieval', 'enable_confidence_gating', True)
+            floor = (
+                min_confidence_tier
+                or cfg('retrieval', 'default_min_confidence_tier', 'low')
+            )
+            obs, raws, gated_reason = apply_confidence_gating(
+                obs, raws, floor=floor, gating_enabled=gating_enabled,
+            )
 
             return {
                 "query": clamped, "mode": mode, "two_tier": True,
