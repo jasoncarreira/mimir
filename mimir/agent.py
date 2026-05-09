@@ -807,7 +807,7 @@ class Agent:
 
         extra_roots = list(config.file_op_extra_roots)
         cc_overflow = claude_code_persisted_output_root()
-        if cc_overflow is not None and cc_overflow not in extra_roots:
+        if cc_overflow not in extra_roots:
             extra_roots.append(cc_overflow)
 
         self._pre_tool_hook = make_pre_tool_use_hook(

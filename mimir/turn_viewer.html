@@ -189,14 +189,26 @@ tr:hover td{background:var(--surface2);cursor:pointer}
 <script>
 (function() {
 var allTurns = [];
-var activeTrigger = 'all';
+// activeTrigger and hidePollers persist in localStorage so a refresh
+// during dev (the viewer is typically left open in a browser tab)
+// keeps the operator's chosen view rather than snapping back to the
+// All / show-everything default.
+var LS_PREFIX = 'mimir.viewer.';
+function lsGet(key, fallback) {
+  try { var v = localStorage.getItem(LS_PREFIX + key); return v == null ? fallback : v; }
+  catch (e) { return fallback; }
+}
+function lsSet(key, value) {
+  try { localStorage.setItem(LS_PREFIX + key, value); } catch (e) { /* private mode / quota */ }
+}
+var activeTrigger = lsGet('activeTrigger', 'all');
 var searchQuery = '';
 var openTurnId = null;
 var pollInterval = null;
 // "hide pollers" suppresses trigger=poller rows from the All view.
 // Most useful default depends on workload; off by default so new
 // users see all activity, with the toggle as the noise-cut hatch.
-var hidePollers = false;
+var hidePollers = lsGet('hidePollers', '0') === '1';
 // Known triggers — the badge CSS knows about these. Anything else
 // renders with badge-unknown so it's visually flagged for follow-up.
 var KNOWN_TRIGGERS = {
@@ -395,12 +407,23 @@ document.addEventListener('keydown', function(e){ if(e.key==='Escape') closeDeta
 document.querySelectorAll('#triggerTabs .tab').forEach(function(btn) {
   btn.addEventListener('click', function() {
     activeTrigger = btn.getAttribute('data-trigger');
+    lsSet('activeTrigger', activeTrigger);
     render();
   });
 });
 
+// Restore the persisted UI state on load, so the initial render
+// matches the variables that filterTurns() reads. The .active tab
+// class is also re-synced here to avoid a brief flash of "All"
+// before the first data-load triggers render() (which itself
+// re-syncs the class from activeTrigger).
+document.getElementById('hidePollersToggle').checked = hidePollers;
+document.querySelectorAll('#triggerTabs .tab').forEach(function(btn) {
+  btn.classList.toggle('active', btn.getAttribute('data-trigger') === activeTrigger);
+});
 document.getElementById('hidePollersToggle').addEventListener('change', function(e) {
   hidePollers = e.target.checked;
+  lsSet('hidePollers', hidePollers ? '1' : '0');
   renderTable();
 });
 

@@ -147,18 +147,23 @@ def test_persisted_output_root_returns_dir_when_present(
     assert out == cc_projects
 
 
-def test_persisted_output_root_returns_none_when_absent(
+def test_persisted_output_root_returns_path_eagerly_when_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     """When the projects dir doesn't exist yet (fresh container, no
-    overflow yet), return None — caller should skip adding the root
-    rather than create it preemptively."""
+    overflow yet), still return the expected path — caller adds it
+    to ``extra_roots`` unconditionally so the very first overflow
+    Read after startup resolves rather than being denied. Claude
+    Code lazy-creates the dir on first overflow; pre-creation by us
+    isn't needed (``resolve_within_roots`` is a prefix check)."""
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
 
-    assert claude_code_persisted_output_root() is None
+    out = claude_code_persisted_output_root()
+    assert out == fake_home / ".claude" / "projects"
+    assert not out.exists()  # confirms eager-return — caller still gets a usable root
 
 
 def test_persisted_output_root_honors_claude_config_dir_env(

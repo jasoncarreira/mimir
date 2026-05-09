@@ -81,8 +81,8 @@ def resolve_within_roots(roots: list[Path], raw_path: str) -> Path:
     )
 
 
-def claude_code_persisted_output_root() -> Path | None:
-    """Return Claude Code's persisted-output parent dir if it exists.
+def claude_code_persisted_output_root() -> Path:
+    """Return Claude Code's persisted-output parent dir.
 
     Claude Code's CLI (the bundled ``claude`` binary that the SDK
     spawns) persists any tool result exceeding ~32KB to a file under
@@ -94,16 +94,20 @@ def claude_code_persisted_output_root() -> Path | None:
     Read — which silently breaks any workflow involving large bash
     output (build logs, pytest -v, large grep, etc.).
 
-    Returns the canonical parent dir; one root covers all sessions.
-    Returns ``None`` if the dir doesn't exist yet (Claude Code creates
-    it lazily on first overflow). Callers should skip adding the root
-    in that case rather than creating it preemptively — the dir
-    appears automatically on first use.
+    Returned eagerly (no on-disk presence check) so the root is
+    included in file-op roots even when the dir hasn't been created
+    yet — Claude Code creates it lazily on first overflow. Without
+    eager inclusion, fresh containers (or any environment where the
+    dir hasn't yet appeared at ``Agent.__init__`` time) hit the same
+    denial this function exists to prevent on the very first
+    overflow Read. ``resolve_within_roots`` is a string-prefix check
+    on resolved paths, so an absent root is harmless until something
+    inside it is referenced — at which point the file's parents do
+    exist and the check passes.
 
     Honors ``CLAUDE_CONFIG_DIR`` if set (the SDK uses this to relocate
     the project state); otherwise falls back to ``~/.claude``.
     """
     base_env = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
     base = Path(base_env) if base_env else Path.home() / ".claude"
-    candidate = base / "projects"
-    return candidate if candidate.is_dir() else None
+    return base / "projects"
