@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Literal
 
 from ._jsonl_tail import tail_jsonl_records
+from .jsonl_snapshot import JsonlSnapshot, iter_snapshot_or_tail
 
 log = logging.getLogger(__name__)
 
@@ -599,8 +600,13 @@ class FeedbackLog:
     """Tails events.jsonl + turns.jsonl, surfaces recent feedback signals.
 
     No persistent state of its own — every call to ``recent`` re-reads
-    the tail of both files. Files may not exist (fresh home, never
-    logged) — handled gracefully.
+    the tail of both files (or a cached snapshot, if injected). Files
+    may not exist (fresh home, never logged) — handled gracefully.
+
+    ``events_snapshot`` / ``turns_snapshot`` (CR#10): when provided by
+    the constructing Agent, ``recent`` iterates the cached snapshot
+    instead of streaming the file each call. Falls back to direct tail
+    when None for back-compat with tests / direct-call paths.
     """
 
     events_path: Path
@@ -608,6 +614,8 @@ class FeedbackLog:
     # Per-call defaults; overridable on the .recent / .recent_block calls.
     default_window_hours: int = 24
     default_limit_per_polarity: int = 5
+    events_snapshot: JsonlSnapshot | None = None
+    turns_snapshot: JsonlSnapshot | None = None
 
     def recent(
         self,
@@ -637,7 +645,7 @@ class FeedbackLog:
         seen_first_only: set[str] = set()
 
         # 1) events.jsonl — known event-type rules.
-        for ev in _iter_jsonl_reverse(self.events_path):
+        for ev in iter_snapshot_or_tail(self.events_snapshot, self.events_path):
             ts = ev.get("timestamp")
             if not isinstance(ts, str) or ts < cutoff_iso:
                 # tail-first scan: as soon as a record predates the window
@@ -687,7 +695,7 @@ class FeedbackLog:
         # 2) turns.jsonl — error / result_is_error are turn-level negatives
         # the events stream might not capture.
         if len(negatives) < limit:
-            for rec in _iter_jsonl_reverse(self.turns_path):
+            for rec in iter_snapshot_or_tail(self.turns_snapshot, self.turns_path):
                 ts = rec.get("ts")
                 if not isinstance(ts, str) or ts < cutoff_iso:
                     if isinstance(ts, str):
@@ -784,7 +792,10 @@ def _short_ts(ts: str) -> str:
 _iter_jsonl_reverse = tail_jsonl_records
 
 
-def pending_forget_candidates_count(events_path: Path) -> int | None:
+def pending_forget_candidates_count(
+    events_path: Path, *,
+    snapshot: JsonlSnapshot | None = None,
+) -> int | None:
     """Return the count from the most recent ``saga_decay_ok`` event,
     iff that event flagged >0 candidates AND no ``saga_forget_ok``
     event has occurred since. Otherwise None — meaning the persistent
@@ -797,11 +808,13 @@ def pending_forget_candidates_count(events_path: Path) -> int | None:
     re-establishes the count if it's still non-zero. Per-call count
     arithmetic is fragile (forget can be partial, ranges can shift)
     so we don't try.
+
+    ``snapshot`` (CR#10) — iterate the cached snapshot when provided.
     """
     latest_decay_ts: str | None = None
     latest_decay_count: int | None = None
     latest_forget_ts: str | None = None
-    for ev in tail_jsonl_records(events_path):
+    for ev in iter_snapshot_or_tail(snapshot, events_path):
         evtype = ev.get("type")
         ts = ev.get("timestamp")
         if not isinstance(ts, str):

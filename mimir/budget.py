@@ -37,7 +37,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from ._jsonl_tail import tail_jsonl_records
+from ._jsonl_tail import tail_jsonl_records  # noqa: F401 — re-export
+from .jsonl_snapshot import JsonlSnapshot, iter_snapshot_or_tail
 from .billing import (
     BillingMode,
     QuotaProvider,
@@ -101,7 +102,15 @@ class HomeostaticArbiter:
     re-read each time so live signals win.
 
     The thresholds default to the §12.4 starting values; operators can
-    tune via the per-instance fields."""
+    tune via the per-instance fields.
+
+    ``events_snapshot`` / ``turns_snapshot`` (CR#10): when provided by
+    the constructing Agent, the homeostat reads through the cached
+    snapshots instead of re-streaming events.jsonl + turns.jsonl on
+    each ``snapshot()`` call. The arbiter is invoked once per turn (via
+    ``_assemble_self_state_block`` from ``run_turn``) AND additionally
+    by the scheduler before firing a tick — both call sites benefit
+    from the per-Agent cache."""
 
     home: Path
     rate_limit_store: RateLimitStore
@@ -113,6 +122,8 @@ class HomeostaticArbiter:
     cost_spike_ratio: float | None = None
     cost_spike_floor_usd: float | None = 5.0
     fallback_model: str | None = None
+    events_snapshot: "JsonlSnapshot | None" = None
+    turns_snapshot: "JsonlSnapshot | None" = None
 
     def snapshot(self, *, now: datetime | None = None) -> BudgetSnapshot:
         now = now or datetime.now(tz=timezone.utc)
@@ -137,6 +148,7 @@ class HomeostaticArbiter:
             report = aggregate_usage(
                 self.turns_log,
                 fallback_model=self.fallback_model,
+                snapshot=self.turns_snapshot,
             )
         except Exception:  # noqa: BLE001
             log.exception("budget snapshot: usage aggregate failed")
@@ -162,6 +174,7 @@ class HomeostaticArbiter:
         # Tool-call partition + token totals from turns.jsonl.
         s3_calls, s4_calls, tokens_24h, tokens_7d = _partition_turns(
             self.turns_log, now=now,
+            snapshot=self.turns_snapshot,
         )
 
         return BudgetSnapshot(
@@ -250,6 +263,7 @@ class HomeostaticArbiter:
         try:
             pending = pending_forget_candidates_count(
                 self.home / "logs" / "events.jsonl",
+                snapshot=self.events_snapshot,
             )
         except Exception:  # noqa: BLE001
             log.exception("pending_forget_candidates_count failed; skipping")
@@ -303,6 +317,7 @@ class HomeostaticArbiter:
 
 def _partition_turns(
     path: Path, *, now: datetime,
+    snapshot: "JsonlSnapshot | None" = None,
 ) -> tuple[int, int, int, int]:
     """Walk turns.jsonl tail-first, return (s3_tool_calls_24h,
     s4_tool_calls_24h, tokens_24h, tokens_7d). S3 = user_message;
@@ -315,6 +330,9 @@ def _partition_turns(
     cutoff, everything still in the file is also older and we stop.
     Avoids the O(file_size) memory spike of the prior
     ``path.read_text()``-based walk. CR#5.
+
+    ``snapshot`` (CR#10) — when provided, iterate the cached snapshot
+    instead of streaming from disk. Falls back to direct tail when None.
     """
     s3_calls = 0
     s4_calls = 0
@@ -326,7 +344,7 @@ def _partition_turns(
     cutoff_24h = now - timedelta(hours=24)
     cutoff_7d = now - timedelta(days=7)
 
-    for rec in tail_jsonl_records(path):
+    for rec in iter_snapshot_or_tail(snapshot, path):
         ts_raw = rec.get("ts")
         if not isinstance(ts_raw, str):
             continue
