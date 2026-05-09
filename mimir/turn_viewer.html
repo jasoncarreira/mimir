@@ -54,7 +54,13 @@ tr:hover td{background:var(--surface2);cursor:pointer}
 .badge-user_message{background:#1e3a5f;color:#60a5fa}
 .badge-scheduled_tick{background:#3b2d14;color:#fbbf24}
 .badge-saga_session_end{background:#2d1e3a;color:#c084fc}
+.badge-poller{background:#103838;color:#5eead4}
+.badge-claude_code_spawn{background:#3a230f;color:#fb923c}
+.badge-shell_job_complete{background:#1f2d1f;color:#86efac}
+.badge-react_received{background:#3a1c2e;color:#f472b6}
+.badge-unknown{background:var(--surface2);color:var(--text2);border:1px dashed var(--border)}
 .badge-channel{background:var(--surface2);color:var(--text2);border:1px solid var(--border)}
+.badge-kind{background:transparent;color:var(--text3);font-weight:500;border:1px solid var(--border);margin-left:4px}
 .detail-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:100;display:none}
 .detail-overlay.open{display:block}
 .detail-panel{position:fixed;top:0;right:0;bottom:0;width:660px;max-width:90vw;background:var(--surface);border-left:1px solid var(--border);overflow-y:auto;z-index:101;transform:translateX(100%);transition:transform .2s ease;display:flex;flex-direction:column}
@@ -113,7 +119,13 @@ tr:hover td{background:var(--surface2);cursor:pointer}
     <button class="tab" data-trigger="user_message">User</button>
     <button class="tab" data-trigger="scheduled_tick">Heartbeat</button>
     <button class="tab" data-trigger="saga_session_end">Synthesis</button>
+    <button class="tab" data-trigger="poller">Poller</button>
+    <button class="tab" data-trigger="claude_code_spawn">Spawn</button>
+    <button class="tab" data-trigger="shell_job_complete">Job</button>
   </div>
+  <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);cursor:pointer;margin-left:12px">
+    <input type="checkbox" id="hidePollersToggle" style="cursor:pointer"> hide pollers
+  </label>
   <div class="filter-group" style="margin-left:auto">
     <input class="search-input" id="searchInput" type="text" placeholder="Search input / output&hellip;">
   </div>
@@ -177,10 +189,33 @@ tr:hover td{background:var(--surface2);cursor:pointer}
 <script>
 (function() {
 var allTurns = [];
-var activeTrigger = 'all';
+// activeTrigger and hidePollers persist in localStorage so a refresh
+// during dev (the viewer is typically left open in a browser tab)
+// keeps the operator's chosen view rather than snapping back to the
+// All / show-everything default.
+var LS_PREFIX = 'mimir.viewer.';
+function lsGet(key, fallback) {
+  try { var v = localStorage.getItem(LS_PREFIX + key); return v == null ? fallback : v; }
+  catch (e) { return fallback; }
+}
+function lsSet(key, value) {
+  try { localStorage.setItem(LS_PREFIX + key, value); } catch (e) { /* private mode / quota */ }
+}
+var activeTrigger = lsGet('activeTrigger', 'all');
 var searchQuery = '';
 var openTurnId = null;
 var pollInterval = null;
+// "hide pollers" suppresses trigger=poller rows from the All view.
+// Most useful default depends on workload; off by default so new
+// users see all activity, with the toggle as the noise-cut hatch.
+var hidePollers = lsGet('hidePollers', '0') === '1';
+// Known triggers — the badge CSS knows about these. Anything else
+// renders with badge-unknown so it's visually flagged for follow-up.
+var KNOWN_TRIGGERS = {
+  user_message: 1, scheduled_tick: 1, saga_session_end: 1,
+  poller: 1, claude_code_spawn: 1, shell_job_complete: 1,
+  react_received: 1,
+};
 
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -195,8 +230,18 @@ function fmtTime(ts) {
   return mo[d.getMonth()]+' '+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
 }
 
-function triggerBadge(t) {
-  return '<span class="badge badge-'+esc(t||'unknown')+'">'+esc(t||'unknown')+'</span>';
+function triggerBadge(t, kind) {
+  var label = t || 'unknown';
+  var cls = KNOWN_TRIGGERS[label] ? 'badge-'+esc(label) : 'badge-unknown';
+  var html = '<span class="badge '+cls+'" title="'+esc(label)+'">'+esc(label)+'</span>';
+  // ``kind`` disambiguates rows that share a trigger but represent
+  // different work (e.g. claude_code_spawn rows carry kind="claude_code_spawn"
+  // for the spawn-completion turn vs scheduler ticks). Surface it inline
+  // when present and not redundant with the trigger itself.
+  if (kind && kind !== label) {
+    html += '<span class="badge badge-kind" title="kind">'+esc(kind)+'</span>';
+  }
+  return html;
 }
 function channelBadge(c) {
   return c ? '<span class="badge badge-channel">'+esc(c)+'</span>' : '';
@@ -218,6 +263,9 @@ function trunc(str, n) {
 function filterTurns() {
   return allTurns.filter(function(t) {
     if (activeTrigger !== 'all' && t.trigger !== activeTrigger) return false;
+    // hidePollers only fires on the All view — explicit Poller tab
+    // overrides (operator opted in to seeing them).
+    if (hidePollers && activeTrigger === 'all' && t.trigger === 'poller') return false;
     if (searchQuery) {
       var q = searchQuery.toLowerCase();
       if (((t.input||'').toLowerCase().indexOf(q)===-1) && ((t.output||'').toLowerCase().indexOf(q)===-1)) return false;
@@ -262,7 +310,7 @@ function renderTable() {
     var errMark = t.error ? ' style="color:var(--red)"' : '';
     return '<tr data-idx="'+i+'">'+
       '<td class="col-time"'+errMark+'>'+fmtTime(t.ts)+'</td>'+
-      '<td class="col-trigger">'+triggerBadge(t.trigger)+'</td>'+
+      '<td class="col-trigger">'+triggerBadge(t.trigger, t.kind)+'</td>'+
       '<td class="col-channel">'+channelBadge(t.channel_id)+'</td>'+
       '<td class="col-events">'+((t.events||[]).length)+'</td>'+
       '<td class="col-duration">'+fmtDuration(t.duration_ms)+'</td>'+
@@ -313,7 +361,7 @@ function openDetail(turn) {
   if (!turn) return;
   openTurnId = turn.turn_id;
   document.getElementById('detailTs').textContent = fmtTime(turn.ts);
-  document.getElementById('detailTrigger').innerHTML = triggerBadge(turn.trigger);
+  document.getElementById('detailTrigger').innerHTML = triggerBadge(turn.trigger, turn.kind);
   document.getElementById('detailChannel').innerHTML = channelBadge(turn.channel_id);
   document.getElementById('detailDuration').innerHTML = turn.duration_ms != null ? fmtDuration(turn.duration_ms) : '';
   document.getElementById('detailTurnId').textContent = turn.turn_id ? 'turn: '+turn.turn_id : '';
@@ -359,8 +407,24 @@ document.addEventListener('keydown', function(e){ if(e.key==='Escape') closeDeta
 document.querySelectorAll('#triggerTabs .tab').forEach(function(btn) {
   btn.addEventListener('click', function() {
     activeTrigger = btn.getAttribute('data-trigger');
+    lsSet('activeTrigger', activeTrigger);
     render();
   });
+});
+
+// Restore the persisted UI state on load, so the initial render
+// matches the variables that filterTurns() reads. The .active tab
+// class is also re-synced here to avoid a brief flash of "All"
+// before the first data-load triggers render() (which itself
+// re-syncs the class from activeTrigger).
+document.getElementById('hidePollersToggle').checked = hidePollers;
+document.querySelectorAll('#triggerTabs .tab').forEach(function(btn) {
+  btn.classList.toggle('active', btn.getAttribute('data-trigger') === activeTrigger);
+});
+document.getElementById('hidePollersToggle').addEventListener('change', function(e) {
+  hidePollers = e.target.checked;
+  lsSet('hidePollers', hidePollers ? '1' : '0');
+  renderTable();
 });
 
 document.getElementById('searchInput').addEventListener('input', function(e) {
