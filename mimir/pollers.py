@@ -1,0 +1,411 @@
+"""Pollers framework — subprocess-shaped external-state watchers.
+
+chainlink #3. Pollers live alongside skills under
+``<home>/.claude/skills/<name>/`` with a ``pollers.json`` manifest that
+declares one or more poller scripts. The scheduler discovers them at
+startup (and on the ``mcp__mimir__reload_pollers`` MCP tool call), runs
+each on its declared cron, and parses the script's stdout as JSONL.
+Each emitted line becomes an ``AgentEvent`` that wakes mimir on a
+known channel, exactly like an inbound bridge message.
+
+Why a separate framework from ``register_callable``: in-process
+callables are mimir-internal maintenance (saga consolidation, OAuth
+quota poll, etc.) — they mutate in-memory state and run regardless
+of whether anything changed. Pollers are user-facing watch jobs
+that emit events when external state changes; they're isolated as
+subprocesses (any language, no mimir import path coupling) and
+silence-on-no-change is the filter. New pollers ship as a skill
+directory drop, no mimir release required.
+
+Ported from open-strix's ``open_strix.scheduler._discover_pollers`` /
+``_on_poller_fire`` (2026-04 vintage).
+
+Output contract (matches open-strix):
+- **stdout**: JSONL, one ``{"poller": str, "prompt": str, ...}`` per
+  actionable event. Other keys (``source_platform``, etc.) flow
+  through to the AgentEvent's ``extra``.
+- **stderr**: free-form diagnostic output. Captured and emitted as
+  a ``poller_stderr`` event for observability; not forwarded to the
+  agent.
+- **exit 0**: success (zero events is fine — silence means nothing
+  to report). **Non-zero**: error, surfaces as ``poller_nonzero_exit``.
+
+Subprocess gets these env vars injected automatically:
+- ``STATE_DIR`` — the skill directory (writable, cursor/state files).
+- ``POLLER_NAME`` — the poller's name from pollers.json.
+- The host process's environment, plus ``env`` overrides from the
+  poller's pollers.json entry.
+
+The 60-second timeout is hard-capped; longer-running pollers should
+either run faster or restructure as ``async-tasks``-style background
+jobs that emit on completion.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Awaitable, Callable
+
+from .event_logger import log_event
+from .models import AgentEvent
+
+log = logging.getLogger(__name__)
+
+POLLER_TIMEOUT_SECONDS = 60
+# Cap stderr text recorded in events.jsonl so a chatty poller doesn't
+# blow the algedonic stream's storage budget.
+POLLER_STDERR_LOG_CHARS = 2000
+# Cap the per-line stdout payload kept in events.jsonl on parse error
+# (bad JSON line). Truncated for the same reason.
+POLLER_INVALID_LINE_CHARS = 500
+# Cap the prompt text on each emitted poller event (~5x typical
+# Discord message). Pollers that need to send larger payloads should
+# stash to a file and emit a path reference instead — matches the
+# ``<send-file>`` directive shape. A buggy poller that emits a 10 MB
+# JSON line would otherwise blow the prompt-build cache and burn
+# budget on the next turn (Mimir's PR #88 review nit 4).
+POLLER_PROMPT_CHARS = 16_000
+# Truncated preview of the rejected prompt kept in
+# ``poller_event_rejected`` events for back-pressure debugging.
+POLLER_REJECTION_PREVIEW_CHARS = 200
+
+
+@dataclass
+class PollerConfig:
+    """One poller declared in a skill's ``pollers.json``.
+
+    ``skill_dir`` is the absolute path to the skill directory; the
+    subprocess runs with that as its cwd. ``persist_dir`` is the
+    poller's writable cursor/state location — under
+    ``<home>/state/pollers/<name>/`` when discovered via
+    ``Scheduler.add_poller_jobs`` (filing-rules-aligned, on the
+    persistent volume regardless of how the skill itself was
+    installed). Tests that construct PollerConfig directly may set
+    ``persist_dir == skill_dir`` for compactness.
+
+    ``env`` are extra env vars from the json entry's ``env`` map
+    (already coerced to ``dict[str, str]``)."""
+
+    name: str
+    command: str
+    cron: str
+    env: dict[str, str]
+    skill_dir: Path
+    persist_dir: Path | None = None
+
+    def channel_id(self) -> str:
+        """Synthetic channel for emitted events. Mirrors the
+        ``scheduler:<name>`` convention used for null-channel
+        scheduler.yaml jobs — keeps poller events queue-isolated
+        per-poller (parallel across pollers, serialized within)."""
+        return f"poller:{self.name}"
+
+    def resolved_persist_dir(self) -> Path:
+        """Effective persist dir — falls back to skill_dir when not
+        explicitly set (compactness for tests + niche call sites)."""
+        return self.persist_dir if self.persist_dir is not None else self.skill_dir
+
+
+def discover_pollers(
+    skills_dir: Path,
+    *,
+    state_root: Path | None = None,
+) -> list[PollerConfig]:
+    """Walk ``skills_dir/**/pollers.json`` and parse out poller configs.
+
+    Sync — called from the Scheduler at startup before the event loop
+    spins up. Per-file failures (bad JSON, missing required fields)
+    log a stderr-visible warning but don't abort the walk; one bad
+    skill shouldn't take the whole framework down. Returns an empty
+    list when ``skills_dir`` doesn't exist (most installs).
+
+    ``state_root`` (when set, typically ``<home>/state/pollers``) is
+    where each poller's persistent cursor/state files belong. The
+    framework injects ``state_root/<poller_name>`` as ``STATE_DIR``
+    in the subprocess env so cursors survive container rebuilds even
+    when the skill itself ships in the image. ``state_root=None``
+    falls back to ``skill_dir`` (back-compat for tests + skill setups
+    where the skill directory itself is on a persistent volume).
+    """
+    pollers: list[PollerConfig] = []
+    if not skills_dir.exists():
+        return pollers
+
+    for pollers_file in sorted(skills_dir.rglob("pollers.json")):
+        skill_dir = pollers_file.parent
+        try:
+            raw = json.loads(pollers_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning(
+                "poller_invalid_json: %s — %s", pollers_file, exc,
+            )
+            continue
+
+        if not isinstance(raw, dict) or "pollers" not in raw:
+            log.warning(
+                "poller_invalid_format: %s — expected dict with 'pollers' key",
+                pollers_file,
+            )
+            continue
+        entries = raw.get("pollers")
+        if not isinstance(entries, list):
+            log.warning(
+                "poller_invalid_format: %s — 'pollers' must be a list",
+                pollers_file,
+            )
+            continue
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "")).strip()
+            command = str(entry.get("command", "")).strip()
+            cron = str(entry.get("cron", "")).strip()
+            if not name or not command or not cron:
+                log.warning(
+                    "poller_missing_fields: %s — entry %r",
+                    pollers_file, entry,
+                )
+                continue
+            env_raw = entry.get("env", {})
+            if not isinstance(env_raw, dict):
+                env_raw = {}
+            persist_dir = (
+                state_root / name if state_root is not None else None
+            )
+            pollers.append(
+                PollerConfig(
+                    name=name,
+                    command=command,
+                    cron=cron,
+                    env={str(k): str(v) for k, v in env_raw.items()},
+                    skill_dir=skill_dir,
+                    persist_dir=persist_dir,
+                ),
+            )
+    return pollers
+
+
+async def run_poller(
+    poller: PollerConfig,
+    *,
+    enqueue: Callable[[AgentEvent], Awaitable[bool]],
+    timeout: float = POLLER_TIMEOUT_SECONDS,
+) -> int:
+    """Run one poller subprocess; parse its stdout JSONL; enqueue
+    each emitted event. Returns the count of events successfully
+    enqueued (excludes dispatcher-rejected events; those land in
+    ``poller_event_rejected`` events for back-pressure auditing).
+    Returns 0 on timeout / error / silence.
+
+    **Command parsing**: ``poller.command`` is parsed by ``/bin/sh -c``
+    via ``asyncio.create_subprocess_shell``. Shell features (env-var
+    expansion, pipes, redirection) are available — and skill authors
+    are responsible for quoting args that contain whitespace or shell
+    metacharacters (``"python poller.py 'arg with spaces'"`` —
+    NOT ``"python poller.py arg with spaces"``). For arg-handling
+    safety, prefer compiling the script to a single binary or quoting
+    consistently in ``pollers.json``.
+
+    **Subprocess hygiene**: a ``finally`` block ensures the process is
+    killed and reaped on every exit path (timeout, exception, normal
+    completion), so cancellation mid-run doesn't leak orphan
+    subprocesses or kernel-side zombies on long-lived mimir processes.
+
+    Always logs a ``poller_complete`` event at the end so the operator
+    can audit "did the poll cycle run?" even when nothing was emitted.
+    The complete event carries both ``events_emitted`` (successful
+    enqueues) and ``events_rejected`` (dispatcher said no, indicating
+    queue back-pressure) so a mismatch between them is grep-able.
+    """
+    persist_dir = poller.resolved_persist_dir()
+    # Lazy-create the persist dir on first use. Skill authors who
+    # write a cursor file to STATE_DIR can rely on the dir existing.
+    try:
+        persist_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        await log_event(
+            "poller_persist_dir_create_failed",
+            poller=poller.name,
+            persist_dir=str(persist_dir),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        # Fall through; the subprocess might handle a missing dir,
+        # OR fail and surface as poller_nonzero_exit.
+
+    env = {**os.environ, **poller.env}
+    env["STATE_DIR"] = str(persist_dir)
+    env["POLLER_NAME"] = poller.name
+
+    proc: asyncio.subprocess.Process | None = None
+    stdout_bytes = b""
+    stderr_bytes = b""
+    fatal_error: str | None = None
+    try:
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                poller.command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(poller.skill_dir),
+                env=env,
+            )
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            await log_event(
+                "poller_timeout",
+                poller=poller.name,
+                timeout_seconds=int(timeout),
+            )
+            return 0
+        except Exception as exc:  # noqa: BLE001 — never let a poller break the scheduler
+            fatal_error = f"{type(exc).__name__}: {exc}"
+            await log_event(
+                "poller_exec_error",
+                poller=poller.name,
+                error=fatal_error,
+            )
+            return 0
+    finally:
+        # Kill + reap on every exit path. The ``returncode is None``
+        # gate makes this a no-op on the happy path (process already
+        # exited via ``communicate``); on timeout or exception it
+        # ensures we don't leak orphans / zombies.
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except (ProcessLookupError, asyncio.CancelledError):
+                pass
+
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+    if stderr_text:
+        await log_event(
+            "poller_stderr",
+            poller=poller.name,
+            stderr=stderr_text[:POLLER_STDERR_LOG_CHARS],
+        )
+
+    if proc is None or proc.returncode != 0:
+        await log_event(
+            "poller_nonzero_exit",
+            poller=poller.name,
+            returncode=proc.returncode if proc is not None else None,
+        )
+        return 0
+
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+    if not stdout_text:
+        await log_event(
+            "poller_complete",
+            poller=poller.name,
+            events_emitted=0,
+            events_rejected=0,
+        )
+        return 0
+
+    event_count = 0
+    rejected_count = 0
+    for line in stdout_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            await log_event(
+                "poller_invalid_line",
+                poller=poller.name,
+                line=line[:POLLER_INVALID_LINE_CHARS],
+            )
+            continue
+
+        if not isinstance(parsed, dict):
+            continue
+        prompt = str(parsed.get("prompt", "")).strip()
+        if not prompt:
+            continue
+
+        # Cap the prompt at POLLER_PROMPT_CHARS so a chatty / buggy
+        # poller can't blow the prompt-build cache by emitting a
+        # giant single event. Truncated payloads carry a clear marker
+        # so the agent (and operator) know the cap fired.
+        if len(prompt) > POLLER_PROMPT_CHARS:
+            await log_event(
+                "poller_prompt_truncated",
+                poller=poller.name,
+                original_chars=len(prompt),
+            )
+            prompt = (
+                prompt[:POLLER_PROMPT_CHARS]
+                + "\n\n[…truncated by poller framework]"
+            )
+
+        # Strip the framework-required keys before stuffing the rest
+        # into AgentEvent.extra so downstream prompt rendering can
+        # surface platform-specific metadata (source_platform, urls,
+        # etc.) without colliding with the AgentEvent dataclass shape.
+        extras = {
+            k: v for k, v in parsed.items()
+            if k not in ("prompt", "poller")
+        }
+
+        event = AgentEvent(
+            trigger="poller",
+            channel_id=poller.channel_id(),
+            content=prompt,
+            source="poller",
+            source_id=f"poller:{poller.name}:{event_count + rejected_count}",
+            extra={"poller_name": poller.name, **extras},
+        )
+        try:
+            accepted = await enqueue(event)
+        except Exception as exc:  # noqa: BLE001
+            await log_event(
+                "poller_enqueue_error",
+                poller=poller.name,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            continue
+        if accepted:
+            event_count += 1
+        else:
+            rejected_count += 1
+            # Back-pressure observability: when the dispatcher refuses
+            # an event (queue cap hit, channel saturated, etc.) record
+            # it so the events_emitted vs events_rejected gap on
+            # poller_complete is grep-able. Truncated preview keeps
+            # events.jsonl small for chatty pollers.
+            await log_event(
+                "poller_event_rejected",
+                poller=poller.name,
+                prompt_preview=prompt[:POLLER_REJECTION_PREVIEW_CHARS],
+            )
+
+    await log_event(
+        "poller_complete",
+        poller=poller.name,
+        events_emitted=event_count,
+        events_rejected=rejected_count,
+    )
+    return event_count
+
+
+__all__ = (
+    "PollerConfig",
+    "discover_pollers",
+    "run_poller",
+    "POLLER_TIMEOUT_SECONDS",
+    "POLLER_PROMPT_CHARS",
+)
