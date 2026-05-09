@@ -3473,17 +3473,43 @@ def merge_atoms(atom_id_keep: str, atom_id_remove: str, merged_content: str = No
     update_sql += " WHERE id = ?"
     params.append(atom_id_keep)
 
-    # CR#16: kept-atom UPDATE + tombstone UPDATE + triples reassign
-    # must commit together. The pre-fix code wrapped the triples
-    # UPDATE in try/except: pass — a real FK / lock failure there
-    # left the keep-side updated and the remove-side tombstoned but
-    # the triples still pointing at the (now-tombstoned) remove atom.
-    # We probe sqlite_master for the triples table instead of
-    # try/except: in test envs that haven't called init_triples_schema
-    # the table genuinely doesn't exist (lazy init), and that's not a
+    # CR#16: kept-atom UPDATE + atoms_fts resync + tombstone UPDATE +
+    # triples reassign must commit together. Pre-fix code wrapped the
+    # triples UPDATE in try/except: pass — a real FK / lock failure
+    # there left the keep-side updated and the remove-side tombstoned
+    # but the triples still pointing at the (now-tombstoned) remove
+    # atom.
+    #
+    # Reviewer (cr16-review #80) flagged a second divergence shape on
+    # this path: when ``merged_content`` is provided, ``atoms.content``
+    # is updated in-place but ``atoms_fts`` (an external-content FTS5
+    # over ``atoms``, no auto-update triggers) was left pointing at the
+    # OLD content — so keyword search returned the pre-merge text
+    # forever. We DELETE+INSERT the FTS row inside the same txn so the
+    # text in atoms and atoms_fts can never disagree post-merge.
+    #
+    # We probe sqlite_master for the triples table instead of try/except:
+    # in test envs that haven't called init_triples_schema the table
+    # genuinely doesn't exist (lazy init), and that's not a
     # rollback-worthy failure — but a real error during the UPDATE is.
     with transactional() as conn:
         conn.execute(update_sql, params)
+        if merged_content:
+            # Re-sync the FTS5 row so keyword search returns the new
+            # content. External-content FTS5 (``content='atoms'``) has
+            # no auto-update trigger; we re-INSERT after a DELETE.
+            row = conn.execute(
+                "SELECT rowid FROM atoms WHERE id = ?", (atom_id_keep,)
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    "DELETE FROM atoms_fts WHERE rowid = ?", (row["rowid"],),
+                )
+                conn.execute(
+                    "INSERT INTO atoms_fts(rowid, content) "
+                    "SELECT rowid, content FROM atoms WHERE id = ?",
+                    (atom_id_keep,),
+                )
         conn.execute("UPDATE atoms SET state = 'tombstone' WHERE id = ?", (atom_id_remove,))
         triples_exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='triples'"

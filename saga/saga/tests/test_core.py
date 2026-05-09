@@ -153,6 +153,44 @@ class TestMerge:
         assert result["kept"] == id1
         assert result["removed"] == id2
 
+    def test_merge_atoms_resyncs_fts5_for_new_content(self):
+        """CR#16 follow-up (#80 review): when ``merged_content`` is
+        provided, ``merge_atoms`` updates ``atoms.content`` in-place.
+        ``atoms_fts`` is an external-content FTS5 over ``atoms``
+        (``content='atoms'``) with no auto-update trigger — without an
+        explicit FTS resync, keyword search returns the OLD pre-merge
+        content forever. This test pins the resync."""
+        from saga.core import store_atom, merge_atoms, keyword_search
+
+        old_content = "vintage typewriter from 1923"
+        new_content = "merged: vintage typewriter manufactured in 1923, restored 2024"
+        id1 = store_atom(old_content)
+        id2 = store_atom("typewriter found at estate sale")
+
+        # Pre-merge: keyword search for the OLD-content distinguisher
+        # finds the keep atom.
+        pre = keyword_search("vintage")
+        assert any(a["id"] == id1 for a in pre)
+
+        merge_atoms(id1, id2, merged_content=new_content)
+
+        # Post-merge: keyword search for a phrase ONLY in the new
+        # content (e.g. "restored") MUST find the kept atom. Pre-fix
+        # this returned no results because atoms_fts still indexed the
+        # old "vintage typewriter from 1923" text.
+        post = keyword_search("restored")
+        post_ids = [a["id"] for a in post]
+        assert id1 in post_ids, (
+            "atoms_fts must reflect merged_content — keyword search for "
+            "a phrase only in the new content should find the merged atom"
+        )
+
+        # And keyword search for "1923" (which appears in BOTH old and
+        # new) still finds the kept atom — verifies we didn't break
+        # the basic indexing path.
+        still = keyword_search("1923")
+        assert id1 in [a["id"] for a in still]
+
 
 class TestDryRetrieve:
     def test_dry_no_side_effects(self):
