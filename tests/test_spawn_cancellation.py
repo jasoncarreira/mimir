@@ -46,23 +46,24 @@ def _wait_for_exit(registry: ShellJobRegistry, job_id: str, timeout: float = 10.
 
 
 def _pid_alive(pid: int) -> bool:
-    """True if pid is reachable AND not a zombie. ``kill -0`` succeeds for
-    zombies, so additionally check ``/proc/<pid>/status`` for State==Z."""
+    """True if ``kill -0`` reaches the pid, False if it's gone.
+
+    Cross-platform via ``os.kill(pid, 0)`` — works on Linux + macOS dev
+    environments. The earlier shape augmented this with a
+    ``/proc/<pid>/status`` zombie check; that path doesn't exist on
+    Darwin, so the function returned False for any process and broke
+    the SIGTERM/SIGKILL tests on macOS dev hosts. The tests give 5s
+    after the kill for the kernel to deliver + init to reap, which
+    closes the zombie window enough that plain ``kill(0)`` raises
+    ``ProcessLookupError`` by the time the assertion runs.
+    """
     try:
         os.kill(pid, 0)
+        return True
     except ProcessLookupError:
         return False
     except PermissionError:  # exists but we don't own it — counts as alive
         return True
-    try:
-        status = Path(f"/proc/{pid}/status").read_text()
-    except FileNotFoundError:
-        return False
-    for line in status.splitlines():
-        if line.startswith("State:"):
-            # ``State:\tZ (zombie)`` — terminated but not yet reaped
-            return "Z" not in line.split(maxsplit=1)[1]
-    return True
 
 
 # ─── tests ────────────────────────────────────────────────────────────
