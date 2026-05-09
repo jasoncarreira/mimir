@@ -47,6 +47,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -204,6 +205,13 @@ def discover_pollers(
             # values (negative, non-int, zero) fall back to default
             # with a stderr-visible warning so a typo doesn't silently
             # break batching for a skill the operator just installed.
+            #
+            # ``log.warning`` (stdlib) rather than ``log_event``
+            # (events.jsonl) because ``discover_pollers`` is sync
+            # and runs at startup before the asyncio loop spins up;
+            # ``log_event`` is async and would deadlock here. Operator
+            # scanning events.jsonl for poller config issues won't
+            # see this — check container stderr / docker logs instead.
             batch_size = POLLER_BATCH_SIZE_DEFAULT
             raw_batch = entry.get("batch_size", POLLER_BATCH_SIZE_DEFAULT)
             try:
@@ -357,9 +365,23 @@ async def run_poller(
     # Phase 1: parse + clean every JSONL line into a list of items.
     # Each item is ``{"prompt": str, "extras": dict[str, Any]}`` —
     # extras are the original parsed keys minus ``prompt``/``poller``.
-    # Per-item prompt truncation is applied here too, so a giant
-    # buggy line doesn't poison a batch.
+    # When ``batch_size > 1`` a per-item soft cap also fires here so
+    # one chatty item can't starve others by consuming the whole
+    # batch-level prompt budget. Single-item batches (default) skip
+    # the per-item cap to preserve verbatim pass-through; the
+    # batch-level cap below handles single giant prompts.
     items: list[dict[str, Any]] = []
+    # Per-item soft cap: divide the prompt budget across the batch,
+    # reserving a small slice (50 chars) per item for the numbered
+    # marker + newline overhead in the rendered batch. Floors at 100
+    # chars to keep tiny batch_sizes from collapsing items to nothing.
+    if poller.batch_size > 1:
+        per_item_cap: int | None = max(
+            100,
+            (POLLER_PROMPT_CHARS // poller.batch_size) - 50,
+        )
+    else:
+        per_item_cap = None
     for line in stdout_text.splitlines():
         line = line.strip()
         if not line:
@@ -379,6 +401,22 @@ async def run_poller(
         prompt = str(parsed.get("prompt", "")).strip()
         if not prompt:
             continue
+
+        # Per-item cap: only when batch_size > 1. Prevents one runaway
+        # item from starving others in a batched render. Marks the
+        # truncation as ``scope=per_item`` so an operator can tell it
+        # apart from the batch-level cap below.
+        if per_item_cap is not None and len(prompt) > per_item_cap:
+            await log_event(
+                "poller_prompt_truncated",
+                poller=poller.name,
+                original_chars=len(prompt),
+                scope="per_item",
+            )
+            prompt = (
+                prompt[:per_item_cap]
+                + "\n\n[…truncated by poller framework]"
+            )
 
         # Strip the framework-required keys before stuffing the rest
         # into AgentEvent.extra so downstream prompt rendering can
@@ -404,11 +442,20 @@ async def run_poller(
     # Phase 2: batch items into groups of up to ``poller.batch_size``.
     # batch_size=1 preserves the per-item-per-turn shape; >1 coalesces
     # to ``ceil(len(items) / batch_size)`` AgentEvents.
+    # ``max(1, ...)`` is defense-in-depth: ``discover_pollers``
+    # already filters non-positive values, but tests construct
+    # ``PollerConfig`` directly bypassing that path.
     batch_size = max(1, poller.batch_size)
     batches: list[list[dict[str, Any]]] = [
         items[i:i + batch_size]
         for i in range(0, len(items), batch_size)
     ]
+    # Per-fire timestamp scoped to source_id — disambiguates events
+    # across overlapping fires (manual fire racing a scheduled fire,
+    # two scheduled ticks delivered out-of-order). ms granularity is
+    # enough for any realistic fire cadence; no risk of collision in
+    # practice.
+    fire_ts_ms = int(time.time() * 1000)
 
     # Phase 3: assemble + dispatch each batch as one AgentEvent.
     event_count = 0
@@ -424,6 +471,7 @@ async def run_poller(
                 poller=poller.name,
                 original_chars=len(content),
                 batch_index=batch_idx,
+                scope="batch",
             )
             content = (
                 content[:POLLER_PROMPT_CHARS]
@@ -446,7 +494,7 @@ async def run_poller(
             channel_id=poller.channel_id(),
             content=content,
             source="poller",
-            source_id=f"poller:{poller.name}:batch:{batch_idx}",
+            source_id=f"poller:{poller.name}:{fire_ts_ms}:batch:{batch_idx}",
             extra=extra,
         )
         try:
@@ -475,6 +523,15 @@ async def run_poller(
                 batch_index=batch_idx,
             )
 
+    # ``events_emitted`` counts AgentEvents enqueued (= batches that
+    # the dispatcher accepted). Pre-batching it counted parsed JSONL
+    # lines, which was 1:1 with items. With ``batch_size > 1`` the
+    # two diverge: ``items_collected`` is the per-item count (what
+    # the old field meant) and ``events_emitted`` is now the per-
+    # turn count (= batches enqueued, what the agent actually sees).
+    # Operator queries reading ``events_emitted`` for "how many items
+    # came in?" should switch to ``items_collected``; queries asking
+    # "how many turns will this fire?" stay on ``events_emitted``.
     await log_event(
         "poller_complete",
         poller=poller.name,
@@ -512,14 +569,18 @@ def _render_batch(
         header += f" (batch {batch_index + 1} of {batch_count})"
     header += ":"
     body_lines = [header]
+    # Width of the largest marker — left-pad smaller numbers so
+    # ``" 1. "`` and ``"10. "`` align in batches that cross 10 items.
+    # Continuation indent matches the marker width + 2 (period +
+    # space) so multi-line item prompts stay visually grouped under
+    # their parent.
+    width = len(str(len(batch)))
+    cont_indent = " " * (width + 2)
     for i, item in enumerate(batch, start=1):
-        # Indent continuation lines so multi-line item prompts (URLs
-        # on their own line, multi-paragraph summaries) stay visually
-        # grouped under the "1." / "2." / etc. number marker.
         item_lines = item["prompt"].splitlines() or [""]
-        body_lines.append(f"{i}. {item_lines[0]}")
+        body_lines.append(f"{i:>{width}}. {item_lines[0]}")
         for tail in item_lines[1:]:
-            body_lines.append(f"   {tail}")
+            body_lines.append(f"{cont_indent}{tail}")
     return "\n".join(body_lines)
 
 

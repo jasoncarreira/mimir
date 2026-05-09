@@ -1009,3 +1009,148 @@ async def test_run_poller_silent_run_reports_zero_metadata(
     assert completes[0]["batches_emitted"] == 0
     assert completes[0]["events_emitted"] == 0
     assert completes[0]["events_rejected"] == 0
+
+
+# ─── per-item starvation cap (PR #93 review nit) ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_poller_batch_size_above_one_caps_per_item(
+    tmp_path: Path, home: Path,
+) -> None:
+    """When batch_size > 1, one giant item shouldn't starve the rest
+    of the batch. Per-item soft cap = POLLER_PROMPT_CHARS//batch_size
+    (minus a 50-char marker overhead, floored at 100). Pre-fix: a
+    single 16K+ item in a 5-item batch consumed the whole prompt
+    budget, items 2-5 got truncated away with no per-item indicator
+    that anything was dropped."""
+    from mimir.pollers import POLLER_PROMPT_CHARS
+    skill_dir = tmp_path / "skill"
+    # 5 items: one giant (>per-item cap), four small. With batch_size=5
+    # the per-item cap is POLLER_PROMPT_CHARS//5 - 50 ≈ 3150 chars.
+    # The giant item should be capped; small items pass through.
+    expected_per_item_cap = POLLER_PROMPT_CHARS // 5 - 50
+    huge = "GIANT" * (expected_per_item_cap + 200)  # well above cap
+    _install_script(skill_dir, "poller.py", f"""
+import json
+print(json.dumps({{"poller": "x", "prompt": {huge!r}}}))
+print(json.dumps({{"poller": "x", "prompt": "small 2"}}))
+print(json.dumps({{"poller": "x", "prompt": "small 3"}}))
+print(json.dumps({{"poller": "x", "prompt": "small 4"}}))
+print(json.dumps({{"poller": "x", "prompt": "small 5"}}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        batch_size=5,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 1  # all 5 items in one batch
+    content = enq.events[0].content
+    # Small items survive — proves per-item cap fired on the giant
+    # rather than the batch-level cap dropping the trailing items.
+    assert "1. GIANT" in content  # giant rendered (truncated)
+    assert "small 2" in content
+    assert "small 3" in content
+    assert "small 4" in content
+    assert "small 5" in content
+    # Per-item truncation event fired with scope="per_item".
+    events = _read_events(home)
+    truncs = [e for e in events if e["type"] == "poller_prompt_truncated"]
+    per_item = [t for t in truncs if t.get("scope") == "per_item"]
+    assert len(per_item) == 1
+    # Final batch render is under the global cap (per-item caps did
+    # their job; batch-level cap doesn't fire).
+    assert len(content) <= POLLER_PROMPT_CHARS + 100
+    batch_truncs = [t for t in truncs if t.get("scope") == "batch"]
+    assert batch_truncs == []
+
+
+@pytest.mark.asyncio
+async def test_run_poller_batch_size_one_does_not_apply_per_item_cap(
+    tmp_path: Path, home: Path,
+) -> None:
+    """The per-item cap fires only at batch_size>1. At batch_size=1
+    (default) a giant single item still goes through the batch-level
+    cap, preserving the verbatim-pass-through shape that matches
+    open-strix for the default path."""
+    from mimir.pollers import POLLER_PROMPT_CHARS
+    skill_dir = tmp_path / "skill"
+    huge = "X" * (POLLER_PROMPT_CHARS + 5000)
+    _install_script(skill_dir, "poller.py", f"""
+import json
+print(json.dumps({{"poller": "x", "prompt": {huge!r}}}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        batch_size=1,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    truncs = [e for e in events if e["type"] == "poller_prompt_truncated"]
+    # Only the batch-level cap fires; no per_item scope.
+    scopes = [t.get("scope") for t in truncs]
+    assert "batch" in scopes
+    assert "per_item" not in scopes
+
+
+@pytest.mark.asyncio
+async def test_run_poller_source_id_carries_fire_timestamp(
+    tmp_path: Path, home: Path,
+) -> None:
+    """source_id includes a per-fire timestamp so overlapping fires
+    of the same poller don't produce colliding source_ids
+    (manual-fire racing scheduled-fire, e.g.). Format:
+    ``poller:<name>:<fire_ts_ms>:batch:<idx>``."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "prompt": "first"}))
+print(json.dumps({"poller": "x", "prompt": "second"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        batch_size=1,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    sids = [e.source_id for e in enq.events]
+    # Format: poller:<name>:<fire_ts_ms>:batch:<idx>
+    parts0 = sids[0].split(":")
+    assert parts0[0] == "poller"
+    assert parts0[1] == "x"
+    # fire_ts_ms is a digit string of reasonable length (13-14 chars
+    # for current epoch ms).
+    assert parts0[2].isdigit()
+    assert len(parts0[2]) >= 13
+    assert parts0[3] == "batch"
+    assert parts0[4] == "0"
+    # Both events from the same fire share the same fire_ts_ms.
+    assert sids[0].split(":")[2] == sids[1].split(":")[2]
+    # But have distinct batch_idx.
+    assert sids[0].endswith(":0") and sids[1].endswith(":1")
+
+
+def test_render_batch_pads_markers_for_double_digit_batches():
+    """When a batch has 10+ items, marker padding aligns so
+    ``"10. "`` and ``" 1. "`` line up. Continuation indent matches
+    the marker width so multi-line items stay grouped under their
+    parent regardless of digit count."""
+    from mimir.pollers import _render_batch
+    batch = [
+        {"prompt": f"item {i}\nurl-{i}", "extras": {}}
+        for i in range(12)
+    ]
+    out = _render_batch("p", batch, 0, 1)
+    # 12 items → width 2. Single-digit markers padded with leading space.
+    assert "\n 1. item 0\n" in out
+    assert "\n 2. item 1\n" in out
+    assert "\n10. item 9\n" in out
+    assert "\n11. item 10\n" in out
+    # Continuation indent: 4 chars (2 for digit + ". ").
+    assert "    url-0" in out
+    assert "    url-9" in out
