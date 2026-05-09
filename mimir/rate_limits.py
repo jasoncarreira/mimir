@@ -72,7 +72,17 @@ def running_on_claude_max() -> bool:
 class RateLimitSnapshot:
     """Persisted shape of a single rate-limit-type entry. Mirrors the
     SDK's ``RateLimitInfo`` minus the type tag (which is the dict key)
-    plus an ``observed_at`` field so we can reason about staleness."""
+    plus an ``observed_at`` field so we can reason about staleness.
+
+    ``derived`` (chainlink #17): true when ``utilization`` was estimated
+    from cost data rather than read from a usage endpoint. The OAuth
+    poller's cost-rate-back-derived 5h estimator sets this when the
+    layer-(a) anomaly detector rejected an endpoint reading and we
+    need a usable 5h signal during a long endpoint glitch. The
+    arbiter (mimir/billing.py:evaluate_quota) applies a higher
+    suppress threshold (90% vs 80% direct) when this is set —
+    derived values are approximations and shouldn't trip the wall
+    threshold as quickly as ground truth."""
 
     status: str  # "allowed" | "allowed_warning" | "rejected"
     utilization: float | None = None
@@ -81,6 +91,7 @@ class RateLimitSnapshot:
     overage_status: str | None = None
     overage_resets_at: int | None = None
     overage_disabled_reason: str | None = None
+    derived: bool = False
 
 
 @dataclass
@@ -133,6 +144,7 @@ class RateLimitStore:
                 overage_status=raw.get("overage_status"),
                 overage_resets_at=raw.get("overage_resets_at"),
                 overage_disabled_reason=raw.get("overage_disabled_reason"),
+                derived=bool(raw.get("derived", False)),
             )
         return out
 
