@@ -818,8 +818,8 @@ class Agent:
                 capture_fn=self._capture_plan_quota_from_client,
             ),
             PostMessageSagaHook(hook_fn=self._post_message_hook),
-            IndexRebuildHook(indexes=self._indexes),
             WikiBacklinksHook(home=self._config.home),
+            IndexRebuildHook(indexes=self._indexes),
             GitCommitHook(
                 home=self._config.home,
                 enabled=self._config.git_tracking_enabled,

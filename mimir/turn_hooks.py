@@ -349,9 +349,18 @@ class WikiBacklinksHook(TurnLifecycleHook):
     that needle — only run when at least one non-generated wiki page
     is newer than the turn's start time.
 
-    Sits between ``IndexRebuildHook`` and ``GitCommitHook`` so the 3
+    Runs **before** ``IndexRebuildHook`` so ``state/INDEX.md`` reflects
+    the freshly-regenerated outputs on the same turn (rather than
+    lagging by one turn). Runs **before** ``GitCommitHook`` so the 3
     regenerated outputs are part of the same git commit as the writes
     that triggered them.
+
+    Loop-safety: the 3 generated outputs land at the wiki *root*
+    (``state/wiki/orphans.md`` etc.); IndexRebuildHook's outputs
+    (``memory/INDEX.md``, ``state/INDEX.md``, ``state/wiki/index.md``)
+    are either outside ``state/wiki/`` or in the wiki backlinks
+    ``_META_FILENAMES`` exclusion set, so neither writes back into
+    files this hook tracks.
     """
 
     name = "wiki_backlinks"
