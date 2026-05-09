@@ -93,6 +93,12 @@ class TurnContext:
     # the ctx (not on the SubagentLifecycleHook) so concurrent turns on
     # different channels don't share state.
     task_descriptions: dict[str, str] = field(default_factory=dict)
+    # WikiBacklinksHook snapshot: ``{absolute_page_path: st_mtime}`` taken
+    # at ``pre_query``, compared at ``finalize`` to detect which wiki
+    # pages were modified during the turn. Same multi-channel-safety
+    # rationale as task_descriptions. Empty dict when the hook didn't
+    # populate it (e.g. tests that drive ``finalize`` directly).
+    wiki_mtime_snapshot: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
