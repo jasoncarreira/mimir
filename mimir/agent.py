@@ -97,6 +97,7 @@ from .sagatools import (
 from .prompts import build_system_prompt, build_turn_prompt
 from .scheduler import Scheduler
 from .search import Indexer
+from .jsonl_snapshot import JsonlSnapshot
 from .session_manager import SessionManager
 from .turn_hooks import (
     CancelTypingHook,
@@ -690,11 +691,22 @@ class Agent:
         # loop). Worker threads use this to schedule coroutines back
         # onto the loop via ``run_coroutine_threadsafe``.
         self._loop: "asyncio.AbstractEventLoop | None" = None
+        # CR#10: per-Agent JsonlSnapshot caches for events.jsonl + turns.jsonl.
+        # Six per-turn call sites used to re-read these files from scratch each
+        # time (feedback assembly, usage block, self-state block, session
+        # summaries, subagent aggregate, budget partition). The snapshot wraps
+        # ``tail_jsonl_records`` with an mtime-checked TTL so within a single
+        # turn (~1s wall-clock) those reads share one cached parse instead of
+        # 6+ independent stream-and-decode passes.
+        self._events_snapshot = JsonlSnapshot(config.events_log)
+        self._turns_snapshot = JsonlSnapshot(config.turns_log)
         self._feedback = FeedbackLog(
             events_path=config.events_log,
             turns_path=config.turns_log,
             default_window_hours=config.feedback_window_hours,
             default_limit_per_polarity=config.feedback_limit_per_polarity,
+            events_snapshot=self._events_snapshot,
+            turns_snapshot=self._turns_snapshot,
         )
         self._session_boundary_log = SessionBoundaryLog(
             path=config.home / ".mimir" / "session_boundaries.jsonl",
@@ -740,6 +752,15 @@ class Agent:
             cost_spike_ratio=config.cost_rate_spike_ratio or None,
             cost_spike_floor_usd=config.cost_rate_spike_floor_usd or None,
             fallback_model=config.model,
+            # CR#10 follow-up (#79 review): without these the homeostat
+            # path (called every turn from _assemble_self_state_block)
+            # falls through to direct tail_jsonl_records, defeating the
+            # cache. Threading the per-Agent snapshots in here makes
+            # both _partition_turns and pending_forget_candidates_count
+            # share the same parsed list as the rest of the per-turn
+            # readers.
+            events_snapshot=self._events_snapshot,
+            turns_snapshot=self._turns_snapshot,
         )
         if scheduler is not None:
             scheduler._arbiter = self._arbiter
@@ -1289,6 +1310,7 @@ class Agent:
             report = aggregate_usage(
                 self._config.turns_log,
                 fallback_model=self._config.model,
+                snapshot=self._turns_snapshot,
             )
         except Exception:  # noqa: BLE001
             log.exception("usage_stats.aggregate failed; skipping block")
@@ -1314,6 +1336,7 @@ class Agent:
                 self._config.events_log,
                 event_kind,
                 cooldown_minutes=self._config.cost_alert_cooldown_minutes,
+                snapshot=self._events_snapshot,
             ):
                 deferred.append(
                     (
@@ -1350,6 +1373,7 @@ class Agent:
                 self._config.events_log,
                 "rate_limit_off_pace",
                 cooldown_minutes=self._config.cost_alert_cooldown_minutes,
+                snapshot=self._events_snapshot,
             ):
                 worst_key, worst_snap, worst_proj = off_pace[0]
                 deferred.append(
@@ -2023,6 +2047,16 @@ class Agent:
         # job waiters, etc.) use this to schedule coroutines back onto
         # the loop via run_coroutine_threadsafe. Idempotent: subsequent
         # calls re-bind to the same loop, which is fine.
+        #
+        # CR#10: invalidate the snapshots at the start of every turn so
+        # this turn's prompt-assembly reads pick up the previous turn's
+        # writes (TurnRecord + log_events) regardless of whether the
+        # snapshot's TTL has elapsed. Cheaper than tracking writes in
+        # log_event / turn_logger directly; the within-turn reads share
+        # one parse, the across-turn writes are visible immediately.
+        self._events_snapshot.invalidate()
+        self._turns_snapshot.invalidate()
+
         if self._loop is None:
             try:
                 self._loop = asyncio.get_running_loop()
