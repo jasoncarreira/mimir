@@ -229,6 +229,13 @@ class Config:
     # boundaries to render in the prompt's "Recent session summaries"
     # block, scoped to the current channel. 0 disables the section.
     recent_boundaries: int
+    # Staleness markers on the Unfinished sub-bullet (chainlink #63).
+    # When a summary's age >= ``stale_age_hours`` OR turns-since-boundary
+    # on the same channel >= ``stale_turns``, the Unfinished header gets
+    # a ``[verify before quoting]`` suffix nudging the
+    # verify-before-claim rule. Either signal alone is enough to fire.
+    unfinished_stale_age_hours: int
+    unfinished_stale_turns: int
 
     # Usage block in the turn prompt: enable/disable, plus optional
     # dollar budgets that gate the "% of budget" annotation. The 5h /
@@ -436,6 +443,8 @@ class Config:
             feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),
 
             recent_boundaries=_env_int("MIMIR_RECENT_BOUNDARIES", 3),
+            unfinished_stale_age_hours=_env_int("MIMIR_UNFINISHED_STALE_AGE_HOURS", 2),
+            unfinished_stale_turns=_env_int("MIMIR_UNFINISHED_STALE_TURNS", 5),
 
             usage_block_enabled=_env("MIMIR_USAGE_BLOCK", "true").lower()
                 not in {"false", "0", "no", "off"},

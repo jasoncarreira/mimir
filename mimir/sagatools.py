@@ -450,7 +450,13 @@ def build_saga_tools(
         "Write a session_boundary atom for an SAGA session. Auto-invoked by "
         "the synthesis turn at idle timeout (SPEC §5.6); call explicitly if "
         "you know a session is wrapping (user says 'talk later'). Empty "
-        "lists / None for the optional fields are dropped.",
+        "lists / None for the optional fields are dropped. ``closed_since`` "
+        "(chainlink #63) carries refs of items from prior boundaries' "
+        "Unfinished lists you've confirmed resolved during this session — "
+        "PR refs (e.g. ``#71``), chainlink IDs (``chainlink #29 G17``), "
+        "file paths. The prompt builder substring-matches these against "
+        "earlier Unfinished items and drops any item containing one of "
+        "the refs.",
         {
             "session_id": str,
             "summary": str,
@@ -458,6 +464,7 @@ def build_saga_tools(
             "decisions_made": list[str],
             "unfinished": list[str],
             "emotional_state": str,
+            "closed_since": list[str],
         },
     )
     @_safe("saga_end_session")
@@ -476,6 +483,7 @@ def build_saga_tools(
         topics = _opt_list("topics_discussed")
         decisions = _opt_list("decisions_made")
         unfinished = _opt_list("unfinished")
+        closed_since = _opt_list("closed_since")
         emotional = (args.get("emotional_state") or "").strip() or None
 
         try:
@@ -486,6 +494,7 @@ def build_saga_tools(
                 decisions_made=decisions,
                 unfinished=unfinished,
                 emotional_state=emotional,
+                closed_since=closed_since,
             )
         except SagaError as exc:
             return _content_block(f"saga_end_session failed: {exc}", is_error=True)
@@ -532,6 +541,7 @@ def build_saga_tools(
                         "topics_discussed": topics or [],
                         "decisions_made": decisions or [],
                         "unfinished": unfinished or [],
+                        "closed_since": closed_since or [],
                         "emotional_state": emotional,
                     }
                 )

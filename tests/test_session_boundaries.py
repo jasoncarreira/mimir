@@ -159,3 +159,454 @@ def test_build_turn_prompt_omits_session_section_when_block_none():
         session_summaries_block=None,
     )
     assert "Recent session summaries" not in prompt
+
+
+# ---- chainlink #63: staleness markers + closed_since applier -----------
+
+from datetime import datetime, timezone
+
+from mimir.session_boundary_log import (
+    _apply_closed_since,
+    _format_relative_age,
+    _format_turn_count,
+    count_turns_since,
+)
+
+
+_NOW = datetime(2026, 5, 9, 18, 0, 0, tzinfo=timezone.utc)
+
+
+# ---- _format_relative_age ----------------------------------------------
+
+
+def test_format_relative_age_buckets():
+    """Buckets match feedback.py's ``target_age`` pattern: <1m / Nm /
+    ~Nh / ~Nd. Boundary cases: 60s == 1m (not <1m), 3600s == ~1h
+    (not 60m), 86400s == ~1d."""
+    assert _format_relative_age("2026-05-09T17:59:30+00:00", _NOW) == "<1m ago"
+    assert _format_relative_age("2026-05-09T17:30:00+00:00", _NOW) == "30m ago"
+    assert _format_relative_age("2026-05-09T14:00:00+00:00", _NOW) == "~4h ago"
+    assert _format_relative_age("2026-05-06T18:00:00+00:00", _NOW) == "~3d ago"
+
+
+def test_format_relative_age_returns_none_when_unparseable():
+    assert _format_relative_age("garbage", _NOW) is None
+    assert _format_relative_age("", _NOW) is None
+
+
+def test_format_relative_age_returns_none_when_now_is_none():
+    """The ``now`` param is the wall-clock reference; without it,
+    age can't be computed and the renderer skips the marker."""
+    assert _format_relative_age("2026-05-09T14:00:00+00:00", None) is None
+
+
+def test_format_relative_age_handles_z_suffix():
+    """ISO-8601 with ``Z`` suffix is common — fromisoformat needs the
+    ``+00:00`` form, so the parser converts it."""
+    assert _format_relative_age("2026-05-09T14:00:00Z", _NOW) == "~4h ago"
+
+
+# ---- _format_turn_count -------------------------------------------------
+
+
+def test_format_turn_count_singular_and_plural():
+    assert _format_turn_count(0) == "0 turns this channel"
+    assert _format_turn_count(1) == "1 turn this channel"
+    assert _format_turn_count(8) == "8 turns this channel"
+
+
+# ---- _apply_closed_since -----------------------------------------------
+
+
+def test_apply_closed_since_drops_substring_match():
+    out = _apply_closed_since(
+        ["PRs #71 + #72 awaiting operator review/merge",
+         "schedule follow-up with Alice"],
+        ["#71"],
+    )
+    # "#71" appears in the first item → dropped. Second item stays.
+    assert out == ["schedule follow-up with Alice"]
+
+
+def test_apply_closed_since_partial_resolution_drops_whole_item():
+    """Documented behavior (chainlink #63): when only #71 of "#71 + #72"
+    is resolved, the whole "PRs #71 + #72" item drops because of the
+    substring match. The synthesis turn is expected to re-list the
+    still-open piece (e.g. "PR #72") in the new boundary's
+    ``unfinished`` so the live state carries forward."""
+    out = _apply_closed_since(
+        ["PRs #71 + #72 awaiting", "PR #72 still awaiting"],
+        ["#71"],
+    )
+    # First dropped (contains #71); second kept (contains only #72).
+    assert out == ["PR #72 still awaiting"]
+
+
+def test_apply_closed_since_case_insensitive():
+    out = _apply_closed_since(
+        ["chainlink #29 G17 awaiting"],
+        ["CHAINLINK #29 G17"],
+    )
+    assert out == []
+
+
+def test_apply_closed_since_empty_refs_keeps_all():
+    out = _apply_closed_since(
+        ["item one", "item two"], [],
+    )
+    assert out == ["item one", "item two"]
+
+
+def test_apply_closed_since_strips_blank_items():
+    out = _apply_closed_since(
+        ["", "  ", "real item"], [],
+    )
+    assert out == ["real item"]
+
+
+# ---- render_session_summaries: header markers ---------------------------
+
+
+def test_render_no_markers_when_no_now_and_no_turn_counts():
+    """Backwards-compat shape: legacy callers passing only
+    ``boundaries`` get the original layout — no age, no turn count."""
+    boundaries = [{
+        "ts": "2026-05-09T14:00:00+00:00",
+        "channel_id": "discord-1",
+        "summary": "test",
+    }]
+    out = render_session_summaries(boundaries)
+    assert "(discord-1)" in out
+    assert "ago" not in out
+    assert "turns" not in out
+
+
+def test_render_age_marker_when_now_supplied():
+    boundaries = [{
+        "ts": "2026-05-09T14:00:00+00:00",
+        "channel_id": "discord-1",
+        "summary": "test",
+    }]
+    out = render_session_summaries(boundaries, now=_NOW)
+    assert "(~4h ago) (discord-1)" in out
+
+
+def test_render_turn_count_marker_when_counts_supplied():
+    """Empty turn_counts dict still triggers rendering — explicit
+    "0 turns this channel" is more informative than absence."""
+    boundaries = [{
+        "ts": "2026-05-09T14:00:00+00:00",
+        "channel_id": "discord-1",
+        "summary": "test",
+    }]
+    out = render_session_summaries(
+        boundaries,
+        turn_counts={"2026-05-09T14:00:00+00:00": 8},
+    )
+    assert "(8 turns this channel) (discord-1)" in out
+
+
+def test_render_both_markers_when_both_supplied():
+    """Mimir's chainlink #63 example shape: ``12:23 (~4h ago, 8 turns
+    this channel) — <summary>``."""
+    boundaries = [{
+        "ts": "2026-05-09T14:00:00+00:00",
+        "channel_id": "discord-1",
+        "summary": "test",
+    }]
+    out = render_session_summaries(
+        boundaries,
+        now=_NOW,
+        turn_counts={"2026-05-09T14:00:00+00:00": 8},
+    )
+    assert "(~4h ago, 8 turns this channel) (discord-1)" in out
+
+
+# ---- render_session_summaries: [verify before quoting] suffix ----------
+
+
+def test_verify_suffix_trips_on_age_alone():
+    """Age >= 2h, turns < 5 → suffix appears (age signal alone is enough)."""
+    boundaries = [{
+        "ts": "2026-05-09T14:00:00+00:00",  # 4h ago
+        "channel_id": "c",
+        "summary": "s",
+        "unfinished": ["item one"],
+    }]
+    out = render_session_summaries(
+        boundaries, now=_NOW,
+        turn_counts={"2026-05-09T14:00:00+00:00": 0},
+        stale_age_hours=2, stale_turns=5,
+    )
+    assert "Unfinished [verify before quoting]: item one" in out
+
+
+def test_verify_suffix_trips_on_turns_alone():
+    """Age < 2h, turns >= 5 → suffix appears (turn signal alone is enough)."""
+    boundaries = [{
+        "ts": "2026-05-09T17:30:00+00:00",  # 30m ago — under age threshold
+        "channel_id": "c",
+        "summary": "s",
+        "unfinished": ["item one"],
+    }]
+    out = render_session_summaries(
+        boundaries, now=_NOW,
+        turn_counts={"2026-05-09T17:30:00+00:00": 8},
+        stale_age_hours=2, stale_turns=5,
+    )
+    assert "Unfinished [verify before quoting]: item one" in out
+
+
+def test_verify_suffix_absent_when_neither_threshold_trips():
+    boundaries = [{
+        "ts": "2026-05-09T17:30:00+00:00",
+        "channel_id": "c",
+        "summary": "s",
+        "unfinished": ["item one"],
+    }]
+    out = render_session_summaries(
+        boundaries, now=_NOW,
+        turn_counts={"2026-05-09T17:30:00+00:00": 2},
+        stale_age_hours=2, stale_turns=5,
+    )
+    assert "Unfinished: item one" in out
+    assert "verify before quoting" not in out
+
+
+def test_thresholds_configurable():
+    """Tightening the age threshold to 1h trips on the same 30m-old
+    boundary IF we lower it below the actual age. Locks the
+    contract that callers can tune both knobs."""
+    boundaries = [{
+        "ts": "2026-05-09T17:00:00+00:00",  # 1h ago
+        "channel_id": "c",
+        "summary": "s",
+        "unfinished": ["item one"],
+    }]
+    out_relaxed = render_session_summaries(
+        boundaries, now=_NOW,
+        turn_counts={"2026-05-09T17:00:00+00:00": 0},
+        stale_age_hours=2, stale_turns=5,
+    )
+    assert "verify before quoting" not in out_relaxed
+    out_strict = render_session_summaries(
+        boundaries, now=_NOW,
+        turn_counts={"2026-05-09T17:00:00+00:00": 0},
+        stale_age_hours=1, stale_turns=5,
+    )
+    assert "verify before quoting" in out_strict
+
+
+# ---- render_session_summaries: closed_since applier --------------------
+
+
+def test_closed_since_drops_resolved_items_from_earlier_boundary():
+    """The acceptance scenario from chainlink #63: T0 boundary lists
+    #71 unfinished, T2 boundary's closed_since=[#71], and the prompt
+    builder drops #71 from the T0 rendering."""
+    boundaries = [
+        {
+            "ts": "2026-05-09T14:00:00+00:00",
+            "channel_id": "discord-1",
+            "summary": "Worked on PRs.",
+            "unfinished": ["PR #71 awaiting merge", "follow up with Alice"],
+        },
+        {
+            "ts": "2026-05-09T17:00:00+00:00",
+            "channel_id": "discord-1",
+            "summary": "Followed up.",
+            "unfinished": [],
+            "closed_since": ["#71"],
+        },
+    ]
+    out = render_session_summaries(boundaries, now=_NOW)
+    # T0's "PR #71" got dropped (matches #71); "follow up with Alice"
+    # remains because no closed_since ref appears in it.
+    assert "PR #71 awaiting" not in out
+    assert "follow up with Alice" in out
+
+
+def test_closed_since_short_refs_ignored():
+    """Single-character refs would over-match (e.g. "#" appears in any
+    PR ref). The applier filters refs below
+    ``_MIN_CLOSED_SINCE_REF_LEN`` before substring-matching."""
+    boundaries = [
+        {
+            "ts": "2026-05-09T14:00:00+00:00",
+            "channel_id": "discord-1",
+            "summary": "s",
+            "unfinished": ["PR #71 awaiting"],
+        },
+        {
+            "ts": "2026-05-09T17:00:00+00:00",
+            "channel_id": "discord-1",
+            "summary": "s",
+            "closed_since": ["#"],  # too short — should be ignored
+        },
+    ]
+    out = render_session_summaries(boundaries, now=_NOW)
+    assert "PR #71 awaiting" in out
+
+
+def test_closed_since_aggregates_across_later_boundaries():
+    """Multiple later boundaries' closed_since refs all apply to
+    earlier Unfinished items."""
+    boundaries = [
+        {
+            "ts": "2026-05-09T10:00:00+00:00",
+            "channel_id": "c",
+            "summary": "s",
+            "unfinished": ["#71", "#72", "still open"],
+        },
+        {
+            "ts": "2026-05-09T13:00:00+00:00",
+            "channel_id": "c",
+            "summary": "s",
+            "closed_since": ["#71"],
+        },
+        {
+            "ts": "2026-05-09T17:00:00+00:00",
+            "channel_id": "c",
+            "summary": "s",
+            "closed_since": ["#72"],
+        },
+    ]
+    out = render_session_summaries(boundaries, now=_NOW)
+    # #71 closed by middle boundary, #72 closed by last; both drop.
+    # The "still open" item stays.
+    # Note: T1's unfinished list is just ["#71", "#72", "still open"];
+    # only "still open" should remain after closed_since application.
+    assert "still open" in out
+    # Look at the rendered Unfinished line for T1 (the only boundary
+    # with unfinished items): it should contain ONLY "still open".
+    # Refs #71/#72 substring-match every literal occurrence of those
+    # in unfinished items, so they drop.
+    unfinished_lines = [l for l in out.splitlines() if "Unfinished" in l]
+    assert len(unfinished_lines) == 1
+    assert "#71" not in unfinished_lines[0]
+    assert "#72" not in unfinished_lines[0]
+    assert "still open" in unfinished_lines[0]
+
+
+# ---- render: SAGA-shape compatibility (latent fix) ---------------------
+
+
+def test_render_accepts_saga_native_field_names():
+    """SAGA's ``get_last_sessions`` historically returned ``timestamp``
+    + ``channel`` (not ``ts`` + ``channel_id``). The renderer now
+    accepts both shapes so a future SAGA-sourced boundary doesn't
+    show up as ``- (-) — (no summary)``."""
+    boundaries = [{
+        "timestamp": "2026-05-09T14:00:00+00:00",
+        "channel": "discord-1",
+        "summary": "saga-shape test",
+    }]
+    out = render_session_summaries(boundaries, now=_NOW)
+    assert "2026-05-09 14:00" in out
+    assert "(discord-1)" in out
+    assert "saga-shape test" in out
+
+
+# ---- count_turns_since --------------------------------------------------
+
+
+def test_count_turns_since_basic(tmp_path: Path):
+    """Walks turns.jsonl and counts records with ``ts > since`` on the
+    target channel. Records on other channels and records at-or-before
+    the cutoff don't contribute."""
+    path = tmp_path / "turns.jsonl"
+    path.write_text(
+        json.dumps({"ts": "2026-05-09T13:00:00+00:00", "channel_id": "c"}) + "\n"
+        + json.dumps({"ts": "2026-05-09T15:00:00+00:00", "channel_id": "c"}) + "\n"
+        + json.dumps({"ts": "2026-05-09T16:00:00+00:00", "channel_id": "c"}) + "\n"
+        + json.dumps({"ts": "2026-05-09T15:30:00+00:00", "channel_id": "other"}) + "\n"
+    )
+    n = count_turns_since(
+        path, channel_id="c", since_ts="2026-05-09T14:00:00+00:00",
+    )
+    # 15:00 + 16:00 are after 14:00 on channel c → 2.
+    # 13:00 is before; 15:30 is on the other channel.
+    assert n == 2
+
+
+def test_count_turns_since_missing_path_returns_zero(tmp_path: Path):
+    n = count_turns_since(
+        tmp_path / "nope.jsonl",
+        channel_id="c", since_ts="2026-05-09T14:00:00+00:00",
+    )
+    assert n == 0
+
+
+def test_count_turns_since_empty_since_returns_zero(tmp_path: Path):
+    """Empty since_ts would otherwise match every record (any string >
+    ""). Guard so a boundary with no ``ts`` doesn't accidentally count
+    every turn ever."""
+    path = tmp_path / "turns.jsonl"
+    path.write_text(
+        json.dumps({"ts": "2026-05-09T13:00:00+00:00", "channel_id": "c"}) + "\n"
+    )
+    n = count_turns_since(path, channel_id="c", since_ts="")
+    assert n == 0
+
+
+def test_count_turns_since_uses_snapshot_callable_when_supplied(tmp_path: Path):
+    """The agent passes ``self._turns_snapshot.records`` so the cached
+    in-memory tail is reused. Confirm the helper consults the
+    callable instead of re-reading the file."""
+    fake_records: list[dict] = [
+        {"ts": "2026-05-09T15:00:00+00:00", "channel_id": "c"},
+        {"ts": "2026-05-09T16:00:00+00:00", "channel_id": "c"},
+        {"ts": "2026-05-09T13:00:00+00:00", "channel_id": "c"},
+    ]
+    n = count_turns_since(
+        tmp_path / "does-not-exist.jsonl",
+        channel_id="c",
+        since_ts="2026-05-09T14:00:00+00:00",
+        snapshot_records=lambda: fake_records,
+    )
+    assert n == 2
+
+
+# ---- end-to-end T0/T1/T2 acceptance scenario ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_acceptance_t0_t1_t2_drops_resolved_items(tmp_path: Path):
+    """Acceptance criterion from chainlink #63:
+       T0:    boundary written with Unfinished=[#X]
+       T0+1h: turn closes #X
+       T0+2h: synthesis turn calls saga_end_session(closed_since=[#X])
+       Subsequent prompt: #X must NOT appear as unfinished.
+
+    Drives the local mirror end-to-end (the in-process path that
+    production currently hits). Verifies both: the closed_since flows
+    through to the next boundary and the renderer drops the item."""
+    path = tmp_path / ".mimir" / "session_boundaries.jsonl"
+    log = SessionBoundaryLog(path=path)
+
+    # T0: first session ended; Unfinished=[#X].
+    await log.append({
+        "channel_id": "c",
+        "saga_session_id": "s1",
+        "summary": "Worked on #X.",
+        "unfinished": ["PR #X awaiting operator merge"],
+    })
+    # T0+2h: synthesis writes corrective override.
+    await log.append({
+        "channel_id": "c",
+        "saga_session_id": "s2",
+        "summary": "Followed up; #X merged.",
+        "unfinished": [],
+        "closed_since": ["#X"],
+    })
+
+    boundaries = log.recent(channel_id="c", count=10)
+    # recent() returns newest-first. The renderer accepts whatever
+    # ordering the source supplies; closed_since aggregation walks
+    # all boundaries regardless of order.
+    out = render_session_summaries(boundaries, now=_NOW)
+    assert out is not None
+    # The T0 Unfinished item containing "#X" must not appear.
+    assert "PR #X awaiting operator merge" not in out
+    # The corrective summary line still renders.
+    assert "Followed up; #X merged." in out
