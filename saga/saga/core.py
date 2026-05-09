@@ -5213,7 +5213,8 @@ def store_session_boundary(session_id: str, summary: str,
                            decisions_made: list[str] = None,
                            unfinished: list[str] = None,
                            emotional_state: str = None,
-                           channel: str = None) -> str:
+                           channel: str = None,
+                           closed_since: list[str] = None) -> str:
     """Store a session boundary atom when a session ends.
 
     Creates a structured episodic atom capturing:
@@ -5221,6 +5222,10 @@ def store_session_boundary(session_id: str, summary: str,
     - What was decided
     - What was left unfinished
     - Emotional state at close
+    - ``closed_since``: refs of items from prior boundaries' ``unfinished``
+      lists that have been resolved during this session (chainlink #63
+      corrective overrides — used by the prompt builder to drop stale
+      Unfinished items in earlier boundaries' renderings).
 
     The agent calls this at session end. Next session can query for continuity:
     'What were we doing last time?'
@@ -5230,9 +5235,11 @@ def store_session_boundary(session_id: str, summary: str,
     primary content. Use ``get_last_sessions()`` for the continuity query, or
     pass ``include_session_boundaries=True`` to retrieve()/hybrid_retrieve().
 
-    The session_id and (optional) channel are persisted to atom metadata so
-    they can be queried later — session_id auto-denormalizes to the
-    ``atoms.session_id`` column; channel is reachable via json_extract.
+    All structured fields (summary, topics, decisions, unfinished,
+    emotional_state, closed_since) are persisted to atom metadata so
+    ``get_last_sessions()`` can return the canonical render shape without
+    re-parsing the markdown content blob. session_id auto-denormalizes to
+    the ``atoms.session_id`` column.
     """
     boundary_content = f"Session Boundary [{session_id}]: {summary}"
 
@@ -5242,12 +5249,27 @@ def store_session_boundary(session_id: str, summary: str,
         boundary_content += f"\nDecisions: {'; '.join(decisions_made)}"
     if unfinished:
         boundary_content += f"\nUnfinished: {'; '.join(unfinished)}"
+    if closed_since:
+        boundary_content += f"\nClosed since: {'; '.join(closed_since)}"
     if emotional_state:
         boundary_content += f"\nMood at close: {emotional_state}"
 
-    metadata = {"session_id": session_id}
+    # Persist structured fields in metadata so get_last_sessions can
+    # surface them as separate keys without re-parsing the markdown.
+    # chainlink #63: closed_since is the corrective-override list.
+    metadata: dict = {"session_id": session_id, "summary": summary}
     if channel:
         metadata["channel"] = channel
+    if topics_discussed:
+        metadata["topics_discussed"] = list(topics_discussed)
+    if decisions_made:
+        metadata["decisions_made"] = list(decisions_made)
+    if unfinished:
+        metadata["unfinished"] = list(unfinished)
+    if closed_since:
+        metadata["closed_since"] = list(closed_since)
+    if emotional_state:
+        metadata["emotional_state"] = emotional_state
 
     atom_id = store_atom(
         content=boundary_content,
@@ -5264,7 +5286,8 @@ def store_session_boundary(session_id: str, summary: str,
     log_provenance("atom", atom_id, "session_boundary",
                    metadata={"session_id": session_id,
                              "channel": channel,
-                             "unfinished_count": len(unfinished or [])})
+                             "unfinished_count": len(unfinished or []),
+                             "closed_since_count": len(closed_since or [])})
 
     return atom_id
 
@@ -5278,6 +5301,13 @@ def get_last_sessions(count: int = 3, channel: str = None,
                  metadata.channel via json_extract).
         session_id: only the boundary for this exact session. Matched on the
                     denormalized session_id column.
+
+    Return shape matches the local-mirror canonical layout (chainlink #63):
+    ``ts``, ``channel_id``, ``summary``, ``unfinished``, ``topics_discussed``,
+    ``decisions_made``, ``emotional_state``, ``closed_since`` extracted from
+    metadata so the prompt-render path doesn't care which source supplied
+    the boundary. Legacy keys (``timestamp``, ``channel``, ``content``) are
+    retained for any downstream caller that depended on them.
     """
     conn = get_db()
     sql = ("SELECT id, content, created_at, topics, session_id, metadata "
@@ -5302,14 +5332,26 @@ def get_last_sessions(count: int = 3, channel: str = None,
             meta = json.loads(r[5] or '{}')
         except (json.JSONDecodeError, TypeError):
             meta = {}
-        out.append({
+        record = {
+            # Canonical render-shape keys (chainlink #63):
+            "ts": r[2],
+            "channel_id": meta.get("channel"),
+            "summary": meta.get("summary"),
+            "unfinished": meta.get("unfinished") or [],
+            "topics_discussed": meta.get("topics_discussed") or [],
+            "decisions_made": meta.get("decisions_made") or [],
+            "emotional_state": meta.get("emotional_state"),
+            "closed_since": meta.get("closed_since") or [],
+            # Legacy / saga-internal keys retained for back-compat:
             "id": r[0],
+            "atom_id": r[0],
             "content": r[1],
             "timestamp": r[2],
             "topics": json.loads(r[3] or '[]'),
             "session_id": r[4],
             "channel": meta.get("channel"),
-        })
+        }
+        out.append(record)
     return out
 
 

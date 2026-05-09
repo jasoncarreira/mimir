@@ -1570,7 +1570,14 @@ class Agent:
         """Render the Recent session summaries block. Tries SAGA first
         (chronological recall via /v1/sessions/recent); falls back to
         the local mirror on empty / failure. Returns None when both are
-        empty or the section is disabled."""
+        empty or the section is disabled.
+
+        chainlink #63: each boundary header gets ``(~Xh ago, N turns
+        this channel)`` markers; Unfinished sub-bullets get a
+        ``[verify before quoting]`` suffix past either staleness
+        threshold; later boundaries' ``closed_since`` corrective lists
+        drop resolved items from earlier Unfinished renderings.
+        """
         count = self._config.recent_boundaries
         if count <= 0:
             return None
@@ -1583,7 +1590,32 @@ class Agent:
             boundaries = self._session_boundary_log.recent(
                 channel_id=channel_id, count=count,
             )
-        return render_session_summaries(boundaries)
+        # Per-boundary turn-count: walk the cached turns snapshot once
+        # per render. Boundaries are typically 3 — counting from each
+        # is cheap (the snapshot iterator is in-memory after the first
+        # call within the TTL window).
+        turn_counts: dict[str, int] = {}
+        if channel_id is not None and boundaries:
+            from .session_boundary_log import count_turns_since
+            snapshot_records = self._turns_snapshot.records
+            for b in boundaries:
+                ts = str(b.get("ts") or b.get("timestamp") or "")
+                if not ts:
+                    continue
+                turn_counts[ts] = count_turns_since(
+                    self._config.turns_log,
+                    channel_id=channel_id,
+                    since_ts=ts,
+                    snapshot_records=snapshot_records,
+                )
+        now = datetime.now(tz=timezone.utc)
+        return render_session_summaries(
+            boundaries,
+            now=now,
+            turn_counts=turn_counts,
+            stale_age_hours=self._config.unfinished_stale_age_hours,
+            stale_turns=self._config.unfinished_stale_turns,
+        )
 
     # VSM: S3 — pre-turn retrieval; saga.query feeds likely-relevant
     #          atoms into the prompt before the agent runs. Precondition

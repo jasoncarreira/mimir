@@ -109,6 +109,7 @@ class SagaClient(Protocol):
         decisions_made: list[str] | None = None,
         unfinished: list[str] | None = None,
         emotional_state: str | None = None,
+        closed_since: list[str] | None = None,
     ) -> dict[str, Any]: ...
 
     async def consolidate(
@@ -349,6 +350,7 @@ class _InProcessSaga:
         decisions_made: list[str] | None = None,
         unfinished: list[str] | None = None,
         emotional_state: str | None = None,
+        closed_since: list[str] | None = None,
     ) -> dict[str, Any]:
         await self._ensure_ready()
 
@@ -360,6 +362,7 @@ class _InProcessSaga:
                 decisions_made=decisions_made,
                 unfinished=unfinished,
                 emotional_state=emotional_state,
+                closed_since=closed_since,
             )
             return {"atom_id": atom_id, "session_id": session_id, "channel": None}
 
@@ -659,6 +662,7 @@ class _HttpSaga:
         decisions_made: list[str] | None = None,
         unfinished: list[str] | None = None,
         emotional_state: str | None = None,
+        closed_since: list[str] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"session_id": session_id, "summary": summary}
         if topics_discussed:
@@ -669,6 +673,8 @@ class _HttpSaga:
             body["unfinished"] = unfinished
         if emotional_state:
             body["emotional_state"] = emotional_state
+        if closed_since:
+            body["closed_since"] = closed_since
         return await self._post("/v1/sessions/end", body)
 
     async def consolidate(

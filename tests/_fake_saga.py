@@ -106,6 +106,7 @@ class FakeSaga:
         decisions_made: list[str] | None = None,
         unfinished: list[str] | None = None,
         emotional_state: str | None = None,
+        closed_since: list[str] | None = None,
     ) -> dict[str, Any]:
         self.calls.append(
             _Call(
@@ -117,6 +118,7 @@ class FakeSaga:
                     "decisions_made": decisions_made,
                     "unfinished": unfinished,
                     "emotional_state": emotional_state,
+                    "closed_since": closed_since,
                 },
             )
         )
