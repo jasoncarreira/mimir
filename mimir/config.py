@@ -368,6 +368,11 @@ class Config:
         home = Path(_env("MIMIR_HOME") or Path.cwd()).resolve()
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
+        # Resolve once — used by both ``billing_mode`` (to detect QUOTA
+        # vs API_KEY billing) and ``oauth_credentials_path`` (the field
+        # itself). Computing it twice was redundant and could in theory
+        # diverge if env state shifted between the two calls.
+        oauth_credentials_path = _oauth_credentials_path()
 
         return cls(
             home=home,
@@ -462,7 +467,7 @@ class Config:
 
             billing_mode=detect_billing_mode(
                 explicit=_env("MIMIR_BILLING_MODE") or None,
-                oauth_credentials_path=_oauth_credentials_path(),
+                oauth_credentials_path=oauth_credentials_path,
             ),
 
             capture_rate_limits=_env("MIMIR_CAPTURE_RATE_LIMITS", "true").lower()
@@ -471,7 +476,7 @@ class Config:
             context_1m=_env("MIMIR_CONTEXT_1M", "true").lower()
                 not in {"false", "0", "no", "off"},
 
-            oauth_credentials_path=_oauth_credentials_path(),
+            oauth_credentials_path=oauth_credentials_path,
             oauth_usage_poll_cron=_env(
                 "MIMIR_OAUTH_USAGE_POLL_CRON", "*/3 * * * *",
             ),
