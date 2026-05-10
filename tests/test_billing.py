@@ -51,13 +51,65 @@ def test_detect_billing_mode_auto_quota_via_oauth_token(monkeypatch):
     assert detect_billing_mode() is BillingMode.QUOTA
 
 
-def test_detect_billing_mode_auto_quota_via_oauth_credentials_path(monkeypatch):
+def test_detect_billing_mode_auto_quota_via_oauth_credentials_path(
+    monkeypatch, tmp_path
+):
+    """An ``oauth_credentials_path`` that points at an existing file
+    drives QUOTA mode. The file-existence is the load-bearing check —
+    see ``test_detect_billing_mode_pay_as_you_go_when_credentials_file_missing``
+    for the bug this fixes."""
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", raising=False)
-    # Even without env-var, an explicit credentials path drives quota mode.
+    creds = tmp_path / ".credentials.json"
+    creds.write_text('{"access_token": "x"}')
     assert (
-        detect_billing_mode(oauth_credentials_path=Path("/some/path"))
+        detect_billing_mode(oauth_credentials_path=creds)
         is BillingMode.QUOTA
+    )
+
+
+def test_detect_billing_mode_pay_as_you_go_when_credentials_file_missing(
+    monkeypatch, tmp_path
+):
+    """Regression for CR2-#1: ``_oauth_credentials_path()`` in config.py
+    returns the *expected location* (e.g. ``$MIMIR_HOME/.claude/.credentials.json``)
+    even on installs that have never run ``claude /login``. Before the
+    ``.is_file()`` guard, a Path-truthy check effectively always fired
+    on any deployment with ``MIMIR_HOME`` set — including pure pay-as-
+    you-go API-key installs that have no OAuth flow at all. The result
+    was that API-key installs auto-detected as QUOTA, demoting
+    ``cost_rate_alert`` to advisory and silently disabling the dollar-
+    cost suppression layer.
+
+    With the guard, a path that doesn't point at an existing file does
+    NOT drive QUOTA — falls through to PAY_AS_YOU_GO.
+    """
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    nonexistent = tmp_path / ".claude" / ".credentials.json"
+    assert not nonexistent.exists()
+    assert (
+        detect_billing_mode(oauth_credentials_path=nonexistent)
+        is BillingMode.PAY_AS_YOU_GO
+    )
+
+
+def test_detect_billing_mode_pay_as_you_go_when_credentials_path_is_directory(
+    monkeypatch, tmp_path
+):
+    """Edge case: ``oauth_credentials_path`` points at a directory (not
+    a file). ``.is_file()`` returns False; falls through to
+    PAY_AS_YOU_GO. Documents that the guard is "is_file" specifically,
+    not "exists" — directories shouldn't masquerade as credentials."""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    a_directory = tmp_path / ".claude"
+    a_directory.mkdir()
+    assert (
+        detect_billing_mode(oauth_credentials_path=a_directory)
+        is BillingMode.PAY_AS_YOU_GO
     )
 
 
