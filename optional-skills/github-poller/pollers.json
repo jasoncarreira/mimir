@@ -3,7 +3,8 @@
     {
       "name": "github-activity",
       "command": "python3 poller.py",
-      "cron": "*/15 * * * *"
+      "cron": "*/15 * * * *",
+      "batch_size": 5
     }
   ]
 }
