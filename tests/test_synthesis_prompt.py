@@ -318,6 +318,92 @@ def test_filter_session_turns_handles_missing_file(tmp_path: Path):
     assert _filter_session_turns(tmp_path / "nope.jsonl", "S1") == []
 
 
+def test_filter_session_turns_handles_interleaved_sessions(tmp_path: Path):
+    """Regression for PR #105 review (mimir-carreira): the previous
+    200-record streak heuristic could silently drop older session
+    turns when many other-session turns interleaved between matches.
+    The replacement time-based break uses ``idle_minutes`` as the
+    cap — sessions are bounded by saga's idle policy, so any record
+    older than ``newest_match - 2*idle_minutes`` cannot belong to
+    the target session.
+
+    Constructs a fixture where the target session's turns straddle
+    300 other-session turns (well over the old 200 streak threshold)
+    BUT all within the 2*idle_minutes time window. The new logic
+    must return both target turns; the old logic would have dropped
+    the older one.
+    """
+    from datetime import datetime, timedelta, timezone
+    from mimir.agent import _filter_session_turns
+
+    base = datetime(2026, 5, 10, 12, 0, tzinfo=timezone.utc)
+    path = tmp_path / "turns.jsonl"
+    lines: list[str] = []
+    # Oldest target turn — 90 minutes ago. Inside 2 * 60min = 120min window.
+    lines.append(json.dumps({
+        "turn_id": "target_old",
+        "saga_session_id": "S1",
+        "timestamp": (base - timedelta(minutes=90)).isoformat(),
+    }))
+    # 300 interleaved other-session turns at 1-minute intervals,
+    # spanning the 90-min-to-5-min-ago range.
+    for i in range(300):
+        offset_min = 90 - (i + 1) * (85 / 300)  # 89.7 → 5.0 min ago
+        lines.append(json.dumps({
+            "turn_id": f"other_{i}",
+            "saga_session_id": f"S_other_{i}",
+            "timestamp": (base - timedelta(minutes=offset_min)).isoformat(),
+        }))
+    # Newest target turn — 1 min ago.
+    lines.append(json.dumps({
+        "turn_id": "target_new",
+        "saga_session_id": "S1",
+        "timestamp": (base - timedelta(minutes=1)).isoformat(),
+    }))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    rows = _filter_session_turns(path, "S1", idle_minutes=60)
+    # Both target turns survive — chronological order. The old streak
+    # heuristic would have stopped after 200 non-matches and missed
+    # ``target_old``.
+    assert [r["turn_id"] for r in rows] == ["target_old", "target_new"]
+
+
+def test_filter_session_turns_break_respects_idle_minutes_margin(tmp_path: Path):
+    """Time-based break bounds the walk to ``2 * idle_minutes`` past
+    the latest match. A non-target record older than that bound IS
+    safely past the session boundary — we stop there to avoid
+    unbounded walks on a hot file.
+
+    Fixture: target session at the tail; an unrelated old record
+    well outside the margin. The walk must NOT include the old
+    record (proves the break fires) AND must include all target
+    records (proves the margin is wide enough)."""
+    from datetime import datetime, timedelta, timezone
+    from mimir.agent import _filter_session_turns
+
+    base = datetime(2026, 5, 10, 12, 0, tzinfo=timezone.utc)
+    path = tmp_path / "turns.jsonl"
+    lines: list[str] = []
+    # Far-old non-match (3 hours ago). Beyond 2*60min margin.
+    lines.append(json.dumps({
+        "turn_id": "old_other",
+        "saga_session_id": "S_other",
+        "timestamp": (base - timedelta(hours=3)).isoformat(),
+    }))
+    # Target session — last 30 minutes.
+    for i in range(3):
+        lines.append(json.dumps({
+            "turn_id": f"target_{i}",
+            "saga_session_id": "S1",
+            "timestamp": (base - timedelta(minutes=30 - i * 10)).isoformat(),
+        }))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    rows = _filter_session_turns(path, "S1", idle_minutes=60)
+    assert [r["turn_id"] for r in rows] == ["target_0", "target_1", "target_2"]
+
+
 def test_filter_session_turns_skips_malformed_lines(tmp_path: Path):
     """Defensive: bad JSON lines are skipped, not crashed on."""
     from mimir.agent import _filter_session_turns

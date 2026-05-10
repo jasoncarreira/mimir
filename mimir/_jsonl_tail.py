@@ -57,14 +57,23 @@ def count_lines_chunked(path: Path, *, chunk_bytes: int = 65536) -> int:
     """Count newline-terminated lines in ``path`` without reading the
     whole file into memory.
 
-    Streams the file in 64 KB chunks and counts ``\\n`` bytes. Used by
-    ``EventLogger`` and ``TurnLogger`` at startup to learn how many
+    Streams the file in 64 KiB chunks and counts ``\\n`` bytes. Used
+    by ``EventLogger`` and ``TurnLogger`` at startup to learn how many
     records the existing log holds (so the trim hysteresis knows when
     to fire) without a multi-hundred-MB memory spike on a hot log.
 
-    A trailing line without a final newline is counted (matches
-    ``wc -l`` behavior of "lines vs newlines": we count records, and
-    a no-final-newline record is a real record with a torn write).
+    A trailing line without a final newline is counted as one more
+    record — that's the shape of a torn write that left the file
+    without a final ``\\n``. ``wc -l`` would *miss* this one; we don't.
+
+    **Behavior note (vs. previous splitlines+strip implementation).**
+    The old code dropped blank lines (``if line.strip()``); this
+    counter does not — every ``\\n`` is one record. On a clean
+    firehose those produce identical counts, but a torn write that
+    leaves a bare ``\\n`` in the middle, or an external process
+    appending an empty line, will over-count by one here. The trim
+    hysteresis absorbs over-counts (a one-line drift just makes the
+    next trim fire a hair sooner — not load-bearing).
 
     Returns 0 for missing or unreadable files.
     """

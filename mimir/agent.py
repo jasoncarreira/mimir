@@ -128,7 +128,12 @@ def _utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
-def _filter_session_turns(turns_path, saga_session_id: str) -> list[dict]:
+def _filter_session_turns(
+    turns_path,
+    saga_session_id: str,
+    *,
+    idle_minutes: int = 60,
+) -> list[dict]:
     """Read turns.jsonl tail-first and return records with the given
     saga_session_id, in chronological order.
 
@@ -136,34 +141,62 @@ def _filter_session_turns(turns_path, saga_session_id: str) -> list[dict]:
     fire on session-idle (an operator-visible pause point) and the
     file caps at ~250 MB; the read could block the to_thread worker
     for seconds. Now we tail-read newest-first, accumulate matches,
-    stop scanning once we encounter a record with a saga_session_id
-    that was assigned BEFORE the target's first observed record (i.e.
-    we've walked past the start of the target session). Implemented
-    as: stop after we've seen a contiguous run of N=200 non-matching
-    records following at least one match — the target session's turns
-    are contiguous in append-order so a long non-match streak past
-    the first match means we're past its start.
+    and break once we've crossed past the saga session's natural
+    boundary.
 
-    The bound prevents pathological cases where the turn count for
-    *some* session exceeds 200 — we trade exhaustive correctness for
-    a hard read-cap on the synthesis turn's prompt assembly. Sessions
-    with > 200 turns are rare (typical is 10-30); if one exists it'll
-    just have its prompt assembled from the most recent 200.
+    **Bound shape (post-PR-105 review fix).** A previous version of
+    this function used a 200-record count-based break ("stop after
+    200 non-matching records past the first match"). That assumed the
+    target session's turns are contiguous in append-order, which is
+    *not* generally true: turns.jsonl is a single file shared across
+    channels and a long-lived session can interleave with hundreds
+    of other-session turns. The count heuristic could silently drop
+    older session turns from the synthesis prompt.
+
+    Replaced with a **time-based break**: saga ends a session after
+    ``idle_minutes`` of no activity (default 60), so any record older
+    than ``newest_match_ts - 2 * idle_minutes`` cannot belong to this
+    session. The 2× margin tolerates clock skew + a single
+    out-of-order record at the boundary. Walks back at most
+    ``2 * idle_minutes`` worth of file activity past the last match —
+    O(session_window) rather than O(file_size).
+
+    Caller (``Agent._render_saga_session_end_prompt``) passes
+    ``self._config.saga_session_idle_minutes`` so the bound matches
+    saga's actual session policy.
     """
     if not turns_path.is_file():
         return []
-    NON_MATCH_BREAK = 200
+    margin_seconds = 2 * idle_minutes * 60
     out: list[dict] = []
+    newest_match_ts: datetime | None = None
     try:
-        non_match_streak_after_first_match = 0
         for rec in tail_jsonl_records(turns_path):
             if rec.get("saga_session_id") == saga_session_id:
                 out.append(rec)
-                non_match_streak_after_first_match = 0
-            elif out:
-                non_match_streak_after_first_match += 1
-                if non_match_streak_after_first_match >= NON_MATCH_BREAK:
-                    break
+                ts_str = rec.get("timestamp")
+                if isinstance(ts_str, str):
+                    try:
+                        rec_ts = datetime.fromisoformat(
+                            ts_str.replace("Z", "+00:00")
+                        )
+                        if newest_match_ts is None or rec_ts > newest_match_ts:
+                            newest_match_ts = rec_ts
+                    except ValueError:
+                        pass
+            elif newest_match_ts is not None:
+                ts_str = rec.get("timestamp")
+                if isinstance(ts_str, str):
+                    try:
+                        rec_ts = datetime.fromisoformat(
+                            ts_str.replace("Z", "+00:00")
+                        )
+                        if (newest_match_ts - rec_ts).total_seconds() > margin_seconds:
+                            break
+                    except ValueError:
+                        # Malformed ts on a non-match — keep scanning;
+                        # don't break on a record we can't reason about.
+                        pass
     except OSError:
         return []
     out.reverse()  # tail yields newest-first; restore chronological
@@ -1872,7 +1905,10 @@ class Agent:
         # indicators, oauth poller cron, scheduled-tick dispatch) for
         # 100-500ms during synthesis. Same pattern as scheduler.list_jobs.
         turns_window = await asyncio.to_thread(
-            _filter_session_turns, self._config.turns_log, saga_session_id
+            _filter_session_turns,
+            self._config.turns_log,
+            saga_session_id,
+            idle_minutes=idle_minutes,
         )
         if not turns_window:
             self._spawn_bg_task(

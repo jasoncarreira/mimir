@@ -108,6 +108,12 @@ def _load_events(events_log: Path, days: int) -> list[dict[str, Any]]:
     for record in tail_jsonl_records(events_log):
         ts = _parse_ts(record.get("timestamp", ""))
         if ts is None:
+            # Malformed / missing ts — keep scanning. Worst case, a
+            # long stretch of malformed records walks us to BOF
+            # without ever crossing the cutoff. In practice every
+            # mimir-emitted event carries a tz-aware UTC ISO ts; bad
+            # values would only arrive from third-party writers, and
+            # the firehose is mimir-only.
             continue
         if ts < cutoff:
             break

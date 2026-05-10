@@ -116,6 +116,12 @@ def _measure_runtime(
     if not expected_types or not events_log.exists():
         return None, 0
     cutoff_dt = now - timedelta(hours=24)
+    # ISO-8601 string compare is correct only when both sides use the
+    # same timezone offset (UTC, +00:00). Every emitter in mimir today
+    # uses ``datetime.now(tz=timezone.utc).isoformat()``, so the format
+    # is consistent. If a future emitter ever lands without tz-aware
+    # UTC (e.g. naive ``datetime.now()``), this compare would silently
+    # misorder records.
     cutoff_iso = cutoff_dt.isoformat()
     types = set(expected_types)
     last_fired: datetime | None = None
