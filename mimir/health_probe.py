@@ -201,31 +201,57 @@ def _read_recent_restart_timestamps(
     within the last ``window_seconds``. Robust to corrupt JSON and
     missing files — both treated as "no recent restarts" (the
     safe-default for restart-on-stale, since refusing to restart on
-    bookkeeping failure would defeat the whole recovery path)."""
+    bookkeeping failure would defeat the whole recovery path).
+
+    PR #113 review fix (item 2 closure): merges entries from the
+    primary path AND ``_FALLBACK_RESTART_PATH`` so the rolling-
+    window guard sees restarts that landed on the fallback path
+    when the primary write failed. Pre-fix the writes were merged
+    (``_append_restart_timestamp`` writes to /tmp on primary
+    failure) but the reads only checked the primary — so a
+    persistently-broken home would still produce an unbounded
+    restart loop, exactly the thrash the guard was designed to
+    prevent. Dedup keys on ``timestamp_unix`` so the same restart
+    isn't double-counted if both paths happened to capture it.
+    """
     if now is None:
         now = time.time()
     cutoff = now - window_seconds
-    if not bookkeeping_path.exists():
-        return []
-    try:
-        text = bookkeeping_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        log.warning("bookkeeping read failed: %s; treating as empty", exc)
-        return []
-    out: list[float] = []
-    for raw in text.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
+    seen_ts: set[float] = set()
+
+    def _read_one(path: Path) -> None:
+        if not path.exists():
+            return
         try:
-            entry = json.loads(raw)
-        except json.JSONDecodeError:
-            log.warning("bookkeeping line is corrupt JSON; skipping")
-            continue
-        ts = entry.get("timestamp_unix") if isinstance(entry, dict) else None
-        if isinstance(ts, (int, float)) and ts >= cutoff:
-            out.append(float(ts))
-    return out
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            log.warning(
+                "bookkeeping read failed at %s: %s; treating as empty",
+                path, exc,
+            )
+            return
+        for raw in text.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError:
+                log.warning(
+                    "bookkeeping line is corrupt JSON in %s; skipping",
+                    path,
+                )
+                continue
+            ts = (
+                entry.get("timestamp_unix")
+                if isinstance(entry, dict) else None
+            )
+            if isinstance(ts, (int, float)) and ts >= cutoff:
+                seen_ts.add(float(ts))
+
+    _read_one(bookkeeping_path)
+    _read_one(_FALLBACK_RESTART_PATH)
+    return sorted(seen_ts)
 
 
 _FALLBACK_RESTART_PATH = Path("/tmp/mimir-health-probe-restarts.jsonl")
