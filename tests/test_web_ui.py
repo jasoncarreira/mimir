@@ -108,6 +108,38 @@ async def test_api_events_filters_by_type_and_limit(app):
 
 
 @pytest.mark.asyncio
+async def test_read_jsonl_caps_at_max_records(app):
+    """Pattern A (2026-05-10): ``_read_jsonl`` is bounded by
+    ``max_records`` (default 5000). Pre-2026-05-10 it forward-read
+    the entire file synchronously per HTTP request — combined with
+    the turn-viewer polling every 5s, the loop got pinned re-parsing
+    hundreds of MB on a hot file. The cap means older records past
+    the limit are silently dropped from the response."""
+    from mimir.web_ui import _read_jsonl
+
+    a, _, events_log = app
+    # Write 50 records but cap at 10.
+    rows = [{"i": i, "type": "x"} for i in range(50)]
+    events_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    out = _read_jsonl(events_log, max_records=10)
+    # Output is chronological — most recent 10 records (i=40..49).
+    assert [r["i"] for r in out] == list(range(40, 50))
+
+
+@pytest.mark.asyncio
+async def test_read_jsonl_under_cap_returns_all(app):
+    """When the file has fewer records than the cap, all are returned
+    in chronological order (no silent dropping)."""
+    from mimir.web_ui import _read_jsonl
+
+    a, _, events_log = app
+    rows = [{"i": i, "type": "x"} for i in range(7)]
+    events_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    out = _read_jsonl(events_log, max_records=100)
+    assert [r["i"] for r in out] == list(range(7))
+
+
+@pytest.mark.asyncio
 async def test_register_routes_is_idempotent(app):
     """Calling register_routes twice (e.g. server rebuild) doesn't crash."""
     a, turns_log, events_log = app

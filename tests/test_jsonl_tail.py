@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir._jsonl_tail import _CHUNK_BYTES, tail_jsonl_records
+from mimir._jsonl_tail import _CHUNK_BYTES, count_lines_chunked, tail_jsonl_records
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -78,3 +78,43 @@ def test_consumer_can_break_early(tmp_path: Path):
         if len(out) == 3:
             break
     assert [r["i"] for r in out] == [999, 998, 997]
+
+
+# ─── count_lines_chunked ──────────────────────────────────────────────
+
+
+def test_count_lines_chunked_counts_newline_terminated(tmp_path: Path):
+    path = tmp_path / "log.jsonl"
+    _write_jsonl(path, [{"i": i} for i in range(42)])
+    assert count_lines_chunked(path) == 42
+
+
+def test_count_lines_chunked_counts_unterminated_last_line(tmp_path: Path):
+    """A torn write (no final newline) is still a record. ``wc -l``
+    would miss it; we don't."""
+    path = tmp_path / "log.jsonl"
+    path.write_text('{"a":1}\n{"a":2}')  # no trailing \n
+    assert count_lines_chunked(path) == 2
+
+
+def test_count_lines_chunked_returns_zero_for_missing_file(tmp_path: Path):
+    assert count_lines_chunked(tmp_path / "does-not-exist.jsonl") == 0
+
+
+def test_count_lines_chunked_returns_zero_for_empty_file(tmp_path: Path):
+    path = tmp_path / "empty.jsonl"
+    path.write_text("")
+    assert count_lines_chunked(path) == 0
+
+
+def test_count_lines_chunked_handles_chunk_boundaries(tmp_path: Path):
+    """Records that straddle the chunk boundary still count exactly
+    once. With chunk_bytes=64 and ~70-byte records, the boundary
+    falls mid-record on most reads."""
+    path = tmp_path / "log.jsonl"
+    # Each record is ~70 bytes including newline; with chunk=64 we
+    # cross at least one record on every chunk read.
+    rec_str = '{"x": "' + "a" * 50 + '"}'
+    n = 100
+    path.write_text("\n".join([rec_str] * n) + "\n")
+    assert count_lines_chunked(path, chunk_bytes=64) == n
