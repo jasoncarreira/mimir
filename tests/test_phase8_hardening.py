@@ -263,3 +263,26 @@ async def test_saga_client_gives_up_after_max_retries(aiohttp_server, monkeypatc
         assert call_count == 4, f"expected 4 attempts (1 + 3 retries), got {call_count}"
     finally:
         await client.close()
+
+
+def test_retry_delay_clamps_to_last_entry():
+    """Regression: ``_MAX_RETRIES`` and ``_RETRY_DELAYS_S`` are loosely
+    coupled — today they line up (3 retries, 3 delays) but a future
+    tuner who bumps ``_MAX_RETRIES`` past ``len(_RETRY_DELAYS_S)``
+    would hit an ``IndexError`` mid-retry. The ``_retry_delay`` helper
+    clamps the lookup to the last valid entry so the call sites stay
+    safe regardless of how the constants drift.
+    """
+    from mimir.saga_client import _RETRY_DELAYS_S, _retry_delay
+
+    # In-bounds attempts return the matching delay.
+    for i, expected in enumerate(_RETRY_DELAYS_S):
+        assert _retry_delay(i) == expected, f"attempt {i} should map to {expected}"
+
+    # Out-of-bounds attempts clamp to the last entry rather than
+    # IndexErroring. Cover ``len(...)`` (one past the last index) and
+    # an arbitrary larger value (a hypothetical _MAX_RETRIES = 10).
+    last = _RETRY_DELAYS_S[-1]
+    assert _retry_delay(len(_RETRY_DELAYS_S)) == last
+    assert _retry_delay(10) == last
+    assert _retry_delay(100) == last
