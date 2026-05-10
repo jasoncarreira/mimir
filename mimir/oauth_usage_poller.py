@@ -283,6 +283,91 @@ def record_first_seen(
     return existing
 
 
+# CR2 (external I/O) fix: sticky logged_out + throttled reminder.
+# Pre-fix, once ``oauth_logged_out`` fired (refresh token revoked /
+# ``invalid_grant``), every subsequent cron tick retried the whole
+# refresh flow — generating a new ``oauth_logged_out`` event per tick
+# (typically every minute on the default cron). The algedonic block's
+# "Recent feedback signals" surface drowned in the same negative
+# repeatedly, drowning out other signals; the token endpoint also got
+# hit needlessly. After the operator sees one ``oauth_logged_out``
+# event, all they need is a periodic reminder that the agent is still
+# in the logged-out state — until they re-run ``/login``.
+_LOGGED_OUT_REMINDER_INTERVAL_SECONDS = 3600  # one reminder per hour
+
+
+def is_known_logged_out(
+    credentials_path: Path,
+) -> tuple[bool, float | None, float | None]:
+    """Read the sidecar; return ``(is_logged_out, logged_out_since_unix,
+    last_reminder_at_unix)``. ``is_logged_out`` reflects
+    ``oauth_logged_out`` having fired with no successful refresh
+    since. Both timestamps may be None when not set. Returns
+    ``(False, None, None)`` for any missing / unreadable / corrupt
+    sidecar — defaults to "not in known logged-out state" so the
+    regular flow runs."""
+    sidecar = _sidecar_path(credentials_path)
+    try:
+        existing = json.loads(sidecar.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            return False, None, None
+    except (OSError, json.JSONDecodeError):
+        return False, None, None
+    logged_out_since = existing.get("logged_out_since_unix")
+    if not isinstance(logged_out_since, (int, float)):
+        return False, None, None
+    last_reminder = existing.get("logged_out_last_reminder_unix")
+    if not isinstance(last_reminder, (int, float)):
+        last_reminder = None
+    return True, float(logged_out_since), last_reminder
+
+
+def mark_logged_out(
+    credentials_path: Path, *, now: float | None = None,
+) -> None:
+    """Stamp the sidecar with ``logged_out_since_unix`` (if not already
+    set) and ``logged_out_last_reminder_unix`` = now. Best-effort; IO
+    failures log a warning."""
+    if now is None:
+        now = time.time()
+    sidecar = _sidecar_path(credentials_path)
+    existing: dict[str, Any] = {}
+    try:
+        existing = json.loads(sidecar.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            existing = {}
+    except (OSError, json.JSONDecodeError):
+        existing = {}
+    existing.setdefault("logged_out_since_unix", int(now))
+    existing["logged_out_last_reminder_unix"] = int(now)
+    try:
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(sidecar, existing)
+    except OSError as exc:
+        log.warning("logged_out sidecar write failed: %s", exc)
+
+
+def clear_logged_out(credentials_path: Path) -> None:
+    """Clear the sticky logged-out state from the sidecar. Called when
+    a refresh succeeds (``oauth_refresh_ok``) — the operator re-ran
+    ``/login`` and the next tick caught up."""
+    sidecar = _sidecar_path(credentials_path)
+    try:
+        existing = json.loads(sidecar.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            return
+    except (OSError, json.JSONDecodeError):
+        return
+    if "logged_out_since_unix" not in existing and "logged_out_last_reminder_unix" not in existing:
+        return  # already clean — skip the write
+    existing.pop("logged_out_since_unix", None)
+    existing.pop("logged_out_last_reminder_unix", None)
+    try:
+        _atomic_write_json(sidecar, existing)
+    except OSError as exc:
+        log.warning("clear_logged_out sidecar write failed: %s", exc)
+
+
 def reset_first_seen(credentials_path: Path, *, now: float | None = None) -> None:
     """Operator-side ``/login`` produced fresh credentials — reset the
     sidecar so the age warning starts counting from now. Call this from
@@ -926,11 +1011,48 @@ async def poll_once(
             credentials_path=str(cfg.credentials_path),
         )
 
+    # CR2 (external I/O) fix: throttled logged_out reminder. If the
+    # sidecar carries ``logged_out_since_unix`` (a previous poll fired
+    # ``oauth_logged_out``), don't churn the same network call every
+    # cron tick. Emit ``oauth_logged_out_reminder`` at most once per
+    # hour — enough for the operator to know the agent is still
+    # waiting on a re-``/login`` without flooding events.jsonl.
+    is_logged_out, logged_out_since, last_reminder = is_known_logged_out(
+        cfg.credentials_path,
+    )
+    if is_logged_out:
+        elapsed = (
+            now - last_reminder
+            if last_reminder is not None else float("inf")
+        )
+        if elapsed >= _LOGGED_OUT_REMINDER_INTERVAL_SECONDS:
+            hours_since_logout = (
+                round((now - logged_out_since) / 3600.0, 1)
+                if logged_out_since is not None else None
+            )
+            await log_event(
+                "oauth_logged_out_reminder",
+                credentials_path=str(cfg.credentials_path),
+                hours_since_logout=hours_since_logout,
+            )
+            mark_logged_out(cfg.credentials_path, now=now)
+        return {"ok": False, "stage": "logged_out_throttled"}
+
     # Open one session per call (the caller passes one in for tests /
     # if multiple polls share connection state).
+    #
+    # CR2 (external I/O) fix: explicit total timeout. ``aiohttp.ClientSession()``
+    # default has NO total timeout — a hung Anthropic endpoint blocks
+    # the cron callback indefinitely; with ``coalesce=True,
+    # max_instances=1`` on the OAuth-usage cron, every subsequent quota
+    # update is silently dropped. The arbiter then suppresses S4 work
+    # on stale data. 30s is generous (refresh + usage typically <1s
+    # each) without making the poll feel hung from the operator's side.
     owns_session = session is None
     if session is None:
-        session = aiohttp.ClientSession()
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+        )
     try:
         # Proactively refresh if the access token is at/past expiry.
         if is_access_token_expired(oauth):
@@ -942,6 +1064,9 @@ async def poll_once(
                     expires_at_ms=oauth.get("expiresAt"),
                     rotated=bool(oauth.get("refreshToken") != refresh_token),
                 )
+                # CR2 fix: refresh succeeded → clear sticky logged_out
+                # state so the next ticks resume normal flow.
+                clear_logged_out(cfg.credentials_path)
             except OAuthRefreshError as exc:
                 if exc.logged_out:
                     await log_event(
@@ -950,6 +1075,10 @@ async def poll_once(
                         status=exc.status,
                         error=str(exc),
                     )
+                    # CR2 fix: stamp the sidecar so the next tick takes
+                    # the throttled-reminder branch above instead of
+                    # re-firing the network call + the same event.
+                    mark_logged_out(cfg.credentials_path, now=now)
                 else:
                     await log_event(
                         "oauth_usage_failed",
@@ -975,6 +1104,7 @@ async def poll_once(
                         expires_at_ms=oauth.get("expiresAt"),
                         reactive=True,
                     )
+                    clear_logged_out(cfg.credentials_path)
                     payload = await fetch_usage(
                         session, oauth.get("accessToken") or "", cfg,
                     )
@@ -986,6 +1116,7 @@ async def poll_once(
                             status=refresh_exc.status,
                             error=str(refresh_exc),
                         )
+                        mark_logged_out(cfg.credentials_path, now=now)
                     else:
                         await log_event(
                             "oauth_usage_failed",

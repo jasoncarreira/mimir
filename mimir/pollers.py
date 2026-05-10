@@ -293,7 +293,31 @@ async def run_poller(
         # Fall through; the subprocess might handle a missing dir,
         # OR fail and surface as poller_nonzero_exit.
 
-    env = {**os.environ, **poller.env}
+    # CR2 (external I/O) fix: previously this passed ``{**os.environ,
+    # **poller.env}`` — the entire mimir process env (including
+    # MIMIR_API_KEY, SAGA_API_KEY, ANTHROPIC_API_KEY, DISCORD_TOKEN,
+    # SLACK_BOT_TOKEN, GITHUB_TOKEN, etc.) flowed to every poller
+    # subprocess. A buggy poller that printed ``env`` to stderr would
+    # leak every secret to events.jsonl (truncated to 2000 chars but
+    # still). Skill authors don't expect their poller scripts to
+    # inherit these, and we shouldn't expand the trust boundary
+    # unnecessarily.
+    #
+    # Whitelist: PATH (so the subprocess can resolve binaries), HOME
+    # (most CLIs need it), TZ + LANG / LC_* (for correct timezone +
+    # locale handling), plus the poller-specific STATE_DIR and
+    # POLLER_NAME we set anyway. Skill authors who need a specific
+    # secret declare it in the skill's ``pollers.json`` ``env``
+    # block — that becomes the operator-review surface.
+    _ALLOWED_ENV_KEYS = {
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TZ",
+        "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+        "PYTHONUNBUFFERED",  # mimir runs with this set in container
+    }
+    env = {
+        k: v for k, v in os.environ.items() if k in _ALLOWED_ENV_KEYS
+    }
+    env.update(poller.env)  # explicit per-skill overlay still wins
     env["STATE_DIR"] = str(persist_dir)
     env["POLLER_NAME"] = poller.name
 

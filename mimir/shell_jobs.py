@@ -320,23 +320,52 @@ class ShellJobRegistry:
             return {"error": f"unknown job_id: {job_id}"}
 
         def _tail(path: Path, n: int) -> str:
-            # TODO(perf): seek-from-end streaming tail. Today we
-            # ``read_bytes()`` then ``splitlines()`` — a 1GB runaway
-            # log spikes memory on the event loop. Bounded in practice
-            # by the async-tasks skill's "wrap in ``timeout 1h``"
-            # discipline; if a job ever produces hundreds of MB
-            # legitimately, the safer shape is read backward in
-            # ~64KB chunks until N newlines are seen, then decode.
-            # See chainlink #56 follow-up if it ever bites.
+            # CR2 (external I/O / Pattern A residual) fix: seek-from-end
+            # streaming tail. Pre-fix this read the entire file with
+            # ``read_bytes()``; a 1GB runaway log spiked memory on the
+            # event loop. The "bounded by skill discipline" claim wasn't
+            # a guarantee — any one buggy script (e.g. ``find /``) could
+            # land the agent process OOM. Now we read backward in
+            # 64 KiB chunks until N newlines are seen (or BOF), then
+            # decode just the tail. Memory is O(n × avg_line_size)
+            # regardless of file size.
+            CHUNK = 65536
+            MAX_BYTES = 10 * 1024 * 1024  # 10 MiB hard cap on tail bytes
             try:
-                data = path.read_bytes()
+                with path.open("rb") as f:
+                    f.seek(0, 2)  # SEEK_END
+                    pos = f.tell()
+                    if n <= 0:
+                        # Caller wants "all of it" — still cap at MAX_BYTES.
+                        size = min(pos, MAX_BYTES)
+                        f.seek(max(0, pos - size))
+                        data = f.read(size)
+                        prefix = "" if pos <= MAX_BYTES else (
+                            f"[…truncated {pos - MAX_BYTES} bytes from head…]\n"
+                        )
+                        return prefix + data.decode("utf-8", errors="replace")
+                    # Bounded line-count tail: read backward chunks
+                    # until we have n+1 newlines (so we can drop the
+                    # first partial line) or hit BOF.
+                    buf = b""
+                    newline_count = 0
+                    while pos > 0 and newline_count <= n and len(buf) < MAX_BYTES:
+                        read_size = min(CHUNK, pos)
+                        pos -= read_size
+                        f.seek(pos)
+                        chunk = f.read(read_size)
+                        buf = chunk + buf
+                        newline_count = buf.count(b"\n")
+                    text = buf.decode("utf-8", errors="replace")
+                    lines = text.splitlines()
+                    if pos == 0 and len(lines) <= n:
+                        return text
+                    # We have at least n full lines plus possibly a
+                    # partial leading line — drop everything past the
+                    # trailing n lines.
+                    return "\n".join(lines[-n:])
             except FileNotFoundError:
                 return ""
-            text = data.decode("utf-8", errors="replace")
-            lines = text.splitlines()
-            if n <= 0 or len(lines) <= n:
-                return text
-            return "\n".join(lines[-n:])
 
         out = _tail(job.stdout_path, tail_lines) if stream in ("stdout", "both") else ""
         err = _tail(job.stderr_path, tail_lines) if stream in ("stderr", "both") else ""

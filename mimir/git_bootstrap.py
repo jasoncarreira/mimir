@@ -670,15 +670,37 @@ def _run(
 ) -> subprocess.CompletedProcess:
     """Tiny wrapper so we get uniform timeout + capture behavior across
     helpers. 30s timeout matches PUSH_TIMEOUT_SECONDS in git_tracking
-    so the bootstrap can't wedge startup on a slow remote."""
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        check=check,
-        capture_output=capture,
-        text=True,
-        timeout=30,
-    )
+    so the bootstrap can't wedge startup on a slow remote.
+
+    CR2 (external I/O) fix: catch ``TimeoutExpired`` and re-raise as
+    ``CalledProcessError`` so callers that catch only the latter still
+    handle the timeout. Pre-fix a 31s remote turned startup into a
+    fatal ``TimeoutExpired`` that the server's bare ``except Exception``
+    swallowed with a one-line ``git_bootstrap_failed`` event, leaving
+    partial state (e.g. ``.git/credentials`` written but remote unset).
+    Now the timeout surfaces as a structured non-zero return that the
+    existing error path handles uniformly.
+    """
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            check=check,
+            capture_output=capture,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise subprocess.CalledProcessError(
+            returncode=124,  # standard timeout exit code
+            cmd=cmd,
+            output=(exc.stdout.decode("utf-8", "replace")
+                    if isinstance(exc.stdout, bytes)
+                    else (exc.stdout or "")) + "\n[git_bootstrap _run timed out after 30s]",
+            stderr=(exc.stderr.decode("utf-8", "replace")
+                    if isinstance(exc.stderr, bytes)
+                    else (exc.stderr or "")),
+        ) from exc
 
 
 __all__: tuple[str, ...] = (
