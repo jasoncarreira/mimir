@@ -1,0 +1,35 @@
+"""Commitments — durable records of future obligations the agent has
+accepted (agent promises, user requests it agreed to follow up on,
+open loops to revisit).
+
+Phase 1 (this module today): data model + JSONL store + CLI commands.
+Operator-managed; no LLM extraction or prompt surfacing yet.
+
+Phase 2 (planned): session-boundary extraction hook + due-check poller
++ algedonic ``commitment_due`` / ``commitment_expired`` events.
+
+Phase 3 (planned): prompt-builder block (Upcoming commitments).
+
+See ``docs/code-review-2026-05-09.md`` and scratch backtest report for
+the design rationale.
+"""
+
+from .models import (
+    CommitmentKind,
+    CommitmentRecord,
+    CommitmentSensitivity,
+    CommitmentStatus,
+    make_commitment_id,
+    make_dedupe_key,
+)
+from .store import CommitmentsStore
+
+__all__ = [
+    "CommitmentKind",
+    "CommitmentRecord",
+    "CommitmentSensitivity",
+    "CommitmentStatus",
+    "CommitmentsStore",
+    "make_commitment_id",
+    "make_dedupe_key",
+]
