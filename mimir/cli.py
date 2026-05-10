@@ -624,14 +624,14 @@ def _default_saga_toml(home: Path, api_key: str) -> str:
         # saga's default token_budget_ceiling is 40k — too low for any
         # real workload (single LongMemEval haystack alone exceeds it).
         # 1M is a comfortable production cap; integration benches that
-        # ingest larger corpora bump this to 100M (matches msam_bench.toml).
+        # ingest larger corpora bump this to 100M (matches saga_bench.toml).
         token_budget_ceiling = 1000000
         auto_compact_threshold_pct = 90
         refuse_threshold_pct = 99
 
         [embedding]
         # OpenAI's text-embedding-3-small at 1536 dims is saga's bench
-        # canonical (matches msam_bench.toml; comparable to the post-fix
+        # canonical (matches saga_bench.toml; comparable to the post-fix
         # P30 baseline of 0.774). Operators can switch to provider="onnx"
         # for fully local embeddings — no API key needed, slower CPU pass.
         provider = "openai"

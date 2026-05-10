@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Initialize MSAM databases.
+Initialize SAGA databases.
 
-Creates empty msam.db and saga_metrics.db with the correct schema.
+Creates empty saga.db and saga_metrics.db with the correct schema.
 Safe to run multiple times (uses CREATE TABLE IF NOT EXISTS).
 
 Usage:
     python -m saga.init_db
     # or
-    python msam/init_db.py
+    python saga/init_db.py
 """
 
 import sys
@@ -74,10 +74,10 @@ def init_databases():
     except Exception:
         pass  # subatom may not exist in minimal installs
 
-    print(f"\nDone. MSAM is ready.")
-    print(f"  Store:    msam store \"Your first memory\"")
-    print(f"  Retrieve: msam query \"What do I know?\"")
-    print(f"  Help:     msam help")
+    print(f"\nDone. SAGA is ready.")
+    print(f"  Store:    saga store \"Your first memory\"")
+    print(f"  Retrieve: saga query \"What do I know?\"")
+    print(f"  Help:     saga help")
 
 
 if __name__ == "__main__":

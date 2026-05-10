@@ -1,4 +1,4 @@
-"""MSAM Sub-Atom Tests -- sentence-level extraction and deduplication."""
+"""SAGA Sub-Atom Tests -- sentence-level extraction and deduplication."""
 
 import struct
 

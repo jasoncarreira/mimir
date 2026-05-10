@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-MSAM Quickstart -- Store, retrieve, and explore memory in 50 lines.
+SAGA Quickstart -- Store, retrieve, and explore memory in 50 lines.
 
 Prerequisites:
     1. Copy saga.example.toml to saga.toml
     2. Set your embedding API key (e.g., NVIDIA_NIM_API_KEY)
-    3. Run: python msam/init_db.py
+    3. Run: python saga/init_db.py
 """
 
 import asyncio

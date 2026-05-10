@@ -1,1 +1,1 @@
-"""LongMemEval benchmark harness for MSAM."""
+"""LongMemEval benchmark harness for SAGA."""

@@ -1,4 +1,4 @@
-"""Comprehensive CLI command tests for msam/remember.py.
+"""Comprehensive CLI command tests for saga/remember.py.
 
 Tests every cmd_* function that was previously untested.
 Pattern: call function directly, capture stdout via capsys, parse JSON output.

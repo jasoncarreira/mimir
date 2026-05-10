@@ -1,5 +1,5 @@
 """
-MSAM Consolidation Engine -- Sleep-inspired memory consolidation.
+SAGA Consolidation Engine -- Sleep-inspired memory consolidation.
 
 Clusters similar atoms, synthesizes abstractions via LLM, and reduces
 source atom stability. This is how human memory works during sleep:

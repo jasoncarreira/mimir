@@ -1,4 +1,4 @@
-"""MSAM Metrics Tests -- observability and statistics collection."""
+"""SAGA Metrics Tests -- observability and statistics collection."""
 
 import sqlite3
 from datetime import datetime, timezone, timedelta

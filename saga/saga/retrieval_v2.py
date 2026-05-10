@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MSAM Retrieval v2: Nine improvements for 1M-scale retrieval.
+SAGA Retrieval v2: Nine improvements for 1M-scale retrieval.
 
 Improvements:
   1. Triple-augmented retrieval (entity→triple→atom graph traversal)
@@ -124,7 +124,7 @@ def extract_query_entities(query: str) -> list[str]:
     
     # Known entity patterns
     known_entities = {
-        'user': 'User', 'agent': 'Agent', 'msam': 'MSAM',
+        'user': 'User', 'agent': 'Agent', 'saga': 'SAGA',
         
         'openclaw': 'OpenClaw',
     }
@@ -561,7 +561,7 @@ async def benchmark_v2():
 
     queries = [
         ("Who is the user?", "companion"),
-        ("What is MSAM?", "task"),
+        ("What is SAGA?", "task"),
         ("What projects is the user working on?", "companion"),
         ("What is the user's profession?", "companion"),
         ("Security rules for the system", "task"),

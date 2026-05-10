@@ -1,5 +1,5 @@
 """
-MSAM Metrics -- Statistics collection for Grafana visualization.
+SAGA Metrics -- Statistics collection for Grafana visualization.
 Stores time-series metrics in SQLite for lightweight monitoring.
 """
 
@@ -61,9 +61,9 @@ CREATE TABLE IF NOT EXISTS comparison_metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
     query TEXT,
-    msam_tokens INTEGER,
-    msam_latency_ms REAL,
-    msam_atoms INTEGER,
+    saga_tokens INTEGER,
+    saga_latency_ms REAL,
+    saga_atoms INTEGER,
     markdown_tokens INTEGER,
     markdown_latency_ms REAL,
     markdown_results INTEGER,
@@ -268,23 +268,23 @@ def log_system_snapshot():
     conn.close()
 
 
-def log_comparison(query, msam_tokens, msam_latency_ms, msam_atoms,
+def log_comparison(query, saga_tokens, saga_latency_ms, saga_atoms,
                    md_tokens, md_latency_ms, md_results):
-    """Log a comparison between MSAM and markdown retrieval."""
+    """Log a comparison between SAGA and markdown retrieval."""
     conn = get_metrics_db()
     now = datetime.now(timezone.utc).isoformat()
     
-    savings = ((md_tokens - msam_tokens) / md_tokens * 100) if md_tokens > 0 else 0
-    density = (0.9 / 0.5) if md_tokens > 0 else 0  # MSAM vs grep info density
+    savings = ((md_tokens - saga_tokens) / md_tokens * 100) if md_tokens > 0 else 0
+    density = (0.9 / 0.5) if md_tokens > 0 else 0  # SAGA vs grep info density
     
     conn.execute("""
         INSERT INTO comparison_metrics
-        (timestamp, query, msam_tokens, msam_latency_ms, msam_atoms,
+        (timestamp, query, saga_tokens, saga_latency_ms, saga_atoms,
          markdown_tokens, markdown_latency_ms, markdown_results,
          token_savings_pct, info_density_ratio)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        now, query, msam_tokens, msam_latency_ms, msam_atoms,
+        now, query, saga_tokens, saga_latency_ms, saga_atoms,
         md_tokens, md_latency_ms, md_results, savings, density
     ))
     conn.commit()
@@ -308,7 +308,7 @@ def log_access_event(
     topics_hit=None,
     detail=None,
 ):
-    """Log every single MSAM access event with full detail."""
+    """Log every single SAGA access event with full detail."""
     conn = get_metrics_db()
     now = datetime.now(timezone.utc).isoformat()
 

@@ -1,4 +1,4 @@
-"""MSAM CLI Tests -- command dispatch, help, grep, export/import."""
+"""SAGA CLI Tests -- command dispatch, help, grep, export/import."""
 
 import sys
 import os
@@ -14,7 +14,7 @@ class TestHelp:
         from saga.remember import cmd_help
         cmd_help()
         captured = capsys.readouterr()
-        assert "MSAM CLI" in captured.out
+        assert "SAGA CLI" in captured.out
         assert "Storage:" in captured.out
         assert "Retrieval:" in captured.out
         assert "grep" in captured.out

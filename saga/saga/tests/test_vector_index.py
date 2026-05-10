@@ -1,4 +1,4 @@
-"""MSAM Vector Index Tests -- FAISS-backed approximate nearest neighbor search."""
+"""SAGA Vector Index Tests -- FAISS-backed approximate nearest neighbor search."""
 
 import struct
 

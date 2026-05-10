@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "saga"
 version = "2026.02.24"
-description = "Saga (formerly MSAM) -- cognitive memory system for AI agents"
+description = "Saga (formerly SAGA) -- cognitive memory system for AI agents"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
@@ -56,9 +56,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jadenschwab/msam"
-Documentation = "https://github.com/jadenschwab/msam/blob/main/SPEC.md"
-Issues = "https://github.com/jadenschwab/msam/issues"
+Homepage = "https://github.com/jadenschwab/saga"
+Documentation = "https://github.com/jadenschwab/saga/blob/main/SPEC.md"
+Issues = "https://github.com/jadenschwab/saga/issues"
 
 [project.scripts]
 saga = "saga.remember:main"

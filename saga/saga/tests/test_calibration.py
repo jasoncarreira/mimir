@@ -1,4 +1,4 @@
-"""MSAM Calibration Tests -- ranking metrics and re-embed logic."""
+"""SAGA Calibration Tests -- ranking metrics and re-embed logic."""
 
 import json
 import struct

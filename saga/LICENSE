@@ -3,14 +3,15 @@ MIT License
 Copyright (c) 2026 Jaden Schwab
 Copyright (c) 2026 Jason Carreira
 
-This software was originally created as MSAM (Multi-Stream Adaptive
-Memory) by Jaden Schwab. It has since been heavily modified and
-extended — renamed to saga, restructured around a two-tier retrieval
-shape, gaining a temporal world model, structured triple-extraction
-during consolidation, contextual-rewrite + missing-reference pivot,
-session-boundary surfacing, and integration as the memory backend of
-the mimir agent harness — by Jason Carreira. The original copyright
-is preserved alongside the modification copyright per MIT terms.
+This software was originally created as the Multi-Stream Adaptive
+Memory project by Jaden Schwab. It has since been heavily modified
+and extended — adopting the name saga, restructured around a two-tier
+retrieval shape, gaining a temporal world model, structured triple-
+extraction during consolidation, contextual-rewrite + missing-reference
+pivot, session-boundary surfacing, and integration as the memory
+backend of the mimir agent harness — by Jason Carreira. The original
+copyright is preserved alongside the modification copyright per MIT
+terms.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
