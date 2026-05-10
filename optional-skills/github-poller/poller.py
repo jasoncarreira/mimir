@@ -279,6 +279,90 @@ def _check_pr_review_comments(repo: str, since: str, token: str, me: str) -> int
     return count
 
 
+def _check_pr_pushes(
+    repo: str,
+    token: str,
+    me: str,
+    pr_heads: dict[str, str],
+) -> tuple[int, dict[str, str]]:
+    """Detect new commits pushed to existing open PRs.
+
+    Different signature from the sibling checks: takes ``pr_heads``
+    (the per-repo ``{number_str: sha}`` snapshot from the previous
+    poll, possibly empty) instead of a ``since`` timestamp, and
+    returns ``(emit_count, new_pr_heads)``. The cleanup model is
+    "rebuild ``pr_heads`` from the current ``state=open`` set on
+    every poll" — closed/merged PRs and PRs in repos no longer in
+    the watch list naturally drop out because they're never copied
+    into the new dict the caller saves.
+
+    First sighting of a PR: record its head sha, do NOT emit.
+    ``_check_prs`` already fires ``pr_opened`` for genuinely-new PRs;
+    the first poll after this feature ships would otherwise bulk-fire
+    on every existing open PR, which is noise.
+
+    Subsequent sighting with a different head sha: emit a
+    ``pr_synchronize`` event and record the new sha. This catches
+    force-pushes too — a rebase that doesn't change the diff vs.
+    base will still advance ``head.sha``, so we'll fire on it. That's
+    a known false-positive; the alternative (compare diffs) is too
+    expensive to run on every poll.
+    """
+    # ``per_page=100`` (vs GitHub's 30 default) gives ~3× headroom against
+    # the active-prune pitfall: a repo with >page-size open PRs would
+    # silently drop everything past the first page from the cursor every
+    # poll, so those PRs would re-record as "first sighting" each time and
+    # never emit a synchronize event. Proper Link-header pagination is the
+    # complete fix; per_page=100 is the cheap headroom bump until then.
+    data = _gh_api(
+        f"repos/{repo}/pulls?state=open&sort=created&direction=desc&per_page=100",
+        token,
+    )
+    new_heads: dict[str, str] = {}
+    if not isinstance(data, list):
+        # On API failure, preserve prior heads so we don't false-fire
+        # on the next successful poll. (If the poll truly missed a
+        # push, we'll catch it next time.)
+        return 0, dict(pr_heads)
+    count = 0
+    for pr in data:
+        if me and pr.get("user", {}).get("login") == me:
+            continue
+        number = pr.get("number")
+        if not number:
+            continue
+        current_sha = (pr.get("head") or {}).get("sha")
+        if not current_sha:
+            continue
+        key = str(number)
+        prev_sha = pr_heads.get(key)
+        if prev_sha is None:
+            # First sighting — record, do not emit.
+            new_heads[key] = current_sha
+            continue
+        if prev_sha != current_sha:
+            author = pr.get("user", {}).get("login", "unknown")
+            title = pr.get("title", "")
+            url = pr.get("html_url", "")
+            prompt = (
+                f"PR #{number} updated on {repo}: {title} (by @{author})\n"
+                f"Previous head: {prev_sha[:8]}, new head: "
+                f"{current_sha[:8]}\n{url}"
+            )
+            _emit(
+                prompt,
+                event_type="pr_synchronize",
+                repo=repo,
+                number=number,
+                url=url,
+                previous_head=prev_sha,
+                new_head=current_sha,
+            )
+            count += 1
+        new_heads[key] = current_sha
+    return count, new_heads
+
+
 def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
     """New PR reviews (approve / changes-requested / commented).
     No ``since=`` query on reviews endpoint — walk open PRs + filter
@@ -378,6 +462,9 @@ def main() -> None:
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
         print(f"First run; looking back to {since}", file=sys.stderr)
 
+    pr_heads_all: dict[str, dict[str, str]] = cursor.get("pr_heads", {}) or {}
+    new_pr_heads_all: dict[str, dict[str, str]] = {}
+
     total = 0
     for repo in repos:
         print(f"Checking {repo} since {since}...", file=sys.stderr)
@@ -386,8 +473,15 @@ def main() -> None:
         total += _check_issue_comments(repo, since, token, me)
         total += _check_pr_review_comments(repo, since, token, me)
         total += _check_pr_reviews(repo, since, token, me)
+        repo_heads = pr_heads_all.get(repo, {}) or {}
+        push_count, new_repo_heads = _check_pr_pushes(
+            repo, token, me, repo_heads,
+        )
+        total += push_count
+        new_pr_heads_all[repo] = new_repo_heads
 
     cursor["last_checked"] = new_cursor_ts
+    cursor["pr_heads"] = new_pr_heads_all
     _save_cursor(cursor)
     print(
         f"Emitted {total} event(s) across {len(repos)} repo(s)",
