@@ -76,9 +76,10 @@ def find_pages(wiki_dir: Path) -> dict[str, Path]:
     Slug is the filename sans ``.md``. Multiple files with the same
     slug across categories — last-wins; the dangling-link detection
     still works correctly because both files contribute their outbound
-    links, but inbound-link grouping conflates them. (Genuine slug
-    collisions are a wiki-health signal we'd want to surface
-    eventually, but Phase 1 doesn't.)
+    links, but inbound-link grouping conflates them. CR2 (memory &
+    retrieval) fix: ``find_slug_collisions`` returns the colliding
+    slugs so callers (build_graph, the introspection skill) can
+    surface them as a wiki-health signal instead of silently merging.
     """
     pages: dict[str, Path] = {}
     if not wiki_dir.is_dir():
@@ -89,6 +90,28 @@ def find_pages(wiki_dir: Path) -> dict[str, Path]:
         slug = md.stem
         pages[slug] = md.relative_to(wiki_dir)
     return pages
+
+
+def find_slug_collisions(wiki_dir: Path) -> dict[str, list[Path]]:
+    """Return ``slug → [paths]`` for every slug that resolves to more
+    than one file under ``wiki_dir``.
+
+    CR2 (memory & retrieval) follow-up: same-stem files across
+    categories (``concepts/foo.md`` and ``topics/foo.md``) produce a
+    silent last-wins conflation in ``find_pages``, AND get dropped as
+    "self-links" in ``build_graph`` (both have ``slug == "foo"``).
+    Surfacing collisions explicitly lets the introspection skill emit
+    a ``wiki_slug_collision`` algedonic event so the operator can
+    rename one of the files.
+    """
+    by_slug: dict[str, list[Path]] = {}
+    if not wiki_dir.is_dir():
+        return {}
+    for md in sorted(wiki_dir.rglob("*.md")):
+        if md.name in _META_FILENAMES:
+            continue
+        by_slug.setdefault(md.stem, []).append(md.relative_to(wiki_dir))
+    return {slug: paths for slug, paths in by_slug.items() if len(paths) > 1}
 
 
 def extract_links(text: str) -> Iterable[tuple[int, str]]:
@@ -114,26 +137,52 @@ class BacklinksGraph:
     ``pages`` maps slug → ``{path, outbound, inbound}``; ``orphans``
     is the slug list with empty inbound; ``dangling`` is the list of
     ``{target, source, line}`` for links that don't resolve to any
-    page. All three derive from one walk."""
+    page. ``collisions`` (PR #112 re-review fix) maps colliding slug
+    → list of relative paths; ``run()`` emits the algedonic
+    ``wiki_slug_collision`` event from this. All four derive from
+    one walk."""
 
     def __init__(
         self,
         pages: dict[str, dict],
         orphans: list[str],
         dangling: list[dict],
+        collisions: dict[str, list[Path]] | None = None,
     ) -> None:
         self.pages = pages
         self.orphans = orphans
         self.dangling = dangling
+        self.collisions = collisions or {}
 
 
 def build_graph(wiki_dir: Path) -> BacklinksGraph:
     """Walk ``wiki_dir``, return the inbound + outbound + dangling
-    structure described in the module docstring."""
+    structure described in the module docstring.
+
+    **Cross-category-same-stem limitation (PR #112 review).** Slug
+    collisions (e.g. ``concepts/foo.md`` AND ``topics/foo.md``) can't
+    be disambiguated via the existing wikilink syntax (``[[foo]]``
+    resolves to one stem; both files have the same stem). The
+    backlinks index conflates them. ``find_slug_collisions`` returns
+    the affected slugs and ``build_graph`` logs a warning so the
+    operator can rename one of the collision pair. The actual link-
+    preservation fix requires a path-key refactor across both
+    ``find_pages`` and the wikilink resolver — bigger than fits in
+    this PR.
+    """
     pages_paths = find_pages(wiki_dir)
     page_data: dict[str, dict] = {}
     inbound: defaultdict[str, set[str]] = defaultdict(set)
     dangling: list[dict] = []
+
+    # PR #112 re-review fix: surface collisions on the BacklinksGraph
+    # and let ``run()`` emit the algedonic event via ``log_event``.
+    # Pre-fix this used stdlib ``log.warning`` which bypasses the
+    # algedonic firehose / events.jsonl — operator never saw it on
+    # the prompt's "Recent feedback signals" surface. ``build_graph``
+    # is sync; ``log_event`` is async; hoisting the emit to ``run()``
+    # is the cleanest split.
+    collisions = find_slug_collisions(wiki_dir)
 
     for slug, rel_path in pages_paths.items():
         full_path = wiki_dir / rel_path
@@ -149,6 +198,13 @@ def build_graph(wiki_dir: Path) -> BacklinksGraph:
                 # itself isn't "supported by another page"). Pre-fix
                 # wikis sometimes had these as a stylistic choice —
                 # exclude either way.
+                #
+                # NOTE: this exclusion ALSO drops genuine cross-category
+                # same-stem links (concepts/foo.md → topics/foo.md), an
+                # acknowledged limitation of the slug-keyed index. See
+                # the docstring above + ``find_slug_collisions``. When
+                # the operator renames one of the collision pair, the
+                # link resolves correctly.
                 if target != slug:
                     inbound[target].add(slug)
             else:
@@ -169,6 +225,7 @@ def build_graph(wiki_dir: Path) -> BacklinksGraph:
 
     return BacklinksGraph(
         pages=page_data, orphans=orphans, dangling=dangling,
+        collisions=collisions,
     )
 
 
@@ -311,6 +368,19 @@ async def run(home: Path) -> dict:
             page_count=page_count,
             orphan_count=orphan_count,
             dangling_count=dangling_count,
+            generated_at=generated_at,
+        )
+
+    # PR #112 re-review fix: emit collision events through the
+    # algedonic surface. Each slug-collision pair becomes a separate
+    # ``wiki_slug_collision`` record so the operator can see exactly
+    # which files clash without a one-shot summary message that the
+    # algedonic feedback dedup would suppress on subsequent runs.
+    for slug, paths in sorted(graph.collisions.items()):
+        await log_event(
+            "wiki_slug_collision",
+            slug=slug,
+            paths=[str(p) for p in paths],
             generated_at=generated_at,
         )
 
