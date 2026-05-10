@@ -224,3 +224,36 @@ async def test_queue_full_returns_false(tmp_path: Path):
     assert accepted is False
     release.set()
     await disp.drain()
+
+
+# ─── CR2-#4: drain() must not deadlock on CancelledError ───────────────
+
+
+@pytest.mark.asyncio
+async def test_drain_completes_when_run_turn_is_cancelled(tmp_path: Path):
+    """CR2-#4 regression: ``queue.task_done()`` must fire even when
+    ``_run_turn`` raises ``CancelledError``. Pre-fix, the task_done()
+    was outside the try/except, so a CancelledError raised inside
+    _run_turn skipped it — leaving ``queue._unfinished_tasks > 0``
+    and blocking ``await queue.join()`` in ``drain()`` forever.
+
+    This test simulates that path: a runner that immediately raises
+    CancelledError. ``drain()`` must complete within a reasonable
+    timeout (here 2s — the deadlock shape would block indefinitely).
+    """
+    cfg = _make_config(tmp_path)
+    cancelled_count = 0
+
+    async def runner(event: AgentEvent) -> None:
+        nonlocal cancelled_count
+        cancelled_count += 1
+        raise asyncio.CancelledError()
+
+    disp = Dispatcher(cfg, runner)
+    assert await disp.enqueue(
+        AgentEvent(trigger="x", channel_id="c1", content="hi"),
+    )
+    # Bound the drain so the deadlock-shape test fails fast rather than
+    # hanging the test runner.
+    await asyncio.wait_for(disp.drain(), timeout=2.0)
+    assert cancelled_count == 1
