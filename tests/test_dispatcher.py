@@ -257,3 +257,64 @@ async def test_drain_completes_when_run_turn_is_cancelled(tmp_path: Path):
     # hanging the test runner.
     await asyncio.wait_for(disp.drain(), timeout=2.0)
     assert cancelled_count == 1
+
+
+# ─── PR #110 review-followup: dict cleanup pin ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_idle_worker_retires_and_cleans_up_per_channel_dicts(
+    tmp_path: Path,
+):
+    """PR #110 review-followup: when a worker idle-times-out, its
+    queue + high-water entries are removed from the per-channel
+    dicts. Pre-fix, ephemeral channel_ids accumulated indefinitely.
+
+    Cleanup is gated on ``queue.qsize() == 0`` and ``not _closed``
+    so an in-flight ``drain()`` waiting on ``queue.join()`` doesn't
+    lose its reference."""
+    cfg = _make_config(tmp_path, worker_idle_timeout_s=0.05)
+
+    async def runner(event: AgentEvent) -> None:
+        return None
+
+    disp = Dispatcher(cfg, runner)
+    assert await disp.enqueue(
+        AgentEvent(trigger="x", channel_id="c-ephemeral", content="hi"),
+    )
+    # Wait for the worker to drain + retire (idle_timeout 0.05s).
+    for _ in range(20):
+        await asyncio.sleep(0.05)
+        if "c-ephemeral" not in disp._queues:
+            break
+    assert "c-ephemeral" not in disp._queues
+    assert "c-ephemeral" not in disp._high_water_logged
+    await disp.drain()
+
+
+@pytest.mark.asyncio
+async def test_drain_does_not_purge_dict_entries_for_busy_channels(
+    tmp_path: Path,
+):
+    """Defensive: ``drain()`` sets ``self._closed = True`` before
+    waiting on ``queue.join()``. The cleanup gate ``not self._closed``
+    must NOT purge a queue entry while drain is iterating queue.values().
+    """
+    cfg = _make_config(tmp_path, worker_idle_timeout_s=0.05)
+    release = asyncio.Event()
+
+    async def runner(event: AgentEvent) -> None:
+        await release.wait()
+
+    disp = Dispatcher(cfg, runner)
+    assert await disp.enqueue(
+        AgentEvent(trigger="x", channel_id="c-busy", content="hi"),
+    )
+    # Worker is parked in runner — closed flag not yet set.
+    drain_task = asyncio.create_task(disp.drain())
+    # Brief yield to ensure drain started.
+    await asyncio.sleep(0.02)
+    # Channel is still tracked while drain is waiting.
+    assert "c-busy" in disp._queues
+    release.set()
+    await drain_task

@@ -987,17 +987,32 @@ class Agent:
         captured asyncio loop so we can enqueue a ``shell_job_complete``
         AgentEvent without crossing thread boundaries unsafely.
 
-        Silently no-ops when no loop has been captured yet (e.g. a job
-        completed before the first turn ran — shouldn't happen in
-        practice but the guard is cheap) or when the dispatcher isn't
-        wired (unit tests). Never raises — the registry guards against
-        callback errors but a pre-callback raise here would still
-        crash the daemon thread.
+        **Loop-unavailable path (PR #109 follow-up).** When the loop is
+        None / closed (shutdown / pre-first-turn / no dispatcher), the
+        spawning channel won't receive a wake event — same silent-
+        no-op shape that bit ``spawn_claude_code`` (CR2-#5). For shell
+        jobs the practical impact is smaller: there's no synthetic
+        TurnRecord to lose, just the wake-up event for the spawning
+        channel. Operators eventually notice via ``bash_jobs_list``
+        showing the completed job. We emit a ``log.warning`` so the
+        drop is at least observable in logs; building a sidecar
+        analogous to spawn-orphans.jsonl was considered overkill for
+        this case (no accounting to preserve).
         """
         loop = self._loop
         if loop is None or loop.is_closed():
+            log.warning(
+                "shell_job_complete dropped (loop unavailable): job_id=%s "
+                "channel_id=%s — spawning channel will not be woken",
+                job.job_id, job.channel_id,
+            )
             return
         if self._dispatcher is None:
+            log.warning(
+                "shell_job_complete dropped (no dispatcher wired): "
+                "job_id=%s channel_id=%s",
+                job.job_id, job.channel_id,
+            )
             return
         try:
             asyncio.run_coroutine_threadsafe(
