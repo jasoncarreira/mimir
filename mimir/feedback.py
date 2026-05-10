@@ -603,30 +603,24 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"resume. Investigate dispatcher state."
         )
     # chainlink #65 (sub B): paired success renderers for the
-    # ntfy / git / shell-job families. Timestamped past-tense, one
-    # line each — kept brief so the positive block doesn't bloat;
-    # the contrast against the paired failure line is the signal.
+    # ntfy / git / shell-job families. Brief past-tense, one line
+    # each — kept terse so the positive block doesn't bloat. The
+    # contrast against the paired failure line is the signal; the
+    # algedonic block's outer rendering already carries timestamps,
+    # so per-line "at HH:MM UTC" is redundant and would be asymmetric
+    # with the existing git_push_failed / shell_job_complete_enqueue_failed
+    # renderers (which don't include timestamp suffixes either).
     if rule_kind == "ntfy_post_ok":
-        hhmm = _short_ts(ev.get("timestamp") or "")[-5:]
-        suffix = f" at {hhmm} UTC" if hhmm and hhmm[2:3] == ":" else ""
-        return f"ntfy post succeeded{suffix}"
+        return "ntfy post succeeded"
     if rule_kind == "git_push_ok":
-        hhmm = _short_ts(ev.get("timestamp") or "")[-5:]
-        suffix = f" at {hhmm} UTC" if hhmm and hhmm[2:3] == ":" else ""
-        return f"git push to mimirbot-state succeeded{suffix}"
+        return "git push to mimirbot-state succeeded"
     if rule_kind == "git_pull_ok":
-        hhmm = _short_ts(ev.get("timestamp") or "")[-5:]
-        suffix = f" at {hhmm} UTC" if hhmm and hhmm[2:3] == ":" else ""
-        return f"git pull --ff-only succeeded{suffix}"
+        return "git pull --ff-only succeeded"
     if rule_kind == "git_fetch_ok":
-        hhmm = _short_ts(ev.get("timestamp") or "")[-5:]
-        suffix = f" at {hhmm} UTC" if hhmm and hhmm[2:3] == ":" else ""
-        return f"git fetch succeeded{suffix}"
+        return "git fetch succeeded"
     if rule_kind == "shell_job_complete_enqueue_ok":
         job_id = ev.get("job_id") or "?"
-        hhmm = _short_ts(ev.get("timestamp") or "")[-5:]
-        suffix = f" at {hhmm} UTC" if hhmm and hhmm[2:3] == ":" else ""
-        return f"shell job {job_id} wake-up enqueued{suffix}"
+        return f"shell job {job_id} wake-up enqueued"
     if rule_kind == "discord_bridge_retry":
         attempt = ev.get("attempt", "?")
         backoff = ev.get("backoff_seconds")
