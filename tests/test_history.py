@@ -436,7 +436,6 @@ async def test_concurrent_appends_run_in_parallel_on_thread_pool(tmp_path: Path)
 def test_recent_for_channel_limit_zero_returns_empty(tmp_path: Path):
     """The bare ``[-0:]`` slice would return the full list — guard against that."""
     buf = _make_buffer(tmp_path)
-    asyncio.get_event_loop()  # ensure asyncio works in test
     # Sync path: append into deques directly via private method for test brevity.
     buf._append_in_memory(
         buf.make_message(channel_id="c1", kind="user_message", content="a", source="slack")
