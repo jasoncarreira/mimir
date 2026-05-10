@@ -30,7 +30,6 @@ the contextvar at the task boundary if that case arrives.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -97,6 +96,7 @@ from .sagatools import (
 from .prompts import build_system_prompt, build_turn_prompt
 from .scheduler import Scheduler
 from .search import Indexer
+from ._jsonl_tail import tail_jsonl_records
 from .jsonl_snapshot import JsonlSnapshot
 from .session_manager import SessionManager
 from .turn_hooks import (
@@ -129,24 +129,44 @@ def _utc_now_iso() -> str:
 
 
 def _filter_session_turns(turns_path, saga_session_id: str) -> list[dict]:
-    """Read turns.jsonl and return all records with the given saga_session_id."""
+    """Read turns.jsonl tail-first and return records with the given
+    saga_session_id, in chronological order.
+
+    Pre-2026-05-10 this forward-read the whole file. Synthesis turns
+    fire on session-idle (an operator-visible pause point) and the
+    file caps at ~250 MB; the read could block the to_thread worker
+    for seconds. Now we tail-read newest-first, accumulate matches,
+    stop scanning once we encounter a record with a saga_session_id
+    that was assigned BEFORE the target's first observed record (i.e.
+    we've walked past the start of the target session). Implemented
+    as: stop after we've seen a contiguous run of N=200 non-matching
+    records following at least one match — the target session's turns
+    are contiguous in append-order so a long non-match streak past
+    the first match means we're past its start.
+
+    The bound prevents pathological cases where the turn count for
+    *some* session exceeds 200 — we trade exhaustive correctness for
+    a hard read-cap on the synthesis turn's prompt assembly. Sessions
+    with > 200 turns are rare (typical is 10-30); if one exists it'll
+    just have its prompt assembled from the most recent 200.
+    """
     if not turns_path.is_file():
         return []
+    NON_MATCH_BREAK = 200
     out: list[dict] = []
     try:
-        with turns_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("saga_session_id") == saga_session_id:
-                    out.append(rec)
+        non_match_streak_after_first_match = 0
+        for rec in tail_jsonl_records(turns_path):
+            if rec.get("saga_session_id") == saga_session_id:
+                out.append(rec)
+                non_match_streak_after_first_match = 0
+            elif out:
+                non_match_streak_after_first_match += 1
+                if non_match_streak_after_first_match >= NON_MATCH_BREAK:
+                    break
     except OSError:
         return []
+    out.reverse()  # tail yields newest-first; restore chronological
     return out
 
 

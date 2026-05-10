@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ._jsonl_tail import _tail_lines, count_lines_chunked
+
 log = logging.getLogger(__name__)
 
 
@@ -29,13 +31,13 @@ class EventLogger:
         self._line_count = 0
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            try:
-                self._line_count = sum(
-                    1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
-                )
-            except OSError:
-                self._line_count = 0
+        # CR2-#6: pre-2026-05-10 this read the entire file via
+        # ``read_text()`` then ``splitlines()``. events.jsonl is bounded
+        # at ~300 MB (750k events × ~400 B); every process start paid
+        # multi-hundred-MB memory + GC churn for a single integer.
+        # ``count_lines_chunked`` reads in 64 KB chunks and counts ``\n``
+        # bytes — O(1) memory.
+        self._line_count = count_lines_chunked(path)
 
     def _ensure_lock(self) -> asyncio.Lock:
         if self._lock is None:
@@ -80,18 +82,40 @@ class EventLogger:
         }
 
     async def _trim(self) -> None:
+        # CR2-#6: tail-stream up to ``max_events`` records and rewrite,
+        # rather than reading the whole file into memory. Memory bound
+        # is O(max_events × avg_record_size); previously the read was
+        # unbounded relative to file size. Wrapped in ``to_thread``
+        # because the rewrite still does sync file IO and trim runs
+        # from inside ``EventLogger.log`` which is on the event loop.
+        if not self._max_events:
+            return
         try:
-            text = self._path.read_text(encoding="utf-8")
-            lines = [l for l in text.splitlines() if l.strip()]
-            if not self._max_events or len(lines) <= self._max_events:
-                return
-            kept = lines[-self._max_events:]
-            tmp = self._path.with_suffix(".jsonl.tmp")
-            tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
-            tmp.rename(self._path)
-            self._line_count = len(kept)
+            await asyncio.to_thread(self._trim_sync)
         except OSError as exc:
             log.warning("events.jsonl trim failed: %s", exc)
+
+    def _trim_sync(self) -> None:
+        kept_reversed: list[str] = []
+        try:
+            for line in _tail_lines(self._path):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                kept_reversed.append(stripped)
+                if len(kept_reversed) >= self._max_events:
+                    break
+        except OSError as exc:
+            log.warning("events.jsonl trim tail-read failed: %s", exc)
+            return
+        if not kept_reversed:
+            return
+        # tail yields newest-first; reverse for chronological rewrite.
+        kept = list(reversed(kept_reversed))
+        tmp = self._path.with_suffix(".jsonl.tmp")
+        tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        tmp.rename(self._path)
+        self._line_count = len(kept)
 
 
 _logger: EventLogger | None = None

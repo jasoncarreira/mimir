@@ -12,11 +12,11 @@ The CLI surfaces these silences so they don't sit invisibly.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from ._jsonl_tail import tail_jsonl_records
 from .loop_inventory import LoopTag, scan as scan_inventory, default_roots
 
 
@@ -101,44 +101,52 @@ def _humanize_age(when: datetime | None, now: datetime) -> str:
 def _measure_runtime(
     events_log: Path, expected_types: list[str], *, now: datetime,
 ) -> tuple[datetime | None, int]:
-    """Tail-scan events.jsonl for the latest matching event timestamp
-    and the count in the last 24h. Cheap (jsonl appends in chrono
-    order; we stop at the cutoff)."""
+    """Tail-scan events.jsonl newest-first for the latest matching
+    event timestamp and the count in the last 24h.
+
+    Pre-2026-05-10 this forward-scanned the entire file. ``mimir loops``
+    is invoked from heartbeats / triage and on a hot log (~300 MB cap)
+    that meant seconds of IO per call. Now we tail-read and break as
+    soon as we cross the 24h cutoff — typical run reads tens of
+    kilobytes regardless of file size.
+
+    Trace-further #3 verified ts order matches append order in the
+    live log; break-on-cutoff is correct in practice.
+    """
     if not expected_types or not events_log.exists():
         return None, 0
-    cutoff = (now - timedelta(hours=24)).isoformat()
+    cutoff_dt = now - timedelta(hours=24)
+    cutoff_iso = cutoff_dt.isoformat()
     types = set(expected_types)
     last_fired: datetime | None = None
     volume = 0
 
-    # Read backwards in 64KB chunks. Most events.jsonl files are
-    # bounded by MIMIR_MAX_EVENTS so even a full forward scan is fine
-    # in practice; we forward-scan for simplicity.
-    try:
-        with events_log.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if ev.get("type") not in types:
-                    continue
-                ts = ev.get("timestamp")
-                if not isinstance(ts, str):
-                    continue
-                try:
-                    when = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                if last_fired is None or when > last_fired:
-                    last_fired = when
-                if ts >= cutoff:
-                    volume += 1
-    except OSError:
-        return None, 0
+    # Tail-read invariant: in chronological-append-order, the first
+    # match we hit (walking newest-first) IS ``last_fired``. ``volume``
+    # is the count of matches inside the 24h cutoff. Once we've crossed
+    # the cutoff AND found ``last_fired``, there's nothing left to do —
+    # older records can't contribute to either. If we haven't found a
+    # match yet, keep scanning past the cutoff so ``last_fired`` can
+    # land on a "fired before but outside the 24h window" status (the
+    # "idle" bucket).
+    for ev in tail_jsonl_records(events_log):
+        ts = ev.get("timestamp")
+        if not isinstance(ts, str):
+            continue
+        in_window = ts >= cutoff_iso
+        if not in_window and last_fired is not None:
+            break
+        if ev.get("type") not in types:
+            continue
+        if last_fired is None:
+            try:
+                last_fired = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                # Bogus ts on a matching record — skip the timestamp
+                # capture but still count toward volume if in-window.
+                pass
+        if in_window:
+            volume += 1
     return last_fired, volume
 
 

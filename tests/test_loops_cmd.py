@@ -39,11 +39,16 @@ def test_measure_runtime_no_events_file(tmp_path):
 def test_measure_runtime_counts_24h_window(tmp_path):
     now = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     events = tmp_path / "events.jsonl"
+    # Chronological order on disk (oldest first) — matches production
+    # reality verified by trace-further #3 (2026-05-10 spike: 0
+    # inversions across 10K events). The tail-read optimization in
+    # ``_measure_runtime`` breaks early when a record predates the
+    # cutoff, so out-of-order test data would mask in-window matches.
     _write_events(events, [
-        {"timestamp": _ts(60, now), "type": "saga_feedback_sent"},     # in window
-        {"timestamp": _ts(120, now), "type": "saga_feedback_sent"},    # in window
-        {"timestamp": _ts(60 * 26, now), "type": "saga_feedback_sent"},  # outside window
-        {"timestamp": _ts(30, now), "type": "other_event"},            # not our type
+        {"timestamp": _ts(60 * 26, now), "type": "saga_feedback_sent"},  # outside window — oldest
+        {"timestamp": _ts(120, now), "type": "saga_feedback_sent"},      # in window
+        {"timestamp": _ts(60, now), "type": "saga_feedback_sent"},       # in window
+        {"timestamp": _ts(30, now), "type": "other_event"},              # not our type — newest
     ])
     last, vol = _measure_runtime(events, ["saga_feedback_sent"], now=now)
     assert vol == 2
@@ -76,9 +81,10 @@ def test_collect_loops_assigns_status_correctly(tmp_path, monkeypatch):
     not in 24h), never-fired (no record at all)."""
     now = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     events = tmp_path / "logs" / "events.jsonl"
+    # Chronological order on disk (oldest first) — see test above.
     _write_events(events, [
-        {"timestamp": _ts(15, now), "type": "saga_feedback_sent"},     # 1.1 healthy
-        {"timestamp": _ts(60 * 30, now), "type": "react_received"},     # 2.6 idle (>24h)
+        {"timestamp": _ts(60 * 30, now), "type": "react_received"},     # 2.6 idle (>24h) — oldest
+        {"timestamp": _ts(15, now), "type": "saga_feedback_sent"},      # 1.1 healthy — newest
         # 2.2 never-fired
     ])
 

@@ -31,6 +31,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from ._jsonl_tail import tail_jsonl_records
+
 log = logging.getLogger(__name__)
 
 
@@ -77,28 +79,41 @@ def _parse_ts(text: str) -> datetime | None:
 
 
 def _load_events(events_log: Path, days: int) -> list[dict[str, Any]]:
-    """Stream the event log; keep records inside the cutoff window.
+    """Stream the event log from the tail; keep records inside the
+    cutoff window.
 
-    Malformed JSON lines are silently skipped (matches the rest of
-    mimir's `_read_jsonl` pattern). Missing log file returns []."""
+    Pre-2026-05-10 this forward-scanned the entire file, filtering
+    by cutoff. With events.jsonl bounded at ~300 MB and the dashboard
+    polled by /api/ops, the forward scan re-parsed up to 75% of the
+    file just to discard records older than the window. Now we
+    tail-read newest-first and break as soon as we cross the cutoff.
+
+    Trace-further #3 (2026-05-10 spike) verified that timestamp order
+    matches append order in the live events.jsonl — 0 inversions across
+    10K events with 10+ concurrent writers. So break-on-cutoff is
+    correct in practice. If a future producer pattern reintroduces
+    out-of-order writes, swap the ``break`` for ``continue`` and let
+    the loop run to BOF.
+
+    Malformed JSON lines are silently skipped. Missing log file
+    returns []. Output is in chronological order (oldest-first) —
+    callers like ``compute_stats`` build day-keyed aggregates that
+    don't depend on ordering, but ordering is preserved for
+    backwards-compat with any future caller that does.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    out: list[dict[str, Any]] = []
     if not events_log.exists():
-        return out
-    with events_log.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ts = _parse_ts(record.get("timestamp", ""))
-            if ts is None or ts < cutoff:
-                continue
-            record["_ts"] = ts
-            out.append(record)
+        return []
+    out: list[dict[str, Any]] = []
+    for record in tail_jsonl_records(events_log):
+        ts = _parse_ts(record.get("timestamp", ""))
+        if ts is None:
+            continue
+        if ts < cutoff:
+            break
+        record["_ts"] = ts
+        out.append(record)
+    out.reverse()  # tail yields newest-first; restore chronological
     return out
 
 
