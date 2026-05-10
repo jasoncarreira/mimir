@@ -213,8 +213,15 @@ class SubagentLifecycleHook(TurnLifecycleHook):
         #
         # Capacity bound: subagent task_ids are 12-char hashes; even
         # a year of heavy use stays well under 10k. Capping at 4096
-        # keeps memory bounded while leaving headroom; eviction is
-        # FIFO (oldest task_id evicted first).
+        # keeps memory bounded while leaving headroom. Eviction is
+        # **LRU** — oldest-by-last-access is evicted first because
+        # ``_record_task_description`` calls ``move_to_end`` on a
+        # re-record (today task_ids never repeat across turns since
+        # they're 12-char hashes from the SDK, so re-records don't
+        # actually happen — but the LRU shape is the safe invariant
+        # if that ever changes). The ``popitem(last=False)`` removes
+        # the front of the OrderedDict, which is the least-recently-
+        # touched entry.
         from collections import OrderedDict
         self._task_descriptions: OrderedDict[str, str] = OrderedDict()
 

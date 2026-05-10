@@ -483,6 +483,11 @@ async def test_dispatcher_send_failure_fires_failure_callback():
     await disp.observe(_assistant(TextBlock(text="plan")))
     await disp.observe(_assistant(ToolUseBlock(id="t1", name="Read", input={})))
     assert fails == [("plan", "bridge offline")]
+    # CR2 (agent runtime) #2: bridge returned ``sent=False`` → user
+    # got NOTHING → ``streamed_plan`` MUST stay False so downstream
+    # ``streaming_active_for_log`` doesn't claim text was suppressed
+    # from the user when in fact nothing reached them.
+    assert disp.streamed_plan is False
 
 
 @pytest.mark.asyncio
@@ -507,6 +512,9 @@ async def test_dispatcher_send_raises_caught_and_logged():
     await disp.observe(_assistant(ToolUseBlock(id="t1", name="Read", input={})))
     assert len(fails) == 1
     assert "network down" in fails[0][1]
+    # Same invariant as the sent=False test above — bridge raised, no
+    # text reached the user, ``streamed_plan`` stays False.
+    assert disp.streamed_plan is False
 
 
 # --------------------------------------------------------------------- #

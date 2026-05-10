@@ -333,7 +333,7 @@ Each turn carries a `TurnContext` value through the call chain — never a modul
 ```python
 @dataclass
 class TurnContext:
-    turn_id: str             # 12-char hex
+    turn_id: str             # 16-char hex
     session_id: str          # = channel_id (lets the viewer filter per-DM)
     trigger: str             # "user_message" | "scheduled_tick" | "msam_session_end" | ...
     channel_id: str | None
@@ -1013,7 +1013,7 @@ Writer: `mimir.event_logger.log_event(event_type, **payload)` — appends to `<h
 @dataclass
 class TurnRecord:
     ts: str                          # ISO timestamp (UTC)
-    turn_id: str                     # 12-char hex (uuid4().hex[:12])
+    turn_id: str                     # 16-char hex (uuid4().hex[:16])
     session_id: str                  # = channel_id (viewer-scope, lets the viewer filter per-DM)
     msam_session_id: str | None      # active MSAM session at turn start (§5.6) — used by the session-end synthesis turn to filter the window
     trigger: str                     # event kind: "user_message", "scheduled_tick", "msam_session_end", ...

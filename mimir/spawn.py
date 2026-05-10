@@ -497,7 +497,7 @@ def build_spawn_tool(
                     "claude_code_spawn_spawn_failed",
                     agent=agent_name,
                     working_dir=args.get("working_dir") or "",
-                    error=f"agent profile not installed",
+                    error=f"agent profile not installed: {agent_name!r}",
                     reason="agent_profile_not_found",
                     available_profiles=installed_profiles,
                 )
