@@ -29,23 +29,54 @@ Polarity = Literal["positive", "negative", "neutral"]
 # glyph directly. Normalize both to a canonical form so the algedonic
 # stream is bridge-agnostic.
 _SLACK_ALIAS_TO_GLYPH = {
+    # Positive — every glyph in ``_POSITIVE_GLYPHS`` should have at least
+    # one alias here so a Slack-delivered reaction (which arrives as the
+    # alias name, not the glyph) classifies correctly. Multiple aliases
+    # for the same glyph are fine — Slack accepts both ``+1`` and
+    # ``thumbsup`` for 👍, both ``no_entry`` and ``no_entry_sign`` for 🚫.
     "thumbsup": "👍",
     "+1": "👍",
     "heart": "❤️",
+    "sparkling_heart": "💖",
+    "heartpulse": "💗",
+    "heartbeat": "💓",
+    "two_hearts": "💕",
     "white_check_mark": "✅",
     "tada": "🎉",
     "rocket": "🚀",
     "100": "💯",
     "fire": "🔥",
     "star": "⭐",
+    "star2": "🌟",
+    "clap": "👏",
+    "raised_hands": "🙌",
+    "smile": "😄",
+    "blush": "😊",
+    "heart_eyes": "😍",
+    "partying_face": "🥳",
+    "sparkles": "✨",
+    "muscle": "💪",
+    "ok_hand": "👌",
+    "ok": "🆗",
+    "dart": "🎯",
+    # Negative.
     "thumbsdown": "👎",
     "-1": "👎",
     "x": "❌",
     "no_entry": "🚫",
+    "no_entry_sign": "🚫",
     "warning": "⚠️",
-    "rage": "😠",
+    "angry": "😠",
+    "rage": "😡",  # per Slack's emoji conventions :rage: is 😡, not 😠
+    "face_with_symbols_on_mouth": "🤬",
     "broken_heart": "💔",
     "confused": "😕",
+    "disappointed": "😞",
+    "worried": "😟",
+    "no_good": "🙅",
+    "confounded": "😖",
+    "octagonal_sign": "🛑",
+    "rotating_light": "🚨",
 }
 
 
