@@ -165,7 +165,15 @@ def advance_state(state: StreamingState, msg: Message) -> str | None:
             candidate_plan = "\n".join(state.plan_buffer).strip()
             if candidate_plan:
                 plan_to_flush = candidate_plan
-                state.streamed_plan = True
+                # CR2 (agent runtime) fix: do NOT set
+                # ``state.streamed_plan = True`` here. The plan flush
+                # may still be reduced to nothing by directive
+                # stripping, may fail at the bridge, or may produce
+                # ``sent=False``. Setting the flag pre-delivery would
+                # mislead downstream telemetry into claiming text was
+                # "suppressed from the user" when in fact the user got
+                # nothing. ``observe()`` flips the flag after the
+                # bridge confirms ``sent=True``.
             state.phase = "post_tool"
     else:  # post_tool
         if tool_uses:
@@ -302,6 +310,17 @@ class StreamingAutoDispatcher:
                     except Exception:  # noqa: BLE001
                         log.exception("on_plan_failed callback raised")
                 return
+            # CR2 (agent runtime) fix: only NOW — after the bridge
+            # confirmed ``sent=True`` — flip ``streamed_plan``. The
+            # downstream ``streaming_active_for_log`` reads this flag
+            # to decide whether intermediate text should be demoted
+            # from ``output`` to ``reasoning`` in turns.jsonl. Pre-fix,
+            # the flag was set in ``advance_state`` before the bridge
+            # was even called, so a directives-only plan, a bridge
+            # crash, or ``sent=False`` would all still cause
+            # turns.jsonl to claim text was suppressed from the user
+            # when in fact nothing reached them.
+            self.state.streamed_plan = True
 
         # Notify the dispatched callback when there's something for it
         # to act on: either a successful bridge send, or directives that

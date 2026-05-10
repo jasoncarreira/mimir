@@ -207,13 +207,16 @@ class TurnLogger:
             await self._write(record)
 
     async def _write(self, record: TurnRecord) -> None:
+        # CR2 (agent runtime) fix: the per-turn append was previously
+        # ``open("a"); f.write(...)`` directly inside an ``async``
+        # method. PR #105 fixed init + _trim but left ``_write``
+        # blocking the event loop on every turn for the duration of
+        # the disk write. Now the small JSON-serialize stays on the
+        # loop (negligible cost) but the actual file IO goes through
+        # ``asyncio.to_thread`` — same shape as ``_trim_sync``.
         line = json.dumps(asdict(record), ensure_ascii=True, default=str)
         try:
-            # Recreate the parent dir if it was removed out-of-band
-            # (e.g. a benchmark cleanup script wiped logs/ while we ran).
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            await asyncio.to_thread(self._append_line, line)
             self._line_count += 1
             # Hysteresis: trim only when over cap by ≥10%. Same rationale
             # as event_logger — avoids O(file) rewrite on every write past
@@ -222,6 +225,14 @@ class TurnLogger:
                 await self._trim()
         except OSError as exc:
             log.warning("turns.jsonl write failed: %s", exc)
+
+    def _append_line(self, line: str) -> None:
+        # Sync — runs in a worker thread via ``asyncio.to_thread``.
+        # Recreate the parent dir if it was removed out-of-band
+        # (e.g. a benchmark cleanup script wiped logs/ while we ran).
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
     async def _trim(self) -> None:
         # Pre-2026-05-10 this read the entire file via ``read_text()``

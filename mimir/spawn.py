@@ -479,6 +479,42 @@ def build_spawn_tool(
         brief = _need(args, "brief")
         working_dir = _need(args, "working_dir")
         agent_name = args.get("agent") or DEFAULT_AGENT
+        # CR2 (agent runtime) fix: validate agent_name against the
+        # actual list of installed profiles BEFORE spawn. Pre-fix, an
+        # unknown name flowed through to ``claude -p --agent <name>``;
+        # the spawn would launch, hit a profile-not-found error from
+        # the bundled CLI, and burn the spawn budget + timeout to
+        # discover a typo. ``PROFILE_DEFAULTS.get(agent_name, {})``
+        # below would silently fall back to the empty dict for the
+        # budget lookup, masking the issue further.
+        agents_dir = mimir_home / ".claude" / "agents"
+        if agents_dir.is_dir():
+            installed_profiles = sorted(
+                p.stem for p in agents_dir.glob("*.md")
+            )
+            if installed_profiles and agent_name not in installed_profiles:
+                await log_event(
+                    "claude_code_spawn_spawn_failed",
+                    agent=agent_name,
+                    working_dir=args.get("working_dir") or "",
+                    error=f"agent profile not installed: {agent_name!r}",
+                    reason="agent_profile_not_found",
+                    available_profiles=installed_profiles,
+                )
+                return _content_block(
+                    f"spawn_claude_code failed: agent profile "
+                    f"{agent_name!r} is not installed in "
+                    f"<mimir_home>/.claude/agents/. Available: "
+                    f"{', '.join(installed_profiles)}. Pick one of "
+                    f"those, or install a new profile by writing "
+                    f"<mimir_home>/.claude/agents/<name>.md and try "
+                    f"again.",
+                    is_error=True,
+                )
+        # If the agents dir is missing or empty, fall through without
+        # validation — bench / non-spawn-using deployments shouldn't
+        # be blocked by this. The spawn would still fail at launch
+        # but the operator would see the "(no profiles)" diagnostic.
         branch = args.get("branch")
         # Reject huge briefs before spawn so the caller sees an
         # actionable error, not an opaque ``[Errno 7] argument list
