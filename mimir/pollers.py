@@ -47,6 +47,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -73,6 +74,14 @@ POLLER_PROMPT_CHARS = 16_000
 # Truncated preview of the rejected prompt kept in
 # ``poller_event_rejected`` events for back-pressure debugging.
 POLLER_REJECTION_PREVIEW_CHARS = 200
+# Default ``batch_size`` when a pollers.json entry doesn't specify
+# one. ``1`` preserves the per-event-per-turn shape that matches
+# open-strix's framework — every emitted JSONL line becomes one
+# AgentEvent, the agent runs once per item. Pollers that produce
+# bursty events (github-poller during PR-review activity, RSS during
+# heavy publish hours) opt into ``batch_size > 1`` to coalesce items
+# into fewer turns.
+POLLER_BATCH_SIZE_DEFAULT = 1
 
 
 @dataclass
@@ -89,7 +98,19 @@ class PollerConfig:
     ``persist_dir == skill_dir`` for compactness.
 
     ``env`` are extra env vars from the json entry's ``env`` map
-    (already coerced to ``dict[str, str]``)."""
+    (already coerced to ``dict[str, str]``).
+
+    ``batch_size`` (chainlink: framework-level coalescing): how
+    many emitted JSONL items to bundle into one AgentEvent (= one
+    turn the agent sees). ``1`` (default) preserves the per-item-
+    per-turn shape that matches open-strix. ``>1`` makes the
+    framework collect items from one cron tick and emit
+    ``ceil(N/batch_size)`` AgentEvents, each carrying a rendered
+    summary of up to ``batch_size`` items + per-item metadata in
+    ``extra.items``. Pollers with bursty output (github-poller
+    during PR-review storms, RSS during heavy publish hours) set
+    this to ``5`` or so to keep the agent's turn count bounded
+    without losing the per-item information."""
 
     name: str
     command: str
@@ -97,6 +118,7 @@ class PollerConfig:
     env: dict[str, str]
     skill_dir: Path
     persist_dir: Path | None = None
+    batch_size: int = POLLER_BATCH_SIZE_DEFAULT
 
     def channel_id(self) -> str:
         """Synthetic channel for emitted events. Mirrors the
@@ -178,6 +200,38 @@ def discover_pollers(
             persist_dir = (
                 state_root / name if state_root is not None else None
             )
+            # ``batch_size`` is optional; defaults to per-item-per-turn
+            # to preserve the open-strix-equivalent shape. Garbage
+            # values (negative, non-int, zero) fall back to default
+            # with a stderr-visible warning so a typo doesn't silently
+            # break batching for a skill the operator just installed.
+            #
+            # ``log.warning`` (stdlib) rather than ``log_event``
+            # (events.jsonl) because ``discover_pollers`` is sync
+            # and runs at startup before the asyncio loop spins up;
+            # ``log_event`` is async and would deadlock here. Operator
+            # scanning events.jsonl for poller config issues won't
+            # see this — check container stderr / docker logs instead.
+            batch_size = POLLER_BATCH_SIZE_DEFAULT
+            raw_batch = entry.get("batch_size", POLLER_BATCH_SIZE_DEFAULT)
+            try:
+                cand = int(raw_batch)
+                if cand >= 1:
+                    batch_size = cand
+                else:
+                    log.warning(
+                        "poller_invalid_batch_size: %s name=%r value=%r "
+                        "(expected positive int); using default %d",
+                        pollers_file, name, raw_batch,
+                        POLLER_BATCH_SIZE_DEFAULT,
+                    )
+            except (TypeError, ValueError):
+                log.warning(
+                    "poller_invalid_batch_size: %s name=%r value=%r "
+                    "(expected positive int); using default %d",
+                    pollers_file, name, raw_batch,
+                    POLLER_BATCH_SIZE_DEFAULT,
+                )
             pollers.append(
                 PollerConfig(
                     name=name,
@@ -186,6 +240,7 @@ def discover_pollers(
                     env={str(k): str(v) for k, v in env_raw.items()},
                     skill_dir=skill_dir,
                     persist_dir=persist_dir,
+                    batch_size=batch_size,
                 ),
             )
     return pollers
@@ -306,17 +361,27 @@ async def run_poller(
         return 0
 
     stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-    if not stdout_text:
-        await log_event(
-            "poller_complete",
-            poller=poller.name,
-            events_emitted=0,
-            events_rejected=0,
-        )
-        return 0
 
-    event_count = 0
-    rejected_count = 0
+    # Phase 1: parse + clean every JSONL line into a list of items.
+    # Each item is ``{"prompt": str, "extras": dict[str, Any]}`` —
+    # extras are the original parsed keys minus ``prompt``/``poller``.
+    # When ``batch_size > 1`` a per-item soft cap also fires here so
+    # one chatty item can't starve others by consuming the whole
+    # batch-level prompt budget. Single-item batches (default) skip
+    # the per-item cap to preserve verbatim pass-through; the
+    # batch-level cap below handles single giant prompts.
+    items: list[dict[str, Any]] = []
+    # Per-item soft cap: divide the prompt budget across the batch,
+    # reserving a small slice (50 chars) per item for the numbered
+    # marker + newline overhead in the rendered batch. Floors at 100
+    # chars to keep tiny batch_sizes from collapsing items to nothing.
+    if poller.batch_size > 1:
+        per_item_cap: int | None = max(
+            100,
+            (POLLER_PROMPT_CHARS // poller.batch_size) - 50,
+        )
+    else:
+        per_item_cap = None
     for line in stdout_text.splitlines():
         line = line.strip()
         if not line:
@@ -337,18 +402,19 @@ async def run_poller(
         if not prompt:
             continue
 
-        # Cap the prompt at POLLER_PROMPT_CHARS so a chatty / buggy
-        # poller can't blow the prompt-build cache by emitting a
-        # giant single event. Truncated payloads carry a clear marker
-        # so the agent (and operator) know the cap fired.
-        if len(prompt) > POLLER_PROMPT_CHARS:
+        # Per-item cap: only when batch_size > 1. Prevents one runaway
+        # item from starving others in a batched render. Marks the
+        # truncation as ``scope=per_item`` so an operator can tell it
+        # apart from the batch-level cap below.
+        if per_item_cap is not None and len(prompt) > per_item_cap:
             await log_event(
                 "poller_prompt_truncated",
                 poller=poller.name,
                 original_chars=len(prompt),
+                scope="per_item",
             )
             prompt = (
-                prompt[:POLLER_PROMPT_CHARS]
+                prompt[:per_item_cap]
                 + "\n\n[…truncated by poller framework]"
             )
 
@@ -360,14 +426,76 @@ async def run_poller(
             k: v for k, v in parsed.items()
             if k not in ("prompt", "poller")
         }
+        items.append({"prompt": prompt, "extras": extras})
 
+    if not items:
+        await log_event(
+            "poller_complete",
+            poller=poller.name,
+            events_emitted=0,
+            events_rejected=0,
+            items_collected=0,
+            batches_emitted=0,
+        )
+        return 0
+
+    # Phase 2: batch items into groups of up to ``poller.batch_size``.
+    # batch_size=1 preserves the per-item-per-turn shape; >1 coalesces
+    # to ``ceil(len(items) / batch_size)`` AgentEvents.
+    # ``max(1, ...)`` is defense-in-depth: ``discover_pollers``
+    # already filters non-positive values, but tests construct
+    # ``PollerConfig`` directly bypassing that path.
+    batch_size = max(1, poller.batch_size)
+    batches: list[list[dict[str, Any]]] = [
+        items[i:i + batch_size]
+        for i in range(0, len(items), batch_size)
+    ]
+    # Per-fire timestamp scoped to source_id — disambiguates events
+    # across overlapping fires (manual fire racing a scheduled fire,
+    # two scheduled ticks delivered out-of-order). ms granularity is
+    # enough for any realistic fire cadence; no risk of collision in
+    # practice.
+    fire_ts_ms = int(time.time() * 1000)
+
+    # Phase 3: assemble + dispatch each batch as one AgentEvent.
+    event_count = 0
+    rejected_count = 0
+    for batch_idx, batch in enumerate(batches):
+        content = _render_batch(poller.name, batch, batch_idx, len(batches))
+        # Apply the prompt cap once more on the assembled batch — even
+        # with per-item caps, ``batch_size × cap`` could exceed the
+        # prompt-build budget on a worst-case fire.
+        if len(content) > POLLER_PROMPT_CHARS:
+            await log_event(
+                "poller_prompt_truncated",
+                poller=poller.name,
+                original_chars=len(content),
+                batch_index=batch_idx,
+                scope="batch",
+            )
+            content = (
+                content[:POLLER_PROMPT_CHARS]
+                + "\n\n[…truncated by poller framework]"
+            )
+
+        # Per-batch extra. ``items`` carries per-item metadata so the
+        # agent can react to specific items without re-parsing the
+        # rendered prompt. ``batch_index`` / ``batch_count`` let
+        # multi-batch fires identify "this is part 2 of 3" without
+        # the agent having to read the prompt header.
+        extra: dict[str, Any] = {
+            "poller_name": poller.name,
+            "batch_index": batch_idx,
+            "batch_count": len(batches),
+            "items": [item["extras"] for item in batch],
+        }
         event = AgentEvent(
             trigger="poller",
             channel_id=poller.channel_id(),
-            content=prompt,
+            content=content,
             source="poller",
-            source_id=f"poller:{poller.name}:{event_count + rejected_count}",
-            extra={"poller_name": poller.name, **extras},
+            source_id=f"poller:{poller.name}:{fire_ts_ms}:batch:{batch_idx}",
+            extra=extra,
         )
         try:
             accepted = await enqueue(event)
@@ -376,6 +504,7 @@ async def run_poller(
                 "poller_enqueue_error",
                 poller=poller.name,
                 error=f"{type(exc).__name__}: {exc}",
+                batch_index=batch_idx,
             )
             continue
         if accepted:
@@ -390,16 +519,69 @@ async def run_poller(
             await log_event(
                 "poller_event_rejected",
                 poller=poller.name,
-                prompt_preview=prompt[:POLLER_REJECTION_PREVIEW_CHARS],
+                prompt_preview=content[:POLLER_REJECTION_PREVIEW_CHARS],
+                batch_index=batch_idx,
             )
 
+    # ``events_emitted`` counts AgentEvents enqueued (= batches that
+    # the dispatcher accepted). Pre-batching it counted parsed JSONL
+    # lines, which was 1:1 with items. With ``batch_size > 1`` the
+    # two diverge: ``items_collected`` is the per-item count (what
+    # the old field meant) and ``events_emitted`` is now the per-
+    # turn count (= batches enqueued, what the agent actually sees).
+    # Operator queries reading ``events_emitted`` for "how many items
+    # came in?" should switch to ``items_collected``; queries asking
+    # "how many turns will this fire?" stay on ``events_emitted``.
     await log_event(
         "poller_complete",
         poller=poller.name,
         events_emitted=event_count,
         events_rejected=rejected_count,
+        items_collected=len(items),
+        batches_emitted=len(batches),
     )
     return event_count
+
+
+def _render_batch(
+    poller_name: str,
+    batch: list[dict[str, Any]],
+    batch_index: int,
+    batch_count: int,
+) -> str:
+    """Render a batch of items into the prompt body for one
+    ``AgentEvent``. Single-item batches return the item's prompt
+    verbatim — preserves the open-strix-equivalent rendering for
+    pollers with ``batch_size=1`` (default). Multi-item batches
+    render with a header (``poller-name reported N items``) and a
+    numbered list of per-item prompts so the agent can scan + react
+    to specific items.
+
+    Multi-batch fires (when ``batch_count > 1``) include a "batch X
+    of Y" suffix on the header so the agent can tell the rest of the
+    items are coming on subsequent turns and decide whether to wait
+    or act on each batch independently.
+    """
+    if len(batch) == 1:
+        return batch[0]["prompt"]
+    header = f"{poller_name} reported {len(batch)} items"
+    if batch_count > 1:
+        header += f" (batch {batch_index + 1} of {batch_count})"
+    header += ":"
+    body_lines = [header]
+    # Width of the largest marker — left-pad smaller numbers so
+    # ``" 1. "`` and ``"10. "`` align in batches that cross 10 items.
+    # Continuation indent matches the marker width + 2 (period +
+    # space) so multi-line item prompts stay visually grouped under
+    # their parent.
+    width = len(str(len(batch)))
+    cont_indent = " " * (width + 2)
+    for i, item in enumerate(batch, start=1):
+        item_lines = item["prompt"].splitlines() or [""]
+        body_lines.append(f"{i:>{width}}. {item_lines[0]}")
+        for tail in item_lines[1:]:
+            body_lines.append(f"{cont_indent}{tail}")
+    return "\n".join(body_lines)
 
 
 __all__ = (
