@@ -439,19 +439,22 @@ async def build_dashboard_payload_async(
     return stats
 
 
-def render_dashboard_html(stats: dict[str, Any]) -> str:
-    """Inject the stats payload into the HTML template via a JSON
-    script tag. The frontend reads it once on load — no XHR back to
-    /api/ops needed.
+def render_dashboard_html(stats: dict[str, Any] | None = None) -> str:
+    """Return the dashboard HTML shell.
 
-    Replaces ``</`` with ``<\\/`` after ``json.dumps`` so a string in
-    the payload (e.g. a failure detail or a chainlink issue title) that
-    happens to contain ``</script>`` can't break out of the
-    ``<script type="application/json">`` tag. ``\\/`` is a legal
-    JSON-string alternate for ``/``, so the JSON parser accepts it
-    unchanged."""
-    payload = json.dumps(stats).replace("</", "<\\/")
-    return _DASHBOARD_HTML.replace("__DATA__", payload)
+    Pre-2026-05-10 this function injected a server-rendered ``stats``
+    payload into the HTML via a ``__DATA__`` placeholder, so the
+    frontend had no XHR. Pattern B (auth-on-all-routes) made that
+    shape untenable: the /ops route is exempt from the auth middleware
+    so the JS can prompt for a key on first visit, but baking the
+    dashboard data into the exempt-route HTML would leak it to anyone
+    who could load the page. The frontend now AJAX-fetches /api/ops
+    (which IS auth-required), so this function no longer takes the
+    stats argument. Kept the parameter for one release of API
+    compatibility — it's silently ignored — and the caller in
+    ``web_ui.ops_page`` no longer computes a payload before calling.
+    """
+    return _DASHBOARD_HTML
 
 
 _DASHBOARD_HTML = """<!doctype html>
@@ -466,24 +469,29 @@ _DASHBOARD_HTML = """<!doctype html>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
+      /* Dark palette — kept the original variable names (--paper, --ink,
+         etc.) so the rest of the stylesheet doesn't have to know we
+         flipped to dark mode. The values now mirror the turn-viewer
+         palette so /turns and /ops share visual vocabulary. */
       :root {
-        --paper: #f5efe3;
-        --paper-strong: #fffaf1;
-        --ink: #1e2430;
-        --muted: #5f6b76;
-        --line: rgba(30, 36, 48, 0.12);
-        --accent: #0d766e;
-        --accent-soft: rgba(13, 118, 110, 0.12);
-        --warn: #b76d0d;
-        --warn-soft: rgba(183, 109, 13, 0.12);
-        --bad: #b13324;
+        --paper: #0f1117;
+        --paper-strong: #1a1d27;
+        --paper-strong-2: #22263a;
+        --ink: #e2e6f0;
+        --muted: #8b92a8;
+        --line: rgba(226, 230, 240, 0.12);
+        --accent: #6c8ef7;
+        --accent-soft: rgba(108, 142, 247, 0.16);
+        --warn: #fbbf24;
+        --warn-soft: rgba(251, 191, 36, 0.14);
+        --bad: #f87171;
       }
       * { box-sizing: border-box; }
       html, body {
         margin: 0;
         background:
-          radial-gradient(circle at top left, rgba(13, 118, 110, 0.08), transparent 32rem),
-          linear-gradient(180deg, #efe4cf 0%, #f7f2e7 36%, #f5efe3 100%);
+          radial-gradient(circle at top left, rgba(108, 142, 247, 0.08), transparent 32rem),
+          linear-gradient(180deg, #0f1117 0%, #141823 60%, #0f1117 100%);
         color: var(--ink);
         font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       }
@@ -550,7 +558,7 @@ _DASHBOARD_HTML = """<!doctype html>
       canvas { max-height: 320px; }
       table { border-collapse: collapse; width: 100%; font-size: 0.9rem; margin: 0.6rem 0 1rem; }
       th, td { padding: 0.45rem 0.7rem; text-align: left; border-bottom: 1px solid var(--line); }
-      th { background: rgba(13, 118, 110, 0.04); font-weight: 600; }
+      th { background: rgba(108, 142, 247, 0.06); font-weight: 600; color: var(--ink); }
       td.num { text-align: right; font-variant-numeric: tabular-nums; }
       .backlog-item {
         background: var(--warn-soft);
@@ -578,13 +586,13 @@ _DASHBOARD_HTML = """<!doctype html>
         padding: 0.6rem 0.8rem;
       }
       .resolution-card h4 { margin: 0 0 0.4rem 0; font-size: 0.9rem; font-family: ui-monospace, SFMono-Regular, monospace; color: var(--ink); }
-      .resolution-bar { display: flex; height: 18px; border-radius: 3px; overflow: hidden; margin: 0.3rem 0; background: rgba(0,0,0,0.04); }
+      .resolution-bar { display: flex; height: 18px; border-radius: 3px; overflow: hidden; margin: 0.3rem 0; background: rgba(255, 255, 255, 0.06); }
       .resolution-seg { font-size: 0.7rem; color: white; text-align: center; line-height: 18px; padding: 0 4px; white-space: nowrap; }
       .resolution-seg.saga_session_id { background: var(--accent); }
-      .resolution-seg.single_active { background: #4a8c84; }
-      .resolution-seg.contextvar { background: var(--warn); }
-      .resolution-seg.missing { background: var(--bad); }
-      .resolution-seg.unknown { background: var(--muted); }
+      .resolution-seg.single_active { background: #4ade80; color: #0f1117; }
+      .resolution-seg.contextvar { background: var(--warn); color: #0f1117; }
+      .resolution-seg.missing { background: var(--bad); color: #0f1117; }
+      .resolution-seg.unknown { background: var(--muted); color: #0f1117; }
       .resolution-legend { font-size: 0.75rem; color: var(--muted); margin-top: 0.3rem; }
     </style>
   </head>
@@ -598,6 +606,7 @@ _DASHBOARD_HTML = """<!doctype html>
         <nav>
           <a href="/turns" title="Turn viewer">Turns</a>
           <a href="/api/ops" title="JSON twin">JSON</a>
+          <a href="#" onclick="event.preventDefault();window.__mimir_promptApiKey()" title="Set or rotate the MIMIR_API_KEY this browser uses">API key</a>
         </nav>
       </header>
 
@@ -667,9 +676,67 @@ _DASHBOARD_HTML = """<!doctype html>
       </section>
     </main>
 
-    <script id="data" type="application/json">__DATA__</script>
     <script>
-      const D = JSON.parse(document.getElementById('data').textContent);
+      // ── API key bootstrap ────────────────────────────────────────────
+      // /ops is exempt from the auth middleware so this shell HTML
+      // loads unauthenticated; the data endpoint /api/ops requires
+      // X-API-Key. Shared localStorage key with /turns so an operator
+      // who entered the key on either page is signed in for both.
+      const API_KEY_LS = 'mimir.api_key';
+      function getApiKey() {
+        try { return localStorage.getItem(API_KEY_LS) || ''; }
+        catch (e) { return ''; }
+      }
+      function setApiKey(k) {
+        try {
+          if (k) localStorage.setItem(API_KEY_LS, k);
+          else localStorage.removeItem(API_KEY_LS);
+        } catch (e) { /* ignore */ }
+      }
+      function promptApiKey(reason) {
+        let msg = 'Enter MIMIR_API_KEY';
+        if (reason) msg += ' (' + reason + ')';
+        msg += ':\n\n(Saved to this browser; leave blank to skip — you\'ll see 401s if the server requires it.)';
+        const v = (window.prompt(msg, '') || '').trim();
+        setApiKey(v);
+        return v;
+      }
+      function authedFetch(url, opts) {
+        opts = opts || {};
+        opts.headers = opts.headers || {};
+        const key = getApiKey();
+        if (key) opts.headers['X-API-Key'] = key;
+        return fetch(url, opts).then(function(r) {
+          if (r.status === 401) {
+            setApiKey('');
+            const fresh = promptApiKey('previous key was rejected');
+            if (fresh) {
+              opts.headers['X-API-Key'] = fresh;
+              return fetch(url, opts);
+            }
+          }
+          return r;
+        });
+      }
+      // Header link wiring ("API key" in the page-header nav).
+      window.__mimir_promptApiKey = function() {
+        promptApiKey('manual rotation');
+        // Reload so the dashboard re-fetches with the new key.
+        window.location.reload();
+      };
+
+      // ── Dark-mode Chart.js defaults ──────────────────────────────────
+      // Without this, Chart.js renders axis labels in #666 / grid in
+      // black — invisible on the dark background.
+      Chart.defaults.color = '#e2e6f0';
+      Chart.defaults.borderColor = 'rgba(226, 230, 240, 0.12)';
+
+      // ── Render: pulled into a function so the AJAX bootstrap below
+      // can call it once data arrives. Previously the data was injected
+      // server-side via a __DATA__ placeholder; that path leaked the
+      // dashboard contents to anyone who could load /ops, so we
+      // refactored to AJAX-fetch from auth-required /api/ops. ─────────
+      function render(D) {
 
       document.getElementById('meta').textContent =
         'Window: ' + D.window_days + ' days · Generated ' + D.generated_at + ' · Live read of logs/events.jsonl';
@@ -837,8 +904,8 @@ _DASHBOARD_HTML = """<!doctype html>
         }
       }
 
-      const accent = '#0d766e';
-      const warn = '#b76d0d';
+      const accent = '#6c8ef7';
+      const warn = '#fbbf24';
 
       const eventLabels = Object.keys(D.by_event).slice(0, 12);
       const eventValues = eventLabels.map(k => D.by_event[k]);
@@ -867,6 +934,23 @@ _DASHBOARD_HTML = """<!doctype html>
         data: { labels: triggerLabels, datasets: [{ label: 'Queued', data: triggerValues, backgroundColor: accent }] },
         options: { indexAxis: 'y', plugins: { title: { display: true, text: 'Events queued by trigger' }, legend: { display: false } } }
       });
+
+      } // end render(D)
+
+      // ── Bootstrap: prompt-if-needed → fetch /api/ops → render ────────
+      if (!getApiKey()) promptApiKey('first visit');
+      authedFetch('/api/ops' + window.location.search)
+        .then(function(r) {
+          if (!r.ok) throw new Error('http ' + r.status);
+          return r.json();
+        })
+        .then(function(D) {
+          render(D);
+        })
+        .catch(function(err) {
+          document.getElementById('meta').textContent =
+            'Failed to load /api/ops (' + err + ') — try clicking "API key" to re-enter.';
+        });
     </script>
   </body>
 </html>
