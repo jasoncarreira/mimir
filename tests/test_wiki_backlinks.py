@@ -121,9 +121,16 @@ def test_find_pages_walks_subdirectories(wiki: Path):
     _write(wiki, "topics/mempalace.md", "# Mempalace")
     _write(wiki, "entities/penny.md", "# Penny")
 
+    # Path-keyed: each markdown file gets a unique entry by its
+    # relative POSIX path string. Slug lives in build_graph's slug
+    # index now.
     pages = find_pages(wiki)
-    assert set(pages) == {"stigmergy", "mempalace", "penny"}
-    assert pages["stigmergy"] == Path("concepts/stigmergy.md")
+    assert set(pages) == {
+        "concepts/stigmergy.md",
+        "topics/mempalace.md",
+        "entities/penny.md",
+    }
+    assert pages["concepts/stigmergy.md"] == Path("concepts/stigmergy.md")
 
 
 def test_find_pages_skips_meta_files(wiki: Path):
@@ -139,7 +146,7 @@ def test_find_pages_skips_meta_files(wiki: Path):
     _write(wiki, "unwired.md", "llm-wiki priority list")
 
     pages = find_pages(wiki)
-    assert set(pages) == {"real"}
+    assert set(pages) == {"concepts/real.md"}
 
 
 def test_find_pages_handles_missing_wiki_dir(tmp_path: Path):
@@ -157,11 +164,18 @@ def test_build_graph_inbound_outbound(wiki: Path):
 
     graph = build_graph(wiki)
 
-    assert graph.pages["stigmergy"]["outbound"] == ["boids"]
-    assert graph.pages["stigmergy"]["inbound"] == ["boids"]
-    assert graph.pages["boids"]["inbound"] == ["stigmergy"]
-    assert graph.pages["orphan"]["inbound"] == []
-    assert graph.orphans == ["orphan"]
+    # Path-keyed: ``pages`` indexed by relative POSIX path. ``inbound``
+    # entries are source paths, ``outbound`` entries are target slugs
+    # (the wikilink form).
+    assert graph.pages["concepts/stigmergy.md"]["outbound"] == ["boids"]
+    assert graph.pages["concepts/stigmergy.md"]["inbound"] == [
+        "concepts/boids.md",
+    ]
+    assert graph.pages["concepts/boids.md"]["inbound"] == [
+        "concepts/stigmergy.md",
+    ]
+    assert graph.pages["topics/orphan.md"]["inbound"] == []
+    assert graph.orphans == ["topics/orphan.md"]
     assert graph.dangling == []
 
 
@@ -174,8 +188,10 @@ def test_build_graph_dangling_link(wiki: Path):
     _write(wiki, "concepts/real-page.md", "# Real")
 
     graph = build_graph(wiki)
-    assert graph.pages["foo"]["inbound"] == []
-    assert graph.pages["real-page"]["inbound"] == ["foo"]
+    assert graph.pages["concepts/foo.md"]["inbound"] == []
+    assert graph.pages["concepts/real-page.md"]["inbound"] == [
+        "concepts/foo.md",
+    ]
     assert len(graph.dangling) == 1
     d = graph.dangling[0]
     assert d["target"] == "ghost-page"
@@ -188,8 +204,8 @@ def test_build_graph_self_link_does_not_count_as_inbound(wiki: Path):
     list — that's not 'another page supports this'."""
     _write(wiki, "concepts/lonely.md", "I link to [[lonely]] which is myself.")
     graph = build_graph(wiki)
-    assert graph.pages["lonely"]["inbound"] == []
-    assert graph.orphans == ["lonely"]
+    assert graph.pages["concepts/lonely.md"]["inbound"] == []
+    assert graph.orphans == ["concepts/lonely.md"]
 
 
 def test_build_graph_dedups_repeated_inbound(wiki: Path):
@@ -197,7 +213,54 @@ def test_build_graph_dedups_repeated_inbound(wiki: Path):
     _write(wiki, "concepts/a.md", "[[b]] and [[b]] and [[b]] again")
     _write(wiki, "concepts/b.md", "# B")
     graph = build_graph(wiki)
-    assert graph.pages["b"]["inbound"] == ["a"]
+    assert graph.pages["concepts/b.md"]["inbound"] == ["concepts/a.md"]
+
+
+def test_build_graph_cross_category_collision_resolves_to_both(wiki: Path):
+    """Path-key refactor regression: ``concepts/foo.md`` and
+    ``topics/foo.md`` both exist; a third page links ``[[foo]]``.
+
+    Pre-refactor the slug-keyed map would have last-wins-dropped one
+    of them in ``find_pages``, so the inbound link would attach to
+    whichever scan order survived. Post-refactor both pages get
+    the inbound entry."""
+    _write(wiki, "concepts/foo.md", "# Foo (concept)")
+    _write(wiki, "topics/foo.md", "# Foo (topic)")
+    _write(wiki, "concepts/linker.md", "See [[foo]] for details.")
+
+    graph = build_graph(wiki)
+
+    # Both ``foo.md`` pages exist as separate entries.
+    assert "concepts/foo.md" in graph.pages
+    assert "topics/foo.md" in graph.pages
+    # Both receive the inbound link (no silent conflation).
+    assert graph.pages["concepts/foo.md"]["inbound"] == [
+        "concepts/linker.md",
+    ]
+    assert graph.pages["topics/foo.md"]["inbound"] == [
+        "concepts/linker.md",
+    ]
+    # Collision is still surfaced for the operator's wiki-health view.
+    assert "foo" in graph.collisions
+    assert len(graph.collisions["foo"]) == 2
+
+
+def test_build_graph_collision_pages_can_link_to_each_other(wiki: Path):
+    """The pre-refactor self-link guard used ``target_slug != source_slug``,
+    which silently dropped genuine cross-category same-stem links
+    (concepts/foo.md → topics/foo.md). Path-key refactor: self-link
+    check is now path-based, so the cross-category link is preserved."""
+    _write(wiki, "concepts/foo.md", "I link to [[foo]] — the other one.")
+    _write(wiki, "topics/foo.md", "# Foo (topic)")
+
+    graph = build_graph(wiki)
+
+    # The link from concepts/foo.md → [[foo]] resolves to BOTH
+    # concepts/foo.md (self — dropped) AND topics/foo.md (kept).
+    assert graph.pages["concepts/foo.md"]["inbound"] == []  # self-link
+    assert graph.pages["topics/foo.md"]["inbound"] == [
+        "concepts/foo.md",
+    ]
 
 
 # ─── Renderers ───────────────────────────────────────────────────────
@@ -239,9 +302,10 @@ def test_render_backlinks_index_marks_orphans(wiki: Path):
     _write(wiki, "concepts/source.md", "[[popular]]")
     graph = build_graph(wiki)
     out = render_backlinks_index_md(graph, "2026-05-09T00:00:00+00:00")
-    assert "## lonely" in out
+    # Path-keyed sections (was slug-keyed pre-refactor).
+    assert "## concepts/lonely.md" in out
     assert "_(orphan — no inbound links)_" in out
-    assert "## popular" in out
+    assert "## concepts/popular.md" in out
     assert "[[source]] — `concepts/source.md`" in out
 
 
