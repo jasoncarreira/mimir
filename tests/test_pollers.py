@@ -489,6 +489,27 @@ def test_poller_timeout_constant_reasonable():
     assert POLLER_TIMEOUT_SECONDS == 60
 
 
+def test_pollers_module_annotations_resolve():
+    """Regression: ``pollers.py`` uses ``Any`` in type annotations
+    (``_render_batch`` signature plus several local annotations) but
+    historically did not import it. Under ``from __future__ import
+    annotations`` the annotations are stringified, so the missing
+    import is latent — it only fires when something resolves the
+    hints (``typing.get_type_hints``, dataclass introspection,
+    ``inspect.signature`` callers that pass ``eval_str=True``, etc.).
+    Locks the import in place so future edits don't silently break
+    introspection-time consumers.
+    """
+    from typing import get_type_hints
+
+    from mimir.pollers import _render_batch
+
+    hints = get_type_hints(_render_batch)
+    # ``batch`` is annotated ``list[dict[str, Any]]`` — resolution
+    # would NameError without the import.
+    assert "batch" in hints
+
+
 # ─── Back-pressure observability (PR #88 review nits 5+6) ─────────────
 
 
