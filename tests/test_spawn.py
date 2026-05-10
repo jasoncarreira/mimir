@@ -1098,3 +1098,71 @@ async def test_spawn_completion_no_orphan_when_loop_available(
     assert not sidecar.exists(), (
         f"sidecar must NOT be written when schedule succeeded, got: {sidecar}"
     )
+
+
+# ─── PR #110 review-followup: missing test pins ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_rejects_unknown_agent_name(home: Path):
+    """Reject a spawn before launch when agent_name doesn't match any
+    profile in ``<home>/.claude/agents/*.md``. Pre-fix the unknown name
+    flowed through to ``claude -p --agent <name>``; the spawn launched,
+    hit profile-not-found error from the bundled CLI ~15s in, burned
+    the spawn budget + timeout to discover a typo."""
+    # Plant two known profiles.
+    agents_dir = home / ".claude" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "code-implementer.md").write_text("---\nname: code-implementer\n---\n")
+    (agents_dir / "doc-writer.md").write_text("---\nname: doc-writer\n---\n")
+
+    registry = _FakeRegistry()
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=lambda coro: (coro.close(), False)[1],
+        chain_on_complete=None,
+    )
+    out = await tool_def.handler({
+        "brief": "ok", "working_dir": "/tmp",
+        "agent": "mighty-implementer",  # not installed
+    })
+    assert out.get("is_error") is True
+    text = out["content"][0]["text"]
+    assert "mighty-implementer" in text
+    assert "code-implementer" in text  # available list surfaced
+    assert "doc-writer" in text
+    # Spawn never launched.
+    assert registry.spawned == []
+    events = _read_events(home)
+    assert any(
+        e.get("reason") == "agent_profile_not_found"
+        for e in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_passes_when_agents_dir_missing(home: Path):
+    """If <home>/.claude/agents/ doesn't exist, validation falls through
+    silently (bench / non-spawn-using deployments shouldn't be blocked
+    by a missing dir). The spawn proceeds and any failure surfaces from
+    the bundled CLI itself."""
+    # Don't create agents_dir.
+    registry = _FakeRegistry()
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=lambda coro: (coro.close(), False)[1],
+        chain_on_complete=None,
+    )
+    out = await tool_def.handler({
+        "brief": "ok", "working_dir": "/tmp",
+        "agent": "anything-goes",
+    })
+    # Spawn launched (no validation when agents_dir is missing).
+    assert out.get("is_error") is not True
+    assert len(registry.spawned) == 1
