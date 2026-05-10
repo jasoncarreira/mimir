@@ -74,6 +74,37 @@ def test_detect_billing_mode_default_pay_as_you_go(monkeypatch):
     assert detect_billing_mode() is BillingMode.PAY_AS_YOU_GO
 
 
+def test_config_from_env_resolves_oauth_path_once(monkeypatch, tmp_path):
+    """Regression: ``Config.from_env`` previously called
+    ``_oauth_credentials_path()`` twice — once for the ``billing_mode``
+    detection and once for the ``oauth_credentials_path`` field — which
+    was redundant and could in theory diverge. Pin the dedup by counting
+    invocations.
+    """
+    import mimir.config as cfg_mod
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    # Avoid env-driven billing override so we exercise the auto-detect
+    # path that calls _oauth_credentials_path.
+    monkeypatch.delenv("MIMIR_BILLING_MODE", raising=False)
+
+    call_count = 0
+    real = cfg_mod._oauth_credentials_path
+
+    def counted() -> Path | None:
+        nonlocal call_count
+        call_count += 1
+        return real()
+
+    monkeypatch.setattr(cfg_mod, "_oauth_credentials_path", counted)
+
+    cfg_mod.Config.from_env()
+    assert call_count == 1, (
+        f"_oauth_credentials_path should be called exactly once per "
+        f"Config.from_env, got {call_count}"
+    )
+
+
 # ─── AnthropicQuotaProvider ────────────────────────────────────────────
 
 
