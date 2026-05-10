@@ -602,6 +602,30 @@ class _HttpSaga:
         )
 
     async def _get_or_empty(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """**Fast degrade-to-empty for prompt-assembly GETs (CR2-#11).**
+
+        Asymmetric to ``_post`` by design: no retries, log + return
+        ``{}`` on ANY failure (4xx/5xx, ClientError, timeout, non-JSON).
+        Used by the prompt-assembly path — ``recent_session_boundaries``,
+        ``most_retrieved_atoms`` — where adding ``_post``'s 1.4s retry
+        backoff would block the prompt build on every transient blip.
+        That's exactly the failure mode the agent's
+        ``_assemble_session_summaries`` fallback (PR #96) is fighting:
+        a SAGA outage at prompt-assembly time should degrade to local-
+        mirror data, not stall the turn.
+
+        Caller contract: empty dict means "no data this time, fall
+        back if you have a fallback." Callers that need fallback
+        semantics MUST handle the empty-result case explicitly —
+        ``_assemble_session_summaries`` reads from the local mirror
+        when this returns ``{}``.
+
+        If a future endpoint genuinely needs retries (e.g. saga adds a
+        ``/v1/expensive_lookup`` that's idempotent and rare enough to
+        justify backoff), add a separate ``_get_with_retries`` rather
+        than turning this asymmetry on for the existing callers — the
+        prompt-assembly path is the load-bearing constraint.
+        """
         try:
             sess = await self._ensure_session()
             async with sess.get(f"{self._endpoint}{path}", params=params) as resp:
