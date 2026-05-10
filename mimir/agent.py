@@ -923,24 +923,46 @@ class Agent:
 
     # ─── Async shell-job completion bridge ──────────────────────────────
 
-    def _schedule_from_thread(self, coro) -> None:
+    def _schedule_from_thread(self, coro) -> bool:
         """Late-bound bridge for code running in non-loop threads.
 
         ``spawn_claude_code``'s completion handler runs on the registry's
         waiter thread and needs to ``log_event`` / ``turn_logger.write``
-        from there. Mirrors ``_handle_shell_job_complete`` — silently
-        no-ops when no loop has been captured yet (e.g. waiter thread
-        fires before the first turn) or when the loop has closed.
+        from there. Mirrors ``_handle_shell_job_complete``.
+
+        **CR2-#5 fix.** Returns True when the coroutine was successfully
+        scheduled, False when it was dropped (no loop, loop closed, or
+        ``run_coroutine_threadsafe`` raised). On drop, the coroutine
+        is explicitly ``close()``-d to suppress Python's
+        "coroutine was never awaited" RuntimeWarning, and a structured
+        ``log.warning`` is emitted so the silent drop is observable.
+        Callers that need to persist accounting beyond the in-process
+        log (e.g. spawn completion's synthetic TurnRecord) can check
+        the return value and fall back to a sync write path.
         """
         loop = self._loop
         if loop is None or loop.is_closed():
-            return
+            try:
+                coro.close()
+            except Exception:  # noqa: BLE001
+                pass
+            log.warning(
+                "schedule_from_thread dropped coroutine (loop unavailable);"
+                " caller should persist via fallback path",
+            )
+            return False
         try:
             asyncio.run_coroutine_threadsafe(coro, loop)
+            return True
         except Exception:
+            try:
+                coro.close()
+            except Exception:  # noqa: BLE001
+                pass
             log.exception(
                 "schedule_from_thread failed to dispatch coroutine"
             )
+            return False
 
     def _handle_shell_job_complete(self, job: ShellJob) -> None:
         """Thread-safe bridge: a shell-job waiter thread invokes this when
