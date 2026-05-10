@@ -670,15 +670,60 @@ def _run(
 ) -> subprocess.CompletedProcess:
     """Tiny wrapper so we get uniform timeout + capture behavior across
     helpers. 30s timeout matches PUSH_TIMEOUT_SECONDS in git_tracking
-    so the bootstrap can't wedge startup on a slow remote."""
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        check=check,
-        capture_output=capture,
-        text=True,
-        timeout=30,
-    )
+    so the bootstrap can't wedge startup on a slow remote.
+
+    CR2 (external I/O) + PR #111 review fix: catch ``TimeoutExpired``
+    and translate to a CompletedProcess-or-CalledProcessError that
+    matches the caller's ``check`` setting.
+
+    - ``check=True`` → raise ``CalledProcessError(returncode=124)``
+      with a structured stderr suffix. Existing
+      ``except CalledProcessError`` handlers catch the timeout
+      uniformly.
+    - ``check=False`` → return ``CompletedProcess(returncode=124)``
+      so caller-side returncode inspection still works. Pre-PR-111-
+      review, the timeout would raise here too — breaking sites
+      like ``_existing_remote_url`` that probe ``rc != 0`` and
+      treated CalledProcessError differently from a structured
+      non-zero return.
+
+    Pre-fix the timeout escaped as a fatal ``TimeoutExpired`` that
+    the server's bare ``except Exception`` swallowed with a one-line
+    ``git_bootstrap_failed`` event, leaving partial state.
+    """
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            check=check,
+            capture_output=capture,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = (
+            exc.stdout.decode("utf-8", "replace")
+            if isinstance(exc.stdout, bytes)
+            else (exc.stdout or "")
+        )
+        stderr = (
+            exc.stderr.decode("utf-8", "replace")
+            if isinstance(exc.stderr, bytes)
+            else (exc.stderr or "")
+        ) + f"\n[git_bootstrap _run timed out after 30s: {' '.join(cmd)}]"
+        if check:
+            raise subprocess.CalledProcessError(
+                returncode=124,
+                cmd=cmd,
+                output=stdout,
+                stderr=stderr,
+            ) from exc
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=124,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
 
 __all__: tuple[str, ...] = (

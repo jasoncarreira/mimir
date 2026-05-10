@@ -293,7 +293,69 @@ async def run_poller(
         # Fall through; the subprocess might handle a missing dir,
         # OR fail and surface as poller_nonzero_exit.
 
-    env = {**os.environ, **poller.env}
+    # CR2 (external I/O) fix: previously this passed ``{**os.environ,
+    # **poller.env}`` — the entire mimir process env (including
+    # MIMIR_API_KEY, SAGA_API_KEY, ANTHROPIC_API_KEY, DISCORD_TOKEN,
+    # SLACK_BOT_TOKEN, GITHUB_TOKEN, etc.) flowed to every poller
+    # subprocess. A buggy poller that printed ``env`` to stderr would
+    # leak every secret to events.jsonl (truncated to 2000 chars but
+    # still). Skill authors don't expect their poller scripts to
+    # inherit these, and we shouldn't expand the trust boundary
+    # unnecessarily.
+    #
+    # Allowlist: shell/locale basics, XDG paths, CA bundles, TMPDIR.
+    # PR #111 review widening — initial allowlist was too narrow and
+    # would break common pollers (``gh`` users with custom XDG,
+    # custom-CA containers, noexec-/tmp setups).
+    #
+    # Skill authors who need an additional env key declare it in
+    # ``pollers.json``'s ``env`` block (per-skill operator-review
+    # surface) OR the operator can extend the global allowlist via
+    # ``MIMIR_POLLER_ENV_ALLOWLIST`` (comma-separated keys).
+    #
+    # Hard-deny suffixes / prefixes apply REGARDLESS of operator
+    # allowlist additions: ``*_API_KEY``, ``*_TOKEN``, ``*_SECRET``,
+    # ``*_PASSWORD`` and ``MIMIR_*`` never reach a poller subprocess.
+    _BUILTIN_ALLOWLIST = {
+        # Shell + locale
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TZ",
+        "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+        "LC_COLLATE", "LC_NUMERIC", "LC_TIME",
+        # XDG basedirs (gh + other CLIs respect XDG_CONFIG_HOME)
+        "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+        "XDG_RUNTIME_DIR", "XDG_STATE_HOME",
+        # Temp-dir overrides for noexec-/tmp setups
+        "TMPDIR", "TMP", "TEMP",
+        # CA bundles for custom-cert containers
+        "SSL_CERT_FILE", "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+        # Python
+        "PYTHONUNBUFFERED",
+        # Terminal
+        "TERM", "COLUMNS", "LINES",
+    }
+    extra_keys = {
+        k.strip()
+        for k in os.environ.get(
+            "MIMIR_POLLER_ENV_ALLOWLIST", "",
+        ).split(",")
+        if k.strip()
+    }
+    _allowed = _BUILTIN_ALLOWLIST | extra_keys
+    _DENY_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
+    _DENY_PREFIXES = ("MIMIR_",)
+
+    def _allowed_env_key(k: str) -> bool:
+        if k not in _allowed:
+            return False
+        if any(k.endswith(s) for s in _DENY_SUFFIXES):
+            return False
+        if any(k.startswith(p) for p in _DENY_PREFIXES):
+            return False
+        return True
+
+    env = {k: v for k, v in os.environ.items() if _allowed_env_key(k)}
+    env.update(poller.env)  # explicit per-skill overlay still wins
     env["STATE_DIR"] = str(persist_dir)
     env["POLLER_NAME"] = poller.name
 

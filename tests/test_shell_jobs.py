@@ -281,7 +281,8 @@ def test_read_output_supports_stream_filter(tmp_path: Path):
 
 
 def test_read_output_tail_lines_truncates(tmp_path: Path):
-    """tail_lines=2 returns the last 2 lines of a 5-line stream."""
+    """tail_lines=2 returns the last 2 lines of a 5-line stream,
+    prefixed by the truncation marker (PR #111 review-fix-2)."""
     registry = _make_registry(tmp_path)
     cmd = "for i in 1 2 3 4 5; do echo line-$i; done"
     job = registry.spawn(cmd, argv=["bash", "-c", cmd])
@@ -289,7 +290,10 @@ def test_read_output_tail_lines_truncates(tmp_path: Path):
 
     result = registry.read_output(job.job_id, tail_lines=2, stream="stdout")
     lines = result["stdout_tail"].splitlines()
-    assert lines == ["line-4", "line-5"]
+    # First line is the truncation marker; followed by the kept tail.
+    assert lines[0].startswith("[…truncated;")
+    assert "3 earlier line(s)" in lines[0]
+    assert lines[1:] == ["line-4", "line-5"]
 
 
 # ─── normalization helpers ────────────────────────────────────────────
@@ -366,3 +370,57 @@ def test_shell_job_snapshots_running_scope_filters(tmp_path: Path):
 def test_shell_job_snapshots_returns_empty_when_no_registry():
     # Caller passes None when shell jobs are disabled — must not blow up.
     assert shell_job_snapshots(None) == []
+
+
+# ─── PR #111 review-fix-2: read_output truncation marker ──────────────
+
+
+def test_read_output_marker_fires_when_file_fits_one_chunk_but_has_extra_lines(
+    tmp_path: Path,
+):
+    """PR #111 re-review regression: pre-fix the marker was gated on
+    ``hit_byte_cap or pos > 0``, which skipped the marker when the
+    whole file fit in one 64 KiB chunk AND had more than `n` lines
+    (pos==0 after seeking, no byte cap hit, dropped_lines>0). The
+    original review flagged this exact silent-truncation shape; the
+    fix-push reintroduced it in different form. This test pins the
+    correct gate ``dropped_lines > 0 or pos > 0``."""
+    registry = _make_registry(tmp_path)
+    job = registry.spawn(
+        "small-many-lines",
+        argv=["bash", "-c", "for i in $(seq 1 100); do echo line_$i; done"],
+    )
+    _wait_until_done(registry, job.job_id)
+    # File is 100 lines × ~10 bytes ≈ 1 KB — fits in one CHUNK (64KB).
+    out = registry.read_output(job.job_id, tail_lines=5, stream="stdout")
+    assert out["status"] == "exited_ok"
+    tail = out["stdout_tail"]
+    # We asked for 5 lines; file has 100 → 95 dropped → marker MUST fire.
+    assert "[…truncated;" in tail
+    assert "earlier line(s)" in tail
+    # The kept tail must be exactly the last 5 lines.
+    lines = [
+        line for line in tail.splitlines()
+        if not line.startswith("[…truncated;")
+    ]
+    assert len(lines) == 5
+    assert lines[-1] == "line_100"
+    assert lines[0] == "line_96"
+
+
+def test_read_output_no_marker_when_file_has_fewer_lines_than_tail(
+    tmp_path: Path,
+):
+    """When the file is shorter than the requested tail, no marker —
+    nothing was actually truncated."""
+    registry = _make_registry(tmp_path)
+    job = registry.spawn(
+        "few-lines",
+        argv=["bash", "-c", "for i in $(seq 1 5); do echo line_$i; done"],
+    )
+    _wait_until_done(registry, job.job_id)
+    out = registry.read_output(job.job_id, tail_lines=100, stream="stdout")
+    tail = out["stdout_tail"]
+    assert "[…truncated;" not in tail
+    assert "line_1" in tail
+    assert "line_5" in tail
