@@ -376,6 +376,53 @@ async def test_saga_failure_does_not_break_turn(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_assemble_session_summaries_falls_back_on_saga_raise(
+    tmp_path: Path,
+):
+    """CR2-#3: a transient SAGA outage during prompt assembly must not
+    crash the turn. ``_assemble_session_summaries`` previously had no
+    try/except around ``recent_session_boundaries`` — the local-mirror
+    fallback only fired on empty results, not on raise. This regression
+    test asserts the call returns the local-mirror content when SAGA
+    raises, mirroring the empty-result fallback path."""
+    saga = FakeSaga(fail_on={"recent_session_boundaries"})
+    agent = _build_agent(tmp_path, saga)
+
+    # Seed the local boundary mirror so the fallback has something to
+    # render — proves we're hitting the mirror path, not just swallowing
+    # the exception silently.
+    await agent._session_boundary_log.append(
+        {
+            "channel_id": "c",
+            "saga_session_id": "s1",
+            "summary": "local mirror seeded for the fallback test.",
+            "unfinished": [],
+        }
+    )
+
+    out = await agent._assemble_session_summaries(channel_id="c")
+
+    assert out is not None
+    assert "local mirror seeded for the fallback test." in out
+
+
+@pytest.mark.asyncio
+async def test_assemble_session_summaries_returns_none_when_both_empty(
+    tmp_path: Path,
+):
+    """CR2-#3 corollary: when SAGA raises AND the local mirror is empty,
+    the assembly returns ``None`` (the section is suppressed) rather
+    than crashing. Pins the degrade-to-None path for fresh installs
+    that hit a saga outage on their first turn."""
+    saga = FakeSaga(fail_on={"recent_session_boundaries"})
+    agent = _build_agent(tmp_path, saga)
+
+    out = await agent._assemble_session_summaries(channel_id="c")
+
+    assert out is None
+
+
+@pytest.mark.asyncio
 async def test_synthesis_turn_filters_turns_jsonl_by_session_id(tmp_path: Path):
     """The synthesis turn embeds turns from turns.jsonl filtered by
     saga_session_id. Pre-seed the file with two sessions and verify only the
