@@ -132,7 +132,7 @@ def _filter_session_turns(
     turns_path,
     saga_session_id: str,
     *,
-    idle_minutes: int = 60,
+    idle_minutes: int = 10,
 ) -> list[dict]:
     """Read turns.jsonl tail-first and return records with the given
     saga_session_id, in chronological order.
@@ -154,8 +154,8 @@ def _filter_session_turns(
     older session turns from the synthesis prompt.
 
     Replaced with a **time-based break**: saga ends a session after
-    ``idle_minutes`` of no activity (default 60), so any record older
-    than ``newest_match_ts - 2 * idle_minutes`` cannot belong to this
+    ``idle_minutes`` of no activity, so any record older than
+    ``newest_match_ts - 2 * idle_minutes`` cannot belong to this
     session. The 2× margin tolerates clock skew + a single
     out-of-order record at the boundary. Walks back at most
     ``2 * idle_minutes`` worth of file activity past the last match —
@@ -163,7 +163,10 @@ def _filter_session_turns(
 
     Caller (``Agent._render_saga_session_end_prompt``) passes
     ``self._config.saga_session_idle_minutes`` so the bound matches
-    saga's actual session policy.
+    saga's actual session policy. The function-level default
+    (``idle_minutes=10``) mirrors ``MIMIR_SAGA_SESSION_IDLE_MINUTES``'s
+    config default — defensive only; production callers always
+    override.
     """
     if not turns_path.is_file():
         return []
