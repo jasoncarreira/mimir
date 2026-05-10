@@ -98,6 +98,14 @@ def detect_billing_mode(
         return BillingMode.QUOTA
     if oauth_credentials_path is not None and oauth_credentials_path.is_file():
         return BillingMode.QUOTA
+    # MIMIR_CLAUDE_OAUTH_CREDENTIALS env-var presence is treated as
+    # operator intent (rather than a default-location heuristic), so
+    # we don't apply the ``.is_file()`` guard here. An operator who
+    # sets the env var is declaring "I'm on the OAuth flow" — even
+    # before ``claude /login`` has written a credentials file. The
+    # asymmetry vs. the path branch above is load-bearing as of
+    # CR2-#1: the path is a resolved-default-location hint, the env
+    # var is an explicit declaration.
     if os.environ.get("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "").strip():
         return BillingMode.QUOTA
     return BillingMode.PAY_AS_YOU_GO
