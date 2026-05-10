@@ -2,7 +2,7 @@
 
 Wraps the SagaClient as five tools:
   - saga_query              — explicit semantic atom retrieval
-  - saga_store              — explicit atom store (rare; SAGA auto-extracts)
+  - saga_store              — explicit atom store for cross-session semantic facts
   - saga_feedback           — corrective signal on a single atom
   - saga_mark_contributions — manual variant of the post-message hook
   - saga_end_session        — synthesis-turn bookkeeping (SPEC §5.6)
@@ -318,11 +318,27 @@ def build_saga_tools(
 
     @tool(
         "saga_store",
-        "Explicitly store a memory atom. SAGA auto-extracts atoms from message "
-        "content, so you rarely need this — only call it for facts you want "
-        "stored verbatim that wouldn't otherwise be picked up. Pass "
-        "``session_id`` (your current saga_session_id from the Current-message "
-        "header) so the stored atom is scoped to your turn.",
+        "Store a memory atom in SAGA for cross-session semantic retrieval. "
+        "Reach for this when you encounter:\n"
+        "- ``semantic`` facts, preferences, knowledge about people, places, "
+        "things, concepts (\"Alice prefers Slack DMs over email for urgent asks\")\n"
+        "- ``episodic`` dated events about specific entities (\"Alice joined "
+        "the Atlas project on 2025-03-12\")\n"
+        "- ``procedural`` recurring how-tos or workflow patterns (\"When "
+        "summarizing a long document, lead with the thesis and supporting "
+        "evidence\")\n\n"
+        "One fact per call. Single self-contained sentence. Dates and numbers "
+        "verbatim.\n\n"
+        "Do NOT store: meta-observations about the runtime (\"the prompt "
+        "fired\"), self-state claims (\"I'm uncertain about X\"), absence "
+        "claims (\"nothing happened\"), duplicates of content already in a "
+        "file, or session-retell content (the session boundary's ``summary`` "
+        "field handles that). If a fact already has a natural file home "
+        "(e.g. operational gotcha → ``memory/issues/``, named concept paired "
+        "with a wiki page) write it there too — files are durable artifacts, "
+        "atoms are the cross-session semantic lure.\n\n"
+        "Pass ``session_id`` (your current saga_session_id from the "
+        "Current-message header) so the stored atom is scoped to your turn.",
         {
             "type": "object",
             "properties": {
