@@ -25,6 +25,7 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
+from ._jsonl_tail import _tail_lines, count_lines_chunked
 from .models import TurnRecord
 
 log = logging.getLogger(__name__)
@@ -191,13 +192,13 @@ class TurnLogger:
         self._lock: asyncio.Lock | None = None
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            try:
-                self._line_count = sum(
-                    1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
-                )
-            except OSError:
-                self._line_count = 0
+        # Pre-2026-05-10 this read the entire file via ``read_text()``
+        # then ``splitlines()``. On a 250 MB cap, every process start
+        # paid hundreds of MB of memory + the GC churn for a single
+        # integer (the line count). ``count_lines_chunked`` reads in
+        # 64 KB chunks and counts ``\n`` bytes — O(1) memory, same
+        # answer.
+        self._line_count = count_lines_chunked(path)
 
     async def write(self, record: TurnRecord) -> None:
         if self._lock is None:
@@ -223,15 +224,40 @@ class TurnLogger:
             log.warning("turns.jsonl write failed: %s", exc)
 
     async def _trim(self) -> None:
+        # Pre-2026-05-10 this read the entire file via ``read_text()``
+        # then sliced the tail and rewrote. On a hot file the read could
+        # block the asyncio loop for hundreds of ms (we're inside
+        # ``await self._write`` from ``run_turn``, so this stalls every
+        # other channel's worker too). Now we tail-stream up to
+        # ``max_turns`` records, write them out atomically, and update
+        # the line count. The tail-read is bounded by ``max_turns`` so
+        # memory is O(max_turns × avg_record_size) — independent of
+        # how big the on-disk file got.
         try:
-            text = self._path.read_text(encoding="utf-8")
-            lines = [l for l in text.splitlines() if l.strip()]
-            if len(lines) <= self._max_turns:
-                return
-            kept = lines[-self._max_turns:]
-            tmp = self._path.with_suffix(".jsonl.tmp")
-            tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
-            tmp.rename(self._path)
-            self._line_count = len(kept)
+            await asyncio.to_thread(self._trim_sync)
         except OSError as exc:
             log.warning("turns.jsonl trim failed: %s", exc)
+
+    def _trim_sync(self) -> None:
+        kept_reversed: list[str] = []
+        try:
+            for line in _tail_lines(self._path):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                kept_reversed.append(stripped)
+                if len(kept_reversed) >= self._max_turns:
+                    break
+        except OSError as exc:
+            log.warning("turns.jsonl trim tail-read failed: %s", exc)
+            return
+        # If file already at-or-below cap, no rewrite needed.
+        if not kept_reversed:
+            return
+        # tail yields newest-first; reverse to chronological for the
+        # rewritten file.
+        kept = list(reversed(kept_reversed))
+        tmp = self._path.with_suffix(".jsonl.tmp")
+        tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        tmp.rename(self._path)
+        self._line_count = len(kept)
