@@ -277,3 +277,141 @@ def test_turn_prompt_shell_job_complete_handles_missing_extra():
     )
     assert "job_id: ?" in header_line  # placeholder when extra is absent
     assert "exit_code: None" in header_line
+
+
+# ─── Per-section size breakdown (chainlink: 2026-05-10 operator request) ──
+
+
+def test_turn_prompt_appends_section_sizes_to_resource_usage_block():
+    """The per-section ~token breakdown lands inside the ``## Resource
+    usage`` section so the agent can see which compartment is driving
+    prompt growth without external instrumentation. Sections appear
+    sorted by descending size; tiny sections (<25 tokens) are filtered
+    out to keep the breakdown readable.
+    """
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1",
+        content="hi",
+        author="discord-99",
+    )
+    # Big-ish blocks so the breakdown has interesting content.
+    big_saga_block = "\n".join(f"- atom-{i}: " + "x" * 200 for i in range(10))
+    medium_summaries = "\n".join(f"- session-{i}: " + "y" * 100 for i in range(5))
+    small_feedback = "Negative (last 24h): - one\n- two"
+    usage_block = (
+        "Last turn: 100k prompt + 1k out tokens (cache hit 99%)\n\n"
+        "Last 1h: $5.00 / 4 turns / cache hit 99%"
+    )
+
+    prompt = build_turn_prompt(
+        event,
+        saga_block=big_saga_block,
+        session_summaries_block=medium_summaries,
+        feedback_block=small_feedback,
+        usage_block=usage_block,
+    )
+
+    # The breakdown is appended to the Resource usage block.
+    assert "## Resource usage" in prompt
+    assert "Section sizes (this prompt, ~tokens):" in prompt
+    # Big saga block dominates — should land first.
+    assert "- Possibly relevant memories (from SAGA):" in prompt
+    # Medium summaries are present.
+    assert "- Recent session summaries:" in prompt
+
+    # Extract just the breakdown's own lines — the prompt continues
+    # past it with a saga block whose entries also start with ``- ``,
+    # so split on the next blank line after the breakdown header.
+    breakdown_section = prompt.split(
+        "Section sizes (this prompt, ~tokens):", 1
+    )[1]
+    # Breakdown ends at the next blank line followed by another section.
+    breakdown_only = breakdown_section.split("\n\n", 1)[0]
+    saga_idx = breakdown_only.find("Possibly relevant memories (from SAGA)")
+    sums_idx = breakdown_only.find("Recent session summaries")
+    assert saga_idx >= 0
+    assert sums_idx >= 0
+    assert saga_idx < sums_idx, (
+        f"saga block ({saga_idx}) should land before session summaries "
+        f"({sums_idx}) in size-sorted breakdown"
+    )
+
+    # Tiny sections (small_feedback is ~32 tokens including label/header;
+    # may or may not pass the floor). Tight check: the breakdown only
+    # includes the labeled blocks we passed in — no leakage into the
+    # subsequent sections, no spurious entries.
+    breakdown_bullets = [
+        line for line in breakdown_only.splitlines()
+        if line.strip().startswith("- ")
+    ]
+    assert 1 <= len(breakdown_bullets) <= 4, (
+        f"breakdown bullet count should match the labeled sections we "
+        f"provided (capped at 4); got {breakdown_bullets}"
+    )
+    # Every bullet should reference a known label (not, say, a saga atom).
+    for bullet in breakdown_bullets:
+        assert any(
+            label in bullet
+            for label in (
+                "Possibly relevant memories",
+                "Recent session summaries",
+                "Recent feedback signals",
+                "Resource usage",
+            )
+        ), f"unexpected breakdown bullet: {bullet}"
+
+
+def test_turn_prompt_omits_section_breakdown_when_no_resource_usage_block():
+    """If the caller didn't pass a ``usage_block``, there's no host
+    section to attach the breakdown to. The breakdown is silently
+    dropped (rather than landing in some other arbitrary block)."""
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1",
+        content="hi",
+        author="discord-99",
+    )
+    prompt = build_turn_prompt(
+        event,
+        saga_block="- atom-1: " + "x" * 500,
+        # No usage_block.
+    )
+    assert "Section sizes" not in prompt
+
+
+def test_format_section_sizes_floors_tiny_and_sorts_descending():
+    """Direct test of the helper — easier to verify the sort order
+    and the SMALL_TOKEN_FLOOR cutoff in isolation.
+    """
+    from mimir.prompts import _format_section_sizes
+
+    sizes = {
+        "Big": 12_000,    # 3000 tokens
+        "Medium": 2_000,  # 500 tokens
+        "Small": 60,      # 15 tokens — filtered
+        "Tiny": 0,        # filtered
+    }
+    rendered = _format_section_sizes(sizes)
+    assert "Section sizes (this prompt, ~tokens):" in rendered
+    lines = rendered.splitlines()
+    bullets = [line for line in lines if line.startswith("- ")]
+    assert len(bullets) == 2  # Big + Medium
+    assert bullets[0].startswith("- Big:")
+    assert bullets[1].startswith("- Medium:")
+    # Token formatting: 3000 → 3.0k, 500 → 500.
+    assert "3.0k" in bullets[0]
+    assert "500" in bullets[1]
+
+
+def test_format_section_sizes_empty_returns_empty_string():
+    from mimir.prompts import _format_section_sizes
+
+    assert _format_section_sizes({}) == ""
+    assert _format_section_sizes({"Tiny": 50}) == ""  # all filtered

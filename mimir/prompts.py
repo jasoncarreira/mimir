@@ -199,6 +199,21 @@ def build_turn_prompt(
     Recent activity render uses the canonical's display_name. None
     falls back to the no-identity-reconciliation rendering."""
     sections: list[str] = []
+    # Per-section size tracking (chars). Surfaced as a ~token breakdown
+    # at the bottom of the resource-usage block so the agent can see
+    # which compartment is driving prompt growth without instrumentation.
+    # Only tracks the labeled context blocks below — the event body /
+    # date / per-event headers are intentionally excluded (small + always
+    # there). 2026-05-10 add: chainlink-pending observation that recent-
+    # activity tail + recent-session-summaries are the two compartments
+    # that grow between ticks.
+    section_sizes: dict[str, int] = {}
+
+    def _add_labeled(label: str, body: str) -> None:
+        """Append a `## Label\n\nbody` section + record its size."""
+        rendered = f"## {label}\n\n{body.rstrip()}"
+        sections.append(rendered)
+        section_sizes[label] = len(rendered)
 
     # Materialize once if we need to scan it twice (identity + render).
     recent_list: list[Message] | None = None
@@ -210,28 +225,30 @@ def build_turn_prompt(
             recent_list or [], event.author, resolver
         )
         if identity_block:
-            sections.append("## Known identities\n\n" + identity_block)
+            _add_labeled("Known identities", identity_block)
 
     # Algedonic channel (v0.4 §2): self-feedback signals between identities
     # and recent activity, so the agent reads its own pain/pleasure data
     # before it reads the conversation it's about to act on.
     if feedback_block:
-        sections.append("## Recent feedback signals\n\n" + feedback_block.rstrip())
+        _add_labeled("Recent feedback signals", feedback_block)
 
     # Recent session summaries (v0.4 §3): one rung wider than the message-
     # level recent activity. Placed before Recent activity so the agent
     # reads the session-level context first.
     if session_summaries_block:
-        sections.append(
-            "## Recent session summaries\n\n" + session_summaries_block.rstrip()
-        )
+        _add_labeled("Recent session summaries", session_summaries_block)
 
     # Resource usage: cost / cache hit rate / context utilization across
     # rolling windows. Same priority as the algedonic feedback channel —
     # it's data about the agent's own state — placed near the top so the
     # agent reads it before the conversation it's about to act on.
+    # The per-section size breakdown (assembled below from
+    # ``section_sizes``) is appended to this block at the end of
+    # assembly, so the resource-usage entry's tracked size doesn't
+    # include the breakdown itself.
     if usage_block:
-        sections.append("## Resource usage\n\n" + usage_block.rstrip())
+        _add_labeled("Resource usage", usage_block)
 
     # Upcoming (FUTURE_WORK §12.1): feedforward — predictable events
     # the agent should know are coming (next-N scheduled ticks,
@@ -239,7 +256,7 @@ def build_turn_prompt(
     # are self-state telemetry; placement above Recent activity so the
     # agent reads "what's coming" before "what just happened."
     if upcoming_block:
-        sections.append("## Upcoming\n\n" + upcoming_block.rstrip())
+        _add_labeled("Upcoming", upcoming_block)
 
     # Self-state (FUTURE_WORK §12.4): the homeostat's interpretation of
     # the four constraint layers (plan window / cost rate / S3-S4
@@ -247,20 +264,20 @@ def build_turn_prompt(
     # agent should know the same constraints the arbiter uses to
     # suppress S4 work.
     if self_state_block:
-        sections.append("## Self-state\n\n" + self_state_block.rstrip())
+        _add_labeled("Self-state", self_state_block)
 
     if recent_list:
         rendered = render_recent_activity(
             recent_list, max_chars=recent_message_chars, resolver=resolver
         )
         if rendered:
-            sections.append("## Recent activity\n\n" + rendered)
+            _add_labeled("Recent activity", rendered)
 
     if saga_block:
-        sections.append("## Possibly relevant memories (from SAGA)\n\n" + saga_block.rstrip())
+        _add_labeled("Possibly relevant memories (from SAGA)", saga_block)
 
     if subagent_block:
-        sections.append("## Subagent updates\n\n" + subagent_block.rstrip())
+        _add_labeled("Subagent updates", subagent_block)
 
     # Prompt-header timestamp: defaults to now (the agent's view of "today")
     # but can be overridden by the inbound event via ``extra.event_ts_iso``.
@@ -347,4 +364,48 @@ def build_turn_prompt(
             f"{body}"
         )
 
+    # Per-section size breakdown (chainlink: 2026-05-10 operator request).
+    # Surfaces which compartment is driving prompt growth — recent-activity
+    # tail and recent-session-summaries are the two that compound between
+    # ticks during high-cadence ship runs. ``chars / 4`` is a rough English
+    # token estimate — close enough for the "is this section bloated?"
+    # judgment without pulling in tiktoken (which would disagree with
+    # Anthropic's tokenizer anyway).
+    if section_sizes:
+        breakdown = _format_section_sizes(section_sizes)
+        if breakdown:
+            for i, body in enumerate(sections):
+                if body.startswith("## Resource usage\n"):
+                    sections[i] = body + "\n\n" + breakdown
+                    break
+
     return "\n\n".join(sections)
+
+
+def _format_section_sizes(sizes: dict[str, int]) -> str:
+    """Render the per-section size breakdown for the resource-usage block.
+
+    Sorted by descending size so the biggest contributors land on top.
+    Sections under ~25 tokens (~100 chars) are dropped to keep the
+    breakdown clean. Empty input returns ``""``.
+    """
+    SMALL_TOKEN_FLOOR = 25  # ~100 chars
+    entries: list[tuple[str, int]] = []
+    for label, char_count in sizes.items():
+        tokens = char_count // 4
+        if tokens < SMALL_TOKEN_FLOOR:
+            continue
+        entries.append((label, tokens))
+    if not entries:
+        return ""
+    entries.sort(key=lambda kv: -kv[1])
+
+    def _human(tokens: int) -> str:
+        if tokens >= 1000:
+            return f"{tokens / 1000:.1f}k"
+        return str(tokens)
+
+    lines = ["Section sizes (this prompt, ~tokens):"]
+    for label, tokens in entries:
+        lines.append(f"- {label}: {_human(tokens)}")
+    return "\n".join(lines)
