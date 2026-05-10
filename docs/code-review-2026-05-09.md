@@ -881,3 +881,82 @@ distinguish "this code's behavior is wrong" from "this code's shape
 looks risky"; the second category needs a verification step before it
 graduates to "high."
 
+---
+
+## Decisions log (2026-05-10, post-mimir-questions pass)
+
+After mimir surfaced the cross-cutting / trace-further / design-call
+items for owner judgment, decisions were recorded as follows:
+
+### Cross-cutting patterns
+
+- **Pattern A (JSONL forward-scans):** SHIP as one PR with per-site
+  tests across 6 sites. `shell_jobs.read_output` (originally lumped in)
+  is a stdout-file read, not JSONL — different fix shape (seek-from-end);
+  drop from this sweep, address separately. `EventLogger.__init__` /
+  `_trim` (CR2-#6) split into its own PR because it touches the trim
+  invariant.
+- **Pattern B (auth + UI):** SHIP. Token middleware on all routes +
+  `127.0.0.1` host port binding (defense-in-depth). Turn viewer + ops
+  page prompt for token on first access, save to localStorage. Ops
+  page also gets dark-mode treatment matching the turn viewer. The
+  port mapping change is in `mimirbot/compose.yml`, not this repo.
+- **Pattern C (break-early ts loops):** GATED on trace-further #3.
+  Cheap fix once verified; not worth shipping blind.
+- **Pattern D (default=str schema drift):** SHELVED. Effort is medium
+  (custom encoder + test fixtures); urgency is low (drift fires once
+  every 6-12 months when SDK ships a schema change). Cost of catching
+  is real every test run; cost of missing is rare. Revisit if a silent
+  shape change ever loses data.
+
+### Trace-further investigations
+
+- **#1 (multi-send double-credit):** SPIKE — grep turns.jsonl for
+  `send_message_count > 1` AND non-empty `saga_atom_ids`. If
+  reproducible, fix is one-line reset of `ctx.saga_atom_ids` after each
+  `send_message` feedback.
+- **#2 (saga response duplicate keys):** DEFER — only investigate if
+  #1 finds reproducible double-credit AND saga's `mark_contributions`
+  isn't idempotent.
+- **#3 (out-of-order ts in events.jsonl):** SPIKE — gates Pattern C.
+  Tail recent file, sort, count inversions. Cheap.
+- **#4 (`_assemble_session_summaries` fallback):** RESOLVED by PR #96
+  — fallback now fires on both empty result AND raise.
+
+### M/L design-call items
+
+- **CR2-#6 EventLogger init/trim:** SHIP. Chunked line-counter for
+  init; `tail_jsonl_records` for trim. Trim invariant preserved.
+- **CR2-#8 cost-rate baseline divisor:** SHIP. Divisor =
+  `min(baseline_window_hours, file_first_ts_hours_old)`. "First ts" is
+  the earliest record's timestamp in the actual file at evaluation
+  time — covers fresh installs and post-trim states alike. Plumb
+  through aggregation output.
+- **Scheduler.reload thread-safety:** SHIP via `_mutate_lock`
+  (asyncio.Lock) around APScheduler mutation segment. Less invasive
+  than the async refactor; same race-protection effect.
+- **Pollers no global concurrency cap:** SHIP. `MIMIR_MAX_CONCURRENT_POLLERS`
+  env + `asyncio.Semaphore`. Default 8. Emit
+  `poller_concurrency_throttled` when wait > 5s.
+- **APScheduler misfire visibility:** SHIP. Lower `misfire_grace_time`
+  60→5-10s. Register `EVENT_JOB_MISSED` listener that emits
+  `poller_misfired` events. Algedonic block aggregates negative event
+  types so the surface is automatic.
+
+### Recommended ordering
+
+1. CR2-#1 billing fix (critical, mechanical, ship today)
+2. Trace-further #3 (out-of-order ts) — gates Pattern C
+3. Pattern C fix (if #3 confirms reachable)
+4. Pattern A sweep (6 sites)
+5. Pattern B (auth + UI + dark mode)
+6. CR2-#6 EventLogger trim (paired conceptually with Pattern A)
+7. APScheduler misfire visibility
+8. Pollers concurrency cap
+9. CR2-#8 baseline divisor
+10. Scheduler.reload lock
+11. Trace-further #1 spike (may not need a fix)
+
+Doc-only fixes for #7 / #10 / #11 fold into low-priority PRs whenever;
+not blocking.
+
