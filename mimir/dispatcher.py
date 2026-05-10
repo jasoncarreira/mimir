@@ -109,31 +109,43 @@ class Dispatcher:
                     await log_event("worker_retired", channel_id=channel_id, reason="idle")
                     return
 
-                async with self._semaphore:
-                    if self._run_turn is None:
-                        await log_event(
-                            "error",
-                            where="dispatcher.worker",
-                            channel_id=channel_id,
-                            message="run_turn not bound; event dropped",
-                        )
-                        queue.task_done()
-                        continue
-                    self._in_flight.add(channel_id)
-                    try:
-                        await self._run_turn(event)
-                    except Exception as exc:  # noqa: BLE001
-                        log.exception("run_turn raised for %s", channel_id)
-                        await log_event(
-                            "error",
-                            where="dispatcher.worker",
-                            channel_id=channel_id,
-                            message=f"{type(exc).__name__}: {exc}",
-                            traceback=traceback.format_exc(),
-                        )
-                    finally:
-                        self._in_flight.discard(channel_id)
-                queue.task_done()
+                # CR2-#4: ``queue.task_done()`` MUST be called for every
+                # ``queue.get()`` regardless of how the dispatch ends —
+                # including when ``_run_turn`` raises CancelledError
+                # (e.g. on shutdown via ``drain()``). Previously the
+                # ``task_done()`` was outside the try/except, so a
+                # CancelledError raised inside ``_run_turn`` skipped it
+                # — leaving the queue's unfinished count > 0 and
+                # blocking ``await queue.join()`` in ``drain()``
+                # forever. The outer ``except asyncio.CancelledError``
+                # below logs and re-raises; ``task_done()`` lives in a
+                # ``finally`` here so neither propagation path skips it.
+                try:
+                    async with self._semaphore:
+                        if self._run_turn is None:
+                            await log_event(
+                                "error",
+                                where="dispatcher.worker",
+                                channel_id=channel_id,
+                                message="run_turn not bound; event dropped",
+                            )
+                            continue
+                        self._in_flight.add(channel_id)
+                        try:
+                            await self._run_turn(event)
+                        except Exception as exc:  # noqa: BLE001
+                            log.exception("run_turn raised for %s", channel_id)
+                            await log_event(
+                                "error",
+                                where="dispatcher.worker",
+                                channel_id=channel_id,
+                                message=f"{type(exc).__name__}: {exc}",
+                                traceback=traceback.format_exc(),
+                            )
+                        finally:
+                            self._in_flight.discard(channel_id)
+                finally:
+                    queue.task_done()
         except asyncio.CancelledError:
             await log_event("worker_cancelled", channel_id=channel_id)
             raise

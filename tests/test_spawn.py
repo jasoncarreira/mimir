@@ -998,3 +998,103 @@ async def test_permission_mode_lands_in_started_event(home: Path):
     started = [e for e in events if e["type"] == "claude_code_spawn_started"]
     assert len(started) == 1
     assert started[0]["resolved_permission_mode"] == "acceptEdits"
+
+
+# ─── CR2-#5: spawn completion accounting fallback path ───────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_completion_writes_orphan_sidecar_when_loop_closed(
+    home: Path, tmp_path: Path,
+):
+    """CR2-#5 regression: when ``schedule_from_thread`` returns False
+    (loop unavailable / closed / pre-first-turn), the spawn's
+    accounting must NOT silently disappear. ``_on_complete`` writes a
+    sidecar entry to ``<mimir_home>/spawn-orphans.jsonl`` so the
+    operator can replay it on next startup."""
+    registry = _FakeRegistry()
+    # schedule_from_thread that always reports "dropped" — simulates
+    # the shutdown / pre-first-turn case. Closes the coro to suppress
+    # the "never awaited" warning, then returns False to mirror what
+    # ``Agent._schedule_from_thread`` would have done.
+    def _dropping_schedule(coro):
+        coro.close()
+        return False
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=_dropping_schedule,
+        chain_on_complete=None,
+    )
+    await tool_def.handler({"brief": "ok", "working_dir": "/tmp"})
+    # Synthesize completion with parseable JSON.
+    stdout_path = tmp_path / "spawn_stdout.json"
+    _fire_completion(
+        registry,
+        stdout_text='{"is_error": false, "terminal_reason": "completed"}',
+        exit_code=0,
+        stdout_path=stdout_path,
+    )
+
+    # The orphan sidecar must exist with one entry.
+    sidecar = home / "spawn-orphans.jsonl"
+    assert sidecar.is_file(), (
+        "spawn-orphans.jsonl must be written when loop is unavailable"
+    )
+    lines = [
+        json.loads(line)
+        for line in sidecar.read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(lines) == 1
+    entry = lines[0]
+    assert entry["event_type"] == "claude_code_spawn_completed"
+    assert "event_payload" in entry
+    assert entry["event_payload"]["agent"]
+    assert "turn_record" in entry
+    assert entry["turn_record"]["kind"] == "claude_code_spawn"
+
+
+@pytest.mark.asyncio
+async def test_spawn_completion_no_orphan_when_loop_available(
+    home: Path, tmp_path: Path,
+):
+    """When schedule_from_thread succeeds (returns True), no sidecar
+    is written — the regular log_event + turn_logger path handles
+    accounting."""
+    registry = _FakeRegistry()
+    captured: list = []
+
+    def schedule(coro):
+        # Don't actually run the coroutine — pytest-asyncio's loop is
+        # busy. Close it to suppress the "never awaited" warning and
+        # report success, which is what the agent's
+        # ``_schedule_from_thread`` would have done if the dispatch
+        # to the live loop succeeded.
+        captured.append(True)
+        coro.close()
+        return True
+
+    [tool_def] = build_spawn_tool(
+        registry=registry,
+        turn_logger=None,
+        mimir_home=home,
+        spawns_dir=home / "state" / "spawns",
+        schedule_from_thread=schedule,
+        chain_on_complete=None,
+    )
+    await tool_def.handler({"brief": "ok", "working_dir": "/tmp"})
+    stdout_path = tmp_path / "spawn_stdout.json"
+    _fire_completion(
+        registry,
+        stdout_text='{"is_error": false, "terminal_reason": "completed"}',
+        exit_code=0,
+        stdout_path=stdout_path,
+    )
+    assert captured == [True]
+    sidecar = home / "spawn-orphans.jsonl"
+    assert not sidecar.exists(), (
+        f"sidecar must NOT be written when schedule succeeded, got: {sidecar}"
+    )
