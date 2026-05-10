@@ -160,6 +160,18 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
 # would crowd out genuinely-new positive signals like react_received
 # or saga_feedback_sent. Tail-first iteration means the first-seen
 # event for a kind in this set IS the most recent.
+# CR2 (memory & retrieval) fix: kinds whose polarity is decided
+# dynamically per event (rather than statically by their entry in
+# ``_RULE``) MUST NOT appear in ``_FIRST_OCCURRENCE_ONLY_KINDS``. The
+# kind-level dedup is global (not per-polarity), so a polarity-dynamic
+# kind would suppress the OTHER polarity bucket's matching event after
+# the first occurrence — silently dropping signal. Today only
+# ``react_received`` is polarity-dynamic and it's NOT in the first-only
+# set; the assertion below pins that invariant so a future change
+# can't break it without seeing the test fail.
+_POLARITY_DYNAMIC_KINDS: frozenset[str] = frozenset({"react"})
+
+
 _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "saga_consolidate_ok",
     "saga_decay_ok",
@@ -235,6 +247,20 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # ``saga_feedback``), not the raw event type.
     "saga_feedback",
 }
+
+# CR2 (memory & retrieval) invariant: polarity-dynamic kinds (their
+# polarity is decided per-event, not by static rule) MUST NOT appear
+# in _FIRST_OCCURRENCE_ONLY_KINDS, because the first-only dedup is
+# global (kind-level) — a polarity-dynamic kind would suppress
+# matching events of the OTHER polarity after the first occurrence,
+# silently dropping signal.
+assert _POLARITY_DYNAMIC_KINDS.isdisjoint(_FIRST_OCCURRENCE_ONLY_KINDS), (
+    "Polarity-dynamic kinds are incompatible with _FIRST_OCCURRENCE_ONLY_KINDS "
+    "(global kind-level dedup would silently suppress the other-polarity "
+    "events). Make seen_first_only per-polarity or remove the kind from "
+    f"the first-only set. Conflict: "
+    f"{_POLARITY_DYNAMIC_KINDS & _FIRST_OCCURRENCE_ONLY_KINDS}"
+)
 
 
 # Render hooks: per-kind one-liner builders. Defaults to a generic

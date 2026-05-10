@@ -423,8 +423,20 @@ class Indexer:
         abs_path = self._abs_path(rel_path)
         if not abs_path.is_file():
             # File deleted — drop from index.
+            # CR2 (memory & retrieval) fix: explicit DELETE on
+            # ``chunks`` too. Pre-fix this branch deleted from
+            # ``files`` and ``chunks_fts`` only, relying on
+            # ``ON DELETE CASCADE`` from ``files(path)`` to clean up
+            # ``chunks``. The cascade DOES work today (FK support is
+            # on per ``_connect`` PRAGMA), but the *update* branch
+            # below explicitly deletes from ``chunks`` + ``chunks_fts``
+            # — inconsistent. If FK support ever flips off (the PRAGMA
+            # is per-connection and easy to drop in a refactor), the
+            # delete branch silently leaks orphan chunks rows. Belt-
+            # and-suspenders: be explicit.
             with self._db_lock, self._connect() as conn:
                 conn.execute("DELETE FROM files WHERE path = ?", (rel_path,))
+                conn.execute("DELETE FROM chunks WHERE path = ?", (rel_path,))
                 conn.execute("DELETE FROM chunks_fts WHERE path = ?", (rel_path,))
             return False
         try:
@@ -484,11 +496,15 @@ class Indexer:
                 if self._reindex_sync(rel):
                     updated += 1
 
-        # Remove deletions
+        # Remove deletions — same explicit-DELETE pattern as the
+        # delete branch in ``_reindex_sync`` (CR2 memory & retrieval
+        # fix). Don't rely on FK cascade silently keeping ``chunks``
+        # in sync.
         for rel in list(indexed.keys()):
             if rel not in on_disk:
                 with self._db_lock, self._connect() as conn:
                     conn.execute("DELETE FROM files WHERE path = ?", (rel,))
+                    conn.execute("DELETE FROM chunks WHERE path = ?", (rel,))
                     conn.execute("DELETE FROM chunks_fts WHERE path = ?", (rel,))
                 removed += 1
 

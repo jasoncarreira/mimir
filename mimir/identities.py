@@ -340,6 +340,22 @@ class IdentityResolver:
             if display_name:
                 channel_display_names[canonical] = display_name
 
+        # CR2 (memory & retrieval) deferred-fix note: the 6 attribute
+        # reassignments below are not atomic relative to each other —
+        # a concurrent reader (e.g. ``display_name(author)`` reads
+        # ``_alias_map`` then ``_display_names``) can straddle the
+        # reassignment and see new ``_alias_map`` against old
+        # ``_display_names``. In practice this race is unreachable on
+        # the asyncio loop (no awaits between the assigns) and only
+        # the scheduler.py:942 worker-thread reload path could trigger
+        # it — but that path constructs a *new* IdentityResolver,
+        # so it doesn't share state with the agent's main resolver.
+        #
+        # The clean fix is to bundle into an immutable holder (frozen
+        # dataclass) and swap once, but it's a 12-site read-path
+        # refactor for a race that hasn't bitten yet. Recording the
+        # known residual risk here so the next reviewer doesn't
+        # re-derive it from scratch.
         self._alias_map = alias_map
         self._display_names = display_names
         self._identities = identities

@@ -317,3 +317,20 @@ async def test_run_no_wiki_raises(tmp_path: Path):
     init_logger(tmp_path / "logs" / "events.jsonl", session_id="test")
     with pytest.raises(FileNotFoundError):
         await run(tmp_path)
+
+
+def test_find_slug_collisions_returns_paths_for_duplicate_stems(tmp_path):
+    """CR2 (memory & retrieval) helper: cross-category same-stem files
+    must be discoverable so the introspection skill can surface them."""
+    from mimir.wiki_backlinks import find_slug_collisions
+
+    (tmp_path / "concepts").mkdir()
+    (tmp_path / "topics").mkdir()
+    (tmp_path / "concepts" / "foo.md").write_text("a")
+    (tmp_path / "topics" / "foo.md").write_text("b")
+    (tmp_path / "topics" / "bar.md").write_text("c")  # no collision
+
+    collisions = find_slug_collisions(tmp_path)
+    assert "foo" in collisions
+    assert len(collisions["foo"]) == 2
+    assert "bar" not in collisions  # only collisions returned

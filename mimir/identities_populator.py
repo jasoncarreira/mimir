@@ -41,6 +41,8 @@ from typing import Any, Iterable
 
 import yaml
 
+from .event_logger import log_event
+
 log = logging.getLogger(__name__)
 
 
@@ -499,7 +501,21 @@ async def populate_from_slack(
             resp = await client.users_list(**kwargs)
         except Exception as exc:  # noqa: BLE001 — best-effort scheduled job
             log.warning("populate_from_slack users_list failed: %s", exc)
+            # CR2 (memory & retrieval) fix: emit a structured event so
+            # the operator can see partial pagination. Pre-fix, page 3
+            # of 10 failing left pages 1-2 partial; merge_into_yaml
+            # didn't know it got partial data; YAML write "looked
+            # complete." Idempotency saves the next run, but operator
+            # visibility was zero.
+            await log_event(
+                "populator_partial_pagination",
+                source="slack",
+                resource="users",
+                error=f"{type(exc).__name__}: {exc}",
+                items_seen=len(people),
+            )
             break
+        # Successfully read this page.
         members = resp.get("members") or []
         for m in members:
             if not isinstance(m, dict):
@@ -553,6 +569,13 @@ async def populate_from_slack(
         except Exception as exc:  # noqa: BLE001 — best-effort scheduled job
             log.warning(
                 "populate_from_slack conversations_list failed: %s", exc
+            )
+            await log_event(
+                "populator_partial_pagination",
+                source="slack",
+                resource="channels",
+                error=f"{type(exc).__name__}: {exc}",
+                items_seen=len(channels),
             )
             break
         chs = resp.get("channels") or []
