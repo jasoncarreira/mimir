@@ -200,6 +200,32 @@ class SubagentLifecycleHook(TurnLifecycleHook):
 
     def __init__(self, inbox: "SubagentInbox") -> None:
         self._inbox = inbox
+        # CR2 (agent runtime) fix: process-level task description
+        # registry. Pre-fix, ``ctx.task_descriptions`` lived for one
+        # turn — but background-spawned subagents (most per
+        # ``subagent_defs.py``: ``background=True``) complete in a
+        # later turn whose ctx has an empty dict. The notification
+        # lookup at ``ctx.task_descriptions.get(msg.task_id)`` then
+        # returned None, and the inbox push carried ``description=None``
+        # — so the ``Subagent updates`` prompt block rendered
+        # ``[completed] task_id=abc — None`` instead of the actual
+        # task description.
+        #
+        # Capacity bound: subagent task_ids are 12-char hashes; even
+        # a year of heavy use stays well under 10k. Capping at 4096
+        # keeps memory bounded while leaving headroom; eviction is
+        # FIFO (oldest task_id evicted first).
+        from collections import OrderedDict
+        self._task_descriptions: OrderedDict[str, str] = OrderedDict()
+
+    _TASK_DESC_LRU_CAP = 4096
+
+    def _record_task_description(self, task_id: str, description: str) -> None:
+        if task_id in self._task_descriptions:
+            self._task_descriptions.move_to_end(task_id)
+        self._task_descriptions[task_id] = description
+        while len(self._task_descriptions) > self._TASK_DESC_LRU_CAP:
+            self._task_descriptions.popitem(last=False)
 
     async def on_message(self, ctx, event, msg):
         from claude_agent_sdk import (
@@ -211,7 +237,11 @@ class SubagentLifecycleHook(TurnLifecycleHook):
         from .subagent_inbox import SubagentResult
 
         if isinstance(msg, TaskStartedMessage):
+            # Keep the per-turn dict for back-compat (callers reading
+            # ``ctx.task_descriptions`` directly still work) AND the
+            # process-level registry for cross-turn lookup.
             ctx.task_descriptions[msg.task_id] = msg.description
+            self._record_task_description(msg.task_id, msg.description)
             await log_event(
                 "subagent_started",
                 turn_id=ctx.turn_id,
@@ -235,6 +265,14 @@ class SubagentLifecycleHook(TurnLifecycleHook):
             )
         elif isinstance(msg, TaskNotificationMessage):
             from .agent import _utc_now_iso  # avoid module-load cycle
+            # Look up description: per-turn dict first (matches the
+            # original semantics for same-turn completions), then the
+            # process-level registry (for background subagents that
+            # complete in a later turn — the original bug).
+            description = (
+                ctx.task_descriptions.get(msg.task_id)
+                or self._task_descriptions.get(msg.task_id)
+            )
             await self._inbox.push(
                 event.channel_id,
                 SubagentResult(
@@ -242,7 +280,7 @@ class SubagentLifecycleHook(TurnLifecycleHook):
                     status=msg.status,
                     summary=msg.summary,
                     output_file=msg.output_file,
-                    description=ctx.task_descriptions.get(msg.task_id),
+                    description=description,
                     usage=msg.usage,
                     received_ts=_utc_now_iso(),
                 ),

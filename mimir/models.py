@@ -58,10 +58,18 @@ class TurnContext:
     saga_session_id: str | None = None
     saga_atom_ids: list[str] = field(default_factory=list)
     # Tool-call budget tracking (SPEC §4.5 follow-on / FUTURE_WORK).
-    # Incremented on every PreToolUse; the budget hook denies once over cap
-    # and warns at the soft threshold. 0 = no budget enforced.
+    # Incremented on every ALLOWED PreToolUse; the budget hook denies
+    # once at-cap (without incrementing) and warns once when the soft
+    # threshold is first crossed. 0 = no budget enforced.
     tool_call_count: int = 0
     tool_call_budget: int = 0
+    # CR2 (agent runtime) fix: soft-warning idempotency. Without this
+    # flag, the previous ``count == soft_threshold`` trigger could miss
+    # a warning if any code path skipped an increment, AND could fire
+    # repeatedly if a future change ever decremented the count. One-shot
+    # flag means the warning fires exactly once per turn at the first
+    # crossing.
+    _tool_call_soft_warning_emitted: bool = False
     # Origin source of the inbound event (carried from AgentEvent.source so
     # outbound assistant replies on the same channel inherit it).
     channel_source: str | None = None
@@ -137,7 +145,14 @@ class TurnRecord:
 
 
 def make_turn_id() -> str:
-    return uuid.uuid4().hex[:12]
+    # CR2 (agent runtime) fix: was ``hex[:12]`` = 48 bits. The
+    # ``_active_turns`` registry (and the budget hook's
+    # ``client_cell.turn_id`` foreign key) is keyed on this id;
+    # birthday-bound 50% collision arrived at ~16M turns. With 64
+    # bits, 50% collision is ~4B turns — well past the lifetime of
+    # any single mimir process. The id is a key, not a display
+    # string, so the brevity-vs-collision trade-off favors safety.
+    return uuid.uuid4().hex[:16]
 
 
 def make_process_session_id() -> str:

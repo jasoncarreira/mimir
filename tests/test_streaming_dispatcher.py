@@ -121,7 +121,12 @@ def test_first_tool_use_flushes_plan_and_transitions_phase():
         _assistant(ToolUseBlock(id="t1", name="Read", input={})),
     )
     assert plan == "**Plan:** I'll do X"
-    assert state.streamed_plan is True
+    # CR2 fix: ``streamed_plan`` is now set in ``observe()`` after the
+    # bridge confirms ``sent=True``, NOT in ``advance_state``. The
+    # state machine returns the plan-to-flush; whether it actually
+    # gets delivered is a separate concern from the directive parser
+    # / bridge send. ``observe()`` flips the flag on success.
+    assert state.streamed_plan is False
     assert state.phase == "post_tool"
 
 
