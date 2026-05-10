@@ -520,3 +520,85 @@ async def test_wiki_backlinks_hook_handles_missing_pre_query_snapshot(tmp_path: 
     await hook.finalize(ctx, _make_event(), _make_record())
     # Regen ran (because empty snapshot != current state).
     assert (wiki / "orphans.md").exists()
+
+
+# ─── PR #110 review-followup: SubagentLifecycleHook cross-turn ─────────
+
+
+@pytest.mark.asyncio
+async def test_subagent_lifecycle_hook_records_task_description_across_turns():
+    """PR #110 review-followup: ``SubagentLifecycleHook`` stores
+    task_descriptions on a process-level OrderedDict (LRU, capped at
+    4096) so background-spawned subagents that complete in a LATER
+    turn (the common case per ``subagent_defs.py``: ``background=True``)
+    surface the description in the inbox push instead of None.
+
+    This test fires TaskStartedMessage in turn 1, then
+    TaskNotificationMessage in turn 2 (different ctx, different
+    task_descriptions dict). Pre-fix the lookup returned None.
+    Post-fix the hook's own registry carries the description."""
+    from types import SimpleNamespace
+    from claude_agent_sdk import (
+        TaskNotificationMessage, TaskStartedMessage,
+    )
+    from mimir.subagent_inbox import SubagentInbox
+    from mimir.turn_hooks import SubagentLifecycleHook
+
+    inbox = SubagentInbox()
+    hook = SubagentLifecycleHook(inbox)
+
+    # Turn 1: subagent starts with description.
+    ctx1 = _make_ctx()
+    event1 = _make_event()
+    started = TaskStartedMessage(
+        subtype="task_started",
+        data={},
+        task_id="task-xyz",
+        description="implement the feature",
+        uuid="u-task-xyz",
+        session_id="s",
+    )
+    await hook.on_message(ctx1, event1, started)
+    # Per-turn ctx dict has it.
+    assert ctx1.task_descriptions.get("task-xyz") == "implement the feature"
+
+    # Turn 2: completion arrives; ctx is fresh (different dict).
+    ctx2 = _make_ctx()
+    event2 = _make_event()
+    assert "task-xyz" not in ctx2.task_descriptions  # fresh ctx
+    notif = TaskNotificationMessage(
+        subtype="task_notification",
+        data={},
+        task_id="task-xyz",
+        status="completed",
+        output_file="",
+        summary="done",
+        uuid="u-task-xyz-2",
+        session_id="s",
+    )
+    await hook.on_message(ctx2, event2, notif)
+
+    # Inbox push carries the description from the hook-level registry,
+    # NOT from ctx2.task_descriptions (which is empty).
+    pushed = await inbox.drain("c-1")
+    assert len(pushed) == 1
+    assert pushed[0].description == "implement the feature"
+
+
+def test_subagent_lifecycle_hook_lru_cap_evicts_oldest():
+    """Process-level dict is capped at _TASK_DESC_LRU_CAP (4096).
+    Once full, oldest-by-last-access is evicted."""
+    from mimir.turn_hooks import SubagentLifecycleHook
+    from mimir.subagent_inbox import SubagentInbox
+
+    hook = SubagentLifecycleHook(SubagentInbox())
+    # Set the cap to a tractable value for testing.
+    hook._TASK_DESC_LRU_CAP = 5
+    for i in range(7):
+        hook._record_task_description(f"task-{i}", f"desc-{i}")
+    # Newest 5 survive; oldest 2 evicted.
+    assert "task-0" not in hook._task_descriptions
+    assert "task-1" not in hook._task_descriptions
+    assert "task-6" in hook._task_descriptions
+    assert hook._task_descriptions.get("task-2") == "desc-2"
+    assert len(hook._task_descriptions) == 5
