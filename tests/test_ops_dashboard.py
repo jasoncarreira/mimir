@@ -98,11 +98,16 @@ def test_build_dashboard_payload_skips_malformed_lines(tmp_path: Path):
 
 
 def test_build_dashboard_payload_respects_cutoff(tmp_path: Path):
-    """Events older than the cutoff are dropped."""
+    """Events older than the cutoff are dropped. File ordering is
+    chronological (oldest first) per production reality verified by
+    trace-further #3 — the ``_load_events`` tail-read breaks early on
+    cutoff crossings, so out-of-order test data would mask in-window
+    records."""
     log = tmp_path / "events.jsonl"
     _write_events(log, [
-        {"timestamp": _ts(0.5), "type": "event_queued", "trigger": "user_message", "channel_id": "c1"},
+        # Oldest first.
         {"timestamp": _ts(50), "type": "event_queued", "trigger": "scheduled_tick", "channel_id": "c1"},
+        {"timestamp": _ts(0.5), "type": "event_queued", "trigger": "user_message", "channel_id": "c1"},
     ])
     payload = build_dashboard_payload(log, days=7)
     assert payload["summary"]["events_queued"] == 1
@@ -449,11 +454,13 @@ async def test_route_ops_with_missing_events_log_still_serves(web_app, aiohttp_c
 
 @pytest.mark.asyncio
 async def test_route_ops_days_param_filters_window(web_app, aiohttp_client):
-    """Events older than the requested window are excluded."""
+    """Events older than the requested window are excluded.
+    Chronological file order (oldest first) — see
+    test_build_dashboard_payload_respects_cutoff."""
     app, _, events_log = web_app
     _write_events(events_log, [
-        {"timestamp": _ts(0.5), "type": "event_queued", "trigger": "user_message"},
         {"timestamp": _ts(50), "type": "event_queued", "trigger": "scheduled_tick"},
+        {"timestamp": _ts(0.5), "type": "event_queued", "trigger": "user_message"},
     ])
     client = await aiohttp_client(app)
     resp = await client.get("/api/ops?days=1")

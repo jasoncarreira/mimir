@@ -18,13 +18,13 @@ recomputes from events.jsonl on every request — no caching.
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
 from aiohttp import web
 
+from ._jsonl_tail import tail_jsonl_records
 from .ops_dashboard import (
     build_dashboard_payload_async,
     parse_days_param,
@@ -45,23 +45,34 @@ def _load_viewer_html() -> str:
     return _TURN_VIEWER_HTML
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    """Read every well-formed JSON line; silently skip malformed records."""
+def _read_jsonl(path: Path, *, max_records: int = 5000) -> list[dict[str, Any]]:
+    """Read up to ``max_records`` records from the tail of ``path``.
+
+    Pre-2026-05-10 this forward-read the entire file synchronously per
+    HTTP request. Combined with the turn-viewer polling every 5s and
+    files capped at ~250 MB (turns) / ~300 MB (events), the loop got
+    pinned re-parsing hundreds of MB per cycle. Now we tail-read up
+    to a soft cap; older records past the cap are silently dropped
+    from the response. The default ``max_records=5000`` matches the
+    config-default cap for turns/events kept on disk, so on a normally-
+    trimmed file the response shape is unchanged.
+
+    Output is in chronological order (oldest-first) — matches the
+    forward-read shape callers used to expect.
+
+    Returns [] for missing or unreadable files.
+    """
     if not path.is_file():
         return []
     out: list[dict[str, Any]] = []
     try:
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        for record in tail_jsonl_records(path):
+            out.append(record)
+            if len(out) >= max_records:
+                break
     except OSError:
         return []
+    out.reverse()  # tail yields newest-first; restore chronological
     return out
 
 
