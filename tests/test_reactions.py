@@ -50,6 +50,60 @@ def test_slack_alias_normalized():
     assert classify_reaction("party_parrot") == "neutral"
 
 
+def test_slack_alias_map_covers_positive_glyphs():
+    """Regression: every glyph in ``_POSITIVE_GLYPHS`` should be reachable
+    by at least one Slack alias name. Otherwise a Slack-bridged reaction
+    arrives as the alias (e.g. ``clap``), normalize_emoji passes it
+    through unchanged (no map entry), and classify_reaction falls to
+    ``neutral`` because ``"clap"`` isn't in the unicode-glyph set —
+    silently mis-classifying an obviously-positive reaction.
+    """
+    from mimir.reactions import (
+        _POSITIVE_GLYPHS, _SLACK_ALIAS_TO_GLYPH, classify_reaction,
+    )
+    # Map glyph → set of aliases that point at it.
+    glyph_to_aliases: dict[str, set[str]] = {}
+    for alias, glyph in _SLACK_ALIAS_TO_GLYPH.items():
+        glyph_to_aliases.setdefault(glyph, set()).add(alias)
+
+    missing = [g for g in _POSITIVE_GLYPHS if g not in glyph_to_aliases]
+    assert not missing, (
+        f"_POSITIVE_GLYPHS without any alias in _SLACK_ALIAS_TO_GLYPH: "
+        f"{missing} — Slack reactions matching these glyphs would "
+        f"mis-classify as neutral"
+    )
+
+    # Spot-check a handful of newly-added aliases classify positive end-
+    # to-end (alias → glyph → polarity).
+    for alias in ("clap", "raised_hands", "ok_hand", "smile", "heart_eyes",
+                  "muscle", "sparkles", "dart"):
+        assert classify_reaction(alias) == "positive", (
+            f"expected {alias!r} to classify as positive"
+        )
+
+
+def test_slack_alias_map_covers_negative_glyphs():
+    """Regression mirror of the positive case."""
+    from mimir.reactions import (
+        _NEGATIVE_GLYPHS, _SLACK_ALIAS_TO_GLYPH, classify_reaction,
+    )
+    glyph_to_aliases: dict[str, set[str]] = {}
+    for alias, glyph in _SLACK_ALIAS_TO_GLYPH.items():
+        glyph_to_aliases.setdefault(glyph, set()).add(alias)
+
+    missing = [g for g in _NEGATIVE_GLYPHS if g not in glyph_to_aliases]
+    assert not missing, (
+        f"_NEGATIVE_GLYPHS without any alias in _SLACK_ALIAS_TO_GLYPH: "
+        f"{missing}"
+    )
+
+    for alias in ("angry", "disappointed", "no_good", "rotating_light",
+                  "octagonal_sign", "confounded"):
+        assert classify_reaction(alias) == "negative", (
+            f"expected {alias!r} to classify as negative"
+        )
+
+
 # ─── algedonic surfacing — per-event polarity override ───────────
 
 
