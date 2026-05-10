@@ -214,6 +214,13 @@ class _InProcessSaga:
         from saga.core import hybrid_retrieve
         from saga.config import get_config
 
+        # Start the latency clock BEFORE ``_ensure_ready`` so the first
+        # query after process start (which lazy-loads the embedding
+        # provider, opens the SQLite pool, applies migrations) reports
+        # honest cold-load latency. Previously the clock started inside
+        # the try-block at line 227, hiding ensure_ready cost (which can
+        # be hundreds of ms on a cold start) from observability.
+        t0 = time.time()
         await self._ensure_ready()
         clamped = _clamp_query(query)
         # Wrap the entire body — including get_config(), the retrieve
@@ -224,7 +231,6 @@ class _InProcessSaga:
         # unexpected atom shape, etc. all fold into this path.
         try:
             cfg = get_config()
-            t0 = time.time()
             result = await hybrid_retrieve(
                 clamped, mode=mode, top_k=top_k,
                 two_tier=True, context=context, session_id=session_id,
