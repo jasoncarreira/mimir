@@ -1653,9 +1653,21 @@ class Agent:
             return None
         boundaries: list[dict] = []
         if self._saga is not None:
-            boundaries = await self._saga.recent_session_boundaries(
-                channel_id=channel_id, count=count,
-            )
+            # CR2-#3: a transient SAGA outage at prompt-assembly time
+            # must not crash the turn — degrade to the local-mirror
+            # fallback the same way an empty result does. Mirrors the
+            # try/except pattern in _assemble_self_state_block.
+            try:
+                boundaries = await self._saga.recent_session_boundaries(
+                    channel_id=channel_id, count=count,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "_assemble_session_summaries: SAGA "
+                    "recent_session_boundaries failed; falling back to "
+                    "local mirror"
+                )
+                boundaries = []
         if not boundaries:
             boundaries = self._session_boundary_log.recent(
                 channel_id=channel_id, count=count,
