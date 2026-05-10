@@ -140,7 +140,7 @@ class FakeSaga:
             _Call("recent_session_boundaries", {"channel_id": channel_id, "count": count})
         )
         if "recent_session_boundaries" in self.fail_on:
-            return []
+            raise SagaError("synthetic recent_session_boundaries failure")
         out = list(self.recent_boundaries)
         if channel_id is not None:
             out = [b for b in out if b.get("channel_id") == channel_id]
