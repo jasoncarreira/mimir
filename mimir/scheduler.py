@@ -725,39 +725,60 @@ class Scheduler:
         """Wipe + re-discover + re-register. Sync — runs on the
         APScheduler thread or via ``to_thread`` from async callers.
 
-        **Atomic dict swap (PR #107).** Previously this cleared
-        ``self._pollers = {}`` before re-populating, so an in-flight
-        ``_fire_poller`` callback that hit the dict mid-reload would
-        see an empty dict, log ``poller_fire_dropped``, and skip the
-        fire — even though the same poller was about to be re-registered.
-        Build the new dict locally and assign once at the end so the
-        reader sees either the old dict or the new dict, never an
-        intermediate state. Atomic in CPython (single-attribute reassign).
+        **Per-entry pre-population, not end-of-loop swap (PR #107
+        review fix).** A previous version of this function built a
+        new dict locally and swapped at the end. That left an
+        add-then-swap window: ``add_job`` registers the poller's
+        callback BEFORE the dict swap, so a cron fire that landed in
+        that window would look up ``self._pollers.get(name)`` against
+        the OLD dict, miss the freshly-registered poller, and emit a
+        spurious ``poller_fire_dropped``.
+
+        The fix flips the order: for each newly-validated poller,
+        we (1) write it into ``self._pollers[name]`` first, then (2)
+        call ``add_job``. A fire that lands between (2)'s callback
+        registration and the next statement now finds the poller in
+        the dict. Stale entries (pollers that disappeared) are
+        cleaned up before the install loop, against the discovered
+        name set, so the live dict stays an accurate snapshot
+        throughout.
         """
         if self._pollers_dir is None:
             return 0
-        # Drop existing poller jobs by id-prefix. APScheduler's
-        # remove_job is keyed on job-id; a fire callback that's
-        # mid-execution finishes against the OLD self._pollers dict —
-        # safe because we don't reassign until the new dict is ready.
+
+        # Phase 1: discover. ``list(...)`` materializes the iterator so
+        # we know all pollers' names up-front for the stale-entry
+        # cleanup below. Discovery is sync and bounded by the number
+        # of skills' ``pollers.json`` files (~10s, not 1000s).
+        state_root = (
+            self._home / "state" / "pollers"
+            if self._home is not None else None
+        )
+        discovered = list(
+            discover_pollers(self._pollers_dir, state_root=state_root)
+        )
+        new_names = {p.name for p in discovered}
+
+        # Phase 2: drop stale APScheduler jobs and dict entries.
+        # Removed before install so a fire that lands during this loop
+        # against a removed poller correctly logs poller_fire_dropped
+        # (the poller really IS gone).
         for job in list(self._scheduler.get_jobs()):
             if job.id.startswith("poller:"):
                 try:
                     self._scheduler.remove_job(job.id)
                 except Exception:  # noqa: BLE001 — JobLookupError, fine
                     pass
+        for name in list(self._pollers):
+            if name not in new_names:
+                del self._pollers[name]
 
-        new_pollers: dict[str, PollerConfig] = {}
-        # Filing-rules-aligned: cursor files live under
-        # ``<home>/state/pollers/<name>/``, NOT inside the skill dir.
-        # Skill dir is the deployable artifact (resettable via
-        # seed_skills); state/pollers/ is the persistent runtime data.
-        # When ``self._home`` is None (tests), fall back to skill_dir.
-        state_root = (
-            self._home / "state" / "pollers"
-            if self._home is not None else None
-        )
-        for poller in discover_pollers(self._pollers_dir, state_root=state_root):
+        # Phase 3: validate cron + register. Pre-populate the dict
+        # entry BEFORE add_job so a fire landing during job
+        # registration finds the poller. Validation failure (bad cron)
+        # leaves the dict unchanged for that name.
+        installed = 0
+        for poller in discovered:
             try:
                 trigger = CronTrigger.from_crontab(poller.cron, timezone=UTC)
             except (ValueError, KeyError) as exc:
@@ -766,6 +787,10 @@ class Scheduler:
                     poller.name, poller.cron, exc,
                 )
                 continue
+            # Pre-populate FIRST. add_job below registers the
+            # callback; if APScheduler fires immediately, the
+            # callback's lookup succeeds.
+            self._pollers[poller.name] = poller
             self._scheduler.add_job(
                 self._fire_poller,
                 trigger=trigger,
@@ -785,12 +810,7 @@ class Scheduler:
                 # discovering it via missing data.
                 misfire_grace_time=5,
             )
-            new_pollers[poller.name] = poller
-        # Atomic swap — readers either see the OLD dict (containing the
-        # poller they just looked up) or the NEW dict (containing it
-        # again because reload re-installed). Never an empty intermediate.
-        self._pollers = new_pollers
-        installed = len(new_pollers)
+            installed += 1
         log.info("pollers reloaded: %d installed from %s", installed, self._pollers_dir)
         return installed
 
@@ -808,9 +828,12 @@ class Scheduler:
         ``poller_concurrency_throttled`` event so the operator sees
         the saturation.
 
-        Always logs ``poller_fire_dropped`` when the registry lookup
-        misses (the dict is now atomically-swapped during reload, so
-        this branch fires only on a genuinely-removed poller).
+        Logs ``poller_fire_dropped`` when the registry lookup misses.
+        Per-entry pre-population in ``_reinstall_pollers`` (PR #107
+        review fix) makes this branch reliable: it only fires when the
+        poller has genuinely been removed (skill uninstalled, config
+        invalidated). Was previously also reachable transiently during
+        reload due to an add-then-swap race; that race is now closed.
         """
         poller = self._pollers.get(poller_name)
         if poller is None:
@@ -821,30 +844,24 @@ class Scheduler:
             )
             return
 
-        # Probe semaphore availability without acquiring; if it'd block
-        # for >5s, emit the throttle event so saturation is visible.
-        # Then await acquisition (no timeout — pollers should always
-        # eventually run).
+        # Acquire under a 5s timeout; emit the throttle event once if
+        # we time out, then re-acquire without a timeout. Single
+        # ``wait_for`` instead of locked()-probe-then-acquire avoids
+        # the small race where the probe sees locked, the slot frees,
+        # and acquire succeeds — emitting no throttle event despite
+        # the contention. (PR #107 review nit.)
         wait_start = time.monotonic()
-        if self._poller_semaphore.locked():
-            # All slots taken — await with periodic throttle warnings.
-            throttled = False
-            while True:
-                try:
-                    await asyncio.wait_for(
-                        self._poller_semaphore.acquire(), timeout=5.0,
-                    )
-                    break
-                except asyncio.TimeoutError:
-                    if not throttled:
-                        await log_event(
-                            "poller_concurrency_throttled",
-                            poller=poller_name,
-                            cap=self._poller_concurrency_cap,
-                            wait_seconds=time.monotonic() - wait_start,
-                        )
-                        throttled = True
-        else:
+        try:
+            await asyncio.wait_for(
+                self._poller_semaphore.acquire(), timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            await log_event(
+                "poller_concurrency_throttled",
+                poller=poller_name,
+                cap=self._poller_concurrency_cap,
+                wait_seconds=time.monotonic() - wait_start,
+            )
             await self._poller_semaphore.acquire()
 
         try:
