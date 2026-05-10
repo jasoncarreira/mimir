@@ -6,6 +6,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from mimir.usage_stats import (
     UsageWindow,
     aggregate,
@@ -389,6 +391,144 @@ def test_absolute_threshold_takes_precedence_when_both_fire(tmp_path: Path):
     alert = evaluate_cost_rate(rep, hourly_limit_usd=10.0, spike_ratio=3.0)
     assert alert is not None
     assert alert.reason == "absolute_hourly_limit"
+
+
+# ─── CR2-#8: baseline divisor clamps to file's actual coverage ───────
+
+
+def test_aggregate_records_oldest_record_ts(tmp_path: Path):
+    """``UsageReport.oldest_record_ts`` carries the timestamp of the
+    oldest turn we walked. ``evaluate_cost_rate`` uses this to clamp
+    the baseline divisor on partial-week installs."""
+    from mimir.usage_stats import aggregate
+
+    path = tmp_path / "turns.jsonl"
+    _write_turns(path, [
+        _turn(hours_ago=36, cost=1.0),    # oldest within 7d window
+        _turn(hours_ago=0.1, cost=2.0),
+    ])
+    rep = aggregate(path)
+    assert rep.oldest_record_ts is not None
+    age_hours = (
+        datetime.now(tz=timezone.utc) - rep.oldest_record_ts
+    ).total_seconds() / 3600.0
+    assert 35 < age_hours < 37  # ~36h ± a fudge for test runtime
+
+
+def test_aggregate_oldest_record_ts_none_for_empty_file(tmp_path: Path):
+    from mimir.usage_stats import aggregate
+
+    path = tmp_path / "turns.jsonl"
+    path.write_text("", encoding="utf-8")
+    rep = aggregate(path)
+    assert rep.oldest_record_ts is None
+
+
+def test_evaluate_clamps_divisor_on_partial_week_data(tmp_path: Path):
+    """CR2-#8: pre-fix, a fresh install with $5 spent over 36h would
+    compute baseline = $5 / 168 = $0.030/hr (vs. the actual $5/36 =
+    $0.139/hr). The 5× underestimate makes the spike check fire on
+    normal-rate sessions during the install's first week. Post-fix,
+    the divisor clamps to ``min(baseline_window_hours, hours_since_oldest)``,
+    so a 36h-deep file uses divisor=36 and the baseline matches reality."""
+    from mimir.usage_stats import aggregate, evaluate_cost_rate
+
+    path = tmp_path / "turns.jsonl"
+    _write_turns(path, [
+        _turn(hours_ago=36, cost=5.0),     # spent $5 36h ago
+        _turn(hours_ago=0.1, cost=6.0),    # last hour: $6/hr
+    ])
+    rep = aggregate(path)
+    alert = evaluate_cost_rate(
+        rep,
+        spike_ratio=3.0,
+        spike_floor_usd_per_hour=None,  # disable floor so we test only the divisor
+    )
+    # With the clamp, baseline = $5/36 ≈ $0.139/hr → 3× threshold ≈ $0.42/hr.
+    # rate_now = $6/hr, well above. Alert fires.
+    # WITHOUT the clamp, baseline = $5/168 ≈ $0.030/hr → 3× ≈ $0.09/hr.
+    # rate_now = $6/hr also above. Both paths trigger here BUT the
+    # threshold value is what proves the clamp is active.
+    assert alert is not None
+    assert alert.reason == "spike_ratio"
+    # Threshold = 3 × baseline_rate. With clamp: ~0.42; without: ~0.09.
+    # Tight check: > 0.30 means we used the clamped divisor.
+    assert alert.threshold_usd_per_hour > 0.30, (
+        f"baseline divisor not clamped — threshold {alert.threshold_usd_per_hour}"
+        f" looks like 7d-divisor ($5/168) instead of 36h-divisor ($5/36)"
+    )
+    assert alert.baseline_usd_per_hour is not None
+    assert alert.baseline_usd_per_hour > 0.10  # ~0.139 with clamp
+
+
+def test_evaluate_defers_spike_check_under_1h_coverage(tmp_path: Path):
+    """CR2-#8 corner case: with < 1h of file coverage, the baseline
+    signal is too noisy to bother. Spike check returns None to defer
+    the alert until enough data accumulates. Prevents the "fresh
+    install fires spike on first turn" failure mode."""
+    from mimir.usage_stats import aggregate, evaluate_cost_rate
+
+    path = tmp_path / "turns.jsonl"
+    _write_turns(path, [
+        _turn(hours_ago=0.5, cost=1.0),    # 30 minutes of coverage
+        _turn(hours_ago=0.1, cost=10.0),
+    ])
+    rep = aggregate(path)
+    alert = evaluate_cost_rate(
+        rep,
+        spike_ratio=3.0,
+        spike_floor_usd_per_hour=None,
+    )
+    # Even though rate_now=$10/hr is huge relative to any plausible
+    # baseline, < 1h of coverage means we defer.
+    assert alert is None
+
+
+def test_evaluate_clamps_to_oldest_seen_in_window(tmp_path: Path):
+    """The divisor is the age of the oldest record we accumulated,
+    clamped to ``baseline_window_hours``. With records at 8d and 6d
+    ago, the 8d record breaks the tail-walk (older than 7d cutoff)
+    so ``oldest_record_ts`` == the 6d record. divisor = 144h, not
+    168h — the clamp uses the file's actual coverage within the
+    window, not the nominal window size."""
+    from mimir.usage_stats import aggregate, evaluate_cost_rate
+
+    path = tmp_path / "turns.jsonl"
+    _write_turns(path, [
+        _turn(hours_ago=24 * 8, cost=1.68),   # outside 7d — break fires here
+        _turn(hours_ago=24 * 6, cost=1.68),   # oldest within 7d window
+        _turn(hours_ago=0.1, cost=5.0),
+    ])
+    rep = aggregate(path)
+    alert = evaluate_cost_rate(rep, spike_ratio=3.0)
+    assert alert is not None
+    assert alert.reason == "spike_ratio"
+    # 7d window total = 1.68 + 5.0 = 6.68 (the 0.1h record is in both
+    # 1h and 7d windows). divisor = 144 (clamped from 168 to age of
+    # the 6d-ago oldest record). baseline = 6.68 / 144 ≈ 0.0464.
+    # Without the clamp, this would be 6.68 / 168 ≈ 0.0398.
+    assert alert.baseline_usd_per_hour == pytest.approx(0.046, abs=0.005)
+
+
+def test_evaluate_baseline_unchanged_when_oldest_record_ts_unknown(tmp_path: Path):
+    """Defensive: if ``oldest_record_ts`` is None (legacy code path,
+    bench fixtures, etc.), the divisor stays at the nominal window
+    — no clamp. Pre-CR2-#8 behavior preserved as the fallback."""
+    from mimir.usage_stats import (
+        UsageReport, UsageWindow, evaluate_cost_rate,
+    )
+
+    rep = UsageReport(
+        windows=[
+            UsageWindow(label="Last 1h", total_cost_usd=5.0, turns=1),
+            UsageWindow(label="Last 7d", total_cost_usd=6.68, turns=2),
+        ],
+        oldest_record_ts=None,
+    )
+    alert = evaluate_cost_rate(rep, spike_ratio=3.0)
+    assert alert is not None
+    # divisor = 168 (no clamp). baseline = 6.68/168 ≈ 0.0398.
+    assert alert.baseline_usd_per_hour == pytest.approx(0.0398, abs=0.001)
 
 
 def test_render_includes_alert_annotation(tmp_path: Path):
