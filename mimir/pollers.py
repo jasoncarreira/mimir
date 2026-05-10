@@ -50,7 +50,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from .event_logger import log_event
 from .models import AgentEvent
