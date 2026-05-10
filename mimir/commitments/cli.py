@@ -129,6 +129,24 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
         "--confidence", type=float, default=1.0,
         help="0-1 confidence (1.0 for manual entries).",
     )
+    # PR #120 review finding #5: forward-compat fields the model
+    # carries but the CLI didn't expose. Used for operator backfill
+    # when a Phase 2 extraction fails (the canonical recovery path).
+    add_p.add_argument(
+        "--dedupe-key", type=str, default=None,
+        help="Override the auto-generated dedupe key. Use when "
+             "backfilling from a failed extraction and the original "
+             "key needs to be preserved for idempotency.",
+    )
+    add_p.add_argument(
+        "--source-turn-id", type=str, default=None,
+        help="Turn ID that produced this commitment (for traceability "
+             "back to the originating turn).",
+    )
+    add_p.add_argument(
+        "--saga-session-id", type=str, default=None,
+        help="Saga session id the commitment was extracted from.",
+    )
 
     complete_p = sub.add_parser(
         "complete", help="Mark a commitment completed.",
@@ -145,9 +163,18 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
     )
     _add_home_flag(snooze_p)
     snooze_p.add_argument("id", type=str)
-    snooze_p.add_argument(
-        "--until-iso", type=str, required=True,
-        help="New earliest-deliver time as ISO-8601.",
+    # PR #120 review nit: ISO is painful to type for the canonical
+    # "snooze 7 days" case. ``--for-days`` is the relative shortcut;
+    # ``--until-iso`` stays for absolute targets. Exactly one is
+    # required.
+    snooze_mut = snooze_p.add_mutually_exclusive_group(required=True)
+    snooze_mut.add_argument(
+        "--until-iso", type=str, default=None,
+        help="New earliest-deliver time as ISO-8601 (absolute).",
+    )
+    snooze_mut.add_argument(
+        "--for-days", type=float, default=None,
+        help="Snooze for N days from now (relative; fractional OK).",
     )
     snooze_p.add_argument("--reason", type=str, default=None)
 
@@ -161,9 +188,17 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
     trim_p = sub.add_parser(
         "trim",
         help="Drop terminal records older than the retention window "
-             "(30 days). Active records always kept.",
+             "(30 days). Active records always kept. Default: dry-run "
+             "(print what would be dropped); pass --apply to rewrite.",
     )
     _add_home_flag(trim_p)
+    # PR #120 review finding #4b: trim is destructive + operator-
+    # invoked. Default behavior is preview-only; ``--apply`` opt-in
+    # required to actually rewrite the file.
+    trim_p.add_argument(
+        "--apply", action="store_true",
+        help="Actually drop terminal records (default: dry-run).",
+    )
 
 
 # ─── Subcommand handlers ───────────────────────────────────────────
@@ -220,6 +255,9 @@ def cmd_add(args: argparse.Namespace) -> int:
         due_window_end_unix=end,
         confidence=args.confidence,
         created_at_unix=time.time(),
+        dedupe_key=args.dedupe_key or "",
+        source_turn_id=args.source_turn_id,
+        saga_session_id=args.saga_session_id,
     )
     saved = asyncio.run(store.add(rec))
     print(f"added {saved.id} ({saved.kind}, status={saved.status})")
@@ -243,7 +281,11 @@ def cmd_snooze(args: argparse.Namespace) -> int:
     if args.id not in state:
         print(f"error: commitment {args.id!r} not found", file=sys.stderr)
         return 2
-    until_unix = _parse_iso(args.until_iso)
+    # Mutually-exclusive group already enforces exactly one of these.
+    if args.for_days is not None:
+        until_unix = time.time() + args.for_days * 86400
+    else:
+        until_unix = _parse_iso(args.until_iso)
     asyncio.run(store.snooze(
         args.id, until_unix=until_unix, reason=args.reason,
     ))
@@ -263,10 +305,43 @@ def cmd_dismiss(args: argparse.Namespace) -> int:
 
 
 def cmd_trim(args: argparse.Namespace) -> int:
+    """``mimir commitments trim`` — preview/apply terminal record purge.
+
+    PR #120 review finding #4b: default is dry-run (preview only).
+    Operators opt in to the destructive rewrite with ``--apply``.
+    """
     store = _resolve_store(args)
-    dropped = asyncio.run(store.trim())
-    print(f"trimmed {dropped} terminal records older than "
-          f"{store.terminal_retention_days} days")
+    if args.apply:
+        dropped = asyncio.run(store.trim())
+        print(f"trimmed {dropped} terminal records older than "
+              f"{store.terminal_retention_days} days")
+        return 0
+    # Dry-run: replay state, identify what WOULD be dropped, print it.
+    import time as _time
+    now = _time.time()
+    retention_secs = store.terminal_retention_days * 86400
+    state = store.current_state()
+    candidates = []
+    for rid, rec in state.items():
+        if not rec.is_terminal():
+            continue
+        terminal_at = (
+            rec.completed_at_unix
+            or rec.dismissed_at_unix
+            or rec.expired_at_unix
+            or 0.0
+        )
+        if (now - terminal_at) > retention_secs:
+            candidates.append((rid, rec))
+    if not candidates:
+        print("(dry-run) 0 terminal records older than "
+              f"{store.terminal_retention_days} days. Nothing to trim.")
+        return 0
+    print(f"(dry-run) would drop {len(candidates)} terminal records "
+          f"older than {store.terminal_retention_days} days:")
+    for rid, rec in sorted(candidates, key=lambda x: x[1].created_at_unix):
+        print(f"  {rid}  [{rec.status:9s}] {rec.kind:14s} — {rec.text}")
+    print("re-run with --apply to actually drop them.")
     return 0
 
 

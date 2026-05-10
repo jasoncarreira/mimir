@@ -341,18 +341,12 @@ async def test_trim_drops_terminal_records_older_than_retention(tmp_path: Path):
         created_at_unix=now - 40 * 86400,
     ))
     await store.complete(r_old.id)
-    # Hand-rewrite to backdate the terminal event so trim sees it as old.
-    # (The store writes its own ts_unix=time.time(); to test trim we
-    # need to manipulate the event after the fact.)
+    # Hand-rewrite to backdate the completed event so trim sees it as
+    # old. (The store writes its own at_unix=time.time(); to test trim
+    # we need to manipulate the event after the fact.)
     path = tmp_path / "c.jsonl"
-    text = path.read_text()
-    text = text.replace(
-        f'"type": "commitment_completed", "ts_unix": ',
-        f'"type": "commitment_completed", "ts_unix": ',
-    )
-    # Easier: rewrite the completed line's at_unix to be 40 days old.
     new_lines = []
-    for line in text.splitlines():
+    for line in path.read_text().splitlines():
         d = json.loads(line)
         if d.get("type") == "commitment_completed" and d.get("id") == r_old.id:
             d["at_unix"] = now - 40 * 86400
@@ -446,3 +440,199 @@ async def test_jsonl_format_is_one_event_per_line(tmp_path: Path):
     assert len(lines) == 3
     for line in lines:
         json.loads(line)  # each line is valid JSON
+
+
+# ─── PR #120 review fixes: lifecycle guards ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_transitions_from_terminal_state(tmp_path: Path):
+    """PR #120 review #1: a lifecycle event arriving for a record
+    already in a terminal state (completed/dismissed/expired) must NOT
+    silently flip the status. The VALID_TRANSITIONS adjacency rejects
+    it; the original terminal state stands."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.complete(rec.id, message_id="m-1")
+    # Late-arriving expire (the Phase 2 expire-poller scenario).
+    await store.expire(rec.id)
+
+    state = store.current_state()
+    # Still completed; expire was rejected.
+    assert state[rec.id].status == CommitmentStatus.COMPLETED.value
+    assert state[rec.id].completion_message_id == "m-1"
+    assert state[rec.id].expired_at_unix is None
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_dismiss_after_complete(tmp_path: Path):
+    """Same shape — once completed, any further transition is rejected."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.complete(rec.id)
+    await store.dismiss(rec.id, reason="too late")
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.COMPLETED.value
+    assert state[rec.id].dismiss_reason is None
+
+
+@pytest.mark.asyncio
+async def test_replay_allows_redelivery(tmp_path: Path):
+    """Self-transition DELIVERED → DELIVERED is allowed (attempt bump
+    on each delivery). The guard rejects only non-listed transitions."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.deliver(rec.id)
+    await store.deliver(rec.id)
+    await store.deliver(rec.id)
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.DELIVERED.value
+    assert state[rec.id].attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_replay_allows_resnooze(tmp_path: Path):
+    """SNOOZED → SNOOZED is allowed; pushing out further."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.snooze(rec.id, until_unix=time.time() + 86400)
+    await store.snooze(rec.id, until_unix=time.time() + 7 * 86400)
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.SNOOZED.value
+
+
+@pytest.mark.asyncio
+async def test_replay_duplicate_add_keeps_first(tmp_path: Path):
+    """PR #120 review #2: a second commitment_added for the same id
+    must NOT overwrite in-progress state. The replay keeps the first
+    add + accumulated lifecycle progress; the duplicate is a no-op."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    cid = make_commitment_id()
+    rec = await store.add(CommitmentRecord(
+        id=cid, channel_id="c1", text="original",
+    ))
+    await store.deliver(rec.id)
+    await store.deliver(rec.id)
+    # Caller-bug: adds the same id again with different text.
+    duplicate = CommitmentRecord(id=cid, channel_id="c1", text="DUPLICATE")
+    await store.add(duplicate)
+
+    state = store.current_state()
+    # Original text preserved; lifecycle progress (attempts=2) intact.
+    assert state[cid].text == "original"
+    assert state[cid].status == CommitmentStatus.DELIVERED.value
+    assert state[cid].attempts == 2
+
+
+# ─── Snooze due-window bumping (review #3) ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_snooze_bumps_end_when_start_exceeds_it(tmp_path: Path):
+    """PR #120 review #3: a snooze that pushes ``start`` past the
+    existing ``end`` must bump ``end`` so the window stays positive.
+    Without this guard, downstream surfacing would see start > end
+    and have to defensively reject."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    start = time.time()
+    end = start + 86400  # 1-day window
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+        due_window_start_unix=start,
+        due_window_end_unix=end,
+    ))
+    # Snooze 30 days out — well past the original 1-day end.
+    new_start = start + 30 * 86400
+    await store.snooze(rec.id, until_unix=new_start)
+    state = store.current_state()
+    assert state[rec.id].due_window_start_unix == new_start
+    # End bumped to new_start + 7 days (DEFAULT_SNOOZE_WINDOW_SECS).
+    assert state[rec.id].due_window_end_unix == new_start + 7 * 86400
+
+
+@pytest.mark.asyncio
+async def test_snooze_preserves_longer_existing_end(tmp_path: Path):
+    """If the existing end is already further out than start + default
+    window, leave it alone — don't shorten the window."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    start = time.time()
+    end = start + 365 * 86400  # 1-year window
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+        due_window_start_unix=start,
+        due_window_end_unix=end,
+    ))
+    new_start = start + 30 * 86400
+    await store.snooze(rec.id, until_unix=new_start)
+    state = store.current_state()
+    # End untouched (still the original 1-year mark, which is further
+    # out than new_start + 7 days).
+    assert state[rec.id].due_window_end_unix == end
+
+
+@pytest.mark.asyncio
+async def test_snooze_sets_end_when_none(tmp_path: Path):
+    """If the original record had no end (open-ended), snooze sets one
+    so the post-snooze record is well-formed."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+        # No due_window_start_unix / due_window_end_unix.
+    ))
+    new_start = time.time() + 86400
+    await store.snooze(rec.id, until_unix=new_start)
+    state = store.current_state()
+    assert state[rec.id].due_window_start_unix == new_start
+    assert state[rec.id].due_window_end_unix == new_start + 7 * 86400
+
+
+# ─── Trim fsync (review #4a) ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_trim_fsyncs_before_replace(tmp_path: Path, monkeypatch):
+    """PR #120 review #4a: trim must flush + fsync the tmp file before
+    os.replace, so the durability claim ("interrupted trim never
+    leaves the store half-written") actually holds. Monkeypatch
+    os.fsync to verify it's called on the tmp file's fd."""
+    import os as _os
+    fsynced_fds: list[int] = []
+    original_fsync = _os.fsync
+
+    def tracking_fsync(fd: int) -> None:
+        fsynced_fds.append(fd)
+        original_fsync(fd)
+
+    monkeypatch.setattr(_os, "fsync", tracking_fsync)
+
+    store = CommitmentsStore(
+        path=tmp_path / "c.jsonl",
+        terminal_retention_days=30,
+    )
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.complete(rec.id)
+    # Backdate so trim picks it up.
+    path = tmp_path / "c.jsonl"
+    lines = []
+    for line in path.read_text().splitlines():
+        d = json.loads(line)
+        if d.get("type") == "commitment_completed":
+            d["at_unix"] = now - 40 * 86400
+        lines.append(json.dumps(d))
+    path.write_text("\n".join(lines) + "\n")
+
+    dropped = await store.trim(now_unix=now)
+    assert dropped == 1
+    # fsync was called at least once during the trim's write path.
+    assert len(fsynced_fds) >= 1

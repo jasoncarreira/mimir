@@ -76,6 +76,61 @@ TERMINAL_STATUSES = frozenset({
 })
 
 
+# Adjacency map for status transitions. Replay consults this when
+# applying a lifecycle event to a known record — any transition not
+# listed here is rejected (warning + skip) so the lifecycle invariant
+# lives in code, not just prose. PR #120 review finding #1.
+#
+# Self-transitions are allowed for non-terminal states to model
+# "re-deliver" (each attempt bumps ``attempts``; status stays the
+# same) and "re-snooze" (push out further). Terminal states allow
+# no transitions; once completed/dismissed/expired, a record is
+# frozen.
+VALID_TRANSITIONS: dict[str, frozenset[str]] = {
+    CommitmentStatus.PENDING.value: frozenset({
+        CommitmentStatus.DELIVERED.value,
+        CommitmentStatus.COMPLETED.value,
+        CommitmentStatus.DISMISSED.value,
+        CommitmentStatus.SNOOZED.value,
+        CommitmentStatus.EXPIRED.value,
+    }),
+    CommitmentStatus.DELIVERED.value: frozenset({
+        CommitmentStatus.DELIVERED.value,  # re-deliver (attempt bump)
+        CommitmentStatus.COMPLETED.value,
+        CommitmentStatus.DISMISSED.value,
+        CommitmentStatus.SNOOZED.value,
+        CommitmentStatus.EXPIRED.value,
+    }),
+    CommitmentStatus.SNOOZED.value: frozenset({
+        CommitmentStatus.DELIVERED.value,
+        CommitmentStatus.COMPLETED.value,
+        CommitmentStatus.DISMISSED.value,
+        CommitmentStatus.SNOOZED.value,  # re-snooze (push out further)
+        CommitmentStatus.EXPIRED.value,
+    }),
+    CommitmentStatus.COMPLETED.value: frozenset(),
+    CommitmentStatus.DISMISSED.value: frozenset(),
+    CommitmentStatus.EXPIRED.value: frozenset(),
+}
+
+# Event-type → target status. Used by replay + the transition guard
+# to map an incoming lifecycle event to the status it would produce.
+EVENT_TO_TARGET_STATUS: dict[str, str] = {
+    "commitment_delivered": CommitmentStatus.DELIVERED.value,
+    "commitment_completed": CommitmentStatus.COMPLETED.value,
+    "commitment_snoozed": CommitmentStatus.SNOOZED.value,
+    "commitment_dismissed": CommitmentStatus.DISMISSED.value,
+    "commitment_expired": CommitmentStatus.EXPIRED.value,
+}
+
+
+# Default window length applied when ``snooze`` slides ``start`` past
+# the existing ``end`` (or when end is None). Matches the CLI's
+# "default end = start + 7d" convention so snooze + add stay
+# consistent. PR #120 review finding #3.
+DEFAULT_SNOOZE_WINDOW_SECS = 7 * 86400
+
+
 @dataclass
 class CommitmentRecord:
     """Replayed current state of a commitment. The store's append-only

@@ -180,7 +180,122 @@ def test_add_with_due_window(home: Path, capsys: pytest.CaptureFixture):
     assert 6.9 < diff_days < 7.1
 
 
-def test_trim_subcommand_runs(home: Path, capsys: pytest.CaptureFixture):
+def test_trim_default_is_dry_run(home: Path, capsys: pytest.CaptureFixture):
+    """PR #120 review #4b: trim defaults to dry-run; never modifies the
+    store without --apply."""
     rc = _run(["commitments", "trim"], home)
     assert rc == 0
+    out = capsys.readouterr().out
+    assert "(dry-run)" in out
+    assert "Nothing to trim" in out
+
+
+def test_trim_apply_writes(home: Path, capsys: pytest.CaptureFixture):
+    """``--apply`` actually rewrites; the dry-run path doesn't."""
+    rc = _run(["commitments", "trim", "--apply"], home)
+    assert rc == 0
     assert "trimmed 0" in capsys.readouterr().out
+
+
+def test_trim_dry_run_lists_candidates(
+    home: Path, capsys: pytest.CaptureFixture,
+):
+    """When there's something to drop, dry-run prints the id list."""
+    # Add + complete a commitment, then backdate its terminal event so
+    # trim sees it as old. Re-using the manipulation pattern from
+    # test_commitments_store.test_trim_drops_terminal_records_*.
+    import json as _json
+    import time as _time
+    _run(["commitments", "add", "--channel", "c1", "--text", "old"], home)
+    events = _read_events(home)
+    cid = events[0]["id"]
+    _run(["commitments", "complete", cid], home)
+    capsys.readouterr()
+
+    path = _commitments_file(home)
+    now = _time.time()
+    lines = []
+    for line in path.read_text().splitlines():
+        d = _json.loads(line)
+        if d.get("type") == "commitment_completed" and d.get("id") == cid:
+            d["at_unix"] = now - 40 * 86400  # 40 days old
+        lines.append(_json.dumps(d))
+    path.write_text("\n".join(lines) + "\n")
+
+    rc = _run(["commitments", "trim"], home)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "would drop 1 terminal records" in out
+    assert cid in out
+    assert "--apply" in out  # instruction to actually apply
+    # File NOT modified.
+    assert cid in path.read_text()
+
+
+def test_add_with_phase2_forward_compat_flags(
+    home: Path, capsys: pytest.CaptureFixture,
+):
+    """PR #120 review #5: --dedupe-key / --source-turn-id /
+    --saga-session-id round-trip through the JSONL store for
+    operator backfill from a failed extraction."""
+    rc = _run(
+        ["commitments", "add",
+         "--channel", "c1",
+         "--text", "X",
+         "--dedupe-key", "manual-dk-12",
+         "--source-turn-id", "t-abc",
+         "--saga-session-id", "s-xyz"],
+        home,
+    )
+    assert rc == 0
+    events = _read_events(home)
+    rec = events[0]["record"]
+    assert rec["dedupe_key"] == "manual-dk-12"
+    assert rec["source_turn_id"] == "t-abc"
+    assert rec["saga_session_id"] == "s-xyz"
+
+
+def test_snooze_for_days_relative(
+    home: Path, capsys: pytest.CaptureFixture,
+):
+    """PR #120 review nit: --for-days as ergonomic alternative to
+    --until-iso."""
+    import time as _time
+    _run(["commitments", "add", "--channel", "c1", "--text", "X"], home)
+    capsys.readouterr()
+    events = _read_events(home)
+    cid = events[0]["id"]
+    rc = _run(
+        ["commitments", "snooze", cid, "--for-days", "7"],
+        home,
+    )
+    assert rc == 0
+    events = _read_events(home)
+    snoozed = [e for e in events if e["type"] == "commitment_snoozed"]
+    assert len(snoozed) == 1
+    # until_unix ≈ now + 7 days; check within 60s tolerance.
+    expected = _time.time() + 7 * 86400
+    assert abs(snoozed[0]["until_unix"] - expected) < 60
+
+
+def test_snooze_until_iso_and_for_days_are_mutex(home: Path):
+    """argparse mutex group must reject both flags together."""
+    _run(["commitments", "add", "--channel", "c1", "--text", "X"], home)
+    events = _read_events(home)
+    cid = events[0]["id"]
+    rc = _run(
+        ["commitments", "snooze", cid,
+         "--for-days", "7",
+         "--until-iso", "2026-06-01T00:00:00Z"],
+        home,
+    )
+    assert rc != 0  # argparse exits non-zero on mutex violation
+
+
+def test_snooze_requires_at_least_one_target(home: Path):
+    """argparse mutex group with required=True must reject neither."""
+    _run(["commitments", "add", "--channel", "c1", "--text", "X"], home)
+    events = _read_events(home)
+    cid = events[0]["id"]
+    rc = _run(["commitments", "snooze", cid], home)
+    assert rc != 0

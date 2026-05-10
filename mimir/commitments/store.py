@@ -28,6 +28,9 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
+    DEFAULT_SNOOZE_WINDOW_SECS,
+    EVENT_TO_TARGET_STATUS,
+    VALID_TRANSITIONS,
     CommitmentRecord,
     CommitmentStatus,
     make_commitment_id,
@@ -190,6 +193,17 @@ class CommitmentsStore:
         if not et or not rid:
             return
         if et == "commitment_added":
+            # PR #120 review finding #2: a duplicate ``commitment_added``
+            # for an id already in records would wipe in-progress state
+            # (status, attempts, delivered_at) with the re-added baseline.
+            # First-write-wins — log + skip the duplicate.
+            if rid in records:
+                log.warning(
+                    "commitments: duplicate commitment_added for %s, "
+                    "keeping first (status=%s)",
+                    rid, records[rid].status,
+                )
+                return
             rec_data = event.get("record") or {}
             try:
                 records[rid] = CommitmentRecord(**rec_data)
@@ -206,6 +220,26 @@ class CommitmentsStore:
             # crashing the replay).
             log.debug("commitments: lifecycle event for unknown id %s", rid)
             return
+        # PR #120 review finding #1: reject transitions not in the
+        # ``VALID_TRANSITIONS`` adjacency. The common case this
+        # defends against: a late ``commitment_expired`` from the
+        # Phase 2 expire-poller arriving after the agent has already
+        # ``commitment_completed`` the same id — without the guard
+        # the status flips and ``completion_message_id`` becomes a
+        # lie. Terminal records reject everything; the lifecycle
+        # invariant lives here in code, not just in prose.
+        target_status = EVENT_TO_TARGET_STATUS.get(et)
+        if target_status is None:
+            log.debug("commitments: unknown lifecycle event type %r", et)
+            return
+        allowed = VALID_TRANSITIONS.get(rec.status, frozenset())
+        if target_status not in allowed:
+            log.warning(
+                "commitments: invalid transition %s → %s for %s; "
+                "skipping (event type %s)",
+                rec.status, target_status, rid, et,
+            )
+            return
         if et == "commitment_delivered":
             rec.status = CommitmentStatus.DELIVERED.value
             rec.delivered_at_unix = event.get("at_unix")
@@ -220,8 +254,16 @@ class CommitmentsStore:
             rec.snooze_reason = event.get("reason")
             # Slide the due window so the snoozed_until becomes the
             # new "earliest deliver" anchor for surfacing logic.
+            # PR #120 review finding #3: also bump the end so a
+            # long snooze past the current end doesn't produce an
+            # inverted window (start > end). Match the CLI's
+            # default-end shape (start + 7d).
             if event.get("until_unix") is not None:
                 rec.due_window_start_unix = event["until_unix"]
+                current_end = rec.due_window_end_unix or 0
+                min_end = event["until_unix"] + DEFAULT_SNOOZE_WINDOW_SECS
+                if current_end < min_end:
+                    rec.due_window_end_unix = min_end
         elif et == "commitment_dismissed":
             rec.status = CommitmentStatus.DISMISSED.value
             rec.dismissed_at_unix = event.get("at_unix")
@@ -336,6 +378,15 @@ class CommitmentsStore:
                         continue
                     dst.write(line if line.endswith("\n") else line + "\n")
                     kept_lines += 1
+                # PR #120 review finding #4a: flush + fsync the tmp
+                # file's contents to disk BEFORE the atomic rename.
+                # ``os.replace`` is atomic w.r.t. the directory entry,
+                # but if the host crashes after rename, the tmp file's
+                # contents may not be fully on disk yet — the original
+                # claim "interrupted trim never leaves the store
+                # half-written" needs this to hold. Page-cache → disk.
+                dst.flush()
+                os.fsync(dst.fileno())
             os.replace(tmp, self.path)
         log.info(
             "commitments trim: dropped %d records (%d events), kept %d lines",
