@@ -901,27 +901,45 @@ items for owner judgment, decisions were recorded as follows:
   page prompt for token on first access, save to localStorage. Ops
   page also gets dark-mode treatment matching the turn viewer. The
   port mapping change is in `mimirbot/compose.yml`, not this repo.
-- **Pattern C (break-early ts loops):** GATED on trace-further #3.
-  Cheap fix once verified; not worth shipping blind.
+- **Pattern C (break-early ts loops):** ~~GATED on trace-further #3~~ →
+  **SHELVED** after #3 spike showed 0 inversions across 10K events.
+  Code is correct under current load; revisit if a new producer
+  pattern emerges (see trace-further #3 below).
 - **Pattern D (default=str schema drift):** SHELVED. Effort is medium
   (custom encoder + test fixtures); urgency is low (drift fires once
   every 6-12 months when SDK ships a schema change). Cost of catching
   is real every test run; cost of missing is rare. Revisit if a silent
   shape change ever loses data.
 
-### Trace-further investigations
+### Trace-further investigations (results from 2026-05-10 spikes)
 
-- **#1 (multi-send double-credit):** SPIKE — grep turns.jsonl for
-  `send_message_count > 1` AND non-empty `saga_atom_ids`. If
-  reproducible, fix is one-line reset of `ctx.saga_atom_ids` after each
-  `send_message` feedback.
-- **#2 (saga response duplicate keys):** DEFER — only investigate if
-  #1 finds reproducible double-credit AND saga's `mark_contributions`
-  isn't idempotent.
-- **#3 (out-of-order ts in events.jsonl):** SPIKE — gates Pattern C.
-  Tail recent file, sort, count inversions. Cheap.
-- **#4 (`_assemble_session_summaries` fallback):** RESOLVED by PR #96
-  — fallback now fires on both empty result AND raise.
+- **#1 (multi-send double-credit):** ✅ **SHELVED.** 0 multi-send turns
+  across 774 turns in the live `turns.jsonl`. Every send-message turn
+  has `send_message_count == 1`. The double-credit path isn't
+  exercised in practice. Code remains theoretically vulnerable to a
+  future single turn that calls `send_message` twice, but no
+  mitigation needed today. Deferred until a real multi-send pattern
+  emerges.
+- **#2 (saga response duplicate keys):** ✅ **SHELVED.** Verified
+  against `saga/server.py:402-413` (two-tier) vs `:511-520`
+  (single-tier) — mutually exclusive branches. Two-tier returns
+  `observations + raws + triples` (no `atoms`); single-tier returns
+  `atoms + triples` (no `observations`/`raws`). The mimir-side
+  `_atoms_in_payload` defense-in-depth iteration over both keysets
+  is correct; no double-count is possible.
+- **#3 (out-of-order ts in events.jsonl):** ✅ **SHELVED.** 0 inversions
+  across the full 10,074-event live log with 10+ concurrent writers
+  (oauth_usage, saga_feedback_ctx_resolution, turn_finished,
+  quota_capture_ok, event_queued, turn_started, worker_retired,
+  saga_feedback_sent, poller_stderr, poller_complete). The asyncio
+  single-thread scheduler + `EventLogger`'s lock serialize writes
+  such that append-order matches ts-order. **Pattern C downgraded
+  from "gated investigation" to "shelved" — the break-early loops
+  are correct under current load.** A future producer that captures
+  ts before the lock acquire (e.g. a worker thread) could re-introduce
+  the risk; revisit if a new writer pattern lands.
+- **#4 (`_assemble_session_summaries` fallback):** ✅ **RESOLVED by
+  PR #96** — fallback now fires on both empty result AND raise.
 
 ### M/L design-call items
 
@@ -943,11 +961,15 @@ items for owner judgment, decisions were recorded as follows:
   `poller_misfired` events. Algedonic block aggregates negative event
   types so the surface is automatic.
 
-### Recommended ordering
+### Recommended ordering (post-spike pruning)
 
-1. CR2-#1 billing fix (critical, mechanical, ship today)
-2. Trace-further #3 (out-of-order ts) — gates Pattern C
-3. Pattern C fix (if #3 confirms reachable)
+After running the trace-further spikes, three of four investigations
+shelved with no follow-on code changes; the queue is shorter than
+originally projected:
+
+1. ~~CR2-#1 billing fix~~ — **shipped, PR #103**
+2. ~~Trace-further #3~~ — **shelved** (0 inversions; Pattern C also shelved)
+3. ~~Pattern C fix~~ — **shelved** (gated on #3)
 4. Pattern A sweep (6 sites)
 5. Pattern B (auth + UI + dark mode)
 6. CR2-#6 EventLogger trim (paired conceptually with Pattern A)
@@ -955,7 +977,7 @@ items for owner judgment, decisions were recorded as follows:
 8. Pollers concurrency cap
 9. CR2-#8 baseline divisor
 10. Scheduler.reload lock
-11. Trace-further #1 spike (may not need a fix)
+11. ~~Trace-further #1~~ — **shelved** (0 multi-send turns)
 
 Doc-only fixes for #7 / #10 / #11 fold into low-priority PRs whenever;
 not blocking.
