@@ -201,31 +201,60 @@ def _read_recent_restart_timestamps(
     within the last ``window_seconds``. Robust to corrupt JSON and
     missing files — both treated as "no recent restarts" (the
     safe-default for restart-on-stale, since refusing to restart on
-    bookkeeping failure would defeat the whole recovery path)."""
+    bookkeeping failure would defeat the whole recovery path).
+
+    PR #113 review fix (item 2 closure): merges entries from the
+    primary path AND ``_FALLBACK_RESTART_PATH`` so the rolling-
+    window guard sees restarts that landed on the fallback path
+    when the primary write failed. Pre-fix the writes were merged
+    (``_append_restart_timestamp`` writes to /tmp on primary
+    failure) but the reads only checked the primary — so a
+    persistently-broken home would still produce an unbounded
+    restart loop, exactly the thrash the guard was designed to
+    prevent. Dedup keys on ``timestamp_unix`` so the same restart
+    isn't double-counted if both paths happened to capture it.
+    """
     if now is None:
         now = time.time()
     cutoff = now - window_seconds
-    if not bookkeeping_path.exists():
-        return []
-    try:
-        text = bookkeeping_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        log.warning("bookkeeping read failed: %s; treating as empty", exc)
-        return []
-    out: list[float] = []
-    for raw in text.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
+    seen_ts: set[float] = set()
+
+    def _read_one(path: Path) -> None:
+        if not path.exists():
+            return
         try:
-            entry = json.loads(raw)
-        except json.JSONDecodeError:
-            log.warning("bookkeeping line is corrupt JSON; skipping")
-            continue
-        ts = entry.get("timestamp_unix") if isinstance(entry, dict) else None
-        if isinstance(ts, (int, float)) and ts >= cutoff:
-            out.append(float(ts))
-    return out
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            log.warning(
+                "bookkeeping read failed at %s: %s; treating as empty",
+                path, exc,
+            )
+            return
+        for raw in text.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError:
+                log.warning(
+                    "bookkeeping line is corrupt JSON in %s; skipping",
+                    path,
+                )
+                continue
+            ts = (
+                entry.get("timestamp_unix")
+                if isinstance(entry, dict) else None
+            )
+            if isinstance(ts, (int, float)) and ts >= cutoff:
+                seen_ts.add(float(ts))
+
+    _read_one(bookkeeping_path)
+    _read_one(_FALLBACK_RESTART_PATH)
+    return sorted(seen_ts)
+
+
+_FALLBACK_RESTART_PATH = Path("/tmp/mimir-health-probe-restarts.jsonl")
 
 
 def _append_restart_timestamp(
@@ -234,7 +263,18 @@ def _append_restart_timestamp(
     """Append a restart record. Returns True on success, False on any
     OSError. The caller should NOT block restart on a False return —
     a write failure here is itself a symptom of the bind-mount
-    pathology we're trying to recover from."""
+    pathology we're trying to recover from.
+
+    **CR2 (ops & observability) fix**: on primary-path failure, write
+    the same record to ``/tmp/mimir-health-probe-restarts.jsonl`` as
+    a fallback. The rolling-window guard in
+    ``_read_recent_restart_timestamps`` reads only the primary path
+    today (so persistent primary-write failure → unbounded restart
+    loop, exactly the thrash the guard was designed to prevent).
+    The fallback gives operator-visible breadcrumb trails AND, when
+    we later teach the guard to read from both paths, defends the
+    rate-limit invariant against the broken-home failure mode itself.
+    """
     if now is None:
         now = time.time()
     record = {"timestamp_unix": int(now), "ts_iso": _iso(now)}
@@ -249,6 +289,23 @@ def _append_restart_timestamp(
             "bookkeeping append failed: %s; restart will proceed anyway",
             exc,
         )
+        # CR2 fallback: write a marker to /tmp so an operator looking
+        # at a thrashing container can see the restart count even when
+        # the bind-mounted home is broken. Best-effort — if /tmp is
+        # also broken (rare), we just log and continue.
+        try:
+            with _FALLBACK_RESTART_PATH.open("a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps({**record, "fallback_path": True}) + "\n"
+                )
+            log.warning(
+                "wrote restart fallback marker to %s",
+                _FALLBACK_RESTART_PATH,
+            )
+        except OSError as fb_exc:
+            log.warning(
+                "fallback restart marker write also failed: %s", fb_exc,
+            )
         return False
 
 
@@ -359,7 +416,29 @@ def _fsync_events_log(events_log: Path) -> None:
     flush, our explanation of the restart goes missing and the
     operator sees an unexplained reboot.
 
-    A short open + fsync is cheap (microseconds) and idempotent."""
+    A short open + fsync is cheap (microseconds) and idempotent.
+
+    **POSIX semantics + virtiofs caveat (CR2-#7 doc clarification).**
+    POSIX ``fsync(2)`` flushes the **inode** referred to by the fd —
+    NOT just "this fd's writes." So a readonly-fd fsync IS standards-
+    compliant for "flush any pending writes to this file": the kernel
+    has a single page cache per inode, and fsync drives all dirty
+    pages for that inode to disk regardless of which fd opened it.
+    Linux and macOS both follow this. The original review at
+    code-review-2026-05-09.md flagged this as undefined / no-op; that
+    framing was overcautious — see the Re-grades section in the
+    review doc.
+
+    Real residual concern: virtiofs / Docker-on-macOS has weaker
+    fsync guarantees than direct-attached storage. ``fsync`` returns
+    success once the data reaches the host's filesystem driver but
+    not necessarily the disk hardware buffer. On macOS specifically,
+    full durability requires ``fcntl(F_FULLFSYNC)``. Mimir's deploy
+    target is Linux containers (where standard fsync is sufficient),
+    and the failure mode this function defends against is
+    bind-mount staleness — itself an OS / virtiofs concern. If
+    durability becomes load-bearing under macOS dev, swap the fsync
+    here for an F_FULLFSYNC equivalent."""
     try:
         fd = os.open(str(events_log), os.O_RDONLY)
     except OSError as exc:
