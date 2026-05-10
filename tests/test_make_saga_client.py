@@ -194,6 +194,44 @@ async def test_inprocess_query_delegates_and_formats(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_inprocess_query_latency_includes_ensure_ready(monkeypatch):
+    """Regression: ``latency_ms`` in the query response should include
+    time spent in ``_ensure_ready``. The clock previously started inside
+    the try-block — after the ``await self._ensure_ready()`` call — so
+    cold-start cost (lazy embedding-provider load, SQLite pool open,
+    migration apply) was invisible to latency observability. Pin the
+    fix by injecting a measurable delay into ``_ensure_ready`` and
+    asserting the reported latency reflects it.
+    """
+    import asyncio
+
+    calls: dict[str, Any] = {}
+    _install_fake_saga(monkeypatch, calls=calls)
+
+    client = _InProcessSaga()
+
+    # Replace _ensure_ready with a stub that sleeps a known amount so
+    # we can assert it shows up in latency_ms.
+    ensure_ready_delay_s = 0.05
+
+    async def _slow_ensure_ready() -> None:
+        await asyncio.sleep(ensure_ready_delay_s)
+
+    monkeypatch.setattr(client, "_ensure_ready", _slow_ensure_ready)
+
+    result = await client.query("hello")
+
+    # Latency must include the ensure_ready delay (~50ms). The actual
+    # value will be a bit higher because hybrid_retrieve + formatting
+    # also runs; floor at the delay is sufficient to prove the clock
+    # started before _ensure_ready rather than after.
+    assert result["latency_ms"] >= ensure_ready_delay_s * 1000 * 0.9, (
+        f"latency_ms={result['latency_ms']} should include "
+        f"~{ensure_ready_delay_s * 1000}ms of ensure_ready time"
+    )
+
+
+@pytest.mark.asyncio
 async def test_inprocess_query_clamps_long_input(monkeypatch):
     calls: dict[str, Any] = {}
     _install_fake_saga(monkeypatch, calls=calls)
