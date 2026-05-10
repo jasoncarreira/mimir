@@ -36,6 +36,8 @@ same way fetch_history does.
 from __future__ import annotations
 
 import logging
+
+from .event_logger import log_event
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -491,6 +493,7 @@ async def populate_from_slack(
     # block the next scheduled run. Broad except is intentional;
     # log + skip the failed half (the other half still tries).
     cursor: str | None = None
+    users_pages_completed = False
     while True:
         try:
             kwargs: dict[str, Any] = {"limit": 200}
@@ -499,7 +502,21 @@ async def populate_from_slack(
             resp = await client.users_list(**kwargs)
         except Exception as exc:  # noqa: BLE001 — best-effort scheduled job
             log.warning("populate_from_slack users_list failed: %s", exc)
+            # CR2 (memory & retrieval) fix: emit a structured event so
+            # the operator can see partial pagination. Pre-fix, page 3
+            # of 10 failing left pages 1-2 partial; merge_into_yaml
+            # didn't know it got partial data; YAML write "looked
+            # complete." Idempotency saves the next run, but operator
+            # visibility was zero.
+            await log_event(
+                "populator_partial_pagination",
+                source="slack",
+                resource="users",
+                error=f"{type(exc).__name__}: {exc}",
+                pages_seen=len(people),  # approximate — count of users so far
+            )
             break
+        # Successfully read this page.
         members = resp.get("members") or []
         for m in members:
             if not isinstance(m, dict):
@@ -529,11 +546,13 @@ async def populate_from_slack(
         meta = resp.get("response_metadata") or {}
         next_cursor = meta.get("next_cursor") or ""
         if not next_cursor:
+            users_pages_completed = True
             break
         cursor = next_cursor
 
     # ---- conversations.list ----
     cursor = None
+    channels_pages_completed = False
     while True:
         try:
             kwargs = {
@@ -553,6 +572,13 @@ async def populate_from_slack(
         except Exception as exc:  # noqa: BLE001 — best-effort scheduled job
             log.warning(
                 "populate_from_slack conversations_list failed: %s", exc
+            )
+            await log_event(
+                "populator_partial_pagination",
+                source="slack",
+                resource="channels",
+                error=f"{type(exc).__name__}: {exc}",
+                pages_seen=len(channels),
             )
             break
         chs = resp.get("channels") or []
@@ -576,9 +602,13 @@ async def populate_from_slack(
         meta = resp.get("response_metadata") or {}
         next_cursor = meta.get("next_cursor") or ""
         if not next_cursor:
+            channels_pages_completed = True
             break
         cursor = next_cursor
 
+    # Best-effort signal: we silently mark the local boolean state
+    # for tests but the algedonic event above is the operator surface.
+    _ = users_pages_completed, channels_pages_completed
     return people, channels
 
 

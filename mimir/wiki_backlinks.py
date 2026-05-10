@@ -76,9 +76,10 @@ def find_pages(wiki_dir: Path) -> dict[str, Path]:
     Slug is the filename sans ``.md``. Multiple files with the same
     slug across categories — last-wins; the dangling-link detection
     still works correctly because both files contribute their outbound
-    links, but inbound-link grouping conflates them. (Genuine slug
-    collisions are a wiki-health signal we'd want to surface
-    eventually, but Phase 1 doesn't.)
+    links, but inbound-link grouping conflates them. CR2 (memory &
+    retrieval) fix: ``find_slug_collisions`` returns the colliding
+    slugs so callers (build_graph, the introspection skill) can
+    surface them as a wiki-health signal instead of silently merging.
     """
     pages: dict[str, Path] = {}
     if not wiki_dir.is_dir():
@@ -89,6 +90,28 @@ def find_pages(wiki_dir: Path) -> dict[str, Path]:
         slug = md.stem
         pages[slug] = md.relative_to(wiki_dir)
     return pages
+
+
+def find_slug_collisions(wiki_dir: Path) -> dict[str, list[Path]]:
+    """Return ``slug → [paths]`` for every slug that resolves to more
+    than one file under ``wiki_dir``.
+
+    CR2 (memory & retrieval) follow-up: same-stem files across
+    categories (``concepts/foo.md`` and ``topics/foo.md``) produce a
+    silent last-wins conflation in ``find_pages``, AND get dropped as
+    "self-links" in ``build_graph`` (both have ``slug == "foo"``).
+    Surfacing collisions explicitly lets the introspection skill emit
+    a ``wiki_slug_collision`` algedonic event so the operator can
+    rename one of the files.
+    """
+    by_slug: dict[str, list[Path]] = {}
+    if not wiki_dir.is_dir():
+        return {}
+    for md in sorted(wiki_dir.rglob("*.md")):
+        if md.name in _META_FILENAMES:
+            continue
+        by_slug.setdefault(md.stem, []).append(md.relative_to(wiki_dir))
+    return {slug: paths for slug, paths in by_slug.items() if len(paths) > 1}
 
 
 def extract_links(text: str) -> Iterable[tuple[int, str]]:

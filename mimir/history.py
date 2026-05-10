@@ -168,6 +168,30 @@ class MessageBuffer:
         await asyncio.to_thread(self._append_disk, msg)
 
     def _append_disk(self, msg: Message) -> None:
+        """Append one JSONL record. **Interleave-atomicity, not
+        durability** (CR2 memory & retrieval clarification).
+
+        ``open("a")`` + ``write(...)`` produces a single ``write(2)``
+        per call thanks to Python's text-mode buffering inside the
+        ``with`` block, and POSIX guarantees ``O_APPEND`` writes are
+        atomic at the kernel level — so concurrent appends from
+        different threads can't corrupt or interleave at the byte
+        level (each line is whole). They may land out of call order
+        on disk (whichever thread wins the inode-lock race), but the
+        file stays valid JSONL.
+
+        However: this is NOT a durability guarantee. The ``with``
+        block's ``close()`` flushes Python's buffer to the OS page
+        cache; we do NOT call ``os.fsync()``. A crash between
+        write-return and OS flush loses the recent records that were
+        in the page cache. ``chat_history.jsonl`` is operator-
+        readable conversational state — informational, not load-
+        bearing — so the durability trade-off (perf cost on every
+        append vs. losing the last few records on crash) lands on
+        skipping fsync. If a future use makes this load-bearing,
+        either ``os.fsync(f.fileno())`` here or rely on the writer
+        to call sync explicitly.
+        """
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with self.history_path.open("a", encoding="utf-8") as f:

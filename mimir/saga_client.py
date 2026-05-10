@@ -563,8 +563,18 @@ class _HttpSaga:
     async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         sess = await self._ensure_session()
         url = f"{self._endpoint}{path}"
+        # CR2 (memory & retrieval) fix: track the last exception
+        # alongside the last 5xx body so the trailing "exhausted" raise
+        # carries the original cause. Pre-fix, the trailing raise only
+        # populated ``last_status`` / ``last_body`` from the 5xx path,
+        # so a ClientError-driven exhaustion would lose the original
+        # exception entirely. Today the trailing raise is unreachable
+        # (every loop branch returns / raises / continues), but a
+        # future edit dropping a ``continue`` would fall through; this
+        # makes that future regression diagnostic-friendly.
         last_status: int | None = None
         last_body: str | None = None
+        last_exc: BaseException | None = None
         for attempt in range(_MAX_RETRIES + 1):
             try:
                 async with sess.post(url, json=body) as resp:
@@ -589,6 +599,7 @@ class _HttpSaga:
                     except ValueError as exc:
                         raise SagaError(f"SAGA {path} returned non-JSON body: {exc}") from exc
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_exc = exc
                 if attempt < _MAX_RETRIES:
                     await asyncio.sleep(_retry_delay(attempt))
                     continue
@@ -599,7 +610,7 @@ class _HttpSaga:
         raise SagaError(
             f"SAGA {path} retry loop exhausted",
             status=last_status, body=last_body,
-        )
+        ) from last_exc
 
     async def _get_or_empty(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         try:
