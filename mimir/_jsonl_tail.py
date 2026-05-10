@@ -53,6 +53,52 @@ def tail_jsonl_records(path: Path) -> Iterator[dict]:
         return
 
 
+def count_lines_chunked(path: Path, *, chunk_bytes: int = 65536) -> int:
+    """Count newline-terminated lines in ``path`` without reading the
+    whole file into memory.
+
+    Streams the file in 64 KiB chunks and counts ``\\n`` bytes. Used
+    by ``EventLogger`` and ``TurnLogger`` at startup to learn how many
+    records the existing log holds (so the trim hysteresis knows when
+    to fire) without a multi-hundred-MB memory spike on a hot log.
+
+    A trailing line without a final newline is counted as one more
+    record — that's the shape of a torn write that left the file
+    without a final ``\\n``. ``wc -l`` would *miss* this one; we don't.
+
+    **Behavior note (vs. previous splitlines+strip implementation).**
+    The old code dropped blank lines (``if line.strip()``); this
+    counter does not — every ``\\n`` is one record. On a clean
+    firehose those produce identical counts, but a torn write that
+    leaves a bare ``\\n`` in the middle, or an external process
+    appending an empty line, will over-count by one here. The trim
+    hysteresis absorbs over-counts (a one-line drift just makes the
+    next trim fire a hair sooner — not load-bearing).
+
+    Returns 0 for missing or unreadable files.
+    """
+    try:
+        with path.open("rb") as f:
+            count = 0
+            had_data = False
+            last_byte: bytes = b""
+            while True:
+                chunk = f.read(chunk_bytes)
+                if not chunk:
+                    break
+                had_data = True
+                count += chunk.count(b"\n")
+                last_byte = chunk[-1:]
+            # File ended with content but no trailing newline → that's
+            # one more record (the pattern most JSONL appenders never
+            # produce, but a torn write can leave one behind).
+            if had_data and last_byte != b"\n":
+                count += 1
+            return count
+    except OSError:
+        return 0
+
+
 def _tail_lines(path: Path) -> Iterator[str]:
     """Yield lines from ``path`` newest-first, reading in fixed-size
     chunks from the end. Lines that span chunk boundaries are stitched
