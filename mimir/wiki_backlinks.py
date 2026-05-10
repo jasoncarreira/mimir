@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import re
 import sys
@@ -37,6 +38,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+log = logging.getLogger(__name__)
 
 from .event_logger import init_logger, log_event
 
@@ -152,11 +155,39 @@ class BacklinksGraph:
 
 def build_graph(wiki_dir: Path) -> BacklinksGraph:
     """Walk ``wiki_dir``, return the inbound + outbound + dangling
-    structure described in the module docstring."""
+    structure described in the module docstring.
+
+    **Cross-category-same-stem limitation (PR #112 review).** Slug
+    collisions (e.g. ``concepts/foo.md`` AND ``topics/foo.md``) can't
+    be disambiguated via the existing wikilink syntax (``[[foo]]``
+    resolves to one stem; both files have the same stem). The
+    backlinks index conflates them. ``find_slug_collisions`` returns
+    the affected slugs and ``build_graph`` logs a warning so the
+    operator can rename one of the collision pair. The actual link-
+    preservation fix requires a path-key refactor across both
+    ``find_pages`` and the wikilink resolver — bigger than fits in
+    this PR.
+    """
     pages_paths = find_pages(wiki_dir)
     page_data: dict[str, dict] = {}
     inbound: defaultdict[str, set[str]] = defaultdict(set)
     dangling: list[dict] = []
+
+    # PR #112 review: surface collisions explicitly. ``build_graph``
+    # is the right place because it's where the conflation actually
+    # affects the output — caller (mimir wiki backlinks command) can
+    # render the warning alongside the orphan/dangling lists.
+    collisions = find_slug_collisions(wiki_dir)
+    if collisions:
+        log.warning(
+            "wiki_slug_collision: %d slug(s) resolve to multiple files "
+            "— backlinks for these slugs will be conflated. Affected: %s",
+            len(collisions),
+            ", ".join(
+                f"{slug} ({len(paths)} files)"
+                for slug, paths in sorted(collisions.items())
+            ),
+        )
 
     for slug, rel_path in pages_paths.items():
         full_path = wiki_dir / rel_path
@@ -172,6 +203,13 @@ def build_graph(wiki_dir: Path) -> BacklinksGraph:
                 # itself isn't "supported by another page"). Pre-fix
                 # wikis sometimes had these as a stylistic choice —
                 # exclude either way.
+                #
+                # NOTE: this exclusion ALSO drops genuine cross-category
+                # same-stem links (concepts/foo.md → topics/foo.md), an
+                # acknowledged limitation of the slug-keyed index. See
+                # the docstring above + ``find_slug_collisions``. When
+                # the operator renames one of the collision pair, the
+                # link resolves correctly.
                 if target != slug:
                     inbound[target].add(slug)
             else:

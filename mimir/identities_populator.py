@@ -493,7 +493,6 @@ async def populate_from_slack(
     # block the next scheduled run. Broad except is intentional;
     # log + skip the failed half (the other half still tries).
     cursor: str | None = None
-    users_pages_completed = False
     while True:
         try:
             kwargs: dict[str, Any] = {"limit": 200}
@@ -513,7 +512,7 @@ async def populate_from_slack(
                 source="slack",
                 resource="users",
                 error=f"{type(exc).__name__}: {exc}",
-                pages_seen=len(people),  # approximate — count of users so far
+                items_seen=len(people),
             )
             break
         # Successfully read this page.
@@ -546,13 +545,11 @@ async def populate_from_slack(
         meta = resp.get("response_metadata") or {}
         next_cursor = meta.get("next_cursor") or ""
         if not next_cursor:
-            users_pages_completed = True
             break
         cursor = next_cursor
 
     # ---- conversations.list ----
     cursor = None
-    channels_pages_completed = False
     while True:
         try:
             kwargs = {
@@ -578,7 +575,7 @@ async def populate_from_slack(
                 source="slack",
                 resource="channels",
                 error=f"{type(exc).__name__}: {exc}",
-                pages_seen=len(channels),
+                items_seen=len(channels),
             )
             break
         chs = resp.get("channels") or []
@@ -602,13 +599,9 @@ async def populate_from_slack(
         meta = resp.get("response_metadata") or {}
         next_cursor = meta.get("next_cursor") or ""
         if not next_cursor:
-            channels_pages_completed = True
             break
         cursor = next_cursor
 
-    # Best-effort signal: we silently mark the local boolean state
-    # for tests but the algedonic event above is the operator surface.
-    _ = users_pages_completed, channels_pages_completed
     return people, channels
 
 
