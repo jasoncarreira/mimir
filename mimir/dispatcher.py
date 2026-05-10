@@ -107,6 +107,18 @@ class Dispatcher:
                     event = await asyncio.wait_for(queue.get(), timeout=idle_timeout)
                 except asyncio.TimeoutError:
                     await log_event("worker_retired", channel_id=channel_id, reason="idle")
+                    # CR2 (agent runtime) fix: clean up per-channel
+                    # bookkeeping when the worker retires. Pre-fix the
+                    # queue and high-water entry remained in the dicts
+                    # forever — ephemeral channel_ids (transient web-
+                    # ad-hoc channels, throwaway per-message channels)
+                    # accumulated indefinitely. Only purge if the
+                    # queue is actually empty AND not closed (the
+                    # ``drain()`` path may be holding a reference to
+                    # this queue while waiting on ``queue.join()``).
+                    if queue.qsize() == 0 and not self._closed:
+                        self._queues.pop(channel_id, None)
+                        self._high_water_logged.pop(channel_id, None)
                     return
 
                 # CR2-#4: ``queue.task_done()`` MUST be called for every
