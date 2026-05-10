@@ -168,7 +168,20 @@ class HomeostaticArbiter:
                 break
         for w in report.windows:
             if w.label == "Last 7d" and w.total_cost_usd > 0:
-                baseline = w.total_cost_usd / (24 * 7)
+                # CR2-#8: clamp the divisor to the file's actual coverage
+                # so a fresh install / post-trim state doesn't artificially
+                # deflate the baseline 5-84× and trigger spike-shaped
+                # advisory readings on normal usage. Mirrors the same
+                # clamp in ``evaluate_cost_rate``.
+                divisor = 24.0 * 7
+                if report.oldest_record_ts is not None:
+                    actual_hours = (
+                        now - report.oldest_record_ts
+                    ).total_seconds() / 3600.0
+                    if actual_hours > 0 and actual_hours < divisor:
+                        divisor = actual_hours
+                if divisor >= 1.0:
+                    baseline = w.total_cost_usd / divisor
                 break
 
         # Tool-call partition + token totals from turns.jsonl.
