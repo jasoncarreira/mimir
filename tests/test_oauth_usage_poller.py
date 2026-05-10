@@ -1201,3 +1201,50 @@ def test_mark_logged_out_preserves_first_login_at(tmp_path):
     # 31 days have elapsed since first_login_at_unix=1000 — exact integer
     # boundary because we used exact day multiples in the test setup.
     assert age == 31.0
+
+
+def test_record_first_seen_clears_logged_out_on_refresh_tail_change(tmp_path):
+    """PR #111 re-review fix: when the refresh-token tail changes
+    (operator re-ran ``/login``), ``record_first_seen`` clears the
+    sticky ``logged_out_*`` fields so the next poll resumes the
+    regular flow. Pre-fix the throttle was permanent for the
+    sidecar's lifetime — re-/login didn't recover the agent's
+    usage polling because ``clear_logged_out`` only ran in the
+    refresh path which was gated by the throttle."""
+    from mimir.oauth_usage_poller import (
+        is_known_logged_out, mark_logged_out, record_first_seen,
+    )
+    creds = tmp_path / ".credentials.json"
+    creds.write_text('{"refreshToken": "old"}')
+    # Establish the prior tail.
+    record_first_seen(creds, "old-token-A", now=1000.0)
+    # Mark logged out (refresh failed earlier).
+    mark_logged_out(creds, now=2000.0)
+    is_lo, _, _ = is_known_logged_out(creds)
+    assert is_lo is True
+
+    # Operator re-runs ``/login`` — refresh token rotates.
+    record_first_seen(creds, "new-token-B", now=3000.0)
+    is_lo_after, since, last = is_known_logged_out(creds)
+    assert is_lo_after is False
+    assert since is None
+    assert last is None
+
+
+def test_record_first_seen_does_not_clear_on_same_tail(tmp_path):
+    """Defensive: a normal poll where the refresh-token tail is
+    unchanged must NOT clear the logged_out state. Recovery is
+    explicitly triggered by tail change, not by the next poll
+    landing."""
+    from mimir.oauth_usage_poller import (
+        is_known_logged_out, mark_logged_out, record_first_seen,
+    )
+    creds = tmp_path / ".credentials.json"
+    creds.write_text('{"refreshToken": "stable"}')
+    record_first_seen(creds, "stable-token", now=1000.0)
+    mark_logged_out(creds, now=2000.0)
+    # Same tail on next poll → throttle stays.
+    record_first_seen(creds, "stable-token", now=3000.0)
+    is_lo, since, _ = is_known_logged_out(creds)
+    assert is_lo is True
+    assert since == 2000.0

@@ -374,7 +374,13 @@ class ShellJobRegistry:
                         return text
                     kept = lines[-n:]
                     dropped_lines = len(lines) - len(kept)
-                    if hit_byte_cap or pos > 0:
+                    # PR #111 review-fix-2: gate on ``dropped_lines``
+                    # directly, not on ``hit_byte_cap or pos > 0``.
+                    # The previous gate skipped the marker when the
+                    # file fit in one CHUNK (pos==0, hit_byte_cap=False)
+                    # and had >n lines — exactly the silent-truncation
+                    # shape the original review flagged.
+                    if dropped_lines > 0 or pos > 0:
                         prefix_parts = []
                         if dropped_lines > 0:
                             prefix_parts.append(
@@ -384,11 +390,10 @@ class ShellJobRegistry:
                             prefix_parts.append(
                                 f"{pos} earlier byte(s) on disk"
                             )
-                        if prefix_parts:
-                            return (
-                                f"[…truncated; {', '.join(prefix_parts)} "
-                                f"not shown…]\n" + "\n".join(kept)
-                            )
+                        return (
+                            f"[…truncated; {', '.join(prefix_parts)} "
+                            f"not shown…]\n" + "\n".join(kept)
+                        )
                     return "\n".join(kept)
             except FileNotFoundError:
                 return ""
