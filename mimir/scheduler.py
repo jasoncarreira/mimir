@@ -25,12 +25,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import yaml
+from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -324,6 +327,71 @@ class Scheduler:
         # ``add_poller_jobs`` runs (most installs no-op cleanly).
         self._pollers_dir: Path | None = None
         self._pollers: dict[str, PollerConfig] = {}
+        # Global concurrency cap on poller subprocess fan-out.
+        # ``MIMIR_MAX_CONCURRENT_POLLERS`` (default 8) bounds how many
+        # ``run_poller`` invocations can be in-flight at once. Without a
+        # cap, 50 skills with ``* * * * *`` crons would launch 50
+        # subprocesses every minute, each up to 60s — no upper bound on
+        # subprocess fork cost or aiohttp/disk pressure inside the
+        # subprocesses. The dispatcher's ``max_concurrent_turns``
+        # doesn't apply here because pollers run BEFORE events get
+        # enqueued. Default 8 is generous for typical 5-10 skill
+        # deployments while throttling buggy fork-bomb skills.
+        try:
+            cap = int(os.environ.get("MIMIR_MAX_CONCURRENT_POLLERS", "8"))
+        except ValueError:
+            cap = 8
+        cap = max(1, cap)  # 0 / negative → 1 (degenerate single-fire)
+        self._poller_semaphore = asyncio.Semaphore(cap)
+        self._poller_concurrency_cap = cap
+
+        # APScheduler ``EVENT_JOB_MISSED`` listener — emits a
+        # ``poller_misfired`` algedonic event whenever a job's fire
+        # time was missed (typically because a previous instance was
+        # still running and the new one fell outside ``misfire_grace_time``).
+        # Without this listener, missed fires were silently dropped:
+        # a poller cron of ``* * * * *`` against a 60s subprocess
+        # timeout would lose every other minute under load with no
+        # operator-visible signal. The lowered ``misfire_grace_time``
+        # (60→5s, see ``_reinstall_pollers``) makes the missed-fire
+        # event reliable rather than rare.
+        self._scheduler.add_listener(
+            self._on_job_missed, EVENT_JOB_MISSED,
+        )
+
+    def _on_job_missed(self, event: JobExecutionEvent) -> None:
+        """APScheduler listener for EVENT_JOB_MISSED.
+
+        AsyncIOScheduler dispatches listener callbacks from within the
+        event loop (its wakeup task IS a coroutine), so we can schedule
+        the log emit via ``asyncio.create_task`` directly. If for some
+        reason there's no running loop (e.g. called during shutdown),
+        fall back to a sync ``log.warning`` so the event isn't silently
+        lost.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            log.warning(
+                "scheduled_job_misfired (no loop): job=%s scheduled=%s",
+                event.job_id, event.scheduled_run_time,
+            )
+            return
+        loop.create_task(self._log_misfire(event))
+
+    async def _log_misfire(self, event: JobExecutionEvent) -> None:
+        # Distinguish poller misses (operator-actionable: tune cron or
+        # bump timeout) from other misses (LLM ticks, callable jobs).
+        is_poller = event.job_id.startswith("poller:")
+        kind = "poller_misfired" if is_poller else "scheduled_job_misfired"
+        await log_event(
+            kind,
+            job_id=event.job_id,
+            scheduled_run_time=(
+                event.scheduled_run_time.isoformat()
+                if event.scheduled_run_time else None
+            ),
+        )
 
     # ---- LLM-tick jobs ------------------------------------------------
 
@@ -639,26 +707,47 @@ class Scheduler:
         """Re-scan the pollers directory and re-install. Called by the
         ``mcp__mimir__reload_pollers`` MCP tool after the agent installs
         a new skill. No-op (returns 0) when ``add_poller_jobs`` was
-        never called (no skills_dir wired)."""
+        never called (no skills_dir wired).
+
+        **Mutate lock (PR #107).** Wrapped with ``self._mutate_lock``
+        so concurrent reload_pollers calls (e.g. operator triggers a
+        reload while a yaml mutation is also reloading) serialize.
+        Without the lock, two concurrent ``_reinstall_pollers``
+        invocations could race the APScheduler ``add_job`` /
+        ``remove_job`` mutations.
+        """
         if self._pollers_dir is None:
             return 0
-        return await asyncio.to_thread(self._reinstall_pollers)
+        async with self._mutate_lock:
+            return await asyncio.to_thread(self._reinstall_pollers)
 
     def _reinstall_pollers(self) -> int:
         """Wipe + re-discover + re-register. Sync — runs on the
-        APScheduler thread or via ``to_thread`` from async callers."""
+        APScheduler thread or via ``to_thread`` from async callers.
+
+        **Atomic dict swap (PR #107).** Previously this cleared
+        ``self._pollers = {}`` before re-populating, so an in-flight
+        ``_fire_poller`` callback that hit the dict mid-reload would
+        see an empty dict, log ``poller_fire_dropped``, and skip the
+        fire — even though the same poller was about to be re-registered.
+        Build the new dict locally and assign once at the end so the
+        reader sees either the old dict or the new dict, never an
+        intermediate state. Atomic in CPython (single-attribute reassign).
+        """
         if self._pollers_dir is None:
             return 0
-        # Drop existing poller jobs by id-prefix.
+        # Drop existing poller jobs by id-prefix. APScheduler's
+        # remove_job is keyed on job-id; a fire callback that's
+        # mid-execution finishes against the OLD self._pollers dict —
+        # safe because we don't reassign until the new dict is ready.
         for job in list(self._scheduler.get_jobs()):
             if job.id.startswith("poller:"):
                 try:
                     self._scheduler.remove_job(job.id)
                 except Exception:  # noqa: BLE001 — JobLookupError, fine
                     pass
-        self._pollers = {}
 
-        installed = 0
+        new_pollers: dict[str, PollerConfig] = {}
         # Filing-rules-aligned: cursor files live under
         # ``<home>/state/pollers/<name>/``, NOT inside the skill dir.
         # Skill dir is the deployable artifact (resettable via
@@ -685,22 +774,44 @@ class Scheduler:
                 replace_existing=True,
                 coalesce=True,
                 max_instances=1,
-                # A poller that takes 65s and fires every minute would
-                # otherwise stack up; with max_instances=1+coalesce the
-                # next tick is dropped instead of overlapping. Same
-                # shape as our oauth-usage-poll registration.
-                misfire_grace_time=60,
+                # PR #107 review fix: was 60s, lowered to 5s. The old
+                # value was equal to ``POLLER_TIMEOUT_SECONDS`` (60),
+                # so a poller that hit its timeout exactly stacked
+                # against the next minute's fire and APScheduler
+                # silently dropped the misfire. With 5s grace + the
+                # ``EVENT_JOB_MISSED`` listener installed in __init__,
+                # the missed fire emits a ``poller_misfired`` event so
+                # the operator sees the cadence problem instead of
+                # discovering it via missing data.
+                misfire_grace_time=5,
             )
-            self._pollers[poller.name] = poller
-            installed += 1
+            new_pollers[poller.name] = poller
+        # Atomic swap — readers either see the OLD dict (containing the
+        # poller they just looked up) or the NEW dict (containing it
+        # again because reload re-installed). Never an empty intermediate.
+        self._pollers = new_pollers
+        installed = len(new_pollers)
         log.info("pollers reloaded: %d installed from %s", installed, self._pollers_dir)
         return installed
 
     async def _fire_poller(self, *, poller_name: str) -> None:
         """APScheduler-side cron callback. Looks up the live PollerConfig
-        (re-fetched on each fire to reflect any reloads) and runs it.
-        Always logs a ``poller_fire_dropped`` event when the lookup
-        misses — should never happen but it's the diagnosable case."""
+        (re-fetched on each fire to reflect any reloads) and runs it
+        under the global concurrency semaphore.
+
+        **Concurrency cap (PR #107).** ``run_poller`` is wrapped in
+        ``self._poller_semaphore`` so at most ``MIMIR_MAX_CONCURRENT_POLLERS``
+        (default 8) subprocess fires are in flight at once. A skill
+        with ``* * * * *`` cron + many sibling skills no longer
+        fork-bombs the host. When the cap is hit, late fires wait for
+        a slot — if the wait stretches more than ~5s, emit a
+        ``poller_concurrency_throttled`` event so the operator sees
+        the saturation.
+
+        Always logs ``poller_fire_dropped`` when the registry lookup
+        misses (the dict is now atomically-swapped during reload, so
+        this branch fires only on a genuinely-removed poller).
+        """
         poller = self._pollers.get(poller_name)
         if poller is None:
             await log_event(
@@ -709,7 +820,37 @@ class Scheduler:
                 reason="poller_not_in_registry",
             )
             return
-        await run_poller(poller, enqueue=self._enqueue)
+
+        # Probe semaphore availability without acquiring; if it'd block
+        # for >5s, emit the throttle event so saturation is visible.
+        # Then await acquisition (no timeout — pollers should always
+        # eventually run).
+        wait_start = time.monotonic()
+        if self._poller_semaphore.locked():
+            # All slots taken — await with periodic throttle warnings.
+            throttled = False
+            while True:
+                try:
+                    await asyncio.wait_for(
+                        self._poller_semaphore.acquire(), timeout=5.0,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    if not throttled:
+                        await log_event(
+                            "poller_concurrency_throttled",
+                            poller=poller_name,
+                            cap=self._poller_concurrency_cap,
+                            wait_seconds=time.monotonic() - wait_start,
+                        )
+                        throttled = True
+        else:
+            await self._poller_semaphore.acquire()
+
+        try:
+            await run_poller(poller, enqueue=self._enqueue)
+        finally:
+            self._poller_semaphore.release()
 
     def registered_pollers(self) -> list[str]:
         """Names of all currently-registered pollers. Used by the

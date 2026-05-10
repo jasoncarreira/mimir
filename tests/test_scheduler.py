@@ -1074,3 +1074,134 @@ async def test_add_poller_jobs_skips_invalid_cron(tmp_path: Path):
     n = sched.add_poller_jobs(skills)
     assert n == 1
     assert sched.registered_pollers() == ["good"]
+
+
+# ─── PR #107: APScheduler misfire visibility + concurrency cap + lock ─
+
+
+@pytest.mark.asyncio
+async def test_pollers_misfire_grace_time_is_5s(tmp_path: Path):
+    """Poller registrations use ``misfire_grace_time=5`` (was 60).
+    The lower value + EVENT_JOB_MISSED listener means a 60s-timeout
+    poller that overruns into the next minute's fire emits a
+    ``poller_misfired`` event instead of silently dropping."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)
+    job = sched._scheduler.get_job("poller:p1")
+    assert job is not None
+    assert job.misfire_grace_time == 5
+
+
+@pytest.mark.asyncio
+async def test_pollers_concurrency_cap_default_is_8(tmp_path: Path):
+    """``MIMIR_MAX_CONCURRENT_POLLERS`` defaults to 8. The semaphore
+    is constructed in __init__ so reading at runtime confirms the
+    binding."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched._poller_concurrency_cap == 8
+    # Semaphore starts fully available — 8 acquire-without-block possible.
+    for _ in range(8):
+        assert not sched._poller_semaphore.locked()
+        await sched._poller_semaphore.acquire()
+    assert sched._poller_semaphore.locked()
+    # Release for cleanup.
+    for _ in range(8):
+        sched._poller_semaphore.release()
+
+
+@pytest.mark.asyncio
+async def test_pollers_concurrency_cap_env_override(
+    tmp_path: Path, monkeypatch
+):
+    """``MIMIR_MAX_CONCURRENT_POLLERS=N`` overrides the default."""
+    async def noop(_e):
+        return True
+    monkeypatch.setenv("MIMIR_MAX_CONCURRENT_POLLERS", "3")
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched._poller_concurrency_cap == 3
+
+
+@pytest.mark.asyncio
+async def test_pollers_concurrency_cap_invalid_env_falls_back(
+    tmp_path: Path, monkeypatch
+):
+    """Garbage value in the env var → default 8 (no crash)."""
+    async def noop(_e):
+        return True
+    monkeypatch.setenv("MIMIR_MAX_CONCURRENT_POLLERS", "not a number")
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched._poller_concurrency_cap == 8
+
+
+@pytest.mark.asyncio
+async def test_pollers_concurrency_cap_clamps_to_one(
+    tmp_path: Path, monkeypatch
+):
+    """Zero / negative → 1 (degenerate single-fire mode, not 0
+    which would deadlock)."""
+    async def noop(_e):
+        return True
+    monkeypatch.setenv("MIMIR_MAX_CONCURRENT_POLLERS", "0")
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched._poller_concurrency_cap == 1
+
+
+@pytest.mark.asyncio
+async def test_reinstall_pollers_atomic_dict_swap(tmp_path: Path):
+    """PR #107 review fix: ``self._pollers`` is built into a local dict
+    and swapped at the end, NOT cleared-then-rebuilt. Concurrent
+    ``_fire_poller`` lookups during a reload either see the OLD dict
+    (with the poller still registered) or the NEW dict (with the
+    poller re-registered) — never an empty intermediate."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)
+    assert "p1" in sched._pollers
+    original_dict = sched._pollers
+
+    # Reload with the same skill present — dict gets a NEW reference,
+    # not a clear of the old one.
+    n = await sched.reload_pollers()
+    assert n == 1
+    assert "p1" in sched._pollers
+    # The OLD dict object still exists with the poller in it (reader
+    # holding the reference would still see the poller).
+    assert "p1" in original_dict
+    # But the live dict is a different object now.
+    assert sched._pollers is not original_dict
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_serializes_via_mutate_lock(tmp_path: Path):
+    """``reload_pollers`` acquires ``self._mutate_lock`` to serialize
+    against concurrent ``add_job`` / ``remove_job`` mutations.
+    Exercise the lock path; the test passes if reload completes
+    without a race-induced crash."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)
+
+    # Race two concurrent reloads + a yaml-mutation through the lock.
+    job = SchedulerJob(name="t", cron="*/5 * * * *", prompt="ping")
+    results = await asyncio.gather(
+        sched.reload_pollers(),
+        sched.reload_pollers(),
+        sched.add_job(job),
+        return_exceptions=True,
+    )
+    # All three return without exceptions (lock serialized them).
+    assert all(not isinstance(r, BaseException) for r in results), results
+    # Pollers still registered after the chaos.
+    assert sched._pollers.get("p1") is not None
