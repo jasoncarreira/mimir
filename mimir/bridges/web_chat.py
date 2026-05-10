@@ -67,7 +67,17 @@ class WebChatBridge(Bridge):
 
     async def disconnect(self) -> None:
         # Drain all subscribers so any open SSE connection sees EOF.
-        for q in list(self._subscribers):
+        # CR2 (external I/O) fix: previously this iterated
+        # ``list(self._subscribers)`` without acquiring ``self._lock``,
+        # while subscribe/unsubscribe DO. A shutdown that races a new
+        # SSE client mid-subscribe could ``put_nowait(None)`` on a
+        # queue that was just removed, or miss a queue just appended.
+        # Acquiring the lock makes the snapshot consistent.
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            subscribers = list(self._subscribers)
+        for q in subscribers:
             try:
                 q.put_nowait(None)
             except asyncio.QueueFull:

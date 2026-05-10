@@ -42,10 +42,52 @@ log = logging.getLogger(__name__)
 
 # ─── module-level coordination ────────────────────────────────────────
 
-# At most one push pending at a time. Each new commit cancels and
-# reschedules so a burst becomes one network round-trip.
-_push_debounce_lock: asyncio.Lock | None = None
-_pending_push_task: asyncio.Task | None = None
+# CR2 (external I/O) fix: keyed by home path, not singleton. Pre-fix
+# ``_push_debounce_lock`` and ``_pending_push_task`` were single
+# module globals — a turn that committed in one repo path would
+# cancel a pending push in a *different* repo path if the agent ever
+# served more than one home. Today only one home is served per
+# process so this was dormant, but the singleton coupled
+# theoretically-independent agents (multi-home dev, integration
+# tests running the agent twice) and made the function untestable
+# in parallel. Per-home dicts keep state isolated; existing API
+# (``commit_turn_changes(home=...)``) flows the discriminator
+# through naturally.
+_push_debounce_locks: dict[str, asyncio.Lock] = {}
+_pending_push_tasks: dict[str, asyncio.Task] = {}
+
+
+def __getattr__(name: str):
+    """Backwards-compat shim for the old singleton API. Tests (and any
+    operator script that introspects module state) can still read
+    ``git_tracking._pending_push_task`` and get the live task for the
+    one-home case. Raises AttributeError when more than one home is
+    active so multi-home callers see a clear signal that they need
+    to use the per-home dict directly."""
+    if name == "_pending_push_task":
+        active = [t for t in _pending_push_tasks.values() if t is not None]
+        if not active:
+            return None
+        if len(active) == 1:
+            return active[0]
+        # Multi-home is the case the per-home shape was added to support;
+        # the singleton accessor can't disambiguate.
+        raise AttributeError(
+            f"_pending_push_task is per-home now ({len(active)} active "
+            f"tasks); use _pending_push_tasks dict keyed by resolved "
+            f"home path."
+        )
+    if name == "_push_debounce_lock":
+        active = list(_push_debounce_locks.values())
+        if not active:
+            return None
+        if len(active) == 1:
+            return active[0]
+        raise AttributeError(
+            f"_push_debounce_lock is per-home now ({len(active)} locks); "
+            f"use _push_debounce_locks dict keyed by resolved home path."
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Tunables — callers can override for tests. Spec says 60s debounce,
 # 30s push timeout, 10s per-call timeout for non-push commands.
@@ -54,22 +96,34 @@ PUSH_TIMEOUT_SECONDS = 30.0
 COMMAND_TIMEOUT_SECONDS = 10.0
 
 
-def _get_lock() -> asyncio.Lock:
+def _home_key(home: Path) -> str:
+    """Resolve home to a canonical key for the per-home state dicts.
+    Use the resolved absolute path so symlinks / relative paths
+    don't produce two keys for the same physical home."""
+    try:
+        return str(home.resolve())
+    except OSError:
+        return str(home)
+
+
+def _get_lock(home: Path) -> asyncio.Lock:
     """Lazy lock creation — asyncio.Lock binds to the running loop, so
     we can't create it at import time (no loop yet)."""
-    global _push_debounce_lock
-    if _push_debounce_lock is None:
-        _push_debounce_lock = asyncio.Lock()
-    return _push_debounce_lock
+    key = _home_key(home)
+    lock = _push_debounce_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _push_debounce_locks[key] = lock
+    return lock
 
 
 def reset_module_state() -> None:
     """Test helper — drop debounce state so each test starts clean."""
-    global _push_debounce_lock, _pending_push_task
-    if _pending_push_task is not None and not _pending_push_task.done():
-        _pending_push_task.cancel()
-    _pending_push_task = None
-    _push_debounce_lock = None
+    for task in list(_pending_push_tasks.values()):
+        if task is not None and not task.done():
+            task.cancel()
+    _pending_push_tasks.clear()
+    _push_debounce_locks.clear()
 
 
 # ─── git error type + subprocess wrapper ─────────────────────────────
@@ -248,17 +302,20 @@ async def commit_turn_changes(
 
 
 async def _schedule_debounced_push(*, turn_id: str, home: Path) -> None:
-    """Cancel any pending debounced push and schedule a fresh one.
+    """Cancel any pending debounced push for this home and schedule a
+    fresh one.
 
-    Holds the module lock briefly so two concurrent turns can't both
-    create push tasks. ``_pending_push_task`` is the canonical
-    "the next push" reference; whoever holds it owns the network call.
+    Holds the per-home lock briefly so two concurrent turns on the
+    SAME home can't both create push tasks. CR2 fix: state is keyed
+    by home so two concurrent turns on DIFFERENT homes (multi-home
+    dev / parallel tests) no longer collide.
     """
-    global _pending_push_task
-    async with _get_lock():
-        if _pending_push_task is not None and not _pending_push_task.done():
-            _pending_push_task.cancel()
-        _pending_push_task = asyncio.create_task(
+    key = _home_key(home)
+    async with _get_lock(home):
+        existing = _pending_push_tasks.get(key)
+        if existing is not None and not existing.done():
+            existing.cancel()
+        _pending_push_tasks[key] = asyncio.create_task(
             _debounced_push(turn_id=turn_id, home=home)
         )
 
