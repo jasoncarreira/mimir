@@ -333,28 +333,48 @@ def test_compute_stats_timeseries_per_day(tmp_path: Path):
 # ─── HTML render ─────────────────────────────────────────────────────
 
 
-def test_render_dashboard_html_injects_data(tmp_path: Path):
-    """The render must replace the ``__DATA__`` placeholder with valid
-    JSON, so the frontend can parse it on load."""
+def test_render_dashboard_html_returns_static_shell(tmp_path: Path):
+    """Pattern B refactor (2026-05-10): the dashboard HTML is now a
+    static shell — no server-side data injection. The frontend AJAX-
+    fetches /api/ops with X-API-Key. Previously the same HTML carried
+    a ``__DATA__`` placeholder replaced with JSON at render time;
+    that path leaked the dashboard contents to anyone who could load
+    the auth-exempt /ops route. The shell contains the bootstrap JS
+    that prompts for an API key on first visit and the render(D)
+    function called once data arrives."""
     log = tmp_path / "events.jsonl"
     _write_events(log, [
         {"timestamp": _ts(0.1), "type": "event_queued", "trigger": "user_message"},
     ])
     payload = build_dashboard_payload(log, days=1)
+    # render_dashboard_html now ignores the payload arg (kept for one
+    # release of API compat). Verify the shell shape:
     html = render_dashboard_html(payload)
-    assert "__DATA__" not in html  # placeholder replaced
-    # The injected JSON has a known field; its presence confirms the
-    # injection worked.
-    assert '"window_days": 1' in html or '"window_days":1' in html
-    assert '"summary"' in html
+    # Placeholder gone — no script tag carrying server-injected data.
+    # (The string ``__DATA__`` may appear in a JS comment explaining the
+    # historical shape, so check the script-tag form specifically.)
+    assert '<script id="data"' not in html
+    assert "<!doctype html>" in html
+    assert "mimir Ops" in html
+    # The shell must NOT contain the actual stats — those come via AJAX.
+    assert '"window_days": 1' not in html
+    assert '"window_days":1' not in html
+    # The shell MUST contain the bootstrap markers proving the new path.
+    assert "authedFetch('/api/ops'" in html
+    assert "function render(D)" in html
+    assert "API_KEY_LS" in html
 
 
 def test_render_dashboard_html_handles_empty_payload(tmp_path: Path):
-    """Empty events log still produces a valid HTML doc."""
-    payload = build_dashboard_payload(tmp_path / "nonexistent.jsonl", days=7)
-    html = render_dashboard_html(payload)
+    """Empty events log still produces a valid HTML doc. The render is
+    static now so the payload is irrelevant; this test just pins the
+    no-args call shape (also accepted) plus the legacy
+    payload-arg-passing path stays callable for one release."""
+    html = render_dashboard_html()
     assert "<!doctype html>" in html
     assert "mimir Ops" in html
+    payload = build_dashboard_payload(tmp_path / "nonexistent.jsonl", days=7)
+    assert render_dashboard_html(payload) == html  # arg ignored
 
 
 # ─── Route wiring through register_routes ────────────────────────────
@@ -441,65 +461,23 @@ async def test_route_ops_days_param_filters_window(web_app, aiohttp_client):
     assert body["summary"]["events_queued"] == 1
 
 
-# ─── XSS hardening: </ → <\/ in injected JSON ────────────────────────
-
-
-def test_render_dashboard_html_escapes_close_script_tag(tmp_path: Path):
-    """If a string in the payload contains ``</script>`` the HTML
-    template's ``<script type=\"application/json\">__DATA__</script>``
-    tag could be broken out of, allowing arbitrary JS injection. The
-    render must escape ``</`` to ``<\\/`` so the JSON string survives
-    the HTML parser (``\\/`` is a legal alternate for ``/`` in JSON
-    strings; consumers parse it identically to ``/``)."""
-    log = tmp_path / "events.jsonl"
-    _write_events(log, [
-        {
-            "timestamp": _ts(0.1),
-            "type": "git_push_failed",
-            "error": "</script><script>alert('xss')</script>"
-        },
-    ])
-    payload = build_dashboard_payload(log, days=1)
-    html = render_dashboard_html(payload)
-    # The literal closing-tag sequence must NOT appear inside the
-    # data block — if it did, the browser would terminate the script
-    # tag early and execute the rest as JS.
-    # Find the data script and verify what's between the opening tag
-    # and the next </script>.
-    data_open = html.find('<script id="data" type="application/json">')
-    assert data_open >= 0
-    data_close = html.find('</script>', data_open)
-    assert data_close >= 0
-    data_body = html[data_open + len('<script id="data" type="application/json">'):data_close]
-    # The escaped form survives.
-    assert "<\\/script>" in data_body
-    # The naked closing tag (which would break out) is absent.
-    assert "</script>" not in data_body
-    # And the JSON is still parseable — \/ is a valid alternate for /.
-    parsed = json.loads(data_body)
-    assert parsed["recent_failures"][0]["detail"] == "</script><script>alert('xss')</script>"
-
-
-def test_render_dashboard_html_escapes_close_anchor_tag(tmp_path: Path):
-    """Be defensive about other ``</`` sequences too — operators have
-    every right to put HTML in their channel names or descriptions
-    and the dashboard shouldn't render any of it."""
-    log = tmp_path / "events.jsonl"
-    _write_events(log, [
-        {
-            "timestamp": _ts(0.1),
-            "type": "event_queued",
-            "trigger": "user_message",
-            "channel_id": "<a href=javascript:alert(1)>click</a>",
-        },
-    ])
-    payload = build_dashboard_payload(log, days=1)
-    html = render_dashboard_html(payload)
-    data_open = html.find('<script id="data" type="application/json">')
-    data_close = html.find('</script>', data_open)
-    data_body = html[data_open + len('<script id="data" type="application/json">'):data_close]
-    assert "<\\/a>" in data_body
-    assert "</a>" not in data_body
+# ─── XSS hardening (legacy) ──────────────────────────────────────────
+# The previous tests verified that ``</`` was escaped to ``<\\/`` when
+# user-controlled strings (failure detail messages, channel ids) were
+# server-side injected into the dashboard HTML. After Pattern B refactor
+# (2026-05-10), the dashboard data is fetched via XHR from /api/ops
+# instead of injected at render time — JSON in an XHR response body
+# can't break out of a script tag because it's never inside one. The
+# escape concern is moot; tests removed.
+#
+# The /api/ops route returns ``Content-Type: application/json`` (set
+# by aiohttp ``web.json_response``), and the frontend parses it via
+# ``r.json()`` — the response body is never written to the DOM. The
+# HTML ``render(D)`` function uses ``td.textContent`` and direct
+# ``innerHTML`` only with payload values it constructs (e.g. backlog
+# items). The backlog text is sourced from the dashboard module's own
+# constants, not from events.jsonl, so XSS via user-controlled input
+# doesn't have a route into the rendered page either.
 
 
 # ─── _load_chainlink_issues — graceful failure paths ─────────────────
