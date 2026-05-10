@@ -145,6 +145,50 @@ async def test_on_complete_logs_routed_event_on_success(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_on_complete_emits_enqueue_ok_on_success(tmp_path: Path):
+    """chainlink #65 (sub B): on a successful enqueue, a
+    ``shell_job_complete_enqueue_ok`` event lands in events.jsonl as
+    the paired positive for the sticky
+    ``shell_job_complete_enqueue_failed`` failure kind. Distinct from
+    ``shell_job_complete_routed`` — the _ok event is the algedonic
+    surface signal (first-occurrence-only at the feedback layer), the
+    _routed event is the broader audit record."""
+    registry = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
+    dispatcher = _FakeDispatcher()
+    loop = asyncio.get_running_loop()
+    bridge = _AgentBridgeStub(dispatcher, registry, loop)
+
+    from mimir.event_logger import init_logger
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="test")
+
+    job = registry.spawn(
+        "true", argv=["bash", "-c", "true"], channel_id="c-ok",
+    )
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if job.exit_code is not None:
+            break
+        await asyncio.sleep(0.05)
+
+    await bridge._on_shell_job_complete(job)
+
+    import json as _json
+    lines = events_path.read_text().splitlines()
+    enqueue_oks = [
+        _json.loads(line)
+        for line in lines
+        if line
+        and _json.loads(line).get("type") == "shell_job_complete_enqueue_ok"
+    ]
+    assert len(enqueue_oks) == 1
+    assert enqueue_oks[0]["job_id"] == job.job_id
+    # And the failure event did NOT fire on the happy path.
+    types = [_json.loads(line).get("type") for line in lines if line]
+    assert "shell_job_complete_enqueue_failed" not in types
+
+
+@pytest.mark.asyncio
 async def test_on_complete_no_routed_event_when_dispatcher_raises(tmp_path: Path):
     """When enqueue raises, ``_enqueue_failed`` fires but
     ``_routed`` does NOT — the wake-up didn't reach the queue, and
