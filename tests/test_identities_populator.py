@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from mimir.event_logger import init_logger
 from mimir.identities import IdentityResolver
 from mimir.identities_populator import (
     merge_into_yaml,
@@ -22,6 +23,22 @@ from mimir.identities_populator import (
     populate_from_discord,
     populate_from_slack,
 )
+
+
+@pytest.fixture(autouse=True)
+def _logger(tmp_path: Path):
+    """PR #112 re-review fix: ``populate_from_slack`` now emits
+    ``populator_partial_pagination`` via ``log_event`` on the
+    broad-except branch. ``log_event`` requires the global event
+    logger to be initialized; without this fixture the broad-except
+    branch raises ``RuntimeError("event_logger not initialized")``
+    and the previously-soft test path becomes loud. Production startup
+    calls ``init_logger`` so this only matters for the suite."""
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    init_logger(
+        tmp_path / "logs" / "events.jsonl",
+        session_id="test-identities-populator",
+    )
 
 
 def _state_yaml(home: Path) -> Path:

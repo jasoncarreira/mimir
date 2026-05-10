@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 import os
 import re
 import sys
@@ -38,8 +37,6 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
-
-log = logging.getLogger(__name__)
 
 from .event_logger import init_logger, log_event
 
@@ -140,17 +137,22 @@ class BacklinksGraph:
     ``pages`` maps slug → ``{path, outbound, inbound}``; ``orphans``
     is the slug list with empty inbound; ``dangling`` is the list of
     ``{target, source, line}`` for links that don't resolve to any
-    page. All three derive from one walk."""
+    page. ``collisions`` (PR #112 re-review fix) maps colliding slug
+    → list of relative paths; ``run()`` emits the algedonic
+    ``wiki_slug_collision`` event from this. All four derive from
+    one walk."""
 
     def __init__(
         self,
         pages: dict[str, dict],
         orphans: list[str],
         dangling: list[dict],
+        collisions: dict[str, list[Path]] | None = None,
     ) -> None:
         self.pages = pages
         self.orphans = orphans
         self.dangling = dangling
+        self.collisions = collisions or {}
 
 
 def build_graph(wiki_dir: Path) -> BacklinksGraph:
@@ -173,21 +175,14 @@ def build_graph(wiki_dir: Path) -> BacklinksGraph:
     inbound: defaultdict[str, set[str]] = defaultdict(set)
     dangling: list[dict] = []
 
-    # PR #112 review: surface collisions explicitly. ``build_graph``
-    # is the right place because it's where the conflation actually
-    # affects the output — caller (mimir wiki backlinks command) can
-    # render the warning alongside the orphan/dangling lists.
+    # PR #112 re-review fix: surface collisions on the BacklinksGraph
+    # and let ``run()`` emit the algedonic event via ``log_event``.
+    # Pre-fix this used stdlib ``log.warning`` which bypasses the
+    # algedonic firehose / events.jsonl — operator never saw it on
+    # the prompt's "Recent feedback signals" surface. ``build_graph``
+    # is sync; ``log_event`` is async; hoisting the emit to ``run()``
+    # is the cleanest split.
     collisions = find_slug_collisions(wiki_dir)
-    if collisions:
-        log.warning(
-            "wiki_slug_collision: %d slug(s) resolve to multiple files "
-            "— backlinks for these slugs will be conflated. Affected: %s",
-            len(collisions),
-            ", ".join(
-                f"{slug} ({len(paths)} files)"
-                for slug, paths in sorted(collisions.items())
-            ),
-        )
 
     for slug, rel_path in pages_paths.items():
         full_path = wiki_dir / rel_path
@@ -230,6 +225,7 @@ def build_graph(wiki_dir: Path) -> BacklinksGraph:
 
     return BacklinksGraph(
         pages=page_data, orphans=orphans, dangling=dangling,
+        collisions=collisions,
     )
 
 
@@ -372,6 +368,19 @@ async def run(home: Path) -> dict:
             page_count=page_count,
             orphan_count=orphan_count,
             dangling_count=dangling_count,
+            generated_at=generated_at,
+        )
+
+    # PR #112 re-review fix: emit collision events through the
+    # algedonic surface. Each slug-collision pair becomes a separate
+    # ``wiki_slug_collision`` record so the operator can see exactly
+    # which files clash without a one-shot summary message that the
+    # algedonic feedback dedup would suppress on subsequent runs.
+    for slug, paths in sorted(graph.collisions.items()):
+        await log_event(
+            "wiki_slug_collision",
+            slug=slug,
+            paths=[str(p) for p in paths],
             generated_at=generated_at,
         )
 

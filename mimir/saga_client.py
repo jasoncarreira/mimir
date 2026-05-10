@@ -585,15 +585,22 @@ class _HttpSaga:
                         if attempt < _MAX_RETRIES:
                             await asyncio.sleep(_retry_delay(attempt))
                             continue
+                        # PR #112 re-review consistency: explicit ``from
+                        # None`` matches the trailing ``raise ... from
+                        # last_exc`` style. There's no enclosing
+                        # exception to chain (we're inside the ``try``
+                        # body, not the ``except``); ``from None``
+                        # makes the absence-of-cause explicit rather
+                        # than implicit-via-default.
                         raise SagaError(
                             f"SAGA {path} returned {resp.status} after {attempt + 1} attempts",
                             status=resp.status, body=text,
-                        )
+                        ) from None
                     if resp.status >= 400:
                         raise SagaError(
                             f"SAGA {path} returned {resp.status}",
                             status=resp.status, body=text,
-                        )
+                        ) from None
                     try:
                         return json.loads(text)
                     except ValueError as exc:

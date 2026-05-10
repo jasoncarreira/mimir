@@ -36,12 +36,12 @@ same way fetch_history does.
 from __future__ import annotations
 
 import logging
-
-from .event_logger import log_event
 from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
+
+from .event_logger import log_event
 
 log = logging.getLogger(__name__)
 
