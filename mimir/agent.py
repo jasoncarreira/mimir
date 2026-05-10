@@ -62,24 +62,13 @@ from . import health
 from .history import MessageBuffer
 from .rate_limits import (
     RateLimitStore,
-    off_pace_buckets,
     record_api_usage,
-    render_off_pace_warning,
     running_on_claude_max,
     snapshot_from_response_bucket,
     snapshot_from_sdk_event,
 )
 from .session_boundary_log import SessionBoundaryLog, render_session_summaries
-from .subagent_stats import (
-    aggregate as aggregate_subagents,
-    render_subagent_block,
-)
-from .usage_stats import (
-    aggregate as aggregate_usage,
-    event_recently_emitted,
-    evaluate_cost_rate,
-    render_usage_block,
-)
+from .usage_stats import event_recently_emitted
 from .hooks import make_post_tool_use_hook, make_pre_tool_use_hook
 from .index import IndexGenerator
 from .loop_detector import LoopDetector
@@ -1454,23 +1443,26 @@ class Agent:
         deferred: list[tuple[str, dict]] = []
         if not self._config.usage_block_enabled:
             return None, deferred
+
+        from .stats_block import assemble_stats_block
+
         try:
-            report = aggregate_usage(
-                self._config.turns_log,
-                fallback_model=self._config.model,
-                snapshot=self._turns_snapshot,
+            result = assemble_stats_block(
+                self._config,
+                self._rate_limits,
+                turns_snapshot=self._turns_snapshot,
+                events_snapshot=self._events_snapshot,
             )
         except Exception:  # noqa: BLE001
-            log.exception("usage_stats.aggregate failed; skipping block")
+            # aggregate() / evaluate_cost_rate() bubble through the
+            # shared helper; partial failures (rate-limits .current()
+            # raise OR projection raise, subagent stats) degrade
+            # gracefully INSIDE assemble_stats_block so they don't
+            # nuke the whole block (PR #116 review-fix).
+            log.exception("assemble_stats_block failed; skipping block")
             return None, deferred
 
-        alert = evaluate_cost_rate(
-            report,
-            hourly_limit_usd=self._config.cost_hourly_limit_usd or None,
-            spike_ratio=self._config.cost_rate_spike_ratio or None,
-            spike_floor_usd_per_hour=self._config.cost_rate_spike_floor_usd or None,
-        )
-        if alert is not None:
+        if result.alert is not None:
             # chainlink #13: under quota mode, cost-rate spikes are
             # advisory (logged but not suppressing — the binding
             # constraint is plan-window utilization, which costs
@@ -1490,89 +1482,44 @@ class Agent:
                     (
                         event_kind,
                         {
-                            "reason": alert.reason,
-                            "rate_now_usd_per_hour": round(alert.rate_now_usd_per_hour, 4),
-                            "threshold_usd_per_hour": round(alert.threshold_usd_per_hour, 4),
+                            "reason": result.alert.reason,
+                            "rate_now_usd_per_hour": round(result.alert.rate_now_usd_per_hour, 4),
+                            "threshold_usd_per_hour": round(result.alert.threshold_usd_per_hour, 4),
                             "baseline_usd_per_hour": (
-                                round(alert.baseline_usd_per_hour, 4)
-                                if alert.baseline_usd_per_hour is not None
+                                round(result.alert.baseline_usd_per_hour, 4)
+                                if result.alert.baseline_usd_per_hour is not None
                                 else None
                             ),
                         },
                     )
                 )
 
-        # Plan-window state from the SDK's stream. Per-response capture
-        # (when capture_rate_limits=True) gives us current state on
-        # every turn; the transition-event capture is a backstop.
-        plan_lines: list[str] = []
-        off_pace_lines: list[str] = []
-        try:
-            from .rate_limits import render_plan_quota_lines
-            current = self._rate_limits.current()
-            plan_lines = render_plan_quota_lines(current)
-            off_pace = off_pace_buckets(current)
-            off_pace_lines = render_off_pace_warning(off_pace)
-            # Cooldown-gated rate_limit_off_pace event for the algedonic
-            # surfacing. Sustained spikes only re-emit once per cooldown
-            # window so the firehose stays clean; the resource block keeps
-            # showing the warning every turn while it's tripped.
-            if off_pace and not event_recently_emitted(
-                self._config.events_log,
-                "rate_limit_off_pace",
-                cooldown_minutes=self._config.cost_alert_cooldown_minutes,
-                snapshot=self._events_snapshot,
-            ):
-                worst_key, worst_snap, worst_proj = off_pace[0]
-                deferred.append(
-                    (
-                        "rate_limit_off_pace",
-                        {
-                            "rate_limit_type": worst_key,
-                            "utilization": worst_snap.utilization,
-                            "on_pace_utilization": round(worst_proj.on_pace_utilization, 4),
-                            "hours_until_reset": round(worst_proj.hours_until_reset, 2),
-                            "resets_at": worst_snap.resets_at,
-                        },
-                    )
+        # Cooldown-gated rate_limit_off_pace event. Sustained spikes
+        # only re-emit once per cooldown window so the firehose stays
+        # clean; the resource block keeps showing the warning every
+        # turn while it's tripped (off_pace lines are baked into
+        # ``result.body``).
+        if result.off_pace and not event_recently_emitted(
+            self._config.events_log,
+            "rate_limit_off_pace",
+            cooldown_minutes=self._config.cost_alert_cooldown_minutes,
+            snapshot=self._events_snapshot,
+        ):
+            worst_key, worst_snap, worst_proj = result.off_pace[0]
+            deferred.append(
+                (
+                    "rate_limit_off_pace",
+                    {
+                        "rate_limit_type": worst_key,
+                        "utilization": worst_snap.utilization,
+                        "on_pace_utilization": round(worst_proj.on_pace_utilization, 4),
+                        "hours_until_reset": round(worst_proj.hours_until_reset, 2),
+                        "resets_at": worst_snap.resets_at,
+                    },
                 )
-        except Exception:  # noqa: BLE001
-            log.exception("rate_limits read/projection failed")
+            )
 
-        # Subagent token spend — climbers / researchers / critics
-        # spawned via the Task tool burn tokens that count against the
-        # parent's plan budget. Surface so the agent knows where the
-        # budget is going (not just "we're at 73% of weekly Opus" but
-        # "and a climber that started 2h ago has burned 320k tokens").
-        subagent_body: str | None = None
-        try:
-            subagent_report = aggregate_subagents(self._config.events_log)
-            subagent_body = render_subagent_block(subagent_report)
-        except Exception:  # noqa: BLE001
-            log.exception("subagent_stats aggregate failed")
-
-        # Reflect the active 1M-context beta in the renderer's
-        # context-window arithmetic — the `% of` denominator should
-        # match the cap actually in effect on the wire.
-        active_betas: list[str] = []
-        if self._config.context_1m:
-            from .usage_stats import CONTEXT_1M_BETA
-            active_betas.append(CONTEXT_1M_BETA)
-
-        return (
-            render_usage_block(
-                report,
-                fallback_model=self._config.model,
-                budget_5h_usd=self._config.usage_5h_limit_usd or None,
-                budget_weekly_usd=self._config.usage_weekly_limit_usd or None,
-                alert=alert,
-                plan_quota_lines=plan_lines,
-                off_pace_warning=off_pace_lines,
-                subagent_block=subagent_body,
-                betas=active_betas or None,
-            ),
-            deferred,
-        )
+        return result.body, deferred
 
     def _assemble_upcoming_block(self) -> str | None:
         """v0.5+ §12.1: feedforward — render the `## Upcoming` block from

@@ -1598,46 +1598,27 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.command == "stats":
         from .config import Config as _Config
-        from .rate_limits import (
-            RateLimitStore,
-            off_pace_buckets,
-            render_off_pace_warning,
-            render_plan_quota_lines,
-        )
-        from .subagent_stats import (
-            aggregate as aggregate_subagents,
-            render_subagent_block,
-        )
-        from .usage_stats import aggregate, evaluate_cost_rate, render_usage_block
+        from .rate_limits import RateLimitStore
+        from .stats_block import assemble_stats_block
         home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
         os.environ["MIMIR_HOME"] = str(Path(home_arg).resolve())
         cfg = _Config.from_env()
-        report = aggregate(cfg.turns_log, fallback_model=cfg.model)
         store = RateLimitStore(path=cfg.home / ".mimir" / "rate_limits.json")
-        current = store.current()
-        alert = evaluate_cost_rate(
-            report,
-            hourly_limit_usd=cfg.cost_hourly_limit_usd or None,
-            spike_ratio=cfg.cost_rate_spike_ratio or None,
-            spike_floor_usd_per_hour=cfg.cost_rate_spike_floor_usd or None,
-        )
-        subagent_body = render_subagent_block(
-            aggregate_subagents(cfg.events_log),
-        )
-        body = render_usage_block(
-            report,
-            fallback_model=cfg.model,
-            budget_5h_usd=cfg.usage_5h_limit_usd or None,
-            budget_weekly_usd=cfg.usage_weekly_limit_usd or None,
-            alert=alert,
-            plan_quota_lines=render_plan_quota_lines(current),
-            off_pace_warning=render_off_pace_warning(off_pace_buckets(current)),
-            subagent_block=subagent_body,
-        )
-        if body is None:
+        # ``assemble_stats_block`` is the shared assembly used on the
+        # agent loop too (mimir/stats_block.py). CLI passes the
+        # ``RateLimitStore`` itself (not the .current() dict) so the
+        # helper can call .current() inside its own try/except and
+        # degrade gracefully on a corrupt rate_limits.json instead
+        # of nuking the whole block. No JsonlSnapshot — one-shot use,
+        # no caching wins. ``betas`` defaults from ``cfg.context_1m``
+        # so the CLI output's context-window arithmetic matches what
+        # the agent renders.
+        result = assemble_stats_block(cfg, store)
+        if result.body is None:
             print("(no turns recorded yet)")
         else:
-            print(body)
+            print(result.body)
+        alert = result.alert
         # CR2 (ops & observability) fix: also print the billing mode
         # and which event the agent WOULD emit for the alert, so an
         # operator triaging "did the agent see an alert?" gets a
