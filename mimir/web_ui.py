@@ -129,15 +129,16 @@ def register_routes(
         return web.json_response({"events": out})
 
     async def ops_page(request: web.Request) -> web.Response:
+        # Static HTML shell — frontend AJAX-fetches /api/ops with the
+        # API key from localStorage. We still validate ``?days=`` here
+        # so a malformed value gets a clear error before the JS tries
+        # to use the same query string against the data endpoint.
         try:
-            days = parse_days_param(request.query.get("days"))
+            parse_days_param(request.query.get("days"))
         except ValueError as exc:
             return web.Response(text=str(exc), status=400)
-        stats = await build_dashboard_payload_async(
-            events_log, days, home=home,
-        )
         return web.Response(
-            text=render_dashboard_html(stats), content_type="text/html",
+            text=render_dashboard_html(), content_type="text/html",
         )
 
     async def ops_data(request: web.Request) -> web.Response:
