@@ -10,6 +10,10 @@ This is a **point-in-time snapshot**. Code changes; before acting on a
 specific finding, re-read the cited file:line to confirm the issue is still
 present.
 
+**Update 2026-05-10 (post-decision pass):** Three findings have been
+re-graded after closer inspection — see the [Re-grades](#re-grades-2026-05-10)
+section at the bottom. Severity adjustments propagated below.
+
 ---
 
 ## TL;DR
@@ -32,9 +36,11 @@ drift:
 - **EventLogger reads the entire events.jsonl into memory at startup** to
   count lines (`event_logger.py:32`); same pattern in `TurnLogger.__init__`,
   `loops_cmd`, `ops_dashboard._load_events`, and `web_ui._read_jsonl`.
-- **fsync-before-restart targets a readonly fd against a different writer's
-  buffered output** — the bind-mount-staleness recovery isn't actually
-  durable (`health_probe.py:362`).
+- ~~**fsync-before-restart targets a readonly fd against a different writer's
+  buffered output**~~ — *re-graded to low (doc-only). POSIX fsync is
+  per-inode, not per-fd-open-flags; a readonly fsync correctly flushes the
+  inode's pending OS-page-cache. The original framing was overcautious. See
+  [Re-grades](#re-grades-2026-05-10).*
 
 Cross-cutting patterns (each appears in ≥3 places): forward-scan whole-file
 JSONL reads on the event loop, unauthenticated web endpoints assuming
@@ -209,17 +215,21 @@ The list to action first. Everything below has been verified to file:line.
   `_trim`, reuse `_jsonl_tail.tail_jsonl_records`.
 
 ### 7. fsync-before-restart targets a readonly fd against different writer's buffered output
-- **Severity:** high
+- **Severity:** ~~high~~ → **low (re-graded 2026-05-10, doc-only)**
 - **Files:** `mimir/health_probe.py:362-376`, `mimir/event_logger.py:53-72`
-- **What:** `_fsync_events_log` opens the file with `os.O_RDONLY` then
-  calls `os.fsync(fd)`. fsync on an unrelated readonly fd is undefined/no-op
-  for flushing a *different* file handle's data on macOS HFS/APFS and not
-  guaranteed on virtiofs. Compounding: `EventLogger.log` doesn't
-  `flush() + fsync()` after writing — relies on the `with` block's close.
-  The bind-mount-staleness recovery may lose its own breadcrumb event.
-- **Fix:** Make `EventLogger.log` flush+fsync for events tagged as
-  critical (e.g. a kwarg), or have `_fsync_events_log` open with
-  `O_WRONLY|O_APPEND` and document the platform assumption.
+- **What:** Original framing claimed readonly-fd fsync was "undefined/no-op
+  for flushing a different file handle's data." That was overcautious —
+  POSIX `fsync(2)` is **per-inode**, not per-fd-open-flags. Linux and
+  macOS both follow this. The readonly-fd fsync DOES flush the inode's
+  pending OS-page-cache regardless of which fd dirtied it. After
+  `EventLogger.log`'s `with` block exits, the writer's Python buffer is
+  flushed to OS page cache; the subsequent fsync correctly drives that
+  to disk.
+- **Why it matters now (smaller):** virtiofs / Docker-on-macOS has weaker
+  fsync semantics — not a bug, a platform constraint worth documenting.
+- **Fix:** Doc-only. Update `_fsync_events_log`'s docstring to acknowledge
+  POSIX inode semantics and flag virtiofs as a known platform caveat. No
+  code change.
 
 ### 8. Cost-rate baseline divides by full window on partial-week data
 - **Severity:** high
@@ -242,31 +252,39 @@ The list to action first. Everything below has been verified to file:line.
   line cap independent of the `?limit=` query.
 
 ### 10. evaluate_cost_rate spike-floor short-circuits the absolute check
-- **Severity:** high
+- **Severity:** ~~high~~ → **low (re-graded 2026-05-10, doc-only)**
 - **File:** `mimir/usage_stats.py:334-339`
-- **What:** Logic is: check absolute hourly limit → if not exceeded,
-  check spike ratio → return None if `rate_now < spike_floor`. The
-  `return None` exits before re-considering anything. Effectively, the
-  spike-ratio path is silenced sub-floor, and an operator who sets only
-  `spike_ratio` (no absolute) and never trips floor gets no signal —
-  alerting works only at high spend rates, exactly when the operator
-  least wants to find out late.
-- **Fix:** Document explicitly that the spike-ratio path is silenced
-  sub-floor and that an absolute ceiling is the only sub-floor backstop.
-  Consider clamping `spike_floor_usd_per_hour` only against the spike
-  branch, not as an early `return None`.
+- **What:** On closer reading, the existing ordering is correct: the
+  absolute hourly-limit check at line 326 fires **before** any spike-branch
+  logic, regardless of floor. The line-339 `return None` exits only the
+  spike branch (after the absolute check has already been evaluated) —
+  the floor doesn't suppress absolute alerts. So the floor is already
+  "spike-only" in effect.
+- **Real residual concern:** an operator who sets only `spike_ratio`
+  (no `hourly_limit_usd`) and runs sub-floor never alerts. That's by
+  design (docstring lines 309-318: "$5/hr is the neighborhood that
+  catches genuine oddities while ignoring normal working sessions") —
+  pair-with-absolute is the documented contract.
+- **Fix:** Doc-only. Update the docstring to make the pairing
+  requirement explicit: "If `spike_ratio` is set without
+  `hourly_limit_usd`, sub-floor rates never alert by design — pair
+  with an absolute ceiling for true protection."
 
 ### 11. _HttpSaga._get_or_empty never retries — silent on transient blip
-- **Severity:** medium-high
+- **Severity:** ~~medium-high~~ → **low (re-graded 2026-05-10, doc-only)**
 - **File:** `mimir/saga_client.py:584-599`
-- **What:** `recent_session_boundaries` and `most_retrieved_atoms` go
-  through `_get_or_empty`, which has zero retries — a single
-  `ClientError`/timeout drops the entire result silently and the prompt
-  gets no session summaries. Meanwhile `_post` retries 3× with backoff.
-  No documented justification for the asymmetry.
-- **Fix:** Reuse the `_post` retry policy (factor a shared helper), or
-  document why GET is intentionally degrade-to-empty AND ensure the
-  local-mirror fallback fires on empty results, not just on raise.
+- **What:** The asymmetry is intentional and the name telegraphs it.
+  `_get_or_empty` is the prompt-assembly fast path; adding `_post`'s
+  ~1.4s retry backoff would block the prompt build on every transient
+  blip — exactly the failure mode PR #96 (CR2-#3, just merged) is
+  fighting. Fast-degrade-to-empty is the right shape.
+- **Why it doesn't matter:** PR #96 closed the consumer-side loop —
+  `_assemble_session_summaries` now falls through to the local mirror
+  on both empty result AND raise. No missing fallback.
+- **Fix:** Doc-only. Update `_get_or_empty`'s docstring to explicitly
+  document "fast degrade for prompt assembly; no retries by design —
+  caller is responsible for fallback semantics on empty result." Keep
+  `_post`'s retry policy as-is.
 
 ### 12. /chat POST unauthenticated with arbitrary extra; SSE wildcard CORS
 - **Severity:** high (subset of pattern B but worth surfacing)
@@ -828,3 +846,38 @@ Findings are weighted toward signal over volume — a short list of real
 issues beats a long list of nits. ~62 raw findings in total; this doc
 reflects the consolidated set, with cross-cutting patterns lifted out
 of per-finding redundancy.
+
+---
+
+## Re-grades (2026-05-10)
+
+After a closer pass on the four highest-stakes "needs-design-call" items,
+three were re-graded down on the basis of "the original review was
+overcautious or missed an existing invariant." Recording the deltas here
+so the same mistake isn't re-derived on the next review:
+
+| # | Title | Original | Re-graded | Reason |
+|---|-------|----------|-----------|--------|
+| 7 | fsync against readonly fd | high | low (doc) | POSIX fsync is per-inode, not per-fd-open-flags; readonly-fd fsync correctly flushes the inode's pending writes regardless of which fd dirtied it. |
+| 10 | spike-floor short-circuits absolute | high | low (doc) | The absolute-limit check at line 326 fires *before* the spike branch, so the floor never suppresses absolute alerts. Sub-floor "no spike alert" is the documented design intent ("ignore normal working sessions"); pair-with-absolute is the contract. |
+| 11 | _get_or_empty no retries | med-high | low (doc) | Intentional fast-degrade-to-empty for the prompt-assembly path. PR #96 closes the consumer loop (local-mirror fallback fires on empty AND raise). |
+
+The doc-only fixes are still worth shipping because they prevent the
+same misreading on the next review, but they shouldn't compete with
+real correctness work for queue priority.
+
+**CR2-#1 (billing-mode auto-detect)** retains its original critical
+severity — verified the path-truthy claim still holds at billing.py:90
+and config.py:52-78. Mechanical fix (add `.is_file()` guard).
+
+### Lesson for future code review prompts
+
+Three of four "high-severity" findings on the design-call slice were
+overstated. Common cause: the review agents flagged shapes that *looked*
+suspicious without verifying the runtime invariant (POSIX fsync
+semantics, branch ordering in `evaluate_cost_rate`, intentional naming
+in `_get_or_empty`). When dispatching review agents, prompt them to
+distinguish "this code's behavior is wrong" from "this code's shape
+looks risky"; the second category needs a verification step before it
+graduates to "high."
+
