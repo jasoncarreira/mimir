@@ -346,10 +346,14 @@ class ShellJobRegistry:
                         return prefix + data.decode("utf-8", errors="replace")
                     # Bounded line-count tail: read backward chunks
                     # until we have n+1 newlines (so we can drop the
-                    # first partial line) or hit BOF.
+                    # first partial line), hit BOF, or hit MAX_BYTES.
                     buf = b""
                     newline_count = 0
-                    while pos > 0 and newline_count <= n and len(buf) < MAX_BYTES:
+                    hit_byte_cap = False
+                    while pos > 0 and newline_count <= n:
+                        if len(buf) >= MAX_BYTES:
+                            hit_byte_cap = True
+                            break
                         read_size = min(CHUNK, pos)
                         pos -= read_size
                         f.seek(pos)
@@ -358,12 +362,34 @@ class ShellJobRegistry:
                         newline_count = buf.count(b"\n")
                     text = buf.decode("utf-8", errors="replace")
                     lines = text.splitlines()
+                    # PR #111 review fix: include a truncation marker
+                    # whenever output is shorter than what's actually
+                    # on disk. Pre-fix the line-count branch silently
+                    # returned the trailing n lines with no signal —
+                    # operator couldn't tell whether the file had
+                    # exactly n lines or N >> n. Marker shape mirrors
+                    # the n<=0 branch's "[...truncated X bytes...]"
+                    # format above.
                     if pos == 0 and len(lines) <= n:
                         return text
-                    # We have at least n full lines plus possibly a
-                    # partial leading line — drop everything past the
-                    # trailing n lines.
-                    return "\n".join(lines[-n:])
+                    kept = lines[-n:]
+                    dropped_lines = len(lines) - len(kept)
+                    if hit_byte_cap or pos > 0:
+                        prefix_parts = []
+                        if dropped_lines > 0:
+                            prefix_parts.append(
+                                f"{dropped_lines} earlier line(s)"
+                            )
+                        if pos > 0:
+                            prefix_parts.append(
+                                f"{pos} earlier byte(s) on disk"
+                            )
+                        if prefix_parts:
+                            return (
+                                f"[…truncated; {', '.join(prefix_parts)} "
+                                f"not shown…]\n" + "\n".join(kept)
+                            )
+                    return "\n".join(kept)
             except FileNotFoundError:
                 return ""
 

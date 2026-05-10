@@ -271,6 +271,30 @@ def record_first_seen(
     first_login_at = existing.get("first_login_at_unix")
     if not isinstance(first_login_at, (int, float)):
         first_login_at = now
+    # CR2 (external I/O) review fix: detect re-``/login`` by tail
+    # change. Pre-fix the sticky ``logged_out_since_unix`` was set
+    # by ``mark_logged_out`` and only cleared by ``clear_logged_out``
+    # — which runs in the refresh path, which is gated by the
+    # throttle. Result: once logged out, the throttle was permanent
+    # for the sidecar's lifetime; re-``/login`` didn't recover the
+    # agent's usage polling. Now: when the refresh-token tail
+    # changes (operator re-ran ``/login``), clear the sticky logged-
+    # out state so the next poll resumes the regular flow.
+    prior_tail = existing.get("last_seen_refresh_tail")
+    if (
+        prior_tail is not None
+        and tail
+        and prior_tail != tail
+        and ("logged_out_since_unix" in existing
+             or "logged_out_last_reminder_unix" in existing)
+    ):
+        existing.pop("logged_out_since_unix", None)
+        existing.pop("logged_out_last_reminder_unix", None)
+        log.info(
+            "refresh-token tail changed (%r → %r); clearing sticky "
+            "logged_out state from sidecar",
+            prior_tail, tail,
+        )
     existing["last_seen_refresh_tail"] = tail
     existing["last_seen_at_unix"] = int(now)
     existing.setdefault("first_login_at_unix", int(first_login_at))
