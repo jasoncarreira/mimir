@@ -56,8 +56,22 @@ _MAX_QUERY_CHARS = 1500
 # 0.2 + 0.4 + 0.8 = 1.4s across 4 attempts, which covers a typical sidecar
 # restart without hanging the agent. Past that, surface the error and let
 # the caller log+continue.
+#
+# The two constants are loosely coupled: ``_MAX_RETRIES`` controls how many
+# retry attempts fire, ``_RETRY_DELAYS_S`` provides the per-attempt sleep.
+# Today they line up (3 retries, 3 delays) so ``_RETRY_DELAYS_S[attempt]``
+# is always in-bounds. A future tuner who bumps ``_MAX_RETRIES`` past
+# ``len(_RETRY_DELAYS_S)`` would IndexError mid-retry; the call sites use
+# ``_retry_delay()`` to clamp the lookup defensively.
 _MAX_RETRIES = 3
 _RETRY_DELAYS_S = (0.2, 0.4, 0.8)
+
+
+def _retry_delay(attempt: int) -> float:
+    """Return the sleep duration for ``attempt`` (0-indexed), clamped to
+    the last entry in ``_RETRY_DELAYS_S`` so the lookup is index-safe
+    when ``_MAX_RETRIES`` is tuned past the tuple's length."""
+    return _RETRY_DELAYS_S[min(attempt, len(_RETRY_DELAYS_S) - 1)]
 
 
 class SagaError(RuntimeError):
@@ -559,7 +573,7 @@ class _HttpSaga:
                         last_status = resp.status
                         last_body = text
                         if attempt < _MAX_RETRIES:
-                            await asyncio.sleep(_RETRY_DELAYS_S[attempt])
+                            await asyncio.sleep(_retry_delay(attempt))
                             continue
                         raise SagaError(
                             f"SAGA {path} returned {resp.status} after {attempt + 1} attempts",
@@ -576,7 +590,7 @@ class _HttpSaga:
                         raise SagaError(f"SAGA {path} returned non-JSON body: {exc}") from exc
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if attempt < _MAX_RETRIES:
-                    await asyncio.sleep(_RETRY_DELAYS_S[attempt])
+                    await asyncio.sleep(_retry_delay(attempt))
                     continue
                 raise SagaError(
                     f"SAGA {path} failed after {attempt + 1} attempts: "
