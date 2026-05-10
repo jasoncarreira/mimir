@@ -1449,14 +1449,16 @@ class Agent:
         try:
             result = assemble_stats_block(
                 self._config,
-                self._rate_limits.current(),
+                self._rate_limits,
                 turns_snapshot=self._turns_snapshot,
                 events_snapshot=self._events_snapshot,
             )
         except Exception:  # noqa: BLE001
             # aggregate() / evaluate_cost_rate() bubble through the
-            # shared helper; partial failures (rate-limits, subagent
-            # stats) degrade gracefully inside assemble_stats_block.
+            # shared helper; partial failures (rate-limits .current()
+            # raise OR projection raise, subagent stats) degrade
+            # gracefully INSIDE assemble_stats_block so they don't
+            # nuke the whole block (PR #116 review-fix).
             log.exception("assemble_stats_block failed; skipping block")
             return None, deferred
 

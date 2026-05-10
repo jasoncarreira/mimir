@@ -1605,11 +1605,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         cfg = _Config.from_env()
         store = RateLimitStore(path=cfg.home / ".mimir" / "rate_limits.json")
         # ``assemble_stats_block`` is the shared assembly used on the
-        # agent loop too (mimir/stats_block.py). CLI passes no
-        # JsonlSnapshot — one-shot use, no caching wins. ``betas``
-        # defaults from ``cfg.context_1m`` so the CLI output's
-        # context-window arithmetic matches what the agent renders.
-        result = assemble_stats_block(cfg, store.current())
+        # agent loop too (mimir/stats_block.py). CLI passes the
+        # ``RateLimitStore`` itself (not the .current() dict) so the
+        # helper can call .current() inside its own try/except and
+        # degrade gracefully on a corrupt rate_limits.json instead
+        # of nuking the whole block. No JsonlSnapshot — one-shot use,
+        # no caching wins. ``betas`` defaults from ``cfg.context_1m``
+        # so the CLI output's context-window arithmetic matches what
+        # the agent renders.
+        result = assemble_stats_block(cfg, store)
         if result.body is None:
             print("(no turns recorded yet)")
         else:

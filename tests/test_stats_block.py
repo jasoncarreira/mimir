@@ -3,8 +3,8 @@
 The agent loop and the ``mimir stats`` CLI both feed through
 ``assemble_stats_block``. These tests pin:
 - the happy path: aggregate + alert + plan + subagent → rendered body
-- partial-failure: rate_limits raises → block still renders (plan
-  lines empty)
+- partial-failure: rate_limits ``.current()`` raises → block still renders
+- partial-failure: rate_limits projection raises → block still renders
 - partial-failure: subagent_stats raises → block still renders
   (subagent body None)
 - ``betas`` auto-defaults from ``cfg.context_1m``
@@ -40,6 +40,21 @@ class _StubCfg:
         self.context_1m = context_1m
 
 
+class _StubStore:
+    """Minimal ``RateLimitStore``-shaped stub. The helper only invokes
+    ``.current()``; tests inject ``side_effect`` to simulate raises or
+    different return values."""
+
+    def __init__(self, current=None, raises: Exception | None = None):
+        self._current = current if current is not None else {}
+        self._raises = raises
+
+    def current(self):
+        if self._raises is not None:
+            raise self._raises
+        return self._current
+
+
 def _ts(hours_ago: float = 0) -> str:
     return (
         datetime.now(tz=timezone.utc) - timedelta(hours=hours_ago)
@@ -67,7 +82,7 @@ def test_assemble_returns_result_with_body_and_state(tmp_path: Path):
     cfg = _StubCfg(tmp_path)
     _write_turn(cfg.turns_log, hours_ago=1, cost=0.50)
 
-    result = assemble_stats_block(cfg, rate_limit_current={})
+    result = assemble_stats_block(cfg, _StubStore())
 
     assert isinstance(result, StatsBlockResult)
     assert result.body is not None
@@ -84,11 +99,30 @@ def test_assemble_returns_none_body_when_no_turns(tmp_path: Path):
     through. The CLI prints '(no turns recorded yet)' on this signal."""
     cfg = _StubCfg(tmp_path)
 
-    result = assemble_stats_block(cfg, rate_limit_current={})
+    result = assemble_stats_block(cfg, _StubStore())
     assert result.body is None
 
 
-def test_assemble_degrades_on_rate_limits_exception(tmp_path: Path):
+def test_assemble_degrades_on_rate_limits_current_raise(tmp_path: Path):
+    """PR #116 review-fix: ``store.current()`` raising (corrupt
+    rate_limits.json, stat() error) must NOT take out the whole block
+    — pre-refactor the agent path caught this inside an inner
+    try/except. The shared helper preserves that by calling
+    ``.current()`` INSIDE its rate-limits try/except instead of
+    requiring the caller to invoke it ahead of time."""
+    cfg = _StubCfg(tmp_path)
+    _write_turn(cfg.turns_log, hours_ago=1, cost=0.50)
+
+    store = _StubStore(raises=RuntimeError("corrupt rate_limits.json"))
+    result = assemble_stats_block(cfg, store)
+
+    # Body still rendered; rate-limit state is the empty default.
+    assert result.body is not None
+    assert result.off_pace == []
+    assert result.rate_limit_current == {}
+
+
+def test_assemble_degrades_on_rate_limits_projection_exception(tmp_path: Path):
     """``rate_limits.render_plan_quota_lines`` blowing up must NOT take
     out the whole block — pre-refactor the agent path caught this and
     rendered with empty plan lines. The shared helper preserves that."""
@@ -99,7 +133,7 @@ def test_assemble_degrades_on_rate_limits_exception(tmp_path: Path):
         "mimir.stats_block.render_plan_quota_lines",
         side_effect=RuntimeError("boom"),
     ):
-        result = assemble_stats_block(cfg, rate_limit_current={"plan": "bad"})
+        result = assemble_stats_block(cfg, _StubStore(current={"plan": "bad"}))
 
     # Body still rendered, just without plan lines / off_pace warning.
     assert result.body is not None
@@ -117,7 +151,7 @@ def test_assemble_degrades_on_subagent_stats_exception(tmp_path: Path):
         "mimir.stats_block.aggregate_subagents",
         side_effect=RuntimeError("boom"),
     ):
-        result = assemble_stats_block(cfg, rate_limit_current={})
+        result = assemble_stats_block(cfg, _StubStore())
 
     # Body still rendered.
     assert result.body is not None
@@ -135,7 +169,7 @@ def test_assemble_aggregate_exception_bubbles(tmp_path: Path):
         side_effect=RuntimeError("boom"),
     ):
         with pytest.raises(RuntimeError, match="boom"):
-            assemble_stats_block(cfg, rate_limit_current={})
+            assemble_stats_block(cfg, _StubStore())
 
 
 def test_assemble_betas_default_from_context_1m(tmp_path: Path):
@@ -156,7 +190,7 @@ def test_assemble_betas_default_from_context_1m(tmp_path: Path):
         return "[rendered]"
 
     with patch("mimir.stats_block.render_usage_block", side_effect=_capture):
-        assemble_stats_block(cfg, rate_limit_current={})
+        assemble_stats_block(cfg, _StubStore())
 
     assert captured.get("betas") == [CONTEXT_1M_BETA]
 
@@ -173,7 +207,7 @@ def test_assemble_betas_explicit_override(tmp_path: Path):
         return "[rendered]"
 
     with patch("mimir.stats_block.render_usage_block", side_effect=_capture):
-        assemble_stats_block(cfg, rate_limit_current={}, betas=[])
+        assemble_stats_block(cfg, _StubStore(), betas=[])
 
     # Empty list → renderer gets ``betas=None`` (the ``betas or None``
     # short-circuit).

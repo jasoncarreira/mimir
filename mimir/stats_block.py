@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .rate_limits import (
+    RateLimitStore,
     off_pace_buckets,
     render_off_pace_warning,
     render_plan_quota_lines,
@@ -81,7 +82,7 @@ class StatsBlockResult:
 
 def assemble_stats_block(
     cfg: "Config",
-    rate_limit_current: dict[str, Any],
+    rate_limits: RateLimitStore,
     *,
     turns_snapshot: "JsonlSnapshot | None" = None,
     events_snapshot: "JsonlSnapshot | None" = None,
@@ -91,9 +92,12 @@ def assemble_stats_block(
     return a ``StatsBlockResult`` with the rendered body and the
     underlying state.
 
-    ``rate_limit_current`` is the SDK rate-limit snapshot dict from
-    either an ``Agent._rate_limits.current()`` (worker-loop path) or
-    ``RateLimitStore(...).current()`` (CLI path).
+    ``rate_limits`` is the ``RateLimitStore`` from either the agent's
+    ``self._rate_limits`` (worker-loop path) or a per-CLI-invocation
+    ``RateLimitStore(path=...)``. The helper calls ``.current()``
+    INSIDE the rate-limits try/except so a corrupt rate_limits.json
+    or transient stat() error degrades to empty plan lines instead
+    of taking down the whole block (PR #116 review-fix).
 
     ``turns_snapshot`` / ``events_snapshot`` are JsonlSnapshot caches
     used by the agent path to avoid re-scanning turns.jsonl /
@@ -107,8 +111,10 @@ def assemble_stats_block(
     Partial-failure shape (matches pre-refactor agent behavior):
     - aggregate() / evaluate_cost_rate() exceptions BUBBLE — the
       whole block goes away (caller catches + skips).
-    - rate-limits exception → ``off_pace = []`` + empty plan/off_pace
-      lines; the block still renders.
+    - rate-limits exception (``.current()`` raise OR projection
+      raise) → ``off_pace = []`` + empty plan/off_pace lines;
+      ``rate_limit_current = {}`` echoed on the result; the block
+      still renders.
     - subagent_stats exception → ``subagent_block = None``; the
       block still renders.
     """
@@ -133,7 +139,9 @@ def assemble_stats_block(
     plan_lines: list[str] = []
     off_pace_lines: list[str] = []
     off_pace: list[Any] = []
+    rate_limit_current: dict[str, Any] = {}
     try:
+        rate_limit_current = rate_limits.current()
         plan_lines = render_plan_quota_lines(rate_limit_current)
         off_pace = off_pace_buckets(rate_limit_current)
         off_pace_lines = render_off_pace_warning(off_pace)
