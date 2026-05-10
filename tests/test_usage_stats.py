@@ -622,3 +622,39 @@ def test_cooldown_zero_disables(tmp_path: Path):
         json.dumps({"timestamp": _ts(0.001), "type": "cost_rate_alert"}) + "\n"
     )
     assert not cost_rate_alert_recently_emitted(events, cooldown_minutes=0)
+
+
+def test_find_window_lookup_by_hours_not_label(tmp_path: Path):
+    """CR2 (ops & observability) fix: ``_find_window`` looks up by
+    ``hours`` field on UsageWindow, not by regenerating the
+    ``_default_label(hours)`` string. Caller-supplied custom
+    ``window_labels`` to ``aggregate()`` no longer silently break
+    the spike-ratio lookup."""
+    from mimir.usage_stats import (
+        UsageReport, UsageWindow, _find_window,
+    )
+    rep = UsageReport(windows=[
+        UsageWindow(label="custom 1h", hours=1.0, total_cost_usd=5.0),
+        UsageWindow(label="custom 7d", hours=24.0 * 7, total_cost_usd=1.68),
+    ])
+    # Lookup by hours succeeds even though label doesn't match
+    # ``_default_label(1.0)`` ("Last 1h").
+    found = _find_window(rep, 1.0)
+    assert found is not None
+    assert found.label == "custom 1h"
+    assert found.total_cost_usd == 5.0
+
+
+def test_find_window_legacy_fallback_via_label(tmp_path: Path):
+    """Defensive: a UsageWindow constructed without ``hours`` (default
+    0.0) falls back to label-string match for back-compat with old
+    test fixtures and external callers."""
+    from mimir.usage_stats import (
+        UsageReport, UsageWindow, _find_window,
+    )
+    rep = UsageReport(windows=[
+        UsageWindow(label="Last 1h", total_cost_usd=5.0),
+    ])
+    found = _find_window(rep, 1.0)
+    assert found is not None
+    assert found.total_cost_usd == 5.0
