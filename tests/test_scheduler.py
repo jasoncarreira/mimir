@@ -1074,3 +1074,336 @@ async def test_add_poller_jobs_skips_invalid_cron(tmp_path: Path):
     n = sched.add_poller_jobs(skills)
     assert n == 1
     assert sched.registered_pollers() == ["good"]
+
+
+# ─── PR #107: APScheduler misfire visibility + concurrency cap + lock ─
+
+
+@pytest.mark.asyncio
+async def test_pollers_misfire_grace_time_is_5s(tmp_path: Path):
+    """Poller registrations use ``misfire_grace_time=5`` (was 60).
+    The lower value + EVENT_JOB_MISSED listener means a 60s-timeout
+    poller that overruns into the next minute's fire emits a
+    ``poller_misfired`` event instead of silently dropping."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)
+    job = sched._scheduler.get_job("poller:p1")
+    assert job is not None
+    assert job.misfire_grace_time == 5
+
+
+@pytest.mark.asyncio
+async def test_pollers_concurrency_cap_default_is_8(tmp_path: Path):
+    """``MIMIR_MAX_CONCURRENT_POLLERS`` defaults to 8. The semaphore
+    is constructed in __init__ so reading at runtime confirms the
+    binding."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched._poller_concurrency_cap == 8
+    # Semaphore starts fully available — 8 acquire-without-block possible.
+    for _ in range(8):
+        assert not sched._poller_semaphore.locked()
+        await sched._poller_semaphore.acquire()
+    assert sched._poller_semaphore.locked()
+    # Release for cleanup.
+    for _ in range(8):
+        sched._poller_semaphore.release()
+
+
+@pytest.mark.asyncio
+async def test_pollers_concurrency_cap_env_override(
+    tmp_path: Path, monkeypatch
+):
+    """``MIMIR_MAX_CONCURRENT_POLLERS=N`` overrides the default."""
+    async def noop(_e):
+        return True
+    monkeypatch.setenv("MIMIR_MAX_CONCURRENT_POLLERS", "3")
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched._poller_concurrency_cap == 3
+
+
+@pytest.mark.asyncio
+async def test_pollers_concurrency_cap_invalid_env_falls_back(
+    tmp_path: Path, monkeypatch
+):
+    """Garbage value in the env var → default 8 (no crash)."""
+    async def noop(_e):
+        return True
+    monkeypatch.setenv("MIMIR_MAX_CONCURRENT_POLLERS", "not a number")
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched._poller_concurrency_cap == 8
+
+
+@pytest.mark.asyncio
+async def test_pollers_concurrency_cap_clamps_to_one(
+    tmp_path: Path, monkeypatch
+):
+    """Zero / negative → 1 (degenerate single-fire mode, not 0
+    which would deadlock)."""
+    async def noop(_e):
+        return True
+    monkeypatch.setenv("MIMIR_MAX_CONCURRENT_POLLERS", "0")
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched._poller_concurrency_cap == 1
+
+
+@pytest.mark.asyncio
+async def test_reinstall_pollers_keeps_present_pollers_in_dict(tmp_path: Path):
+    """PR #107 review fix: ``_reinstall_pollers`` no longer
+    clears-then-rebuilds; it does in-place per-entry pre-population
+    (each new poller is set in ``self._pollers[name]`` BEFORE its
+    ``add_job`` call) and removes only stale entries after discovery.
+    A reload-with-same-skills-present produces no observable gap in
+    the dict — no entry is ever absent during the reload window.
+
+    See ``test_reinstall_pollers_pre_populates_dict_before_add_job``
+    for the direct ordering proof; this test exercises the
+    same-set-reload happy path."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)
+    assert "p1" in sched._pollers
+    poller_before = sched._pollers["p1"]
+
+    # Reload with the same skill present — entry stays in the dict
+    # throughout (in-place update, not clear-and-rebuild).
+    n = await sched.reload_pollers()
+    assert n == 1
+    assert "p1" in sched._pollers
+    # The poller config is re-loaded but identity-equivalent.
+    assert sched._pollers["p1"].name == poller_before.name
+    assert sched._pollers["p1"].cron == poller_before.cron
+
+
+@pytest.mark.asyncio
+async def test_reinstall_pollers_drops_removed_skills_from_dict(
+    tmp_path: Path,
+):
+    """Stale entries cleanup: a poller that was registered last time
+    but is gone from disk this time gets removed from the dict via
+    the new-names diff (computed up-front from the discovery pass)."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "to-drop")
+    _drop_pollers_skill(skills, "to-keep")
+    sched.add_poller_jobs(skills)
+    assert "to-drop" in sched._pollers
+    assert "to-keep" in sched._pollers
+
+    # Remove the to-drop skill on disk, then reload.
+    import shutil
+    shutil.rmtree(skills / "to-drop")
+    n = await sched.reload_pollers()
+    assert n == 1
+    assert "to-keep" in sched._pollers
+    # Stale entry dropped.
+    assert "to-drop" not in sched._pollers
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_serializes_via_mutate_lock(tmp_path: Path):
+    """``reload_pollers`` acquires ``self._mutate_lock`` to serialize
+    against concurrent ``add_job`` / ``remove_job`` mutations.
+    Exercise the lock path; the test passes if reload completes
+    without a race-induced crash."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)
+
+    # Race two concurrent reloads + a yaml-mutation through the lock.
+    job = SchedulerJob(name="t", cron="*/5 * * * *", prompt="ping")
+    results = await asyncio.gather(
+        sched.reload_pollers(),
+        sched.reload_pollers(),
+        sched.add_job(job),
+        return_exceptions=True,
+    )
+    # All three return without exceptions (lock serialized them).
+    assert all(not isinstance(r, BaseException) for r in results), results
+    # Pollers still registered after the chaos.
+    assert sched._pollers.get("p1") is not None
+
+
+# ─── PR #107 review-fix: misfire listener + behavioral concurrency cap ─
+
+
+@pytest.mark.asyncio
+async def test_on_job_missed_emits_poller_misfired_for_poller_jobs(
+    tmp_path: Path, monkeypatch
+):
+    """The EVENT_JOB_MISSED listener emits ``poller_misfired`` when
+    the missed job's id is prefixed ``poller:``. PR #107 review fix —
+    the headline behavioral change wasn't covered by the original
+    tests, so a future refactor that broke the listener wiring would
+    go undetected."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    # Capture log_event calls.
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(event_type: str, **kwargs):
+        captured.append((event_type, kwargs))
+
+    with patch("mimir.scheduler.log_event", new=fake_log_event):
+        # Synthesize the EVENT_JOB_MISSED payload. apscheduler's
+        # JobExecutionEvent has these fields; SimpleNamespace is
+        # enough for our listener.
+        fake_event = SimpleNamespace(
+            job_id="poller:my-skill",
+            scheduled_run_time=datetime(
+                2026, 5, 10, 12, 0, tzinfo=timezone.utc,
+            ),
+        )
+        sched._on_job_missed(fake_event)
+        # The listener schedules the log call as a task; yield once.
+        await asyncio.sleep(0)
+
+    assert len(captured) == 1
+    event_type, kwargs = captured[0]
+    assert event_type == "poller_misfired"
+    assert kwargs["job_id"] == "poller:my-skill"
+    assert kwargs["scheduled_run_time"] == "2026-05-10T12:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_on_job_missed_emits_scheduled_job_misfired_for_other_jobs(
+    tmp_path: Path,
+):
+    """Non-poller jobs (LLM ticks, OAuth quota poll, callable jobs)
+    emit ``scheduled_job_misfired`` so the operator can disambiguate
+    poller-cron mismatches from other scheduling problems."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(event_type: str, **kwargs):
+        captured.append((event_type, kwargs))
+
+    with patch("mimir.scheduler.log_event", new=fake_log_event):
+        fake_event = SimpleNamespace(
+            job_id="scheduler:morning-ping",
+            scheduled_run_time=datetime(
+                2026, 5, 10, 8, 0, tzinfo=timezone.utc,
+            ),
+        )
+        sched._on_job_missed(fake_event)
+        await asyncio.sleep(0)
+
+    assert len(captured) == 1
+    event_type, _ = captured[0]
+    assert event_type == "scheduled_job_misfired"
+
+
+@pytest.mark.asyncio
+async def test_fire_poller_serializes_through_semaphore(
+    tmp_path: Path, monkeypatch
+):
+    """Behavioral test of the concurrency cap: spawn N+1 concurrent
+    ``_fire_poller`` calls with a mocked ``run_poller`` that sleeps,
+    assert max concurrency stays <= cap. Pre-PR #107 a buggy skill
+    with many siblings could fork-bomb the host; this proves the
+    semaphore actually serializes."""
+    monkeypatch.setenv("MIMIR_MAX_CONCURRENT_POLLERS", "2")
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    for n in ("p1", "p2", "p3", "p4"):
+        _drop_pollers_skill(skills, n)
+    sched.add_poller_jobs(skills)
+
+    in_flight = 0
+    max_in_flight = 0
+    lock = asyncio.Lock()
+
+    async def fake_run_poller(poller, enqueue):
+        nonlocal in_flight, max_in_flight
+        async with lock:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+        # Hold the slot long enough that all 4 fires overlap if
+        # unbounded.
+        await asyncio.sleep(0.05)
+        async with lock:
+            in_flight -= 1
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+
+    # Fire 4 concurrent _fire_poller calls. Cap is 2; the other 2 wait.
+    await asyncio.gather(
+        sched._fire_poller(poller_name="p1"),
+        sched._fire_poller(poller_name="p2"),
+        sched._fire_poller(poller_name="p3"),
+        sched._fire_poller(poller_name="p4"),
+    )
+    assert max_in_flight <= 2, (
+        f"semaphore cap=2 failed; max_in_flight={max_in_flight}"
+    )
+    # All four eventually completed.
+    assert in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_reinstall_pollers_pre_populates_dict_before_add_job(
+    tmp_path: Path, monkeypatch
+):
+    """PR #107 review fix: ``self._pollers[name]`` is set BEFORE
+    ``add_job`` so a fire that lands during job registration finds
+    the poller in the dict.
+
+    Verifies the ordering by intercepting ``add_job`` with a callback
+    that probes ``self._pollers``. If pre-population didn't happen,
+    the probe would see the missing key and the assertion would fail.
+    """
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+
+    # Wrap add_job to probe self._pollers at call time.
+    real_add_job = sched._scheduler.add_job
+    probed_states: list[bool] = []
+
+    def probe_add_job(*args, **kwargs):
+        # Look up the poller name from the kwargs payload.
+        name = kwargs.get("kwargs", {}).get("poller_name")
+        # The poller MUST already be in self._pollers by now (PR
+        # #107 ordering fix). Pre-fix, this would be False.
+        probed_states.append(name in sched._pollers)
+        return real_add_job(*args, **kwargs)
+
+    monkeypatch.setattr(sched._scheduler, "add_job", probe_add_job)
+
+    sched.add_poller_jobs(skills)
+
+    assert probed_states == [True], (
+        "self._pollers[name] must be set BEFORE add_job; "
+        f"got probe states {probed_states}"
+    )
