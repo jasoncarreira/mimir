@@ -89,9 +89,17 @@ class CommitmentRecord:
     Fields:
     - ``id``: unique handle, ``c-<10 hex>`` for visual disambiguation
       from turn_ids (which are 12 hex).
-    - ``channel_id``: where the commitment was made. ``None`` for
-      channel-agnostic / agent-internal commitments — surfaced cross-
-      channel under a per-prompt budget.
+    - ``channel_id``: where the commitment was made — also the default
+      delivery channel (where made = where delivered, common case).
+      ``None`` for channel-agnostic / agent-internal commitments —
+      surfaced cross-channel under a per-prompt budget.
+    - ``recipient_identity``: canonical identity (e.g., a display name
+      or platform-resolved handle) the commitment is for. ``None`` for
+      agent-internal commitments. Distinct from ``channel_id`` because
+      a single channel can have multiple participants — when a reminder
+      fires, the surfacing layer @-mentions ``recipient_identity`` so
+      the right person sees it. Resolved via ``identities.py`` at
+      extraction time.
     - ``text``: natural-language description of the obligation,
       ≤120 chars by convention.
     - ``suggested_reminder``: what to say at delivery, ≤200 chars.
@@ -110,6 +118,7 @@ class CommitmentRecord:
     text: str
     kind: str = CommitmentKind.OPEN_LOOP.value
     sensitivity: str = CommitmentSensitivity.ROUTINE.value
+    recipient_identity: str | None = None
     suggested_reminder: str = ""
     due_window_start_unix: float | None = None
     due_window_end_unix: float | None = None
@@ -154,20 +163,29 @@ def make_dedupe_key(
     channel_id: str | None,
     text: str,
     due_window_start_unix: float | None,
+    recipient_identity: str | None = None,
 ) -> str:
     """Stable hash used to detect when the same commitment is extracted
-    twice. Same channel + same normalized text + same due-day → same
-    key.
+    twice. Same channel + recipient + normalized text + same due-day →
+    same key.
+
+    Including ``recipient_identity`` means "remind Alice about X" and
+    "remind Bob about X" in the same channel are distinct commitments
+    — without it they'd dedupe together and one would lose its
+    addressee on re-extraction.
 
     Normalization: lowercase, collapse internal whitespace, strip.
     Due-day: floor(start / 86400). ``None`` due window hashes as the
     literal string ``"none"`` (so all no-deadline commitments with the
-    same channel+text dedupe together).
+    same channel+recipient+text dedupe together).
     """
     text_norm = _WHITESPACE_RE.sub(" ", (text or "").lower()).strip()
     if due_window_start_unix is None:
         day_bucket = "none"
     else:
         day_bucket = str(int(due_window_start_unix // 86400))
-    payload = f"{channel_id or ''}|{text_norm}|{day_bucket}"
+    payload = (
+        f"{channel_id or ''}|{recipient_identity or ''}|"
+        f"{text_norm}|{day_bucket}"
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

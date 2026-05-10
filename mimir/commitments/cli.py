@@ -94,6 +94,12 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
     _add_home_flag(add_p)
     add_p.add_argument("--channel", type=str, default=None)
     add_p.add_argument(
+        "--recipient", type=str, default=None,
+        help="Canonical identity the commitment is for (resolves via "
+             "identities.py at extraction time; manual entry passes "
+             "through verbatim).",
+    )
+    add_p.add_argument(
         "--text", type=str, required=True,
         help="Natural-language commitment description.",
     )
@@ -184,9 +190,10 @@ def cmd_list(args: argparse.Namespace) -> int:
     for r in rows:
         due = _short_iso(r.due_window_start_unix)
         ch = r.channel_id or "<unbound>"
+        recipient = f" @{r.recipient_identity}" if r.recipient_identity else ""
         print(
             f"{r.id}  [{r.status:9s}] {r.kind:14s} due={due}  "
-            f"({ch}) — {r.text}"
+            f"({ch}{recipient}) — {r.text}"
         )
     return 0
 
@@ -207,6 +214,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         text=args.text,
         kind=args.kind,
         sensitivity=args.sensitivity,
+        recipient_identity=args.recipient,
         suggested_reminder=args.reminder,
         due_window_start_unix=start,
         due_window_end_unix=end,

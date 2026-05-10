@@ -142,6 +142,26 @@ def test_dismiss_with_reason(home: Path, capsys: pytest.CaptureFixture):
     assert dismissed[0]["reason"] == "no longer needed"
 
 
+def test_add_with_recipient(home: Path, capsys: pytest.CaptureFixture):
+    """--recipient persists to the record and shows in `list`."""
+    rc = _run(
+        ["commitments", "add",
+         "--channel", "chan-1",
+         "--recipient", "alice",
+         "--text", "Send the deploy summary"],
+        home,
+    )
+    assert rc == 0
+    capsys.readouterr()
+
+    events = _read_events(home)
+    assert events[0]["record"]["recipient_identity"] == "alice"
+
+    _run(["commitments", "list"], home)
+    out = capsys.readouterr().out
+    assert "@alice" in out
+
+
 def test_add_with_due_window(home: Path, capsys: pytest.CaptureFixture):
     """--due-iso default-extends end by 7 days when --due-end-iso omitted."""
     rc = _run(

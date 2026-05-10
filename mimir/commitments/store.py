@@ -82,6 +82,7 @@ class CommitmentsStore:
                 channel_id=record.channel_id,
                 text=record.text,
                 due_window_start_unix=record.due_window_start_unix,
+                recipient_identity=record.recipient_identity,
             )
         # Ensure starting status is pending — caller setting status to
         # anything else on add() is a contract violation; we coerce
