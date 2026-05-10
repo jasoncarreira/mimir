@@ -143,6 +143,11 @@ class LastTurnSnapshot:
 class UsageReport:
     last_turn: LastTurnSnapshot = field(default_factory=LastTurnSnapshot)
     windows: list[UsageWindow] = field(default_factory=list)
+    # CR2-#8: timestamp of the oldest record we walked during this
+    # aggregate. Used by ``evaluate_cost_rate`` to clamp the baseline
+    # divisor on partial-week installs (fresh deploy, post-trim, etc.).
+    # ``None`` means we touched no records (empty / missing file).
+    oldest_record_ts: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -231,6 +236,13 @@ def aggregate(
     out_windows = [UsageWindow(label=label) for label in window_labels]
     last_turn = LastTurnSnapshot()
     saw_first = False
+    # CR2-#8: track the oldest record we actually accumulate into the
+    # widest window. On a 30d-deep file this is the 7d-cutoff record;
+    # on a 24h-old fresh install (no break fires) this is the file's
+    # oldest record. ``evaluate_cost_rate`` uses this to clamp the
+    # baseline divisor when the file's coverage is shorter than the
+    # nominal baseline window.
+    oldest_record_ts: datetime | None = None
 
     for rec in iter_snapshot_or_tail(snapshot, turns_path):
         ts_str = rec.get("ts")
@@ -281,7 +293,17 @@ def aggregate(
                 w.output_tokens += int(usage.get("output_tokens") or 0)
                 w.total_cost_usd += float(rec.get("total_cost_usd") or 0.0)
 
-    return UsageReport(last_turn=last_turn, windows=out_windows)
+        # Track the oldest ts we actually processed (not the one that
+        # triggered the break). Newest-first iteration → each
+        # successive record is older than the last; ``ts`` after the
+        # final loop iteration is the oldest accumulated record.
+        oldest_record_ts = ts
+
+    return UsageReport(
+        last_turn=last_turn,
+        windows=out_windows,
+        oldest_record_ts=oldest_record_ts,
+    )
 
 
 def evaluate_cost_rate(
@@ -315,6 +337,21 @@ def evaluate_cost_rate(
     so $5/hr is the neighborhood that catches genuine oddities while
     ignoring normal working sessions. Set to 0 or None to disable the
     floor and revert to baseline-only gating.
+
+    **Pairing requirement (re-grade follow-up).** If ``spike_ratio`` is
+    set without ``hourly_limit_usd``, sub-floor rates never alert by
+    design — the floor exists precisely to ignore normal working
+    sessions. Pair with an absolute ceiling for true protection.
+
+    **Baseline divisor (CR2-#8).** Below ``baseline_window_hours``,
+    the divisor used for the baseline rate clamps to the file's actual
+    coverage (``min(baseline_window_hours, hours_since_oldest_record)``).
+    Without the clamp, a fresh install (file spans 2h) or post-trim
+    state (file spans 30h) would divide 7d's cost by 168 and produce
+    a baseline 5-84× too low — making the spike check hyper-sensitive
+    on day 1 and after every major trim. With < 1h of coverage, the
+    spike check defers entirely (returns None) until enough data
+    accumulates.
     """
     cur = _find_window(report, current_window_hours)
     if cur is None:
@@ -339,7 +376,29 @@ def evaluate_cost_rate(
                 return None
         baseline_w = _find_window(report, baseline_window_hours)
         if baseline_w is not None and baseline_window_hours > 0:
-            baseline_rate = baseline_w.total_cost_usd / baseline_window_hours
+            # CR2-#8: clamp the divisor to the file's actual coverage.
+            # On a fresh install (file spans 2h) or post-trim state
+            # (file spans 30h), dividing 7d's cost by 168 underestimates
+            # the baseline 5–84×, making the spike check hyper-sensitive
+            # right when the operator has the least data to reason
+            # about. ``oldest_record_ts`` is the timestamp of the oldest
+            # turn we actually walked — when present, the file covers at
+            # most ``hours_since_oldest`` worth of activity. Use the
+            # smaller of (nominal baseline window, actual coverage).
+            now = datetime.now(tz=timezone.utc)
+            divisor = baseline_window_hours
+            if report.oldest_record_ts is not None:
+                actual_hours = (
+                    now - report.oldest_record_ts
+                ).total_seconds() / 3600.0
+                if actual_hours > 0 and actual_hours < divisor:
+                    divisor = actual_hours
+            # Below ~1h of coverage, the baseline signal is too noisy
+            # to bother — defer the spike check until enough data
+            # accumulates.
+            if divisor < 1.0:
+                return None
+            baseline_rate = baseline_w.total_cost_usd / divisor
             # 1¢/hr noise floor — below this we have no baseline signal
             # and the spike check is meaningless.
             if baseline_rate >= 0.01 and rate_now > spike_ratio * baseline_rate:
