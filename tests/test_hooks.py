@@ -546,7 +546,11 @@ async def test_pre_hook_budget_denies_over_cap(tmp_path: Path):
         assert decision.get("permissionDecision") == "deny"
         reason = decision.get("permissionDecisionReason", "")
         assert "Tool-call budget exhausted" in reason
-        assert "4/3" in reason
+        # CR2 fix: count is no longer incremented on denied calls, so
+        # the denial reads "3/3" (at-cap) rather than the pre-fix
+        # "4/3" (count drifted past budget). The deny still fires; the
+        # message just reports the count that triggered it accurately.
+        assert "3/3" in reason
     finally:
         _context.reset_current_turn(token)
 
@@ -878,8 +882,12 @@ async def test_pre_hook_budget_per_client_cell_isolates_budget_breaches(
             _current_client_cell.reset(token)
         assert out == {}
         assert ctx_fresh.tool_call_count == 1
-        # Busy ctx wasn't bumped further by the second call.
-        assert ctx_busy.tool_call_count == 3  # was 2, deny incremented to 3
+        # CR2 fix: denied calls no longer increment the count. Pre-fix
+        # this stayed at 3 (start at 2, deny incremented to 3) — the
+        # count would drift arbitrarily above ``budget`` as more
+        # denied calls landed. Post-fix the count stays at 2 (at-cap)
+        # because the budget check fires BEFORE the increment.
+        assert ctx_busy.tool_call_count == 2
     finally:
         _active_turns.pop(ctx_busy.turn_id, None)
         _active_turns.pop(ctx_fresh.turn_id, None)
@@ -904,5 +912,62 @@ async def test_pre_hook_budget_zero_disables_check(tmp_path: Path):
             )
             assert out == {}
         assert ctx.tool_call_count == 0  # not incremented when budget=0
+    finally:
+        _context.reset_current_turn(token)
+
+
+@_pytest.mark.asyncio
+async def test_pre_hook_budget_soft_warning_fires_once(tmp_path: Path):
+    """CR2 fix: soft warning is one-shot per turn. Pre-fix the trigger
+    was ``count == soft_threshold`` — fragile if any path skipped an
+    increment, and would fire repeatedly if any future change ever
+    decremented count. Post-fix uses ``>=`` plus a one-shot flag."""
+    hook = make_pre_tool_use_hook(tmp_path)
+    ctx = _budget_ctx(budget=10)  # soft threshold = 7
+    token = _context.set_current_turn(ctx)
+    try:
+        # First 6 calls: no warning.
+        for _i in range(6):
+            out = await hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "memory/x.md"},
+                    "tool_use_id": "tu",
+                },
+                "tu",
+                _ctx(),
+            )
+            decision = out.get("hookSpecificOutput", {})
+            # No reason text means no warning.
+            assert "Heads up" not in (decision.get("permissionDecisionReason") or "")
+        # 7th: at threshold — warning fires.
+        out = await hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "memory/y.md"},
+                "tool_use_id": "tu",
+            },
+            "tu",
+            _ctx(),
+        )
+        reason = out.get("hookSpecificOutput", {}).get("permissionDecisionReason", "")
+        assert "Heads up" in reason
+        assert ctx._tool_call_soft_warning_emitted is True
+        # 8th, 9th, 10th: warning does NOT re-fire (idempotent).
+        for _i in range(3):
+            out = await hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "memory/z.md"},
+                    "tool_use_id": "tu",
+                },
+                "tu",
+                _ctx(),
+            )
+            reason = out.get("hookSpecificOutput", {}).get("permissionDecisionReason", "") or ""
+            assert "Heads up" not in reason
     finally:
         _context.reset_current_turn(token)

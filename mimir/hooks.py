@@ -217,15 +217,23 @@ def make_pre_tool_use_hook(
             and ctx.tool_call_budget > 0
             and tool_name not in BUDGET_EXEMPT_TOOLS
         ):
-            ctx.tool_call_count += 1
             budget = ctx.tool_call_budget
-            count = ctx.tool_call_count
-            if count > budget:
+            # CR2 (agent runtime) fix: check the budget BEFORE
+            # incrementing so denied calls don't drift the count
+            # arbitrarily above ``budget``. Pre-fix:
+            # ``ctx.tool_call_count += 1`` ran first, so a turn that
+            # exceeded the budget by N kept incrementing on every
+            # subsequent denied call — events.jsonl would show
+            # "65/40", "66/40", "67/40", ... while the deny was
+            # already in effect. Now the count is at-most ``budget``;
+            # the deny fires when the NEXT call would push past it.
+            current = ctx.tool_call_count
+            if current >= budget:
                 await log_event(
                     "tool_call_denied",
                     tool=tool_name,
                     reason="tool_call_budget_exceeded",
-                    count=count,
+                    count=current,
                     budget=budget,
                     resolution_path=resolution_path,
                 )
@@ -234,7 +242,7 @@ def make_pre_tool_use_hook(
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "deny",
                         "permissionDecisionReason": (
-                            f"Tool-call budget exhausted ({count}/{budget} for "
+                            f"Tool-call budget exhausted ({current}/{budget} for "
                             f"this turn). Stop searching — answer NOW with what "
                             f"you've already found via mcp__mimir__send_message. "
                             f"If you don't have the answer, say 'I don't have "
@@ -243,8 +251,17 @@ def make_pre_tool_use_hook(
                         ),
                     }
                 }
+            # Allowed — increment and check the soft warning threshold.
+            ctx.tool_call_count += 1
+            count = ctx.tool_call_count
             soft_threshold = max(1, int(budget * 0.7))
-            if count == soft_threshold:
+            # CR2 (agent runtime) fix: ``>= soft_threshold`` plus a
+            # one-shot flag, replacing the fragile ``== soft_threshold``
+            # equality. The old form would miss the warning if any path
+            # ever skipped an increment, and fire repeatedly if any
+            # future change decremented count. Idempotent here.
+            if count >= soft_threshold and not ctx._tool_call_soft_warning_emitted:
+                ctx._tool_call_soft_warning_emitted = True
                 # Pass-through allow, but the model sees the warning in the
                 # next turn's events.jsonl + the description carries through
                 # via the additionalContext mechanism.

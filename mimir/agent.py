@@ -445,31 +445,48 @@ class ClientPool(BoundedAsyncPool[_PoolEntry]):
                     # the contextvar value at fork time — capturing the
                     # cell reference means later mutations of
                     # ``entry.cell.turn_id`` (on each acquire/release)
-                    # remain visible to the hook task. No reset of the
-                    # token afterwards: each new client's connect should
-                    # see *its own* cell on the contextvar, and we always
-                    # set a fresh one before the next construct above.
+                    # remain visible to the hook task.
+                    #
+                    # CR2 (agent runtime) fix: capture the Token from
+                    # ``set()`` and ``reset()`` it after connect returns.
+                    # Pre-fix the binding leaked: every ``asyncio.create_task``
+                    # the acquiring task spawned afterward (e.g.
+                    # ``_spawn_bg_task`` for log_event) inherited this
+                    # cell — so any code that read the contextvar from
+                    # the agent's own task would see whichever client
+                    # was most recently constructed, not the one
+                    # currently in use. The hook task itself is
+                    # unaffected: it captured the cell reference at
+                    # fork time, so the reset on our side doesn't take
+                    # the binding away from the SDK's hook task.
                     from ._context import _current_client_cell
-                    _current_client_cell.set(entry.cell)
+                    cell_token = _current_client_cell.set(entry.cell)
                     try:
-                        await client.connect()
-                    except BaseException:
-                        # Connect failed — back out the reservation,
-                        # then propagate. We re-acquire the lock so the
-                        # bookkeeping mutation is safe and notify any
-                        # peer waiting at ``cond.wait()`` below that the
-                        # in-flight count went down. Do NOT manually
-                        # release here: the surrounding ``async with
-                        # cond:`` block's ``__aexit__`` releases when
-                        # the exception unwinds. A manual release would
-                        # leave the lock unheld and ``__aexit__`` would
-                        # then raise ``RuntimeError: Lock is not
-                        # acquired`` — masking the real connect failure.
+                        try:
+                            await client.connect()
+                        except BaseException:
+                            # Connect failed — back out the reservation,
+                            # then propagate. We re-acquire the lock so the
+                            # bookkeeping mutation is safe and notify any
+                            # peer waiting at ``cond.wait()`` below that the
+                            # in-flight count went down. Do NOT manually
+                            # release here: the surrounding ``async with
+                            # cond:`` block's ``__aexit__`` releases when
+                            # the exception unwinds. A manual release would
+                            # leave the lock unheld and ``__aexit__`` would
+                            # then raise ``RuntimeError: Lock is not
+                            # acquired`` — masking the real connect failure.
+                            await cond.acquire()
+                            self._in_flight.discard(entry)
+                            cond.notify_all()
+                            raise
                         await cond.acquire()
-                        self._in_flight.discard(entry)
-                        cond.notify_all()
-                        raise
-                    await cond.acquire()
+                    finally:
+                        # Reset whether connect succeeded or failed. The
+                        # SDK's forked hook task already captured the
+                        # cell reference at fork time, so the reset
+                        # here doesn't take the binding away from it.
+                        _current_client_cell.reset(cell_token)
                     # If a fingerprint flip raced our connect, the
                     # current fingerprint has moved on. Mark stale —
                     # the caller will use the client for one request
