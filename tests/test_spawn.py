@@ -1014,13 +1014,18 @@ async def test_spawn_completion_writes_orphan_sidecar_when_loop_closed(
     operator can replay it on next startup."""
     registry = _FakeRegistry()
     # schedule_from_thread that always reports "dropped" — simulates
-    # the shutdown / pre-first-turn case.
+    # the shutdown / pre-first-turn case. Closes the coro to suppress
+    # the "never awaited" warning, then returns False to mirror what
+    # ``Agent._schedule_from_thread`` would have done.
+    def _dropping_schedule(coro):
+        coro.close()
+        return False
     [tool_def] = build_spawn_tool(
         registry=registry,
         turn_logger=None,
         mimir_home=home,
         spawns_dir=home / "state" / "spawns",
-        schedule_from_thread=lambda coro: (coro.close(), False)[1],
+        schedule_from_thread=_dropping_schedule,
         chain_on_complete=None,
     )
     await tool_def.handler({"brief": "ok", "working_dir": "/tmp"})

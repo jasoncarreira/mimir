@@ -39,6 +39,7 @@ import os
 import re
 import time
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -226,7 +227,6 @@ def _record_to_dict(record: TurnRecord) -> dict[str, Any]:
     """Serialize a TurnRecord to a JSON-safe dict for the orphan
     sidecar write (CR2-#5 fallback path). Mirrors ``TurnLogger._write``
     minus the asyncio context."""
-    from dataclasses import asdict
     return asdict(record)
 
 
@@ -339,7 +339,7 @@ def build_spawn_tool(
     turn_logger: Optional[TurnLogger],
     mimir_home: Path,
     spawns_dir: Path,
-    schedule_from_thread: Callable[[Awaitable[Any]], None],
+    schedule_from_thread: Callable[[Awaitable[Any]], bool],
     chain_on_complete: Optional[Callable[[ShellJob], None]] = None,
 ) -> list[SdkMcpTool]:
     """Build the ``spawn_claude_code`` tool, closures binding the
