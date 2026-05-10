@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 from typing import Any
 
@@ -83,17 +84,20 @@ def _safe_str_eq(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
-# Paths exempt from the auth middleware. These are HTML page shells
-# (the JS inside prompts for an API key on first visit, saves to
-# localStorage, and sends ``X-API-Key`` on subsequent data fetches)
+# (method, path) tuples exempt from the auth middleware. HTML page
+# shells (the JS inside prompts for an API key on first visit, saves
+# to localStorage, and sends ``X-API-Key`` on subsequent data fetches)
 # and the liveness endpoint (which container orchestrators hit without
 # credentials). The data behind these surfaces is auth-required —
 # /turns and /ops serve only static-shaped HTML; their data comes
 # from /api/turns, /api/events, /api/ops which DO require auth.
-_AUTH_EXEMPT_PATHS: frozenset[str] = frozenset({
-    "/health",
-    "/turns",
-    "/ops",
+#
+# Method-keyed (PR #104 review fix): if a future ``POST /turns`` is
+# ever added (e.g. for a server-side form), it inherits NO exemption.
+_AUTH_EXEMPT: frozenset[tuple[str, str]] = frozenset({
+    ("GET", "/health"),
+    ("GET", "/turns"),
+    ("GET", "/ops"),
 })
 
 
@@ -124,7 +128,7 @@ def _make_auth_middleware(expected_key: str):
             # No key configured → no auth. Dev / localhost-only path.
             return await handler(request)
 
-        if request.path in _AUTH_EXEMPT_PATHS:
+        if (request.method, request.path) in _AUTH_EXEMPT:
             return await handler(request)
 
         provided = request.headers.get("X-API-Key", "")
@@ -133,7 +137,10 @@ def _make_auth_middleware(expected_key: str):
             # / EventSource clients (the browser API can't set
             # custom headers natively) and by humans clicking a
             # bookmarked URL once. Header is preferred when both
-            # are present; query is the fallback only.
+            # are present; query is the fallback only. Note: query-
+            # param keys land in aiohttp's access log; the access-log
+            # filter installed in ``build_app`` masks ``api_key=`` in
+            # the request line so the secret doesn't end up on disk.
             provided = request.query.get("api_key", "")
 
         if not provided or not _safe_str_eq(provided, expected_key):
@@ -143,6 +150,37 @@ def _make_auth_middleware(expected_key: str):
         return await handler(request)
 
     return web.middleware(_auth_middleware)
+
+
+# Regex for the access-log filter — ``?api_key=...`` or ``&api_key=...``
+# in URL query strings. Replaces the value with ``REDACTED`` so the
+# query-param fallback in the auth middleware doesn't leave secrets
+# in stdout / log files.
+_API_KEY_QUERY_RE = re.compile(
+    r"([?&]api_key=)[^\s&]+",
+    flags=re.IGNORECASE,
+)
+
+
+class _MaskApiKeyInAccessLog(logging.Filter):
+    """Logging filter for ``aiohttp.access`` that masks ``api_key=``
+    query values in formatted records. aiohttp logs the full request
+    line including the query string; if a client used the ``?api_key=``
+    SSE fallback the secret would otherwise land in stdout / log
+    files. PR #104 review note (mimir-carreira)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Both the raw msg and the formatted message can carry the
+        # query string depending on aiohttp version + format string.
+        if isinstance(record.msg, str):
+            record.msg = _API_KEY_QUERY_RE.sub(r"\1REDACTED", record.msg)
+        if record.args:
+            record.args = tuple(
+                _API_KEY_QUERY_RE.sub(r"\1REDACTED", a)
+                if isinstance(a, str) else a
+                for a in record.args
+            )
+        return True
 
 
 async def _handle_health(request: web.Request) -> web.Response:
@@ -159,11 +197,19 @@ def build_app(config: Config) -> web.Application:
     # Auth middleware: gates every non-exempt route on ``X-API-Key`` when
     # ``MIMIR_API_KEY`` is set. Empty key → middleware passes through
     # unconditionally (dev / localhost). See ``_make_auth_middleware``
-    # and ``_AUTH_EXEMPT_PATHS``.
+    # and ``_AUTH_EXEMPT``.
     app = web.Application(
         client_max_size=10 * 1024 * 1024,
         middlewares=[_make_auth_middleware(config.api_key or "")],
     )
+
+    # Access-log filter: mask ``?api_key=`` query values so the SSE
+    # fallback path doesn't leave secrets in stdout / log files. PR #104
+    # review note. Idempotent — multiple calls don't stack the filter
+    # because aiohttp.access is a singleton logger.
+    _access_log = logging.getLogger("aiohttp.access")
+    if not any(isinstance(f, _MaskApiKeyInAccessLog) for f in _access_log.filters):
+        _access_log.addFilter(_MaskApiKeyInAccessLog())
 
     config.logs_dir.mkdir(parents=True, exist_ok=True)
     (config.home / "memory" / "core").mkdir(parents=True, exist_ok=True)

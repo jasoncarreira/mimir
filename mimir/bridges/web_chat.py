@@ -162,10 +162,16 @@ class WebChatBridge(Bridge):
                 "Content-Type": "text/event-stream",
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                # Allow plain `curl localhost:.../chat/stream` from any origin —
-                # the Web UI runs same-origin, but the local-dev story is nicer
-                # without CORS friction.
-                "Access-Control-Allow-Origin": "*",
+                # No ``Access-Control-Allow-Origin: *`` (was set pre-PR
+                # #104). With the auth middleware now gating /chat/stream,
+                # a malicious cross-origin page can't open the stream
+                # without the key — but a wildcard ACAO would still
+                # allow a page that already has the key (e.g. via a
+                # phishing prompt that mimics the API-key dialog) to
+                # exfiltrate the live agent feed cross-origin. Same-
+                # origin only. Operators who want curl access from a
+                # different host can still hit the endpoint directly;
+                # CORS only restricts browsers.
             },
         )
         await resp.prepare(request)

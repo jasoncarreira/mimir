@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from claude_agent_sdk import AssistantMessage, TextBlock
 
@@ -243,3 +244,87 @@ async def test_auth_middleware_open_when_api_key_unset(tmp_path: Path):
                     f"{path} should pass when api_key unset"
                 )
             await app["dispatcher"].drain()
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_exempt_set_is_method_keyed(tmp_path: Path):
+    """PR #104 review note 4 (mimir-carreira): the exempt set is keyed
+    on (method, path) tuples. If a future POST /turns is ever added,
+    it does NOT inherit the GET /turns exemption.
+
+    Today only GET methods exist for /turns and /ops; this test
+    proves a hypothetical POST would still be gated."""
+    cfg = Config.from_env()
+    cfg = replace(cfg, home=tmp_path, api_key="secret-token")
+    fake = await _fake_query_factory("noop")
+    with patch("mimir.agent.query", new=fake):
+        app = mimir_server.build_app(cfg)
+        # Inject a fake POST handler at /turns to verify the gate
+        # treats it differently from GET /turns.
+        async def _fake_post(_request):
+            return web.json_response({"ok": True})
+        app.router.add_post("/turns", _fake_post)
+        async with TestClient(TestServer(app)) as client:
+            # GET /turns is exempt — no auth.
+            r = await client.get("/turns")
+            assert r.status == 200
+            # POST /turns must still require auth.
+            r = await client.post("/turns", json={})
+            assert r.status == 401
+            r = await client.post(
+                "/turns", json={},
+                headers={"X-API-Key": "secret-token"},
+            )
+            assert r.status == 200
+            await app["dispatcher"].drain()
+
+
+def test_access_log_filter_masks_api_key_query_param():
+    """PR #104 review note 2 (mimir-carreira): the SSE ``?api_key=``
+    fallback would otherwise land in aiohttp's access log on disk.
+    The filter rewrites the query value to REDACTED while leaving
+    the rest of the request line intact."""
+    import logging
+    from mimir.server import _MaskApiKeyInAccessLog
+
+    f = _MaskApiKeyInAccessLog()
+
+    # Direct msg form.
+    rec = logging.LogRecord(
+        name="aiohttp.access", level=logging.INFO, pathname="", lineno=0,
+        msg='192.168.1.1 [10/May/2026:12:00:00] "GET /api/ops?api_key=ghp_xyz HTTP/1.1" 200',
+        args=(), exc_info=None,
+    )
+    assert f.filter(rec) is True
+    assert "ghp_xyz" not in rec.msg
+    assert "api_key=REDACTED" in rec.msg
+
+    # Other query params untouched.
+    rec2 = logging.LogRecord(
+        name="aiohttp.access", level=logging.INFO, pathname="", lineno=0,
+        msg='"GET /api/ops?days=7&api_key=secret&fmt=json HTTP/1.1"',
+        args=(), exc_info=None,
+    )
+    f.filter(rec2)
+    assert "secret" not in rec2.msg
+    assert "days=7" in rec2.msg
+    assert "fmt=json" in rec2.msg
+
+    # Args form (some aiohttp formatters use printf-style).
+    rec3 = logging.LogRecord(
+        name="aiohttp.access", level=logging.INFO, pathname="", lineno=0,
+        msg="%s %s",
+        args=("GET", "/api/ops?api_key=ghp_abc"),
+        exc_info=None,
+    )
+    f.filter(rec3)
+    assert "ghp_abc" not in str(rec3.args)
+    assert any("REDACTED" in str(a) for a in rec3.args)
+
+    # Records without ``api_key=`` are unaffected.
+    rec4 = logging.LogRecord(
+        name="aiohttp.access", level=logging.INFO, pathname="", lineno=0,
+        msg='"GET /api/ops?days=7 HTTP/1.1"', args=(), exc_info=None,
+    )
+    f.filter(rec4)
+    assert rec4.msg == '"GET /api/ops?days=7 HTTP/1.1"'
