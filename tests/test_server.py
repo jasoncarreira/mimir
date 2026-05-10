@@ -143,3 +143,103 @@ async def test_event_endpoint_open_when_api_key_unset(tmp_path: Path):
             )
             assert r.status == 200
             await app["dispatcher"].drain()
+
+
+# ─── Pattern B: middleware-level auth on every non-exempt route ───────
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_gates_api_routes_when_key_set(tmp_path: Path):
+    """Pattern B (CR2-#2): every JSON / data route requires X-API-Key
+    when MIMIR_API_KEY is set. Pre-2026-05-10 only POST /event was
+    gated; /api/turns, /api/events, /api/ops, /chat were all open.
+    Now the gate is at the app middleware so new routes inherit
+    protection by default."""
+    cfg = Config.from_env()
+    cfg = replace(cfg, home=tmp_path, api_key="secret-token")
+    fake = await _fake_query_factory("noop")
+    with patch("mimir.agent.query", new=fake):
+        app = mimir_server.build_app(cfg)
+        async with TestClient(TestServer(app)) as client:
+            # Each of these returns 401 without auth, 200 with.
+            for path in ("/api/turns", "/api/events", "/api/ops"):
+                r = await client.get(path)
+                assert r.status == 401, f"{path} should require auth"
+                r = await client.get(
+                    path, headers={"X-API-Key": "secret-token"},
+                )
+                assert r.status == 200, f"{path} with key should pass"
+
+            # /chat POST requires auth.
+            r = await client.post("/chat", json={"content": "hi"})
+            assert r.status == 401
+            r = await client.post(
+                "/chat", json={"content": "hi"},
+                headers={"X-API-Key": "secret-token"},
+            )
+            assert r.status == 200
+
+            await app["dispatcher"].drain()
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_exempts_html_shells_and_health(tmp_path: Path):
+    """The HTML shells (/turns, /ops) AND /health are exempt — the
+    shells contain JS that prompts for an API key and uses it for
+    subsequent /api/* fetches; health is for orchestrators that
+    poll without credentials."""
+    cfg = Config.from_env()
+    cfg = replace(cfg, home=tmp_path, api_key="secret-token")
+    fake = await _fake_query_factory("noop")
+    with patch("mimir.agent.query", new=fake):
+        app = mimir_server.build_app(cfg)
+        async with TestClient(TestServer(app)) as client:
+            for path in ("/turns", "/ops", "/health"):
+                r = await client.get(path)
+                assert r.status == 200, f"{path} should be exempt"
+
+            await app["dispatcher"].drain()
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_accepts_query_param_fallback(tmp_path: Path):
+    """SSE / EventSource clients can't set custom headers natively.
+    The middleware accepts ``?api_key=`` as a fallback so /chat/stream
+    and similar SSE endpoints can be gated. Header is preferred when
+    both are present (header wins on equal validity)."""
+    cfg = Config.from_env()
+    cfg = replace(cfg, home=tmp_path, api_key="secret-token")
+    fake = await _fake_query_factory("noop")
+    with patch("mimir.agent.query", new=fake):
+        app = mimir_server.build_app(cfg)
+        async with TestClient(TestServer(app)) as client:
+            # No auth at all → 401.
+            r = await client.get("/api/ops")
+            assert r.status == 401
+            # ?api_key= → 200.
+            r = await client.get("/api/ops?api_key=secret-token")
+            assert r.status == 200
+            # Wrong query value → 401.
+            r = await client.get("/api/ops?api_key=wrong")
+            assert r.status == 401
+
+            await app["dispatcher"].drain()
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_open_when_api_key_unset(tmp_path: Path):
+    """When MIMIR_API_KEY is unset, the middleware passes through
+    unconditionally — every route stays open. Operator gets a startup
+    warning explaining the unsafe state."""
+    cfg = Config.from_env()
+    cfg = replace(cfg, home=tmp_path, api_key="")
+    fake = await _fake_query_factory("noop")
+    with patch("mimir.agent.query", new=fake):
+        app = mimir_server.build_app(cfg)
+        async with TestClient(TestServer(app)) as client:
+            for path in ("/api/turns", "/api/events", "/api/ops"):
+                r = await client.get(path)
+                assert r.status == 200, (
+                    f"{path} should pass when api_key unset"
+                )
+            await app["dispatcher"].drain()

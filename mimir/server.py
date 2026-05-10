@@ -44,20 +44,7 @@ log = logging.getLogger(__name__)
 
 
 async def _handle_event(request: web.Request) -> web.Response:
-    # Auth gate: when MIMIR_API_KEY is set, the request must carry a
-    # matching X-API-Key header. The server binds to 0.0.0.0 and the
-    # /event payload accepts arbitrary trigger strings, so an attacker
-    # who can reach the port without auth can steer the agent into the
-    # synthesis path against an unrelated session and call
-    # saga_end_session. Empty key = no auth (dev / localhost-only).
-    expected_key = request.app.get("api_key") or ""
-    if expected_key:
-        provided = request.headers.get("X-API-Key", "")
-        if not _safe_str_eq(provided, expected_key):
-            return web.json_response(
-                {"error": "unauthorized"}, status=401,
-            )
-
+    # Auth: gated at the app-level middleware. See ``_make_auth_middleware``.
     try:
         body: dict[str, Any] = await request.json()
     except json.JSONDecodeError:
@@ -96,6 +83,68 @@ def _safe_str_eq(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
+# Paths exempt from the auth middleware. These are HTML page shells
+# (the JS inside prompts for an API key on first visit, saves to
+# localStorage, and sends ``X-API-Key`` on subsequent data fetches)
+# and the liveness endpoint (which container orchestrators hit without
+# credentials). The data behind these surfaces is auth-required —
+# /turns and /ops serve only static-shaped HTML; their data comes
+# from /api/turns, /api/events, /api/ops which DO require auth.
+_AUTH_EXEMPT_PATHS: frozenset[str] = frozenset({
+    "/health",
+    "/turns",
+    "/ops",
+})
+
+
+def _make_auth_middleware(expected_key: str):
+    """Build an aiohttp middleware that gates every non-exempt route on
+    a matching ``X-API-Key`` header (or, as a fallback for clients that
+    can't set headers — SSE / EventSource — an ``?api_key=`` query
+    string parameter).
+
+    Empty ``expected_key`` (``MIMIR_API_KEY`` unset) disables the gate
+    entirely — the warning at startup tells the operator they're
+    running open. Any non-empty key activates the middleware.
+
+    Why middleware (vs per-handler checks):
+
+    - The original code only gated ``POST /event``. Every other route —
+      ``/api/turns``, ``/api/events``, ``/api/ops``, ``/chat`` — was
+      open. Centralizing the gate here means new routes inherit
+      protection by default; opting OUT requires adding the path to
+      the exempt set, which is operator-visible.
+    - One source of truth for the safe-eq compare and the 401 response
+      shape. Per-handler implementations had drifted (``/event``
+      returned a JSON ``error`` body; the others would return whatever
+      ad hoc shape the next author picked).
+    """
+    async def _auth_middleware(request: web.Request, handler):
+        if not expected_key:
+            # No key configured → no auth. Dev / localhost-only path.
+            return await handler(request)
+
+        if request.path in _AUTH_EXEMPT_PATHS:
+            return await handler(request)
+
+        provided = request.headers.get("X-API-Key", "")
+        if not provided:
+            # Fallback: ``?api_key=...`` query param. Needed by SSE
+            # / EventSource clients (the browser API can't set
+            # custom headers natively) and by humans clicking a
+            # bookmarked URL once. Header is preferred when both
+            # are present; query is the fallback only.
+            provided = request.query.get("api_key", "")
+
+        if not provided or not _safe_str_eq(provided, expected_key):
+            return web.json_response(
+                {"error": "unauthorized"}, status=401,
+            )
+        return await handler(request)
+
+    return web.middleware(_auth_middleware)
+
+
 async def _handle_health(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
@@ -106,7 +155,15 @@ def build_app(config: Config) -> web.Application:
     # well past 1MB. Bridges read attachment bytes from disk via filesystem
     # paths (``attachment_names``), not from the request body, so the cap
     # doesn't need to accommodate binary uploads.
-    app = web.Application(client_max_size=10 * 1024 * 1024)
+    #
+    # Auth middleware: gates every non-exempt route on ``X-API-Key`` when
+    # ``MIMIR_API_KEY`` is set. Empty key → middleware passes through
+    # unconditionally (dev / localhost). See ``_make_auth_middleware``
+    # and ``_AUTH_EXEMPT_PATHS``.
+    app = web.Application(
+        client_max_size=10 * 1024 * 1024,
+        middlewares=[_make_auth_middleware(config.api_key or "")],
+    )
 
     config.logs_dir.mkdir(parents=True, exist_ok=True)
     (config.home / "memory" / "core").mkdir(parents=True, exist_ok=True)
@@ -293,9 +350,11 @@ def build_app(config: Config) -> web.Application:
 
     if not config.api_key:
         log.warning(
-            "MIMIR_API_KEY is unset — POST /event accepts unauthenticated "
-            "requests. Set the env var before exposing the port beyond "
-            "localhost."
+            "MIMIR_API_KEY is unset — every route accepts unauthenticated "
+            "requests (POST /event, GET /api/turns, GET /api/events, GET "
+            "/api/ops, POST /chat, GET /chat/stream, plus the HTML shells "
+            "at /turns and /ops). Set the env var before exposing the "
+            "port beyond localhost."
         )
 
     app.router.add_post("/event", _handle_event)
