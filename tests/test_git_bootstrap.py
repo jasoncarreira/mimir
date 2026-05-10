@@ -769,3 +769,51 @@ def test_unreachable_remote_does_not_raise(
     assert res.initial_push is False
     # No upstream events at all — helper bailed before trying to push.
     assert not any(k == "git_upstream_set" for k, _ in events)
+
+
+# ─── PR #111 review-fix-2: TimeoutExpired contract ────────────────────
+
+
+def test_run_translates_timeout_to_called_process_error_when_check_true(
+    monkeypatch,
+):
+    """PR #111 re-review pin: when ``_run`` hits the 30s timeout AND
+    the caller used ``check=True``, the wrapper raises
+    ``CalledProcessError(returncode=124)`` so existing
+    ``except CalledProcessError`` handlers cover the timeout path."""
+    import subprocess
+    from mimir.git_bootstrap import _run
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=kwargs.get("args") or args[0], timeout=30,
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run(["git", "fetch"], cwd=Path("/tmp"), check=True)
+    assert exc_info.value.returncode == 124
+    assert "timed out after 30s" in (exc_info.value.stderr or "")
+
+
+def test_run_returns_completed_process_on_timeout_when_check_false(
+    monkeypatch,
+):
+    """PR #111 re-review pin: ``check=False`` callers (e.g.
+    ``_existing_remote_url``) inspect ``returncode`` directly. The
+    wrapper must NOT raise on timeout for them — instead return a
+    ``CompletedProcess(returncode=124)`` so the existing returncode
+    branch keeps working."""
+    import subprocess
+    from mimir.git_bootstrap import _run
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=kwargs.get("args") or args[0], timeout=30,
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = _run(["git", "remote", "-v"], cwd=Path("/tmp"), check=False)
+    assert isinstance(result, subprocess.CompletedProcess)
+    assert result.returncode == 124
+    assert "timed out after 30s" in (result.stderr or "")

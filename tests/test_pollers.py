@@ -1175,3 +1175,113 @@ def test_render_batch_pads_markers_for_double_digit_batches():
     # Continuation indent: 4 chars (2 for digit + ". ").
     assert "    url-0" in out
     assert "    url-9" in out
+
+
+# ─── PR #111 review-fix: env scrub regression tests ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_poller_env_strips_secrets(
+    tmp_path: Path, home: Path, monkeypatch,
+):
+    """PR #111 review fix: secrets MUST NOT survive into the poller
+    subprocess env. ANTHROPIC_API_KEY, MIMIR_API_KEY, GITHUB_TOKEN,
+    *_SECRET, *_PASSWORD all hard-deny regardless of operator
+    allowlist additions."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-secret")
+    monkeypatch.setenv("MIMIR_API_KEY", "mimir-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    monkeypatch.setenv("DATABASE_PASSWORD", "pwd-secret")
+    monkeypatch.setenv("API_SECRET", "another-secret")
+    # Even an explicit allowlist add for a secret is denied.
+    monkeypatch.setenv("MIMIR_POLLER_ENV_ALLOWLIST", "ANTHROPIC_API_KEY")
+
+    skill_dir = tmp_path / "skill"
+    # Poller dumps env to stderr; we inspect for secrets.
+    _install_script(skill_dir, "poller.py", """
+import os
+import sys
+print("|".join(f"{k}={v}" for k, v in sorted(os.environ.items())), file=sys.stderr)
+print('{"poller": "x", "prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    stderr_payloads = [
+        e.get("stderr", "")
+        for e in events if e.get("type") == "poller_stderr"
+    ]
+    combined_stderr = "|".join(stderr_payloads)
+    # Secrets MUST NOT appear anywhere in the subprocess env dump.
+    assert "sk-ant-test-secret" not in combined_stderr
+    assert "mimir-secret" not in combined_stderr
+    assert "ghp_secret" not in combined_stderr
+    assert "pwd-secret" not in combined_stderr
+    assert "another-secret" not in combined_stderr
+
+
+@pytest.mark.asyncio
+async def test_run_poller_env_allowlist_override_works(
+    tmp_path: Path, home: Path, monkeypatch,
+):
+    """PR #111 review fix: ``MIMIR_POLLER_ENV_ALLOWLIST`` lets the
+    operator extend the built-in list with arbitrary non-secret keys."""
+    monkeypatch.setenv("MY_CUSTOM_ENV", "operator-set-value")
+    monkeypatch.setenv("MIMIR_POLLER_ENV_ALLOWLIST", "MY_CUSTOM_ENV,OTHER")
+
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import os
+import sys
+print(f"GOT={os.environ.get('MY_CUSTOM_ENV', '')}", file=sys.stderr)
+print('{"poller": "x", "prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    stderr_payloads = [
+        e.get("stderr", "")
+        for e in events if e.get("type") == "poller_stderr"
+    ]
+    combined_stderr = "|".join(stderr_payloads)
+    assert "GOT=operator-set-value" in combined_stderr
+
+
+@pytest.mark.asyncio
+async def test_run_poller_env_xdg_paths_pass_through(
+    tmp_path: Path, home: Path, monkeypatch,
+):
+    """PR #111 review fix: XDG_CONFIG_HOME etc. must reach pollers
+    so ``gh`` and other XDG-respecting CLIs work."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/some/xdg/config")
+    monkeypatch.setenv("SSL_CERT_FILE", "/some/ca/cert.pem")
+
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import os
+import sys
+print(f"XDG={os.environ.get('XDG_CONFIG_HOME', '')}|SSL={os.environ.get('SSL_CERT_FILE', '')}", file=sys.stderr)
+print('{"poller": "x", "prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    stderr_payloads = [
+        e.get("stderr", "")
+        for e in events if e.get("type") == "poller_stderr"
+    ]
+    combined_stderr = "|".join(stderr_payloads)
+    assert "XDG=/some/xdg/config" in combined_stderr
+    assert "SSL=/some/ca/cert.pem" in combined_stderr

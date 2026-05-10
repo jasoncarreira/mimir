@@ -182,7 +182,13 @@ def build_shell_tools(
             stream = normalize_shell_job_stream(args.get("stream"))
         except ValueError as exc:
             return _content_block(f"bash_job_output failed: {exc}", is_error=True)
-        result = registry.read_output(
+        # CR2 + PR #111 review: ``read_output`` does sync file IO
+        # (seek-from-end tail). Wrap in ``to_thread`` so a multi-MB
+        # read doesn't block the event loop while the tail walks
+        # backward through chunks.
+        import asyncio
+        result = await asyncio.to_thread(
+            registry.read_output,
             job_id, tail_lines=tail_lines, stream=stream,
         )
         if "error" in result:

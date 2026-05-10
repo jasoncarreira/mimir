@@ -314,29 +314,101 @@ class ShellJobRegistry:
         """Return tail of stdout/stderr for ``job_id``.
 
         ``stream`` ∈ {"stdout", "stderr", "both"}. Returns
-        ``{"error": ...}`` for unknown jobs."""
+        ``{"error": ...}`` for unknown jobs.
+
+        **Sync I/O note (PR #111 review).** This method does file IO
+        (seek-from-end tail, up to 10 MiB) and is intentionally
+        synchronous — matches the codebase pattern for "small bounded
+        IO that fits a loop tick." The MCP tool handler that calls
+        this from an async context (``shelltools.bash_job_output``)
+        wraps the call in ``asyncio.to_thread`` so the IO doesn't
+        block the loop. Direct sync callers (tests, CLI scripts)
+        keep working without async churn. If multiple async sites
+        end up needing this, the right escalation is to split into
+        ``_read_output_sync`` private + async ``read_output`` public,
+        not to async-ify the whole call chain."""
         job = self.get(job_id)
         if job is None:
             return {"error": f"unknown job_id: {job_id}"}
 
         def _tail(path: Path, n: int) -> str:
-            # TODO(perf): seek-from-end streaming tail. Today we
-            # ``read_bytes()`` then ``splitlines()`` — a 1GB runaway
-            # log spikes memory on the event loop. Bounded in practice
-            # by the async-tasks skill's "wrap in ``timeout 1h``"
-            # discipline; if a job ever produces hundreds of MB
-            # legitimately, the safer shape is read backward in
-            # ~64KB chunks until N newlines are seen, then decode.
-            # See chainlink #56 follow-up if it ever bites.
+            # CR2 (external I/O / Pattern A residual) fix: seek-from-end
+            # streaming tail. Pre-fix this read the entire file with
+            # ``read_bytes()``; a 1GB runaway log spiked memory on the
+            # event loop. The "bounded by skill discipline" claim wasn't
+            # a guarantee — any one buggy script (e.g. ``find /``) could
+            # land the agent process OOM. Now we read backward in
+            # 64 KiB chunks until N newlines are seen (or BOF), then
+            # decode just the tail. Memory is O(n × avg_line_size)
+            # regardless of file size.
+            CHUNK = 65536
+            MAX_BYTES = 10 * 1024 * 1024  # 10 MiB hard cap on tail bytes
             try:
-                data = path.read_bytes()
+                with path.open("rb") as f:
+                    f.seek(0, 2)  # SEEK_END
+                    pos = f.tell()
+                    if n <= 0:
+                        # Caller wants "all of it" — still cap at MAX_BYTES.
+                        size = min(pos, MAX_BYTES)
+                        f.seek(max(0, pos - size))
+                        data = f.read(size)
+                        prefix = "" if pos <= MAX_BYTES else (
+                            f"[…truncated {pos - MAX_BYTES} bytes from head…]\n"
+                        )
+                        return prefix + data.decode("utf-8", errors="replace")
+                    # Bounded line-count tail: read backward chunks
+                    # until we have n+1 newlines (so we can drop the
+                    # first partial line), hit BOF, or hit MAX_BYTES.
+                    buf = b""
+                    newline_count = 0
+                    hit_byte_cap = False
+                    while pos > 0 and newline_count <= n:
+                        if len(buf) >= MAX_BYTES:
+                            hit_byte_cap = True
+                            break
+                        read_size = min(CHUNK, pos)
+                        pos -= read_size
+                        f.seek(pos)
+                        chunk = f.read(read_size)
+                        buf = chunk + buf
+                        newline_count = buf.count(b"\n")
+                    text = buf.decode("utf-8", errors="replace")
+                    lines = text.splitlines()
+                    # PR #111 review fix: include a truncation marker
+                    # whenever output is shorter than what's actually
+                    # on disk. Pre-fix the line-count branch silently
+                    # returned the trailing n lines with no signal —
+                    # operator couldn't tell whether the file had
+                    # exactly n lines or N >> n. Marker shape mirrors
+                    # the n<=0 branch's "[...truncated X bytes...]"
+                    # format above.
+                    if pos == 0 and len(lines) <= n:
+                        return text
+                    kept = lines[-n:]
+                    dropped_lines = len(lines) - len(kept)
+                    # PR #111 review-fix-2: gate on ``dropped_lines``
+                    # directly, not on ``hit_byte_cap or pos > 0``.
+                    # The previous gate skipped the marker when the
+                    # file fit in one CHUNK (pos==0, hit_byte_cap=False)
+                    # and had >n lines — exactly the silent-truncation
+                    # shape the original review flagged.
+                    if dropped_lines > 0 or pos > 0:
+                        prefix_parts = []
+                        if dropped_lines > 0:
+                            prefix_parts.append(
+                                f"{dropped_lines} earlier line(s)"
+                            )
+                        if pos > 0:
+                            prefix_parts.append(
+                                f"{pos} earlier byte(s) on disk"
+                            )
+                        return (
+                            f"[…truncated; {', '.join(prefix_parts)} "
+                            f"not shown…]\n" + "\n".join(kept)
+                        )
+                    return "\n".join(kept)
             except FileNotFoundError:
                 return ""
-            text = data.decode("utf-8", errors="replace")
-            lines = text.splitlines()
-            if n <= 0 or len(lines) <= n:
-                return text
-            return "\n".join(lines[-n:])
 
         out = _tail(job.stdout_path, tail_lines) if stream in ("stdout", "both") else ""
         err = _tail(job.stderr_path, tail_lines) if stream in ("stderr", "both") else ""
