@@ -38,6 +38,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 from .rate_limits import (
@@ -63,7 +64,7 @@ class BillingMode(str, Enum):
 def detect_billing_mode(
     *,
     explicit: str | None = None,
-    oauth_credentials_path: object | None = None,
+    oauth_credentials_path: Path | None = None,
 ) -> BillingMode:
     """Resolve ``BillingMode`` from explicit override + environment.
 
@@ -72,8 +73,16 @@ def detect_billing_mode(
     1. ``explicit`` (case-insensitive; rejects unknown values with a
        warning and falls through to auto-detect).
     2. ``CLAUDE_CODE_OAUTH_TOKEN`` env var → quota.
-    3. ``oauth_credentials_path`` truthy → quota (poller is configured,
-       even if direct OAuth isn't).
+    3. ``oauth_credentials_path`` points at an existing file → quota
+       (an OAuth credentials file is the OAuth-flow signal). The
+       file-existence check matters: ``_oauth_credentials_path()`` in
+       ``config.py`` returns the *expected location* even on installs
+       that have never run ``claude /login``, so a Path-truthy check
+       was effectively always-true on any deployment with ``MIMIR_HOME``
+       set — which is virtually every deployment, including pure
+       pay-as-you-go API-key installs. Result: API-key installs auto-
+       detected as QUOTA, demoting ``cost_rate_alert`` to advisory and
+       silently disabling the dollar-cost suppression layer.
     4. Default → pay-as-you-go.
     """
     if explicit:
@@ -87,8 +96,16 @@ def detect_billing_mode(
             )
     if running_on_claude_max():
         return BillingMode.QUOTA
-    if oauth_credentials_path:
+    if oauth_credentials_path is not None and oauth_credentials_path.is_file():
         return BillingMode.QUOTA
+    # MIMIR_CLAUDE_OAUTH_CREDENTIALS env-var presence is treated as
+    # operator intent (rather than a default-location heuristic), so
+    # we don't apply the ``.is_file()`` guard here. An operator who
+    # sets the env var is declaring "I'm on the OAuth flow" — even
+    # before ``claude /login`` has written a credentials file. The
+    # asymmetry vs. the path branch above is load-bearing as of
+    # CR2-#1: the path is a resolved-default-location hint, the env
+    # var is an explicit declaration.
     if os.environ.get("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "").strip():
         return BillingMode.QUOTA
     return BillingMode.PAY_AS_YOU_GO
