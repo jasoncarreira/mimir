@@ -314,7 +314,19 @@ class ShellJobRegistry:
         """Return tail of stdout/stderr for ``job_id``.
 
         ``stream`` ∈ {"stdout", "stderr", "both"}. Returns
-        ``{"error": ...}`` for unknown jobs."""
+        ``{"error": ...}`` for unknown jobs.
+
+        **Sync I/O note (PR #111 review).** This method does file IO
+        (seek-from-end tail, up to 10 MiB) and is intentionally
+        synchronous — matches the codebase pattern for "small bounded
+        IO that fits a loop tick." The MCP tool handler that calls
+        this from an async context (``shelltools.bash_job_output``)
+        wraps the call in ``asyncio.to_thread`` so the IO doesn't
+        block the loop. Direct sync callers (tests, CLI scripts)
+        keep working without async churn. If multiple async sites
+        end up needing this, the right escalation is to split into
+        ``_read_output_sync`` private + async ``read_output`` public,
+        not to async-ify the whole call chain."""
         job = self.get(job_id)
         if job is None:
             return {"error": f"unknown job_id: {job_id}"}
