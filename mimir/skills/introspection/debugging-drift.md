@@ -65,13 +65,19 @@ Platform A or somewhere else?
 ### Measure It
 
 ```bash
-# Find poller events and the first send_message in the same session
+# Find poller events and the first send_message in the same session.
+# Per-item metadata (source_platform, URLs, IDs) lives at
+# .event.extra.items[i] after the framework's batching change —
+# poller events are coalesced into AgentEvents of up to batch_size
+# items each. This jq pulls the source_platform from the first item
+# in the first poller event of each session.
 jq -s '
   group_by(.session_id) |
   map({
     session: .[0].session_id,
     poller_source: ([.[] | select(.type == "turn_start" and .event.event_type == "poller")] | first | .event.scheduler_name // "none"),
-    source_platform: ([.[] | select(.type == "turn_start" and .event.source_platform)] | first | .event.source_platform // "none"),
+    source_platform: ([.[] | select(.type == "turn_start" and .event.event_type == "poller")] | first | .event.extra.items[0].source_platform // "none"),
+    batch_count: ([.[] | select(.type == "turn_start" and .event.event_type == "poller")] | first | .event.extra.batch_count // 1),
     responded_channel: ([.[] | select(.tool == "send_message" and .sent == true)] | first | .channel_id // "none")
   }) |
   map(select(.poller_source != "none"))
