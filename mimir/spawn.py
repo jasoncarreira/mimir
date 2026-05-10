@@ -222,6 +222,58 @@ def _model_usage_to_record_usage(
     return totals if saw_any else None
 
 
+def _record_to_dict(record: TurnRecord) -> dict[str, Any]:
+    """Serialize a TurnRecord to a JSON-safe dict for the orphan
+    sidecar write (CR2-#5 fallback path). Mirrors ``TurnLogger._write``
+    minus the asyncio context."""
+    from dataclasses import asdict
+    return asdict(record)
+
+
+def _write_orphan_spawn_record(
+    mimir_home: Path,
+    *,
+    event_type: str,
+    payload: dict[str, Any],
+    record_dict: dict[str, Any],
+) -> None:
+    """CR2-#5 fallback path: when the asyncio loop is unavailable at
+    spawn-completion time (shutdown / pre-first-turn), the regular
+    log_event + turn_logger.write coroutines get dropped. Persist the
+    accounting to a sidecar file synchronously so the data isn't lost.
+
+    On next startup, the operator (or a sweep cron) can replay
+    ``<mimir_home>/spawn-orphans.jsonl`` into events.jsonl /
+    turns.jsonl. Single-line JSON wraps both the event and the
+    synthetic TurnRecord so a single sweep covers both surfaces.
+
+    Best-effort: failure to write the sidecar logs a warning and
+    falls through (we're already in a degraded state; the spawn
+    completed and the subprocess is gone).
+    """
+    sidecar_path = mimir_home / "spawn-orphans.jsonl"
+    entry = {
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
+        "event_type": event_type,
+        "event_payload": payload,
+        "turn_record": record_dict,
+    }
+    try:
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        with sidecar_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str, ensure_ascii=True) + "\n")
+        log.warning(
+            "spawn completion accounting orphaned to %s "
+            "(loop unavailable); event_type=%s job_id=%s",
+            sidecar_path, event_type, payload.get("job_id"),
+        )
+    except OSError as exc:
+        log.warning(
+            "spawn orphan write failed: %s (event_type=%s job_id=%s)",
+            exc, event_type, payload.get("job_id"),
+        )
+
+
 def _build_spawn_record(
     *,
     job_id: str,
@@ -607,7 +659,20 @@ def build_spawn_tool(
                                 "spawn synthetic turn-record write failed",
                             )
 
-                schedule_from_thread(_emit())
+                # CR2-#5: capture the dispatch result. ``False`` means the
+                # event loop wasn't available (shutdown / pre-first-turn /
+                # closed) and the coroutine was dropped. Without a
+                # fallback the spawn's accounting silently disappears.
+                # Write a sync sidecar entry so the operator can see
+                # "spawns completed during shutdown" on next startup.
+                scheduled = schedule_from_thread(_emit())
+                if not scheduled:
+                    _write_orphan_spawn_record(
+                        mimir_home,
+                        event_type=event_type,
+                        payload=payload,
+                        record_dict=_record_to_dict(record),
+                    )
             except Exception:  # noqa: BLE001
                 log.exception(
                     "spawn completion accounting failed for %s", job.job_id,
