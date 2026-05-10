@@ -155,7 +155,16 @@ def test_api_failure_preserves_prior_heads(monkeypatch, captured_emits):
 
 def test_emit_payload_is_jsonable(monkeypatch):
     """Sanity: the real ``_emit`` writes JSONL; make sure our event
-    extras serialize cleanly (no datetimes, no sets)."""
+    extras serialize cleanly (no datetimes, no sets).
+
+    NOTE: monkeypatching ``poller.print`` works because Python resolves
+    bare ``print(...)`` calls inside ``poller`` against the module
+    globals first, then falls through to builtins. A future refactor
+    that switches to ``from builtins import print`` or
+    ``sys.stdout.write(...)`` would silently break this capture (the
+    assertions below would fail because nothing got written). If that
+    happens, switch to capsys or monkeypatch ``sys.stdout.write``.
+    """
     captured_lines: list[str] = []
 
     def fake_print(*args, **kwargs):

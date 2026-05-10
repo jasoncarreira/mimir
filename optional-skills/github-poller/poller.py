@@ -308,8 +308,14 @@ def _check_pr_pushes(
     a known false-positive; the alternative (compare diffs) is too
     expensive to run on every poll.
     """
+    # ``per_page=100`` (vs GitHub's 30 default) gives ~3× headroom against
+    # the active-prune pitfall: a repo with >page-size open PRs would
+    # silently drop everything past the first page from the cursor every
+    # poll, so those PRs would re-record as "first sighting" each time and
+    # never emit a synchronize event. Proper Link-header pagination is the
+    # complete fix; per_page=100 is the cheap headroom bump until then.
     data = _gh_api(
-        f"repos/{repo}/pulls?state=open&sort=created&direction=desc",
+        f"repos/{repo}/pulls?state=open&sort=created&direction=desc&per_page=100",
         token,
     )
     new_heads: dict[str, str] = {}
