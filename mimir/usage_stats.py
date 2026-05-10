@@ -79,9 +79,18 @@ _CONTEXT_1M_MODEL_PREFIXES = ("claude-opus-4-", "claude-sonnet-4-")
 class UsageWindow:
     """Aggregated usage over a contiguous time window. Field semantics
     match the SDK's ``usage`` dict (Anthropic's ``Message.usage`` shape):
-    counts are tokens; cost is dollars."""
+    counts are tokens; cost is dollars.
+
+    ``hours`` is the window size used by ``_find_window`` for lookup
+    (CR2 ops & observability fix). Pre-fix, ``_find_window`` matched
+    by label string, regenerating the label via ``_default_label`` —
+    so a caller passing custom ``window_labels`` to ``aggregate()``
+    silently broke the spike-ratio lookup. Now lookup is by hours
+    directly.
+    """
 
     label: str
+    hours: float = 0.0
     turns: int = 0
     input_tokens: int = 0
     cache_creation_input_tokens: int = 0
@@ -233,7 +242,10 @@ def aggregate(
     order = sorted(range(len(windows)), key=lambda i: cutoffs[i], reverse=True)
     oldest_cutoff = min(cutoffs)
 
-    out_windows = [UsageWindow(label=label) for label in window_labels]
+    out_windows = [
+        UsageWindow(label=label, hours=h)
+        for label, h in zip(window_labels, windows)
+    ]
     last_turn = LastTurnSnapshot()
     saw_first = False
     # CR2-#8: track the oldest record we actually accumulate into the
@@ -412,13 +424,26 @@ def evaluate_cost_rate(
 
 
 def _find_window(report: UsageReport, hours: float) -> UsageWindow | None:
-    """Lookup helper: pick the window whose label matches the
-    expected ``Last Nh`` / ``Last Nd`` token, or fall back to the
-    first one with the matching turn count > 0. Returns None when
-    nothing matches."""
+    """Lookup helper: pick the window with the matching ``hours``
+    field. Returns None when nothing matches.
+
+    CR2 (ops & observability) fix: was a label-string compare against
+    a regenerated ``_default_label(hours)`` — caller-supplied custom
+    ``window_labels`` to ``aggregate()`` silently broke the spike-
+    ratio lookup. Lookup is now by ``hours`` directly so labels are
+    purely cosmetic. Falls back to label-match for legacy callers
+    that may construct ``UsageWindow(label=...)`` without setting
+    ``hours``.
+    """
+    for w in report.windows:
+        if w.hours == hours:
+            return w
+    # Legacy fallback: any UsageWindow constructed without ``hours``
+    # has the dataclass default 0.0; match on label as a backstop so
+    # external callers / older test fixtures still work.
     target = _default_label(hours)
     for w in report.windows:
-        if w.label == target:
+        if w.hours == 0.0 and w.label == target:
             return w
     return None
 

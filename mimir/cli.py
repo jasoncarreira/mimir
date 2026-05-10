@@ -1059,9 +1059,19 @@ def setup_home(home: Path) -> dict[str, object]:
     # before running setup. Skipped when MIMIR_GIT_TRACKING_ENABLED is
     # set explicitly to a falsy value — otherwise bootstrap is the
     # default once 4b lands.
+    #
+    # CR2 (ops & observability) fix: use ``_env_bool`` from config.py
+    # so the truthy/falsy interpretation matches Config.from_env's
+    # parsing exactly. Pre-fix this used a bespoke 4-token list
+    # (``{"false", "0", "no", "off"}``) while config.py uses
+    # ``_env_bool`` (truthy = ``1/true/yes/on``, default for anything
+    # else). For e.g. ``MIMIR_GIT_TRACKING_ENABLED=enabled`` or ``=y``
+    # the two parsers disagreed: setup interpreted as enabled (not
+    # in the falsy list), Config interpreted as disabled (not in the
+    # truthy list). Now both use the same canonical parser.
+    from .config import _env_bool
     git_bootstrap_status: dict[str, object] | None = None
-    if (os.environ.get("MIMIR_GIT_TRACKING_ENABLED", "true").lower()
-            not in {"false", "0", "no", "off"}):
+    if _env_bool("MIMIR_GIT_TRACKING_ENABLED", True):
         try:
             from .git_bootstrap import bootstrap_git_repo
             br = bootstrap_git_repo(
@@ -1322,9 +1332,23 @@ def _identities_remove_cmd(
 
 def regenerate_api_key(home: Path) -> str:
     """Rewrite ``<home>/.env``'s MIMIR_API_KEY line with a fresh random
-    value. Returns the new key. Other env vars are left untouched."""
+    value. Returns the new key. Other env vars are left untouched.
+
+    CR2 (ops & observability) fix: refuse to scaffold a fresh ``.env``
+    in a home that has never been ``mimir setup``-ed. Pre-fix this
+    function created ``<home>/.env`` if missing — so a typo'd home
+    path (``regenerate_api_key("/tmp/typo")``) would silently produce
+    a one-line .env in an unrelated directory. The CLI front-door has
+    a check; importing the function from elsewhere bypassed it.
+    """
     home = home.resolve()
     env_path = home / ".env"
+    if not env_path.is_file():
+        raise FileNotFoundError(
+            f"{env_path} does not exist. Run 'mimir setup --home "
+            f"{home}' first to scaffold the home directory before "
+            f"regenerating the API key."
+        )
     new_key = _generate_api_key()
     _env_set_api_key(env_path, new_key)
     return new_key
@@ -1614,6 +1638,33 @@ def main(argv: Sequence[str] | None = None) -> None:
             print("(no turns recorded yet)")
         else:
             print(body)
+        # CR2 (ops & observability) fix: also print the billing mode
+        # and which event the agent WOULD emit for the alert, so an
+        # operator triaging "did the agent see an alert?" gets a
+        # diagnostic that mirrors the agent's actual decision.
+        # Pre-fix, ``mimir stats`` skipped billing-mode evaluation
+        # entirely — a quota-mode install with the alert tripped
+        # showed identical output to a pay-as-you-go install,
+        # because the agent's advisory-vs-alert distinction was
+        # absent here.
+        from .billing import detect_billing_mode, BillingMode
+        from .config import _oauth_credentials_path
+        oauth_path = _oauth_credentials_path()
+        billing_mode = detect_billing_mode(
+            explicit=os.environ.get("MIMIR_BILLING_MODE") or None,
+            oauth_credentials_path=oauth_path,
+        )
+        print(f"\nBilling mode (auto-detected): {billing_mode.value}")
+        if alert is not None:
+            event_name = (
+                "cost_rate_advisory"
+                if billing_mode == BillingMode.QUOTA
+                else "cost_rate_alert"
+            )
+            print(
+                f"On the agent loop, this would emit: {event_name} "
+                f"(reason={alert.reason})"
+            )
         return
 
     if args.command == "regenerate-api-key":
