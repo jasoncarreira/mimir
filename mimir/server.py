@@ -491,6 +491,26 @@ def build_app(config: Config) -> web.Application:
             )
             introspection_registered = False
 
+        # Commitments Phase 2b — periodic due-check sweep. Reuses the
+        # agent's CommitmentsStore so deliver/expire calls land in
+        # the same JSONL as Phase 1's manual operator entries +
+        # Phase 2a's extracted commitments.
+        if config.commitments_due_check_cron and getattr(agent, "_commitments", None):
+            try:
+                scheduler.add_commitments_due_check_job(
+                    agent._commitments,
+                    config.commitments_due_check_cron,
+                    snooze_pileup_threshold=(
+                        config.commitments_snooze_pileup_threshold
+                    ),
+                )
+            except ValueError as exc:
+                await log_event(
+                    "scheduler_invalid_cron",
+                    job="commitments-due-check",
+                    error=str(exc),
+                )
+
         # Stage 5 of CLAUDE_SDK_CLIENT_MIGRATION.md retired the original
         # quota-poll cron because the plan was to use the shared
         # persistent client's get_context_usage(). That endpoint turned

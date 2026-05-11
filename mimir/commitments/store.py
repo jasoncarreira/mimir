@@ -322,6 +322,10 @@ class CommitmentsStore:
             rec.status = CommitmentStatus.SNOOZED.value
             rec.snoozed_until_unix = event.get("until_unix")
             rec.snooze_reason = event.get("reason")
+            # Phase 2b: bump per-record snooze counter. The poller
+            # uses this to detect commitments that keep getting
+            # punted (≥ threshold → ``commitment_snooze_pileup``).
+            rec.snooze_count += 1
             # Slide the due window so the snoozed_until becomes the
             # new "earliest deliver" anchor for surfacing logic.
             # PR #120 review finding #3: also bump the end so a
