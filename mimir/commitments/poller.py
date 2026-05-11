@@ -133,11 +133,31 @@ async def check_due_and_expired(
             if on_cooldown:
                 result.snooze_pileup_suppressed_cooldown += 1
             else:
-                # PR #126 review nit: increment AFTER the emit + alarm
-                # succeed so the counter doesn't claim work that
-                # didn't happen (matches the ``if ok:`` shape of the
+                # PR #126 review nit: increment AFTER the alarm + emit
+                # succeed (matches the ``if ok:`` shape of the
                 # due/expired branches below).
+                #
+                # PR #126 re-review observation (this PR): ``alarm_pileup``
+                # is called FIRST, then ``log_event``. Both are
+                # file-append IO on different files (commitments.jsonl
+                # vs events.jsonl). The ordering matters when one
+                # succeeds and the other fails:
+                #
+                # - alarm succeeds, log_event fails → cooldown marker
+                #   recorded; the algedonic block misses this round,
+                #   re-fires after 24h. Bounded: one surfacing round
+                #   missed per crash.
+                # - alarm fails, log_event never called → consistent
+                #   state, no row, no marker. Next tick retries.
+                #
+                # The reversed order (log_event first) would leave an
+                # algedonic row WITHOUT a cooldown marker if alarm
+                # fails — next tick re-emits, accruing a duplicate
+                # row per crash. Trading "duplicate algedonic row"
+                # for "missed surfacing round" — the latter is the
+                # cleaner failure mode.
                 try:
+                    await store.alarm_pileup(rec.id)
                     await log_event(
                         "commitment_snooze_pileup",
                         commitment_id=rec.id,
@@ -148,7 +168,6 @@ async def check_due_and_expired(
                         kind=rec.kind,
                         sensitivity=rec.sensitivity,
                     )
-                    await store.alarm_pileup(rec.id)
                     result.snooze_pileup_emitted += 1
                 except Exception:  # noqa: BLE001
                     log.exception(

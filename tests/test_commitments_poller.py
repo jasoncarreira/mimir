@@ -433,3 +433,97 @@ async def test_emit_at_exact_end_uses_due_branch(tmp_path: Path, home: Path):
     assert result.due_emitted == 1
     assert result.expired_emitted == 0
     assert store.current_state()[rec.id].status == CommitmentStatus.DELIVERED.value
+
+
+@pytest.mark.asyncio
+async def test_pileup_alarm_runs_before_log_event(tmp_path: Path, home: Path):
+    """PR #126 re-review observation: ``alarm_pileup`` must complete
+    BEFORE ``log_event`` so a failure on either side never leaves the
+    pair inconsistent in the way that produces a duplicate algedonic
+    row. We can't easily inject a real file-append failure on
+    events.jsonl mid-test, but we can monkeypatch the ordering and
+    assert alarm was called first."""
+    from mimir.commitments import poller as poller_mod
+
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    for _ in range(3):
+        await store.snooze(rec.id, until_unix=now + 86400)
+
+    call_order: list[str] = []
+    original_alarm = store.alarm_pileup
+    original_log = poller_mod.log_event
+
+    async def tracking_alarm(id: str) -> bool:
+        call_order.append("alarm")
+        return await original_alarm(id)
+
+    async def tracking_log(event_type: str, **payload):
+        call_order.append("log")
+        return await original_log(event_type, **payload)
+
+    store.alarm_pileup = tracking_alarm  # type: ignore[method-assign]
+    poller_mod.log_event = tracking_log  # type: ignore[assignment]
+    try:
+        result = await check_due_and_expired(
+            store, now_unix=now, snooze_pileup_threshold=3,
+        )
+    finally:
+        poller_mod.log_event = original_log  # type: ignore[assignment]
+
+    assert call_order == ["alarm", "log"], (
+        f"expected alarm before log_event, got {call_order}. "
+        "Reversed order would leave a duplicate row on log_event "
+        "failure-then-recover; alarm-first means we miss one "
+        "surfacing round instead of duplicating."
+    )
+    # PR #132 review nit: pin that the counter increments after the
+    # await pair so a future reorder of the increment relative to the
+    # awaits gets caught.
+    assert result.snooze_pileup_emitted == 1
+
+
+@pytest.mark.asyncio
+async def test_pileup_alarm_failure_skips_log_event(tmp_path: Path, home: Path):
+    """When ``alarm_pileup`` raises, the algedonic emit must NOT fire
+    (we'd otherwise write events.jsonl with no cooldown marker,
+    re-firing on the next tick). The try/except catches the alarm
+    raise; counter stays 0."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    for _ in range(3):
+        await store.snooze(rec.id, until_unix=now + 86400)
+
+    log_called = False
+    from mimir.commitments import poller as poller_mod
+    original_log = poller_mod.log_event
+
+    async def tracking_log(event_type: str, **payload):
+        nonlocal log_called
+        if event_type == "commitment_snooze_pileup":
+            log_called = True
+        return await original_log(event_type, **payload)
+
+    async def failing_alarm(id: str) -> bool:
+        raise OSError("disk full")
+
+    store.alarm_pileup = failing_alarm  # type: ignore[method-assign]
+    poller_mod.log_event = tracking_log  # type: ignore[assignment]
+    try:
+        result = await check_due_and_expired(
+            store, now_unix=now, snooze_pileup_threshold=3,
+        )
+    finally:
+        poller_mod.log_event = original_log  # type: ignore[assignment]
+
+    assert log_called is False, (
+        "alarm_pileup raised → log_event must not fire (would leave "
+        "an algedonic row without a cooldown marker)."
+    )
+    assert result.snooze_pileup_emitted == 0
