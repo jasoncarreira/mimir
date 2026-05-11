@@ -141,6 +141,19 @@ class Config:
     saga_session_idle_minutes: int
     saga_consolidate_cron: str
 
+    # Commitments Phase 2b — periodic due-check sweep emits
+    # commitment_due / commitment_expired / commitment_snooze_pileup
+    # algedonic events. Empty string disables the cron entirely.
+    # 5-min default is fine-grained enough that an explicit "remind
+    # me at 14:00" surfaces within 5 min of 14:00, coarse-grained
+    # enough that the sweep cost (replay + 0–N writes) is negligible.
+    commitments_due_check_cron: str
+    # Pileup threshold: when a single commitment's snooze_count
+    # reaches this, the poller fires commitment_snooze_pileup.
+    # Default 3 — "you've punted this thing 3 times already, time
+    # to commit or dismiss."
+    commitments_snooze_pileup_threshold: int
+
     # Weekly event-introspection report (FEEDBACK-LOOPS §4.7) + heartbeat
     # health monitor (§4.8). Empty string disables the cron. Default is
     # Friday 14:00 UTC so the report lands before reflection (Sun 06:00)
@@ -399,6 +412,12 @@ class Config:
 
             saga_session_idle_minutes=_env_int("MIMIR_SAGA_SESSION_IDLE_MINUTES", 10),
             saga_consolidate_cron=_env("MIMIR_SAGA_CONSOLIDATE_CRON", "0 4 * * *"),
+            commitments_due_check_cron=_env(
+                "MIMIR_COMMITMENTS_DUE_CHECK_CRON", "*/5 * * * *",
+            ),
+            commitments_snooze_pileup_threshold=_env_int(
+                "MIMIR_COMMITMENTS_SNOOZE_PILEUP_THRESHOLD", 3,
+            ),
             introspection_report_cron=_env(
                 "MIMIR_INTROSPECTION_REPORT_CRON", "0 14 * * 5",
             ),
