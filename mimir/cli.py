@@ -1537,6 +1537,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     from . import wiki_backlinks as _wiki_backlinks
     _wiki_backlinks.add_argparse(wiki_bl_p)
 
+    skills_p = sub.add_parser(
+        "skills",
+        help="Skills maintenance helpers (catalog regeneration, "
+             "future lint passes).",
+    )
+    skills_sub = skills_p.add_subparsers(dest="skills_action")
+
+    skills_cat_p = skills_sub.add_parser(
+        "catalog",
+        help="Regenerate the skills catalog page (chainlink #81 / G5) — "
+             "walks SKILL.md frontmatter to produce a RESOLVER.md-style "
+             "dispatcher. Default output is stdout; pass --out to write "
+             "to state/wiki/topics/skills-catalog.md.",
+    )
+    from . import skill_catalog as _skill_catalog
+    _skill_catalog.add_argparse(skills_cat_p)
+
     commitments_p = sub.add_parser(
         "commitments",
         help="Manage durable commitments (list/add/complete/snooze/"
@@ -1689,6 +1706,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             from . import wiki_backlinks as _wiki_backlinks
             sys.exit(_wiki_backlinks.cmd_backlinks(args))
         wiki_p.print_help()
+        sys.exit(1)
+
+    if args.command == "skills":
+        if args.skills_action == "catalog":
+            from . import skill_catalog as _skill_catalog
+            sys.exit(_skill_catalog.cmd(args))
+        skills_p.print_help()
         sys.exit(1)
 
     if args.command == "commitments":
