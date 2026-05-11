@@ -8,10 +8,10 @@ itself) get a single map of what skills exist and how to invoke them.
 
 Wired into the ``mimir`` CLI as ``mimir skills catalog`` (writes to
 the path passed in, defaulting to stdout). The catalog file lives at
-``state/wiki/topics/skills-catalog.md`` by convention so file_search
-surfaces it on demand; not loaded into the per-turn prompt (operators
-who want per-turn visibility can copy/include the catalog file
-manually into core memory).
+``memory/skills-catalog.md`` by convention so the indexer surfaces
+its ``<!-- desc: -->`` line in the every-turn ``memory/INDEX.md`` block
+(tier 7 in memory/SKILL.md's visibility hierarchy) — the catalog is
+high-signal-per-byte enough to earn that prompt cost as a description.
 
 Auto-extracted trigger phrase rule:
 
@@ -148,7 +148,7 @@ def load_catalog(skills_root: Path) -> list[SkillEntry]:
 def render_catalog(entries: list[SkillEntry]) -> str:
     """Render a list of :class:`SkillEntry` as the catalog markdown."""
     lines: list[str] = []
-    lines.append("<!-- desc: auto-generated catalog of bundled mimir skills (chainlink #81 / G5). Regenerate with `mimir skills catalog`. -->")
+    lines.append("<!-- desc: All bundled mimir skills, one row per skill (name, trigger phrase, allowed tools). Use to find which skill applies to a problem. Regen via `mimir skills catalog`. -->")
     lines.append("# Skills Catalog")
     lines.append("")
     lines.append(
@@ -207,8 +207,9 @@ def add_argparse(parser) -> None:
         type=Path,
         default=None,
         help="Output file path (default: stdout). "
-             "Recommended target: state/wiki/topics/skills-catalog.md "
-             "under MIMIR_HOME.",
+             "Recommended target: memory/skills-catalog.md under "
+             "MIMIR_HOME — landing there surfaces the catalog's "
+             "<!-- desc: --> line in the every-turn memory/INDEX.md.",
     )
     parser.add_argument(
         "--skills-root",
