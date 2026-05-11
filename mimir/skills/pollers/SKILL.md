@@ -31,7 +31,7 @@ The script runs with the skill directory as its **cwd**. It receives these envir
 | `STATE_DIR` | Persistent cursor/state directory at `<home>/state/pollers/<poller_name>/` — created lazily on first run, on the home volume so cursor files survive container rebuilds even when the skill itself ships in the image. |
 | `POLLER_NAME` | The poller's name from pollers.json (matches the `STATE_DIR` subpath). |
 
-Plus any custom env vars from the `env` field, plus the agent's existing environment.
+Plus any literal env vars from the `env` field, plus any pass-throughs declared in `pass_env` (see field docs below), plus the deny-filtered allowlist of the agent's process environment.
 
 **Why STATE_DIR is separate from the skill dir**: skills are deployable artifacts (resettable via `seed_skills`, image-shippable, optionally reset on container rebuild). Cursor files are persistent runtime data — losing them means re-emitting the entire backlog of "events since cursor=0" on next run, which for a github-poller would be every PR comment in every watched repo. Mimir's filing rules separate these — skills under `.claude/skills/`, runtime state under `state/`.
 
@@ -105,7 +105,8 @@ if __name__ == "__main__":
 | `name` | yes | Unique identifier. Used in logs and event routing. |
 | `command` | yes | Shell command, relative to the skill directory. |
 | `cron` | yes | Cron expression (5-field, UTC). |
-| `env` | no | Additional environment variables for the script. |
+| `env` | no | Additional environment variables for the script. Values are literal — no shell expansion. Use this for fixed config (URLs, feature flags) declared in pollers.json itself. |
+| `pass_env` | no | List of env var names to pass through from mimir's process environment to the subprocess, **bypassing the deny-suffix/deny-prefix filter** (see [security.md](security.md)). This is the supported path for getting secrets (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`) and `MIMIR_*`-prefixed knobs into a poller subprocess — the global allowlist `MIMIR_POLLER_ENV_ALLOWLIST` does NOT bypass the deny filter, so it can't be used for `*_TOKEN` keys. Keys not set in `os.environ` are silently skipped; keys whose names match a deny pattern emit a `poller_env_passthrough_named_secret` event (visibility, not blocking). |
 | `batch_size` | no | Coalesce up to N items per emitted AgentEvent (= per turn the agent sees). Default `1` (per-item-per-turn, matches open-strix). Use `>1` for bursty pollers (github-poller, RSS) so the agent sees one turn per cron tick instead of one per item. Items beyond `batch_size` overflow into additional batches with `batch_index` / `batch_count` set in `extra` so the agent can tell it's seeing part of a multi-batch fire. |
 
 **On `batch_size`**: the poller script always emits per-item JSONL lines (clean contract). The framework collects all items, then emits `ceil(N/batch_size)` AgentEvents, each carrying a rendered prompt summarizing up to `batch_size` items + per-item metadata in `extra.items`. Single-item batches (default) render the prompt verbatim — no header. Multi-item batches render with a header (`<poller-name> reported N items` plus a `(batch X of Y)` suffix on multi-batch fires) and a numbered list of per-item prompts.

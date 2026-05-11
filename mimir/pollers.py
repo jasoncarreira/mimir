@@ -105,7 +105,28 @@ class PollerConfig:
     ``persist_dir == skill_dir`` for compactness.
 
     ``env`` are extra env vars from the json entry's ``env`` map
-    (already coerced to ``dict[str, str]``).
+    (already coerced to ``dict[str, str]``). Values are literal —
+    no shell expansion. Use this when the poller needs a fixed
+    config value the operator declared in pollers.json itself.
+
+    ``pass_env`` (chainlink #82 sub #83/#85): explicit list of env
+    var names to pass through from the mimir process's environment
+    to the subprocess, **bypassing the deny-suffix/deny-prefix
+    filter**. This is the supported path for getting secrets
+    (``GITHUB_TOKEN``, ``ANTHROPIC_API_KEY``, etc.) and
+    ``MIMIR_*``-prefixed knobs (``MIMIR_GITHUB_SELF_LOGIN``) into a
+    poller subprocess — the global allowlist
+    (``MIMIR_POLLER_ENV_ALLOWLIST``) does NOT bypass the deny
+    filter, so it can't be used for ``*_TOKEN`` keys. Each name in
+    ``pass_env`` is opt-in per pollers.json entry, so a poller
+    declares exactly what it needs and operator-review of the
+    manifest is sufficient to audit the trust boundary. Keys named
+    in ``pass_env`` that aren't set in the process env are silently
+    skipped (no error — that's the operator's signal to set the
+    env var); keys named in ``pass_env`` whose names match a
+    deny-list pattern emit a ``poller_env_passthrough_named_secret``
+    event for visibility (not blocking — it's how operators get
+    secrets through).
 
     ``batch_size`` (chainlink: framework-level coalescing): how
     many emitted JSONL items to bundle into one AgentEvent (= one
@@ -126,6 +147,7 @@ class PollerConfig:
     skill_dir: Path
     persist_dir: Path | None = None
     batch_size: int = POLLER_BATCH_SIZE_DEFAULT
+    pass_env: tuple[str, ...] = ()
 
     def channel_id(self) -> str:
         """Synthetic channel for emitted events. Mirrors the
@@ -204,6 +226,26 @@ def discover_pollers(
             env_raw = entry.get("env", {})
             if not isinstance(env_raw, dict):
                 env_raw = {}
+            pass_env_raw = entry.get("pass_env", [])
+            if not isinstance(pass_env_raw, list):
+                log.warning(
+                    "poller_invalid_pass_env: %s name=%r value=%r "
+                    "(expected list of strings); ignoring",
+                    pollers_file, name, pass_env_raw,
+                )
+                pass_env_raw = []
+            pass_env_clean: list[str] = []
+            for item in pass_env_raw:
+                if not isinstance(item, str):
+                    log.warning(
+                        "poller_invalid_pass_env_item: %s name=%r "
+                        "item=%r (expected string); skipping",
+                        pollers_file, name, item,
+                    )
+                    continue
+                key = item.strip()
+                if key:
+                    pass_env_clean.append(key)
             persist_dir = (
                 state_root / name if state_root is not None else None
             )
@@ -248,6 +290,7 @@ def discover_pollers(
                     skill_dir=skill_dir,
                     persist_dir=persist_dir,
                     batch_size=batch_size,
+                    pass_env=tuple(pass_env_clean),
                 ),
             )
     return pollers
@@ -362,6 +405,31 @@ async def run_poller(
         return True
 
     env = {k: v for k, v in os.environ.items() if _allowed_env_key(k)}
+    # Per-poller pass_env (chainlink #82 sub #83/#85): explicit
+    # whitelist of env keys that bypass the deny-suffix/deny-prefix
+    # filter. This is how pollers get secrets (``GITHUB_TOKEN``) and
+    # ``MIMIR_*``-prefixed knobs (``MIMIR_GITHUB_SELF_LOGIN``) — the
+    # global ``MIMIR_POLLER_ENV_ALLOWLIST`` does NOT bypass the deny
+    # filter, so it can't be used for any ``*_TOKEN`` key. Keys
+    # named here whose names match a deny pattern emit a
+    # ``poller_env_passthrough_named_secret`` event for visibility
+    # (operators get a paper trail of "this poller pulls a secret
+    # named env var through"); the value is not logged. Keys named
+    # here that aren't set in os.environ are silently skipped — that
+    # absence is itself the operator's signal that the env var wasn't
+    # provisioned.
+    for key in poller.pass_env:
+        if key not in os.environ:
+            continue
+        env[key] = os.environ[key]
+        if any(key.endswith(s) for s in _DENY_SUFFIXES) or any(
+            key.startswith(p) for p in _DENY_PREFIXES
+        ):
+            await log_event(
+                "poller_env_passthrough_named_secret",
+                poller=poller.name,
+                key=key,
+            )
     env.update(poller.env)  # explicit per-skill overlay still wins
     env["STATE_DIR"] = str(persist_dir)
     env["POLLER_NAME"] = poller.name

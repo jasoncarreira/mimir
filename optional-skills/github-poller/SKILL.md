@@ -25,6 +25,17 @@ won't watch a GitHub repo, so the framework doesn't seed it by default.
    | `GITHUB_TOKEN` | recommended | GitHub PAT. Falls back to `gh auth token` when unset. |
    | `MIMIR_GITHUB_SELF_LOGIN` | optional | GitHub login mimir authors as. Events from this login get filtered out (mimir doesn't wake itself). Leave empty if mimir uses the operator's PAT — the operator is the signal you want, not the noise. |
 
+   These env vars must be exported in mimir's process environment
+   (e.g. via the container's env file). The framework strips
+   ``*_TOKEN`` and ``MIMIR_*`` keys from a poller's subprocess env
+   by default; the ``pass_env`` field in this skill's
+   ``pollers.json`` declares the three keys above as the explicit
+   pass-through whitelist, which bypasses that filter. If you
+   rename or relocate a var, update ``pollers.json`` accordingly.
+   ``GITHUB_TOKEN`` set but not declared in ``pass_env`` →
+   silently absent in the subprocess → poller falls through to
+   ``gh auth token`` → zero events forever if ``gh`` isn't authed.
+
 3. Bring it live:
    ```
    reload_pollers
