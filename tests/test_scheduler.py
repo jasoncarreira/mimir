@@ -1407,3 +1407,167 @@ async def test_reinstall_pollers_pre_populates_dict_before_add_job(
         "self._pollers[name] must be set BEFORE add_job; "
         f"got probe states {probed_states}"
     )
+
+
+# ─── chainlink #84: preserve pollers on malformed-manifest reload ────
+
+
+@pytest.mark.asyncio
+async def test_reinstall_pollers_preserves_entries_from_corrupted_manifest(
+    tmp_path: Path,
+):
+    """chainlink #84 acceptance: an operator edits a working
+    ``pollers.json`` and introduces a syntax error. On the next
+    reload, the previously-installed poller from that manifest must
+    NOT be silently dropped — the pre-edit cron job stays registered,
+    the dict entry stays put. Sibling skills with clean manifests
+    reload normally."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "doomed-then-saved")
+    _drop_pollers_skill(skills, "always-fine")
+    sched.add_poller_jobs(skills)
+    assert "doomed-then-saved" in sched._pollers
+    assert "always-fine" in sched._pollers
+    pre_edit_cfg = sched._pollers["doomed-then-saved"]
+
+    # Operator-typo simulation: corrupt the manifest mid-edit.
+    (skills / "doomed-then-saved" / "pollers.json").write_text(
+        "{ this is not json", encoding="utf-8",
+    )
+
+    n = await sched.reload_pollers()
+
+    # Both pollers still present in the live dict — the corrupted-
+    # manifest one was preserved (chainlink #84 fix), the clean one
+    # reloaded normally.
+    assert "always-fine" in sched._pollers
+    assert "doomed-then-saved" in sched._pollers
+    # Preserved config is the SAME object (in-place preservation,
+    # not a re-add with new identity) — proves the scheduler kept
+    # the prior PollerConfig rather than constructing a fresh one
+    # from a manifest it couldn't parse.
+    assert sched._pollers["doomed-then-saved"] is pre_edit_cfg
+    # PR #141 review item #2: ``reload_pollers`` returns the live
+    # total (preserved + freshly-installed), not just Phase 3
+    # installs — matches ``registered_pollers()`` semantics so the
+    # MCP reply's count agrees with the names list. Pre-fix this
+    # returned 1 (only the cleanly-reinstalled poller); now returns
+    # 2 (the preserved one + the cleanly-reinstalled one).
+    assert n == 2, (
+        "reload_pollers should return the live total "
+        "(preserved + fresh), matching registered_pollers()"
+    )
+    assert n == len(sched.registered_pollers())
+
+    # APScheduler job for the preserved poller is still registered.
+    job_ids = {j.id for j in sched._scheduler.get_jobs()}
+    assert "poller:doomed-then-saved" in job_ids
+    assert "poller:always-fine" in job_ids
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_emits_invalid_manifest_event(
+    tmp_path: Path,
+):
+    """chainlink #84: when a manifest fails to JSON-parse on reload,
+    a ``poller_reload_invalid_manifest`` algedonic event lands in
+    events.jsonl with the failing path, the parse error message, and
+    the list of preserved poller names. This is the algedonic signal
+    the operator needs — without it, a silent drop would show up only
+    in mysteriously-stale reload-tool reply counts."""
+    from unittest.mock import patch
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    _drop_pollers_skill(skills, "p2")
+    sched.add_poller_jobs(skills)
+
+    # Corrupt p1's manifest.
+    bad_path = skills / "p1" / "pollers.json"
+    bad_path.write_text("garbage {", encoding="utf-8")
+
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(event_type: str, **kwargs):
+        captured.append((event_type, kwargs))
+
+    with patch("mimir.scheduler.log_event", new=fake_log_event):
+        await sched.reload_pollers()
+
+    invalid_events = [
+        (et, kw) for et, kw in captured
+        if et == "poller_reload_invalid_manifest"
+    ]
+    assert len(invalid_events) == 1
+    _et, payload = invalid_events[0]
+    assert payload["manifest_path"] == str(bad_path)
+    assert "JSONDecodeError" in payload["error"]
+    # The preserved-pollers list carries the names that were rescued
+    # from the broken manifest path (here, just "p1").
+    assert payload["preserved_pollers"] == ["p1"]
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_drops_poller_when_manifest_deleted(
+    tmp_path: Path,
+):
+    """Negative case for chainlink #84 fix: if a ``pollers.json`` is
+    REMOVED entirely (not corrupted, just absent — operator
+    intentionally uninstalled the skill), the poller from it must
+    still be dropped on reload. Preserve-on-parse-fail must NOT
+    over-correct into preserve-on-anything-missing."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "to-uninstall")
+    _drop_pollers_skill(skills, "to-keep")
+    sched.add_poller_jobs(skills)
+    assert "to-uninstall" in sched._pollers
+
+    # Remove the manifest entirely (clean uninstall — file gone).
+    import shutil
+    shutil.rmtree(skills / "to-uninstall")
+    n = await sched.reload_pollers()
+    assert n == 1
+    assert "to-keep" in sched._pollers
+    # Clean deletion still drops the poller. This is the explicit
+    # negative-case guard against over-correcting the chainlink #84
+    # fix into "preserve on anything missing".
+    assert "to-uninstall" not in sched._pollers
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_preserves_apscheduler_job_for_broken_manifest(
+    tmp_path: Path,
+):
+    """The poller_invalid_manifest fix must keep the APScheduler job
+    registered too — not just the dict entry. Otherwise the dict
+    would carry a stale config that never fires, which is just
+    "silent drop" by a different name."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "keep-firing")
+    sched.add_poller_jobs(skills)
+    assert sched._scheduler.get_job("poller:keep-firing") is not None
+
+    (skills / "keep-firing" / "pollers.json").write_text(
+        "{ broken json", encoding="utf-8",
+    )
+    await sched.reload_pollers()
+
+    # Job still registered with APScheduler — fires will continue
+    # using the last-known-good cron.
+    job = sched._scheduler.get_job("poller:keep-firing")
+    assert job is not None, (
+        "APScheduler job for poller with corrupted manifest must be "
+        "preserved (chainlink #84) — dict entry alone isn't enough."
+    )

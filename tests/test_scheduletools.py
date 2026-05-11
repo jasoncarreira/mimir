@@ -215,3 +215,106 @@ async def test_add_schedule_rejects_prompt_and_callable_together(tmp_path: Path)
     })
     assert out.get("is_error") is True
     assert "mutually exclusive" in out["content"][0]["text"]
+
+
+# ─── reload_pollers MCP reply — PR #141 review items #1+2 ──────────
+
+
+def _write_manifest(skills_dir: Path, name: str, body: str) -> Path:
+    """Write ``skills_dir/<name>/pollers.json`` with ``body``; create
+    the skill subdir if needed. Returns the manifest path."""
+    sd = skills_dir / name
+    sd.mkdir(parents=True, exist_ok=True)
+    p = sd / "pollers.json"
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_reply_clean_path(tmp_path: Path):
+    """A clean reload renders only the ok-line — no parse-failure
+    warning suffix (PR #141 review item #1, negative case)."""
+    sched = _make_scheduler(tmp_path)
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    _write_manifest(
+        skills, "alpha",
+        '{"pollers": [{"name": "alpha", "command": "echo hi",'
+        ' "cron": "* * * * *"}]}',
+    )
+    sched.add_poller_jobs(skills)
+    tools = {t.name: t for t in build_schedule_tools(sched)}
+
+    out = await tools["reload_pollers"].handler({})
+    body = out["content"][0]["text"]
+    assert "reload_pollers ok: 1 poller(s) registered" in body
+    assert "alpha" in body
+    assert "warning" not in body, (
+        "clean reload should not render the parse-failure suffix"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_reply_surfaces_invalid_manifest(tmp_path: Path):
+    """When a manifest fails to JSON-parse on reload, the MCP reply
+    flags the parse failure inline AND the count reflects the live
+    total (preserved + freshly-installed) — not just Phase 3 installs
+    (PR #141 review items #1+2 together)."""
+    sched = _make_scheduler(tmp_path)
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    alpha = _write_manifest(
+        skills, "alpha",
+        '{"pollers": [{"name": "alpha", "command": "echo hi",'
+        ' "cron": "* * * * *"}]}',
+    )
+    _write_manifest(
+        skills, "beta",
+        '{"pollers": [{"name": "beta", "command": "echo hi",'
+        ' "cron": "* * * * *"}]}',
+    )
+    # Bootstrap: both pollers install cleanly.
+    sched.add_poller_jobs(skills)
+    assert sorted(sched.registered_pollers()) == ["alpha", "beta"]
+
+    # Operator mid-edit: alpha's manifest gets a syntax error.
+    alpha.write_text("{not valid json", encoding="utf-8")
+    tools = {t.name: t for t in build_schedule_tools(sched)}
+
+    out = await tools["reload_pollers"].handler({})
+    body = out["content"][0]["text"]
+    # Item #2: count matches names list (2, not 1).
+    assert "2 poller(s) registered" in body, (
+        f"expected live-total count of 2, got: {body!r}"
+    )
+    assert "alpha" in body and "beta" in body
+    # Item #1: warning suffix flags the parse failure inline + preserved.
+    assert "warning" in body.lower()
+    assert "1 manifest failed to parse" in body
+    assert "preserved 1 prior poller" in body
+    assert "alpha" in body  # preserved poller named in the suffix
+    assert "events.jsonl" in body
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_zero_with_invalid_manifest(tmp_path: Path):
+    """When a manifest is invalid AND no pollers end up registered,
+    the reply still surfaces the parse failure — the 0-pollers
+    early-return path must not swallow the warning."""
+    sched = _make_scheduler(tmp_path)
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    # Bootstrap with a valid manifest so add_poller_jobs wires
+    # _pollers_dir; otherwise reload_pollers no-ops at the
+    # self._pollers_dir is None check.
+    bad = _write_manifest(skills, "doomed", '{"pollers": []}')
+    sched.add_poller_jobs(skills)
+    bad.write_text("not json", encoding="utf-8")
+    tools = {t.name: t for t in build_schedule_tools(sched)}
+
+    out = await tools["reload_pollers"].handler({})
+    body = out["content"][0]["text"]
+    # 0-with-warning path: does NOT take the no-skills-dir early-return.
+    assert "no <home>/.claude/skills" not in body
+    assert "warning" in body.lower()
+    assert "1 manifest failed to parse" in body

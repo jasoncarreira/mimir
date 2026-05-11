@@ -158,18 +158,48 @@ def build_schedule_tools(scheduler: Scheduler) -> list[SdkMcpTool]:
     )
     @_safe("reload_pollers")
     async def reload_pollers(args: dict[str, Any]) -> dict[str, Any]:
+        # PR #141 review item #1+2: ``count`` now reflects the live
+        # total (preserved + freshly-installed), matching the names
+        # list. ``invalid_events`` (chainlink #84) is non-empty when
+        # one or more ``pollers.json`` failed to JSON-parse this
+        # reload — surface a warning inline so the operator who
+        # triggered this tool doesn't have to scan events.jsonl to
+        # learn the reload partially failed.
         count = await scheduler.reload_pollers()
         names = scheduler.registered_pollers()
-        if count == 0:
+        invalid_events = scheduler.last_invalid_manifest_events()
+        if count == 0 and not invalid_events:
             return _content_block(
                 "reload_pollers: 0 pollers registered (no "
                 "<home>/.claude/skills/**/pollers.json files found, "
                 "or skills_dir not wired)."
             )
-        return _content_block(
+        body = (
             f"reload_pollers ok: {count} poller(s) registered — "
             f"{', '.join(names)}"
         )
+        if invalid_events:
+            n = len(invalid_events)
+            preserved = sorted(
+                {
+                    name
+                    for ev in invalid_events
+                    for name in ev.get("preserved_pollers", [])
+                }
+            )
+            preserved_clause = (
+                f"; preserved {len(preserved)} prior poller"
+                f"{'s' if len(preserved) != 1 else ''}"
+                f" ({', '.join(preserved)})"
+                if preserved
+                else ""
+            )
+            body += (
+                f" (warning: {n} manifest"
+                f"{'s' if n != 1 else ''} failed to parse"
+                f"{preserved_clause} — see events.jsonl for paths)"
+            )
+        return _content_block(body)
 
     return [list_schedules, add_schedule, remove_schedule, reload_pollers]
 
