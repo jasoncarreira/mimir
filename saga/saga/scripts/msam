@@ -1,4 +1,4 @@
 #!/bin/bash
-# Convenience wrapper. Prefer: pip install -e . && msam <command>
-SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-exec python3 -m msam.remember "$@"
+# DEPRECATED: 'msam' is the previous name of this script. Use 'saga' going forward.
+# This shim will be removed in a future release. It forwards to the saga-named binary.
+exec "$(dirname "$0")/saga" "$@"

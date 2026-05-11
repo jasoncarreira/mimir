@@ -3,16 +3,16 @@
 Persistent memory for AI agents — atoms, observations, triples, and a
 two-tier retriever that knows what it knows and what it doesn't.
 
-Originally [MSAM][msam] (Multi-Stream Adaptive Memory) by Jaden
+Originally [SAGA][saga] (Multi-Stream Adaptive Memory) by Jaden
 Schwab. Heavily modified and renamed; see [LICENSE](./LICENSE) for the
 combined copyright. saga is the memory backend of [mimir](../README.md)
 but is usable standalone via a Python library or HTTP server.
 
-[msam]: https://github.com/jadenschwab/msam
+[saga]: https://github.com/jadenschwab/saga
 
-## What changed from MSAM
+## What changed from SAGA
 
-If you arrive here from the MSAM repo, the differences worth knowing:
+If you arrive here from the SAGA repo, the differences worth knowing:
 
 - **Two-tier retrieval is the canonical mechanism.** Observations
   (consolidation-synthesized beliefs) and raws (direct atoms) ride
@@ -130,7 +130,7 @@ Nothing is deleted; everything is auditable.
 
 ## Documentation
 
-- **[SPEC.md](./SPEC.md)** — original MSAM specification (covers
+- **[SPEC.md](./SPEC.md)** — original SAGA specification (covers
   the foundational ACT-R + multi-stream architecture)
 - **[BENCHMARK-RESULTS.md](./BENCHMARK-RESULTS.md)** — every benchmark
   run with per-category breakdowns, ordered by date

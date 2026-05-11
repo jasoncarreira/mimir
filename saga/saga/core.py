@@ -1,5 +1,5 @@
 """
-MSAM Core -- Multi-Stream Adaptive Memory
+SAGA Core -- Multi-Stream Adaptive Memory
 Proof of Concept Implementation
 
 Storage, retrieval, and activation scoring for memory atoms.
@@ -23,10 +23,10 @@ from pathlib import Path
 # post-retrieval HyDE gate. INFO logs fire only when an LLM path
 # actually did work; DEBUG covers gate-skipped cases. Mimir / ops can
 # tune ``saga.retrieval`` independently to count path frequencies in
-# production logs without changing other MSAM verbosity.
+# production logs without changing other SAGA verbosity.
 _retrieval_log = logging.getLogger("saga.retrieval")
 
-# Ensure msam/ is on the path so config is importable when called directly
+# Ensure saga/ is on the path so config is importable when called directly
 from .config import get_config as _get_config, get_data_dir as _get_data_dir
 _cfg = _get_config()
 DB_PATH = _get_data_dir() / _cfg('storage', 'db_path', 'saga.db')
@@ -706,7 +706,7 @@ def _sigmoid_boost(x: float, midpoint: float = None, steepness: float = None) ->
 
 def compute_activation(atom: dict, query_similarity: float = 0.0, mode: str = "task") -> float:
     """
-    Compute activation score using ACT-R formula + MSAM extensions.
+    Compute activation score using ACT-R formula + SAGA extensions.
     
     base = min(ln(access_count + 1), 3.0) - 0.5 * ln(age_hours + 1)
     similarity = sigmoid_boost(cosine_sim) * spread_weight  [threshold: 0.2]
@@ -1104,7 +1104,7 @@ def register_hook(event: str, callback):
     Events: on_store, on_retrieve, on_decay, on_expire, on_correct, on_promote
     Callback receives **kwargs with event-specific data.
 
-    The agent uses this to react to MSAM events without polling.
+    The agent uses this to react to SAGA events without polling.
     """
     with _hooks_lock:
         if event not in _lifecycle_hooks:
@@ -3828,7 +3828,7 @@ MIGRATIONS = {
         "CREATE INDEX IF NOT EXISTS idx_atoms_memory_type ON atoms(memory_type)",
         # Back-fill: atoms whose metadata mentions consolidated_from are
         # observations by construction. JSON1 is available in SQLite
-        # 3.38+; all MSAM deployments ship with that.
+        # 3.38+; all SAGA deployments ship with that.
         """UPDATE atoms
            SET memory_type = 'observation',
                evidence_count = json_array_length(json_extract(metadata, '$.consolidated_from'))
@@ -4509,7 +4509,7 @@ _QUERY_EXPANSIONS_DEFAULT = {
     "home": ["hometown", "residence", "where lives", "based"],
     "family": ["parents", "siblings", "relatives"],
     "feelings": ["emotions", "mood", "emotional state"],
-    "memory": ["remember", "recall", "memories", "msam"],
+    "memory": ["remember", "recall", "memories", "saga"],
 }
 _QUERY_EXPANSIONS = _cfg('query_expansion', 'synonyms', _QUERY_EXPANSIONS_DEFAULT) or _QUERY_EXPANSIONS_DEFAULT
 

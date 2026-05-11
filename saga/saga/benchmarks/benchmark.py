@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-MSAM Benchmark Suite
+SAGA Benchmark Suite
 
 Three benchmark categories:
-  1. Retrieval Quality -- precision/recall/MRR comparing MSAM hybrid vs raw vector
+  1. Retrieval Quality -- precision/recall/MRR comparing SAGA hybrid vs raw vector
   2. Efficiency -- token savings with quality-adjusted measurement
   3. Cognitive Features -- metamemory accuracy, decay value, contribution feedback
 
@@ -109,15 +109,15 @@ def raw_vector_retrieve(query: str, top_k: int = 12) -> list[str]:
 
 
 def benchmark_retrieval(ground_truth: dict) -> dict:
-    """Compare MSAM hybrid retrieval vs raw vector search."""
+    """Compare SAGA hybrid retrieval vs raw vector search."""
     print("\n=== Benchmark 1: Retrieval Quality ===")
 
     k_values = [5, 10, 20]
     results = {
-        "msam": {f"p@{k}": [] for k in k_values},
+        "saga": {f"p@{k}": [] for k in k_values},
         "raw_vector": {f"p@{k}": [] for k in k_values},
     }
-    for method in ["msam", "raw_vector"]:
+    for method in ["saga", "raw_vector"]:
         for k in k_values:
             results[method][f"r@{k}"] = []
             results[method][f"ndcg@{k}"] = []
@@ -134,29 +134,29 @@ def benchmark_retrieval(ground_truth: dict) -> dict:
 
         print(f"  [{i+1}/{total}] {query[:50]}... ", end="", flush=True)
 
-        # MSAM hybrid retrieval
+        # SAGA hybrid retrieval
         t0 = time.time()
-        msam_results = dry_retrieve(query, mode="task", top_k=20)
-        msam_latency = (time.time() - t0) * 1000
-        msam_ids = [r["id"] for r in msam_results]
+        saga_results = dry_retrieve(query, mode="task", top_k=20)
+        saga_latency = (time.time() - t0) * 1000
+        saga_ids = [r["id"] for r in saga_results]
 
         # Raw vector retrieval
         t0 = time.time()
         raw_ids = raw_vector_retrieve(query, top_k=20)
         raw_latency = (time.time() - t0) * 1000
 
-        results["msam"]["latency_ms"].append(msam_latency)
+        results["saga"]["latency_ms"].append(saga_latency)
         results["raw_vector"]["latency_ms"].append(raw_latency)
 
         if expected_empty:
             # For expected-empty queries, good = low similarity scores
             # We measure "false positive rate" -- how many irrelevant atoms score high
-            results["msam"]["mrr"].append(1.0 if not msam_ids else 0.0)
+            results["saga"]["mrr"].append(1.0 if not saga_ids else 0.0)
             results["raw_vector"]["mrr"].append(1.0 if not raw_ids else 0.0)
             for k in k_values:
-                results["msam"][f"p@{k}"].append(1.0)
-                results["msam"][f"r@{k}"].append(1.0)
-                results["msam"][f"ndcg@{k}"].append(1.0)
+                results["saga"][f"p@{k}"].append(1.0)
+                results["saga"][f"r@{k}"].append(1.0)
+                results["saga"][f"ndcg@{k}"].append(1.0)
                 results["raw_vector"][f"p@{k}"].append(1.0)
                 results["raw_vector"][f"r@{k}"].append(1.0)
                 results["raw_vector"][f"ndcg@{k}"].append(1.0)
@@ -168,21 +168,21 @@ def benchmark_retrieval(ground_truth: dict) -> dict:
             continue
 
         # Score both methods
-        for method, ids in [("msam", msam_ids), ("raw_vector", raw_ids)]:
+        for method, ids in [("saga", saga_ids), ("raw_vector", raw_ids)]:
             results[method]["mrr"].append(mrr(ids, relevant))
             for k in k_values:
                 results[method][f"p@{k}"].append(precision_at_k(ids, relevant, k))
                 results[method][f"r@{k}"].append(recall_at_k(ids, relevant, k))
                 results[method][f"ndcg@{k}"].append(ndcg_at_k(ids, relevant, k))
 
-        msam_mrr_val = results["msam"]["mrr"][-1]
+        saga_mrr_val = results["saga"]["mrr"][-1]
         raw_mrr_val = results["raw_vector"]["mrr"][-1]
-        winner = "MSAM" if msam_mrr_val >= raw_mrr_val else "RAW"
-        print(f"MRR: MSAM={msam_mrr_val:.3f} RAW={raw_mrr_val:.3f} [{winner}]")
+        winner = "SAGA" if saga_mrr_val >= raw_mrr_val else "RAW"
+        print(f"MRR: SAGA={saga_mrr_val:.3f} RAW={raw_mrr_val:.3f} [{winner}]")
 
     # Aggregate
     summary = {}
-    for method in ["msam", "raw_vector"]:
+    for method in ["saga", "raw_vector"]:
         summary[method] = {}
         for metric, values in results[method].items():
             if values:
@@ -190,9 +190,9 @@ def benchmark_retrieval(ground_truth: dict) -> dict:
 
     # Compute deltas
     deltas = {}
-    for metric in summary["msam"]:
+    for metric in summary["saga"]:
         if metric in summary["raw_vector"]:
-            delta = summary["msam"][metric] - summary["raw_vector"][metric]
+            delta = summary["saga"][metric] - summary["raw_vector"][metric]
             deltas[metric] = round(delta, 4)
 
     return {
@@ -211,7 +211,7 @@ def estimate_tokens(text: str) -> int:
 
 
 async def benchmark_efficiency(ground_truth: dict) -> dict:
-    """Measure token savings: MSAM context vs loading all relevant atoms as flat text."""
+    """Measure token savings: SAGA context vs loading all relevant atoms as flat text."""
     print("\n=== Benchmark 2: Token Efficiency ===")
 
     conn = get_db()
@@ -224,7 +224,7 @@ async def benchmark_efficiency(ground_truth: dict) -> dict:
     all_content = "\n".join(a[1] for a in all_atoms)
     total_all_tokens = estimate_tokens(all_content)
 
-    # The REAL baseline: what an agent without MSAM loads at session startup.
+    # The REAL baseline: what an agent without SAGA loads at session startup.
     # That's ALL context files the agent would read. Production measured: 9,301 tokens.
     baseline_files = [
         "memory/MEMORY.md",
@@ -252,19 +252,19 @@ async def benchmark_efficiency(ground_truth: dict) -> dict:
         if not relevant_ids:
             continue
 
-        # MSAM retrieval with token budget
+        # SAGA retrieval with token budget
         hybrid = await hybrid_retrieve_with_triples(query, mode="task", token_budget=300)
-        msam_tokens = hybrid.get("total_tokens", 0)
+        saga_tokens = hybrid.get("total_tokens", 0)
         # Use _raw_atoms (pre-triple) for coverage, as hybrid may swap atoms for triples
         raw_atoms = hybrid.get("_raw_atoms", hybrid.get("atoms", []))
-        msam_atom_ids = set()
+        saga_atom_ids = set()
         for a in raw_atoms:
             if isinstance(a, dict) and "id" in a:
-                msam_atom_ids.add(a["id"])
+                saga_atom_ids.add(a["id"])
         # Also check the final atoms list
         for a in hybrid.get("atoms", []):
             if isinstance(a, dict) and "id" in a:
-                msam_atom_ids.add(a["id"])
+                saga_atom_ids.add(a["id"])
 
         # Relevant-only baseline: tokens if you could perfectly grep just the right atoms
         relevant_content = []
@@ -273,18 +273,18 @@ async def benchmark_efficiency(ground_truth: dict) -> dict:
                 relevant_content.append(atom[1])
         relevant_only_tokens = estimate_tokens("\n".join(relevant_content))
 
-        # Quality: how many relevant atoms did MSAM actually return?
-        hits = len(msam_atom_ids & relevant_ids)
+        # Quality: how many relevant atoms did SAGA actually return?
+        hits = len(saga_atom_ids & relevant_ids)
         coverage = hits / len(relevant_ids) if relevant_ids else 0
 
         # Savings vs flat file baseline (the real comparison)
-        savings_vs_flat = 1 - (msam_tokens / max(flat_baseline_tokens, 1))
+        savings_vs_flat = 1 - (saga_tokens / max(flat_baseline_tokens, 1))
         # Savings vs perfect oracle (theoretical ceiling -- no system achieves this)
-        savings_vs_oracle = 1 - (msam_tokens / max(relevant_only_tokens, 1)) if relevant_only_tokens > 0 else 0
+        savings_vs_oracle = 1 - (saga_tokens / max(relevant_only_tokens, 1)) if relevant_only_tokens > 0 else 0
 
         results.append({
             "query": query,
-            "msam_tokens": msam_tokens,
+            "saga_tokens": saga_tokens,
             "flat_baseline_tokens": flat_baseline_tokens,
             "relevant_only_tokens": relevant_only_tokens,
             "savings_vs_flat_pct": round(savings_vs_flat * 100, 1),
@@ -295,14 +295,14 @@ async def benchmark_efficiency(ground_truth: dict) -> dict:
         })
 
         print(f"  [{i+1}/{len(queries)}] {query[:40]}... "
-              f"MSAM={msam_tokens}tok flat={flat_baseline_tokens}tok oracle={relevant_only_tokens}tok "
+              f"SAGA={saga_tokens}tok flat={flat_baseline_tokens}tok oracle={relevant_only_tokens}tok "
               f"save_flat={savings_vs_flat*100:.0f}% cov={coverage:.0%}")
 
     # Aggregate
     avg_savings_flat = sum(r["savings_vs_flat_pct"] for r in results) / len(results)
     avg_savings_oracle = sum(r["savings_vs_oracle_pct"] for r in results) / len(results)
     avg_coverage = sum(r["coverage"] for r in results) / len(results)
-    total_msam = sum(r["msam_tokens"] for r in results)
+    total_saga = sum(r["saga_tokens"] for r in results)
     total_relevant_found = sum(r["relevant_found"] for r in results)
     total_relevant = sum(r["relevant_total"] for r in results)
 
@@ -312,12 +312,12 @@ async def benchmark_efficiency(ground_truth: dict) -> dict:
             "avg_savings_vs_flat_pct": round(avg_savings_flat, 1),
             "avg_savings_vs_oracle_pct": round(avg_savings_oracle, 1),
             "avg_coverage": round(avg_coverage, 3),
-            "total_msam_tokens": total_msam,
+            "total_saga_tokens": total_saga,
             "flat_baseline_tokens": flat_baseline_tokens,
             "total_all_atom_tokens": total_all_tokens,
             "total_relevant_found": total_relevant_found,
             "total_relevant_possible": total_relevant,
-            "overall_savings_vs_flat": round((1 - total_msam / (flat_baseline_tokens * len(results))) * 100, 1),
+            "overall_savings_vs_flat": round((1 - total_saga / (flat_baseline_tokens * len(results))) * 100, 1),
         },
         "queries_evaluated": len(results),
     }
@@ -326,7 +326,7 @@ async def benchmark_efficiency(ground_truth: dict) -> dict:
 # ─── Benchmark 3: Cognitive Features ─────────────────────────────
 
 def benchmark_cognitive(ground_truth: dict) -> dict:
-    """Test MSAM's cognitive features: metamemory, quality scoring, absent detection."""
+    """Test SAGA's cognitive features: metamemory, quality scoring, absent detection."""
     print("\n=== Benchmark 3: Cognitive Features ===")
 
     results = {
@@ -492,25 +492,25 @@ def benchmark_cognitive(ground_truth: dict) -> dict:
 def print_summary(results: dict):
     """Print human-readable benchmark summary."""
     print("\n" + "=" * 60)
-    print("MSAM BENCHMARK RESULTS")
+    print("SAGA BENCHMARK RESULTS")
     print("=" * 60)
 
     if "retrieval" in results:
         r = results["retrieval"]["summary"]
         d = results["retrieval"]["deltas"]
         print("\n--- Retrieval Quality ---")
-        print(f"  {'Metric':<12} {'MSAM':>8} {'Raw Vec':>8} {'Delta':>8}")
+        print(f"  {'Metric':<12} {'SAGA':>8} {'Raw Vec':>8} {'Delta':>8}")
         print(f"  {'-'*12} {'-'*8} {'-'*8} {'-'*8}")
         for metric in ["p@5", "p@10", "r@10", "r@20", "mrr", "ndcg@10"]:
-            msam_val = r.get("msam", {}).get(metric, 0)
+            saga_val = r.get("saga", {}).get(metric, 0)
             raw_val = r.get("raw_vector", {}).get(metric, 0)
             delta = d.get(metric, 0)
             sign = "+" if delta >= 0 else ""
-            print(f"  {metric:<12} {msam_val:>8.4f} {raw_val:>8.4f} {sign}{delta:>7.4f}")
+            print(f"  {metric:<12} {saga_val:>8.4f} {raw_val:>8.4f} {sign}{delta:>7.4f}")
 
-        lat_msam = r.get("msam", {}).get("latency_ms", 0)
+        lat_saga = r.get("saga", {}).get("latency_ms", 0)
         lat_raw = r.get("raw_vector", {}).get("latency_ms", 0)
-        print(f"  {'latency_ms':<12} {lat_msam:>8.1f} {lat_raw:>8.1f}")
+        print(f"  {'latency_ms':<12} {lat_saga:>8.1f} {lat_raw:>8.1f}")
 
     if "efficiency" in results:
         e = results["efficiency"]["summary"]
@@ -521,7 +521,7 @@ def print_summary(results: dict):
         print(f"  Overall savings vs flat:        {e['overall_savings_vs_flat']}%")
         print(f"  Flat baseline (per query):      {e['flat_baseline_tokens']} tokens")
         print(f"  Relevant found/possible:        {e['total_relevant_found']}/{e['total_relevant_possible']}")
-        print(f"  MSAM tokens (total):            {e['total_msam_tokens']}")
+        print(f"  SAGA tokens (total):            {e['total_saga_tokens']}")
 
     if "cognitive" in results:
         c = results["cognitive"]["summary"]

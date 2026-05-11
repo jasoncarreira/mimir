@@ -1,5 +1,5 @@
 """
-MSAM Decay -- Forgetting and lifecycle management.
+SAGA Decay -- Forgetting and lifecycle management.
 
 Implements stability-based retrievability decay (ACT-R inspired),
 state transitions (active -> fading -> dormant), profile compaction,
@@ -14,7 +14,7 @@ import sys
 import os
 from datetime import datetime, timezone
 
-# Ensure msam/ is importable when called directly
+# Ensure saga/ is importable when called directly
 
 from .config import get_config as _get_config
 _cfg = _get_config()
@@ -389,7 +389,7 @@ def run_decay_cycle() -> dict:
     import time
     start = time.time()
 
-    logger.info("=== MSAM Decay Cycle Start ===")
+    logger.info("=== SAGA Decay Cycle Start ===")
 
     # Step 1: Budget check BEFORE (for delta measurement)
     budget_before = budget_check()
@@ -499,7 +499,7 @@ def run_decay_cycle() -> dict:
         "forgetting_actions": forgetting_result["actions_taken"],
     }
 
-    logger.info(f"=== MSAM Decay Cycle Complete: {elapsed:.3f}s ===")
+    logger.info(f"=== SAGA Decay Cycle Complete: {elapsed:.3f}s ===")
     logger.info(f"  faded={transitions['faded']} dormanted={transitions['dormanted']} "
                 f"compacted={compaction['total_compacted']} tokens_freed={compaction['tokens_freed']} "
                 f"budget={budget_after['budget_pct']:.1f}%")

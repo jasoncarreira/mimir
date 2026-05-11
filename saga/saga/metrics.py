@@ -1,5 +1,5 @@
 """
-MSAM Metrics -- Statistics collection for Grafana visualization.
+SAGA Metrics -- Statistics collection for Grafana visualization.
 Stores time-series metrics in SQLite for lightweight monitoring.
 """
 
@@ -61,9 +61,9 @@ CREATE TABLE IF NOT EXISTS comparison_metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
     query TEXT,
-    msam_tokens INTEGER,
-    msam_latency_ms REAL,
-    msam_atoms INTEGER,
+    saga_tokens INTEGER,
+    saga_latency_ms REAL,
+    saga_atoms INTEGER,
     markdown_tokens INTEGER,
     markdown_latency_ms REAL,
     markdown_results INTEGER,
@@ -190,7 +190,47 @@ def get_metrics_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(METRICS_DB))
     conn.row_factory = sqlite3.Row
     conn.executescript(METRICS_SCHEMA)
+    _migrate_msam_to_saga_columns(conn)
     return conn
+
+
+def _migrate_msam_to_saga_columns(conn: sqlite3.Connection) -> None:
+    """One-shot migration: rename `comparison_metrics.msam_*` columns
+    to `saga_*` on existing databases.
+
+    The MSAM→SAGA rename (PR #122) updated `METRICS_SCHEMA` to use the
+    new column names, but `CREATE TABLE IF NOT EXISTS` does NOT alter
+    an existing table — so installs with an older `saga_metrics.db`
+    keep the legacy `msam_*` columns and fail on the new INSERT.
+
+    This runs once per process startup and is idempotent: if the new
+    columns already exist (fresh install OR migration already applied),
+    each `RENAME COLUMN` raises OperationalError ("no such column:
+    msam_tokens") and we continue. SQLite 3.25+ supports per-column
+    rename; the standard-library `sqlite3` module ships with a libsqlite3
+    well past that minimum on every supported Python version.
+
+    Migration is best-effort silent — log only on unexpected failure
+    shapes (not the expected "column doesn't exist" no-op). The
+    `comparison_metrics` table is bench-only / non-load-bearing, so
+    losing this migration on an exotic SQLite build is recoverable
+    by removing the file.
+    """
+    legacy_to_new = [
+        ("msam_tokens", "saga_tokens"),
+        ("msam_latency_ms", "saga_latency_ms"),
+        ("msam_atoms", "saga_atoms"),
+    ]
+    for legacy, new in legacy_to_new:
+        try:
+            conn.execute(
+                f"ALTER TABLE comparison_metrics "
+                f"RENAME COLUMN {legacy} TO {new}"
+            )
+        except sqlite3.OperationalError:
+            # Expected when the legacy column doesn't exist (fresh
+            # install OR migration already applied). Silent no-op.
+            pass
 
 
 def log_retrieval(query, mode, results, latency_ms):
@@ -268,23 +308,23 @@ def log_system_snapshot():
     conn.close()
 
 
-def log_comparison(query, msam_tokens, msam_latency_ms, msam_atoms,
+def log_comparison(query, saga_tokens, saga_latency_ms, saga_atoms,
                    md_tokens, md_latency_ms, md_results):
-    """Log a comparison between MSAM and markdown retrieval."""
+    """Log a comparison between SAGA and markdown retrieval."""
     conn = get_metrics_db()
     now = datetime.now(timezone.utc).isoformat()
     
-    savings = ((md_tokens - msam_tokens) / md_tokens * 100) if md_tokens > 0 else 0
-    density = (0.9 / 0.5) if md_tokens > 0 else 0  # MSAM vs grep info density
+    savings = ((md_tokens - saga_tokens) / md_tokens * 100) if md_tokens > 0 else 0
+    density = (0.9 / 0.5) if md_tokens > 0 else 0  # SAGA vs grep info density
     
     conn.execute("""
         INSERT INTO comparison_metrics
-        (timestamp, query, msam_tokens, msam_latency_ms, msam_atoms,
+        (timestamp, query, saga_tokens, saga_latency_ms, saga_atoms,
          markdown_tokens, markdown_latency_ms, markdown_results,
          token_savings_pct, info_density_ratio)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        now, query, msam_tokens, msam_latency_ms, msam_atoms,
+        now, query, saga_tokens, saga_latency_ms, saga_atoms,
         md_tokens, md_latency_ms, md_results, savings, density
     ))
     conn.commit()
@@ -308,7 +348,7 @@ def log_access_event(
     topics_hit=None,
     detail=None,
 ):
-    """Log every single MSAM access event with full detail."""
+    """Log every single SAGA access event with full detail."""
     conn = get_metrics_db()
     now = datetime.now(timezone.utc).isoformat()
 

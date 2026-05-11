@@ -1,4 +1,4 @@
-"""Tests for the MSAM Predictive Prefetch Engine."""
+"""Tests for the SAGA Predictive Prefetch Engine."""
 
 import json
 import sqlite3

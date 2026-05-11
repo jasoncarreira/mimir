@@ -1,4 +1,4 @@
-"""MSAM Metrics Tests -- observability and statistics collection."""
+"""SAGA Metrics Tests -- observability and statistics collection."""
 
 import sqlite3
 from datetime import datetime, timezone, timedelta
@@ -35,6 +35,119 @@ class TestMetricsDbCreation:
         assert "store_metrics" in table_names
         assert "decay_metrics" in table_names
         assert "access_events" in table_names
+        conn.close()
+
+
+class TestMsamToSagaMigration:
+    """PR #122: legacy `comparison_metrics.msam_*` columns rename to
+    `saga_*` on existing databases. CREATE TABLE IF NOT EXISTS won't
+    alter an existing table — the migration runs on every connection
+    open and is idempotent."""
+
+    def test_renames_legacy_columns_on_existing_db(self, tmp_path, monkeypatch):
+        """Pre-create the metrics DB with the legacy schema, then call
+        get_metrics_db() — the legacy msam_* columns should be renamed
+        to saga_* and an INSERT against the new column names should
+        succeed.
+        """
+        legacy_path = tmp_path / "legacy_metrics.db"
+        legacy_conn = sqlite3.connect(str(legacy_path))
+        legacy_conn.executescript("""
+            CREATE TABLE comparison_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                query TEXT,
+                msam_tokens INTEGER,
+                msam_latency_ms REAL,
+                msam_atoms INTEGER,
+                markdown_tokens INTEGER,
+                markdown_latency_ms REAL,
+                markdown_results INTEGER,
+                token_savings_pct REAL,
+                info_density_ratio REAL
+            );
+        """)
+        legacy_conn.commit()
+        legacy_conn.close()
+
+        monkeypatch.setattr("saga.metrics.METRICS_DB", legacy_path)
+        from saga.metrics import get_metrics_db
+        conn = get_metrics_db()
+
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(comparison_metrics)"
+        ).fetchall()}
+        assert "saga_tokens" in cols
+        assert "saga_latency_ms" in cols
+        assert "saga_atoms" in cols
+        assert "msam_tokens" not in cols
+        assert "msam_latency_ms" not in cols
+        assert "msam_atoms" not in cols
+
+        # Sanity: an INSERT against the new column names succeeds.
+        conn.execute(
+            "INSERT INTO comparison_metrics "
+            "(timestamp, query, saga_tokens, saga_latency_ms, saga_atoms) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-05-11T00:00:00", "test", 100, 5.0, 3),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_no_op_on_fresh_install(self, tmp_path, monkeypatch):
+        """Fresh install: the migration's RENAME COLUMN raises
+        OperationalError ("no such column: msam_tokens") and is
+        caught silently. The new schema's saga_* columns are present
+        from the CREATE TABLE."""
+        fresh_path = tmp_path / "fresh_metrics.db"
+        monkeypatch.setattr("saga.metrics.METRICS_DB", fresh_path)
+        from saga.metrics import get_metrics_db
+        conn = get_metrics_db()
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(comparison_metrics)"
+        ).fetchall()}
+        assert {"saga_tokens", "saga_latency_ms", "saga_atoms"}.issubset(cols)
+        conn.close()
+
+    def test_migration_is_idempotent(self, tmp_path, monkeypatch):
+        """Calling get_metrics_db() repeatedly on an already-migrated
+        DB is a no-op (no exception, schema unchanged)."""
+        legacy_path = tmp_path / "legacy_metrics.db"
+        legacy_conn = sqlite3.connect(str(legacy_path))
+        # Match the legacy comparison_metrics shape (timestamp column +
+        # CREATE INDEX both depend on it).
+        legacy_conn.executescript("""
+            CREATE TABLE comparison_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                query TEXT,
+                msam_tokens INTEGER,
+                msam_latency_ms REAL,
+                msam_atoms INTEGER,
+                markdown_tokens INTEGER,
+                markdown_latency_ms REAL,
+                markdown_results INTEGER,
+                token_savings_pct REAL,
+                info_density_ratio REAL
+            );
+        """)
+        legacy_conn.commit()
+        legacy_conn.close()
+
+        monkeypatch.setattr("saga.metrics.METRICS_DB", legacy_path)
+        from saga.metrics import get_metrics_db
+        # First call applies the migration.
+        get_metrics_db().close()
+        # Second + third calls are no-ops.
+        get_metrics_db().close()
+        get_metrics_db().close()
+        # Verify the schema is in its final shape.
+        conn = get_metrics_db()
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(comparison_metrics)"
+        ).fetchall()}
+        assert {"saga_tokens", "saga_latency_ms", "saga_atoms"}.issubset(cols)
+        assert not any(c.startswith("msam_") for c in cols)
         conn.close()
 
 

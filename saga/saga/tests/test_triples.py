@@ -1,4 +1,4 @@
-"""MSAM Triples Tests -- knowledge graph triple layer."""
+"""SAGA Triples Tests -- knowledge graph triple layer."""
 
 import struct
 import hashlib

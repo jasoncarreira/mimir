@@ -1,5 +1,5 @@
 """
-MSAM Config -- Central configuration loader.
+SAGA Config -- Central configuration loader.
 
 Config search order:
   1. $SAGA_CONFIG (explicit path to saga.toml)
@@ -319,7 +319,7 @@ _DEFAULTS = {
             "feelings":   ["emotions", "mood", "emotional state"],
 
             # Meta
-            "memory":     ["remember", "recall", "memories", "msam"],
+            "memory":     ["remember", "recall", "memories", "saga"],
         },
     },
     "retrieval_v2": {
@@ -433,7 +433,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def get_data_dir() -> Path:
-    """Return the MSAM data directory, creating it if needed.
+    """Return the SAGA data directory, creating it if needed.
 
     Resolution order:
       1. $SAGA_DATA_DIR (explicit override)
@@ -443,7 +443,7 @@ def get_data_dir() -> Path:
     if env:
         data_dir = Path(env)
     else:
-        data_dir = Path.home() / ".msam"
+        data_dir = Path.home() / ".saga"
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir
 
@@ -471,7 +471,7 @@ def _find_toml() -> Optional[Path]:
             return p
 
     # 3. User-level config
-    p = Path.home() / ".msam" / "saga.toml"
+    p = Path.home() / ".saga" / "saga.toml"
     if p.exists():
         return p
 

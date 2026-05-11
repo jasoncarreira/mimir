@@ -1,18 +1,18 @@
-# Hindsight Ideas for MSAM
+# Hindsight Ideas for SAGA
 
-Design notes for selectively borrowing architectural ideas from [Vectorize's Hindsight](https://github.com/vectorize-io/hindsight) into MSAM, plus what to skip and why.
+Design notes for selectively borrowing architectural ideas from [Vectorize's Hindsight](https://github.com/vectorize-io/hindsight) into SAGA, plus what to skip and why.
 
 Context: Hindsight is a recent open-source agent-memory system built around retain / recall / reflect, with a memory hierarchy (Mental Models → Observations → World Facts / Experience Facts), TEMPR parallel retrieval (Semantic + Keyword + Graph + Temporal), and evidence/confidence tracking on consolidated beliefs. It reports 91.4% on LongMemEval (Dec 2025). Worth studying; not worth copying wholesale.
 
-This document is the output of a session on 2026-04-19. MSAM head is `d4bfcad`.
+This document is the output of a session on 2026-04-19. SAGA head is `d4bfcad`.
 
 ---
 
-## 1. What MSAM already has that overlaps
+## 1. What SAGA already has that overlaps
 
 Before planning additions, a scan of what's already implemented so we don't re-invent:
 
-| Hindsight concept | MSAM equivalent | Notes |
+| Hindsight concept | SAGA equivalent | Notes |
 |---|---|---|
 | World facts / Experience facts | `stream = "semantic" / "episodic"` | Already multi-stream with different retrieval behavior |
 | Temporal graph with time ranges | `world_model` (`valid_from`, `valid_until`) | Auto-closes prior facts when a new one supersedes |
@@ -24,7 +24,7 @@ Before planning additions, a scan of what's already implemented so we don't re-i
 | Outcome feedback | `felt_consequence` (`record_outcome`, `get_outcome_history`) | Already carries positive/negative signal per atom |
 | Forgetting | `forgetting.py`, `decay.py` | Four-signal forgetting, ACT-R decay |
 
-**Takeaway:** MSAM has the raw materials for most of what Hindsight does — the deltas are organizational, not foundational.
+**Takeaway:** SAGA has the raw materials for most of what Hindsight does — the deltas are organizational, not foundational.
 
 ---
 
@@ -34,7 +34,7 @@ Three pieces stand out:
 
 1. **Explicit memory hierarchy during recall.** Mental Models → Observations → Raw Facts are not just separate rows; they're a *retrieval priority order*. The agent sees the distilled versions first; raw facts are evidence, not primary surface.
 2. **Observations carry evidence metadata** — a proof count (how many raw facts support this) and a **trend label** (`stable / strengthening / weakening / stale`). The model reasoning over memory can weigh beliefs by their evidence strength.
-3. **TEMPR with rank fusion.** Four retrieval strategies run in parallel, ranks are fused with RRF, then cross-encoder reranking. MSAM runs hybrid retrieval in one combined function; weak semantic signal can drag down strong keyword signal (or vice versa) because everything is multiplied in one activation score.
+3. **TEMPR with rank fusion.** Four retrieval strategies run in parallel, ranks are fused with RRF, then cross-encoder reranking. SAGA runs hybrid retrieval in one combined function; weak semantic signal can drag down strong keyword signal (or vice versa) because everything is multiplied in one activation score.
 
 Each of those maps to a concrete proposal below.
 
@@ -100,7 +100,7 @@ Runs inside the existing decay cycle. For each observation, look at `felt_conseq
 - positive/total dropped AND negative outcomes appearing → `weakening`
 - no accesses in window AND age > stale_threshold → `stale`
 
-Reuses signal MSAM already collects (`record_outcome`, access log). Zero new data pipeline.
+Reuses signal SAGA already collects (`record_outcome`, access log). Zero new data pipeline.
 
 #### Acceptance criteria
 
@@ -132,7 +132,7 @@ It's the fusion method Hindsight uses, the one most modern hybrid retrievers (We
 
 #### Implementation sketch
 
-New module `msam/retrieval_fusion.py`:
+New module `saga/retrieval_fusion.py`:
 
 ```python
 def reciprocal_rank_fusion(
@@ -191,7 +191,7 @@ Each pathway returns its own ranked list. Fuse via RRF (P2). Apply P1 observatio
 
 #### Why
 
-With four independent rankings, pathway-level weights (in `msam.toml`) become a meaningful tuning knob. Temporal queries can dial up temporal weight; factual queries can dial up graph weight. Right now the fact that the pipeline has all four signals is hidden behind one blended activation score, so operators can't steer it.
+With four independent rankings, pathway-level weights (in `saga.toml`) become a meaningful tuning knob. Temporal queries can dial up temporal weight; factual queries can dial up graph weight. Right now the fact that the pipeline has all four signals is hidden behind one blended activation score, so operators can't steer it.
 
 Also unlocks measurement: per-pathway recall@K on LongMemEval tells us which signal is actually pulling weight on which question type.
 
@@ -227,7 +227,7 @@ Once P1 lands, trend state becomes a standalone retrieval *filter* the agent can
 - `retrieve(query, filter=include_weakening)` — when the agent wants to flag uncertainty
 - `retrieve(query, filter=recent_strengthening)` — for "what have I learned lately"
 
-Also: **expose trend via a new primitive**. If P6 lands (removing startup context), this becomes `msam trends --filter strengthening` as its own command. If startup context stays, add a fifth section to it (`recently_strengthening` — beliefs the system is gaining confidence in). Either way, the value is giving the agent a signal that the memory system is actively learning.
+Also: **expose trend via a new primitive**. If P6 lands (removing startup context), this becomes `saga trends --filter strengthening` as its own command. If startup context stays, add a fifth section to it (`recently_strengthening` — beliefs the system is gaining confidence in). Either way, the value is giving the agent a signal that the memory system is actively learning.
 
 #### Why
 
@@ -235,8 +235,8 @@ P1 adds the data; P4 makes it useful as an API surface, not just a ranking tweak
 
 #### Acceptance criteria
 
-- New CLI: `msam trends --filter strengthening --limit 20`
-- `msam context` output includes a `recently_strengthening` section (configurable)
+- New CLI: `saga trends --filter strengthening --limit 20`
+- `saga context` output includes a `recently_strengthening` section (configurable)
 - Integration test: simulate 30 days of positive outcomes on an atom, verify trend transitions `stable → strengthening`
 
 ---
@@ -247,12 +247,12 @@ P1 adds the data; P4 makes it useful as an API surface, not just a ranking tweak
 
 #### What
 
-Hindsight's headline integration story is "two lines of code": wrap your LLM call, and the system auto-extracts narrative facts from every turn. MSAM currently requires explicit `store_atom` calls or batch ingestion.
+Hindsight's headline integration story is "two lines of code": wrap your LLM call, and the system auto-extracts narrative facts from every turn. SAGA currently requires explicit `store_atom` calls or batch ingestion.
 
-Build `msam/wrapper.py`:
+Build `saga/wrapper.py`:
 
 ```python
-from msam import wrap
+from saga import wrap
 client = wrap(OpenAI())  # or Anthropic, etc.
 
 # All calls go through; the wrapper:
@@ -265,7 +265,7 @@ Fact extraction reuses `annotate.py` + `triples.py`. Extraction runs async so it
 
 #### Why
 
-Memory systems that require explicit store calls have adoption friction. The wrapper pattern is why Mem0, Zep, and Hindsight are picking up deployments. It's also the only way MSAM gets tested on long-running, real conversations (not synthetic haystacks).
+Memory systems that require explicit store calls have adoption friction. The wrapper pattern is why Mem0, Zep, and Hindsight are picking up deployments. It's also the only way SAGA gets tested on long-running, real conversations (not synthetic haystacks).
 
 #### Caveats
 
@@ -276,7 +276,7 @@ Memory systems that require explicit store calls have adoption friction. The wra
 #### Acceptance criteria
 
 - `wrap()` works with both `openai` and `anthropic` clients
-- Round-trip example (`examples/wrapper_integration.py`): start empty MSAM, have a 5-turn conversation, verify the user's stated facts are retrievable by the end
+- Round-trip example (`examples/wrapper_integration.py`): start empty SAGA, have a 5-turn conversation, verify the user's stated facts are retrievable by the end
 - Latency overhead ≤ 400ms p95 (measured with mock LLM)
 
 ---
@@ -428,9 +428,9 @@ Defaults:
 #### What
 
 Add an agglomerative merge pass after `_cluster_phase` in
-`msam/consolidation.py`. Greedy clustering walks atoms once and
+`saga/consolidation.py`. Greedy clustering walks atoms once and
 grabs unclustered similar neighbors, which fragments on the
-"A is near B, B is near C, but A isn't near C" pattern — MSAM's
+"A is near B, B is near C, but A isn't near C" pattern — SAGA's
 benchmarks hit this because conversational topics drift over many
 turns, producing long similarity chains.
 
@@ -484,9 +484,9 @@ and `max_cluster_size` configurable.
 
 #### Acceptance criteria
 
-- `msam_p1_minimax_v3` (P1 + merge pass) produces observations with
-  larger average evidence_count than `msam_p1_minimax_v2`.
-- Overall LongMemEval accuracy improves ≥ 2 pp vs. `msam_p1_minimax_v2`,
+- `saga_p1_minimax_v3` (P1 + merge pass) produces observations with
+  larger average evidence_count than `saga_p1_minimax_v2`.
+- Overall LongMemEval accuracy improves ≥ 2 pp vs. `saga_p1_minimax_v2`,
   OR multi-session / preference subtypes improve measurably.
 - Number of observations per question stays bounded (max_cluster_size
   cap prevents balloon clusters).
@@ -509,7 +509,7 @@ and `max_cluster_size` configurable.
 
 #### What
 
-`msam/triples.py::extract_triples_llm` currently makes one LLM call per atom. MSAM's bench ingest is a serial `for turn in turns: store_atom(...)` loop, so with extraction enabled you eat one network round-trip per atom.
+`saga/triples.py::extract_triples_llm` currently makes one LLM call per atom. SAGA's bench ingest is a serial `for turn in turns: store_atom(...)` loop, so with extraction enabled you eat one network round-trip per atom.
 
 On LongMemEval that's 500 questions × ~500 atoms × ~1.5s = ~100 hours of ingest. Way too slow to actually benchmark the graph pathway's contribution. Hindsight avoids this by batching 5–10 items per retain-extract call (visible as `sub-batch N/M` in their logs).
 
@@ -541,13 +541,13 @@ It's also the right shape for the P5 wrapper later (the wrapper extracts on the 
 #### What
 
 Delete:
-- `msam/remember.py`: `cmd_context()` (~340 lines) and its helpers — `_CODEBOOK`, `_compress`/`_decompress`, `_shannon_floor_tokens`, `_load_hashes`/`_save_hashes`/`_section_hash`, `_DELTA_HASH_FILE` (~60 lines)
-- `msam/server.py`: `POST /v1/context` endpoint + `ContextRequest` model (~50 lines)
+- `saga/remember.py`: `cmd_context()` (~340 lines) and its helpers — `_CODEBOOK`, `_compress`/`_decompress`, `_shannon_floor_tokens`, `_load_hashes`/`_save_hashes`/`_section_hash`, `_DELTA_HASH_FILE` (~60 lines)
+- `saga/server.py`: `POST /v1/context` endpoint + `ContextRequest` model (~50 lines)
 - One line each in: CLI dispatch, help text, test_server's `/v1/context` test
-- `[context]` section from `msam.example.toml`
+- `[context]` section from `saga.example.toml`
 - Headline "99.3% startup savings" claims from `README.md`, `BENCHMARKS.md`, `CONTROL-FLOW.md`
 
-Leave `msam/subatom.py` alone — subatom extraction is a general-purpose utility even if startup is no longer the primary caller. Leave `msam/api.py`'s Grafana filters referencing `caller=session_startup` — harmless, purely a no-op metrics filter.
+Leave `saga/subatom.py` alone — subatom extraction is a general-purpose utility even if startup is no longer the primary caller. Leave `saga/api.py`'s Grafana filters referencing `caller=session_startup` — harmless, purely a no-op metrics filter.
 
 Total: ~450 LOC deleted, zero refactoring.
 
@@ -555,7 +555,7 @@ Total: ~450 LOC deleted, zero refactoring.
 
 Two reasons, independent of Hindsight:
 
-1. **The default startup queries don't match real deployments.** When this was exercised against muninn's 1,242-active-atom corpus (2026-04-19), the canonical queries — `"agent identity core traits personality"` / `"user preferences relationship current situation"` / `"what happened today recent activity"` / `"emotional state mood current feeling"` — returned mediocre matches (similarity 0.30–0.52) that were not identity, not partner info, not emotional state, and not the most salient recent activity. They were whatever atoms happened to contain those words. The feature depends on a corpus style (atoms *about* the agent and its partner) that MSAM's actual users don't produce.
+1. **The default startup queries don't match real deployments.** When this was exercised against muninn's 1,242-active-atom corpus (2026-04-19), the canonical queries — `"agent identity core traits personality"` / `"user preferences relationship current situation"` / `"what happened today recent activity"` / `"emotional state mood current feeling"` — returned mediocre matches (similarity 0.30–0.52) that were not identity, not partner info, not emotional state, and not the most salient recent activity. They were whatever atoms happened to contain those words. The feature depends on a corpus style (atoms *about* the agent and its partner) that SAGA's actual users don't produce.
 
 2. **Muninn's architecture doesn't need it.** Jason's stated position: agent state is in context immediately at session start. Startup context was designed as a replacement for the "cold-read SOUL.md + USER.md + MEMORY.md" pattern. If that pattern isn't being used, the feature has no consumer.
 
@@ -570,14 +570,14 @@ So: P6 is the cleanup that *follows* P1 naturally. Raw facts → observations wo
 #### Acceptance criteria
 
 - Single focused commit (or two: one for delta encoding, one for the rest) with docs updated in the same commit
-- `pytest msam/tests/` still passes (only one test touches `/v1/context` — delete it)
-- `msam help` output no longer lists `context`
+- `pytest saga/tests/` still passes (only one test touches `/v1/context` — delete it)
+- `saga help` output no longer lists `context`
 - `README.md` benchmark table either removes the startup-compression row or replaces it with something factual about query-time output volume
 - No dangling imports, no broken Grafana dashboards (check `api.py` metric query filters still resolve)
 
 #### Risks
 
-- **Narrative cost.** The "Shannon-compressed startup" is the README's most distinctive claim. Removing it means repositioning MSAM away from "99.3% token savings" as the headline. The underlying architectural advantages (multi-stream, ACT-R scoring, forgetting, world model) don't change — but the pitch does.
+- **Narrative cost.** The "Shannon-compressed startup" is the README's most distinctive claim. Removing it means repositioning SAGA away from "99.3% token savings" as the headline. The underlying architectural advantages (multi-stream, ACT-R scoring, forgetting, world model) don't change — but the pitch does.
 - **External API contract.** Any deployment that calls `POST /v1/context` breaks with a 404. Safe to delete in a project that's not versioning its REST surface; otherwise note in release notes.
 - **Undo if we're wrong.** Single commit, single revert. Low blast radius.
 
@@ -591,11 +591,11 @@ After the LongMemEval baseline lands and before P1 work starts. Reason: the remo
 
 ### Personality parameters (skepticism, literalism, empathy)
 
-Hindsight exposes these as tunables that shape reflection. Dressed up as architecture, it's prompt-template selection. MSAM agents already isolate by `agent_id`; if a deployment wants a skeptical agent they can write the system prompt themselves. Adding tunables just creates more configuration surface we'd need to test and document.
+Hindsight exposes these as tunables that shape reflection. Dressed up as architecture, it's prompt-template selection. SAGA agents already isolate by `agent_id`; if a deployment wants a skeptical agent they can write the system prompt themselves. Adding tunables just creates more configuration surface we'd need to test and document.
 
 ### Mental Models as user-curated summaries
 
-The "user manually writes summaries of common queries" premise is friction most deployments won't pay. MSAM's `pinned` atoms serve the same function (human-authored, protected from decay) without the ceremony of a dedicated tier. If P1 lands, we already have two tiers (raw / observation); adding a third curated tier is premature.
+The "user manually writes summaries of common queries" premise is friction most deployments won't pay. SAGA's `pinned` atoms serve the same function (human-authored, protected from decay) without the ceremony of a dedicated tier. If P1 lands, we already have two tiers (raw / observation); adding a third curated tier is premature.
 
 ### TEMPR's cross-encoder reranker
 
@@ -607,7 +607,7 @@ Hindsight reranks fused results with a cross-encoder (a small transformer that s
 
 Order chosen to maximize information gain per unit of work:
 
-1. **Establish the baseline first** (done — see `msam/benchmarks/longmemeval/` and `BENCHMARK-RESULTS.md`). No proposal is worth implementing without a measurable starting point.
+1. **Establish the baseline first** (done — see `saga/benchmarks/longmemeval/` and `BENCHMARK-RESULTS.md`). No proposal is worth implementing without a measurable starting point.
 2. **P6 (remove startup context + delta encoding).** Clean slate. 2 hours, one commit, makes everything downstream easier to reason about. Do right after baseline, before P1. ✅ landed (`39b633d`)
 3. **P2 (RRF).** Smallest diff, cleanly A/B-able. Tells us if our current weighted-sum fusion is actually holding us back. ✅ landed (`5f665d1`); default flipped to `rrf`.
 4. **P3 (four-pathway split).** RRF is only meaningful if pathways are independent. Do these together. ✅ landed (`d9d7602`); graph pathway returns `[]` until triples exist.
@@ -624,15 +624,15 @@ Each step gets its own benchmark run. The goal is a dose-response curve, not a b
 
 ## 6. Measurement
 
-Every proposal lands behind a flag and gets compared against `msam_baseline_v0` on LongMemEval `S`. The pipeline already exists; we add `--run-tag` per variant:
+Every proposal lands behind a flag and gets compared against `saga_baseline_v0` on LongMemEval `S`. The pipeline already exists; we add `--run-tag` per variant:
 
 ```
-msam_baseline_v0         # main, no changes
-msam_rrf_v1              # P2
-msam_rrf_pathways_v1     # P2 + P3
-msam_observations_v1     # P2 + P3 + P1 (default bonuses)
-msam_observations_v2     # P2 + P3 + P1 (tuned bonuses)
-msam_full_v1             # P1..P4
+saga_baseline_v0         # main, no changes
+saga_rrf_v1              # P2
+saga_rrf_pathways_v1     # P2 + P3
+saga_observations_v1     # P2 + P3 + P1 (default bonuses)
+saga_observations_v2     # P2 + P3 + P1 (tuned bonuses)
+saga_full_v1             # P1..P4
 ```
 
 Per-question-type breakdown is the real signal — overall accuracy can move for the wrong reason. Watch:
@@ -651,8 +651,8 @@ Also track:
 
 ## 7. Open questions
 
-- **Does MSAM's existing felt_consequence signal carry enough information for trend computation, or does the trend labeller need its own access log?** Spike: run P1 with trends computed purely from `record_outcome` history; if trends look noisy, layer in retrieval-frequency data.
-- **For P3, is the temporal pathway worth a first-class retrieval mode, or is it better as a post-filter on the other three?** Hindsight treats it as a first-class mode; MSAM could go either way. Measure.
+- **Does SAGA's existing felt_consequence signal carry enough information for trend computation, or does the trend labeller need its own access log?** Spike: run P1 with trends computed purely from `record_outcome` history; if trends look noisy, layer in retrieval-frequency data.
+- **For P3, is the temporal pathway worth a first-class retrieval mode, or is it better as a post-filter on the other three?** Hindsight treats it as a first-class mode; SAGA could go either way. Measure.
 - **How does P1 interact with `felt_consequence`'s existing score boosting?** Potential for double-counting (an observation that's been positively reinforced gets boosted once via felt_consequence and again via its evidence_count). Need a single reconciled scoring function, not two bonuses stacked.
 - **Do we want a "mental model" tier (P1 extension) at all, or does pinning solve that?** Leaning toward no; revisit if P1 users start asking for it.
 

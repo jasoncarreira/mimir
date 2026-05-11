@@ -1,14 +1,14 @@
 """
-MSAM REST API Server -- FastAPI + Uvicorn async HTTP interface.
+SAGA REST API Server -- FastAPI + Uvicorn async HTTP interface.
 
 This is SEPARATE from api.py (which serves Grafana metrics). This server
-exposes the full MSAM pipeline (store, query, context, feedback, decay,
+exposes the full SAGA pipeline (store, query, context, feedback, decay,
 triples, contradictions, prediction, consolidation, replay) as a REST API.
 
 Usage:
-    msam serve                     # Start on default host/port from config
-    msam serve --port 3001         # Override port
-    msam serve --host 0.0.0.0      # Override host
+    saga serve                     # Start on default host/port from config
+    saga serve --port 3001         # Override port
+    saga serve --host 0.0.0.0      # Override host
 
     Or programmatically:
         from saga.server import run_server
@@ -61,7 +61,7 @@ _cfg = get_config()
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 
-app = FastAPI(title="MSAM REST API", version="2026.02.22")
+app = FastAPI(title="SAGA REST API", version="2026.02.22")
 
 _allowed_origins = _cfg("api", "allowed_origins",
     ["http://127.0.0.1:3000", "http://localhost:3000"])
@@ -120,7 +120,7 @@ class QueryRequest(BaseModel):
     # falls back to [retrieval] default_min_confidence_tier (default "low",
     # which drops only "none"-tier atoms).
     min_confidence_tier: Optional[str] = None
-    # Production-only: prior conversation messages so MSAM can rewrite the
+    # Production-only: prior conversation messages so SAGA can rewrite the
     # current query into a self-contained form. Each entry is
     # {"role": "user"|"assistant", "content": str}, most recent last.
     # When provided AND [retrieval] enable_contextual_rewrite is True,
@@ -816,7 +816,7 @@ async def api_agents_share(req: AgentShareRequest):
 # ─── Run Server ───────────────────────────────────────────────────────────────
 
 def run_server(host=None, port=None):
-    """Start the MSAM REST API server with uvicorn.
+    """Start the SAGA REST API server with uvicorn.
 
     Args:
         host: Bind address. Defaults to config [api] host or 127.0.0.1.
@@ -827,7 +827,7 @@ def run_server(host=None, port=None):
     _host = host or _cfg('api', 'host', '127.0.0.1')
     _port = port or int(_cfg('api', 'port', 3001))
 
-    print(f"MSAM REST API server starting on {_host}:{_port}")
+    print(f"SAGA REST API server starting on {_host}:{_port}")
     print(f"  Health check: http://{_host}:{_port}/v1/health")
     print(f"  API key: {'required' if os.environ.get('SAGA_API_KEY') else 'not required (open access)'}")
     print(f"  Version: {_get_version()}")
