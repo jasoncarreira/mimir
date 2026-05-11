@@ -411,6 +411,53 @@ async def test_status_failure_emits_git_commit_failed(
     assert "git binary missing" in failures[0]["error"]
 
 
+# ─── chainlink #65: paired-positive emit on successful push ──────────
+
+
+@pytest.mark.asyncio
+async def test_push_success_emits_git_push_ok(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chainlink #65 (sub B): a successful push emits ``git_push_ok``
+    so the algedonic block can surface recovery alongside the sticky
+    ``git_push_failed`` failure line."""
+    _short_debounce(monkeypatch, 0.02)
+
+    # Stub `_git` so the push invocation succeeds without needing a
+    # real remote. ``_has_origin_remote`` only checks that
+    # ``git remote get-url origin`` succeeds; we add a dummy origin
+    # so that probe returns True, then short-circuit the push itself.
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
+    real_git = git_tracking._git
+
+    async def quiet_push(*args: str, **kwargs: Any) -> Any:
+        if args and args[0] == "push":
+            return git_tracking.GitResult(stdout="", stderr="")
+        return await real_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_git", quiet_push)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "ok.md").write_text("ok\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t-ok", trigger="user_message",
+        home=home_repo, enabled=True,
+    )
+    assert git_tracking._pending_push_task is not None
+    await asyncio.wait_for(git_tracking._pending_push_task, timeout=2.0)
+
+    events = _read_events(tmp_path)
+    push_oks = [e for e in events if e["type"] == "git_push_ok"]
+    assert len(push_oks) == 1
+    assert push_oks[0]["turn_id"] == "t-ok"
+    # No failure was emitted for this turn.
+    push_failures = [e for e in events if e["type"] == "git_push_failed"]
+    assert push_failures == []
+
+
 # ─── PR 4b: no-remote skips push silently ───────────────────────────
 
 

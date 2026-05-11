@@ -3,8 +3,8 @@
 Covers the helper's eight contractual behaviors:
 
 1. No NTFY_TOPIC env → emit ``ntfy_skip_no_topic``, no HTTP.
-2. 2xx happy path → no event, dedup table stamped, headers + body
-   match what the caller passed.
+2. 2xx happy path → emit ``ntfy_post_ok`` (chainlink #65 paired
+   positive), dedup table stamped, headers + body match.
 3. Re-fire within dedup window → no-op (no HTTP, no event).
 4. Re-fire after dedup window → posts again.
 5. Network failure → ``ntfy_post_failed`` with error repr; no
@@ -141,10 +141,14 @@ async def test_no_topic_emits_skip_event(
 
 
 @pytest.mark.asyncio
-async def test_happy_path_2xx_no_event(
+async def test_happy_path_2xx_emits_post_ok(
     monkeypatch: pytest.MonkeyPatch,
     captured_events: list[tuple[str, dict]],
 ) -> None:
+    """chainlink #65: 2xx now emits ``ntfy_post_ok`` as the paired
+    positive for the sticky ``ntfy_post_failed`` / ``ntfy_post_rejected``
+    failure lines. First-occurrence-only dedup at the feedback layer
+    keeps events.jsonl growth bounded in the algedonic block."""
     monkeypatch.setenv("NTFY_TOPIC", "mimir-alarms-xyz")
     session = _MockSession(post_resp=_MockResponse(200, "ok"))
     _install_session(monkeypatch, session)
@@ -158,7 +162,10 @@ async def test_happy_path_2xx_no_event(
         tags=["warning"],
     )
 
-    assert captured_events == []
+    assert captured_events == [(
+        "ntfy_post_ok",
+        {"category": "discord-down", "dedupe_key": "discord-down:outbound"},
+    )]
     assert len(session.calls) == 1
     url, kwargs = session.calls[0]
     assert url == "https://ntfy.sh/mimir-alarms-xyz"
@@ -189,9 +196,9 @@ async def test_dedup_within_window_skips(
 
     # Only the first call hit the wire.
     assert len(session.calls) == 1
-    # Neither call emitted an event (success is silent; dedup-skip is
-    # silent).
-    assert captured_events == []
+    # The first call emitted ``ntfy_post_ok`` (chainlink #65 paired
+    # positive); the dedup-skipped second call emits nothing.
+    assert [evt[0] for evt in captured_events] == ["ntfy_post_ok"]
 
 
 @pytest.mark.asyncio
@@ -224,7 +231,8 @@ async def test_dedup_window_expiry_re_posts(
 
     # Both calls hit the wire.
     assert len(session.calls) == 2
-    assert captured_events == []
+    # Each successful post emits ``ntfy_post_ok`` (chainlink #65).
+    assert [evt[0] for evt in captured_events] == ["ntfy_post_ok", "ntfy_post_ok"]
 
 
 @pytest.mark.asyncio
