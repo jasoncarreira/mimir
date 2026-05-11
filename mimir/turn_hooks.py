@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from claude_agent_sdk import ClaudeAgentOptions
 
     from .channel_registry import ChannelRegistry
+    from .commitments.store import CommitmentsStore
     from .indexes import IndexGenerator
     from .models import AgentEvent, TurnContext, TurnRecord
     from .rate_limits import RateLimitStore
@@ -506,6 +507,176 @@ class GitCommitHook(TurnLifecycleHook):
             home=self._home,
             enabled=self._enabled,
         )
+
+
+class CommitmentExtractionHook(TurnLifecycleHook):
+    """Phase 2a of commitments. On ``trigger="saga_session_end"`` turns,
+    extract durable commitments from the synthesis output via a haiku-
+    tier LLM call and persist them to the ``CommitmentsStore``.
+
+    Why finalize, not on_message or post_query: the session-end synthesis
+    output is the ``record.output`` written by run_turn — only available
+    at finalize. Per-message hooking would race the synthesis itself.
+
+    Why this hook, not the agent's loop: the synthesis turn is already
+    an LLM call; embedding the extraction in the same loop would conflate
+    the bookkeeping (atom scoring, memory writes) with the structured-
+    extraction step. Running as a separate one-shot ``query()`` lets the
+    extraction prompt be tuned independently and tested in isolation
+    (see ``scratch/commitments_backtest_report.md``).
+
+    Why dedupe at the hook (not the store): the store's
+    ``find_by_dedupe_key`` already returns active commitments only —
+    a freshly-extracted record whose key matches an in-flight
+    commitment from a prior session is a re-emergence and a no-op.
+    The hook checks that before calling ``store.add`` so the JSONL
+    doesn't accumulate duplicate adds (replay would warn-and-skip
+    per PR #120 #2, but the cleaner shape is to not write them).
+
+    Best-effort failure shape:
+    - Extraction raises → log + return; the synthesis turn record
+      itself is unaffected. Mimir loses one extraction attempt; the
+      same commitments will re-surface in a future session-end output
+      if they're real.
+    - LLM returns 0 commitments → silent success (most sessions
+      genuinely have none; backtest showed ~67% empty).
+    - Store.add raises (disk full, etc.) → log + continue with the
+      next extracted record. Partial-write is acceptable.
+
+    Events emitted (PR #125 review #6 — observability for the
+    LLM-ran-but-nothing-added paths):
+
+    - ``commitments_extracted`` when ≥1 commitment was persisted.
+      Carries ``count``, ``skipped_dedupe``, ``prompt_version``,
+      and the usual channel / session / source-turn context.
+    - ``commitments_extraction_no_op`` when extraction ran (or was
+      short-output-skipped) but nothing landed in the store. Carries
+      ``reason`` — one of ``short_output``, ``llm_returned_zero``,
+      ``all_dedupe_skipped`` — so backtest validation in production
+      can tell those three states apart instead of collapsing them
+      into silence.
+    """
+
+    name = "commitment_extraction"
+
+    def __init__(self, store: "CommitmentsStore") -> None:
+        self._store = store
+
+    async def finalize(self, ctx, event, record):
+        if ctx.trigger != "saga_session_end":
+            return
+        output = getattr(record, "output", "") or ""
+        if not output:
+            return
+
+        # Import here so the constant moves with the prompt version
+        # in extractor.py without a separate import-update step.
+        from .commitments.extractor import (
+            EXTRACTION_PROMPT_VERSION,
+            MIN_OUTPUT_LEN,
+            extract_commitments,
+        )
+
+        # PR #125 review #6: observability for the "short output"
+        # skip path (extractor returns [] without an LLM call).
+        # Distinguishable from LLM-ran-but-zero via the reason field.
+        if len(output) < MIN_OUTPUT_LEN:
+            await log_event(
+                "commitments_extraction_no_op",
+                reason="short_output",
+                output_len=len(output),
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+            )
+            return
+
+        try:
+            extracted = await extract_commitments(
+                output,
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "commitment extraction failed for turn %s; skipping",
+                ctx.turn_id,
+            )
+            return
+
+        if not extracted:
+            # LLM ran (we passed the MIN_OUTPUT_LEN gate) and returned
+            # zero commitments. Distinct from short_output above —
+            # this is "model says no commitments here," not "skipped
+            # the call." Helps validate the backtest's claim of ~67%
+            # empty rate in production.
+            await log_event(
+                "commitments_extraction_no_op",
+                reason="llm_returned_zero",
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+            )
+            return
+
+        # PR #125 review #2: snapshot dedupe keys once at the top of
+        # the loop. The previous shape called ``find_by_dedupe_key``
+        # per record, each doing a full ``current_state()`` JSONL
+        # replay — N×|JSONL| in the worst case. A single replay +
+        # in-memory set lookup is N + |JSONL|. The active-only filter
+        # matches ``find_by_dedupe_key``'s "non-terminal" semantics.
+        state = self._store.current_state()
+        existing_keys = {
+            r.dedupe_key
+            for r in state.values()
+            if r.dedupe_key and not r.is_terminal()
+        }
+
+        added = 0
+        skipped_dedupe = 0
+        for rec in extracted:
+            if rec.dedupe_key in existing_keys:
+                skipped_dedupe += 1
+                continue
+            try:
+                await self._store.add(rec)
+                added += 1
+                existing_keys.add(rec.dedupe_key)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "commitments store.add failed for record %s", rec.id,
+                )
+
+        if added > 0:
+            await log_event(
+                "commitments_extracted",
+                count=added,
+                skipped_dedupe=skipped_dedupe,
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+                # PR #125 review #1: prompt version on the event for
+                # backtest filtering ("all v3-extracted records before
+                # timestamp T" vs "all v4-extracted after T").
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+            )
+        else:
+            # Extracted but everything dedupe-skipped (re-emergence
+            # of prior commitments, common path after Phase 3 ships
+            # and commitments persist across sessions).
+            await log_event(
+                "commitments_extraction_no_op",
+                reason="all_dedupe_skipped",
+                extracted_count=len(extracted),
+                skipped_dedupe=skipped_dedupe,
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+            )
 
 
 class CancelTypingHook(TurnLifecycleHook):
