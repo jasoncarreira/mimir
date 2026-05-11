@@ -7,6 +7,7 @@ allowed-tools:
   - Read
   - Write
   - file_search
+  - saga_end_session
   - saga_query
   - saga_store
   - send_message
