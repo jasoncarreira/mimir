@@ -1,4 +1,4 @@
-# SAGA: Multi-Stream Adaptive Memory
+# SAGA
 
 ## A Specification for Persistent Agent Memory
 

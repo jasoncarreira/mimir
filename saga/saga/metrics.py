@@ -190,7 +190,47 @@ def get_metrics_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(METRICS_DB))
     conn.row_factory = sqlite3.Row
     conn.executescript(METRICS_SCHEMA)
+    _migrate_msam_to_saga_columns(conn)
     return conn
+
+
+def _migrate_msam_to_saga_columns(conn: sqlite3.Connection) -> None:
+    """One-shot migration: rename `comparison_metrics.msam_*` columns
+    to `saga_*` on existing databases.
+
+    The MSAM→SAGA rename (PR #122) updated `METRICS_SCHEMA` to use the
+    new column names, but `CREATE TABLE IF NOT EXISTS` does NOT alter
+    an existing table — so installs with an older `saga_metrics.db`
+    keep the legacy `msam_*` columns and fail on the new INSERT.
+
+    This runs once per process startup and is idempotent: if the new
+    columns already exist (fresh install OR migration already applied),
+    each `RENAME COLUMN` raises OperationalError ("no such column:
+    msam_tokens") and we continue. SQLite 3.25+ supports per-column
+    rename; the standard-library `sqlite3` module ships with a libsqlite3
+    well past that minimum on every supported Python version.
+
+    Migration is best-effort silent — log only on unexpected failure
+    shapes (not the expected "column doesn't exist" no-op). The
+    `comparison_metrics` table is bench-only / non-load-bearing, so
+    losing this migration on an exotic SQLite build is recoverable
+    by removing the file.
+    """
+    legacy_to_new = [
+        ("msam_tokens", "saga_tokens"),
+        ("msam_latency_ms", "saga_latency_ms"),
+        ("msam_atoms", "saga_atoms"),
+    ]
+    for legacy, new in legacy_to_new:
+        try:
+            conn.execute(
+                f"ALTER TABLE comparison_metrics "
+                f"RENAME COLUMN {legacy} TO {new}"
+            )
+        except sqlite3.OperationalError:
+            # Expected when the legacy column doesn't exist (fresh
+            # install OR migration already applied). Silent no-op.
+            pass
 
 
 def log_retrieval(query, mode, results, latency_ms):
