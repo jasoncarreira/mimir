@@ -504,6 +504,20 @@ async def _amain(argv: list[str] | None = None) -> int:
     os.environ["MIMIR_HOME"] = str(home)
     os.environ.setdefault("SAGA_DATA_DIR", str(home / ".mimir"))
     (home / ".mimir").mkdir(parents=True, exist_ok=True)
+    # Suppress production bridges in bench mode. The bench dispatches
+    # through BenchBridge ONLY — but ``mimir/server.py:build_app``
+    # registers ``DiscordBridge`` / ``SlackBridge`` if their tokens are
+    # set in the env. When mimir launches this bench as a subagent, the
+    # tokens are inherited from the parent shell, so the bench-mimir
+    # connects to the same Discord bot account and starts receiving +
+    # replying to live Discord messages — burning bench budget on chat,
+    # polluting the bench's chat_history.jsonl, and shifting the prompt
+    # cache between LongMemEval questions. Set the tokens to empty
+    # BEFORE ``Config.from_env()`` so the bridges don't register.
+    # (Unconditional set, not setdefault — even if the operator has
+    # them in their .env, bench mode should never touch live chat.)
+    for _var in ("DISCORD_TOKEN", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
+        os.environ[_var] = ""
     # Disable saga_session_end firing during the bench. Default idle
     # is 10 minutes; SessionManager flushes ended sessions on a timer
     # and any channel that's been quiet long enough triggers a
