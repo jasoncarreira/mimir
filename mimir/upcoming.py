@@ -34,6 +34,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+from .scheduler import SCHEDULER_CHANNEL_PREFIX
+
 
 @dataclass
 class UpcomingItem:
@@ -115,7 +117,11 @@ def collect_scheduler_jobs(
         # Friendly label: scheduler:<name> → just <name>; bare ids
         # (e.g. saga-consolidate) pass through.
         jid = str(getattr(job, "id", "") or "?")
-        label = jid.split(":", 1)[1] if jid.startswith("scheduler:") else jid
+        label = (
+            jid.split(":", 1)[1]
+            if jid.startswith(SCHEDULER_CHANNEL_PREFIX)
+            else jid
+        )
         item = UpcomingItem(
             when=next_run,
             label=label,
