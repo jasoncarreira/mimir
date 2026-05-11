@@ -4,7 +4,12 @@
       "name": "github-activity",
       "command": "python3 poller.py",
       "cron": "*/15 * * * *",
-      "batch_size": 5
+      "batch_size": 5,
+      "pass_env": [
+        "GITHUB_TOKEN",
+        "GITHUB_REPOS",
+        "MIMIR_GITHUB_SELF_LOGIN"
+      ]
     }
   ]
 }
