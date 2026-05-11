@@ -548,6 +548,10 @@ async def test_assemble_recent_activity_skips_synthetic_scheduler_channels(tmp_p
         )
     )
 
+    # Pin that the message IS in the buffer — the filter, not absence,
+    # is the load-bearing thing (per PR #127 review tightening).
+    assert len(buf.recent_for_channel("scheduler:heartbeat", limit=10)) == 1
+
     out = buf.assemble_recent_activity(
         channel_id="scheduler:heartbeat",
         author=None,  # ticks have no inbound author
@@ -574,6 +578,46 @@ async def test_assemble_recent_activity_skips_all_scheduler_prefixed_channels(
                 author=None,
             )
         )
+        # Filter-vs-absence pin: the message IS in the buffer. The
+        # public ``recent_for_channel`` pools across non-private
+        # channels (chainlink #40), so we filter the result by
+        # ``channel_id`` to isolate this iteration's contribution.
+        pool = buf.recent_for_channel(ch, limit=100)
+        assert any(m.channel_id == ch for m in pool)
+        out = buf.assemble_recent_activity(
+            channel_id=ch,
+            author=None,
+            recent_per_channel=10,
+            recent_author_cross=10,
+            cross_hours=24,
+        )
+        assert out == [], f"expected empty for {ch}, got {out}"
+
+
+@pytest.mark.asyncio
+async def test_assemble_recent_activity_skips_synthetic_poller_channels(
+    tmp_path: Path,
+):
+    """Same fix extends to ``poller:*`` channels (PR #127 review). Each
+    poller emits events on ``poller:<name>``; the agent's prior replies
+    to past events on the same poller are not useful context for the
+    next discrete event."""
+    buf = _make_buffer(tmp_path)
+    for ch in ("poller:github-activity", "poller:oauth-usage", "poller:custom-watcher"):
+        await buf.append(
+            buf.make_message(
+                channel_id=ch,
+                kind="assistant_message",
+                content=f"prior {ch} reply",
+                author=None,
+            )
+        )
+        # Filter-vs-absence pin: the message IS in the buffer. The
+        # public ``recent_for_channel`` pools across non-private
+        # channels (chainlink #40), so we filter the result by
+        # ``channel_id`` to isolate this iteration's contribution.
+        pool = buf.recent_for_channel(ch, limit=100)
+        assert any(m.channel_id == ch for m in pool)
         out = buf.assemble_recent_activity(
             channel_id=ch,
             author=None,
