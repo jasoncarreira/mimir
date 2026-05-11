@@ -468,7 +468,7 @@ async def test_pileup_alarm_runs_before_log_event(tmp_path: Path, home: Path):
     store.alarm_pileup = tracking_alarm  # type: ignore[method-assign]
     poller_mod.log_event = tracking_log  # type: ignore[assignment]
     try:
-        await check_due_and_expired(
+        result = await check_due_and_expired(
             store, now_unix=now, snooze_pileup_threshold=3,
         )
     finally:
@@ -480,6 +480,10 @@ async def test_pileup_alarm_runs_before_log_event(tmp_path: Path, home: Path):
         "failure-then-recover; alarm-first means we miss one "
         "surfacing round instead of duplicating."
     )
+    # PR #132 review nit: pin that the counter increments after the
+    # await pair so a future reorder of the increment relative to the
+    # awaits gets caught.
+    assert result.snooze_pileup_emitted == 1
 
 
 @pytest.mark.asyncio
