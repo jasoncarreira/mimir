@@ -516,6 +516,13 @@ class Config:
     def events_log(self) -> Path:
         return self.logs_dir / "events.jsonl"
 
+    @property
+    def commitments_log(self) -> Path:
+        """Append-only commitments JSONL. Lives under ``.mimir/`` (not
+        ``state/``) so the indexer doesn't walk it as searchable
+        knowledge — it's internal lifecycle state, not content."""
+        return self.home / ".mimir" / "commitments.jsonl"
+
     def sdk_env_overrides(self) -> dict[str, str]:
         """Env vars to forward via ClaudeAgentOptions.env (§14.1)."""
         out = {}
