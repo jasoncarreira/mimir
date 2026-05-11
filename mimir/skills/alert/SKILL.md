@@ -1,6 +1,9 @@
 ---
 name: alert
 description: When and how to use the operator alert channel for high-priority signals that don't fit the current conversation. Pair with MIMIR_OPERATOR_ALERT_CHANNEL in your system prompt's Operator config section.
+allowed-tools:
+  - Read
+  - send_message
 ---
 
 # Operator alert channel

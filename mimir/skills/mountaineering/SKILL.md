@@ -1,6 +1,11 @@
 ---
 name: mountaineering
 description: Autonomous hill-climbing loops for continuous improvement. Use when optimizing something measurable — prompts, configs, code, predictions — through iterative propose/test/keep-or-revert cycles. Also use when figuring out WHAT to optimize and how to measure it.
+allowed-tools:
+  - Agent
+  - Read
+  - Task
+  - Write
 ---
 
 # Mountaineering

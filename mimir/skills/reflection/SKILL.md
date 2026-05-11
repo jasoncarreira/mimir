@@ -1,6 +1,13 @@
 ---
 name: reflection
 description: Weekly cross-session audit. Run when a turn fires with trigger=scheduled_tick on channel scheduler:reflect (the operator wires the cron entry; skill drives the audit). Two parallel tracks - behavioral analysis (failures, drift, patterns) AND memory architecture review (cleanup, promotion, demotion). Output is propose-only by default; HITL boundary lives in memory/core/30-reflection-policy.md.
+allowed-tools:
+  - Bash
+  - Edit
+  - Glob
+  - Read
+  - Write
+  - saga_query
 ---
 
 # Reflection
