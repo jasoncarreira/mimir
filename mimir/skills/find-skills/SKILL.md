@@ -1,6 +1,9 @@
 ---
 name: find-skills
 description: Discover what bundled skills exist in this mimir install and what each one does. Use when you're not sure if a capability is already covered by a skill ("can I X?", "is there a skill for Y?", "what skills do I have?"). Reads SKILL.md frontmatter from each skill directory and surfaces names + descriptions.
+allowed-tools:
+  - Bash
+  - Read
 ---
 
 # Find Skills
