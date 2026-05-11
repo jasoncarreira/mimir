@@ -22,9 +22,10 @@ from .models import (
     make_commitment_id,
     make_dedupe_key,
 )
-from .store import CommitmentsStore
+from .store import COMMITMENTS_JSONL_SCHEMA_VERSION, CommitmentsStore
 
 __all__ = [
+    "COMMITMENTS_JSONL_SCHEMA_VERSION",
     "CommitmentKind",
     "CommitmentRecord",
     "CommitmentSensitivity",

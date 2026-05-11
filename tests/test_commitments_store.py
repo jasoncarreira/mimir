@@ -771,3 +771,229 @@ def test_find_trim_candidates_returns_record_objects(tmp_path: Path):
     assert cid == rid
     assert rec.text == "payload"
     assert rec.kind == CommitmentKind.AGENT_PROMISE.value
+
+
+# ─── chainlink #82 sub #86: JSONL schema version envelope ───────────
+
+
+@pytest.mark.asyncio
+async def test_append_stamps_schema_version_on_every_event(tmp_path: Path):
+    """Every event written through ``_append`` carries the current
+    schema version under the ``v`` key — covers all 7 lifecycle event
+    types (commitment_added, _delivered, _completed, _snoozed,
+    _dismissed, _expired, _pileup_alarmed). Chainlink #82 sub #86.
+
+    PR #137 review nit: original version of this test exercised only
+    5 of 7 event types on a single record (after complete() the record
+    is terminal so dismiss/expire are rejected). Split across three
+    records so every event type round-trips through _append at least
+    once.
+    """
+    from mimir.commitments.store import COMMITMENTS_JSONL_SCHEMA_VERSION
+
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+
+    # Record A: add → deliver → snooze → alarm_pileup → complete
+    # Exercises: added, delivered, snoozed, pileup_alarmed, completed
+    rec_a = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1", text="A",
+        kind=CommitmentKind.AGENT_PROMISE.value,
+    ))
+    await store.deliver(rec_a.id)
+    await store.snooze(rec_a.id, until_unix=time.time() + 60)
+    await store.alarm_pileup(rec_a.id)
+    await store.complete(rec_a.id)
+
+    # Record B: add → dismiss. Exercises: dismissed.
+    rec_b = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1", text="B",
+        kind=CommitmentKind.AGENT_PROMISE.value,
+    ))
+    await store.dismiss(rec_b.id, reason="no longer relevant")
+
+    # Record C: add → expire. Exercises: expired.
+    rec_c = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1", text="C",
+        kind=CommitmentKind.AGENT_PROMISE.value,
+    ))
+    await store.expire(rec_c.id)
+
+    lines = store.path.read_text().splitlines()
+    # Tight count: A produces 5 events (add + 4 lifecycle); B produces 2
+    # (add + dismiss); C produces 2 (add + expire). Total = 9.
+    assert len(lines) == 9, f"expected 9 events, got {len(lines)}"
+    event_types: set[str] = set()
+    for line in lines:
+        event = json.loads(line)
+        assert event.get("v") == COMMITMENTS_JSONL_SCHEMA_VERSION, (
+            f"missing/wrong v on event {event!r}"
+        )
+        event_types.add(event["type"])
+    # All 7 event types reached _append.
+    assert event_types == {
+        "commitment_added",
+        "commitment_delivered",
+        "commitment_snoozed",
+        "commitment_pileup_alarmed",
+        "commitment_completed",
+        "commitment_dismissed",
+        "commitment_expired",
+    }, f"missing event types; saw {sorted(event_types)}"
+
+
+@pytest.mark.asyncio
+async def test_replay_treats_missing_v_as_current_version(tmp_path: Path):
+    """Legacy events (appended before chainlink #82 sub #86 landed)
+    have no ``v`` key. Replay must treat them as the current schema —
+    that's the backward-compat guarantee."""
+    path = tmp_path / "c.jsonl"
+    rid = make_commitment_id()
+    rec_data = {
+        "id": rid,
+        "channel_id": "c1",
+        "text": "legacy",
+        "kind": CommitmentKind.AGENT_PROMISE.value,
+        "status": CommitmentStatus.PENDING.value,
+        "created_at_unix": time.time(),
+        "dedupe_key": make_dedupe_key(
+            channel_id="c1", text="legacy", due_window_start_unix=None,
+        ),
+    }
+    # Legacy: no v field
+    legacy_event = {
+        "type": "commitment_added",
+        "ts_unix": time.time(),
+        "id": rid,
+        "record": rec_data,
+    }
+    path.write_text(json.dumps(legacy_event) + "\n")
+    store = CommitmentsStore(path=path)
+    state = store.current_state()
+    assert rid in state
+    assert state[rid].text == "legacy"
+
+
+@pytest.mark.asyncio
+async def test_replay_skips_future_schema_version(tmp_path: Path, caplog):
+    """Events stamped with v greater than this build's schema version
+    are skipped on replay (the new event might rely on fields this
+    build doesn't know about — replaying as-is risks corrupt state).
+    A warning is logged so the operator sees the version skew."""
+    import logging
+    from mimir.commitments.store import COMMITMENTS_JSONL_SCHEMA_VERSION
+    path = tmp_path / "c.jsonl"
+    rid = make_commitment_id()
+    future_event = {
+        "v": COMMITMENTS_JSONL_SCHEMA_VERSION + 1,
+        "type": "commitment_added",
+        "ts_unix": time.time(),
+        "id": rid,
+        "record": {
+            "id": rid, "channel_id": "c1", "text": "from-future",
+            "kind": CommitmentKind.AGENT_PROMISE.value,
+            "status": CommitmentStatus.PENDING.value,
+            "created_at_unix": time.time(),
+        },
+    }
+    path.write_text(json.dumps(future_event) + "\n")
+    store = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        state = store.current_state()
+    assert rid not in state  # future event dropped
+    assert any(
+        "future schema" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_skips_malformed_v(tmp_path: Path, caplog):
+    """A ``v`` field that isn't parseable as int (e.g. dict, list,
+    non-numeric string) gets skipped with a warning. Defensive against
+    a corrupt write."""
+    import logging
+    path = tmp_path / "c.jsonl"
+    rid = make_commitment_id()
+    bad_v_event = {
+        "v": {"unexpected": "shape"},
+        "type": "commitment_added",
+        "ts_unix": time.time(),
+        "id": rid,
+        "record": {
+            "id": rid, "channel_id": "c1", "text": "bad-v",
+            "kind": CommitmentKind.AGENT_PROMISE.value,
+            "status": CommitmentStatus.PENDING.value,
+            "created_at_unix": time.time(),
+        },
+    }
+    path.write_text(json.dumps(bad_v_event) + "\n")
+    store = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        state = store.current_state()
+    assert rid not in state
+    assert any(
+        "malformed v" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_skips_non_positive_v(tmp_path: Path, caplog):
+    """PR #137 review: ``v: 0`` / ``v: -1`` parse as int but aren't
+    legitimate schema versions (versions start at 1). The defensive
+    gate logs a warning and drops the event rather than silently
+    falling through to the v1 replay path."""
+    import logging
+    path = tmp_path / "c.jsonl"
+    rid_zero = make_commitment_id()
+    rid_neg = make_commitment_id()
+    events = [
+        {
+            "v": 0,
+            "type": "commitment_added",
+            "ts_unix": time.time(),
+            "id": rid_zero,
+            "record": {
+                "id": rid_zero, "channel_id": "c1", "text": "zero-v",
+                "kind": CommitmentKind.AGENT_PROMISE.value,
+                "status": CommitmentStatus.PENDING.value,
+                "created_at_unix": time.time(),
+            },
+        },
+        {
+            "v": -1,
+            "type": "commitment_added",
+            "ts_unix": time.time(),
+            "id": rid_neg,
+            "record": {
+                "id": rid_neg, "channel_id": "c1", "text": "neg-v",
+                "kind": CommitmentKind.AGENT_PROMISE.value,
+                "status": CommitmentStatus.PENDING.value,
+                "created_at_unix": time.time(),
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    store = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        state = store.current_state()
+    assert rid_zero not in state
+    assert rid_neg not in state
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum("non-positive schema" in m for m in msgs) == 2, (
+        f"expected 2 non-positive warnings; got {msgs}"
+    )
+
+
+def test_commitments_init_exports_schema_version_constant():
+    """PR #137 review: ``COMMITMENTS_JSONL_SCHEMA_VERSION`` is part of
+    the package's ``__all__`` so future migration code can
+    ``from mimir.commitments import COMMITMENTS_JSONL_SCHEMA_VERSION``
+    without reaching into ``.store``."""
+    from mimir import commitments
+    assert "COMMITMENTS_JSONL_SCHEMA_VERSION" in commitments.__all__
+    assert isinstance(commitments.COMMITMENTS_JSONL_SCHEMA_VERSION, int)
+    assert commitments.COMMITMENTS_JSONL_SCHEMA_VERSION >= 1
