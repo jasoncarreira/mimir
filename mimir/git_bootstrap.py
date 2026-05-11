@@ -244,6 +244,19 @@ def bootstrap_git_repo(
         # loop that bites the very first container start.
         if (state_repo and github_token and result.bootstrap_commit):
             _ensure_upstream_tracking(home, log_event, result)
+            # Re-install credentials AFTER network ops. git's
+            # ``credential-store`` helper invokes ``erase`` when the
+            # remote returns 401/403/404 (the test path's fake URLs hit
+            # this; production hits it too on a stale PAT or transient
+            # auth failure), which silently truncates ``.git/credentials``.
+            # The bootstrap function's contract is "after I return, the
+            # credentials file contains the PAT" — re-install at the
+            # end of the path seals that contract regardless of what
+            # the upstream-tracking probe did. Idempotent + cheap (one
+            # atomic write + two ``git config`` calls).
+            _install_credential_helper(
+                home, state_repo, github_token, result,
+            )
         log_event(
             "git_bootstrap_ok",
             path=str(home),
@@ -320,6 +333,16 @@ def bootstrap_git_repo(
                         ),
                     )
             # fetch failure is silent — network outage shouldn't block start.
+
+        # Re-install credentials AFTER all network ops. Same reason as
+        # path 2's post-tracking re-install: ``credential-store`` erases
+        # entries on 401/403/404, which silently truncates the file.
+        # The bootstrap function's contract is "after I return, the
+        # credentials file contains the PAT" — re-install seals that
+        # contract regardless of what fetch/pull/ls-remote did. Idempotent.
+        _install_credential_helper(
+            home, state_repo, github_token, result,
+        )
 
     log_event(
         "git_bootstrap_ok",
