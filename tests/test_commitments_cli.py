@@ -364,22 +364,31 @@ def test_bare_commitments_prints_full_help_to_stdout(
     home: Path, capsys: pytest.CaptureFixture,
 ):
     """Operator typing bare ``mimir commitments`` cold sees argparse's
-    full subcommand listing on stdout (not stderr) with per-action
-    help strings, and the process exits 0 — the discovery path other
-    agents' operators will follow when they don't know the
-    subcommands yet (chainlink #82 sub #87)."""
+    full subcommand listing on stdout (not stderr) and the process
+    exits 1 — matches the sibling subcommands
+    (identities/wiki/skills/reflection), which also print help and
+    exit 1 on bare invocation. Non-zero exit is the contract for
+    ``mimir <something> || handle_error`` callers (chainlink #82
+    sub #87, PR #139 review)."""
     rc = _run(["commitments"], home)
-    assert rc == 0, "bare 'commitments' should exit 0 (help is intentional)"
+    # Exit 1 matches identities/wiki/skills/reflection — see
+    # mimir/cli.py under ``args.command == "commitments"``.
+    assert rc == 1, (
+        "bare 'commitments' should exit 1 to match sibling subcommands"
+    )
     captured = capsys.readouterr()
     # Help goes to stdout, not stderr — pipeline-friendly.
     out = captured.out
-    # Each subcommand appears with its descriptive help string.
-    assert "list" in out and "Show commitments" in out
-    assert "add" in out and "Manually create" in out
-    assert "complete" in out and "Mark a commitment completed" in out
-    assert "snooze" in out and "Push a commitment to a later time" in out
-    assert "dismiss" in out and "no longer relevant" in out
-    assert "trim" in out and "terminal records" in out
+    # Structural assertion: each subcommand name appears in the
+    # argparse-rendered subcommand list. The exact prose in each
+    # subparser's ``help=`` kwarg is intentionally NOT asserted —
+    # future help-text polish must not break this test. The
+    # ``    <name>`` shape (4-space indent + name) is argparse's
+    # canonical subparser-list rendering.
+    for name in ("list", "add", "complete", "snooze", "dismiss", "trim"):
+        assert f"    {name}" in out, (
+            f"expected subparser '{name}' in argparse help-list; got:\n{out}"
+        )
     # Argparse rendering includes the canonical usage line.
     assert "usage:" in out.lower()
 

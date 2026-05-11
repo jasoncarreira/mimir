@@ -70,16 +70,15 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
 
     ``--home`` lives on each leaf parser (not the parent) so users
     can write it after the action name, matching the natural
-    invocation shape (``mimir commitments list --home /path``)."""
-    # chainlink #82 sub #87: stash a back-ref to the parent parser
-    # on the args namespace so ``dispatch`` can render the parent's
-    # ``--help`` block when the operator types bare ``mimir
-    # commitments`` with no subcommand. Without this, dispatch would
-    # need to reconstruct a parser or fall through to a hand-rolled
-    # usage string (which is what was happening before — single
-    # ``usage: ...`` line on stderr with no subcommand descriptions,
-    # nothing for a new operator to learn from cold).
-    p.set_defaults(_commitments_parser=p)
+    invocation shape (``mimir commitments list --home /path``).
+
+    Bare ``mimir commitments`` (no subcommand) is handled in
+    ``mimir.cli`` itself — it calls ``commitments_p.print_help()``
+    in lexical scope and exits 1, matching the sibling subcommands
+    (identities/wiki/skills/reflection). This module's ``dispatch``
+    therefore assumes ``args.commitments_action`` is set; the
+    no-action fallback below is defensive (for callers that
+    synthesize a namespace without going through ``mimir.cli``)."""
     sub = p.add_subparsers(dest="commitments_action")
 
     list_p = sub.add_parser(
@@ -380,22 +379,11 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_dismiss(args)
     if action == "trim":
         return cmd_trim(args)
-    # chainlink #82 sub #87: bare ``mimir commitments`` (no
-    # subcommand) prints the parent parser's full ``--help`` block
-    # to stdout and exits 0. Previously fell through to a
-    # hand-rolled ``usage: mimir commitments {list|add|...}``
-    # single-line message on stderr with no subcommand descriptions
-    # — a new operator typing the command cold had no way to learn
-    # that e.g. ``snooze`` needs ``--for-days``. Now the help
-    # block from argparse renders the full subcommand list with
-    # per-action help strings.
-    parser = getattr(args, "_commitments_parser", None)
-    if parser is not None:
-        parser.print_help()
-    else:
-        # Defensive fallback for callers that synthesized an args
-        # namespace without going through ``add_argparse``.
-        print("usage: mimir commitments {list|add|complete|snooze|"
-              "dismiss|trim} [...]", file=sys.stderr)
-        return 1
-    return 0
+    # Defensive fallback for callers that synthesize a namespace
+    # without going through ``mimir.cli`` (which handles the bare-
+    # command help-and-exit shape in lexical scope — see
+    # ``mimir/cli.py`` under ``args.command == "commitments"``).
+    # Exit 1 matches the sibling subcommands' bare-invocation code.
+    print("usage: mimir commitments {list|add|complete|snooze|"
+          "dismiss|trim} [...]", file=sys.stderr)
+    return 1
