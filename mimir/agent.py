@@ -90,6 +90,7 @@ from .jsonl_snapshot import JsonlSnapshot
 from .session_manager import SessionManager
 from .turn_hooks import (
     CancelTypingHook,
+    CommitmentExtractionHook,
     GitCommitHook,
     IndexRebuildHook,
     PlanQuotaCaptureHook,
@@ -880,6 +881,14 @@ class Agent:
             config.home, _reindex if indexer is not None else None
         )
 
+        # Commitments store (Phase 1) + extraction hook (Phase 2a).
+        # The store is operator-managed via ``mimir commitments`` plus
+        # the extraction hook on saga_session_end turns. Lives under
+        # ``.mimir/commitments.jsonl`` (alongside session_boundaries)
+        # so the indexer doesn't walk it as "knowledge."
+        from .commitments.store import CommitmentsStore
+        self._commitments = CommitmentsStore(path=self._config.commitments_log)
+
         # Per-turn lifecycle hooks (CR#15). Each fires at one of four
         # seams in run_turn: pre_query / on_message / post_query /
         # finalize. Order matters — finalize hooks run sequentially, so
@@ -897,6 +906,11 @@ class Agent:
                 capture_fn=self._capture_plan_quota_from_client,
             ),
             PostMessageSagaHook(hook_fn=self._post_message_hook),
+            # Phase 2a — runs on saga_session_end finalize. Reads the
+            # synthesis output, extracts structured commitments via
+            # a haiku-tier ``query()`` call, dedupes against existing
+            # store entries, persists net-new ones. Best-effort.
+            CommitmentExtractionHook(store=self._commitments),
             WikiBacklinksHook(home=self._config.home),
             IndexRebuildHook(indexes=self._indexes),
             GitCommitHook(
