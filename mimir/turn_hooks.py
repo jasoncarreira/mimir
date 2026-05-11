@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from claude_agent_sdk import ClaudeAgentOptions
 
     from .channel_registry import ChannelRegistry
+    from .commitments.store import CommitmentsStore
     from .indexes import IndexGenerator
     from .models import AgentEvent, TurnContext, TurnRecord
     from .rate_limits import RateLimitStore
@@ -506,6 +507,100 @@ class GitCommitHook(TurnLifecycleHook):
             home=self._home,
             enabled=self._enabled,
         )
+
+
+class CommitmentExtractionHook(TurnLifecycleHook):
+    """Phase 2a of commitments. On ``trigger="saga_session_end"`` turns,
+    extract durable commitments from the synthesis output via a haiku-
+    tier LLM call and persist them to the ``CommitmentsStore``.
+
+    Why finalize, not on_message or post_query: the session-end synthesis
+    output is the ``record.output`` written by run_turn — only available
+    at finalize. Per-message hooking would race the synthesis itself.
+
+    Why this hook, not the agent's loop: the synthesis turn is already
+    an LLM call; embedding the extraction in the same loop would conflate
+    the bookkeeping (atom scoring, memory writes) with the structured-
+    extraction step. Running as a separate one-shot ``query()`` lets the
+    extraction prompt be tuned independently and tested in isolation
+    (see ``scratch/commitments_backtest_report.md``).
+
+    Why dedupe at the hook (not the store): the store's
+    ``find_by_dedupe_key`` already returns active commitments only —
+    a freshly-extracted record whose key matches an in-flight
+    commitment from a prior session is a re-emergence and a no-op.
+    The hook checks that before calling ``store.add`` so the JSONL
+    doesn't accumulate duplicate adds (replay would warn-and-skip
+    per PR #120 #2, but the cleaner shape is to not write them).
+
+    Best-effort failure shape:
+    - Extraction raises → log + return; the synthesis turn record
+      itself is unaffected. Mimir loses one extraction attempt; the
+      same commitments will re-surface in a future session-end output
+      if they're real.
+    - LLM returns 0 commitments → silent success (most sessions
+      genuinely have none; backtest showed ~67% empty).
+    - Store.add raises (disk full, etc.) → log + continue with the
+      next extracted record. Partial-write is acceptable.
+
+    Emits ``commitments_extracted`` event with the add count when
+    ≥1 commitment was persisted. Skipped on zero (no signal worth
+    rendering).
+    """
+
+    name = "commitment_extraction"
+
+    def __init__(self, store: "CommitmentsStore") -> None:
+        self._store = store
+
+    async def finalize(self, ctx, event, record):
+        if ctx.trigger != "saga_session_end":
+            return
+        output = getattr(record, "output", "") or ""
+        if not output:
+            return
+
+        try:
+            from .commitments.extractor import extract_commitments
+            extracted = await extract_commitments(
+                output,
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "commitment extraction failed for turn %s; skipping",
+                ctx.turn_id,
+            )
+            return
+
+        if not extracted:
+            return
+
+        added = 0
+        skipped_dedupe = 0
+        for rec in extracted:
+            if self._store.find_by_dedupe_key(rec.dedupe_key):
+                skipped_dedupe += 1
+                continue
+            try:
+                await self._store.add(rec)
+                added += 1
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "commitments store.add failed for record %s", rec.id,
+                )
+
+        if added > 0:
+            await log_event(
+                "commitments_extracted",
+                count=added,
+                skipped_dedupe=skipped_dedupe,
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+            )
 
 
 class CancelTypingHook(TurnLifecycleHook):
