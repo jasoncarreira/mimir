@@ -168,6 +168,78 @@ def test_discover_walks_nested_skill_dirs(tmp_path: Path):
     assert names == ["a-poll", "b-poll"]
 
 
+# ─── chainlink #84: invalid-manifest reporting + back-reference ──────
+
+
+def test_discover_pollers_sets_manifest_path_on_each_config(tmp_path: Path):
+    """chainlink #84: each returned ``PollerConfig`` carries the
+    absolute path of the ``pollers.json`` it was parsed from, so the
+    scheduler can later identify which previously-installed pollers
+    belong to a manifest that fails to parse on reload."""
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "a", [
+        {"name": "p1", "command": "x", "cron": "* * * * *"},
+    ])
+    _write_pollers_json(skills / "b", [
+        {"name": "p2", "command": "y", "cron": "* * * * *"},
+    ])
+    out = discover_pollers(skills)
+    by_name = {p.name: p for p in out}
+    assert by_name["p1"].manifest_path == skills / "a" / "pollers.json"
+    assert by_name["p2"].manifest_path == skills / "b" / "pollers.json"
+
+
+def test_discover_pollers_reports_invalid_manifests_via_outlist(
+    tmp_path: Path,
+):
+    """chainlink #84: when ``invalid_manifests`` is supplied, each
+    ``pollers.json`` whose JSON parse failed gets appended as a
+    ``(path, error)`` tuple. The valid manifest in the same skills
+    tree still returns its config in the regular list. Format-level
+    failures (e.g. missing 'pollers' key) are NOT reported — those
+    are structural bugs, not transient typos."""
+    skills = tmp_path / "skills"
+    bad = skills / "broken-skill"
+    bad.mkdir(parents=True)
+    (bad / "pollers.json").write_text("not json {{{", encoding="utf-8")
+    _write_pollers_json(skills / "good-skill", [
+        {"name": "good", "command": "echo hi", "cron": "* * * * *"},
+    ])
+    # Format-level miss: missing 'pollers' key. Should NOT be reported
+    # as an invalid manifest (it's a structural bug, not a typo).
+    format_bad = skills / "format-bad"
+    format_bad.mkdir(parents=True)
+    (format_bad / "pollers.json").write_text("{}", encoding="utf-8")
+
+    invalid: list[tuple[Path, str]] = []
+    out = discover_pollers(skills, invalid_manifests=invalid)
+    # Valid one returned.
+    assert [p.name for p in out] == ["good"]
+    # Parse-failure manifest reported.
+    assert len(invalid) == 1
+    failing_path, err = invalid[0]
+    assert failing_path == bad / "pollers.json"
+    # Error message carries enough info to debug (exception type name
+    # + parser-emitted message).
+    assert "JSONDecodeError" in err
+
+
+def test_discover_pollers_invalid_manifests_default_none_no_crash(
+    tmp_path: Path,
+):
+    """Back-compat: callers that don't pass ``invalid_manifests`` see
+    the same behavior as before (warning logged, file skipped, no
+    crash). Existing call sites in tests / niche code paths must
+    continue to work unchanged."""
+    skills = tmp_path / "skills"
+    bad = skills / "broken-skill"
+    bad.mkdir(parents=True)
+    (bad / "pollers.json").write_text("not json", encoding="utf-8")
+    # No ``invalid_manifests`` kwarg — must not raise.
+    out = discover_pollers(skills)
+    assert out == []
+
+
 # ─── run_poller: success paths ───────────────────────────────────────
 
 

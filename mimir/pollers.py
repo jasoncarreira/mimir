@@ -148,6 +148,22 @@ class PollerConfig:
     persist_dir: Path | None = None
     batch_size: int = POLLER_BATCH_SIZE_DEFAULT
     pass_env: tuple[str, ...] = ()
+    #: Absolute path to the ``pollers.json`` manifest this config was
+    #: parsed from, as yielded by ``Path.rglob("pollers.json")`` over
+    #: ``skills_dir``. Not explicitly symlink-resolved — two manifests
+    #: reachable via different symlink chains would conflate (PR #141
+    #: review item #4). Given the ``skills_dir/<skill>/pollers.json``
+    #: layout this isn't a realistic concern; if a deployment exposes
+    #: ``skills_dir`` as a symlink farm, normalize with ``.resolve()``
+    #: at the assignment site in ``discover_pollers``. ``None`` only
+    #: when ``PollerConfig`` is constructed directly (most tests).
+    #: Used by the scheduler to identify previously-installed entries
+    #: whose manifest fails to parse on reload and preserve them
+    #: in-place (chainlink #84) — without this back-reference the
+    #: scheduler can't tell "manifest deleted on purpose" apart from
+    #: "manifest typo'd mid-edit", and the latter silently drops a
+    #: working poller.
+    manifest_path: Path | None = None
 
     def channel_id(self) -> str:
         """Synthetic channel for emitted events. Mirrors the
@@ -166,6 +182,7 @@ def discover_pollers(
     skills_dir: Path,
     *,
     state_root: Path | None = None,
+    invalid_manifests: list[tuple[Path, str]] | None = None,
 ) -> list[PollerConfig]:
     """Walk ``skills_dir/**/pollers.json`` and parse out poller configs.
 
@@ -182,6 +199,19 @@ def discover_pollers(
     when the skill itself ships in the image. ``state_root=None``
     falls back to ``skill_dir`` (back-compat for tests + skill setups
     where the skill directory itself is on a persistent volume).
+
+    ``invalid_manifests`` (chainlink #84): out-parameter list. When
+    provided, each ``pollers.json`` whose **JSON parse** failed (the
+    "operator typo'd mid-edit" case) is appended as a
+    ``(manifest_path, error_message)`` tuple. The scheduler uses this
+    to distinguish "manifest deleted on purpose" from "manifest broke
+    mid-edit" on reload and preserve previously-installed pollers in
+    the latter case. Format-level failures (top-level type wrong,
+    missing 'pollers' key, etc.) are NOT reported here — those are
+    structural manifest bugs, not transient typos, and treating them
+    as "preserve previously installed" would mask real misconfig.
+    Out-list rather than tuple return so existing call sites that
+    don't care about the new signal need no unpacking change.
     """
     pollers: list[PollerConfig] = []
     if not skills_dir.exists():
@@ -195,6 +225,10 @@ def discover_pollers(
             log.warning(
                 "poller_invalid_json: %s — %s", pollers_file, exc,
             )
+            if invalid_manifests is not None:
+                invalid_manifests.append(
+                    (pollers_file, f"{type(exc).__name__}: {exc}"),
+                )
             continue
 
         if not isinstance(raw, dict) or "pollers" not in raw:
@@ -291,6 +325,7 @@ def discover_pollers(
                     persist_dir=persist_dir,
                     batch_size=batch_size,
                     pass_env=tuple(pass_env_clean),
+                    manifest_path=pollers_file,
                 ),
             )
     return pollers
