@@ -264,21 +264,39 @@ def cmd_add(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_complete(args: argparse.Namespace) -> int:
-    store = _resolve_store(args)
-    state = store.current_state()
-    if args.id not in state:
+def _report_transition_failure(
+    args: argparse.Namespace, verb: str, store: CommitmentsStore,
+) -> int:
+    """Helper used by complete/snooze/dismiss when the store rejects
+    the transition (already-terminal record). PR #120 re-review N2:
+    surface a clear "already terminal" message to the operator rather
+    than silently succeeding."""
+    rec = store.current_state().get(args.id)
+    if rec is None:
         print(f"error: commitment {args.id!r} not found", file=sys.stderr)
         return 2
-    asyncio.run(store.complete(args.id, message_id=args.message_id))
+    print(
+        f"error: cannot {verb} {args.id} — already {rec.status}",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def cmd_complete(args: argparse.Namespace) -> int:
+    store = _resolve_store(args)
+    if args.id not in store.current_state():
+        print(f"error: commitment {args.id!r} not found", file=sys.stderr)
+        return 2
+    ok = asyncio.run(store.complete(args.id, message_id=args.message_id))
+    if not ok:
+        return _report_transition_failure(args, "complete", store)
     print(f"completed {args.id}")
     return 0
 
 
 def cmd_snooze(args: argparse.Namespace) -> int:
     store = _resolve_store(args)
-    state = store.current_state()
-    if args.id not in state:
+    if args.id not in store.current_state():
         print(f"error: commitment {args.id!r} not found", file=sys.stderr)
         return 2
     # Mutually-exclusive group already enforces exactly one of these.
@@ -286,20 +304,23 @@ def cmd_snooze(args: argparse.Namespace) -> int:
         until_unix = time.time() + args.for_days * 86400
     else:
         until_unix = _parse_iso(args.until_iso)
-    asyncio.run(store.snooze(
+    ok = asyncio.run(store.snooze(
         args.id, until_unix=until_unix, reason=args.reason,
     ))
+    if not ok:
+        return _report_transition_failure(args, "snooze", store)
     print(f"snoozed {args.id} until {_short_iso(until_unix)}")
     return 0
 
 
 def cmd_dismiss(args: argparse.Namespace) -> int:
     store = _resolve_store(args)
-    state = store.current_state()
-    if args.id not in state:
+    if args.id not in store.current_state():
         print(f"error: commitment {args.id!r} not found", file=sys.stderr)
         return 2
-    asyncio.run(store.dismiss(args.id, reason=args.reason))
+    ok = asyncio.run(store.dismiss(args.id, reason=args.reason))
+    if not ok:
+        return _report_transition_failure(args, "dismiss", store)
     print(f"dismissed {args.id}")
     return 0
 
@@ -316,23 +337,10 @@ def cmd_trim(args: argparse.Namespace) -> int:
         print(f"trimmed {dropped} terminal records older than "
               f"{store.terminal_retention_days} days")
         return 0
-    # Dry-run: replay state, identify what WOULD be dropped, print it.
-    import time as _time
-    now = _time.time()
-    retention_secs = store.terminal_retention_days * 86400
-    state = store.current_state()
-    candidates = []
-    for rid, rec in state.items():
-        if not rec.is_terminal():
-            continue
-        terminal_at = (
-            rec.completed_at_unix
-            or rec.dismissed_at_unix
-            or rec.expired_at_unix
-            or 0.0
-        )
-        if (now - terminal_at) > retention_secs:
-            candidates.append((rid, rec))
+    # Dry-run: ask the store for trim candidates via the shared
+    # predicate. PR #120 re-review N1: keeps the canonical
+    # "what counts as trimmable" definition in one place.
+    candidates = store.find_trim_candidates()
     if not candidates:
         print("(dry-run) 0 terminal records older than "
               f"{store.terminal_retention_days} days. Nothing to trim.")

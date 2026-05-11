@@ -636,3 +636,138 @@ async def test_trim_fsyncs_before_replace(tmp_path: Path, monkeypatch):
     assert dropped == 1
     # fsync was called at least once during the trim's write path.
     assert len(fsynced_fds) >= 1
+
+
+# ─── PR #120 re-review N1 + N2 ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_write_methods_return_false_on_terminal_rejection(tmp_path: Path):
+    """PR #120 re-review N2: write-path methods now return bool. A
+    write against an already-terminal record returns False AND skips
+    the JSONL append, instead of appending a no-op event that replay
+    would silently reject. Saves JSONL bloat + gives the CLI a signal
+    to surface to the operator."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    assert await store.complete(rec.id) is True
+    # Now-terminal record rejects further transitions at the write path.
+    assert await store.complete(rec.id) is False
+    assert await store.dismiss(rec.id) is False
+    assert await store.expire(rec.id) is False
+    assert await store.snooze(rec.id, until_unix=time.time() + 86400) is False
+    assert await store.deliver(rec.id) is False
+    # JSONL only has the original add + complete — no no-op events.
+    lines = store.path.read_text().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["type"] == "commitment_added"
+    assert json.loads(lines[1])["type"] == "commitment_completed"
+
+
+@pytest.mark.asyncio
+async def test_write_methods_return_false_on_unknown_id(tmp_path: Path):
+    """Unknown id → False on every lifecycle method, no events appended."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    assert await store.complete("c-nonexistent") is False
+    assert await store.dismiss("c-nonexistent") is False
+    assert await store.expire("c-nonexistent") is False
+    assert await store.deliver("c-nonexistent") is False
+    assert await store.snooze("c-nonexistent", until_unix=time.time()) is False
+    # No file created (no appends happened).
+    assert not store.path.exists()
+
+
+@pytest.mark.asyncio
+async def test_write_methods_return_true_on_valid_transitions(tmp_path: Path):
+    """Sanity: the bool return is True for legitimate transitions."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    assert await store.deliver(rec.id) is True
+    assert await store.deliver(rec.id) is True  # re-deliver allowed
+    assert await store.snooze(rec.id, until_unix=time.time() + 86400) is True
+    assert await store.complete(rec.id) is True
+
+
+@pytest.mark.asyncio
+async def test_find_trim_candidates_shares_predicate_with_trim(tmp_path: Path):
+    """PR #120 re-review N1: ``find_trim_candidates`` is the single
+    source of truth for the trim predicate; trim() uses it for the
+    drop set, the CLI dry-run uses it for the preview. Same input
+    must yield the same output, by construction."""
+    store = CommitmentsStore(
+        path=tmp_path / "c.jsonl",
+        terminal_retention_days=30,
+    )
+    now = time.time()
+    # Two terminals: one old (should be a candidate), one fresh (not).
+    r_old = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="old",
+    ))
+    await store.complete(r_old.id)
+    r_fresh = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="fresh",
+    ))
+    await store.complete(r_fresh.id)
+    # Plus one active that should never be a candidate.
+    r_active = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="active",
+    ))
+    # Backdate r_old's terminal event.
+    new_lines = []
+    for line in store.path.read_text().splitlines():
+        d = json.loads(line)
+        if d.get("type") == "commitment_completed" and d.get("id") == r_old.id:
+            d["at_unix"] = now - 40 * 86400
+        new_lines.append(json.dumps(d))
+    store.path.write_text("\n".join(new_lines) + "\n")
+
+    candidates = store.find_trim_candidates(now_unix=now)
+    candidate_ids = {rid for rid, _ in candidates}
+    assert candidate_ids == {r_old.id}
+    assert r_fresh.id not in candidate_ids  # too recent
+    assert r_active.id not in candidate_ids  # not terminal
+
+    # trim() with the same inputs drops the same set.
+    dropped = await store.trim(now_unix=now)
+    assert dropped == 1
+    state = store.current_state()
+    assert r_old.id not in state
+    assert r_fresh.id in state
+    assert r_active.id in state
+
+
+def test_find_trim_candidates_returns_record_objects(tmp_path: Path):
+    """``find_trim_candidates`` returns ``list[tuple[str, CommitmentRecord]]``
+    so the CLI dry-run can print rich per-record info without a second
+    lookup."""
+    import asyncio
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+
+    async def setup():
+        rec = await store.add(CommitmentRecord(
+            id=make_commitment_id(), channel_id="c1",
+            text="payload", kind=CommitmentKind.AGENT_PROMISE.value,
+        ))
+        await store.complete(rec.id)
+        # Backdate.
+        now = time.time()
+        new_lines = []
+        for line in store.path.read_text().splitlines():
+            d = json.loads(line)
+            if d.get("type") == "commitment_completed":
+                d["at_unix"] = now - 40 * 86400
+            new_lines.append(json.dumps(d))
+        store.path.write_text("\n".join(new_lines) + "\n")
+        return rec.id
+
+    rid = asyncio.run(setup())
+    out = store.find_trim_candidates()
+    assert len(out) == 1
+    cid, rec = out[0]
+    assert cid == rid
+    assert rec.text == "payload"
+    assert rec.kind == CommitmentKind.AGENT_PROMISE.value

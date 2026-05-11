@@ -299,3 +299,59 @@ def test_snooze_requires_at_least_one_target(home: Path):
     cid = events[0]["id"]
     rc = _run(["commitments", "snooze", cid], home)
     assert rc != 0
+
+
+def test_complete_already_completed_errors_cleanly(
+    home: Path, capsys: pytest.CaptureFixture,
+):
+    """PR #120 re-review N2: completing an already-completed record
+    surfaces a clear error rather than silently succeeding (which it
+    used to do — the no-op event would land in JSONL and the CLI
+    would print 'completed' regardless)."""
+    _run(["commitments", "add", "--channel", "c1", "--text", "X"], home)
+    events = _read_events(home)
+    cid = events[0]["id"]
+    _run(["commitments", "complete", cid], home)
+    capsys.readouterr()  # discard
+    # Second complete on the now-terminal record must error.
+    rc = _run(["commitments", "complete", cid], home)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "already completed" in err
+    assert f"cannot complete {cid}" in err
+    # JSONL still has only one commitment_completed event.
+    events_after = _read_events(home)
+    completed = [e for e in events_after if e["type"] == "commitment_completed"]
+    assert len(completed) == 1
+
+
+def test_dismiss_already_dismissed_errors_cleanly(
+    home: Path, capsys: pytest.CaptureFixture,
+):
+    """Same shape as complete: dismiss-after-dismiss is an error."""
+    _run(["commitments", "add", "--channel", "c1", "--text", "X"], home)
+    events = _read_events(home)
+    cid = events[0]["id"]
+    _run(["commitments", "dismiss", cid], home)
+    capsys.readouterr()
+    rc = _run(["commitments", "dismiss", cid], home)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "already dismissed" in err
+
+
+def test_snooze_after_dismissed_errors_cleanly(
+    home: Path, capsys: pytest.CaptureFixture,
+):
+    """Cross-verb: snoozing a dismissed record is an error too."""
+    _run(["commitments", "add", "--channel", "c1", "--text", "X"], home)
+    events = _read_events(home)
+    cid = events[0]["id"]
+    _run(["commitments", "dismiss", cid], home)
+    capsys.readouterr()
+    rc = _run(
+        ["commitments", "snooze", cid, "--for-days", "7"], home,
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "already dismissed" in err

@@ -99,19 +99,70 @@ class CommitmentsStore:
         })
         return record
 
-    async def deliver(self, id: str) -> None:
-        """Mark delivered (reminder fired). Bumps ``attempts``."""
+    def _can_apply(self, id: str, target_status: str) -> bool:
+        """Pre-write transition check. PR #120 re-review N2.
+
+        Replay's ``VALID_TRANSITIONS`` guard already protects state
+        correctness — an invalid lifecycle event is rejected on read.
+        But without a pre-write check, the JSONL accumulates no-op
+        events and the CLI gives no feedback when an operator does
+        ``commitments complete <id>`` against an already-terminal
+        record. This helper reads current state once, consults the
+        adjacency, and returns False (with a warning log) on rejection.
+        Public lifecycle methods consult it before appending.
+
+        Returns True if the transition is valid; False if the record
+        is unknown or the transition violates ``VALID_TRANSITIONS``.
+
+        Note on TOCTOU: a concurrent writer can land an event between
+        this check and the append. Replay's invariant still holds —
+        the append is rejected at read time. So the worst case under
+        a race is one stray no-op event in the JSONL; state stays
+        correct. The simple read-then-append shape is fine for Phase 1.
+        """
+        state = self.current_state()
+        rec = state.get(id)
+        if rec is None:
+            log.warning(
+                "commitments: lifecycle write rejected — %s not found "
+                "(target %s)",
+                id, target_status,
+            )
+            return False
+        allowed = VALID_TRANSITIONS.get(rec.status, frozenset())
+        if target_status not in allowed:
+            log.warning(
+                "commitments: lifecycle write rejected — invalid "
+                "transition %s → %s for %s",
+                rec.status, target_status, id,
+            )
+            return False
+        return True
+
+    async def deliver(self, id: str) -> bool:
+        """Mark delivered (reminder fired). Bumps ``attempts``.
+
+        Returns True if the event was appended; False if the
+        transition was rejected (unknown id, terminal record)."""
+        if not self._can_apply(id, CommitmentStatus.DELIVERED.value):
+            return False
         await self._append({
             "type": "commitment_delivered",
             "ts_unix": time.time(),
             "id": id,
             "at_unix": time.time(),
         })
+        return True
 
     async def complete(
         self, id: str, *, message_id: str | None = None,
-    ) -> None:
-        """Mark completed (agent followed through). Terminal."""
+    ) -> bool:
+        """Mark completed (agent followed through). Terminal.
+
+        Returns True if the event was appended; False if the
+        transition was rejected."""
+        if not self._can_apply(id, CommitmentStatus.COMPLETED.value):
+            return False
         await self._append({
             "type": "commitment_completed",
             "ts_unix": time.time(),
@@ -119,6 +170,7 @@ class CommitmentsStore:
             "at_unix": time.time(),
             "message_id": message_id,
         })
+        return True
 
     async def snooze(
         self,
@@ -126,10 +178,15 @@ class CommitmentsStore:
         *,
         until_unix: float,
         reason: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Push out to a later time. ``until_unix`` becomes the new
         ``due_window_start_unix`` after replay (the original end stays
-        unless explicitly re-snoozed past it)."""
+        unless explicitly re-snoozed past it).
+
+        Returns True if the event was appended; False if the
+        transition was rejected."""
+        if not self._can_apply(id, CommitmentStatus.SNOOZED.value):
+            return False
         await self._append({
             "type": "commitment_snoozed",
             "ts_unix": time.time(),
@@ -137,11 +194,17 @@ class CommitmentsStore:
             "until_unix": until_unix,
             "reason": reason,
         })
+        return True
 
     async def dismiss(
         self, id: str, *, reason: str | None = None,
-    ) -> None:
-        """Drop as no longer relevant. Terminal."""
+    ) -> bool:
+        """Drop as no longer relevant. Terminal.
+
+        Returns True if the event was appended; False if the
+        transition was rejected."""
+        if not self._can_apply(id, CommitmentStatus.DISMISSED.value):
+            return False
         await self._append({
             "type": "commitment_dismissed",
             "ts_unix": time.time(),
@@ -149,16 +212,23 @@ class CommitmentsStore:
             "at_unix": time.time(),
             "reason": reason,
         })
+        return True
 
-    async def expire(self, id: str) -> None:
+    async def expire(self, id: str) -> bool:
         """Mark expired (due_window_end passed without resolution).
-        Typically called from a poller, not by the agent. Terminal."""
+        Typically called from a poller, not by the agent. Terminal.
+
+        Returns True if the event was appended; False if the
+        transition was rejected."""
+        if not self._can_apply(id, CommitmentStatus.EXPIRED.value):
+            return False
         await self._append({
             "type": "commitment_expired",
             "ts_unix": time.time(),
             "id": id,
             "at_unix": time.time(),
         })
+        return True
 
     # ─── Replay-to-state ────────────────────────────────────────────
 
@@ -315,6 +385,36 @@ class CommitmentsStore:
 
     # ─── Trim ───────────────────────────────────────────────────────
 
+    def find_trim_candidates(
+        self, *, now_unix: float | None = None,
+    ) -> list[tuple[str, CommitmentRecord]]:
+        """Return ``(id, record)`` pairs for terminal records whose
+        terminal event is older than ``terminal_retention_days``.
+
+        Single source of truth for the trim predicate. Used by both
+        ``trim()`` (to determine which ids to drop) and the CLI's
+        dry-run path (to preview what would be dropped). PR #120
+        re-review N1: keeping the definition here avoids drift if a
+        future change adds a new terminal status that updates only
+        one of the two paths.
+        """
+        if now_unix is None:
+            now_unix = time.time()
+        retention_secs = self.terminal_retention_days * 86400
+        out: list[tuple[str, CommitmentRecord]] = []
+        for rid, rec in self.current_state().items():
+            if not rec.is_terminal():
+                continue
+            terminal_at = (
+                rec.completed_at_unix
+                or rec.dismissed_at_unix
+                or rec.expired_at_unix
+                or 0.0
+            )
+            if (now_unix - terminal_at) > retention_secs:
+                out.append((rid, rec))
+        return out
+
     async def trim(self, *, now_unix: float | None = None) -> int:
         """Rewrite the file dropping terminal records whose terminal
         event is older than ``terminal_retention_days`` (default 30).
@@ -331,24 +431,11 @@ class CommitmentsStore:
         """
         if not self.path.exists():
             return 0
-        if now_unix is None:
-            now_unix = time.time()
-        retention_secs = self.terminal_retention_days * 86400
 
-        # First pass (no lock): identify which ids to drop.
-        state = self.current_state()
-        drop_ids: set[str] = set()
-        for rid, rec in state.items():
-            if not rec.is_terminal():
-                continue
-            terminal_at = (
-                rec.completed_at_unix
-                or rec.dismissed_at_unix
-                or rec.expired_at_unix
-                or 0.0
-            )
-            if (now_unix - terminal_at) > retention_secs:
-                drop_ids.add(rid)
+        # First pass (no lock): identify which ids to drop via the
+        # shared predicate helper. PR #120 re-review N1.
+        candidates = self.find_trim_candidates(now_unix=now_unix)
+        drop_ids: set[str] = {rid for rid, _ in candidates}
         if not drop_ids:
             return 0
 
