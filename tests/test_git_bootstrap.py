@@ -675,6 +675,58 @@ def test_existing_repo_no_tracking_remote_has_main(
     assert len(upstream_events) == 1
 
 
+def test_bootstrap_emits_paired_positives_on_pull_success(
+    tmp_path: Path,
+    upstream_repo: Path,
+    captured_events: tuple[list, Any],
+) -> None:
+    """chainlink #65 (sub B): on a clean fast-forward pull, bootstrap
+    emits ``git_fetch_ok`` and ``git_pull_ok`` so the algedonic block
+    can surface recovery alongside any sticky ``git_pull_blocked``
+    failure line."""
+    # Seed the remote with a commit so there's something to fetch + pull.
+    op = tmp_path / "op-clone"
+    op.mkdir()
+    _git("init", "-q", "-b", "main", cwd=op)
+    _git("config", "user.email", "op@x", cwd=op)
+    _git("config", "user.name", "op", cwd=op)
+    _git("config", "commit.gpgsign", "false", cwd=op)
+    (op / "README.md").write_text("seed\n")
+    _git("add", "README.md", cwd=op)
+    _git("commit", "-q", "-m", "seed", cwd=op)
+    _git("remote", "add", "origin", upstream_repo.as_uri(), cwd=op)
+    _git("push", "-q", "-u", "origin", "main", cwd=op)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    events, cb = captured_events
+    git_bootstrap.bootstrap_git_repo(
+        home, state_repo=upstream_repo.as_uri(), github_token="tok",
+        log_event=cb,
+    )
+
+    # Operator lands a new commit upstream so the next bootstrap pulls it.
+    (op / "added.md").write_text("added\n")
+    _git("add", "added.md", cwd=op)
+    _git("commit", "-q", "-m", "added", cwd=op)
+    _git("push", "-q", "origin", "main", cwd=op)
+
+    events.clear()
+    res = git_bootstrap.bootstrap_git_repo(
+        home, state_repo=upstream_repo.as_uri(), github_token="tok",
+        log_event=cb,
+    )
+
+    assert res.pulled is True
+    assert res.pull_blocked is False
+    kinds = [k for k, _ in events]
+    # Both paired positives fire on the happy path.
+    assert "git_fetch_ok" in kinds
+    assert "git_pull_ok" in kinds
+    # And the sticky failure event does NOT fire on the happy path.
+    assert "git_pull_blocked" not in kinds
+
+
 def test_existing_repo_already_tracking_is_noop(
     tmp_path: Path,
     upstream_repo: Path,

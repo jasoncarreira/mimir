@@ -348,6 +348,7 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
             timeout_s=PUSH_TIMEOUT_SECONDS,
             turn_id=turn_id,
         )
+        return
     except GitError as exc:
         await log_event(
             "git_push_failed",
@@ -355,6 +356,7 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
             returncode=exc.returncode,
             turn_id=turn_id,
         )
+        return
     except (OSError, asyncio.CancelledError) as exc:
         # OSError: git binary missing / fork failed. CancelledError
         # post-sleep is exotic but treat the same — log and move on.
@@ -365,6 +367,16 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
             reason=_short_err(exc),
             turn_id=turn_id,
         )
+        return
+    # chainlink #65 (sub B): paired-positive emit. The push succeeded;
+    # surface it so the algedonic block can show "old git_push_failed
+    # + recent git_push_ok = transient, recovered" against the sticky
+    # 24h failure line. First-occurrence-only at the feedback layer
+    # keeps the latest success the live state.
+    await log_event(
+        "git_push_ok",
+        turn_id=turn_id,
+    )
 
 
 # ─── helpers ─────────────────────────────────────────────────────────
