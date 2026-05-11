@@ -40,6 +40,7 @@ SKILLS_ROOT = Path(__file__).parent.parent / "mimir" / "skills"
 # ``yaml.safe_load``.
 _FRONTMATTER_DELIM = re.compile(r"^---\s*$")
 _KEY_LINE = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(?P<value>.*)$")
+_LIST_ITEM = re.compile(r"^\s+-\s+(?P<value>.+)$")
 
 
 def _parse_frontmatter(text: str) -> dict[str, str]:
@@ -81,6 +82,57 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
     return out
 
 
+def _extract_list_field(text: str, key: str) -> list[str] | None:
+    """Return the YAML-list values under ``<key>:`` in the frontmatter,
+    or ``None`` if the field is missing entirely. Returns ``[]`` for
+    an explicitly empty list (``<key>:`` with no bullet lines).
+
+    Used for ``allowed-tools:`` which is a list shape that the flat
+    ``_parse_frontmatter`` collapses awkwardly. Kept separate so the
+    primary parser stays simple.
+    """
+    lines = text.splitlines()
+    if not lines or not _FRONTMATTER_DELIM.match(lines[0]):
+        return None
+
+    found = False
+    in_block = False
+    items: list[str] = []
+    for raw in lines[1:]:
+        if _FRONTMATTER_DELIM.match(raw):
+            break
+        match = _KEY_LINE.match(raw)
+        if match:
+            if match.group("key") == key:
+                found = True
+                in_block = True
+                inline_value = match.group("value").strip()
+                # Inline form (``allowed-tools: [Foo, Bar]``) — split.
+                if inline_value.startswith("[") and inline_value.endswith("]"):
+                    payload = inline_value[1:-1].strip()
+                    if not payload:
+                        return []
+                    return [v.strip() for v in payload.split(",")]
+                # Empty value followed by bullet lines — fall through.
+                if inline_value:
+                    # ``allowed-tools: Foo`` — scalar form. Not the list
+                    # shape we expect; treat as a single-element list so
+                    # the caller's "field present" check still passes.
+                    return [inline_value]
+            else:
+                # A different top-level key — close the list block but
+                # remember that we found the field, so accumulated items
+                # are still returned.
+                in_block = False
+        elif in_block:
+            list_match = _LIST_ITEM.match(raw)
+            if list_match:
+                items.append(list_match.group("value").strip())
+    if found:
+        return items
+    return None
+
+
 def _bundled_skill_dirs() -> list[Path]:
     return sorted(
         d for d in SKILLS_ROOT.iterdir() if d.is_dir() and (d / "SKILL.md").is_file()
@@ -117,6 +169,33 @@ def test_skill_md_has_required_frontmatter(skill_dir: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("skill_dir", _bundled_skill_dirs(), ids=lambda p: p.name)
+def test_skill_md_has_allowed_tools(skill_dir: Path) -> None:
+    """Every bundled SKILL.md must declare ``allowed-tools:`` in frontmatter.
+
+    chainlink #79 (G3) under chainlink #29 (GBrain pattern adoption).
+    The field lists the tools the skill body explicitly references,
+    so reviewers can spot ad-hoc tool dependencies growing into a
+    skill without updating the documented surface. Docs-only today
+    (no runtime enforcement — see state/spec/g3-allowed-tools-audit.md
+    for the enforcement-decision discussion).
+
+    An explicitly empty list is allowed for skills that are pure prose
+    (no tool surface) but the convention is to enumerate at least the
+    ``Read`` you need to follow the skill's instructions.
+    """
+    skill_md = skill_dir / "SKILL.md"
+    text = skill_md.read_text()
+    tools = _extract_list_field(text, "allowed-tools")
+    assert tools is not None, (
+        f"{skill_dir.name}/SKILL.md: missing 'allowed-tools:' field in "
+        f"frontmatter. Add a YAML list of the tools the skill body "
+        f"references — see state/spec/g3-allowed-tools-audit.md for "
+        f"the audit-derived per-skill surface. Use an explicit empty "
+        f"list (``allowed-tools: []``) if the skill is pure prose."
+    )
+
+
 def test_parse_frontmatter_rejects_missing_opening_delim() -> None:
     """The parser must fail loudly on malformed frontmatter so the
     main parametrized test surfaces it correctly."""
@@ -142,3 +221,44 @@ def test_parse_frontmatter_handles_folded_description() -> None:
     fm = _parse_frontmatter(text)
     assert fm["name"] == "example"
     assert fm["description"] == "First line continuation. Second line."
+
+
+def test_extract_list_field_block_form() -> None:
+    text = (
+        "---\n"
+        "name: example\n"
+        "allowed-tools:\n"
+        "  - Read\n"
+        "  - Write\n"
+        "  - Bash\n"
+        "---\n"
+    )
+    assert _extract_list_field(text, "allowed-tools") == ["Read", "Write", "Bash"]
+
+
+def test_extract_list_field_missing_returns_none() -> None:
+    text = "---\nname: example\ndescription: foo\n---\n"
+    assert _extract_list_field(text, "allowed-tools") is None
+
+
+def test_extract_list_field_explicitly_empty() -> None:
+    text = "---\nname: example\nallowed-tools: []\n---\n"
+    assert _extract_list_field(text, "allowed-tools") == []
+
+
+def test_extract_list_field_inline_array_form() -> None:
+    text = "---\nname: example\nallowed-tools: [Read, Write]\n---\n"
+    assert _extract_list_field(text, "allowed-tools") == ["Read", "Write"]
+
+
+def test_extract_list_field_stops_at_next_key() -> None:
+    """List block should NOT swallow the following frontmatter key."""
+    text = (
+        "---\n"
+        "name: example\n"
+        "allowed-tools:\n"
+        "  - Read\n"
+        "description: foo\n"
+        "---\n"
+    )
+    assert _extract_list_field(text, "allowed-tools") == ["Read"]

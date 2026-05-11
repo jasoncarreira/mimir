@@ -1,6 +1,14 @@
 ---
 name: memory
 description: Criteria for deciding when, where and how to remember information. Use this skill whenever you might need to update a core memory block, file something under memory/, or write to a state file. It is CRITICAL that you use this skill.
+allowed-tools:
+  - Edit
+  - Glob
+  - Read
+  - Write
+  - file_search
+  - saga_query
+  - saga_store
 ---
 
 # Memory
