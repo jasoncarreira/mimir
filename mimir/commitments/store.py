@@ -340,6 +340,17 @@ class CommitmentsStore:
                 v_int, COMMITMENTS_JSONL_SCHEMA_VERSION,
             )
             return
+        if v_int < 1:
+            # PR #137 review: ``int(0)`` / ``int(-1)`` succeed and would
+            # otherwise silently fall through to the v1 replay path.
+            # No legitimate writer produces these — flag them loud
+            # rather than silently degrading. Rounds out the defensive
+            # gate alongside the malformed and future-version arms.
+            log.warning(
+                "commitments: skipping event with non-positive schema "
+                "v=%d (versions start at 1)", v_int,
+            )
+            return
         et = event.get("type")
         rid = event.get("id")
         if not et or not rid:
