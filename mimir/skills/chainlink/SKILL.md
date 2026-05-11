@@ -4,6 +4,8 @@ description: Local CLI issue tracker for todos, follow-ups, and structured recor
 allowed-tools:
   - Bash
   - Read
+  - saga_store
+  - send_message
 ---
 
 # Chainlink

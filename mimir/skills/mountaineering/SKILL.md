@@ -4,6 +4,7 @@ description: Autonomous hill-climbing loops for continuous improvement. Use when
 allowed-tools:
   - Agent
   - Read
+  - Task
   - Write
 ---
 

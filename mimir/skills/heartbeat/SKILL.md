@@ -5,6 +5,7 @@ allowed-tools:
   - Bash
   - Edit
   - Read
+  - Task
   - Write
   - send_message
 ---

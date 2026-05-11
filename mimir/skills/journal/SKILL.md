@@ -4,6 +4,7 @@ description: Append a dated entry to a daily journal under `state/journal/YYYY-M
 allowed-tools:
   - Bash
   - Read
+  - send_message
 ---
 
 # Journal

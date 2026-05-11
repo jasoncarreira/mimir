@@ -9,6 +9,7 @@ allowed-tools:
   - file_search
   - saga_query
   - saga_store
+  - send_message
 ---
 
 # Memory

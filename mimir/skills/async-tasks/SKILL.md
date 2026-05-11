@@ -4,6 +4,8 @@ description: Turn "block until condition X is met" into an agent wake-up via the
 allowed-tools:
   - Bash
   - Read
+  - Task
+  - add_schedule
   - bash_async
   - bash_job_output
   - bash_jobs_list

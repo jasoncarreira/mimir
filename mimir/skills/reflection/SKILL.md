@@ -7,6 +7,7 @@ allowed-tools:
   - Glob
   - Read
   - Write
+  - saga_query
 ---
 
 # Reflection
