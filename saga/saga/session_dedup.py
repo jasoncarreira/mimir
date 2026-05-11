@@ -18,7 +18,7 @@ def _session_file():
     """Get session file path. Uses parent PID to share across subprocesses."""
     # Use a time-windowed approach: same hour = same session
     hour_key = time.strftime("%Y%m%d%H")
-    return os.path.join(SESSION_DIR, f"msam_session_{hour_key}.json")
+    return os.path.join(SESSION_DIR, f"saga_session_{hour_key}.json")
 
 def get_served_ids() -> set:
     """Get atom IDs already served this session."""

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-MSAM Remember -- Integration layer for MSAM memory pipeline.
-Replaces markdown file reads with MSAM retrieval.
+SAGA Remember -- Integration layer for SAGA memory pipeline.
+Replaces markdown file reads with SAGA retrieval.
 
 Usage:
-    msam query "What does the user like?"
-    msam query "server config" --mode companion
-    msam store "User mentioned they prefer sushi over pizza"
-    msam snapshot  # Log system metrics
+    saga query "What does the user like?"
+    saga query "server config" --mode companion
+    saga store "User mentioned they prefer sushi over pizza"
+    saga snapshot  # Log system metrics
 
     All commands accept --caller <name> (heartbeat|conversation|pulse|cron|unknown)
 """
@@ -194,7 +194,7 @@ async def cmd_query(args):
         output["confidence_advisory"] = "[LOW_CONFIDENCE] Results exist but confidence is below threshold. Treat with caution."
 
     # ── Confidence-gated output volume ──
-    # When MSAM doesn't know something, output should approach zero, not pad with noise.
+    # When SAGA doesn't know something, output should approach zero, not pad with noise.
     # Gate: none → empty, low → top 1 atom only (for context), medium/high → full results
     if confidence_tier == "none":
         # No data: return nothing. The advisory IS the response.
@@ -209,7 +209,7 @@ async def cmd_query(args):
         output["gated_reason"] = "no data -- output suppressed"
     elif confidence_tier == "low":
         # Low confidence: return minimal context (top 1 atom, no triples)
-        # Just enough to see what MSAM partially matched, but not noise
+        # Just enough to see what SAGA partially matched, but not noise
         atom_results = atom_results[:1] if atom_results else []
         result["triples"] = []
         output["triples"] = []
@@ -320,9 +320,9 @@ async def cmd_query(args):
         md_estimate = _measure_markdown_query_tokens()
         log_comparison(
             query=query,
-            msam_tokens=result["total_tokens"],
-            msam_latency_ms=latency_ms,
-            msam_atoms=result["items_returned"],
+            saga_tokens=result["total_tokens"],
+            saga_latency_ms=latency_ms,
+            saga_atoms=result["items_returned"],
             md_tokens=md_estimate,
             md_latency_ms=0,
             md_results=0,
@@ -485,9 +485,9 @@ async def cmd_snapshot(args=None):
         md_tokens = _measure_markdown_startup_tokens()
         log_comparison(
             query=probe_q2,
-            msam_tokens=probe_tokens,
-            msam_latency_ms=0,
-            msam_atoms=len(probe_atoms),
+            saga_tokens=probe_tokens,
+            saga_latency_ms=0,
+            saga_atoms=len(probe_atoms),
             md_tokens=md_tokens,
             md_latency_ms=0,
             md_results=0,
@@ -632,10 +632,10 @@ def cmd_graph(args):
     from .triples import graph_traverse, graph_path
 
     if len(args) >= 3 and args[0] == "path":
-        # msam graph path <entity_a> <entity_b>
+        # saga graph path <entity_a> <entity_b>
         result = graph_path(args[1], args[2], max_hops=int(args[3]) if len(args) > 3 else 4)
     elif args:
-        # msam graph <entity> [--hops N]
+        # saga graph <entity> [--hops N]
         entity = args[0]
         max_hops = 2
         if "--hops" in args:
@@ -749,10 +749,10 @@ def cmd_feedback_mark(args):
     Mark atom contributions after a response (feedback loop wire-up).
 
     Usage:
-        msam feedback-mark <atom_ids_comma_sep> <response_text>
+        saga feedback-mark <atom_ids_comma_sep> <response_text>
 
     Example:
-        msam feedback-mark abc123,def456 "The user liked the recommendation"
+        saga feedback-mark abc123,def456 "The user liked the recommendation"
 
     Calls mark_contributions() which updates contribution_score and retrieval
     adjustment data used by compute_retrieval_adjustments() during decay cycles.
@@ -813,8 +813,8 @@ def cmd_feedback(args):
     """Record outcome feedback or run retrieval analysis.
 
     Usage:
-        msam feedback <atom_id> positive|negative|neutral   -- record outcome
-        msam feedback --analyze                             -- run retrieval analysis
+        saga feedback <atom_id> positive|negative|neutral   -- record outcome
+        saga feedback --analyze                             -- run retrieval analysis
     """
     if not args or "--analyze" in args:
         from .core import compute_retrieval_adjustments
@@ -837,8 +837,8 @@ def cmd_outcomes(args):
     """Show outcome feedback history.
 
     Usage:
-        msam outcomes <atom_id>    -- history for specific atom
-        msam outcomes --summary    -- summary of all outcomes
+        saga outcomes <atom_id>    -- history for specific atom
+        saga outcomes --summary    -- summary of all outcomes
     """
     from .core import get_outcome_history, get_db
     if args and args[0] != "--summary":
@@ -1326,9 +1326,9 @@ def cmd_forget(args):
     """Identify atoms that should be forgotten (intentional forgetting engine).
 
     Usage:
-        msam forget [--dry-run] [--auto]
-        msam forget --dry-run               # Just report candidates (default)
-        msam forget --auto                   # Apply transitions automatically
+        saga forget [--dry-run] [--auto]
+        saga forget --dry-run               # Just report candidates (default)
+        saga forget --auto                   # Apply transitions automatically
     """
     from .forgetting import identify_forgetting_candidates
 
@@ -1344,7 +1344,7 @@ def cmd_calibrate(args):
     """Compare embedding rankings between current and target provider.
 
     Usage:
-        msam calibrate <provider> [--top-k N]
+        saga calibrate <provider> [--top-k N]
     """
     from .calibration import calibrate
 
@@ -1369,7 +1369,7 @@ def cmd_reembed(args):
     """Re-embed all active atoms with a new provider.
 
     Usage:
-        msam re-embed <provider> [--batch-size N] [--dry-run]
+        saga re-embed <provider> [--batch-size N] [--dry-run]
     """
     from .calibration import re_embed
 
@@ -1392,7 +1392,7 @@ def cmd_reembed(args):
 
 
 def cmd_serve(args):
-    """Start the MSAM REST API server."""
+    """Start the SAGA REST API server."""
     from .server import run_server
     host = None
     port = None
@@ -1411,11 +1411,11 @@ def cmd_world(args):
     """World model query/update -- temporal knowledge graph.
 
     Usage:
-        msam world                              Show all currently-valid triples
-        msam world "Jaden"                      Show current state for entity
-        msam world "Jaden" --at "2026-02-20"    Point-in-time query
-        msam world --set "Jaden" "is_in" "Oakland" [--from ...] [--until ...]
-        msam world --history "Jaden" ["is_in"]  Show all values over time
+        saga world                              Show all currently-valid triples
+        saga world "Jaden"                      Show current state for entity
+        saga world "Jaden" --at "2026-02-20"    Point-in-time query
+        saga world --set "Jaden" "is_in" "Oakland" [--from ...] [--until ...]
+        saga world --history "Jaden" ["is_in"]  Show all values over time
     """
     from .triples import query_world, update_world, world_history
 
@@ -1483,7 +1483,7 @@ def cmd_world(args):
 
 def cmd_help(args=None):
     """Print grouped command reference."""
-    help_text = """MSAM CLI -- Multi-Stream Adaptive Memory
+    help_text = """SAGA CLI -- Multi-Stream Adaptive Memory
 
 Storage:
   store <content>              Store a new memory atom
@@ -1559,7 +1559,7 @@ Maintenance:
 def cmd_grep(args):
     """Search atom content by text pattern."""
     if not args:
-        print("Usage: msam grep <pattern>")
+        print("Usage: saga grep <pattern>")
         return
     from .core import get_db
     pattern = " ".join(args)
@@ -1576,7 +1576,7 @@ def cmd_grep(args):
 def cmd_export(args):
     """Export active/fading atoms to JSONL."""
     if not args:
-        print("Usage: msam export <file.jsonl>")
+        print("Usage: saga export <file.jsonl>")
         return
     from .core import get_db
     filepath = args[0]
@@ -1604,7 +1604,7 @@ def cmd_export(args):
 def cmd_import(args):
     """Import atoms from JSONL file."""
     if not args:
-        print("Usage: msam import <file.jsonl>")
+        print("Usage: saga import <file.jsonl>")
         return
     filepath = args[0]
     imported = 0

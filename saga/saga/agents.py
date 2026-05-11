@@ -1,5 +1,5 @@
 """
-MSAM Multi-Agent Memory Management
+SAGA Multi-Agent Memory Management
 
 Agent isolation and sharing for memory atoms.
 Each agent gets its own namespace of atoms, with explicit sharing between agents.

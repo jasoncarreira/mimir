@@ -1,8 +1,8 @@
-# MSAM Control Flow
+# SAGA Control Flow
 
 **Multi-Stream Adaptive Memory** -- system control flow and architecture reference.
 
-This document maps every path through the MSAM system: how atoms are stored, how queries become confidence-gated output, how decay reclaims budget, and how the feedback loop closes. Each flow corresponds to a code path in production -- the diagrams are extracted from the implementation, not designed before it.
+This document maps every path through the SAGA system: how atoms are stored, how queries become confidence-gated output, how decay reclaims budget, and how the feedback loop closes. Each flow corresponds to a code path in production -- the diagrams are extracted from the implementation, not designed before it.
 
 ## System Overview
 
@@ -39,7 +39,7 @@ Three entry points drive the system: scheduled heartbeats (cron-based decay, sna
 
 ## Primary Flows
 
-The five primary flows below represent the complete operational surface of MSAM. Store and Retrieve handle the read/write path. Decay manages the lifecycle. Feedback closes the loop between retrieval quality and future scoring. Session boundary capture bridges the gap between conversations.
+The five primary flows below represent the complete operational surface of SAGA. Store and Retrieve handle the read/write path. Decay manages the lifecycle. Feedback closes the loop between retrieval quality and future scoring. Session boundary capture bridges the gap between conversations.
 
 ### 1. STORE
 
@@ -194,10 +194,10 @@ retrieve -> adjusted scores from stability changes
 heartbeat -> scripts/session-capture.sh
   -> check memory/context/last-session-summary.md
   -> if non-empty:
-    -> msam store "<summary>" (episodic atom)
+    -> saga store "<summary>" (episodic atom)
     -> clear the file
   -> check memory/context/ for stale files
-  -> msam snapshot (metrics to Grafana)
+  -> saga snapshot (metrics to Grafana)
 ```
 
 ### 6. STREAM CLASSIFICATION

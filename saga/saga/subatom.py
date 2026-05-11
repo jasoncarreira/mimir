@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MSAM Sub-Atom Extraction (Phase 1: Shannon Compression)
+SAGA Sub-Atom Extraction (Phase 1: Shannon Compression)
 
 Instead of retrieving whole atoms (~25 tokens each), extract the relevant
 SENTENCE from each atom. Reduces token output by ~60% with minimal quality loss.

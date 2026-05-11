@@ -1,4 +1,4 @@
-"""MSAM Contradictions Tests -- unit tests for semantic contradiction detection."""
+"""SAGA Contradictions Tests -- unit tests for semantic contradiction detection."""
 
 import os
 import sys
@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-# Ensure msam is importable
+# Ensure saga is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from saga.contradictions import (

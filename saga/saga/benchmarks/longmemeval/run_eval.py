@@ -1,5 +1,5 @@
 """
-LongMemEval benchmark runner for MSAM.
+LongMemEval benchmark runner for SAGA.
 
 Usage:
     python -m saga.benchmarks.longmemeval.run_eval --limit 10
@@ -38,7 +38,7 @@ from .env_loader import load_env
 
 
 def _prepare_environment(work_dir: Path, config_path: Path | None = None):
-    """Set env vars MSAM reads at import time.
+    """Set env vars SAGA reads at import time.
 
     config_path overrides the default BENCH_SAGA_CONFIG so two parallel
     benches can run with different threshold variants without touching
@@ -55,7 +55,7 @@ def _prepare_environment(work_dir: Path, config_path: Path | None = None):
 
 
 def _switch_db(db_path: Path):
-    """Point MSAM at a new SQLite file for this question."""
+    """Point SAGA at a new SQLite file for this question."""
     import saga.core
     import saga.triples
 
@@ -105,7 +105,7 @@ async def run(
     from saga.config import reload_config
     reload_config()
     # Reset the embedding provider singleton in case something constructed it
-    # before reload_config ran (msam/__init__.py eagerly imports core).
+    # before reload_config ran (saga/__init__.py eagerly imports core).
     import saga.embeddings
     saga.embeddings._provider_instance = None
     from saga.core import hybrid_retrieve, mark_contributions
@@ -278,12 +278,12 @@ def main():
     import asyncio
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None, help="cap number of questions")
-    ap.add_argument("--run-tag", default="msam_baseline_v0", help="tag for output files")
+    ap.add_argument("--run-tag", default="saga_baseline_v0", help="tag for output files")
     ap.add_argument("--resume", action="store_true", help="skip questions already in JSONL")
     ap.add_argument("--keep-dbs", action="store_true", help="don't delete per-question SQLite files")
     ap.add_argument(
         "--config", default=None,
-        help="path to MSAM config (overrides default bench msam_bench.toml — "
+        help="path to SAGA config (overrides default bench saga_bench.toml — "
              "useful for parallel runs with different threshold variants)",
     )
     ap.add_argument(

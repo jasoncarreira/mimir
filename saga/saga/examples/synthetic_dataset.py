@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MSAM Synthetic Dataset -- Demonstrates the full MSAM pipeline with mocked embeddings.
+SAGA Synthetic Dataset -- Demonstrates the full SAGA pipeline with mocked embeddings.
 
 No API keys needed. Creates a temporary database with ~35 atoms across all four
 cognitive streams, then runs retrieval, metamemory, decay, and forgetting demos.
@@ -47,7 +47,7 @@ def _setattr(module_path, value):
 
 async def main():
     # ─── Setup: temp DB + mocked embeddings ──────────────────────
-    tmp_dir = tempfile.mkdtemp(prefix="msam_demo_")
+    tmp_dir = tempfile.mkdtemp(prefix="saga_demo_")
     db_path = os.path.join(tmp_dir, "demo.db")
 
     os.environ["SAGA_DATA_DIR"] = tmp_dir
@@ -68,7 +68,7 @@ async def main():
     _fake_embed = _mock_embeddings(_setattr)
 
     print("=" * 70)
-    print("MSAM Synthetic Dataset Demo")
+    print("SAGA Synthetic Dataset Demo")
     print(f"Temp DB: {db_path}")
     print("=" * 70)
 
@@ -97,7 +97,7 @@ async def main():
         "Relationship Dynamic: Built through technical collaboration. Trust established over architecture discussions.",
         "User Schedule: Wakes at 8 AM, deep work 9-12, meetings 13-15, creative work 15-18.",
         "User Learning Goals: Currently studying Rust ownership model and WASM compilation targets.",
-        "Agent Knowledge: Familiar with MSAM architecture, ACT-R theory, and embedding model internals.",
+        "Agent Knowledge: Familiar with SAGA architecture, ACT-R theory, and embedding model internals.",
         "User Food Preferences: Vegetarian, enjoys Italian and Japanese cuisine. Coffee with oat milk.",
         "Shared Reference: Both find it funny that the memory system has better recall than its creators.",
     ]

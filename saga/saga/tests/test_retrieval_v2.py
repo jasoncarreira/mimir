@@ -1,4 +1,4 @@
-"""MSAM Retrieval v2 Tests -- advanced retrieval pipeline."""
+"""SAGA Retrieval v2 Tests -- advanced retrieval pipeline."""
 
 import struct
 import hashlib

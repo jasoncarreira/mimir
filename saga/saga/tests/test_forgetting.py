@@ -1,4 +1,4 @@
-"""MSAM Forgetting Engine Tests -- signal detectors and candidate identification."""
+"""SAGA Forgetting Engine Tests -- signal detectors and candidate identification."""
 
 import json
 import struct

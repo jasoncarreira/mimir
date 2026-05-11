@@ -1,9 +1,8 @@
-# MSAM config — P36 variant (graph pathway as tiebreaker).
-# Triples + graph pathway ON (same as P35 features) EXCEPT
-# rrf_graph_weight = 0.3 (default 0.7). Tests whether the P35
-# regression was caused by the graph pathway voting too loudly in
-# RRF; at 0.3 it acts as a tiebreaker rather than a vote.
-# See NEXT-EXPERIMENTS.md P36.
+# SAGA config — P43 variant (subatom beam ON, triple_augment_v2 OFF).
+# Same as saga_bench.toml (canonical) EXCEPT
+# [retrieval] enable_subatom_beam = true.
+# Pair config saga_bench_p43_p41.toml flips both flags on for the
+# 3-beam comparison.
 
 [embedding]
 provider = "openai"
@@ -16,10 +15,10 @@ batch_size = 256
 api_key_env = "OPENAI_API_KEY"
 
 [storage]
-db_path = "msam.db"
-metrics_db_path = "msam_metrics.db"
+db_path = "saga.db"
+metrics_db_path = "saga_metrics.db"
 # Disable the storage backpressure: per-question haystacks can push thousands
-# of atoms; MSAM's production budget (40k tokens) would auto-compact/refuse.
+# of atoms; SAGA's production budget (40k tokens) would auto-compact/refuse.
 token_budget_ceiling = 100000000
 auto_compact_threshold_pct = 99
 refuse_threshold_pct = 100
@@ -32,18 +31,15 @@ fusion = "rrf"
 rrf_k = 60
 rrf_semantic_weight = 1.0
 rrf_keyword_weight = 1.0
-# P36: drop graph pathway weight from default 0.7 to 0.3 — graph
-# becomes a tiebreaker rather than a co-equal vote.
-rrf_graph_weight = 0.3
 # P9: two-tier retrieval with observation->raw evidence boost.
 two_tier_enabled = true
 observations_top_k = 5
 observation_confidence_min_sim = 0.30
 evidence_boost_cap_multiplier = 3.0
-# P36: graph pathway ON, but with rrf_graph_weight=0.3 (above) so it
-# only breaks ties rather than overwhelming the fusion. Tests whether
-# weight tuning rescues triples-as-byproduct.
-enable_graph_pathway = true
+# P32/P35: graph pathway off — triples-as-byproduct of consolidation
+# regressed -2.6pp on canonical (saga_p35_canon_v1). Code stays for
+# production-graph-feature deployments; bench defaults to off.
+enable_graph_pathway = false
 # Single-tier bonus is redundant in two_tier mode; leave off to avoid double-handling.
 enable_observation_bonus = false
 similarity_threshold = 0.15
@@ -63,18 +59,33 @@ spreading_activation_enabled = false
 temporal_recency_hours = 24
 outcome_weight = 0.0
 outcome_decay = 1.0
+# P43: subatom (sentence-level) retrieval as an additional beam.
+# compressed_retrieve runs on the original query, top sentences map
+# back to parent atoms, atoms join RRF as a 'subatom' pathway.
+enable_subatom_beam = true
+# P41 OFF for this variant — see saga_bench_p43_p41.toml for the
+# combined run.
+enable_triple_augment_v2 = false
+
+[compression]
+# Subatom needs sentence-level extraction enabled. Defaults are on
+# in production but the canonical bench config flipped them off;
+# turning back on for this variant.
+enable_subatom = true
+enable_fact_dedup = true
+enable_synthesis = false
 
 [retrieval_v2]
-enable_rerank = false   # P15 cross-encoder LLM rerank (regressed in msam_rerank_gptoss_v1)
+enable_rerank = false   # P15 cross-encoder LLM rerank (regressed in saga_rerank_gptoss_v1)
 enabled = false
-# Cherry-picks (P11/P12/P13) regressed -2.8pp in msam_cherrypicks_minimax_v1
-# (logged 2026-04-27). Disabled while we decide whether to ablate or skip.
-enable_query_rewriting = true
-enable_query_expansion = false
-enable_quality_filter = false
+# P12 (synonym expansion on the keyword pathway via _expand_query_for_keyword
+# in core.py) — the only positive single lever since P30. Shipped to
+# canonical 2026-04-29. Same flag still gates this even after the
+# triple-graph expand_query removal in the cleanup batch.
+enable_query_expansion = true
 
 [llm]
-# Unified LLM endpoint for every MSAM subsystem (consolidation synthesis,
+# Unified LLM endpoint for every SAGA subsystem (consolidation synthesis,
 # annotation, triple extraction, rerank, subatom synthesis). Bench routes
 # through OpenRouter to test gpt-oss-120b end-to-end (paid tier — free
 # tier daily caps would kill a 500q run).
@@ -83,16 +94,12 @@ model           = "openai/gpt-oss-120b"
 api_key_env     = "OPENROUTER_API_KEY"
 timeout_seconds = 60
 
-[compression]
-enable_subatom = false
-enable_fact_dedup = false
-enable_synthesis = false
-
 [triples]
-# P36: triples ON (same as P35) so the graph pathway has material to
-# retrieve from. The whole point is testing whether the graph pathway
-# is useful AT THE RIGHT WEIGHT.
-enable_extraction = true
+# P35: triples are extracted *during consolidation* now (one LLM call
+# per cluster produces both observation + triples). This flag gates
+# persistence — off for the bench (P35 regressed -2.6pp on canonical),
+# on for production deployments that use the graph pathway.
+enable_extraction = false
 
 [annotation]
 # Use heuristic-only annotation (fast, deterministic, free).
@@ -102,9 +109,6 @@ use_llm = false
 enabled = false
 
 [world_model]
-enabled = false
-
-[sycophancy]
 enabled = false
 
 [decay]

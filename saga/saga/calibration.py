@@ -1,5 +1,5 @@
 """
-MSAM Calibration -- Cross-provider identity calibration for safe
+SAGA Calibration -- Cross-provider identity calibration for safe
 embedding provider switching.
 
 Provides two operations:

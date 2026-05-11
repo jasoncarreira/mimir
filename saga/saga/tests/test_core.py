@@ -1,4 +1,4 @@
-"""MSAM Core Tests -- smoke tests for storage, retrieval, and scoring."""
+"""SAGA Core Tests -- smoke tests for storage, retrieval, and scoring."""
 
 import sys
 import os
@@ -10,7 +10,7 @@ import sqlite3
 import pytest
 import numpy as np
 
-# Ensure msam is importable
+# Ensure saga is importable
 
 
 @pytest.fixture(autouse=True)

@@ -56,9 +56,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jadenschwab/msam"
-Documentation = "https://github.com/jadenschwab/msam/blob/main/SPEC.md"
-Issues = "https://github.com/jadenschwab/msam/issues"
+Homepage = "https://github.com/jasoncarreira/mimir/tree/main/saga"
+Documentation = "https://github.com/jasoncarreira/mimir/blob/main/saga/SPEC.md"
+Issues = "https://github.com/jasoncarreira/mimir/issues"
 
 [project.scripts]
 saga = "saga.remember:main"

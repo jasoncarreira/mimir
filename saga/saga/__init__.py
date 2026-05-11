@@ -1,12 +1,12 @@
 """
-MSAM -- Multi-Stream Adaptive Memory
+SAGA -- Multi-Stream Adaptive Memory
 
 Cognitive memory system for AI agents. Stores knowledge as atoms across
 semantic, episodic, and procedural streams with ACT-R-inspired activation
 scoring, hybrid retrieval (atoms + knowledge graph triples), and adaptive
 decay with contribution-based feedback. Cross-turn conversation state is
 the agent's responsibility (e.g. message history in the LLM context),
-not MSAM's.
+not SAGA's.
 
 Usage:
     from saga import store_atom, retrieve, hybrid_retrieve

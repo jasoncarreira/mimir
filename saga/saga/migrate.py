@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-MSAM Migration -- Convert markdown memory files into MSAM atoms.
+SAGA Migration -- Convert markdown memory files into SAGA atoms.
 
 This is a template. Customize the file paths and entity names for your deployment.
 
 Usage:
-    python msam/migrate.py [--dry-run]
+    python saga/migrate.py [--dry-run]
 """
 
 import sys
@@ -74,7 +74,7 @@ async def run_migration():
 
     if not files:
         print("No files configured for migration.")
-        print("Edit msam/migrate.py and add your file paths to the 'files' list.")
+        print("Edit saga/migrate.py and add your file paths to the 'files' list.")
         return
 
     total = 0
