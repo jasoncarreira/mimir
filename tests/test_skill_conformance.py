@@ -28,117 +28,15 @@ from pathlib import Path
 
 import pytest
 
+from mimir.skill_md import (
+    extract_list_field as _extract_list_field,
+    parse_frontmatter as _parse_frontmatter,
+    strip_frontmatter as _strip_frontmatter,
+)
+
 # Bundled skills live alongside the source so the test does not depend
 # on a seeded ``<home>/.claude/skills/`` directory.
 SKILLS_ROOT = Path(__file__).parent.parent / "mimir" / "skills"
-
-# Bare-bones YAML frontmatter parser: avoid pulling in PyYAML for a
-# 30-line schema check. SKILL.md frontmatter is single-level key: value
-# pairs (with the occasional folded ``>`` block); a tolerant
-# line-by-line scan is enough for the conformance bar this test
-# enforces. If the schema grows nested structure later, swap in
-# ``yaml.safe_load``.
-_FRONTMATTER_DELIM = re.compile(r"^---\s*$")
-_KEY_LINE = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(?P<value>.*)$")
-_LIST_ITEM = re.compile(r"^\s+-\s+(?P<value>.+)$")
-
-
-def _parse_frontmatter(text: str) -> dict[str, str]:
-    """Return a flat key->value map for the leading ``--- ... ---`` block.
-
-    Raises ``ValueError`` if the block is missing or malformed (no
-    closing delimiter). Values are stripped; multi-line folded values
-    are collapsed to the literal first line plus continuation suffix.
-    """
-    lines = text.splitlines()
-    if not lines or not _FRONTMATTER_DELIM.match(lines[0]):
-        raise ValueError("missing opening '---' delimiter")
-
-    out: dict[str, str] = {}
-    current_key: str | None = None
-    closed = False
-    for raw in lines[1:]:
-        if _FRONTMATTER_DELIM.match(raw):
-            closed = True
-            break
-        match = _KEY_LINE.match(raw)
-        if match:
-            current_key = match.group("key")
-            value = match.group("value").strip()
-            # Strip ``>`` folded-block marker (onboarding/SKILL.md uses
-            # ``description: >`` then continues on subsequent indented
-            # lines). The continuation accumulates below.
-            if value in {">", "|"}:
-                out[current_key] = ""
-            else:
-                out[current_key] = value
-        elif current_key is not None and raw.strip():
-            # Continuation line for a folded block.
-            prior = out.get(current_key, "")
-            out[current_key] = (prior + " " + raw.strip()).strip()
-
-    if not closed:
-        raise ValueError("missing closing '---' delimiter")
-    return out
-
-
-def _extract_list_field(text: str, key: str) -> list[str] | None:
-    """Return the YAML-list values under ``<key>:`` in the frontmatter,
-    or ``None`` if the field is missing entirely. Returns ``[]`` for
-    an explicitly empty list (``<key>:`` with no bullet lines).
-
-    Used for ``allowed-tools:`` which is a list shape that the flat
-    ``_parse_frontmatter`` collapses awkwardly. Kept separate so the
-    primary parser stays simple.
-    """
-    lines = text.splitlines()
-    if not lines or not _FRONTMATTER_DELIM.match(lines[0]):
-        return None
-
-    found = False
-    in_block = False
-    items: list[str] = []
-    for raw in lines[1:]:
-        if _FRONTMATTER_DELIM.match(raw):
-            break
-        match = _KEY_LINE.match(raw)
-        if match:
-            if match.group("key") == key:
-                found = True
-                in_block = True
-                inline_value = match.group("value").strip()
-                # Inline form (``allowed-tools: [Foo, Bar]``) — split.
-                if inline_value.startswith("[") and inline_value.endswith("]"):
-                    payload = inline_value[1:-1].strip()
-                    if not payload:
-                        return []
-                    return [v.strip() for v in payload.split(",")]
-                # Empty value followed by bullet lines — fall through.
-                if inline_value:
-                    # ``allowed-tools: Foo`` — scalar form. Reject by
-                    # returning ``None`` so the conformance test reports
-                    # it as "missing field" with the YAML-list-required
-                    # message. Coercing scalar → ``[Foo]`` was the prior
-                    # behavior; PR #130 review pointed out it hides a
-                    # schema-shape mistake (the writer probably meant a
-                    # list and forgot the bullets, or wrote
-                    # ``allowed-tools: ['Foo', 'Bar']`` Python-list shape
-                    # that also gets coerced wrong). Loud rejection is
-                    # safer than silent coercion.
-                    return None
-            else:
-                # A different top-level key — close the list block but
-                # remember that we found the field, so accumulated items
-                # are still returned.
-                in_block = False
-        elif in_block:
-            list_match = _LIST_ITEM.match(raw)
-            if list_match:
-                items.append(list_match.group("value").strip())
-    if found:
-        return items
-    return None
-
 
 def _bundled_skill_dirs() -> list[Path]:
     return sorted(
@@ -271,20 +169,6 @@ _BACKTICK_TOKEN = re.compile(r"`(?:mcp__mimir__)?([A-Za-z_][\w_]*)`")
 
 # Prose "X tool" suffix: ``Bash tool``, ``Task tool``. CamelCase + ``tool``.
 _X_TOOL_SUFFIX = re.compile(r"\b([A-Z][a-zA-Z]+)\s+tool\b")
-
-
-def _strip_frontmatter(text: str) -> str:
-    """Return everything AFTER the closing frontmatter delimiter.
-
-    Empty string if no frontmatter is present.
-    """
-    lines = text.splitlines()
-    if not lines or not _FRONTMATTER_DELIM.match(lines[0]):
-        return text
-    for idx, raw in enumerate(lines[1:], start=1):
-        if _FRONTMATTER_DELIM.match(raw):
-            return "\n".join(lines[idx + 1 :])
-    return ""
 
 
 def _extract_body_tool_references(body: str) -> set[str]:
