@@ -837,6 +837,14 @@ class Agent:
             jobs_dir=config.home / "logs" / "bash-jobs",
         )
 
+        # Commitments store (Phase 1) — instantiated BEFORE the MCP
+        # server build so the Phase 2c agent-facing tools
+        # (commitment_complete/snooze/dismiss/list) get wired in.
+        # The extraction hook (Phase 2a) reuses this same instance
+        # below in the turn-hook list.
+        from .commitments.store import CommitmentsStore
+        self._commitments = CommitmentsStore(path=self._config.commitments_log)
+
         self._mcp_server = build_mcp_server(
             config.home,
             indexer=indexer,
@@ -851,6 +859,7 @@ class Agent:
             on_shell_job_complete=self._handle_shell_job_complete,
             schedule_from_thread=self._schedule_from_thread,
             mimir_home=config.home,
+            commitments_store=self._commitments,
         )
 
         # Hooks layer mimir's path confinement + post-write reindex onto the
@@ -880,14 +889,6 @@ class Agent:
         self._post_tool_hook = make_post_tool_use_hook(
             config.home, _reindex if indexer is not None else None
         )
-
-        # Commitments store (Phase 1) + extraction hook (Phase 2a).
-        # The store is operator-managed via ``mimir commitments`` plus
-        # the extraction hook on saga_session_end turns. Lives under
-        # ``.mimir/commitments.jsonl`` (alongside session_boundaries)
-        # so the indexer doesn't walk it as "knowledge."
-        from .commitments.store import CommitmentsStore
-        self._commitments = CommitmentsStore(path=self._config.commitments_log)
 
         # Per-turn lifecycle hooks (CR#15). Each fires at one of four
         # seams in run_turn: pre_query / on_message / post_query /
@@ -1562,6 +1563,33 @@ class Agent:
             log.exception("_assemble_upcoming_block failed; skipping")
             return None
 
+    def _assemble_commitments_block(
+        self, channel_id: str | None,
+    ) -> str | None:
+        """Phase 3: ``## Upcoming commitments`` block — active records
+        for this channel (+ unbound). Suppressed on synthetic
+        ``scheduler:*`` / ``poller:*`` channels (the agent doesn't act
+        on commitments from a heartbeat tick context).
+
+        ``None`` when no active records to surface."""
+        if channel_id is None:
+            return None
+        from .history import SYNTHETIC_CHANNEL_PREFIXES
+        if channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES):
+            return None
+        try:
+            from .commitments.render import render_commitments_block
+            records = self._commitments.list(
+                channel_id=channel_id,
+                include_unbound=True,
+            )
+            return render_commitments_block(records)
+        except Exception:  # noqa: BLE001 — never crash a turn for this
+            log.exception(
+                "_assemble_commitments_block failed; skipping"
+            )
+            return None
+
     def _assemble_self_state_block(self) -> str | None:
         """v0.5+ §12.4: render the `## Self-state` block — homeostat's
         view of the four layered constraints (plan window / cost rate /
@@ -2019,6 +2047,9 @@ class Agent:
         for event_kind, event_kwargs in deferred_usage_events:
             self._spawn_bg_task(log_event(event_kind, **event_kwargs))
         upcoming_block = self._assemble_upcoming_block()
+        commitments_block = self._assemble_commitments_block(
+            channel_id=event.channel_id,
+        )
         self_state_block = await asyncio.to_thread(
             self._assemble_self_state_block,
         )
@@ -2033,6 +2064,7 @@ class Agent:
             session_summaries_block=session_summaries_block,
             usage_block=usage_block,
             upcoming_block=upcoming_block,
+            commitments_block=commitments_block,
             self_state_block=self_state_block,
             # chainlink #23 #26 Option P: surface this turn's
             # saga_session_id so the model can pass it as ``session_id``
