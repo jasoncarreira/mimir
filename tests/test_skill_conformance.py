@@ -159,6 +159,10 @@ _KNOWN_MCP_TOOLS = frozenset(
         "bash_jobs_list",
         "bash_job_output",
         "spawn_claude_code",
+        "commitment_complete",
+        "commitment_snooze",
+        "commitment_dismiss",
+        "commitment_list",
     }
 )
 
