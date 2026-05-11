@@ -710,9 +710,20 @@ class Scheduler:
         are deployable artifacts, ``state/`` is persistent runtime).
         Falls back to the skill_dir when ``self._home`` isn't set
         (tests / niche call sites). See ``mimir/pollers.py`` for the
-        full contract."""
+        full contract.
+
+        Any ``poller_reload_invalid_manifest`` events produced by the
+        underlying ``_reinstall_pollers`` call are scheduled via the
+        running event loop when one is present (startup-time callers
+        like ``server.py`` run this from within an awaited init
+        coroutine), or dropped to ``log.warning`` otherwise (test
+        harnesses without a loop). Mirrors the pattern in
+        ``_on_job_missed``.
+        """
         self._pollers_dir = skills_dir
-        return self._reinstall_pollers()
+        installed, invalid_events = self._reinstall_pollers()
+        self._dispatch_invalid_manifest_events(invalid_events)
+        return installed
 
     async def reload_pollers(self) -> int:
         """Re-scan the pollers directory and re-install. Called by the
@@ -726,15 +737,43 @@ class Scheduler:
         Without the lock, two concurrent ``_reinstall_pollers``
         invocations could race the APScheduler ``add_job`` /
         ``remove_job`` mutations.
+
+        **Algedonic on malformed manifests (chainlink #84).** A
+        ``pollers.json`` that fails to JSON-parse mid-edit no longer
+        silently drops the previously-installed poller — the prior
+        entry is preserved AND a ``poller_reload_invalid_manifest``
+        event lands in events.jsonl with the failing path + error +
+        names of preserved pollers. The drop loop only fires for
+        manifests that parsed cleanly but no longer contain the
+        poller (i.e. operator intentionally removed it).
         """
         if self._pollers_dir is None:
             return 0
         async with self._mutate_lock:
-            return await asyncio.to_thread(self._reinstall_pollers)
+            installed, invalid_events = await asyncio.to_thread(
+                self._reinstall_pollers,
+            )
+        # Emit invalid-manifest algedonic events from the awaited
+        # caller (we have a running loop here, unlike inside the
+        # ``to_thread`` worker). Outside the mutate lock — the events
+        # are observational, not mutating, and holding the lock
+        # across awaited disk writes would just widen the contention
+        # window.
+        for payload in invalid_events:
+            await log_event("poller_reload_invalid_manifest", **payload)
+        return installed
 
-    def _reinstall_pollers(self) -> int:
+    def _reinstall_pollers(self) -> tuple[int, list[dict[str, Any]]]:
         """Wipe + re-discover + re-register. Sync — runs on the
         APScheduler thread or via ``to_thread`` from async callers.
+
+        Returns ``(installed_count, invalid_manifest_events)``. The
+        second element is a list of event payloads (one per
+        ``pollers.json`` whose JSON parse failed this reload). Callers
+        in async contexts emit each as a
+        ``poller_reload_invalid_manifest`` algedonic event;
+        ``add_poller_jobs`` (sync) routes through
+        ``_dispatch_invalid_manifest_events``.
 
         **Per-entry pre-population, not end-of-loop swap (PR #107
         review fix).** A previous version of this function built a
@@ -753,36 +792,86 @@ class Scheduler:
         cleaned up before the install loop, against the discovered
         name set, so the live dict stays an accurate snapshot
         throughout.
+
+        **Preserve-on-parse-failure (chainlink #84).** When a
+        previously-installed poller's manifest fails to JSON-parse on
+        this reload, the prior entry is kept in ``self._pollers``
+        AND the APScheduler job stays registered (never removed in
+        Phase 2 for that manifest path) so an operator's mid-edit
+        syntax error doesn't silently knock a working poller offline.
+        Clean manifest deletion (file gone, not just broken) still
+        drops the poller — only **parse** failures preserve. A
+        ``poller_reload_invalid_manifest`` algedonic event surfaces
+        the failing path + parse error + preserved names so the
+        operator sees the situation in events.jsonl.
         """
         if self._pollers_dir is None:
-            return 0
+            return 0, []
 
         # Phase 1: discover. ``list(...)`` materializes the iterator so
         # we know all pollers' names up-front for the stale-entry
         # cleanup below. Discovery is sync and bounded by the number
         # of skills' ``pollers.json`` files (~10s, not 1000s).
+        # ``invalid_manifests`` (chainlink #84) collects ``pollers.json``
+        # paths whose JSON parse failed — we preserve previously
+        # -installed pollers from those manifests instead of dropping
+        # them.
         state_root = (
             self._home / "state" / "pollers"
             if self._home is not None else None
         )
+        invalid_manifests: list[tuple[Path, str]] = []
         discovered = list(
-            discover_pollers(self._pollers_dir, state_root=state_root)
+            discover_pollers(
+                self._pollers_dir,
+                state_root=state_root,
+                invalid_manifests=invalid_manifests,
+            )
         )
         new_names = {p.name for p in discovered}
+        invalid_paths = {path for path, _err in invalid_manifests}
+
+        # Map of failing manifest_path → previously-installed names,
+        # so we can identify which existing entries belong to a manifest
+        # that failed to parse on this reload and must be preserved.
+        # Manifests that were already in ``self._pollers`` from a
+        # pre-chainlink-#84 reload will have ``manifest_path=None`` and
+        # fall through to the normal stale check — operator restart
+        # picks up the new ``manifest_path`` for any future reloads.
+        preserved_names_by_path: dict[Path, list[str]] = {}
+        for existing_name, existing_cfg in self._pollers.items():
+            if (
+                existing_cfg.manifest_path is not None
+                and existing_cfg.manifest_path in invalid_paths
+            ):
+                preserved_names_by_path.setdefault(
+                    existing_cfg.manifest_path, [],
+                ).append(existing_name)
+        preserved_names = {
+            name for names in preserved_names_by_path.values() for name in names
+        }
 
         # Phase 2: drop stale APScheduler jobs and dict entries.
         # Removed before install so a fire that lands during this loop
         # against a removed poller correctly logs poller_fire_dropped
-        # (the poller really IS gone).
+        # (the poller really IS gone). Pollers whose manifest failed
+        # to parse this reload are PRESERVED — their job stays
+        # registered with the prior cron, dict entry stays put.
         for job in list(self._scheduler.get_jobs()):
-            if job.id.startswith(POLLER_CHANNEL_PREFIX):
-                try:
-                    self._scheduler.remove_job(job.id)
-                except Exception:  # noqa: BLE001 — JobLookupError, fine
-                    pass
+            if not job.id.startswith(POLLER_CHANNEL_PREFIX):
+                continue
+            # ``poller:<name>`` — strip the prefix to recover the name.
+            job_poller_name = job.id[len(POLLER_CHANNEL_PREFIX):]
+            if job_poller_name in preserved_names:
+                continue
+            try:
+                self._scheduler.remove_job(job.id)
+            except Exception:  # noqa: BLE001 — JobLookupError, fine
+                pass
         for name in list(self._pollers):
-            if name not in new_names:
-                del self._pollers[name]
+            if name in new_names or name in preserved_names:
+                continue
+            del self._pollers[name]
 
         # Phase 3: validate cron + register. Pre-populate the dict
         # entry BEFORE add_job so a fire landing during job
@@ -823,7 +912,48 @@ class Scheduler:
             )
             installed += 1
         log.info("pollers reloaded: %d installed from %s", installed, self._pollers_dir)
-        return installed
+
+        # Build algedonic event payloads (chainlink #84). One per
+        # invalid manifest, with the names of pollers preserved from
+        # that path so the operator can correlate the log line with
+        # which working pollers were rescued.
+        invalid_events: list[dict[str, Any]] = []
+        for path, err in invalid_manifests:
+            invalid_events.append({
+                "manifest_path": str(path),
+                "error": err,
+                "preserved_pollers": sorted(
+                    preserved_names_by_path.get(path, []),
+                ),
+            })
+        return installed, invalid_events
+
+    def _dispatch_invalid_manifest_events(
+        self,
+        events: list[dict[str, Any]],
+    ) -> None:
+        """Emit ``poller_reload_invalid_manifest`` events from a sync
+        context (``add_poller_jobs``). When a running event loop is
+        available (server.py startup is awaited init), schedule the
+        async ``log_event`` via ``create_task``. Otherwise fall back
+        to ``log.warning`` so the event isn't silently lost. Mirrors
+        the pattern in ``_on_job_missed``.
+        """
+        if not events:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            for payload in events:
+                log.warning(
+                    "poller_reload_invalid_manifest (no loop): %s",
+                    payload,
+                )
+            return
+        for payload in events:
+            loop.create_task(
+                log_event("poller_reload_invalid_manifest", **payload),
+            )
 
     async def _fire_poller(self, *, poller_name: str) -> None:
         """APScheduler-side cron callback. Looks up the live PollerConfig
