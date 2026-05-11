@@ -771,3 +771,128 @@ def test_find_trim_candidates_returns_record_objects(tmp_path: Path):
     assert cid == rid
     assert rec.text == "payload"
     assert rec.kind == CommitmentKind.AGENT_PROMISE.value
+
+
+# ─── chainlink #82 sub #86: JSONL schema version envelope ───────────
+
+
+@pytest.mark.asyncio
+async def test_append_stamps_schema_version_on_every_event(tmp_path: Path):
+    """Every event written through ``_append`` carries the current
+    schema version under the ``v`` key — covers add + every lifecycle
+    method (delivered, completed, snoozed, dismissed, expired,
+    pileup_alarmed). Chainlink #82 sub #86."""
+    from mimir.commitments.store import COMMITMENTS_JSONL_SCHEMA_VERSION
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1", text="t",
+        kind=CommitmentKind.AGENT_PROMISE.value,
+    ))
+    await store.deliver(rec.id)
+    await store.snooze(rec.id, until_unix=time.time() + 60)
+    await store.complete(rec.id)
+    await store.alarm_pileup(rec.id)
+    lines = store.path.read_text().splitlines()
+    assert len(lines) >= 4
+    for line in lines:
+        event = json.loads(line)
+        assert event.get("v") == COMMITMENTS_JSONL_SCHEMA_VERSION, (
+            f"missing/wrong v on event {event!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_replay_treats_missing_v_as_current_version(tmp_path: Path):
+    """Legacy events (appended before chainlink #82 sub #86 landed)
+    have no ``v`` key. Replay must treat them as the current schema —
+    that's the backward-compat guarantee."""
+    path = tmp_path / "c.jsonl"
+    rid = make_commitment_id()
+    rec_data = {
+        "id": rid,
+        "channel_id": "c1",
+        "text": "legacy",
+        "kind": CommitmentKind.AGENT_PROMISE.value,
+        "status": CommitmentStatus.PENDING.value,
+        "created_at_unix": time.time(),
+        "dedupe_key": make_dedupe_key(
+            channel_id="c1", text="legacy", due_window_start_unix=None,
+        ),
+    }
+    # Legacy: no v field
+    legacy_event = {
+        "type": "commitment_added",
+        "ts_unix": time.time(),
+        "id": rid,
+        "record": rec_data,
+    }
+    path.write_text(json.dumps(legacy_event) + "\n")
+    store = CommitmentsStore(path=path)
+    state = store.current_state()
+    assert rid in state
+    assert state[rid].text == "legacy"
+
+
+@pytest.mark.asyncio
+async def test_replay_skips_future_schema_version(tmp_path: Path, caplog):
+    """Events stamped with v greater than this build's schema version
+    are skipped on replay (the new event might rely on fields this
+    build doesn't know about — replaying as-is risks corrupt state).
+    A warning is logged so the operator sees the version skew."""
+    import logging
+    from mimir.commitments.store import COMMITMENTS_JSONL_SCHEMA_VERSION
+    path = tmp_path / "c.jsonl"
+    rid = make_commitment_id()
+    future_event = {
+        "v": COMMITMENTS_JSONL_SCHEMA_VERSION + 1,
+        "type": "commitment_added",
+        "ts_unix": time.time(),
+        "id": rid,
+        "record": {
+            "id": rid, "channel_id": "c1", "text": "from-future",
+            "kind": CommitmentKind.AGENT_PROMISE.value,
+            "status": CommitmentStatus.PENDING.value,
+            "created_at_unix": time.time(),
+        },
+    }
+    path.write_text(json.dumps(future_event) + "\n")
+    store = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        state = store.current_state()
+    assert rid not in state  # future event dropped
+    assert any(
+        "future schema" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_skips_malformed_v(tmp_path: Path, caplog):
+    """A ``v`` field that isn't parseable as int (e.g. dict, list,
+    non-numeric string) gets skipped with a warning. Defensive against
+    a corrupt write."""
+    import logging
+    path = tmp_path / "c.jsonl"
+    rid = make_commitment_id()
+    bad_v_event = {
+        "v": {"unexpected": "shape"},
+        "type": "commitment_added",
+        "ts_unix": time.time(),
+        "id": rid,
+        "record": {
+            "id": rid, "channel_id": "c1", "text": "bad-v",
+            "kind": CommitmentKind.AGENT_PROMISE.value,
+            "status": CommitmentStatus.PENDING.value,
+            "created_at_unix": time.time(),
+        },
+    }
+    path.write_text(json.dumps(bad_v_event) + "\n")
+    store = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        state = store.current_state()
+    assert rid not in state
+    assert any(
+        "malformed v" in r.getMessage()
+        for r in caplog.records
+    )

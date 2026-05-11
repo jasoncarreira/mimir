@@ -44,6 +44,32 @@ log = logging.getLogger(__name__)
 DEFAULT_TERMINAL_RETENTION_DAYS = 30
 
 
+#: Current schema version for every event appended to the JSONL.
+#: Stamped on every appended event under the ``v`` key so future
+#: schema changes (field rename, required-field add, event-type
+#: split) can be implemented as a versioned replay path without
+#: breaking deployments that already have events on disk.
+#:
+#: Replay treatment (see :meth:`CommitmentsStore._apply_event`):
+#:
+#: - ``v`` absent → treated as v1 (legacy events appended before
+#:   chainlink #82 sub #86 landed). The current event shape IS v1,
+#:   so this is the safe default.
+#: - ``v == 1`` → current shape; replay as-is.
+#: - ``v > 1`` → unknown major; log a warning and skip the event.
+#:   The next agent build that knows about that version will replay
+#:   it correctly.
+#:
+#: When evolving the schema:
+#:
+#: 1. Bump ``COMMITMENTS_JSONL_SCHEMA_VERSION``.
+#: 2. Add per-version handling in ``_apply_event`` (or a dispatch
+#:    table keyed on ``v``).
+#: 3. Land a migration test that asserts the new version replays
+#:    correctly AND that old (v < new) events still replay.
+COMMITMENTS_JSONL_SCHEMA_VERSION = 1
+
+
 @dataclass
 class CommitmentsStore:
     """Owns ``<path>`` — typically ``<home>/.mimir/commitments.jsonl``.
@@ -63,6 +89,13 @@ class CommitmentsStore:
     # ─── Appenders ──────────────────────────────────────────────────
 
     async def _append(self, event: dict[str, Any]) -> None:
+        # Stamp the schema version (chainlink #82 sub #86): every
+        # appended event carries ``"v": COMMITMENTS_JSONL_SCHEMA_VERSION``
+        # so a future schema change can be implemented as a versioned
+        # replay path. Callers must not pre-set ``v`` — _append is the
+        # single source of truth for the current version. Defensive
+        # overwrite handles a stray copy-paste in the lifecycle methods.
+        event = {**event, "v": COMMITMENTS_JSONL_SCHEMA_VERSION}
         async with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as f:
@@ -281,6 +314,32 @@ class CommitmentsStore:
     def _apply_event(
         records: dict[str, CommitmentRecord], event: dict,
     ) -> None:
+        # Schema version gate (chainlink #82 sub #86).
+        #
+        # - Absent ``v`` field → legacy event appended before the
+        #   version stamp landed; treat as v1 (current shape).
+        # - ``v`` present and known → replay as-is (current code path).
+        # - ``v`` greater than the version this build knows → log a
+        #   warning and skip. The next build that recognizes that
+        #   version will replay it correctly. We deliberately do NOT
+        #   silently down-grade — that risks lossy replay of events
+        #   the new schema considers load-bearing.
+        v = event.get("v", COMMITMENTS_JSONL_SCHEMA_VERSION)
+        try:
+            v_int = int(v)
+        except (TypeError, ValueError):
+            log.warning(
+                "commitments: skipping event with malformed v=%r", v,
+            )
+            return
+        if v_int > COMMITMENTS_JSONL_SCHEMA_VERSION:
+            log.warning(
+                "commitments: skipping event with future schema "
+                "v=%d (this build understands up to v=%d). Upgrade "
+                "to a build that knows this version to replay.",
+                v_int, COMMITMENTS_JSONL_SCHEMA_VERSION,
+            )
+            return
         et = event.get("type")
         rid = event.get("id")
         if not et or not rid:
