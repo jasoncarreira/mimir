@@ -165,6 +165,24 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "claude_code_spawn_completed": ("positive", "spawn_ok"),
     "claude_code_spawn_auth_failed": ("negative", "spawn_auth_fail"),
     "claude_code_spawn_work_failed": ("negative", "spawn_work_fail"),
+    # Commitments Phase 2b — periodic due-check sweep emits these.
+    # ``commitment_due``: positive — "informational follow-through
+    # nudge." The commitment is in its due window and the agent should
+    # act. Not a miss; not a failure. Mimir's positive signals are
+    # gentler than negative; this fits the same shape as the
+    # "saga_feedback_sent" positive line.
+    # ``commitment_expired``: negative — the window fully elapsed
+    # without the agent acting. This IS a miss; surface it loudly so
+    # the next session-end synthesis can reason about why.
+    "commitment_due": ("positive", "commitment_due"),
+    "commitment_expired": ("negative", "commitment_expired"),
+    # Phase 2b: pileup signal. Fires when any single commitment's
+    # snooze_count crosses the threshold (default 3). Surfaces
+    # "I keep punting this thing" as a feedback loop so the next
+    # session-end synthesis reflects on overcommitment / avoidance.
+    # Negative polarity — pileups are an avoidance smell, not a
+    # neutral event.
+    "commitment_snooze_pileup": ("negative", "commitment_snooze_pileup"),
 }
 
 
@@ -270,6 +288,21 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # rule_kind (line 128 maps event ``saga_feedback_sent`` → kind
     # ``saga_feedback``), not the raw event type.
     "saga_feedback",
+    # Commitments Phase 2b. The poller fires every 5 min and the same
+    # commitment (eg. "review PR #111") could surface in N sweeps if
+    # the agent hasn't acted. Latest-only keeps the algedonic block
+    # focused on "most-recently-due commitment" + "most-recent expiry"
+    # — the Phase 3 prompt-builder block carries the full pending list
+    # so no information is lost; the algedonic line is the attention-
+    # grabber.
+    "commitment_due",
+    "commitment_expired",
+    # Phase 2b: snooze pileup fires from the poller every tick while
+    # any commitment is above threshold. Latest-only at the algedonic
+    # layer means one line surfaces — the most recently flagged
+    # commitment. The full pending list lives in the Phase 3 prompt
+    # block so the agent can see all the offenders if needed.
+    "commitment_snooze_pileup",
 }
 
 # CR2 (memory & retrieval) invariant: polarity-dynamic kinds (their
@@ -717,6 +750,58 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "saga_feedback":
         n = ev.get("n_atoms")
         return f"saga_feedback_sent ({n} atoms credited)"
+    if rule_kind == "commitment_due":
+        # Phase 2b. Surface the commitment ID + channel + text so the
+        # agent can match the prompt-builder block's structured list
+        # against the algedonic nudge. The Phase 3 prompt block
+        # carries the canonical pending list; this is the
+        # attention-grabber on the most-recently-due one.
+        cid = ev.get("commitment_id") or "?"
+        text = (ev.get("text") or "").strip()
+        if len(text) > 80:
+            text = text[:77] + "..."
+        channel = ev.get("channel_id")
+        recipient = ev.get("recipient_identity")
+        scope_parts: list[str] = []
+        if channel:
+            scope_parts.append(f"chan={channel}")
+        if recipient:
+            scope_parts.append(f"@{recipient}")
+        scope = f" [{', '.join(scope_parts)}]" if scope_parts else ""
+        return f"commitment due {cid}{scope}: {text}"
+    if rule_kind == "commitment_expired":
+        # Phase 2b — the actual miss. Negative polarity so it surfaces
+        # in the agent's "things to notice" block. Same shape as the
+        # _due line above; the polarity is the load-bearing difference.
+        cid = ev.get("commitment_id") or "?"
+        text = (ev.get("text") or "").strip()
+        if len(text) > 80:
+            text = text[:77] + "..."
+        channel = ev.get("channel_id")
+        scope = f" [chan={channel}]" if channel else ""
+        return (
+            f"commitment EXPIRED {cid}{scope}: {text} — "
+            f"due window elapsed without follow-through. "
+            f"Reflect at next session boundary."
+        )
+    if rule_kind == "commitment_snooze_pileup":
+        # Phase 2b — "this commitment keeps getting punted." Operator
+        # framing: snooze counts starting to rise is an avoidance /
+        # overcommitment smell worth reflecting on at the next session
+        # boundary. Negative polarity; first-occurrence-only dedup so
+        # the line surfaces ONCE in the algedonic block even as the
+        # poller fires it on every tick.
+        cid = ev.get("commitment_id") or "?"
+        text = (ev.get("text") or "").strip()
+        if len(text) > 80:
+            text = text[:77] + "..."
+        n = ev.get("snooze_count", "?")
+        threshold = ev.get("threshold", "?")
+        return (
+            f"commitment {cid} snoozed {n}× (threshold {threshold}): "
+            f"{text} — consider committing or dismissing rather than "
+            f"snoozing again."
+        )
     if rule_kind == "react":
         emoji = ev.get("emoji") or "?"
         author = ev.get("author") or "?"

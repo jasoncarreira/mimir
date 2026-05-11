@@ -30,7 +30,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+if TYPE_CHECKING:
+    from .commitments.store import CommitmentsStore
 
 import yaml
 from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
@@ -1047,6 +1050,77 @@ class Scheduler:
             misfire_grace_time=3600,
             max_instances=1,
             coalesce=False,
+        )
+
+    # ---- Commitments due-check cron ----------------------------------
+
+    # VSM: S3 (commitments-internal) — periodic sweep of the
+    #      commitments store. Emits ``commitment_due`` (positive,
+    #      first-occurrence-only) on records whose due window opened,
+    #      and ``commitment_expired`` (negative, first-occurrence-only)
+    #      on records whose due window has fully elapsed. Marks each
+    #      via store.deliver() / store.expire() so the next sweep
+    #      doesn't re-emit.
+    # loop_id: 4.10 (commitments Phase 2b)
+    def add_commitments_due_check_job(
+        self,
+        commitments_store: "CommitmentsStore",
+        cron_expr: str,
+        *,
+        snooze_pileup_threshold: int = 3,
+        job_id: str = "commitments-due-check",
+    ) -> bool:
+        """Register the commitments due-check cron.
+
+        ``commitments_store`` is ``Agent._commitments`` — the per-agent
+        ``CommitmentsStore`` instance (path = ``<home>/.mimir/
+        commitments.jsonl``). The job is in-process; it reads the
+        store and writes both to the store (deliver/expire) and to
+        events.jsonl (algedonic events).
+
+        Default cron is operator-tuneable via the env var
+        ``MIMIR_COMMITMENTS_DUE_CHECK_CRON`` plumbed through
+        ``Config.from_env``. ``*/5 * * * *`` (every 5 minutes) is the
+        ship default — fine-grained enough that an operator who
+        commits to "remind me at 14:00" sees the reminder within
+        5 minutes of 14:00, coarse-grained enough that the sweep cost
+        (replay + 0–N deliver/expire writes) is negligible relative
+        to the rest of the agent loop.
+        """
+        async def _run() -> None:
+            try:
+                from .commitments.poller import check_due_and_expired
+                result = await check_due_and_expired(
+                    commitments_store,
+                    snooze_pileup_threshold=snooze_pileup_threshold,
+                )
+                # Rollup event — single line per sweep, not per record.
+                # Only emit when SOMETHING happened (due / expired /
+                # pileup) to keep events.jsonl from accruing one no-op
+                # record per poll tick.
+                if (result.due_emitted or result.expired_emitted
+                        or result.snooze_pileup_emitted):
+                    await log_event(
+                        "commitments_due_check_ok",
+                        due_emitted=result.due_emitted,
+                        expired_emitted=result.expired_emitted,
+                        snooze_pileup_emitted=result.snooze_pileup_emitted,
+                        scanned=result.scanned,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                await log_event(
+                    "commitments_due_check_error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+        return self.register_callable(
+            name=job_id,
+            fn=_run,
+            default_cron=cron_expr,
+            job_id=job_id,
+            misfire_grace_time=300,
+            max_instances=1,
+            coalesce=True,  # if the agent was paused, don't catch up
         )
 
     # ---- OAuth usage poller cron -------------------------------------

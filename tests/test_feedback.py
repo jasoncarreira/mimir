@@ -663,3 +663,96 @@ def test_pending_forget_persists_when_forget_predates_decay(tmp_path: Path):
 
 def test_pending_forget_returns_none_when_file_missing(tmp_path: Path):
     assert pending_forget_candidates_count(tmp_path / "nope.jsonl") is None
+
+
+# ─── Commitments Phase 2b ───────────────────────────────────────────
+
+
+def test_commitment_due_renders_with_metadata(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(0.5), "type": "commitment_due",
+         "commitment_id": "c-abc12", "channel_id": "chan-1",
+         "text": "Review PR #111",
+         "recipient_identity": "alice",
+         "suggested_reminder": "PR #111 still open",
+         "kind": "agent_promise"},
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "Positive" in block
+    assert "c-abc12" in block
+    assert "Review PR #111" in block
+    assert "@alice" in block
+    assert "chan=chan-1" in block
+
+
+def test_commitment_expired_is_negative(tmp_path: Path):
+    """commitment_expired surfaces under Negative with the 'reflect at
+    next session boundary' framing — operator can grep for EXPIRED in
+    the prompt block."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(0.5), "type": "commitment_expired",
+         "commitment_id": "c-ghi34", "channel_id": "chan-2",
+         "text": "Send draft",
+         "kind": "agent_promise"},
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "Negative" in block
+    assert "EXPIRED" in block
+    assert "c-ghi34" in block
+    assert "Send draft" in block
+    assert "next session boundary" in block
+
+
+def test_commitment_due_dedup_to_latest(tmp_path: Path):
+    """First-occurrence-only at the algedonic layer — multiple
+    commitment_due lines in a single window surface only the most
+    recent (Phase 3 prompt block carries the full pending list)."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(5.0), "type": "commitment_due",
+         "commitment_id": "c-old", "text": "First", "kind": "agent_promise"},
+        {"timestamp": _ts(2.0), "type": "commitment_due",
+         "commitment_id": "c-mid", "text": "Middle", "kind": "agent_promise"},
+        {"timestamp": _ts(0.5), "type": "commitment_due",
+         "commitment_id": "c-new", "text": "Newest", "kind": "agent_promise"},
+    ])
+    block = log.recent_block()
+    assert block is not None
+    # Only the newest should render.
+    assert "c-new" in block
+    assert "c-old" not in block
+    assert "c-mid" not in block
+
+
+def test_commitment_snooze_pileup_negative(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(0.5), "type": "commitment_snooze_pileup",
+         "commitment_id": "c-punted",
+         "text": "Read paper",
+         "snooze_count": 4,
+         "threshold": 3,
+         "kind": "open_loop"},
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "Negative" in block
+    assert "c-punted" in block
+    assert "4×" in block
+    assert "threshold 3" in block
+    assert "committing or dismissing" in block
+
+
+def test_commitments_polarity_dynamic_invariant_holds():
+    """Adding the 3 new commitment_* kinds must not break the
+    polarity-dynamic disjointness invariant (assertion in
+    feedback.py at import time)."""
+    from mimir.feedback import (
+        _FIRST_OCCURRENCE_ONLY_KINDS,
+        _POLARITY_DYNAMIC_KINDS,
+    )
+    new_kinds = {
+        "commitment_due", "commitment_expired", "commitment_snooze_pileup",
+    }
+    assert new_kinds.issubset(_FIRST_OCCURRENCE_ONLY_KINDS)
+    assert _POLARITY_DYNAMIC_KINDS.isdisjoint(new_kinds)

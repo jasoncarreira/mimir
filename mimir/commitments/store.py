@@ -230,6 +230,29 @@ class CommitmentsStore:
         })
         return True
 
+    async def alarm_pileup(self, id: str) -> bool:
+        """Record that a ``commitment_snooze_pileup`` algedonic event
+        was emitted for this record. PR #126 review #2: bumps
+        ``pileup_alarmed_at_unix`` so the poller's 24h cooldown
+        suppresses re-emission. Idempotent — calling again on an
+        already-alarmed record just updates the timestamp.
+
+        Annotational, not a status transition: ``VALID_TRANSITIONS``
+        isn't consulted; the record's status is untouched. Returns
+        True if appended, False on unknown id."""
+        if id not in self.current_state():
+            log.warning(
+                "commitments: alarm_pileup for unknown id %s", id,
+            )
+            return False
+        await self._append({
+            "type": "commitment_pileup_alarmed",
+            "ts_unix": time.time(),
+            "id": id,
+            "at_unix": time.time(),
+        })
+        return True
+
     # ─── Replay-to-state ────────────────────────────────────────────
 
     def current_state(self) -> dict[str, CommitmentRecord]:
@@ -290,6 +313,14 @@ class CommitmentsStore:
             # crashing the replay).
             log.debug("commitments: lifecycle event for unknown id %s", rid)
             return
+        # PR #126 review #2: annotational events (no status change,
+        # just field update). Handle BEFORE the VALID_TRANSITIONS
+        # guard since they don't model a transition. Currently just
+        # ``commitment_pileup_alarmed`` — fires the 24h cooldown
+        # bookkeeping for the snooze-pileup poller.
+        if et == "commitment_pileup_alarmed":
+            rec.pileup_alarmed_at_unix = event.get("at_unix")
+            return
         # PR #120 review finding #1: reject transitions not in the
         # ``VALID_TRANSITIONS`` adjacency. The common case this
         # defends against: a late ``commitment_expired`` from the
@@ -322,6 +353,10 @@ class CommitmentsStore:
             rec.status = CommitmentStatus.SNOOZED.value
             rec.snoozed_until_unix = event.get("until_unix")
             rec.snooze_reason = event.get("reason")
+            # Phase 2b: bump per-record snooze counter. The poller
+            # uses this to detect commitments that keep getting
+            # punted (≥ threshold → ``commitment_snooze_pileup``).
+            rec.snooze_count += 1
             # Slide the due window so the snoozed_until becomes the
             # new "earliest deliver" anchor for surfacing logic.
             # PR #120 review finding #3: also bump the end so a
