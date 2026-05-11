@@ -1,0 +1,65 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies (with dev extras)
+        # ``--extra dev`` is REQUIRED — plain ``uv sync`` skips
+        # pytest-aiohttp and other dev-only deps, which produces
+        # cascading ``fixture 'aiohttp_server' not found`` errors
+        # (see memory/issues/pytest-aiohttp-dev-extras.md).
+        run: uv sync --extra dev
+
+      - name: Run pytest
+        # Workspace member ``saga/`` lives under /workspace/mimir
+        # and is editable-installed via [tool.uv.sources]. Tests
+        # for both packages live under ``tests/`` (mimir) and
+        # ``saga/tests/`` (saga); we run mimir's suite here.
+        run: uv run pytest tests/ -q --tb=short
+
+  skill-conformance:
+    # Fast gate — runs even on the same matrix entries but as a
+    # dedicated job so PR status shows a single ``skill-conformance``
+    # check the SKILL-author can grep for. Catches the body-vs-declared
+    # ``allowed-tools`` drift gap that pre-beta review flagged as
+    # blocker #88 (no CI catching skill_conformance regressions).
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Sync dependencies (with dev extras)
+        run: uv sync --extra dev
+
+      - name: Skill conformance + catalog tests
+        run: |
+          uv run pytest tests/test_skill_conformance.py tests/test_skill_catalog.py -v
