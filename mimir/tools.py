@@ -27,6 +27,8 @@ from claude_agent_sdk import McpSdkServerConfig, create_sdk_mcp_server, tool
 
 from .channel_registry import ChannelRegistry
 from .channeltools import build_channel_tools, channel_tool_names
+from .commitments.store import CommitmentsStore
+from .committools import build_commitment_tools, commitment_tool_names
 from .history import MessageBuffer
 from .saga_client import SagaClient
 from .sagatools import build_saga_tools, saga_tool_names
@@ -233,6 +235,7 @@ def build_mcp_server(
     on_shell_job_complete: Any | None = None,
     schedule_from_thread: Any | None = None,
     mimir_home: Path | None = None,
+    commitments_store: CommitmentsStore | None = None,
 ) -> McpSdkServerConfig:
     """Bundle the in-process MCP tools (everything with no SDK preset)."""
     tools = [echo]
@@ -264,6 +267,13 @@ def build_mcp_server(
             schedule_from_thread=schedule_from_thread,
             chain_on_complete=on_shell_job_complete,
         )
+    if commitments_store is not None:
+        # Phase 2c: agent-facing commitment lifecycle tools
+        # (complete / snooze / dismiss / list). Pair the prompt-block
+        # visibility (Phase 3) with action affordances so the agent
+        # can resolve commitments inline instead of waiting for the
+        # operator CLI.
+        tools += build_commitment_tools(commitments_store)
     if channel_registry is not None:
         # send_message fires SAGA mark_contributions when saga_client is
         # available; handles the credit pass at the actual reply boundary
@@ -301,6 +311,7 @@ def allowed_tool_names(
     include_turns: bool = True,
     include_shell: bool = True,
     include_spawn: bool = True,
+    include_commitments: bool = True,
 ) -> list[str]:
     """Names referenced in ``ClaudeAgentOptions.allowed_tools`` — both SDK
     preset names and ``mcp__mimir__*`` MCP tool names."""
@@ -319,4 +330,6 @@ def allowed_tool_names(
         names += shell_tool_names()
     if include_spawn:
         names += spawn_tool_names()
+    if include_commitments:
+        names += commitment_tool_names()
     return names

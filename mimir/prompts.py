@@ -182,6 +182,7 @@ def build_turn_prompt(
     session_summaries_block: str | None = None,
     usage_block: str | None = None,
     upcoming_block: str | None = None,
+    commitments_block: str | None = None,
     self_state_block: str | None = None,
     saga_session_id: str | None = None,
 ) -> str:
@@ -257,6 +258,15 @@ def build_turn_prompt(
     # agent reads "what's coming" before "what just happened."
     if upcoming_block:
         _add_labeled("Upcoming", upcoming_block)
+
+    # Upcoming commitments (Phase 3): active commitment records for
+    # this channel (+ unbound). Sits right after `## Upcoming` because
+    # both are feedforward — what's coming the agent should know about.
+    # Most extracted commitments lack unix-second anchors, so the
+    # Phase 2b poller can't fire algedonic events for them; this block
+    # is how those hint-only commitments stay visible.
+    if commitments_block:
+        _add_labeled("Upcoming commitments", commitments_block)
 
     # Self-state (FUTURE_WORK §12.4): the homeostat's interpretation of
     # the four constraint layers (plan window / cost rate / S3-S4
