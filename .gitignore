@@ -59,3 +59,8 @@ home/
 
 # Agent home dotenv (in case a smoke run spits one out at workspace root).
 .env
+
+# Local scratch / spike / backtest artifacts. Keep WIP scripts and
+# one-shot data dumps out of the repo (e.g. commitments-extraction
+# backtest results, throwaway profiling output).
+/scratch/
