@@ -161,6 +161,51 @@ def test_render_catalog_handles_empty_allowed_tools() -> None:
     assert "| `silent` | No tools needed | — |" in output
 
 
+def test_load_skill_handles_empty_description(tmp_path: Path) -> None:
+    """``description:`` present but empty — both ``_extract_trigger`` and
+    the row renderer must handle it cleanly (em-dash sentinel, no crash).
+    PR #131 review feedback: the other edge cases (missing SKILL.md,
+    malformed frontmatter, missing name, missing allowed-tools) are
+    pinned; this one wasn't."""
+    skill_dir = _make_skill(
+        tmp_path,
+        "blank-desc",
+        "---\n"
+        "name: blank-desc\n"
+        "description: \n"
+        "allowed-tools:\n"
+        "  - Read\n"
+        "---\n",
+    )
+    entry = load_skill(skill_dir)
+    assert entry is not None
+    assert entry.description == ""
+    assert entry.trigger == ""
+    output = render_catalog([entry])
+    # Empty trigger renders as the em-dash sentinel (matches empty-tools
+    # cell convention, so the table doesn't have visually-empty cells).
+    assert "| `blank-desc` | — | `Read` |" in output
+    # Per-skill section falls back to the explicit "no description" stub.
+    assert "_(no description)_" in output
+
+
+def test_load_skill_handles_omitted_description(tmp_path: Path) -> None:
+    """``description:`` entirely omitted from frontmatter — same fallback
+    path as the explicitly-empty case."""
+    skill_dir = _make_skill(
+        tmp_path,
+        "no-desc",
+        "---\n"
+        "name: no-desc\n"
+        "allowed-tools: []\n"
+        "---\n",
+    )
+    entry = load_skill(skill_dir)
+    assert entry is not None
+    assert entry.description == ""
+    assert entry.trigger == ""
+
+
 def test_render_catalog_escapes_pipes_in_trigger() -> None:
     entries = [
         SkillEntry(

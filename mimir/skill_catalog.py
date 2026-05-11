@@ -46,9 +46,25 @@ _TRIGGER_PHRASES = (
     "Run when",
 )
 
-# Sentence-split heuristic. Periods inside parentheses or quoted text
-# are not perfect sentence boundaries, but for description text this
-# tolerant split is fine.
+# Sentence-split heuristic: `.` / `!` / `?` followed by whitespace and a
+# capital letter. Tolerant; documented failure modes (none currently
+# tripped by the 29 bundled skills, verified by smoke):
+#
+# * Abbreviations followed by a capitalized word — ``U.S. Department``
+#   would split between ``U.S.`` and ``Department``; ``e.g. When X``
+#   would split between ``e.g.`` and ``When``. Safe shapes the regex
+#   handles correctly: ``e.g. when X happens`` (lowercase next word),
+#   ``8.5 million`` (digit next, not a letter), and end-of-sentence
+#   followed by start of next (the intended split).
+# * Sentences ending in ``."`` / ``.)`` (period-then-closer) — the
+#   regex doesn't account for trailing quote/paren, so a sentence
+#   like ``He said "Hi." Then left.`` won't split at the ``.``
+#   inside the quote (acceptable — that one's an actual sentence).
+#
+# If a future skill's description hits a failure mode, prefer
+# rewriting the description to avoid the abbreviation rather than
+# growing the regex into a state machine — the catalog trigger is a
+# discovery hint, not a load-bearing parse target.
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
 
 
@@ -149,7 +165,13 @@ def render_catalog(entries: list[SkillEntry]) -> str:
     lines.append("| Skill | Trigger | Allowed tools |")
     lines.append("|-------|---------|---------------|")
     for entry in entries:
-        trigger = entry.trigger or _trim_trailing_punct(entry.description)
+        # ``entry.trigger`` is already passed through ``_trim_trailing_punct``
+        # by ``_extract_trigger``; it is empty only when ``description`` is
+        # empty, in which case ``_trim_trailing_punct(entry.description)``
+        # is also empty — so the old ``or _trim_trailing_punct(...)``
+        # fallback was always-empty dead code (PR #131 review). Use the
+        # em-dash sentinel for consistency with the empty-tools cell.
+        trigger = entry.trigger or "—"
         tools = ", ".join(f"`{t}`" for t in entry.allowed_tools) or "—"
         # Escape pipes inside cells so the table layout doesn't break.
         trigger_cell = trigger.replace("|", r"\|")
