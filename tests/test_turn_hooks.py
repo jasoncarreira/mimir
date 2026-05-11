@@ -698,8 +698,13 @@ async def test_commitment_extraction_persists_records(tmp_path, monkeypatch):
     )
 
     ctx = _make_session_end_ctx()
+    # Output must clear MIN_OUTPUT_LEN (100 chars) for the hook to
+    # invoke the extractor — short outputs short-circuit to the
+    # ``short_output`` no-op event without calling extract_commitments.
     record = _make_session_end_record(
-        "Boundary recorded. Two unfinished items carried forward."
+        "Boundary recorded. Two unfinished items carried forward: "
+        "PR #111 Item 7 fix pending, and follow up on Mary's "
+        "paper recommendation from last Tuesday afternoon."
     )
     await hook.finalize(ctx, _make_event(), record)
 
@@ -751,7 +756,10 @@ async def test_commitment_extraction_dedupes_against_existing(tmp_path, monkeypa
     )
 
     ctx = _make_session_end_ctx(turn_id="t-later", saga="s-2")
-    record = _make_session_end_record("...", turn_id="t-later")
+    # Long enough to clear MIN_OUTPUT_LEN — the fake extractor below
+    # ignores the content but the hook's short-output gate would skip
+    # to the no-op path otherwise.
+    record = _make_session_end_record("x" * 200, turn_id="t-later")
     await hook.finalize(ctx, _make_event(), record)
 
     state = store.current_state()
@@ -786,3 +794,167 @@ async def test_commitment_extraction_swallows_extractor_failures(
     # Must not raise.
     await hook.finalize(ctx, _make_event(), record)
     assert store.current_state() == {}
+
+
+# ─── PR #125 review fixes ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_commitment_extraction_emits_short_output_no_op(
+    tmp_path, monkeypatch,
+):
+    """PR #125 review #6: short-output skip path now emits
+    ``commitments_extraction_no_op`` with reason=short_output so
+    backtest validation can tell it apart from llm_returned_zero."""
+    import json
+    from mimir.commitments import CommitmentsStore
+    from mimir.commitments.extractor import EXTRACTION_PROMPT_VERSION
+    from mimir.event_logger import init_logger
+    from mimir.turn_hooks import CommitmentExtractionHook
+
+    # Autouse ``_logger`` fixture already initialized the logger.
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    hook = CommitmentExtractionHook(store=store)
+
+    ctx = _make_session_end_ctx()
+    record = _make_session_end_record("too short")  # < 100 chars
+    await hook.finalize(ctx, _make_event(), record)
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    no_ops = [e for e in events if e.get("type") == "commitments_extraction_no_op"]
+    assert len(no_ops) == 1
+    assert no_ops[0]["reason"] == "short_output"
+    assert no_ops[0]["output_len"] == len("too short")
+    assert no_ops[0]["prompt_version"] == EXTRACTION_PROMPT_VERSION
+
+
+@pytest.mark.asyncio
+async def test_commitment_extraction_emits_llm_returned_zero_no_op(
+    tmp_path, monkeypatch,
+):
+    """LLM ran (output cleared MIN_OUTPUT_LEN) but returned [] →
+    ``commitments_extraction_no_op`` with reason=llm_returned_zero."""
+    import json
+    from mimir.commitments import CommitmentsStore
+    from mimir.event_logger import init_logger
+    from mimir.turn_hooks import CommitmentExtractionHook
+
+    # Autouse ``_logger`` fixture already initialized the logger.
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    hook = CommitmentExtractionHook(store=store)
+
+    async def empty_extract(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(
+        "mimir.commitments.extractor.extract_commitments", empty_extract,
+    )
+
+    ctx = _make_session_end_ctx()
+    record = _make_session_end_record("x" * 200)
+    await hook.finalize(ctx, _make_event(), record)
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    no_ops = [e for e in events if e.get("type") == "commitments_extraction_no_op"]
+    assert len(no_ops) == 1
+    assert no_ops[0]["reason"] == "llm_returned_zero"
+
+
+@pytest.mark.asyncio
+async def test_commitment_extraction_emits_all_dedupe_skipped_no_op(
+    tmp_path, monkeypatch,
+):
+    """Extractor returned N records, all skipped on dedupe (common
+    after Phase 3 surfacing surfaces commitments across sessions) →
+    ``commitments_extraction_no_op`` with reason=all_dedupe_skipped."""
+    import json
+    from mimir.commitments import CommitmentsStore
+    from mimir.commitments.models import CommitmentRecord, make_commitment_id
+    from mimir.event_logger import init_logger
+    from mimir.turn_hooks import CommitmentExtractionHook
+
+    # Autouse ``_logger`` fixture already initialized the logger.
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    hook = CommitmentExtractionHook(store=store)
+
+    # Pre-seed an active commitment whose dedupe key the fake
+    # extractor's record will match.
+    pre = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    pre_key = store.current_state()[pre.id].dedupe_key
+
+    async def dupe_extract(*args, **kwargs):
+        rec = CommitmentRecord(
+            id=make_commitment_id(), channel_id="c1", text="X",
+        )
+        rec.dedupe_key = pre_key
+        return [rec]
+
+    monkeypatch.setattr(
+        "mimir.commitments.extractor.extract_commitments", dupe_extract,
+    )
+
+    ctx = _make_session_end_ctx()
+    record = _make_session_end_record("x" * 200)
+    await hook.finalize(ctx, _make_event(), record)
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    no_ops = [e for e in events if e.get("type") == "commitments_extraction_no_op"]
+    assert len(no_ops) == 1
+    assert no_ops[0]["reason"] == "all_dedupe_skipped"
+    assert no_ops[0]["skipped_dedupe"] == 1
+
+
+@pytest.mark.asyncio
+async def test_commitments_extracted_event_carries_prompt_version(
+    tmp_path, monkeypatch,
+):
+    """PR #125 review #1: ``commitments_extracted`` event payload
+    includes ``prompt_version`` for backtest filtering."""
+    import json
+    from mimir.commitments import CommitmentsStore
+    from mimir.commitments.extractor import EXTRACTION_PROMPT_VERSION
+    from mimir.commitments.models import CommitmentRecord, make_commitment_id
+    from mimir.event_logger import init_logger
+    from mimir.turn_hooks import CommitmentExtractionHook
+
+    # Autouse ``_logger`` fixture already initialized the logger.
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    hook = CommitmentExtractionHook(store=store)
+
+    async def fake_extract(*args, **kwargs):
+        return [CommitmentRecord(
+            id=make_commitment_id(), channel_id="c1",
+            text="extracted thing",
+        )]
+
+    monkeypatch.setattr(
+        "mimir.commitments.extractor.extract_commitments", fake_extract,
+    )
+
+    ctx = _make_session_end_ctx()
+    record = _make_session_end_record("x" * 200)
+    await hook.finalize(ctx, _make_event(), record)
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    extracted_events = [e for e in events if e.get("type") == "commitments_extracted"]
+    assert len(extracted_events) == 1
+    assert extracted_events[0]["prompt_version"] == EXTRACTION_PROMPT_VERSION
+    assert extracted_events[0]["count"] == 1

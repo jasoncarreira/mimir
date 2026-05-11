@@ -370,3 +370,88 @@ def test_extraction_prompt_version_constant_present():
     uses to detect when the prompt has changed. Keep it stable as a
     public attribute."""
     assert EXTRACTION_PROMPT_VERSION  # non-empty
+
+
+# ─── PR #125 review fixes (provenance + due_window_hint + channel_bound) ──
+
+
+def test_coerce_record_persists_due_window_hint():
+    """PR #125 review #4: due_window_hint is no longer dropped on the
+    floor — Phase 2b's poller and Phase 3's prompt block need the
+    operator-facing time anchor verbatim."""
+    rec = _coerce_to_record(
+        {
+            "text": "Tighten skip guard",
+            "confidence": 0.85,
+            "due_window_hint": "once #108 merges",
+            "kind": "deadline_check",
+        },
+        channel_id="c1", saga_session_id=None, source_turn_id=None,
+    )
+    assert rec is not None
+    assert rec.due_window_hint == "once #108 merges"
+
+
+def test_coerce_record_due_window_hint_none_when_missing():
+    rec = _coerce_to_record(
+        {"text": "X", "confidence": 0.7},
+        channel_id="c1", saga_session_id=None, source_turn_id=None,
+    )
+    assert rec is not None
+    assert rec.due_window_hint is None
+
+
+def test_coerce_record_due_window_hint_strips_empty():
+    """Whitespace-only hint coerces to None — don't persist garbage."""
+    rec = _coerce_to_record(
+        {"text": "X", "confidence": 0.7, "due_window_hint": "   "},
+        channel_id="c1", saga_session_id=None, source_turn_id=None,
+    )
+    assert rec is not None
+    assert rec.due_window_hint is None
+
+
+def test_coerce_record_due_window_hint_non_string_ignored():
+    """Defensive: if the LLM returns a non-string (number, list, object),
+    drop it gracefully — schema drift shouldn't break coercion."""
+    rec = _coerce_to_record(
+        {"text": "X", "confidence": 0.7, "due_window_hint": 42},
+        channel_id="c1", saga_session_id=None, source_turn_id=None,
+    )
+    assert rec is not None
+    assert rec.due_window_hint is None
+
+
+def test_coerce_record_channel_bound_defaults_to_false():
+    """PR #125 review #5: missing ``channel_bound`` field defaults
+    False (safer — over-surface > under-surface). Most poller
+    channels are non-personal; a missed binding would scope a
+    generic commitment to a synthetic channel."""
+    rec = _coerce_to_record(
+        {"text": "X", "confidence": 0.7},  # no channel_bound key
+        channel_id="poller:github-activity",
+        saga_session_id=None, source_turn_id=None,
+    )
+    assert rec is not None
+    assert rec.channel_id is None  # treated as unbound
+
+
+def test_coerce_record_explicit_channel_bound_true_honored():
+    """Explicit True still binds — only the silent default flipped."""
+    rec = _coerce_to_record(
+        {"text": "X", "confidence": 0.7, "channel_bound": True},
+        channel_id="dm:alice", saga_session_id=None, source_turn_id=None,
+    )
+    assert rec is not None
+    assert rec.channel_id == "dm:alice"
+
+
+def test_coerce_record_carries_prompt_version():
+    """PR #125 review #1: each extracted record records which prompt
+    version produced it. Lets a future backtest filter by version."""
+    rec = _coerce_to_record(
+        {"text": "X", "confidence": 0.7},
+        channel_id="c1", saga_session_id=None, source_turn_id=None,
+    )
+    assert rec is not None
+    assert rec.extraction_prompt_version == EXTRACTION_PROMPT_VERSION

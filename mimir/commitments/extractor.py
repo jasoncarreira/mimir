@@ -208,14 +208,29 @@ def _coerce_to_record(
     if sensitivity not in _VALID_SENSITIVITIES:
         sensitivity = CommitmentSensitivity.ROUTINE.value
     suggested_reminder = (item.get("suggested_reminder") or text).strip()
-    channel_bound = bool(item.get("channel_bound", True))
+    # PR #125 review #5: default-False is safer than default-True for
+    # poller-driven session-ends. Most poller channels (e.g.
+    # ``poller:github-activity``) are non-personal; a missed
+    # ``channel_bound`` would otherwise scope a generic commitment
+    # (``read the paper``) to a poller channel where it never
+    # surfaces to the operator. Default-False = "if uncertain,
+    # surface cross-channel" — over-surface > under-surface for
+    # extracted commitments.
+    channel_bound = bool(item.get("channel_bound", False))
     bound_channel = channel_id if channel_bound else None
 
-    # We don't parse the due_window_hint into unix seconds at extraction
-    # time — natural-language phrases like "next sprint" or "soon"
-    # don't have a single right answer. Future-Phase 3 surfacing can
-    # apply heuristics or ask the agent. For now we leave start/end as
-    # None and store the hint via the record's text/reminder fields.
+    # PR #125 review #4: preserve the LLM's natural-language time
+    # anchor verbatim. We don't parse "Thursday" / "next sprint" /
+    # "tomorrow" into unix seconds at extraction time — those don't
+    # have a single right answer — but the hint goes onto the record
+    # so Phase 2b's poller + Phase 3's prompt block can render the
+    # operator-facing phrasing and a future hint-to-unix parser has
+    # the raw source available. ``None`` when the LLM omits it.
+    due_window_hint = item.get("due_window_hint")
+    if isinstance(due_window_hint, str):
+        due_window_hint = due_window_hint.strip() or None
+    else:
+        due_window_hint = None
     rec = CommitmentRecord(
         id=make_commitment_id(),
         channel_id=bound_channel,
@@ -225,10 +240,14 @@ def _coerce_to_record(
         suggested_reminder=suggested_reminder[:300],
         due_window_start_unix=None,
         due_window_end_unix=None,
+        due_window_hint=due_window_hint,
         confidence=confidence,
         source_turn_id=source_turn_id,
         saga_session_id=saga_session_id,
         created_at_unix=time.time(),
+        # PR #125 review #1: provenance — which prompt version produced
+        # this record. Filterable in backtest comparisons.
+        extraction_prompt_version=EXTRACTION_PROMPT_VERSION,
     )
     rec.dedupe_key = make_dedupe_key(
         channel_id=bound_channel,
