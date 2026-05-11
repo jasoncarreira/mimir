@@ -68,22 +68,43 @@ The pattern isn't Bluesky-specific. The relationship graph varies by platform:
 
 ## Credential Handling
 
-Poller credentials come from environment variables, never hardcoded. The `env` field in `pollers.json` passes additional variables, and the agent's existing environment is inherited.
+Poller credentials come from the agent's process environment, never hardcoded in `pollers.json`. The subprocess env is built by:
+
+1. **Deny-filtered allowlist** of the agent's process env — `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `MIMIR_*` are stripped by default (`mimir/pollers.py:_DENY_SUFFIXES` / `_DENY_PREFIXES`), so a stray secret can't leak to a poller that didn't ask for it.
+2. **`pass_env` overlay** — explicit per-poller list of env keys to pass through from the agent's process env, **bypassing the deny filter**. This is the supported path for getting secrets (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`) and `MIMIR_*`-prefixed knobs (`MIMIR_GITHUB_SELF_LOGIN`) to a poller.
+3. **`env` overlay** — literal `key: value` pairs from `pollers.json`. No shell expansion. Use for fixed config (URLs, feature flags) declared in `pollers.json` itself.
 
 ```json
 {
-  "my-poller": {
+  "pollers": [{
+    "name": "my-poller",
     "command": "python poller.py",
     "cron": "*/5 * * * *",
+    "pass_env": ["GITHUB_TOKEN", "MY_API_KEY"],
     "env": {
       "SERVICE_URL": "https://api.example.com"
     }
-  }
+  }]
 }
 ```
 
-**Rules:**
-- **Secrets go in the agent's environment** (`.env` file, system env), not in `pollers.json`. The `env` field is for non-secret configuration.
+### Operator review of third-party skills
+
+**Before installing a third-party skill, audit its `pollers.json` `pass_env` list.** Those are the env keys the poller can read from your environment. A malicious skill declaring `pass_env: ["ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY"]` and shipping a poller that POSTs them to an attacker server is the threat model the deny-list exists for; `pass_env` is the audit surface for that threat.
+
+Two layers of visibility back the audit:
+
+- **Review-time**: `pass_env` is plain text in `pollers.json`, opt-in per manifest. An operator reviewing the manifest before `reload_pollers` sees exactly which env vars cross the trust boundary.
+- **Runtime**: when a `pass_env` entry matches a deny-list pattern (`*_TOKEN`, `MIMIR_*`, etc.), the framework emits a `poller_env_passthrough_named_secret` event the first time it's pulled through. Grep `events.jsonl` for `poller_env_passthrough_named_secret` to audit which pollers pull which secrets through at runtime. The value itself is never logged — the event payload carries only `poller=`, `key=`.
+
+### `pass_env` also bypasses the built-in allowlist
+
+`pass_env` is named for the deny-filter-bypass case (which is the load-bearing one for secrets), but it also bypasses the built-in allowlist (`_BUILTIN_ALLOWLIST` covers shell/locale basics + XDG dirs + CA bundles + TMPDIR — see `mimir/pollers.py`). So `pass_env: ["GITHUB_REPOS"]` works for a key that isn't a secret but also isn't in the built-in allowlist — same end result (key reaches the subprocess), slightly different mechanism. The intuition: `pass_env` is the **per-poller env keys you want passed through**, regardless of whether they'd be denied or simply missing from the allowlist.
+
+### Rules
+
+- **Secrets live in the agent's process env** (`.env` file, system env), NOT in `pollers.json`. Use `pass_env` to declare per-poller pass-through.
+- **`env` is for non-secret literal config only.** Don't put `"GITHUB_TOKEN": "ghp_..."` in `env` — values land in the subprocess env without any deny-filter check OR visibility event, defeating both audit layers.
 - **Don't log credentials.** If you write to `events.jsonl` or stderr, strip tokens and passwords.
 - **Use per-agent credentials** when the service supports it. This gives each agent its own identity and lets the operator revoke access without affecting others.
 
