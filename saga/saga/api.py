@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MSAM Metrics API -- Lightweight HTTP API for Grafana JSON datasource.
+SAGA Metrics API -- Lightweight HTTP API for Grafana JSON datasource.
 Runs on port 3001 (localhost only).
 Grafana connects via simpod-json-datasource plugin.
 """
@@ -39,7 +39,7 @@ def _check_api_key():
 
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "service": "msam-metrics"})
+    return jsonify({"status": "ok", "service": "saga-metrics"})
 
 
 @app.route("/api/stats")
@@ -690,16 +690,16 @@ def grafana_query():
 
         elif metric in ("contribution_rate", "pinned_atom_count",
                         "confidence_avg", "forgetting_events_count"):
-            # Live-computed metrics from main MSAM database
+            # Live-computed metrics from main SAGA database
             try:
                 from .config import get_data_dir as _gdd
-                msam_db_path = str(_gdd() / _cfg('storage', 'db_path', 'saga.db'))
-                msam_conn = sqlite3.connect(msam_db_path)
-                msam_conn.row_factory = sqlite3.Row
+                saga_db_path = str(_gdd() / _cfg('storage', 'db_path', 'saga.db'))
+                saga_conn = sqlite3.connect(saga_db_path)
+                saga_conn.row_factory = sqlite3.Row
                 now_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
 
                 if metric == "contribution_rate":
-                    r = msam_conn.execute("""
+                    r = saga_conn.execute("""
                         SELECT COALESCE(
                             CAST(SUM(CASE WHEN contributed=1 THEN 1 ELSE 0 END) AS REAL) /
                             NULLIF(SUM(CASE WHEN contributed IN (0,1) THEN 1 ELSE 0 END), 0),
@@ -710,24 +710,24 @@ def grafana_query():
                     datapoints = [[round(r[0] * 100, 2), now_ts]]
 
                 elif metric == "pinned_atom_count":
-                    r = msam_conn.execute(
+                    r = saga_conn.execute(
                         "SELECT COUNT(*) FROM atoms WHERE state='active' AND is_pinned = 1"
                     ).fetchone()
                     datapoints = [[r[0], now_ts]]
 
                 elif metric == "confidence_avg":
-                    r = msam_conn.execute(
+                    r = saga_conn.execute(
                         "SELECT AVG(encoding_confidence) FROM atoms WHERE state='active'"
                     ).fetchone()
                     datapoints = [[round(r[0], 4) if r[0] else 0, now_ts]]
 
                 elif metric == "forgetting_events_count":
-                    r = msam_conn.execute(
+                    r = saga_conn.execute(
                         "SELECT COUNT(*) FROM forgetting_log WHERE timestamp > datetime('now', '-24 hours')"
                     ).fetchone()
                     datapoints = [[r[0], now_ts]]
 
-                msam_conn.close()
+                saga_conn.close()
             except Exception:
                 datapoints = []
 

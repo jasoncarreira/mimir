@@ -1,9 +1,9 @@
-# Next Experiments for MSAM
+# Next Experiments for SAGA
 
 Proposed list of investigations and code changes to look at next. Companion
 to `HINDSIGHT-IDEAS.md`, which captured the original P1–P10 roadmap.
 
-This document is the output of a session on 2026-04-26. MSAM head is `591e48a`.
+This document is the output of a session on 2026-04-26. SAGA head is `591e48a`.
 
 ## Status updates since this doc was created
 
@@ -526,7 +526,7 @@ for "look at these atoms, produce structured output."
   time = one LLM call per cluster (per session boundary, or per
   scheduled run). Order-of-magnitude cost reduction.
 
-**The previous P32 result was negative** (msam_p32_gptoss_v1 = 0.646,
+**The previous P32 result was negative** (saga_p32_gptoss_v1 = 0.646,
 -2.2pp vs baseline 0.668), with multi-session and knowledge-update
 cratering. That measured "is triples-as-extra-pipeline worth it?"
 The answer was no — too expensive for too little signal. The right
@@ -578,7 +578,7 @@ knowledge-update where cross-time facts cluster well), bigger win.
 
 ### P36 — Lower `rrf_graph_weight` to test graph pathway as tiebreaker [tested, doesn't help]
 
-**Status.** Tested at `rrf_graph_weight = 0.3` (`msam_p36_canon_v1` =
+**Status.** Tested at `rrf_graph_weight = 0.3` (`saga_p36_canon_v1` =
 0.760 vs ~0.774 baseline → **−1.4pp**). The graph pathway as an RRF
 ranker just doesn't earn its keep at any weight tested. Decision:
 leave at 0.7 in code; do **not** spend more bench cycles tuning the
@@ -602,7 +602,7 @@ tiebreaker, not a vote.
 - (already measured) `rrf_graph_weight = 0.7` — current default
 
 Run on the canonical stack with P35 features ON (triples-as-
-byproduct, graph pathway on). Tag `msam_p35_canon_lowgraph_v1` etc.
+byproduct, graph pathway on). Tag `saga_p35_canon_lowgraph_v1` etc.
 
 **Why it might rescue triples:** the graph pathway's atoms are noisier
 than direct atom embeddings (triples synthesize away per-turn
@@ -711,7 +711,7 @@ fine for a feature whose primary value is non-bench.
 (0.762 vs P30v3 0.784).** Code stays behind `enable_hyde=false`
 default for production deployments that may have a different
 question/answer-shape profile. Bench config will revert. Full
-post-mortem in BENCHMARK-RESULTS.md §msam_p38_canon_v1; short
+post-mortem in BENCHMARK-RESULTS.md §saga_p38_canon_v1; short
 version: P33's question/answer shape-gap analysis didn't predict
 retrieval outcomes — the cohorts expected to gain the most
 (multi-session, knowledge-update) lost the most. The hypothetical-
@@ -868,12 +868,12 @@ superseded atoms getting pulled in.
    that gates the median pivot on whether the endorsing observation's
    evidence is current (no superseded atoms).
 
-See BENCHMARK-RESULTS.md §msam_p39_canon_v1 for full data and the
+See BENCHMARK-RESULTS.md §saga_p39_canon_v1 for full data and the
 side-by-side with P12_v2.
 
 **What.** In `_two_tier_split`, observation-endorsed raws that miss
 the cheap-path candidate pool (the `missing_ids` branch in
-`msam/core.py`) get a base score of `ref_score × sim(query, R)`,
+`saga/core.py`) get a base score of `ref_score × sim(query, R)`,
 where `ref_score = min positive RRF score in the in-pool raws`.
 Their cap is then `2 × base`. A pulled-in raw at sim 1.0 (perfect
 query match the cheap path missed) caps at exactly `ref_score`'s
@@ -973,7 +973,7 @@ subtypes — same A/B answer either way.
 - Orthogonal to triples / graph pathway (those are dead anyway).
 - Doesn't touch the cap formula; just where `ref_score` lands.
 
-**File location:** `msam/core.py:_two_tier_split` around line 1403
+**File location:** `saga/core.py:_two_tier_split` around line 1403
 (the `in_pool_scores` / `ref_score` assignment). Tests should
 cover the math: synthetic atoms with known RRF scores, verify
 pulled-in atoms rank where the formula predicts.
@@ -1082,7 +1082,7 @@ signal.
 - Doesn't touch the LLM stack — pure scoring change.
 - Can ship behind a flag without changing prod behavior.
 
-**File location:** `msam/core.py:_two_tier_split` around line 1391
+**File location:** `saga/core.py:_two_tier_split` around line 1391
 (the `if boost_map:` that triggers the pull-in branch). Tests
 should cover both flag states and confirm that endorsed-but-
 missing atoms simply don't appear in the response when the flag
@@ -1103,14 +1103,14 @@ multi-session crowd-out cost dominates the overall delta.
 Code stays behind `enable_triple_augment_v2 = false` (default) for
 production deployments where the query mix differs. Not shipped to
 canonical. Full data + analysis: BENCHMARK-RESULTS.md
-§msam_p43_p41_canon_v1.
+§saga_p43_p41_canon_v1.
 
 **What.** The current `enable_triple_augment` (in `retrieval_v2.py`)
 has two design problems:
 
 1. **Brittle entity extraction.** `extract_query_entities` uses
    regex on capitalized words + a tiny hardcoded entity dict
-   (`user`, `agent`, `msam`, `openclaw`). NER-free, embedding-
+   (`user`, `agent`, `saga`, `openclaw`). NER-free, embedding-
    free. Misses anything not in title case or in the dict.
 2. **Flat score baseline.** Triple-augmented atoms get
    `_combined_score = 2.0` regardless of how strong the triple's
@@ -1166,7 +1166,7 @@ augmenting via atom is a different pattern from RRF-as-pathway,
 but the underlying signal is the same.
 
 **File location:** rewrite `triple_augmented_retrieve` in
-`msam/retrieval_v2.py:36`. Drop `extract_query_entities` calls
+`saga/retrieval_v2.py:36`. Drop `extract_query_entities` calls
 within it. Tests for cosine ranking, score scaling, and no-op
 when triples table is empty.
 
@@ -1266,7 +1266,7 @@ entity matching.
 
 **`valid_until` population — currently mostly NULL.** The
 consolidation prompt asks for `(subject, predicate, object)` only
-(msam/consolidation.py:600); the temporal columns aren't being
+(saga/consolidation.py:600); the temporal columns aren't being
 extracted. `update_world(valid_until=...)` only sets them when
 callers pass them explicitly, and `auto_close_on_conflict` only
 fires on the `update_world` path (not the consolidation path).
@@ -1310,7 +1310,7 @@ include the triples block (then it's a real A/B).
 - Orthogonal to graph pathway (which we've established is dead
   for retrieval). P42 is presentation, not ranking.
 
-**File location:** `msam/server.py:api_query` two-tier path.
+**File location:** `saga/server.py:api_query` two-tier path.
 Tests: cosine ranking, top_k cap, expired-triple filtering, empty
 when triples table empty.
 
@@ -1318,7 +1318,7 @@ when triples table empty.
 
 ### P43 — Beam search always-on; subatom retrieval as third beam [re-test queued 2026-05-02]
 
-**Update 2026-05-02.** Last result `msam_p43_canon_v1` was flat at
+**Update 2026-05-02.** Last result `saga_p43_canon_v1` was flat at
 0.784. Worth re-running now that P30 baseline has shifted (post-
 consolidation-similarity 0.75, post-P42 wiring) — the original
 neutral-result reading may have been correct only against the old
@@ -1342,7 +1342,7 @@ equivalent; cleaner code path; no need to flip
 
 Code stays behind `enable_subatom_beam = false` (default) for
 production. Not shipped to canonical. Full data:
-BENCHMARK-RESULTS.md §msam_p43_canon_v1.
+BENCHMARK-RESULTS.md §saga_p43_canon_v1.
 
 **What.** Three coupled changes:
 
@@ -1367,7 +1367,7 @@ BENCHMARK-RESULTS.md §msam_p43_canon_v1.
    `enable_subatom` + `enable_fact_dedup`. Beam 3 currently calls
    `expand_query()` which appends triple-graph subject/object
    terms to the query — effectively dead in our bench (triples
-   extraction is off in `msam_bench.toml`) and overlaps with
+   extraction is off in `saga_bench.toml`) and overlaps with
    what P41 will surface via direct cosine match anyway.
 
 **Why test these together.** Beam search's value is in covering
@@ -1411,9 +1411,9 @@ surface atoms whose whole-atom RRF ranks them out of top-K.
 **Recommended run plan: ship P41 + P43 together, A/B in parallel.**
 Implement both behind strict-no-op flags. Bench two configs at the
 same time:
-- **A (`msam_p43_canon_v1`)**: P43 minimal — 2 beams (original-
+- **A (`saga_p43_canon_v1`)**: P43 minimal — 2 beams (original-
   hybrid + subatom). P41-as-beam flag OFF.
-- **B (`msam_p43_p41_canon_v1`)**: P43 + P41 — 3 beams (original-
+- **B (`saga_p43_p41_canon_v1`)**: P43 + P41 — 3 beams (original-
   hybrid + subatom + P41 triple-augmented). P41-as-beam flag ON.
 
 Comparisons:
@@ -1460,7 +1460,7 @@ glue it into beam 3.
   level matches that drag in atoms the cheap path missed, those
   could become P39's pulled-in atoms.
 
-**File location:** `msam/retrieval_v2.py:beam_search_retrieve`.
+**File location:** `saga/retrieval_v2.py:beam_search_retrieve`.
 Tests: beam fuse correctness, atom_id-level dedup of sentence
 results, subatom path no-op when no sentences match.
 
@@ -1489,7 +1489,7 @@ that follows `elaborates` edges from a hit atom).
 
 **What.** The `atom_relations` table allows
 `elaborates / supports / contextualizes / depends_on / refines /
-contradicts` edges, but **nothing in MSAM auto-writes them**.
+contradicts` edges, but **nothing in SAGA auto-writes them**.
 They exist only when callers manually call `add_atom_relation()`.
 Spreading activation reads from
 `elaborates / supports / contextualizes / consolidated_into` —
@@ -1571,7 +1571,7 @@ model (gpt-5.4-nano).
 - Orthogonal to triples / graph pathway (those track facts, not
   inter-atom semantic relations).
 
-**File location:** new file `msam/relations_maintenance.py`. Hook
+**File location:** new file `saga/relations_maintenance.py`. Hook
 into the decay cycle as an optional periodic pass.
 
 ---
@@ -1581,7 +1581,7 @@ into the decay cycle as an optional periodic pass.
 **Status.** Filed 2026-04-30, expanded 2026-05-01. Not yet
 implemented.
 
-Two related REST endpoints that surface MSAM's chronological /
+Two related REST endpoints that surface SAGA's chronological /
 frequency-based state for prompt assembly. Both are paired
 because they share the same auth, response shape, and latency
 profile (single SELECT, no LLM, ~5-10ms each), and callers tend
@@ -1731,10 +1731,10 @@ at the overall level despite favorable per-subtype shape. Stays
 behind `enable_subatom_beam = false` and `enable_triple_augment_v2
 = false` defaults.
 
-Full data: BENCHMARK-RESULTS.md §msam_p43_canon_v2 and
-§msam_p43_p41_canon_v2.
+Full data: BENCHMARK-RESULTS.md §saga_p43_canon_v2 and
+§saga_p43_p41_canon_v2.
 
-**Why.** P43 bench (msam_p43_canon_v1) showed sentence-level
+**Why.** P43 bench (saga_p43_canon_v1) showed sentence-level
 retrieval helps multi-session +2.2pp but hurts knowledge-update
 −3.8pp. Inspecting the per-question DBs revealed the splitter
 breaks long assistant responses into way too many fragments,
@@ -1796,7 +1796,7 @@ canonical while keeping multi-session gain.
 any change has to be evaluated by re-benching, but the fragment
 problem is concrete and the fix is targeted.
 
-**File location:** `msam/subatom.py:split_sentences` (line 39)
+**File location:** `saga/subatom.py:split_sentences` (line 39)
 + `_SENT_SPLIT` regex (line 30). Tests in `test_subatom.py`.
 
 ---
@@ -2250,11 +2250,11 @@ after the next two bench runs prove we don't need it.
 ### P21 — Decide on `session_dedup.py`
 
 **What.** Hour-windowed file-based "served IDs" tracking, used only by
-the CLI `msam query` command. Confusing name overlap with the agent's
+the CLI `saga query` command. Confusing name overlap with the agent's
 session_id concept.
 
 **Three options:**
-1. Delete entirely (`msam query` loses the `previously_served: True`
+1. Delete entirely (`saga query` loses the `previously_served: True`
    annotation).
 2. Rename to `cli_query_dedup.py` so the name reflects purpose.
 3. Promote to a real per-agent dedup that affects `retrieve()` (heavier,
@@ -2269,7 +2269,7 @@ CLI poking; the name is just misleading.
 
 ### P22 — Audit the compression / subatom subsystem
 
-**What.** `msam/subatom.py` and the `[compression]` config block.
+**What.** `saga/subatom.py` and the `[compression]` config block.
 Disabled in bench (`enable_subatom = false`). Code exists but may be
 bit-rotted (broken imports, references to removed functions).
 
@@ -2310,7 +2310,7 @@ later improvements) and the new agent harness configured for two-tier,
 ask whether the single-tier code path is still earning its keep.
 
 **Single-tier surface area:**
-- `hybrid_retrieve_with_triples` in `msam/triples.py` — wraps
+- `hybrid_retrieve_with_triples` in `saga/triples.py` — wraps
   `hybrid_retrieve` (single-tier mode) and merges triples results.
 - The `else` branch in `hybrid_retrieve` (`core.py:1486-1517`) —
   RRF combine + observation_bonus + sort path. Different from the

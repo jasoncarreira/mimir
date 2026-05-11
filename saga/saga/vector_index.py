@@ -1,5 +1,5 @@
 """
-MSAM Vector Index -- FAISS-backed approximate nearest neighbor search.
+SAGA Vector Index -- FAISS-backed approximate nearest neighbor search.
 
 Replaces O(n) brute-force cosine similarity with O(sqrt(n)) FAISS search.
 Supports both exact (IndexFlatIP) for <50K vectors and approximate (IndexIVFFlat)

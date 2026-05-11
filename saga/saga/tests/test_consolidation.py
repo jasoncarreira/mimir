@@ -1,4 +1,4 @@
-"""MSAM Consolidation Tests -- sleep-inspired memory consolidation."""
+"""SAGA Consolidation Tests -- sleep-inspired memory consolidation."""
 
 import struct
 import hashlib

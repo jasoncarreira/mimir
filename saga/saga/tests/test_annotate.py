@@ -1,4 +1,4 @@
-"""MSAM Annotation Tests -- heuristic, classification, and LLM annotation."""
+"""SAGA Annotation Tests -- heuristic, classification, and LLM annotation."""
 
 import sys
 import os

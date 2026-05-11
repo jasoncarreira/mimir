@@ -1,5 +1,5 @@
 """
-MSAM Annotation Engine
+SAGA Annotation Engine
 Fast-path heuristic annotations + optional LLM slow-path.
 """
 

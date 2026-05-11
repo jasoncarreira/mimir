@@ -1,4 +1,4 @@
-"""MSAM Decay Tests -- lifecycle management, retrievability, state transitions."""
+"""SAGA Decay Tests -- lifecycle management, retrievability, state transitions."""
 
 import struct
 import hashlib

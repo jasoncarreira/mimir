@@ -1,5 +1,5 @@
 """
-MSAM Embeddings -- Pluggable embedding provider interface.
+SAGA Embeddings -- Pluggable embedding provider interface.
 
 Supports:
   - nvidia-nim: NVIDIA NIM API (nv-embedqa-e5-v5, etc.)

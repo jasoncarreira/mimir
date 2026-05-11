@@ -74,7 +74,7 @@ class TestQueryExpansion:
 
 class TestContextualRewrite:
     """Production-only feature: agents may pass prior conversation
-    messages so MSAM can resolve references like 'yes, look for that'
+    messages so SAGA can resolve references like 'yes, look for that'
     into self-contained queries via an LLM. Default-off; no-op when
     context is None/empty regardless of flag (so the bench harness pays
     nothing).

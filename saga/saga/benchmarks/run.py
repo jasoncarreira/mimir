@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-One-command MSAM benchmark: generate synthetic data -> populate DB -> run benchmarks.
+One-command SAGA benchmark: generate synthetic data -> populate DB -> run benchmarks.
 
 Uses deterministic content-hash embeddings (no API key required).
 Texts sharing character n-grams produce correlated vectors, giving rough
@@ -8,7 +8,7 @@ semantic similarity for meaningful retrieval quality comparisons.
 
 Usage:
     python -m saga.benchmarks.run           # run all benchmarks
-    python msam/benchmarks/run.py           # same, direct execution
+    python saga/benchmarks/run.py           # same, direct execution
 """
 
 import hashlib
@@ -21,9 +21,9 @@ import time
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# 1. Set up a fresh temp DB *before* any msam imports touch DB_PATH
+# 1. Set up a fresh temp DB *before* any saga imports touch DB_PATH
 # ---------------------------------------------------------------------------
-_tmpdir = tempfile.mkdtemp(prefix="msam_bench_")
+_tmpdir = tempfile.mkdtemp(prefix="saga_bench_")
 os.environ["SAGA_DATA_DIR"] = _tmpdir
 
 # Force config reload so data_dir picks up the new env var
@@ -58,7 +58,7 @@ def _content_embedding(text: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# 2. Import all msam modules, then patch embedding functions
+# 2. Import all saga modules, then patch embedding functions
 # ---------------------------------------------------------------------------
 import saga.core
 import saga.embeddings
@@ -83,7 +83,7 @@ if hasattr(saga.core, '_cached_embed_query_import'):
 
 def main():
     print("=" * 60)
-    print("MSAM Synthetic Benchmark Runner")
+    print("SAGA Synthetic Benchmark Runner")
     print("=" * 60)
     print(f"Temp data dir:  {_tmpdir}")
     print(f"DB path:        {DB_PATH}")

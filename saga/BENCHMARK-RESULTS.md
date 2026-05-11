@@ -4,53 +4,53 @@ Running log of every graded run so we can compare deltas across upgrades.
 Judge is always GPT-4o-2024-08-06 (required for leaderboard comparability).
 
 Dataset: LongMemEval `S` (500 questions) unless noted.
-Harness: `msam/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
+Harness: `saga/benchmarks/longmemeval/` (worktree copy on `hindsight-ideas`).
 
 ## Summary table (overall accuracy)
 
 | Run tag | Reader | Fusion | Pathways | Questions | Overall |
 |---|---|---|---|---|---|
-| `msam_baseline_v0` | MiniMax-M2.7 | weighted_sum | sem + kw | 500 | **0.734** |
-| `msam_rrf_v1` | MiniMax-M2.7 | rrf | sem + kw | 500 (498 graded) | **0.799** |
-| `msam_rrf_gpt4omini_v1` | gpt-4o-mini | rrf | sem + kw | 500 | **0.728** |
+| `saga_baseline_v0` | MiniMax-M2.7 | weighted_sum | sem + kw | 500 | **0.734** |
+| `saga_rrf_v1` | MiniMax-M2.7 | rrf | sem + kw | 500 (498 graded) | **0.799** |
+| `saga_rrf_gpt4omini_v1` | gpt-4o-mini | rrf | sem + kw | 500 | **0.728** |
 | `pref_probe_max1024` | MiniMax-M2.7 | weighted_sum | sem + kw | 30 (pref only) | **0.333** |
-| `msam_p3_minimax_v1` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal (chrono) | 500 | **0.772** |
-| `msam_p3_minimax_v2` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal (cos-ranked) | 500 | **0.768** |
-| `msam_p1_minimax_v1` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (obs enabled, consolidation on) | 500 | **0.720** |
-| `msam_p1_minimax_v2` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (preserve-specifics consolidation prompt) | 500 | **0.692** |
-| `msam_p1_minimax_v3` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (consolidation.enable_llm=false, longest-atom fallback) | 500 | **0.704** |
-| `msam_p9_minimax_v1` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (consolidation gpt-5.4-nano, min_cluster_size=2) | 500 (499 graded) | **0.7816** |
-| `msam_p9_minimax_v2` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (consolidation gpt-5.4-nano, min_cluster_size=3) | 500 | **0.796** |
-| `msam_p9_minimax_v3` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (per-stream cluster floors, obs_top_k=3, obs_sim≥0.35, per-stream prompts) | 500 | **0.760** |
-| `msam_p8_minimax_v1` | MiniMax-M2.7 | rrf + two-tier (P9v2) + cluster merge pass (P8) + session_boundaries + mark_contributions (P10) | sem + kw (merge_threshold=0.75, max_cluster_size=50) | 500 | **0.752** |
-| `msam_p8_minimax_v2` | MiniMax-M2.7 | P8v1 stack with tighter merge knobs | sem + kw (merge_threshold=0.85, max_cluster_size=15) | 500 | **0.758** |
-| `msam_p4_minimax_v1` | MiniMax-M2.7 | P9v2 + P4-bench (contradiction→supersedes→demotion); P10 disabled | sem + kw (supersedes_resolution_threshold=0.85, supersedes_score_multiplier=0.4) | 500 | **0.766** |
-| `msam_p30_minimax_v1` | MiniMax-M2.7 | P9v2 + P30 (missing-atom base score in two-tier); atom-level supersedes off; obs-level supersedes on | sem + kw (additive boost + P30 cosine-based missing-atom pull-in) | 500 | **0.780** |
-| `msam_p30_minimax_v2` | MiniMax-M2.7 | P30v1 stack with **flat 2× restoration** replacing the additive boost; per-atom confidence filtering | sem + kw (raws endorsed by surfaced obs get score×2; no additive boost) | 500 | **0.756** |
-| `msam_p30_minimax_v3` | MiniMax-M2.7 | P30v1 stack reinstated (additive boost) + per-atom confidence filtering retained from P30v2 | sem + kw (additive boost + P30 cosine-based missing-atom pull-in; per-atom tiers) | 500 | **0.784** |
-| `msam_cherrypicks_minimax_v1` | MiniMax-M2.7 | P30v3 + P11/P12/P13 cherry-picks (query rewriting + synonym expansion + atom quality multiplier), all on | sem + kw (P11 rewriting on both pathways; P12 synonyms on keyword only; P13 quality ×0.5/×1.1 multiplier) | 500 | **0.756** |
-| `msam_cherrypicks_off_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 mechanism (cherry-picks reverted to off); reader + MSAM consolidation + judge ALL on `openai/gpt-oss-120b` via OpenRouter | sem + kw (P30v3 stack — additive boost + per-atom tiers + missing-atom pull-in) | 500 | **0.668** |
-| `msam_p32_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 + P32 (triple extraction via P7 batched, graph pathway joins RRF as 4th ranker) | sem + kw + **graph** (triples populated per-question via batch_extract_and_store) | 500 | **0.646** |
-| `msam_rerank_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 + P15 (cross-encoder LLM rerank on top-8 candidates); triples + graph pathway off | sem + kw, then LLM rerank on top-8 | 500 | **0.648** |
-| `msam_p35_canon_v1` | MiniMax-M2.7 | P30v3 + P35 (consolidation as structured-cognition pass: observation + triples in one LLM call); graph pathway on; cherry-picks off; rerank off | sem + kw + **graph** (triples-as-byproduct of consolidation, not separate extraction pipeline) | 500 | **0.758** |
-| `msam_p11_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P11 ONLY (`enable_query_rewriting=true`); P12/P13 off | sem + kw (P11 rewriting on both pathways via built-in `_QUERY_REWRITES`) | 498 (2 errors) | **0.771** |
-| `msam_p12_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P12 ONLY (`enable_query_expansion=true`); P11/P13 off | sem + kw (P12 synonym expansion on keyword pathway only via 29-key default synonym dict) | 499 (1 error) | **0.792** ✓ |
-| `msam_p13_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P13 ONLY (`enable_quality_filter=true`); P11/P12 off | sem + kw (P13 atom-quality multiplier ×0.5/×1.1 on raws and observations after RRF) | 500 | **0.758** |
-| `msam_p34_canon_v1` | MiniMax-M2.7 | P30v3 mechanism + `[consolidation] similarity_threshold = 0.75` (was 0.80); cherry-picks off; triples off | sem + kw (lower clustering threshold → more clusters → more observations) | 500 | **0.772** |
-| `msam_p36_canon_v1` | MiniMax-M2.7 | P35 features ON (triples + graph pathway) + `[retrieval] rrf_graph_weight = 0.3` (was 0.7) | sem + kw + **graph at lower fusion weight** (graph as tiebreaker rather than co-equal vote) | 500 | **0.760** |
-| `msam_p38_canon_v1` | MiniMax-M2.7 | P30v3 + P38 (confidence-gated HyDE: gpt-5.4-nano hypothetical answer added as RRF pathway when first-pass max sim < 0.45 AND query is question-shaped) | sem + kw + **hyde_semantic** (hypothetical-answer pathway, gated) | 500 | **0.762** |
-| `msam_p12_canon_v2` | MiniMax-M2.7 | P30v3 + P12 re-baseline after shipping `enable_query_expansion=true` to canonical (matches msam_p12_canon_v1's config); investigates whether P12's +0.8pp held | sem + kw (P12 synonym expansion on keyword pathway only) | 500 | **0.762** ⚠ |
-| `msam_p39_canon_v1` | MiniMax-M2.7 | P30v3 + P12 + P39 (`missing_ref_score_pivot = "median"` pivots pulled-in atom base scores on the median of in-pool RRF rather than the min) | sem + kw (median pivot lifts pulled-in atom scores so endorsed-but-cheap-path-missed raws can compete with mid-rank in-pool raws) | 500 | **0.780** |
-| `msam_p12_canon_v3` | MiniMax-M2.7 | Same config as `msam_p12_canon_v2` (canonical + P12 on, min pivot); solo re-run to factor out parallel-run interference seen in v2 | sem + kw (P12 synonym expansion only) | 500 | **0.768** |
-| `msam_p43_canon_v1` | MiniMax-M2.7 | Canonical (P30v3 + P12) + P43 subatom beam (compressed_retrieve sentence-level extracts mapped back to parent atoms, joins RRF as 'subatom' pathway). Tests whether sentence-level relevance signal complements whole-atom retrieval | sem + kw + **subatom** (sentence-level relevance via compressed_retrieve) | 500 | **0.784** |
-| `msam_p43_p41_canon_v1` | MiniMax-M2.7 | Canonical + P43 subatom + P41 triple_augment_v2 (cosine-match query embedding to active triple embeddings, surface source atoms). Three RRF pathways alongside semantic+keyword | sem + kw + subatom + **triple_augment_v2** (embedding-cosine on triples → atoms) | 500 | **0.770** |
-| `msam_p43_canon_v2` | MiniMax-M2.7 | P43 (subatom beam) re-run with the P46 list-aware sentence splitter (paragraph-level chunking, 30-char min length, list blocks stay grouped instead of fragmenting per bullet) | sem + kw + **subatom** (now coarser-grained chunks; markdown lists kept together) | 500 | **0.778** |
-| `msam_p43_p41_canon_v2` | MiniMax-M2.7 | P43+P41 re-run with the P46 splitter | sem + kw + subatom + triple_augment_v2 (with the cleaner sentence-chunking) | 500 | **0.782** ⚠² |
-| `msam_p30_canon_v4` | MiniMax-M2.7 | Canonical re-baseline AFTER fixing the silent consolidation bug (`max_completion_tokens` for gpt-5.4-nano). Real LLM-synthesized observations, not source-atom fallbacks | sem + kw + two-tier with REAL observations | 500 | **0.774** |
-| `msam_p41_canon_v1` | MiniMax-M2.7 | Canonical + triple_augment_v2 only (no subatom). First clean P41 measurement — prior P41 runs had no triples populated due to the consolidation bug | sem + kw + **triple_augment_v2** (real cosine match against populated triples) | 500 | **0.768** |
+| `saga_p3_minimax_v1` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal (chrono) | 500 | **0.772** |
+| `saga_p3_minimax_v2` | MiniMax-M2.7 | rrf | sem + kw + graph* + temporal (cos-ranked) | 500 | **0.768** |
+| `saga_p1_minimax_v1` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (obs enabled, consolidation on) | 500 | **0.720** |
+| `saga_p1_minimax_v2` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (preserve-specifics consolidation prompt) | 500 | **0.692** |
+| `saga_p1_minimax_v3` | MiniMax-M2.7 | rrf + obs-bonus | sem + kw (consolidation.enable_llm=false, longest-atom fallback) | 500 | **0.704** |
+| `saga_p9_minimax_v1` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (consolidation gpt-5.4-nano, min_cluster_size=2) | 500 (499 graded) | **0.7816** |
+| `saga_p9_minimax_v2` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (consolidation gpt-5.4-nano, min_cluster_size=3) | 500 | **0.796** |
+| `saga_p9_minimax_v3` | MiniMax-M2.7 | rrf + two-tier (P9) | sem + kw (per-stream cluster floors, obs_top_k=3, obs_sim≥0.35, per-stream prompts) | 500 | **0.760** |
+| `saga_p8_minimax_v1` | MiniMax-M2.7 | rrf + two-tier (P9v2) + cluster merge pass (P8) + session_boundaries + mark_contributions (P10) | sem + kw (merge_threshold=0.75, max_cluster_size=50) | 500 | **0.752** |
+| `saga_p8_minimax_v2` | MiniMax-M2.7 | P8v1 stack with tighter merge knobs | sem + kw (merge_threshold=0.85, max_cluster_size=15) | 500 | **0.758** |
+| `saga_p4_minimax_v1` | MiniMax-M2.7 | P9v2 + P4-bench (contradiction→supersedes→demotion); P10 disabled | sem + kw (supersedes_resolution_threshold=0.85, supersedes_score_multiplier=0.4) | 500 | **0.766** |
+| `saga_p30_minimax_v1` | MiniMax-M2.7 | P9v2 + P30 (missing-atom base score in two-tier); atom-level supersedes off; obs-level supersedes on | sem + kw (additive boost + P30 cosine-based missing-atom pull-in) | 500 | **0.780** |
+| `saga_p30_minimax_v2` | MiniMax-M2.7 | P30v1 stack with **flat 2× restoration** replacing the additive boost; per-atom confidence filtering | sem + kw (raws endorsed by surfaced obs get score×2; no additive boost) | 500 | **0.756** |
+| `saga_p30_minimax_v3` | MiniMax-M2.7 | P30v1 stack reinstated (additive boost) + per-atom confidence filtering retained from P30v2 | sem + kw (additive boost + P30 cosine-based missing-atom pull-in; per-atom tiers) | 500 | **0.784** |
+| `saga_cherrypicks_minimax_v1` | MiniMax-M2.7 | P30v3 + P11/P12/P13 cherry-picks (query rewriting + synonym expansion + atom quality multiplier), all on | sem + kw (P11 rewriting on both pathways; P12 synonyms on keyword only; P13 quality ×0.5/×1.1 multiplier) | 500 | **0.756** |
+| `saga_cherrypicks_off_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 mechanism (cherry-picks reverted to off); reader + SAGA consolidation + judge ALL on `openai/gpt-oss-120b` via OpenRouter | sem + kw (P30v3 stack — additive boost + per-atom tiers + missing-atom pull-in) | 500 | **0.668** |
+| `saga_p32_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 + P32 (triple extraction via P7 batched, graph pathway joins RRF as 4th ranker) | sem + kw + **graph** (triples populated per-question via batch_extract_and_store) | 500 | **0.646** |
+| `saga_rerank_gptoss_v1` | **gpt-oss-120b**¹ | P30v3 + P15 (cross-encoder LLM rerank on top-8 candidates); triples + graph pathway off | sem + kw, then LLM rerank on top-8 | 500 | **0.648** |
+| `saga_p35_canon_v1` | MiniMax-M2.7 | P30v3 + P35 (consolidation as structured-cognition pass: observation + triples in one LLM call); graph pathway on; cherry-picks off; rerank off | sem + kw + **graph** (triples-as-byproduct of consolidation, not separate extraction pipeline) | 500 | **0.758** |
+| `saga_p11_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P11 ONLY (`enable_query_rewriting=true`); P12/P13 off | sem + kw (P11 rewriting on both pathways via built-in `_QUERY_REWRITES`) | 498 (2 errors) | **0.771** |
+| `saga_p12_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P12 ONLY (`enable_query_expansion=true`); P11/P13 off | sem + kw (P12 synonym expansion on keyword pathway only via 29-key default synonym dict) | 499 (1 error) | **0.792** ✓ |
+| `saga_p13_canon_v1` | MiniMax-M2.7 | P30v3 + cherry-pick P13 ONLY (`enable_quality_filter=true`); P11/P12 off | sem + kw (P13 atom-quality multiplier ×0.5/×1.1 on raws and observations after RRF) | 500 | **0.758** |
+| `saga_p34_canon_v1` | MiniMax-M2.7 | P30v3 mechanism + `[consolidation] similarity_threshold = 0.75` (was 0.80); cherry-picks off; triples off | sem + kw (lower clustering threshold → more clusters → more observations) | 500 | **0.772** |
+| `saga_p36_canon_v1` | MiniMax-M2.7 | P35 features ON (triples + graph pathway) + `[retrieval] rrf_graph_weight = 0.3` (was 0.7) | sem + kw + **graph at lower fusion weight** (graph as tiebreaker rather than co-equal vote) | 500 | **0.760** |
+| `saga_p38_canon_v1` | MiniMax-M2.7 | P30v3 + P38 (confidence-gated HyDE: gpt-5.4-nano hypothetical answer added as RRF pathway when first-pass max sim < 0.45 AND query is question-shaped) | sem + kw + **hyde_semantic** (hypothetical-answer pathway, gated) | 500 | **0.762** |
+| `saga_p12_canon_v2` | MiniMax-M2.7 | P30v3 + P12 re-baseline after shipping `enable_query_expansion=true` to canonical (matches saga_p12_canon_v1's config); investigates whether P12's +0.8pp held | sem + kw (P12 synonym expansion on keyword pathway only) | 500 | **0.762** ⚠ |
+| `saga_p39_canon_v1` | MiniMax-M2.7 | P30v3 + P12 + P39 (`missing_ref_score_pivot = "median"` pivots pulled-in atom base scores on the median of in-pool RRF rather than the min) | sem + kw (median pivot lifts pulled-in atom scores so endorsed-but-cheap-path-missed raws can compete with mid-rank in-pool raws) | 500 | **0.780** |
+| `saga_p12_canon_v3` | MiniMax-M2.7 | Same config as `saga_p12_canon_v2` (canonical + P12 on, min pivot); solo re-run to factor out parallel-run interference seen in v2 | sem + kw (P12 synonym expansion only) | 500 | **0.768** |
+| `saga_p43_canon_v1` | MiniMax-M2.7 | Canonical (P30v3 + P12) + P43 subatom beam (compressed_retrieve sentence-level extracts mapped back to parent atoms, joins RRF as 'subatom' pathway). Tests whether sentence-level relevance signal complements whole-atom retrieval | sem + kw + **subatom** (sentence-level relevance via compressed_retrieve) | 500 | **0.784** |
+| `saga_p43_p41_canon_v1` | MiniMax-M2.7 | Canonical + P43 subatom + P41 triple_augment_v2 (cosine-match query embedding to active triple embeddings, surface source atoms). Three RRF pathways alongside semantic+keyword | sem + kw + subatom + **triple_augment_v2** (embedding-cosine on triples → atoms) | 500 | **0.770** |
+| `saga_p43_canon_v2` | MiniMax-M2.7 | P43 (subatom beam) re-run with the P46 list-aware sentence splitter (paragraph-level chunking, 30-char min length, list blocks stay grouped instead of fragmenting per bullet) | sem + kw + **subatom** (now coarser-grained chunks; markdown lists kept together) | 500 | **0.778** |
+| `saga_p43_p41_canon_v2` | MiniMax-M2.7 | P43+P41 re-run with the P46 splitter | sem + kw + subatom + triple_augment_v2 (with the cleaner sentence-chunking) | 500 | **0.782** ⚠² |
+| `saga_p30_canon_v4` | MiniMax-M2.7 | Canonical re-baseline AFTER fixing the silent consolidation bug (`max_completion_tokens` for gpt-5.4-nano). Real LLM-synthesized observations, not source-atom fallbacks | sem + kw + two-tier with REAL observations | 500 | **0.774** |
+| `saga_p41_canon_v1` | MiniMax-M2.7 | Canonical + triple_augment_v2 only (no subatom). First clean P41 measurement — prior P41 runs had no triples populated due to the consolidation bug | sem + kw + **triple_augment_v2** (real cosine match against populated triples) | 500 | **0.768** |
 | `hindsight_rrf_baseline` | gpt-4o-mini | Hindsight TEMPR | 4-way + cross-encoder | 60 | (running) |
 
-² CAVEAT: every run before `msam_p30_canon_v4` had silently-broken
+² CAVEAT: every run before `saga_p30_canon_v4` had silently-broken
 consolidation (`max_tokens` rejected by gpt-5.4-nano with HTTP 400,
 exception caught, fallback to source-atom + prefix). Observations
 were source-atom fallbacks, not LLM synthesis. Triples were never
@@ -59,16 +59,16 @@ measuring P41 as a no-op. The post-fix canonical (v4 = 0.774) is
 the new baseline; the old "0.784 P30v3" is no longer comparable to
 post-fix runs.
 
-¹ Indicative-only result. Reader, MSAM's consolidation LLM, and judge were
+¹ Indicative-only result. Reader, SAGA's consolidation LLM, and judge were
 all switched to gpt-oss-120b for this run. Direct comparison to MiniMax /
 gpt-4o-judged runs above is not strictly apples-to-apples; absolute numbers
 shift, deltas-vs-baseline within this same configuration would be.
 
-\* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `msam_bench.toml`. Unblocked by P7.
+\* graph pathway returns `[]` during these runs because `[triples] enable_extraction = false` in `saga_bench.toml`. Unblocked by P7.
 
 ## Per-subtype scores
 
-### `msam_baseline_v0` — weighted_sum, MiniMax (500q)
+### `saga_baseline_v0` — weighted_sum, MiniMax (500q)
 | Subtype | Score | N |
 |---|---|---|
 | single-session-assistant | 0.964 | 56 |
@@ -78,7 +78,7 @@ shift, deltas-vs-baseline within this same configuration would be.
 | multi-session | 0.549 | 133 |
 | single-session-preference | 0.233 | 30 |
 
-### `msam_rrf_v1` — RRF, MiniMax (500q, 498 graded after 2 errors)
+### `saga_rrf_v1` — RRF, MiniMax (500q, 498 graded after 2 errors)
 | Subtype | Score | N | Δ vs baseline |
 |---|---|---|---|
 | single-session-assistant | 1.000 | 56 | +3.6 |
@@ -90,7 +90,7 @@ shift, deltas-vs-baseline within this same configuration would be.
 
 **Overall: 0.734 → 0.799 (+6.6 pp)**. Cleared P2's ≥1 pt bar.
 
-### `msam_rrf_gpt4omini_v1` — RRF, gpt-4o-mini (500q)
+### `saga_rrf_gpt4omini_v1` — RRF, gpt-4o-mini (500q)
 | Subtype | Score | N | Δ vs RRF+MiniMax |
 |---|---|---|---|
 | single-session-assistant | 0.946 | 56 | -5.4 |
@@ -102,9 +102,9 @@ shift, deltas-vs-baseline within this same configuration would be.
 
 **Overall: 0.799 → 0.728 (-7.1 pp)**. Reader downgrade hurts across the board.
 MiniMax-M2.7's `<think>`-budgeted reasoning beats gpt-4o-mini on this task
-despite the token-cap overhead. Keep MiniMax for future MSAM runs.
+despite the token-cap overhead. Keep MiniMax for future SAGA runs.
 
-### `msam_p3_minimax_v1` — RRF + graph + temporal, MiniMax (500q)
+### `saga_p3_minimax_v1` — RRF + graph + temporal, MiniMax (500q)
 | Subtype | Score | N | Δ vs RRF+MiniMax (P2) |
 |---|---|---|---|
 | single-session-assistant | 0.982 | 56 | -1.8 |
@@ -126,7 +126,7 @@ Follow-up work:
 3. Gate pathway activation on window-width (only fire for narrow scopes).
 Graph pathway has no effect this run — triples disabled.
 
-### `msam_p3_minimax_v2` — temporal pathway ranks by cosine within window (500q)
+### `saga_p3_minimax_v2` — temporal pathway ranks by cosine within window (500q)
 | Subtype | Score | N | Δ vs P3v1 | Δ vs P2 (RRF+MiniMax) |
 |---|---|---|---|---|
 | single-session-assistant | 0.982 | 56 | 0.0 | -1.8 |
@@ -152,7 +152,7 @@ supported at these weights. Potential rescues:
 3. Move temporal handling from "parallel pathway" to "post-filter boost"
    on the semantic list (multiply by an in-window bonus).
 
-### `msam_p1_minimax_v1` — observations tier + bonus, MiniMax (500q)
+### `saga_p1_minimax_v1` — observations tier + bonus, MiniMax (500q)
 
 Bench config: `[consolidation] enabled=true` with `min_cluster_size=2`
 and `max_clusters_per_run=20`; consolidation LLM = gpt-4o-mini;
@@ -192,7 +192,7 @@ Paths to rescue P1:
 4. Gate the bonus on query type — preference-ish queries get it,
    factual/temporal queries skip it.
 
-### `msam_p1_minimax_v2` — consolidation prompt v2 (preserve dates, numbers, named entities), MiniMax (500q)
+### `saga_p1_minimax_v2` — consolidation prompt v2 (preserve dates, numbers, named entities), MiniMax (500q)
 
 Prompt changed from "synthesize a concise summary" to a version that
 requires verbatim preservation of dates, times, numbers, names, direct
@@ -232,7 +232,7 @@ both prompt variants. Schema + wiring are useful for future work
 but we should stop defaulting `enable_observation_bonus = true` until
 we have a design that doesn't trade one subtype for another.
 
-### `msam_p1_minimax_v3` — LLM off in consolidation, longest-atom fallback (500q)
+### `saga_p1_minimax_v3` — LLM off in consolidation, longest-atom fallback (500q)
 
 Bench config: `consolidation.enable_llm = false`. The fallback path
 picks the longest atom in each cluster, prefixes with "[Consolidated
@@ -279,7 +279,7 @@ Reader prompt presents both as labeled blocks so preference queries
 lean on observations, temporal queries lean on raws. Expected to land
 the preference lift without sacrificing temporal/multi-session.
 
-### `msam_p9_minimax_v1` — two-tier retrieval (P9), MiniMax reader, gpt-5.4-nano consolidation (500q)
+### `saga_p9_minimax_v1` — two-tier retrieval (P9), MiniMax reader, gpt-5.4-nano consolidation (500q)
 
 Bench config: `retrieval.two_tier_enabled = true`, `observations_top_k = 5`,
 `observation_confidence_min_sim = 0.30`, `evidence_boost_cap_multiplier = 3.0`,
@@ -321,7 +321,7 @@ Observation fire rates from the run:
 Errors: 1 (Q `8a137a7f` lost to OpenAI 500 on embeddings).
 Pace: ~37s/q with gpt-5.4-nano consolidation (vs ~110s with MiniMax).
 
-### `msam_p9_minimax_v2` — same as v1 but min_cluster_size=3 (overnight)
+### `saga_p9_minimax_v2` — same as v1 but min_cluster_size=3 (overnight)
 
 Reasoning:
 - v1 hit the 20-cluster cap on most questions with min=2, meaning many
@@ -335,7 +335,7 @@ Reasoning:
   queries — wrong direction given temporal is the only weak subtype.
   Going with min=3 alone.
 
-### `msam_p9_minimax_v2` — same as v1 but `min_cluster_size=3` (500q)
+### `saga_p9_minimax_v2` — same as v1 but `min_cluster_size=3` (500q)
 
 | Subtype | Score | N | Δ vs P9v1 (min=2) | Δ vs P2 |
 |---|---|---|---|---|
@@ -365,7 +365,7 @@ hitting the 20-cap on most v1 questions to ~7-12 on v2, confirming
 ~50-80% of v1's clusters were size-2 noise. Cons time fell from
 ~22s/q to ~12s/q.
 
-### `msam_p9_minimax_v3` — per-stream cluster floors + tighter obs gating + per-stream prompts (500q)
+### `saga_p9_minimax_v3` — per-stream cluster floors + tighter obs gating + per-stream prompts (500q)
 
 Four tunings stacked on top of v2 to try to recover the v1 preference
 gain without losing v2's multi-session lift:
@@ -411,7 +411,7 @@ every subtype except single-session-assistant. The tunings worked
 In short: each tuning was individually defensible; together they
 compounded into a net loss. P9v2 is still the best P9 variant.
 
-### `msam_p8_minimax_v1` — P9v2 + cluster merge pass + P10 wiring (500q)
+### `saga_p8_minimax_v1` — P9v2 + cluster merge pass + P10 wiring (500q)
 
 P9v2 baseline (the best P9 variant) + P8 merge pass + P10 session
 boundary writes during ingest + mark_contributions after each probe.
@@ -474,7 +474,7 @@ embedding calls during ingest — each boundary goes through `store_atom`
 without a pre-computed embedding, so each hits the OpenAI API solo
 instead of being batched.
 
-### `msam_p8_minimax_v2` — P8v1 stack with tighter merge knobs (500q)
+### `saga_p8_minimax_v2` — P8v1 stack with tighter merge knobs (500q)
 
 Same code, same P10 wiring, only two config changes:
 - `merge_threshold` 0.75 → 0.85
@@ -531,7 +531,7 @@ no merge). That would tell us whether the session_boundary atoms
 themselves are dragging single-session subtypes — they all dropped
 ~5 pp vs P9v2 in both P8v1 and P8v2, which is suspicious.
 
-### `msam_p4_minimax_v1` — P9v2 + P4-bench supersedes resolution (500q)
+### `saga_p4_minimax_v1` — P9v2 + P4-bench supersedes resolution (500q)
 
 P9v2 baseline + per-question contradiction-to-supersedes resolution
 between consolidation and retrieval, plus retrieval-side multiplicative
@@ -608,7 +608,7 @@ Possible follow-ups (not yet tried):
 P9v2 (0.796) remains the best configuration. P4-bench is a clear
 regression on this benchmark and should not ship as default.
 
-### `msam_p30_minimax_v1` — P9v2 + P30 missing-atom base score fix (500q)
+### `saga_p30_minimax_v1` — P9v2 + P30 missing-atom base score fix (500q)
 
 P9v2 baseline + P30 (asymmetric missing-atom scoring fix) + atom-level
 supersedes auto-triggers disabled (commit `591e48a`) + observation-level
@@ -653,7 +653,7 @@ raws from being inflated above their relevance.
 Pace: ~28s/q (vs P9v2's ~38s/q). The supersedes resolver is gone, so
 each question runs ~10s faster.
 
-### `msam_p30_minimax_v2` — P30v1 stack with flat 2× restoration (500q)
+### `saga_p30_minimax_v2` — P30v1 stack with flat 2× restoration (500q)
 
 Replaced the additive boost (`base + min(2 × obs_score, 2 × base)`) with
 a flat `base × 2` restoration applied to raws endorsed by surfaced
@@ -693,7 +693,7 @@ mechanism) is the canonical model.** It was a trade — preference lift
 at the cost of moderate losses elsewhere — and that trade is the
 right one given the data.
 
-### `msam_p30_minimax_v3` — P30v1 additive boost reinstated + per-atom tiers (500q)
+### `saga_p30_minimax_v3` — P30v1 additive boost reinstated + per-atom tiers (500q)
 
 After P30v2 confirmed flat restoration was strictly worse (commit `5cbcb26`
 reverted it), this run measures the additive boost on the **current**
@@ -743,7 +743,7 @@ P4-bench's atom-level supersedes also fell to.
 
 Pace: ~31s/q (within noise of P30v1's ~28s/q).
 
-### `msam_cherrypicks_minimax_v1` — P30v3 + all three cherry-picks (500q)
+### `saga_cherrypicks_minimax_v1` — P30v3 + all three cherry-picks (500q)
 
 The full P11/P12/P13 cherry-pick stack (commits `fa201ec` + `3d5d497`)
 on top of the P30v3 baseline:
@@ -810,19 +810,19 @@ forward:
 
 The cherry-picks are not a regression in the codebase — they're
 opt-in flags, prod is unaffected. Just leave the bench config with
-them off until ablation says otherwise. Updating msam_bench.toml to
+them off until ablation says otherwise. Updating saga_bench.toml to
 disable the three flags accordingly is a follow-up task (next
 session). Pace: ~32s/q (vs P30v3's ~31s/q — synonym expansion +
 quality scoring add minor overhead).
 
-### `msam_cherrypicks_off_gptoss_v1` — P30v3 mechanism, gpt-oss-120b for everything (500q)
+### `saga_cherrypicks_off_gptoss_v1` — P30v3 mechanism, gpt-oss-120b for everything (500q)
 
 Two changes from the prior P30v3 baseline (0.784):
-- **Cherry-picks reverted to off** (post `msam_cherrypicks_minimax_v1` regression).
+- **Cherry-picks reverted to off** (post `saga_cherrypicks_minimax_v1` regression).
   Mechanism is exactly the P30v3 stack: additive boost, per-atom confidence
   tiers, missing-atom cosine pull-in.
 - **Every LLM in the bench loop switched to `openai/gpt-oss-120b`** via
-  OpenRouter — reader (was MiniMax-M2.7), MSAM's consolidation synthesizer
+  OpenRouter — reader (was MiniMax-M2.7), SAGA's consolidation synthesizer
   (was gpt-5.4-nano), and the judge (was gpt-4o). Auth via the new unified
   `[llm]` section + `OPENAI_BASE_URL` override on the judge.
 
@@ -880,14 +880,14 @@ atom backfill fix in `29efa38`.
 Pace: ~25s/q ingest (vs P30v3's ~31s/q — gpt-oss-120b reader is
 faster than MiniMax). Judge: ~2 min for 500q (vs ~7 min on gpt-4o).
 
-### `msam_p32_gptoss_v1` — P30v3 + triples + graph pathway (500q)
+### `saga_p32_gptoss_v1` — P30v3 + triples + graph pathway (500q)
 
 P32 wired end-to-end. Bench's `ingest.py` now collects (atom_id, content)
 for every semantic-stream atom, then calls `batch_extract_and_store`
 (P7) once per question after embedding. ~12 LLM calls per question
 instead of ~250 single-shot. Graph pathway joins RRF as a fourth
 ranked list (`enable_graph_pathway = true`). All other knobs match
-P30v3 + cherry-picks-off baseline. Reader, MSAM consolidation, judge,
+P30v3 + cherry-picks-off baseline. Reader, SAGA consolidation, judge,
 and triple extraction all on `openai/gpt-oss-120b` via OpenRouter.
 
 | Subtype | Score | N | Δ vs `cherrypicks_off_gptoss` (0.668) |
@@ -957,7 +957,7 @@ config and `[retrieval] enable_graph_pathway = false` in retrieval.
 But these are follow-on experiments, not corrections to the running
 P32 baseline. P32 is a **null result** for this corpus + judge.
 
-### `msam_rerank_gptoss_v1` — P30v3 + cross-encoder LLM rerank (500q)
+### `saga_rerank_gptoss_v1` — P30v3 + cross-encoder LLM rerank (500q)
 
 P15 cherry-picked from `retrieval_v2.rerank_with_llm`. After RRF
 fusion produces the top-K candidates, the top 8 atoms are sent to
@@ -1029,7 +1029,7 @@ extraction cost).
 Pace: rerank ~24s/q (vs baseline ~25s/q — rerank adds ~100ms per
 query in the LLM call but cons/retrieve/read sum dominates).
 
-### `msam_p35_canon_v1` — P30v3 + P35 (triples as consolidation byproduct), canonical stack (500q)
+### `saga_p35_canon_v1` — P30v3 + P35 (triples as consolidation byproduct), canonical stack (500q)
 
 P35 takes the same end-state as P32 (triples + graph pathway on) but
 moves extraction inside consolidation: one LLM call per cluster
@@ -1067,8 +1067,8 @@ canonical baselines:
 
 | Bench | Stack | Triples | Δ vs same-stack baseline |
 |---|---|---|---|
-| `msam_p32_gptoss_v1` | gpt-oss | separate pipeline | -2.2 vs 0.668 |
-| `msam_p35_canon_v1` | canonical | byproduct of consolidation | -2.6 vs 0.784 |
+| `saga_p32_gptoss_v1` | gpt-oss | separate pipeline | -2.2 vs 0.668 |
+| `saga_p35_canon_v1` | canonical | byproduct of consolidation | -2.6 vs 0.784 |
 
 So **triples + graph pathway is just net-negative on LongMemEval**,
 independent of how they're extracted. The cluster-level quality
@@ -1105,7 +1105,7 @@ P35 architecture — it's strictly better for production agents that
 transfer, prior-belief handling). But on LongMemEval the graph
 pathway is a net regression regardless of extraction quality.
 
-`msam_bench.toml` going forward: `enable_extraction = false` (P35
+`saga_bench.toml` going forward: `enable_extraction = false` (P35
 no-op when disabled — synthesizer just emits observation, skips
 triples in its prompt) and `enable_graph_pathway = false`. P30v3
 mechanism remains the canonical configuration.
@@ -1131,10 +1131,10 @@ LongMemEval, kept in code for production-graph-feature deployments."
 Pace: ~38s/q (vs P30v3's ~31s/q — consolidation prompt produces more
 output and gpt-5.4-nano takes a bit longer for the structured format).
 
-### `msam_p11_canon_v1` — cherry-pick ablation: P11 alone (498q, 2 errors)
+### `saga_p11_canon_v1` — cherry-pick ablation: P11 alone (498q, 2 errors)
 
 First of three ablation runs disambiguating the cherry-picks bundle
-regression (`msam_cherrypicks_minimax_v1` = 0.756, -2.8pp vs P30v3 =
+regression (`saga_cherrypicks_minimax_v1` = 0.756, -2.8pp vs P30v3 =
 0.784). P11 is built-in query rewriting (`user → User`,
 `agent → Agent`, etc.) applied on both pathways via
 `_apply_query_rewriting`. P12 and P13 stay off.
@@ -1175,7 +1175,7 @@ API hiccups during the run. Subtype counts shifted slightly
 
 Pace: ~33s/q (~4h29m for 500 questions).
 
-### `msam_p12_canon_v1` — cherry-pick ablation: P12 alone (499q, 1 error)
+### `saga_p12_canon_v1` — cherry-pick ablation: P12 alone (499q, 1 error)
 
 Second of three ablation runs. P12 is synonym expansion on the
 keyword pathway only — for query terms matching keys in the 29-entry
@@ -1247,7 +1247,7 @@ the +21.6pp lift).
 
 Pace: ~32s/q. P12 took 4h42m total ingest.
 
-### `msam_p13_canon_v1` — cherry-pick ablation: P13 alone (500q)
+### `saga_p13_canon_v1` — cherry-pick ablation: P13 alone (500q)
 
 Third and final ablation. P13 is the heuristic atom-quality
 multiplier — `compute_atom_quality(content)` produces a 0-1 score
@@ -1320,7 +1320,7 @@ delete `enable_quality_filter` entirely.
 
 Pace: ~32s/q, 4h42m total ingest.
 
-### `msam_p34_canon_v1` — consolidation threshold sweep (500q)
+### `saga_p34_canon_v1` — consolidation threshold sweep (500q)
 
 P34 lowers `[consolidation] similarity_threshold` from 0.80 to 0.75
 on the canonical stack. P34's offline pair-similarity analysis
@@ -1365,7 +1365,7 @@ That's a future test — not run yet.
 
 ---
 
-### `msam_p36_canon_v1` — graph pathway as tiebreaker (500q)
+### `saga_p36_canon_v1` — graph pathway as tiebreaker (500q)
 
 P36 keeps P35's triples + graph pathway ON but drops
 `[retrieval] rrf_graph_weight` from 0.7 to 0.3. Tests whether graph
@@ -1425,7 +1425,7 @@ config keeps `enable_extraction = false` and
 Pace: P34 ~42s/q (slow because more clusters → more LLM calls per
 question); P36 ~35s/q.
 
-### `msam_p38_canon_v1` — confidence-gated HyDE (500q)
+### `saga_p38_canon_v1` — confidence-gated HyDE (500q)
 
 P38 wraps standard HyDE in a confidence gate: only generate a
 hypothetical answer (gpt-5.4-nano, 1-2 sentences) and re-run the
@@ -1527,11 +1527,11 @@ stability-halving harm, and made consolidation a benefit-or-neutral
 on this bench rather than the net-negative P1 was. P9v2 is the
 recommended P9 configuration. Good shape to ship.
 
-### `msam_p12_canon_v2` — P12 re-baseline (500q) — REGRESSED unexpectedly
+### `saga_p12_canon_v2` — P12 re-baseline (500q) — REGRESSED unexpectedly
 
 After shipping `enable_query_expansion = true` to canonical
-`msam_bench.toml` (commit `45b7ec3`), this run was meant to confirm
-P12's +0.8pp from the original P12 ablation (`msam_p12_canon_v1` =
+`saga_bench.toml` (commit `45b7ec3`), this run was meant to confirm
+P12's +0.8pp from the original P12 ablation (`saga_p12_canon_v1` =
 0.792). Instead it scored **0.762** — a -3.0pp regression on
 identical config 3 days later.
 
@@ -1558,7 +1558,7 @@ rewrite (off in bench), HyDE infra (off), session_id plumbing
 behavior). None of these obviously affect the keyword pathway P12
 operates on. Possible causes ordered by likelihood:
 
-1. **Parallel-run interference** with `msam_p39_canon_v1` sharing
+1. **Parallel-run interference** with `saga_p39_canon_v1` sharing
    API/CPU. Both runs ingested concurrently; even at temperature=0,
    the consolidation LLM (gpt-5.4-nano) could behave subtly
    differently under contention. Re-running P12_v2 solo would
@@ -1577,7 +1577,7 @@ P39's apparent win may be smaller against a properly-behaving P12.
 
 Pace: ~31s/q in parallel.
 
-### `msam_p39_canon_v1` — median pivot for missing-atom scoring (500q)
+### `saga_p39_canon_v1` — median pivot for missing-atom scoring (500q)
 
 P39 changes `_two_tier_split`'s missing-atom (pulled-in) base
 scoring to pivot on the **median** of the in-pool RRF distribution
@@ -1588,7 +1588,7 @@ endorsed atoms compete with mid-rank in-pool raws instead of being
 silently dropped.
 
 Run on top of P12_canon_v2 config (canonical + P12 on + median
-pivot), parallel with `msam_p12_canon_v2`. The direct comparison is
+pivot), parallel with `saga_p12_canon_v2`. The direct comparison is
 P12_v2 (min pivot) vs P39 (median pivot) — same code, same day,
 only the pivot config differs.
 
@@ -1646,7 +1646,7 @@ fact-replacement for the same reason).
 
 Pace: ~31s/q in parallel.
 
-### `msam_p12_canon_v3` — P12 solo re-baseline (500q) + variance characterization
+### `saga_p12_canon_v3` — P12 solo re-baseline (500q) + variance characterization
 
 Solo re-run of the P12 baseline after v2's regression looked
 suspicious. Same config as v2 — canonical with `enable_query_expansion
@@ -1708,7 +1708,7 @@ time of day. Indication that the bench's bottleneck is API
 latency, not local CPU; parallel runs interleave waits well enough
 that they don't lose total wall-clock time vs solo.
 
-### `msam_p43_canon_v1` — subatom beam as RRF pathway (500q)
+### `saga_p43_canon_v1` — subatom beam as RRF pathway (500q)
 
 P43: `compressed_retrieve` runs sentence-level extraction on top of
 the cheap-path's retrieved atoms; sentences are mapped back to
@@ -1745,7 +1745,7 @@ Pace: 271 min (~33s/q), ~6s of which is the new subatom retrieve.
 Bulk batch_embed_texts kept the per-question cost manageable;
 without bulk batching, smoke showed 42s/q.
 
-### `msam_p43_p41_canon_v1` — subatom beam + triple_augment_v2 (500q)
+### `saga_p43_p41_canon_v1` — subatom beam + triple_augment_v2 (500q)
 
 P43 + P41: subatom beam from above PLUS embedding-cosine match on
 active triples → source atoms as a 5th RRF pathway. Triples are
@@ -1802,7 +1802,7 @@ Pace: 271 min for P43, 277 min for P43+P41 (~33-37s/q each, in
 parallel). Adding P41 cost ~6 min over P43 — the cosine pass on
 active triples per query is cheap once triples are populated.
 
-### `msam_p43_canon_v2` — P43 re-bench with list-aware splitter (500q)
+### `saga_p43_canon_v2` — P43 re-bench with list-aware splitter (500q)
 
 P46 sentence splitter rewrite (commit `cb3ea83`): paragraph-level
 chunking with list-block detection (≥2 lines starting with bullet
@@ -1843,7 +1843,7 @@ Pace: 287 min (~34s/q). Splitter v2 produces fewer chunks per
 atom (8 vs 50 for the example), so per-question retrieve is
 3-5s instead of 5-7s with v1.
 
-### `msam_p43_p41_canon_v2` — P43+P41 re-bench with list-aware splitter (500q)
+### `saga_p43_p41_canon_v2` — P43+P41 re-bench with list-aware splitter (500q)
 
 Same splitter fix applied to the 3-pathway run. Direct comparison
 to v1 isolates the splitter's effect on the P41 outcome.
@@ -1906,7 +1906,7 @@ variance.
 Pace: 287 min for P43_v2, 289 min for P43+P41_v2 (~35s/q each,
 in parallel).
 
-### `msam_p30_canon_v4` — canonical re-baseline AFTER consolidation fix (500q)
+### `saga_p30_canon_v4` — canonical re-baseline AFTER consolidation fix (500q)
 
 **Critical context**: every prior bench run (including P30v3 = 0.784,
 all P12 / P34 / P38 / P39 / P43 / P43+P41 results) used a silently-
@@ -1917,7 +1917,7 @@ zero triples written.
 
 This run is the first canonical measurement with consolidation
 actually working. Reader, judge, retrieval pipeline all unchanged
-from `msam_p30_minimax_v3`; only the consolidation LLM call is
+from `saga_p30_minimax_v3`; only the consolidation LLM call is
 fixed (commit `a426959`: switch to `max_completion_tokens`).
 
 | Subtype | Score | N | Δ vs P30v3 (broken cons) |
@@ -1955,7 +1955,7 @@ runs (the LLM is now actually generating output) — was ~10s/cluster
 broken, now ~3-4s/cluster fixed (the broken path's "fast" timing
 was misleading because it was just exception handling).
 
-### `msam_p41_canon_v1` — canonical + triple_augment_v2 only (500q)
+### `saga_p41_canon_v1` — canonical + triple_augment_v2 only (500q)
 
 First clean P41 measurement. All prior P41-flagged runs (P43+P41_v1,
 v2) had no triples populated due to the consolidation bug above —
@@ -2031,7 +2031,7 @@ preference gap — the rest is retrieval.
 
 ## Notes on errors / caveats
 
-- `msam_rrf_v1` processed 500, saved 498 to hypotheses (2 ingestion errors).
+- `saga_rrf_v1` processed 500, saved 498 to hypotheses (2 ingestion errors).
 - Hindsight's 60q run uses their own harness and patched `prepare_sessions_for_ingestion` for duplicate-`session_id` questions (Q4, Q5, Q45 in the first 60).
 - Hindsight's reported 91.4% is on the same dataset but their prior runs used different reader config; our 60q run recreates under matched reader (gpt-4o-mini).
 
@@ -2039,7 +2039,7 @@ preference gap — the rest is retrieval.
 
 Hypotheses + metrics: `results/longmemeval/hypotheses_<tag>.jsonl` and
 `metrics_<tag>.jsonl`. Judge output: same filename + `.eval-results-gpt-4o`.
-Full MSAM run logs: `results/longmemeval/<tag>.log`.
+Full SAGA run logs: `results/longmemeval/<tag>.log`.
 Hindsight results JSON: `external/hindsight/hindsight-dev/benchmarks/longmemeval/results/*.json`.
 
 ## Update protocol

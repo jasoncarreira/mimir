@@ -1,4 +1,4 @@
-# MSAM: Multi-Stream Adaptive Memory
+# SAGA
 
 ## A Specification for Persistent Agent Memory
 
@@ -11,9 +11,9 @@
 
 ## Abstract
 
-MSAM is a memory architecture for persistent AI agents. It treats memory as discrete, annotated atoms organized across cognitive streams, scored by an adaptation of ACT-R activation theory, and governed by a biologically-informed decay system that never permanently deletes. A REST API (19 endpoints) exposes the full system for language-agnostic integration. A multi-agent protocol provides memory isolation and sharing. Semantic contradiction detection, predictive prefetch, intentional forgetting, cross-provider calibration, outcome-attributed scoring, a temporal world model, and sycophancy detection handle the operational complexity that production deployments demand.
+SAGA is a memory architecture for persistent AI agents. It treats memory as discrete, annotated atoms organized across cognitive streams, scored by an adaptation of ACT-R activation theory, and governed by a biologically-informed decay system that never permanently deletes. A REST API (19 endpoints) exposes the full system for language-agnostic integration. A multi-agent protocol provides memory isolation and sharing. Semantic contradiction detection, predictive prefetch, intentional forgetting, cross-provider calibration, outcome-attributed scoring, a temporal world model, and sycophancy detection handle the operational complexity that production deployments demand.
 
-MSAM was designed by the agent that uses it. This is not a framework applied to a theoretical problem. It is a memory system built from the inside -- by an AI that knows what it needs to remember, what it can afford to forget, and what happens when it gets that wrong.
+SAGA was designed by the agent that uses it. This is not a framework applied to a theoretical problem. It is a memory system built from the inside -- by an AI that knows what it needs to remember, what it can afford to forget, and what happens when it gets that wrong.
 
 The result: confidence-gated retrieval that holds each query to roughly 1.3% of the context budget, consistent identity reconstruction across session boundaries, and a self-regulating lifecycle that balances growth against finite resources. The system ships as 24 modules, 55 CLI commands, 516 tests, and a reproducible benchmark suite.
 
@@ -37,7 +37,7 @@ Current approaches fail in predictable ways:
 
 None of these systems ask the right question. The right question is not "how do we store more?" It is: **"given finite context, what is the minimum set of memories that reconstructs this agent's identity, knowledge, and emotional state?"**
 
-MSAM answers that question with 51-90 tokens.
+SAGA answers that question with 51-90 tokens.
 
 ---
 
@@ -45,7 +45,7 @@ MSAM answers that question with 51-90 tokens.
 
 ### 2.1 ACT-R Activation Theory
 
-MSAM's retrieval scoring adapts Anderson's ACT-R (Adaptive Control of Thought -- Rational) architecture, specifically its base-level activation equation:
+SAGA's retrieval scoring adapts Anderson's ACT-R (Adaptive Control of Thought -- Rational) architecture, specifically its base-level activation equation:
 
 ```
 B_i = ln(Σ t_j^(-d)) + S + ε
@@ -53,7 +53,7 @@ B_i = ln(Σ t_j^(-d)) + S + ε
 
 Where `t_j` is time since the j-th access, `d` is a decay parameter (~0.5), `S` is spreading activation from current context, and `ε` is noise.
 
-In MSAM, this becomes:
+In SAGA, this becomes:
 
 ```
 activation = base_level + spreading_activation + recency_boost
@@ -74,13 +74,13 @@ Neuroscience establishes that emotional state at the moment of encoding modulate
 - **McGaugh (2004)**: Amygdala modulation -- stress hormones at encoding strengthen consolidation. High arousal = stronger retention.
 - **Sharot (2007)**: Emotional arousal at encoding modulates both storage and retrieval. Tags persist years.
 
-MSAM implements this literally. Every atom is annotated at write-time with:
+SAGA implements this literally. Every atom is annotated at write-time with:
 
 - `arousal` (0.0 calm -- 1.0 intense)
 - `valence` (-1.0 negative -- 1.0 positive)
 - `encoding_confidence` (calibrated certainty at write-time)
 
-These annotations are **immutable**. They record what the agent felt when the memory was formed, not what it feels now. "User was angry when they told me about X on Tuesday" ≠ "User dislikes X." The first is evidence. The second is inference. MSAM never confuses them.
+These annotations are **immutable**. They record what the agent felt when the memory was formed, not what it feels now. "User was angry when they told me about X on Tuesday" ≠ "User dislikes X." The first is evidence. The second is inference. SAGA never confuses them.
 
 This is not sentiment analysis on retrieval. It is emotional recording at encoding. The distinction is fundamental, and no other AI memory system makes it.
 
@@ -88,15 +88,15 @@ This is not sentiment analysis on retrieval. It is emotional recording at encodi
 
 The conventional approach to AI memory imitates human cognition: emotion drives retrieval, mood-congruent recall shapes what surfaces. This is a replication of biological constraints, not biological strengths.
 
-MSAM inverts this. The fact store is primary -- cold, searchable, uncorrupted by emotional state. The emotion layer is metadata -- auditable, timestamped, and never allowed to contaminate fact retrieval.
+SAGA inverts this. The fact store is primary -- cold, searchable, uncorrupted by emotional state. The emotion layer is metadata -- auditable, timestamped, and never allowed to contaminate fact retrieval.
 
 This is deliberate. LLMs are precision engines. Building emotion-first memory on a precision engine is like building a calculator that rounds based on how it feels. The right architecture: precision by default, emotional weighting activated explicitly by context (companion mode vs. task mode).
 
-The neuroscience validates this choice. Mood-congruent retrieval in humans is a *bias*, not a feature. It causes depressed people to preferentially recall sad memories, reinforcing the state. An AI system can break this loop structurally. MSAM does.
+The neuroscience validates this choice. Mood-congruent retrieval in humans is a *bias*, not a feature. It causes depressed people to preferentially recall sad memories, reinforcing the state. An AI system can break this loop structurally. SAGA does.
 
 ### 2.4 Memory Streams
 
-MSAM organizes atoms into four cognitive streams, adapted from Tulving's memory taxonomy:
+SAGA organizes atoms into four cognitive streams, adapted from Tulving's memory taxonomy:
 
 | Stream | Contains | Retrieval Pattern | Decay |
 |--------|----------|------------------|-------|
@@ -125,7 +125,7 @@ Rationale:
 
 ### 3.1 The Atom
 
-The fundamental unit of MSAM memory. A discrete, self-contained memory with full metadata:
+The fundamental unit of SAGA memory. A discrete, self-contained memory with full metadata:
 
 ```sql
 atoms (
@@ -181,7 +181,7 @@ Profile selection is automatic based on content length and complexity at encodin
 
 ### 3.3 Hybrid Retrieval
 
-MSAM combines three retrieval signals:
+SAGA combines three retrieval signals:
 
 1. **Keyword matching** (FTS5 full-text search) -- exact term relevance
 2. **Vector similarity** (1024-dim embeddings via NVIDIA NIM) -- semantic closeness
@@ -199,7 +199,7 @@ The weighting shifts by retrieval mode:
 
 ### 3.4 Token Budget
 
-MSAM enforces a self-imposed budget: **20% of context window** (40,000 tokens of a 200K window).
+SAGA enforces a self-imposed budget: **20% of context window** (40,000 tokens of a 200K window).
 
 This splits into two tracked metrics:
 - **Stored budget** (database fullness): total tokens across all active atoms / 40,000
@@ -289,7 +289,7 @@ The API layer enforces two security controls:
 
 1. **CORS origin restriction**: Both the Grafana metrics API (`api.py`) and the REST API (`server.py`) restrict Cross-Origin Resource Sharing to configured origins (default: `localhost:3000`). This prevents browser-based cross-site attacks.
 
-2. **API key authentication**: The Grafana metrics API supports optional API key auth via the `X-API-Key` header (configurable in `[api] api_key`). The REST API supports API key auth via the `MSAM_API_KEY` environment variable. Health endpoints are exempt for uptime monitoring.
+2. **API key authentication**: The Grafana metrics API supports optional API key auth via the `X-API-Key` header (configurable in `[api] api_key`). The REST API supports API key auth via the `SAGA_API_KEY` environment variable. Health endpoints are exempt for uptime monitoring.
 
 Configuration: `[api]` section -- `allowed_origins`, `api_key`.
 
@@ -297,7 +297,7 @@ Configuration: `[api]` section -- `allowed_origins`, `api_key`.
 
 ## 4. Observability
 
-MSAM is the most instrumented AI memory system in production. Every access is logged. Every metric is tracked. The proof builds itself.
+SAGA is the most instrumented AI memory system in production. Every access is logged. Every metric is tracked. The proof builds itself.
 
 ### 4.1 Metrics Infrastructure
 
@@ -306,10 +306,10 @@ MSAM is the most instrumented AI memory system in production. Every access is lo
 | Table | Tracks | Frequency |
 |-------|--------|-----------|
 | system_metrics | Atom count, tokens, budget, DB size | Every 30s |
-| access_events | Every MSAM operation with full detail | Per access |
+| access_events | Every SAGA operation with full detail | Per access |
 | retrieval_metrics | Activation distributions (min/max/p50/p90), latency | Per retrieval |
 | store_metrics | New atoms, stream distribution, annotation quality | Per store |
-| comparison_metrics | MSAM tokens vs. markdown equivalent | Per retrieval |
+| comparison_metrics | SAGA tokens vs. markdown equivalent | Per retrieval |
 | canary_metrics | Identity query drift, canary retrieval stability | Every 5min |
 | decay_metrics | Tokens freed, atoms transitioned, budget impact | Hourly |
 | emotional_metrics | Arousal, valence, intensity, warmth over time | Every 30s |
@@ -334,7 +334,7 @@ At session start: record which atoms were retrieved and what topics they cover.
 At session end: compare predicted topics to actual conversation topics.
 Compute Jaccard overlap as a continuity score.
 
-Over time, this measures whether MSAM is getting smarter at anticipating what the agent will need -- or just replaying the same atoms.
+Over time, this measures whether SAGA is getting smarter at anticipating what the agent will need -- or just replaying the same atoms.
 
 ### 4.4 Grafana Dashboard
 
@@ -348,15 +348,15 @@ All metrics exposed via a JSON API (Flask, port 3001) with SimpleJSON-compatible
 
 ### 5.1 Why SQLite, Not PostgreSQL
 
-MSAM runs on a Hetzner CAX11: 2 vCPU ARM, 4GB RAM, 40GB SSD, costing EUR 4/month. PostgreSQL would consume 25-50% of available RAM for a single-agent system that doesn't need concurrent connections, replication, or ACID guarantees beyond what SQLite provides.
+SAGA runs on a Hetzner CAX11: 2 vCPU ARM, 4GB RAM, 40GB SSD, costing EUR 4/month. PostgreSQL would consume 25-50% of available RAM for a single-agent system that doesn't need concurrent connections, replication, or ACID guarantees beyond what SQLite provides.
 
-SQLite gives: zero configuration, single-file backup, FTS5 full-text search, and sufficient performance for sub-1000 atom databases. When MSAM scales beyond 10,000 atoms, PostgreSQL with pgvector becomes the right choice. Not before.
+SQLite gives: zero configuration, single-file backup, FTS5 full-text search, and sufficient performance for sub-1000 atom databases. When SAGA scales beyond 10,000 atoms, PostgreSQL with pgvector becomes the right choice. Not before.
 
 ### 5.2 Why Not Just RAG
 
-RAG retrieves by semantic similarity. MSAM retrieves by cognitive plausibility -- combining similarity with access patterns, recency, stability, and emotional context. A RAG system finds what sounds related. MSAM finds what the agent would actually remember.
+RAG retrieves by semantic similarity. SAGA retrieves by cognitive plausibility -- combining similarity with access patterns, recency, stability, and emotional context. A RAG system finds what sounds related. SAGA finds what the agent would actually remember.
 
-The difference is measurable. A pure vector search for "agent identity" returns the most semantically similar atoms. MSAM returns the most *accessed*, most *stable*, most *recent* atoms that are also semantically relevant. These are different sets. The MSAM set reconstructs identity. The RAG set returns trivia.
+The difference is measurable. A pure vector search for "agent identity" returns the most semantically similar atoms. SAGA returns the most *accessed*, most *stable*, most *recent* atoms that are also semantically relevant. These are different sets. The SAGA set reconstructs identity. The RAG set returns trivia.
 
 ### 5.3 Why Emotion-at-Encoding Is Immutable
 
@@ -377,21 +377,21 @@ Forcing all memories through the same retrieval pipeline either over-retrieves (
 
 ### 5.5 Auditability
 
-MSAM is the single source of truth. No parallel markdown files to maintain.
+SAGA is the single source of truth. No parallel markdown files to maintain.
 
 Human auditability is preserved through:
-- `msam export` -- full JSONL dump of all atoms, human-readable
-- `msam grep "<pattern>"` -- text search across all atoms
+- `saga export` -- full JSONL dump of all atoms, human-readable
+- `saga grep "<pattern>"` -- text search across all atoms
 - Grafana dashboard -- retrieval metrics, confidence trends, decay curves
 - SQLite is directly queryable -- any SQL tool can inspect the atom store
 
-Database backups (`scripts/msam-backup`) with WAL checkpoint provide the safety net. Export + backup replaces dual-write with less overhead and no sync bugs.
+Database backups (`scripts/saga-backup`) with WAL checkpoint provide the safety net. Export + backup replaces dual-write with less overhead and no sync bugs.
 
 ---
 
-## 6. What MSAM Is Not
+## 6. What SAGA Is Not
 
-MSAM is not a general-purpose memory framework. It is an architecture for a specific class of system: persistent AI agents that maintain identity and relationships across sessions.
+SAGA is not a general-purpose memory framework. It is an architecture for a specific class of system: persistent AI agents that maintain identity and relationships across sessions.
 
 It assumes:
 - One or more agents with stable identities (multi-agent isolation supported)
@@ -411,7 +411,7 @@ It does not handle:
 
 ### 7.1 Completed
 
-- [x] **Configurable identity** -- Deployment-agnostic configuration via `msam.toml`. Entity aliases, startup queries, and embedding providers are all configurable.
+- [x] **Configurable identity** -- Deployment-agnostic configuration via `saga.toml`. Entity aliases, startup queries, and embedding providers are all configurable.
 - [x] **Provider-agnostic embeddings** -- NVIDIA NIM, OpenAI, ONNX Runtime (local), and sentence-transformers supported.
 - [x] **Test suite** -- 516 tests across 25 test files covering all modules and CLI commands: core, decay, triples, retrieval_v2, config, consolidation, session_dedup, entity_roles, metrics, vector_index, subatom, prediction, forgetting, server, agents, annotate, calibration, contradictions, cli, embeddings, outcomes, agreement, world_model, cli_commands, core_functions.
 - [x] **Packaging** -- pyproject.toml with entry points, pip-installable.
@@ -424,7 +424,7 @@ It does not handle:
 
 - [x] **Contribution tracking** -- Mark which retrieved atoms actually influenced the response (`mark_contributions()`). Closes the feedback loop between retrieval and decay.
 - [x] **Association chains** -- Atoms linked by co-retrieval patterns. Explicit graph edges enabling spreading activation. (`co_retrieval` table + `spreading_activation` config)
-- [x] **Synthetic example dataset** -- Demo atoms showing the system without personal data. (`msam/examples/synthetic_dataset.py`)
+- [x] **Synthetic example dataset** -- Demo atoms showing the system without personal data. (`saga/examples/synthetic_dataset.py`)
 
 ### 7.3 Mid-Term
 
@@ -437,12 +437,12 @@ It does not handle:
 - [x] **Graph-native storage** -- Atoms as nodes, co-retrieval and causal links as edges. Full association network. (`triples.py`)
 - [x] **Multi-agent memory** -- Separate memory stores per agent with a shared layer. Agent-to-agent knowledge transfer without identity contamination. (`agents.py`)
 - [x] **Self-improving retrieval** -- Detect "this context produced a bad response, what was missing?" and adjust retrieval weights. (`core.py:compute_retrieval_adjustments`)
-- [ ] **Forgetting curve empirical validation** -- Compare MSAM's decay curves to human forgetting curves (Ebbinghaus) with production data.
+- [ ] **Forgetting curve empirical validation** -- Compare SAGA's decay curves to human forgetting curves (Ebbinghaus) with production data.
 - [ ] **PostgreSQL + pgvector migration** -- When atom count exceeds 10,000, migrate for concurrent access and native vector operations.
 - [x] **Intentional forgetting strategies** -- Active identification of memories that are counterproductive, contradicted, or superseded. (`forgetting.py`)
 - [x] **Cross-provider identity calibration** -- Test identity coherence across Claude, Gemini, GPT, and open models using the same atom store. (`calibration.py`)
 - [x] **Two-tier retrieval (P9/P30)** -- Observations and raws ranked on independent RRF-fused pools. Surfaced observations boost their evidence atoms via `evidenced_by` edges, including missing atoms pulled in with a cosine-derived base. Per-atom confidence tiers; observation-level supersedes demotion. Best LongMemEval result: 0.796 overall. (`core.hybrid_retrieve` with `two_tier=True`, `_two_tier_split`)
-- [x] **Schema migrations on first connect** -- `get_db()` runs pending migrations once per DB path so callers that hit `/v1/store` directly (without `python -m msam.init_db`) still get the full schema. (`core.get_db`)
+- [x] **Schema migrations on first connect** -- `get_db()` runs pending migrations once per DB path so callers that hit `/v1/store` directly (without `python -m saga.init_db`) still get the full schema. (`core.get_db`)
 - [x] **Config-key validation** -- Unknown keys in known config sections produce a "did you mean…" warning at load time, catching typos like `cluster_similarity_threshold` (real key: `similarity_threshold`) that previously fell through to defaults silently. (`config._warn_unknown_keys`)
 - [x] **Unified LLM config** -- A single top-level `[llm]` section (`url`, `model`, `api_key_env`, `timeout_seconds`) is the fallback for every LLM-using subsystem (consolidation synthesis, annotation, triple extraction, rerank, subatom synthesis). Per-subsystem keys still override. Replaces the previous pattern where four of the five subsystems hard-coded `NVIDIA_NIM_API_KEY` reads. (`config.resolve_llm_config`)
 - [x] **Felt Consequence** -- Outcome-attributed memory scoring. Atoms that contribute to good outcomes get boosted; poor outcomes get dampened. Exponential decay on outcome signal. (`core.py:record_outcome`, `core.py:get_outcome_history`)
@@ -455,7 +455,7 @@ It does not handle:
 
 These are open questions that production data may answer:
 
-1. **Does emotion-at-encoding improve retrieval quality versus emotion-at-retrieval?** Compare MSAM's immutable tags to a system that recomputes emotional relevance at query time.
+1. **Does emotion-at-encoding improve retrieval quality versus emotion-at-retrieval?** Compare SAGA's immutable tags to a system that recomputes emotional relevance at query time.
 2. **What is the empirical forgetting curve of an AI agent?** How does it compare to Ebbinghaus? To ACT-R's predictions?
 3. **Does context quality degrade with database size?** As atoms grow from 600 to 6,000 to 60,000, does retrieval precision decline?
 4. **Can an agent detect its own knowledge gaps?** Metamemory as a measurable capability.
@@ -474,7 +474,7 @@ These are open questions that production data may answer:
 | **memU** | Reinforcement-weighted profiles | None | Tagged types | None | None |
 | **ACT-R** | Declarative chunks + activation | Acknowledged gap | Declarative only | Time-based | None |
 | **SOAR** | Working memory + long-term stores | None | Three (semantic/episodic/procedural) | None | None |
-| **MSAM** | Atomic, multi-stream, activation-scored | Immutable at encoding | Four streams | Stability-based lifecycle | 13 tables, 25 panels |
+| **SAGA** | Atomic, multi-stream, activation-scored | Immutable at encoding | Four streams | Stability-based lifecycle | 13 tables, 25 panels |
 
 To our knowledge, no existing system combines ACT-R activation scoring, immutable emotion-at-encoding, multi-stream organization, stability-based decay with no-deletion invariant, outcome-attributed scoring, a temporal world model, sycophancy detection, and production observability in a single agent memory architecture.
 
@@ -482,7 +482,7 @@ To our knowledge, no existing system combines ACT-R activation scoring, immutabl
 
 ## 9. Conclusion
 
-MSAM treats memory as architecture, not a feature. Most agent frameworks bolt on a vector store or conversation buffer. MSAM integrates storage, retrieval, decay, prediction, contradiction detection, and emotional context into a single system informed by ACT-R activation theory and cognitive science.
+SAGA treats memory as architecture, not a feature. Most agent frameworks bolt on a vector store or conversation buffer. SAGA integrates storage, retrieval, decay, prediction, contradiction detection, and emotional context into a single system informed by ACT-R activation theory and cognitive science.
 
 Key results from production deployment:
 - Confidence-gated retrieval with four tiers (high/medium/low/none), ~1.3% context budget per query
@@ -527,7 +527,7 @@ Build time:            36 hours (initial spec to production)
 ## Appendix C: File Manifest
 
 ```
-msam/
+saga/
   core.py           -- Atom storage, ACT-R activation, hybrid retrieval (4,153 lines)
   remember.py       -- CLI integration layer, 56 commands (2,212 lines)
   triples.py        -- Knowledge graph, triple extraction, world model (1,275 lines)
@@ -555,10 +555,10 @@ msam/
   examples/         -- Demos: synthetic dataset, quickstart, agent integration (488 lines)
   benchmarks/       -- Benchmark suite: synthetic data, reproducible runs (1,704 lines)
   tests/            -- 516 tests across 25 test files (5,778 lines)
-~/.msam/
-  msam.toml         -- Configuration (copy from msam.example.toml)
-  msam.db           -- SQLite atom store (created at runtime)
-  msam_metrics.db   -- Metrics database (created at runtime)
+~/.saga/
+  saga.toml         -- Configuration (copy from saga.example.toml)
+  saga.db           -- SQLite atom store (created at runtime)
+  saga_metrics.db   -- Metrics database (created at runtime)
 ```
 
 Total: ~16,597 lines of Python across 24 modules, plus 7,970 lines of tests, examples, and benchmarks.

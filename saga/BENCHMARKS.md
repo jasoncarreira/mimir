@@ -1,13 +1,13 @@
-# MSAM Benchmark Report
+# SAGA Benchmark Report
 
-**System**: MSAM (Multi-Stream Adaptive Memory)
+**System**: SAGA (Multi-Stream Adaptive Memory)
 **Date**: 2026-02-23
 **Hardware**: Hetzner CAX11 -- 2 vCPU ARM64 (Ampere Altra), 4GB RAM, Debian 13
 **Embedding**: NVIDIA NIM nv-embedqa-e5-v5 (1024-dim, API)
 **Database**: SQLite, 675+ atoms, 1,500+ triples, ~26MB
 **Baseline**: Raw markdown files (17 files, 24,513 tokens)
 
-This report measures MSAM against the alternative it replaces: loading flat markdown files into the context window. Every number is from a production deployment on low-cost ARM hardware, not a synthetic ideal. Two benchmark types are reported: production benchmarks (real atoms, real embeddings, real queries) and a reproducible synthetic suite (100 atoms, deterministic embeddings, no API key required).
+This report measures SAGA against the alternative it replaces: loading flat markdown files into the context window. Every number is from a production deployment on low-cost ARM hardware, not a synthetic ideal. Two benchmark types are reported: production benchmarks (real atoms, real embeddings, real queries) and a reproducible synthetic suite (100 atoms, deterministic embeddings, no API key required).
 
 > **Note (2026-04+).** Numbers in this report are from the pre-P9 single-tier
 > pipeline. Active development tracks against the LongMemEval public
@@ -24,7 +24,7 @@ This report measures MSAM against the alternative it replaces: loading flat mark
 |---|---|---|---|---|---|---|---|
 | Known: user profession | 7,327t | 201t | 91t | **98.8%** | medium | Y | 1,082ms |
 | Known: user birthday | 7,327t | 158t | 176t | **97.6%** | high | Y | 1,090ms |
-| Known: MSAM architecture | 7,327t | 232t | 140t | **98.1%** | high | Y | 1,111ms |
+| Known: SAGA architecture | 7,327t | 232t | 140t | **98.1%** | high | Y | 1,111ms |
 | Partial: known topic | 7,327t | 162t | 131t | **98.2%** | medium | Y | 1,062ms |
 | Temporal: mood right now | 7,327t | 177t | 33t | **99.5%** | low | Y | 1,092ms |
 | Temporal: today's activity | 7,327t | 120t | 0t | **100%** | low | Y | 1,064ms |
@@ -41,7 +41,7 @@ This report measures MSAM against the alternative it replaces: loading flat mark
 
 ### Per-Query (targeted retrieval vs selective file reads)
 
-| Metric | Selective File Load | MSAM | Savings |
+| Metric | Selective File Load | SAGA | Savings |
 |---|---|---|---|
 | Tokens per query | ~500-2,000t (load relevant file) | 91-176t (confidence-gated) | 64-91% |
 | Token scaling | Linear with file count | Constant (top-k gated) | Bounded |
@@ -85,7 +85,7 @@ Note: ONNX is slower than API on ARM64 (Ampere Altra) due to single-core inferen
 
 ## Confidence Tier System
 
-MSAM classifies retrieval confidence to prevent hallucination from weak data.
+SAGA classifies retrieval confidence to prevent hallucination from weak data.
 
 | Tier | Similarity Threshold | Output Behavior | Token Volume |
 |---|---|---|---|
@@ -110,7 +110,7 @@ Multi-path beam search (3x parallel retrieval) activates automatically based on 
 | < 10,000 | Single beam | 1x hybrid_retrieve | Baseline |
 | ≥ 10,000 | Multi-beam (3x) | 3x hybrid_retrieve | +2-4x latency |
 
-Configurable via `msam.toml`:
+Configurable via `saga.toml`:
 ```toml
 [retrieval_v2]
 enable_beam_search = "auto"          # "auto" | true | false
@@ -124,15 +124,15 @@ At 675+ atoms, beam search found 0 additional unique results vs single-beam (8x 
 
 ## Synthetic Benchmark Suite
 
-The synthetic benchmark provides a reproducible, API-free validation of MSAM's retrieval pipeline. It uses 100 atoms about a fictional user "Alex" across 8 topic domains, 25 ground truth queries with labeled relevant atoms, and deterministic n-gram hash embeddings that produce consistent results on any machine. No API key, no network, no GPU required.
+The synthetic benchmark provides a reproducible, API-free validation of SAGA's retrieval pipeline. It uses 100 atoms about a fictional user "Alex" across 8 topic domains, 25 ground truth queries with labeled relevant atoms, and deterministic n-gram hash embeddings that produce consistent results on any machine. No API key, no network, no GPU required.
 
-The tradeoff: n-gram hashes capture lexical overlap but not true semantic similarity, so these results represent a lower bound on retrieval quality. Production deployments with real embeddings (NIM, OpenAI) show larger gains from MSAM's cognitive scoring because meaningful cosine similarity gives the ACT-R activation model richer signals to work with.
+The tradeoff: n-gram hashes capture lexical overlap but not true semantic similarity, so these results represent a lower bound on retrieval quality. Production deployments with real embeddings (NIM, OpenAI) show larger gains from SAGA's cognitive scoring because meaningful cosine similarity gives the ACT-R activation model richer signals to work with.
 
-Run: `python -m msam.benchmarks.run`
+Run: `python -m saga.benchmarks.run`
 
-### Retrieval Quality (MSAM hybrid vs raw vector)
+### Retrieval Quality (SAGA hybrid vs raw vector)
 
-| Metric | MSAM | Raw Vector | Delta |
+| Metric | SAGA | Raw Vector | Delta |
 |---|---|---|---|
 | P@5 | 0.328 | 0.352 | -0.024 |
 | P@10 | 0.264 | 0.292 | -0.028 |
@@ -142,7 +142,7 @@ Run: `python -m msam.benchmarks.run`
 | nDCG@10 | 0.395 | 0.411 | -0.016 |
 | Latency | 2.6ms | 6.7ms | **2.6x faster** |
 
-Note: n-gram hash embeddings lack true semantic understanding, so MSAM's ACT-R scoring and triple augmentation provide modest MRR improvement. With real embeddings (NIM, OpenAI), MSAM's hybrid pipeline shows larger gains over raw vector search due to meaningful similarity signals for the cognitive scoring to amplify.
+Note: n-gram hash embeddings lack true semantic understanding, so SAGA's ACT-R scoring and triple augmentation provide modest MRR improvement. With real embeddings (NIM, OpenAI), SAGA's hybrid pipeline shows larger gains over raw vector search due to meaningful similarity signals for the cognitive scoring to amplify.
 
 ### Token Efficiency (synthetic)
 
@@ -150,7 +150,7 @@ Note: n-gram hash embeddings lack true semantic understanding, so MSAM's ACT-R s
 |---|---|
 | Avg savings vs flat files | **98.8%** |
 | Avg coverage of relevant atoms | 42.4% |
-| Total MSAM tokens (21 queries) | 2,347 |
+| Total SAGA tokens (21 queries) | 2,347 |
 | Flat baseline per query | 9,301 |
 | Overall savings | **98.8%** |
 
@@ -212,7 +212,7 @@ Output → confidence gating:
 
 ## Methodology
 
-All measurements are from a production system under real operating conditions, not isolated benchmarks in clean environments. The hardware is deliberately modest (EUR 4/month ARM VPS) to demonstrate that MSAM performs well without requiring high-end infrastructure.
+All measurements are from a production system under real operating conditions, not isolated benchmarks in clean environments. The hardware is deliberately modest (EUR 4/month ARM VPS) to demonstrate that SAGA performs well without requiring high-end infrastructure.
 
 - All benchmarks run on production hardware (Hetzner CAX11, ARM64)
 - Latency measured end-to-end including CLI overhead

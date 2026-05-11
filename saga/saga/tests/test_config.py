@@ -1,4 +1,4 @@
-"""MSAM Config Tests -- configuration loader and accessor."""
+"""SAGA Config Tests -- configuration loader and accessor."""
 
 import pytest
 
@@ -88,7 +88,7 @@ class TestGetDataDir:
         from saga.config import get_data_dir
         monkeypatch.delenv("SAGA_DATA_DIR", raising=False)
         data_dir = get_data_dir()
-        assert ".msam" in str(data_dir)
+        assert ".saga" in str(data_dir)
 
 
 class TestGetRawConfig:

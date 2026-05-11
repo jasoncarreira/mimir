@@ -1,9 +1,9 @@
-# MSAM config — P34 variant (consolidation threshold sweep).
-# Same as msam_bench.toml (canonical P30v3 mechanism) EXCEPT
-# [consolidation] similarity_threshold = 0.75 (default 0.80).
-# Tests whether lowering the consolidation threshold lifts retrieval
-# by producing more clusters → more observations → more two-tier boost.
-# See NEXT-EXPERIMENTS.md P34.
+# SAGA config — P36 variant (graph pathway as tiebreaker).
+# Triples + graph pathway ON (same as P35 features) EXCEPT
+# rrf_graph_weight = 0.3 (default 0.7). Tests whether the P35
+# regression was caused by the graph pathway voting too loudly in
+# RRF; at 0.3 it acts as a tiebreaker rather than a vote.
+# See NEXT-EXPERIMENTS.md P36.
 
 [embedding]
 provider = "openai"
@@ -16,10 +16,10 @@ batch_size = 256
 api_key_env = "OPENAI_API_KEY"
 
 [storage]
-db_path = "msam.db"
-metrics_db_path = "msam_metrics.db"
+db_path = "saga.db"
+metrics_db_path = "saga_metrics.db"
 # Disable the storage backpressure: per-question haystacks can push thousands
-# of atoms; MSAM's production budget (40k tokens) would auto-compact/refuse.
+# of atoms; SAGA's production budget (40k tokens) would auto-compact/refuse.
 token_budget_ceiling = 100000000
 auto_compact_threshold_pct = 99
 refuse_threshold_pct = 100
@@ -32,15 +32,18 @@ fusion = "rrf"
 rrf_k = 60
 rrf_semantic_weight = 1.0
 rrf_keyword_weight = 1.0
+# P36: drop graph pathway weight from default 0.7 to 0.3 — graph
+# becomes a tiebreaker rather than a co-equal vote.
+rrf_graph_weight = 0.3
 # P9: two-tier retrieval with observation->raw evidence boost.
 two_tier_enabled = true
 observations_top_k = 5
 observation_confidence_min_sim = 0.30
 evidence_boost_cap_multiplier = 3.0
-# P32/P35: graph pathway off — triples-as-byproduct of consolidation
-# regressed -2.6pp on canonical (msam_p35_canon_v1). Code stays for
-# production-graph-feature deployments; bench defaults to off.
-enable_graph_pathway = false
+# P36: graph pathway ON, but with rrf_graph_weight=0.3 (above) so it
+# only breaks ties rather than overwhelming the fusion. Tests whether
+# weight tuning rescues triples-as-byproduct.
+enable_graph_pathway = true
 # Single-tier bonus is redundant in two_tier mode; leave off to avoid double-handling.
 enable_observation_bonus = false
 similarity_threshold = 0.15
@@ -62,16 +65,16 @@ outcome_weight = 0.0
 outcome_decay = 1.0
 
 [retrieval_v2]
-enable_rerank = false   # P15 cross-encoder LLM rerank (regressed in msam_rerank_gptoss_v1)
+enable_rerank = false   # P15 cross-encoder LLM rerank (regressed in saga_rerank_gptoss_v1)
 enabled = false
-# Cherry-picks (P11/P12/P13) regressed -2.8pp in msam_cherrypicks_minimax_v1
+# Cherry-picks (P11/P12/P13) regressed -2.8pp in saga_cherrypicks_minimax_v1
 # (logged 2026-04-27). Disabled while we decide whether to ablate or skip.
 enable_query_rewriting = true
 enable_query_expansion = false
 enable_quality_filter = false
 
 [llm]
-# Unified LLM endpoint for every MSAM subsystem (consolidation synthesis,
+# Unified LLM endpoint for every SAGA subsystem (consolidation synthesis,
 # annotation, triple extraction, rerank, subatom synthesis). Bench routes
 # through OpenRouter to test gpt-oss-120b end-to-end (paid tier — free
 # tier daily caps would kill a 500q run).
@@ -86,11 +89,10 @@ enable_fact_dedup = false
 enable_synthesis = false
 
 [triples]
-# P35: triples are extracted *during consolidation* now (one LLM call
-# per cluster produces both observation + triples). This flag gates
-# persistence — off for the bench (P35 regressed -2.6pp on canonical),
-# on for production deployments that use the graph pathway.
-enable_extraction = false
+# P36: triples ON (same as P35) so the graph pathway has material to
+# retrieve from. The whole point is testing whether the graph pathway
+# is useful AT THE RIGHT WEIGHT.
+enable_extraction = true
 
 [annotation]
 # Use heuristic-only annotation (fast, deterministic, free).
@@ -122,8 +124,6 @@ api_key_env = "OPENAI_API_KEY"
 min_cluster_size = 3
 max_clusters_per_run = 20
 stability_reduction_factor = 0.5
-# P34: lower clustering threshold from 0.80 to 0.75.
-similarity_threshold = 0.75
 
 [atoms]
 # Bench harness runs resolve_contradictions_to_supersedes() once per

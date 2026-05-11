@@ -1,4 +1,4 @@
-"""MSAM Embeddings Tests -- provider interface, ONNX, retry, batch."""
+"""SAGA Embeddings Tests -- provider interface, ONNX, retry, batch."""
 
 import sys
 import os

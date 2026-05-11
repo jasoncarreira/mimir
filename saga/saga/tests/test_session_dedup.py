@@ -1,4 +1,4 @@
-"""MSAM Session Dedup Tests -- multi-turn deduplication tracking."""
+"""SAGA Session Dedup Tests -- multi-turn deduplication tracking."""
 
 import json
 import os

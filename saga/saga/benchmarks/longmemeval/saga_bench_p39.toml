@@ -1,6 +1,7 @@
-# MSAM config used during LongMemEval runs.
-# Loaded via MSAM_CONFIG env var before msam imports resolve.
-# Keeps the prod ~/.msam/msam.toml untouched.
+# SAGA config — P39 variant (median pivot for missing-atom base score).
+# Same as saga_bench.toml (canonical P30v3 + P12 shipped) EXCEPT
+# [retrieval] missing_ref_score_pivot = "median".
+# See NEXT-EXPERIMENTS.md P39.
 
 [embedding]
 provider = "openai"
@@ -13,10 +14,10 @@ batch_size = 256
 api_key_env = "OPENAI_API_KEY"
 
 [storage]
-db_path = "msam.db"
-metrics_db_path = "msam_metrics.db"
+db_path = "saga.db"
+metrics_db_path = "saga_metrics.db"
 # Disable the storage backpressure: per-question haystacks can push thousands
-# of atoms; MSAM's production budget (40k tokens) would auto-compact/refuse.
+# of atoms; SAGA's production budget (40k tokens) would auto-compact/refuse.
 token_budget_ceiling = 100000000
 auto_compact_threshold_pct = 99
 refuse_threshold_pct = 100
@@ -35,7 +36,7 @@ observations_top_k = 5
 observation_confidence_min_sim = 0.30
 evidence_boost_cap_multiplier = 3.0
 # P32/P35: graph pathway off — triples-as-byproduct of consolidation
-# regressed -2.6pp on canonical (msam_p35_canon_v1). Code stays for
+# regressed -2.6pp on canonical (saga_p35_canon_v1). Code stays for
 # production-graph-feature deployments; bench defaults to off.
 enable_graph_pathway = false
 # Single-tier bonus is redundant in two_tier mode; leave off to avoid double-handling.
@@ -57,18 +58,25 @@ spreading_activation_enabled = false
 temporal_recency_hours = 24
 outcome_weight = 0.0
 outcome_decay = 1.0
+# P39: pivot pulled-in (missing-atom) base scores on the MEDIAN of the
+# in-pool RRF distribution rather than the MIN (default). Roughly
+# doubles pulled-in bases so strongly-similar endorsed atoms can
+# compete with mid-rank in-pool raws instead of being silently dropped.
+missing_ref_score_pivot = "median"
 
 [retrieval_v2]
-enable_rerank = false   # P15 cross-encoder LLM rerank (regressed in msam_rerank_gptoss_v1)
+enable_rerank = false   # P15 cross-encoder LLM rerank (regressed in saga_rerank_gptoss_v1)
 enabled = false
-# P12 (synonym expansion on the keyword pathway via _expand_query_for_keyword
-# in core.py) — the only positive single lever since P30. Shipped to
-# canonical 2026-04-29. Same flag still gates this even after the
-# triple-graph expand_query removal in the cleanup batch.
+# Cherry-pick ablation (logged 2026-04-27 / 2026-04-28) showed P11 alone
+# regressed -1.3pp and P13 alone regressed -2.6pp; the bundle was -2.8pp
+# (P11+P13's combined damage). P12 alone scored 0.792, the only positive
+# lever since P30 — shipped to canonical 2026-04-29.
+enable_query_rewriting = false
 enable_query_expansion = true
+enable_quality_filter = false
 
 [llm]
-# Unified LLM endpoint for every MSAM subsystem (consolidation synthesis,
+# Unified LLM endpoint for every SAGA subsystem (consolidation synthesis,
 # annotation, triple extraction, rerank, subatom synthesis). Bench routes
 # through OpenRouter to test gpt-oss-120b end-to-end (paid tier — free
 # tier daily caps would kill a 500q run).
@@ -97,6 +105,9 @@ use_llm = false
 enabled = false
 
 [world_model]
+enabled = false
+
+[sycophancy]
 enabled = false
 
 [decay]

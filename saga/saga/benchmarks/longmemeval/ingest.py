@@ -1,4 +1,4 @@
-"""Turn LongMemEval haystack_sessions into MSAM atoms (one atom per turn)."""
+"""Turn LongMemEval haystack_sessions into SAGA atoms (one atom per turn)."""
 from __future__ import annotations
 
 import sqlite3

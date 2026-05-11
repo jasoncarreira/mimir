@@ -1,5 +1,5 @@
 """
-MSAM Predictive Prefetch Engine -- Real prediction based on access patterns.
+SAGA Predictive Prefetch Engine -- Real prediction based on access patterns.
 
 Replaces the stub in core.py with three complementary prediction strategies:
   1. Temporal patterns -- mine access_log for time-of-day correlations
