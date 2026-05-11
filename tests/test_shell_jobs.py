@@ -81,7 +81,11 @@ def test_on_complete_fires_after_exit(tmp_path: Path):
         argv=["bash", "-c", "echo done"],
         on_complete=on_complete,
     )
-    assert event.wait(timeout=5.0), "on_complete didn't fire"
+    # 30s timeout gives headroom for CI runner variance — PR #136 CI
+    # caught a 3.12-only flake in a sibling test at the original 5s
+    # threshold. proc.wait → drainer thread → callback chain is normally
+    # sub-second; 30s only affects wall-clock on legitimate test failures.
+    assert event.wait(timeout=30.0), "on_complete didn't fire"
     assert fired == [job.job_id]
     # Snapshot has both fields populated by the time the callback runs.
     snap = job.snapshot()
@@ -100,7 +104,9 @@ def test_on_complete_error_isolated_from_registry(tmp_path: Path):
         raise RuntimeError("boom")
 
     job1 = registry.spawn("true", argv=["bash", "-c", "true"], on_complete=bad_callback)
-    assert finished.wait(timeout=5.0)
+    # 30s timeout — see test_on_complete_fires_when_subprocess_exits
+    # for the CI-runner-variance rationale.
+    assert finished.wait(timeout=30.0)
     # Brief wait for the waiter thread to handle the post-callback
     # registry update — exit_code is set BEFORE the callback fires, so
     # the job is already marked done.
@@ -123,7 +129,9 @@ def test_on_complete_runs_for_nonzero_exit(tmp_path: Path):
         argv=["bash", "-c", "exit 3"],
         on_complete=on_complete,
     )
-    assert fired.wait(timeout=5.0), "on_complete must fire on nonzero exits"
+    # 30s timeout — see test_on_complete_fires_when_subprocess_exits
+    # for the CI-runner-variance rationale.
+    assert fired.wait(timeout=30.0), "on_complete must fire on nonzero exits"
 
 
 # ─── channel_id captured at spawn time ────────────────────────────────
