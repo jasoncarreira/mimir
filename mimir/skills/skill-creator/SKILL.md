@@ -77,14 +77,14 @@ Do NOT rely on `allowed-tools` as a sandbox; relying on it as documentation is t
 
 ## Gotchas
 
-- **YAML folded scalars** (`description: >`): if the next key is at the same indent without a blank line, YAML can fold it into the description's value. Stick to plain quoted strings unless you've tested round-trip parsing via `python -c "import yaml; print(yaml.safe_load(open('SKILL.md').read().split('---')[1]))"`.
+- **YAML folded scalars** (`description: >`): the bundled `mimir/skill_md.py` parser handles `description: >` and `description: |` blocks correctly (covered by `test_parse_frontmatter_handles_folded_description`; `mimir/skills/onboarding/SKILL.md` ships using folded form), so mimir's own catalog + INDEX rendering is fine. The pitfall is for *downstream* tooling that uses `yaml.safe_load` directly: if the next key sits at the same indent without a blank-line separator, `yaml.safe_load` can fold it into the description's value. Stick to plain quoted strings if you want maximum portability across tooling that doesn't go through `mimir/skill_md.py`.
 - **`allowed-tools: Foo`** (scalar) is silently parsed by some YAML readers as `allowed-tools: "Foo"`. The conformance test rejects this — the field is **list-only**. Use `allowed-tools: [Foo]` or the multi-line bullet form.
 - **Stale catalog**: after editing a SKILL.md, run `mimir skills catalog` to regenerate `memory/skills-catalog.md`. The catalog isn't auto-regenerated on file write today.
 - **Missing `<!-- desc: -->`**: indexer falls back to `[auto]` + first sentence. Functional, but the per-skill prompt row gets less specific.
 
 ## Authoring Checklist
 
-1. Write frontmatter with `name`, a high-signal `description`, and a `allowed-tools` list (YAML list shape, not scalar). Use `[]` for prose-only skills.
+1. Write frontmatter with `name`, a high-signal `description`, and an `allowed-tools` list (YAML list shape, not scalar). Use `[]` for prose-only skills.
 2. Add the `<!-- desc: -->` first-body-line comment (agent-facing voice, dense).
 3. Add concise execution steps in the SKILL body.
 4. Include concrete paths/commands the agent should run.

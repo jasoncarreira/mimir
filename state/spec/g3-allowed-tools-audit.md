@@ -17,6 +17,16 @@ Tools enumerated using their short name (no `mcp__mimir__` prefix in
 frontmatter — the field is for human readability and reviewer drift
 detection, not the harness's tool-call surface).
 
+> **Snapshot — not auto-regenerated.** The table below is the
+> 2026-05-11 09:00 UTC body-scan baseline. SKILL.md `allowed-tools`
+> declarations may have grown since via subsequent PRs (declared
+> lists are a superset of body references; the audit walks BODY
+> only, so divergence is structurally expected as skills evolve).
+> Run a fresh body-scan via the chainlink #79 process before using
+> this table as ground-truth for current state. The conformance
+> test (`tests/test_skill_conformance.py`) enforces the
+> body-vs-declared invariant on PR — that's the live check.
+
 ## Per-skill surfaces
 
 | Skill | Tools |
