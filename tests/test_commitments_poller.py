@@ -315,3 +315,121 @@ async def test_pileup_threshold_is_configurable(tmp_path: Path, home: Path):
 async def test_default_threshold_constant():
     """The default threshold is exposed for the agent wiring + docs."""
     assert DEFAULT_SNOOZE_PILEUP_THRESHOLD == 3
+
+
+# ─── PR #126 review #2: pileup cooldown ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pileup_cooldown_suppresses_within_24h(tmp_path: Path, home: Path):
+    """PR #126 review #2: after a pileup alarm fires, subsequent
+    poll ticks within 24h must NOT re-emit. Otherwise events.jsonl
+    accrues a fresh row every 5 min (6k+ rows/week/chronic)."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="punted thing",
+    ))
+    for i in range(3):
+        await store.snooze(rec.id, until_unix=now + (i + 1) * 86400)
+
+    # First sweep: fires the alarm.
+    r1 = await check_due_and_expired(
+        store, now_unix=now, snooze_pileup_threshold=3,
+    )
+    assert r1.snooze_pileup_emitted == 1
+    assert r1.snooze_pileup_suppressed_cooldown == 0
+
+    # Second sweep, 1h later: must NOT re-fire (still in 24h window).
+    r2 = await check_due_and_expired(
+        store, now_unix=now + 3600, snooze_pileup_threshold=3,
+    )
+    assert r2.snooze_pileup_emitted == 0
+    assert r2.snooze_pileup_suppressed_cooldown == 1
+
+    # And the events.jsonl has exactly one pileup row, not two.
+    pileups = [
+        e for e in _events(home) if e.get("type") == "commitment_snooze_pileup"
+    ]
+    assert len(pileups) == 1
+
+
+@pytest.mark.asyncio
+async def test_pileup_re_emits_after_24h(tmp_path: Path, home: Path):
+    """After the 24h cooldown elapses, the next pileup-detected sweep
+    re-emits — the agent still hasn't acted, surface again."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    for _ in range(3):
+        await store.snooze(rec.id, until_unix=now + 86400)
+
+    r1 = await check_due_and_expired(
+        store, now_unix=now, snooze_pileup_threshold=3,
+    )
+    assert r1.snooze_pileup_emitted == 1
+
+    # 25h later — cooldown elapsed.
+    r2 = await check_due_and_expired(
+        store, now_unix=now + 25 * 3600, snooze_pileup_threshold=3,
+    )
+    assert r2.snooze_pileup_emitted == 1
+    assert r2.snooze_pileup_suppressed_cooldown == 0
+
+
+@pytest.mark.asyncio
+async def test_pileup_alarm_sets_record_field(tmp_path: Path, home: Path):
+    """The alarm writes a ``commitment_pileup_alarmed`` event that
+    replay translates to ``rec.pileup_alarmed_at_unix``. The record's
+    status is unchanged (annotational, not a transition)."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    for _ in range(3):
+        await store.snooze(rec.id, until_unix=now + 86400)
+
+    # Pre-alarm: field is None.
+    assert store.current_state()[rec.id].pileup_alarmed_at_unix is None
+    pre_status = store.current_state()[rec.id].status
+
+    await check_due_and_expired(
+        store, now_unix=now, snooze_pileup_threshold=3,
+    )
+
+    state = store.current_state()
+    # Field bumped.
+    assert state[rec.id].pileup_alarmed_at_unix is not None
+    assert state[rec.id].pileup_alarmed_at_unix > 0
+    # Status NOT changed (still SNOOZED from the last snooze).
+    assert state[rec.id].status == pre_status
+
+
+@pytest.mark.asyncio
+async def test_store_alarm_pileup_unknown_id(tmp_path: Path):
+    """alarm_pileup on a nonexistent id returns False; no events written."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    assert await store.alarm_pileup("c-nonexistent") is False
+
+
+@pytest.mark.asyncio
+async def test_emit_at_exact_end_uses_due_branch(tmp_path: Path, home: Path):
+    """PR #126 review nit on `>` strict inequality: a commitment
+    whose ``end == now_unix`` is treated as still-in-window — fires
+    ``commitment_due``, not ``commitment_expired``. Pins the boundary
+    behavior so a future refactor can't accidentally flip it."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="boundary",
+        due_window_start_unix=now - 86400,
+        due_window_end_unix=now,  # exactly equal to now
+    ))
+    result = await check_due_and_expired(store, now_unix=now)
+    # Due fires, not expired.
+    assert result.due_emitted == 1
+    assert result.expired_emitted == 0
+    assert store.current_state()[rec.id].status == CommitmentStatus.DELIVERED.value

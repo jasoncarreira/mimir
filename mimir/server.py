@@ -495,21 +495,42 @@ def build_app(config: Config) -> web.Application:
         # agent's CommitmentsStore so deliver/expire calls land in
         # the same JSONL as Phase 1's manual operator entries +
         # Phase 2a's extracted commitments.
-        if config.commitments_due_check_cron and getattr(agent, "_commitments", None):
-            try:
-                scheduler.add_commitments_due_check_job(
-                    agent._commitments,
-                    config.commitments_due_check_cron,
-                    snooze_pileup_threshold=(
-                        config.commitments_snooze_pileup_threshold
+        #
+        # PR #126 review #1: the store is wired in Agent.__init__
+        # by Phase 2a (PR #125). If 2b lands before 2a, the attribute
+        # is missing and the registration block would silently no-op.
+        # Path 2 (observable no-op): emit ``scheduler_skipped`` when
+        # the cron is configured but the store isn't ready — operator
+        # sees "poller didn't run because the agent doesn't have the
+        # store" instead of wondering why commitments never expire.
+        if config.commitments_due_check_cron:
+            commitments_store = getattr(agent, "_commitments", None)
+            if commitments_store is None:
+                await log_event(
+                    "scheduler_skipped",
+                    job="commitments-due-check",
+                    reason="agent_commitments_attr_missing",
+                    note=(
+                        "Phase 2b cron configured but Agent._commitments "
+                        "not wired; merge Phase 2a (PR #125) first or "
+                        "clear MIMIR_COMMITMENTS_DUE_CHECK_CRON."
                     ),
                 )
-            except ValueError as exc:
-                await log_event(
-                    "scheduler_invalid_cron",
-                    job="commitments-due-check",
-                    error=str(exc),
-                )
+            else:
+                try:
+                    scheduler.add_commitments_due_check_job(
+                        commitments_store,
+                        config.commitments_due_check_cron,
+                        snooze_pileup_threshold=(
+                            config.commitments_snooze_pileup_threshold
+                        ),
+                    )
+                except ValueError as exc:
+                    await log_event(
+                        "scheduler_invalid_cron",
+                        job="commitments-due-check",
+                        error=str(exc),
+                    )
 
         # Stage 5 of CLAUDE_SDK_CLIENT_MIGRATION.md retired the original
         # quota-poll cron because the plan was to use the shared

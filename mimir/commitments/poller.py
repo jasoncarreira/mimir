@@ -62,6 +62,7 @@ class DueCheckResult:
     due_emitted: int = 0
     expired_emitted: int = 0
     snooze_pileup_emitted: int = 0
+    snooze_pileup_suppressed_cooldown: int = 0
     scanned: int = 0
     skipped_no_due_window: int = 0
     skipped_not_yet_due: int = 0
@@ -72,6 +73,12 @@ class DueCheckResult:
 # (plumbed through Config + passed to the poller). 3 = "you've punted
 # this thing 3 times already, time to either commit or dismiss."
 DEFAULT_SNOOZE_PILEUP_THRESHOLD = 3
+
+# 24h cooldown between successive pileup emissions for the SAME
+# commitment. Matches the algedonic surfacing dedup window so the
+# write-layer behavior (events.jsonl) aligns with the prompt-layer
+# behavior. PR #126 review #2.
+SNOOZE_PILEUP_COOLDOWN_SECS = 86400
 
 
 async def check_due_and_expired(
@@ -109,23 +116,45 @@ async def check_due_and_expired(
         # at the algedonic layer means the per-tick re-emission only
         # surfaces one line per 24h window.
         if rec.snooze_count >= snooze_pileup_threshold:
-            try:
-                result.snooze_pileup_emitted += 1
-                await log_event(
-                    "commitment_snooze_pileup",
-                    commitment_id=rec.id,
-                    channel_id=rec.channel_id,
-                    text=rec.text,
-                    snooze_count=rec.snooze_count,
-                    threshold=snooze_pileup_threshold,
-                    kind=rec.kind,
-                    sensitivity=rec.sensitivity,
-                )
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "commitment snooze pileup emit failed for %s",
-                    rec.id,
-                )
+            # PR #126 review #2: 24h cooldown. Without this the poller
+            # writes a fresh events.jsonl row every 5-min tick per
+            # above-threshold record — algedonic dedup keeps the
+            # agent's prompt clean but events.jsonl accrues 6k+ rows
+            # per chronic commitment per week. Skip emission when
+            # we last alarmed less than 24h ago. The store's
+            # ``alarm_pileup`` writes a ``commitment_pileup_alarmed``
+            # event that replay translates to
+            # ``rec.pileup_alarmed_at_unix``.
+            on_cooldown = (
+                rec.pileup_alarmed_at_unix is not None
+                and now_unix - rec.pileup_alarmed_at_unix
+                    < SNOOZE_PILEUP_COOLDOWN_SECS
+            )
+            if on_cooldown:
+                result.snooze_pileup_suppressed_cooldown += 1
+            else:
+                # PR #126 review nit: increment AFTER the emit + alarm
+                # succeed so the counter doesn't claim work that
+                # didn't happen (matches the ``if ok:`` shape of the
+                # due/expired branches below).
+                try:
+                    await log_event(
+                        "commitment_snooze_pileup",
+                        commitment_id=rec.id,
+                        channel_id=rec.channel_id,
+                        text=rec.text,
+                        snooze_count=rec.snooze_count,
+                        threshold=snooze_pileup_threshold,
+                        kind=rec.kind,
+                        sensitivity=rec.sensitivity,
+                    )
+                    await store.alarm_pileup(rec.id)
+                    result.snooze_pileup_emitted += 1
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "commitment snooze pileup emit failed for %s",
+                        rec.id,
+                    )
         if rec.due_window_start_unix is None:
             result.skipped_no_due_window += 1
             continue
@@ -134,6 +163,14 @@ async def check_due_and_expired(
         # the same tick (rare: commitment due window fully elapsed
         # between two poll ticks), the expire is the load-bearing
         # signal. Mark expired and skip the due emit.
+        #
+        # PR #126 review nit: strict ``>`` inequality. A commitment
+        # whose ``end`` is exactly equal to ``now_unix`` is still
+        # treated as in-window (the due branch handles it). Sub-second
+        # exact-equality is implausible in practice (the poller runs
+        # every 5 min) but worth noting — and the test fixture in
+        # ``test_commitments_poller.py:test_emit_at_exact_end`` pins
+        # the boundary behavior so a future refactor can't drift.
         end = rec.due_window_end_unix
         if end is not None and now_unix > end:
             try:

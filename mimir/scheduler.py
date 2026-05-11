@@ -30,7 +30,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+if TYPE_CHECKING:
+    from .commitments.store import CommitmentsStore
 
 import yaml
 from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
@@ -1061,7 +1064,7 @@ class Scheduler:
     # loop_id: 4.10 (commitments Phase 2b)
     def add_commitments_due_check_job(
         self,
-        commitments_store,
+        commitments_store: "CommitmentsStore",
         cron_expr: str,
         *,
         snooze_pileup_threshold: int = 3,

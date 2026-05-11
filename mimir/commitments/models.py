@@ -192,6 +192,14 @@ class CommitmentRecord:
     # keeps punting this commitment" as a feedback signal at the next
     # session boundary's synthesis — overcommitment / avoidance smell.
     snooze_count: int = 0
+    # PR #126 review #2: 24h cooldown for the snooze-pileup alarm.
+    # Without this, the poller emits a fresh
+    # ``commitment_snooze_pileup`` event every 5-min tick per
+    # above-threshold record — 6k+ rows/week/chronic in events.jsonl.
+    # Set by the ``commitment_pileup_alarmed`` lifecycle event; the
+    # poller skips emission until ``now - this > 86400``. ``None`` =
+    # never alarmed (eligible for first emission immediately).
+    pileup_alarmed_at_unix: float | None = None
     confidence: float = 1.0
     dedupe_key: str = ""
     source_turn_id: str | None = None
