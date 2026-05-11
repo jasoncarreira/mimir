@@ -1,5 +1,5 @@
-# MSAM config — P38 variant (confidence-gated HyDE).
-# Same as msam_bench.toml (canonical P30v3 mechanism) EXCEPT
+# SAGA config — P38 variant (confidence-gated HyDE).
+# Same as saga_bench.toml (canonical P30v3 mechanism) EXCEPT
 # [retrieval] enable_hyde = true with trigger 0.45. The bench passes
 # no `context`, so the contextual-rewrite path is irrelevant — this
 # isolates HyDE's contribution.
@@ -16,8 +16,8 @@ batch_size = 256
 api_key_env = "OPENAI_API_KEY"
 
 [storage]
-db_path = "msam.db"
-metrics_db_path = "msam_metrics.db"
+db_path = "saga.db"
+metrics_db_path = "saga_metrics.db"
 token_budget_ceiling = 100000000
 auto_compact_threshold_pct = 99
 refuse_threshold_pct = 100

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MSAM Agent Integration -- How to wire MSAM into an AI agent loop.
+SAGA Agent Integration -- How to wire SAGA into an AI agent loop.
 
 Three integration points:
   1. Session startup (load context)
@@ -8,7 +8,7 @@ Three integration points:
   3. Between sessions (decay + consolidation)
 
 Cross-turn conversation state (the user's last few messages, in-flight task
-state) lives in the agent's LLM context, not in MSAM. MSAM is the long-term
+state) lives in the agent's LLM context, not in SAGA. SAGA is the long-term
 memory store. The agent decides what's worth persisting and calls
 ``store_atom`` for it.
 """

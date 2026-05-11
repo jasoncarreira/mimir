@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Synthetic Benchmark Dataset for MSAM
+Synthetic Benchmark Dataset for SAGA
 
 Generates ~100 realistic memory atoms for a fictional user named "Alex" across all
 3 memory streams (semantic, episodic, procedural) and 8 topic domains

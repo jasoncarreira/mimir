@@ -111,7 +111,7 @@ _BENCH_SAGA_TOML_TEMPLATE = """\
 [storage]
 db_path = "{db_path}"
 metrics_db_path = "{metrics_db_path}"
-# Match msam_bench.toml: effectively unlimited.
+# Match saga_bench.toml: effectively unlimited.
 token_budget_ceiling = 100000000
 auto_compact_threshold_pct = 99
 refuse_threshold_pct = 100
@@ -184,7 +184,7 @@ def _write_bench_saga_toml(home: Path) -> None:
 
     The default saga.toml mimir setup writes caps storage at 1M tokens —
     fine for daily use, fatal for LongMemEval haystacks. This bench
-    saga.toml uses msam_bench.toml's effectively-unlimited cap. LLM
+    saga.toml uses saga_bench.toml's effectively-unlimited cap. LLM
     config respects ``SAGA_BENCH_LLM_PROVIDER`` (default ``claude_code``
     for free Max OAuth; set to ``openai_compat`` to use gpt-5.4-nano for
     bench parity).

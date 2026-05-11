@@ -1,5 +1,5 @@
 """
-MSAM Triples -- Knowledge Graph Triple Layer
+SAGA Triples -- Knowledge Graph Triple Layer
 Extracts, stores, and retrieves factual triples from atoms.
 
 Architecture:

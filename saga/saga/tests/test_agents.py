@@ -1,5 +1,5 @@
 """
-Tests for MSAM multi-agent memory management.
+Tests for SAGA multi-agent memory management.
 
 Covers agent registration, isolation, sharing, and statistics.
 """

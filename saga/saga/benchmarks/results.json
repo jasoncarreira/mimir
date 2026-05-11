@@ -1,12 +1,12 @@
 {
   "timestamp": "2026-02-23 08:31:57 UTC",
-  "data_dir": "/var/folders/3n/s_rxht7128x9yc60qn8862y40000gn/T/msam_bench_7mqqbdmi",
+  "data_dir": "/var/folders/3n/s_rxht7128x9yc60qn8862y40000gn/T/saga_bench_7mqqbdmi",
   "atom_count": 100,
   "query_count": 25,
   "embedding_mode": "deterministic_ngram_hash",
   "retrieval": {
     "per_query": {
-      "msam": {
+      "saga": {
         "p@5": [
           0.2,
           0.0,
@@ -606,7 +606,7 @@
       }
     },
     "summary": {
-      "msam": {
+      "saga": {
         "p@5": 0.328,
         "p@10": 0.264,
         "p@20": 0.244,
@@ -652,7 +652,7 @@
     "per_query": [
       {
         "query": "What is Alex's job?",
-        "msam_tokens": 97,
+        "saga_tokens": 97,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 56,
         "savings_vs_flat_pct": 99.0,
@@ -663,7 +663,7 @@
       },
       {
         "query": "Where does Alex live?",
-        "msam_tokens": 120,
+        "saga_tokens": 120,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 32,
         "savings_vs_flat_pct": 98.7,
@@ -674,7 +674,7 @@
       },
       {
         "query": "Tell me about Alex's family.",
-        "msam_tokens": 79,
+        "saga_tokens": 79,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 56,
         "savings_vs_flat_pct": 99.2,
@@ -685,7 +685,7 @@
       },
       {
         "query": "What programming languages does Alex know?",
-        "msam_tokens": 130,
+        "saga_tokens": 130,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 33,
         "savings_vs_flat_pct": 98.6,
@@ -696,7 +696,7 @@
       },
       {
         "query": "Who is Jordan?",
-        "msam_tokens": 86,
+        "saga_tokens": 86,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 26,
         "savings_vs_flat_pct": 99.1,
@@ -707,7 +707,7 @@
       },
       {
         "query": "What are Alex's hobbies?",
-        "msam_tokens": 78,
+        "saga_tokens": 78,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 94,
         "savings_vs_flat_pct": 99.2,
@@ -718,7 +718,7 @@
       },
       {
         "query": "What happened in December 2025?",
-        "msam_tokens": 104,
+        "saga_tokens": 104,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 128,
         "savings_vs_flat_pct": 98.9,
@@ -729,7 +729,7 @@
       },
       {
         "query": "What happened recently at work?",
-        "msam_tokens": 135,
+        "saga_tokens": 135,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 61,
         "savings_vs_flat_pct": 98.5,
@@ -740,7 +740,7 @@
       },
       {
         "query": "What did Alex do in November 2025?",
-        "msam_tokens": 104,
+        "saga_tokens": 104,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 72,
         "savings_vs_flat_pct": 98.9,
@@ -751,7 +751,7 @@
       },
       {
         "query": "How does Alex feel about work?",
-        "msam_tokens": 129,
+        "saga_tokens": 129,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 45,
         "savings_vs_flat_pct": 98.6,
@@ -762,7 +762,7 @@
       },
       {
         "query": "What makes Alex happy?",
-        "msam_tokens": 116,
+        "saga_tokens": 116,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 31,
         "savings_vs_flat_pct": 98.8,
@@ -773,7 +773,7 @@
       },
       {
         "query": "How does Alex deploy code?",
-        "msam_tokens": 133,
+        "saga_tokens": 133,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 31,
         "savings_vs_flat_pct": 98.6,
@@ -784,7 +784,7 @@
       },
       {
         "query": "What is Alex's morning routine?",
-        "msam_tokens": 107,
+        "saga_tokens": 107,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 48,
         "savings_vs_flat_pct": 98.8,
@@ -795,7 +795,7 @@
       },
       {
         "query": "How does Alex practice guitar?",
-        "msam_tokens": 148,
+        "saga_tokens": 148,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 28,
         "savings_vs_flat_pct": 98.4,
@@ -806,7 +806,7 @@
       },
       {
         "query": "How does Alex make sourdough bread?",
-        "msam_tokens": 142,
+        "saga_tokens": 142,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 33,
         "savings_vs_flat_pct": 98.5,
@@ -817,7 +817,7 @@
       },
       {
         "query": "Does Alex still work at TechCorp?",
-        "msam_tokens": 89,
+        "saga_tokens": 89,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 74,
         "savings_vs_flat_pct": 99.0,
@@ -828,7 +828,7 @@
       },
       {
         "query": "What is Alex's salary?",
-        "msam_tokens": 70,
+        "saga_tokens": 70,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 23,
         "savings_vs_flat_pct": 99.2,
@@ -839,7 +839,7 @@
       },
       {
         "query": "What is Alex working on right now?",
-        "msam_tokens": 127,
+        "saga_tokens": 127,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 72,
         "savings_vs_flat_pct": 98.6,
@@ -850,7 +850,7 @@
       },
       {
         "query": "What is Alex's schedule this week?",
-        "msam_tokens": 92,
+        "saga_tokens": 92,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 51,
         "savings_vs_flat_pct": 99.0,
@@ -861,7 +861,7 @@
       },
       {
         "query": "Who is Marcus?",
-        "msam_tokens": 128,
+        "saga_tokens": 128,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 20,
         "savings_vs_flat_pct": 98.6,
@@ -872,7 +872,7 @@
       },
       {
         "query": "How does Alex stay healthy?",
-        "msam_tokens": 133,
+        "saga_tokens": 133,
         "flat_baseline_tokens": 9301,
         "relevant_only_tokens": 49,
         "savings_vs_flat_pct": 98.6,
@@ -886,7 +886,7 @@
       "avg_savings_vs_flat_pct": 98.8,
       "avg_savings_vs_oracle_pct": -181.4,
       "avg_coverage": 0.424,
-      "total_msam_tokens": 2347,
+      "total_saga_tokens": 2347,
       "flat_baseline_tokens": 9301,
       "total_all_atom_tokens": 1911,
       "total_relevant_found": 19,

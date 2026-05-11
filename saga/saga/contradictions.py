@@ -1,5 +1,5 @@
 """
-MSAM Contradictions -- Semantic Contradiction Detection
+SAGA Contradictions -- Semantic Contradiction Detection
 
 Finds contradictions that share meaning but use different words,
 going beyond the existing string-based predicate matching in triples.py.

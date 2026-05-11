@@ -1,5 +1,5 @@
 # Integration bench: P30 canonical (post-fix baseline 0.774).
-# Same retrieval config as msam_bench.toml's canonical except triples
+# Same retrieval config as saga_bench.toml's canonical except triples
 # extraction is ON (P41-comparison configs need triples populated and
 # integration mimir-prod has it on anyway). enable_triple_augment_v2
 # stays OFF — this is the comparison's reference run.
@@ -12,7 +12,7 @@
 # distinct data dirs and can't collide.
 db_path = "saga.db"
 metrics_db_path = "saga_metrics.db"
-# Match msam_bench.toml: effectively unlimited.
+# Match saga_bench.toml: effectively unlimited.
 token_budget_ceiling = 100000000
 auto_compact_threshold_pct = 99
 refuse_threshold_pct = 100
@@ -59,7 +59,7 @@ enabled = true
 enable_llm = true
 
 [benchmark]
-# msam_bench.toml's bench-mode "off" flags that we need to mirror or
+# saga_bench.toml's bench-mode "off" flags that we need to mirror or
 # ingest quietly does ~50 extra embedding+store calls per question
 # (one session_boundary per haystack session). Bisected: omitting this
 # section made ingest 41s; adding it brings ingest to 17s. The integration
@@ -71,7 +71,7 @@ enable_mark_contributions = false
 
 [compression]
 # Subatom beam compression / dedup / synthesis are off in saga's bench
-# canonical (msam_bench.toml). Defaults differ; pin them off here.
+# canonical (saga_bench.toml). Defaults differ; pin them off here.
 enable_subatom = false
 enable_fact_dedup = false
 enable_synthesis = false

@@ -1,5 +1,5 @@
 """
-MSAM Forgetting Engine -- Intentional identification and retirement of
+SAGA Forgetting Engine -- Intentional identification and retirement of
 counterproductive memory atoms.
 
 Four signal detectors identify atoms that should be forgotten:

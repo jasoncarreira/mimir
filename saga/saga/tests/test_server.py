@@ -1,4 +1,4 @@
-"""MSAM REST API Server Tests -- tests for the FastAPI-based REST API."""
+"""SAGA REST API Server Tests -- tests for the FastAPI-based REST API."""
 
 import json
 import os
