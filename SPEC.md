@@ -16,9 +16,9 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
 2. **Auto-populated indexes.** Two of them: `memory/INDEX.md` (in the system prompt every turn) lists everything under `memory/` outside `core/`. `state/INDEX.md` (NOT in the prompt — read on demand) lists everything under `state/`. Both rebuild at end-of-turn (debounced) plus a 60s sweep.
 3. **One in-context location.** `memory/core/` is the only always-in-context tier. Anything else the agent wants to keep — under `memory/` or `state/` — it organizes however it likes; both are reached through search or direct read.
 4. **Searchable bulk content.** All non-core memory and state files are embedded into a local SQLite + fastembed index. The agent reaches them through a single `file_search` skill.
-5. **Search/MSAM/indexing ship as skills, not inline tools.** A skill is a folder with `SKILL.md` + a Python module; at the model's interface a skill that exposes a function is still a tool. The distinction is packaging — skills are filesystem-installable and can be added without redeploying. Inline tools stay minimal — bash, file ops, channel messaging, scheduling, web.
+5. **Search/SAGA/indexing ship as skills, not inline tools.** A skill is a folder with `SKILL.md` + a Python module; at the model's interface a skill that exposes a function is still a tool. The distinction is packaging — skills are filesystem-installable and can be added without redeploying. Inline tools stay minimal — bash, file ops, channel messaging, scheduling, web.
 6. **No bespoke memory-block tools.** The agent edits memory blocks the same way a human would: bash and file ops. No `create_memory_block` / `update_memory_block` / etc.
-7. **MSAM in the same container, hooked on both ends.** Pre-message: MSAM is queried for relevant atoms and the hits are injected into the turn prompt (muninnbot/open-strix-hindsight pattern). Post-message: MSAM's `mark_contributions` is called to weight the atoms that informed the reply.
+7. **SAGA in the same container, hooked on both ends.** Pre-message: SAGA is queried for relevant atoms and the hits are injected into the turn prompt (muninnbot/open-strix-hindsight pattern). Post-message: SAGA's `mark_contributions` is called to weight the atoms that informed the reply.
 8. **Subagents replace mountaineering.** The SDK's first-class `Agent` tool gives us isolated-context climbers without writing a supervisor of our own.
 
 ---
@@ -65,10 +65,10 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
 │   ├── config.py                 # env + config loading
 │   ├── session_manager.py        # per-channel saga session lifecycle (§5.6)
 │   ├── prompts/
-│   │   └── msam_session_end.md   # synthesis-turn template (§5.6); overridable
-│   │                             # via MIMIR_PROMPTS_DIR. (Filename retained
-│   │                             # for back-compat with operator overrides;
-│   │                             # the underlying lifecycle is saga's.)
+│   │   └── saga_session_end.md   # synthesis-turn template (§5.6); overridable
+│   │                             # via MIMIR_PROMPTS_DIR.
+│   │                             # `saga_session_end_lean.md` sibling
+│   │                             # is the lean variant for narrow contexts.
 │   ├── sagatools.py              # MCP tool wrappers around SagaClient
 │   └── skills/                   # Claude Agent SDK skills (bundled)
 │       ├── memory-search/
@@ -222,7 +222,7 @@ Exactly one of `cron` or `time_of_day` must be set per job.
 Two processes inside one container, supervised by `supervisord`:
 
 1. **Mimir** — Python service running the Claude Agent SDK loop, plus the indexer thread, plus the channel bridges (§7.2.1) as asyncio tasks, plus a small HTTP control surface (event injection, health check).
-2. **MSAM** — the existing MSAM server (Python / FastAPI + Uvicorn, port 3002, source vendored under `saga/saga/`), unmodified, configured against the same volume-mounted home.
+2. **SAGA** — the existing SAGA server (Python / FastAPI + Uvicorn, port 3002, source vendored under `saga/saga/`), unmodified, configured against the same volume-mounted home.
 
 Channel bridges (Slack, Discord, Bluesky, Web UI, Bench) are NOT separate processes — they run inside the mimir process as asyncio coroutines, sharing the per-channel dispatcher (§4.5) and the global concurrency cap. Subprocess pollers (§7.2.2) are the only out-of-process channel components, and they're inbound-only.
 
@@ -236,16 +236,16 @@ A single-container deployment matches the user's "we're going to be containerizi
 ├──────────────────────────────────────────────────────────────┤
 │ 1. mimir.index.rebuild()    # regenerate memory/INDEX.md     │
 │                             # and state/INDEX.md             │
-│ 2. msam pre-message hook    # query MSAM with the incoming   │
+│ 2. saga pre-message hook    # query SAGA with the incoming   │
 │                             # event text; format hits as a   │
 │                             # turn-prompt block              │
 │ 3. mimir.prompts.build()    # system + turn prompts (incl.   │
-│                             # MSAM hits)                     │
+│                             # SAGA hits)                     │
 │ 4. claude_agent_sdk.query(prompt, options=...)               │
 │      ├─ tool calls flow through mimir.tools                  │
 │      ├─ skill invocations resolve to mimir/skills/*          │
 │      └─ subagent calls (Agent tool) spawn isolated loops     │
-│ 5. msam post-message hook   # call msam_mark_contributions   │
+│ 5. saga post-message hook   # call saga_mark_contributions   │
 │                             # with the atom ids that were    │
 │                             # injected pre-message           │
 │ 6. persist final assistant message; emit channel output      │
@@ -335,14 +335,14 @@ Each turn carries a `TurnContext` value through the call chain — never a modul
 class TurnContext:
     turn_id: str             # 16-char hex
     session_id: str          # = channel_id (lets the viewer filter per-DM)
-    trigger: str             # "user_message" | "scheduled_tick" | "msam_session_end" | ...
+    trigger: str             # "user_message" | "scheduled_tick" | "saga_session_end" | ...
     channel_id: str | None
     started_at: float
-    msam_session_id: str | None = None    # active MSAM session for this channel (§5.6)
-    msam_atom_ids: list[str] = field(default_factory=list)
+    saga_session_id: str | None = None    # active SAGA session for this channel (§5.6)
+    saga_atom_ids: list[str] = field(default_factory=list)
 ```
 
-The MSAM pre-message hook stashes `atom_ids` on the context; the post-message hook reads from it. Concurrent turns each have their own context — no cross-talk.
+The SAGA pre-message hook stashes `atom_ids` on the context; the post-message hook reads from it. Concurrent turns each have their own context — no cross-talk.
 
 `session_id = channel_id` is intentional: it lets the HTML viewer filter turns per-DM ("show me only Alice's conversation") and matches the open-strix convention of one session per logical channel.
 
@@ -354,7 +354,7 @@ The MSAM pre-message hook stashes `atom_ids` on the context; the post-message ho
 | `events.jsonl` | Same — append-only with a lock. |
 | Indexer thread | Single writer, drains its own work queue. Concurrent file writes enqueue indexing tasks; eventually consistent within the 60s sweep. |
 | `INDEX.md` regeneration | Lock-serialized; the second writer overwrites with the newer snapshot. |
-| MSAM service | Handles its own concurrency. Each turn's pre/post hooks are independent HTTP calls. |
+| SAGA service | Handles its own concurrency. Each turn's pre/post hooks are independent HTTP calls. |
 | `Write` / `Edit` (SDK preset tools) | **Single-process serialization** via the dispatcher's per-channel queue + global semaphore. Within a turn, tool calls are sequential. Across turns on the same channel, the per-channel worker FIFO serializes. Across channels, two simultaneous edits to the same memory file would race — but in practice each channel writes only to its own subtree, and the agent uses `Edit` (atomic read-modify-write inside the SDK) for shared paths. Note: an earlier draft of this spec called for per-file `flock(LOCK_EX)` on every write. That predated the switch from custom MCP file-op tools to SDK preset hooks (see `mimir/hooks.py` docstring) — the actual write happens in the CLI subprocess, which mimir's process can't transactionally wrap. If multi-process mimir ever ships, revisit. |
 | `Bash` writes | Out of band; we don't intercept syscalls. OS gives small-write atomicity. Semantic collisions are on the agent. The prompt steers content edits toward `Write` / `Edit`; bash is for moves, listings, processes. |
 | Per-channel writes (`memory/channels/<id>/`, etc.) | No contention in practice — only the channel's worker writes there, and the per-channel worker FIFO serializes its own writes. |
@@ -464,9 +464,9 @@ If a public channel needs the same restriction (a "confidential" tag), add a `pr
 
 Independent of the message buffer, the agent gets per-channel **memory** scoped under `memory/channels/<channel_id>/`. This is for agent-curated notes ("things I learned about Alice", "open questions in #eng", etc.) — not message history. Per-channel notes don't race with other channels' writes, and they're searchable via `file_search`. Cross-channel knowledge belongs in `memory/shared/` (no special concurrency semantics — same `flock` rules as everything else).
 
-### 5.6 Per-channel MSAM sessions
+### 5.6 Per-channel SAGA sessions
 
-MSAM models memory in the context of **sessions** — TTL'd contexts that scope working-memory atoms, co-retrieval edges, and retrieval outcomes (see `msam/core.py:1139`, `:2209`, `:2311`). Mimir scopes one MSAM session per channel and uses the channel's idle period as the session boundary.
+SAGA models memory in the context of **sessions** — TTL'd contexts that scope working-memory atoms, co-retrieval edges, and retrieval outcomes (see `saga/saga/core.py:1139`, `:2209`, `:2311`). Mimir scopes one SAGA session per channel and uses the channel's idle period as the session boundary.
 
 #### State
 
@@ -475,7 +475,7 @@ MSAM models memory in the context of **sessions** — TTL'd contexts that scope 
 ```python
 @dataclass
 class ChannelSession:
-    msam_session_id: str         # f"msam-{channel_id}-{epoch_ms}"
+    saga_session_id: str         # f"saga-{channel_id}-{epoch_ms}"
     channel_id: str
     started_at: float
     last_message_at: float
@@ -483,17 +483,17 @@ class ChannelSession:
     idle_handle: asyncio.TimerHandle | None
 ```
 
-Each session has an asyncio timer that fires after `MIMIR_MSAM_SESSION_IDLE_MINUTES` of inactivity (default 10, configurable per `§14`). When the timer fires, the manager first asks the dispatcher whether the channel is *busy* (any turn in flight or events queued); if so, it re-arms the timer and emits `msam_session_idle_deferred` to events.jsonl rather than firing synthesis behind the in-flight work. Synthesis dispatches only once the channel is genuinely parked.
+Each session has an asyncio timer that fires after `MIMIR_SAGA_SESSION_IDLE_MINUTES` of inactivity (default 10, configurable per `§14`). When the timer fires, the manager first asks the dispatcher whether the channel is *busy* (any turn in flight or events queued); if so, it re-arms the timer and emits `saga_session_idle_deferred` to events.jsonl rather than firing synthesis behind the in-flight work. Synthesis dispatches only once the channel is genuinely parked.
 
 #### Lifecycle
 
 **On every inbound event** (bridge, scheduler tick, HTTP injection), the dispatcher (§4.5) calls `session_manager.touch(channel_id)` *before* enqueueing onto the per-channel queue:
 
 1. If a session exists for this channel: cancel its idle timer, update `last_message_at`, restart the timer.
-2. Otherwise: mint `msam_session_id = f"msam-{channel_id}-{int(time.time() * 1000)}"`, create the session, start the timer, log `msam_session_started` to events.jsonl.
-3. Either way, attach the current `msam_session_id` to the upcoming turn's `TurnContext.msam_session_id` (§4.6).
+2. Otherwise: mint `saga_session_id = f"saga-{channel_id}-{int(time.time() * 1000)}"`, create the session, start the timer, log `saga_session_started` to events.jsonl.
+3. Either way, attach the current `saga_session_id` to the upcoming turn's `TurnContext.saga_session_id` (§4.6).
 
-**On idle timeout** — the asyncio timer fires `_end_session(channel_id)`. Session-end is an **LLM-driven synthesis turn**, not a fire-and-forget HTTP call, because MSAM's bookkeeping call (`core.store_session_boundary`, `msam/core.py:3393-3437`) takes structured fields the LLM is best-placed to produce:
+**On idle timeout** — the asyncio timer fires `_end_session(channel_id)`. Session-end is an **LLM-driven synthesis turn**, not a fire-and-forget HTTP call, because SAGA's bookkeeping call (`core.store_session_boundary`, `saga/saga/core.py:3393-3437`) takes structured fields the LLM is best-placed to produce:
 
 ```python
 store_session_boundary(
@@ -509,19 +509,19 @@ store_session_boundary(
 
 Flow:
 
-1. Read `<home>/logs/turns.jsonl` and extract every record where `msam_session_id == this_session.msam_session_id`. Every TurnRecord carries this field (§10.2), populated from `TurnContext.msam_session_id` at turn start, so filtering is exact — no timestamp-window heuristics, no risk of off-by-one against rapid neighboring sessions.
-2. Enqueue a synthesis turn with `trigger="msam_session_end"`, `channel_id=channel_id`, empty inbound text, and the turn window embedded in the turn prompt under `## Turns from this session`. The template lives at `mimir/prompts/msam_session_end.md` (overridable via `MIMIR_PROMPTS_DIR`).
-3. Pre-message MSAM hook is **skipped** for `trigger="msam_session_end"`. Post-message `mark_contributions` is also skipped — the "response" is tool calls, not a user-facing reply.
-4. The agent does three things in this turn (see prompt below): captures session memories to disk, upvotes/downvotes useful MSAM atoms, and calls `msam_end_session(...)` with the synthesized boundary fields.
-5. After the synthesis turn finishes (regardless of which step errored), the session manager drops the in-memory session and logs `msam_session_ended` with `duration_s`, `turn_count`, `synthesis_ok`, `feedback_count`, `memory_writes`.
+1. Read `<home>/logs/turns.jsonl` and extract every record where `saga_session_id == this_session.saga_session_id`. Every TurnRecord carries this field (§10.2), populated from `TurnContext.saga_session_id` at turn start, so filtering is exact — no timestamp-window heuristics, no risk of off-by-one against rapid neighboring sessions.
+2. Enqueue a synthesis turn with `trigger="saga_session_end"`, `channel_id=channel_id`, empty inbound text, and the turn window embedded in the turn prompt under `## Turns from this session`. The template lives at `mimir/prompts/saga_session_end.md` (overridable via `MIMIR_PROMPTS_DIR`).
+3. Pre-message SAGA hook is **skipped** for `trigger="saga_session_end"`. Post-message `mark_contributions` is also skipped — the "response" is tool calls, not a user-facing reply.
+4. The agent does three things in this turn (see prompt below): captures session memories to disk, upvotes/downvotes useful SAGA atoms, and calls `saga_end_session(...)` with the synthesized boundary fields.
+5. After the synthesis turn finishes (regardless of which step errored), the session manager drops the in-memory session and logs `saga_session_ended` with `duration_s`, `turn_count`, `synthesis_ok`, `feedback_count`, `memory_writes`.
 
-Synthesis prompt template (`mimir/prompts/msam_session_end.md`):
+Synthesis prompt template (`mimir/prompts/saga_session_end.md`):
 
 ```markdown
-The MSAM session for channel {channel_id} has been idle for {idle_minutes}
+The SAGA session for channel {channel_id} has been idle for {idle_minutes}
 minutes and is being closed. Below are the turns from this session, filtered
-by msam_session_id. Each turn record carries `msam_atom_ids` — the atoms
-MSAM injected pre-message plus any you queried mid-turn.
+by saga_session_id. Each turn record carries `saga_atom_ids` — the atoms
+SAGA injected pre-message plus any you queried mid-turn.
 
 Do three things, in order:
 
@@ -537,14 +537,14 @@ future sessions — write or edit files under:
 Use bash and the file-op tools. Skip this step entirely if nothing notable
 came up — no need to manufacture content.
 
-### 2. Score MSAM atoms
+### 2. Score SAGA atoms
 
-For each atom_id in the union of `msam_atom_ids` across the turns below,
+For each atom_id in the union of `saga_atom_ids` across the turns below,
 decide whether it actually helped:
 
-  msam_feedback(atom_id, "useful")     # genuinely informed a reply
-  msam_feedback(atom_id, "incorrect")  # was wrong or misleading
-  msam_feedback(atom_id, "stale")      # outdated, should decay
+  saga_feedback(atom_id, "useful")     # genuinely informed a reply
+  saga_feedback(atom_id, "incorrect")  # was wrong or misleading
+  saga_feedback(atom_id, "stale")      # outdated, should decay
 
 Skip atoms that were neutral / not applicable — silence is a valid signal.
 
@@ -552,8 +552,8 @@ Skip atoms that were neutral / not applicable — silence is a valid signal.
 
 Synthesize and call:
 
-  msam_end_session(
-    session_id="{msam_session_id}",
+  saga_end_session(
+    session_id="{saga_session_id}",
     summary="<one-sentence summary>",
     topics_discussed=["..."],         # omit if nothing concrete
     decisions_made=["..."],           # omit if nothing concrete
@@ -568,20 +568,20 @@ After step 3, do not send any user-facing message — this is a bookkeeping turn
 {turns_window_jsonl}
 ```
 
-A session **cannot reopen** after it ends. The next inbound event for the same channel mints a fresh `msam_session_id`. This matches the boundary-atom semantics — the boundary is what's queried by the next session for "what were we doing last time?".
+A session **cannot reopen** after it ends. The next inbound event for the same channel mints a fresh `saga_session_id`. This matches the boundary-atom semantics — the boundary is what's queried by the next session for "what were we doing last time?".
 
-#### Dependencies on MSAM
+#### Dependencies on SAGA
 
-Two MSAM-side changes; both flagged for the MSAM owner. The `/v1/outcome` and `/v1/consolidate` endpoints we use for upvoting and weekly consolidation already exist as-is (`/v1/outcome` already accepts `session_id`). Until the changes below land, mimir's hooks pass the fields anyway (extras drop on the wire) and the synthesis turn's tool call surfaces as a 404 in events.jsonl — the session is still dropped locally so it doesn't get stuck:
+Two SAGA-side changes; both flagged for the SAGA maintainer. The `/v1/outcome` and `/v1/consolidate` endpoints we use for upvoting and weekly consolidation already exist as-is (`/v1/outcome` already accepts `session_id`). Until the changes below land, mimir's hooks pass the fields anyway (extras drop on the wire) and the synthesis turn's tool call surfaces as a 404 in events.jsonl — the session is still dropped locally so it doesn't get stuck:
 
-1. **NEW endpoint `POST /v1/sessions/end`** — required. Body: `{session_id, summary, topics_discussed?, decisions_made?, unfinished?, emotional_state?}`. ~10-line wrapper in `msam/server.py` around `core.store_session_boundary` (`msam/core.py:3393-3437`). Without this, the boundary atom doesn't get written and the next session can't query "what were we doing last time?".
-2. **Add `session_id: Optional[str] = None` to `FeedbackRequest`** (`msam/server.py:114-117`) and pass it through to `core.mark_contributions` (which already accepts the kwarg — `msam/core.py:2129`). One-line schema add + one-line plumbing. Nice-to-have: gives MSAM session-scoped co-retrieval stats. Without it, contribution credit still works, just not bucketed by session.
+1. **NEW endpoint `POST /v1/sessions/end`** — required. Body: `{session_id, summary, topics_discussed?, decisions_made?, unfinished?, emotional_state?}`. ~10-line wrapper in `saga/saga/server.py` around `core.store_session_boundary` (`saga/saga/core.py:3393-3437`). Without this, the boundary atom doesn't get written and the next session can't query "what were we doing last time?".
+2. **Add `session_id: Optional[str] = None` to `FeedbackRequest`** (`saga/saga/server.py:114-117`) and pass it through to `core.mark_contributions` (which already accepts the kwarg — `saga/saga/core.py:2129`). One-line schema add + one-line plumbing. Nice-to-have: gives SAGA session-scoped co-retrieval stats. Without it, contribution credit still works, just not bucketed by session.
 
 `/v1/query` does not need `session_id` for v1 — the underlying retrieval (`hybrid_retrieve_with_triples`) doesn't use it. Skip.
 
 #### Weekly consolidation
 
-`mimir/scheduler.py` runs a hard-coded periodic MSAM consolidation job — `MIMIR_MSAM_CONSOLIDATE_CRON` (default `"0 4 * * 0"`, Sundays 04:00 UTC) POSTs `/v1/consolidate` directly, bypassing the LLM. This is *not* a `scheduler.yaml` entry — those are LLM ticks, this is an out-of-band MSAM control call. Set `MIMIR_MSAM_CONSOLIDATE_CRON=""` to disable. Errors log to events.jsonl as `msam_consolidate_error`. Decay (`/v1/decay`) and forgetting (`/v1/forget`) are deferred to a later spec revision — MSAM's internal defaults are good enough for v1.
+`mimir/scheduler.py` runs a hard-coded periodic SAGA consolidation job — `MIMIR_SAGA_CONSOLIDATE_CRON` (default `"0 4 * * *"`, daily at 04:00 UTC) POSTs `/v1/consolidate` directly, bypassing the LLM. This is *not* a `scheduler.yaml` entry — those are LLM ticks, this is an out-of-band SAGA control call. Set `MIMIR_SAGA_CONSOLIDATE_CRON=""` to disable. Errors log to events.jsonl as `saga_consolidate_error`. Decay (`/v1/decay`) and forgetting (`/v1/forget`) are deferred to a later spec revision — SAGA's internal defaults are good enough for v1.
 
 ---
 
@@ -647,7 +647,7 @@ Returned to the agent via the `file_search` skill. Default `k=5`, max `k=20`. Re
 
 ## 7. Tools
 
-Tools are deliberately minimal. Memory editing is *not* a tool — the agent uses bash and file ops to create, edit, rename, and delete memory blocks the same way a human would. Anything heavier (search, MSAM, indexing) is a skill.
+Tools are deliberately minimal. Memory editing is *not* a tool — the agent uses bash and file ops to create, edit, rename, and delete memory blocks the same way a human would. Anything heavier (search, SAGA, indexing) is a skill.
 
 ### 7.1 Channel & messaging
 - `send_message(text: str, channel_id: str | None = None, attachment_paths: list[str] | None = None)` — emit to a channel. If `channel_id` is omitted, defaults to the current turn's channel. The `ChannelRegistry` (§7.2) dispatches on the channel_id prefix to the right bridge. Subject to the loop-detection circuit breaker (§7.2.4). Returns a status string: `send_message complete (sent={bool}, chunks={n}, message_id={id})`.
@@ -782,17 +782,21 @@ file_search(query: str, scope: "memory" | "state" | "all" = "all", k: int = 5)
 
 `SKILL.md` documents when to use it: "when you need to find a memory or state file by topic, not by exact path." Routing rule in the prompt: "if you know the path, `read_file` directly; otherwise `file_search`."
 
-### 8.2 `msam/`
+### 8.2 `memory/`
 
-Wraps the MSAM HTTP client. Most MSAM activity is automatic through the pre/post-message hooks (§9.3); the skill exposes the manual escape hatches:
+(Bundled at `mimir/skills/memory/`; the directory was renamed
+from `msam/` during the SAGA rebrand. Operator overrides under
+`<home>/.claude/skills/memory/` follow the same name.)
 
-- `msam_query(query: str, top_k: int = 12)` — explicit semantic atom retrieval (the same call the pre-message hook makes; available for follow-up queries inside a turn). Returned `atom_id`s are auto-appended to the parent's `turn_state.msam_atom_ids` so they get credited at post-message without the agent having to remember (§9.3).
-- `msam_store(content: str, kind: str, confidence: float)` — explicit store. The agent rarely calls this directly — MSAM extracts atoms from messages on its own.
-- `msam_feedback(atom_id: str, signal: "useful" | "incorrect" | "stale")` — corrective signal. Skill translates to MSAM's `/v1/outcome` vocabulary: `useful → positive`, `incorrect → negative`, `stale → negative` (no MSAM-side change required; `/v1/outcome` already accepts `session_id`, which the skill passes from `TurnContext`).
-- `msam_mark_contributions(atom_ids: list[str])` — manual variant of the post-message hook, for cases where the agent wants to credit atoms it pulled in mid-turn via `msam_query`.
-- `msam_end_session(session_id: str, summary: str, topics_discussed: list[str] | None = None, decisions_made: list[str] | None = None, unfinished: list[str] | None = None, emotional_state: str | None = None)` — POSTs to `/v1/sessions/end`, which calls `core.store_session_boundary` and writes a "Session Boundary [<id>]: <summary>\nTopics: ...\nDecisions: ...\nUnfinished: ...\nMood at close: ..." episodic atom (only the fields with substance render; empty lists/None are dropped). Auto-invoked by the synthesis turn at idle timeout (§5.6); the agent can also call it explicitly when it knows a session is wrapping (e.g. user says "talk later").
+Wraps the SAGA HTTP client. Most SAGA activity is automatic through the pre/post-message hooks (§9.3); the skill exposes the manual escape hatches:
 
-`SKILL.md` describes the MSAM atom model (semantic / episodic / procedural with confidence gating), the auto pre/post hooks, and when to prefer MSAM over `file_search` (semantic gist vs. verbatim retrieval).
+- `saga_query(query: str, top_k: int = 12)` — explicit semantic atom retrieval (the same call the pre-message hook makes; available for follow-up queries inside a turn). Returned `atom_id`s are auto-appended to the parent's `turn_state.saga_atom_ids` so they get credited at post-message without the agent having to remember (§9.3).
+- `saga_store(content: str, kind: str, confidence: float)` — explicit store. The agent rarely calls this directly — SAGA extracts atoms from messages on its own.
+- `saga_feedback(atom_id: str, signal: "useful" | "incorrect" | "stale")` — corrective signal. Skill translates to SAGA's `/v1/outcome` vocabulary: `useful → positive`, `incorrect → negative`, `stale → negative` (no SAGA-side change required; `/v1/outcome` already accepts `session_id`, which the skill passes from `TurnContext`).
+- `saga_mark_contributions(atom_ids: list[str])` — manual variant of the post-message hook, for cases where the agent wants to credit atoms it pulled in mid-turn via `saga_query`.
+- `saga_end_session(session_id: str, summary: str, topics_discussed: list[str] | None = None, decisions_made: list[str] | None = None, unfinished: list[str] | None = None, emotional_state: str | None = None)` — POSTs to `/v1/sessions/end`, which calls `core.store_session_boundary` and writes a "Session Boundary [<id>]: <summary>\nTopics: ...\nDecisions: ...\nUnfinished: ...\nMood at close: ..." episodic atom (only the fields with substance render; empty lists/None are dropped). Auto-invoked by the synthesis turn at idle timeout (§5.6); the agent can also call it explicitly when it knows a session is wrapping (e.g. user says "talk later").
+
+`SKILL.md` describes the SAGA atom model (semantic / episodic / procedural with confidence gating), the auto pre/post hooks, and when to prefer SAGA over `file_search` (semantic gist vs. verbatim retrieval).
 
 ### 8.3 `index/`
 
@@ -883,7 +887,7 @@ input is empty):
 {Negative (last Nh): / Positive (last Nh): bullets from feedback.py}
 
 ## Recent session summaries              # v0.4 §3 session-boundary surfacing
-{recent boundaries for the current channel from MSAM (or local mirror fallback)}
+{recent boundaries for the current channel from SAGA (or local mirror fallback)}
 
 ## Recent activity
 {merged chronological stream:
@@ -891,8 +895,8 @@ input is empty):
   - last M messages by the same author from other channels (last 24h)
   each line: [<ts> <channel_id>] <author>: <content>}
 
-## Possibly relevant memories (from MSAM)
-{pre_message_msam_block — see 9.3}
+## Possibly relevant memories (from SAGA)
+{pre_message_saga_block — see 9.3}
 
 ## Subagent updates                      # only when subagent_inbox has entries
 {TaskNotificationMessage payloads from prior turns}
@@ -912,7 +916,7 @@ For scheduled wakeups (no inbound author, so cross-author pull is skipped):
 
 No journal entries. No always-injected core memory beyond what's already in the system prompt.
 
-### 9.3 MSAM hooks
+### 9.3 SAGA hooks
 
 (Hook code samples below use `ctx.*` to match the actual attribute
 name on `TurnContext`; the original spec drafted these as
@@ -921,36 +925,36 @@ name on `TurnContext`; the original spec drafted these as
 **Pre-message** — fires after `index.rebuild()` and before `query()`. Mirrors muninnbot's `msam_hooks.mjs:PreMessage` and open-strix-hindsight's pre-message retrieval:
 
 ```python
-hits = msam_client.query(
+hits = saga_client.query(
     text=event_body,
     top_k=12,
-    session_id=ctx.msam_session_id,   # §5.6
+    session_id=ctx.saga_session_id,   # §5.6
 )
 # hits = [{atom_id, content, kind, confidence, score}, ...]
-ctx.msam_atom_ids = [h["atom_id"] for h in hits]
-ctx.msam_block = format_atoms_for_prompt(hits)
+ctx.saga_atom_ids = [h["atom_id"] for h in hits]
+ctx.saga_block = format_atoms_for_prompt(hits)
 ```
 
 `format_atoms_for_prompt` produces a short bullet list — kind tag, content, no IDs in the visible output. The atom IDs are stashed on `ctx` for the post-message hook. If the query returns nothing, the block is omitted from the turn prompt entirely.
 
-**Mid-turn `msam_query` tracking.** The `msam` skill's `msam_query` wrapper (§8.2) appends every returned `atom_id` to `ctx.msam_atom_ids` in addition to passing the hits back to the model. The agent doesn't have to remember to credit mid-turn retrievals — they're auto-merged into the post-message call below.
+**Mid-turn `saga_query` tracking.** The `memory/` skill's `saga_query` wrapper (§8.2) appends every returned `atom_id` to `ctx.saga_atom_ids` in addition to passing the hits back to the model. The agent doesn't have to remember to credit mid-turn retrievals — they're auto-merged into the post-message call below.
 
 **Post-message** — fires after the SDK returns the final assistant message:
 
 ```python
-if ctx.msam_atom_ids:
-    msam_client.mark_contributions(
-        atom_ids=list(set(ctx.msam_atom_ids)),  # pre-injected ∪ mid-turn-queried
+if ctx.saga_atom_ids:
+    saga_client.mark_contributions(
+        atom_ids=list(set(ctx.saga_atom_ids)),  # pre-injected ∪ mid-turn-queried
         response_text=final_assistant_text,
-        session_id=ctx.msam_session_id,         # §5.6
+        session_id=ctx.saga_session_id,         # §5.6
     )
 ```
 
-`mark_contributions` is MSAM's `POST /v1/feedback` endpoint (`msam/server.py:425-429`) for crediting atoms that influenced a reply (used for confidence weighting / promotion / decay). MSAM's scorer decides which atoms in the passed set actually contributed based on overlap with the response text — we don't disambiguate client-side.
+`mark_contributions` is SAGA's `POST /v1/feedback` endpoint (`saga/saga/server.py:425-429`) for crediting atoms that influenced a reply (used for confidence weighting / promotion / decay). SAGA's scorer decides which atoms in the passed set actually contributed based on overlap with the response text — we don't disambiguate client-side.
 
-**Subagents do not inherit the parent's `msam_atom_ids`.** A subagent sees its own `TurnContext`. If a subagent calls `msam_query` and wants the retrievals credited, it credits them via its own `msam_mark_contributions` from inside the subagent. The parent neither tracks nor credits subagent-internal MSAM activity. This keeps the parent's credit signal clean and lets each context decide what counts as "useful".
+**Subagents do not inherit the parent's `saga_atom_ids`.** A subagent sees its own `TurnContext`. If a subagent calls `saga_query` and wants the retrievals credited, it credits them via its own `saga_mark_contributions` from inside the subagent. The parent neither tracks nor credits subagent-internal SAGA activity. This keeps the parent's credit signal clean and lets each context decide what counts as "useful".
 
-`ctx.msam_atom_ids` is per-turn (cleared between turns). MSAM session boundaries (per-channel, idle-driven) are §5.6. Weekly consolidation is a separate scheduled job (§5.6).
+`ctx.saga_atom_ids` is per-turn (cleared between turns). SAGA session boundaries (per-channel, idle-driven) are §5.6. Weekly consolidation is a separate scheduled job (§5.6).
 
 ---
 
@@ -1000,8 +1004,8 @@ Event types ported from open-strix (`open-strix-base/docs/events.md`):
 | `slack_message` / `discord_message` / `bsky_message` | `channel_id, content, source_id, author, author_id, author_is_bot?, channel_name?, channel_conversation_type, channel_visibility, attachment_names?` — same shape as `web_message`, one type per bridge (§7.2.1) |
 | `bridge_connecting` / `bridge_ready` / `bridge_error` | `bridge, source, error?` — bridge lifecycle |
 | `bridge_stub_called` | `bridge, channel_id, method` — stubbed bridges (§15 Phase 6.3) log instead of sending |
-| `msam_session_started` / `msam_session_ended` | `channel_id, msam_session_id, duration_s?, turn_count?, synthesis_ok?, feedback_count?, memory_writes?` — per-channel session lifecycle (§5.6) |
-| `msam_consolidate_ok` / `msam_consolidate_error` | `dry_run, max_clusters?, error?` — weekly cron (§5.6) |
+| `saga_session_started` / `saga_session_ended` | `channel_id, saga_session_id, duration_s?, turn_count?, synthesis_ok?, feedback_count?, memory_writes?` — per-channel session lifecycle (§5.6) |
+| `saga_consolidate_ok` / `saga_consolidate_error` | `dry_run, max_clusters?, error?` — weekly cron (§5.6) |
 | `poller_stderr` / `poller_nonzero_exit` | `poller, exit_code, stderr` — pollers (§7.2.2) |
 | `send_message_loop_warning` / `send_message_loop_hard_stop` / `send_message_loop_detected` | `tool, channel_id, streak, similarity_ratio, reacted?` — circuit breaker (§7.2.4) |
 
@@ -1015,11 +1019,11 @@ class TurnRecord:
     ts: str                          # ISO timestamp (UTC)
     turn_id: str                     # 16-char hex (uuid4().hex[:16])
     session_id: str                  # = channel_id (viewer-scope, lets the viewer filter per-DM)
-    msam_session_id: str | None      # active MSAM session at turn start (§5.6) — used by the session-end synthesis turn to filter the window
-    trigger: str                     # event kind: "user_message", "scheduled_tick", "msam_session_end", ...
+    saga_session_id: str | None      # active SAGA session at turn start (§5.6) — used by the session-end synthesis turn to filter the window
+    trigger: str                     # event kind: "user_message", "scheduled_tick", "saga_session_end", ...
     channel_id: str | None
     input: str                       # input prompt text (truncated to 2KB)
-    msam_atom_ids: list[str]         # union of pre-injected + mid-turn-queried atoms (§9.3) — read by session-end to drive feedback
+    saga_atom_ids: list[str]         # union of pre-injected + mid-turn-queried atoms (§9.3) — read by session-end to drive feedback
     events: list[dict]               # chronological event sequence
     output: str = ""                 # final assistant text
     duration_ms: int = 0             # total turn duration
@@ -1116,15 +1120,15 @@ open http://localhost:<host_port>/turns
 
 ### 12.1 Dockerfile
 
-Single Python image — MSAM is Python (FastAPI + Uvicorn), so we just `pip install` it alongside mimir:
+Single Python image — SAGA is Python (FastAPI + Uvicorn), so we just `pip install` it alongside mimir:
 
 ```dockerfile
 FROM python:3.12-slim
 RUN apt-get update && apt-get install -y supervisor curl git && rm -rf /var/lib/apt/lists/*
 
-# MSAM (Python / FastAPI), copied from the vendored saga package.
-COPY saga /opt/msam
-RUN pip install /opt/msam
+# SAGA (Python / FastAPI), copied from the vendored saga package.
+COPY saga /opt/saga
+RUN pip install /opt/saga
 
 # Mimir
 COPY pyproject.toml /opt/mimir/
@@ -1140,18 +1144,18 @@ ENTRYPOINT ["/entrypoint.sh"]
 ### 12.2 supervisord.conf
 
 ```ini
-[program:msam]
-command=python -m msam.server
+[program:saga]
+command=python -m saga.server
 autostart=true
 autorestart=true
-stdout_logfile=/app/logs/msam.log
+stdout_logfile=/app/logs/saga.log
 
 [program:mimir]
 command=python -m mimir.server
 autostart=true
 autorestart=true
 stdout_logfile=/app/logs/mimir.log
-environment=MSAM_ENDPOINT="http://localhost:3002"
+environment=SAGA_ENDPOINT="http://localhost:3002"
 ```
 
 ### 12.3 Volumes
@@ -1184,7 +1188,7 @@ def reset(self) -> None:
     self._archive_and_truncate_turns()  # if relevant
     self._restore_home_from_baseline_tar()
     self._truncate_index_db()
-    self._reset_msam()  # delete /home/.msam/atoms.db or POST /reset
+    self._reset_saga()  # delete /home/.saga/atoms.db or POST /reset
 ```
 
 ---
@@ -1199,9 +1203,9 @@ def reset(self) -> None:
 | `MIMIR_EFFORT` | `high` | Effort param |
 | `MIMIR_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed model |
 | `MIMIR_INDEX_DB` | `$MIMIR_HOME/.mimir/index.db` | SQLite path |
-| `MSAM_ENDPOINT` | `http://localhost:3002` | MSAM server |
-| `MIMIR_MSAM_SESSION_IDLE_MINUTES` | `30` | Per-channel MSAM session idle timeout (§5.6); session-end fires after this much silence on a channel |
-| `MIMIR_MSAM_CONSOLIDATE_CRON` | `0 4 * * 0` | Cron expression for periodic `POST /v1/consolidate`; empty string disables (§5.6) |
+| `SAGA_ENDPOINT` | `http://localhost:3002` | SAGA server |
+| `MIMIR_SAGA_SESSION_IDLE_MINUTES` | `10` | Per-channel SAGA session idle timeout (§5.6); session-end fires after this much silence on a channel |
+| `MIMIR_SAGA_CONSOLIDATE_CRON` | `0 4 * * *` | Cron expression for periodic `POST /v1/consolidate`; empty string disables (§5.6) |
 | `MIMIR_PROMPTS_DIR` | `mimir/prompts/` (bundled) | Override path for prompt templates; mimir falls back to bundled defaults if a file isn't found (§5.6) |
 | `MIMIR_TURNS_ARCHIVE_DIR` | (unset) | If set, `reset()` archives turns.jsonl + events.jsonl here before truncate |
 | `MIMIR_MAX_TURNS` | `5000` | Retention cap for turns.jsonl (hard ceiling 50000) |
@@ -1287,18 +1291,18 @@ Channel-specific config (Bluesky/Slack) is deferred — `send_message` only need
 - `index/rebuild_index` skill.
 - Tests for incremental indexing, bash-write detection via mtime sweep, hybrid scoring.
 
-### Phase 4 — MSAM integration (2 days)
-- Bundle MSAM into the Dockerfile.
-- `msam` skill (`msam_query`, `msam_store`, `msam_feedback`, `msam_mark_contributions`, `msam_end_session`); `msam_query` auto-tracks atom_ids on `TurnContext` (§9.3).
-- Pre-message hook: query MSAM, format hits into turn prompt, stash atom IDs.
+### Phase 4 — SAGA integration (2 days)
+- Bundle SAGA into the Dockerfile.
+- `memory/` skill (`saga_query`, `saga_store`, `saga_feedback`, `saga_mark_contributions`, `saga_end_session`); `saga_query` auto-tracks atom_ids on `TurnContext` (§9.3).
+- Pre-message hook: query SAGA, format hits into turn prompt, stash atom IDs.
 - Post-message hook: call `mark_contributions` with the union of pre-injected and mid-turn-queried atom IDs.
-- **Per-channel MSAM session manager (§5.6)** — `mimir/session_manager.py` with `touch(channel_id)`, idle timer. Hook into the dispatcher (§4.5) so every inbound event touches the session before enqueueing.
-- **Session-end synthesis turn** — on idle, dispatcher enqueues a turn with `trigger="msam_session_end"`, the channel's turn window from turns.jsonl in the prompt, and `mimir/prompts/msam_session_end.md` as the template. Pre/post MSAM hooks skip on this trigger.
-- `msam_end_session` tool that POSTs `/v1/sessions/end` (`store_session_boundary` server-side).
-- Weekly consolidation cron (`MIMIR_MSAM_CONSOLIDATE_CRON`) wired into `mimir/scheduler.py` as a non-LLM job — direct POST `/v1/consolidate`.
-- Turn logger writes `msam_session_id` and `msam_atom_ids` to every TurnRecord (§10.2) so the synthesis turn can filter the window exactly.
-- Tests: session start/touch/idle-end lifecycle; timer reset on rapid messages; synthesis turn reads only turns with the matching `msam_session_id` (verifies tagging); agent calls `msam_end_session` with at least `session_id` + `summary`; agent emits at least one `msam_feedback` call when atoms are present in the window; consolidation cron fires and logs; session manager tolerates `/v1/sessions/end` 404 (drops in-memory session, `synthesis_ok=False`).
-- File MSAM-side feature requests: `POST /v1/sessions/end` endpoint with `{session_id, summary, topics_discussed?, decisions_made?, unfinished?, emotional_state?}` body + `session_id` field on `/v1/feedback` and `/v1/query` (§5.6 dependencies).
+- **Per-channel SAGA session manager (§5.6)** — `mimir/session_manager.py` with `touch(channel_id)`, idle timer. Hook into the dispatcher (§4.5) so every inbound event touches the session before enqueueing.
+- **Session-end synthesis turn** — on idle, dispatcher enqueues a turn with `trigger="saga_session_end"`, the channel's turn window from turns.jsonl in the prompt, and `mimir/prompts/saga_session_end.md` as the template. Pre/post SAGA hooks skip on this trigger.
+- `saga_end_session` tool that POSTs `/v1/sessions/end` (`store_session_boundary` server-side).
+- Weekly consolidation cron (`MIMIR_SAGA_CONSOLIDATE_CRON`) wired into `mimir/scheduler.py` as a non-LLM job — direct POST `/v1/consolidate`.
+- Turn logger writes `saga_session_id` and `saga_atom_ids` to every TurnRecord (§10.2) so the synthesis turn can filter the window exactly.
+- Tests: session start/touch/idle-end lifecycle; timer reset on rapid messages; synthesis turn reads only turns with the matching `saga_session_id` (verifies tagging); agent calls `saga_end_session` with at least `session_id` + `summary`; agent emits at least one `saga_feedback` call when atoms are present in the window; consolidation cron fires and logs; session manager tolerates `/v1/sessions/end` 404 (drops in-memory session, `synthesis_ok=False`).
+- File SAGA-side feature requests: `POST /v1/sessions/end` endpoint with `{session_id, summary, topics_discussed?, decisions_made?, unfinished?, emotional_state?}` body + `session_id` field on `/v1/feedback` and `/v1/query` (§5.6 dependencies).
 
 ### Phase 5 — scheduling + subagents (2.5 days)
 - `add_schedule` / `list_schedules` / `remove_schedule`.
@@ -1342,7 +1346,7 @@ Channel-specific config (Bluesky/Slack) is deferred — `send_message` only need
 ### Phase 7 — benchmark adapter (1–2 days)
 - `adapters/mimir.py`.
 - `prompts/mimir/*.md`.
-- Reset semantics (tar snapshot + index truncate + msam reset).
+- Reset semantics (tar snapshot + index truncate + saga reset).
 - 1-task smoke test on bluesky_recall.
 - 5-task run, compare to lettabot/open-strix baselines.
 
@@ -1352,7 +1356,7 @@ Channel-specific config (Bluesky/Slack) is deferred — `send_message` only need
 - Resume detection (task-result JSON).
 - Error path coverage (MiniMax tool-arg drops, SDK timeouts).
 
-Total: ~15.5 working days for a first benchmarkable build (Phase 4 expanded by 0.5 day for the per-channel MSAM session manager + weekly consolidation).
+Total: ~15.5 working days for a first benchmarkable build (Phase 4 expanded by 0.5 day for the per-channel SAGA session manager + weekly consolidation).
 
 ---
 
@@ -1360,11 +1364,11 @@ Total: ~15.5 working days for a first benchmarkable build (Phase 4 expanded by 0
 
 1. **Slack and Bluesky bridge implementations.** Phase 6.3 lands stubs; production fill-in (auth flow, retry, rate limits, attachments) is deferred until needed. Per-channel rate limits to prevent cross-turn `send_message` spam are also deferred — circuit breaker (§7.2.4) only covers within-turn loops.
 2. **Embedder upgrade path.** Likely target: `text-embedding-3-large` or a stronger open model. Decision deferred; v1 ships fastembed bge-small.
-3. **MSAM auto-store cadence.** MSAM's own atom extractor decides when to store from message content; mimir doesn't impose a separate cadence. Revisit if extraction is too noisy.
+3. **SAGA auto-store cadence.** SAGA's own atom extractor decides when to store from message content; mimir doesn't impose a separate cadence. Revisit if extraction is too noisy.
 4. **Subagent recursion.** SDK forbids it (verified against `claude-agent-sdk==0.1.58` docs: "Subagents cannot spawn their own subagents. Don't include `Agent` in a subagent's `tools` array."). If a future climber needs to spawn a researcher, the parent dispatches both sequentially. The `Agent` tool is *omitted* from each subagent definition's `tools` list.
 5. **Index regeneration cost.** With end-of-turn debounce (§3.4, §6.3) regeneration is one tree-walk per turn regardless of how many writes happened. Cheap for ~50 files; revisit if either tree crosses ~500 — at that point add a `MIMIR_INDEX_MAX_ENTRIES` cap on what `memory/INDEX.md` renders into the prompt and let the rest live behind `file_search`.
 6. **Renumbering pressure.** With 10-spacing, gaps close after ~10 inserts at a single position. Add a maintenance scheduled job ("renumber memory/core/ if gaps closed") in Phase 5.
-7. **MSAM decay/forget cadence.** Mimir runs weekly consolidation (§5.6) but leaves `/v1/decay` and `/v1/forget` to MSAM's internal defaults. Revisit if working memory grows unbounded or stale atoms degrade retrieval.
+7. **SAGA decay/forget cadence.** Mimir runs periodic consolidation (§5.6) but leaves `/v1/decay` and `/v1/forget` to SAGA's internal defaults. Revisit if working memory grows unbounded or stale atoms degrade retrieval.
 8. **Git audit/rollback layer.** Optional: wrap the agent home in a git repo and commit per turn (or per memory write). Not the concurrency story — that's already solved by namespacing + the cross-channel writer thread — but useful for "show me what changed in the last 5 turns" and "roll back the last turn" capabilities. Deferred. Cost: every memory op gains a git op; benefit: free history + rollback.
 9. **Chat history file growth.** `messages/chat_history.jsonl` is unbounded by default. Daily logrotate or size-based trimming when a real production deployment cares. Memory deques are bounded; the file is a complete history.
 10. **Bash content writes.** The prompt steers the agent toward `write_file`/`edit_file` for memory edits, but if it `echo > memory/core/00-persona.md`s anyway, last-writer-wins applies and there's no `flock`. Acceptable today; if it becomes a real failure mode, wrap bash with a path-aware preflight that runs cross-channel-path commands under `flock(1)`.
