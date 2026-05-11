@@ -33,7 +33,8 @@ that fed that turn isn't useful for synthesis and re-embedding it is
 exactly the cost path we're avoiding). Be surgical — most turns won't
 be worth re-reading.
 
-Do three things, in order:
+Do three things, in order (plus an optional Step 1b for inline atom
+storage — see below):
 
 ### 1. Capture memories worth keeping
 
@@ -61,6 +62,39 @@ durable rules from one-off events. The pending buffer is the safe path.
 Use bash and the file-op tools. Call `mimir_get_turn` only for turns
 whose summary suggests they're worth a closer look. Skip this step
 entirely if nothing notable came up — no need to manufacture content.
+
+### 1b. Store SAGA atoms for cross-session semantic facts
+
+If the session surfaced concrete, positive, world-facts that benefit
+from embedding-based cross-session retrieval (and aren't already going
+into a file under Step 1), call saga_store for each.
+
+**Good shapes:**
+
+- **semantic** — facts, preferences, knowledge about people, places,
+  things, concepts ("Alice prefers Slack DMs over email for urgent
+  asks"; "Brander's actors thesis: LLM agents map to Hewitt's actor
+  model"; "The Mariana Trench is the deepest known oceanic trench").
+- **episodic** — dated events about specific entities ("Alice joined
+  the Atlas project on 2025-03-12"; "The Hindenburg disaster occurred
+  on 1937-05-06"). Dates verbatim where they appear.
+- **procedural** — recurring how-tos / workflow patterns ("When
+  summarizing a long document, lead with the thesis and supporting
+  evidence"; "Use a hot pan and high heat for searing meat").
+
+**Do NOT store:**
+
+- Meta-observations about this turn or the runtime itself ("the
+  synthesis prompt ran"; "the scheduler fired silently")
+- Self-state claims ("I'm uncertain about X", "no info about Y")
+- Negative / absence claims ("nothing happened today")
+- Generic session-retell — the boundary's `summary` field handles
+  that
+- Duplicates of content already going into a file under Step 1, or
+  already covered by a recent boundary's summary/topics/decisions
+
+One fact per call. Single self-contained sentence. Dates and numbers
+verbatim. If nothing fits, skip this step entirely — silence is fine.
 
 ### 2. Score SAGA atoms
 
@@ -124,9 +158,11 @@ After step 3, do not send any user-facing message — this is a bookkeeping turn
 # bookkeeping turn for the contribution-credit + atom-scoring
 # scaffolding; when the session genuinely has zero atoms cited there's
 # nothing to credit and the scaffolding is pure cost. The lean
-# variant keeps memory capture (step 1) and the boundary record
-# (step 2 — renumbered from step 3) and drops:
-#   - step 2 (Score SAGA atoms)
+# variant keeps memory capture (step 1), the optional inline atom
+# storage step (step 1b — added 2026-05-10 per operator discussion on
+# why mimir rarely reaches for saga_store), and the boundary record
+# (step 2 — renumbered from step 3 in the full template) and drops:
+#   - the dedicated atom-scoring step (Score SAGA atoms)
 #   - the trailing ``## Atoms cited across the session`` block
 # The session summary is still the valuable artifact (it feeds the
 # Recent session summaries block in every subsequent prompt) — we
@@ -149,7 +185,8 @@ that fed that turn isn't useful for synthesis and re-embedding it is
 exactly the cost path we're avoiding). Be surgical — most turns won't
 be worth re-reading.
 
-Do two things, in order:
+Do two things, in order (plus an optional Step 1b for inline atom
+storage — see below):
 
 ### 1. Capture memories worth keeping
 
@@ -177,6 +214,39 @@ durable rules from one-off events. The pending buffer is the safe path.
 Use bash and the file-op tools. Call `mimir_get_turn` only for turns
 whose summary suggests they're worth a closer look. Skip this step
 entirely if nothing notable came up — no need to manufacture content.
+
+### 1b. Store SAGA atoms for cross-session semantic facts
+
+If the session surfaced concrete, positive, world-facts that benefit
+from embedding-based cross-session retrieval (and aren't already going
+into a file under Step 1), call saga_store for each.
+
+**Good shapes:**
+
+- **semantic** — facts, preferences, knowledge about people, places,
+  things, concepts ("Alice prefers Slack DMs over email for urgent
+  asks"; "Brander's actors thesis: LLM agents map to Hewitt's actor
+  model"; "The Mariana Trench is the deepest known oceanic trench").
+- **episodic** — dated events about specific entities ("Alice joined
+  the Atlas project on 2025-03-12"; "The Hindenburg disaster occurred
+  on 1937-05-06"). Dates verbatim where they appear.
+- **procedural** — recurring how-tos / workflow patterns ("When
+  summarizing a long document, lead with the thesis and supporting
+  evidence"; "Use a hot pan and high heat for searing meat").
+
+**Do NOT store:**
+
+- Meta-observations about this turn or the runtime itself ("the
+  synthesis prompt ran"; "the scheduler fired silently")
+- Self-state claims ("I'm uncertain about X", "no info about Y")
+- Negative / absence claims ("nothing happened today")
+- Generic session-retell — the boundary's `summary` field handles
+  that
+- Duplicates of content already going into a file under Step 1, or
+  already covered by a recent boundary's summary/topics/decisions
+
+One fact per call. Single self-contained sentence. Dates and numbers
+verbatim. If nothing fits, skip this step entirely — silence is fine.
 
 ### 2. Record the session boundary
 
