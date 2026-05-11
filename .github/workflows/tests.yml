@@ -4,10 +4,69 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# Least-privilege at the workflow level. First workflow in the repo →
+# sets the template for everything that follows; explicit minimal scope
+# is the right default. Individual jobs can opt UP if needed.
+permissions:
+  contents: read
+
+# Cancel in-flight runs for the same ref when a new commit lands. Saves
+# minutes on PR force-pushes; main-branch runs use ref=refs/heads/main
+# so cancel-in-progress only fires on PR events.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  pytest:
+  skill-conformance:
+    # Fast gate (<1s of pytest work). Surfaces a single status check
+    # SKILL-authors can grep for on a PR. Closes the body-vs-declared
+    # ``allowed-tools`` drift gap that pre-beta review flagged
+    # (chainlink #82 sub #88). Runs first so the slower pytest matrix
+    # below can fail-fast on conformance breaks via ``needs:``.
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          # Pin to a known-good minor — ``latest`` is a slow-motion
+          # supply-chain risk + a reproducibility hole. Bump
+          # deliberately with a code review, not silently.
+          version: "0.11.12"
+          # Cache uv's resolver state keyed on the lockfile. Heavy
+          # deps (fastembed/faiss-cpu/aiohttp) reinstall on every run
+          # without this — the 4m32s install time on the cold 3.12
+          # run was almost entirely pip work.
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Sync dependencies (with dev extras)
+        # ``--extra dev`` is required — plain ``uv sync`` skips
+        # pytest-aiohttp (declared under [project.optional-dependencies].dev
+        # in pyproject.toml) and other dev-only deps, which produces
+        # cascading ``fixture 'aiohttp_server' not found`` errors.
+        run: uv sync --extra dev
+
+      - name: Skill conformance + catalog tests
+        run: uv run pytest tests/test_skill_conformance.py tests/test_skill_catalog.py -v
+
+  pytest:
+    # Full mimir test suite under py 3.11 + 3.12 matrix. ``needs:
+    # skill-conformance`` makes the fast gate fail-fast PRs that bust
+    # frontmatter, instead of waiting for the slower full matrix to
+    # come back red on the same root cause.
+    needs: skill-conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -19,47 +78,24 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v3
         with:
-          version: latest
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
       - name: Sync dependencies (with dev extras)
-        # ``--extra dev`` is REQUIRED — plain ``uv sync`` skips
-        # pytest-aiohttp and other dev-only deps, which produces
-        # cascading ``fixture 'aiohttp_server' not found`` errors
-        # (see memory/issues/pytest-aiohttp-dev-extras.md).
+        # ``--extra dev`` is required — see skill-conformance job's
+        # comment for the rationale.
         run: uv sync --extra dev
 
-      - name: Run pytest
-        # Workspace member ``saga/`` lives under /workspace/mimir
-        # and is editable-installed via [tool.uv.sources]. Tests
-        # for both packages live under ``tests/`` (mimir) and
-        # ``saga/tests/`` (saga); we run mimir's suite here.
-        run: uv run pytest tests/ -q --tb=short
-
-  skill-conformance:
-    # Fast gate — runs even on the same matrix entries but as a
-    # dedicated job so PR status shows a single ``skill-conformance``
-    # check the SKILL-author can grep for. Catches the body-vs-declared
-    # ``allowed-tools`` drift gap that pre-beta review flagged as
-    # blocker #88 (no CI catching skill_conformance regressions).
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
-        with:
-          version: latest
-
-      - name: Set up Python 3.11
-        run: uv python install 3.11
-
-      - name: Sync dependencies (with dev extras)
-        run: uv sync --extra dev
-
-      - name: Skill conformance + catalog tests
-        run: |
-          uv run pytest tests/test_skill_conformance.py tests/test_skill_catalog.py -v
+      - name: Run mimir test suite
+        # ``testpaths`` is set in pyproject.toml so no explicit path
+        # arg needed. Excludes saga/saga/tests/ (workspace member's
+        # nested test tree) and optional-skills/github-poller/tests/
+        # by virtue of testpaths defaulting to "tests" only. Both
+        # exclusions are deliberate — saga has its own conftest, and
+        # github-poller's tests need the skill directory's
+        # conftest. Future matrix entries can cover those test trees.
+        run: uv run pytest -q --tb=short
