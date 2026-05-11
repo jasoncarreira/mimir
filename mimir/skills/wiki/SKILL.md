@@ -1,6 +1,12 @@
 ---
 name: wiki
 description: Maintain a structured wiki under state/wiki/ — ingest raw sources from state/raw/, synthesize cross-linked pages, and lint for health. Use this skill whenever you need to build durable, graph-shaped knowledge with cross-references (entities with relationships, topics that recur, concepts you trace across many sources).
+allowed-tools:
+  - Edit
+  - Read
+  - Write
+  - file_search
+  - saga_store
 ---
 
 # Wiki
