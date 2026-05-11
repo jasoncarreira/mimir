@@ -116,6 +116,8 @@ it?"
 4. **Recent session summaries** — last N boundaries on this channel
    (written by `saga_end_session` at idle close).
 5. **Recent activity** — last N rendered messages on this channel.
+   _Suppressed on synthetic `scheduler:*` / `poller:*` channels per
+   chainlink #78._
 6. **Recent feedback signals** — 24h algedonic in/out from
    `events.jsonl`.
 7. **`memory/INDEX.md` descriptions** — one-line `<!-- desc: -->`
