@@ -1,6 +1,11 @@
 ---
 name: chainlink
 description: Local CLI issue tracker for todos, follow-ups, and structured records. Use when the user mentions a task to remember, a bug to track, an open question, or anything that needs to outlive the current turn. Pairs with five-whys (chainlink is the storage backend for RCA trees) and works as a general-purpose backlog you can query later. Storage is local — issues live under a `.chainlink/` directory in the operator's repo.
+allowed-tools:
+  - Bash
+  - Read
+  - saga_store
+  - send_message
 ---
 
 # Chainlink

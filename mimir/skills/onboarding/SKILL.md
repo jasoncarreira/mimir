@@ -4,6 +4,10 @@ description: >
   Guide for the first days with a new human. Use when: the `init` memory block exists (pointing
   you here), you have no persona/communication blocks yet, or a human explicitly asks about setup.
   This skill is about having good conversations — not filling out forms.
+allowed-tools:
+  - Edit
+  - Read
+  - Write
 ---
 
 # Onboarding

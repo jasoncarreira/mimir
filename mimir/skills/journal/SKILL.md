@@ -1,6 +1,10 @@
 ---
 name: journal
 description: Append a dated entry to a daily journal under `state/journal/YYYY-MM-DD.md`. Use to checkpoint your reasoning at meaningful turn boundaries — what the user wanted, what you actually did, what you predict next. The journal is a long-running log you can grep later when something surprising shows up and you want to know "what did I think was going on at the time?".
+allowed-tools:
+  - Bash
+  - Read
+  - send_message
 ---
 
 # Journal
