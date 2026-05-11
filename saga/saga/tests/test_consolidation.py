@@ -168,6 +168,44 @@ class TestConsolidate:
         result = await engine.consolidate(dry_run=True)
         assert result["clusters_found"] == 0
 
+    @pytest.mark.asyncio
+    async def test_skips_session_boundaries(self):
+        """Session-boundary atoms (source_type='session_boundary') are
+        already-summarized session synthesis — re-consolidating them
+        produces meta-summaries-of-summaries (mimir 2026-05-11 finding:
+        28 noisy observation atoms generated from 228 boundaries). The
+        cluster-phase query must exclude them even when they would
+        otherwise satisfy the cluster shape (active, embedded, raw).
+        """
+        from saga.core import get_db, run_migrations
+        from saga.consolidation import ConsolidationEngine
+
+        conn = get_db()
+        run_migrations(conn)
+
+        # Five atoms with identical embeddings so they would cluster if
+        # not filtered. Mark all as session_boundary via source_type.
+        same_emb = struct.pack('1024f', *np.random.randn(1024).astype(np.float32))
+        for i in range(5):
+            content = f"Session Boundary [s_{i}]: synthesis text {i}"
+            content_hash = hashlib.sha256(content.encode()).hexdigest()[:32]
+            conn.execute("""
+                INSERT OR IGNORE INTO atoms (id, content, content_hash, created_at, state,
+                    is_pinned, embedding, topics, metadata, encoding_confidence, stream,
+                    profile, access_count, stability, source_type, memory_type)
+                VALUES (?, ?, ?, datetime('now'), 'active', 0, ?, '[]', '{}', 0.7,
+                    'episodic', 'standard', 0, 1.0, 'session_boundary', 'raw')
+            """, (f"bound_{i}", content, content_hash, same_emb))
+        conn.commit()
+        conn.close()
+
+        engine = ConsolidationEngine(similarity_threshold=0.5, min_cluster_size=3)
+        result = await engine.consolidate(dry_run=True)
+        assert result["clusters_found"] == 0, (
+            "session_boundary atoms must be excluded from consolidation "
+            "input — they're already-summarized synthesis, not raw evidence"
+        )
+
 
 class TestSkipExistingObservation:
     """Idempotence: cluster with same source set as an existing observation
