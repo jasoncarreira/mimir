@@ -51,9 +51,11 @@ def test_render_saga_session_end_excludes_inputs():
         prompts_dir=None,
     )
     assert "x" * 30000 not in out
-    # Synthesis prompt for two trivial turns must be small (well under
-    # 5k chars even on a long template).
-    assert len(out) < 5000
+    # Synthesis prompt for two trivial turns must be small. Threshold
+    # bumped from 5000 → 6500 when Step 1b (saga_store discipline) added
+    # ~900 chars to both templates 2026-05-10 — still bounded against
+    # the cubic-blowup failure mode this test is guarding.
+    assert len(out) < 6500
 
 
 def test_render_saga_session_end_lists_turn_ids():
@@ -182,6 +184,50 @@ def test_render_mentions_learnings_pending_buffer():
     flat = " ".join(out.split())
     assert "Do NOT write directly to" in flat
     assert "memory/core/40-learned-behaviors.md" in flat
+
+
+def test_render_full_template_includes_saga_store_step_1b():
+    """Full synthesis template must contain Step 1b (SAGA atom storage
+    discipline) with the streams taxonomy + do-NOT list. Without this
+    section the synthesis turn never reaches for saga_store; the empirical
+    data showed 4 non-boundary raw atoms across a 6-day window before
+    this prompt landed."""
+    turns = [_turn("t1", saga_atom_ids=["atom-1"])]  # force full template
+    out = render_saga_session_end(
+        channel_id="c", saga_session_id="s", idle_minutes=10,
+        turns_window=turns, prompts_dir=None,
+    )
+    assert "1b. Store SAGA atoms" in out
+    # Streams taxonomy present.
+    assert "semantic" in out
+    assert "episodic" in out
+    assert "procedural" in out
+    # Do-NOT list present (the load-bearing protection against
+    # workflow-state / session-retell pollution of the atom layer).
+    flat = " ".join(out.split())
+    assert "Do NOT store" in flat
+    assert "Meta-observations" in flat
+    assert "Self-state claims" in flat
+    # saga_store actually mentioned (the original gap was that the
+    # synthesis prompt never named the tool).
+    assert "saga_store" in out
+
+
+def test_render_lean_template_includes_saga_store_step_1b():
+    """Lean variant must also have Step 1b — sessions with zero atom
+    citations can still surface durable semantic facts worth storing."""
+    turns = [_turn("t1", saga_atom_ids=[]), _turn("t2", saga_atom_ids=[])]
+    out = render_saga_session_end(
+        channel_id="c", saga_session_id="s", idle_minutes=10,
+        turns_window=turns, prompts_dir=None,
+    )
+    # Confirm we're hitting the lean template (Step 2 is the boundary,
+    # not Step 3 as in the full variant — chainlink #7 lean shape).
+    assert "Do two things" in out
+    assert "1b. Store SAGA atoms" in out
+    assert "saga_store" in out
+    # Lean variant still drops the dedicated atom-scoring step.
+    assert "Score SAGA atoms" not in out
 
 
 def test_render_handles_empty_turns_window():
