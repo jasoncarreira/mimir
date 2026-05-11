@@ -23,6 +23,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Literal
 
+from .pollers import POLLER_CHANNEL_PREFIX
+from .scheduler import SCHEDULER_CHANNEL_PREFIX
+
+#: Channel-id prefixes that identify synthetic per-tick channels (no
+#: narrative continuity across turns — each turn has a discrete job).
+#: Used by :meth:`MessageBuffer.assemble_recent_activity` to skip the
+#: within-channel pull for these channels. Chainlink #78 (2026-05-11)
+#: extended via PR #127 review (poller:* added 2026-05-11).
+SYNTHETIC_CHANNEL_PREFIXES = (SCHEDULER_CHANNEL_PREFIX, POLLER_CHANNEL_PREFIX)
+
 log = logging.getLogger(__name__)
 
 MessageKind = Literal["user_message", "assistant_message", "system_note"]
@@ -369,14 +379,34 @@ class MessageBuffer:
         Cross-channel pull is skipped when ``author`` is None (e.g. scheduled
         ticks have no inbound author).
 
+        Within-channel pull is **also** skipped when ``channel_id`` is a
+        synthetic per-tick channel — ``scheduler:*`` (heartbeat, reflect,
+        saga-consolidate, introspection-report) or ``poller:*`` (each
+        registered poller's emitted-event channel). See
+        :data:`SYNTHETIC_CHANNEL_PREFIXES`. Those channels only ever
+        hold prior assistant scheduled-tick or poller-event replies —
+        no narrative continuity, no useful prior context. Each
+        synthetic tick has a specific job (heartbeat picks ONE backlog
+        item; reflect looks at agent behavior across the week; a
+        poller turn responds to one discrete external event) that
+        doesn't benefit from chat-tail context, and cross-tick
+        assistant-reply tail just inflates the prompt without
+        informing the work. Chainlink #78 (2026-05-11); ``poller:``
+        added via PR #127 review (same review-thread).
+
         ``source_allowlist`` (SPEC §5.4) keeps benchmark / API / scheduler
         events out of the prompt by default — only "real conversation"
         sources participate. Mirrors open-strix's hard-coded
         ``{"discord","web","stdin"}`` filter (``app.py:734``).
         """
-        within = self.recent_for_channel(
-            channel_id, recent_per_channel, source_allowlist=source_allowlist
-        )
+        if channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES):
+            # Synthetic scheduler:* or poller:* channel — no useful
+            # prior context. See docstring above for rationale.
+            within: list[Message] = []
+        else:
+            within = self.recent_for_channel(
+                channel_id, recent_per_channel, source_allowlist=source_allowlist
+            )
         cross: list[Message] = []
         if author:
             # Cross-pull is one-directional: DM messages are excluded by

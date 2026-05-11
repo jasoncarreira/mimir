@@ -83,6 +83,13 @@ POLLER_REJECTION_PREVIEW_CHARS = 200
 # into fewer turns.
 POLLER_BATCH_SIZE_DEFAULT = 1
 
+#: Channel-id prefix for synthetic poller-tick channels. Each registered
+#: poller emits events on ``poller:<name>``. Exported so other modules
+#: (recent-activity assembly, scheduler-tick routing) can recognize the
+#: prefix without duplicating the literal. Sibling of
+#: :data:`mimir.scheduler.SCHEDULER_CHANNEL_PREFIX`.
+POLLER_CHANNEL_PREFIX = "poller:"
+
 
 @dataclass
 class PollerConfig:
@@ -125,7 +132,7 @@ class PollerConfig:
         ``scheduler:<name>`` convention used for null-channel
         scheduler.yaml jobs — keeps poller events queue-isolated
         per-poller (parallel across pollers, serialized within)."""
-        return f"poller:{self.name}"
+        return f"{POLLER_CHANNEL_PREFIX}{self.name}"
 
     def resolved_persist_dir(self) -> Path:
         """Effective persist dir — falls back to skill_dir when not
@@ -556,7 +563,7 @@ async def run_poller(
             channel_id=poller.channel_id(),
             content=content,
             source="poller",
-            source_id=f"poller:{poller.name}:{fire_ts_ms}:batch:{batch_idx}",
+            source_id=f"{POLLER_CHANNEL_PREFIX}{poller.name}:{fire_ts_ms}:batch:{batch_idx}",
             extra=extra,
         )
         try:
