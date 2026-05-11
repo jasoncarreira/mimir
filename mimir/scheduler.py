@@ -42,12 +42,20 @@ from apscheduler.triggers.cron import CronTrigger
 
 from .event_logger import log_event
 from .models import AgentEvent
-from .pollers import PollerConfig, discover_pollers, run_poller
+from .pollers import POLLER_CHANNEL_PREFIX, PollerConfig, discover_pollers, run_poller
 from .saga_client import SagaClient, SagaError
 
 log = logging.getLogger(__name__)
 
 UTC = timezone.utc
+
+#: Channel-id prefix for synthetic scheduler-tick channels. Each named
+#: scheduler job (heartbeat, reflect, saga-consolidate, etc.) without a
+#: real channel uses ``scheduler:<job_name>`` as its event key. Exported
+#: so other modules can recognize the prefix without duplicating the
+#: literal — see :data:`mimir.pollers.POLLER_CHANNEL_PREFIX` for the
+#: sibling convention.
+SCHEDULER_CHANNEL_PREFIX = "scheduler:"
 
 EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
 
@@ -234,7 +242,7 @@ def _scheduler_channel_id(job_name: str, channel_id: str | None) -> str:
     parallelize across jobs but serialize within a job."""
     if channel_id:
         return channel_id
-    return f"scheduler:{job_name}"
+    return f"{SCHEDULER_CHANNEL_PREFIX}{job_name}"
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +393,7 @@ class Scheduler:
     async def _log_misfire(self, event: JobExecutionEvent) -> None:
         # Distinguish poller misses (operator-actionable: tune cron or
         # bump timeout) from other misses (LLM ticks, callable jobs).
-        is_poller = event.job_id.startswith("poller:")
+        is_poller = event.job_id.startswith(POLLER_CHANNEL_PREFIX)
         kind = "poller_misfired" if is_poller else "scheduled_job_misfired"
         await log_event(
             kind,
@@ -408,7 +416,7 @@ class Scheduler:
         Callable entries are tracked separately via the registry."""
         # Drop existing scheduler:* jobs; leave non-prefixed (e.g. saga-consolidate).
         for job in list(self._scheduler.get_jobs()):
-            if job.id.startswith("scheduler:"):
+            if job.id.startswith(SCHEDULER_CHANNEL_PREFIX):
                 self._scheduler.remove_job(job.id)
 
         yaml_jobs = load_jobs(self._yaml_path)
@@ -451,7 +459,7 @@ class Scheduler:
                 self._fire,
                 trigger=trigger,
                 kwargs={"job": job},
-                id=f"scheduler:{job.name}",
+                id=f"{SCHEDULER_CHANNEL_PREFIX}{job.name}",
                 replace_existing=True,
                 coalesce=True,
                 max_instances=1,
@@ -767,7 +775,7 @@ class Scheduler:
         # against a removed poller correctly logs poller_fire_dropped
         # (the poller really IS gone).
         for job in list(self._scheduler.get_jobs()):
-            if job.id.startswith("poller:"):
+            if job.id.startswith(POLLER_CHANNEL_PREFIX):
                 try:
                     self._scheduler.remove_job(job.id)
                 except Exception:  # noqa: BLE001 — JobLookupError, fine
@@ -798,7 +806,7 @@ class Scheduler:
                 self._fire_poller,
                 trigger=trigger,
                 kwargs={"poller_name": poller.name},
-                id=f"poller:{poller.name}",
+                id=f"{POLLER_CHANNEL_PREFIX}{poller.name}",
                 replace_existing=True,
                 coalesce=True,
                 max_instances=1,
