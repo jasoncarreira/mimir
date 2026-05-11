@@ -1330,6 +1330,27 @@ def test_discover_pollers_pass_env_non_list_is_ignored(tmp_path: Path) -> None:
     assert configs[0].pass_env == ()
 
 
+def test_discover_pollers_pass_env_non_string_items_are_dropped(tmp_path: Path) -> None:
+    """PR #135 review nit: the OUTER-type check (whole field isn't a
+    list) is covered above. This pins the PER-ITEM filter at
+    ``pollers.py:_invalid_pass_env_item`` — items inside a list that
+    aren't strings get dropped individually with a log warning, and
+    empty-string-after-strip entries are silently dropped. Surviving
+    entries preserve declaration order."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "pollers.json").write_text(
+        '{"pollers": [{"name": "x", "command": "true",'
+        ' "cron": "* * * * *",'
+        ' "pass_env": ["GITHUB_TOKEN", 42, null, "", "  ", "OK", true]}]}'
+    )
+    configs = discover_pollers(tmp_path)
+    assert len(configs) == 1
+    # Only the two real strings survive; 42/null/true (non-string),
+    # ""/"  " (empty-after-strip) all dropped. Order preserved.
+    assert configs[0].pass_env == ("GITHUB_TOKEN", "OK")
+
+
 @pytest.mark.asyncio
 async def test_run_poller_pass_env_bypasses_deny_filter(
     tmp_path: Path, home: Path, monkeypatch,

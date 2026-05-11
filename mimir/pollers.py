@@ -407,11 +407,28 @@ async def run_poller(
     env = {k: v for k, v in os.environ.items() if _allowed_env_key(k)}
     # Per-poller pass_env (chainlink #82 sub #83/#85): explicit
     # whitelist of env keys that bypass the deny-suffix/deny-prefix
-    # filter. This is how pollers get secrets (``GITHUB_TOKEN``) and
-    # ``MIMIR_*``-prefixed knobs (``MIMIR_GITHUB_SELF_LOGIN``) — the
-    # global ``MIMIR_POLLER_ENV_ALLOWLIST`` does NOT bypass the deny
-    # filter, so it can't be used for any ``*_TOKEN`` key. Keys
-    # named here whose names match a deny pattern emit a
+    # filter AND the built-in allowlist. This is how pollers get
+    # secrets (``GITHUB_TOKEN``) and ``MIMIR_*``-prefixed knobs
+    # (``MIMIR_GITHUB_SELF_LOGIN``) — the global
+    # ``MIMIR_POLLER_ENV_ALLOWLIST`` does NOT bypass the deny filter,
+    # so it can't be used for any ``*_TOKEN`` key. It's also the path
+    # for arbitrary non-secret keys not in ``_BUILTIN_ALLOWLIST``
+    # (e.g. ``GITHUB_REPOS``): pass_env's job is "give the poller these
+    # keys regardless of deny / allowlist gating," not specifically
+    # "bypass the deny filter."
+    #
+    # **Precedence**: a key in ``pass_env`` that's ALSO in the
+    # allowlist-filtered env unconditionally replaces the allowlist
+    # value here (``env[key] = os.environ[key]``). No built-in
+    # allowlist key currently matches a typical ``pass_env`` shape,
+    # but operators re-declaring ``PATH`` / ``HOME`` etc. in
+    # ``pass_env`` for emphasis will see their ``os.environ`` value
+    # take precedence over whatever the allowlist filter selected.
+    # The ``env`` overlay (``poller.env``) below wins over both —
+    # that's the explicit literal-value path and the highest
+    # precedence by design.
+    #
+    # Keys named in pass_env whose names match a deny pattern emit a
     # ``poller_env_passthrough_named_secret`` event for visibility
     # (operators get a paper trail of "this poller pulls a secret
     # named env var through"); the value is not logged. Keys named
