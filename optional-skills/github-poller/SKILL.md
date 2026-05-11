@@ -25,6 +25,27 @@ won't watch a GitHub repo, so the framework doesn't seed it by default.
    | `GITHUB_TOKEN` | recommended | GitHub PAT. Falls back to `gh auth token` when unset. |
    | `MIMIR_GITHUB_SELF_LOGIN` | optional | GitHub login mimir authors as. Events from this login get filtered out (mimir doesn't wake itself). Leave empty if mimir uses the operator's PAT — the operator is the signal you want, not the noise. |
 
+   These env vars must be exported in mimir's process environment
+   (e.g. via the container's env file). The framework gates subprocess
+   env keys two ways: a built-in allowlist (``PATH``, ``HOME``,
+   locale, XDG, CA bundles — everything else is stripped) plus a deny
+   filter on top (``*_TOKEN``, ``*_SECRET``, ``*_API_KEY``,
+   ``*_PASSWORD``, ``MIMIR_*`` are stripped even if allowlisted).
+   The ``pass_env`` field in this skill's ``pollers.json`` declares
+   all three keys above as explicit pass-throughs, bypassing both
+   gates — different mechanism per key:
+   - ``GITHUB_TOKEN`` — matches ``*_TOKEN`` deny pattern → `pass_env`
+     bypasses the deny filter.
+   - ``MIMIR_GITHUB_SELF_LOGIN`` — matches ``MIMIR_*`` deny pattern →
+     `pass_env` bypasses the deny filter.
+   - ``GITHUB_REPOS`` — not a secret, but not in the built-in
+     allowlist either → `pass_env` bypasses the allowlist gate. Same
+     end result (key reaches the subprocess), just gated differently.
+   If you rename or relocate a var, update ``pollers.json``
+   accordingly. ``GITHUB_TOKEN`` set but not declared in ``pass_env``
+   → silently absent in the subprocess → poller falls through to
+   ``gh auth token`` → zero events forever if ``gh`` isn't authed.
+
 3. Bring it live:
    ```
    reload_pollers

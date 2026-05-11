@@ -1285,3 +1285,166 @@ print('{"poller": "x", "prompt": "ok"}')
     combined_stderr = "|".join(stderr_payloads)
     assert "XDG=/some/xdg/config" in combined_stderr
     assert "SSL=/some/ca/cert.pem" in combined_stderr
+
+
+# ─── chainlink #82 sub #83/#85: pass_env passthrough mechanism ─────────
+
+
+def test_discover_pollers_parses_pass_env_list(tmp_path: Path) -> None:
+    """``pass_env`` field in pollers.json is parsed into PollerConfig.pass_env."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "pollers.json").write_text(
+        '{"pollers": [{"name": "x", "command": "true",'
+        ' "cron": "* * * * *",'
+        ' "pass_env": ["GITHUB_TOKEN", "MIMIR_GITHUB_SELF_LOGIN"]}]}'
+    )
+    configs = discover_pollers(tmp_path)
+    assert len(configs) == 1
+    assert configs[0].pass_env == ("GITHUB_TOKEN", "MIMIR_GITHUB_SELF_LOGIN")
+
+
+def test_discover_pollers_pass_env_missing_defaults_empty(tmp_path: Path) -> None:
+    """Absent ``pass_env`` field → empty tuple (back-compat)."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "pollers.json").write_text(
+        '{"pollers": [{"name": "x", "command": "true",'
+        ' "cron": "* * * * *"}]}'
+    )
+    configs = discover_pollers(tmp_path)
+    assert configs[0].pass_env == ()
+
+
+def test_discover_pollers_pass_env_non_list_is_ignored(tmp_path: Path) -> None:
+    """Malformed ``pass_env`` (e.g. dict, scalar) is rejected with a
+    log warning and ignored — the poller still registers."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "pollers.json").write_text(
+        '{"pollers": [{"name": "x", "command": "true",'
+        ' "cron": "* * * * *", "pass_env": "GITHUB_TOKEN"}]}'
+    )
+    configs = discover_pollers(tmp_path)
+    assert len(configs) == 1
+    assert configs[0].pass_env == ()
+
+
+def test_discover_pollers_pass_env_non_string_items_are_dropped(tmp_path: Path) -> None:
+    """PR #135 review nit: the OUTER-type check (whole field isn't a
+    list) is covered above. This pins the PER-ITEM filter at
+    ``pollers.py:_invalid_pass_env_item`` — items inside a list that
+    aren't strings get dropped individually with a log warning, and
+    empty-string-after-strip entries are silently dropped. Surviving
+    entries preserve declaration order."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "pollers.json").write_text(
+        '{"pollers": [{"name": "x", "command": "true",'
+        ' "cron": "* * * * *",'
+        ' "pass_env": ["GITHUB_TOKEN", 42, null, "", "  ", "OK", true]}]}'
+    )
+    configs = discover_pollers(tmp_path)
+    assert len(configs) == 1
+    # Only the two real strings survive; 42/null/true (non-string),
+    # ""/"  " (empty-after-strip) all dropped. Order preserved.
+    assert configs[0].pass_env == ("GITHUB_TOKEN", "OK")
+
+
+@pytest.mark.asyncio
+async def test_run_poller_pass_env_bypasses_deny_filter(
+    tmp_path: Path, home: Path, monkeypatch,
+):
+    """``pass_env`` declares per-poller env keys that bypass the
+    deny-suffix/deny-prefix filter — this is the supported path for
+    getting secrets and ``MIMIR_*``-prefixed knobs to a poller. Without
+    this, github-poller's ``GITHUB_TOKEN`` and ``MIMIR_GITHUB_SELF_LOGIN``
+    are stripped before subprocess invocation (chainlink #82 sub #83/#85)."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test_pass_env_value")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import os, sys
+print(f"TOKEN={os.environ.get('GITHUB_TOKEN', 'absent')}", file=sys.stderr)
+print(f"LOGIN={os.environ.get('MIMIR_GITHUB_SELF_LOGIN', 'absent')}", file=sys.stderr)
+print('{"poller": "x", "prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("GITHUB_TOKEN", "MIMIR_GITHUB_SELF_LOGIN"),
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    stderr_payloads = [
+        e.get("stderr", "")
+        for e in events if e.get("type") == "poller_stderr"
+    ]
+    combined_stderr = "|".join(stderr_payloads)
+    assert "TOKEN=ghp_test_pass_env_value" in combined_stderr
+    assert "LOGIN=mimir-bot" in combined_stderr
+
+
+@pytest.mark.asyncio
+async def test_run_poller_pass_env_unset_in_environ_is_skipped(
+    tmp_path: Path, home: Path, monkeypatch,
+):
+    """``pass_env`` entries that aren't set in os.environ are silently
+    skipped — that absence is itself the operator's signal that the
+    env var wasn't provisioned. The poller still runs (it'll likely
+    fall through to its own default-handling path)."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import os, sys
+print(f"TOKEN={os.environ.get('GITHUB_TOKEN', 'absent')}", file=sys.stderr)
+print('{"poller": "x", "prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("GITHUB_TOKEN",),
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    stderr_payloads = [
+        e.get("stderr", "")
+        for e in events if e.get("type") == "poller_stderr"
+    ]
+    combined_stderr = "|".join(stderr_payloads)
+    assert "TOKEN=absent" in combined_stderr
+
+
+@pytest.mark.asyncio
+async def test_run_poller_pass_env_secret_named_key_emits_event(
+    tmp_path: Path, home: Path, monkeypatch,
+):
+    """When ``pass_env`` includes a key whose name matches a
+    deny-list pattern (``*_TOKEN``, ``MIMIR_*``), the framework
+    emits a ``poller_env_passthrough_named_secret`` event for
+    visibility. The value itself is NOT logged."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret_should_not_appear_in_event")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print('{"poller": "x", "prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("GITHUB_TOKEN",),
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    passthrough_events = [
+        e for e in events
+        if e.get("type") == "poller_env_passthrough_named_secret"
+    ]
+    assert len(passthrough_events) == 1
+    assert passthrough_events[0].get("key") == "GITHUB_TOKEN"
+    # Value must NOT leak into the event payload.
+    payload = json.dumps(passthrough_events[0])
+    assert "ghp_secret_should_not_appear_in_event" not in payload
