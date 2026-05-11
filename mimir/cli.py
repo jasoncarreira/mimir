@@ -1537,6 +1537,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     from . import wiki_backlinks as _wiki_backlinks
     _wiki_backlinks.add_argparse(wiki_bl_p)
 
+    commitments_p = sub.add_parser(
+        "commitments",
+        help="Manage durable commitments (list/add/complete/snooze/"
+             "dismiss/trim). Phase 1 = operator-driven; extraction + "
+             "surfacing land in Phase 2/3.",
+    )
+    from .commitments import cli as _commitments_cli
+    _commitments_cli.add_argparse(commitments_p)
+
     refl_audit_p = refl_sub.add_parser(
         "audit",
         help="Print the '## Effects of prior proposals' block — "
@@ -1681,6 +1690,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             sys.exit(_wiki_backlinks.cmd_backlinks(args))
         wiki_p.print_help()
         sys.exit(1)
+
+    if args.command == "commitments":
+        from .commitments import cli as _commitments_cli
+        sys.exit(_commitments_cli.dispatch(args))
 
     if args.command == "reflection":
         if args.reflection_action == "most-retrieved":
