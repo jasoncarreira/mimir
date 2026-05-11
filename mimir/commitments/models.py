@@ -177,6 +177,15 @@ class CommitmentRecord:
     suggested_reminder: str = ""
     due_window_start_unix: float | None = None
     due_window_end_unix: float | None = None
+    # PR #125 review #4: natural-language time anchor as the LLM
+    # extracted it ("Thursday", "next sprint", "tomorrow", "once #108
+    # merges"). Phase 2b's due-check poller fires on unix-second
+    # windows; this preserves the operator-facing phrasing so Phase 3
+    # surfacing can render "remind me about X (Thursday)" verbatim
+    # and so a future hint-to-unix parser has the raw source available.
+    # ``None`` when the LLM extractor omitted the field OR the operator
+    # added the commitment manually without a hint.
+    due_window_hint: str | None = None
     status: str = CommitmentStatus.PENDING.value
     created_at_unix: float = 0.0
     delivered_at_unix: float | None = None
@@ -192,6 +201,13 @@ class CommitmentRecord:
     completion_message_id: str | None = None
     dismiss_reason: str | None = None
     snooze_reason: str | None = None
+    # PR #125 review #1: which extraction prompt version produced this
+    # record. ``None`` for operator-added (CLI) records; set to the
+    # extractor's ``EXTRACTION_PROMPT_VERSION`` constant for
+    # LLM-extracted records. Lets a future backtest filter "all v3-
+    # extracted records before T" against "all v4-extracted after T"
+    # for side-by-side precision/recall comparison.
+    extraction_prompt_version: str | None = None
 
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
