@@ -1716,6 +1716,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(1)
 
     if args.command == "commitments":
+        # chainlink #82 sub #87: bare ``mimir commitments`` (no
+        # subcommand) prints the parent parser's full ``--help`` and
+        # exits 1, matching the discovery-friendly shape established
+        # by identities/wiki/skills/reflection above. Argparse sends
+        # ``print_help()`` to stdout so the help is pipeline-friendly
+        # (greppable, redirectable); the non-zero exit signals "no
+        # action taken" for ``mimir <something> || handle_error``
+        # callers — uniform with the sibling subcommands.
+        if args.commitments_action is None:
+            commitments_p.print_help()
+            sys.exit(1)
         from .commitments import cli as _commitments_cli
         sys.exit(_commitments_cli.dispatch(args))
 
