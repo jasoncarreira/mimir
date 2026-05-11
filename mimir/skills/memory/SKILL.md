@@ -100,6 +100,67 @@ technical phrases. The pre-message hook injects relevant atoms
 automatically; mid-turn queries via `mcp__mimir__saga_query` work for
 follow-ups.
 
+## What gets seen turn-to-turn
+
+"Memory Surface" above cuts by *write-cost*. This section cuts by
+*read-visibility* — useful when the placement question is "if I file
+this here, under what symptom does the future-me actually surface
+it?"
+
+### Every-turn (delivered in the system prompt)
+
+1. **`memory/core/*.md`** — ordered by numeric prefix.
+2. **`memory/channels/<id>/*.md`** — only on that channel.
+3. **SAGA "Possibly relevant memories"** — embedding-ranked against
+   the inbound message, top-k only.
+4. **Recent session summaries** — last N boundaries on this channel
+   (written by `saga_end_session` at idle close).
+5. **Recent activity** — last N rendered messages on this channel.
+6. **Recent feedback signals** — 24h algedonic in/out from
+   `events.jsonl`.
+7. **`memory/INDEX.md` descriptions** — one-line `<!-- desc: -->`
+   per file. The file content isn't loaded; the description is the
+   discoverability hook.
+
+### Read-on-demand (findable, not delivered)
+
+8. **`memory/{issues,learnings-pending,channels/*,...}` non-core**
+   — `Read` by path or `mcp__mimir__file_search` by topic.
+9. **`state/wiki/`, `state/spec/`, `state/proposed-changes.md`** —
+   `file_search` or direct path; `state/INDEX.md` lives outside the
+   prompt, and the wiki's own `index.md` + backlinks are the
+   navigation layer.
+10. **SAGA atoms (full content)** — `mcp__mimir__saga_query` reaches
+    beyond the auto-injected top-k.
+11. **`events.jsonl`** — `introspection` skill; ~30-day retention at
+    default 75k cap.
+12. **Subagent completion payloads** — delivered ONCE on the
+    wake-up turn; capture anything durable to memory before that
+    turn ends.
+
+### Placement heuristic
+
+The load-bearing question per layer is *"what's the 'I forgot this
+exists' failure mode?"*
+
+- Tiers 1-2 surface **unconditionally** — pay the prompt cost only
+  when content must be seen-every-turn (persona, conventions,
+  channel-scoped facts).
+- Tiers 3-6 surface **automatically but rank- or time-windowed** —
+  good for content that should resurface near relevant turns
+  without filling the prompt always.
+- Tier 7 surfaces *only the description* — the `<!-- desc: -->`
+  line is the hash-lookup hook; empty or `[auto]` descriptions
+  waste this channel.
+- Tiers 8-11 surface **only when queried** — fine for content
+  where retrieval beats unconditional prompt cost.
+- Tier 12 surfaces **once** — capture durable bits to memory
+  before the wake-up turn ends, or the payload is gone.
+
+If forgetting would silently degrade behavior, push higher. If
+forgetting just means the content waits for a topic-shaped query,
+lower is fine.
+
 ## Things to Track
 
 - **People or agents**: contact info, things they've done, interests,
