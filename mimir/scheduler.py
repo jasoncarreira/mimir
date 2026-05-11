@@ -338,6 +338,15 @@ class Scheduler:
         # ``add_poller_jobs`` runs (most installs no-op cleanly).
         self._pollers_dir: Path | None = None
         self._pollers: dict[str, PollerConfig] = {}
+        # Snapshot of the most-recent reload's invalid-manifest events
+        # (chainlink #84, PR #141 review). Cleared and re-populated on
+        # each ``add_poller_jobs`` / ``reload_pollers`` call. Read by the
+        # ``mcp__mimir__reload_pollers`` MCP tool to surface a warning
+        # in the operator-visible reply (events.jsonl already carries
+        # the full payload — this just lets the MCP layer flag
+        # "1 manifest failed to parse — see events.jsonl" inline). An
+        # empty list means "last reload had no parse failures."
+        self._last_invalid_manifest_events: list[dict[str, Any]] = []
         # Global concurrency cap on poller subprocess fan-out.
         # ``MIMIR_MAX_CONCURRENT_POLLERS`` (default 8) bounds how many
         # ``run_poller`` invocations can be in-flight at once. Without a
@@ -722,6 +731,13 @@ class Scheduler:
         """
         self._pollers_dir = skills_dir
         installed, invalid_events = self._reinstall_pollers()
+        # Snapshot for the MCP reply (PR #141 review item #1+2).
+        # ``installed`` returned here is the count of pollers
+        # freshly registered in Phase 3 — at bootstrap time there
+        # are no preserved entries, so this equals the live total.
+        # ``reload_pollers`` (below) overrides with the live total
+        # to handle the preserved case correctly.
+        self._last_invalid_manifest_events = list(invalid_events)
         self._dispatch_invalid_manifest_events(invalid_events)
         return installed
 
@@ -748,20 +764,48 @@ class Scheduler:
         poller (i.e. operator intentionally removed it).
         """
         if self._pollers_dir is None:
+            self._last_invalid_manifest_events = []
             return 0
         async with self._mutate_lock:
-            installed, invalid_events = await asyncio.to_thread(
+            _installed_fresh, invalid_events = await asyncio.to_thread(
                 self._reinstall_pollers,
             )
+            # PR #141 review item #2: ``_reinstall_pollers`` returns
+            # the count of pollers freshly registered in Phase 3, not
+            # the total live count. Preserved pollers (chainlink #84:
+            # entries whose manifest failed to parse this reload) skip
+            # Phase 3, so a reload that preserved 1 and re-registered
+            # 1 would return 1 even though ``registered_pollers()``
+            # has 2 names. Return ``len(self._pollers)`` instead so
+            # the count matches the names list in the MCP reply. Read
+            # under the mutate lock so concurrent reloads can't
+            # observe a torn snapshot.
+            live_total = len(self._pollers)
+        # PR #141 review item #1: snapshot for the MCP reply so the
+        # operator-visible response can flag "X manifest(s) failed to
+        # parse — see events.jsonl" inline. Set before emitting the
+        # algedonic events to keep the snapshot consistent with what
+        # the MCP layer reads.
+        self._last_invalid_manifest_events = list(invalid_events)
         # Emit invalid-manifest algedonic events from the awaited
         # caller (we have a running loop here, unlike inside the
         # ``to_thread`` worker). Outside the mutate lock — the events
         # are observational, not mutating, and holding the lock
         # across awaited disk writes would just widen the contention
         # window.
+        #
+        # Concurrency note (PR #141 review inline): if a second
+        # ``reload_pollers`` enters ``_reinstall_pollers`` between
+        # this lock release and the ``await log_event`` loop, and
+        # the manifest is still broken, both calls will emit events
+        # for the same parse failure. The mutate lock prevents torn
+        # state but not duplicate observational events; given reload
+        # is operator-triggered (MCP tool / startup), the practical
+        # risk is near-zero. Algedonic-event ordering across
+        # concurrent reloads is intentionally non-deterministic.
         for payload in invalid_events:
             await log_event("poller_reload_invalid_manifest", **payload)
-        return installed
+        return live_total
 
     def _reinstall_pollers(self) -> tuple[int, list[dict[str, Any]]]:
         """Wipe + re-discover + re-register. Sync — runs on the
@@ -1015,6 +1059,20 @@ class Scheduler:
         ``reload_pollers`` MCP tool to render the post-reload count
         and by tests."""
         return sorted(self._pollers.keys())
+
+    def last_invalid_manifest_events(self) -> list[dict[str, Any]]:
+        """Snapshot of the most-recent reload's invalid-manifest event
+        payloads (chainlink #84, PR #141 review item #1). Returns a
+        copy so callers can't mutate scheduler state. Read by the
+        ``mcp__mimir__reload_pollers`` MCP tool to flag parse
+        failures in the operator-visible reply.
+
+        Each payload has the same shape as the
+        ``poller_reload_invalid_manifest`` event in events.jsonl:
+        ``{"manifest_path": str, "error": str,
+        "preserved_pollers": list[str]}``. Empty list when the last
+        reload had no parse failures."""
+        return list(self._last_invalid_manifest_events)
 
     # ---- SAGA consolidation cron -------------------------------------
 

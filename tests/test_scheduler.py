@@ -1450,9 +1450,17 @@ async def test_reinstall_pollers_preserves_entries_from_corrupted_manifest(
     # the prior PollerConfig rather than constructing a fresh one
     # from a manifest it couldn't parse.
     assert sched._pollers["doomed-then-saved"] is pre_edit_cfg
-    # Return count counts only the cleanly-reinstalled poller; the
-    # preserved one was never reinstalled.
-    assert n == 1
+    # PR #141 review item #2: ``reload_pollers`` returns the live
+    # total (preserved + freshly-installed), not just Phase 3
+    # installs — matches ``registered_pollers()`` semantics so the
+    # MCP reply's count agrees with the names list. Pre-fix this
+    # returned 1 (only the cleanly-reinstalled poller); now returns
+    # 2 (the preserved one + the cleanly-reinstalled one).
+    assert n == 2, (
+        "reload_pollers should return the live total "
+        "(preserved + fresh), matching registered_pollers()"
+    )
+    assert n == len(sched.registered_pollers())
 
     # APScheduler job for the preserved poller is still registered.
     job_ids = {j.id for j in sched._scheduler.get_jobs()}

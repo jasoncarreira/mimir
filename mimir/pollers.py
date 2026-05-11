@@ -149,13 +149,20 @@ class PollerConfig:
     batch_size: int = POLLER_BATCH_SIZE_DEFAULT
     pass_env: tuple[str, ...] = ()
     #: Absolute path to the ``pollers.json`` manifest this config was
-    #: parsed from. ``None`` only when ``PollerConfig`` is constructed
-    #: directly (most tests). Used by the scheduler to identify
-    #: previously-installed entries whose manifest fails to parse on
-    #: reload and preserve them in-place (chainlink #84) — without
-    #: this back-reference the scheduler can't tell "manifest deleted
-    #: on purpose" apart from "manifest typo'd mid-edit", and the
-    #: latter silently drops a working poller.
+    #: parsed from, as yielded by ``Path.rglob("pollers.json")`` over
+    #: ``skills_dir``. Not explicitly symlink-resolved — two manifests
+    #: reachable via different symlink chains would conflate (PR #141
+    #: review item #4). Given the ``skills_dir/<skill>/pollers.json``
+    #: layout this isn't a realistic concern; if a deployment exposes
+    #: ``skills_dir`` as a symlink farm, normalize with ``.resolve()``
+    #: at the assignment site in ``discover_pollers``. ``None`` only
+    #: when ``PollerConfig`` is constructed directly (most tests).
+    #: Used by the scheduler to identify previously-installed entries
+    #: whose manifest fails to parse on reload and preserve them
+    #: in-place (chainlink #84) — without this back-reference the
+    #: scheduler can't tell "manifest deleted on purpose" apart from
+    #: "manifest typo'd mid-edit", and the latter silently drops a
+    #: working poller.
     manifest_path: Path | None = None
 
     def channel_id(self) -> str:
