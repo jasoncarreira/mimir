@@ -355,3 +355,44 @@ def test_snooze_after_dismissed_errors_cleanly(
     assert rc == 2
     err = capsys.readouterr().err
     assert "already dismissed" in err
+
+
+# ─── chainlink #82 sub #87: bare-command help discoverability ──────
+
+
+def test_bare_commitments_prints_full_help_to_stdout(
+    home: Path, capsys: pytest.CaptureFixture,
+):
+    """Operator typing bare ``mimir commitments`` cold sees argparse's
+    full subcommand listing on stdout (not stderr) with per-action
+    help strings, and the process exits 0 — the discovery path other
+    agents' operators will follow when they don't know the
+    subcommands yet (chainlink #82 sub #87)."""
+    rc = _run(["commitments"], home)
+    assert rc == 0, "bare 'commitments' should exit 0 (help is intentional)"
+    captured = capsys.readouterr()
+    # Help goes to stdout, not stderr — pipeline-friendly.
+    out = captured.out
+    # Each subcommand appears with its descriptive help string.
+    assert "list" in out and "Show commitments" in out
+    assert "add" in out and "Manually create" in out
+    assert "complete" in out and "Mark a commitment completed" in out
+    assert "snooze" in out and "Push a commitment to a later time" in out
+    assert "dismiss" in out and "no longer relevant" in out
+    assert "trim" in out and "terminal records" in out
+    # Argparse rendering includes the canonical usage line.
+    assert "usage:" in out.lower()
+
+
+def test_bare_commitments_help_distinct_from_argparse_error(
+    home: Path, capsys: pytest.CaptureFixture,
+):
+    """Distinguish the bare-command-help path (chainlink #82 sub #87)
+    from argparse's own ``usage: ...; error: ...`` rendering for
+    actually-invalid invocations. A bogus subcommand should still
+    error out via argparse (exit 2), not fall through to our help
+    path."""
+    rc = _run(["commitments", "this-is-not-a-real-subcommand"], home)
+    assert rc == 2, (
+        f"unknown subcommand should be argparse error (exit 2), got {rc}"
+    )
