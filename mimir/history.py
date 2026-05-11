@@ -369,14 +369,29 @@ class MessageBuffer:
         Cross-channel pull is skipped when ``author`` is None (e.g. scheduled
         ticks have no inbound author).
 
+        Within-channel pull is **also** skipped when ``channel_id`` is a
+        synthetic scheduler channel (``scheduler:*`` — heartbeat, reflect,
+        saga-consolidate, introspection-report). Those channels only ever
+        hold prior assistant scheduled-tick replies — no narrative
+        continuity, no useful prior context. Each scheduled tick has a
+        specific job (heartbeat picks ONE backlog item; reflect looks at
+        agent behavior across the week; etc.) that doesn't benefit from
+        chat-tail context, and cross-tick assistant-reply tail just inflates
+        the prompt without informing the work. Chainlink #78 (2026-05-11).
+
         ``source_allowlist`` (SPEC §5.4) keeps benchmark / API / scheduler
         events out of the prompt by default — only "real conversation"
         sources participate. Mirrors open-strix's hard-coded
         ``{"discord","web","stdin"}`` filter (``app.py:734``).
         """
-        within = self.recent_for_channel(
-            channel_id, recent_per_channel, source_allowlist=source_allowlist
-        )
+        if channel_id.startswith("scheduler:"):
+            # Synthetic scheduler channel — no useful prior context.
+            # See docstring above for rationale.
+            within: list[Message] = []
+        else:
+            within = self.recent_for_channel(
+                channel_id, recent_per_channel, source_allowlist=source_allowlist
+            )
         cross: list[Message] = []
         if author:
             # Cross-pull is one-directional: DM messages are excluded by

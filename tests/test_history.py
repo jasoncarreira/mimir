@@ -526,3 +526,84 @@ def test_render_recent_activity_legacy_resolver_without_channel_api(tmp_path: Pa
     # Author display rendered; channel falls through to bare id.
     assert "Alice S." in rendered
     assert "discord-1500" in rendered
+
+
+@pytest.mark.asyncio
+async def test_assemble_recent_activity_skips_synthetic_scheduler_channels(tmp_path: Path):
+    """Chainlink #78: synthetic ``scheduler:*`` channel IDs (heartbeat,
+    reflect, saga-consolidate, introspection-report) hold only prior
+    assistant scheduled-tick replies — no narrative continuity. The
+    within-channel pull is skipped entirely for these channels, and
+    cross-channel pull is naturally already skipped when author is None
+    (the normal case for scheduled ticks)."""
+    buf = _make_buffer(tmp_path)
+    # Populate a "prior heartbeat reply" on the synthetic channel — the
+    # exact noise the fix exists to drop.
+    await buf.append(
+        buf.make_message(
+            channel_id="scheduler:heartbeat",
+            kind="assistant_message",
+            content="prior heartbeat reply that should NOT leak into next tick",
+            author=None,
+        )
+    )
+
+    out = buf.assemble_recent_activity(
+        channel_id="scheduler:heartbeat",
+        author=None,  # ticks have no inbound author
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+    )
+    assert out == []  # within-channel skipped + cross-channel skipped (no author)
+
+
+@pytest.mark.asyncio
+async def test_assemble_recent_activity_skips_all_scheduler_prefixed_channels(
+    tmp_path: Path,
+):
+    """Same fix covers reflect / saga-consolidate / introspection-report
+    — anything starting with ``scheduler:``."""
+    buf = _make_buffer(tmp_path)
+    for ch in ("scheduler:reflect", "scheduler:saga-consolidate", "scheduler:introspection-report"):
+        await buf.append(
+            buf.make_message(
+                channel_id=ch,
+                kind="assistant_message",
+                content=f"prior {ch} reply",
+                author=None,
+            )
+        )
+        out = buf.assemble_recent_activity(
+            channel_id=ch,
+            author=None,
+            recent_per_channel=10,
+            recent_author_cross=10,
+            cross_hours=24,
+        )
+        assert out == [], f"expected empty for {ch}, got {out}"
+
+
+@pytest.mark.asyncio
+async def test_assemble_recent_activity_real_channel_still_pulls(tmp_path: Path):
+    """Regression guard: the chainlink #78 gate must not affect real
+    channels — user_message turns must still see their channel tail."""
+    buf = _make_buffer(tmp_path)
+    await buf.append(
+        buf.make_message(
+            channel_id="discord-1500672382166110321",
+            kind="user_message",
+            content="hello",
+            author="jason",
+        )
+    )
+
+    out = buf.assemble_recent_activity(
+        channel_id="discord-1500672382166110321",
+        author="jason",
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+    )
+    assert len(out) == 1
+    assert out[0].content == "hello"
