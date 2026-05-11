@@ -298,12 +298,18 @@ def bootstrap_git_repo(
                 cwd=home, check=False, capture=True,
             )
             if fetch.returncode == 0:
+                # chainlink #65 (sub B): paired-positive emit. Surfaces
+                # alongside any sticky ``git_pull_blocked`` line so the
+                # operator can read recovery against the 24h failure
+                # line. First-occurrence-only at the feedback layer.
+                log_event("git_fetch_ok", path=str(home))
                 pull = _run(
                     ["git", "pull", "--ff-only", "--quiet"],
                     cwd=home, check=False, capture=True,
                 )
                 if pull.returncode == 0:
                     result.pulled = True
+                    log_event("git_pull_ok", path=str(home))
                 else:
                     result.pull_blocked = True
                     log_event(

@@ -1078,6 +1078,19 @@ class Agent:
                 error=str(exc)[:500],
             )
             return
+        # chainlink #65 (sub B): paired-positive emit for the cross-
+        # thread bridge. Surfaces alongside any sticky
+        # ``shell_job_complete_enqueue_failed`` line so the operator
+        # can read recovery against the 24h failure line. First-
+        # occurrence-only at the feedback layer. Distinct from
+        # ``shell_job_complete_routed`` below, which is the broader
+        # success-path observability record (carries channel_id,
+        # exit_code, accepted-state) — the _ok event is the algedonic
+        # surface signal, the _routed event is the audit record.
+        await log_event(
+            "shell_job_complete_enqueue_ok",
+            job_id=job.job_id,
+        )
         # Success path observability: closes the loop for "did the
         # wake-up actually go out?" without making the operator
         # cross-reference the next turn's prompt against the

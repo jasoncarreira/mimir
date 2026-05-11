@@ -470,6 +470,108 @@ def test_saga_feedback_sent_dedups_to_most_recent(tmp_path: Path):
     assert block.count("saga_feedback_sent") == 1
 
 
+def test_chainlink65_paired_positive_kinds_render(tmp_path: Path):
+    """chainlink #65 (sub B): the new positive event kinds —
+    ``ntfy_post_ok`` / ``git_push_ok`` / ``git_pull_ok`` /
+    ``git_fetch_ok`` / ``shell_job_complete_enqueue_ok`` — each
+    render with a brief past-tense one-liner so the operator can
+    read recovery against the sticky 24h failure line."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(0.5), "type": "ntfy_post_ok",
+         "category": "discord-down", "dedupe_key": "discord-down:outbound"},
+        {"timestamp": _ts(0.4), "type": "git_push_ok", "turn_id": "t1"},
+        {"timestamp": _ts(0.3), "type": "git_pull_ok",
+         "path": "/mimir-home"},
+        {"timestamp": _ts(0.2), "type": "git_fetch_ok",
+         "path": "/mimir-home"},
+        {"timestamp": _ts(0.1), "type": "shell_job_complete_enqueue_ok",
+         "job_id": "j_abc"},
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "Positive" in block
+    assert "ntfy post succeeded" in block
+    assert "git push to mimirbot-state succeeded" in block
+    assert "git pull --ff-only succeeded" in block
+    assert "git fetch succeeded" in block
+    assert "shell job j_abc wake-up enqueued" in block
+
+
+def test_chainlink65_paired_positives_surface_next_to_failures(tmp_path: Path):
+    """Operator-decided shape (chainlink #36 comment 42): the paired
+    success and the sticky failure line must surface side-by-side so
+    the contrast ("old failure + recent success = transient,
+    recovered") is readable. Both polarity blocks render with their
+    respective lines."""
+    log = _make_log(tmp_path, events=[
+        # Old failure — first-occurrence-only-deduped sticky line.
+        {"timestamp": _ts(20.0), "type": "git_push_failed",
+         "reason": "ssh: connection refused", "returncode": 128,
+         "turn_id": "t_old"},
+        # Recent recovery — the paired positive.
+        {"timestamp": _ts(0.5), "type": "git_push_ok",
+         "turn_id": "t_new"},
+    ])
+    block = log.recent_block()
+    assert block is not None
+    # Negative block carries the sticky failure.
+    assert "git push to mimirbot-state failed" in block
+    # Positive block carries the paired success.
+    assert "git push to mimirbot-state succeeded" in block
+    # Both subsections present.
+    assert "Negative" in block
+    assert "Positive" in block
+
+
+def test_chainlink65_paired_positives_dedup_to_most_recent(tmp_path: Path):
+    """All five new kinds are in ``_FIRST_OCCURRENCE_ONLY_KINDS`` so
+    a healthy pipeline emitting on every poll/turn doesn't crowd the
+    24h algedonic window. Tail-first iteration means the kept item
+    is always the most recent."""
+    log = _make_log(tmp_path, events=[
+        # Three git_push_ok in the window — only most recent renders.
+        {"timestamp": _ts(5.0), "type": "git_push_ok", "turn_id": "t_a"},
+        {"timestamp": _ts(2.0), "type": "git_push_ok", "turn_id": "t_b"},
+        {"timestamp": _ts(0.5), "type": "git_push_ok", "turn_id": "t_c"},
+        # And three ntfy_post_ok — same dedup shape.
+        {"timestamp": _ts(4.0), "type": "ntfy_post_ok",
+         "category": "x", "dedupe_key": "k1"},
+        {"timestamp": _ts(1.5), "type": "ntfy_post_ok",
+         "category": "x", "dedupe_key": "k1"},
+        {"timestamp": _ts(0.2), "type": "ntfy_post_ok",
+         "category": "x", "dedupe_key": "k1"},
+    ])
+    negatives, positives = log.recent()
+    # Exactly one git_push_ok line and one ntfy_post_ok line surface.
+    push_oks = [s for s in positives if s.kind == "git_push_ok"]
+    ntfy_oks = [s for s in positives if s.kind == "ntfy_post_ok"]
+    assert len(push_oks) == 1
+    assert len(ntfy_oks) == 1
+
+
+def test_chainlink65_polarity_dynamic_invariant_holds(tmp_path: Path):
+    """Acceptance criterion #6: adding the new positive kinds must not
+    violate the polarity-dynamic invariant (line 257 assertion in
+    feedback.py). The assertion would fire at import time if any of
+    the new kinds were polarity-dynamic AND in
+    ``_FIRST_OCCURRENCE_ONLY_KINDS``. This test re-confirms the
+    expectation by checking the sets directly."""
+    from mimir.feedback import (
+        _FIRST_OCCURRENCE_ONLY_KINDS,
+        _POLARITY_DYNAMIC_KINDS,
+    )
+    new_kinds = {
+        "ntfy_post_ok", "git_push_ok", "git_pull_ok", "git_fetch_ok",
+        "shell_job_complete_enqueue_ok",
+    }
+    # All new kinds are in the first-only set.
+    assert new_kinds.issubset(_FIRST_OCCURRENCE_ONLY_KINDS)
+    # None of the new kinds are polarity-dynamic.
+    assert _POLARITY_DYNAMIC_KINDS.isdisjoint(new_kinds)
+    # And the global invariant still holds.
+    assert _POLARITY_DYNAMIC_KINDS.isdisjoint(_FIRST_OCCURRENCE_ONLY_KINDS)
+
+
 def test_introspection_report_error_renders_as_negative(tmp_path: Path):
     log = _make_log(tmp_path, events=[
         {

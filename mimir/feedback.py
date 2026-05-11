@@ -108,6 +108,20 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # never woke the spawning channel — the operator sees a missing
     # wake-up before they'd notice without surfacing here.
     "shell_job_complete_enqueue_failed": ("negative", "shell_job_complete_enqueue_failed"),
+    # chainlink #65 (sub B): paired positive counterparts for the
+    # ntfy / git / shell-job failure kinds above. First-occurrence-only
+    # dedup makes failures sticky for 24h regardless of recovery —
+    # without these, the operator sees ``ntfy_post_failed at 02:14``
+    # but has no way to tell whether the channel recovered at 02:15
+    # or is still broken at 21:00. Paired positives let them read the
+    # contrast ("old failure + recent success = transient, recovered")
+    # without a separate success-cancels-failure pass. See chainlink
+    # #36 comment 42 for the design call.
+    "ntfy_post_ok": ("positive", "ntfy_post_ok"),
+    "git_push_ok": ("positive", "git_push_ok"),
+    "git_pull_ok": ("positive", "git_pull_ok"),
+    "git_fetch_ok": ("positive", "git_fetch_ok"),
+    "shell_job_complete_enqueue_ok": ("positive", "shell_job_complete_enqueue_ok"),
     # Discord bridge supervisor — surfaces sustained Discord-side
     # degradation (5xx at token-auth, gateway disconnect storms) that
     # would otherwise live only in container logs. ``discord_bridge_retry``
@@ -214,6 +228,16 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # completes. Same shape as git_*_failed — dedup so the operator
     # sees the latest failure, not N stale copies.
     "shell_job_complete_enqueue_failed",
+    # chainlink #65 (sub B): paired positives. Latest-only on both
+    # polarities — a healthy ntfy/git/shell pipeline fires success
+    # on every poll/turn, which would otherwise crowd out the rest
+    # of the algedonic block. The most-recent success is the live
+    # state; older copies add no information.
+    "ntfy_post_ok",
+    "git_push_ok",
+    "git_pull_ok",
+    "git_fetch_ok",
+    "shell_job_complete_enqueue_ok",
     # Discord bridge supervisor: a sustained outage fires
     # ``discord_bridge_retry`` every backoff tick (5s → 5min cap).
     # Without dedup the algedonic block would fill with retry lines
@@ -578,6 +602,25 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"disk under logs/bash-jobs/; the spawning channel did NOT "
             f"resume. Investigate dispatcher state."
         )
+    # chainlink #65 (sub B): paired success renderers for the
+    # ntfy / git / shell-job families. Brief past-tense, one line
+    # each — kept terse so the positive block doesn't bloat. The
+    # contrast against the paired failure line is the signal; the
+    # algedonic block's outer rendering already carries timestamps,
+    # so per-line "at HH:MM UTC" is redundant and would be asymmetric
+    # with the existing git_push_failed / shell_job_complete_enqueue_failed
+    # renderers (which don't include timestamp suffixes either).
+    if rule_kind == "ntfy_post_ok":
+        return "ntfy post succeeded"
+    if rule_kind == "git_push_ok":
+        return "git push to mimirbot-state succeeded"
+    if rule_kind == "git_pull_ok":
+        return "git pull --ff-only succeeded"
+    if rule_kind == "git_fetch_ok":
+        return "git fetch succeeded"
+    if rule_kind == "shell_job_complete_enqueue_ok":
+        job_id = ev.get("job_id") or "?"
+        return f"shell job {job_id} wake-up enqueued"
     if rule_kind == "discord_bridge_retry":
         attempt = ev.get("attempt", "?")
         backoff = ev.get("backoff_seconds")

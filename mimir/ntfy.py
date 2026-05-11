@@ -39,9 +39,13 @@ block in mimir/feedback.py — wiring deferred to chainlink #65):
 - ``ntfy_post_rejected`` — HTTP 4xx (topic invalid, banned, request
   malformed). Carries ``{category, dedupe_key, status, body_excerpt}``.
   Configuration-shaped; operator action needed.
-
-Successful (2xx) sends emit no event — events.jsonl bloat is the
-concern and "alarm went out" isn't worth a record per cycle.
+- ``ntfy_post_ok`` — HTTP 2xx successful send. Carries
+  ``{category, dedupe_key}``. Surfaces as the paired positive next to
+  ``ntfy_post_failed`` / ``ntfy_post_rejected`` (chainlink #65) so the
+  operator can read recovery against the sticky failure line. The
+  feedback layer dedups to first-occurrence-only in the 24h window —
+  events.jsonl still records each one (tiny) but the algedonic block
+  only renders the most recent.
 """
 
 from __future__ import annotations
@@ -171,9 +175,18 @@ async def post_algedonic_alarm(
         return
 
     if 200 <= status < 300:
-        # Success. Stamp the dedup table; emit no event (success path
-        # is silent by design).
+        # Success. Stamp the dedup table; emit the paired-positive
+        # event (chainlink #65) so the algedonic block can show
+        # recovery alongside the sticky ``ntfy_post_failed`` /
+        # ``ntfy_post_rejected`` line. First-occurrence-only at the
+        # feedback layer means events.jsonl carries one record per
+        # successful send but only the latest renders.
         _LAST_POST[dedupe_key] = now
+        await log_event(
+            "ntfy_post_ok",
+            category=category,
+            dedupe_key=dedupe_key,
+        )
         return
 
     body_excerpt = (text or "")[:200]
