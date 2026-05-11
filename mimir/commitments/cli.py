@@ -70,7 +70,15 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
 
     ``--home`` lives on each leaf parser (not the parent) so users
     can write it after the action name, matching the natural
-    invocation shape (``mimir commitments list --home /path``)."""
+    invocation shape (``mimir commitments list --home /path``).
+
+    Bare ``mimir commitments`` (no subcommand) is handled in
+    ``mimir.cli`` itself — it calls ``commitments_p.print_help()``
+    in lexical scope and exits 1, matching the sibling subcommands
+    (identities/wiki/skills/reflection). This module's ``dispatch``
+    therefore assumes ``args.commitments_action`` is set; the
+    no-action fallback below is defensive (for callers that
+    synthesize a namespace without going through ``mimir.cli``)."""
     sub = p.add_subparsers(dest="commitments_action")
 
     list_p = sub.add_parser(
@@ -371,6 +379,11 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_dismiss(args)
     if action == "trim":
         return cmd_trim(args)
+    # Defensive fallback for callers that synthesize a namespace
+    # without going through ``mimir.cli`` (which handles the bare-
+    # command help-and-exit shape in lexical scope — see
+    # ``mimir/cli.py`` under ``args.command == "commitments"``).
+    # Exit 1 matches the sibling subcommands' bare-invocation code.
     print("usage: mimir commitments {list|add|complete|snooze|"
           "dismiss|trim} [...]", file=sys.stderr)
     return 1
