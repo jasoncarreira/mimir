@@ -163,7 +163,13 @@ async def test_bash_async_passes_on_complete_callback(tmp_path: Path):
     finally:
         _context.reset_current_turn(token)
 
-    assert fired.wait(timeout=5.0), "on_complete callback didn't fire"
+    # 30s timeout gives headroom for CI runner variance (PR #136 CI
+    # caught a 3.12-only flake here at the original 5s threshold —
+    # cold-cache fastembed/faiss install + thread scheduling drift on
+    # heavily-loaded runners can push the proc.wait → drainer → callback
+    # chain past 5s. Normal completion is sub-second, so 30s only
+    # affects wall-clock on legitimate test failures.
+    assert fired.wait(timeout=30.0), "on_complete callback didn't fire"
 
 
 # ─── bash_jobs_list ──────────────────────────────────────────────────
