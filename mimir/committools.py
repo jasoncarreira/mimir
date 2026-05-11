@@ -31,7 +31,20 @@ from typing import Any
 from claude_agent_sdk import SdkMcpTool, tool
 
 from ._tool_helpers import _content_block, _need, _safe
+from .commitments.models import CommitmentStatus
 from .commitments.store import CommitmentsStore
+
+# Active (non-terminal) statuses — what ``commitment_list`` returns by
+# default when the agent doesn't pass an explicit ``status`` filter.
+# Mirrors ``render._ACTIVE_STATUSES`` (kept module-local rather than
+# imported to avoid coupling the prompt-rendering surface to the tool
+# surface). PR #140 review nit: use the enum values rather than bare
+# strings so a future enum rename trips the type checker.
+_ACTIVE_STATUS_VALUES: tuple[str, ...] = (
+    CommitmentStatus.PENDING.value,
+    CommitmentStatus.DELIVERED.value,
+    CommitmentStatus.SNOOZED.value,
+)
 
 
 def build_commitment_tools(store: CommitmentsStore) -> list[SdkMcpTool]:
@@ -175,10 +188,7 @@ def build_commitment_tools(store: CommitmentsStore) -> list[SdkMcpTool]:
             # Default: active-only (matches the agent's "what should I
             # be paying attention to" use case; terminal records aren't
             # in the surfacing path).
-            rows = [
-                r for r in rows
-                if r.status in ("pending", "delivered", "snoozed")
-            ]
+            rows = [r for r in rows if r.status in _ACTIVE_STATUS_VALUES]
         payload = [
             {
                 "id": r.id,

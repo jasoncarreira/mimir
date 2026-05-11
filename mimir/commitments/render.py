@@ -41,18 +41,26 @@ def _due_phrase(rec: CommitmentRecord, *, now_unix: float) -> str:
     2. ``due_window_hint`` set (natural-language) → render verbatim
        in parens: ``"(Thursday)"``.
     3. Neither → ``"(no anchor)"`` so the agent knows it lacks a time.
+
+    Rounding (PR #140 review nit #2): both branches bias toward
+    urgency — future deltas floor (2.5d → ``"in 2d"`` understates
+    remaining time so the agent doesn't read it as "I still have 3
+    days") and overdue deltas ceil (2.5d late → ``"overdue 3d"``
+    overstates lateness so the agent doesn't read it as "only 2 days
+    late"). Net effect: the displayed integer always pushes against
+    procrastination.
     """
     start = rec.due_window_start_unix
     if start is not None:
         delta_secs = start - now_unix
         delta_days = delta_secs / 86400
         if delta_days < -1:
-            return f"overdue {int(-delta_days)}d"
+            return f"overdue {int(math.ceil(-delta_days))}d"
         if delta_days < 0:
             return "overdue <1d"
         if delta_days < 1:
             return "today"
-        return f"in {int(math.ceil(delta_days))}d"
+        return f"in {int(delta_days)}d"
     if rec.due_window_hint:
         # Strip extreme whitespace + cap at 40 chars for safety
         hint = " ".join(rec.due_window_hint.split())

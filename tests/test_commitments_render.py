@@ -81,6 +81,35 @@ def test_today_phrase():
     assert "today" in out
 
 
+def test_future_delta_floors_for_urgency_bias():
+    """PR #140 review nit #2: future deltas floor so the displayed
+    integer understates remaining time (2.5d → "in 2d", not "in 3d").
+    Net effect: pushes the agent against procrastination."""
+    now = 1_715_000_000.0
+    rec = _rec(
+        id="c-future-frac",
+        due_window_start_unix=now + 2.5 * 86400,
+    )
+    out = render_commitments_block([rec], now_unix=now)
+    assert "in 2d" in out
+    assert "in 3d" not in out
+
+
+def test_overdue_delta_ceils_for_urgency_bias():
+    """PR #140 review nit #2: overdue deltas ceil so the displayed
+    integer overstates lateness (2.5d late → "overdue 3d", not
+    "overdue 2d"). Net effect: pushes the agent against
+    procrastination."""
+    now = 1_715_000_000.0
+    rec = _rec(
+        id="c-overdue-frac",
+        due_window_start_unix=now - 2.5 * 86400,
+    )
+    out = render_commitments_block([rec], now_unix=now)
+    assert "overdue 3d" in out
+    assert "overdue 2d" not in out
+
+
 def test_hint_falls_back_when_no_unix_anchor():
     rec = _rec(
         id="c-hint",
