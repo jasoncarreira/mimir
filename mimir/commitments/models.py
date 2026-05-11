@@ -194,6 +194,21 @@ class CommitmentRecord:
     snoozed_until_unix: float | None = None
     expired_at_unix: float | None = None
     attempts: int = 0
+    # Phase 2b: snooze counter. Replay increments on each
+    # ``commitment_snoozed`` event. The poller emits a
+    # ``commitment_snooze_pileup`` algedonic signal when this crosses
+    # the threshold (default 3, operator-tunable). Surfaces "the agent
+    # keeps punting this commitment" as a feedback signal at the next
+    # session boundary's synthesis — overcommitment / avoidance smell.
+    snooze_count: int = 0
+    # PR #126 review #2: 24h cooldown for the snooze-pileup alarm.
+    # Without this, the poller emits a fresh
+    # ``commitment_snooze_pileup`` event every 5-min tick per
+    # above-threshold record — 6k+ rows/week/chronic in events.jsonl.
+    # Set by the ``commitment_pileup_alarmed`` lifecycle event; the
+    # poller skips emission until ``now - this > 86400``. ``None`` =
+    # never alarmed (eligible for first emission immediately).
+    pileup_alarmed_at_unix: float | None = None
     confidence: float = 1.0
     dedupe_key: str = ""
     source_turn_id: str | None = None
