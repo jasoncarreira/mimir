@@ -71,6 +71,158 @@ class TestStoreAndRetrieve:
         assert stats["by_stream"].get("procedural", 0) >= 1
 
 
+class TestRetrieveMemoryTypeFilter:
+    """retrieve(memory_type=...) MUST be honored on the FAISS fast path.
+
+    Pre-fix, FAISS bypassed the memory_type SQL filter entirely (the
+    fast-path gate at saga.core.retrieve only checked
+    topic_filter/stream/since/before/agent_id). Effect: on a DB skewed
+    toward one tier, hybrid_retrieve's per-tier calls would return
+    cross-tier atoms — the same raw atom would surface in BOTH the
+    observations and raws lists of the two-tier response, breaking the
+    tier separation _two_tier_split relies on. Confirmed on mimirbot's
+    live saga.db (1 observation, 327 raws): a query returned 8 atom IDs
+    with 3 duplicates across tiers.
+    """
+
+    def _setup_with_distinct_embeddings(self, monkeypatch):
+        """Override the test_core shared-vector fixture with per-text
+        embeddings, so FAISS retrieval is meaningful (otherwise all
+        atoms have identical scores and ordering tests are moot)."""
+        import hashlib
+        from saga.vector_index import reset_indexes
+        reset_indexes()
+
+        def _per_text_emb(text: str) -> list[float]:
+            # Deterministic, distinct-per-text 1024d vector. Bytes from
+            # SHA256 → 32 floats, tiled out to 1024. Not a real embedding
+            # but FAISS only cares about cosine distance between vectors,
+            # which this gives us deterministically per input.
+            seed = int.from_bytes(
+                hashlib.sha256(text.encode()).digest()[:8], "big"
+            ) % (2**32)
+            rng = np.random.default_rng(seed)
+            return list(rng.standard_normal(1024).astype(float))
+
+        monkeypatch.setattr("saga.core.embed_text", _per_text_emb)
+        monkeypatch.setattr("saga.core.embed_query", _per_text_emb)
+        monkeypatch.setattr(
+            "saga.core._cached_embed_query_import",
+            lambda t: tuple(_per_text_emb(t)),
+        )
+        monkeypatch.setattr("saga.core.cached_embed_query", _per_text_emb)
+
+    def test_observation_filter_excludes_raws_under_faiss(self, monkeypatch):
+        from saga.core import store_atom, retrieve
+        self._setup_with_distinct_embeddings(monkeypatch)
+
+        obs_id = store_atom(
+            "Operators prefer Sony cameras",
+            memory_type="observation", evidence_count=3,
+        )
+        # 5 raws on related topics — pre-fix FAISS would happily return
+        # these for a memory_type='observation' query if they're more
+        # similar to the query than the lone observation.
+        raw_ids = [
+            store_atom("I picked up a Sony A7 III"),
+            store_atom("My Sony camera takes great photos"),
+            store_atom("Canon vs Sony in low light"),
+            store_atom("Looking at mirrorless cameras"),
+            store_atom("Bought a new Sony lens"),
+        ]
+        assert isinstance(obs_id, str)
+        assert all(isinstance(r, str) for r in raw_ids)
+
+        results = retrieve(
+            "Sony camera question", top_k=10,
+            memory_type="observation",
+        )
+        for r in results:
+            assert r["memory_type"] == "observation", (
+                f"retrieve(memory_type='observation') returned a "
+                f"non-observation atom: id={r['id']}, "
+                f"memory_type={r['memory_type']}, content={r['content'][:60]}"
+            )
+
+    def test_raw_filter_excludes_observations_under_faiss(self, monkeypatch):
+        from saga.core import store_atom, retrieve
+        self._setup_with_distinct_embeddings(monkeypatch)
+
+        store_atom(
+            "Operators prefer Sony cameras",
+            memory_type="observation", evidence_count=3,
+        )
+        store_atom("I picked up a Sony A7 III")
+        store_atom("Canon vs Sony in low light")
+
+        results = retrieve(
+            "Sony camera question", top_k=10, memory_type="raw",
+        )
+        for r in results:
+            assert r["memory_type"] == "raw", (
+                f"retrieve(memory_type='raw') leaked an observation: "
+                f"id={r['id']}, content={r['content'][:60]}"
+            )
+
+    def test_raw_filter_still_excludes_session_boundaries_under_faiss(
+        self, monkeypatch,
+    ):
+        """The FAISS post-filter clause for session_boundary atoms
+        (source_type filter) lived in retrieve() pre-PR. The new
+        memory_type filter is layered on top — both filters must apply
+        to the same SQL. A session_boundary atom is tagged
+        memory_type='raw' by default, so without the source_type
+        filter it would surface for retrieve(memory_type='raw') —
+        which is exactly the path mimir's pre_message_hook hits on
+        every turn. This test pins the AND-of-both-filters behavior."""
+        from saga.core import store_atom, retrieve
+        self._setup_with_distinct_embeddings(monkeypatch)
+
+        # One ordinary raw + one session_boundary raw on the same topic.
+        ordinary_id = store_atom("Sony cameras are popular in 2026")
+        boundary_id = store_atom(
+            "session ended: Sony cameras discussion wrapped up",
+            source_type="session_boundary",
+        )
+        assert isinstance(ordinary_id, str)
+        assert isinstance(boundary_id, str)
+
+        # Default: include_session_boundaries=False. The boundary atom
+        # must not appear.
+        results = retrieve(
+            "Sony camera question", top_k=10, memory_type="raw",
+        )
+        result_ids = {r["id"] for r in results}
+        assert boundary_id not in result_ids, (
+            "session_boundary atom leaked into memory_type='raw' "
+            "retrieval — FAISS post-filter is missing the source_type "
+            "clause when memory_type is set"
+        )
+        # Sanity: ordinary raw is still findable.
+        assert ordinary_id in result_ids
+
+    def test_no_memory_type_filter_returns_mixed(self, monkeypatch):
+        """Sanity check: with no memory_type filter, retrieve returns
+        whatever's nearest regardless of tier. Pins the contract for
+        callers that genuinely want mixed (e.g. session-boundary lookups
+        that don't care about the observation/raw split)."""
+        from saga.core import store_atom, retrieve
+        self._setup_with_distinct_embeddings(monkeypatch)
+
+        store_atom(
+            "Operators prefer Sony cameras",
+            memory_type="observation", evidence_count=3,
+        )
+        store_atom("I picked up a Sony A7 III")
+
+        results = retrieve("Sony camera question", top_k=10)
+        types = {r["memory_type"] for r in results}
+        # Both tiers should be representable in the unfiltered result —
+        # ``and`` not ``or``; the latter is vacuously true as long as
+        # the result has any atoms.
+        assert "observation" in types and "raw" in types
+
+
 class TestBatchCosine:
     def test_batch_matches_individual(self):
         from saga.core import batch_cosine_similarity, cosine_similarity, pack_embedding

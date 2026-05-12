@@ -936,13 +936,29 @@ def retrieve(
     # Get query embedding (cached)
     query_emb = cached_embed_query(query)
 
-    # Try FAISS fast path first (when no complex SQL filters)
+    # Try FAISS fast path first (when no complex SQL filters). ``memory_type``
+    # IS supported here — pushed into the post-FAISS SQL below — so two-tier
+    # retrieval's per-tier ``retrieve(memory_type='observation' / 'raw')``
+    # calls keep the FAISS speedup. Without this, FAISS returned the top-K
+    # by cosine regardless of tier and the same atom could appear in BOTH
+    # tiers of the two-tier response, breaking the observation/raw split
+    # that ``_two_tier_split`` relies on.
     _use_faiss = not topic_filter and not stream and not since and not before and not agent_id
     if _use_faiss:
         try:
             from .vector_index import faiss_search_atoms, FAISS_AVAILABLE
             if FAISS_AVAILABLE:
-                candidates = faiss_search_atoms(query_emb, top_k=top_k * 3, conn=conn)
+                # Over-fetch when memory_type is set so the post-filter
+                # has headroom — FAISS itself doesn't know about tiers,
+                # so on a DB skewed heavily toward one tier the top-K
+                # candidates may all be in the wrong tier and get dropped.
+                # 5× is empirically sufficient for the bench-shape DBs;
+                # min-cap at 50 keeps small-top_k queries (top_k=3) from
+                # under-fetching.
+                _faiss_top_k = top_k * 3
+                if memory_type:
+                    _faiss_top_k = max(_faiss_top_k * 5, 50)
+                candidates = faiss_search_atoms(query_emb, top_k=_faiss_top_k, conn=conn)
                 if candidates:
                     candidate_ids = [c[0] for c in candidates]
                     sim_map = {c[0]: c[1] for c in candidates}
@@ -951,9 +967,13 @@ def retrieve(
                         f"SELECT * FROM atoms WHERE id IN ({placeholders}) "
                         f"AND state IN ('active', 'fading')"
                     )
+                    faiss_params: list = list(candidate_ids)
+                    if memory_type:
+                        faiss_sql += " AND memory_type = ?"
+                        faiss_params.append(memory_type)
                     if not include_session_boundaries:
                         faiss_sql += " AND (source_type IS NULL OR source_type != 'session_boundary')"
-                    rows = conn.execute(faiss_sql, candidate_ids).fetchall()
+                    rows = conn.execute(faiss_sql, faiss_params).fetchall()
 
                     scored = []
                     for row in rows:
