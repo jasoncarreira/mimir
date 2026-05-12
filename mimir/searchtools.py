@@ -26,7 +26,7 @@ def build_search_tools(indexer: Indexer) -> list[SdkMcpTool]:
         "Returns up to k results with path, score, snippet, description.",
         {"query": str, "scope": str, "k": int},
     )
-    @_safe("file_search")
+    @_safe("file_search", param_names=["query", "scope", "k"])
     async def file_search(args: dict[str, Any]) -> dict[str, Any]:
         query = _need(args, "query")
         scope = (args.get("scope") or "all").strip().lower()
@@ -54,7 +54,7 @@ def build_search_tools(indexer: Indexer) -> list[SdkMcpTool]:
         "Returns added/updated/removed counts.",
         {"scope": str},
     )
-    @_safe("rebuild_index")
+    @_safe("rebuild_index", param_names=["scope"])
     async def rebuild_index(args: dict[str, Any]) -> dict[str, Any]:
         # ``scope`` is accepted for forward-compat with §8.3's signature, but
         # the indexer always sweeps both trees at once (cheap).

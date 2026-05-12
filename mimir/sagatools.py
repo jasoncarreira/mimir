@@ -279,7 +279,7 @@ def build_saga_tools(
             "required": ["query"],
         },
     )
-    @_safe("saga_query")
+    @_safe("saga_query", param_names=["query", "top_k", "min_confidence_tier", "session_id"])
     async def saga_query(args: dict[str, Any]) -> dict[str, Any]:
         q = _need(args, "query")
         try:
@@ -349,7 +349,7 @@ def build_saga_tools(
             "required": ["content", "stream"],
         },
     )
-    @_safe("saga_store")
+    @_safe("saga_store", param_names=["content", "stream", "session_id"])
     async def saga_store(args: dict[str, Any]) -> dict[str, Any]:
         content = _need(args, "content")
         stream = (args.get("stream") or "").strip() or None
@@ -389,7 +389,7 @@ def build_saga_tools(
             "required": ["atom_id", "signal"],
         },
     )
-    @_safe("saga_feedback")
+    @_safe("saga_feedback", param_names=["atom_id", "signal", "session_id"])
     async def saga_feedback(args: dict[str, Any]) -> dict[str, Any]:
         atom_id = _need(args, "atom_id")
         signal = _need(args, "signal").strip().lower()
@@ -431,7 +431,10 @@ def build_saga_tools(
             "required": ["atom_ids", "response_text"],
         },
     )
-    @_safe("saga_mark_contributions")
+    @_safe(
+        "saga_mark_contributions",
+        param_names=["atom_ids", "response_text", "session_id"],
+    )
     async def saga_mark_contributions(args: dict[str, Any]) -> dict[str, Any]:
         atom_ids = args.get("atom_ids") or []
         if not isinstance(atom_ids, list) or not all(isinstance(a, str) for a in atom_ids):
@@ -483,7 +486,18 @@ def build_saga_tools(
             "closed_since": list[str],
         },
     )
-    @_safe("saga_end_session")
+    @_safe(
+        "saga_end_session",
+        param_names=[
+            "session_id",
+            "summary",
+            "topics_discussed",
+            "decisions_made",
+            "unfinished",
+            "emotional_state",
+            "closed_since",
+        ],
+    )
     async def saga_end_session(args: dict[str, Any]) -> dict[str, Any]:
         session_id = _need(args, "session_id")
         summary = _need(args, "summary")
@@ -592,7 +606,17 @@ def build_saga_tools(
             "required": [],
         },
     )
-    @_safe("saga_forget")
+    @_safe(
+        "saga_forget",
+        param_names=[
+            "dry_run",
+            "min_retrievals",
+            "contribution_threshold",
+            "contradiction_threshold",
+            "confidence_floor",
+            "grace_days",
+        ],
+    )
     async def saga_forget(args: dict[str, Any]) -> dict[str, Any]:
         # dry_run defaults True both here and on the saga side — being
         # explicit lets us key the event-emit decision off it cleanly.

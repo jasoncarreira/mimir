@@ -474,7 +474,21 @@ def build_spawn_tool(
             "required": ["brief", "working_dir"],
         },
     )
-    @_safe("spawn_claude_code")
+    @_safe(
+        "spawn_claude_code",
+        param_names=[
+            "brief",
+            "working_dir",
+            "agent",
+            "branch",
+            "timeout_sec",
+            "max_budget_usd",
+            "max_turns",
+            "model",
+            "session_id",
+            "permission_mode",
+        ],
+    )
     async def spawn_claude_code(args: dict[str, Any]) -> dict[str, Any]:
         brief = _need(args, "brief")
         working_dir = _need(args, "working_dir")
