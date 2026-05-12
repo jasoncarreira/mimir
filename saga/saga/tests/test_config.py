@@ -76,6 +76,71 @@ class TestReloadConfig:
         assert cfg2('embedding', 'dimensions') == 1024
 
 
+class TestWasSetInToml:
+    """``was_set_in_toml`` — distinguishes operator-written keys from
+    ``_DEFAULTS``-inherited values. Used by VoyageProvider for
+    override gating (issue #149)."""
+
+    def _write_toml_and_reload(self, tmp_path, monkeypatch, body: str):
+        toml_path = tmp_path / "saga.toml"
+        toml_path.write_text(body)
+        monkeypatch.setenv("SAGA_CONFIG", str(toml_path))
+        from saga.config import reload_config
+        reload_config()
+
+    def test_explicit_key_returns_true(self, tmp_path, monkeypatch):
+        self._write_toml_and_reload(tmp_path, monkeypatch, """
+            [embedding]
+            provider = "voyage"
+            url = "https://custom.example.com/v1/embeddings"
+        """)
+        from saga.config import was_set_in_toml
+        assert was_set_in_toml("embedding", "url") is True
+        assert was_set_in_toml("embedding", "provider") is True
+
+    def test_defaults_inherited_key_returns_false(self, tmp_path, monkeypatch):
+        """``_DEFAULTS["embedding"]`` has many keys (model, dimensions,
+        etc.) — keys NOT written by the operator must NOT report as set,
+        even though they show up in the merged config."""
+        self._write_toml_and_reload(tmp_path, monkeypatch, """
+            [embedding]
+            provider = "voyage"
+        """)
+        from saga.config import was_set_in_toml, get_config
+        cfg = get_config()
+        # model IS in the merged config (inherited from _DEFAULTS)…
+        assert cfg("embedding", "model") is not None
+        # …but the operator didn't write it.
+        assert was_set_in_toml("embedding", "model") is False
+        assert was_set_in_toml("embedding", "url") is False
+
+    def test_unknown_section_returns_false(self, tmp_path, monkeypatch):
+        self._write_toml_and_reload(tmp_path, monkeypatch, """
+            [embedding]
+            provider = "voyage"
+        """)
+        from saga.config import was_set_in_toml
+        assert was_set_in_toml("nonexistent_section", "anything") is False
+
+    def test_reload_resets_tracking(self, tmp_path, monkeypatch):
+        """``reload_config`` must clear ``_explicit_keys`` so a second
+        load reflects only the second toml's contents."""
+        self._write_toml_and_reload(tmp_path, monkeypatch, """
+            [embedding]
+            url = "https://first.example.com"
+        """)
+        from saga.config import was_set_in_toml
+        assert was_set_in_toml("embedding", "url") is True
+
+        self._write_toml_and_reload(tmp_path, monkeypatch, """
+            [embedding]
+            provider = "voyage"
+        """)
+        # Old `url` should no longer be reported as set.
+        assert was_set_in_toml("embedding", "url") is False
+        assert was_set_in_toml("embedding", "provider") is True
+
+
 class TestGetDataDir:
     def test_returns_path(self, tmp_path, monkeypatch):
         from saga.config import get_data_dir

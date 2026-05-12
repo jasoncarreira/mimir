@@ -419,6 +419,14 @@ _DEFAULTS = {
 
 _config = None
 _config_loaded = False
+# Records which (section, key) pairs were explicitly written in the
+# operator's saga.toml — not merely present in the merged config via
+# ``_DEFAULTS`` inheritance. Used by ``was_set_in_toml`` so providers
+# like ``VoyageProvider`` can apply provider-specific defaults only
+# when the operator hasn't already specified a value. Distinguishing
+# "explicitly set" from "inherited from _DEFAULTS" is otherwise
+# impossible at the _cfg layer because _deep_merge collapses the two.
+_explicit_keys: dict[str, set[str]] = {}
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -506,6 +514,9 @@ def _load_config() -> dict:
         try:
             with open(toml_path, "rb") as f:
                 toml_data = tomllib.load(f)
+            for section, items in toml_data.items():
+                if isinstance(items, dict):
+                    _explicit_keys.setdefault(section, set()).update(items.keys())
             config = _deep_merge(config, toml_data)
         except Exception as e:
             import logging
@@ -719,12 +730,27 @@ def reload_config():
     global _config, _config_loaded
     _config = None
     _config_loaded = False
+    _explicit_keys.clear()
     return get_config()
 
 
 def get_raw_config() -> dict:
     """Return the full config dict (for debugging)."""
     return _load_config()
+
+
+def was_set_in_toml(section: str, key: str) -> bool:
+    """Did the operator explicitly set ``[section] key`` in saga.toml?
+
+    Returns False when the merged value came from ``_DEFAULTS`` alone.
+    Lets provider subclasses (e.g. ``VoyageProvider``) apply
+    provider-specific defaults only when the operator hasn't already
+    set a value — the ``_cfg`` accessor can't make this distinction
+    because ``_deep_merge`` collapses defaults and explicit keys into
+    one dict.
+    """
+    _load_config()
+    return key in _explicit_keys.get(section, set())
 
 
 # ─── LLM config resolution ────────────────────────────────────────
