@@ -66,7 +66,7 @@ def build_commitment_tools(store: CommitmentsStore) -> list[SdkMcpTool]:
             "required": ["id"],
         },
     )
-    @_safe("commitment_complete")
+    @_safe("commitment_complete", param_names=["id", "message_id"])
     async def commitment_complete(args: dict[str, Any]) -> dict[str, Any]:
         cid = _need(args, "id")
         message_id = (args.get("message_id") or "").strip() or None
@@ -101,7 +101,7 @@ def build_commitment_tools(store: CommitmentsStore) -> list[SdkMcpTool]:
             "required": ["id"],
         },
     )
-    @_safe("commitment_snooze")
+    @_safe("commitment_snooze", param_names=["id", "for_days", "until_unix", "reason"])
     async def commitment_snooze(args: dict[str, Any]) -> dict[str, Any]:
         cid = _need(args, "id")
         for_days = args.get("for_days")
@@ -148,7 +148,7 @@ def build_commitment_tools(store: CommitmentsStore) -> list[SdkMcpTool]:
             "required": ["id"],
         },
     )
-    @_safe("commitment_dismiss")
+    @_safe("commitment_dismiss", param_names=["id", "reason"])
     async def commitment_dismiss(args: dict[str, Any]) -> dict[str, Any]:
         cid = _need(args, "id")
         reason = (args.get("reason") or "").strip() or None
@@ -179,7 +179,7 @@ def build_commitment_tools(store: CommitmentsStore) -> list[SdkMcpTool]:
             },
         },
     )
-    @_safe("commitment_list")
+    @_safe("commitment_list", param_names=["channel_id", "status"])
     async def commitment_list(args: dict[str, Any]) -> dict[str, Any]:
         channel_id = (args.get("channel_id") or "").strip() or None
         status = (args.get("status") or "").strip() or None

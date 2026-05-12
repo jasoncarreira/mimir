@@ -90,7 +90,7 @@ def build_shell_tools(
             "required": ["command"],
         },
     )
-    @_safe("bash_async")
+    @_safe("bash_async", param_names=["command", "session_id"])
     async def bash_async(args: dict[str, Any]) -> dict[str, Any]:
         command = _need(args, "command")
         ctx, resolution_path = resolve_active_ctx(args)
@@ -139,7 +139,7 @@ def build_shell_tools(
             "required": [],
         },
     )
-    @_safe("bash_jobs_list")
+    @_safe("bash_jobs_list", param_names=["scope"])
     async def bash_jobs_list(args: dict[str, Any]) -> dict[str, Any]:
         try:
             scope = normalize_shell_job_scope(args.get("scope"))
@@ -174,7 +174,7 @@ def build_shell_tools(
             "required": ["job_id"],
         },
     )
-    @_safe("bash_job_output")
+    @_safe("bash_job_output", param_names=["job_id", "tail_lines", "stream"])
     async def bash_job_output(args: dict[str, Any]) -> dict[str, Any]:
         job_id = _need(args, "job_id")
         try:

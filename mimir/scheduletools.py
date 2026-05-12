@@ -27,7 +27,7 @@ def build_schedule_tools(scheduler: Scheduler) -> list[SdkMcpTool]:
         "List all currently registered schedule jobs as YAML.",
         {},
     )
-    @_safe("list_schedules")
+    @_safe("list_schedules", param_names=[])
     async def list_schedules(args: dict[str, Any]) -> dict[str, Any]:
         jobs = await scheduler.list_jobs()
         if not jobs:
@@ -69,7 +69,18 @@ def build_schedule_tools(scheduler: Scheduler) -> list[SdkMcpTool]:
             "required": ["name"],
         },
     )
-    @_safe("add_schedule")
+    @_safe(
+        "add_schedule",
+        param_names=[
+            "name",
+            "prompt",
+            "prompt_file",
+            "callable",
+            "cron",
+            "time_of_day",
+            "channel_id",
+        ],
+    )
     async def add_schedule(args: dict[str, Any]) -> dict[str, Any]:
         name = _need(args, "name")
         prompt = (args.get("prompt") or "").strip()
@@ -139,7 +150,7 @@ def build_schedule_tools(scheduler: Scheduler) -> list[SdkMcpTool]:
         "name exists.",
         {"name": str},
     )
-    @_safe("remove_schedule")
+    @_safe("remove_schedule", param_names=["name"])
     async def remove_schedule(args: dict[str, Any]) -> dict[str, Any]:
         name = _need(args, "name")
         removed = await scheduler.remove_job(name)
@@ -156,7 +167,7 @@ def build_schedule_tools(scheduler: Scheduler) -> list[SdkMcpTool]:
         "pollers registered.",
         {},
     )
-    @_safe("reload_pollers")
+    @_safe("reload_pollers", param_names=[])
     async def reload_pollers(args: dict[str, Any]) -> dict[str, Any]:
         # PR #141 review item #1+2: ``count`` now reflects the live
         # total (preserved + freshly-installed), matching the names
