@@ -140,6 +140,12 @@ class SagaCallRecord:
     - ``result`` — output summary (atom IDs retrieved, atom ID stored,
       etc.). Bounded for the same reason.
     - ``latency_ms`` — wall-clock duration of the call.
+    - ``t_ms`` — wall-clock offset from ``ctx.started_at`` to the
+      moment the call STARTED (not finished). Lets the turn viewer
+      interleave saga calls with SDK events on a single chronological
+      timeline. ``None`` when the recorder couldn't resolve the active
+      ctx (e.g. saga calls fired outside any turn — consolidation cron,
+      decay sweeps).
     - ``error`` — exception message if the call raised, else ``None``.
       An errored call still produces a record so the turn viewer can
       surface failures.
@@ -150,6 +156,7 @@ class SagaCallRecord:
     result: dict
     latency_ms: float
     error: str | None = None
+    t_ms: float | None = None
 
     def to_dict(self) -> dict:
         out = {
@@ -158,6 +165,8 @@ class SagaCallRecord:
             "result": self.result,
             "latency_ms": round(self.latency_ms, 2),
         }
+        if self.t_ms is not None:
+            out["t_ms"] = round(self.t_ms, 2)
         if self.error is not None:
             out["error"] = self.error
         return out
