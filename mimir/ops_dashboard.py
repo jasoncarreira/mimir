@@ -478,6 +478,20 @@ def render_dashboard_html(stats: dict[str, Any] | None = None) -> str:
     return _DASHBOARD_HTML
 
 
+# IMPORTANT: this is a Python triple-double-quoted string. Python
+# processes backslash escapes (``\n`` → LF, ``\'`` → ``'``) BEFORE the
+# browser sees it. If you write a JS string literal here that needs a
+# real JS escape sequence (e.g., ``msg = 'a\nb'`` for a newline inside
+# a JS single-quote string), the backslash MUST be doubled in this
+# source (``'a\\nb'``) so Python emits the JS-escape form to the wire.
+#
+# Forgetting this produces malformed JS: an actual LF inside a single-
+# quoted JS string is a SyntaxError, and an un-doubled ``\'`` becomes a
+# bare ``'`` that closes the string early. The whole <script> block
+# fails to parse, getApiKey/authedFetch never get defined, and the
+# dashboard silently fails to load /api/ops.
+#
+# Pinned by ``test_dashboard_html_js_escapes_survive_python_rendering``.
 _DASHBOARD_HTML = """<!doctype html>
 <html lang="en">
   <head>
@@ -717,7 +731,7 @@ _DASHBOARD_HTML = """<!doctype html>
       function promptApiKey(reason) {
         let msg = 'Enter MIMIR_API_KEY';
         if (reason) msg += ' (' + reason + ')';
-        msg += ':\n\n(Saved to this browser; leave blank to skip — you\'ll see 401s if the server requires it.)';
+        msg += ':\\n\\n(Saved to this browser; leave blank to skip — you\\'ll see 401s if the server requires it.)';
         const v = (window.prompt(msg, '') || '').trim();
         setApiKey(v);
         return v;
