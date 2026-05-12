@@ -219,7 +219,7 @@ def build_channel_tools(
             "required": ["text"],
         },
     )
-    @_safe("send_message")
+    @_safe("send_message", param_names=["text", "channel_id"])
     async def send_message(args: dict[str, Any]) -> dict[str, Any]:
         text = args.get("text", "")
         if not isinstance(text, str):
@@ -463,7 +463,7 @@ def build_channel_tools(
         "support native reactions (e.g. Bluesky) log a no-op.",
         {"emoji": str, "message_id": str, "channel_id": str},
     )
-    @_safe("react")
+    @_safe("react", param_names=["emoji", "message_id", "channel_id"])
     async def react(args: dict[str, Any]) -> dict[str, Any]:
         emoji = _need(args, "emoji")
         ctx = get_current_turn()
@@ -527,7 +527,7 @@ def build_channel_tools(
             "required": [],
         },
     )
-    @_safe("fetch_channel_history")
+    @_safe("fetch_channel_history", param_names=["channel_id", "limit", "before"])
     async def fetch_channel_history(args: dict[str, Any]) -> dict[str, Any]:
         ctx = get_current_turn()
         channel_id = (args.get("channel_id") or "").strip()
