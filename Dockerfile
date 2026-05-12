@@ -25,9 +25,23 @@ FROM python:3.11-slim AS base
 # Claude Code CLI (the SDK transport) ships via npm; install Node + the
 # CLI globally. Pin the major to keep image rebuilds deterministic;
 # dependabot can bump the minor on its own cadence.
+#
+# Also installs PDF-ingest tooling used by mimir's reading-queue
+# pipeline:
+#   - poppler-utils: pdftotext / pdftoppm for PDFs with a text layer
+#   - tesseract-ocr: OCR fallback for scanned (image-only) PDFs via
+#     `pdftoppm -r 300 file.pdf out && tesseract out-*.ppm out`
+#   - tesseract-ocr-eng: English language pack. tesseract-ocr's
+#     control file declares `Depends: tesseract-ocr-eng |
+#     tesseract-ocr-osd` — an OR-relationship that APT can satisfy
+#     with `osd` alone (orientation detection only, no text output)
+#     under `--no-install-recommends`. Pinning eng explicitly removes
+#     that ambiguity so a clean rebuild always produces an English-
+#     capable OCR install.
 ENV NODE_VERSION=20
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg \
+        poppler-utils tesseract-ocr tesseract-ocr-eng \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g @anthropic-ai/claude-code \
