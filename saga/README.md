@@ -149,7 +149,7 @@ Saga reads its config from `<home>/saga.toml`. The full surface lives
 in [`saga.example.toml`](./saga.example.toml) with inline comments.
 Defaults are conservative; the only flag most operators flip is
 `[embedding] provider` (NVIDIA NIM, OpenAI, ONNX, sentence-
-transformers, fastembed).
+transformers, fastembed, Voyage AI).
 
 `[retrieval]` is the section to know:
 - `two_tier_enabled = true` (canonical)
@@ -160,8 +160,84 @@ transformers, fastembed).
 - `include_triples_in_response` — opt in for P42-shape responses
 - `enable_endorsed_atom_pull_in` — opt out (P40 boost-only mode)
 
-`[consolidation]`:
-- `similarity_threshold = 0.75` (P34)
+### `[consolidation] similarity_threshold` — tune per embedding model
+
+The default `similarity_threshold = 0.80` is calibrated for NVIDIA NIM
+`nv-embedqa-e5-v5` (saga's historical default) and OpenAI
+`text-embedding-3-small` — both work cleanly at 0.80. Other embedding
+models produce tighter cosine distributions and need a higher
+threshold to keep saga's consolidator from saturating its `n=50`
+cluster cap.
+
+Recommended values from offline sweeps on LongMemEval-S kept saga DBs:
+
+| Embedding model | Dims | Recommended threshold | At default 0.80 |
+|---|---|---|---|
+| NVIDIA NIM `nv-embedqa-e5-v5` | 1024 | **0.80** | clean |
+| OpenAI `text-embedding-3-small` | 1536 | **0.80** | clean |
+| OpenAI `text-embedding-3-large` | 3072 | **0.80** (untuned, likely fine) | likely clean |
+| Voyage `voyage-4-lite` | 1024 | **0.92** | cap-saturates 100% |
+| Voyage `voyage-3-large` | 1024 | **~0.90** (untuned estimate) | likely cap-saturates |
+| fastembed `BAAI/bge-small-en-v1.5` | 384 | **0.92** | cap-saturates 98.8% |
+| fastembed `BAAI/bge-base-en-v1.5` | 768 | untested | unknown |
+| fastembed `BAAI/bge-large-en-v1.5` | 1024 | untested | unknown |
+
+The thresholds were picked as the lowest value where `cap_hit_pct`
+drops below 5% with `mean_cluster_size` in the healthy [2, 4] range.
+Cap-saturation **doesn't materially hurt accuracy** (Phase 2A bench
+result — the first 50 clusters capture the load-bearing merges) but
+does waste wall-clock: tuned thresholds give ~2× faster consolidation
+without quality loss.
+
+**Shortcut**: set `similarity_threshold = "auto"` in `[consolidation]`
+and saga resolves to the per-provider value at boot. Default for
+fresh installs via `mimir setup`.
+
+```toml
+[consolidation]
+similarity_threshold = "auto"   # 0.92 for voyage/fastembed, 0.80 otherwise
+```
+
+### `[embedding] provider = "voyage"` — first-class Voyage shortcut
+
+`provider = "voyage"` is a one-line shortcut for the Voyage AI API. It
+bakes in voyage's required URL + `send_input_type = true` + default
+`api_key_env = "VOYAGE_API_KEY"`, so the minimal config is:
+
+```toml
+[embedding]
+provider = "voyage"
+model = "voyage-4-lite"   # or voyage-3-large, voyage-4, voyage-4-large
+dimensions = 1024
+api_key_env = "VOYAGE_API_KEY"
+```
+
+Operators can still override any field via saga.toml; the shortcut
+just provides correct defaults so a fresh install picking voyage
+needs no other voyage-specific knowledge.
+
+### `[embedding] send_input_type` — manual Voyage compatibility
+
+Voyage AI's embedding models REQUIRE the `input_type` parameter
+(`"query"` / `"document"`) to produce retrieval-quality embeddings —
+the models are trained with instruction prefixes that don't get
+applied without it. OpenAI's API rejects the parameter as unknown,
+so the flag is opt-in:
+
+```toml
+[embedding]
+provider = "openai"
+url = "https://api.voyageai.com/v1/embeddings"
+model = "voyage-4-lite"
+dimensions = 1024
+api_key_env = "VOYAGE_API_KEY"
+send_input_type = true   # Voyage compat
+```
+
+Without this flag, voyage scores **0.70** aggregate on LongMemEval-S;
+with it, voyage scores **0.904** aggregate (vs OpenAI's 0.880). The
+prefix is load-bearing. Default `false` so existing OpenAI deployments
+are unaffected.
 
 P48 (canonical predicate vocabulary in the consolidation prompt) is
 always on whenever `[triples] enable_extraction = true` — the block

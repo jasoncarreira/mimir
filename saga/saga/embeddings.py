@@ -100,7 +100,24 @@ class NvidiaNimProvider(EmbeddingProvider):
 
 
 class OpenAIProvider(EmbeddingProvider):
-    """OpenAI-compatible API provider (works with OpenAI, Azure, local vLLM, etc.)."""
+    """OpenAI-compatible API provider (works with OpenAI, Azure, local vLLM,
+    and — with ``send_input_type=true`` — Voyage AI).
+
+    ``send_input_type`` config flag (default False): when True, includes
+    the ``input_type`` parameter ("query" / "document") in the JSON
+    request body. Voyage AI REQUIRES this for retrieval-quality
+    embeddings (model trained expecting instruction prefixes); OpenAI's
+    API REJECTS the parameter as unknown. The flag must be set per
+    provider deployment via ``[embedding] send_input_type = true`` in
+    saga.toml.
+
+    The flag also maps saga's internal ``"passage"`` → ``"document"`` to
+    match Voyage's accepted vocabulary. Voyage's two valid values are
+    ``"query"`` and ``"document"``; saga internally uses
+    ``"query"`` / ``"passage"`` (a holdover from the NIM provider's
+    convention). The mapping is one-way: ``passage → document``,
+    ``query → query``.
+    """
 
     def __init__(self):
         self.url = _cfg('embedding', 'url', 'https://api.openai.com/v1/embeddings')
@@ -108,21 +125,33 @@ class OpenAIProvider(EmbeddingProvider):
         self.timeout = _cfg('embedding', 'timeout_seconds', 10)
         self.max_chars = _cfg('embedding', 'max_input_chars', 8000)
         self.api_key_env = _cfg('embedding', 'api_key_env', 'OPENAI_API_KEY')
+        # Default False — sending input_type to OpenAI's embeddings API
+        # results in a 400 "Unknown parameter" error. Operators pointing
+        # this provider at Voyage flip this to True.
+        self.send_input_type = _cfg('embedding', 'send_input_type', False)
 
     def embed(self, text: str, input_type: str = "passage") -> list[float]:
-        return self._call_api([text[:self.max_chars]])[0]
+        return self._call_api([text[:self.max_chars]], input_type)[0]
 
-    def _call_api(self, inputs: list[str]) -> list[list[float]]:
+    def _call_api(
+        self, inputs: list[str], input_type: str = "passage",
+    ) -> list[list[float]]:
         import requests
         api_key = os.environ.get(self.api_key_env)
         if not api_key:
             raise RuntimeError(f"{self.api_key_env} not set. Run: export {self.api_key_env}=\"your-key\" or switch to provider=\"onnx\" in saga.toml for local embeddings.")
 
+        payload: dict = {"input": inputs, "model": self.model}
+        if self.send_input_type:
+            # Voyage uses "document" where saga internally says "passage".
+            voyage_input_type = "document" if input_type == "passage" else input_type
+            payload["input_type"] = voyage_input_type
+
         def _do_request():
             r = requests.post(
                 self.url,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"input": inputs, "model": self.model},
+                json=payload,
                 timeout=self.timeout,
             )
             r.raise_for_status()
@@ -137,7 +166,7 @@ class OpenAIProvider(EmbeddingProvider):
         batch_size = _cfg('embedding', 'batch_size', 256)
         for i in range(0, len(texts), batch_size):
             chunk = [t[:self.max_chars] for t in texts[i:i + batch_size]]
-            results.extend(self._call_api(chunk))
+            results.extend(self._call_api(chunk, input_type))
         return results
 
 
@@ -233,14 +262,98 @@ class ONNXProvider(EmbeddingProvider):
         return _cfg('embedding', 'dimensions', 384)
 
 
+class VoyageProvider(OpenAIProvider):
+    """Voyage AI (acquired by MongoDB Feb 2025) embeddings via their
+    OpenAI-compatible REST API.
+
+    Wraps OpenAIProvider with the voyage-specific defaults baked in:
+
+    - ``url``: ``https://api.voyageai.com/v1/embeddings``
+    - ``model``: ``voyage-4-lite`` (default — best price/quality at
+      $0.02/1M tokens with 200M signup free credit)
+    - ``api_key_env``: ``VOYAGE_API_KEY``
+    - ``send_input_type``: ``True`` (REQUIRED — voyage models trained
+      with instruction prefixes that don't get applied without it)
+
+    Operators can still override any of the above via the ``[embedding]``
+    block in saga.toml. The defaults exist so a minimal config
+    (``provider = "voyage"`` alone) just works.
+    """
+
+    def __init__(self):
+        # Reuse OpenAIProvider's __init__ via super(), then patch the
+        # voyage-specific defaults on top of whatever it read from
+        # config. We can't pass the defaults as constructor args
+        # because the base class reads them from _cfg directly; just
+        # post-override.
+        super().__init__()
+        # Override defaults only when the operator hasn't already set
+        # them in saga.toml. Detect "default" by comparing against the
+        # OpenAI defaults that the base class would have read.
+        if self.url == "https://api.openai.com/v1/embeddings":
+            self.url = "https://api.voyageai.com/v1/embeddings"
+        if self.model == "text-embedding-3-small":
+            self.model = "voyage-4-lite"
+        if self.api_key_env == "OPENAI_API_KEY":
+            self.api_key_env = "VOYAGE_API_KEY"
+        # send_input_type is hardcoded True for voyage — non-negotiable
+        # since voyage's models REQUIRE the input_type prefix. Only
+        # log a warning when the operator EXPLICITLY set False in
+        # saga.toml; the OpenAIProvider default is False and a fresh
+        # voyage saga.toml without an explicit ``send_input_type`` key
+        # shouldn't spuriously trip the warning.
+        explicit_value = _cfg('embedding', 'send_input_type', None)
+        if explicit_value is False:
+            import logging
+            logging.getLogger("saga.embeddings").warning(
+                "[embedding] send_input_type=false was set for "
+                "provider=voyage; voyage REQUIRES input_type for "
+                "retrieval-quality embeddings — forcing True"
+            )
+        self.send_input_type = True
+
+
 # ─── Provider Registry ────────────────────────────────────────────
 
 _PROVIDERS = {
     "nvidia-nim": NvidiaNimProvider,
     "openai": OpenAIProvider,
+    "voyage": VoyageProvider,
     "onnx": ONNXProvider,
     "local": LocalProvider,
 }
+
+#: Per-provider recommended ``[consolidation] similarity_threshold``
+#: values, picked from offline cosine-distribution sweeps against
+#: LongMemEval-S DBs. Used when ``[consolidation] similarity_threshold
+#: = "auto"`` is set in saga.toml — the value resolves to the entry
+#: matching the configured embedding provider. See saga README for the
+#: full sweep methodology.
+#:
+#: Falls back to 0.80 (saga's historical default) for providers without
+#: an explicit entry — that's the right value for any embedding model
+#: whose cosine distribution sits in the OpenAI/NIM range (1024-1536d
+#: general-purpose). Providers like voyage and fastembed-bge-small
+#: produce tighter distributions and need 0.92 to keep saga's
+#: consolidator from cap-saturating.
+_PROVIDER_AUTO_THRESHOLDS: dict[str, float] = {
+    "nvidia-nim": 0.80,
+    "openai": 0.80,
+    "voyage": 0.92,
+    "onnx": 0.92,
+    "local": 0.80,
+}
+
+
+def resolve_auto_threshold(provider_name: str) -> float:
+    """Resolve ``[consolidation] similarity_threshold = "auto"`` to a
+    numeric value based on the configured embedding provider.
+
+    Returns the entry from ``_PROVIDER_AUTO_THRESHOLDS`` matching
+    ``provider_name``, or 0.80 (saga's historical default) for
+    unrecognized providers.
+    """
+    return _PROVIDER_AUTO_THRESHOLDS.get(provider_name, 0.80)
 
 _provider_instance = None
 # CR#1: lock the singleton init. Saga is called from mimir's
@@ -276,9 +389,22 @@ def get_provider() -> EmbeddingProvider:
         import os
         provider_name = _cfg('embedding', 'provider', 'nvidia-nim')
 
-        if provider_name in ("openai", "nvidia-nim"):
-            api_key_env = _cfg('embedding', 'api_key_env',
-                               'NVIDIA_NIM_API_KEY' if provider_name == 'nvidia-nim' else 'OPENAI_API_KEY')
+        # API-keyed providers — auto-fall-back to onnx when the
+        # required env var isn't set. Voyage is included since
+        # ``mimir setup --embedding voyage`` is the new default; a
+        # fresh install without VOYAGE_API_KEY should fall back to
+        # local fastembed rather than raising on first embed.
+        _API_KEYED_PROVIDERS = ("openai", "voyage", "nvidia-nim")
+        _DEFAULT_KEY_ENVS = {
+            "openai": "OPENAI_API_KEY",
+            "voyage": "VOYAGE_API_KEY",
+            "nvidia-nim": "NVIDIA_NIM_API_KEY",
+        }
+        if provider_name in _API_KEYED_PROVIDERS:
+            api_key_env = _cfg(
+                'embedding', 'api_key_env',
+                _DEFAULT_KEY_ENVS[provider_name],
+            )
             if api_key_env and not os.environ.get(api_key_env):
                 logging.getLogger("saga.embeddings").info(
                     "[embedding] provider=%s but %s is unset — falling back "
