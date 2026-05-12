@@ -229,3 +229,52 @@ def test_to_dict_shape():
         error="RuntimeError: nope",
     )
     assert r2.to_dict()["error"] == "RuntimeError: nope"
+
+
+@pytest.mark.asyncio
+async def test_records_mcp_dispatched_calls_via_saga_session_id():
+    """Reproduces the SDK-forked-task scenario: an MCP tool handler
+    runs without an active contextvar (forked at SDK connect, captured
+    None) but the TurnContext IS registered in ``_active_turns`` and
+    can be found via ``saga_session_id`` passed in kwargs.
+
+    This is the PR #147 review blocker — the prior implementation
+    only consulted ``get_current_turn()`` and would silently drop
+    every model-driven saga call (the most interesting ones).
+    """
+    from mimir._context import _active_turns
+    saga_sid = "saga-test-sid-1234"
+    ctx = TurnContext(
+        turn_id=make_turn_id(),
+        session_id="ch-test",
+        trigger="user_message",
+        channel_id="ch-test",
+        started_at=0.0,
+        saga_session_id=saga_sid,
+    )
+    # Register the turn WITHOUT setting the contextvar — simulates a
+    # forked task that captured contextvar=None at fork time.
+    _active_turns[ctx.turn_id] = ctx
+    try:
+        inner = _FakeSaga()
+        wrapped = RecordingSagaClient(inner)
+        # MCP-dispatched-style call: session_id flows through kwargs.
+        await wrapped.query("model-driven query", session_id=saga_sid)
+        assert len(ctx.saga_calls) == 1
+        assert ctx.saga_calls[0].call_type == "query"
+        assert ctx.saga_calls[0].args["session_id"] == saga_sid
+    finally:
+        _active_turns.pop(ctx.turn_id, None)
+
+
+@pytest.mark.asyncio
+async def test_records_via_only_active_fallback(ctx_for_test):
+    """Single-channel deployments: exactly one active turn is registered
+    in ``_active_turns`` (the ctx_for_test fixture does this). Even
+    without a saga_session_id in kwargs, the resolver should pick up
+    the active ctx via ``get_only_active_turn``."""
+    inner = _FakeSaga()
+    wrapped = RecordingSagaClient(inner)
+    # Call without session_id — falls through to single-active heuristic.
+    await wrapped.query("no session id passed")
+    assert len(ctx_for_test.saga_calls) == 1

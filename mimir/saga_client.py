@@ -830,9 +830,16 @@ class RecordingSagaClient:
     # Methods we wrap. Anything not in this list passes through
     # __getattr__ unchanged (e.g. private helpers, future additions
     # that don't need recording).
+    #
+    # Note: ``mark_contributions`` is intentionally NOT here — mimir
+    # uses ``feedback()`` for the credit-pass call (see
+    # ``agent.py:_post_message_hook``, line 1859). There's no
+    # ``mark_contributions`` method on ``_InProcessSaga`` or
+    # ``_HttpSaga`` either; adding it to this set would AttributeError
+    # at runtime.
     _RECORDED_METHODS = frozenset({
         "query", "store", "feedback", "outcome", "end_session",
-        "mark_contributions", "consolidate", "decay", "forget",
+        "consolidate", "decay", "forget",
     })
 
     def __init__(self, inner: SagaClient) -> None:
@@ -861,11 +868,6 @@ class RecordingSagaClient:
     async def end_session(self, *args, **kwargs):
         return await self._call(
             "end_session", self._inner.end_session, args, kwargs,
-        )
-
-    async def mark_contributions(self, *args, **kwargs):
-        return await self._call(
-            "mark_contributions", self._inner.mark_contributions, args, kwargs,
         )
 
     async def consolidate(self, *args, **kwargs):
@@ -898,7 +900,7 @@ class RecordingSagaClient:
         finally:
             elapsed_ms = (_time.monotonic() - started) * 1000.0
             try:
-                ctx = _get_current_turn_ctx()
+                ctx = _resolve_turn_ctx(kwargs)
                 if ctx is not None:
                     ctx.saga_calls.append(SagaCallRecord(
                         call_type=call_type,
@@ -912,17 +914,36 @@ class RecordingSagaClient:
                 pass
 
 
-def _get_current_turn_ctx():
-    """Resolve the active TurnContext via the standard lookup chain.
+def _resolve_turn_ctx(kwargs: dict):
+    """Resolve the active TurnContext via the three-level chain that
+    works across MCP-dispatched + in-process saga calls.
 
-    Mirrors the resolution sagatools.py uses (saga_session_id → only
-    active → contextvar). Defined here to keep RecordingSagaClient
-    self-contained — it doesn't need the args-based resolver since
-    every saga call within a turn happens on a task that captured
-    the contextvar at acquire time.
+    The MCP tools (``saga_query`` / ``saga_store`` / ``saga_feedback``
+    / ``saga_end_session``) run on a fresh task forked by the SDK's
+    control-protocol handler. That task captured the
+    ``_current_turn`` contextvar at fork time (= ``None``) and never
+    sees later ``set()`` calls in ``run_turn`` (see
+    ``mimir/_context.py`` module docstring + chainlink #23 design).
+    A bare ``get_current_turn()`` lookup from this wrapper returns
+    ``None`` on every model-driven saga call — exactly the most
+    important calls to record.
+
+    ``_context.resolve_active_ctx`` is the canonical three-level
+    chain that survives the task-fork boundary:
+    1. ``kwargs["session_id"]`` → match against
+       ``ctx.saga_session_id`` in ``_active_turns`` (multi-channel
+       safe; required because the SDK forks per-call)
+    2. ``get_only_active_turn()`` — works in single-channel
+       deployments where the dispatcher serializes turns
+    3. ``get_current_turn()`` — works for direct-handler-call paths
+       (mimir's pre/post-message hooks, sagatools tests)
+
+    Returns ``None`` if all three miss (saga calls from consolidation
+    cron, decay sweeps, etc., have no active turn — that's by design).
     """
-    from ._context import get_current_turn
-    return get_current_turn()
+    from ._context import resolve_active_ctx
+    ctx, _resolution = resolve_active_ctx(kwargs or {})
+    return ctx
 
 
 # Per-call-type arg/result summarizers. Truncate strings to 200 chars
@@ -946,6 +967,7 @@ def _summarize_args(call_type: str, args: tuple, kwargs: dict) -> dict:
             "query": _trunc(args[0] if args else kwargs.get("query", "")),
             "top_k": kwargs.get("top_k"),
             "mode": kwargs.get("mode"),
+            "min_confidence_tier": kwargs.get("min_confidence_tier"),
             "session_id": kwargs.get("session_id"),
             "context_present": bool(kwargs.get("context")),
         }
@@ -982,10 +1004,10 @@ def _summarize_args(call_type: str, args: tuple, kwargs: dict) -> dict:
             "decisions_made_count": len(kwargs.get("decisions_made") or []),
             "unfinished_count": len(kwargs.get("unfinished") or []),
         }
-    if call_type == "mark_contributions":
-        # Signature varies; capture whatever was passed.
-        return {"args": [_trunc(a) for a in args], **{k: _trunc(v) for k, v in kwargs.items()}}
-    # Default: shallow copy with truncation.
+    # Default: shallow copy with truncation. Covers outcome / consolidate /
+    # decay / forget — the per-call shapes are operator-tunable enough
+    # that hardcoded summarizers would drift faster than the dict shape
+    # itself. The 200-char string truncation bounds size regardless.
     return {"args": [_trunc(a) for a in args], **{k: _trunc(v) for k, v in kwargs.items()}}
 
 
