@@ -164,6 +164,43 @@ class TestRetrieveMemoryTypeFilter:
                 f"id={r['id']}, content={r['content'][:60]}"
             )
 
+    def test_raw_filter_still_excludes_session_boundaries_under_faiss(
+        self, monkeypatch,
+    ):
+        """The FAISS post-filter clause for session_boundary atoms
+        (source_type filter) lived in retrieve() pre-PR. The new
+        memory_type filter is layered on top — both filters must apply
+        to the same SQL. A session_boundary atom is tagged
+        memory_type='raw' by default, so without the source_type
+        filter it would surface for retrieve(memory_type='raw') —
+        which is exactly the path mimir's pre_message_hook hits on
+        every turn. This test pins the AND-of-both-filters behavior."""
+        from saga.core import store_atom, retrieve
+        self._setup_with_distinct_embeddings(monkeypatch)
+
+        # One ordinary raw + one session_boundary raw on the same topic.
+        ordinary_id = store_atom("Sony cameras are popular in 2026")
+        boundary_id = store_atom(
+            "session ended: Sony cameras discussion wrapped up",
+            source_type="session_boundary",
+        )
+        assert isinstance(ordinary_id, str)
+        assert isinstance(boundary_id, str)
+
+        # Default: include_session_boundaries=False. The boundary atom
+        # must not appear.
+        results = retrieve(
+            "Sony camera question", top_k=10, memory_type="raw",
+        )
+        result_ids = {r["id"] for r in results}
+        assert boundary_id not in result_ids, (
+            "session_boundary atom leaked into memory_type='raw' "
+            "retrieval — FAISS post-filter is missing the source_type "
+            "clause when memory_type is set"
+        )
+        # Sanity: ordinary raw is still findable.
+        assert ordinary_id in result_ids
+
     def test_no_memory_type_filter_returns_mixed(self, monkeypatch):
         """Sanity check: with no memory_type filter, retrieve returns
         whatever's nearest regardless of tier. Pins the contract for
