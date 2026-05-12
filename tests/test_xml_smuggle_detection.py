@@ -202,10 +202,12 @@ async def test_safe_no_param_names_skips_detection():
 
 @pytest.mark.asyncio
 async def test_safe_empty_param_names_skips_detection():
-    """``param_names=[]`` is treated like the no-param-names case (the
-    detection would be a no-op for Shape 1 with an empty list, and we
-    don't want to false-positive zero-arg tools on Shape 2/3 from
-    callers who consciously opted in with an empty list)."""
+    """``param_names=[]`` is treated like the no-param-names case: the
+    empty list is falsy in ``if param_names:``, so the detection branch
+    in ``_safe`` is skipped entirely. (The zero-arg case ``args={}``
+    would have nothing to scan regardless; this test pins the behavior
+    when a caller passes ``[]`` explicitly and the args dict happens to
+    carry a string with smuggle-looking bytes.)"""
 
     @_safe("test_tool", param_names=[])
     async def handler(args):
