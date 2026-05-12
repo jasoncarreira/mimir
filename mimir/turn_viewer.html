@@ -94,6 +94,13 @@ tr:hover td{background:var(--surface2);cursor:pointer}
 .ev-tool_result.is-error{background:var(--treb);border-color:var(--trebd)}
 .ev-tool_result.is-error .event-hdr{background:var(--trebd);color:#fecaca}
 .ev-tool_result.is-error .event-bdy{color:#fee2e2}
+.ev-saga{background:#1f1b2e;border:1px solid #3b2d54}
+.ev-saga .event-hdr{background:#3b2d54;color:#d8b4fe}
+.ev-saga .event-bdy{color:#e9d5ff}
+.ev-saga.is-error{background:var(--treb);border-color:var(--trebd)}
+.ev-saga.is-error .event-hdr{background:var(--trebd);color:#fecaca}
+.ev-saga.is-error .event-bdy{color:#fee2e2}
+.ev-saga .saga-latency{font-family:monospace;opacity:.6;font-size:11px;margin-left:auto}
 .no-events{color:var(--text3);font-size:13px;font-style:italic}
 .error-box{background:var(--treb);border:1px solid var(--trebd);border-radius:8px;padding:12px 14px;font-size:13px;color:#fecaca;white-space:pre-wrap;word-break:break-word}
 ::-webkit-scrollbar{width:6px;height:6px}
@@ -175,6 +182,10 @@ tr:hover td{background:var(--surface2);cursor:pointer}
     <div class="section" id="detailErrorSection" style="display:none">
       <div class="section-label">Error</div>
       <div class="error-box" id="detailError"></div>
+    </div>
+    <div class="section" id="detailSagaCallsSection" style="display:none">
+      <div class="section-label">Saga calls (<span id="detailSagaCallsCount">0</span>)</div>
+      <div class="events-list" id="detailSagaCalls"></div>
     </div>
     <div class="section">
       <div class="section-label">Events (<span id="detailEventsCount">0</span>)</div>
@@ -411,6 +422,53 @@ function renderEvent(e, i) {
   return '<div style="border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text3);font-size:12px">Unknown: '+esc(e.type)+'</div>';
 }
 
+// Saga call icon by call_type. Falls back to a generic disc for unknown
+// types so a future call_type (e.g. "mark_contributions") shows up
+// rather than getting silently mis-rendered.
+var SAGA_ICONS = {
+  query: '\u{1F50D}',         // magnifying glass
+  store: '\u{1F4BE}',         // floppy disk
+  feedback: '\u{1F44D}',      // thumbs up
+  outcome: '\u{1F3AF}',       // bullseye
+  end_session: '\u{1F3C1}',   // checkered flag
+  consolidate: '\u{1F501}',   // counterclockwise arrows
+  decay: '\u{231B}',          // hourglass
+  forget: '\u{1F5D1}️'   // wastebasket
+};
+
+function renderSagaCall(c, i) {
+  var t = c.call_type || 'unknown';
+  var icon = SAGA_ICONS[t] || '\u{2022}';
+  var lat = c.latency_ms != null ? Math.round(c.latency_ms) + 'ms' : '';
+  var errCls = c.error ? ' is-error' : '';
+  // Body shows args + result side-by-side as JSON. The summarizer in
+  // saga_client.py keeps strings under 200 chars so this stays bounded.
+  var argsStr='', resultStr='';
+  try { argsStr = JSON.stringify(c.args, null, 2); } catch (ex) { argsStr = String(c.args); }
+  try { resultStr = JSON.stringify(c.result, null, 2); } catch (ex) { resultStr = String(c.result); }
+  var body = 'args:\n' + argsStr + '\n\nresult:\n' + resultStr;
+  if (c.error) body = 'error: ' + c.error + '\n\n' + body;
+  return '<div class="event ev-saga'+errCls+'">'+
+    '<div class="event-hdr"><span>'+icon+' '+esc(t)+(c.error?' (error)':'')+'</span>'+
+    '<span class="saga-latency">'+lat+'</span>'+
+    '<span class="event-toggle">&#x25B2;</span></div>'+
+    '<div class="event-bdy">'+esc(body)+'</div></div>';
+}
+
+// Attach click-to-toggle to all .event-hdr children of ``container``.
+// Used by both the model-event list and the saga-call list — same
+// expand/collapse behavior, same indicator glyph.
+function bindEventToggles(container) {
+  container.querySelectorAll('.event-hdr').forEach(function(h) {
+    h.addEventListener('click', function() {
+      var body=h.nextElementSibling, toggle=h.querySelector('.event-toggle');
+      var hidden=body.style.display==='none';
+      body.style.display=hidden?'':'none';
+      toggle.innerHTML=hidden?'&#x25B2;':'&#x25BC;';
+    });
+  });
+}
+
 function openDetail(turn) {
   if (!turn) return;
   openTurnId = turn.turn_id;
@@ -430,20 +488,28 @@ function openDetail(turn) {
     errorSection.style.display = 'none';
   }
 
+  // Saga calls — populated by RecordingSagaClient (mimir/saga_client.py).
+  // Hidden when empty so synthetic ticks / sessions-with-no-saga don't
+  // get a useless empty section.
+  var sagaCalls = turn.saga_calls||[];
+  var sagaSection = document.getElementById('detailSagaCallsSection');
+  if (sagaCalls.length) {
+    sagaSection.style.display = '';
+    document.getElementById('detailSagaCallsCount').textContent = sagaCalls.length;
+    var sagaList = document.getElementById('detailSagaCalls');
+    sagaList.innerHTML = sagaCalls.map(renderSagaCall).join('');
+    bindEventToggles(sagaList);
+  } else {
+    sagaSection.style.display = 'none';
+  }
+
   var events = turn.events||[];
   document.getElementById('detailEventsCount').textContent = events.length;
   var evList = document.getElementById('detailEvents');
   evList.innerHTML = events.length===0
     ? '<div class="no-events">No events recorded for this turn.</div>'
     : events.map(renderEvent).join('');
-  evList.querySelectorAll('.event-hdr').forEach(function(h) {
-    h.addEventListener('click', function() {
-      var body=h.nextElementSibling, toggle=h.querySelector('.event-toggle');
-      var hidden=body.style.display==='none';
-      body.style.display=hidden?'':'none';
-      toggle.innerHTML=hidden?'&#x25B2;':'&#x25BC;';
-    });
-  });
+  bindEventToggles(evList);
   document.getElementById('detailPanel').classList.add('open');
   document.getElementById('detailOverlay').classList.add('open');
 }
