@@ -252,3 +252,125 @@ class TestOpenAIProviderInputType:
         provider.batch_embed(["one", "two"], input_type="query")
         assert captured["json"]["input_type"] == "query"
         assert captured["json"]["input"] == ["one", "two"]
+
+
+class TestVoyageProvider:
+    """``VoyageProvider`` shortcut — sets voyage-friendly defaults so
+    ``provider = "voyage"`` alone in saga.toml is enough config."""
+
+    def _voyage_config(self, **overrides):
+        """Baseline minimal voyage config — only ``provider`` set, all
+        other fields fall through to VoyageProvider defaults."""
+        snap = {"embedding": {"provider": "voyage"}}
+        snap["embedding"].update(overrides)
+        return snap
+
+    def test_defaults_set_voyage_url_model_key_env(self, monkeypatch):
+        import saga.config as cfg_mod
+        import saga.embeddings as emb
+        monkeypatch.setattr(cfg_mod, "_config", self._voyage_config())
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        provider = emb.VoyageProvider()
+        assert provider.url == "https://api.voyageai.com/v1/embeddings"
+        assert provider.model == "voyage-4-lite"
+        assert provider.api_key_env == "VOYAGE_API_KEY"
+        assert provider.send_input_type is True
+
+    def test_operator_can_override_model(self, monkeypatch):
+        """Explicit ``model`` in saga.toml beats the default."""
+        import saga.config as cfg_mod
+        import saga.embeddings as emb
+        monkeypatch.setattr(
+            cfg_mod, "_config",
+            self._voyage_config(model="voyage-3-large"),
+        )
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        provider = emb.VoyageProvider()
+        assert provider.model == "voyage-3-large"
+        assert provider.url == "https://api.voyageai.com/v1/embeddings"
+        assert provider.send_input_type is True  # still forced True
+
+    def test_send_input_type_false_is_overridden(self, monkeypatch):
+        """Operator setting ``send_input_type=false`` for voyage would
+        produce broken embeddings; the provider overrides to True
+        regardless."""
+        import saga.config as cfg_mod
+        import saga.embeddings as emb
+        monkeypatch.setattr(
+            cfg_mod, "_config",
+            self._voyage_config(send_input_type=False),
+        )
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        provider = emb.VoyageProvider()
+        assert provider.send_input_type is True
+
+    def test_registered_in_provider_registry(self):
+        from saga.embeddings import _PROVIDERS, VoyageProvider
+        assert "voyage" in _PROVIDERS
+        assert _PROVIDERS["voyage"] is VoyageProvider
+
+
+class TestAutoThresholdResolution:
+    """``resolve_auto_threshold`` produces per-provider recommendations
+    when ``[consolidation] similarity_threshold = "auto"``."""
+
+    def test_voyage_resolves_to_092(self):
+        from saga.embeddings import resolve_auto_threshold
+        assert resolve_auto_threshold("voyage") == 0.92
+
+    def test_onnx_fastembed_resolves_to_092(self):
+        from saga.embeddings import resolve_auto_threshold
+        assert resolve_auto_threshold("onnx") == 0.92
+
+    def test_openai_resolves_to_080(self):
+        from saga.embeddings import resolve_auto_threshold
+        assert resolve_auto_threshold("openai") == 0.80
+
+    def test_nvidia_nim_resolves_to_080(self):
+        from saga.embeddings import resolve_auto_threshold
+        assert resolve_auto_threshold("nvidia-nim") == 0.80
+
+    def test_unknown_provider_falls_back_to_080(self):
+        from saga.embeddings import resolve_auto_threshold
+        assert resolve_auto_threshold("does-not-exist") == 0.80
+
+
+class TestConsolidationThresholdSentinel:
+    """``[consolidation] similarity_threshold = "auto"`` flows through
+    ``saga.consolidation._resolve_threshold`` to produce the per-
+    provider value at module load time."""
+
+    def test_auto_resolves_per_provider(self, monkeypatch):
+        import saga.config as cfg_mod
+        snapshot = {
+            "embedding": {"provider": "voyage"},
+            "consolidation": {"similarity_threshold": "auto"},
+        }
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        from saga.consolidation import _resolve_threshold
+        assert _resolve_threshold() == 0.92
+
+    def test_numeric_passes_through(self, monkeypatch):
+        import saga.config as cfg_mod
+        snapshot = {
+            "embedding": {"provider": "openai"},
+            "consolidation": {"similarity_threshold": 0.85},
+        }
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        from saga.consolidation import _resolve_threshold
+        assert _resolve_threshold() == 0.85
+
+    def test_malformed_falls_back_to_080(self, monkeypatch):
+        """Unrecognized non-numeric strings ("high", "auto-magic", etc.)
+        fall back to 0.80 rather than crashing."""
+        import saga.config as cfg_mod
+        snapshot = {
+            "embedding": {"provider": "openai"},
+            "consolidation": {"similarity_threshold": "highest"},
+        }
+        monkeypatch.setattr(cfg_mod, "_config", snapshot)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        from saga.consolidation import _resolve_threshold
+        assert _resolve_threshold() == 0.80

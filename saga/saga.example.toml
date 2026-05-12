@@ -176,6 +176,10 @@ approx_threshold = 50000                     # switch from exact to approximate 
 # Cap-saturation doesn't hurt accuracy (Phase 2A LongMemEval result —
 # the first 50 clusters capture the load-bearing merges) but wastes
 # ~2× wall-clock on consolidation. See saga README for the full table.
+#
+# SHORTCUT: set `similarity_threshold = "auto"` (string) and saga
+# resolves to the per-provider value at boot. Default for fresh
+# installs via `mimir setup`.
 similarity_threshold = 0.80
 min_cluster_size = 3                        # minimum atoms to form a cluster
 max_clusters_per_run = 50                   # cap clusters per consolidation run

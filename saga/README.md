@@ -189,7 +189,34 @@ result — the first 50 clusters capture the load-bearing merges) but
 does waste wall-clock: tuned thresholds give ~2× faster consolidation
 without quality loss.
 
-### `[embedding] send_input_type` — required for Voyage
+**Shortcut**: set `similarity_threshold = "auto"` in `[consolidation]`
+and saga resolves to the per-provider value at boot. Default for
+fresh installs via `mimir setup`.
+
+```toml
+[consolidation]
+similarity_threshold = "auto"   # 0.92 for voyage/fastembed, 0.80 otherwise
+```
+
+### `[embedding] provider = "voyage"` — first-class Voyage shortcut
+
+`provider = "voyage"` is a one-line shortcut for the Voyage AI API. It
+bakes in voyage's required URL + `send_input_type = true` + default
+`api_key_env = "VOYAGE_API_KEY"`, so the minimal config is:
+
+```toml
+[embedding]
+provider = "voyage"
+model = "voyage-4-lite"   # or voyage-3-large, voyage-4, voyage-4-large
+dimensions = 1024
+api_key_env = "VOYAGE_API_KEY"
+```
+
+Operators can still override any field via saga.toml; the shortcut
+just provides correct defaults so a fresh install picking voyage
+needs no other voyage-specific knowledge.
+
+### `[embedding] send_input_type` — manual Voyage compatibility
 
 Voyage AI's embedding models REQUIRE the `input_type` parameter
 (`"query"` / `"document"`) to produce retrieval-quality embeddings —

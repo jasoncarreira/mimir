@@ -262,14 +262,95 @@ class ONNXProvider(EmbeddingProvider):
         return _cfg('embedding', 'dimensions', 384)
 
 
+class VoyageProvider(OpenAIProvider):
+    """Voyage AI (acquired by MongoDB Feb 2025) embeddings via their
+    OpenAI-compatible REST API.
+
+    Wraps OpenAIProvider with the voyage-specific defaults baked in:
+
+    - ``url``: ``https://api.voyageai.com/v1/embeddings``
+    - ``model``: ``voyage-4-lite`` (default — best price/quality at
+      $0.02/1M tokens with 200M signup free credit)
+    - ``api_key_env``: ``VOYAGE_API_KEY``
+    - ``send_input_type``: ``True`` (REQUIRED — voyage models trained
+      with instruction prefixes that don't get applied without it)
+
+    Operators can still override any of the above via the ``[embedding]``
+    block in saga.toml. The defaults exist so a minimal config
+    (``provider = "voyage"`` alone) just works.
+    """
+
+    def __init__(self):
+        # Reuse OpenAIProvider's __init__ via super(), then patch the
+        # voyage-specific defaults on top of whatever it read from
+        # config. We can't pass the defaults as constructor args
+        # because the base class reads them from _cfg directly; just
+        # post-override.
+        super().__init__()
+        # Override defaults only when the operator hasn't already set
+        # them in saga.toml. Detect "default" by comparing against the
+        # OpenAI defaults that the base class would have read.
+        if self.url == "https://api.openai.com/v1/embeddings":
+            self.url = "https://api.voyageai.com/v1/embeddings"
+        if self.model == "text-embedding-3-small":
+            self.model = "voyage-4-lite"
+        if self.api_key_env == "OPENAI_API_KEY":
+            self.api_key_env = "VOYAGE_API_KEY"
+        # send_input_type is hardcoded True for voyage — non-negotiable
+        # since voyage's models REQUIRE the input_type prefix. If the
+        # operator set it to False in saga.toml we override anyway and
+        # log a warning since False would produce broken embeddings.
+        if not self.send_input_type:
+            import logging
+            logging.getLogger("saga.embeddings").warning(
+                "[embedding] send_input_type=false was set for "
+                "provider=voyage; voyage REQUIRES input_type for "
+                "retrieval-quality embeddings — forcing True"
+            )
+        self.send_input_type = True
+
+
 # ─── Provider Registry ────────────────────────────────────────────
 
 _PROVIDERS = {
     "nvidia-nim": NvidiaNimProvider,
     "openai": OpenAIProvider,
+    "voyage": VoyageProvider,
     "onnx": ONNXProvider,
     "local": LocalProvider,
 }
+
+#: Per-provider recommended ``[consolidation] similarity_threshold``
+#: values, picked from offline cosine-distribution sweeps against
+#: LongMemEval-S DBs. Used when ``[consolidation] similarity_threshold
+#: = "auto"`` is set in saga.toml — the value resolves to the entry
+#: matching the configured embedding provider. See saga README for the
+#: full sweep methodology.
+#:
+#: Falls back to 0.80 (saga's historical default) for providers without
+#: an explicit entry — that's the right value for any embedding model
+#: whose cosine distribution sits in the OpenAI/NIM range (1024-1536d
+#: general-purpose). Providers like voyage and fastembed-bge-small
+#: produce tighter distributions and need 0.92 to keep saga's
+#: consolidator from cap-saturating.
+_PROVIDER_AUTO_THRESHOLDS: dict[str, float] = {
+    "nvidia-nim": 0.80,
+    "openai": 0.80,
+    "voyage": 0.92,
+    "onnx": 0.92,
+    "local": 0.80,
+}
+
+
+def resolve_auto_threshold(provider_name: str) -> float:
+    """Resolve ``[consolidation] similarity_threshold = "auto"`` to a
+    numeric value based on the configured embedding provider.
+
+    Returns the entry from ``_PROVIDER_AUTO_THRESHOLDS`` matching
+    ``provider_name``, or 0.80 (saga's historical default) for
+    unrecognized providers.
+    """
+    return _PROVIDER_AUTO_THRESHOLDS.get(provider_name, 0.80)
 
 _provider_instance = None
 # CR#1: lock the singleton init. Saga is called from mimir's
