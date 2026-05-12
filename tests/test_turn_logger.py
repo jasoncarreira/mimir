@@ -118,6 +118,37 @@ def test_tool_result_name_correlates_with_preceding_tool_call():
     }
 
 
+def test_extract_attaches_t_ms_from_message_timestamps():
+    """``message_t_ms`` flows through to each emitted event's ``t_ms``
+    field. Lets the turn viewer interleave events with saga_calls on
+    one chronological timeline. One AssistantMessage that produces
+    multiple events (reasoning + tool_call) shares its message's
+    timestamp across the derived events."""
+    msgs = [
+        _assistant(
+            TextBlock(text="thinking"),
+            ToolUseBlock(id="t1", name="echo", input={}),
+        ),
+        UserMessage(content=[ToolResultBlock(
+            tool_use_id="t1", content="ok", is_error=False,
+        )]),
+    ]
+    events, _ = extract_turn_events(msgs, message_t_ms=[12.0, 45.0])
+    assert [e["t_ms"] for e in events] == [12.0, 12.0, 45.0]
+
+
+def test_extract_omits_t_ms_when_message_timestamps_missing():
+    """Without ``message_t_ms``, events stay un-stamped (legacy shape).
+    Pre-PR turns don't have it, so the viewer falls back to the
+    two-section layout for them."""
+    msgs = [_assistant(TextBlock(text="hi"), ToolUseBlock(
+        id="t1", name="echo", input={},
+    ))]
+    events, _ = extract_turn_events(msgs)
+    for e in events:
+        assert "t_ms" not in e
+
+
 def test_extract_handles_full_turn_round_trip():
     msgs = [
         _assistant(

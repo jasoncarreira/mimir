@@ -902,12 +902,23 @@ class RecordingSagaClient:
             try:
                 ctx = _resolve_turn_ctx(kwargs)
                 if ctx is not None:
+                    # ``t_ms`` is start-relative, not finish-relative, so
+                    # the call appears on the timeline at the moment it
+                    # KICKED OFF (matches how operators read tool_call
+                    # events). Without a turn ctx (consolidation cron,
+                    # decay sweeps), t_ms stays None — the record still
+                    # carries latency_ms for diagnostics.
+                    t_ms: float | None = None
+                    ctx_started = getattr(ctx, "started_at", None)
+                    if ctx_started is not None:
+                        t_ms = (started - ctx_started) * 1000.0
                     ctx.saga_calls.append(SagaCallRecord(
                         call_type=call_type,
                         args=_summarize_args(call_type, args, kwargs),
                         result=_summarize_result(call_type, result, error),
                         latency_ms=elapsed_ms,
                         error=error,
+                        t_ms=t_ms,
                     ))
             except Exception:  # noqa: BLE001
                 # Observability must never break the loop. Swallow.
