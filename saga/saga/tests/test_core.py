@@ -180,8 +180,10 @@ class TestRetrieveMemoryTypeFilter:
 
         results = retrieve("Sony camera question", top_k=10)
         types = {r["memory_type"] for r in results}
-        # Both tiers should be representable in the unfiltered result.
-        assert "observation" in types or "raw" in types
+        # Both tiers should be representable in the unfiltered result —
+        # ``and`` not ``or``; the latter is vacuously true as long as
+        # the result has any atoms.
+        assert "observation" in types and "raw" in types
 
 
 class TestBatchCosine:
