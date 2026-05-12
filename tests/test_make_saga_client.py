@@ -200,6 +200,44 @@ async def test_inprocess_query_delegates_and_formats(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_inprocess_query_propagates_rewritten_query_when_present(monkeypatch):
+    """``_InProcessSaga.query`` MUST forward saga's ``rewritten_query``
+    field into its own response so ``RecordingSagaClient`` can surface
+    it in turns.jsonl. Saga only sets the key when the contextual
+    rewrite actually changed the query — its absence means "no-op or
+    disabled", not "ran but unchanged."
+    """
+    calls: dict[str, Any] = {}
+    _install_fake_saga(
+        monkeypatch, calls=calls,
+        query_result={
+            "observations": [], "raws": [], "triples": [],
+            "rewritten_query": "What is my Sony WH-1000XM5 model?",
+        },
+    )
+
+    client = _InProcessSaga()
+    result = await client.query(
+        "yes, that one", top_k=5, session_id="sid",
+        context=[{"role": "user", "content": "Tell me about my headphones"}],
+    )
+    assert result.get("rewritten_query") == "What is my Sony WH-1000XM5 model?"
+
+
+@pytest.mark.asyncio
+async def test_inprocess_query_omits_rewritten_query_when_absent(monkeypatch):
+    """When saga's response has no ``rewritten_query`` (the rewrite
+    path didn't fire or was a no-op), the in-process response MUST NOT
+    carry the key — caller distinguishes by presence."""
+    calls: dict[str, Any] = {}
+    _install_fake_saga(monkeypatch, calls=calls)  # default fake omits the key
+
+    client = _InProcessSaga()
+    result = await client.query("clean query", top_k=5, session_id="sid")
+    assert "rewritten_query" not in result
+
+
+@pytest.mark.asyncio
 async def test_inprocess_query_latency_includes_ensure_ready(monkeypatch):
     """Regression: ``latency_ms`` in the query response should include
     time spent in ``_ensure_ready``. The clock previously started inside

@@ -2436,6 +2436,13 @@ async def hybrid_retrieve(
     # two round-trips. The resulting hypothetical is reused below
     # instead of calling _hyde_query post-retrieval.
     pre_hypothetical: str | None = None
+    # Capture the pre-rewrite query so we can surface the actual
+    # rewrite (when one happened) in the response. Without this the
+    # rewritten text was used for retrieval but never returned —
+    # callers had no way to tell "rewrite fired but no-op" from
+    # "rewrite fired and changed the query." With ``enable_contextual_rewrite``
+    # on, rewrite-rate observability matters for tuning + bench.
+    _original_query = query
     _want_rewrite = (
         bool(context)
         and _cfg('retrieval', 'enable_contextual_rewrite', False)
@@ -2454,6 +2461,11 @@ async def hybrid_retrieve(
         _retrieval_log.info("path=rewrite_only")
     # else: no pre-retrieval LLM. HyDE may still fire post-retrieval
     # under the confidence gate — that path's logging lives below.
+    # None when no rewrite fired OR when the LLM returned the query
+    # unchanged (treated as a no-op — caller distinguishes by presence).
+    _rewritten_query: str | None = (
+        query if _want_rewrite and query != _original_query else None
+    )
 
     _sem_weight = _cfg('retrieval', 'semantic_weight', 0.7)
     _kw_weight = 1.0 - _sem_weight
@@ -2732,7 +2744,7 @@ async def hybrid_retrieve(
             for aid, score in obs_ranked:
                 if aid in obs_combined:
                     obs_combined[aid]["_combined_score"] = score
-            return _two_tier_split(
+            result = _two_tier_split(
                 obs_combined=obs_combined,
                 obs_ranked=obs_ranked,
                 raw_combined=combined,
@@ -2744,6 +2756,9 @@ async def hybrid_retrieve(
                 boost_cap_multiplier=_cfg('retrieval', 'evidence_boost_cap_multiplier', 3.0),
                 query_emb=cached_embed_query(query),
             )
+            if _rewritten_query is not None:
+                result["rewritten_query"] = _rewritten_query
+            return result
 
         # P1: observation bonus. Well-supported distilled beliefs (memory_type
         # = 'observation', evidence_count > 0) get a log-scaled multiplier so
