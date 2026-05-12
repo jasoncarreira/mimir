@@ -127,6 +127,51 @@ async def test_pre_message_hook_injects_atoms_and_post_credits_them(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_recording_saga_client_captures_pre_and_post_hook_calls(
+    tmp_path: Path,
+):
+    """Regression: ``_pre_message_hook`` fires before
+    ``_run_query_loop`` and ``_post_message_hook`` fires after — both
+    were previously outside the ``set_current_turn`` scope, so
+    ``RecordingSagaClient`` couldn't find the active TurnContext and
+    silently dropped per-turn ``saga_calls`` records. Hoisting the
+    contextvar/registry binding to ``run_turn`` covers both hooks.
+    """
+    from mimir.saga_client import RecordingSagaClient
+
+    inner = FakeSaga(
+        query_response={
+            "_raw_atoms": [
+                {"id": "atom-1", "stream": "semantic", "content": "x"},
+            ]
+        }
+    )
+    wrapped = RecordingSagaClient(inner)
+    agent = _build_agent(tmp_path, wrapped)
+
+    fake_q = _fake_query_yielding("ack")
+    with patch("mimir.agent.query", new=fake_q):
+        record = await agent.run_turn(
+            AgentEvent(
+                trigger="user_message",
+                channel_id="bench-1",
+                content="hello",
+                author="alice",
+            )
+        )
+
+    call_types = [c["call_type"] for c in record.saga_calls]
+    assert "query" in call_types, (
+        f"pre_message_hook saga.query not recorded; saga_calls={record.saga_calls}"
+    )
+    assert "feedback" in call_types, (
+        f"post_message_hook saga.feedback not recorded; saga_calls={record.saga_calls}"
+    )
+    # Ordering: pre-hook query fires before post-hook feedback.
+    assert call_types.index("query") < call_types.index("feedback")
+
+
+@pytest.mark.asyncio
 async def test_pre_message_hook_credits_triple_source_atoms(tmp_path: Path):
     """P42: when saga returns triples in the response, their
     source_atom_id values should also flow into ctx.saga_atom_ids so

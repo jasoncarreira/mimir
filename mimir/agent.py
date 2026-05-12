@@ -2138,8 +2138,13 @@ class Agent:
         Returns ``(messages, error)``. ``error`` is non-None when the
         query loop raised; downstream phases (post_query, finalize) can
         still run on a None ctx but generally short-circuit on error.
+
+        The ``_current_turn`` contextvar + ``_active_turns`` registry
+        are bound by ``run_turn``, not here — ``RecordingSagaClient`` /
+        ``resolve_active_ctx`` need the ctx to be findable during
+        ``_pre_message_hook`` (which fires before this method) and
+        during ``_post_message_hook`` (which fires after).
         """
-        token = _context.set_current_turn(ctx)
         messages: list = []
         error: str | None = None
         try:
@@ -2171,7 +2176,6 @@ class Agent:
                 error = f"{type(exc).__name__}: {exc}"
                 log.exception("query() failed for turn %s", ctx.turn_id)
         finally:
-            _context.reset_current_turn(token)
             # Stage 3: drop this turn's session entries from the store
             # so memory stays flat across long-lived processes. Runs
             # in finally so a query() crash still cleans up. Adapter
@@ -2287,6 +2291,30 @@ class Agent:
             ctx.saga_session_id = session.saga_session_id
             self._sessions.increment_turn_count(event.channel_id)
 
+        # Register the turn for the whole run_turn body — both the
+        # ``_current_turn`` contextvar and the ``_active_turns``
+        # registry. Was previously scoped to ``_run_query_loop`` only,
+        # which left ``_pre_message_hook``'s ``saga.query`` and the
+        # post-query ``saga.feedback`` call invisible to
+        # ``RecordingSagaClient`` — ``resolve_active_ctx`` couldn't find
+        # the ctx, so per-turn ``saga_calls`` records were dropped.
+        # Hoisting registration to cover the full turn fixes that
+        # without changing SDK fork semantics (the SDK's hook task is
+        # forked once at first connect; it still relies on the
+        # ``saga_session_id``-keyed lookup chain via ``args``).
+        _turn_token = _context.set_current_turn(ctx)
+        try:
+            return await self._run_turn_body(ctx, event)
+        finally:
+            _context.reset_current_turn(_turn_token)
+
+    async def _run_turn_body(
+        self, ctx: TurnContext, event: AgentEvent,
+    ) -> TurnRecord:
+        """The body of ``run_turn`` — extracted so the contextvar /
+        ``_active_turns`` registration in ``run_turn`` can wrap the
+        whole thing in one try/finally without indenting the method
+        by another level."""
         # Inbound → chat_history (skipped for synthesis turns; their
         # "input" is the turn-window block, not a real user message).
         await self._record_inbound(event)
