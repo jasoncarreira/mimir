@@ -24,6 +24,31 @@ batch_size = 50                                # max texts per API batch request
 # provider = "onnx"
 # model = "BAAI/bge-small-en-v1.5"         # auto-downloads from HuggingFace
 # dimensions = 384
+# # NOTE: bge-small's tighter cosine distribution cap-saturates saga's
+# # consolidator at the default threshold. See `[consolidation]
+# # similarity_threshold` below — recommend 0.92 with this provider.
+
+# OpenAI text-embedding-3-small (1536d, hosted, $0.02/1M tokens):
+# [embedding]
+# provider = "openai"
+# url = "https://api.openai.com/v1/embeddings"
+# model = "text-embedding-3-small"
+# dimensions = 1536
+# api_key_env = "OPENAI_API_KEY"
+# # Works cleanly at the default [consolidation] similarity_threshold = 0.80.
+
+# Voyage AI voyage-4-lite (1024d, hosted, $0.02/1M tokens + 200M free credit):
+# [embedding]
+# provider = "openai"                       # voyage uses OpenAI-compatible API shape
+# url = "https://api.voyageai.com/v1/embeddings"
+# model = "voyage-4-lite"
+# dimensions = 1024
+# api_key_env = "VOYAGE_API_KEY"
+# send_input_type = true                    # REQUIRED — voyage's models need
+#                                           # input_type ("query" / "document")
+#                                           # for retrieval-quality embeddings.
+# # NOTE: also bump [consolidation] similarity_threshold to 0.92 — voyage's
+# # tight retrieval-tuned distribution cap-saturates at 0.80.
 
 [storage]
 db_path = "db/saga.db"                      # relative to saga/ directory
@@ -135,7 +160,27 @@ supports_bonus = 0.5                        # activation bonus for supported ato
 approx_threshold = 50000                     # switch from exact to approximate FAISS at this atom count
 
 [consolidation]
-similarity_threshold = 0.80                 # cosine similarity to group atoms
+# Cosine similarity threshold to group atoms into merge candidates.
+# TUNE PER EMBEDDING MODEL — different providers produce different
+# cosine distributions, and the default 0.80 cap-saturates on tighter
+# distributions (bge-small, voyage-4-lite). Sweep-based recommendations:
+#
+#   Embedding model                          | Recommended threshold
+#   ----------------------------------------- | ----------------------
+#   NVIDIA NIM nv-embedqa-e5-v5               | 0.80 (default — clean)
+#   OpenAI text-embedding-3-small             | 0.80 (default — clean)
+#   OpenAI text-embedding-3-large             | 0.80 (likely clean, untuned)
+#   Voyage voyage-4-lite                      | 0.92 (caps 100% at 0.80)
+#   fastembed BAAI/bge-small-en-v1.5          | 0.92 (caps 98.8% at 0.80)
+#
+# Cap-saturation doesn't hurt accuracy (Phase 2A LongMemEval result —
+# the first 50 clusters capture the load-bearing merges) but wastes
+# ~2× wall-clock on consolidation. See saga README for the full table.
+#
+# SHORTCUT: set `similarity_threshold = "auto"` (string) and saga
+# resolves to the per-provider value at boot. Default for fresh
+# installs via `mimir setup`.
+similarity_threshold = 0.80
 min_cluster_size = 3                        # minimum atoms to form a cluster
 max_clusters_per_run = 50                   # cap clusters per consolidation run
 stability_reduction_factor = 0.5            # stability reduction for merged atoms
