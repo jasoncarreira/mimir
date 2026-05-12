@@ -190,7 +190,7 @@ tr:hover td{background:var(--surface2);cursor:pointer}
       <div class="events-list" id="detailSagaCalls"></div>
     </div>
     <div class="section">
-      <div class="section-label">Events (<span id="detailEventsCount">0</span>)</div>
+      <div class="section-label">Events (<span id="detailEventsCount">0</span>)<span id="detailSagaInline" style="display:none">, <span id="detailSagaInlineCount">0</span> saga</span></div>
       <div class="events-list" id="detailEvents"></div>
     </div>
     <div class="section">
@@ -520,9 +520,11 @@ function openDetail(turn) {
     && events.every(function(e){ return typeof e.t_ms === 'number'; });
 
   var sagaSection = document.getElementById('detailSagaCallsSection');
+  var sagaInlineCount = document.getElementById('detailSagaInline');
   if (canInterleave) {
     // Single chronological list. Hide the separate saga-calls section;
-    // events section header gets a count of both kinds.
+    // events section header shows "(N events, M saga)" so operators
+    // who think in saga-call count don't lose visibility.
     sagaSection.style.display = 'none';
     var combined = events.map(function(e){ return {kind:'event', t:e.t_ms, item:e}; })
       .concat(sagaCalls.map(function(c){ return {kind:'saga', t:c.t_ms, item:c}; }));
@@ -532,7 +534,9 @@ function openDetail(turn) {
     // dispatch in the natural read order even though their t_ms
     // may collide on the same message.
     combined.sort(function(a,b){ return a.t - b.t; });
-    document.getElementById('detailEventsCount').textContent = combined.length;
+    document.getElementById('detailEventsCount').textContent = events.length;
+    sagaInlineCount.style.display = '';
+    document.getElementById('detailSagaInlineCount').textContent = sagaCalls.length;
     var evList = document.getElementById('detailEvents');
     var seq = {ev: 0, saga: 0};
     evList.innerHTML = combined.map(function(entry){
@@ -551,6 +555,7 @@ function openDetail(turn) {
     // Legacy layout: separate saga-calls section above events. Used
     // for pre-t_ms turns (any turn recorded before the schema added
     // t_ms to events + saga_calls).
+    sagaInlineCount.style.display = 'none';
     if (sagaCalls.length) {
       sagaSection.style.display = '';
       document.getElementById('detailSagaCallsCount').textContent = sagaCalls.length;
