@@ -265,7 +265,7 @@ class _InProcessSaga:
                 obs, raws, floor=floor, gating_enabled=gating_enabled,
             )
 
-            return {
+            payload = {
                 "query": clamped, "mode": mode, "two_tier": True,
                 "gated": gated_reason is not None,
                 "gated_reason": gated_reason,
@@ -275,6 +275,15 @@ class _InProcessSaga:
                 "items_returned": len(obs) + len(raws),
                 "latency_ms": round((time.time() - t0) * 1000, 2),
             }
+            # Propagate the rewritten query (if any) from saga's
+            # response so RecordingSagaClient's summarizer can surface
+            # it in turns.jsonl. Saga only sets this key when rewrite
+            # actually changed the query — its absence means "no-op or
+            # disabled", not "ran but unchanged."
+            rewritten = result.get("rewritten_query")
+            if rewritten:
+                payload["rewritten_query"] = rewritten
+            return payload
         except SagaError:
             raise
         except Exception as exc:

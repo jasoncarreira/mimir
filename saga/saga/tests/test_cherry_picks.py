@@ -184,6 +184,117 @@ class TestContextualRewrite:
         assert await _resolve_contextual_query("yes, that", ctx) == "yes, that"
 
 
+class TestRewrittenQuerySurfaced:
+    """``hybrid_retrieve`` MUST surface the rewritten query in its
+    response (two-tier path) when ``enable_contextual_rewrite`` fired AND
+    produced a different query. Without this, callers see the rewrite
+    LLM fire (via the ``path=rewrite_only`` log line) but have no way
+    to tell whether the rewrite was a no-op or actually changed the
+    query — measured rewrite rate becomes unanswerable.
+
+    Contract:
+
+    - Rewrite fired AND changed the query → ``result["rewritten_query"]``
+      is set to the new query string.
+    - Rewrite fired but LLM returned the original (or empty/whitespace,
+      which the helper treats as a no-op) → key absent.
+    - Rewrite disabled (flag off, no api key, no context) → key absent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rewrite_changes_query_surfaces_in_response(
+        self, cfg_override, monkeypatch,
+    ):
+        from saga.core import hybrid_retrieve, store_atom
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        cfg_override["retrieval"]["two_tier_enabled"] = True
+        monkeypatch.setattr(
+            "saga.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "k", "timeout": 5},
+        )
+
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {
+                    "content": "What is the model number of my Sony headphones?"
+                }}]}
+        monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
+
+        store_atom("Sony WH-1000XM5 — bought in Boston, $399, March 2026.")
+        ctx = [{"role": "user", "content": "Tell me about my Sony headphones"}]
+
+        result = await hybrid_retrieve(
+            "yes, that one", top_k=5, two_tier=True, context=ctx,
+        )
+        assert "rewritten_query" in result, (
+            "rewritten_query must surface in the response when rewrite "
+            f"actually changed the query. Got keys: {sorted(result.keys())}"
+        )
+        assert "Sony" in result["rewritten_query"]
+
+    @pytest.mark.asyncio
+    async def test_rewrite_no_op_omits_key(self, cfg_override, monkeypatch):
+        """LLM returns the original query unchanged — no rewrite
+        happened, so the response must NOT carry the field. Caller
+        distinguishes 'no rewrite' from 'rewrite ran' by key presence."""
+        from saga.core import hybrid_retrieve, store_atom
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        cfg_override["retrieval"]["two_tier_enabled"] = True
+        monkeypatch.setattr(
+            "saga.config.resolve_llm_config",
+            lambda subsystem: {"url": "u", "model": "m", "api_key": "k", "timeout": 5},
+        )
+
+        # LLM returns the SAME query — treated as a no-op rewrite.
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {
+                    "content": "What is my Sony headphone model?"
+                }}]}
+        monkeypatch.setattr("requests.post", lambda *a, **kw: _Resp())
+
+        store_atom("Sony WH-1000XM5 — Boston, $399.")
+        ctx = [{"role": "user", "content": "Tell me about my headphones"}]
+
+        result = await hybrid_retrieve(
+            "What is my Sony headphone model?", top_k=5, two_tier=True, context=ctx,
+        )
+        assert "rewritten_query" not in result, (
+            f"rewritten_query must be absent when LLM returned the "
+            f"original query unchanged. Got: {result.get('rewritten_query')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rewrite_disabled_omits_key(self, cfg_override):
+        """Flag off → no rewrite path → no key."""
+        from saga.core import hybrid_retrieve, store_atom
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = False
+        cfg_override["retrieval"]["two_tier_enabled"] = True
+
+        store_atom("Sony WH-1000XM5 — Boston, $399.")
+        ctx = [{"role": "user", "content": "Tell me about my headphones"}]
+
+        result = await hybrid_retrieve(
+            "yes, that", top_k=5, two_tier=True, context=ctx,
+        )
+        assert "rewritten_query" not in result
+
+    @pytest.mark.asyncio
+    async def test_no_context_omits_key(self, cfg_override):
+        """No context passed → rewrite skipped → no key."""
+        from saga.core import hybrid_retrieve, store_atom
+        cfg_override.setdefault("retrieval", {})["enable_contextual_rewrite"] = True
+        cfg_override["retrieval"]["two_tier_enabled"] = True
+
+        store_atom("Sony WH-1000XM5 — Boston, $399.")
+        result = await hybrid_retrieve(
+            "yes, that", top_k=5, two_tier=True, context=None,
+        )
+        assert "rewritten_query" not in result
+
+
 # ─── P38: confidence-gated HyDE ──────────────────────────────────────────
 
 class TestHydeHelper:
