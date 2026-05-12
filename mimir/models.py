@@ -107,6 +107,60 @@ class TurnContext:
     # rationale as task_descriptions. Empty dict when the hook didn't
     # populate it (e.g. tests that drive ``finalize`` directly).
     wiki_mtime_snapshot: dict[str, float] = field(default_factory=dict)
+    # Per-turn saga call audit log. Populated by the
+    # ``RecordingSagaClient`` wrapper around every saga method invocation
+    # (query / store / feedback / mark_contributions / end_session /
+    # contextual rewrite). Surfaces in turns.jsonl so the turn viewer
+    # can show "what saga did this turn" without joining to events.jsonl.
+    # Each entry: ``SagaCallRecord`` (call type, args summary, result
+    # summary, latency_ms, error). Empty when no saga calls fired (e.g.
+    # synthetic ticks with no inbound, scheduled callables).
+    saga_calls: list[SagaCallRecord] = field(default_factory=list)
+
+
+@dataclass
+class SagaCallRecord:
+    """One saga API call captured during a turn.
+
+    Recorded by ``RecordingSagaClient`` (mimir/saga_client.py) which
+    wraps the underlying ``_InProcessSaga`` / ``_HttpSaga`` and appends
+    to ``TurnContext.saga_calls`` on every method invocation. The
+    rollup writes these into ``turns.jsonl`` so the turn viewer can
+    display saga's per-turn behavior inline without joining to
+    events.jsonl.
+
+    Field rationale:
+    - ``call_type`` — saga method name (``query`` / ``store`` /
+      ``feedback`` / ``mark_contributions`` / ``end_session`` /
+      ``rewrite``). ``rewrite`` is the contextual-rewrite path that
+      fires inside ``query`` when a non-empty ``context`` is passed.
+    - ``args`` — input summary as a JSON-able dict. Strings are
+      truncated to 200 chars to bound row size. Full content lives
+      in events.jsonl if needed.
+    - ``result`` — output summary (atom IDs retrieved, atom ID stored,
+      etc.). Bounded for the same reason.
+    - ``latency_ms`` — wall-clock duration of the call.
+    - ``error`` — exception message if the call raised, else ``None``.
+      An errored call still produces a record so the turn viewer can
+      surface failures.
+    """
+
+    call_type: str
+    args: dict
+    result: dict
+    latency_ms: float
+    error: str | None = None
+
+    def to_dict(self) -> dict:
+        out = {
+            "call_type": self.call_type,
+            "args": self.args,
+            "result": self.result,
+            "latency_ms": round(self.latency_ms, 2),
+        }
+        if self.error is not None:
+            out["error"] = self.error
+        return out
 
 
 @dataclass
@@ -142,6 +196,13 @@ class TurnRecord:
     # final ``total_cost_usd`` and ``modelUsage`` flow through here so
     # ``aggregate_usage`` sees plan-window spend natively.
     kind: str | None = None
+    # Inline saga call audit. Each entry is a ``SagaCallRecord.to_dict()``
+    # populated by ``RecordingSagaClient`` during the turn. Empty list
+    # for turns that didn't touch saga (synthetic ticks, no-op heartbeats,
+    # synthesis turns that didn't call back). Surfaces in the turn viewer
+    # so "what saga did this turn" is visible inline without joining to
+    # events.jsonl.
+    saga_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 def make_turn_id() -> str:
