@@ -58,11 +58,32 @@ EMBED_QUERY_CACHE_SIZE = 64
 class Embedder(Protocol):
     dim: int
 
-    def embed(self, texts: list[str]) -> list[list[float]]: ...
+    def embed(
+        self, texts: list[str], input_type: str = "passage",
+    ) -> list[list[float]]:
+        """Embed a batch of texts.
+
+        ``input_type`` distinguishes document/passage embedding (the
+        default — what you call when indexing file content) from query
+        embedding (what you call to embed a search string). Providers
+        like Voyage produce DIFFERENT vectors for the two — passing the
+        right input_type at query time is a material recall win.
+        FastEmbedder and HashEmbedder ignore it (no asymmetric query/
+        doc model); SagaProviderEmbedder routes it through saga's
+        provider chain.
+        """
 
 
 class FastEmbedder:
-    """Wraps ``fastembed.TextEmbedding``. Lazy-loads the ONNX model on first use."""
+    """Wraps ``fastembed.TextEmbedding`` directly. Lazy-loads the ONNX
+    model on first use.
+
+    Kept as a back-compat / test-fallback for the rare case where
+    callers want to pin file_search to bge-small specifically without
+    going through saga's provider chain. The Indexer's default
+    embedder is now ``SagaProviderEmbedder`` — file_search and saga
+    atoms share one embedding provider so the cosine spaces align.
+    """
 
     def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5", dim: int = 384) -> None:
         self._model_name = model_name
@@ -78,13 +99,77 @@ class FastEmbedder:
 
                     self._impl = TextEmbedding(model_name=self._model_name)
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(
+        self, texts: list[str], input_type: str = "passage",
+    ) -> list[list[float]]:
+        # ``input_type`` ignored — fastembed's bge-small treats query
+        # and passage embeddings identically at this entry point.
+        del input_type
         if not texts:
             return []
         self._ensure()
         # ``list(v)`` on a numpy array yields np.float32 scalars — coerce to
         # Python floats here so cosines, scores, and json.dumps all stay clean.
         return [[float(x) for x in v] for v in self._impl.embed(texts)]  # type: ignore[union-attr]
+
+
+class SagaProviderEmbedder:
+    """Routes file_search embeddings through saga's configured provider.
+
+    Default Indexer embedder. Same provider as saga atoms — one model
+    download, one cosine space, one config knob in saga.toml drives
+    both surfaces. Picks up voyage / openai / fastembed / nvidia-nim
+    based on the ``[embedding] provider`` in the active saga.toml.
+
+    Lazy initialization: defer the provider instantiation until first
+    ``embed()`` call so Indexer construction stays cheap (matches
+    FastEmbedder's lazy-load semantics). ``dim`` resolves at the first
+    embed too (saga's provider only knows its dimension after model
+    config is read).
+
+    For tests that want offline / no-API behavior, pass ``HashEmbedder``
+    explicitly to the Indexer constructor instead.
+    """
+
+    def __init__(self) -> None:
+        self._provider = None
+        self._dim: int | None = None
+        self._lock = threading.Lock()
+
+    def _ensure(self) -> None:
+        if self._provider is None:
+            with self._lock:
+                if self._provider is None:
+                    from saga.embeddings import get_provider
+
+                    provider = get_provider()
+                    self._dim = provider.dimensions()
+                    # Assign provider LAST so concurrent readers see a
+                    # fully-initialized object (Python attribute writes
+                    # are atomic under the GIL, but we want both fields
+                    # visible together).
+                    self._provider = provider
+
+    @property
+    def dim(self) -> int:
+        if self._dim is None:
+            self._ensure()
+        return self._dim  # type: ignore[return-value]
+
+    def embed(
+        self, texts: list[str], input_type: str = "passage",
+    ) -> list[list[float]]:
+        if not texts:
+            return []
+        self._ensure()
+        # Forward ``input_type`` to saga's provider. For voyage this
+        # becomes the "document" or "query" instruction prefix — a
+        # real recall win at query time. For OpenAI the parameter is
+        # dropped (unknown to OpenAI's API). For fastembed/onnx the
+        # BGE-specific query_embed entry point is used when
+        # input_type="query".
+        vecs = self._provider.batch_embed(texts, input_type=input_type)  # type: ignore[union-attr]
+        return [[float(x) for x in v] for v in vecs]
 
 
 class HashEmbedder:
@@ -94,7 +179,12 @@ class HashEmbedder:
 
     dim = 16
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(
+        self, texts: list[str], input_type: str = "passage",
+    ) -> list[list[float]]:
+        # ``input_type`` ignored — hash-derived fake doesn't model
+        # query/doc asymmetry.
+        del input_type
         import hashlib
 
         out: list[list[float]] = []
@@ -282,7 +372,11 @@ class Indexer:
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     ) -> None:
         self._home = home
-        self._embedder: Embedder = embedder or FastEmbedder()
+        # Default routes through saga's configured provider so file_search
+        # embeddings live in the same cosine space as saga atoms — one
+        # ``[embedding] provider`` setting drives both surfaces. Tests
+        # pin ``HashEmbedder`` explicitly to stay offline.
+        self._embedder: Embedder = embedder or SagaProviderEmbedder()
         self._db_path = db_path or (home / ".mimir" / "index.db")
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
@@ -365,8 +459,13 @@ class Indexer:
 
     def _embed_query_uncached(self, text: str) -> tuple[float, ...]:
         """Single-query embed; tuple return is hashable + immutable so the
-        LRU value can't be mutated by callers."""
-        return tuple(self._embedder.embed([text])[0])
+        LRU value can't be mutated by callers.
+
+        Passes ``input_type="query"`` so providers that distinguish
+        query vs document embeddings (voyage, BGE) produce the right
+        vector for the retrieval-side cosine.
+        """
+        return tuple(self._embedder.embed([text], input_type="query")[0])
 
     async def stats(self) -> IndexerStats:
         return await asyncio.to_thread(self._stats_sync)

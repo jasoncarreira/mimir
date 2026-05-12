@@ -308,9 +308,9 @@ class _CountingEmbedder(HashEmbedder):
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
 
-    def embed(self, texts):  # type: ignore[override]
+    def embed(self, texts, input_type: str = "passage"):  # type: ignore[override]
         self.calls.append(list(texts))
-        return super().embed(texts)
+        return super().embed(texts, input_type=input_type)
 
 
 @pytest.mark.asyncio
@@ -444,3 +444,86 @@ async def test_post_tool_use_hook_reindexes_after_write(tmp_path: Path):
 
     results = await idx.search("relativity", scope="memory", k=5)
     assert any("relativity.md" in r.path for r in results)
+
+
+# ---- SagaProviderEmbedder routing (PR feat/mimir-file-search-via-saga-provider) ----
+
+
+class _MockSagaProvider:
+    """In-memory provider that records calls. Lets us verify
+    SagaProviderEmbedder threads ``input_type`` through to saga's
+    provider chain without actually loading any embedding model."""
+
+    def __init__(self, dim: int = 8):
+        self._dim = dim
+        self.calls: list[tuple[list[str], str]] = []
+
+    def dimensions(self) -> int:
+        return self._dim
+
+    def batch_embed(self, texts: list[str], input_type: str = "passage"):
+        self.calls.append((list(texts), input_type))
+        # Return deterministic-ish fake embeddings — index encodes input_type
+        # so a query call vs passage call produce DIFFERENT vectors (the
+        # whole point of the input_type plumbing).
+        tag = 0.5 if input_type == "query" else 0.1
+        return [[tag + i * 0.01 for i in range(self._dim)] for _ in texts]
+
+
+def test_saga_provider_embedder_dimensions_lazy(monkeypatch):
+    """``SagaProviderEmbedder.dim`` defers provider construction until
+    first access — matches FastEmbedder's lazy-load semantics."""
+    from mimir.search import SagaProviderEmbedder
+    import saga.embeddings as saga_emb
+
+    construction_count = [0]
+
+    def fake_get_provider():
+        construction_count[0] += 1
+        return _MockSagaProvider(dim=384)
+
+    monkeypatch.setattr(saga_emb, "get_provider", fake_get_provider)
+    emb = SagaProviderEmbedder()
+    assert construction_count[0] == 0  # not yet
+    assert emb.dim == 384  # triggers init
+    assert construction_count[0] == 1
+    _ = emb.dim  # cached
+    assert construction_count[0] == 1
+
+
+def test_saga_provider_embedder_passes_input_type(monkeypatch):
+    """SagaProviderEmbedder threads ``input_type`` through to the
+    saga provider's batch_embed — the load-bearing fix that lets
+    voyage produce different query-vs-document embeddings."""
+    from mimir.search import SagaProviderEmbedder
+    import saga.embeddings as saga_emb
+
+    mock = _MockSagaProvider(dim=4)
+    monkeypatch.setattr(saga_emb, "get_provider", lambda: mock)
+
+    emb = SagaProviderEmbedder()
+    emb.embed(["a doc"], input_type="passage")
+    emb.embed(["a query"], input_type="query")
+
+    assert len(mock.calls) == 2
+    assert mock.calls[0] == (["a doc"], "passage")
+    assert mock.calls[1] == (["a query"], "query")
+
+
+def test_saga_provider_embedder_empty_input_skips_provider(monkeypatch):
+    """Empty input list short-circuits before touching the provider —
+    avoids needlessly initializing voyage/openai/fastembed on a no-op."""
+    from mimir.search import SagaProviderEmbedder
+    import saga.embeddings as saga_emb
+
+    construction_count = [0]
+
+    def fake_get_provider():
+        construction_count[0] += 1
+        return _MockSagaProvider()
+
+    monkeypatch.setattr(saga_emb, "get_provider", fake_get_provider)
+    emb = SagaProviderEmbedder()
+    result = emb.embed([], input_type="passage")
+    assert result == []
+    assert construction_count[0] == 0  # never initialized
