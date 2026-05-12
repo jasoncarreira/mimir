@@ -2396,6 +2396,7 @@ class Agent:
             total_cost_usd=result_msg.total_cost_usd if result_msg else None,
             usage=result_msg.usage if result_msg else None,
             permission_denials=list(result_msg.permission_denials or []) if result_msg else [],
+            saga_calls=[r.to_dict() for r in ctx.saga_calls],
         )
         await self._turn_logger.write(record)
 

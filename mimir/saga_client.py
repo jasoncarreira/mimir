@@ -805,11 +805,256 @@ class _HttpSaga:
 # ─── Factory ─────────────────────────────────────────────────────
 
 
+class RecordingSagaClient:
+    """Transparent wrapper that appends a ``SagaCallRecord`` to the
+    current ``TurnContext.saga_calls`` on every method invocation.
+
+    The recording is a side-effect only — args + result pass through
+    unchanged. When no current turn is registered (saga calls from
+    consolidation cron, decay sweeps, etc.), the wrapper silently
+    skips the append; only turn-scoped calls produce records.
+
+    Records carry compact arg/result summaries (strings truncated to
+    200 chars) so turns.jsonl row size stays bounded. Full saga
+    detail still goes to events.jsonl via the existing
+    ``saga_query_ctx_resolution`` / ``saga_store_ctx_resolution`` /
+    etc. events — these records are the inline view, not a
+    replacement.
+
+    Errors during a saga call produce a record with ``error`` set and
+    re-raise so callers see the original exception. Errors during
+    the recording itself (e.g. TurnContext shape drift) are swallowed
+    — observability must never break the agent loop.
+    """
+
+    # Methods we wrap. Anything not in this list passes through
+    # __getattr__ unchanged (e.g. private helpers, future additions
+    # that don't need recording).
+    #
+    # Note: ``mark_contributions`` is intentionally NOT here — mimir
+    # uses ``feedback()`` for the credit-pass call (see
+    # ``agent.py:_post_message_hook``, line 1859). There's no
+    # ``mark_contributions`` method on ``_InProcessSaga`` or
+    # ``_HttpSaga`` either; adding it to this set would AttributeError
+    # at runtime.
+    _RECORDED_METHODS = frozenset({
+        "query", "store", "feedback", "outcome", "end_session",
+        "consolidate", "decay", "forget",
+    })
+
+    def __init__(self, inner: SagaClient) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str):
+        """Default-passthrough — for anything not in
+        ``_RECORDED_METHODS`` (e.g. ``recent_session_boundaries``,
+        ``most_retrieved_atoms``, private helpers on the wrapped
+        impl), forward to ``self._inner`` unchanged. Recorded methods
+        are defined explicitly below."""
+        return getattr(self._inner, name)
+
+    async def query(self, *args, **kwargs):
+        return await self._call("query", self._inner.query, args, kwargs)
+
+    async def store(self, *args, **kwargs):
+        return await self._call("store", self._inner.store, args, kwargs)
+
+    async def feedback(self, *args, **kwargs):
+        return await self._call("feedback", self._inner.feedback, args, kwargs)
+
+    async def outcome(self, *args, **kwargs):
+        return await self._call("outcome", self._inner.outcome, args, kwargs)
+
+    async def end_session(self, *args, **kwargs):
+        return await self._call(
+            "end_session", self._inner.end_session, args, kwargs,
+        )
+
+    async def consolidate(self, *args, **kwargs):
+        return await self._call(
+            "consolidate", self._inner.consolidate, args, kwargs,
+        )
+
+    async def decay(self, *args, **kwargs):
+        return await self._call("decay", self._inner.decay, args, kwargs)
+
+    async def forget(self, *args, **kwargs):
+        return await self._call("forget", self._inner.forget, args, kwargs)
+
+    async def _call(
+        self, call_type: str, fn, args: tuple, kwargs: dict,
+    ):
+        """Common dispatch — time the call, capture args + result,
+        append to TurnContext.saga_calls, re-raise any exception."""
+        import time as _time
+        from .models import SagaCallRecord
+        started = _time.monotonic()
+        error: str | None = None
+        result: Any = None
+        try:
+            result = await fn(*args, **kwargs)
+            return result
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            elapsed_ms = (_time.monotonic() - started) * 1000.0
+            try:
+                ctx = _resolve_turn_ctx(kwargs)
+                if ctx is not None:
+                    ctx.saga_calls.append(SagaCallRecord(
+                        call_type=call_type,
+                        args=_summarize_args(call_type, args, kwargs),
+                        result=_summarize_result(call_type, result, error),
+                        latency_ms=elapsed_ms,
+                        error=error,
+                    ))
+            except Exception:  # noqa: BLE001
+                # Observability must never break the loop. Swallow.
+                pass
+
+
+def _resolve_turn_ctx(kwargs: dict):
+    """Resolve the active TurnContext via the three-level chain that
+    works across MCP-dispatched + in-process saga calls.
+
+    The MCP tools (``saga_query`` / ``saga_store`` / ``saga_feedback``
+    / ``saga_end_session``) run on a fresh task forked by the SDK's
+    control-protocol handler. That task captured the
+    ``_current_turn`` contextvar at fork time (= ``None``) and never
+    sees later ``set()`` calls in ``run_turn`` (see
+    ``mimir/_context.py`` module docstring + chainlink #23 design).
+    A bare ``get_current_turn()`` lookup from this wrapper returns
+    ``None`` on every model-driven saga call — exactly the most
+    important calls to record.
+
+    ``_context.resolve_active_ctx`` is the canonical three-level
+    chain that survives the task-fork boundary:
+    1. ``kwargs["session_id"]`` → match against
+       ``ctx.saga_session_id`` in ``_active_turns`` (multi-channel
+       safe; required because the SDK forks per-call)
+    2. ``get_only_active_turn()`` — works in single-channel
+       deployments where the dispatcher serializes turns
+    3. ``get_current_turn()`` — works for direct-handler-call paths
+       (mimir's pre/post-message hooks, sagatools tests)
+
+    Returns ``None`` if all three miss (saga calls from consolidation
+    cron, decay sweeps, etc., have no active turn — that's by design).
+    """
+    from ._context import resolve_active_ctx
+    ctx, _resolution = resolve_active_ctx(kwargs or {})
+    return ctx
+
+
+# Per-call-type arg/result summarizers. Truncate strings to 200 chars
+# so turns.jsonl row size stays bounded; full detail lives in
+# events.jsonl. Keep keys stable — turn viewer renders them.
+
+_TRUNC_CHARS = 200
+
+
+def _trunc(s: Any) -> Any:
+    if isinstance(s, str) and len(s) > _TRUNC_CHARS:
+        return s[: _TRUNC_CHARS - 1] + "…"
+    return s
+
+
+def _summarize_args(call_type: str, args: tuple, kwargs: dict) -> dict:
+    """Compact, bounded summary of the call's input. Each call_type
+    has a known signature, so this is a positional-vs-kwargs unify."""
+    if call_type == "query":
+        return {
+            "query": _trunc(args[0] if args else kwargs.get("query", "")),
+            "top_k": kwargs.get("top_k"),
+            "mode": kwargs.get("mode"),
+            "min_confidence_tier": kwargs.get("min_confidence_tier"),
+            "session_id": kwargs.get("session_id"),
+            "context_present": bool(kwargs.get("context")),
+        }
+    if call_type == "store":
+        return {
+            "content": _trunc(args[0] if args else kwargs.get("content", "")),
+            "stream": kwargs.get("stream"),
+            "profile": kwargs.get("profile"),
+            "source_type": kwargs.get("source_type"),
+        }
+    if call_type == "feedback":
+        atom_ids = args[0] if args else kwargs.get("atom_ids", [])
+        return {
+            "atom_ids": list(atom_ids) if atom_ids else [],
+            "response_text": _trunc(
+                args[1] if len(args) > 1 else kwargs.get("response_text", "")
+            ),
+            "feedback": kwargs.get("feedback"),
+        }
+    if call_type == "outcome":
+        atom_ids = args[0] if args else kwargs.get("atom_ids", [])
+        return {
+            "atom_ids": list(atom_ids) if atom_ids else [],
+            "feedback": args[1] if len(args) > 1 else kwargs.get("feedback"),
+            "query": _trunc(kwargs.get("query") or ""),
+        }
+    if call_type == "end_session":
+        return {
+            "session_id": args[0] if args else kwargs.get("session_id"),
+            "summary": _trunc(
+                args[1] if len(args) > 1 else kwargs.get("summary", "")
+            ),
+            "topics_discussed": kwargs.get("topics_discussed") or [],
+            "decisions_made_count": len(kwargs.get("decisions_made") or []),
+            "unfinished_count": len(kwargs.get("unfinished") or []),
+        }
+    # Default: shallow copy with truncation. Covers outcome / consolidate /
+    # decay / forget — the per-call shapes are operator-tunable enough
+    # that hardcoded summarizers would drift faster than the dict shape
+    # itself. The 200-char string truncation bounds size regardless.
+    return {"args": [_trunc(a) for a in args], **{k: _trunc(v) for k, v in kwargs.items()}}
+
+
+def _summarize_result(
+    call_type: str, result: Any, error: str | None,
+) -> dict:
+    """Compact, bounded summary of the call's output."""
+    if error is not None:
+        return {"ok": False}
+    if not isinstance(result, dict):
+        # Some clients return list (e.g. recent_session_boundaries —
+        # not in _RECORDED_METHODS so this is a safety net).
+        return {"ok": True, "type": type(result).__name__}
+    if call_type == "query":
+        # saga returns {atoms: [...]} or {observations, raws, triples}.
+        atom_ids = []
+        for k in ("atoms", "observations", "raws"):
+            for a in (result.get(k) or []):
+                if isinstance(a, dict) and a.get("id"):
+                    atom_ids.append(a["id"])
+        return {
+            "ok": True,
+            "atom_ids": atom_ids[:50],  # bounded
+            "atom_count": len(atom_ids),
+            "rewritten_query": _trunc(result.get("rewritten_query") or ""),
+        }
+    if call_type == "store":
+        return {
+            "ok": True,
+            "atom_id": result.get("atom_id") or result.get("id"),
+        }
+    if call_type == "feedback":
+        return {
+            "ok": True,
+            "marked": result.get("marked"),
+            "total": result.get("total"),
+        }
+    # Default: just status.
+    return {"ok": True}
+
+
 def make_saga_client(
     endpoint: str | None = None,
     api_key: str | None = None,
     *,
     timeout_s: float = 30.0,
+    record_calls: bool = True,
 ) -> SagaClient:
     """Pick the right implementation based on ``endpoint``.
 
@@ -820,10 +1065,21 @@ def make_saga_client(
     saga.core works in either case. The HTTP path is just there for
     operators who explicitly want a separate saga deployment (shared
     saga across multiple agents, scaling, dev pointing at staging).
+
+    ``record_calls`` (default True): wrap the underlying client in
+    ``RecordingSagaClient`` so each call appends a ``SagaCallRecord``
+    to the active ``TurnContext.saga_calls``. Set False for tests
+    that want to inspect the bare client without recording overhead.
     """
     if not endpoint or _is_localhost(endpoint):
-        return _InProcessSaga()
-    return _HttpSaga(endpoint=endpoint, api_key=api_key, timeout_s=timeout_s)
+        inner: SagaClient = _InProcessSaga()
+    else:
+        inner = _HttpSaga(
+            endpoint=endpoint, api_key=api_key, timeout_s=timeout_s,
+        )
+    if record_calls:
+        return RecordingSagaClient(inner)  # type: ignore[return-value]
+    return inner
 
 
 def _is_localhost(endpoint: str) -> bool:
