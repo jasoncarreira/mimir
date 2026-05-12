@@ -91,6 +91,71 @@ def test_setup_writes_saga_toml(tmp_path: Path):
     assert str(home / ".mimir" / "saga.db") in body
 
 
+# ── --embedding preset tests (PR #144 review nit #4) ─────────────────
+
+
+def test_setup_embedding_default_is_voyage(tmp_path: Path):
+    """Per the Phase 3 LongMemEval cross-bench result, voyage is the
+    new canonical default. Status dict records the chosen preset."""
+    home = tmp_path / "agent"
+    status = setup_home(home)
+    assert status["embedding_preset"] == "voyage"
+    body = (home / "saga.toml").read_text()
+    assert 'provider = "voyage"' in body
+    assert 'model = "voyage-4-lite"' in body
+    assert 'api_key_env = "VOYAGE_API_KEY"' in body
+
+
+def test_setup_embedding_openai_preset(tmp_path: Path):
+    home = tmp_path / "agent"
+    status = setup_home(home, embedding="openai")
+    assert status["embedding_preset"] == "openai"
+    body = (home / "saga.toml").read_text()
+    assert 'provider = "openai"' in body
+    assert 'model = "text-embedding-3-small"' in body
+    assert 'api_key_env = "OPENAI_API_KEY"' in body
+
+
+def test_setup_embedding_fastembed_preset(tmp_path: Path):
+    """Local-only preset — no api_key_env, fully offline-capable."""
+    home = tmp_path / "agent"
+    status = setup_home(home, embedding="fastembed")
+    assert status["embedding_preset"] == "fastembed"
+    body = (home / "saga.toml").read_text()
+    assert 'provider = "onnx"' in body
+    assert 'model = "BAAI/bge-small-en-v1.5"' in body
+    # No api_key_env line — local provider doesn't need one.
+    assert "api_key_env" not in body.split("[llm]")[0]
+
+
+def test_setup_embedding_nvidia_nim_preset(tmp_path: Path):
+    home = tmp_path / "agent"
+    status = setup_home(home, embedding="nvidia-nim")
+    assert status["embedding_preset"] == "nvidia-nim"
+    body = (home / "saga.toml").read_text()
+    assert 'provider = "nvidia-nim"' in body
+    assert 'model = "nvidia/nv-embedqa-e5-v5"' in body
+    assert 'api_key_env = "NVIDIA_NIM_API_KEY"' in body
+
+
+def test_setup_all_presets_write_auto_threshold_sentinel(tmp_path: Path):
+    """Regardless of preset, [consolidation] similarity_threshold should
+    be the "auto" sentinel — saga resolves per-provider at boot."""
+    from mimir.cli import EMBEDDING_PRESETS
+    for preset in EMBEDDING_PRESETS:
+        home = tmp_path / f"agent_{preset}"
+        setup_home(home, embedding=preset)
+        body = (home / "saga.toml").read_text()
+        assert 'similarity_threshold = "auto"' in body, \
+            f"preset {preset} missing auto-threshold sentinel"
+
+
+def test_setup_invalid_preset_raises(tmp_path: Path):
+    home = tmp_path / "agent"
+    with pytest.raises(ValueError, match="unknown embedding preset"):
+        setup_home(home, embedding="does-not-exist")
+
+
 def test_setup_saga_toml_uses_generated_saga_api_key(tmp_path: Path):
     """saga.toml's [server] api_key should match SAGA_API_KEY in .env so
     that flipping to external-saga later doesn't require re-running setup."""

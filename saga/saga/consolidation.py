@@ -28,7 +28,40 @@ _cfg = get_config()
 
 # ─── Configuration ──────────────────────────────────────────────
 
-DEFAULT_SIMILARITY_THRESHOLD = _cfg('consolidation', 'similarity_threshold', 0.80)
+def _resolve_threshold() -> float:
+    """Read ``[consolidation] similarity_threshold`` from config.
+
+    Supports the special string sentinel ``"auto"`` which resolves to
+    a per-provider recommended value via
+    ``saga.embeddings.resolve_auto_threshold``. Useful when the
+    operator wants the threshold to track the embedding provider
+    without manual tuning — e.g., a fresh ``mimir setup --embedding
+    voyage`` writes ``similarity_threshold = "auto"`` and the value
+    resolves to 0.92 (voyage's recommended threshold) at boot.
+
+    Falls back to numeric 0.80 (saga's historical default) for any
+    other unrecognized non-numeric value.
+    """
+    raw = _cfg('consolidation', 'similarity_threshold', 0.80)
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str) and raw.strip().lower() == "auto":
+        from .embeddings import resolve_auto_threshold
+        provider = _cfg('embedding', 'provider', 'nvidia-nim')
+        resolved = resolve_auto_threshold(provider)
+        logger.info(
+            "[consolidation] similarity_threshold='auto' resolved to "
+            "%.2f for provider=%r", resolved, provider,
+        )
+        return resolved
+    logger.warning(
+        "[consolidation] similarity_threshold=%r is not numeric or "
+        "'auto'; falling back to 0.80", raw,
+    )
+    return 0.80
+
+
+DEFAULT_SIMILARITY_THRESHOLD = _resolve_threshold()
 DEFAULT_MIN_CLUSTER_SIZE = _cfg('consolidation', 'min_cluster_size', 3)
 DEFAULT_MAX_CLUSTERS = _cfg('consolidation', 'max_clusters_per_run', 50)
 DEFAULT_STABILITY_REDUCTION = _cfg('consolidation', 'stability_reduction_factor', 0.5)

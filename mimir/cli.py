@@ -587,7 +587,103 @@ DEFAULT_ISSUES_README = dedent(
 )
 
 
-def _default_saga_toml(home: Path, api_key: str) -> str:
+#: Supported ``--embedding`` preset names for ``mimir setup``.
+#: Each preset writes a tailored ``[embedding]`` block in the
+#: generated saga.toml. Voyage is the default per the LongMemEval
+#: cross-bench (Phase 3, 2026-05-12): voyage-4-lite beat OpenAI
+#: text-embedding-3-small by 2.4pp aggregate / 4.5pp multi-session.
+#:
+#: Note: the operator-facing preset name "fastembed" maps to saga's
+#: provider name "onnx" in the generated saga.toml — saga's provider
+#: class is ``ONNXProvider`` (fastembed under the hood; saga's
+#: registry key predates the fastembed library merger). The
+#: ``mimir setup --embedding fastembed`` shortcut is meant to be
+#: discoverable; operators reading saga.toml will see
+#: ``provider = "onnx"`` and need to know they're the same thing.
+EMBEDDING_PRESETS: tuple[str, ...] = ("voyage", "openai", "fastembed", "nvidia-nim")
+DEFAULT_EMBEDDING_PRESET = "voyage"
+
+
+def _embedding_block_for_preset(preset: str) -> str:
+    """Return the ``[embedding]`` block text for the named preset.
+
+    All presets pair with ``[consolidation] similarity_threshold =
+    "auto"`` (also written by ``_default_saga_toml``), which lets saga
+    resolve the right threshold per provider at boot.
+    """
+    if preset == "voyage":
+        return dedent(
+            """\
+            [embedding]
+            # Voyage AI voyage-4-lite — LongMemEval cross-bench winner
+            # (Phase 3, 2026-05-12): 0.904 aggregate vs OpenAI's 0.880
+            # at $0.02/1M tokens + 200M signup free credit. saga's
+            # ``provider = "voyage"`` shortcut sets the URL,
+            # send_input_type, and api_key_env automatically — only the
+            # model + dimensions are exposed here for operator visibility.
+            provider = "voyage"
+            model = "voyage-4-lite"
+            dimensions = 1024
+            api_key_env = "VOYAGE_API_KEY"
+            """
+        )
+    if preset == "openai":
+        return dedent(
+            """\
+            [embedding]
+            # OpenAI text-embedding-3-small — the historical default;
+            # bench-canonical at saga's default threshold 0.80. Use if
+            # you don't have a Voyage account or prefer the OpenAI
+            # ecosystem. Same per-token price ($0.02/1M) as voyage.
+            provider = "openai"
+            url = "https://api.openai.com/v1/embeddings"
+            model = "text-embedding-3-small"
+            dimensions = 1536
+            api_key_env = "OPENAI_API_KEY"
+            """
+        )
+    if preset == "fastembed":
+        return dedent(
+            """\
+            [embedding]
+            # fastembed BAAI/bge-small-en-v1.5 — fully local, no API
+            # key required. Cold-start downloads the ~33MB ONNX model
+            # into ~/.cache/fastembed/. Bench result on LongMemEval:
+            # 0.72 aggregate / 0.5333 multi-session — 7pp below
+            # hosted options. Right pick when offline / air-gapped /
+            # zero-spend is the priority.
+            provider = "onnx"
+            model = "BAAI/bge-small-en-v1.5"
+            dimensions = 384
+            """
+        )
+    if preset == "nvidia-nim":
+        return dedent(
+            """\
+            [embedding]
+            # NVIDIA NIM nv-embedqa-e5-v5 — saga's historical default.
+            # 1024d retrieval-tuned via NIM hosted API. Untested on the
+            # 2026-05 LongMemEval bench; kept for legacy compatibility
+            # with saga deployments that already use NIM.
+            provider = "nvidia-nim"
+            url = "https://integrate.api.nvidia.com/v1/embeddings"
+            model = "nvidia/nv-embedqa-e5-v5"
+            dimensions = 1024
+            api_key_env = "NVIDIA_NIM_API_KEY"
+            """
+        )
+    raise ValueError(
+        f"unknown embedding preset: {preset!r}. "
+        f"valid: {EMBEDDING_PRESETS}"
+    )
+
+
+def _default_saga_toml(
+    home: Path,
+    api_key: str,
+    *,
+    embedding: str = DEFAULT_EMBEDDING_PRESET,
+) -> str:
     """v0.5 §2: saga.toml the in-process saga reads at boot.
 
     Defaults are saga's canonical post-fix settings (P30 + two-tier on,
@@ -599,6 +695,12 @@ def _default_saga_toml(home: Path, api_key: str) -> str:
       single-writer per file, and saga's consolidation pass writes for
       several minutes (which would block mimir's per-turn reindexes if
       the file were shared).
+    - ``[embedding]`` block is templated from one of ``EMBEDDING_PRESETS``
+      (see ``_embedding_block_for_preset``); default is voyage per the
+      Phase 3 LongMemEval cross-bench result.
+    - ``[consolidation] similarity_threshold = "auto"`` resolves to the
+      per-provider recommended value at boot — 0.92 for voyage / fastembed,
+      0.80 for openai / nvidia-nim. See saga README for the sweep table.
     - ``[retrieval].enable_contextual_rewrite = true`` — mimir already
       passes ``context=`` on every query; flipping rewrite on means short
       referential queries ("yes, look for that") get resolved before
@@ -612,6 +714,7 @@ def _default_saga_toml(home: Path, api_key: str) -> str:
       Unused in-process.
     """
     saga_dir = home / ".mimir"
+    embedding_block = _embedding_block_for_preset(embedding)
     return dedent(
         f"""\
         # saga.toml — in-process saga config used by mimir.
@@ -629,16 +732,9 @@ def _default_saga_toml(home: Path, api_key: str) -> str:
         auto_compact_threshold_pct = 90
         refuse_threshold_pct = 99
 
-        [embedding]
-        # OpenAI's text-embedding-3-small at 1536 dims is saga's bench
-        # canonical (matches saga_bench.toml; comparable to the post-fix
-        # P30 baseline of 0.774). Operators can switch to provider="onnx"
-        # for fully local embeddings — no API key needed, slower CPU pass.
-        provider = "openai"
-        url = "https://api.openai.com/v1/embeddings"
-        model = "text-embedding-3-small"
-        dimensions = 1536
-        api_key_env = "OPENAI_API_KEY"
+        """
+    ) + embedding_block + dedent(
+        f"""\
 
         [llm]
         # Single LLM config for ALL saga internals: consolidation
@@ -693,6 +789,12 @@ def _default_saga_toml(home: Path, api_key: str) -> str:
         [consolidation]
         enabled = true
         enable_llm = true
+        # "auto" resolves to a per-provider value at boot — 0.92 for
+        # voyage and fastembed (tight cosine distributions cap-saturate
+        # at saga's historical default 0.80), 0.80 for openai and
+        # nvidia-nim. See saga README for the full sweep table; swap
+        # to a literal float here to override.
+        similarity_threshold = "auto"
 
         [server]
         # Matches SAGA_API_KEY in mimir's .env. Unused in in-process mode;
@@ -938,8 +1040,15 @@ def _env_get_api_key(env_path: Path) -> str | None:
     return _env_get_var(env_path, _API_KEY_LINE_RE)
 
 
-def setup_home(home: Path) -> dict[str, object]:
-    """Scaffold an agent home directory. Returns a status dict for printing."""
+def setup_home(
+    home: Path, *, embedding: str = DEFAULT_EMBEDDING_PRESET,
+) -> dict[str, object]:
+    """Scaffold an agent home directory. Returns a status dict for printing.
+
+    ``embedding`` selects the saga.toml ``[embedding]`` preset (one of
+    ``EMBEDDING_PRESETS``). Default: voyage (see
+    ``DEFAULT_EMBEDDING_PRESET`` for rationale).
+    """
     home = home.resolve()
     if home.exists() and not home.is_dir():
         raise ValueError(
@@ -993,7 +1102,10 @@ def setup_home(home: Path) -> dict[str, object]:
     # caller passes that signal by setting saga_key to None — but for now
     # setup always generates one).
     (home / ".mimir").mkdir(parents=True, exist_ok=True)
-    if _write_if_missing(home / "saga.toml", _default_saga_toml(home, saga_key)):
+    if _write_if_missing(
+        home / "saga.toml",
+        _default_saga_toml(home, saga_key, embedding=embedding),
+    ):
         files_created.append("saga.toml")
     if _write_if_missing(home / "scheduler.yaml", DEFAULT_SCHEDULER_YAML):
         files_created.append("scheduler.yaml")
@@ -1108,6 +1220,7 @@ def setup_home(home: Path) -> dict[str, object]:
         "api_key_action": api_key_action,
         "saga_api_key_action": saga_api_key_action,
         "git_bootstrap": git_bootstrap_status,
+        "embedding_preset": embedding,
     }
 
 
@@ -1182,8 +1295,24 @@ def _print_setup_report(status: dict[str, object]) -> None:
     print(f"     b. Anthropic API:    set ANTHROPIC_API_KEY in {home}/.env")
     print(f"     c. Gateway (e.g. LiteLLM, OpenRouter):")
     print(f"        set ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN in .env")
-    print(f"  2. (optional) set OPENAI_API_KEY in .env for saga's embeddings;")
-    print(f"     leave blank to fall back to local fastembed (no API needed).")
+    # Embedding-provider-specific guidance — the saga.toml mimir setup
+    # generated has provider=<preset>, so the step here surfaces the
+    # matching env var. Falls back to fastembed automatically if the
+    # key is unset (saga.embeddings.get_provider auto-fallback).
+    preset = status.get("embedding_preset", DEFAULT_EMBEDDING_PRESET)
+    if preset == "voyage":
+        print(f"  2. (optional) set VOYAGE_API_KEY in .env for saga's embeddings")
+        print(f"     (voyage-4-lite — $0.02/1M tokens, 200M signup free credit).")
+        print(f"     Leave blank to fall back to local fastembed (no API needed).")
+    elif preset == "openai":
+        print(f"  2. (optional) set OPENAI_API_KEY in .env for saga's embeddings;")
+        print(f"     leave blank to fall back to local fastembed (no API needed).")
+    elif preset == "nvidia-nim":
+        print(f"  2. (optional) set NVIDIA_NIM_API_KEY in .env for saga's embeddings;")
+        print(f"     leave blank to fall back to local fastembed (no API needed).")
+    else:  # fastembed
+        print(f"  2. saga embeddings configured for local fastembed —")
+        print(f"     no API key needed. First run downloads the ~33MB ONNX model.")
     print(f"  3. (optional) Edit {home}/memory/core/identity.md")
     print(f"  4. Run:  mimir run --home {home}")
 
@@ -1380,6 +1509,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     setup_p.add_argument(
         "--home", type=Path, default=Path.cwd(),
         help="Target directory (default: current working dir).",
+    )
+    setup_p.add_argument(
+        "--embedding", type=str, default=DEFAULT_EMBEDDING_PRESET,
+        choices=list(EMBEDDING_PRESETS),
+        help=(
+            f"Embedding provider preset for the generated saga.toml "
+            f"(default: {DEFAULT_EMBEDDING_PRESET}). Voyage requires "
+            f"VOYAGE_API_KEY; openai requires OPENAI_API_KEY; "
+            f"nvidia-nim requires NVIDIA_NIM_API_KEY; fastembed is "
+            f"fully local. saga's [consolidation] similarity_threshold "
+            f"automatically tunes to the matching value (0.92 for "
+            f"voyage/fastembed, 0.80 for openai/nvidia-nim)."
+        ),
     )
 
     run_p = sub.add_parser("run", help="Run the mimir server (default).")
@@ -1588,7 +1730,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.command == "setup":
-        status = setup_home(args.home)
+        status = setup_home(args.home, embedding=args.embedding)
         _print_setup_report(status)
         return
 
