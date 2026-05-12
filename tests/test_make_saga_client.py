@@ -34,7 +34,11 @@ from mimir.saga_client import (
      "http://[::1]:8080", "http://0.0.0.0:3002"],
 )
 def test_factory_returns_inprocess_for_localhost_or_empty(endpoint):
-    client = make_saga_client(endpoint=endpoint)
+    # ``record_calls=False`` strips the RecordingSagaClient wrapper so
+    # the isinstance check on the underlying implementation passes.
+    # Production (record_calls=True, default) wraps for inline turn
+    # auditing — covered separately in test_recording_saga_client.py.
+    client = make_saga_client(endpoint=endpoint, record_calls=False)
     assert isinstance(client, _InProcessSaga)
     assert isinstance(client, SagaClient)  # Protocol check (runtime_checkable)
 
@@ -45,7 +49,9 @@ def test_factory_returns_inprocess_for_localhost_or_empty(endpoint):
      "http://10.0.0.5:3002"],
 )
 def test_factory_returns_http_for_non_localhost(endpoint):
-    client = make_saga_client(endpoint=endpoint, api_key="ak")
+    client = make_saga_client(
+        endpoint=endpoint, api_key="ak", record_calls=False,
+    )
     assert isinstance(client, _HttpSaga)
 
 
