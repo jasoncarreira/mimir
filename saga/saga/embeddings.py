@@ -100,7 +100,24 @@ class NvidiaNimProvider(EmbeddingProvider):
 
 
 class OpenAIProvider(EmbeddingProvider):
-    """OpenAI-compatible API provider (works with OpenAI, Azure, local vLLM, etc.)."""
+    """OpenAI-compatible API provider (works with OpenAI, Azure, local vLLM,
+    and — with ``send_input_type=true`` — Voyage AI).
+
+    ``send_input_type`` config flag (default False): when True, includes
+    the ``input_type`` parameter ("query" / "document") in the JSON
+    request body. Voyage AI REQUIRES this for retrieval-quality
+    embeddings (model trained expecting instruction prefixes); OpenAI's
+    API REJECTS the parameter as unknown. The flag must be set per
+    provider deployment via ``[embedding] send_input_type = true`` in
+    saga.toml.
+
+    The flag also maps saga's internal ``"passage"`` → ``"document"`` to
+    match Voyage's accepted vocabulary. Voyage's two valid values are
+    ``"query"`` and ``"document"``; saga internally uses
+    ``"query"`` / ``"passage"`` (a holdover from the NIM provider's
+    convention). The mapping is one-way: ``passage → document``,
+    ``query → query``.
+    """
 
     def __init__(self):
         self.url = _cfg('embedding', 'url', 'https://api.openai.com/v1/embeddings')
@@ -108,21 +125,33 @@ class OpenAIProvider(EmbeddingProvider):
         self.timeout = _cfg('embedding', 'timeout_seconds', 10)
         self.max_chars = _cfg('embedding', 'max_input_chars', 8000)
         self.api_key_env = _cfg('embedding', 'api_key_env', 'OPENAI_API_KEY')
+        # Default False — sending input_type to OpenAI's embeddings API
+        # results in a 400 "Unknown parameter" error. Operators pointing
+        # this provider at Voyage flip this to True.
+        self.send_input_type = _cfg('embedding', 'send_input_type', False)
 
     def embed(self, text: str, input_type: str = "passage") -> list[float]:
-        return self._call_api([text[:self.max_chars]])[0]
+        return self._call_api([text[:self.max_chars]], input_type)[0]
 
-    def _call_api(self, inputs: list[str]) -> list[list[float]]:
+    def _call_api(
+        self, inputs: list[str], input_type: str = "passage",
+    ) -> list[list[float]]:
         import requests
         api_key = os.environ.get(self.api_key_env)
         if not api_key:
             raise RuntimeError(f"{self.api_key_env} not set. Run: export {self.api_key_env}=\"your-key\" or switch to provider=\"onnx\" in saga.toml for local embeddings.")
 
+        payload: dict = {"input": inputs, "model": self.model}
+        if self.send_input_type:
+            # Voyage uses "document" where saga internally says "passage".
+            voyage_input_type = "document" if input_type == "passage" else input_type
+            payload["input_type"] = voyage_input_type
+
         def _do_request():
             r = requests.post(
                 self.url,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"input": inputs, "model": self.model},
+                json=payload,
                 timeout=self.timeout,
             )
             r.raise_for_status()
@@ -137,7 +166,7 @@ class OpenAIProvider(EmbeddingProvider):
         batch_size = _cfg('embedding', 'batch_size', 256)
         for i in range(0, len(texts), batch_size):
             chunk = [t[:self.max_chars] for t in texts[i:i + batch_size]]
-            results.extend(self._call_api(chunk))
+            results.extend(self._call_api(chunk, input_type))
         return results
 
 

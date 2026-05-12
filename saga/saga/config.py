@@ -569,6 +569,11 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
     },
     "embedding": {
         "max_chars", "dimensions",
+        # Voyage-compat flag: enables input_type ("query" / "document")
+        # in the embeddings API request. OpenAI rejects it; Voyage
+        # requires it for retrieval-quality embeddings. Opt-in per
+        # deployment.
+        "send_input_type",
     },
     "triples": {
         "enable_extraction", "llm_url", "llm_model", "api_key_env",
