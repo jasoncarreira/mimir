@@ -122,6 +122,39 @@ class TestWasSetInToml:
         from saga.config import was_set_in_toml
         assert was_set_in_toml("nonexistent_section", "anything") is False
 
+    def test_nested_sections_use_dotted_path(self, tmp_path, monkeypatch):
+        """``[llm.consolidation] model = ...`` registers under section
+        ``"llm.consolidation"`` (with leaf key ``"model"``), not under
+        section ``"llm"`` with key ``"consolidation"`` only. Lets
+        provider subclasses gate on ``was_set_in_toml`` for nested
+        config keys without false negatives. The one-level alias
+        (``was_set_in_toml("llm", "consolidation")``) also returns True
+        for back-compat.
+        """
+        self._write_toml_and_reload(tmp_path, monkeypatch, """
+            [llm.consolidation]
+            model = "gpt-4o"
+            api_key_env = "OPENAI_API_KEY"
+        """)
+        from saga.config import was_set_in_toml
+        # Dotted-path lookup works as intuited:
+        assert was_set_in_toml("llm.consolidation", "model") is True
+        assert was_set_in_toml("llm.consolidation", "api_key_env") is True
+        assert was_set_in_toml("llm.consolidation", "did_not_set") is False
+        # And the prior one-level form still works:
+        assert was_set_in_toml("llm", "consolidation") is True
+
+    def test_deeply_nested_section(self, tmp_path, monkeypatch):
+        """Recursion handles arbitrary depth — not just one nested level."""
+        self._write_toml_and_reload(tmp_path, monkeypatch, """
+            [a.b.c]
+            leaf = "x"
+        """)
+        from saga.config import was_set_in_toml
+        assert was_set_in_toml("a.b.c", "leaf") is True
+        assert was_set_in_toml("a.b", "c") is True
+        assert was_set_in_toml("a", "b") is True
+
     def test_reload_resets_tracking(self, tmp_path, monkeypatch):
         """``reload_config`` must clear ``_explicit_keys`` so a second
         load reflects only the second toml's contents."""
