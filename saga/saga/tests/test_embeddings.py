@@ -258,18 +258,25 @@ class TestVoyageProvider:
     """``VoyageProvider`` shortcut — sets voyage-friendly defaults so
     ``provider = "voyage"`` alone in saga.toml is enough config."""
 
-    def _voyage_config(self, **overrides):
-        """Baseline minimal voyage config — only ``provider`` set, all
-        other fields fall through to VoyageProvider defaults."""
+    def _install_voyage_config(self, monkeypatch, **overrides):
+        """Install a fake saga.toml state simulating ``provider="voyage"``
+        plus any operator overrides. Sets both ``_config`` (merged
+        values) and ``_explicit_keys`` (what the operator wrote in
+        the toml) so ``was_set_in_toml`` returns the right answer
+        for VoyageProvider's override gating.
+        """
+        import saga.config as cfg_mod
         snap = {"embedding": {"provider": "voyage"}}
         snap["embedding"].update(overrides)
+        explicit = {"embedding": set(snap["embedding"].keys())}
+        monkeypatch.setattr(cfg_mod, "_config", snap)
+        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        monkeypatch.setattr(cfg_mod, "_explicit_keys", explicit)
         return snap
 
     def test_defaults_set_voyage_url_model_key_env(self, monkeypatch):
-        import saga.config as cfg_mod
         import saga.embeddings as emb
-        monkeypatch.setattr(cfg_mod, "_config", self._voyage_config())
-        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        self._install_voyage_config(monkeypatch)
         provider = emb.VoyageProvider()
         assert provider.url == "https://api.voyageai.com/v1/embeddings"
         assert provider.model == "voyage-4-lite"
@@ -278,13 +285,8 @@ class TestVoyageProvider:
 
     def test_operator_can_override_model(self, monkeypatch):
         """Explicit ``model`` in saga.toml beats the default."""
-        import saga.config as cfg_mod
         import saga.embeddings as emb
-        monkeypatch.setattr(
-            cfg_mod, "_config",
-            self._voyage_config(model="voyage-3-large"),
-        )
-        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        self._install_voyage_config(monkeypatch, model="voyage-3-large")
         provider = emb.VoyageProvider()
         assert provider.model == "voyage-3-large"
         assert provider.url == "https://api.voyageai.com/v1/embeddings"
@@ -294,15 +296,40 @@ class TestVoyageProvider:
         """Operator setting ``send_input_type=false`` for voyage would
         produce broken embeddings; the provider overrides to True
         regardless."""
-        import saga.config as cfg_mod
         import saga.embeddings as emb
-        monkeypatch.setattr(
-            cfg_mod, "_config",
-            self._voyage_config(send_input_type=False),
-        )
-        monkeypatch.setattr(cfg_mod, "_config_loaded", True)
+        self._install_voyage_config(monkeypatch, send_input_type=False)
         provider = emb.VoyageProvider()
         assert provider.send_input_type is True
+
+    def test_url_default_survives_nvidia_nim_in_DEFAULTS(self, monkeypatch):
+        """Regression for issue #149: minimal voyage saga.toml (no
+        explicit ``url``) used to leave ``self.url`` pointing at
+        nvidia-nim's endpoint because saga's ``_DEFAULTS`` defaults
+        ``url`` to nvidia-nim's URL and the prior detection compared
+        against OpenAI's URL. With ``was_set_in_toml``-gated overrides,
+        the unset key correctly falls through to voyage's URL.
+        """
+        import saga.embeddings as emb
+        self._install_voyage_config(monkeypatch)  # no explicit url
+        provider = emb.VoyageProvider()
+        assert provider.url == "https://api.voyageai.com/v1/embeddings"
+        assert "nvidia" not in provider.url
+
+    def test_operator_can_override_url(self, monkeypatch):
+        """Explicit ``url`` (e.g. corporate proxy) beats the default."""
+        import saga.embeddings as emb
+        custom = "https://internal-voyage-proxy.example.com/v1/embeddings"
+        self._install_voyage_config(monkeypatch, url=custom)
+        provider = emb.VoyageProvider()
+        assert provider.url == custom
+
+    def test_operator_can_override_api_key_env(self, monkeypatch):
+        """Explicit ``api_key_env`` lets operators point at a different
+        env var (e.g. ``MY_VOYAGE_KEY``)."""
+        import saga.embeddings as emb
+        self._install_voyage_config(monkeypatch, api_key_env="MY_VOYAGE_KEY")
+        provider = emb.VoyageProvider()
+        assert provider.api_key_env == "MY_VOYAGE_KEY"
 
     def test_registered_in_provider_registry(self):
         from saga.embeddings import _PROVIDERS, VoyageProvider
