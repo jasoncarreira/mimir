@@ -44,16 +44,30 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
-# Per-1M-token cost estimates for hosted embedding providers. Used for
-# the cost preview in ``--dry-run`` mode. Conservative — actual rates
-# may be lower under tier discounts / free credits. None = local
-# inference (no per-token cost).
-_PROVIDER_COST_PER_M_TOKENS: dict[str, float | None] = {
-    "openai": 0.02,
-    "voyage": 0.02,
-    "nvidia-nim": 0.00,  # free tier on NIM credits
-    "onnx": None,
-    "local": None,
+# Per-1M-token cost estimates keyed on MODEL name (mimir review PR #146:
+# voyage's voyage-4-large is $0.12/M, not $0.02 — keying on provider was
+# wrong). Used for the cost preview in ``--dry-run`` mode. Conservative —
+# actual rates may be lower under tier discounts / free credits.
+# Missing entries fall back to None (no per-token cost — assume local).
+_MODEL_COST_PER_M_TOKENS: dict[str, float | None] = {
+    # OpenAI
+    "text-embedding-3-small": 0.02,
+    "text-embedding-3-large": 0.13,
+    "text-embedding-ada-002": 0.10,
+    # Voyage 4 series
+    "voyage-4-lite": 0.02,
+    "voyage-4": 0.06,
+    "voyage-4-large": 0.12,
+    # Voyage 3 series (legacy)
+    "voyage-3.5-lite": 0.02,
+    "voyage-3.5": 0.06,
+    "voyage-3-large": 0.18,
+    # NVIDIA NIM — hosted but free under typical signup credits
+    "nvidia/nv-embedqa-e5-v5": 0.00,
+    # Local / fastembed / ONNX — no per-token cost
+    "BAAI/bge-small-en-v1.5": None,
+    "BAAI/bge-base-en-v1.5": None,
+    "BAAI/bge-large-en-v1.5": None,
 }
 
 
@@ -98,17 +112,85 @@ def reindex_saga_atoms(
     dry_run: bool = True,
     batch_size: int = 50,
 ) -> ReindexReport:
-    """Re-embed atoms in saga's atoms table whose embedding dimension
-    doesn't match the currently-configured provider."""
-    return _reindex_table(
-        target="atoms",
-        db_path=db_path,
-        table="atoms",
-        id_column="id",
-        content_column="content",
-        embedding_column="embedding",
-        dry_run=dry_run,
-        batch_size=batch_size,
+    """Re-embed atoms in saga's atoms table under the currently-
+    configured provider.
+
+    Delegates to ``saga.calibration.re_embed`` — saga's canonical
+    migration helper. The saga function:
+
+    - Filters ``state IN ('active', 'fading')`` so forgotten atoms
+      don't burn API calls
+    - Updates the ``embedding_provider`` column for per-atom
+      provenance
+    - Sets ``saga.vector_index._index_dirty`` so the FAISS index
+      rebuilds on next query
+
+    Behaviors mimir's earlier walk-and-update implementation didn't
+    cover — delegating ensures the saga semantics stay canonical.
+
+    ``db_path`` is accepted for API symmetry with
+    ``reindex_file_search`` but is informational only — saga reads its
+    own db path from saga.toml via ``saga.core.get_db()``.
+
+    Note on the ``sentence_embeddings`` table: if the operator has
+    ``[retrieval] enable_subatom_beam = true`` in saga.toml, the
+    per-sentence embedding cache populated by ``saga.subatom`` is NOT
+    migrated by this reindex (saga.calibration.re_embed scope is atoms
+    only). Operators using subatom retrieval should clear that table
+    manually after reindex; the next compressed_retrieve call repopulates
+    against the new provider. Filed as a chainlink for follow-up.
+    """
+    started = time.time()
+    provider_name, dim = _provider_info()
+    try:
+        from saga.calibration import re_embed
+    except ImportError:
+        log.warning("reindex(atoms): saga.calibration.re_embed unavailable")
+        return ReindexReport(
+            target="atoms", db_path=db_path,
+            total_rows=0, already_current=0, needs_reindex=0,
+            reindexed=0, failed=0, estimated_input_chars=0,
+            elapsed_seconds=0.0, provider=provider_name, dimension=dim,
+        )
+
+    # saga's re_embed handles dry-run + apply + FAISS dirty-flag + the
+    # state filter. Forward our flags through and adapt the response
+    # shape to ReindexReport.
+    try:
+        result = re_embed(
+            target_provider_name=provider_name,
+            batch_size=batch_size,
+            dry_run=dry_run,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("reindex(atoms): saga.calibration.re_embed failed")
+        return ReindexReport(
+            target="atoms", db_path=db_path,
+            total_rows=0, already_current=0, needs_reindex=0,
+            reindexed=0, failed=1, estimated_input_chars=0,
+            elapsed_seconds=time.time() - started,
+            provider=provider_name, dimension=dim,
+        )
+
+    total = result.get("atoms_total", 0)
+    updated = result.get("atoms_updated", 0)
+    # saga.re_embed doesn't pre-filter already-current rows — it
+    # re-embeds every active/fading atom regardless. For the dry-run
+    # estimate we treat them all as needs_reindex.
+    needs = total if dry_run else updated
+    # Estimated input chars — saga doesn't return this; approximate
+    # from total atom count times an average content size.
+    estimated_chars = total * 200 if dry_run else 0
+    return ReindexReport(
+        target="atoms", db_path=db_path,
+        total_rows=total,
+        already_current=0,
+        needs_reindex=needs,
+        reindexed=updated,
+        failed=0,
+        estimated_input_chars=estimated_chars,
+        elapsed_seconds=time.time() - started,
+        provider=provider_name, dimension=dim,
     )
 
 
@@ -266,18 +348,30 @@ def _print_report(report: ReindexReport, *, dry_run: bool) -> None:
         f"  needs reindex:       {report.needs_reindex}\n"
     )
     if dry_run and report.needs_reindex:
-        cost = _PROVIDER_COST_PER_M_TOKENS.get(report.provider)
+        # Look up cost by MODEL (not provider) — voyage-4-large is
+        # $0.12/M, very different from voyage-4-lite's $0.02. Per PR
+        # #146 review polish.
+        from saga.config import get_config
+        cfg = get_config()
+        model = cfg("embedding", "model", "")
+        cost = _MODEL_COST_PER_M_TOKENS.get(model)
         if cost is not None and cost > 0:
-            # Rough estimate: 4 chars per token. Cheap upper bound.
             est_tokens = report.estimated_input_chars / 4
             est_cost = est_tokens / 1_000_000 * cost
+            voyage_note = (
+                " (voyage has 200M free signup credit)"
+                if report.provider == "voyage" else ""
+            )
             print(
+                f"  model:               {model}\n"
                 f"  estimated tokens:    ~{est_tokens:,.0f}\n"
                 f"  estimated cost:      ~${est_cost:.4f} "
-                f"(at ${cost}/M tokens; voyage has 200M free credit)\n"
+                f"(at ${cost}/M tokens){voyage_note}\n"
             )
+        elif cost == 0:
+            print(f"  model:               {model} (free tier)\n")
         else:
-            print("  cost:                local — no API spend\n")
+            print(f"  model:               {model or '(local)'} — no API spend\n")
         print(
             "  Re-run with --apply to actually re-embed.\n"
         )
@@ -337,9 +431,48 @@ def dispatch(args: argparse.Namespace) -> int:
         os.environ["SAGA_CONFIG"] = str(saga_toml)
 
     dry_run = not args.apply
+
+    # Apply-mode safety: warn loudly about concurrent writes. There's no
+    # cross-process lock against a live mimir process, so an operator who
+    # forgets to stop mimir first might get write contention on the
+    # SQLite files mid-reindex. The DB-level locking would surface as
+    # transient errors; clearer to warn up-front than debug after.
+    if not dry_run:
+        print(
+            "\n⚠ APPLY MODE: ensure mimir is stopped before continuing.\n"
+            "  Reindex writes to saga.db / index.db without a "
+            "cross-process lock; a running mimir may cause write "
+            "contention or duplicate work.\n"
+            "  If you see SQLite 'database is locked' errors, stop "
+            "mimir and re-run.\n"
+        )
+
+    # If subatom retrieval is enabled, the sentence_embeddings table
+    # isn't migrated by saga.calibration.re_embed — flag it so operators
+    # know to manually clear that cache for full provider migration.
+    from saga.config import get_config
+    cfg = get_config()
+    if args.target in ("atoms", "both") and \
+            cfg("retrieval", "enable_subatom_beam", False):
+        print(
+            "\nNote: [retrieval] enable_subatom_beam = true is set. The "
+            "sentence_embeddings cache (saga/saga/subatom.py) is NOT "
+            "migrated by this reindex. Clear it manually after this run "
+            "(or wait for it to repopulate naturally on next "
+            "compressed_retrieve calls):\n"
+            "  sqlite3 <home>/.mimir/saga.db 'DELETE FROM "
+            "sentence_embeddings;'\n"
+        )
+
     reports: list[ReindexReport] = []
     if args.target in ("atoms", "both"):
-        atoms_db = home / ".mimir" / "saga.db"
+        # saga's db_path comes from saga.toml [storage] db_path —
+        # reading from config rather than hardcoding so non-default
+        # layouts work. Used only for ReindexReport display since
+        # saga.calibration.re_embed reads via get_db() internally.
+        atoms_db = Path(cfg("storage", "db_path", str(home / ".mimir" / "saga.db")))
+        if not atoms_db.is_absolute():
+            atoms_db = home / atoms_db
         reports.append(reindex_saga_atoms(
             atoms_db, dry_run=dry_run, batch_size=args.batch_size,
         ))

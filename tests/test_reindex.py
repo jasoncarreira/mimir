@@ -122,77 +122,81 @@ def test_expected_blob_len_is_4_bytes_per_dim():
     assert _expected_blob_len(1536) == 6144
 
 
-def test_dry_run_reports_mismatched_rows(tmp_path, patch_provider):
-    """Dry-run identifies rows whose blob length != current dim * 4
-    and reports counts without writing."""
+def test_atoms_delegates_to_saga_calibration_dry_run(tmp_path, patch_provider, monkeypatch):
+    """``reindex_saga_atoms`` in dry-run mode calls saga.calibration.
+    re_embed(dry_run=True) and maps the result dict to ReindexReport.
+
+    This is the per-mimir-review-feedback change: instead of mimir
+    duplicating saga's atom-walking logic, delegate to saga's
+    canonical re_embed which handles state filter + embedding_provider
+    column + FAISS dirty flag.
+    """
     patch_provider(dim=1024, provider_name="voyage")
-    db = tmp_path / "saga.db"
-    _make_atoms_db(db, [
-        ("a", "first atom", [0.1] * 1024),   # current dim — already current
-        ("b", "second atom", [0.2] * 384),   # old dim — needs reindex
-        ("c", "third atom", [0.3] * 1536),   # other old dim — needs reindex
-    ])
-    report = reindex_saga_atoms(db, dry_run=True)
-    assert report.total_rows == 3
-    assert report.already_current == 1
-    assert report.needs_reindex == 2
+    import saga.calibration
+
+    captured: dict = {}
+
+    def fake_re_embed(target_provider_name, batch_size=50, dry_run=False):
+        captured["provider"] = target_provider_name
+        captured["batch_size"] = batch_size
+        captured["dry_run"] = dry_run
+        return {
+            "target_provider": target_provider_name,
+            "atoms_total": 10,
+            "atoms_updated": 0,
+            "dry_run": True,
+            "index_rebuild_needed": True,
+        }
+
+    monkeypatch.setattr(saga.calibration, "re_embed", fake_re_embed)
+
+    report = reindex_saga_atoms(tmp_path / "saga.db", dry_run=True)
+    assert captured == {"provider": "voyage", "batch_size": 50, "dry_run": True}
+    assert report.total_rows == 10
+    assert report.needs_reindex == 10
     assert report.reindexed == 0
     assert report.provider == "voyage"
     assert report.dimension == 1024
-    assert report.estimated_input_chars > 0
 
 
-def test_apply_rewrites_mismatched_blobs(tmp_path, patch_provider):
-    """Apply mode re-embeds candidates via the stub provider and writes
-    1024-dim BLOBs."""
+def test_atoms_delegates_to_saga_calibration_apply(tmp_path, patch_provider, monkeypatch):
+    """In apply mode, saga.calibration.re_embed returns atoms_updated
+    > 0 and mimir's reindex maps that to ``reindexed`` in the report."""
     patch_provider(dim=1024, provider_name="voyage")
-    db = tmp_path / "saga.db"
-    _make_atoms_db(db, [
-        ("a", "first", [0.1] * 1024),
-        ("b", "second", [0.2] * 384),
-        ("c", "third", [0.3] * 1536),
-    ])
+    import saga.calibration
 
-    report = reindex_saga_atoms(db, dry_run=False, batch_size=10)
-    assert report.needs_reindex == 2
-    assert report.reindexed == 2
+    def fake_re_embed(target_provider_name, batch_size=50, dry_run=False):
+        return {
+            "target_provider": target_provider_name,
+            "atoms_total": 7,
+            "atoms_updated": 7,
+            "dry_run": False,
+            "index_rebuild_needed": True,
+        }
+
+    monkeypatch.setattr(saga.calibration, "re_embed", fake_re_embed)
+
+    report = reindex_saga_atoms(tmp_path / "saga.db", dry_run=False)
+    assert report.total_rows == 7
+    assert report.reindexed == 7
     assert report.failed == 0
 
-    # Verify on-disk blobs are now all 1024 dims.
-    conn = sqlite3.connect(str(db))
-    rows = conn.execute(
-        "SELECT id, length(embedding) FROM atoms ORDER BY id"
-    ).fetchall()
-    conn.close()
-    for atom_id, blob_len in rows:
-        assert blob_len == _expected_blob_len(1024), \
-            f"atom {atom_id} has length {blob_len}, expected 4096"
 
-
-def test_reindex_skips_already_current(tmp_path, patch_provider):
-    """When all rows match the current dim, nothing gets re-embedded."""
+def test_atoms_handles_saga_calibration_exception(tmp_path, patch_provider, monkeypatch):
+    """If saga.calibration.re_embed raises, mimir's reindex counts a
+    failure rather than crashing — operator sees the error in the
+    report instead of an uncaught traceback."""
     patch_provider(dim=1024)
-    db = tmp_path / "saga.db"
-    _make_atoms_db(db, [
-        ("a", "first", [0.1] * 1024),
-        ("b", "second", [0.2] * 1024),
-    ])
-    report = reindex_saga_atoms(db, dry_run=False)
-    assert report.already_current == 2
-    assert report.needs_reindex == 0
+    import saga.calibration
+
+    def fake_re_embed(**kwargs):
+        raise RuntimeError("simulated saga failure")
+
+    monkeypatch.setattr(saga.calibration, "re_embed", fake_re_embed)
+
+    report = reindex_saga_atoms(tmp_path / "saga.db", dry_run=False)
+    assert report.failed == 1
     assert report.reindexed == 0
-
-
-def test_reindex_missing_db_returns_empty_report(tmp_path, patch_provider):
-    """A non-existent DB doesn't crash — returns a zero-count report.
-    Useful for ``--target both`` against a home that only has one of
-    the two DBs initialized."""
-    patch_provider(dim=1024)
-    db = tmp_path / "nonexistent.db"
-    report = reindex_saga_atoms(db, dry_run=True)
-    assert report.total_rows == 0
-    assert report.needs_reindex == 0
-    assert report.db_path == db
 
 
 def test_file_search_reindex_same_path(tmp_path, patch_provider):
@@ -217,57 +221,21 @@ def test_file_search_reindex_same_path(tmp_path, patch_provider):
     assert all(b == _expected_blob_len(1024) for b in blob_lens)
 
 
-def test_resumable_after_partial_run(tmp_path, patch_provider):
-    """Running reindex twice should be idempotent — the second run finds
-    all rows current and does nothing. Simulates a recovery from a
-    crash-mid-batch scenario."""
+def test_file_search_missing_db_returns_empty_report(tmp_path, patch_provider):
+    """``reindex_file_search`` on a non-existent DB returns a zero-
+    count report — useful for ``--target both`` against a home that
+    only has one of the two DBs initialized."""
     patch_provider(dim=1024)
-    db = tmp_path / "saga.db"
-    _make_atoms_db(db, [
-        ("a", "first", [0.1] * 384),
-        ("b", "second", [0.2] * 384),
-        ("c", "third", [0.3] * 384),
-    ])
-    # First run — re-embeds all 3.
-    r1 = reindex_saga_atoms(db, dry_run=False)
-    assert r1.reindexed == 3
-
-    # Second run — all 3 are now current; nothing to do.
-    r2 = reindex_saga_atoms(db, dry_run=False)
-    assert r2.already_current == 3
-    assert r2.needs_reindex == 0
-    assert r2.reindexed == 0
+    db = tmp_path / "nonexistent.db"
+    report = reindex_file_search(db, dry_run=True)
+    assert report.total_rows == 0
+    assert report.needs_reindex == 0
+    assert report.db_path == db
 
 
-def test_provider_failure_counts_failures_continues(tmp_path, patch_provider, monkeypatch):
-    """If a batch_embed call raises, the rows in that batch are counted
-    as failures but the overall reindex doesn't crash — subsequent
-    batches still process."""
-    patch_provider(dim=1024)
-    db = tmp_path / "saga.db"
-    _make_atoms_db(db, [
-        ("a", "first", [0.1] * 384),
-        ("b", "second", [0.2] * 384),
-        ("c", "third", [0.3] * 384),
-        ("d", "fourth", [0.4] * 384),
-    ])
-
-    # Patch the provider so first batch raises, rest succeed.
-    import saga.embeddings as saga_emb
-    stub = saga_emb.get_provider()
-    call_count = [0]
-    real_batch = stub.batch_embed
-
-    def flaky(texts, input_type="passage"):
-        call_count[0] += 1
-        if call_count[0] == 1:
-            raise RuntimeError("simulated API failure")
-        return real_batch(texts, input_type=input_type)
-
-    monkeypatch.setattr(stub, "batch_embed", flaky)
-
-    report = reindex_saga_atoms(db, dry_run=False, batch_size=2)
-    # First batch (a, b) fails; second batch (c, d) succeeds.
-    assert report.failed == 2
-    assert report.reindexed == 2
-    assert report.needs_reindex == 4
+# The previous tests (resumable, batch-failure on atoms) covered
+# mimir's own atom-walking implementation. Those behaviors now live
+# in saga's calibration.re_embed; we no longer test them at this
+# layer — saga owns its own test coverage. mimir's tests focus on
+# the delegation contract: provider name passed correctly, return
+# shape mapped to ReindexReport, exception isolation.
