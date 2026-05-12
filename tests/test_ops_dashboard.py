@@ -382,6 +382,68 @@ def test_render_dashboard_html_handles_empty_payload(tmp_path: Path):
     assert render_dashboard_html(payload) == html  # arg ignored
 
 
+def test_dashboard_html_js_escapes_survive_python_rendering():
+    """Pinned regression for the 2026-05-12 ops-page-broken bug.
+
+    ``_DASHBOARD_HTML`` is a Python triple-double-quoted string that
+    contains a ``<script>`` block. Python's lexer processes backslash
+    escapes in that string BEFORE the browser sees it — so a JS source
+    line written as ``msg += 'a\\n\\nb'`` (intended to produce a
+    JS-escape ``\\n``) gets emitted to the wire as ``msg += 'a<LF><LF>b'``.
+    A single-quoted JS string can't span lines, so the script throws
+    SyntaxError at parse time, all the bootstrap functions
+    (``getApiKey``, ``setApiKey``, ``authedFetch``) never get defined,
+    and the dashboard silently fails to load /api/ops. From the
+    operator's POV: the page loads, the bootstrap prompt never fires,
+    and "Failed to load /api/ops" is the only signal.
+
+    Concrete check: the rendered JS string literal that holds the
+    API-key prompt message MUST contain literal ``\\n`` (a real
+    backslash followed by ``n`` — the JS-escape form), NOT a raw
+    newline character. Same for the ``you\\'ll`` apostrophe escape.
+
+    Future authors adding more JS string literals to ``_DASHBOARD_HTML``:
+    every backslash escape inside a JS string must be DOUBLED in the
+    Python source. See the comment above ``_DASHBOARD_HTML``.
+    """
+    html = render_dashboard_html()
+    # Locate the promptApiKey message-building line. Search by the
+    # operator-visible marker ("Saved to this browser") — robust against
+    # cosmetic edits to the function body.
+    candidates = [
+        ln for ln in html.split("\n")
+        if "msg +=" in ln and "Saved to this browser" in ln
+    ]
+    assert len(candidates) == 1, (
+        f"expected exactly 1 JS line containing the API-key prompt "
+        f"message; got {len(candidates)}. Likely cause: Python "
+        f"interpreted ``\\n`` in the Python source as a real LF, so the "
+        f"JS string got split across two lines and the marker text now "
+        f"lives on a separate line from ``msg +=``. Fix: double the "
+        f"backslashes in the Python source (``\\\\n\\\\n`` not "
+        f"``\\n\\n``). Alternate causes: marker text was edited or the "
+        f"function was duplicated."
+    )
+    line = candidates[0]
+    # The JS-escape form survives Python rendering — the backslash is
+    # literal, followed by ``n``. We assert on the exact substring.
+    assert r"\n\n" in line, (
+        f"JS string literal for the prompt message lost its '\\n\\n' "
+        f"escape — Python interpreted the backslashes as escape "
+        f"sequences instead of passing them through to the JS source. "
+        f"Double the backslashes in the Python source. "
+        f"Got rendered line: {line!r}"
+    )
+    # And the apostrophe escape — Python ate ``\'`` in the prior bug,
+    # leaving a bare ``'`` that closed the JS string early at ``you'll``.
+    assert r"you\'ll" in line, (
+        f"JS string literal lost its escaped apostrophe in 'you\\'ll' — "
+        f"Python interpreted ``\\'`` as a bare ``'``, closing the JS "
+        f"string early. Double the backslash in the Python source. "
+        f"Got rendered line: {line!r}"
+    )
+
+
 # ─── Route wiring through register_routes ────────────────────────────
 
 
