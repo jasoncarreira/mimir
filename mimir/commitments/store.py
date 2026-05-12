@@ -50,6 +50,17 @@ DEFAULT_TERMINAL_RETENTION_DAYS = 30
 #: split) can be implemented as a versioned replay path without
 #: breaking deployments that already have events on disk.
 #:
+#: **Scope.** ``v`` versions the EVENT envelope — the top-level
+#: keys on each JSONL line (``type``, ``id``, ``ts``, ``v``, plus
+#: per-event-type payload keys like ``record`` / ``reason`` /
+#: ``until_unix``). It does NOT version the inner
+#: :class:`CommitmentRecord` field set carried under
+#: ``commitment_added``'s ``record`` key. A ``CommitmentRecord``
+#: field rename / add / drop is caught by the ``TypeError`` arm on
+#: ``**rec_data`` at :meth:`CommitmentsStore._apply_event` (the
+#: ``commitment_added`` branch), not the version gate — bump
+#: ``v`` only when the envelope itself changes.
+#:
 #: Replay treatment (see :meth:`CommitmentsStore._apply_event`):
 #:
 #: - ``v`` absent → treated as v1 (legacy events appended before
