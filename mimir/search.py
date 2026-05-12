@@ -1,4 +1,4 @@
-"""SQLite + fastembed hybrid indexer (SPEC §6).
+"""SQLite + saga-provider hybrid indexer (SPEC §6).
 
 Recipe ported from muninnbot's ``scripts/state_search.py`` (PostgreSQL+pgvector
 in source) → SQLite + FTS5 here so the benchmark container has no Postgres
@@ -6,16 +6,22 @@ dependency. Same hybrid score weights:
 
     score = 0.5 * cosine + 0.2 * fts_bm25 + 0.3 * recency
 
+Embeddings route through saga's configured provider (voyage / openai /
+fastembed / nvidia-nim) via ``SagaProviderEmbedder`` so file_search and
+saga atoms share one vector space. Tests pass ``HashEmbedder`` to stay
+offline; ``FastEmbedder`` is kept as a back-compat / pin-to-bge-small
+option but is no longer the default.
+
 Lifecycle:
-- ``start()`` — create schema, run an initial mtime sweep, kick off the 60s
-  background sweep loop.
+- ``start()`` — create schema, dim-mismatch check, run an initial mtime
+  sweep, kick off the 60s background sweep loop.
 - File writes call ``enqueue_path()`` (non-blocking) → indexer thread reads,
   embeds, writes. The ``flush()`` helper waits for the queue to drain in tests.
 - ``search()`` returns ranked ``SearchResult`` rows.
 - ``stop()`` cancels the sweep loop and lets the worker drain.
 
 The ``Embedder`` interface is split so tests can plug in a deterministic fake
-without paying the fastembed cold-start (model download + ONNX load).
+without paying the cold-start cost.
 """
 
 from __future__ import annotations
@@ -58,11 +64,32 @@ EMBED_QUERY_CACHE_SIZE = 64
 class Embedder(Protocol):
     dim: int
 
-    def embed(self, texts: list[str]) -> list[list[float]]: ...
+    def embed(
+        self, texts: list[str], input_type: str = "passage",
+    ) -> list[list[float]]:
+        """Embed a batch of texts.
+
+        ``input_type`` distinguishes document/passage embedding (the
+        default — what you call when indexing file content) from query
+        embedding (what you call to embed a search string). Providers
+        like Voyage produce DIFFERENT vectors for the two — passing the
+        right input_type at query time is a material recall win.
+        FastEmbedder and HashEmbedder ignore it (no asymmetric query/
+        doc model); SagaProviderEmbedder routes it through saga's
+        provider chain.
+        """
 
 
 class FastEmbedder:
-    """Wraps ``fastembed.TextEmbedding``. Lazy-loads the ONNX model on first use."""
+    """Wraps ``fastembed.TextEmbedding`` directly. Lazy-loads the ONNX
+    model on first use.
+
+    Kept as a back-compat / test-fallback for the rare case where
+    callers want to pin file_search to bge-small specifically without
+    going through saga's provider chain. The Indexer's default
+    embedder is now ``SagaProviderEmbedder`` — file_search and saga
+    atoms share one embedding provider so the cosine spaces align.
+    """
 
     def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5", dim: int = 384) -> None:
         self._model_name = model_name
@@ -78,13 +105,77 @@ class FastEmbedder:
 
                     self._impl = TextEmbedding(model_name=self._model_name)
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(
+        self, texts: list[str], input_type: str = "passage",
+    ) -> list[list[float]]:
+        # ``input_type`` ignored — fastembed's bge-small treats query
+        # and passage embeddings identically at this entry point.
+        del input_type
         if not texts:
             return []
         self._ensure()
         # ``list(v)`` on a numpy array yields np.float32 scalars — coerce to
         # Python floats here so cosines, scores, and json.dumps all stay clean.
         return [[float(x) for x in v] for v in self._impl.embed(texts)]  # type: ignore[union-attr]
+
+
+class SagaProviderEmbedder:
+    """Routes file_search embeddings through saga's configured provider.
+
+    Default Indexer embedder. Same provider as saga atoms — one model
+    download, one cosine space, one config knob in saga.toml drives
+    both surfaces. Picks up voyage / openai / fastembed / nvidia-nim
+    based on the ``[embedding] provider`` in the active saga.toml.
+
+    Lazy initialization: defer the provider instantiation until first
+    ``embed()`` call so Indexer construction stays cheap (matches
+    FastEmbedder's lazy-load semantics). ``dim`` resolves at the first
+    embed too (saga's provider only knows its dimension after model
+    config is read).
+
+    For tests that want offline / no-API behavior, pass ``HashEmbedder``
+    explicitly to the Indexer constructor instead.
+    """
+
+    def __init__(self) -> None:
+        self._provider = None
+        self._dim: int | None = None
+        self._lock = threading.Lock()
+
+    def _ensure(self) -> None:
+        if self._provider is None:
+            with self._lock:
+                if self._provider is None:
+                    from saga.embeddings import get_provider
+
+                    provider = get_provider()
+                    self._dim = provider.dimensions()
+                    # Assign provider LAST so concurrent readers see a
+                    # fully-initialized object (Python attribute writes
+                    # are atomic under the GIL, but we want both fields
+                    # visible together).
+                    self._provider = provider
+
+    @property
+    def dim(self) -> int:
+        if self._dim is None:
+            self._ensure()
+        return self._dim  # type: ignore[return-value]
+
+    def embed(
+        self, texts: list[str], input_type: str = "passage",
+    ) -> list[list[float]]:
+        if not texts:
+            return []
+        self._ensure()
+        # Forward ``input_type`` to saga's provider. For voyage this
+        # becomes the "document" or "query" instruction prefix — a
+        # real recall win at query time. For OpenAI the parameter is
+        # dropped (unknown to OpenAI's API). For fastembed/onnx the
+        # BGE-specific query_embed entry point is used when
+        # input_type="query".
+        vecs = self._provider.batch_embed(texts, input_type=input_type)  # type: ignore[union-attr]
+        return [[float(x) for x in v] for v in vecs]
 
 
 class HashEmbedder:
@@ -94,7 +185,12 @@ class HashEmbedder:
 
     dim = 16
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(
+        self, texts: list[str], input_type: str = "passage",
+    ) -> list[list[float]]:
+        # ``input_type`` ignored — hash-derived fake doesn't model
+        # query/doc asymmetry.
+        del input_type
         import hashlib
 
         out: list[list[float]] = []
@@ -282,7 +378,11 @@ class Indexer:
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     ) -> None:
         self._home = home
-        self._embedder: Embedder = embedder or FastEmbedder()
+        # Default routes through saga's configured provider so file_search
+        # embeddings live in the same cosine space as saga atoms — one
+        # ``[embedding] provider`` setting drives both surfaces. Tests
+        # pin ``HashEmbedder`` explicitly to stay offline.
+        self._embedder: Embedder = embedder or SagaProviderEmbedder()
         self._db_path = db_path or (home / ".mimir" / "index.db")
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
@@ -306,8 +406,48 @@ class Indexer:
                 conn.execute(stmt)
             conn.commit()
 
+    def _check_dim_mismatch(self) -> None:
+        """Detect existing chunks whose embedding dim doesn't match the
+        current embedder's dim. After an operator switches providers
+        (e.g. fastembed bge-small at 384d → voyage at 1024d), existing
+        BLOBs are in the OLD vector space — ``_cosine`` returns 0.0 on
+        the length mismatch, so semantic search silently degrades to
+        BM25-only with no signal to the operator.
+
+        Log a loud warning here pointing at ``mimir reindex --target
+        files --apply`` so the next operator hitting a stale file_search
+        index gets immediate diagnostic visibility instead of debugging
+        why retrieval looks wrong. Best-effort: errors during the probe
+        are swallowed (no DB existing yet on first boot, transient lock,
+        etc.).
+        """
+        try:
+            expected = self._embedder.dim * 4
+        except Exception:  # noqa: BLE001 — embedder.dim init may fail
+            return
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT length(embedding) FROM chunks LIMIT 1"
+                ).fetchone()
+        except sqlite3.Error:
+            return
+        if row is None:
+            return  # empty index, nothing to mismatch
+        actual = row[0]
+        if actual != expected:
+            log.warning(
+                "file_search index dim mismatch: chunks stored at %d "
+                "bytes/embedding (%dd) but current embedder expects %d "
+                "bytes (%dd). Semantic search will return cosine=0 for "
+                "every chunk until you migrate: "
+                "`mimir reindex --target files --apply`",
+                actual, actual // 4, expected, self._embedder.dim,
+            )
+
     async def start(self, run_initial_sweep: bool = True, sweep_loop: bool = True) -> None:
         await asyncio.to_thread(self.init_schema)
+        await asyncio.to_thread(self._check_dim_mismatch)
         if run_initial_sweep:
             await self.sweep()
         if sweep_loop:
@@ -365,8 +505,13 @@ class Indexer:
 
     def _embed_query_uncached(self, text: str) -> tuple[float, ...]:
         """Single-query embed; tuple return is hashable + immutable so the
-        LRU value can't be mutated by callers."""
-        return tuple(self._embedder.embed([text])[0])
+        LRU value can't be mutated by callers.
+
+        Passes ``input_type="query"`` so providers that distinguish
+        query vs document embeddings (voyage, BGE) produce the right
+        vector for the retrieval-side cosine.
+        """
+        return tuple(self._embedder.embed([text], input_type="query")[0])
 
     async def stats(self) -> IndexerStats:
         return await asyncio.to_thread(self._stats_sync)

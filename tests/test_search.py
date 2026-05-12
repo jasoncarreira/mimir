@@ -308,9 +308,9 @@ class _CountingEmbedder(HashEmbedder):
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
 
-    def embed(self, texts):  # type: ignore[override]
+    def embed(self, texts, input_type: str = "passage"):  # type: ignore[override]
         self.calls.append(list(texts))
-        return super().embed(texts)
+        return super().embed(texts, input_type=input_type)
 
 
 @pytest.mark.asyncio
@@ -444,3 +444,164 @@ async def test_post_tool_use_hook_reindexes_after_write(tmp_path: Path):
 
     results = await idx.search("relativity", scope="memory", k=5)
     assert any("relativity.md" in r.path for r in results)
+
+
+# ---- SagaProviderEmbedder routing (PR feat/mimir-file-search-via-saga-provider) ----
+
+
+class _MockSagaProvider:
+    """In-memory provider that records calls. Lets us verify
+    SagaProviderEmbedder threads ``input_type`` through to saga's
+    provider chain without actually loading any embedding model."""
+
+    def __init__(self, dim: int = 8):
+        self._dim = dim
+        self.calls: list[tuple[list[str], str]] = []
+
+    def dimensions(self) -> int:
+        return self._dim
+
+    def batch_embed(self, texts: list[str], input_type: str = "passage"):
+        self.calls.append((list(texts), input_type))
+        # Return deterministic-ish fake embeddings — index encodes input_type
+        # so a query call vs passage call produce DIFFERENT vectors (the
+        # whole point of the input_type plumbing).
+        tag = 0.5 if input_type == "query" else 0.1
+        return [[tag + i * 0.01 for i in range(self._dim)] for _ in texts]
+
+
+def test_saga_provider_embedder_dimensions_lazy(monkeypatch):
+    """``SagaProviderEmbedder.dim`` defers provider construction until
+    first access — matches FastEmbedder's lazy-load semantics."""
+    from mimir.search import SagaProviderEmbedder
+    import saga.embeddings as saga_emb
+
+    construction_count = [0]
+
+    def fake_get_provider():
+        construction_count[0] += 1
+        return _MockSagaProvider(dim=384)
+
+    monkeypatch.setattr(saga_emb, "get_provider", fake_get_provider)
+    emb = SagaProviderEmbedder()
+    assert construction_count[0] == 0  # not yet
+    assert emb.dim == 384  # triggers init
+    assert construction_count[0] == 1
+    _ = emb.dim  # cached
+    assert construction_count[0] == 1
+
+
+def test_saga_provider_embedder_passes_input_type(monkeypatch):
+    """SagaProviderEmbedder threads ``input_type`` through to the
+    saga provider's batch_embed — the load-bearing fix that lets
+    voyage produce different query-vs-document embeddings."""
+    from mimir.search import SagaProviderEmbedder
+    import saga.embeddings as saga_emb
+
+    mock = _MockSagaProvider(dim=4)
+    monkeypatch.setattr(saga_emb, "get_provider", lambda: mock)
+
+    emb = SagaProviderEmbedder()
+    emb.embed(["a doc"], input_type="passage")
+    emb.embed(["a query"], input_type="query")
+
+    assert len(mock.calls) == 2
+    assert mock.calls[0] == (["a doc"], "passage")
+    assert mock.calls[1] == (["a query"], "query")
+
+
+def test_saga_provider_embedder_empty_input_skips_provider(monkeypatch):
+    """Empty input list short-circuits before touching the provider —
+    avoids needlessly initializing voyage/openai/fastembed on a no-op."""
+    from mimir.search import SagaProviderEmbedder
+    import saga.embeddings as saga_emb
+
+    construction_count = [0]
+
+    def fake_get_provider():
+        construction_count[0] += 1
+        return _MockSagaProvider()
+
+    monkeypatch.setattr(saga_emb, "get_provider", fake_get_provider)
+    emb = SagaProviderEmbedder()
+    result = emb.embed([], input_type="passage")
+    assert result == []
+    assert construction_count[0] == 0  # never initialized
+
+
+# ---- Dim-mismatch detection (PR #145 review blocker) -------------------
+
+
+class _CustomDimEmbedder:
+    """HashEmbedder-style test fake with a configurable ``dim``. Used to
+    simulate the post-provider-switch scenario where existing chunks
+    have a different dim than the new embedder expects."""
+
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+
+    def embed(self, texts, input_type: str = "passage"):
+        # Match HashEmbedder's shape but with the configured dim.
+        import hashlib
+        out: list[list[float]] = []
+        for t in texts:
+            h = hashlib.sha256(t.encode("utf-8")).digest()
+            # Repeat / truncate the hash bytes to fill ``dim`` floats.
+            vec = [(h[i % len(h)] / 127.5) - 1.0 for i in range(self.dim)]
+            out.append(vec)
+        return out
+
+
+@pytest.mark.asyncio
+async def test_dim_mismatch_warns_loudly(tmp_path: Path, caplog):
+    """After an operator switches providers, existing chunks in
+    index.db are in the OLD vector space. Indexer.start() must emit a
+    loud warning pointing at `mimir reindex` so the operator gets
+    diagnostic visibility instead of silently-degraded retrieval."""
+    _seed(tmp_path)
+    # First Indexer: 16-dim (HashEmbedder default). Index everything.
+    idx_a = Indexer(tmp_path, embedder=HashEmbedder())
+    await idx_a.start(run_initial_sweep=True, sweep_loop=False)
+    await idx_a.stop()
+
+    # Second Indexer: 32-dim — mismatched against the 16-dim BLOBs on
+    # disk. start() should detect + warn.
+    import logging
+    idx_b = Indexer(tmp_path, embedder=_CustomDimEmbedder(dim=32))
+    with caplog.at_level(logging.WARNING, logger="mimir.search"):
+        await idx_b.start(run_initial_sweep=False, sweep_loop=False)
+    matching = [r for r in caplog.records if "dim mismatch" in r.message]
+    assert len(matching) == 1, \
+        f"expected 1 dim-mismatch warning, got {[r.message for r in matching]}"
+    msg = matching[0].message
+    assert "mimir reindex" in msg
+    # Verify the actual + expected byte counts surface in the warning.
+    assert "64 bytes" in msg or "128 bytes" in msg  # 16d * 4 or 32d * 4
+
+
+@pytest.mark.asyncio
+async def test_no_warning_on_empty_index(tmp_path: Path, caplog):
+    """First-boot with no chunks yet shouldn't fire the warning."""
+    _seed(tmp_path)
+    idx = Indexer(tmp_path, embedder=HashEmbedder())
+    import logging
+    with caplog.at_level(logging.WARNING, logger="mimir.search"):
+        await idx.start(run_initial_sweep=False, sweep_loop=False)
+    matching = [r for r in caplog.records if "dim mismatch" in r.message]
+    assert matching == []
+
+
+@pytest.mark.asyncio
+async def test_no_warning_when_dims_match(tmp_path: Path, caplog):
+    """Same-dim re-open shouldn't fire the warning."""
+    _seed(tmp_path)
+    idx_a = Indexer(tmp_path, embedder=HashEmbedder())
+    await idx_a.start(run_initial_sweep=True, sweep_loop=False)
+    await idx_a.stop()
+
+    idx_b = Indexer(tmp_path, embedder=HashEmbedder())
+    import logging
+    with caplog.at_level(logging.WARNING, logger="mimir.search"):
+        await idx_b.start(run_initial_sweep=False, sweep_loop=False)
+    matching = [r for r in caplog.records if "dim mismatch" in r.message]
+    assert matching == []
