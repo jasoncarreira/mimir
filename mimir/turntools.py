@@ -40,7 +40,7 @@ def build_turn_tools(turns_log: Path) -> list[SdkMcpTool]:
         "re-embedding it would re-replay the prior session's history.",
         {"turn_id": str},
     )
-    @_safe("get_turn")
+    @_safe("get_turn", param_names=["turn_id"])
     async def get_turn(args: dict[str, Any]) -> dict[str, Any]:
         turn_id = _need(args, "turn_id")
         if not turns_log.is_file():
