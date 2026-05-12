@@ -101,6 +101,8 @@ tr:hover td{background:var(--surface2);cursor:pointer}
 .ev-saga.is-error .event-hdr{background:var(--trebd);color:#fecaca}
 .ev-saga.is-error .event-bdy{color:#fee2e2}
 .ev-saga .saga-latency{font-family:monospace;opacity:.6;font-size:11px;margin-left:auto}
+.t-marker{font-family:monospace;opacity:.45;font-size:10px;margin-left:auto}
+.event-hdr > .t-marker ~ .event-toggle{margin-left:0}
 .no-events{color:var(--text3);font-size:13px;font-style:italic}
 .error-box{background:var(--treb);border:1px solid var(--trebd);border-radius:8px;padding:12px 14px;font-size:13px;color:#fecaca;white-space:pre-wrap;word-break:break-word}
 ::-webkit-scrollbar{width:6px;height:6px}
@@ -397,10 +399,23 @@ function renderTable() {
   }
 }
 
+// Format a t_ms value (milliseconds since turn start) for display:
+// integer ms under 10s, seconds-with-1-decimal beyond. Empty string
+// for null/undefined so legacy turns render without a stray marker.
+function fmtTMs(t) {
+  if (typeof t !== 'number') return '';
+  if (t < 10000) return Math.round(t) + 'ms';
+  return (t / 1000).toFixed(1) + 's';
+}
+
 function renderEvent(e, i) {
+  var tHtml = e.t_ms != null
+    ? '<span class="t-marker" title="ms since turn start">'+fmtTMs(e.t_ms)+'</span>'
+    : '';
   if (e.type === 'reasoning') {
     return '<div class="event ev-reasoning">'+
-      '<div class="event-hdr"><span>&#x1F4AD; Reasoning #'+(i+1)+'</span><span class="event-toggle">&#x25B2;</span></div>'+
+      '<div class="event-hdr"><span>&#x1F4AD; Reasoning #'+(i+1)+'</span>'+tHtml+
+      '<span class="event-toggle">&#x25B2;</span></div>'+
       '<div class="event-bdy">'+esc(e.content||'')+'</div></div>';
   }
   if (e.type === 'tool_call') {
@@ -408,6 +423,7 @@ function renderEvent(e, i) {
     return '<div class="event ev-tool_call">'+
       '<div class="event-hdr"><span>&#x2699;&#xFE0F; '+esc(e.name||'unknown')+'</span>'+
       '<span style="font-family:monospace;opacity:.5;font-size:11px">'+esc((e.id||'').slice(0,12))+'</span>'+
+      tHtml+
       '<span class="event-toggle">&#x25B2;</span></div>'+
       '<div class="event-bdy">'+esc(args)+'</div></div>';
   }
@@ -416,6 +432,7 @@ function renderEvent(e, i) {
     return '<div class="event ev-tool_result'+errCls+'">'+
       '<div class="event-hdr"><span>'+icon+' Result'+(e.is_error?' (error)':'')+'</span>'+
       '<span style="font-family:monospace;opacity:.5;font-size:11px">'+esc((e.id||'').slice(0,12))+'</span>'+
+      tHtml+
       '<span class="event-toggle">&#x25B2;</span></div>'+
       '<div class="event-bdy">'+esc(e.content||'')+'</div></div>';
   }
@@ -441,6 +458,9 @@ function renderSagaCall(c, i) {
   var icon = SAGA_ICONS[t] || '\u{2022}';
   var lat = c.latency_ms != null ? Math.round(c.latency_ms) + 'ms' : '';
   var errCls = c.error ? ' is-error' : '';
+  var tHtml = c.t_ms != null
+    ? '<span class="t-marker" title="ms since turn start">'+fmtTMs(c.t_ms)+'</span>'
+    : '';
   // Body shows args + result side-by-side as JSON. The summarizer in
   // saga_client.py keeps strings under 200 chars so this stays bounded.
   var argsStr='', resultStr='';
@@ -451,6 +471,7 @@ function renderSagaCall(c, i) {
   return '<div class="event ev-saga'+errCls+'">'+
     '<div class="event-hdr"><span>'+icon+' '+esc(t)+(c.error?' (error)':'')+'</span>'+
     '<span class="saga-latency">'+lat+'</span>'+
+    tHtml+
     '<span class="event-toggle">&#x25B2;</span></div>'+
     '<div class="event-bdy">'+esc(body)+'</div></div>';
 }
@@ -488,28 +509,66 @@ function openDetail(turn) {
     errorSection.style.display = 'none';
   }
 
-  // Saga calls — populated by RecordingSagaClient (mimir/saga_client.py).
-  // Hidden when empty so synthetic ticks / sessions-with-no-saga don't
-  // get a useless empty section.
+  // Interleave saga_calls with events on one chronological timeline
+  // when both carry ``t_ms`` (relative ms from turn start). Falls back
+  // to the legacy two-section layout for old turns that don't have
+  // t_ms — same render functions, just split into two lists.
+  var events = turn.events||[];
   var sagaCalls = turn.saga_calls||[];
+  var canInterleave = sagaCalls.length > 0
+    && sagaCalls.every(function(c){ return typeof c.t_ms === 'number'; })
+    && events.every(function(e){ return typeof e.t_ms === 'number'; });
+
   var sagaSection = document.getElementById('detailSagaCallsSection');
-  if (sagaCalls.length) {
-    sagaSection.style.display = '';
-    document.getElementById('detailSagaCallsCount').textContent = sagaCalls.length;
-    var sagaList = document.getElementById('detailSagaCalls');
-    sagaList.innerHTML = sagaCalls.map(renderSagaCall).join('');
-    bindEventToggles(sagaList);
-  } else {
+  if (canInterleave) {
+    // Single chronological list. Hide the separate saga-calls section;
+    // events section header gets a count of both kinds.
     sagaSection.style.display = 'none';
+    var combined = events.map(function(e){ return {kind:'event', t:e.t_ms, item:e}; })
+      .concat(sagaCalls.map(function(c){ return {kind:'saga', t:c.t_ms, item:c}; }));
+    // Stable sort by t_ms — JS Array.prototype.sort is stable in
+    // modern engines. Ties preserve insertion order, which keeps
+    // tool_call + saga + tool_result for the same MCP saga_query
+    // dispatch in the natural read order even though their t_ms
+    // may collide on the same message.
+    combined.sort(function(a,b){ return a.t - b.t; });
+    document.getElementById('detailEventsCount').textContent = combined.length;
+    var evList = document.getElementById('detailEvents');
+    var seq = {ev: 0, saga: 0};
+    evList.innerHTML = combined.map(function(entry){
+      if (entry.kind === 'event') {
+        var html = renderEvent(entry.item, seq.ev);
+        seq.ev += 1;
+        return html;
+      } else {
+        var html = renderSagaCall(entry.item, seq.saga);
+        seq.saga += 1;
+        return html;
+      }
+    }).join('') || '<div class="no-events">No events recorded for this turn.</div>';
+    bindEventToggles(evList);
+  } else {
+    // Legacy layout: separate saga-calls section above events. Used
+    // for pre-t_ms turns (any turn recorded before the schema added
+    // t_ms to events + saga_calls).
+    if (sagaCalls.length) {
+      sagaSection.style.display = '';
+      document.getElementById('detailSagaCallsCount').textContent = sagaCalls.length;
+      var sagaList = document.getElementById('detailSagaCalls');
+      sagaList.innerHTML = sagaCalls.map(renderSagaCall).join('');
+      bindEventToggles(sagaList);
+    } else {
+      sagaSection.style.display = 'none';
+    }
+
+    document.getElementById('detailEventsCount').textContent = events.length;
+    var evList = document.getElementById('detailEvents');
+    evList.innerHTML = events.length===0
+      ? '<div class="no-events">No events recorded for this turn.</div>'
+      : events.map(renderEvent).join('');
+    bindEventToggles(evList);
   }
 
-  var events = turn.events||[];
-  document.getElementById('detailEventsCount').textContent = events.length;
-  var evList = document.getElementById('detailEvents');
-  evList.innerHTML = events.length===0
-    ? '<div class="no-events">No events recorded for this turn.</div>'
-    : events.map(renderEvent).join('');
-  bindEventToggles(evList);
   document.getElementById('detailPanel').classList.add('open');
   document.getElementById('detailOverlay').classList.add('open');
 }

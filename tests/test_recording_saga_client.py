@@ -180,6 +180,66 @@ async def test_error_records_and_reraises(ctx_for_test):
 
 
 @pytest.mark.asyncio
+async def test_records_t_ms_relative_to_ctx_started_at():
+    """``t_ms`` captures the wall-clock offset (ms) from
+    ``ctx.started_at`` to the moment the saga call STARTED, so the
+    turn viewer can interleave saga calls with model events on one
+    chronological timeline. Uses a real monotonic clock — the assertion
+    bounds the value rather than pinning an exact number."""
+    import time
+    ctx = TurnContext(
+        turn_id=make_turn_id(),
+        session_id="ch-test",
+        trigger="user_message",
+        channel_id="ch-test",
+        # Pin started_at to "100ms ago" so the captured t_ms must be
+        # >= ~100 (the call fires now, started_at was 100ms in the past).
+        started_at=time.monotonic() - 0.100,
+    )
+    tok = set_current_turn(ctx)
+    try:
+        inner = _FakeSaga()
+        wrapped = RecordingSagaClient(inner)
+        await wrapped.query("hello")
+        rec = ctx.saga_calls[0]
+        assert rec.t_ms is not None
+        # Lower bound: at least 100ms since ctx.started_at. Upper bound:
+        # generous — test infra latency shouldn't push past 5s.
+        assert 100.0 <= rec.t_ms < 5000.0, f"t_ms={rec.t_ms}"
+    finally:
+        reset_current_turn(tok)
+
+
+@pytest.mark.asyncio
+async def test_t_ms_none_when_ctx_has_no_started_at():
+    """If the registered ctx is somehow missing ``started_at`` (e.g. a
+    test-only mock), the wrapper records ``t_ms=None`` rather than
+    raising — observability must never break the loop."""
+    class _MinimalCtx:
+        # Mimic TurnContext shape but lacks ``started_at``. Use a real
+        # turn_id so set_current_turn doesn't blow up.
+        turn_id = make_turn_id()
+        session_id = "ch-test"
+        channel_id = "ch-test"
+        saga_session_id = None
+        saga_calls: list = []  # type: ignore[var-annotated]
+    ctx = _MinimalCtx()
+    # Skip the normal set_current_turn — go straight to the registry
+    # since _MinimalCtx isn't a real TurnContext. resolve_active_ctx's
+    # only-active-turn fallback (level 2) picks it up.
+    from mimir._context import _active_turns
+    _active_turns[ctx.turn_id] = ctx  # type: ignore[arg-type]
+    try:
+        inner = _FakeSaga()
+        wrapped = RecordingSagaClient(inner)
+        await wrapped.query("hello")
+        rec = ctx.saga_calls[0]
+        assert rec.t_ms is None
+    finally:
+        _active_turns.pop(ctx.turn_id, None)
+
+
+@pytest.mark.asyncio
 async def test_no_turn_context_silently_skips():
     """saga calls outside a turn (consolidation cron, etc.) don't crash
     — the record append is skipped, but the call still goes through."""

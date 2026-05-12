@@ -2146,6 +2146,13 @@ class Agent:
         during ``_post_message_hook`` (which fires after).
         """
         messages: list = []
+        # Parallel list — per-message wall-clock offset from
+        # ``ctx.started_at``, in ms. Threaded into ``extract_turn_events``
+        # so each emitted event carries its arrival time; the turn viewer
+        # uses this together with ``saga_calls[i].t_ms`` to render one
+        # interleaved chronological timeline rather than two siloed
+        # sections.
+        message_t_ms: list[float] = []
         error: str | None = None
         try:
             try:
@@ -2155,6 +2162,7 @@ class Agent:
                     session_id=ctx.turn_id,
                 ):
                     messages.append(msg)
+                    message_t_ms.append((time.monotonic() - ctx.started_at) * 1000.0)
                     # observe() is best-effort — failures inside the
                     # streaming dispatcher must never break the main
                     # message loop. Logged inside the dispatcher.
@@ -2195,7 +2203,7 @@ class Agent:
                     "(continuing — entry will be evicted on next process restart)",
                     ctx.turn_id,
                 )
-        return messages, error
+        return messages, error, message_t_ms
 
     async def _record_turn_outbound(
         self,
@@ -2357,7 +2365,7 @@ class Agent:
 
         await fire_pre_query(self._turn_hooks, ctx, event)
 
-        messages, error = await self._run_query_loop(
+        messages, error, message_t_ms = await self._run_query_loop(
             ctx, event,
             prompt=turn_prompt,
             options=options,
@@ -2375,6 +2383,7 @@ class Agent:
         )
         events_list, output = extract_turn_events(
             messages, streaming_active=streaming_active_for_log,
+            message_t_ms=message_t_ms,
         )
         duration_ms = int((time.monotonic() - ctx.started_at) * 1000)
 
