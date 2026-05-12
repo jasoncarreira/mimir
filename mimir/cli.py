@@ -592,6 +592,14 @@ DEFAULT_ISSUES_README = dedent(
 #: generated saga.toml. Voyage is the default per the LongMemEval
 #: cross-bench (Phase 3, 2026-05-12): voyage-4-lite beat OpenAI
 #: text-embedding-3-small by 2.4pp aggregate / 4.5pp multi-session.
+#:
+#: Note: the operator-facing preset name "fastembed" maps to saga's
+#: provider name "onnx" in the generated saga.toml — saga's provider
+#: class is ``ONNXProvider`` (fastembed under the hood; saga's
+#: registry key predates the fastembed library merger). The
+#: ``mimir setup --embedding fastembed`` shortcut is meant to be
+#: discoverable; operators reading saga.toml will see
+#: ``provider = "onnx"`` and need to know they're the same thing.
 EMBEDDING_PRESETS: tuple[str, ...] = ("voyage", "openai", "fastembed", "nvidia-nim")
 DEFAULT_EMBEDDING_PRESET = "voyage"
 
@@ -1212,6 +1220,7 @@ def setup_home(
         "api_key_action": api_key_action,
         "saga_api_key_action": saga_api_key_action,
         "git_bootstrap": git_bootstrap_status,
+        "embedding_preset": embedding,
     }
 
 
@@ -1286,8 +1295,24 @@ def _print_setup_report(status: dict[str, object]) -> None:
     print(f"     b. Anthropic API:    set ANTHROPIC_API_KEY in {home}/.env")
     print(f"     c. Gateway (e.g. LiteLLM, OpenRouter):")
     print(f"        set ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN in .env")
-    print(f"  2. (optional) set OPENAI_API_KEY in .env for saga's embeddings;")
-    print(f"     leave blank to fall back to local fastembed (no API needed).")
+    # Embedding-provider-specific guidance — the saga.toml mimir setup
+    # generated has provider=<preset>, so the step here surfaces the
+    # matching env var. Falls back to fastembed automatically if the
+    # key is unset (saga.embeddings.get_provider auto-fallback).
+    preset = status.get("embedding_preset", DEFAULT_EMBEDDING_PRESET)
+    if preset == "voyage":
+        print(f"  2. (optional) set VOYAGE_API_KEY in .env for saga's embeddings")
+        print(f"     (voyage-4-lite — $0.02/1M tokens, 200M signup free credit).")
+        print(f"     Leave blank to fall back to local fastembed (no API needed).")
+    elif preset == "openai":
+        print(f"  2. (optional) set OPENAI_API_KEY in .env for saga's embeddings;")
+        print(f"     leave blank to fall back to local fastembed (no API needed).")
+    elif preset == "nvidia-nim":
+        print(f"  2. (optional) set NVIDIA_NIM_API_KEY in .env for saga's embeddings;")
+        print(f"     leave blank to fall back to local fastembed (no API needed).")
+    else:  # fastembed
+        print(f"  2. saga embeddings configured for local fastembed —")
+        print(f"     no API key needed. First run downloads the ~33MB ONNX model.")
     print(f"  3. (optional) Edit {home}/memory/core/identity.md")
     print(f"  4. Run:  mimir run --home {home}")
 

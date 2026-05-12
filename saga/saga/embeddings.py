@@ -297,10 +297,13 @@ class VoyageProvider(OpenAIProvider):
         if self.api_key_env == "OPENAI_API_KEY":
             self.api_key_env = "VOYAGE_API_KEY"
         # send_input_type is hardcoded True for voyage — non-negotiable
-        # since voyage's models REQUIRE the input_type prefix. If the
-        # operator set it to False in saga.toml we override anyway and
-        # log a warning since False would produce broken embeddings.
-        if not self.send_input_type:
+        # since voyage's models REQUIRE the input_type prefix. Only
+        # log a warning when the operator EXPLICITLY set False in
+        # saga.toml; the OpenAIProvider default is False and a fresh
+        # voyage saga.toml without an explicit ``send_input_type`` key
+        # shouldn't spuriously trip the warning.
+        explicit_value = _cfg('embedding', 'send_input_type', None)
+        if explicit_value is False:
             import logging
             logging.getLogger("saga.embeddings").warning(
                 "[embedding] send_input_type=false was set for "
@@ -386,9 +389,22 @@ def get_provider() -> EmbeddingProvider:
         import os
         provider_name = _cfg('embedding', 'provider', 'nvidia-nim')
 
-        if provider_name in ("openai", "nvidia-nim"):
-            api_key_env = _cfg('embedding', 'api_key_env',
-                               'NVIDIA_NIM_API_KEY' if provider_name == 'nvidia-nim' else 'OPENAI_API_KEY')
+        # API-keyed providers — auto-fall-back to onnx when the
+        # required env var isn't set. Voyage is included since
+        # ``mimir setup --embedding voyage`` is the new default; a
+        # fresh install without VOYAGE_API_KEY should fall back to
+        # local fastembed rather than raising on first embed.
+        _API_KEYED_PROVIDERS = ("openai", "voyage", "nvidia-nim")
+        _DEFAULT_KEY_ENVS = {
+            "openai": "OPENAI_API_KEY",
+            "voyage": "VOYAGE_API_KEY",
+            "nvidia-nim": "NVIDIA_NIM_API_KEY",
+        }
+        if provider_name in _API_KEYED_PROVIDERS:
+            api_key_env = _cfg(
+                'embedding', 'api_key_env',
+                _DEFAULT_KEY_ENVS[provider_name],
+            )
             if api_key_env and not os.environ.get(api_key_env):
                 logging.getLogger("saga.embeddings").info(
                     "[embedding] provider=%s but %s is unset — falling back "
