@@ -1,4 +1,4 @@
-"""SQLite + fastembed hybrid indexer (SPEC §6).
+"""SQLite + saga-provider hybrid indexer (SPEC §6).
 
 Recipe ported from muninnbot's ``scripts/state_search.py`` (PostgreSQL+pgvector
 in source) → SQLite + FTS5 here so the benchmark container has no Postgres
@@ -6,16 +6,22 @@ dependency. Same hybrid score weights:
 
     score = 0.5 * cosine + 0.2 * fts_bm25 + 0.3 * recency
 
+Embeddings route through saga's configured provider (voyage / openai /
+fastembed / nvidia-nim) via ``SagaProviderEmbedder`` so file_search and
+saga atoms share one vector space. Tests pass ``HashEmbedder`` to stay
+offline; ``FastEmbedder`` is kept as a back-compat / pin-to-bge-small
+option but is no longer the default.
+
 Lifecycle:
-- ``start()`` — create schema, run an initial mtime sweep, kick off the 60s
-  background sweep loop.
+- ``start()`` — create schema, dim-mismatch check, run an initial mtime
+  sweep, kick off the 60s background sweep loop.
 - File writes call ``enqueue_path()`` (non-blocking) → indexer thread reads,
   embeds, writes. The ``flush()`` helper waits for the queue to drain in tests.
 - ``search()`` returns ranked ``SearchResult`` rows.
 - ``stop()`` cancels the sweep loop and lets the worker drain.
 
 The ``Embedder`` interface is split so tests can plug in a deterministic fake
-without paying the fastembed cold-start (model download + ONNX load).
+without paying the cold-start cost.
 """
 
 from __future__ import annotations
@@ -400,8 +406,48 @@ class Indexer:
                 conn.execute(stmt)
             conn.commit()
 
+    def _check_dim_mismatch(self) -> None:
+        """Detect existing chunks whose embedding dim doesn't match the
+        current embedder's dim. After an operator switches providers
+        (e.g. fastembed bge-small at 384d → voyage at 1024d), existing
+        BLOBs are in the OLD vector space — ``_cosine`` returns 0.0 on
+        the length mismatch, so semantic search silently degrades to
+        BM25-only with no signal to the operator.
+
+        Log a loud warning here pointing at ``mimir reindex --target
+        files --apply`` so the next operator hitting a stale file_search
+        index gets immediate diagnostic visibility instead of debugging
+        why retrieval looks wrong. Best-effort: errors during the probe
+        are swallowed (no DB existing yet on first boot, transient lock,
+        etc.).
+        """
+        try:
+            expected = self._embedder.dim * 4
+        except Exception:  # noqa: BLE001 — embedder.dim init may fail
+            return
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT length(embedding) FROM chunks LIMIT 1"
+                ).fetchone()
+        except sqlite3.Error:
+            return
+        if row is None:
+            return  # empty index, nothing to mismatch
+        actual = row[0]
+        if actual != expected:
+            log.warning(
+                "file_search index dim mismatch: chunks stored at %d "
+                "bytes/embedding (%dd) but current embedder expects %d "
+                "bytes (%dd). Semantic search will return cosine=0 for "
+                "every chunk until you migrate: "
+                "`mimir reindex --target files --apply`",
+                actual, actual // 4, expected, self._embedder.dim,
+            )
+
     async def start(self, run_initial_sweep: bool = True, sweep_loop: bool = True) -> None:
         await asyncio.to_thread(self.init_schema)
+        await asyncio.to_thread(self._check_dim_mismatch)
         if run_initial_sweep:
             await self.sweep()
         if sweep_loop:

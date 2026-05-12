@@ -527,3 +527,81 @@ def test_saga_provider_embedder_empty_input_skips_provider(monkeypatch):
     result = emb.embed([], input_type="passage")
     assert result == []
     assert construction_count[0] == 0  # never initialized
+
+
+# ---- Dim-mismatch detection (PR #145 review blocker) -------------------
+
+
+class _CustomDimEmbedder:
+    """HashEmbedder-style test fake with a configurable ``dim``. Used to
+    simulate the post-provider-switch scenario where existing chunks
+    have a different dim than the new embedder expects."""
+
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+
+    def embed(self, texts, input_type: str = "passage"):
+        # Match HashEmbedder's shape but with the configured dim.
+        import hashlib
+        out: list[list[float]] = []
+        for t in texts:
+            h = hashlib.sha256(t.encode("utf-8")).digest()
+            # Repeat / truncate the hash bytes to fill ``dim`` floats.
+            vec = [(h[i % len(h)] / 127.5) - 1.0 for i in range(self.dim)]
+            out.append(vec)
+        return out
+
+
+@pytest.mark.asyncio
+async def test_dim_mismatch_warns_loudly(tmp_path: Path, caplog):
+    """After an operator switches providers, existing chunks in
+    index.db are in the OLD vector space. Indexer.start() must emit a
+    loud warning pointing at `mimir reindex` so the operator gets
+    diagnostic visibility instead of silently-degraded retrieval."""
+    _seed(tmp_path)
+    # First Indexer: 16-dim (HashEmbedder default). Index everything.
+    idx_a = Indexer(tmp_path, embedder=HashEmbedder())
+    await idx_a.start(run_initial_sweep=True, sweep_loop=False)
+    await idx_a.stop()
+
+    # Second Indexer: 32-dim — mismatched against the 16-dim BLOBs on
+    # disk. start() should detect + warn.
+    import logging
+    idx_b = Indexer(tmp_path, embedder=_CustomDimEmbedder(dim=32))
+    with caplog.at_level(logging.WARNING, logger="mimir.search"):
+        await idx_b.start(run_initial_sweep=False, sweep_loop=False)
+    matching = [r for r in caplog.records if "dim mismatch" in r.message]
+    assert len(matching) == 1, \
+        f"expected 1 dim-mismatch warning, got {[r.message for r in matching]}"
+    msg = matching[0].message
+    assert "mimir reindex" in msg
+    # Verify the actual + expected byte counts surface in the warning.
+    assert "64 bytes" in msg or "128 bytes" in msg  # 16d * 4 or 32d * 4
+
+
+@pytest.mark.asyncio
+async def test_no_warning_on_empty_index(tmp_path: Path, caplog):
+    """First-boot with no chunks yet shouldn't fire the warning."""
+    _seed(tmp_path)
+    idx = Indexer(tmp_path, embedder=HashEmbedder())
+    import logging
+    with caplog.at_level(logging.WARNING, logger="mimir.search"):
+        await idx.start(run_initial_sweep=False, sweep_loop=False)
+    matching = [r for r in caplog.records if "dim mismatch" in r.message]
+    assert matching == []
+
+
+@pytest.mark.asyncio
+async def test_no_warning_when_dims_match(tmp_path: Path, caplog):
+    """Same-dim re-open shouldn't fire the warning."""
+    _seed(tmp_path)
+    idx_a = Indexer(tmp_path, embedder=HashEmbedder())
+    await idx_a.start(run_initial_sweep=True, sweep_loop=False)
+    await idx_a.stop()
+
+    idx_b = Indexer(tmp_path, embedder=HashEmbedder())
+    import logging
+    with caplog.at_level(logging.WARNING, logger="mimir.search"):
+        await idx_b.start(run_initial_sweep=False, sweep_loop=False)
+    matching = [r for r in caplog.records if "dim mismatch" in r.message]
+    assert matching == []
