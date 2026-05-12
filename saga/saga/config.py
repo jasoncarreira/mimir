@@ -419,6 +419,44 @@ _DEFAULTS = {
 
 _config = None
 _config_loaded = False
+# Records which (section, key) pairs were explicitly written in the
+# operator's saga.toml — not merely present in the merged config via
+# ``_DEFAULTS`` inheritance. Used by ``was_set_in_toml`` so providers
+# like ``VoyageProvider`` can apply provider-specific defaults only
+# when the operator hasn't already specified a value. Distinguishing
+# "explicitly set" from "inherited from _DEFAULTS" is otherwise
+# impossible at the _cfg layer because _deep_merge collapses the two.
+_explicit_keys: dict[str, set[str]] = {}
+
+
+def _record_explicit_keys(data: dict, *, prefix: str) -> None:
+    """Walk a parsed toml dict and populate ``_explicit_keys`` with
+    dotted-path section names. Handles arbitrarily nested tables —
+    e.g. ``[llm.consolidation]`` registers as section
+    ``"llm.consolidation"`` with the leaf keys (``model``,
+    ``api_key_env``, etc.) under it, not as section ``"llm"`` with a
+    single key ``"consolidation"``. This way ``was_set_in_toml`` can
+    answer "did the operator write [llm.consolidation] model?" the
+    intuitive way.
+
+    Each TOML section (top-level or nested) gets its leaf scalars +
+    its sub-section names recorded against the dotted-path section
+    key. Sub-sections also recurse so deeper nesting works.
+    """
+    leaf_keys: set[str] = set()
+    for key, value in data.items():
+        if isinstance(value, dict):
+            nested_prefix = f"{prefix}.{key}" if prefix else key
+            _record_explicit_keys(value, prefix=nested_prefix)
+            # Also note the sub-section's existence under this prefix,
+            # so ``was_set_in_toml("llm", "consolidation")`` keeps
+            # returning True (the prior one-level behavior) for
+            # callers who happen to ask that way.
+            leaf_keys.add(key)
+        else:
+            leaf_keys.add(key)
+    if leaf_keys:
+        _explicit_keys.setdefault(prefix, set()).update(leaf_keys)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -506,6 +544,7 @@ def _load_config() -> dict:
         try:
             with open(toml_path, "rb") as f:
                 toml_data = tomllib.load(f)
+            _record_explicit_keys(toml_data, prefix="")
             config = _deep_merge(config, toml_data)
         except Exception as e:
             import logging
@@ -719,12 +758,40 @@ def reload_config():
     global _config, _config_loaded
     _config = None
     _config_loaded = False
+    _explicit_keys.clear()
     return get_config()
 
 
 def get_raw_config() -> dict:
     """Return the full config dict (for debugging)."""
     return _load_config()
+
+
+def was_set_in_toml(section: str, key: str) -> bool:
+    """Did the operator explicitly set ``[section] key`` in saga.toml?
+
+    Returns False when the merged value came from ``_DEFAULTS`` alone.
+    Lets provider subclasses (e.g. ``VoyageProvider``) apply
+    provider-specific defaults only when the operator hasn't already
+    set a value — the ``_cfg`` accessor can't make this distinction
+    because ``_deep_merge`` collapses defaults and explicit keys into
+    one dict.
+
+    ``section`` accepts dotted-path names for nested TOML tables:
+    ``was_set_in_toml("llm.consolidation", "model")`` checks whether
+    the operator wrote ``[llm.consolidation] model = ...``. The
+    one-level form (``was_set_in_toml("llm", "consolidation")``) also
+    works and reports True when the nested section exists at all.
+
+    Test-fixture note: tests that monkeypatch ``_config`` directly
+    must also patch ``_explicit_keys`` for production parity — see
+    ``tests/test_embeddings.py::TestVoyageProvider._install_voyage_config``
+    for the canonical pattern. A merged ``_config`` alone is not
+    enough; ``was_set_in_toml`` reads ``_explicit_keys`` which is
+    populated during real ``_load_config`` calls.
+    """
+    _load_config()
+    return key in _explicit_keys.get(section, set())
 
 
 # ─── LLM config resolution ────────────────────────────────────────

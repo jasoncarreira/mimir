@@ -287,14 +287,19 @@ class VoyageProvider(OpenAIProvider):
         # because the base class reads them from _cfg directly; just
         # post-override.
         super().__init__()
-        # Override defaults only when the operator hasn't already set
-        # them in saga.toml. Detect "default" by comparing against the
-        # OpenAI defaults that the base class would have read.
-        if self.url == "https://api.openai.com/v1/embeddings":
+        # Apply voyage defaults only for keys the operator didn't
+        # explicitly set in saga.toml. Earlier this checked
+        # ``self.url == openai-default-url``, but saga's
+        # ``_DEFAULTS["embedding"]`` is nvidia-nim — so a minimal
+        # voyage saga.toml without an explicit ``url`` left
+        # ``self.url`` pointing at nvidia-nim and the override never
+        # fired. See issue #149.
+        from .config import was_set_in_toml
+        if not was_set_in_toml("embedding", "url"):
             self.url = "https://api.voyageai.com/v1/embeddings"
-        if self.model == "text-embedding-3-small":
+        if not was_set_in_toml("embedding", "model"):
             self.model = "voyage-4-lite"
-        if self.api_key_env == "OPENAI_API_KEY":
+        if not was_set_in_toml("embedding", "api_key_env"):
             self.api_key_env = "VOYAGE_API_KEY"
         # send_input_type is hardcoded True for voyage — non-negotiable
         # since voyage's models REQUIRE the input_type prefix. Only
