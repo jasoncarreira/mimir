@@ -62,6 +62,7 @@ def extract_turn_events(
     messages: list[Message],
     *,
     streaming_active: bool = False,
+    message_t_ms: list[float] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Walk a Claude Agent SDK message stream and produce ``(events, output)``.
 
@@ -96,10 +97,40 @@ def extract_turn_events(
     Behaves identically to the default for turns with zero or one
     tool_use AssistantMessage — there's no "intermediate" range
     when there's at most one boundary.
+
+    message_t_ms
+    ------------
+
+    Optional parallel list, same length as ``messages``, carrying the
+    wall-clock offset (ms from ``ctx.started_at``) at which each
+    message was received. When provided, each event derived from
+    ``messages[i]`` gets ``t_ms = message_t_ms[i]``. Lets the turn
+    viewer interleave events with ``saga_calls`` (which carry their
+    own ``t_ms``) on one chronological timeline. When ``None``, events
+    are emitted without ``t_ms`` and the viewer falls back to the
+    legacy two-section layout.
     """
     events: list[dict[str, Any]] = []
     output_parts: list[str] = []
     tool_name_by_id: dict[str, str] = {}
+
+    def _now_t_ms(idx: int) -> float | None:
+        """Look up ``message_t_ms[idx]`` defensively. Returns None when
+        the caller didn't supply timestamps OR when ``idx`` overruns
+        the list (defensive against drift between ``messages`` and
+        ``message_t_ms`` lengths)."""
+        if message_t_ms is None or idx >= len(message_t_ms):
+            return None
+        return message_t_ms[idx]
+
+    def _stamp(ev: dict[str, Any], t_ms: float | None) -> dict[str, Any]:
+        """Attach ``t_ms`` to an event dict in-place when non-None.
+        Keeps the event JSON shape stable for legacy turns (no t_ms
+        key at all) while letting timestamped turns surface the
+        chronology to the viewer."""
+        if t_ms is not None:
+            ev["t_ms"] = round(t_ms, 2)
+        return ev
 
     # Pre-compute the "intermediate" range when streaming was active,
     # so each AssistantMessage knows whether its text-only payload is
@@ -136,34 +167,46 @@ def extract_turn_events(
                 elif isinstance(block, ToolUseBlock):
                     tool_uses.append(block)
 
+            t_ms = _now_t_ms(idx)
+
             if thinking_parts:
-                events.append({"type": "reasoning", "content": "\n".join(thinking_parts)})
+                events.append(_stamp(
+                    {"type": "reasoning", "content": "\n".join(thinking_parts)},
+                    t_ms,
+                ))
 
             if text_parts and tool_uses:
                 # Text alongside tool calls reads as reasoning that precedes the call.
-                events.append({"type": "reasoning", "content": "\n".join(text_parts)})
+                events.append(_stamp(
+                    {"type": "reasoning", "content": "\n".join(text_parts)},
+                    t_ms,
+                ))
             elif text_parts:
                 if idx in intermediate_indices:
                     # chainlink #5: streaming would have suppressed
                     # this text from the user; record it as reasoning
                     # so turns.jsonl mirrors what was delivered.
-                    events.append({
-                        "type": "reasoning",
-                        "content": "\n".join(text_parts),
-                    })
+                    events.append(_stamp(
+                        {"type": "reasoning", "content": "\n".join(text_parts)},
+                        t_ms,
+                    ))
                 else:
                     output_parts.extend(text_parts)
 
             for tu in tool_uses:
                 tool_name_by_id[tu.id] = tu.name
-                events.append({
-                    "type": "tool_call",
-                    "id": tu.id,
-                    "name": tu.name,
-                    "args": tu.input,
-                })
+                events.append(_stamp(
+                    {
+                        "type": "tool_call",
+                        "id": tu.id,
+                        "name": tu.name,
+                        "args": tu.input,
+                    },
+                    t_ms,
+                ))
 
         elif isinstance(msg, UserMessage):
+            t_ms = _now_t_ms(idx)
             content = msg.content
             if isinstance(content, list):
                 for block in content:
@@ -171,13 +214,16 @@ def extract_turn_events(
                         body = _coerce_tool_result_content(block.content)
                         if len(body) > MAX_TOOL_RESULT_BYTES:
                             body = body[:MAX_TOOL_RESULT_BYTES] + "…[truncated]"
-                        events.append({
-                            "type": "tool_result",
-                            "id": block.tool_use_id,
-                            "name": tool_name_by_id.get(block.tool_use_id, ""),
-                            "content": body,
-                            "is_error": bool(block.is_error),
-                        })
+                        events.append(_stamp(
+                            {
+                                "type": "tool_result",
+                                "id": block.tool_use_id,
+                                "name": tool_name_by_id.get(block.tool_use_id, ""),
+                                "content": body,
+                                "is_error": bool(block.is_error),
+                            },
+                            t_ms,
+                        ))
 
     return events, "\n".join(output_parts)
 
