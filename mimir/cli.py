@@ -1705,6 +1705,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .commitments import cli as _commitments_cli
     _commitments_cli.add_argparse(commitments_p)
 
+    reindex_p = sub.add_parser(
+        "reindex",
+        help="Re-embed saga atoms and/or file_search chunks under the "
+             "currently-configured embedding provider. Use after "
+             "switching providers (e.g. mimir setup --embedding voyage) "
+             "to migrate existing data into the new vector space. "
+             "Dry-run by default; pass --apply to actually write.",
+    )
+    from . import reindex as _reindex
+    _reindex.add_argparse(reindex_p)
+
     refl_audit_p = refl_sub.add_parser(
         "audit",
         help="Print the '## Effects of prior proposals' block — "
@@ -1871,6 +1882,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             sys.exit(1)
         from .commitments import cli as _commitments_cli
         sys.exit(_commitments_cli.dispatch(args))
+
+    if args.command == "reindex":
+        from . import reindex as _reindex
+        sys.exit(_reindex.dispatch(args))
 
     if args.command == "reflection":
         if args.reflection_action == "most-retrieved":
