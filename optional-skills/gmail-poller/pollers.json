@@ -1,0 +1,15 @@
+{
+  "pollers": [
+    {
+      "name": "gmail-inbox",
+      "command": "python3 poller.py",
+      "cron": "*/5 * * * *",
+      "batch_size": 5,
+      "pass_env": [
+        "GOG_ACCOUNT",
+        "MIMIR_GMAIL_QUERY",
+        "MIMIR_GMAIL_MAX_FETCH"
+      ]
+    }
+  ]
+}

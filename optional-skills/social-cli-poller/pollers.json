@@ -1,0 +1,16 @@
+{
+  "pollers": [
+    {
+      "name": "social-cli-notifications",
+      "command": "python3 poller.py",
+      "cron": "*/15 * * * *",
+      "batch_size": 3,
+      "pass_env": [
+        "MIMIR_SOCIAL_PLATFORMS",
+        "MIMIR_SOCIAL_LIMIT",
+        "MIMIR_SOCIAL_USERS_DIR",
+        "SOCIAL_CLI_BIN"
+      ]
+    }
+  ]
+}
