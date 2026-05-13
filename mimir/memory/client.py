@@ -146,6 +146,8 @@ class MemoryClient:
         agent_id: str = "default",
         embedding_dim: int | None = None,
         synonyms: dict[str, list[str]] | None = None,
+        include_triples_in_response: bool = True,
+        triples_top_n: int = 10,
     ) -> None:
         self._db_path = db_path
         self._conn = conn  # may be None until first use
@@ -155,6 +157,14 @@ class MemoryClient:
         # bench passes the bench-tuned dict; production callers can
         # pass None (no expansion) or a domain-specific dict.
         self._synonyms = synonyms
+        # P42 half-2: surface a top-N triples block in query responses.
+        # ON by default so production prompt rendering picks it up
+        # automatically; the bench harness leaves this on too, which
+        # means triples land in the payload but ``saga.harness.build_prompt``
+        # ignores them (only consumes observations + raws) — bench-neutral.
+        # Set to False to opt out (saga's older default).
+        self._include_triples_in_response = include_triples_in_response
+        self._triples_top_n = triples_top_n
         self._index: VectorIndex | None = None
         self._index_built = False
         # LLM synth callable for consolidate(). Late-bound (lazy import
@@ -255,7 +265,29 @@ class MemoryClient:
                 session_id=session_id,
                 agent_id=self._agent_id,
                 reference_date=reference_date,
+                min_confidence_tier=min_confidence_tier,
             )
+            # P42 half-2: surface a top-N triples block in the response so
+            # production prompt rendering (mimir/sagatools.py:_format_saga_payload)
+            # can show structured (s, p, o) facts alongside obs/raws, and
+            # the post-message hook's _source_atom_ids_from_triples can
+            # credit atoms via mark_contributions. Opt-in via the
+            # ``include_triples`` kwarg below — left ON when triples are
+            # populated in the DB. Empty list when the triples table is
+            # empty (no extra prompt block, no behavior change).
+            triples_payload: list[dict[str, Any]] = []
+            if self._include_triples_in_response:
+                from .triples import top_triples_with_payload
+                rich = top_triples_with_payload(
+                    conn, _query_embed_sync(effective_query),
+                    top_n=self._triples_top_n, dim=triple_dim,
+                )
+                # Strip the internal _cosine field from the wire shape;
+                # keep it out of the agent-facing dict.
+                for t in rich:
+                    triples_payload.append({
+                        k: v for k, v in t.items() if not k.startswith("_")
+                    })
             # Translate the RecallResult into saga's response shape so
             # mimir's call sites don't change.
             return {
@@ -264,7 +296,7 @@ class MemoryClient:
                 "gated_reason": result.gated_reason,
                 "observations": [_candidate_to_atom(c) for c in result.observations],
                 "raws": [_candidate_to_atom(c) for c in result.raws],
-                "triples": [],
+                "triples": triples_payload,
                 "items_returned": len(result.observations) + len(result.raws),
                 "rewritten_query": (
                     rewritten_query
@@ -880,10 +912,17 @@ def _candidate_to_atom(c) -> dict[str, Any]:
         "content": a["content"],
         "stream": a.get("stream"),
         "memory_type": a.get("memory_type"),
+        "source_type": a.get("source_type"),
         "_activation": c.activation,
         "_similarity": c.similarity,
         "_combined_score": c.total,
         "_trend": c.trend_label,
+        # Both keys: saga's prompt renderer at sagatools.py:54 checks
+        # ``confidence_tier`` first, then falls back to ``_confidence_tier``
+        # (back-compat with an older saga shape). Setting both means
+        # whichever consumer reads, it sees the tier.
+        "confidence_tier": c.confidence_tier,
+        "_confidence_tier": c.confidence_tier,
         "topics": _safe_json_load(a.get("topics")),
         "metadata": _safe_json_load(a.get("metadata")),
     }
