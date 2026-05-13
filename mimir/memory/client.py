@@ -443,10 +443,9 @@ class MemoryClient:
                 conn, session_id=session_id, channel_id=channel_id,
                 embed_fn=_embed_text_sync,
                 boundary_synth_fn=_stub_synth,
-                # observation_synth_fn=None — saga's end_session
-                # didn't auto-synthesize observations; the
-                # consolidator did. Same here: leave observation
-                # synthesis to consolidate().
+                # No observation synth at session-end — that lives in
+                # consolidate() (cron-driven, cross-session). reflect's
+                # within-session synth hook was removed 2026-05-13.
             )
             # Return BOTH the saga-compatible ``atom_id`` (consumed by
             # mimir/sagatools.py:583/603 for the local boundary mirror +

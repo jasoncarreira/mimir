@@ -1,15 +1,17 @@
-"""reflect — session-end consolidation.
+"""reflect — session-end bookkeeping.
 
-Triggered at session_boundary turn (mimir's existing synthesis-turn
-mechanism). Emits exactly one session_boundary atom per session
-(always), plus optionally zero-or-more observation atoms when
-clusters of session events warrant synthesis.
+Triggered at session_boundary turn (mimir's synthesis-turn mechanism).
+Emits exactly one session_boundary atom per session, plus the
+session_member relations that link the boundary to atoms accessed
+during the session.
 
-This is the ONLY consolidation entry point in mimir.memory — the
-daily-cron pattern saga has today goes away. CLS framing: reflection
-is the offline "sleep" pass that extracts schemas from episodes;
-firing at session-end matches biology and bounds the scope (we only
-consider what was actually used).
+Observation synthesis is NOT done here — it lives in
+``mimir.memory.consolidate.consolidate()``, which runs on a cron over
+cross-session evidence. The within-session synthesis hook that lived
+here through earlier iterations was removed (2026-05-13): no
+production caller used it, and the cluster + synth + relations logic
+duplicated consolidate.py's path. Cross-session evidence accumulates
+into tighter, more reliable clusters than single-session snapshots.
 
 Idempotency: reflect(session_id) called twice returns the existing
 session_boundary atom and skips re-synthesis. The agent can call
@@ -21,34 +23,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
-from .mark_access import AccessEvent, mark_access
-from .observations import (
-    find_equal_evidence_obs, find_superseded_observations,
-    refresh_trend,
-)
 from .store import store
-
-
-# Activity filter — number of distinct atoms touched in the session
-# before we'll consider synthesizing observations. Quiet sessions
-# (e.g. heartbeats with no useful content) get a session_boundary but
-# no observation synthesis.
-MIN_SESSION_EVENTS_FOR_OBSERVATIONS = 5
-
-# Cap on observations emitted per reflect call. Bounds the LLM cost
-# per session and prevents one verbose session from spawning a swarm
-# of half-baked beliefs.
-MAX_OBSERVATIONS_PER_SESSION = 3
-
-# Minimum atoms per cluster to synthesize an observation. Below this,
-# the cluster is "just one or two related raws" and doesn't justify
-# a new observation; let saga's two-tier evidence boost surface the
-# raws directly when relevant.
-MIN_CLUSTER_SIZE_FOR_OBSERVATION = 3
 
 
 # Injected callables — same pattern as store.EmbedFn.
@@ -59,25 +38,12 @@ MIN_CLUSTER_SIZE_FOR_OBSERVATION = 3
 # decisions_made, unfinished, emotional_state.
 BoundarySynthFn = Callable[[list[dict], dict | None], dict]
 
-# Observation synthesis: cluster of raw atoms → observation content.
-# Returns (content, topics) tuple.
-ObservationSynthFn = Callable[[list[dict]], tuple[str, list[str]]]
-
-# Cluster fn: list of session atoms → list of clusters (lists of atoms).
-# v1 sketch uses similarity-based clustering; entity-aware clustering
-# is a Tier 3 stretch (Hindsight's framing).
-ClusterFn = Callable[[list[dict]], list[list[dict]]]
-
 
 @dataclass
 class ReflectResult:
     session_id: str
     boundary_atom_id: str | None = None
     boundary_created: bool = False         # False = pre-existing (idempotent re-run)
-    observation_ids: list[str] = field(default_factory=list)
-    observations_superseded: list[tuple[str, str]] = field(
-        default_factory=list,
-    )  # (new_obs_id, superseded_old_id)
     session_member_count: int = 0
 
 
@@ -147,134 +113,6 @@ def _link_session_members(
     return len(atom_ids)
 
 
-def _synthesize_observations(
-    conn: sqlite3.Connection,
-    session_atoms: list[dict],
-    session_id: str,
-    *,
-    embed_fn,
-    cluster_fn: ClusterFn | None,
-    observation_synth_fn: ObservationSynthFn,
-    agent_id: str,
-) -> list[tuple[str, list[str], list[str]]]:
-    """Cluster the session's raws → call observation_synth_fn per
-    cluster → return list of (observation_id, evidence_atom_ids,
-    superseded_old_ids).
-
-    Transaction shape: each emitted observation is its own transaction.
-    The LLM call (observation_synth_fn) happens OUTSIDE any transaction
-    — holding a SQLite write lock across an LLM call (seconds) would
-    block any concurrent writer. After the LLM returns, one txn wraps
-    the observation + relations + evidence access_events + supersedes
-    edges + metadata + trend recompute.
-    """
-    raws = [a for a in session_atoms if a["memory_type"] == "raw"
-            and a["source_type"] != "session_boundary"]
-    if len(raws) < MIN_SESSION_EVENTS_FOR_OBSERVATIONS:
-        return []
-    if cluster_fn is None:
-        return []
-
-    clusters = cluster_fn(raws)
-    emitted: list[tuple[str, list[str], list[str]]] = []
-    for cluster in clusters:
-        if len(emitted) >= MAX_OBSERVATIONS_PER_SESSION:
-            break
-        if len(cluster) < MIN_CLUSTER_SIZE_FOR_OBSERVATION:
-            continue
-
-        # LLM synth call — OUTSIDE the transaction.
-        content, topics = observation_synth_fn(cluster)
-        if not content or not content.strip():
-            continue
-        evidence_ids = [a["id"] for a in cluster]
-
-        # Pre-check: equal-evidence observation already exists?
-        # Read-only; no transaction needed.
-        existing_equal = find_equal_evidence_obs(conn, set(evidence_ids))
-        if existing_equal:
-            # Don't fire an access_event: consolidation is
-            # system-internal, not external access. The
-            # ``consolidated_into`` / ``evidenced_by`` relations
-            # remain the persistent audit trail; access_events is
-            # reserved for external-access record only.
-            continue
-
-        # store() opens its own transaction internally for the atom +
-        # embedding + topics + initial access_event. After it returns,
-        # the observation exists committed.
-        result = store(
-            conn, content,
-            embed_fn=embed_fn,
-            memory_type="observation",
-            stream="semantic",
-            topics=topics,
-            agent_id=agent_id,
-            session_id=session_id,
-        )
-        if not result.stored:
-            # Content-hash dedupe hit on the observation. Relations
-            # were already in place from the prior cluster pass; no
-            # access_event fired (consolidation stays out of activation).
-            continue
-
-        # Now wrap the rest in ONE transaction: relations + consolidation
-        # access_events on evidence + supersedes + observations_metadata
-        # seed.
-        now = _utc_now_iso()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.executemany(
-                "INSERT INTO atom_relations "
-                "(source_id, target_id, relation_type, confidence, created_at) "
-                "VALUES (?, ?, 'evidenced_by', 1.0, ?)",
-                [(result.atom_id, raw_id, now) for raw_id in evidence_ids],
-            )
-            conn.executemany(
-                "INSERT INTO atom_relations "
-                "(source_id, target_id, relation_type, confidence, created_at) "
-                "VALUES (?, ?, 'consolidated_into', 1.0, ?)",
-                [(raw_id, result.atom_id, now) for raw_id in evidence_ids],
-            )
-            # No mark_access on evidence raws: consolidation is
-            # system-internal. The evidence_boost on retrieval is the
-            # only ranking signal consolidation produces; activation
-            # stays a pure external-access record.
-
-            superseded = find_superseded_observations(
-                conn, result.atom_id, set(evidence_ids),
-            )
-            for old_obs_id in superseded:
-                conn.execute(
-                    "INSERT OR IGNORE INTO atom_relations "
-                    "(source_id, target_id, relation_type, confidence, "
-                    "created_at, metadata) "
-                    "VALUES (?, ?, 'supersedes', 1.0, ?, ?)",
-                    (result.atom_id, old_obs_id, now,
-                     json.dumps({"trigger": "reflect"})),
-                )
-
-            conn.execute(
-                "INSERT INTO observations_metadata "
-                "(atom_id, evidence_count, trend, last_evidence_at, "
-                "consolidated_at, consolidation_session) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (result.atom_id, len(evidence_ids), "strengthening",
-                 now, now, session_id),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-
-        # Trend recompute is its own short txn inside refresh_trend.
-        refresh_trend(conn, result.atom_id)
-
-        emitted.append((result.atom_id, evidence_ids, superseded))
-
-    return emitted
-
-
 def reflect(
     conn: sqlite3.Connection,
     session_id: str,
@@ -282,12 +120,14 @@ def reflect(
     channel_id: str | None,
     embed_fn,
     boundary_synth_fn: BoundarySynthFn,
-    observation_synth_fn: ObservationSynthFn | None = None,
-    cluster_fn: ClusterFn | None = None,
     boundary_context: dict | None = None,
     agent_id: str = "default",
 ) -> ReflectResult:
-    """Session-end reflection. See module docstring.
+    """Session-end bookkeeping. See module docstring.
+
+    Writes the session_boundary atom + session_member relations + the
+    sessions table row. Does NOT synthesize observations — that's
+    consolidate.py's job (cron-driven, cross-session).
 
     ``boundary_context`` is optional state from mimir's lifecycle layer
     (e.g., recent boundaries to chain from, the agent's running
@@ -363,16 +203,10 @@ def reflect(
             conn.rollback()
             raise
 
-    # ─── Maybe: synthesize observations from session clusters ─────
-    observations: list[tuple[str, list[str], list[str]]] = []
-    if observation_synth_fn is not None:
-        observations = _synthesize_observations(
-            conn, atoms, session_id,
-            embed_fn=embed_fn,
-            cluster_fn=cluster_fn,
-            observation_synth_fn=observation_synth_fn,
-            agent_id=agent_id,
-        )
+    # Observation synthesis is handled separately by consolidate.py
+    # (cron-driven, cross-session). Within-session synthesis was
+    # removed 2026-05-13 — no production caller used it and the
+    # cluster + synth logic duplicated consolidate's path.
 
     # ─── Update sessions table ────────────────────────────────────
     try:
@@ -400,11 +234,6 @@ def reflect(
         session_id=session_id,
         boundary_atom_id=boundary_id,
         boundary_created=True,
-        observation_ids=[o[0] for o in observations],
-        observations_superseded=[
-            (o[0], old_id)
-            for o in observations for old_id in o[2]
-        ],
         session_member_count=member_count,
     )
 
