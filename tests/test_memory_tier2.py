@@ -363,9 +363,14 @@ def test_reflect_synthesizes_observations_when_threshold_met(conn):
     assert len(evidence) == 6
 
 
-def test_reflect_fires_consolidation_events_on_evidence_raws(conn):
-    """Per SCORING.md: when reflect pulls a raw into a synthesis,
-    the raw gets a 'consolidation' access_event (weight 0.5)."""
+def test_reflect_does_not_fire_consolidation_events_on_evidence_raws(conn):
+    """Consolidation is system-internal — it must NOT write
+    access_events. Pre-2026-05-13 it did, with ``ts = now()`` and
+    weight 0.5, which inadvertently reset the Petrov-OL recency
+    anchor on every evidence raw. The fix: skip the access_event
+    entirely. The ``consolidated_into`` / ``evidenced_by`` relations
+    remain the audit trail; the retrieval-side evidence_boost is the
+    ranking signal."""
     raw_ids = []
     for i in range(6):
         r = store(conn, f"fact {i}", embed_fn=_fake_embed, session_id="s1")
@@ -377,7 +382,7 @@ def test_reflect_fires_consolidation_events_on_evidence_raws(conn):
         observation_synth_fn=_stub_observation_synth,
         cluster_fn=_all_in_one_cluster,
     )
-    # Each raw should have a 'consolidation' source access_event.
+    # Each raw should have ONLY 'store' events — no 'consolidation' row.
     for raw_id in raw_ids:
         sources = [
             r[0] for r in conn.execute(
@@ -385,7 +390,21 @@ def test_reflect_fires_consolidation_events_on_evidence_raws(conn):
                 (raw_id,),
             )
         ]
-        assert "consolidation" in sources
+        assert "consolidation" not in sources
+        assert "store" in sources
+    # The relations are the persistent audit trail.
+    obs_rows = conn.execute(
+        "SELECT id FROM atoms WHERE memory_type = 'observation'"
+    ).fetchall()
+    assert obs_rows, "consolidation should still produce an observation atom"
+    obs_id = obs_rows[0][0]
+    edges = conn.execute(
+        "SELECT target_id FROM atom_relations "
+        "WHERE source_id = ? AND relation_type = 'evidenced_by'",
+        (obs_id,),
+    ).fetchall()
+    edge_targets = {r[0] for r in edges}
+    assert edge_targets == set(raw_ids)
 
 
 def test_superset_observation_is_created_not_blocked(conn):

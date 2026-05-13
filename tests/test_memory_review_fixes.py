@@ -181,9 +181,14 @@ async def test_most_retrieved_filters_by_channel_id(client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_outcome_negative_writes_event(client, monkeypatch):
-    """outcome("negative") must produce a queryable side effect — a
-    feedback_negative access event flag for forget review."""
+async def test_outcome_negative_writes_event_with_subtractive_weight(client, monkeypatch):
+    """outcome("negative") fires a feedback_negative access event with
+    weight −1.0. Updated 2026-05-13: previous design used weight 0.0
+    (flag-only), but that left the retrieval event's +1.0 activation
+    boost untouched when the access turned out to be unhelpful. The
+    subtractive weight cancels exactly one access-equivalent, so an
+    atom retrieved once and then marked negative ends up activation-
+    neutral relative to never having been touched."""
     _patch_provider(monkeypatch)
     r = await client.store("test atom")
     result = await client.outcome([r["atom_id"]], "negative")
@@ -196,8 +201,40 @@ async def test_outcome_negative_writes_event(client, monkeypatch):
         (r["atom_id"],),
     ).fetchone()
     assert row is not None
-    # Zero-weight: doesn't decay activation; the row is the flag.
-    assert row[1] == 0.0
+    assert row[1] == -1.0
+
+
+@pytest.mark.asyncio
+async def test_outcome_negative_cancels_retrieval_boost(client, monkeypatch):
+    """End-to-end: atom whose only events are store + retrieval (Σ=2.0)
+    → mark negative → Σ=1.0 (store alone). Activation should drop but
+    the atom remains retrievable (B = ln(1.0) = 0 > semantic threshold
+    of -1.5). Atom whose only event is store (Σ=1.0) → mark negative
+    → Σ=0 → B=-inf → filtered. Pins the subtractive-weight semantic."""
+    _patch_provider(monkeypatch)
+    from mimir.memory.activation import compute_activation
+    import json as _json
+
+    r = await client.store("test atom")
+    aid = r["atom_id"]
+    # Atom has just one 'store' event so far. Mark negative.
+    await client.outcome([aid], "negative")
+    conn = client._ensure_conn()
+    # Read the current summary; activation should be -inf (sum is 0).
+    row = conn.execute(
+        "SELECT recent_ts_json, recent_weights_json, old_count, "
+        "old_weight_sum, old_oldest_ts FROM atom_access_summary "
+        "WHERE atom_id = ?",
+        (aid,),
+    ).fetchone()
+    assert row is not None
+    activation = compute_activation(
+        recent_ts=_json.loads(row[0]),
+        recent_weights=_json.loads(row[1]),
+        old_count=row[2], old_weight_sum=row[3],
+        old_oldest_ts=row[4],
+    )
+    assert activation == float("-inf")
 
 
 @pytest.mark.asyncio

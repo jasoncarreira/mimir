@@ -570,15 +570,11 @@ class MemoryClient:
                 evidence_ids = [a["id"] for a in cluster]
                 existing_equal = find_equal_evidence_obs(conn, set(evidence_ids))
                 if existing_equal:
-                    try:
-                        conn.execute("BEGIN IMMEDIATE")
-                        mark_access(conn, [AccessEvent(
-                            atom_id=existing_equal, source="consolidation",
-                        )])
-                        conn.commit()
-                    except Exception:
-                        conn.rollback()
-                        raise
+                    # Don't fire an access_event: consolidation is
+                    # system-internal, not external access. The
+                    # ``consolidated_into`` / ``evidenced_by`` relations
+                    # provide the persistent audit trail; activation is
+                    # for external-access record only.
                     continue
 
                 store_result = _store_atom(
@@ -591,15 +587,9 @@ class MemoryClient:
                     session_id=None,
                 )
                 if not store_result.stored:
-                    try:
-                        conn.execute("BEGIN IMMEDIATE")
-                        mark_access(conn, [AccessEvent(
-                            atom_id=store_result.atom_id, source="consolidation",
-                        )])
-                        conn.commit()
-                    except Exception:
-                        conn.rollback()
-                        raise
+                    # Dedupe hit on the observation content — relations
+                    # were already in place from the prior cluster pass.
+                    # See note above: no consolidation access_event.
                     continue
 
                 observation_id = store_result.atom_id
@@ -617,10 +607,10 @@ class MemoryClient:
                         "VALUES (?, ?, 'consolidated_into', 1.0, ?)",
                         [(rid, observation_id, now) for rid in evidence_ids],
                     )
-                    mark_access(conn, [
-                        AccessEvent(atom_id=rid, source="consolidation")
-                        for rid in evidence_ids
-                    ])
+                    # No mark_access on evidence raws: consolidation is
+                    # system-internal. The evidence_boost on retrieval
+                    # provides the ranking signal; access_events stays
+                    # a pure external-access record.
 
                     old_obs = find_superseded_observations(
                         conn, observation_id, set(evidence_ids),

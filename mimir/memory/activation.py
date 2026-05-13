@@ -95,14 +95,26 @@ SOURCE_WEIGHTS = {
                                # `feedback()` in __init__.py — keyed
                                # differently here silently degrades the
                                # endorsement signal to 1.0.
-    "feedback_negative": 0.0,  # Zero-weight flag: the event records that
-                               # the agent disowned the atom but doesn't
-                               # decay activation. Used as a forget-review
-                               # signal (forget_by_criteria can query for
-                               # atoms with a recent negative event).
+    "feedback_negative": -1.0, # Subtracts one access-equivalent. When
+                               # the agent marks an atom as unhelpful, the
+                               # retrieval event that fired during the
+                               # turn (weight +1.0) is cancelled — the
+                               # atom doesn't carry forward an unwarranted
+                               # recency boost. Activation Σ ≤ 0 → B=−inf
+                               # (filtered from retrieval); future
+                               # accesses can rehabilitate the atom by
+                               # adding positive contributions.
     "store": 1.0,           # the create event counts as one access
-    "consolidation": 0.5,
     "pinned_init": 5.0,     # pinned atoms get a heavy initial weight
+    # Note: ``consolidation`` is deliberately NOT a source here.
+    # access_events is reserved for external-access record only;
+    # consolidation is a system-internal process and produces no
+    # access_event row. The ``consolidated_into`` / ``evidenced_by``
+    # atom_relations are the persistent audit trail; the retrieval-
+    # side evidence_boost is the ranking signal. This was a 2026-05-13
+    # design correction — prior versions wrote a weight-0.5 event with
+    # ``ts = now()`` which inadvertently reset the recency anchor on
+    # every consolidated raw.
 }
 
 

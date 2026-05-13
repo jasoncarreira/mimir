@@ -413,14 +413,17 @@ def test_consolidate_skips_synthesis_when_cluster_evidence_equals_existing(conn)
     # Synth was not invoked (or, if invoked, the result was discarded).
     # Either way: no new observations emitted.
     assert len(result.observations_emitted) == 0
-    # The existing observation gets a 'consolidation' access_event.
+    # Per 2026-05-13 design correction: consolidation is system-internal
+    # and produces NO access_event. The existing observation's audit
+    # trail is in atom_relations (consolidated_into / evidenced_by),
+    # not access_events.
     sources = [
         s for (s,) in conn.execute(
             "SELECT source FROM access_events WHERE atom_id = ? ORDER BY id",
             (existing,)
         )
     ]
-    assert "consolidation" in sources
+    assert "consolidation" not in sources
 
 
 def test_consolidate_respects_lookback_days(conn):
