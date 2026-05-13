@@ -83,6 +83,7 @@ def store(
     valence: float = 0.0,
     encoding_confidence: float = 0.7,
     precomputed_embedding: tuple[bytes, str, str, int] | None = None,
+    session_dedup_threshold: float | None = None,
 ) -> StoreResult:
     """Persist one atom + its embedding + the initial access event.
 
@@ -95,6 +96,15 @@ def store(
     Pass ``(vec_bytes, provider, model, dim)`` in the same shape
     ``embed_fn`` would return. The single-atom path keeps the embed_fn
     contract; only batch paths flip this.
+
+    ``session_dedup_threshold`` enables near-duplicate dedup within the
+    current session (saga's pre-storage session_dedup). Before content-
+    hash dedupe, if both ``session_id`` and this threshold are set, we
+    cosine-compare the new embedding against every existing atom in
+    the same session. Best match above threshold → dedupe to that atom
+    + fire a store re-encounter event. Use 0.92-0.97 for paraphrase
+    catching; default None (off) preserves current behavior so the
+    bench is unaffected.
     """
     if not content or not content.strip():
         raise ValueError("store: content cannot be empty")
@@ -139,6 +149,48 @@ def store(
                 conn.rollback()
                 raise
             return StoreResult(atom_id=atom_id, stored=False, reason="duplicate")
+
+    # Session near-duplicate dedup (saga's session_dedup, pre-storage).
+    # Only fires when caller supplies BOTH a session_id and a threshold;
+    # default behavior is unchanged.
+    if (
+        not skip_dedupe
+        and session_id is not None
+        and session_dedup_threshold is not None
+    ):
+        # Need an embedding to compare. If the caller already has one
+        # (precomputed path), use it; otherwise compute now (we'd
+        # compute it for the insert anyway).
+        if precomputed_embedding is not None:
+            cand_vec_bytes, cand_provider, cand_model, cand_dim = precomputed_embedding
+        else:
+            cand_vec_bytes, cand_provider, cand_model, cand_dim = embed_fn(content)
+            # Stash so the insert path doesn't re-embed below.
+            precomputed_embedding = (
+                cand_vec_bytes, cand_provider, cand_model, cand_dim,
+            )
+        existing_id = _find_session_near_duplicate(
+            conn, session_id, agent_id,
+            cand_vec_bytes, cand_dim,
+            threshold=session_dedup_threshold,
+        )
+        if existing_id is not None:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                mark_access(conn, [AccessEvent(
+                    atom_id=existing_id,
+                    source="store",
+                    session_id=session_id,
+                    metadata={"dedupe": "session_near"},
+                )])
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            return StoreResult(
+                atom_id=existing_id, stored=False,
+                reason="session_near_duplicate",
+            )
 
     atom_id = _make_atom_id()
 
@@ -197,3 +249,60 @@ def store(
         raise
 
     return StoreResult(atom_id=atom_id, stored=True)
+
+
+def _find_session_near_duplicate(
+    conn: sqlite3.Connection,
+    session_id: str,
+    agent_id: str,
+    cand_vec_bytes: bytes,
+    cand_dim: int,
+    *,
+    threshold: float,
+) -> str | None:
+    """Cosine-scan every atom in ``session_id`` for one whose embedding
+    is ≥ threshold similar to ``cand_vec_bytes``. Returns the best
+    matching atom_id, or None if no atom clears the threshold.
+
+    Scoped per-session because the bench / production case for this is
+    "the user is paraphrasing the same fact within a single conversation."
+    Cross-session paraphrases get caught later by the consolidation
+    similarity clustering, not here.
+
+    Atoms with mismatched embedding dim are skipped (provider switch
+    safety).
+    """
+    import math
+    import struct as _struct
+
+    cand_floats = _struct.unpack(f"{cand_dim}f", cand_vec_bytes[: cand_dim * 4])
+    cand_norm = math.sqrt(sum(x * x for x in cand_floats))
+    if cand_norm == 0.0:
+        return None
+
+    rows = conn.execute(
+        "SELECT a.id, e.vec, e.dim FROM atoms a "
+        "JOIN embeddings e ON e.atom_id = a.id "
+        "WHERE a.session_id = ? AND a.agent_id = ? AND a.tombstoned = 0",
+        (session_id, agent_id),
+    ).fetchall()
+
+    best_id: str | None = None
+    best_sim = threshold  # only beat the threshold to win
+    for atom_id, vec, dim in rows:
+        if dim != cand_dim:
+            continue
+        if vec is None or len(vec) < dim * 4:
+            continue
+        try:
+            atom_floats = _struct.unpack(f"{dim}f", vec[: dim * 4])
+        except _struct.error:
+            continue
+        a_norm = math.sqrt(sum(x * x for x in atom_floats))
+        if a_norm == 0.0:
+            continue
+        sim = sum(c * a for c, a in zip(cand_floats, atom_floats)) / (cand_norm * a_norm)
+        if sim > best_sim:
+            best_sim = sim
+            best_id = atom_id
+    return best_id
