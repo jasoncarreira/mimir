@@ -53,6 +53,16 @@ from .activation import (
     SOURCE_WEIGHTS, DEFAULT_STREAM_THRESHOLDS,
 )
 
+# Search adapters
+from .fts import fts_search, fts5_query
+from .vector_index import VectorIndex, FAISS_AVAILABLE
+
+# LLM-backed synthesis (lazy: import-time pulls in saga._llm)
+from .synthesize import (
+    make_observation_synth_fn, make_async_observation_synth_fn,
+    make_boundary_synth_fn, make_async_boundary_synth_fn,
+)
+
 # Config
 from .config import (
     MemoryConfig, ActivationConfig, ThresholdConfig,
@@ -122,6 +132,11 @@ __all__ = [
     # Activation (introspection / test surface)
     "compute_activation", "activation_from_events", "activation_exact",
     "SOURCE_WEIGHTS", "DEFAULT_STREAM_THRESHOLDS",
+    # Search adapters
+    "fts_search", "fts5_query", "VectorIndex", "FAISS_AVAILABLE",
+    # Synthesis
+    "make_observation_synth_fn", "make_async_observation_synth_fn",
+    "make_boundary_synth_fn", "make_async_boundary_synth_fn",
     # Config
     "MemoryConfig", "ActivationConfig", "ThresholdConfig",
     "ScoringWeights", "TrendModifiers", "BoostsAndPenalties",

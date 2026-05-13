@@ -1716,6 +1716,30 @@ def main(argv: Sequence[str] | None = None) -> None:
     from . import reindex as _reindex
     _reindex.add_argparse(reindex_p)
 
+    # ``mimir migrate-memory`` — port saga.db (or MSAM snapshot) into
+    # the new mimir.memory.db schema. The new memory subsystem
+    # (mimir.memory.*) is a clean-room rewrite that drops saga's
+    # age-anchored retrievability / one-way state machine / consolidation-
+    # halves-stability bugs. This subcommand carries the existing atom
+    # corpus + access history forward without re-encoding from scratch.
+    migrate_p = sub.add_parser(
+        "migrate-memory",
+        help="Migrate saga.db (or MSAM snapshot) to mimir.memory.db. "
+             "One-way; new DB lives alongside the old until cutover.",
+    )
+    migrate_p.add_argument(
+        "--source", type=Path, required=True,
+        help="Path to saga.db or MSAM snapshot",
+    )
+    migrate_p.add_argument(
+        "--dest", type=Path, required=True,
+        help="Output mimir.memory.db (won't overwrite without --force)",
+    )
+    migrate_p.add_argument(
+        "--force", action="store_true",
+        help="Overwrite --dest if it exists",
+    )
+
     refl_audit_p = refl_sub.add_parser(
         "audit",
         help="Print the '## Effects of prior proposals' block — "
@@ -1886,6 +1910,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "reindex":
         from . import reindex as _reindex
         sys.exit(_reindex.dispatch(args))
+
+    if args.command == "migrate-memory":
+        from .memory.migrate import migrate as _migrate_memory
+        try:
+            _migrate_memory(
+                source=args.source,
+                dest=args.dest,
+                force=args.force,
+                log=print,
+            )
+        except FileExistsError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
 
     if args.command == "reflection":
         if args.reflection_action == "most-retrieved":
