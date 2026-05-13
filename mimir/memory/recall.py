@@ -448,17 +448,56 @@ def _score_candidates(
         )
 
 
+#: Multiplier applied to each surfaced observation's RRF score when
+#: computing the boost it contributes to its evidence raws. Mirrors
+#: saga's ``1 / stability_reduction_factor`` (= 2.0 with
+#: ``stability_reduction_factor = 0.5``). The theoretical motivation
+#: is "consolidation halves the source raws' stability — compensate by
+#: 2× on retrieval"; without per-atom stability we keep the constant
+#: as a bench-derived tuning value.
+OBSERVATION_BOOST_MULTIPLIER = 2.0
+
+#: Per-raw cap on the cumulative boost: a raw's evidence boost cannot
+#: exceed ``base × OBSERVATION_BOOST_CAP_RATIO`` so a strongly-endorsed
+#: but otherwise-weak raw can't dominate the top-K. Mirrors saga's
+#: ``evidence_boost_cap_multiplier = 3.0`` (cap factor is cap-1 since
+#: saga's cap is the FINAL score multiplier; we cap the BOOST itself).
+OBSERVATION_BOOST_CAP_RATIO = 2.0
+
+
 def _apply_evidence_boost(
     conn: sqlite3.Connection,
     surfaced_obs: list[RecallCandidate],
     raws: list[RecallCandidate],
     weights: dict[str, float],
 ) -> None:
-    """Each surfaced observation lifts its evidenced_by raws (the
-    raws it consolidated from) by a fixed boost. Two-tier evidence
-    propagation per SCORING.md."""
+    """Surfaced observations lift their evidenced_by raws.
+
+    Per-observation contribution (saga's mechanism):
+      ``boost(raw) = OBSERVATION_BOOST_MULTIPLIER × Σ obs.rrf_score``
+      over the surfaced observations that endorse this raw.
+
+    Cap:
+      ``boost ≤ base × OBSERVATION_BOOST_CAP_RATIO``
+      where ``base`` is the raw's RRF-derived total contribution
+      (``w_rrf × rrf_score``). Without this a strongly-endorsed-but-
+      weakly-ranked raw could leap to the top-K on observation
+      endorsement alone.
+
+    Scaling to total-score space: saga's RRF score is the final score
+    directly; ours multiplies by ``w_rrf`` (default 20). To keep the
+    boost the same *fraction* of base as saga, we multiply the raw
+    rrf-space boost by ``w_rrf`` before adding to ``total``.
+
+    No pull-in: only raws already in the candidate pool are boosted.
+    Saga's canonical bench has ``enable_endorsed_atom_pull_in = false``
+    (P40) — pulling in cheap-path-rejected atoms regressed bench, so
+    in-pool-only is the right default.
+    """
     if not surfaced_obs:
         return
+    # Map each evidenced raw → cumulative boost contribution (in RRF
+    # units, pre-scale).
     obs_ids = [c.atom["id"] for c in surfaced_obs]
     placeholders = ",".join(["?"] * len(obs_ids))
     rows = conn.execute(
@@ -466,11 +505,33 @@ def _apply_evidence_boost(
         f"WHERE source_id IN ({placeholders}) AND relation_type = 'evidenced_by'",
         obs_ids,
     ).fetchall()
-    boosted_raws: set[str] = {target for _, target in rows}
-    if not boosted_raws:
+    if not rows:
         return
-    BOOST = 0.20  # matches saga's surfaced-obs raw-lift magnitude
+    # obs_id → rrf_score lookup
+    obs_score: dict[str, float] = {c.atom["id"]: c.rrf_score for c in surfaced_obs}
+    # raw_id → Σ multiplier × obs_score over endorsing surfaced obs
+    raw_boost_rrf: dict[str, float] = {}
+    for source_id, target_id in rows:
+        contrib = OBSERVATION_BOOST_MULTIPLIER * obs_score.get(source_id, 0.0)
+        if contrib <= 0:
+            continue
+        raw_boost_rrf[target_id] = raw_boost_rrf.get(target_id, 0.0) + contrib
+    if not raw_boost_rrf:
+        return
+    w_rrf = weights.get("w_rrf", 20.0)
     for c in raws:
-        if c.atom["id"] in boosted_raws:
-            c.evidence_boost = BOOST
-            c.total += BOOST
+        boost_rrf = raw_boost_rrf.get(c.atom["id"], 0.0)
+        if boost_rrf <= 0:
+            continue
+        # Cap relative to the raw's own base RRF contribution. base in
+        # RRF units = c.rrf_score; cap is "boost can at most equal
+        # CAP_RATIO × that". A raw with rrf_score=0 has no own base —
+        # we still let it accept the boost (set a small floor) so an
+        # observation-only-found raw can surface, capped at its
+        # ABSOLUTE boost not relative.
+        base_rrf = max(c.rrf_score, 1e-6)
+        capped_boost_rrf = min(boost_rrf, base_rrf * OBSERVATION_BOOST_CAP_RATIO)
+        # Scale to total-score space.
+        boost_total = w_rrf * capped_boost_rrf
+        c.evidence_boost = boost_total
+        c.total += boost_total
