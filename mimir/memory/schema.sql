@@ -211,6 +211,34 @@ CREATE VIRTUAL TABLE IF NOT EXISTS atoms_fts USING fts5(
     content_rowid='rowid'
 );
 
+-- External-content FTS5 doesn't auto-sync from atoms. These three
+-- triggers keep atoms_fts current. INSERT/UPDATE write the new content
+-- so MATCH finds it; DELETE uses the FTS5 delete-on-rowid sentinel to
+-- drop the old row before re-inserting (UPDATE) or just to remove (DELETE).
+-- Tombstoning is *not* deletion — the row stays so audit reads still
+-- work; the WHERE-tombstoned=0 clause in the FTS query path is what
+-- excludes tombstoned atoms from search results.
+CREATE TRIGGER IF NOT EXISTS atoms_fts_insert
+AFTER INSERT ON atoms
+BEGIN
+    INSERT INTO atoms_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS atoms_fts_delete
+AFTER DELETE ON atoms
+BEGIN
+    INSERT INTO atoms_fts(atoms_fts, rowid, content)
+    VALUES('delete', old.rowid, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS atoms_fts_update
+AFTER UPDATE OF content ON atoms
+BEGIN
+    INSERT INTO atoms_fts(atoms_fts, rowid, content)
+    VALUES('delete', old.rowid, old.content);
+    INSERT INTO atoms_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
 -- ──────────────────────────────────────────────────────────────────
 -- Sessions (informational — sessions live in mimir's lifecycle layer
 -- but a sidecar table lets reflect query "what happened this session")
