@@ -82,12 +82,19 @@ def store(
     arousal: float = 0.5,
     valence: float = 0.0,
     encoding_confidence: float = 0.7,
+    precomputed_embedding: tuple[bytes, str, str, int] | None = None,
 ) -> StoreResult:
     """Persist one atom + its embedding + the initial access event.
 
     Raises ``ValueError`` for empty content. Embedding-provider errors
     propagate (caller can retry; nothing landed). DB errors propagate
     too.
+
+    ``precomputed_embedding`` lets bulk callers (bench ingest, importer)
+    batch-embed externally and skip the per-atom ``embed_fn`` call.
+    Pass ``(vec_bytes, provider, model, dim)`` in the same shape
+    ``embed_fn`` would return. The single-atom path keeps the embed_fn
+    contract; only batch paths flip this.
     """
     if not content or not content.strip():
         raise ValueError("store: content cannot be empty")
@@ -137,8 +144,12 @@ def store(
 
     # Embed BEFORE entering the DB transaction. Embedding is network
     # I/O (50-300ms via voyage); we don't want to hold a SQLite write
-    # lock over it — concurrent writers would block.
-    vec_bytes, provider, model, dim = embed_fn(content)
+    # lock over it — concurrent writers would block. Bulk callers can
+    # bypass this with precomputed_embedding.
+    if precomputed_embedding is not None:
+        vec_bytes, provider, model, dim = precomputed_embedding
+    else:
+        vec_bytes, provider, model, dim = embed_fn(content)
 
     # One transaction wraps EVERYTHING: atom + embedding + topics +
     # initial access_event(s). Pre-restructure this opened BEGIN twice

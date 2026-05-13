@@ -241,6 +241,7 @@ class MemoryClient:
         profile: str | None = None, source_type: str = "api",
         use_llm_annotate: bool = False,
         metadata: dict[str, Any] | None = None,
+        precomputed_embedding: tuple[bytes, str, str, int] | None = None,
     ) -> dict[str, Any]:
         def _do():
             conn = self._ensure_conn()
@@ -251,6 +252,7 @@ class MemoryClient:
                 source_type=source_type,
                 metadata=metadata,
                 agent_id=self._agent_id,
+                precomputed_embedding=precomputed_embedding,
             )
             if result.stored:
                 # Incremental-add to the FAISS index if it's already
