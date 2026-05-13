@@ -1,0 +1,46 @@
+# Bench config for mimir.memory's LongMemEval runner.
+#
+# Mirrors saga's saga_bench.toml shape but only the sections
+# mimir.memory actually reads:
+#   - [embedding] → saga.embeddings.get_provider()
+#   - [consolidation] → resolve_llm_config("consolidation") in
+#     mimir.memory.synthesize
+#
+# Everything else from saga_bench.toml (triples / decay / world_model /
+# prediction / annotation) is saga-internal and not used by the
+# memory-direct runner.
+
+[embedding]
+# OpenAI text-embedding-3-small — saga's canonical bench provider since
+# v0. Swap to voyage by setting `provider = "voyage"`, `url =
+# "https://api.voyageai.com/v1/embeddings"`, `model = "voyage-3"`,
+# `dimensions = 1024`, `api_key_env = "VOYAGE_API_KEY"`.
+provider = "openai"
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dimensions = 1536
+max_input_chars = 8000
+timeout_seconds = 30
+batch_size = 256
+api_key_env = "OPENAI_API_KEY"
+
+[consolidation]
+# Consolidation LLM = gpt-5.4-nano via OpenAI. Matches saga_bench.toml
+# line 112-115. Fast and cheap; observation synthesis is the
+# "combine N atoms into one sentence" task and doesn't need a heavy
+# model.
+enabled = true
+enable_llm = true
+llm_url = "https://api.openai.com/v1/chat/completions"
+llm_model = "gpt-5.4-nano"
+timeout_seconds = 30
+api_key_env = "OPENAI_API_KEY"
+
+[llm]
+# Fallback for any subsystem we add later (annotation, triples, etc.).
+# Currently unused by the memory-direct bench; resolve_llm_config falls
+# through to [consolidation] for our only LLM caller.
+url = "https://api.openai.com/v1/chat/completions"
+model = "gpt-5.4-nano"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 30
