@@ -432,6 +432,73 @@ def triple_augment_search(
     return ordered[:top_k]
 
 
+def top_triples_with_payload(
+    conn: sqlite3.Connection,
+    query_emb: list[float],
+    *,
+    top_n: int = 10,
+    dim: int | None = None,
+) -> list[dict]:
+    """Same cosine match as ``triple_augment_search`` but returns the
+    FULL triple data — subject/predicate/object/source_atom_id/valid
+    range/confidence — keyed on triple id rather than collapsing to one
+    row per source atom.
+
+    Used by ``MemoryClient.query`` to surface a top-N triples block in
+    the response payload (saga's P42 ``include_triples_in_response``
+    shape). Distinct from ``triple_augment_search`` because the
+    retrieval-pathway view wants the best-triple-per-atom (no
+    duplicates ranking the same atom), but the response-payload view
+    wants each individual triple match so the agent reads structured
+    facts directly.
+    """
+    rows = conn.execute(
+        "SELECT id, source_atom_id, subject, predicate, object, "
+        "valid_from, valid_until, confidence, embedding, embedding_dim "
+        "FROM triples WHERE tombstoned = 0 AND embedding IS NOT NULL",
+    ).fetchall()
+    if not rows:
+        return []
+    import math
+    q_norm = math.sqrt(sum(x * x for x in query_emb))
+    if q_norm == 0.0:
+        return []
+    scored: list[tuple[float, dict]] = []
+    for (triple_id, source_atom_id, subj, pred, obj,
+         valid_from, valid_until, confidence, blob, t_dim) in rows:
+        if source_atom_id is None:
+            continue
+        if dim is not None and t_dim is not None and t_dim != dim:
+            continue
+        if t_dim is None:
+            t_dim = len(query_emb)
+        if len(blob) < t_dim * 4:
+            continue
+        try:
+            vec = list(struct.unpack(f"{t_dim}f", blob[: t_dim * 4]))
+        except struct.error:
+            continue
+        if len(vec) != len(query_emb):
+            continue
+        v_norm = math.sqrt(sum(x * x for x in vec))
+        if v_norm == 0.0:
+            continue
+        sim = sum(a * b for a, b in zip(query_emb, vec)) / (q_norm * v_norm)
+        scored.append((sim, {
+            "id": triple_id,
+            "source_atom_id": source_atom_id,
+            "subject": subj,
+            "predicate": pred,
+            "object": obj,
+            "valid_from": valid_from,
+            "valid_until": valid_until,
+            "confidence": confidence,
+            "_cosine": sim,
+        }))
+    scored.sort(key=lambda x: -x[0])
+    return [t for _, t in scored[:top_n]]
+
+
 # ─── Entity-side retrieval (no embedding needed) ─────────────────────
 
 

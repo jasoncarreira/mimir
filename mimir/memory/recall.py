@@ -71,6 +71,45 @@ DEFAULT_RRF_WEIGHTS = {
                        # saga's rrf_triple_augment_weight default.
 }
 
+#: Per-atom confidence_tier thresholds. Saga bench TOML defaults:
+#: ``confidence_sim_high = 0.45``, ``_medium = 0.30``, ``_low = 0.10``.
+#: An atom's similarity (max of FAISS cosine vs query embedding,
+#: triple cosine, and a small floor) maps to a tier label. Production
+#: callers filter retrieval by ``min_confidence_tier`` to suppress
+#: weakly-grounded atoms; prompt rendering uses the tag for the
+#: per-atom label (``observation/high``, ``raw/medium``).
+CONFIDENCE_TIER_THRESHOLDS = {
+    "high":   0.45,
+    "medium": 0.30,
+    "low":    0.10,
+}
+
+# Tier ranking for the ``min_confidence_tier`` filter — higher index
+# means stricter tier. min_confidence_tier="medium" keeps medium+high.
+_TIER_ORDER = ["none", "low", "medium", "high"]
+
+
+def _tier_for_similarity(sim: float) -> str:
+    """Map a similarity score to a tier label using the bench defaults."""
+    if sim >= CONFIDENCE_TIER_THRESHOLDS["high"]:
+        return "high"
+    if sim >= CONFIDENCE_TIER_THRESHOLDS["medium"]:
+        return "medium"
+    if sim >= CONFIDENCE_TIER_THRESHOLDS["low"]:
+        return "low"
+    return "none"
+
+
+def _passes_min_tier(tier: str, min_tier: str | None) -> bool:
+    """Whether ``tier`` is at-or-above ``min_tier``. None min means
+    accept everything (filter off)."""
+    if min_tier is None:
+        return True
+    try:
+        return _TIER_ORDER.index(tier) >= _TIER_ORDER.index(min_tier)
+    except ValueError:
+        return True  # unknown tier label — don't filter
+
 # Trend score modifiers — Hindsight P1's "agent should weight beliefs
 # by evidence trajectory." Small magnitudes; trend is a tiebreaker, not
 # a dominant factor. Stale gets the harshest penalty since the agent
@@ -123,6 +162,7 @@ class RecallCandidate:
     pinned_boost: float = 0.0
     trend_modifier: float = 0.0      # +0.1 strengthening / -0.1 weakening / -0.25 stale
     trend_label: str | None = None   # for observability (turn viewer)
+    confidence_tier: str = "none"    # high / medium / low / none — derived from similarity vs threshold
     supersession_penalty: float = 0.0
     contradiction_penalty: float = 0.0
     total: float = 0.0
@@ -155,6 +195,7 @@ def recall(
     weights: dict[str, float] | None = None,
     fire_access_events: bool = True,
     reference_date=None,
+    min_confidence_tier: str | None = None,
 ) -> RecallResult:
     """Two-pass recall. See SCORING.md for the contract.
 
@@ -293,6 +334,19 @@ def recall(
         # compete.
         if not atom["is_pinned"] and activation < threshold:
             continue
+        # The atom's "best" similarity is the max of its FAISS cosine
+        # and its triple-augment cosine — both are embedding-cosine
+        # comparable; keyword BM25 isn't. This drives the
+        # confidence_tier label saga's prompt uses for the
+        # per-atom tag (observation/high, raw/medium, etc.) and that
+        # min_confidence_tier filters on.
+        best_sim = max(
+            sim_map.get(atom_id, 0.0),
+            triple_sim_map.get(atom_id, 0.0),
+        )
+        tier = _tier_for_similarity(best_sim)
+        if not _passes_min_tier(tier, min_confidence_tier):
+            continue
         candidates.append(RecallCandidate(
             atom=atom,
             activation=activation,
@@ -303,6 +357,7 @@ def recall(
             keyword_rank=keyword_rank_map.get(atom_id, -1),
             triple_rank=triple_rank_map.get(atom_id, -1),
             triple_similarity=triple_sim_map.get(atom_id, 0.0),
+            confidence_tier=tier,
         ))
 
     if not candidates:
