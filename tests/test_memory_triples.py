@@ -300,6 +300,41 @@ def test_resolve_contradictions_to_supersedes_writes_edges(conn):
     assert row == ("new", "old")
 
 
+def test_resolve_contradictions_does_not_leak_transaction(conn):
+    """Regression: before the fix, the function did its INSERTs in
+    Python's sqlite3 implicit-transaction mode and never committed,
+    leaving subsequent BEGIN IMMEDIATE callers to crash with
+    'cannot start a transaction within a transaction'. The v4 bench
+    hit this end-to-end on Q1 right after consolidate completed."""
+    _seed_atom(conn, "old", "old fact")
+    _seed_atom(conn, "new", "newer correction")
+    conn.execute("UPDATE atoms SET created_at = '2025-01-01' WHERE id = 'old'")
+    conn.execute("UPDATE atoms SET created_at = '2026-01-01' WHERE id = 'new'")
+    conn.execute(
+        "INSERT INTO atom_relations (source_id, target_id, relation_type, "
+        "confidence, created_at) "
+        "VALUES ('old', 'new', 'contradicts', 1.0, '2026-01-02')"
+    )
+    conn.commit()
+    resolve_contradictions_to_supersedes(conn)
+    # Now BEGIN IMMEDIATE should succeed (no dangling implicit txn).
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("INSERT INTO atoms (id, content, content_hash, created_at) "
+                 "VALUES ('z', 'z', 'zhz', '2026-01-03')")
+    conn.commit()
+    row = conn.execute("SELECT id FROM atoms WHERE id = 'z'").fetchone()
+    assert row is not None
+
+
+def test_resolve_contradictions_no_pairs_no_op(conn):
+    """When there are no contradicts edges, the function should not
+    open a transaction at all (so subsequent BEGIN IMMEDIATE works
+    immediately)."""
+    resolve_contradictions_to_supersedes(conn)
+    conn.execute("BEGIN IMMEDIATE")  # would crash if a txn was open
+    conn.commit()
+
+
 def test_resolve_contradictions_is_idempotent(conn):
     _seed_atom(conn, "old", "old fact")
     _seed_atom(conn, "new", "newer correction")
