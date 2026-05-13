@@ -292,11 +292,23 @@ async def _run_one(
 
         # Consolidate (LLM-backed; cross-session pass)
         n_clusters = 0
+        n_triples = 0
+        n_contra = 0
+        n_supersedes_from_contra = 0
         t0 = time.time()
         if consolidate_enabled:
             try:
                 cresult = await client.consolidate()
                 n_clusters = cresult.get("clusters_consolidated", 0)
+                # P42 + contradiction telemetry (Tier 3). Older versions of
+                # MemoryClient.consolidate didn't return these keys, so
+                # .get(key, 0) keeps the runner compatible with pre-Tier 3
+                # builds.
+                n_triples = cresult.get("triples_stored", 0)
+                n_contra = cresult.get("contradicts_stored", 0)
+                n_supersedes_from_contra = cresult.get(
+                    "supersedes_from_contradictions", 0,
+                )
             except Exception as ce:
                 # Don't kill the bench on consolidation failure; it
                 # affects two-tier numbers but raws still rank.
@@ -305,6 +317,33 @@ async def _run_one(
                 )
         metrics["consolidate_s"] = round(time.time() - t0, 2)
         metrics["clusters_consolidated"] = n_clusters
+        metrics["triples_stored"] = n_triples
+        metrics["contradicts_stored"] = n_contra
+        metrics["supersedes_from_contradictions"] = n_supersedes_from_contra
+
+        # World-state row count + cumulative triples (counts ALL triples
+        # in this question's DB, not just the ones added this call —
+        # accumulating triple count across multiple consolidate passes
+        # for cross-session DBs would otherwise be invisible). One
+        # cheap COUNT(*) post-consolidate.
+        def _post_consolidate_counts():
+            conn = client._ensure_conn()
+            t = conn.execute(
+                "SELECT COUNT(*) FROM triples WHERE tombstoned = 0"
+            ).fetchone()[0]
+            w = conn.execute("SELECT COUNT(*) FROM world_state").fetchone()[0]
+            return t, w
+        try:
+            n_triples_total, n_world_state = await asyncio.to_thread(
+                _post_consolidate_counts,
+            )
+            metrics["triples_total"] = n_triples_total
+            metrics["world_state_rows"] = n_world_state
+        except Exception:
+            # Pre-Tier-3 DBs lack the triples/world_state tables — skip
+            # the counters rather than crash. The .get fallbacks above
+            # already cover the consolidate response shape.
+            pass
 
         # Query (two-tier shape — saga's reader handles either)
         t0 = time.time()
