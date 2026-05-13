@@ -81,6 +81,41 @@ def _make_client(db_path: Path, *, embedding_dim: int = 1024):
     )
 
 
+def _batch_embed_texts(texts: list[str]) -> list[tuple[bytes, str, str, int]]:
+    """Batch-embed via the saga provider's ``batch_embed`` API (or fall
+    back to per-text). Returns parallel list of
+    ``(vec_bytes, provider, model, dim)`` tuples matching the shape
+    ``mimir.memory.store.EmbedFn`` would produce.
+    """
+    import struct as _struct
+    from saga.embeddings import get_provider
+    from saga.config import get_config
+
+    cfg = get_config()
+    provider = get_provider()
+    max_chars = cfg("embedding", "max_input_chars", 2000)
+    provider_name = cfg("embedding", "provider", "unknown")
+    model = cfg("embedding", "model", "unknown")
+    dim = provider.dimensions()
+    batch_size = cfg("embedding", "batch_size", 256)
+
+    truncated = [t[:max_chars] for t in texts]
+    vecs: list[list[float]] = []
+    if hasattr(provider, "batch_embed"):
+        for i in range(0, len(truncated), batch_size):
+            chunk = truncated[i : i + batch_size]
+            vecs.extend(provider.batch_embed(chunk, input_type="passage"))
+    else:
+        for t in truncated:
+            vecs.append(provider.embed(t, input_type="passage"))
+
+    out: list[tuple[bytes, str, str, int]] = []
+    for v in vecs:
+        vec_bytes = _struct.pack(f"{dim}f", *v)
+        out.append((vec_bytes, provider_name, model, dim))
+    return out
+
+
 def _parse_question_date(question_date: str):
     """Parse LongMemEval's question_date ('YYYY/MM/DD (Day) HH:MM') into
     a UTC datetime. Passed as ``reference_date`` to recall() so the
@@ -150,14 +185,25 @@ async def _ingest_question(client, q: dict) -> dict:
     Stream choice mirrors saga: user turns → episodic, assistant turns
     → semantic. Affects activation thresholds and the consolidation
     cluster grouping.
+
+    Batches embedding calls (256 atoms per provider request) so the
+    OpenAI / Voyage round trip cost amortizes — single-call ingest
+    was ~250s/q on text-embedding-3-small with ~500 atoms; batched
+    drops to ~30s/q.
     """
     turns = list(_iter_turns(q))
     if not turns:
         return {"ingested": 0, "total_turns": 0}
 
+    # Batch-embed all turn texts up front via the provider's
+    # batch_embed API (falls back to per-text if not available).
+    embeddings = await asyncio.to_thread(_batch_embed_texts,
+                                          [t["text_for_atom"] for t in turns])
+
+    # Store atoms with the pre-computed embeddings.
     ingested = 0
     stored_ids: list[tuple[str, str]] = []
-    for t in turns:
+    for t, emb in zip(turns, embeddings):
         stream = "episodic" if t["role"] == "user" else "semantic"
         r = await client.store(
             t["text_for_atom"],
@@ -170,6 +216,7 @@ async def _ingest_question(client, q: dict) -> dict:
                 "role": t["role"],
                 "has_answer": t["has_answer"],
             },
+            precomputed_embedding=emb,
         )
         if r.get("stored"):
             ingested += 1
@@ -309,6 +356,33 @@ def _load_done(output_path: Path) -> set[str]:
 
 
 async def _amain(args) -> int:
+    # Point saga's config loader at our bench saga.toml BEFORE any
+    # saga imports trigger config resolution. This sets the
+    # consolidation LLM to gpt-5.4-nano and the embedding provider
+    # to OpenAI text-embedding-3-small (canonical bench setup).
+    # Override by setting SAGA_CONFIG in the env before running.
+    if not os.environ.get("SAGA_CONFIG"):
+        default_cfg = Path(__file__).parent / "bench_saga.toml"
+        if args.saga_config:
+            os.environ["SAGA_CONFIG"] = str(Path(args.saga_config).resolve())
+        else:
+            os.environ["SAGA_CONFIG"] = str(default_cfg)
+
+    # Load .env from repo root so OPENAI_API_KEY / MINIMAX_API_KEY land
+    # in os.environ before any provider code reads them.
+    repo_root = Path(__file__).resolve().parents[2]
+    env_path = repo_root / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value and key not in os.environ:
+                os.environ[key] = value
+
     # Resolve dataset path — defaults to saga's bench DATASET_PATH so
     # this runner doesn't ship its own copy. Set --dataset to point
     # elsewhere.
@@ -425,6 +499,12 @@ def main() -> None:
         "--no-consolidate", action="store_true",
         help="skip the consolidate() pass — produces a raws-only baseline "
              "to compare against the two-tier number",
+    )
+    ap.add_argument(
+        "--saga-config", default=None,
+        help="override SAGA_CONFIG path. Default: bench_saga.toml in "
+             "this directory (OpenAI text-embedding-3-small + "
+             "gpt-5.4-nano consolidation LLM).",
     )
     args = ap.parse_args()
     sys.exit(asyncio.run(_amain(args)))
