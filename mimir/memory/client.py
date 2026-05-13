@@ -6,21 +6,25 @@ Adapts ``mimir.memory.*`` operations to the ``SagaClient`` Protocol
 with one wiring change (``make_saga_client(..)`` returns a
 ``MemoryClient`` instead of an ``_InProcessSaga``).
 
-Provider/index plumbing reuses saga's existing infrastructure during
-the transition:
+Provider/index plumbing:
 
-- Embedding provider: ``saga.embeddings.get_provider()`` — already
-  configured for voyage/openai/onnx via saga.toml.
-- FAISS index: ``saga.vector_index.faiss_search_atoms`` — points at
-  saga.db today; switching it to mimir.memory.db is a follow-up.
-- FTS5: this client doesn't ship its own FTS5 path yet; keyword
-  search falls back to the bare-bones ``WHERE content LIKE ?`` SQL
-  for now. RRF + tsvector-style scoring is a Tier 3 follow-up.
+- Embedding provider: ``saga.embeddings.get_provider()`` — reused
+  as-is. Configurable via saga.toml (voyage / openai / onnx).
+- FAISS index: ``mimir.memory.vector_index.VectorIndex`` — owns its
+  own index keyed on ``mimir.memory.db``'s embeddings table. Built
+  lazily on first ``query()``; incrementally updated after each
+  ``store()`` via ``on_atom_stored``.
+- FTS5: ``mimir.memory.fts.fts_search`` — BM25 over the ``atoms_fts``
+  virtual table. Triggers in schema.sql keep atoms_fts in sync with
+  atoms; the client just calls the search.
+- LLM synth for consolidate: ``mimir.memory.synthesize.
+  make_async_observation_synth_fn`` — wraps saga's ``call_llm`` so
+  consolidate() can actually emit observations rather than no-op'ing.
 
-This means the v1 ``MemoryClient`` is structurally complete but
-operationally tied to saga's infra. Replacing each piece — FAISS,
-FTS5, embeddings — is incremental work that can land per-piece
-without breaking the API surface.
+v2 is operationally complete: real FAISS over mimir.memory.db, real
+FTS5, real LLM-backed consolidation. Embeddings still flow through
+saga's provider — that stays until the final mimir/memory →
+mimir/saga rename, at which point we move the provider too.
 """
 
 from __future__ import annotations
@@ -41,6 +45,8 @@ from .reflect import (
 )
 from .consolidate import consolidate as _consolidate
 from .forget import forget as _forget
+from .fts import fts_search
+from .vector_index import VectorIndex
 
 
 # ─── Provider/index adapters ─────────────────────────────────────────
@@ -77,36 +83,19 @@ def _query_embed_sync(text: str) -> list[float]:
                           input_type="query")
 
 
-def _faiss_search_stub(query_emb: list[float], top_k: int) -> list[tuple[str, float]]:
-    """Placeholder for FAISS-against-mimir.memory.db.
-
-    Saga's FAISS index is keyed on saga.db atoms — pointing it at
-    mimir.memory.db requires either rebuilding the index here or
-    sharing the schema (which we deliberately don't). v1: returns
-    empty; recall falls back on FTS-only candidates. Wire properly
-    in the follow-up that adds FAISS-on-mimir.memory.
-    """
-    return []
-
-
-def _fts_search_naive(conn: sqlite3.Connection):
-    """A naive keyword-search adapter that does ``WHERE content LIKE ?``
-    against atoms. Replace with a real FTS5 path during integration.
-    Returned callable closes over the connection so it matches
-    recall.FtsSearchFn's shape."""
-    def _fn(query: str, top_k: int) -> list[tuple[str, float]]:
-        # Split into terms, build a naive LIKE pattern (each term must
-        # appear at least once). Score = number of matching terms.
-        terms = [t.strip().lower() for t in query.split() if len(t) > 2]
-        if not terms:
+def _make_faiss_search_fn(index: VectorIndex | None):
+    """Closure over the VectorIndex matching recall.FaissSearchFn shape."""
+    def _fn(query_emb: list[float], top_k: int) -> list[tuple[str, float]]:
+        if index is None:
             return []
-        like_clauses = " AND ".join(["LOWER(content) LIKE ?"] * len(terms))
-        params = [f"%{t}%" for t in terms]
-        rows = conn.execute(
-            f"SELECT id FROM atoms WHERE tombstoned = 0 AND {like_clauses} LIMIT ?",
-            params + [top_k],
-        ).fetchall()
-        return [(r[0], float(len(terms))) for r in rows]
+        return index.search(query_emb, top_k=top_k)
+    return _fn
+
+
+def _make_fts_search_fn(conn: sqlite3.Connection, *, agent_id: str = "default"):
+    """Closure over the connection matching recall.FtsSearchFn shape."""
+    def _fn(query: str, top_k: int) -> list[tuple[str, float]]:
+        return fts_search(conn, query, top_k=top_k, agent_id=agent_id)
     return _fn
 
 
@@ -133,9 +122,19 @@ class MemoryClient:
         *,
         db_path: Path | None = None,
         conn: sqlite3.Connection | None = None,
+        agent_id: str = "default",
+        embedding_dim: int | None = None,
     ) -> None:
         self._db_path = db_path
         self._conn = conn  # may be None until first use
+        self._agent_id = agent_id
+        self._embedding_dim = embedding_dim
+        self._index: VectorIndex | None = None
+        self._index_built = False
+        # LLM synth callable for consolidate(). Late-bound (lazy import
+        # of synthesize.py) so MemoryClient doesn't transitively pull in
+        # the saga LLM transport at construction time.
+        self._observation_synth_fn = None
 
     def _ensure_conn(self) -> sqlite3.Connection:
         if self._conn is not None:
@@ -147,7 +146,7 @@ class MemoryClient:
             )
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         fresh = not self._db_path.exists()
-        self._conn = sqlite3.connect(str(self._db_path))
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         if fresh:
@@ -155,6 +154,34 @@ class MemoryClient:
             self._conn.executescript(schema_path.read_text())
             self._conn.commit()
         return self._conn
+
+    def _ensure_index(self, conn: sqlite3.Connection) -> VectorIndex | None:
+        """Lazily build the FAISS index on first retrieval. After build,
+        store() incremental-adds keep it current; periodic rebuilds
+        handle tombstoning accumulation."""
+        if self._index_built:
+            return self._index
+        # Determine the embedding dim from the first embedding row if
+        # not pre-set; falls back to 1024 (voyage default).
+        dim = self._embedding_dim
+        if dim is None:
+            row = conn.execute("SELECT dim FROM embeddings LIMIT 1").fetchone()
+            dim = row[0] if row else 1024
+            self._embedding_dim = dim
+        self._index = VectorIndex(dimension=dim)
+        self._index.build_from_db(conn)
+        self._index_built = True
+        return self._index
+
+    def rebuild_index(self) -> None:
+        """Force a full FAISS rebuild from the current DB state.
+        Called by the bench harness between per-question DBs and by
+        the migration importer after bulk-loading atoms."""
+        conn = self._ensure_conn()
+        if self._index is None:
+            self._ensure_index(conn)
+        else:
+            self._index.build_from_db(conn)
 
     # ── SagaClient surface ──────────────────────────────────────────
 
@@ -166,13 +193,15 @@ class MemoryClient:
     ) -> dict[str, Any]:
         def _do():
             conn = self._ensure_conn()
+            index = self._ensure_index(conn)
             result = _recall(
                 conn, query,
                 query_embed_fn=_query_embed_sync,
-                faiss_search_fn=_faiss_search_stub,
-                fts_search_fn=_fts_search_naive(conn),
+                faiss_search_fn=_make_faiss_search_fn(index),
+                fts_search_fn=_make_fts_search_fn(conn, agent_id=self._agent_id),
                 k=top_k,
                 session_id=session_id,
+                agent_id=self._agent_id,
             )
             # Translate the RecallResult into saga's response shape so
             # mimir's call sites don't change.
@@ -202,8 +231,19 @@ class MemoryClient:
                 profile=profile or "standard",
                 source_type=source_type,
                 metadata=metadata,
+                agent_id=self._agent_id,
             )
             if result.stored:
+                # Incremental-add to the FAISS index if it's already
+                # been built. If not, the next query's lazy build
+                # will pick the new atom up from disk.
+                if self._index is not None and self._index.built:
+                    row = conn.execute(
+                        "SELECT vec FROM embeddings WHERE atom_id = ?",
+                        (result.atom_id,),
+                    ).fetchone()
+                    if row is not None and row[0] is not None:
+                        self._index.add(result.atom_id, row[0])
                 return {"stored": True, "atom_id": result.atom_id}
             return {
                 "stored": False, "atom_id": result.atom_id,
@@ -281,18 +321,203 @@ class MemoryClient:
     async def consolidate(
         self, *, dry_run: bool = False, max_clusters: int | None = None,
         extra_canonical_subjects: list[str] | None = None,
+        lookback_days: int = 30,
+        min_cluster_size: int = 3,
     ) -> dict[str, Any]:
-        # The new consolidate() needs a cluster_fn + observation_synth_fn.
-        # In v1 we don't have an LLM wired in directly — caller would
-        # inject from mimir's existing saga.consolidation infrastructure
-        # during the integration pass. For now, return a no-op response
-        # so the API contract is satisfied but consolidation actually
-        # runs via saga's existing cron until we wire the LLM.
+        """Cross-session consolidation pass. Runs the LLM-backed
+        observation synthesizer over recent raw atoms; emits one
+        observation per cluster that survives the supersession/equal-
+        evidence checks. See ``consolidate.consolidate()`` for the
+        per-cluster contract.
+
+        ``dry_run=True`` walks the candidate set and reports cluster
+        counts without paying any LLM cost — useful for the bench
+        harness's pre-flight check.
+        """
+        from .cluster import make_default_cluster_fn
+
+        # Build/look up the cached LLM synth_fn — async variant so we
+        # can await directly from this coroutine. Cached on the client
+        # because make_async_observation_synth_fn closes over llm_config
+        # (resolved once per process is fine).
+        if self._observation_synth_fn is None:
+            from .synthesize import make_async_observation_synth_fn
+            self._observation_synth_fn = make_async_observation_synth_fn()
+
+        # Synth is async, but consolidate() runs synchronously under
+        # to_thread (so transactions stay in one thread). We adapt: a
+        # sync wrapper that re-enters the running loop is unsafe
+        # (asyncio.run inside an executor thread would deadlock against
+        # the parent loop). Instead, we resolve clusters here on the
+        # caller's loop, run the LLM calls concurrently, and pass a
+        # pre-computed lookup into a sync consolidate variant.
+        conn = self._ensure_conn()
+
+        # 1. Candidate selection + clustering (sync; reads only).
+        from .consolidate import (
+            _candidate_raws, MIN_CLUSTER_SIZE_FOR_OBSERVATION,
+            MAX_OBSERVATIONS_PER_RUN,
+        )
+        raws = await asyncio.to_thread(
+            _candidate_raws,
+            conn,
+            lookback_days=lookback_days,
+            agent_id=self._agent_id,
+        )
+        if len(raws) < min_cluster_size:
+            return {"clusters_formed": 0, "observations_emitted": []}
+
+        cluster_fn = make_default_cluster_fn(conn)
+        clusters = await asyncio.to_thread(cluster_fn, raws)
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "candidates_scanned": len(raws),
+                "clusters_found": len(clusters),
+                "total_atoms_in_clusters": sum(len(c) for c in clusters),
+            }
+
+        # 2. LLM synthesis fan-out — concurrent calls, bounded by a
+        # semaphore so we don't blow the provider's rate limits.
+        # Reuses saga's call_llm transport (anthropic/openai_compat
+        # plumbing already lives there).
+        max_obs = max_clusters or MAX_OBSERVATIONS_PER_RUN
+        eligible = [c for c in clusters if len(c) >= min_cluster_size][:max_obs]
+        sem = asyncio.Semaphore(4)
+
+        async def _synth(cluster):
+            async with sem:
+                try:
+                    return await self._observation_synth_fn(cluster)
+                except Exception:
+                    return ("", [])
+
+        results = await asyncio.gather(*[_synth(c) for c in eligible])
+
+        # 3. Per-cluster restructure: store observation, link evidence,
+        # emit access events. Each cluster runs its own short transaction
+        # so an LLM failure on one doesn't block the others. Done in a
+        # thread so SQLite stays on one writer thread.
+        def _restructure():
+            from .consolidate import (
+                find_equal_evidence_obs, find_superseded_observations,
+            )
+            from .observations import refresh_trend
+            from .store import store as _store_atom
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            emitted: list[str] = []
+            superseded: list[tuple[str, str]] = []
+            for cluster, (content, topics) in zip(eligible, results):
+                if not content or not content.strip():
+                    continue
+                evidence_ids = [a["id"] for a in cluster]
+                existing_equal = find_equal_evidence_obs(conn, set(evidence_ids))
+                if existing_equal:
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        mark_access(conn, [AccessEvent(
+                            atom_id=existing_equal, source="consolidation",
+                        )])
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                    continue
+
+                store_result = _store_atom(
+                    conn, content,
+                    embed_fn=_embed_text_sync,
+                    memory_type="observation",
+                    stream="semantic",
+                    topics=topics,
+                    agent_id=self._agent_id,
+                    session_id=None,
+                )
+                if not store_result.stored:
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        mark_access(conn, [AccessEvent(
+                            atom_id=store_result.atom_id, source="consolidation",
+                        )])
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                    continue
+
+                observation_id = store_result.atom_id
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.executemany(
+                        "INSERT INTO atom_relations "
+                        "(source_id, target_id, relation_type, confidence, created_at) "
+                        "VALUES (?, ?, 'evidenced_by', 1.0, ?)",
+                        [(observation_id, rid, now) for rid in evidence_ids],
+                    )
+                    conn.executemany(
+                        "INSERT INTO atom_relations "
+                        "(source_id, target_id, relation_type, confidence, created_at) "
+                        "VALUES (?, ?, 'consolidated_into', 1.0, ?)",
+                        [(rid, observation_id, now) for rid in evidence_ids],
+                    )
+                    mark_access(conn, [
+                        AccessEvent(atom_id=rid, source="consolidation")
+                        for rid in evidence_ids
+                    ])
+
+                    old_obs = find_superseded_observations(
+                        conn, observation_id, set(evidence_ids),
+                    )
+                    for old_id in old_obs:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO atom_relations "
+                            "(source_id, target_id, relation_type, confidence, "
+                            "created_at, metadata) "
+                            "VALUES (?, ?, 'supersedes', 1.0, ?, ?)",
+                            (observation_id, old_id, now,
+                             json.dumps({"trigger": "consolidate"})),
+                        )
+                    conn.execute(
+                        "INSERT INTO observations_metadata "
+                        "(atom_id, evidence_count, trend, last_evidence_at, "
+                        "consolidated_at) VALUES (?, ?, ?, ?, ?)",
+                        (observation_id, len(evidence_ids),
+                         "strengthening", now, now),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+                # Trend recompute in its own short txn (refresh_trend
+                # manages its own BEGIN/COMMIT).
+                refresh_trend(conn, observation_id)
+
+                # Incrementally add the new observation to the FAISS
+                # index so the next query can surface it.
+                if self._index is not None and self._index.built:
+                    row = conn.execute(
+                        "SELECT vec FROM embeddings WHERE atom_id = ?",
+                        (observation_id,),
+                    ).fetchone()
+                    if row is not None and row[0] is not None:
+                        self._index.add(observation_id, row[0])
+
+                emitted.append(observation_id)
+                for old_id in old_obs:
+                    superseded.append((observation_id, old_id))
+            return emitted, superseded
+
+        emitted, superseded = await asyncio.to_thread(_restructure)
         return {
-            "clusters_formed": 0, "observations_emitted": [],
-            "note": "MemoryClient.consolidate is not yet wired to an LLM "
-                    "synth_fn — falls through. Configure via the "
-                    "integration follow-up.",
+            "candidates_scanned": len(raws),
+            "clusters_found": len(clusters),
+            "clusters_consolidated": len(emitted),
+            "observations_emitted": emitted,
+            "observations_superseded": superseded,
+            "observations_created": len(emitted),
         }
 
     async def decay(self) -> dict[str, Any]:
