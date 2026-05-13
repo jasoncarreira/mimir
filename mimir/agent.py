@@ -72,7 +72,7 @@ from .usage_stats import event_recently_emitted
 from .hooks import make_post_tool_use_hook, make_pre_tool_use_hook
 from .index import IndexGenerator
 from .loop_detector import LoopDetector
-from .memory import load_core
+from .core_blocks import load_core
 from .models import AgentEvent, TurnContext, TurnRecord, make_turn_id
 from .saga_client import SagaClient, SagaError
 from .sagatools import (

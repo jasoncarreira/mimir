@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Protocol
 
-from .memory import describe_file
+from .core_blocks import describe_file
 
 log = logging.getLogger(__name__)
 
