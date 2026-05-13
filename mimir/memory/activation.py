@@ -95,6 +95,11 @@ SOURCE_WEIGHTS = {
                                # `feedback()` in __init__.py — keyed
                                # differently here silently degrades the
                                # endorsement signal to 1.0.
+    "feedback_negative": 0.0,  # Zero-weight flag: the event records that
+                               # the agent disowned the atom but doesn't
+                               # decay activation. Used as a forget-review
+                               # signal (forget_by_criteria can query for
+                               # atoms with a recent negative event).
     "store": 1.0,           # the create event counts as one access
     "consolidation": 0.5,
     "pinned_init": 5.0,     # pinned atoms get a heavy initial weight
