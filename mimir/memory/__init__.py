@@ -60,7 +60,16 @@ from .vector_index import VectorIndex, FAISS_AVAILABLE
 # LLM-backed synthesis (lazy: import-time pulls in saga._llm)
 from .synthesize import (
     make_observation_synth_fn, make_async_observation_synth_fn,
+    make_async_rich_synth_fn,
     make_boundary_synth_fn, make_async_boundary_synth_fn,
+)
+
+# Triples + temporal world model (P42, P37)
+from .triples import (
+    make_triple_id, parse_triples, store_triples,
+    triple_augment_search, retrieve_by_entity,
+    get_current_value, get_history, WorldFact,
+    detect_contradictions, resolve_contradictions_to_supersedes,
 )
 
 # Config

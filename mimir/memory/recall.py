@@ -66,6 +66,9 @@ DEFAULT_SCORING_WEIGHTS = {
 DEFAULT_RRF_WEIGHTS = {
     "semantic": 1.0,
     "keyword":  1.0,
+    "triple":   1.0,   # P42 triple-augment pathway; only contributes
+                       # when a triple_search_fn is wired in. Matches
+                       # saga's rrf_triple_augment_weight default.
 }
 
 # Trend score modifiers — Hindsight P1's "agent should weight beliefs
@@ -93,6 +96,11 @@ QueryEmbedFn = Callable[[str], list[float]]
 FaissSearchFn = Callable[[list[float], int], list[tuple[str, float]]]
 # FTS5 search: (query_string, top_k) → [(atom_id, bm25_score), ...]
 FtsSearchFn = Callable[[str, int], list[tuple[str, float]]]
+# Triple-augment search: (query_emb, top_k) → [(source_atom_id, cosine), ...]
+# Same shape as FaissSearchFn so the RRF assembly stays uniform; the
+# atoms surfaced here are atoms whose extracted triples match the query
+# embedding, complementary to the direct atom-embedding match.
+TripleSearchFn = Callable[[list[float], int], list[tuple[str, float]]]
 
 
 @dataclass
@@ -104,9 +112,11 @@ class RecallCandidate:
     activation: float                # ACT-R base-level
     similarity: float                # cosine (0..1), -1.0 if not in FAISS list
     keyword_score: float = 0.0       # BM25 contribution
-    rrf_score: float = 0.0           # fused rank score from FAISS + FTS lists
+    rrf_score: float = 0.0           # fused rank score from FAISS + FTS + triple lists
     semantic_rank: int = -1          # 1-based rank in FAISS list; -1 if absent
     keyword_rank: int = -1           # 1-based rank in FTS list; -1 if absent
+    triple_rank: int = -1            # 1-based rank in triple-augment list; -1 if absent
+    triple_similarity: float = 0.0   # best cosine of any triple sourcing this atom
     topic_score: float = 0.0
     evidence_boost: float = 0.0
     session_boost: float = 0.0
@@ -134,6 +144,7 @@ def recall(
     query_embed_fn: QueryEmbedFn,
     faiss_search_fn: FaissSearchFn,
     fts_search_fn: FtsSearchFn,
+    triple_search_fn: TripleSearchFn | None = None,
     k: int = 12,
     thresholds: dict[str, float] | None = None,
     agent_id: str = "default",
@@ -168,28 +179,45 @@ def recall(
     fts_candidates = fts_search_fn(
         query, k * FTS_CANDIDATE_MULTIPLIER,
     )
+    # Third pathway: triple-augment. Embed query → cosine-match against
+    # extracted triples → follow source_atom_id back to the atom. Off
+    # by default (triple_search_fn=None); the bench wires it via
+    # MemoryClient when triples are populated.
+    triple_candidates: list[tuple[str, float]] = []
+    if triple_search_fn is not None:
+        try:
+            triple_candidates = triple_search_fn(
+                query_emb, k * FAISS_CANDIDATE_MULTIPLIER,
+            )
+        except Exception:
+            triple_candidates = []
     sim_map = {aid: sim for aid, sim in faiss_candidates}
     kw_map = {aid: kw for aid, kw in fts_candidates}
+    triple_sim_map = {aid: sim for aid, sim in triple_candidates}
     # Per-pathway 1-based rank, used by both RRF and the candidate
     # diagnostic fields. faiss_candidates / fts_candidates arrive
     # pre-sorted (best first) from their respective adapters.
     semantic_rank_map = {aid: i + 1 for i, (aid, _) in enumerate(faiss_candidates)}
     keyword_rank_map = {aid: i + 1 for i, (aid, _) in enumerate(fts_candidates)}
-    candidate_ids = set(sim_map) | set(kw_map)
+    triple_rank_map = {aid: i + 1 for i, (aid, _) in enumerate(triple_candidates)}
+    candidate_ids = set(sim_map) | set(kw_map) | set(triple_sim_map)
     if not candidate_ids:
         return RecallResult()
 
     # ── RRF fusion ──────────────────────────────────────────────────
     # Compute once, here, over the union of candidate IDs. Per-candidate
     # rrf_score lookups go into _score_candidates. We use the saga
-    # canonical weights (semantic=keyword=1.0) and k=60 by default.
+    # canonical weights (semantic=keyword=triple=1.0) and k=60 by default.
     rrf_weights = (weights and weights.get("rrf_pathway_weights")) or DEFAULT_RRF_WEIGHTS
     rrf_k = (weights and weights.get("rrf_k")) or RRF_DEFAULT_K
+    ranked_lists = {
+        "semantic": [aid for aid, _ in faiss_candidates],
+        "keyword":  [aid for aid, _ in fts_candidates],
+    }
+    if triple_candidates:
+        ranked_lists["triple"] = [aid for aid, _ in triple_candidates]
     rrf_fused = reciprocal_rank_fusion(
-        {
-            "semantic": [aid for aid, _ in faiss_candidates],
-            "keyword":  [aid for aid, _ in fts_candidates],
-        },
+        ranked_lists,
         k=rrf_k, weights=rrf_weights,
     )
     rrf_map = dict(rrf_fused)
@@ -273,6 +301,8 @@ def recall(
             rrf_score=rrf_map.get(atom_id, 0.0),
             semantic_rank=semantic_rank_map.get(atom_id, -1),
             keyword_rank=keyword_rank_map.get(atom_id, -1),
+            triple_rank=triple_rank_map.get(atom_id, -1),
+            triple_similarity=triple_sim_map.get(atom_id, 0.0),
         ))
 
     if not candidates:
