@@ -182,19 +182,12 @@ def consolidate(
         evidence_ids = [a["id"] for a in cluster]
 
         # Pre-check: an observation with exactly this evidence set
-        # already exists? Skip synthesis; log a re-encounter event on
-        # the existing one. Cheap to check before paying the LLM cost.
+        # already exists? Skip synthesis (no LLM cost) and continue.
+        # No access_event fired: consolidation is system-internal; the
+        # ``consolidated_into`` / ``evidenced_by`` relations remain the
+        # audit trail. access_events is reserved for external access.
         existing_equal = find_equal_evidence_obs(conn, set(evidence_ids))
         if existing_equal:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                mark_access(conn, [AccessEvent(
-                    atom_id=existing_equal, source="consolidation",
-                )])
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
             continue
 
         # LLM call OUTSIDE transaction.
@@ -216,18 +209,9 @@ def consolidate(
             session_id=None,
         )
         if not store_result.stored:
-            # Content-hash dedupe hit: an observation with identical
-            # text already exists. Log a consolidation event on the
-            # existing observation and move on.
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                mark_access(conn, [AccessEvent(
-                    atom_id=store_result.atom_id, source="consolidation",
-                )])
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+            # Content-hash dedupe hit on the observation. Relations
+            # were already in place from the prior cluster pass; no
+            # access_event fired (consolidation stays out of activation).
             continue
 
         observation_id = store_result.atom_id
@@ -249,12 +233,10 @@ def consolidate(
                 "VALUES (?, ?, 'consolidated_into', 1.0, ?)",
                 [(raw_id, observation_id, now) for raw_id in evidence_ids],
             )
-            mark_access(conn, [
-                AccessEvent(
-                    atom_id=raw_id, source="consolidation",
-                )
-                for raw_id in evidence_ids
-            ])
+            # No mark_access on evidence raws: consolidation is
+            # system-internal. The evidence_boost on retrieval is the
+            # only ranking signal consolidation produces; activation
+            # stays a pure external-access record.
 
             superseded = find_superseded_observations(
                 conn, observation_id, set(evidence_ids),
