@@ -217,7 +217,23 @@ class MemoryClient:
         min_confidence_tier: str | None = None,
         context: list[dict[str, str]] | None = None,
         reference_date=None,
+        enable_contextual_rewrite: bool = False,
     ) -> dict[str, Any]:
+        # Opt-in contextual rewrite (saga's P-feature, off in bench).
+        # We only call the LLM when both the flag and a non-empty
+        # context are present — empty context is a no-op so the cost
+        # never pays for nothing. The rewritten form replaces the
+        # original for retrieval; the response includes both so the
+        # caller (turn viewer / metrics) can see what was done.
+        rewritten_query: str | None = None
+        if enable_contextual_rewrite and context:
+            from .query_rewrite import rewrite_query
+            try:
+                rewritten_query = await rewrite_query(query, context)
+            except Exception:
+                rewritten_query = None
+        effective_query = rewritten_query or query
+
         def _do():
             conn = self._ensure_conn()
             index = self._ensure_index(conn)
@@ -227,7 +243,7 @@ class MemoryClient:
             # dim get filtered.
             triple_dim = self._embedding_dim
             result = _recall(
-                conn, query,
+                conn, effective_query,
                 query_embed_fn=_query_embed_sync,
                 faiss_search_fn=_make_faiss_search_fn(index),
                 fts_search_fn=_make_fts_search_fn(
@@ -250,7 +266,10 @@ class MemoryClient:
                 "raws": [_candidate_to_atom(c) for c in result.raws],
                 "triples": [],
                 "items_returned": len(result.observations) + len(result.raws),
-                "rewritten_query": result.rewritten_query or "",
+                "rewritten_query": (
+                    rewritten_query
+                    or (result.rewritten_query or "")
+                ),
             }
         return await asyncio.to_thread(_do)
 
@@ -260,7 +279,12 @@ class MemoryClient:
         use_llm_annotate: bool = False,
         metadata: dict[str, Any] | None = None,
         precomputed_embedding: tuple[bytes, str, str, int] | None = None,
+        session_id: str | None = None,
+        session_dedup_threshold: float | None = None,
     ) -> dict[str, Any]:
+        # session_dedup_threshold is forwarded straight to store() — off
+        # by default, opt-in by callers that want session-paraphrase
+        # collapse. The bench harness leaves it None.
         def _do():
             conn = self._ensure_conn()
             result = _store(
@@ -270,7 +294,9 @@ class MemoryClient:
                 source_type=source_type,
                 metadata=metadata,
                 agent_id=self._agent_id,
+                session_id=session_id,
                 precomputed_embedding=precomputed_embedding,
+                session_dedup_threshold=session_dedup_threshold,
             )
             if result.stored:
                 # Incremental-add to the FAISS index if it's already
@@ -792,6 +818,42 @@ class MemoryClient:
                 for r in rows
             ]
         return await asyncio.to_thread(_do)
+
+    async def mark_contributions(
+        self,
+        retrieved_atoms: list[dict[str, Any]],
+        response_text: str,
+        *,
+        session_id: str | None = None,
+        threshold: float | None = None,
+    ) -> dict[str, Any]:
+        """Credit-pass: identify which retrieved atoms contributed to a
+        response and fire ``feedback_positive`` events on them. See
+        ``mimir.memory.contributions.mark_contributions`` for the
+        heuristic. Returns a dict the bench harness can log
+        (``contribution_rate``, ``contributed_count``, ``total``).
+
+        Opt-in by call site. The bench harness doesn't call this (saga's
+        bench has it off too).
+        """
+        from .contributions import (
+            mark_contributions as _mc, DEFAULT_CONTRIBUTION_THRESHOLD,
+        )
+        thr = threshold if threshold is not None else DEFAULT_CONTRIBUTION_THRESHOLD
+        def _do():
+            conn = self._ensure_conn()
+            return _mc(
+                conn, retrieved_atoms, response_text,
+                session_id=session_id, threshold=thr,
+            )
+        result = await asyncio.to_thread(_do)
+        return {
+            "contributed_count": len(result.contributed_atom_ids),
+            "total": len(retrieved_atoms),
+            "contribution_rate": result.contribution_rate,
+            "contributed": result.contributed_atom_ids,
+            "threshold": result.threshold,
+        }
 
     async def health(self) -> bool:
         try:

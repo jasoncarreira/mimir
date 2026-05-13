@@ -72,6 +72,14 @@ from .triples import (
     detect_contradictions, resolve_contradictions_to_supersedes,
 )
 
+# Credit-pass + contextual query rewrite
+from .contributions import (
+    mark_contributions as mark_contributions_fn,
+    ContributionResult,
+    DEFAULT_CONTRIBUTION_THRESHOLD,
+)
+from .query_rewrite import rewrite_query
+
 # Config
 from .config import (
     MemoryConfig, ActivationConfig, ThresholdConfig,
