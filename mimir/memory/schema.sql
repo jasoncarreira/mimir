@@ -179,14 +179,22 @@ CREATE INDEX IF NOT EXISTS idx_topics_topic ON atom_topics(topic);
 -- ──────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS triples (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- Content-addressed: hash(subject:predicate:object) lower-cased, so
+    -- identical claims from different source atoms dedup into one row.
+    id TEXT PRIMARY KEY,
     subject TEXT NOT NULL,
-    predicate TEXT NOT NULL,
+    predicate TEXT NOT NULL,         -- lower_snake_case
     object TEXT NOT NULL,
-    source_atom_id TEXT,
+    source_atom_id TEXT,             -- the originating raw/observation
     confidence REAL DEFAULT 1.0,
     valid_from TEXT,                  -- ISO ts, NULL = "from forever"
     valid_until TEXT,                 -- ISO ts, NULL = "still valid"
+    -- Embedding of "{subject} {predicate_readable} {object}" so retrieval
+    -- can cosine-match the query against triple statements directly
+    -- (P41-style triple_augment_v2). Same provider/dim as the atom
+    -- embeddings; mismatched-dim rows get filtered by the index loader.
+    embedding BLOB,
+    embedding_dim INTEGER,
     tombstoned INTEGER DEFAULT 0,
     created_at TEXT NOT NULL,
     metadata TEXT DEFAULT '{}',
@@ -196,6 +204,37 @@ CREATE TABLE IF NOT EXISTS triples (
 CREATE INDEX IF NOT EXISTS idx_triples_spo ON triples(subject, predicate, object);
 CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject) WHERE tombstoned = 0;
 CREATE INDEX IF NOT EXISTS idx_triples_current ON triples(subject, predicate) WHERE valid_until IS NULL AND tombstoned = 0;
+
+-- ──────────────────────────────────────────────────────────────────
+-- World state (P37, derived from triples)
+-- ──────────────────────────────────────────────────────────────────
+--
+-- Tracks the current value of every (subject, predicate) pair plus
+-- its history. Built incrementally as triples land: a new triple for
+-- a (subj, pred) that already has a current value end-dates the
+-- previous current row (valid_until = new.valid_from) and inserts a
+-- new is_current=1 row.
+--
+-- Production callers query ``get_current_value(subject, predicate)``
+-- to answer "what is X's current Y?" without scanning atoms. Bench is
+-- off (per saga); table exists so the triples writer can populate it
+-- and consumers can flip on later.
+
+CREATE TABLE IF NOT EXISTS world_state (
+    subject TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    value TEXT NOT NULL,
+    valid_from TEXT,
+    valid_until TEXT,
+    is_current INTEGER DEFAULT 1,
+    source_triple_id TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (subject, predicate, valid_from),
+    FOREIGN KEY (source_triple_id) REFERENCES triples(id)
+);
+CREATE INDEX IF NOT EXISTS idx_world_current
+    ON world_state(subject, predicate) WHERE is_current = 1;
+CREATE INDEX IF NOT EXISTS idx_world_subject ON world_state(subject);
 
 -- ──────────────────────────────────────────────────────────────────
 -- FTS5 keyword search on atoms (carry over)

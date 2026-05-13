@@ -73,6 +73,124 @@ Atoms:
 """
 
 
+# ─── Rich prompt: OBSERVATION + TRIPLES + CONTRADICTIONS (P42 + P4) ──
+#
+# Produced in one LLM call per cluster so we pay one round-trip for
+# all three signals. The parser handles each section independently —
+# any can be NONE without affecting the others.
+RICH_PROMPT = """\
+You are consolidating {n} related memory atoms. Produce THREE outputs in a \
+single response.
+
+Output format (exactly these section headers, in this order):
+
+OBSERVATION:
+<one or two sentences capturing what the atoms collectively convey>
+
+TRIPLES:
+(subject, predicate, object)
+(subject, predicate, object, valid_from=YYYY-MM-DD)
+(subject, predicate, object, valid_from=YYYY-MM-DD, valid_until=YYYY-MM-DD)
+...
+[OR write: NONE if no clean triples]
+
+CONTRADICTIONS:
+<atom_index_a> vs <atom_index_b>: <one-sentence summary of what they disagree on>
+...
+[OR write: NONE if no contradictions]
+
+Rules for the OBSERVATION:
+- Preserve specific dates, times, numbers, names, and direct quotes VERBATIM \
+when they appear in the atoms.
+- If atoms disagree on a fact, keep both versions ("user first mentioned X on \
+date A, then updated to Y on date B").
+- If an atom is dated "[YYYY-MM-DD role] ...", include the date in the \
+observation when the date matters to the content.
+- Do not invent details not present in the atoms.
+
+Rules for TRIPLES:
+- Subject must be a NAMED ENTITY (person, system, tool, place), max 30 chars
+- Object must be a SHORT SPECIFIC VALUE, max 30 chars
+- Predicate must be lowercase_snake_case
+- PREFER reusing canonical intent predicates over inventing domain-specific \
+compounds. Detail goes in the OBJECT, not the predicate. Instead of \
+(User, prefers_podcast_length, 20-30_minutes), emit \
+(User, prefers, podcast_length=20-30_minutes).
+- Implicit subject "User" for user-preference statements
+- Lists become multiple triples (one per item)
+- Skip emotional/philosophical/meta-commentary content (write NONE)
+
+Rules for TEMPORAL TAGS (optional valid_from/valid_until):
+- Use ONLY when the atoms show a fact CHANGED over time. Take the YYYY-MM-DD \
+from the dated atom prefix(es).
+- valid_from only: fact starts on a date and is still current (most \
+user-preference statements). Example: user moves — emit (User, lives_in, \
+NewCity, valid_from=YYYY-MM-DD).
+- Both bounds: closed interval. Example: user held a job from A to B.
+- DO NOT add bounds to facts that don't change (genres, languages, ratings).
+- DO NOT use the consolidation date — use the source atom's own date.
+
+Rules for CONTRADICTIONS:
+- Only flag *direct* disagreements where two atoms make incompatible claims \
+about the same fact (different objects for the same subject+predicate; \
+opposing preferences on the same topic; incompatible dates).
+- Use 1-based atom indices from the list below.
+- Don't flag temporal evolution ("used to like X, now likes Y") — that's a \
+TRIPLES temporal-tag case, not a contradiction.
+- Don't flag stylistic / phrasing differences. Substance only.
+
+Atoms:
+{indexed_atoms}
+"""
+
+
+_TRIPLES_HEADER = re.compile(r"^\s*TRIPLES\s*:?\s*$", re.IGNORECASE | re.MULTILINE)
+_CONTRADICTIONS_HEADER = re.compile(
+    r"^\s*CONTRADICTIONS\s*:?\s*$", re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _parse_contradictions(raw: str) -> list[dict]:
+    """Pull the CONTRADICTIONS section out of the rich response.
+
+    Recognized line format::
+
+        3 vs 7: <one-sentence summary>
+
+    Returns ``[{atom_index_a, atom_index_b, summary}, ...]``. Empty
+    when the section is missing or the LLM wrote "NONE".
+    """
+    if not raw:
+        return []
+    m = _CONTRADICTIONS_HEADER.search(raw)
+    if not m:
+        return []
+    body = raw[m.end():]
+    # Stop at the next ALL-CAPS section header if any.
+    end_m = re.search(r"^\s*(OBSERVATION|TRIPLES)\s*:?\s*$",
+                       body, re.IGNORECASE | re.MULTILINE)
+    if end_m:
+        body = body[: end_m.start()]
+    out: list[dict] = []
+    line_re = re.compile(
+        r"^\s*(\d+)\s*(?:vs|VS|v\.|×|x)\s*(\d+)\s*:\s*(.+?)\s*$",
+        re.MULTILINE,
+    )
+    for line_m in line_re.finditer(body):
+        try:
+            a = int(line_m.group(1))
+            b = int(line_m.group(2))
+        except ValueError:
+            continue
+        if a == b:
+            continue
+        summary = line_m.group(3).strip()
+        if not summary or summary.upper() == "NONE":
+            continue
+        out.append({"atom_index_a": a, "atom_index_b": b, "summary": summary})
+    return out
+
+
 _OBSERVATION_HEADER = re.compile(r"^OBSERVATION:\s*", re.IGNORECASE | re.MULTILINE)
 
 
@@ -121,6 +239,79 @@ def make_observation_synth_fn(
         return asyncio.run(async_fn(cluster))
 
     return _sync
+
+
+def make_async_rich_synth_fn(
+    *,
+    llm_config: dict | None = None,
+    max_tokens: int = 1500,
+    temperature: float = 0.3,
+) -> Callable[[list[dict]], Any]:
+    """Async rich synthesizer — returns OBSERVATION + TRIPLES +
+    CONTRADICTIONS in a single LLM call.
+
+    Returns a coroutine that, given a cluster, resolves to a dict::
+
+        {
+            "content": "<observation prose>",
+            "topics": ["topic", ...],
+            "triples": [
+                {"subject": ..., "predicate": ..., "object": ...,
+                 "valid_from": ...?, "valid_until": ...?},
+                ...
+            ],
+            "contradictions": [
+                {"atom_index_a": int, "atom_index_b": int,
+                 "summary": "..."},
+                ...
+            ],
+        }
+
+    The triples and contradictions lists may be empty (LLM returns
+    NONE for the section, or the parser couldn't validate any). The
+    observation content may also be empty on LLM failure — caller
+    should check ``result["content"]`` and skip if missing.
+    """
+    async def _do(cluster: list[dict]) -> dict:
+        from saga._llm import call_llm
+        from saga.config import resolve_llm_config
+
+        cfg = llm_config or resolve_llm_config("consolidation")
+        indexed = "\n".join(
+            f"[{i + 1}] {a['content']}"
+            for i, a in enumerate(cluster)
+        )
+        prompt = RICH_PROMPT.format(n=len(cluster), indexed_atoms=indexed)
+        try:
+            raw = await call_llm(
+                cfg,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "rich_synth_fn LLM call failed (cluster size=%d): %s",
+                len(cluster), exc,
+            )
+            return {
+                "content": "", "topics": [],
+                "triples": [], "contradictions": [],
+            }
+
+        # Lazy import to avoid the cycle when triples.py imports
+        # back from synthesize for prompt-shared helpers.
+        from .triples import parse_triples
+
+        return {
+            "content": _parse_observation(raw),
+            "topics": _collect_topics(cluster),
+            "triples": parse_triples(raw),
+            "contradictions": _parse_contradictions(raw),
+        }
+
+    return _do
 
 
 def make_async_observation_synth_fn(

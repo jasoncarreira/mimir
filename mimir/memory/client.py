@@ -108,6 +108,18 @@ def _make_fts_search_fn(
     return _fn
 
 
+def _make_triple_search_fn(conn: sqlite3.Connection, *, dim: int | None):
+    """Closure over the connection matching recall.TripleSearchFn shape.
+    Returns None when triples are disabled (the dim arg is None, meaning
+    the FAISS index isn't built — same condition under which the
+    semantic pathway would also be empty)."""
+    from .triples import triple_augment_search
+
+    def _fn(query_emb: list[float], top_k: int) -> list[tuple[str, float]]:
+        return triple_augment_search(conn, query_emb, top_k=top_k, dim=dim)
+    return _fn
+
+
 # ─── The facade ──────────────────────────────────────────────────────
 
 
@@ -209,6 +221,11 @@ class MemoryClient:
         def _do():
             conn = self._ensure_conn()
             index = self._ensure_index(conn)
+            # Triple-augment pathway uses the SAME embedding dim as the
+            # atom-level FAISS index (triples are embedded under the
+            # same provider). Pass dim through so triples with a stale
+            # dim get filtered.
+            triple_dim = self._embedding_dim
             result = _recall(
                 conn, query,
                 query_embed_fn=_query_embed_sync,
@@ -217,6 +234,7 @@ class MemoryClient:
                     conn, agent_id=self._agent_id,
                     synonyms=self._synonyms,
                 ),
+                triple_search_fn=_make_triple_search_fn(conn, dim=triple_dim),
                 k=top_k,
                 session_id=session_id,
                 agent_id=self._agent_id,
@@ -405,13 +423,15 @@ class MemoryClient:
         """
         from .cluster import make_default_cluster_fn
 
-        # Build/look up the cached LLM synth_fn — async variant so we
-        # can await directly from this coroutine. Cached on the client
-        # because make_async_observation_synth_fn closes over llm_config
-        # (resolved once per process is fine).
+        # Build/look up the cached LLM synth_fn. The rich variant
+        # returns observation + triples + contradictions in one call;
+        # the per-cluster restructure pass then routes each output
+        # into the right table. Cached on the client because
+        # make_async_rich_synth_fn closes over llm_config (resolved
+        # once per process is fine).
         if self._observation_synth_fn is None:
-            from .synthesize import make_async_observation_synth_fn
-            self._observation_synth_fn = make_async_observation_synth_fn()
+            from .synthesize import make_async_rich_synth_fn
+            self._observation_synth_fn = make_async_rich_synth_fn()
 
         # Synth is async, but consolidate() runs synchronously under
         # to_thread (so transactions stay in one thread). We adapt: a
@@ -460,7 +480,8 @@ class MemoryClient:
                 try:
                     return await self._observation_synth_fn(cluster)
                 except Exception:
-                    return ("", [])
+                    return {"content": "", "topics": [],
+                            "triples": [], "contradictions": []}
 
         results = await asyncio.gather(*[_synth(c) for c in eligible])
 
@@ -474,11 +495,18 @@ class MemoryClient:
             )
             from .observations import refresh_trend
             from .store import store as _store_atom
+            from .triples import store_triples
             from datetime import datetime, timezone
             now = datetime.now(timezone.utc).isoformat()
             emitted: list[str] = []
             superseded: list[tuple[str, str]] = []
-            for cluster, (content, topics) in zip(eligible, results):
+            triples_stored = 0
+            contradicts_stored = 0
+            for cluster, result in zip(eligible, results):
+                content = result.get("content", "")
+                topics = result.get("topics", [])
+                triples = result.get("triples", [])
+                contradictions = result.get("contradictions", [])
                 if not content or not content.strip():
                     continue
                 evidence_ids = [a["id"] for a in cluster]
@@ -555,6 +583,51 @@ class MemoryClient:
                         (observation_id, len(evidence_ids),
                          "strengthening", now, now),
                     )
+                    # P42: store any triples the LLM extracted. Source
+                    # them to the new observation atom (not the raws)
+                    # so triple retrieval surfaces the observation —
+                    # the two-tier pathway then lifts the raws via the
+                    # existing evidenced_by boost in recall.py.
+                    if triples:
+                        added = store_triples(
+                            conn, triples,
+                            source_atom_id=observation_id,
+                            embed_fn=_embed_text_sync,
+                        )
+                        triples_stored += len(added)
+                    # Contradiction edges: map LLM-emitted 1-based atom
+                    # indices to atom IDs in the cluster and insert a
+                    # 'contradicts' relation. The
+                    # resolve_contradictions_to_supersedes() pass turns
+                    # these into supersedes edges. Skip self-references
+                    # and out-of-range indices.
+                    if contradictions:
+                        for c in contradictions:
+                            ia = c.get("atom_index_a")
+                            ib = c.get("atom_index_b")
+                            if not isinstance(ia, int) or not isinstance(ib, int):
+                                continue
+                            if ia < 1 or ia > len(cluster):
+                                continue
+                            if ib < 1 or ib > len(cluster):
+                                continue
+                            aid_a = cluster[ia - 1]["id"]
+                            aid_b = cluster[ib - 1]["id"]
+                            if aid_a == aid_b:
+                                continue
+                            cursor = conn.execute(
+                                "INSERT OR IGNORE INTO atom_relations "
+                                "(source_id, target_id, relation_type, "
+                                " confidence, created_at, metadata) "
+                                "VALUES (?, ?, 'contradicts', 1.0, ?, ?)",
+                                (aid_a, aid_b, now,
+                                 json.dumps({
+                                     "summary": c.get("summary", ""),
+                                     "trigger": "consolidate",
+                                 })),
+                            )
+                            if cursor.rowcount > 0:
+                                contradicts_stored += 1
                     conn.commit()
                 except Exception:
                     conn.rollback()
@@ -577,9 +650,21 @@ class MemoryClient:
                 emitted.append(observation_id)
                 for old_id in old_obs:
                     superseded.append((observation_id, old_id))
-            return emitted, superseded
+            # After all contradicts edges land, resolve them into
+            # supersedes edges (newer-atom-wins strategy). One pass
+            # at end of consolidate so the run sees a consistent view
+            # of all contradictions discovered together.
+            from .triples import resolve_contradictions_to_supersedes
+            new_supersedes_from_contra = (
+                resolve_contradictions_to_supersedes(conn) if contradicts_stored
+                else 0
+            )
+            return (emitted, superseded, triples_stored,
+                    contradicts_stored, new_supersedes_from_contra)
 
-        emitted, superseded = await asyncio.to_thread(_restructure)
+        emitted, superseded, n_triples, n_contra, n_supersedes_contra = (
+            await asyncio.to_thread(_restructure)
+        )
         return {
             "candidates_scanned": len(raws),
             "clusters_found": len(clusters),
@@ -587,6 +672,9 @@ class MemoryClient:
             "observations_emitted": emitted,
             "observations_superseded": superseded,
             "observations_created": len(emitted),
+            "triples_stored": n_triples,
+            "contradicts_stored": n_contra,
+            "supersedes_from_contradictions": n_supersedes_contra,
         }
 
     async def decay(self) -> dict[str, Any]:
