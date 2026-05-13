@@ -521,11 +521,19 @@ def resolve_contradictions_to_supersedes(
 
     Idempotent: relations already present are skipped via
     ``INSERT OR IGNORE``.
+
+    Manages its own transaction (BEGIN IMMEDIATE / COMMIT). Without
+    this, the INSERT loop starts an implicit transaction that
+    Python's sqlite3 module never auto-commits, leaving subsequent
+    ``BEGIN IMMEDIATE`` callers (e.g. recall's post-retrieval
+    access-event write) to crash with "cannot start a transaction
+    within a transaction."
     """
     if strategy != "newest":
         raise ValueError(f"unknown strategy: {strategy!r}")
     now = datetime.now(timezone.utc).isoformat()
     # Find every contradicts pair and pick the newer atom as winner.
+    # Read-only — no transaction needed for the SELECT.
     rows = conn.execute(
         "SELECT r.source_id, r.target_id, a.created_at AS source_at, "
         "b.created_at AS target_at "
@@ -535,25 +543,33 @@ def resolve_contradictions_to_supersedes(
         "WHERE r.relation_type = 'contradicts' "
         "AND a.tombstoned = 0 AND b.tombstoned = 0",
     ).fetchall()
-    added = 0
-    for source_id, target_id, source_at, target_at in rows:
-        winner, loser = (
-            (source_id, target_id)
-            if (source_at or "") > (target_at or "")
-            else (target_id, source_id)
-        )
-        if winner == loser:
-            continue
-        cursor = conn.execute(
-            "INSERT OR IGNORE INTO atom_relations "
-            "(source_id, target_id, relation_type, confidence, "
-            " created_at, metadata) "
-            "VALUES (?, ?, 'supersedes', 1.0, ?, ?)",
-            (winner, loser, now,
-             json.dumps({"trigger": "contradiction_resolution"})),
-        )
-        if cursor.rowcount > 0:
-            added += 1
+    if not rows:
+        return 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        added = 0
+        for source_id, target_id, source_at, target_at in rows:
+            winner, loser = (
+                (source_id, target_id)
+                if (source_at or "") > (target_at or "")
+                else (target_id, source_id)
+            )
+            if winner == loser:
+                continue
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO atom_relations "
+                "(source_id, target_id, relation_type, confidence, "
+                " created_at, metadata) "
+                "VALUES (?, ?, 'supersedes', 1.0, ?, ?)",
+                (winner, loser, now,
+                 json.dumps({"trigger": "contradiction_resolution"})),
+            )
+            if cursor.rowcount > 0:
+                added += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return added
 
 
