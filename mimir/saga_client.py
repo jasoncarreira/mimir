@@ -124,6 +124,7 @@ class SagaClient(Protocol):
         unfinished: list[str] | None = None,
         emotional_state: str | None = None,
         closed_since: list[str] | None = None,
+        channel_id: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def consolidate(
@@ -380,7 +381,11 @@ class _InProcessSaga:
         unfinished: list[str] | None = None,
         emotional_state: str | None = None,
         closed_since: list[str] | None = None,
+        channel_id: str | None = None,
     ) -> dict[str, Any]:
+        # ``channel_id`` is accepted for Protocol compatibility but the
+        # in-process saga's ``store_session_boundary`` doesn't take it
+        # — saga records channel separately via its sessions table.
         await self._ensure_ready()
 
         def _do() -> dict[str, Any]:
@@ -393,7 +398,7 @@ class _InProcessSaga:
                 emotional_state=emotional_state,
                 closed_since=closed_since,
             )
-            return {"atom_id": atom_id, "session_id": session_id, "channel": None}
+            return {"atom_id": atom_id, "session_id": session_id, "channel": channel_id}
 
         try:
             return await asyncio.to_thread(_do)
@@ -734,6 +739,7 @@ class _HttpSaga:
         unfinished: list[str] | None = None,
         emotional_state: str | None = None,
         closed_since: list[str] | None = None,
+        channel_id: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"session_id": session_id, "summary": summary}
         if topics_discussed:
@@ -746,6 +752,8 @@ class _HttpSaga:
             body["emotional_state"] = emotional_state
         if closed_since:
             body["closed_since"] = closed_since
+        if channel_id:
+            body["channel_id"] = channel_id
         return await self._post("/v1/sessions/end", body)
 
     async def consolidate(
