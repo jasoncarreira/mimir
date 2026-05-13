@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mimir.memory import (
+from mimir.core_blocks import (
     describe_file,
     extract_desc_comment,
     first_sentence_fallback,
