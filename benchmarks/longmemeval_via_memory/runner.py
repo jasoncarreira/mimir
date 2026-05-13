@@ -62,8 +62,14 @@ INGEST_BATCH_SIZE = 256
 
 
 def _make_client(db_path: Path, *, embedding_dim: int = 1024):
-    """Construct a MemoryClient with a fresh per-question DB."""
+    """Construct a MemoryClient with a fresh per-question DB.
+
+    Wires the bench-tuned P12 synonym dict (DEFAULT_LONGMEMEVAL_SYNONYMS)
+    so the FTS5 keyword pathway gets the same query expansion saga's
+    canonical bench used. RRF fusion is on by default in recall.py.
+    """
     from mimir.memory.client import MemoryClient
+    from mimir.memory.fts import DEFAULT_LONGMEMEVAL_SYNONYMS
     if db_path.exists():
         db_path.unlink()
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,7 +77,23 @@ def _make_client(db_path: Path, *, embedding_dim: int = 1024):
         db_path=db_path,
         agent_id="longmemeval",
         embedding_dim=embedding_dim,
+        synonyms=DEFAULT_LONGMEMEVAL_SYNONYMS,
     )
+
+
+def _parse_question_date(question_date: str):
+    """Parse LongMemEval's question_date ('YYYY/MM/DD (Day) HH:MM') into
+    a UTC datetime. Passed as ``reference_date`` to recall() so the
+    Petrov OL activation computes ages against the haystack's timeline,
+    not wall-clock 2026. Without this every 2023-dated atom looks
+    "3 years old" and activation cratering destroys temporal probes."""
+    from datetime import datetime, timezone
+    try:
+        return datetime.strptime(
+            question_date, "%Y/%m/%d (%a) %H:%M",
+        ).replace(tzinfo=timezone.utc)
+    except (ValueError, KeyError, TypeError):
+        return None
 
 
 # ─── Ingest ──────────────────────────────────────────────────────────
@@ -231,9 +253,11 @@ async def _run_one(
 
         # Query (two-tier shape — saga's reader handles either)
         t0 = time.time()
+        ref_date = _parse_question_date(q["question_date"])
         retrieved = await client.query(
             q["question"],
             top_k=RETRIEVAL_TOP_K,
+            reference_date=ref_date,
         )
         metrics["retrieve_s"] = round(time.time() - t0, 2)
         metrics["n_observations"] = len(retrieved.get("observations", []))
