@@ -516,6 +516,13 @@ def build_saga_tools(
         closed_since = _opt_list("closed_since")
         emotional = (args.get("emotional_state") or "").strip() or None
 
+        # Resolve the active TurnContext BEFORE the end_session call so
+        # we can pass channel_id through. Previously we resolved ctx
+        # only after the call (for the post-call log_event); but the
+        # MemoryClient's end_session needs channel_id to write the
+        # sessions row with the right scope (review #5).
+        ctx, resolution_path = resolve_active_ctx({"session_id": session_id})
+
         try:
             payload = await client.end_session(
                 session_id=session_id,
@@ -525,6 +532,7 @@ def build_saga_tools(
                 unfinished=unfinished,
                 emotional_state=emotional,
                 closed_since=closed_since,
+                channel_id=ctx.channel_id if ctx is not None else None,
             )
         except SagaError as exc:
             return _content_block(f"saga_end_session failed: {exc}", is_error=True)
@@ -535,18 +543,12 @@ def build_saga_tools(
         # for non-synthesis callers (rare — operator manually closes a
         # session) it's harmless extra bookkeeping.
         #
-        # chainlink #23 subissue #25: the SDK dispatches MCP tool handlers
-        # on a fresh asyncio task forked at first connect. ``_current_turn``
-        # is invisible inside that task even when ``run_turn`` set it on
-        # its own task — same pattern as hooks (CR#18). Use the shared
-        # three-level lookup (saga_session_id → single_active → contextvar
-        # → missing). ``saga_session_id`` is the load-bearing path here;
-        # the middle step is harmless extra coverage when the model
-        # forgets to pass session_id (synthesis turns are serialized so
-        # single_active typically resolves to the right ctx).
-        # ``resolution_path`` mirrors CR#18's pattern so the rate of each
-        # path is visible in events.jsonl.
-        ctx, resolution_path = resolve_active_ctx({"session_id": session_id})
+        # Note: ``ctx`` was resolved above (before the end_session call)
+        # so channel_id could be threaded through. The lookup logic is
+        # the shared three-level (saga_session_id → single_active →
+        # contextvar → missing) used elsewhere; resolution_path is
+        # logged below so the rate of each path stays visible in
+        # events.jsonl.
         if ctx is not None:
             ctx.saga_end_session_called = True
         await log_event(

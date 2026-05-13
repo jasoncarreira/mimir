@@ -59,12 +59,15 @@ DEFAULT_LOOKBACK_DAYS = 30
 MIN_CLUSTER_SIZE_FOR_OBSERVATION = 3
 
 # Cap on observations emitted per consolidate pass. Bounds LLM cost.
-# A weekly pass over a busy agent's month-of-raws can produce a long
-# tail of small clusters; we only synthesize the strongest ones.
-MAX_OBSERVATIONS_PER_RUN = 20
+# Saga's canonical bench uses 50; bench v1 ran with 20 and capped on
+# every question (cluster sweep showed 60+ clusters forming at the
+# old 0.60 threshold). With the new 0.80 threshold this rarely binds
+# (~12 clusters/question), but 50 leaves headroom for domain-specific
+# tuning that drops threshold lower.
+MAX_OBSERVATIONS_PER_RUN = 50
 
 # Default similarity threshold for clustering (matches cluster.py).
-DEFAULT_SIMILARITY_THRESHOLD = 0.6
+DEFAULT_SIMILARITY_THRESHOLD = 0.80
 
 
 # Injected callables — same shapes as in reflect.py
