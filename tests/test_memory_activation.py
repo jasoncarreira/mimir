@@ -191,3 +191,36 @@ def test_summary_invariant_under_incremental_updates():
         now=now,
     )
     assert abs(b_a - b_b) < 1e-9
+
+
+def test_feedback_event_weight_round_trips():
+    """Regression for the silent-degradation bug where SOURCE_WEIGHTS
+    was keyed `"feedback"` but events were written with source
+    `"feedback_positive"`. mark_access does
+    `SOURCE_WEIGHTS.get(source, 1.0)`, so a key mismatch silently
+    falls through to 1.0 — same weight as a plain retrieval.
+
+    This test wires the round-trip end-to-end: write a feedback event
+    via mark_access without an explicit weight, then verify the
+    persisted access_events row carries the documented 2.0 weight.
+    """
+    import sqlite3
+    from pathlib import Path
+    from mimir.memory.mark_access import AccessEvent, mark_access
+
+    schema = (Path(__file__).resolve().parent.parent
+              / "mimir" / "memory" / "schema.sql").read_text()
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema)
+    conn.execute(
+        "INSERT INTO atoms (id, content, content_hash, created_at) "
+        "VALUES ('a1', 'x', 'h1', '2026-05-12T00:00:00Z')",
+    )
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    mark_access(conn, [AccessEvent(atom_id="a1", source="feedback_positive")])
+    conn.commit()
+    row = conn.execute(
+        "SELECT source, weight FROM access_events WHERE atom_id='a1'"
+    ).fetchone()
+    assert row == ("feedback_positive", 2.0)

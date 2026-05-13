@@ -20,7 +20,7 @@ from mimir.memory.store import store
 @pytest.fixture
 def conn():
     """In-memory SQLite with the new schema applied."""
-    schema = Path("/Users/jcarreira/projects/odin/mimir/mimir/memory/schema.sql").read_text()
+    schema = (Path(__file__).resolve().parent.parent / "mimir" / "memory" / "schema.sql").read_text()
     c = sqlite3.connect(":memory:")
     c.executescript(schema)
     yield c
