@@ -91,7 +91,10 @@ GLOBAL_FALLBACK_THRESHOLD = -1.5
 #: but wasn't directly used"). Tune empirically.
 SOURCE_WEIGHTS = {
     "retrieval": 1.0,
-    "feedback": 2.0,
+    "feedback_positive": 2.0,  # MUST match the source string written by
+                               # `feedback()` in __init__.py — keyed
+                               # differently here silently degrades the
+                               # endorsement signal to 1.0.
     "store": 1.0,           # the create event counts as one access
     "consolidation": 0.5,
     "pinned_init": 5.0,     # pinned atoms get a heavy initial weight

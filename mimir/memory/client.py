@@ -271,8 +271,16 @@ class MemoryClient:
                 # consolidator did. Same here: leave observation
                 # synthesis to consolidate().
             )
+            # Return BOTH the saga-compatible ``atom_id`` (consumed by
+            # mimir/sagatools.py:583/603 for the local boundary mirror +
+            # the user-facing success message) AND the
+            # ``boundary_atom_id`` alias for clarity. Dropping either
+            # breaks an existing call site silently.
             return {
+                "atom_id": result.boundary_atom_id,
                 "boundary_atom_id": result.boundary_atom_id,
+                "session_id": session_id,
+                "channel": None,
                 "boundary_created": result.boundary_created,
                 "session_member_count": result.session_member_count,
             }
