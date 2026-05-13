@@ -59,12 +59,15 @@ DEFAULT_LOOKBACK_DAYS = 30
 MIN_CLUSTER_SIZE_FOR_OBSERVATION = 3
 
 # Cap on observations emitted per consolidate pass. Bounds LLM cost.
-# Saga's canonical bench uses 50; bench v1 ran with 20 and capped on
-# every question (cluster sweep showed 60+ clusters forming at the
-# old 0.60 threshold). With the new 0.80 threshold this rarely binds
-# (~12 clusters/question), but 50 leaves headroom for domain-specific
-# tuning that drops threshold lower.
-MAX_OBSERVATIONS_PER_RUN = 50
+# Saga's bench TOMLs override the code default (50) to 20 across
+# every variant including the canonical 81.6% run. We match the
+# bench override here so the bench setup is directly comparable.
+# At threshold 0.80 we form ~12 clusters/question per the sweep —
+# the cap doesn't bind in practice, but if it ever does that's a
+# real divergence from saga's bench shape and we want to see it.
+# Production callers can override via consolidate(max_observations=50)
+# to match saga's production default.
+MAX_OBSERVATIONS_PER_RUN = 20
 
 # Default similarity threshold for clustering (matches cluster.py).
 DEFAULT_SIMILARITY_THRESHOLD = 0.80

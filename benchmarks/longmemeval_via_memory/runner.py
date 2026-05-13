@@ -61,12 +61,20 @@ INGEST_BATCH_SIZE = 256
 # ─── Per-question DB ─────────────────────────────────────────────────
 
 
-def _make_client(db_path: Path, *, embedding_dim: int = 1024):
+def _make_client(db_path: Path, *, embedding_dim: int | None = None):
     """Construct a MemoryClient with a fresh per-question DB.
 
     Wires the bench-tuned P12 synonym dict (DEFAULT_LONGMEMEVAL_SYNONYMS)
     so the FTS5 keyword pathway gets the same query expansion saga's
     canonical bench used. RRF fusion is on by default in recall.py.
+
+    ``embedding_dim=None`` (the default) lets ``MemoryClient`` auto-
+    detect the dimension from the first embedding row on first
+    ``query()``. Hardcoding the wrong dim is a silent FAISS-killer:
+    ``VectorIndex.build_from_db`` filters rows where stored dim
+    doesn't match ``self.dimension``, so OpenAI 1536d embeddings
+    against a 1024-dim index produced an empty FAISS index in the
+    earlier 73.4% run — recall fell back to keyword-only.
     """
     from mimir.memory.client import MemoryClient
     from mimir.memory.fts import DEFAULT_LONGMEMEVAL_SYNONYMS
