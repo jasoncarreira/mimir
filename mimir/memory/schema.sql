@@ -45,12 +45,8 @@ CREATE TABLE IF NOT EXISTS atoms (
     -- Identity / namespacing
     agent_id TEXT DEFAULT 'default',
     session_id TEXT,                   -- session-of-origin (informational)
-    -- Provisional flag (transient observations from in-flight reflect)
-    provisional INTEGER DEFAULT 0,
     -- Timestamps
-    created_at TEXT NOT NULL,
-    -- Schema versioning
-    schema_version INTEGER DEFAULT 1
+    created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_atoms_memory_type ON atoms(memory_type);

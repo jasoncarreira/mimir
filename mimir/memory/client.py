@@ -293,12 +293,45 @@ class MemoryClient:
         self, atom_ids: list[str], feedback: str, *,
         session_id: str | None = None, query: str | None = None,
     ) -> dict[str, Any]:
-        # Outcome is saga's "after the response was delivered, was it
-        # well-received?" signal. We map positive → feedback_positive
-        # event (same as the credit pass); negative is a no-op event-wise
-        # but flags atoms for explicit forget review.
-        return await self.feedback(atom_ids, "", session_id=session_id,
-                                    feedback=feedback)
+        """Outcome is saga's "after the response was delivered, was it
+        well-received?" signal.
+
+        - ``feedback="positive"`` → write a ``feedback_positive``
+          access event on each atom (weight 2.0). Same as the credit
+          pass.
+        - ``feedback="negative"`` → write a ``feedback_negative`` event
+          (weight 0.0 — no activation contribution; the event is the
+          flag). ``forget_by_criteria`` can later use this to surface
+          atoms for review by joining on access_events.
+        - other values → no-op.
+
+        Returns ``{"marked": n, "total": len(atom_ids), "signal": ...}``.
+        """
+        signal = (feedback or "").lower()
+        if signal == "positive":
+            return await self.feedback(
+                atom_ids, "", session_id=session_id, feedback="positive",
+            )
+        if signal == "negative":
+            def _do():
+                conn = self._ensure_conn()
+                events = [AccessEvent(
+                    atom_id=aid, source="feedback_negative",
+                    session_id=session_id,
+                    metadata={"reason": "outcome_negative"},
+                ) for aid in atom_ids]
+                if not events:
+                    return {"marked": 0, "total": 0, "signal": "negative"}
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    n = mark_access(conn, events)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                return {"marked": n, "total": len(atom_ids), "signal": "negative"}
+            return await asyncio.to_thread(_do)
+        return {"marked": 0, "total": len(atom_ids), "signal": signal or "noop"}
 
     async def end_session(
         self, session_id: str, summary: str, *,
@@ -307,7 +340,14 @@ class MemoryClient:
         unfinished: list[str] | None = None,
         emotional_state: str | None = None,
         closed_since: list[str] | None = None,
+        channel_id: str | None = None,
     ) -> dict[str, Any]:
+        """Close a session. ``channel_id`` is persisted on the
+        sessions row so ``recent_session_boundaries(channel_id=...)``
+        can scope to a single channel — without it the LEFT JOIN on
+        sessions can't filter (every boundary's channel_id would be
+        NULL).
+        """
         # The agent has already done the synthesis — it's calling
         # end_session with the rendered fields. The new reflect()
         # would re-derive them via LLM; here we just persist what was
@@ -324,7 +364,7 @@ class MemoryClient:
         def _do():
             conn = self._ensure_conn()
             result = _reflect(
-                conn, session_id=session_id, channel_id=None,
+                conn, session_id=session_id, channel_id=channel_id,
                 embed_fn=_embed_text_sync,
                 boundary_synth_fn=_stub_synth,
                 # observation_synth_fn=None — saga's end_session
@@ -341,7 +381,7 @@ class MemoryClient:
                 "atom_id": result.boundary_atom_id,
                 "boundary_atom_id": result.boundary_atom_id,
                 "session_id": session_id,
-                "channel": None,
+                "channel": channel_id,
                 "boundary_created": result.boundary_created,
                 "session_member_count": result.session_member_count,
             }
@@ -596,24 +636,69 @@ class MemoryClient:
         channel_id: str | None = None, contributed_only: bool = False,
         trend: str | None = None,
     ) -> list[dict[str, Any]]:
-        # Map to access_events log — count retrieval events per atom
-        # in the last N days.
+        """Count retrieval / feedback events per atom in the last N days.
+
+        Filters:
+        - ``channel_id``: join access_events.session_id → sessions.id
+          and require ``sessions.channel_id = ?``. Lets per-channel
+          callers (reflection / per-channel summaries) scope the
+          ranking to one channel.
+        - ``contributed_only``: count only ``feedback_positive`` events
+          (i.e. the credit-pass endorsements), excluding plain
+          retrievals. Matches saga's "contributed atoms" semantics.
+        - ``trend``: join observations_metadata.trend = ?. Filters to
+          observation-typed atoms with the given trend label
+          (strengthening / stable / weakening / stale).
+        """
         from datetime import datetime, timedelta, timezone
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
         def _do():
             conn = self._ensure_conn()
-            sources = ("retrieval", "feedback_positive")
+            if contributed_only:
+                sources = ("feedback_positive",)
+            else:
+                sources = ("retrieval", "feedback_positive")
             placeholders = ",".join(["?"] * len(sources))
-            rows = conn.execute(
+
+            joins = []
+            where = [
+                "a.tombstoned = 0",
+                "a.agent_id = ?",
+                "e.ts >= ?",
+                f"e.source IN ({placeholders})",
+            ]
+            params: list = [self._agent_id, cutoff, *sources]
+
+            if channel_id is not None:
+                # access_events.session_id → sessions.id → channel_id.
+                # LEFT JOIN so atoms with NULL session_id (consolidation-
+                # synthesized observations etc.) don't get dropped by
+                # an INNER JOIN when channel_id is unfiltered — but
+                # WHERE clause ensures they ARE dropped when channel_id
+                # is filtered, which is the right semantics.
+                joins.append("JOIN sessions s ON s.id = e.session_id")
+                where.append("s.channel_id = ?")
+                params.append(channel_id)
+
+            if trend is not None:
+                joins.append("JOIN observations_metadata om ON om.atom_id = a.id")
+                where.append("om.trend = ?")
+                params.append(trend)
+
+            join_sql = " ".join(joins)
+            where_sql = " AND ".join(where)
+            params.append(count)
+
+            sql = (
                 f"SELECT a.id, a.content, COUNT(e.id) AS n "
                 f"FROM atoms a "
                 f"JOIN access_events e ON e.atom_id = a.id "
-                f"WHERE a.tombstoned = 0 "
-                f"AND e.ts >= ? "
-                f"AND e.source IN ({placeholders}) "
-                f"GROUP BY a.id ORDER BY n DESC LIMIT ?",
-                [cutoff] + list(sources) + [count],
-            ).fetchall()
+                f"{join_sql} "
+                f"WHERE {where_sql} "
+                f"GROUP BY a.id ORDER BY n DESC LIMIT ?"
+            )
+            rows = conn.execute(sql, params).fetchall()
             return [
                 {"id": r[0], "content": r[1], "retrieval_count": r[2]}
                 for r in rows

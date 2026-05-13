@@ -54,7 +54,7 @@ ATOMS_SHARED_COLUMNS = (
     "id", "content", "content_hash", "created_at",
     "stream", "profile", "arousal", "valence",
     "encoding_confidence", "topics", "source_type", "metadata",
-    "agent_id", "session_id", "is_pinned", "provisional",
+    "agent_id", "session_id", "is_pinned",
 )
 
 # Source-event weight map. ``access_log`` doesn't distinguish; we use

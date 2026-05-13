@@ -32,10 +32,18 @@ import struct
 from typing import Callable
 
 
-# Empirical default. Calibrate per provider — voyage's 1024d
-# embeddings produce tighter cosine distributions than openai's
-# 1536d, so a higher threshold may be appropriate.
-DEFAULT_SIMILARITY_THRESHOLD = 0.6
+# Default threshold for OpenAI text-embedding-3-small (1536d) /
+# saga's canonical bench. Calibrated against LongMemEval-S via the
+# threshold sweep in `benchmarks/longmemeval_via_memory/threshold_sweep.py`:
+# 0.80 produces ~12 clusters/question with mean intra-cluster cohesion
+# 0.84 — tight enough that observation synthesis has on-topic evidence,
+# small enough that the eligible set fits inside any reasonable cap.
+# Below 0.70 the clusters become kitchen-sink (cohesion < 0.76) and
+# the 20-cluster cap silently drops 40-50 candidates per question
+# (bench v1 ran at 0.60 and hit this — see 73.4% baseline metrics).
+# Voyage's 1024d distributions are tighter, so a higher value may be
+# appropriate when switching providers.
+DEFAULT_SIMILARITY_THRESHOLD = 0.80
 
 # Floor on cluster size that triggers a similarity check. Below this
 # (e.g. one-atom clusters), every new atom is considered for join.
