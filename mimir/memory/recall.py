@@ -28,14 +28,44 @@ from .activation import (
     compute_activation,
 )
 from .mark_access import AccessEvent, mark_access
+from .retrieval_fusion import DEFAULT_K as RRF_DEFAULT_K, reciprocal_rank_fusion
 
 
-# Default scoring weights. See SCORING.md for derivation.
+# Default scoring weights.
+#
+# History: v1 used weighted-sum (``w_sim * similarity + w_kw * keyword_score``)
+# which required careful score-scale calibration between FAISS cosine
+# (~[0,1]) and FTS5 BM25 (~[0,50]). v2 switches to Reciprocal Rank
+# Fusion on the FAISS + FTS ranked lists per saga's canonical bench
+# (saga_bench.toml: fusion="rrf", rrf_k=60, equal pathway weights).
+# RRF produces a normalized base score; the orthogonal modifiers
+# (activation, trend, evidence_boost, session_boost, pinned_boost)
+# are still added on top.
+#
+# Calibration of ``w_rrf``: raw RRF score with k=60 maxes at
+# 1/(60+1) = 0.0164 per pathway, so a candidate at rank 1 in both
+# semantic + keyword pathways gets ~0.033. To keep the modifier
+# magnitudes (session_boost=0.15, pinned=0.25, trend ±0.10/-0.25,
+# evidence_boost=0.20) as tiebreakers rather than dominators, we
+# scale RRF up so top-of-both lands around ~0.65 — comparable to
+# the old top-semantic-match base score under weighted-sum.
 DEFAULT_SCORING_WEIGHTS = {
+    "w_rrf":    20.0,  # RRF base contribution (see calibration above)
+    "w_topic":  0.1,
+    "w_act":    0.3,
+    # Legacy keys preserved so callers passing v1 weight dicts still
+    # work; the recall path no longer reads them under fusion="rrf".
     "w_sim":   0.7,
     "w_kw":    0.2,
-    "w_topic": 0.1,
-    "w_act":   0.3,
+}
+
+# Per-pathway RRF weights. Saga's bench used equal weights since v0;
+# keeping the same here. The semantic pathway can be biased up for
+# domains where embedding quality dominates keyword overlap (e.g.
+# heavily paraphrased question sets) — leaving as a knob.
+DEFAULT_RRF_WEIGHTS = {
+    "semantic": 1.0,
+    "keyword":  1.0,
 }
 
 # Trend score modifiers — Hindsight P1's "agent should weight beliefs
@@ -72,8 +102,11 @@ class RecallCandidate:
     for the turn viewer and for debugging."""
     atom: dict                       # the atom row (everything except embedding)
     activation: float                # ACT-R base-level
-    similarity: float                # cosine (0..1)
+    similarity: float                # cosine (0..1), -1.0 if not in FAISS list
     keyword_score: float = 0.0       # BM25 contribution
+    rrf_score: float = 0.0           # fused rank score from FAISS + FTS lists
+    semantic_rank: int = -1          # 1-based rank in FAISS list; -1 if absent
+    keyword_rank: int = -1           # 1-based rank in FTS list; -1 if absent
     topic_score: float = 0.0
     evidence_boost: float = 0.0
     session_boost: float = 0.0
@@ -110,12 +143,19 @@ def recall(
     session_id: str | None = None,
     weights: dict[str, float] | None = None,
     fire_access_events: bool = True,
+    reference_date=None,
 ) -> RecallResult:
     """Two-pass recall. See SCORING.md for the contract.
 
     ``fire_access_events=False`` skips Pass 4 (the access_event for
     returned atoms). Used by the migration importer and by tests; the
     agent's normal recall path keeps it True.
+
+    ``reference_date`` (datetime) anchors temporal scoring to a
+    specific moment instead of wall-clock now. Critical for benches
+    over historical haystacks ("2 weeks ago" in a 2023 corpus run
+    from 2026 should compute against the haystack's timeline). When
+    None, all temporal reasoning uses datetime.now(utc).
     """
     thresholds = thresholds or DEFAULT_STREAM_THRESHOLDS
     weights = weights or DEFAULT_SCORING_WEIGHTS
@@ -130,9 +170,29 @@ def recall(
     )
     sim_map = {aid: sim for aid, sim in faiss_candidates}
     kw_map = {aid: kw for aid, kw in fts_candidates}
+    # Per-pathway 1-based rank, used by both RRF and the candidate
+    # diagnostic fields. faiss_candidates / fts_candidates arrive
+    # pre-sorted (best first) from their respective adapters.
+    semantic_rank_map = {aid: i + 1 for i, (aid, _) in enumerate(faiss_candidates)}
+    keyword_rank_map = {aid: i + 1 for i, (aid, _) in enumerate(fts_candidates)}
     candidate_ids = set(sim_map) | set(kw_map)
     if not candidate_ids:
         return RecallResult()
+
+    # ── RRF fusion ──────────────────────────────────────────────────
+    # Compute once, here, over the union of candidate IDs. Per-candidate
+    # rrf_score lookups go into _score_candidates. We use the saga
+    # canonical weights (semantic=keyword=1.0) and k=60 by default.
+    rrf_weights = (weights and weights.get("rrf_pathway_weights")) or DEFAULT_RRF_WEIGHTS
+    rrf_k = (weights and weights.get("rrf_k")) or RRF_DEFAULT_K
+    rrf_fused = reciprocal_rank_fusion(
+        {
+            "semantic": [aid for aid, _ in faiss_candidates],
+            "keyword":  [aid for aid, _ in fts_candidates],
+        },
+        k=rrf_k, weights=rrf_weights,
+    )
+    rrf_map = dict(rrf_fused)
 
     # Fetch full atom rows + summaries in one pass.
     placeholders = ",".join(["?"] * len(candidate_ids))
@@ -196,6 +256,7 @@ def recall(
                 old_count=s["old_count"],
                 old_weight_sum=s["old_weight_sum"],
                 old_oldest_ts=s["old_oldest_ts"],
+                now=reference_date,
             )
         threshold = thresholds.get(atom["stream"], GLOBAL_FALLBACK_THRESHOLD)
         # Pinned atoms bypass the threshold filter — they're meant to
@@ -209,6 +270,9 @@ def recall(
             activation=activation,
             similarity=sim_map.get(atom_id, 0.0),
             keyword_score=kw_map.get(atom_id, 0.0),
+            rrf_score=rrf_map.get(atom_id, 0.0),
+            semantic_rank=semantic_rank_map.get(atom_id, -1),
+            keyword_rank=keyword_rank_map.get(atom_id, -1),
         ))
 
     if not candidates:
@@ -340,18 +404,17 @@ def _score_candidates(
             c.trend_label = trend
             c.trend_modifier = TREND_MODIFIERS.get(trend, 0.0)
 
+        # Base ranking signal: RRF over FAISS + FTS ranked lists.
+        # See DEFAULT_SCORING_WEIGHTS docstring for the w_rrf calibration.
         c.total = (
-            weights["w_sim"]   * c.similarity
-          + weights["w_kw"]    * c.keyword_score
-          + weights["w_topic"] * c.topic_score
-          + weights["w_act"]   * _sigmoid(c.activation - threshold)
+            weights.get("w_rrf", 20.0)  * c.rrf_score
+          + weights["w_topic"]         * c.topic_score
+          + weights["w_act"]           * _sigmoid(c.activation - threshold)
           + c.session_boost
           + c.pinned_boost
           + c.trend_modifier
           # Evidence boost applied in _apply_evidence_boost (post-split).
-          # Supersession/contradiction penalties are TBD — they require
-          # querying atom_relations for the candidate set and aren't
-          # in this v1 sketch.
+          # Supersession/contradiction penalties are TBD.
         )
 
 

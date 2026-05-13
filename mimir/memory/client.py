@@ -92,10 +92,19 @@ def _make_faiss_search_fn(index: VectorIndex | None):
     return _fn
 
 
-def _make_fts_search_fn(conn: sqlite3.Connection, *, agent_id: str = "default"):
-    """Closure over the connection matching recall.FtsSearchFn shape."""
+def _make_fts_search_fn(
+    conn: sqlite3.Connection,
+    *,
+    agent_id: str = "default",
+    synonyms: dict[str, list[str]] | None = None,
+):
+    """Closure over the connection matching recall.FtsSearchFn shape.
+    ``synonyms`` is the P12 query-expansion dict (FTS-only pathway)."""
     def _fn(query: str, top_k: int) -> list[tuple[str, float]]:
-        return fts_search(conn, query, top_k=top_k, agent_id=agent_id)
+        return fts_search(
+            conn, query, top_k=top_k,
+            agent_id=agent_id, synonyms=synonyms,
+        )
     return _fn
 
 
@@ -124,11 +133,16 @@ class MemoryClient:
         conn: sqlite3.Connection | None = None,
         agent_id: str = "default",
         embedding_dim: int | None = None,
+        synonyms: dict[str, list[str]] | None = None,
     ) -> None:
         self._db_path = db_path
         self._conn = conn  # may be None until first use
         self._agent_id = agent_id
         self._embedding_dim = embedding_dim
+        # P12 synonyms for FTS5-only query expansion. Saga's canonical
+        # bench passes the bench-tuned dict; production callers can
+        # pass None (no expansion) or a domain-specific dict.
+        self._synonyms = synonyms
         self._index: VectorIndex | None = None
         self._index_built = False
         # LLM synth callable for consolidate(). Late-bound (lazy import
@@ -190,6 +204,7 @@ class MemoryClient:
         token_budget: int = 500, session_id: str | None = None,
         min_confidence_tier: str | None = None,
         context: list[dict[str, str]] | None = None,
+        reference_date=None,
     ) -> dict[str, Any]:
         def _do():
             conn = self._ensure_conn()
@@ -198,10 +213,14 @@ class MemoryClient:
                 conn, query,
                 query_embed_fn=_query_embed_sync,
                 faiss_search_fn=_make_faiss_search_fn(index),
-                fts_search_fn=_make_fts_search_fn(conn, agent_id=self._agent_id),
+                fts_search_fn=_make_fts_search_fn(
+                    conn, agent_id=self._agent_id,
+                    synonyms=self._synonyms,
+                ),
                 k=top_k,
                 session_id=session_id,
                 agent_id=self._agent_id,
+                reference_date=reference_date,
             )
             # Translate the RecallResult into saga's response shape so
             # mimir's call sites don't change.
