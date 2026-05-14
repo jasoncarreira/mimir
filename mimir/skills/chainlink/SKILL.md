@@ -1,6 +1,6 @@
 ---
 name: chainlink
-description: Local CLI issue tracker for todos, follow-ups, and structured records. Use when the user mentions a task to remember, a bug to track, an open question, or anything that needs to outlive the current turn. Pairs with five-whys (chainlink is the storage backend for RCA trees) and works as a general-purpose backlog you can query later. Storage is local — issues live under a `.chainlink/` directory in the operator's repo.
+description: Local CLI issue tracker for todos, follow-ups, structured records, and the canonical pattern for decomposing multi-step work into a parent + subissues with acceptance criteria, dependency edges, and priority. Use when the user mentions a task to remember, a bug to track, an open question, anything that needs to outlive the current turn, or when planning multi-heartbeat work that needs `chainlink issue ready`-driven pickup across sessions. Includes guidance on writing descriptions future-you can act on (handles, success path, failure path) and idempotency tactics for actions that might fire twice (boundary firing, overlapping heartbeats, retried subagent completion). Pairs with five-whys (chainlink is the storage backend for RCA trees). Storage is local — issues live under a `.chainlink/` directory in the operator's repo.
 allowed-tools:
   - Bash
   - Read
