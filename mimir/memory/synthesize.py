@@ -115,20 +115,23 @@ Rules for TRIPLES:
 - PREFER reusing canonical intent predicates over inventing domain-specific \
 compounds. Detail goes in the OBJECT, not the predicate. Instead of \
 (User, prefers_podcast_length, 20-30_minutes), emit \
-(User, prefers, podcast_length=20-30_minutes).
+(User, prefers, podcast_length=20-30_minutes). You MAY introduce a new \
+predicate when no canonical fits — typically for domain relations between \
+two non-User entities, e.g. (CompanyX, manufactures, ProductY).
 - Implicit subject "User" for user-preference statements
 - Lists become multiple triples (one per item)
 - Skip emotional/philosophical/meta-commentary content (write NONE)
 
-Rules for TEMPORAL TAGS (optional valid_from/valid_until):
+{vocab_block}Rules for TEMPORAL TAGS (optional valid_from/valid_until):
 - Use ONLY when the atoms show a fact CHANGED over time. Take the YYYY-MM-DD \
 from the dated atom prefix(es).
 - valid_from only: fact starts on a date and is still current (most \
-user-preference statements). Example: user moves — emit (User, lives_in, \
-NewCity, valid_from=YYYY-MM-DD).
-- Both bounds: closed interval. Example: user held a job from A to B.
-- DO NOT add bounds to facts that don't change (genres, languages, ratings).
-- DO NOT use the consolidation date — use the source atom's own date.
+user-preference statements). Example: user moves to a new city — emit \
+(User, lives_in, NewCity, valid_from=YYYY-MM-DD).
+- Both bounds: closed interval. Example: user held a job from A to B — emit \
+(User, employed_at, OldJob, valid_from=A, valid_until=B).
+- DO NOT add bounds to facts that don't change (genres, languages, ratings, \
+etc.). DO NOT use the consolidation date — use the source atom's own date.
 
 Rules for CONTRADICTIONS:
 - Only flag *direct* disagreements where two atoms make incompatible claims \
@@ -139,9 +142,161 @@ opposing preferences on the same topic; incompatible dates).
 TRIPLES temporal-tag case, not a contradiction.
 - Don't flag stylistic / phrasing differences. Substance only.
 
-Atoms:
+{prior_block}Atoms:
 {indexed_atoms}
 """
+
+
+# Seed values for the vocab block — applied even on a cold DB so the
+# LLM sees a non-empty canonical set on the very first consolidate
+# pass. Mirrors saga's _CANONICAL_PREDICATE_SEED / _SUBJECT_SEED.
+_CANONICAL_PREDICATE_SEED = (
+    "prefers", "lives_in", "works_at", "employed_at", "born_in",
+    "studied_at", "graduated_with_degree_in", "owns", "uses",
+    "manages", "manufactures", "located_in", "married_to",
+    "parent_of", "child_of", "sibling_of", "friend_of",
+    "interested_in", "dislikes", "fluent_in",
+)
+_CANONICAL_SUBJECT_SEED = ("User", "Assistant")
+
+
+def build_vocab_block(
+    conn,
+    *,
+    top_n_predicates: int = 25,
+    top_n_subjects: int = 15,
+    extra_subjects: list[str] | None = None,
+) -> str:
+    """Build the P48 canonical-vocabulary block injected between TRIPLES
+    rules and TEMPORAL TAGS in the rich prompt. Reads top-N predicates
+    and subjects from the live ``triples`` table by frequency, unions
+    them with the static seed, and (for subjects only) appends
+    operator-supplied canonical names like identities.yaml entries.
+
+    Returns an empty string when there's nothing to surface (cold DB
+    with no seed and no extras — shouldn't happen since the seed is
+    always non-empty, but defensive).
+    """
+    pred_lines: list[tuple[str, int | None]] = []
+    subj_lines: list[tuple[str, int | None]] = []
+    seen_preds: set[str] = set()
+    seen_subjs: set[str] = set()
+    try:
+        rows = conn.execute(
+            "SELECT predicate, COUNT(*) c FROM triples "
+            "WHERE tombstoned = 0 "
+            "GROUP BY predicate ORDER BY c DESC LIMIT ?",
+            (top_n_predicates,),
+        ).fetchall()
+        for pred, cnt in rows:
+            if pred and pred not in seen_preds:
+                pred_lines.append((pred, int(cnt or 0)))
+                seen_preds.add(pred)
+        rows = conn.execute(
+            "SELECT subject, COUNT(*) c FROM triples "
+            "WHERE tombstoned = 0 "
+            "GROUP BY subject ORDER BY c DESC LIMIT ?",
+            (top_n_subjects,),
+        ).fetchall()
+        for subj, cnt in rows:
+            if subj and subj not in seen_subjs:
+                subj_lines.append((subj, int(cnt or 0)))
+                seen_subjs.add(subj)
+    except Exception:
+        # DB read failed — fall back to seed-only.
+        pass
+    # Union with the static seed.
+    for p in _CANONICAL_PREDICATE_SEED:
+        if p not in seen_preds:
+            pred_lines.append((p, None))
+            seen_preds.add(p)
+    for s in _CANONICAL_SUBJECT_SEED:
+        if s not in seen_subjs:
+            subj_lines.append((s, None))
+            seen_subjs.add(s)
+    # Operator-supplied canonical subjects (identities.yaml).
+    if extra_subjects:
+        for s in extra_subjects:
+            if isinstance(s, str) and s.strip() and s not in seen_subjs:
+                subj_lines.append((s.strip(), None))
+                seen_subjs.add(s.strip())
+    if not pred_lines and not subj_lines:
+        return ""
+
+    def _render(lines):
+        return ", ".join(
+            f"{name} ({cnt})" if cnt is not None else name
+            for name, cnt in lines
+        )
+
+    parts = [
+        "Existing canonical vocabulary (PREFER reusing these — counts in "
+        "parens for DB-derived entries; bare names are seed values):",
+    ]
+    if pred_lines:
+        parts.append("Predicates: " + _render(pred_lines))
+    if subj_lines:
+        parts.append("Subjects: " + _render(subj_lines))
+    return "\n".join(parts) + "\n\n"
+
+
+def build_prior_block(conn, evidence_ids: list[str]) -> str:
+    """Build the P47 prior-beliefs block for a single cluster. Finds
+    observations whose evidence is a strict subset of ``evidence_ids``
+    and renders the triples those observations carry as
+    ``(subject, predicate, object)`` lines.
+
+    Empty string when there are no subset observations or they carry no
+    triples — the prompt's ``{prior_block}`` placeholder gracefully
+    handles that.
+
+    The LLM then either restates each prior in its own TRIPLES section
+    (if still supported), revises (if the new atoms contradict), or
+    omits (if the prior is no longer true). Matches saga P47.
+    """
+    if len(evidence_ids) < 2:
+        return ""
+    placeholders = ",".join("?" * len(evidence_ids))
+    # Find observations whose evidence is a strict subset.
+    rows = conn.execute(
+        f"SELECT obs.id, GROUP_CONCAT(ar.target_id, '|') AS evi "
+        f"FROM atoms obs "
+        f"JOIN atom_relations ar ON ar.source_id = obs.id "
+        f" AND ar.relation_type = 'evidenced_by' "
+        f"WHERE obs.memory_type = 'observation' AND obs.tombstoned = 0 "
+        f"GROUP BY obs.id",
+    ).fetchall()
+    target_set = set(evidence_ids)
+    subset_obs: list[str] = []
+    for obs_id, evi in rows:
+        old_set = set((evi or "").split("|")) - {""}
+        if old_set and old_set < target_set:  # strict subset
+            subset_obs.append(obs_id)
+    if not subset_obs:
+        return ""
+    # Fetch triples attached to those observations.
+    obs_placeholders = ",".join("?" * len(subset_obs))
+    triple_rows = conn.execute(
+        f"SELECT subject, predicate, object FROM triples "
+        f"WHERE source_atom_id IN ({obs_placeholders}) "
+        f"AND tombstoned = 0",
+        subset_obs,
+    ).fetchall()
+    if not triple_rows:
+        return ""
+    prior_lines = [
+        f"({subj}, {pred}, {obj})"
+        for subj, pred, obj in triple_rows
+    ]
+    return (
+        "Previous beliefs about these atoms (from earlier consolidations "
+        "on a smaller evidence set):\n"
+        + "\n".join(prior_lines)
+        + "\n\nFor each previous belief: if the new atoms still support "
+        "it, restate it in your TRIPLES section; if the new atoms revise "
+        "or contradict it, output the updated version (or omit if it's "
+        "no longer true).\n\n"
+    )
 
 
 _TRIPLES_HEADER = re.compile(r"^\s*TRIPLES\s*:?\s*$", re.IGNORECASE | re.MULTILINE)
@@ -246,11 +401,28 @@ def make_async_rich_synth_fn(
     llm_config: dict | None = None,
     max_tokens: int = 1500,
     temperature: float = 0.3,
-) -> Callable[[list[dict]], Any]:
+) -> Callable[..., Any]:
     """Async rich synthesizer — returns OBSERVATION + TRIPLES +
     CONTRADICTIONS in a single LLM call.
 
-    Returns a coroutine that, given a cluster, resolves to a dict::
+    Signature: ``_do(cluster, *, prior_block="", vocab_block="")``.
+    Caller (e.g. ``MemoryClient.consolidate``) can inject:
+
+    - ``prior_block`` (P47): a per-cluster string surfacing existing
+      observations whose evidence is a subset of this cluster, so the
+      LLM revises rather than duplicates. Build via
+      ``build_prior_block(conn, evidence_ids)``.
+    - ``vocab_block`` (P48): a per-run string surfacing the live DB's
+      canonical predicates + subjects + operator-supplied identities,
+      so the LLM canonicalizes against existing vocabulary. Build via
+      ``build_vocab_block(conn, extra_subjects=...)``.
+
+    Both default to empty — the prompt's ``{prior_block}`` and
+    ``{vocab_block}`` placeholders gracefully render nothing when off,
+    keeping the bench harness's no-priors / no-canonicals path
+    behavior-equivalent.
+
+    Returns a coroutine that resolves to a dict::
 
         {
             "content": "<observation prose>",
@@ -266,13 +438,12 @@ def make_async_rich_synth_fn(
                 ...
             ],
         }
-
-    The triples and contradictions lists may be empty (LLM returns
-    NONE for the section, or the parser couldn't validate any). The
-    observation content may also be empty on LLM failure — caller
-    should check ``result["content"]`` and skip if missing.
     """
-    async def _do(cluster: list[dict]) -> dict:
+    async def _do(
+        cluster: list[dict], *,
+        prior_block: str = "",
+        vocab_block: str = "",
+    ) -> dict:
         from saga._llm import call_llm
         from saga.config import resolve_llm_config
 
@@ -281,7 +452,12 @@ def make_async_rich_synth_fn(
             f"[{i + 1}] {a['content']}"
             for i, a in enumerate(cluster)
         )
-        prompt = RICH_PROMPT.format(n=len(cluster), indexed_atoms=indexed)
+        prompt = RICH_PROMPT.format(
+            n=len(cluster),
+            indexed_atoms=indexed,
+            prior_block=prior_block,
+            vocab_block=vocab_block,
+        )
         try:
             raw = await call_llm(
                 cfg,
