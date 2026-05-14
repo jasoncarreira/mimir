@@ -327,3 +327,110 @@ async def test_rewrite_query_refusal_falls_back(monkeypatch):
         context=[{"role": "user", "content": "We talked about Alice"}],
     )
     assert out == "what about Alice?"
+
+
+@pytest.mark.asyncio
+async def test_rewrite_query_strips_bare_rewritten_prefix(monkeypatch):
+    """Updated 2026-05-13: the prompt now ends with literal ``Rewritten:``
+    (matching saga), not ``Rewritten question:``. The LLM sometimes
+    echoes the label verbatim — we strip either form."""
+    from mimir.memory import query_rewrite
+
+    async def fake_call_llm(*a, **k):
+        return "Rewritten: look for my Sony headphones"
+
+    monkeypatch.setattr("saga._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        "saga.config.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+    )
+
+    out = await query_rewrite.rewrite_query(
+        "yes, look for that",
+        context=[{"role": "user", "content": "I'm shopping for Sony headphones"}],
+    )
+    assert out == "look for my Sony headphones"
+
+
+@pytest.mark.asyncio
+async def test_rewrite_query_truncates_long_message_content(monkeypatch):
+    """Each conversation turn's content is capped at 400 chars in the
+    prompt. Long assistant explanations are the usual source of prompt
+    bloat; pinning the per-turn cap keeps cost bounded as conversations
+    grow. Matches saga's ``_resolve_contextual_query`` window."""
+    from mimir.memory import query_rewrite
+
+    captured_prompt: dict[str, str] = {}
+
+    async def fake_call_llm(cfg, *, prompt, max_tokens, temperature, system):
+        captured_prompt["text"] = prompt
+        return "rewritten message"
+
+    monkeypatch.setattr("saga._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        "saga.config.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+    )
+
+    long_msg = "x" * 5000  # well above the 400-char cap
+    await query_rewrite.rewrite_query(
+        "tell me more",
+        context=[{"role": "assistant", "content": long_msg}],
+    )
+    # The full 5000-char string must NOT appear; the truncation marker
+    # (ellipsis) signals the cap fired.
+    assert "x" * 5000 not in captured_prompt["text"]
+    assert "x" * 400 in captured_prompt["text"]  # cap kept first 400
+    assert "…" in captured_prompt["text"]
+
+
+@pytest.mark.asyncio
+async def test_rewrite_query_caps_at_last_n_messages(monkeypatch):
+    """Conversation windows longer than the cap drop the oldest turns.
+    Saga uses last-10; we mirror that. Older context tends to be stale
+    for reference resolution — the antecedent of a referential phrase
+    is almost always within the recent window."""
+    from mimir.memory import query_rewrite
+
+    captured_prompt: dict[str, str] = {}
+
+    async def fake_call_llm(cfg, *, prompt, max_tokens, temperature, system):
+        captured_prompt["text"] = prompt
+        return "rewritten message"
+
+    monkeypatch.setattr("saga._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        "saga.config.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+    )
+
+    # 20 turns — the cap should drop the oldest 10. We tag each turn
+    # with a unique substring so we can verify which made it in.
+    history = [
+        {"role": "user", "content": f"OLD_TURN_{i}"} for i in range(10)
+    ] + [
+        {"role": "user", "content": f"RECENT_TURN_{i}"} for i in range(10)
+    ]
+    await query_rewrite.rewrite_query("what about it?", context=history)
+    # OLDest turns clipped.
+    assert "OLD_TURN_0" not in captured_prompt["text"]
+    assert "OLD_TURN_9" not in captured_prompt["text"]
+    # Recent window survives.
+    assert "RECENT_TURN_0" in captured_prompt["text"]
+    assert "RECENT_TURN_9" in captured_prompt["text"]
+
+
+def test_rewrite_prompt_carries_saga_rules():
+    """Prompt structure pinning: when the LLM never runs (bench/prod
+    default), no behavior to verify. Pin the prompt's load-bearing
+    instructions instead — examples, intent-preservation, single-line
+    output constraint. Matches saga's contextual-rewrite prompt so
+    behavior at the model is comparable."""
+    from mimir.memory.query_rewrite import REWRITE_PROMPT
+    # Concrete reference-resolution examples (saga's three).
+    assert "Sony headphones" in REWRITE_PROMPT
+    # Intent-shape preservation rule — without this the LLM happily
+    # rewrites statements as questions.
+    assert "Do not turn statements into questions" in REWRITE_PROMPT
+    # Single-line output discipline.
+    assert "single line" in REWRITE_PROMPT
+    # Broad framing — question, statement, or command (vs saga's
+    # earlier question-only framing which we used to share).
+    assert "question, a statement, or a command" in REWRITE_PROMPT
