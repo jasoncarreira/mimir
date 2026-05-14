@@ -31,56 +31,83 @@ from typing import Any
 logger = logging.getLogger("mimir.memory.query_rewrite")
 
 
+# Bounds matched to saga's _resolve_contextual_query — keep prompt
+# token cost roughly stable regardless of how long the conversation
+# has gotten. Last-10-msgs window catches the antecedent window for
+# nearly every reference resolution case; 400-char per-message cap
+# trims long assistant answers (the usual source of bloat).
+_MAX_CONTEXT_MESSAGES = 10
+_MAX_CONTEXT_CONTENT_CHARS = 400
+
+
 REWRITE_PROMPT = """\
-You are rewriting a user's question so it stands alone — a future \
-component will use it to search a memory store that has no access to \
-the conversation history.
+You rewrite a user's current message into a self-contained query for a \
+memory-retrieval system. The message may be a question, a statement, \
+or a command — preserve its original intent and shape.
 
 Rules:
-- Resolve pronouns ("he", "she", "they", "it") to the named entities \
-they refer to in the context.
-- Resolve referential phrases ("the other one", "that thing we \
-discussed", "earlier") to their concrete referents.
-- Preserve all proper nouns, dates, numbers, and direct quotes \
-verbatim.
-- If the question already stands alone, return it unchanged.
-- Do NOT add explanation or commentary. Output ONLY the rewritten \
-question on a single line.
-- If the context is empty or doesn't disambiguate the question, \
-return the original question unchanged.
+- If the message already stands alone, return it unchanged.
+- If the message references prior content ("yes", "that", "the same \
+one", "those", "it", "them", "this", "he", "she", "they"), rewrite it \
+to include the specific entity or topic from the conversation \
+transcript. Examples:
+  - "yes, look for that" + transcript about Sony headphones → \
+"look for my Sony headphones"
+  - "yes, please save that" + transcript about a meeting → \
+"save the meeting"
+  - "tell me more" + transcript about Italy → "tell me more about Italy"
+- Preserve all proper nouns, dates, numbers, and direct quotes verbatim.
+- Do not add information not present in the transcript.
+- Do not turn statements into questions or vice versa.
+- Output ONLY the rewritten message on a single line. No preamble, no \
+explanation, no quotes around the output.
+- If the transcript is empty or doesn't disambiguate the message, \
+return the original message unchanged.
 
-Conversation context (oldest first):
+Conversation transcript (most recent last):
 {context}
 
-User's question to rewrite:
-{question}
+Current message: {question}
 
-Rewritten question:"""
+Rewritten:"""
 
 
 def _format_context(context: list[dict[str, str]]) -> str:
     """Render the conversation context for the rewrite prompt. Each
-    entry is ``{"role": "user"|"assistant", "content": "..."}``."""
+    entry is ``{"role": "user"|"assistant", "content": "..."}``.
+
+    Caps the window at the last ``_MAX_CONTEXT_MESSAGES`` turns and
+    truncates each turn's content to ``_MAX_CONTEXT_CONTENT_CHARS`` —
+    keeps the prompt's token cost bounded as conversations grow, and
+    pins prompt structure to saga's contextual rewrite (the reference
+    implementation).
+    """
+    recent = context[-_MAX_CONTEXT_MESSAGES:]
     lines: list[str] = []
-    for turn in context:
+    for turn in recent:
         role = turn.get("role", "user")
         content = (turn.get("content") or "").strip()
         if not content:
             continue
+        if len(content) > _MAX_CONTEXT_CONTENT_CHARS:
+            content = content[:_MAX_CONTEXT_CONTENT_CHARS] + "…"
         lines.append(f"{role}: {content}")
     return "\n".join(lines)
 
 
 def _clean_rewrite(raw: str, original: str) -> str:
     """Strip the LLM's preface noise — trailing whitespace, leading
-    "Rewritten question:" echoes, surrounding quotes. Returns the
-    original query if the parsed rewrite is empty or starts with one
-    of the well-known refusal phrases."""
+    "Rewritten:" or "Rewritten question:" echoes, surrounding quotes.
+    Returns the original query if the parsed rewrite is empty or
+    starts with one of the well-known refusal phrases."""
     text = (raw or "").strip()
     if not text:
         return original
-    # Drop a "Rewritten question:" prefix if the LLM echoed it.
-    text = re.sub(r"^[Rr]ewritten\s*[Qq]uestion\s*:\s*", "", text)
+    # Drop a "Rewritten:" or "Rewritten question:" prefix if the LLM
+    # echoed the prompt's label line.
+    text = re.sub(
+        r"^[Rr]ewritten(?:\s*[Qq]uestion)?\s*:\s*", "", text,
+    )
     # Take only the first line — paragraph drift confuses retrieval.
     text = text.splitlines()[0].strip()
     text = text.strip("\"'`")
