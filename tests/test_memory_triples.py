@@ -384,3 +384,205 @@ def test_parse_contradictions_returns_empty_when_no_section():
     from mimir.memory.synthesize import _parse_contradictions
     out = _parse_contradictions("OBSERVATION: just an observation.")
     assert out == []
+
+
+# ─── P48: build_vocab_block ──────────────────────────────────────────
+
+
+def test_build_vocab_block_seed_only_on_cold_db(conn):
+    """Cold DB → block contains the static predicate + subject seed.
+    Bench-OFF callers (and the first consolidate pass ever) hit this
+    path. The non-empty seed guarantees the LLM always sees a canonical
+    set, not an empty hint."""
+    from mimir.memory.synthesize import build_vocab_block
+    block = build_vocab_block(conn)
+    # Seed predicates surface as bare names (no counts).
+    assert "prefers" in block
+    assert "lives_in" in block
+    # Seed subjects surface as bare names.
+    assert "User" in block
+    assert "Assistant" in block
+    # Header is the load-bearing instruction to the LLM.
+    assert "Existing canonical vocabulary" in block
+    # Trailing double-newline lets the prompt template flow into the
+    # next section cleanly.
+    assert block.endswith("\n\n")
+
+
+def test_build_vocab_block_surfaces_db_top_n_with_counts(conn):
+    """Predicates and subjects present in the live triples table land
+    in the block annotated with their count, ordered most-frequent
+    first. The seed unions in below."""
+    from mimir.memory.synthesize import build_vocab_block
+    _seed_atom(conn, "obs1", "obs1")
+    _seed_atom(conn, "obs2", "obs2")
+    _seed_atom(conn, "obs3", "obs3")
+    # 3 'manufactures' predicates → highest count.
+    store_triples(conn, [
+        {"subject": "ACME", "predicate": "manufactures", "object": "widgets"},
+    ], source_atom_id="obs1")
+    store_triples(conn, [
+        {"subject": "ACME", "predicate": "manufactures", "object": "gizmos"},
+    ], source_atom_id="obs2")
+    store_triples(conn, [
+        {"subject": "ACME", "predicate": "manufactures", "object": "thingamajigs"},
+    ], source_atom_id="obs3")
+    # 1 'employs' predicate → lower count, still surfaces.
+    store_triples(conn, [
+        {"subject": "ACME", "predicate": "employs", "object": "engineers"},
+    ], source_atom_id="obs1")
+    block = build_vocab_block(conn)
+    # DB-derived predicates carry parenthesized counts.
+    assert "manufactures (3)" in block
+    assert "employs (1)" in block
+    # DB-derived subject surfaces with its count.
+    assert "ACME (4)" in block
+
+
+def test_build_vocab_block_includes_extra_subjects(conn):
+    """Operator-supplied subjects (identities.yaml entries) land in the
+    subject list as bare names, distinguishing them from DB-derived
+    entries. Surface for production callers that want to inject custom
+    canonical identities into the LLM's view."""
+    from mimir.memory.synthesize import build_vocab_block
+    block = build_vocab_block(conn, extra_subjects=["MyCompany", "MyTeam"])
+    assert "MyCompany" in block
+    assert "MyTeam" in block
+
+
+def test_build_vocab_block_dedupes_extras_against_seed(conn):
+    """Passing a subject that's already in the seed (e.g. ``User``)
+    doesn't duplicate it. Defensive: operators shouldn't have to
+    remember which subjects are seeded."""
+    from mimir.memory.synthesize import build_vocab_block
+    block = build_vocab_block(conn, extra_subjects=["User", "MyTeam"])
+    subj_line = [l for l in block.split("\n") if l.startswith("Subjects:")][0]
+    # Strip the "Subjects: " header before splitting by comma.
+    entries = [s.strip() for s in subj_line[len("Subjects:"):].split(",")]
+    user_entries = [s for s in entries if s == "User"]
+    assert len(user_entries) == 1
+    # MyTeam landed.
+    assert "MyTeam" in entries
+
+
+# ─── P47: build_prior_block ──────────────────────────────────────────
+
+
+def test_build_prior_block_empty_when_no_priors(conn):
+    """Cluster with no subset observations → empty block. The prompt
+    placeholder gracefully renders nothing."""
+    from mimir.memory.synthesize import build_prior_block
+    _seed_atom(conn, "raw1", "raw1")
+    _seed_atom(conn, "raw2", "raw2")
+    assert build_prior_block(conn, ["raw1", "raw2"]) == ""
+
+
+def test_build_prior_block_surfaces_strict_subset_observation_triples(conn):
+    """An older observation built from raws ⊂ the new cluster's raws
+    surfaces its triples in the prior block. Equal-evidence (not strict
+    subset) is excluded — equal-evidence reuse is handled separately."""
+    from mimir.memory.synthesize import build_prior_block
+    # Two raws — earlier observation evidenced by just raw1.
+    _seed_atom(conn, "raw1", "raw1")
+    _seed_atom(conn, "raw2", "raw2")
+    _seed_atom(conn, "obs_old", "old observation")
+    conn.execute(
+        "UPDATE atoms SET memory_type = 'observation' WHERE id = 'obs_old'"
+    )
+    conn.execute(
+        "INSERT INTO atom_relations "
+        "(source_id, target_id, relation_type, confidence, created_at) "
+        "VALUES ('obs_old', 'raw1', 'evidenced_by', 1.0, '2026-05-13T00:00:00Z')"
+    )
+    conn.commit()
+    store_triples(conn, [
+        {"subject": "User", "predicate": "prefers", "object": "tea"},
+    ], source_atom_id="obs_old")
+    # New cluster pulls in raw1 + raw2 → obs_old's evidence ({raw1}) is
+    # a strict subset of {raw1, raw2}.
+    block = build_prior_block(conn, ["raw1", "raw2"])
+    assert "(User, prefers, tea)" in block
+    assert "Previous beliefs" in block
+
+
+def test_build_prior_block_excludes_equal_and_superset_observations(conn):
+    """Observations with evidence ⊇ the cluster (equal or superset)
+    are NOT priors — they're either the equal-evidence-skip case or
+    can't be revised by a smaller cluster. Only strict subsets count."""
+    from mimir.memory.synthesize import build_prior_block
+    _seed_atom(conn, "raw1", "raw1")
+    _seed_atom(conn, "raw2", "raw2")
+    _seed_atom(conn, "raw3", "raw3")
+    _seed_atom(conn, "obs_equal", "equal-evidence obs")
+    _seed_atom(conn, "obs_super", "superset obs")
+    conn.execute(
+        "UPDATE atoms SET memory_type = 'observation' "
+        "WHERE id IN ('obs_equal', 'obs_super')"
+    )
+    # obs_equal: evidence = {raw1, raw2} (equal).
+    conn.executemany(
+        "INSERT INTO atom_relations "
+        "(source_id, target_id, relation_type, confidence, created_at) "
+        "VALUES (?, ?, 'evidenced_by', 1.0, '2026-05-13T00:00:00Z')",
+        [("obs_equal", "raw1"), ("obs_equal", "raw2")],
+    )
+    # obs_super: evidence = {raw1, raw2, raw3} (superset).
+    conn.executemany(
+        "INSERT INTO atom_relations "
+        "(source_id, target_id, relation_type, confidence, created_at) "
+        "VALUES (?, ?, 'evidenced_by', 1.0, '2026-05-13T00:00:00Z')",
+        [("obs_super", "raw1"), ("obs_super", "raw2"), ("obs_super", "raw3")],
+    )
+    conn.commit()
+    store_triples(conn, [
+        {"subject": "User", "predicate": "prefers", "object": "equal_obj"},
+    ], source_atom_id="obs_equal")
+    store_triples(conn, [
+        {"subject": "User", "predicate": "prefers", "object": "super_obj"},
+    ], source_atom_id="obs_super")
+    block = build_prior_block(conn, ["raw1", "raw2"])
+    # Neither observation's triples should appear.
+    assert "equal_obj" not in block
+    assert "super_obj" not in block
+    # And with no strict-subset priors at all, the block is empty.
+    assert block == ""
+
+
+def test_build_prior_block_skips_when_cluster_too_small(conn):
+    """A 1-atom cluster can't have any strict-subset priors (subset of
+    a 1-element set is the empty set, which we don't track as
+    evidence). Guard returns empty without hitting the DB."""
+    from mimir.memory.synthesize import build_prior_block
+    _seed_atom(conn, "raw1", "raw1")
+    assert build_prior_block(conn, ["raw1"]) == ""
+
+
+def test_rich_prompt_renders_with_blocks_populated():
+    """End-to-end: ``RICH_PROMPT.format`` accepts vocab_block and
+    prior_block as kwargs without KeyError or stray braces. Pins the
+    template format-string contract."""
+    from mimir.memory.synthesize import RICH_PROMPT
+    out = RICH_PROMPT.format(
+        n=2,
+        indexed_atoms="[1] hello\n[2] world",
+        prior_block="Previous beliefs: foo\n\n",
+        vocab_block="Existing canonical vocabulary: bar\n\n",
+    )
+    assert "Previous beliefs: foo" in out
+    assert "Existing canonical vocabulary: bar" in out
+    assert "[1] hello" in out
+
+
+def test_rich_prompt_renders_with_blocks_empty():
+    """Bench-neutrality: empty blocks render to literal empty in the
+    template — no leftover placeholder strings, no double newlines that
+    would change the prompt's structure for the bench-OFF path."""
+    from mimir.memory.synthesize import RICH_PROMPT
+    out = RICH_PROMPT.format(
+        n=2, indexed_atoms="[1] hello\n[2] world",
+        prior_block="", vocab_block="",
+    )
+    assert "{prior_block}" not in out
+    assert "{vocab_block}" not in out
+    # Atoms section still flows cleanly even with empty prior block.
+    assert "Atoms:\n[1] hello" in out

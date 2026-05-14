@@ -532,15 +532,35 @@ class MemoryClient:
         eligible = [c for c in clusters if len(c) >= min_cluster_size][:max_obs]
         sem = asyncio.Semaphore(4)
 
-        async def _synth(cluster):
+        # P47 / P48: build vocab_block once per run, prior_block per
+        # cluster. Both inject into the rich prompt. Empty when DB is
+        # cold or there are no priors — bench-neutral.
+        from .synthesize import build_vocab_block, build_prior_block
+        vocab_block = await asyncio.to_thread(
+            build_vocab_block, conn,
+            extra_subjects=list(extra_canonical_subjects or []),
+        )
+        prior_blocks: list[str] = []
+        for cluster in eligible:
+            evidence_ids = [a["id"] for a in cluster]
+            pb = await asyncio.to_thread(build_prior_block, conn, evidence_ids)
+            prior_blocks.append(pb)
+
+        async def _synth(cluster, prior_block):
             async with sem:
                 try:
-                    return await self._observation_synth_fn(cluster)
+                    return await self._observation_synth_fn(
+                        cluster,
+                        prior_block=prior_block,
+                        vocab_block=vocab_block,
+                    )
                 except Exception:
                     return {"content": "", "topics": [],
                             "triples": [], "contradictions": []}
 
-        results = await asyncio.gather(*[_synth(c) for c in eligible])
+        results = await asyncio.gather(
+            *[_synth(c, pb) for c, pb in zip(eligible, prior_blocks)]
+        )
 
         # 3. Per-cluster restructure: store observation, link evidence,
         # emit access events. Each cluster runs its own short transaction
