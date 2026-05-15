@@ -42,7 +42,7 @@ def _stub_provider(monkeypatch, dim_vec):
             return list(dim_vec(text))
         def dimensions(self):
             return len(dim_vec(""))
-    monkeypatch.setattr("saga.embeddings.get_provider", lambda: _StubProvider())
+    monkeypatch.setattr("mimir.memory.embeddings.get_provider", lambda: _StubProvider())
     def fake_get_config():
         def cfg(section, key, default=None):
             return {
@@ -51,7 +51,7 @@ def _stub_provider(monkeypatch, dim_vec):
                 ("embedding", "model"): "stub",
             }.get((section, key), default)
         return cfg
-    monkeypatch.setattr("saga.config.get_config", fake_get_config)
+    monkeypatch.setattr("mimir.memory._config_io.get_config", fake_get_config)
 
 
 # ─── mark_contributions ──────────────────────────────────────────────
@@ -254,9 +254,9 @@ async def test_rewrite_query_uses_llm_when_context_present(monkeypatch):
         assert "Alice" in prompt
         return "What about Alice?\n"
 
-    monkeypatch.setattr("saga._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("mimir.memory._llm.call_llm", fake_call_llm)
     monkeypatch.setattr(
-        "saga.config.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     out = await query_rewrite.rewrite_query(
@@ -277,9 +277,9 @@ async def test_rewrite_query_llm_failure_falls_back(monkeypatch):
     async def boom(*a, **k):
         raise RuntimeError("transport down")
 
-    monkeypatch.setattr("saga._llm.call_llm", boom)
+    monkeypatch.setattr("mimir.memory._llm.call_llm", boom)
     monkeypatch.setattr(
-        "saga.config.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     out = await query_rewrite.rewrite_query(
@@ -297,9 +297,9 @@ async def test_rewrite_query_strips_preface_noise(monkeypatch):
     async def fake_call_llm(*a, **k):
         return 'Rewritten question: "What did Alice say about Boston?"'
 
-    monkeypatch.setattr("saga._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("mimir.memory._llm.call_llm", fake_call_llm)
     monkeypatch.setattr(
-        "saga.config.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     out = await query_rewrite.rewrite_query(
@@ -317,9 +317,9 @@ async def test_rewrite_query_refusal_falls_back(monkeypatch):
     async def fake_call_llm(*a, **k):
         return "No change needed."
 
-    monkeypatch.setattr("saga._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("mimir.memory._llm.call_llm", fake_call_llm)
     monkeypatch.setattr(
-        "saga.config.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     out = await query_rewrite.rewrite_query(
@@ -339,9 +339,9 @@ async def test_rewrite_query_strips_bare_rewritten_prefix(monkeypatch):
     async def fake_call_llm(*a, **k):
         return "Rewritten: look for my Sony headphones"
 
-    monkeypatch.setattr("saga._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("mimir.memory._llm.call_llm", fake_call_llm)
     monkeypatch.setattr(
-        "saga.config.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     out = await query_rewrite.rewrite_query(
@@ -365,9 +365,9 @@ async def test_rewrite_query_truncates_long_message_content(monkeypatch):
         captured_prompt["text"] = prompt
         return "rewritten message"
 
-    monkeypatch.setattr("saga._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("mimir.memory._llm.call_llm", fake_call_llm)
     monkeypatch.setattr(
-        "saga.config.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     long_msg = "x" * 5000  # well above the 400-char cap
@@ -396,9 +396,9 @@ async def test_rewrite_query_caps_at_last_n_messages(monkeypatch):
         captured_prompt["text"] = prompt
         return "rewritten message"
 
-    monkeypatch.setattr("saga._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("mimir.memory._llm.call_llm", fake_call_llm)
     monkeypatch.setattr(
-        "saga.config.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     # 20 turns — the cap should drop the oldest 10. We tag each turn

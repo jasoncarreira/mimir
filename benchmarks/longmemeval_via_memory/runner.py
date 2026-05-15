@@ -96,8 +96,8 @@ def _batch_embed_texts(texts: list[str]) -> list[tuple[bytes, str, str, int]]:
     ``mimir.memory.store.EmbedFn`` would produce.
     """
     import struct as _struct
-    from saga.embeddings import get_provider
-    from saga.config import get_config
+    from mimir.memory.embeddings import get_provider
+    from mimir.memory._config_io import get_config
 
     cfg = get_config()
     provider = get_provider()

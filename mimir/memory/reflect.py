@@ -134,9 +134,26 @@ def reflect(
     emotional_state). Passed through to ``boundary_synth_fn`` so the
     synthesis can stitch sessions together coherently.
     """
-    # Idempotency: short-circuit if a boundary already exists.
+    # Idempotency: short-circuit if a boundary already exists. Still
+    # upsert the sessions row though — a caller re-ending a session
+    # with a freshly-resolved channel_id (e.g., the dispatcher learned
+    # which channel the boundary belongs to between calls) should be
+    # able to backfill that without us silently no-opping the row.
     existing_bid = _existing_boundary(conn, session_id)
     if existing_bid is not None:
+        if channel_id is not None:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE sessions SET channel_id = ? "
+                    "WHERE id = ? AND (channel_id IS NULL OR channel_id != ?)",
+                    (channel_id, session_id, channel_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                # Non-fatal — the boundary still resolves; the
+                # channel_id backfill is best-effort.
         return ReflectResult(
             session_id=session_id,
             boundary_atom_id=existing_bid,
