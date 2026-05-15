@@ -33,14 +33,25 @@ from mimir.saga_client import (
     ["", None, "http://localhost:3002", "http://127.0.0.1:3002",
      "http://[::1]:8080", "http://0.0.0.0:3002"],
 )
-def test_factory_returns_inprocess_for_localhost_or_empty(endpoint):
-    # ``record_calls=False`` strips the RecordingSagaClient wrapper so
-    # the isinstance check on the underlying implementation passes.
-    # Production (record_calls=True, default) wraps for inline turn
-    # auditing — covered separately in test_recording_saga_client.py.
-    client = make_saga_client(endpoint=endpoint, record_calls=False)
-    assert isinstance(client, _InProcessSaga)
+def test_factory_returns_memory_client_for_localhost_or_empty(endpoint, tmp_path):
+    # Post-cutover (2026-05-15): localhost/empty endpoints get
+    # ``MemoryClient`` (mimir.memory) as the in-process backend rather
+    # than the legacy ``_InProcessSaga``. ``MIMIR_LEGACY_INPROCESS_SAGA=1``
+    # restores the old path; covered by the legacy-fallback test below.
+    from mimir.memory.client import MemoryClient
+    client = make_saga_client(
+        endpoint=endpoint, record_calls=False,
+        db_path=tmp_path / "memory.db",
+    )
+    assert isinstance(client, MemoryClient)
     assert isinstance(client, SagaClient)  # Protocol check (runtime_checkable)
+
+
+def test_factory_legacy_inprocess_via_env(monkeypatch):
+    # Env escape hatch restores the legacy in-process saga adapter.
+    monkeypatch.setenv("MIMIR_LEGACY_INPROCESS_SAGA", "1")
+    client = make_saga_client(endpoint="", record_calls=False)
+    assert isinstance(client, _InProcessSaga)
 
 
 @pytest.mark.parametrize(

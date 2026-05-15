@@ -424,9 +424,9 @@ def all_mimir_tools() -> list:
     setters in mimir/server.py:build_app once and let the agent
     discover them all at construction time.
     """
-    from .memory_tool import memory_query
-    from .store_tool import memory_store
-    from .extra_tools import file_search, mimir_get_turn, shell_exec
+    from .memory import memory_query
+    from .store import memory_store
+    from .extra import file_search, mimir_get_turn, shell_exec
     return [
         # Memory (read + write)
         memory_query, memory_store,

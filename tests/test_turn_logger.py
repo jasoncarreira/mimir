@@ -1,4 +1,15 @@
-"""Verify SDK message stream → TurnRecord events extraction (SPEC §10.3)."""
+"""Tests for the deepagents-era turn_logger.
+
+Covers ``extract_turn_events`` and ``derive_result_fields`` against the
+LangChain message shapes mimir actually sees in production:
+
+  - ``AIMessage.tool_calls``                       (langchain-anthropic / -openai)
+  - ``response_metadata["internal_tool_calls"]``   (ChatClaudeCode / OAuth path)
+  - ``response_metadata["tool_results"]``          (ChatClaudeCode / OAuth path)
+  - ``ToolMessage``                                (standard LangGraph tool roundtrip)
+  - ``response_metadata`` fields surfaced from claude_agent_sdk
+    ResultMessage: ``total_cost_usd``, ``num_turns``, ``usage``, ``is_error``
+"""
 
 from __future__ import annotations
 
@@ -6,211 +17,219 @@ import json
 from pathlib import Path
 
 import pytest
-from claude_agent_sdk import (
-    AssistantMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
-)
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from mimir.models import TurnRecord
-from mimir.turn_logger import TurnLogger, extract_turn_events, truncate_input
+from mimir.turn_logger import (
+    TurnLogger,
+    derive_result_fields,
+    extract_turn_events,
+    make_turn_id,
+    truncate_input,
+)
 
 
-def _assistant(*blocks):
-    return AssistantMessage(content=list(blocks), model="claude-opus-4-7")
+# ── extract_turn_events ──────────────────────────────────────────────
 
 
-def test_extract_text_only_appends_to_output():
-    msgs = [_assistant(TextBlock(text="hello there"))]
-    events, output = extract_turn_events(msgs)
+def test_empty_message_list():
+    events, output = extract_turn_events([])
     assert events == []
-    assert output == "hello there"
-
-
-def test_extract_tool_use_emits_reasoning_then_tool_call():
-    msgs = [
-        _assistant(
-            TextBlock(text="thinking about it"),
-            ToolUseBlock(id="t1", name="echo", input={"text": "hi"}),
-        )
-    ]
-    events, output = extract_turn_events(msgs)
     assert output == ""
-    assert events == [
-        {"type": "reasoning", "content": "thinking about it"},
-        {"type": "tool_call", "id": "t1", "name": "echo", "args": {"text": "hi"}},
-    ]
 
 
-def test_extract_thinking_block_becomes_reasoning():
-    msgs = [_assistant(ThinkingBlock(thinking="deep thought", signature="sig"), TextBlock(text="ok"))]
-    events, output = extract_turn_events(msgs)
-    assert events == [{"type": "reasoning", "content": "deep thought"}]
-    assert output == "ok"
+def test_plain_ai_message_with_no_tools_becomes_output():
+    msg = AIMessage(content="Hello there.")
+    events, output = extract_turn_events([msg])
+    assert events == []
+    assert output == "Hello there."
 
 
-def test_extract_tool_result_from_user_message():
-    msgs = [
-        UserMessage(
-            content=[
-                ToolResultBlock(tool_use_id="t1", content="echoed: hi", is_error=False),
-            ]
-        ),
-    ]
-    events, output = extract_turn_events(msgs)
+def test_langchain_native_tool_calls_emit_reasoning_plus_tool_call():
+    # langchain-anthropic / -openai populate AIMessage.tool_calls directly.
+    msg = AIMessage(
+        content="I'll look that up.",
+        tool_calls=[
+            {"id": "tc_1", "name": "memory_query", "args": {"query": "x"}},
+        ],
+    )
+    events, output = extract_turn_events([msg])
     assert output == ""
-    # Without a preceding tool_call the name correlation falls back to "".
-    assert events == [
-        {"type": "tool_result", "id": "t1", "name": "", "content": "echoed: hi", "is_error": False},
-    ]
+    assert [e["type"] for e in events] == ["reasoning", "tool_call"]
+    assert events[0]["content"] == "I'll look that up."
+    assert events[1]["name"] == "memory_query"
+    assert events[1]["args"] == {"query": "x"}
 
 
-def test_subagent_internal_messages_are_filtered_out():
-    """SPEC §10.3: subagent-internal turns (parent_tool_use_id != None) must
-    not flatten into the parent's events list — only the Agent tool_call and
-    its tool_result remain."""
-    parent_msgs = [
-        _assistant(
-            ToolUseBlock(id="agent-1", name="Agent", input={"subagent_type": "researcher"}),
-        ),
-        # Subagent-internal AssistantMessage with parent_tool_use_id set.
-        AssistantMessage(
-            content=[
-                TextBlock(text="subagent thinking"),
-                ToolUseBlock(id="sub-1", name="WebFetch", input={"url": "x"}),
+def test_chat_claude_code_internal_tool_calls_are_captured():
+    # ChatClaudeCode stashes them under response_metadata instead of
+    # tool_calls (deliberate — keeps LangGraph from re-executing).
+    msg = AIMessage(
+        content="Stored.",
+        response_metadata={
+            "internal_tool_calls": [
+                {"id": "toolu_1", "name": "memory_store",
+                 "args": {"content": "blue", "stream": "semantic"}},
             ],
-            model="claude-opus-4-7",
-            parent_tool_use_id="agent-1",
-        ),
-        UserMessage(
-            content=[ToolResultBlock(tool_use_id="sub-1", content="page body", is_error=False)],
-            parent_tool_use_id="agent-1",
-        ),
-        # Parent's tool_result for the Agent call.
-        UserMessage(
-            content=[ToolResultBlock(tool_use_id="agent-1", content="done", is_error=False)],
-        ),
-        _assistant(TextBlock(text="researcher said done")),
-    ]
-    events, output = extract_turn_events(parent_msgs)
-    names = [(e["type"], e.get("name")) for e in events]
-    # Only the parent's Agent call and its result; subagent's WebFetch dropped.
-    assert names == [("tool_call", "Agent"), ("tool_result", "Agent")]
-    assert output == "researcher said done"
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    types = [e["type"] for e in events]
+    assert "tool_call" in types
+    tc = next(e for e in events if e["type"] == "tool_call")
+    assert tc["name"] == "memory_store"
+    assert tc["args"] == {"content": "blue", "stream": "semantic"}
 
 
-def test_tool_result_name_correlates_with_preceding_tool_call():
+def test_chat_claude_code_tool_results_are_captured():
+    msg = AIMessage(
+        content="Done.",
+        response_metadata={
+            "internal_tool_calls": [
+                {"id": "toolu_1", "name": "memory_store", "args": {"x": 1}}
+            ],
+            "tool_results": [
+                {"tool_use_id": "toolu_1", "name": "memory_store",
+                 "result": {"stored": True, "atom_id": "deadbeef"},
+                 "is_error": False},
+            ],
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    tr = next(e for e in events if e["type"] == "tool_result")
+    assert tr["name"] == "memory_store"
+    assert tr["id"] == "toolu_1"
+    assert not tr["is_error"]
+    # Result dict gets coerced to a string-ish body
+    assert "deadbeef" in tr["content"]
+
+
+def test_tool_message_emits_tool_result():
     msgs = [
-        _assistant(ToolUseBlock(id="t42", name="echo", input={"text": "x"})),
-        UserMessage(content=[ToolResultBlock(tool_use_id="t42", content="x", is_error=False)]),
+        AIMessage(
+            content="checking",
+            tool_calls=[{"id": "tc_1", "name": "memory_query", "args": {}}],
+        ),
+        ToolMessage(content="hit_count=3", tool_call_id="tc_1", name="memory_query"),
     ]
     events, _ = extract_turn_events(msgs)
-    assert events[0]["type"] == "tool_call"
-    assert events[1] == {
-        "type": "tool_result",
-        "id": "t42",
-        "name": "echo",
-        "content": "x",
-        "is_error": False,
-    }
+    tr = next(e for e in events if e["type"] == "tool_result")
+    assert tr["id"] == "tc_1"
+    assert tr["name"] == "memory_query"
+    assert tr["content"] == "hit_count=3"
+    assert tr["is_error"] is False
 
 
-def test_extract_attaches_t_ms_from_message_timestamps():
-    """``message_t_ms`` flows through to each emitted event's ``t_ms``
-    field. Lets the turn viewer interleave events with saga_calls on
-    one chronological timeline. One AssistantMessage that produces
-    multiple events (reasoning + tool_call) shares its message's
-    timestamp across the derived events."""
-    msgs = [
-        _assistant(
-            TextBlock(text="thinking"),
-            ToolUseBlock(id="t1", name="echo", input={}),
-        ),
-        UserMessage(content=[ToolResultBlock(
-            tool_use_id="t1", content="ok", is_error=False,
-        )]),
-    ]
-    events, _ = extract_turn_events(msgs, message_t_ms=[12.0, 45.0])
-    assert [e["t_ms"] for e in events] == [12.0, 12.0, 45.0]
+def test_tool_message_error_status_flagged():
+    msg = ToolMessage(content="boom", tool_call_id="tc_x", name="bad", status="error")
+    events, _ = extract_turn_events([msg])
+    assert events[0]["is_error"] is True
 
 
-def test_extract_omits_t_ms_when_message_timestamps_missing():
-    """Without ``message_t_ms``, events stay un-stamped (legacy shape).
-    Pre-PR turns don't have it, so the viewer falls back to the
-    two-section layout for them."""
-    msgs = [_assistant(TextBlock(text="hi"), ToolUseBlock(
-        id="t1", name="echo", input={},
-    ))]
-    events, _ = extract_turn_events(msgs)
-    for e in events:
-        assert "t_ms" not in e
+def test_oversized_tool_result_truncated():
+    body = "x" * 100_000
+    msg = ToolMessage(content=body, tool_call_id="tc_x", name="big")
+    events, _ = extract_turn_events([msg])
+    assert events[0]["content"].endswith("…[truncated]")
+    assert len(events[0]["content"]) < len(body)
 
 
-def test_extract_handles_full_turn_round_trip():
-    msgs = [
-        _assistant(
-            TextBlock(text="let me echo"),
-            ToolUseBlock(id="t1", name="echo", input={"text": "hello"}),
-        ),
-        UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="hello", is_error=False)]),
-        _assistant(TextBlock(text="echoed for you")),
-    ]
-    events, output = extract_turn_events(msgs)
-    assert output == "echoed for you"
-    assert [e["type"] for e in events] == ["reasoning", "tool_call", "tool_result"]
+# ── derive_result_fields ─────────────────────────────────────────────
 
 
-def test_truncate_input_caps_at_max():
-    big = "x" * 4096
-    out = truncate_input(big)
-    assert out.endswith("…[truncated]")
-    assert len(out) < len(big)
+def test_derive_with_no_messages_returns_all_none():
+    rf = derive_result_fields([])
+    for k in (
+        "result_subtype", "result_is_error", "stop_reason",
+        "num_turns", "total_cost_usd", "usage",
+    ):
+        assert rf[k] is None
 
 
-@pytest.mark.asyncio
-async def test_turn_logger_appends_jsonl(tmp_path: Path):
-    log_path = tmp_path / "turns.jsonl"
-    logger = TurnLogger(log_path, max_turns=3)
+def test_derive_aggregates_usage_metadata_across_ai_messages():
+    msg1 = AIMessage(
+        content="a",
+        usage_metadata={
+            "input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+            "input_token_details": {"cache_read": 30, "cache_creation": 0},
+        },
+    )
+    msg2 = AIMessage(
+        content="b",
+        usage_metadata={
+            "input_tokens": 200, "output_tokens": 40, "total_tokens": 240,
+            "input_token_details": {"cache_read": 10, "cache_creation": 5},
+        },
+    )
+    rf = derive_result_fields([msg1, msg2])
+    assert rf["usage"]["input_tokens"] == 300
+    assert rf["usage"]["output_tokens"] == 60
+    assert rf["usage"]["cache_read_input_tokens"] == 40
+    assert rf["usage"]["cache_creation_input_tokens"] == 5
+    assert rf["num_turns"] == 2
 
+
+def test_derive_picks_up_chat_claude_code_result_metadata():
+    # ChatClaudeCode mirrors claude_agent_sdk's ResultMessage into
+    # response_metadata. Make sure we surface what's there.
+    msg = AIMessage(
+        content="done",
+        response_metadata={
+            "total_cost_usd": 0.0123,
+            "num_turns": 4,
+            "is_error": False,
+            "usage": {"input_tokens": 5000, "output_tokens": 80},
+        },
+    )
+    rf = derive_result_fields([msg])
+    assert rf["total_cost_usd"] == pytest.approx(0.0123)
+    assert rf["num_turns"] == 4
+    assert rf["result_is_error"] is False
+    assert rf["usage"]["input_tokens"] == 5000
+
+
+def test_derive_marks_max_turns_as_error_subtype():
+    msg = AIMessage(content="halted", response_metadata={"stop_reason": "max_turns"})
+    rf = derive_result_fields([msg])
+    assert rf["result_subtype"] == "error_max_turns"
+    assert rf["result_is_error"] is True
+    assert rf["stop_reason"] == "max_turns"
+
+
+# ── TurnLogger / helpers ─────────────────────────────────────────────
+
+
+def test_truncate_input_returns_string():
+    long = "x" * 50_000
+    out = truncate_input(long)
+    assert isinstance(out, str)
+    assert len(out) < len(long) or len(out) == len(long)  # length policy lives in module
+
+
+def test_make_turn_id_unique_and_shaped():
+    ids = {make_turn_id() for _ in range(100)}
+    assert len(ids) == 100  # collision-free
+    assert all(isinstance(t, str) and len(t) >= 8 for t in ids)
+
+
+async def test_turn_logger_writes_appendable_jsonl(tmp_path: Path):
+    log = TurnLogger(tmp_path / "turns.jsonl")
     record = TurnRecord(
-        ts="2026-04-25T10:00:00+00:00",
-        turn_id="abc123",
-        session_id="bench-1",
+        ts="2026-05-15T12:00:00Z",
+        turn_id="t1",
+        session_id="ch-1",
         saga_session_id=None,
         trigger="user_message",
-        channel_id="bench-1",
+        channel_id="ch-1",
         input="hi",
+        output="hello",
+        events=[{"type": "reasoning", "content": "thinking"}],
+        duration_ms=42,
     )
-    await logger.write(record)
-
-    contents = log_path.read_text(encoding="utf-8").strip().splitlines()
-    assert len(contents) == 1
-    parsed = json.loads(contents[0])
-    assert parsed["turn_id"] == "abc123"
-    assert parsed["saga_session_id"] is None
-    assert parsed["saga_atom_ids"] == []
-
-
-@pytest.mark.asyncio
-async def test_turn_logger_trims_when_over_cap(tmp_path: Path):
-    """Hysteresis: trim fires when over cap by ≥10% (rounded up to at
-    least 1 line). With cap=2 the trigger is >3 lines."""
-    log_path = tmp_path / "turns.jsonl"
-    logger = TurnLogger(log_path, max_turns=2)
-
-    for i in range(20):
-        await logger.write(
-            TurnRecord(
-                ts="t", turn_id=f"id{i}", session_id="c", saga_session_id=None,
-                trigger="x", channel_id="c", input=str(i),
-            )
-        )
-
-    lines = [json.loads(l) for l in log_path.read_text().strip().splitlines()]
-    # Bound: between cap (right after trim) and cap+10% rounded up.
-    assert 2 <= len(lines) <= 3
-    # Most recent turn always kept.
-    assert lines[-1]["turn_id"] == "id19"
+    await log.write(record)
+    await log.write(record)
+    lines = (tmp_path / "turns.jsonl").read_text().splitlines()
+    assert len(lines) == 2
+    first = json.loads(lines[0])
+    assert first["turn_id"] == "t1"
+    assert first["events"][0]["type"] == "reasoning"

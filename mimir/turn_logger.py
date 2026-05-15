@@ -1,19 +1,21 @@
 """turns.jsonl writer + LangChain message → events extractor.
 
-Post-cutover (2026-05-14): replaces the claude_agent_sdk message
-types with langchain_core.messages (AIMessage, ToolMessage,
-HumanMessage). Schema is unchanged — the existing bench tooling /
-benchmark/scripts/collate_turns.py / benchmark/overview_turns.py /
-turn viewer all read this output without modification.
+Walks a list of ``langchain_core.messages`` (AIMessage, ToolMessage,
+HumanMessage) and produces:
+  - a list of events (``reasoning``, ``tool_call``, ``tool_result``)
+  - a final-output string (assistant text not associated with tool use)
+  - SDK-equivalent result fields (cost / usage / stop_reason /
+    num_turns) derived from ``response_metadata`` and ``usage_metadata``
 
-What's dropped from the SDK version (Phase D cleanup, can re-add):
-  - streaming_active intermediate-narration demotion (chainlink #5)
-  - message_t_ms per-event timestamping
-  - parent_tool_use_id subagent-message skipping (deepagents
-    ``task`` tool has its own subagent shape)
+The schema is unchanged from the SDK era — bench tooling
+(``benchmark/scripts/collate_turns.py``, ``benchmark/overview_turns.py``,
+the turn viewer) reads this output without modification.
 
-These are kept as stubs in the function signature so call sites
-that pass them through don't break — they're just ignored.
+Three message shapes are supported:
+  - ``AIMessage.tool_calls`` (langchain-anthropic, langchain-openai)
+  - ``AIMessage.response_metadata["internal_tool_calls"]`` +
+    ``["tool_results"]`` (ChatClaudeCode / Max OAuth subprocess)
+  - ``ToolMessage`` (standard LangGraph tool-call roundtrip)
 """
 
 from __future__ import annotations
@@ -81,16 +83,38 @@ def extract_turn_events(
     for msg in messages:
         if isinstance(msg, AIMessage):
             content_text = _coerce_content(msg.content)
-            if content_text and msg.tool_calls:
+            # ChatClaudeCode executes tools inside the ``claude`` CLI
+            # subprocess and stashes the parsed ToolUseBlocks under
+            # ``response_metadata["internal_tool_calls"]`` (NOT on
+            # ``msg.tool_calls``, to keep LangGraph from re-executing
+            # them). Tool results land in ``response_metadata["tool_results"]``.
+            # Fold both shapes into one stream so the turn log captures
+            # tool activity regardless of provider.
+            rmd = getattr(msg, "response_metadata", None) or {}
+            internal_tcs = rmd.get("internal_tool_calls") or []
+            internal_trs = rmd.get("tool_results") or []
+            tcs = list(msg.tool_calls or []) + list(internal_tcs)
+            if content_text and tcs:
                 events.append({"type": "reasoning", "content": content_text})
             elif content_text:
                 output_parts.append(content_text)
-            for tc in (msg.tool_calls or []):
+            for tc in tcs:
                 events.append({
                     "type": "tool_call",
                     "id": tc.get("id", ""),
                     "name": tc.get("name", "unknown"),
-                    "args": tc.get("args"),
+                    "args": tc.get("args") or tc.get("input"),
+                })
+            for tr in internal_trs:
+                body = _coerce_content(tr.get("content") or tr.get("result"))
+                if len(body) > MAX_TOOL_RESULT_BYTES:
+                    body = body[:MAX_TOOL_RESULT_BYTES] + "…[truncated]"
+                events.append({
+                    "type": "tool_result",
+                    "id": tr.get("tool_use_id", "") or "",
+                    "name": tr.get("name", "") or "",
+                    "content": body,
+                    "is_error": bool(tr.get("is_error")),
                 })
         elif isinstance(msg, ToolMessage):
             body = _coerce_content(msg.content)
@@ -154,9 +178,24 @@ def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
             "cache_creation_input_tokens": agg_cache_create,
         }
 
-    num_turns = sum(1 for m in messages if isinstance(m, AIMessage)) or None
+    # ChatClaudeCode is the LangChain provider that wraps the Claude
+    # Code CLI subprocess. It mirrors the CLI's final ResultMessage
+    # into ``response_metadata`` — pick up the cost, turn count,
+    # usage, and is_error signals it surfaces there. The native
+    # langchain providers (anthropic / openai) populate
+    # ``usage_metadata`` instead, handled above.
+    cc_usage = md.get("usage")
+    if usage is None and cc_usage:
+        usage = cc_usage
+    cc_num_turns = md.get("num_turns")
+    cc_total_cost = md.get("total_cost_usd")
+    cc_is_error = md.get("is_error")
+
+    num_turns = cc_num_turns if cc_num_turns is not None else (
+        sum(1 for m in messages if isinstance(m, AIMessage)) or None
+    )
     result_subtype = "success"
-    result_is_error = False
+    result_is_error = bool(cc_is_error) if cc_is_error is not None else False
     if stop_reason in ("max_turns", "max_tokens"):
         result_subtype = "error_max_turns"
         result_is_error = True
@@ -166,7 +205,7 @@ def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
         "result_is_error": result_is_error,
         "stop_reason": stop_reason,
         "num_turns": num_turns,
-        "total_cost_usd": None,  # not surfaced by langchain-anthropic/openai uniformly
+        "total_cost_usd": cc_total_cost,
         "usage": usage,
     }
 
