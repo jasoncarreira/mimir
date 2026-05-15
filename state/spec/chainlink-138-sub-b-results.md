@@ -57,6 +57,86 @@ Autopass-on regressed hit-rate by 10.00% (Δ -10.00%) and did not significantly 
 | 29 | procedural | `mimir/skills/async-tasks` | no | yes | 1 | 1 |
 | 30 | procedural | `mimir/skills/find-skills` | no | no | 1 | 1 |
 
+## Caveats and follow-on observations
+
+These notes were folded in post-review (Jason's PR #167 review,
+2026-05-15 23:04 UTC). The data and recommendation in the prior
+sections are unchanged; this section makes the metric definitions
+and the failure-mode reading more explicit.
+
+### 1. The hit-rate is a strict floor, not an answer-quality metric
+
+The `outcome quality (hit-rate)` column is a case-insensitive
+substring match between the agent's reply and the probe's
+`expected_target` path. That's a conservative bar — the agent could
+locate the right concept and answer the question correctly without
+ever quoting the exact path. So absolute hit-rates here under-
+represent the agent's actual answer accuracy.
+
+The **relative** comparison (on vs off, same metric) is unaffected
+by this strictness — both arms are floored equally. Read the Δ as
+a path-citation-rate delta, not as an answer-quality delta.
+
+### 2. The latency win and the hit-rate regression are the same mechanism
+
+The -7.3s/turn wall-clock improvement (p=0.036) is real, but it is
+**not** a free win for autopass. Off-arm has higher Read/Grep/Glob
+counts in raw means (Read +0.067, grep+Glob +0.067) — the agent
+spends those seconds doing additional file reads. Several of those
+reads land on the correct target, which is what produces off-arm's
+higher hit-rate.
+
+Same mechanism, two views: off-arm reads more files and finds the
+right ones; on-arm treats the autopass block as authoritative and
+skips the reads it would otherwise have done. The latency
+improvement is the cost of the quality regression, not an
+independent gain.
+
+### 3. Cost Δ is not significant — parallelization won't recover it
+
+The cost Δ of -$0.408/turn is not statistically significant
+(p=0.509). PR #166's prose flagged cost as a likely autopass win;
+the n=30 data does not support that claim.
+
+Implication for chainlink-spec #142 (the autopass + main-call
+parallelization follow-up): a parallel architecture wouldn't
+recover meaningful cost either, because the underlying problem
+isn't a slow second retrieval — it's a retrieval whose output
+suppresses the better one. Parallelizing two retrievals where one
+crowds out the other doesn't help.
+
+### 4. Regression cluster: recent-decision + concept-lookup, not fingerprinted-errors
+
+Looking at the per-probe table by shape:
+
+| Shape | n | hit→miss flips (on vs off) | net on-arm regression |
+|---|---|---|---|
+| fingerprinted-error | 8 | 0 | none |
+| concept-lookup | 8 | 1 (probe #6) | mild |
+| recent-decision | 7 | 2 (probes #9, #10) | strong |
+| procedural | 7 | 1 (probe #29) | mild |
+
+Fingerprinted-error probes are **essentially unaffected** —
+autopass either nails them or misses them in both arms, because
+the corpus has unique near-zero-overlap matches for distinctive
+error fingerprints. Recent-decision and concept-lookup probes are
+where the regressions cluster, because those query shapes have
+overlapping near-matches in the corpus (multiple chainlink-138 spec
+files for #9/#10; multiple core/ files for #6) where surfacing the
+wrong partial-match becomes "the answer the agent stops at."
+
+**Future direction (not in scope for this PR):** if autopass is
+ever revisited, gating it on query shape — autopass-on only for
+fingerprinted-error queries, off for everything else — could
+preserve the latency win on the safe slice without the quality
+regression on the unsafe slice. Alternatively, reframing the
+autopass block from authoritative-presentation ("here is the
+relevant file") to advisory-presentation ("these may or may not
+be relevant; check before relying") could push the agent to
+explicit retrieval rather than treating the block as the answer.
+Neither is committed work; flagging the shape for the chainlink
+#138 close-out.
+
 ## Interpreting the recommendation
 
 - **"ship Sub A as-is, skip Sub C"** — autopass produces a
