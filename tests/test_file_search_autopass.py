@@ -115,8 +115,16 @@ def _ctx(channel_id: str = "discord-1") -> TurnContext:
 # ---- _format_file_search_autopass ---------------------------------------
 
 
-def test_format_file_search_autopass_empty_returns_placeholder():
-    assert _format_file_search_autopass([]) == "(no files)"
+def test_format_file_search_autopass_empty_returns_empty_string():
+    """Empty-input degrades to ``""``; prompt-builder's ``if file_block:``
+    guard handles it without orphaning a `## Possibly relevant files`
+    section in the prompt. Pre-PR-166-review-fixup this returned the
+    sentinel string ``"(no files)"`` — that branch was unreachable
+    (the caller gates on ``if not results: return None``) and would
+    have produced an orphan section if the gate ever changed. Removed
+    for safety; the falsy fall-through is the canonical pattern (same
+    shape as `saga_block`)."""
+    assert _format_file_search_autopass([]) == ""
 
 
 def test_format_file_search_autopass_renders_saga_style_bullets():
@@ -145,18 +153,59 @@ def test_format_file_search_autopass_renders_saga_style_bullets():
         ),
     ]
     rendered = _format_file_search_autopass(results)
-    # One bullet per hit, SAGA-block shape: `- [<label> (score)] <preview>`.
+    # One bullet per hit, SAGA-block shape: `- [<label> — <desc> (score)] <preview>`.
+    # Description rides between the label and the snippet (PR #166 review nit 1)
+    # so the agent sees the file's `<!-- desc: -->` header alongside the chunk.
     lines = rendered.splitlines()
     assert len(lines) == 2
     assert lines[0] == (
-        "- [memory/topics/quantum.md:#0 (0.732)] "
+        "- [memory/topics/quantum.md:#0 (0.732) — quantum mechanics notes] "
         "Quantum mechanics describes nature at atomic scales."
     )
     # Newlines in the snippet are flattened into spaces, matching the
-    # _format_atoms SAGA renderer.
+    # _format_atoms SAGA renderer. Description also gets newline
+    # flattening for the same reason.
     assert lines[1] == (
-        "- [state/transcripts/kickoff.md:#1 (0.411)] multi line snippet content"
+        "- [state/transcripts/kickoff.md:#1 (0.411) — kickoff transcript] "
+        "multi line snippet content"
     )
+
+
+def test_format_file_search_autopass_omits_description_when_none():
+    """When ``SearchResult.description`` is None or empty, the bullet
+    falls back to the original ``[path:#chunk (score)] snippet`` shape
+    (no `` — `` separator, no description suffix on the label). Most
+    state/wiki + memory/issues + memory/core files have a
+    ``<!-- desc: -->`` header so the description branch is the common
+    case; raw transcripts or undescribed files fall through cleanly."""
+    results = [
+        SearchResult(
+            path="state/raw/uncaptioned.md",
+            scope="state",
+            chunk_index=0,
+            score=0.5,
+            cosine=0.5,
+            bm25=0.0,
+            recency=0.0,
+            snippet="some snippet",
+            description=None,
+        ),
+        SearchResult(
+            path="state/raw/empty-desc.md",
+            scope="state",
+            chunk_index=0,
+            score=0.4,
+            cosine=0.4,
+            bm25=0.0,
+            recency=0.0,
+            snippet="another snippet",
+            description="   ",  # whitespace-only → treated as empty
+        ),
+    ]
+    rendered = _format_file_search_autopass(results)
+    lines = rendered.splitlines()
+    assert lines[0] == "- [state/raw/uncaptioned.md:#0 (0.500)] some snippet"
+    assert lines[1] == "- [state/raw/empty-desc.md:#0 (0.400)] another snippet"
 
 
 def test_format_file_search_autopass_truncates_long_snippets():
