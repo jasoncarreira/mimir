@@ -1834,6 +1834,16 @@ class Agent:
                 turn_id=ctx.turn_id,
             )
             return None
+        # Stash saga's contextual rewrite (when it changed the query)
+        # so sibling retrieval surfaces — currently just the file_search
+        # autopass (chainlink #139) — can query against the expanded
+        # text instead of the raw inbound. Saga only sets this key when
+        # rewrite actually fired and changed the query; key absent or
+        # falsy means "no rewrite" and the autopass will fall back to
+        # event.content (its prior behavior).
+        rewritten = payload.get("rewritten_query") if isinstance(payload, dict) else None
+        if rewritten and isinstance(rewritten, str):
+            ctx.saga_rewritten_query = rewritten
         ids = _atom_ids_from_response(payload)
         # P42: also credit the atoms whose triples were surfaced — when
         # the agent grounds its reply in a triple, the originating atom
@@ -1892,11 +1902,29 @@ class Agent:
         if event.trigger != "user_message":
             return None
         text = (event.content or "").strip()
-        if len(text) < self._config.file_search_autopass_min_chars:
+        # Prefer saga's contextual rewrite (when one fired) over the
+        # raw inbound — `_pre_message_hook` runs first and stashes
+        # `ctx.saga_rewritten_query` exactly when saga's two-tier
+        # response carried a `rewritten_query` field (i.e. rewrite was
+        # enabled, fired, and changed the query). Same expansion the
+        # SAGA atoms block was retrieved with; keeps the two retrieval
+        # surfaces consistent so a short ambiguous user message
+        # ("what was that thing?") doesn't surface SAGA's expanded
+        # atoms next to a bag-of-3-tokens file_search result.
+        rewritten = (ctx.saga_rewritten_query or "").strip()
+        query = rewritten if rewritten else text
+        # Min-chars gate applies to the EFFECTIVE query, not the raw
+        # inbound — gating on raw content would cancel the
+        # rewrite-benefit precisely for the cases that benefit most
+        # (short ambiguous inbound → long rewritten query → currently
+        # the most signal-rich retrieval input we have). When no
+        # rewrite fired, this falls through to gating on raw content
+        # exactly as the original chainlink #139 implementation did.
+        if len(query) < self._config.file_search_autopass_min_chars:
             return None
         try:
             results = await self._indexer.search(
-                text,
+                query,
                 scope="all",
                 k=self._config.file_search_autopass_k,
             )
