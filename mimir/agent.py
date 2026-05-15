@@ -70,6 +70,26 @@ log = logging.getLogger(__name__)
 
 
 # ────────────────────────────────────────────────────────────────────
+# Stubs for legacy server.py reads
+# ────────────────────────────────────────────────────────────────────
+
+
+class _RateLimitStub:
+    """No-op replacement for agent._rate_limits, which used to capture
+    SDK RateLimitEvent stream events. Post-cutover the oauth_usage_poller
+    owns its own RateLimitStore; this stub keeps server.py wiring code
+    from KeyError'ing during build_app."""
+    async def update_from_event(self, *args, **kwargs) -> None:
+        return None
+
+    def snapshot(self) -> dict:
+        return {}
+
+    async def append(self, *args, **kwargs) -> None:
+        return None
+
+
+# ────────────────────────────────────────────────────────────────────
 # Model / tool resolution helpers (lifted from deepagent_poc)
 # ────────────────────────────────────────────────────────────────────
 
@@ -182,6 +202,12 @@ class Agent:
         self._channels = channel_registry
         self._dispatcher = dispatcher
         self._loop: asyncio.AbstractEventLoop | None = None
+
+        # Stubs for legacy server.py reads — post-cutover these are
+        # not the agent's responsibility (rate-limit tracking moved
+        # to the oauth_usage_poller's own store). Stubbed to a tiny
+        # no-op so server.py's wiring code doesn't blow up.
+        self._rate_limits = _RateLimitStub()
 
         # Build the deepagent singleton. Done lazily to keep import-time
         # fast and to let tests construct Agent without a real model.

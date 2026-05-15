@@ -1689,6 +1689,7 @@ dependencies = [
     { name = "langchain-openai" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
+    { name = "requests" },
     { name = "saga" },
 ]
 
@@ -1730,6 +1731,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "requests", specifier = ">=2.33.1" },
     { name = "saga", editable = "saga" },
     { name = "slack-bolt", marker = "extra == 'dev'", specifier = ">=1.18" },
     { name = "slack-bolt", marker = "extra == 'slack'", specifier = ">=1.18" },
