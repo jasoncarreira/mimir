@@ -7,7 +7,8 @@ authors = [{ name = "jcarreira" }]
 license = { text = "MIT" }
 
 dependencies = [
-    "claude-agent-sdk>=0.1.58",
+    # Post-cutover (2026-05-14): claude-agent-sdk removed; agent loop
+    # now via deepagents/LangGraph. See DEEPAGENTS_MIGRATION_ANALYSIS.md.
     "aiohttp>=3.12",
     "apscheduler>=3.11",
     "python-dotenv>=1.0",
@@ -17,6 +18,8 @@ dependencies = [
     # editable-installed via [tool.uv.sources] below.
     "saga",
     "deepagents>=0.6.1",
+    "langchain>=1.3",
+    "langchain-anthropic>=1.4",
     "langchain-openai>=1.2.1",
     "langchain-claude-code>=0.1.0",
 ]

@@ -285,40 +285,39 @@ async def extract_commitments(
     if not session_end_output or len(session_end_output) < MIN_OUTPUT_LEN:
         return []
 
-    # Import the SDK at call time (not module load) so the test path
-    # can monkeypatch ``claude_agent_sdk.query`` without dragging in
-    # the live transport.
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        TextBlock,
-        query,
-    )
-
+    # Post-cutover (2026-05-14): use langchain-anthropic or
+    # init_chat_model instead of the SDK's query(). Test paths that
+    # monkeypatched ``claude_agent_sdk.query`` need to patch
+    # ``langchain.chat_models.init_chat_model`` instead — Phase D
+    # test cleanup.
     user_msg = USER_TEMPLATE.format(
         channel_id=channel_id or "(none)",
-        ts="",  # injected at the LLM's discretion if it needs it
+        ts="",
         saga_session_id=saga_session_id or "(none)",
         output=session_end_output,
-    )
-    options = ClaudeAgentOptions(
-        system_prompt=EXTRACTION_SYSTEM,
-        model=model,
-        # No tools — text-only extraction. Constrains the loop to a
-        # single assistant turn.
-        allowed_tools=[],
-        max_turns=1,
     )
 
     raw_text = ""
     try:
-        async for msg in query(prompt=user_msg, options=options):
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        raw_text += block.text
+        from langchain.chat_models import init_chat_model
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        chat = init_chat_model(model or "anthropic:claude-haiku-4-5")
+        msgs = [
+            SystemMessage(content=EXTRACTION_SYSTEM),
+            HumanMessage(content=user_msg),
+        ]
+        response = await chat.ainvoke(msgs)
+        content = response.content
+        if isinstance(content, str):
+            raw_text = content
+        elif isinstance(content, list):
+            raw_text = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b)
+                for b in content
+            )
     except Exception:  # noqa: BLE001
-        log.exception("commitments extractor: SDK query failed")
+        log.exception("commitments extractor: LLM call failed")
         return []
 
     parsed = _parse_extraction_json(raw_text)
