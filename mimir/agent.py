@@ -125,18 +125,30 @@ def _format_file_search_autopass(results: list[SearchResult]) -> str:
     per hit, ``[<label> (score)] <preview>``. The label here is
     ``<path>:#<chunk_index>`` rather than ``<memory_type/tier>`` so the
     agent can read which file (and roughly where within it) the snippet
-    came from. Snippet preview is capped at 240 chars and single-line —
-    same shape as SAGA atoms so the two blocks read uniformly.
+    came from. When the indexer captured a file-level
+    ``<!-- desc: -->`` header (most state/ + memory/ files have one),
+    the description rides between the label and the snippet —
+    surfacing the "what this file is about" signal for free without
+    the agent having to read the file. Snippet preview is capped at
+    240 chars and single-line — same shape as SAGA atoms so the two
+    blocks read uniformly.
+
+    The caller (``_run_file_search_autopass``) gates on
+    ``if not results: return None`` upstream, so an empty list never
+    reaches this formatter in production. The empty-input case
+    nonetheless degrades to an empty string (``"\\n".join([])``)
+    which the prompt builder's ``if file_block:`` guard handles
+    correctly — no orphan block in the prompt.
     """
-    if not results:
-        return "(no files)"
     lines: list[str] = []
     for r in results:
         snippet = (r.snippet or "").strip().replace("\n", " ")
         if len(snippet) > 240:
             snippet = snippet[:240] + "…"
+        desc = (r.description or "").strip().replace("\n", " ")
+        desc_part = f" — {desc}" if desc else ""
         lines.append(
-            f"- [{r.path}:#{r.chunk_index} ({r.score:.3f})] {snippet}"
+            f"- [{r.path}:#{r.chunk_index} ({r.score:.3f}){desc_part}] {snippet}"
         )
     return "\n".join(lines)
 
