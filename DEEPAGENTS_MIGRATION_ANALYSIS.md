@@ -298,6 +298,47 @@ The hybrid PoC matches this shape end-to-end. The wrapper handles the pre-inject
 
 Day 2 strengthens the 2.5-3.5 week total estimate. No surprises.
 
+## Day 3 update: post-message credit pass
+
+Built the credit-pass external wrapper (`post_message_hook.py`, ~90 LOC). Walks the agent's ToolMessages, regex-extracts atom IDs from tool result strings, unions with pre-message-hook atom IDs, calls `MemoryClient.feedback(atom_ids, response_text, feedback="positive")`. Same semantic as mimir's `_post_message_hook`.
+
+**Smoke verifies** (smoke_full.py): both LongMemEval probes answer correctly, post-message hook writes `feedback_positive` rows with weight=2.0 (the mimir.memory SOURCE_WEIGHTS default) for 18-19 credited atoms per question. Post-hook latency ~1-3ms (one SQL insert per atom).
+
+Bundled `run_turn()` (`turn_runner.py`, ~140 LOC) ties pre → invoke → post → log. Returns a `TurnOutcome` envelope with everything mimir's dispatcher consumes today. This is the migration target shape — mimir's existing dispatcher calls `run_turn()` in place of the SDK's query loop.
+
+## Day 4 update: write-tool migration
+
+Ported `saga_store` → `memory_store` (~70 LOC, `store_tool.py`). The LangChain `@tool` decorator reads the Python type hints + docstring for the tool's schema, so we drop the SDK's separate JSON-schema arg entirely. Round-trip smoke (smoke_store.py):
+
+- Step 1: "Please remember: my favorite color is blue." → agent calls `memory_store(content="The user's favorite color is blue.", stream="semantic", source_type="agent_authored")` → atom persisted ✓
+- Step 2: "What's my favorite color?" → agent calls `memory_query("favorite color")` → answers "blue" ✓
+
+Pattern confirmed for write-side tools. **~20 LOC saved per tool migration** vs the SDK's 3-arg `@tool(name, description, schema)` shape. Across 10 tool files: ~200 LOC negative.
+
+## Day 5: bench runner
+
+`mimir/deepagent_poc/bench.py` — bench at scale through the full pipeline. Same args as `via_mimir/runner_memory.py` (`--limit`, `--run-tag`, `--output-dir`, `--model`). Incremental hypothesis writes for crash-survivability. 10-q smoke currently running.
+
+## PoC totals
+
+| Day | What | LOC | Status |
+|---|---|---|---|
+| 1 | turn_logger + memory_tool + agent + smoke | ~400 | ✓ end-to-end correct, cache hits visible |
+| 2 | pre_message_hook + smoke_wrapper + smoke_hybrid | ~270 | ✓ hybrid (pre+tool) matches mimir production |
+| 3 | post_message_hook + turn_runner + smoke_full | ~270 | ✓ feedback_positive rows confirmed |
+| 4 | store_tool + smoke_store | ~150 | ✓ write tool round-trip |
+| 5 | bench runner | ~240 | running 10-q smoke |
+| **Total** | | **~1330 LOC** | |
+
+What's NOT in the PoC but would be in the full migration:
+- 8 remaining tool files (search/turn/schedule/shell/channel/commit/spawn) — but mostly the same `@tool` translation
+- `mimir/agent.py` Agent class wrapper rewrite (kill ClientPool, replace with deepagent singleton)
+- Test migration (3 SDK-specific test files)
+- Telemetry adapter at production-scale ops-dashboard integration
+- Real production cutover (rename `mimir/agent.py` Agent → DeepAgentRunner, switch `mimir/server.py` to construct it)
+
+**Estimate sticks at 2.5-3.5 weeks.** Nothing in the PoC surfaced an obstacle that wasn't in the analysis. Cache hits, telemetry, tool registration, hooks, concurrency, model switching, credit pass — all proven working.
+
 ## What this branch contains
 
 - `DEEPAGENTS_MIGRATION_ANALYSIS.md` (this file)
