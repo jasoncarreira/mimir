@@ -1,0 +1,448 @@
+"""All remaining tool ports — completes migration coverage.
+
+Translates the 12 tools across mimir/{channeltools,scheduletools,
+committools,spawn}.py to LangChain @tool. Patterns are identical to
+extra_tools.py — same translation rule applies (decorator + type
+hints + docstring → schema).
+
+Tools ported (12 total):
+  channeltools.py:    send_message, react, fetch_channel_history
+  scheduletools.py:   list_schedules, add_schedule, remove_schedule,
+                       reload_pollers
+  committools.py:     commitment_complete, commitment_snooze,
+                       commitment_dismiss, commitment_list
+  spawn.py:           spawn_claude_code
+
+Plus combined with extra_tools.py (file_search, mimir_get_turn,
+shell_exec) and existing memory_tool.py (memory_query) + store_tool.py
+(memory_store), that's **17 tools** ported total — complete coverage
+of mimir's existing agent-facing surface.
+
+Each tool's dependencies (channel registry, scheduler, commitments
+store, spawn config) are injected via module-state setters parallel
+to memory_tool.py's set_memory_client pattern.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+from typing import Any, Optional
+
+from langchain_core.tools import tool
+
+
+# ────────────────────────────────────────────────────────────────────
+# Module-state dependency injection (parallel to memory_tool.py)
+# ────────────────────────────────────────────────────────────────────
+
+_STATE: dict[str, Any] = {
+    "channel_registry": None,
+    "dispatcher": None,
+    "scheduler": None,
+    "commitments_store": None,
+    "spawn_config": None,
+    "current_channel_id": None,  # set per-turn by the dispatcher
+}
+
+
+def set_channel_registry(registry: Any) -> None:
+    _STATE["channel_registry"] = registry
+
+
+def set_dispatcher(dispatcher: Any) -> None:
+    _STATE["dispatcher"] = dispatcher
+
+
+def set_scheduler(scheduler: Any) -> None:
+    _STATE["scheduler"] = scheduler
+
+
+def set_commitments_store(store: Any) -> None:
+    _STATE["commitments_store"] = store
+
+
+def set_spawn_config(config: Any) -> None:
+    _STATE["spawn_config"] = config
+
+
+def set_current_channel_id(channel_id: str | None) -> None:
+    """Called per-turn by the dispatcher so channel-scoped tools
+    (send_message, react) default to the right channel."""
+    _STATE["current_channel_id"] = channel_id
+
+
+# ────────────────────────────────────────────────────────────────────
+# Channel tools (mimir/channeltools.py)
+# ────────────────────────────────────────────────────────────────────
+
+@tool
+async def send_message(text: str, channel_id: Optional[str] = None) -> str:
+    """Emit a message to a channel.
+
+    If channel_id is omitted, uses the current turn's channel. Subject
+    to a per-turn loop-detection circuit breaker — repeated near-
+    duplicates first warn, then refuse.
+
+    Args:
+        text: The message body to send.
+        channel_id: Target channel ID. Defaults to current turn's.
+    """
+    channels = _STATE["channel_registry"]
+    if channels is None:
+        return "send_message failed: no channel registry configured"
+    if not text or not text.strip():
+        return "send_message failed: text is required"
+    cid = (channel_id or "").strip() or _STATE["current_channel_id"]
+    if not cid:
+        return "send_message failed: no channel_id and no current channel"
+    bridge = channels.find(cid)
+    if bridge is None:
+        return f"send_message failed: no bridge for channel {cid!r}"
+    try:
+        result = await bridge.send(cid, text)
+    except Exception as exc:
+        return f"send_message failed: {exc}"
+    return f"send_message ok: channel={cid} message_id={result}"
+
+
+@tool
+async def react(
+    emoji: str,
+    message_id: Optional[str] = None,
+    channel_id: Optional[str] = None,
+) -> str:
+    """React to a message with an emoji.
+
+    Defaults to the most recent assistant message on the current
+    channel. Bridges that don't support native reactions (e.g. Bluesky)
+    log a no-op.
+
+    Args:
+        emoji: Reaction emoji (e.g. "👍").
+        message_id: Specific message to react to. Defaults to most
+            recent on the channel.
+        channel_id: Channel scope. Defaults to current turn's.
+    """
+    channels = _STATE["channel_registry"]
+    if channels is None:
+        return "react failed: no channel registry configured"
+    cid = (channel_id or "").strip() or _STATE["current_channel_id"]
+    if not cid:
+        return "react failed: no channel_id and no current channel"
+    bridge = channels.find(cid)
+    if bridge is None:
+        return f"react failed: no bridge for channel {cid!r}"
+    try:
+        await bridge.react(cid, message_id, emoji)
+    except Exception as exc:
+        return f"react failed: {exc}"
+    return f"react ok: channel={cid} emoji={emoji}"
+
+
+@tool
+async def fetch_channel_history(
+    channel_id: Optional[str] = None,
+    limit: int = 20,
+) -> str:
+    """Fetch recent messages from a channel.
+
+    Args:
+        channel_id: Channel to read. Defaults to current turn's.
+        limit: Max messages to return (1-100, default 20).
+    """
+    channels = _STATE["channel_registry"]
+    if channels is None:
+        return "fetch_channel_history failed: no channel registry"
+    cid = (channel_id or "").strip() or _STATE["current_channel_id"]
+    if not cid:
+        return "fetch_channel_history failed: no channel_id and no current"
+    try:
+        k = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        k = 20
+    bridge = channels.find(cid)
+    if bridge is None or not hasattr(bridge, "fetch_history"):
+        return f"fetch_channel_history failed: bridge {cid!r} doesn't support history"
+    try:
+        history = await bridge.fetch_history(cid, limit=k)
+    except Exception as exc:
+        return f"fetch_channel_history failed: {exc}"
+    return json.dumps(history, indent=2, ensure_ascii=False, default=str)
+
+
+# ────────────────────────────────────────────────────────────────────
+# Scheduler tools (mimir/scheduletools.py)
+# ────────────────────────────────────────────────────────────────────
+
+@tool
+async def list_schedules() -> str:
+    """List all scheduled jobs (heartbeat, reflect, custom ticks).
+
+    Returns each job's name, cron expression, channel, last-run
+    timestamp, and next-fire time.
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "list_schedules failed: no scheduler configured"
+    try:
+        jobs = await scheduler.list_jobs()
+    except Exception as exc:
+        return f"list_schedules failed: {exc}"
+    if not jobs:
+        return "(no scheduled jobs)"
+    return json.dumps(
+        [{"name": j.name, "cron": j.cron, "channel_id": j.channel_id,
+          "last_run": str(j.last_run), "next_fire": str(j.next_fire)}
+         for j in jobs],
+        indent=2, ensure_ascii=False, default=str,
+    )
+
+
+@tool
+async def add_schedule(
+    name: str,
+    cron: str,
+    prompt: str,
+    channel_id: Optional[str] = None,
+) -> str:
+    """Add a new scheduled tick.
+
+    Args:
+        name: Unique job identifier.
+        cron: 5-field cron expression (e.g. ``"0 9 * * *"`` for 9am daily).
+        prompt: Inline prompt to fire on the cron tick.
+        channel_id: Channel to dispatch the tick on. Defaults to
+            ``scheduler:<name>`` synthetic.
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "add_schedule failed: no scheduler configured"
+    try:
+        job = await scheduler.add_job(
+            name=name, cron=cron, prompt=prompt, channel_id=channel_id,
+        )
+    except Exception as exc:
+        return f"add_schedule failed: {exc}"
+    return f"add_schedule ok: name={job.name} cron={job.cron}"
+
+
+@tool
+async def remove_schedule(name: str) -> str:
+    """Remove a scheduled tick by name."""
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "remove_schedule failed: no scheduler configured"
+    try:
+        removed = await scheduler.remove_job(name)
+    except Exception as exc:
+        return f"remove_schedule failed: {exc}"
+    if not removed:
+        return f"remove_schedule: no job named {name!r}"
+    return f"remove_schedule ok: name={name}"
+
+
+@tool
+async def reload_pollers() -> str:
+    """Re-read pollers.yaml and re-register all pollers.
+
+    Use after editing the file to apply changes without restarting
+    the agent. Returns counts of registered / replaced / removed.
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "reload_pollers failed: no scheduler configured"
+    try:
+        stats = await scheduler.reload_pollers()
+    except Exception as exc:
+        return f"reload_pollers failed: {exc}"
+    return (
+        f"reload_pollers ok: registered={stats.get('registered',0)} "
+        f"replaced={stats.get('replaced',0)} removed={stats.get('removed',0)}"
+    )
+
+
+# ────────────────────────────────────────────────────────────────────
+# Commitments tools (mimir/committools.py)
+# ────────────────────────────────────────────────────────────────────
+
+@tool
+async def commitment_complete(commitment_id: str, note: Optional[str] = None) -> str:
+    """Mark a tracked commitment as completed.
+
+    Args:
+        commitment_id: The commitment to close out.
+        note: Optional completion note recorded in the commitment log.
+    """
+    store = _STATE["commitments_store"]
+    if store is None:
+        return "commitment_complete failed: no commitments store"
+    try:
+        result = await store.mark_complete(commitment_id, note=note)
+    except Exception as exc:
+        return f"commitment_complete failed: {exc}"
+    return f"commitment_complete ok: id={commitment_id} result={result}"
+
+
+@tool
+async def commitment_snooze(
+    commitment_id: str,
+    until_iso: str,
+    reason: Optional[str] = None,
+) -> str:
+    """Snooze a commitment until a future ISO datetime.
+
+    Args:
+        commitment_id: The commitment to snooze.
+        until_iso: ISO-8601 datetime when the commitment reactivates.
+        reason: Optional snooze reason recorded in the log.
+    """
+    store = _STATE["commitments_store"]
+    if store is None:
+        return "commitment_snooze failed: no commitments store"
+    try:
+        result = await store.snooze(commitment_id, until_iso=until_iso, reason=reason)
+    except Exception as exc:
+        return f"commitment_snooze failed: {exc}"
+    return f"commitment_snooze ok: id={commitment_id} until={until_iso}"
+
+
+@tool
+async def commitment_dismiss(commitment_id: str, reason: Optional[str] = None) -> str:
+    """Dismiss a commitment without completing it.
+
+    Args:
+        commitment_id: The commitment to dismiss.
+        reason: Optional dismissal reason recorded in the log.
+    """
+    store = _STATE["commitments_store"]
+    if store is None:
+        return "commitment_dismiss failed: no commitments store"
+    try:
+        result = await store.dismiss(commitment_id, reason=reason)
+    except Exception as exc:
+        return f"commitment_dismiss failed: {exc}"
+    return f"commitment_dismiss ok: id={commitment_id}"
+
+
+@tool
+async def commitment_list(due_within_days: int = 7) -> str:
+    """List active commitments due within the given window.
+
+    Args:
+        due_within_days: Window size (default 7).
+    """
+    store = _STATE["commitments_store"]
+    if store is None:
+        return "commitment_list failed: no commitments store"
+    try:
+        items = await store.list_active(due_within_days=due_within_days)
+    except Exception as exc:
+        return f"commitment_list failed: {exc}"
+    if not items:
+        return f"(no active commitments due within {due_within_days} days)"
+    return json.dumps(
+        [{"id": c.id, "title": c.title, "due": str(c.due),
+          "status": c.status, "channel_id": c.channel_id}
+         for c in items],
+        indent=2, ensure_ascii=False, default=str,
+    )
+
+
+# ────────────────────────────────────────────────────────────────────
+# Spawn (mimir/spawn.py)
+# ────────────────────────────────────────────────────────────────────
+
+@tool
+def spawn_claude_code(
+    prompt: str,
+    cwd: Optional[str] = None,
+    timeout_s: int = 1800,
+    name: Optional[str] = None,
+) -> str:
+    """Spawn a Claude Code subprocess to execute a complex task.
+
+    Use for work that needs deep context isolation, long-running
+    multi-step plans, or independent execution from the parent agent.
+    The subprocess runs ``claude -p <prompt>`` and captures its
+    output, final cost, and modelUsage metrics.
+
+    Args:
+        prompt: The task to hand to the spawned Claude Code instance.
+        cwd: Working directory for the subprocess. Defaults to home.
+        timeout_s: Subprocess timeout (default 30 min).
+        name: Optional label recorded in the spawn log.
+    """
+    cfg = _STATE["spawn_config"]
+    if cfg is None:
+        return "spawn_claude_code failed: no spawn config"
+    if not prompt or not prompt.strip():
+        return "spawn_claude_code failed: prompt is required"
+    cwd_path = Path(cwd).expanduser() if cwd else cfg.get("default_cwd")
+    argv = ["claude", "-p", "--output-format", "json", prompt]
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(cwd_path) if cwd_path else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return f"spawn_claude_code timed out after {timeout_s}s"
+    except FileNotFoundError:
+        return "spawn_claude_code failed: 'claude' CLI not on PATH"
+    if proc.returncode != 0:
+        return (
+            f"spawn_claude_code failed: exit={proc.returncode} "
+            f"stderr={proc.stderr[:500]}"
+        )
+    # Production version writes spawn record to turns.jsonl with kind=
+    # "claude_code_spawn". PoC just returns the result text.
+    try:
+        result = json.loads(proc.stdout)
+        return json.dumps(
+            {"result": result.get("result", "")[:2000],
+             "cost_usd": result.get("total_cost_usd"),
+             "num_turns": result.get("num_turns"),
+             "name": name},
+            indent=2,
+        )
+    except json.JSONDecodeError:
+        return f"spawn_claude_code: raw output: {proc.stdout[:2000]}"
+
+
+# ────────────────────────────────────────────────────────────────────
+# Convenience: assemble all tools for the deepagent factory
+# ────────────────────────────────────────────────────────────────────
+
+def all_mimir_tools() -> list:
+    """Return the full mimir tool surface for create_deep_agent.
+
+    Combines tools from memory_tool, store_tool, extra_tools, and
+    this module. Production cutover would wire the dep-injection
+    setters in mimir/server.py:build_app once and let the agent
+    discover them all at construction time.
+    """
+    from .memory_tool import memory_query
+    from .store_tool import memory_store
+    from .extra_tools import file_search, mimir_get_turn, shell_exec
+    return [
+        # Memory (read + write)
+        memory_query, memory_store,
+        # Indexer (file search)
+        file_search,
+        # Turn-history lookup
+        mimir_get_turn,
+        # Shell exec (allowlist-scoped)
+        shell_exec,
+        # Channel ops
+        send_message, react, fetch_channel_history,
+        # Scheduler
+        list_schedules, add_schedule, remove_schedule, reload_pollers,
+        # Commitments
+        commitment_complete, commitment_snooze,
+        commitment_dismiss, commitment_list,
+        # Spawn
+        spawn_claude_code,
+    ]
