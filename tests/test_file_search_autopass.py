@@ -315,6 +315,112 @@ async def test_autopass_renders_block_when_enabled_with_results(
 
 
 @pytest.mark.asyncio
+async def test_autopass_uses_rewritten_query_when_present_on_ctx(
+    tmp_path: Path,
+):
+    """Follow-up to chainlink #139: when ``_pre_message_hook`` stashed
+    SAGA's contextual rewrite on ``ctx.saga_rewritten_query``, the
+    autopass must query the indexer with that expanded text — not the
+    raw inbound ``event.content``. Keeps the SAGA atoms block and the
+    Possibly relevant files block side-by-side in the prompt seeing
+    consistent (and equally-expanded) queries; without this, a short
+    ambiguous user message ("yes, that one") surfaces SAGA's expanded
+    atoms next to a bag-of-3-tokens file_search result.
+
+    Asserted by capturing the actual query string handed to
+    ``Indexer.search``.
+    """
+    _seed_indexable(tmp_path)
+    indexer = Indexer(tmp_path, embedder=HashEmbedder())
+    await indexer.start(run_initial_sweep=True, sweep_loop=False)
+    try:
+        agent = await _build_agent(
+            tmp_path, indexer=indexer, file_search_autopass_k=3,
+        )
+        event = AgentEvent(
+            trigger="user_message",
+            # Raw inbound is referential / short on signal — exactly the
+            # case where contextual rewrite earns its keep. The autopass
+            # MUST NOT use this string; it must use the rewritten one.
+            content="yes that one",
+            channel_id="discord-1",
+            author="discord-99",
+        )
+        ctx = _ctx()
+        # Simulate _pre_message_hook having stashed the rewrite.
+        ctx.saga_rewritten_query = (
+            "quantum entanglement particle physics — the topic discussed earlier"
+        )
+
+        # Capture the actual query handed to Indexer.search.
+        captured: dict[str, str] = {}
+        real_search = indexer.search
+
+        async def _capture_search(query: str, *args, **kwargs):
+            captured["query"] = query
+            return await real_search(query, *args, **kwargs)
+
+        indexer.search = _capture_search  # type: ignore[method-assign]
+        try:
+            await agent._run_file_search_autopass(ctx, event)
+        finally:
+            indexer.search = real_search  # type: ignore[method-assign]
+
+        # The captured query is the rewrite, not the raw inbound.
+        assert "query" in captured, "Indexer.search was not called"
+        assert captured["query"] == ctx.saga_rewritten_query
+        assert captured["query"] != event.content
+    finally:
+        await indexer.stop()
+
+
+@pytest.mark.asyncio
+async def test_autopass_falls_back_to_raw_content_when_no_rewrite(
+    tmp_path: Path,
+):
+    """The complement of the rewrite-path test: when
+    ``ctx.saga_rewritten_query`` is None (rewrite disabled, didn't
+    fire, or was a no-op), the autopass uses the raw ``event.content``
+    as it did before the follow-up — same behavior as the original
+    chainlink #139 implementation.
+    """
+    _seed_indexable(tmp_path)
+    indexer = Indexer(tmp_path, embedder=HashEmbedder())
+    await indexer.start(run_initial_sweep=True, sweep_loop=False)
+    try:
+        agent = await _build_agent(
+            tmp_path, indexer=indexer, file_search_autopass_k=3,
+        )
+        event = AgentEvent(
+            trigger="user_message",
+            channel_id="discord-1",
+            content="tell me about quantum entanglement and particle physics",
+            author="discord-99",
+        )
+        ctx = _ctx()
+        # ctx.saga_rewritten_query stays None (its dataclass default) —
+        # _pre_message_hook didn't fire / saga didn't carry a rewrite.
+
+        captured: dict[str, str] = {}
+        real_search = indexer.search
+
+        async def _capture_search(query: str, *args, **kwargs):
+            captured["query"] = query
+            return await real_search(query, *args, **kwargs)
+
+        indexer.search = _capture_search  # type: ignore[method-assign]
+        try:
+            await agent._run_file_search_autopass(ctx, event)
+        finally:
+            indexer.search = real_search  # type: ignore[method-assign]
+
+        # Raw inbound (stripped) is what the indexer got.
+        assert captured.get("query") == event.content.strip()
+    finally:
+        await indexer.stop()
+
+
+@pytest.mark.asyncio
 async def test_autopass_respects_top_k_override(tmp_path: Path):
     """Bumping ``file_search_autopass_k`` is plumbed all the way to
     ``Indexer.search``, so a higher K can surface more hits."""
