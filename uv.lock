@@ -1392,6 +1392,19 @@ wheels = [
 ]
 
 [[package]]
+name = "langchain-claude-code"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "claude-agent-sdk" },
+    { name = "langchain-core" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e5/6b/0d4ecd906dd70a8f018cf555360e71718e48e4c8856994c9a53cac423297/langchain_claude_code-0.1.0.tar.gz", hash = "sha256:959273ee091374e087a657846a0258c287e0dbd7c4c0c8361875bc53e6babadb", size = 184861, upload-time = "2025-12-02T19:44:25.095Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/bd/aef448681b6ebc1bca59fd9a67019f5225caec1ea17a1809930eec5491a3/langchain_claude_code-0.1.0-py3-none-any.whl", hash = "sha256:0f98d851654793e1d8cf3cc42aa5a33ff32b46e5f491ba8ff51d08b3279b507a", size = 10821, upload-time = "2025-12-02T19:44:23.418Z" },
+]
+
+[[package]]
 name = "langchain-core"
 version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1671,6 +1684,7 @@ dependencies = [
     { name = "claude-agent-sdk" },
     { name = "deepagents" },
     { name = "fastembed" },
+    { name = "langchain-claude-code" },
     { name = "langchain-openai" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
@@ -1701,6 +1715,7 @@ requires-dist = [
     { name = "discord-py", marker = "extra == 'dev'", specifier = ">=2.6" },
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.6" },
     { name = "fastembed", specifier = ">=0.4" },
+    { name = "langchain-claude-code", specifier = ">=0.1.0" },
     { name = "langchain-openai", specifier = ">=1.2.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-aiohttp", marker = "extra == 'dev'", specifier = ">=1.0" },

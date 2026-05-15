@@ -16,10 +16,58 @@ from __future__ import annotations
 from typing import Any
 
 from deepagents import create_deep_agent
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 
 from mimir.memory.client import MemoryClient
 from .memory_tool import memory_query, set_memory_client
+
+
+def resolve_model(spec: str | BaseChatModel) -> str | BaseChatModel:
+    """Translate a mimir-friendly model spec into something
+    ``create_deep_agent`` accepts.
+
+    Supported specs (in order of preference for parity / cost):
+
+    - ``"claude-code:<model>"`` → ``ChatClaudeCode(model=<model>)`` via
+      ``langchain-claude-code`` package. Uses Claude Pro/Max OAuth
+      (claude auth login); **no API key required**. Best for parity
+      with saga 81.6 canonical (sonnet-4-6) without paying API rates.
+      Caveats: counts against Max usage limits, subprocess spawn per
+      call adds ~500ms-2s latency.
+
+    - ``"<provider>:<model>"`` (e.g. ``"openai:gpt-5.4-nano"``,
+      ``"anthropic:claude-haiku-4-5"``, ``"google:gemini-2.5-pro"``)
+      → ``init_chat_model(spec)`` via the standard LangChain registry.
+      Requires the corresponding API key env var
+      (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.).
+
+    - Pre-instantiated ``BaseChatModel`` → passed through unchanged.
+
+    The string ``"<provider>:<model>"`` form is what ``create_deep_agent``
+    itself supports for everything except claude-code; we only need
+    custom handling for the Max-OAuth case (and any future bespoke
+    providers — Bedrock + Titan, AWS roadmap item).
+    """
+    if isinstance(spec, BaseChatModel):
+        return spec
+    if not isinstance(spec, str):
+        raise TypeError(f"unexpected model spec type: {type(spec).__name__}")
+    if spec.startswith("claude-code:"):
+        try:
+            from langchain_claude_code import ChatClaudeCode  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise RuntimeError(
+                "claude-code: model spec requested but langchain-claude-code "
+                "is not installed. Run `uv add langchain-claude-code` first. "
+                "Also ensure the Claude Code CLI is installed and "
+                "`claude auth login` has been run."
+            ) from exc
+        model_name = spec.split(":", 1)[1]
+        return ChatClaudeCode(model=model_name)
+    # Everything else: pass through; create_deep_agent's init_chat_model
+    # handles "openai:...", "anthropic:...", etc.
+    return spec
 
 
 SYSTEM_PROMPT = """\
@@ -53,19 +101,24 @@ factual answer, no preamble."""
 def make_agent(
     memory_client: MemoryClient,
     *,
-    # PoC default: gpt-5.4-nano via OPENAI_API_KEY (we have the key
-    # in .env; ANTHROPIC_API_KEY isn't set because mimir uses Max OAuth
-    # via claude_code subprocess, which LangChain doesn't grok natively).
-    # For sonnet-4-6 parity with the saga 81.6 canonical reader, install
-    # ``langchain-claude-code-cli`` and switch to its provider.
-    model: str = "openai:gpt-5.4-nano",
+    model: str | BaseChatModel = "openai:gpt-5.4-nano",
     extra_system: str | None = None,
 ) -> Any:
     """Build a compiled deepagent wired to ``memory_client``.
 
-    ``model`` defaults to sonnet-4-6 for parity with the saga 81.6
-    canonical reader. Pass other providers (``"openai:gpt-5.4-nano"``,
-    ``"anthropic:claude-haiku-4-5"``) for cost/speed experiments.
+    ``model`` accepts:
+
+    - ``"openai:gpt-5.4-nano"`` (default) — cheapest, works with our
+      OPENAI_API_KEY today
+    - ``"openai:gpt-5.4"`` / ``"openai:gpt-5.4-mini"`` — quality dial
+    - ``"anthropic:claude-sonnet-4-6"`` — requires ANTHROPIC_API_KEY
+    - ``"anthropic:claude-haiku-4-5"`` — same, faster/cheaper
+    - ``"claude-code:claude-sonnet-4-6"`` — Max OAuth via Claude Code
+      CLI subprocess (no API key, counts against your Max usage; install
+      ``langchain-claude-code``). Best for saga 81.6 parity runs.
+    - any pre-instantiated ``BaseChatModel`` — passed through
+
+    See ``resolve_model`` for the routing logic.
 
     ``extra_system`` is appended to SYSTEM_PROMPT — useful for the bench
     harness to inject per-question date anchoring.
@@ -75,7 +128,7 @@ def make_agent(
     if extra_system:
         system_prompt = system_prompt + "\n\n" + extra_system
     return create_deep_agent(
-        model=model,
+        model=resolve_model(model),
         tools=[memory_query],
         system_prompt=system_prompt,
     )

@@ -18,6 +18,7 @@ dependencies = [
     "saga",
     "deepagents>=0.6.1",
     "langchain-openai>=1.2.1",
+    "langchain-claude-code>=0.1.0",
 ]
 
 [project.optional-dependencies]
