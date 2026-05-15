@@ -254,6 +254,50 @@ Before committing to the migration:
 
 If all three PoCs hit parity within a week, commit to the full migration. If any fail substantively, pause and evaluate.
 
+## Day 2 update (2026-05-14): hook patterns verified
+
+Built three PoC variants to test the hook-injection patterns:
+
+| File | Pattern | Q1 ("What degree?") | Q2 ("Daily commute?") |
+|---|---|---|---|
+| `smoke.py` | **Tool only** — agent calls `memory_query` on demand | ✓ Business Administration | ✓ 45 minutes |
+| `smoke_wrapper.py` | **Pre-inject only** — wrapper prepends memory, no tool | ✗ "I don't have access" | ✓ 45 minutes |
+| `smoke_hybrid.py` | **Hybrid** — pre-inject + tool registered | ✓ Business Administration | ✓ 45 minutes |
+
+### Key finding: external wrapper, not middleware
+
+For mimir's pre-message-hook semantics ("fire ONCE per turn before the first model call"), the right deepagents primitive is an **external wrapper around `agent.ainvoke`**, not `AgentMiddleware.before_model`:
+
+- Middleware `before_model` fires before EVERY model call inside the agent loop (multi-step turns). Wrong cadence — re-fetching memory mid-turn is wasted work.
+- External wrapper fires once, augments the HumanMessage, then hands off to the agent. Same shape as `open-strix/open_strix/app.py:1188`.
+
+The wrapper is ~60 LOC (`mimir/deepagent_poc/pre_message_hook.py`):
+
+```python
+async def invoke_with_pre_message(agent, *, memory_client, question, ...):
+    pre = await run_pre_message(memory_client=memory_client, question=question, ...)
+    result = await agent.ainvoke({"messages": pre.augmented_messages}, config=config)
+    return result, pre
+```
+
+Returns `(agent_result, pre_message_result)` so the turn logger can capture both surfaces — saga_atom_ids, rewritten_query, pre_message_ms timing — exactly what mimir's existing TurnRecord schema expects.
+
+### Migration target: hybrid pattern
+
+Production mimir has both:
+- Pre-message hook → injects memory context every turn
+- `saga_query` tool → agent can fetch additional memory mid-turn if needed
+
+The hybrid PoC matches this shape end-to-end. The wrapper handles the pre-inject; the deepagents `memory_query` tool handles the follow-up. Cache reads visible across all three patterns (4-11k cache_read_input_tokens via langchain-openai's Responses API).
+
+### Updated cost estimate (post Day 2)
+
+| Phase | Previous estimate | After Day 2 |
+|---|---|---|
+| Hook migration | 2-3 days | **Verified at 2 days** (wrapper pattern is ~60 LOC, mechanical translation of mimir's existing pre/post hook contract) |
+
+Day 2 strengthens the 2.5-3.5 week total estimate. No surprises.
+
 ## What this branch contains
 
 - `DEEPAGENTS_MIGRATION_ANALYSIS.md` (this file)
