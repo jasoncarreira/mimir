@@ -126,6 +126,7 @@ def forget_by_criteria(
     dry_run: bool = True,
     max_atoms: int = 1000,
     reason: str | None = None,
+    reference_date: datetime | None = None,
 ) -> ForgetResult:
     """Bulk forget by predicate. Dry-run by default (preview the set
     without writing).
@@ -146,9 +147,16 @@ def forget_by_criteria(
     where = ["a.agent_id = ?", "a.tombstoned = 0"]
     params: list = [agent_id]
 
+    # ``now`` for age + activation math. Defaults to wall clock; bench
+    # replays pass an explicit ``reference_date`` so historical-corpus
+    # runs (longmemeval, etc.) age atoms against the corpus's epoch,
+    # not the wall clock that ran the bench. Without this, a forget
+    # pass during a 2023-era replay computes activation against 2026
+    # and tombstones the entire corpus.
+    now = reference_date or datetime.now(timezone.utc)
+
     if min_age_days is not None:
-        cutoff = (datetime.now(timezone.utc)
-                  - timedelta(days=min_age_days)).isoformat()
+        cutoff = (now - timedelta(days=min_age_days)).isoformat()
         where.append("a.created_at <= ?")
         params.append(cutoff)
 
@@ -205,6 +213,7 @@ def forget_by_criteria(
                 old_count=row[3] or 0,
                 old_weight_sum=row[4] or 0.0,
                 old_oldest_ts=row[5],
+                now=now,
             )
             if act < activation_below:
                 below.append(atom_id)

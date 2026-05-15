@@ -257,14 +257,25 @@ def build_prior_block(conn, evidence_ids: list[str]) -> str:
     if len(evidence_ids) < 2:
         return ""
     placeholders = ",".join("?" * len(evidence_ids))
-    # Find observations whose evidence is a strict subset.
+    # Find observations whose evidence is a strict subset of the
+    # incoming cluster. Push the narrowing into SQL so we only scan
+    # observations whose evidence OVERLAPS with the target set
+    # (which is the universe of candidates anyway — if no overlap,
+    # no chance of subset). For a year-old DB with thousands of
+    # observations this avoids an O(N_obs) pull-to-Python.
     rows = conn.execute(
         f"SELECT obs.id, GROUP_CONCAT(ar.target_id, '|') AS evi "
         f"FROM atoms obs "
         f"JOIN atom_relations ar ON ar.source_id = obs.id "
         f" AND ar.relation_type = 'evidenced_by' "
         f"WHERE obs.memory_type = 'observation' AND obs.tombstoned = 0 "
+        f"  AND obs.id IN ("
+        f"    SELECT source_id FROM atom_relations "
+        f"    WHERE target_id IN ({placeholders}) "
+        f"    AND relation_type = 'evidenced_by'"
+        f"  ) "
         f"GROUP BY obs.id",
+        list(evidence_ids),
     ).fetchall()
     target_set = set(evidence_ids)
     subset_obs: list[str] = []
@@ -444,8 +455,8 @@ def make_async_rich_synth_fn(
         prior_block: str = "",
         vocab_block: str = "",
     ) -> dict:
-        from saga._llm import call_llm
-        from saga.config import resolve_llm_config
+        from ._llm import call_llm
+        from ._config_io import resolve_llm_config
 
         cfg = llm_config or resolve_llm_config("consolidation")
         indexed = "\n".join(
@@ -500,8 +511,8 @@ def make_async_observation_synth_fn(
     be awaited from inside an existing event loop (the bench harness,
     mimir's dispatcher worker)."""
     async def _do(cluster: list[dict]) -> tuple[str, list[str]]:
-        from saga._llm import call_llm
-        from saga.config import resolve_llm_config
+        from ._llm import call_llm
+        from ._config_io import resolve_llm_config
 
         cfg = llm_config or resolve_llm_config("consolidation")
         atoms_block = "\n- ".join(a["content"] for a in cluster)
@@ -607,8 +618,8 @@ def make_async_boundary_synth_fn(
     temperature: float = 0.2,
 ) -> Callable[[list[dict], dict | None], Any]:
     async def _do(atoms: list[dict], ctx: dict | None = None) -> dict:
-        from saga._llm import call_llm
-        from saga.config import resolve_llm_config
+        from ._llm import call_llm
+        from ._config_io import resolve_llm_config
 
         cfg = llm_config or resolve_llm_config("reflection")
         if not atoms:

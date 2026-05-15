@@ -96,9 +96,9 @@ def _expected_blob_len(dimension: int) -> int:
 
 def _provider_info() -> tuple[str, int]:
     """Return ``(provider_name, dimension)`` for the currently-configured
-    saga embedding provider. Resolves via saga.config + saga.embeddings."""
-    from saga.config import get_config
-    from saga.embeddings import get_provider
+    embedding provider. Resolves via mimir.memory._config_io + mimir.memory.embeddings."""
+    from .memory._config_io import get_config
+    from .memory.embeddings import get_provider
 
     cfg = get_config()
     provider_name = cfg("embedding", "provider", "nvidia-nim")
@@ -112,40 +112,36 @@ def reindex_saga_atoms(
     dry_run: bool = True,
     batch_size: int = 50,
 ) -> ReindexReport:
-    """Re-embed atoms in saga's atoms table under the currently-
-    configured provider.
+    """Re-embed atoms in mimir.memory's atoms table under the
+    currently-configured provider.
 
-    Delegates to ``saga.calibration.re_embed`` — saga's canonical
-    migration helper. The saga function:
+    Delegates to ``mimir.memory.calibration.re_embed`` — the ported
+    saga.calibration logic adapted to mimir.memory's schema (atoms
+    use ``tombstoned`` not ``state``; embeddings live in a sidecar
+    table, not on the atom row). The function:
 
-    - Filters ``state IN ('active', 'fading')`` so forgotten atoms
-      don't burn API calls
-    - Updates the ``embedding_provider`` column for per-atom
-      provenance
-    - Sets ``saga.vector_index._index_dirty`` so the FAISS index
-      rebuilds on next query
+    - Filters ``tombstoned = 0`` so forgotten atoms don't burn API calls
+    - Upserts the ``embeddings`` table with new (provider, model, dim, vec)
+    - Bumps ``atoms.embedding_dim`` so the FAISS index loader filters
+      mismatched-dim rows on rebuild
 
-    Behaviors mimir's earlier walk-and-update implementation didn't
-    cover — delegating ensures the saga semantics stay canonical.
-
-    ``db_path`` is accepted for API symmetry with
-    ``reindex_file_search`` but is informational only — saga reads its
-    own db path from saga.toml via ``saga.core.get_db()``.
+    After completion the caller should ``MemoryClient.rebuild_index``
+    — the dim or provider may have changed.
 
     Note on the ``sentence_embeddings`` table: if the operator has
     ``[retrieval] enable_subatom_beam = true`` in saga.toml, the
-    per-sentence embedding cache populated by ``saga.subatom`` is NOT
-    migrated by this reindex (saga.calibration.re_embed scope is atoms
-    only). Operators using subatom retrieval should clear that table
-    manually after reindex; the next compressed_retrieve call repopulates
-    against the new provider. Filed as a chainlink for follow-up.
+    per-sentence embedding cache (saga-era subatom) is NOT migrated
+    by this reindex (scope is atoms only). Operators using subatom
+    retrieval should clear that table manually after reindex; the
+    next compressed_retrieve call repopulates against the new
+    provider. Filed as a chainlink for follow-up.
     """
     started = time.time()
     provider_name, dim = _provider_info()
     try:
-        from saga.calibration import re_embed
+        from .memory.calibration import re_embed
     except ImportError:
-        log.warning("reindex(atoms): saga.calibration.re_embed unavailable")
+        log.warning("reindex(atoms): mimir.memory.calibration.re_embed unavailable")
         return ReindexReport(
             target="atoms", db_path=db_path,
             total_rows=0, already_current=0, needs_reindex=0,
@@ -153,17 +149,17 @@ def reindex_saga_atoms(
             elapsed_seconds=0.0, provider=provider_name, dimension=dim,
         )
 
-    # saga's re_embed handles dry-run + apply + FAISS dirty-flag + the
-    # state filter. Forward our flags through and adapt the response
-    # shape to ReindexReport.
+    # The ported re_embed handles dry-run + apply + the tombstoned
+    # filter; we just adapt its response to ReindexReport.
     try:
         result = re_embed(
+            db_path=db_path,
             target_provider_name=provider_name,
             batch_size=batch_size,
             dry_run=dry_run,
         )
     except Exception as exc:  # noqa: BLE001
-        log.exception("reindex(atoms): saga.calibration.re_embed failed")
+        log.exception("reindex(atoms): mimir.memory.calibration.re_embed failed")
         return ReindexReport(
             target="atoms", db_path=db_path,
             total_rows=0, already_current=0, needs_reindex=0,
@@ -234,7 +230,7 @@ def _reindex_table(
     3. Batch up to ``batch_size`` queued rows, call provider.batch_embed,
        update each row atomically.
     """
-    from saga.embeddings import get_provider
+    from .memory.embeddings import get_provider
 
     if not db_path.exists():
         log.warning("reindex: db not found at %s — skipping", db_path)
@@ -351,7 +347,7 @@ def _print_report(report: ReindexReport, *, dry_run: bool) -> None:
         # Look up cost by MODEL (not provider) — voyage-4-large is
         # $0.12/M, very different from voyage-4-lite's $0.02. Per PR
         # #146 review polish.
-        from saga.config import get_config
+        from .memory._config_io import get_config
         cfg = get_config()
         model = cfg("embedding", "model", "")
         cost = _MODEL_COST_PER_M_TOKENS.get(model)
@@ -450,7 +446,7 @@ def dispatch(args: argparse.Namespace) -> int:
     # If subatom retrieval is enabled, the sentence_embeddings table
     # isn't migrated by saga.calibration.re_embed — flag it so operators
     # know to manually clear that cache for full provider migration.
-    from saga.config import get_config
+    from .memory._config_io import get_config
     cfg = get_config()
     if args.target in ("atoms", "both") and \
             cfg("retrieval", "enable_subatom_beam", False):

@@ -27,7 +27,7 @@ def _patch_provider(monkeypatch):
             return [float(h % 7), float(h % 11), float(h % 13), float(h % 17)]
         def dimensions(self):
             return 4
-    monkeypatch.setattr("saga.embeddings.get_provider", lambda: _StubProvider())
+    monkeypatch.setattr("mimir.memory.embeddings.get_provider", lambda: _StubProvider())
     def fake_get_config():
         def cfg(section, key, default=None):
             return {
@@ -36,7 +36,7 @@ def _patch_provider(monkeypatch):
                 ("embedding", "model"): "stub-4d",
             }.get((section, key), default)
         return cfg
-    monkeypatch.setattr("saga.config.get_config", fake_get_config)
+    monkeypatch.setattr("mimir.memory._config_io.get_config", fake_get_config)
 
 
 @pytest.fixture

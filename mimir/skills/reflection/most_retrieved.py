@@ -51,7 +51,11 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
 # loop_id: 2.5
 async def run(args: argparse.Namespace) -> int:
     cfg = Config.from_env()
-    client = make_saga_client(endpoint=cfg.saga_endpoint, api_key=cfg.saga_api_key or None)
+    client = make_saga_client(
+        endpoint=cfg.saga_endpoint,
+        api_key=cfg.saga_api_key or None,
+        db_path=cfg.home / ".mimir" / "memory.db",
+    )
     try:
         atoms = await client.most_retrieved_atoms(
             days=args.days,

@@ -1,11 +1,12 @@
-"""Saga client — Protocol with two implementations (v0.5 §2).
+"""Saga client — Protocol with one in-process and one HTTP implementation.
 
-Mimir interacts with saga's atom store through a unified ``SagaClient``
+Mimir interacts with the memory store through a unified ``SagaClient``
 interface. Two implementations:
 
-- ``_InProcessSaga`` — direct calls into ``saga.core`` via
-  ``asyncio.to_thread``. Default since v0.5 §2: saga and mimir live in
-  the same workspace, same process, same SQLite directory. No HTTP loop.
+- ``MemoryClient`` (in ``mimir.memory.client``) — the in-process
+  retrieval/consolidation engine. Default for empty/localhost endpoints;
+  same process, same SQLite directory, no HTTP loop. ``make_saga_client``
+  constructs and returns one (wrapped in ``RecordingSagaClient``).
 - ``_HttpSaga`` — the original aiohttp client against saga's FastAPI
   server. Used when ``SAGA_ENDPOINT`` is set to a non-localhost URL,
   i.e. an external saga deployment. Kept intact so multi-agent shared-
@@ -88,7 +89,7 @@ class SagaError(RuntimeError):
 class SagaClient(Protocol):
     """The eight-method surface mimir uses against saga.
 
-    Both ``_InProcessSaga`` and ``_HttpSaga`` implement this. Most call
+    Both ``MemoryClient`` and ``_HttpSaga`` implement this. Most call
     sites accept ``SagaClient | None`` — None disables the integration
     (e.g., when running mimir without saga at all).
     """
@@ -132,8 +133,6 @@ class SagaClient(Protocol):
         extra_canonical_subjects: list[str] | None = None,
     ) -> dict[str, Any]: ...
 
-    async def decay(self) -> dict[str, Any]: ...
-
     async def forget(
         self, *,
         dry_run: bool = True,
@@ -158,369 +157,6 @@ class SagaClient(Protocol):
     async def close(self) -> None: ...
 
 
-# ─── In-process implementation ───────────────────────────────────
-
-
-class _InProcessSaga:
-    """Direct calls into saga.core.
-
-    Saga's retrieval / consolidation entry points are async-native as of
-    chainlink #20 Phase 3: ``hybrid_retrieve``, ``ConsolidationEngine.consolidate``,
-    and the LLM-using annotate paths are awaited directly here. The remaining
-    sync entry points (``store_atom``, ``mark_contributions``, ``record_outcome``,
-    ``run_decay_cycle``, etc.) are CPU-bound — embeddings, FTS5, vector ops
-    that hold the GIL — so they stay wrapped in ``asyncio.to_thread`` to keep
-    mimir's event loop responsive.
-
-    The response shape mirrors what saga's ``/v1/<endpoint>`` route handlers
-    return, so mimir's call sites don't care which client they're using.
-    Atom formatting (the ``_format_atom`` shape with id/content/similarity/
-    score/confidence_tier/topics/metadata/source_type) is reproduced here
-    because saga doesn't currently expose a service-layer function for it;
-    the server handler is the source of truth (see ``saga/saga/server.py``
-    ``api_query`` for the canonical implementation). If they drift, the
-    integration bench (v0.5 §3) catches it.
-    """
-
-    def __init__(self) -> None:
-        self._healthy: bool | None = None
-
-    async def _ensure_ready(self) -> None:
-        """Boot-time check: import saga + run get_stats. Surfaces config
-        issues (missing DB, embedding model fails to load) immediately
-        rather than at first query."""
-        if self._healthy is not None:
-            return
-        try:
-            await asyncio.to_thread(self._sync_stats)
-            self._healthy = True
-        except Exception as exc:
-            self._healthy = False
-            log.warning("in-process saga health check failed: %s", exc)
-            raise SagaError(f"saga health check failed: {exc}") from exc
-
-    @staticmethod
-    def _sync_stats() -> dict[str, Any]:
-        from saga.core import get_stats
-        return get_stats()
-
-    async def health(self) -> bool:
-        try:
-            await asyncio.to_thread(self._sync_stats)
-            return True
-        except Exception as exc:
-            log.warning("in-process saga health probe failed: %s", exc)
-            return False
-
-    async def close(self) -> None:
-        # Nothing to release — saga uses per-call SQLite connections.
-        return
-
-    async def query(
-        self, query: str, *, top_k: int = 12, mode: str = "task",
-        token_budget: int = 500, session_id: str | None = None,
-        min_confidence_tier: str | None = None,
-        context: list[dict[str, str]] | None = None,
-    ) -> dict[str, Any]:
-        # Mirrors saga/saga/server.py::api_query (two-tier branch — the
-        # default since [retrieval].two_tier_enabled = true is the v0.5
-        # canonical setting).
-        import time
-        from saga.core import hybrid_retrieve
-        from saga.config import get_config
-
-        # Start the latency clock BEFORE ``_ensure_ready`` so the first
-        # query after process start (which lazy-loads the embedding
-        # provider, opens the SQLite pool, applies migrations) reports
-        # honest cold-load latency. Previously the clock started inside
-        # the try-block at line 227, hiding ensure_ready cost (which can
-        # be hundreds of ms on a cold start) from observability.
-        t0 = time.time()
-        await self._ensure_ready()
-        clamped = _clamp_query(query)
-        # Wrap the entire body — including get_config(), the retrieve
-        # call, gating, and per-atom formatting — so any failure surfaces
-        # as SagaError. The agent's pre-message hook catches SagaError
-        # and degrades gracefully (logs + skips auto-fetch); RuntimeError
-        # from missing embedding API key, SQLite OperationalError,
-        # unexpected atom shape, etc. all fold into this path.
-        try:
-            cfg = get_config()
-            result = await hybrid_retrieve(
-                clamped, mode=mode, top_k=top_k,
-                two_tier=True, context=context, session_id=session_id,
-            )
-            obs = result.get("observations", []) or []
-            raws = result.get("raws", []) or []
-
-            # CR#14: apply_confidence_gating is the shared helper —
-            # same logic on both sides of the in-process / HTTP saga
-            # boundary, so the two paths can't drift.
-            from saga.core import apply_confidence_gating
-            gating_enabled = cfg('retrieval', 'enable_confidence_gating', True)
-            floor = (
-                min_confidence_tier
-                or cfg('retrieval', 'default_min_confidence_tier', 'low')
-            )
-            obs, raws, gated_reason = apply_confidence_gating(
-                obs, raws, floor=floor, gating_enabled=gating_enabled,
-            )
-
-            payload = {
-                "query": clamped, "mode": mode, "two_tier": True,
-                "gated": gated_reason is not None,
-                "gated_reason": gated_reason,
-                "observations": [_format_atom(o) for o in obs],
-                "raws": [_format_atom(r) for r in raws],
-                "triples": [],
-                "items_returned": len(obs) + len(raws),
-                "latency_ms": round((time.time() - t0) * 1000, 2),
-            }
-            # Propagate the rewritten query (if any) from saga's
-            # response so RecordingSagaClient's summarizer can surface
-            # it in turns.jsonl. Saga only sets this key when rewrite
-            # actually changed the query — its absence means "no-op or
-            # disabled", not "ran but unchanged."
-            rewritten = result.get("rewritten_query")
-            if rewritten:
-                payload["rewritten_query"] = rewritten
-            return payload
-        except SagaError:
-            raise
-        except Exception as exc:
-            raise SagaError(f"in-process saga query failed: {exc}") from exc
-
-    async def store(
-        self, content: str, *, stream: str | None = None,
-        profile: str | None = None, source_type: str = "api",
-        use_llm_annotate: bool = False,
-        metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        from saga.annotate import smart_annotate, classify_stream, classify_profile
-        from saga.core import store_atom
-
-        await self._ensure_ready()
-        try:
-            actual_stream = stream or classify_stream(content)
-            actual_profile = profile or classify_profile(content)
-            # smart_annotate is async-native (LLM path optionally awaits
-            # call_llm); the heuristic short-circuit also returns via the
-            # async signature.
-            annotations = await smart_annotate(content, use_llm=use_llm_annotate)
-            # store_atom remains sync (FTS5 + embedding write is CPU-bound
-            # and holds the GIL); offload to a thread so the event loop
-            # stays responsive during the SQLite writes.
-            result = await asyncio.to_thread(
-                store_atom,
-                content=content, stream=actual_stream, profile=actual_profile,
-                source_type=source_type, metadata=metadata, **annotations,
-            )
-
-            if isinstance(result, tuple):
-                atom_id, reason = result
-            else:
-                atom_id = result
-                reason = "duplicate content" if result is None else None
-
-            if atom_id is None:
-                return {
-                    "stored": False, "atom_id": None,
-                    "stream": actual_stream, "profile": actual_profile,
-                    "annotations": annotations,
-                    "triples_extracted": 0, "reason": reason,
-                }
-            return {
-                "stored": True, "atom_id": atom_id,
-                "stream": actual_stream, "profile": actual_profile,
-                "annotations": annotations,
-                "triples_extracted": 0,
-            }
-        except SagaError:
-            raise
-        except Exception as exc:
-            raise SagaError(f"in-process saga store failed: {exc}") from exc
-
-    async def feedback(
-        self, atom_ids: list[str], response_text: str, *,
-        session_id: str | None = None, feedback: str | None = None,
-    ) -> dict[str, Any]:
-        await self._ensure_ready()
-
-        def _do() -> dict[str, Any]:
-            from saga.core import mark_contributions
-            return mark_contributions(atom_ids, response_text, session_id) or {}
-
-        try:
-            return await asyncio.to_thread(_do)
-        except SagaError:
-            raise
-        except Exception as exc:
-            raise SagaError(f"in-process saga feedback failed: {exc}") from exc
-
-    async def outcome(
-        self, atom_ids: list[str], feedback: str, *,
-        session_id: str | None = None, query: str | None = None,
-    ) -> dict[str, Any]:
-        await self._ensure_ready()
-
-        def _do() -> dict[str, Any]:
-            from saga.core import record_outcome
-            return record_outcome(atom_ids, feedback, session_id, query) or {}
-
-        try:
-            return await asyncio.to_thread(_do)
-        except SagaError:
-            raise
-        except Exception as exc:
-            raise SagaError(f"in-process saga outcome failed: {exc}") from exc
-
-    async def end_session(
-        self, session_id: str, summary: str, *,
-        topics_discussed: list[str] | None = None,
-        decisions_made: list[str] | None = None,
-        unfinished: list[str] | None = None,
-        emotional_state: str | None = None,
-        closed_since: list[str] | None = None,
-        channel_id: str | None = None,
-    ) -> dict[str, Any]:
-        # ``channel_id`` is accepted for Protocol compatibility but the
-        # in-process saga's ``store_session_boundary`` doesn't take it
-        # — saga records channel separately via its sessions table.
-        await self._ensure_ready()
-
-        def _do() -> dict[str, Any]:
-            from saga.core import store_session_boundary
-            atom_id = store_session_boundary(
-                session_id=session_id, summary=summary,
-                topics_discussed=topics_discussed,
-                decisions_made=decisions_made,
-                unfinished=unfinished,
-                emotional_state=emotional_state,
-                closed_since=closed_since,
-            )
-            return {"atom_id": atom_id, "session_id": session_id, "channel": channel_id}
-
-        try:
-            return await asyncio.to_thread(_do)
-        except SagaError:
-            raise
-        except Exception as exc:
-            raise SagaError(f"in-process saga end_session failed: {exc}") from exc
-
-    async def consolidate(
-        self, *, dry_run: bool = False, max_clusters: int | None = None,
-        extra_canonical_subjects: list[str] | None = None,
-    ) -> dict[str, Any]:
-        from saga.consolidation import ConsolidationEngine
-
-        await self._ensure_ready()
-        try:
-            kwargs: dict[str, Any] = {"dry_run": dry_run}
-            if max_clusters is not None:
-                kwargs["max_clusters"] = max_clusters
-            if extra_canonical_subjects:
-                kwargs["extra_canonical_subjects"] = list(extra_canonical_subjects)
-            result = await ConsolidationEngine().consolidate(**kwargs) or {}
-            # mimir's scheduler logs the result; defensive flat dict.
-            if not isinstance(result, dict):
-                return {"result": result}
-            return result
-        except SagaError:
-            raise
-        except Exception as exc:
-            raise SagaError(f"in-process saga consolidate failed: {exc}") from exc
-
-    async def decay(self) -> dict[str, Any]:
-        """Run saga's decay cycle — recompute retrievability, fade/
-        dormant state transitions, profile compaction. Surfaces
-        forgetting candidates as part of the result; doesn't act on
-        them (POST /v1/forget is the explicit removal path)."""
-        await self._ensure_ready()
-
-        def _do() -> dict[str, Any]:
-            from saga.decay import run_decay_cycle
-            result = run_decay_cycle() or {}
-            if not isinstance(result, dict):
-                return {"result": result}
-            return result
-
-        try:
-            return await asyncio.to_thread(_do)
-        except Exception as exc:
-            raise SagaError(f"in-process saga decay failed: {exc}") from exc
-
-    async def forget(
-        self, *,
-        dry_run: bool = True,
-        min_retrievals: int | None = None,
-        contribution_threshold: float | None = None,
-        contradiction_threshold: float | None = None,
-        confidence_floor: float | None = None,
-        grace_days: int | None = None,
-    ) -> dict[str, Any]:
-        """Run saga's intentional-forgetting engine. ``dry_run=True``
-        (default) only identifies candidates; ``dry_run=False`` will
-        transition atoms when saga's config mode permits. Forgetting
-        is irreversible on the saga side."""
-        await self._ensure_ready()
-
-        def _do() -> dict[str, Any]:
-            from saga.forgetting import identify_forgetting_candidates
-            result = identify_forgetting_candidates(
-                dry_run=dry_run,
-                min_retrievals=min_retrievals,
-                contribution_threshold=contribution_threshold,
-                contradiction_threshold=contradiction_threshold,
-                confidence_floor=confidence_floor,
-                grace_days=grace_days,
-            ) or {}
-            if not isinstance(result, dict):
-                return {"result": result}
-            return result
-
-        try:
-            return await asyncio.to_thread(_do)
-        except Exception as exc:
-            raise SagaError(f"in-process saga forget failed: {exc}") from exc
-
-    async def recent_session_boundaries(
-        self, *, channel_id: str | None = None, count: int = 3,
-    ) -> list[dict[str, Any]]:
-        await self._ensure_ready()
-
-        def _do() -> list[dict[str, Any]]:
-            from saga.core import get_last_sessions
-            return get_last_sessions(count=count, channel=channel_id) or []
-
-        try:
-            return await asyncio.to_thread(_do)
-        except Exception as exc:  # noqa: BLE001 — best-effort parity with HTTP client.
-            log.warning("in-process recent_session_boundaries failed: %s", exc)
-            return []
-
-    async def most_retrieved_atoms(
-        self, *, days: int = 7, count: int = 10,
-        channel_id: str | None = None, contributed_only: bool = False,
-        trend: str | None = None,
-    ) -> list[dict[str, Any]]:
-        await self._ensure_ready()
-
-        def _do() -> list[dict[str, Any]]:
-            from saga.core import get_most_retrieved
-            return get_most_retrieved(
-                days=days, count=count,
-                channel=channel_id,
-                contributed_only=contributed_only,
-                trend=trend,
-            ) or []
-
-        try:
-            return await asyncio.to_thread(_do)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("in-process most_retrieved_atoms failed: %s", exc)
-            return []
-
-
 # ─── HTTP implementation (legacy / external-saga path) ───────────
 
 
@@ -541,7 +177,7 @@ class _HttpSaga:
         # both saw ``self._session is None`` and both constructed a
         # ``ClientSession``, with the loser's session leaking and
         # producing aiohttp deprecation warnings in production logs.
-        # Mostly a multi-deployment edge case (default is ``_InProcessSaga``)
+        # Mostly a multi-deployment edge case (default is ``MemoryClient``)
         # but the lock is cheap and the failure mode is silent.
         self._session_lock = asyncio.Lock()
 
@@ -767,10 +403,6 @@ class _HttpSaga:
             body["extra_canonical_subjects"] = list(extra_canonical_subjects)
         return await self._post("/v1/consolidate", body)
 
-    async def decay(self) -> dict[str, Any]:
-        """Run saga's decay cycle via /v1/decay."""
-        return await self._post("/v1/decay", {})
-
     async def forget(
         self, *,
         dry_run: bool = True,
@@ -851,7 +483,7 @@ class RecordingSagaClient:
     # Note: ``mark_contributions`` is intentionally NOT here — mimir
     # uses ``feedback()`` for the credit-pass call (see
     # ``agent.py:_post_message_hook``, line 1859). There's no
-    # ``mark_contributions`` method on ``_InProcessSaga`` or
+    # ``mark_contributions`` method on ``MemoryClient`` or
     # ``_HttpSaga`` either; adding it to this set would AttributeError
     # at runtime.
     _RECORDED_METHODS = frozenset({
@@ -891,9 +523,6 @@ class RecordingSagaClient:
         return await self._call(
             "consolidate", self._inner.consolidate, args, kwargs,
         )
-
-    async def decay(self, *args, **kwargs):
-        return await self._call("decay", self._inner.decay, args, kwargs)
 
     async def forget(self, *args, **kwargs):
         return await self._call("forget", self._inner.forget, args, kwargs)
@@ -1088,37 +717,41 @@ def make_saga_client(
 ) -> SagaClient:
     """Pick the right implementation based on ``endpoint``.
 
-    Post-cutover (2026-05-15): localhost/empty endpoint returns a
-    ``MemoryClient`` (mimir.memory) instead of legacy ``_InProcessSaga``.
-    ``db_path`` resolves from ``$MIMIR_HOME/.mimir/memory.db`` by default.
+    - Empty/unset, ``localhost``, or ``127.0.0.1`` → in-process
+      ``MemoryClient`` (the mimir.memory clean-room rewrite of saga's
+      retrieval/consolidation engine). ``db_path`` defaults to
+      ``$MIMIR_HOME/.mimir/memory.db``; pass explicitly to override
+      (tests, alternative DB layouts).
+    - Anything else → ``_HttpSaga(endpoint, api_key, timeout_s)``
+      (kept for operators running a separate saga HTTP server; this
+      path will be retired once the in-process backend covers all
+      production use cases).
 
-    Legacy escape hatch: ``MIMIR_LEGACY_INPROCESS_SAGA=1`` falls back
-    to ``_InProcessSaga`` for diagnosis. Will be deleted once
-    mimir.memory has burned in.
+    ``record_calls`` (default True): wrap the underlying client in
+    ``RecordingSagaClient`` so each call appends a ``SagaCallRecord``
+    to the active ``TurnContext.saga_calls``. Set False for tests
+    that want to inspect the bare client without recording overhead.
     """
     import os
     from pathlib import Path
     if not endpoint or _is_localhost(endpoint):
-        if os.environ.get("MIMIR_LEGACY_INPROCESS_SAGA"):
-            inner: SagaClient = _InProcessSaga()
+        from .memory.client import MemoryClient
+        resolved_db: Path
+        if db_path is not None:
+            resolved_db = Path(db_path)
         else:
-            from .memory.client import MemoryClient
-            if db_path is not None:
-                resolved_db = Path(db_path)
-            else:
-                home = os.environ.get("MIMIR_HOME", "")
-                if not home:
-                    # Last-resort fallback: in-process saga, since we can't
-                    # resolve a MemoryClient db path without MIMIR_HOME.
-                    inner = _InProcessSaga()
-                    if record_calls:
-                        return RecordingSagaClient(inner)  # type: ignore[return-value]
-                    return inner
-                resolved_db = Path(home) / ".mimir" / "memory.db"
-            resolved_db.parent.mkdir(parents=True, exist_ok=True)
-            inner = MemoryClient(
-                db_path=resolved_db, embedding_dim=embedding_dim,
-            )
+            home = os.environ.get("MIMIR_HOME")
+            if not home:
+                raise RuntimeError(
+                    "make_saga_client(): MIMIR_HOME not set and db_path "
+                    "not supplied — cannot resolve in-process MemoryClient "
+                    "db path. Set MIMIR_HOME or pass db_path explicitly."
+                )
+            resolved_db = Path(home) / ".mimir" / "memory.db"
+        resolved_db.parent.mkdir(parents=True, exist_ok=True)
+        inner: SagaClient = MemoryClient(
+            db_path=resolved_db, embedding_dim=embedding_dim,
+        )
     else:
         inner = _HttpSaga(
             endpoint=endpoint, api_key=api_key, timeout_s=timeout_s,
