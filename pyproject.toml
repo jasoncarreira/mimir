@@ -22,6 +22,7 @@ dependencies = [
     "langchain-anthropic>=1.4",
     "langchain-openai>=1.2.1",
     "langchain-claude-code>=0.1.0",
+    "requests>=2.33.1",
 ]
 
 [project.optional-dependencies]
