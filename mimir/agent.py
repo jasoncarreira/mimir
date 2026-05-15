@@ -53,8 +53,19 @@ from .config import Config
 from .event_logger import log_event
 from .history import MessageBuffer
 from .index import IndexGenerator
+from . import _langchain_claude_code_patches as _lcc_patches
 from .models import AgentEvent, TurnRecord
 from .saga_client import SagaClient
+
+# Idempotent runtime patch for langchain-claude-code's ``_arun`` call —
+# see the module docstring for the bug + upstream PR. No-op if the
+# claude-code extra isn't installed.
+_lcc_patches.apply_patches()
+from .sagatools import (
+    _atom_ids_from_response,
+    _format_saga_payload,
+    _source_atom_ids_from_triples,
+)
 from .search import Indexer
 from .session_manager import SessionManager
 from .subagent_inbox import SubagentInbox
@@ -90,8 +101,15 @@ class _RateLimitStub:
 
 
 # ────────────────────────────────────────────────────────────────────
-# Model / tool resolution helpers (lifted from deepagent_poc)
+# Model / tool resolution helpers
 # ────────────────────────────────────────────────────────────────────
+
+
+_PROVIDER_EXTRAS: dict[str, str] = {
+    "claude-code": "claude-code",  # → pip install 'mimir[claude-code]'
+    "anthropic": "anthropic",
+    "openai": "openai",
+}
 
 
 def _resolve_model(spec: str | BaseChatModel) -> str | BaseChatModel:
@@ -99,17 +117,36 @@ def _resolve_model(spec: str | BaseChatModel) -> str | BaseChatModel:
 
     Supported:
       - ``claude-code:<model>`` → ChatClaudeCode (Max OAuth subprocess)
-      - ``<provider>:<model>``  → init_chat_model via deepagents
-      - BaseChatModel instance  → pass-through (Bedrock/Vertex/etc.)
+      - ``<provider>:<model>``  → init_chat_model via langchain (deepagents
+                                  resolves the provider package at call time)
+      - BaseChatModel instance  → pass-through (Bedrock/Vertex/custom)
+
+    The model-provider package (``langchain-claude-code``,
+    ``langchain-anthropic``, etc.) is a pip extra (see pyproject.toml's
+    ``[project.optional-dependencies]``). We lazy-import here so installing
+    only the extras you'll use keeps the dep graph small — raising a
+    clear hint on ImportError tells the operator exactly which extra
+    they're missing.
     """
     if isinstance(spec, BaseChatModel):
         return spec
     if not isinstance(spec, str):
         raise TypeError(f"unexpected model spec type: {type(spec).__name__}")
     if spec.startswith("claude-code:"):
-        from langchain_claude_code import ChatClaudeCode  # type: ignore[import-untyped]
+        try:
+            from langchain_claude_code import ChatClaudeCode  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ImportError(
+                "MIMIR_MODEL_SPEC=claude-code:* requires the 'claude-code' extra. "
+                "Install via `pip install 'mimir[claude-code]'` "
+                "(or `uv pip install langchain-claude-code`)."
+            ) from exc
         model_name = spec.split(":", 1)[1]
         return ChatClaudeCode(model=model_name)
+    # langchain ``init_chat_model`` resolves provider extras at call time
+    # (``anthropic:`` → langchain-anthropic, ``openai:`` → langchain-openai).
+    # We pass the spec through; if the extra isn't installed, deepagents
+    # raises its own ImportError with the right hint.
     return spec
 
 
@@ -201,12 +238,11 @@ class Agent:
         self._inbox = subagent_inbox or SubagentInbox()
         self._channels = channel_registry
         self._dispatcher = dispatcher
-        self._loop: asyncio.AbstractEventLoop | None = None
 
-        # Stubs for legacy server.py reads — post-cutover these are
-        # not the agent's responsibility (rate-limit tracking moved
-        # to the oauth_usage_poller's own store). Stubbed to a tiny
-        # no-op so server.py's wiring code doesn't blow up.
+        # Stub for back-compat with any caller that still reads
+        # ``agent._rate_limits``. Post-cutover the oauth_usage_poller
+        # owns the real RateLimitStore directly (server.py wires it).
+        # When all callers are updated, drop this entirely.
         self._rate_limits = _RateLimitStub()
 
         # Build the deepagent singleton. Done lazily to keep import-time
@@ -220,54 +256,62 @@ class Agent:
             self._try_inject_memory_client(saga_client)
 
     def _try_inject_memory_client(self, saga_client: SagaClient) -> None:
-        """If saga_client is a MemoryClient (or wraps one), wire it
-        into the memory_query / memory_store tools.
+        """If saga_client is a MemoryClient (or wraps one at any depth),
+        wire it into the memory_query / memory_store tools.
 
         Production saga_client is a RecordingSagaClient wrapping
-        either _InProcessSaga (legacy) or MemoryClient. We unwrap one
-        level to find the concrete client.
+        either _InProcessSaga (legacy) or MemoryClient. Test harnesses
+        and bench middleware may add additional wrappers (capture
+        proxies, recording layers); we peel ``_inner`` until we find
+        a concrete MemoryClient or run out of layers.
         """
         try:
             from .memory.client import MemoryClient
         except Exception:
             return
         candidate: Any = saga_client
-        # RecordingSagaClient stores the inner under _inner.
-        inner = getattr(candidate, "_inner", None)
-        if inner is not None:
-            candidate = inner
-        # _MemoryStateProxy / similar — find the actual client.
-        if isinstance(candidate, MemoryClient):
-            from .deepagent_poc.memory_tool import set_memory_client
-            set_memory_client(candidate)
+        seen: set[int] = set()
+        # Peel ``_inner`` chains — RecordingSagaClient, _MemoryStateProxy,
+        # any test/bench wrapper that follows the convention.
+        while candidate is not None and id(candidate) not in seen:
+            seen.add(id(candidate))
+            if isinstance(candidate, MemoryClient):
+                from .tools import set_memory_client
+                set_memory_client(candidate)
+                return
+            candidate = getattr(candidate, "_inner", None)
 
     def _build_agent_if_needed(self) -> Any:
         if self._agent is not None:
             return self._agent
         from deepagents import create_deep_agent
-        from .deepagent_poc.memory_tool import memory_query
-        from .deepagent_poc.store_tool import memory_store
+        from .tools import all_mimir_tools
 
-        model_spec = os.environ.get("MIMIR_MODEL_SPEC", "claude-code:claude-sonnet-4-6")
+        # Config carries the operator-set model spec; env override
+        # exists for ad-hoc bench / smoke runs that don't go through
+        # Config.from_env. See Config.model_spec for the format
+        # (``claude-code:<model>`` or ``<provider>:<model>``).
+        model_spec = os.environ.get(
+            "MIMIR_MODEL_SPEC",
+            getattr(self._config, "model_spec", "claude-code:claude-sonnet-4-6"),
+        )
+        # Assemble the real system prompt — core memory + memory index +
+        # operator alert channel + skill catalog. Built fresh per turn
+        # so skill bucket assignments / outcome aggregates stay current
+        # (chainlink #15: install-stable section comes first for cache).
         system_prompt = os.environ.get(
             "MIMIR_SYSTEM_PROMPT_OVERRIDE",
-            _DEFAULT_SYSTEM_PROMPT,
+            self._build_system_prompt(),
         )
         self._agent = create_deep_agent(
             model=_resolve_model(model_spec),
-            tools=[memory_query, memory_store],
+            tools=all_mimir_tools(),
             system_prompt=system_prompt,
         )
         return self._agent
 
     async def run_turn(self, event: AgentEvent) -> TurnRecord:
         """Run one agent turn — preserves the SDK Agent.run_turn contract."""
-        if self._loop is None:
-            try:
-                self._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
-
         turn_id = make_turn_id()
         t_total_start = time.monotonic()
 
@@ -282,7 +326,6 @@ class Agent:
             self._sessions.increment_turn_count(event.channel_id)
 
         # Pre-message memory inject.
-        from .sagatools import _format_saga_payload, _atom_ids_from_response, _source_atom_ids_from_triples
         memory_block = ""
         saga_atom_ids: list[str] = []
         if self._saga is not None:
@@ -330,8 +373,24 @@ class Agent:
             events = []
             log.exception("agent.ainvoke failed: %s", exc)
 
-        # Post-message credit pass.
-        if error is None and saga_atom_ids and self._saga is not None:
+        # Result fields drive both the TurnRecord and the feedback-signal
+        # branch below, so compute once and reuse.
+        result_fields = derive_result_fields(messages)
+
+        # Post-message credit pass. Branch on result: a successful turn
+        # contributes positive evidence ("these atoms helped the agent
+        # answer"); an errored or max_turns-truncated turn is negative
+        # evidence ("retrieval surfaced these but the agent couldn't
+        # land an answer"). Saga's record_outcome routes the signal to
+        # the activation-log weight accordingly.
+        if saga_atom_ids and self._saga is not None:
+            stop_reason = result_fields.get("stop_reason")
+            is_failure = (
+                error is not None
+                or result_fields.get("result_is_error")
+                or stop_reason in ("max_turns", "max_tokens")
+            )
+            feedback_signal = "negative" if is_failure else "positive"
             try:
                 # Union: pre-message atoms + atom IDs surfaced in tool results
                 tool_atom_ids = _extract_atom_ids_from_tool_results(messages)
@@ -344,13 +403,12 @@ class Agent:
                     saga_atom_ids,
                     output,
                     session_id=saga_session_id,
-                    feedback="positive",
+                    feedback=feedback_signal,
                 )
             except Exception as exc:
                 log.warning("post-message saga.feedback failed: %s", exc)
 
         # Build and write TurnRecord — matches the SDK schema.
-        result_fields = derive_result_fields(messages)
         record = TurnRecord(
             ts=_utc_now(),
             turn_id=turn_id,
@@ -385,7 +443,7 @@ class Agent:
                 except Exception as exc:
                     log.warning("bridge.send failed: %s", exc)
 
-        log_event(
+        await log_event(
             "turn_finished",
             turn_id=turn_id,
             channel_id=event.channel_id,
@@ -394,3 +452,57 @@ class Agent:
             stop_reason=result_fields.get("stop_reason"),
         )
         return record
+
+    # ────────────────────────────────────────────────────────────
+    # System prompt assembly
+    # ────────────────────────────────────────────────────────────
+
+    def _build_system_prompt(self) -> str:
+        """Assemble the per-turn system prompt: persona + core memory +
+        memory index + operator alert channel + skill catalog. Rebuilt
+        each turn so skill bucket assignments / outcome counters stay
+        current (chainlink #15: install-stable section comes first so
+        the prompt cache prefix extends through it).
+
+        Falls back to the minimal default prompt on any failure — a
+        broken core-block read or skill-catalog crash should NEVER
+        prevent a turn from running."""
+        try:
+            from .core_blocks import load_core
+            from .prompts import build_system_prompt
+            core_blocks = load_core(self._config.home)
+            memory_index_body = (
+                self._indexes.read_memory_index()
+                if self._indexes is not None else None
+            )
+            skill_block = self._assemble_skill_block()
+            return build_system_prompt(
+                core_blocks=core_blocks,
+                memory_index_body=memory_index_body,
+                operator_alert_channel=getattr(
+                    self._config, "operator_alert_channel", "",
+                ),
+                skill_block=skill_block,
+            )
+        except Exception:
+            log.exception("_build_system_prompt failed; using minimal default")
+            return _DEFAULT_SYSTEM_PROMPT
+
+    def _assemble_skill_block(self) -> str | None:
+        """v0.5+ §12.3: render the install-stable skill catalog for the
+        system prompt. Returns None when no skills are seeded; volatile
+        per-turn telemetry (success/total counts) is handled separately
+        via the self-state block (deferred to Phase D)."""
+        try:
+            from .skill_outcomes import SkillPinConfig, render_skill_catalog
+            from .skill_defs import installed_skill_names
+            seeded = installed_skill_names(self._config.home)
+            if not seeded:
+                return None
+            pin = SkillPinConfig.load(
+                self._config.home / "state" / "skill-pin.yaml",
+            )
+            return render_skill_catalog(seeded, pin)
+        except Exception:
+            log.exception("_assemble_skill_block failed; skipping")
+            return None

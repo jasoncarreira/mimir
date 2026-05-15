@@ -1081,26 +1081,44 @@ def make_saga_client(
     endpoint: str | None = None,
     api_key: str | None = None,
     *,
+    db_path: "Path | None" = None,
+    embedding_dim: int | None = None,
     timeout_s: float = 30.0,
     record_calls: bool = True,
 ) -> SagaClient:
     """Pick the right implementation based on ``endpoint``.
 
-    - Empty/unset, ``localhost``, or ``127.0.0.1`` → ``_InProcessSaga``.
-    - Anything else → ``_HttpSaga(endpoint, api_key, timeout_s)``.
+    Post-cutover (2026-05-15): localhost/empty endpoint returns a
+    ``MemoryClient`` (mimir.memory) instead of legacy ``_InProcessSaga``.
+    ``db_path`` resolves from ``$MIMIR_HOME/.mimir/memory.db`` by default.
 
-    saga still installs as a workspace member regardless, so importing
-    saga.core works in either case. The HTTP path is just there for
-    operators who explicitly want a separate saga deployment (shared
-    saga across multiple agents, scaling, dev pointing at staging).
-
-    ``record_calls`` (default True): wrap the underlying client in
-    ``RecordingSagaClient`` so each call appends a ``SagaCallRecord``
-    to the active ``TurnContext.saga_calls``. Set False for tests
-    that want to inspect the bare client without recording overhead.
+    Legacy escape hatch: ``MIMIR_LEGACY_INPROCESS_SAGA=1`` falls back
+    to ``_InProcessSaga`` for diagnosis. Will be deleted once
+    mimir.memory has burned in.
     """
+    import os
+    from pathlib import Path
     if not endpoint or _is_localhost(endpoint):
-        inner: SagaClient = _InProcessSaga()
+        if os.environ.get("MIMIR_LEGACY_INPROCESS_SAGA"):
+            inner: SagaClient = _InProcessSaga()
+        else:
+            from .memory.client import MemoryClient
+            if db_path is not None:
+                resolved_db = Path(db_path)
+            else:
+                home = os.environ.get("MIMIR_HOME", "")
+                if not home:
+                    # Last-resort fallback: in-process saga, since we can't
+                    # resolve a MemoryClient db path without MIMIR_HOME.
+                    inner = _InProcessSaga()
+                    if record_calls:
+                        return RecordingSagaClient(inner)  # type: ignore[return-value]
+                    return inner
+                resolved_db = Path(home) / ".mimir" / "memory.db"
+            resolved_db.parent.mkdir(parents=True, exist_ok=True)
+            inner = MemoryClient(
+                db_path=resolved_db, embedding_dim=embedding_dim,
+            )
     else:
         inner = _HttpSaga(
             endpoint=endpoint, api_key=api_key, timeout_s=timeout_s,

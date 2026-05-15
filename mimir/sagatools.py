@@ -1,15 +1,11 @@
-"""SAGA-payload helpers — post-cutover (2026-05-14).
+"""SAGA-payload rendering helpers.
 
-The original SDK-decorated tool functions (``saga_query``, ``saga_store``,
-``saga_feedback``, ``saga_mark_contributions``, ``saga_end_session``)
-are gone — deepagents picks up tool definitions from
-``mimir/deepagent_poc/{memory_tool,store_tool,all_tools}.py`` via the
-LangChain ``@tool`` decorator instead.
+Used by ``mimir.agent`` (pre-message memory injection) and
+``mimir.tools.memory`` (the langchain memory_query tool). Renders
+the ``{atoms, triples, observations, raws}`` shape that
+``SagaClient.query`` returns into the prompt block the agent sees.
 
-What remains here: the payload-rendering helpers that mimir/agent.py
-still uses for the pre-message memory injection step
-(``_format_saga_payload``, ``_atom_ids_from_response``,
-``_source_atom_ids_from_triples``, ``_format_atoms``, etc).
+Pure functions — no dependencies, no state.
 """
 from __future__ import annotations
 
@@ -173,21 +169,3 @@ def _hits_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
 # ────────────────────────────────────────────────────────────────────
 
 
-def build_saga_tools(*args, **kwargs):
-    """SDK tool registration — no-op post-cutover. Tools are defined
-    in mimir/deepagent_poc/ via @tool from langchain_core."""
-    return []
-
-
-def saga_tool_names() -> list[str]:
-    """Pre-cutover names list — kept for legacy callers that reference
-    the names without trying to register them."""
-    return [
-        "saga_query", "saga_store", "saga_feedback",
-        "saga_mark_contributions", "saga_end_session",
-    ]
-
-
-# Re-export so legacy imports `from mimir.sagatools import echo` etc. don't break.
-def echo(*args, **kwargs):
-    return "ok"

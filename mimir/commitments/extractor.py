@@ -10,7 +10,8 @@ unfinished items into 100-1100 chars of prose; this module asks Claude
 - Not the agent loop: the session-end synthesis turn is already an
   LLM call; we don't want to wrap that in another LLM call from the
   same loop. The extraction runs in the finalize hook on a separate
-  ``claude_agent_sdk.query()`` (one-shot, OAuth path, haiku-tier).
+  one-shot LLM call via ``langchain.chat_models.init_chat_model``
+  (haiku-tier by default; configurable via the ``model`` kwarg).
 - Not a poller: session-end output is event-driven, not time-driven.
   A poller would either miss output (debounced) or re-extract the
   same content (idempotent only via the store's dedupe-key gate).
@@ -285,11 +286,9 @@ async def extract_commitments(
     if not session_end_output or len(session_end_output) < MIN_OUTPUT_LEN:
         return []
 
-    # Post-cutover (2026-05-14): use langchain-anthropic or
-    # init_chat_model instead of the SDK's query(). Test paths that
-    # monkeypatched ``claude_agent_sdk.query`` need to patch
-    # ``langchain.chat_models.init_chat_model`` instead — Phase D
-    # test cleanup.
+    # Single-shot LLM call via langchain. Tests patch
+    # ``langchain.chat_models.init_chat_model`` to substitute a
+    # stub chat model — see test_commitments_extractor.py.
     user_msg = USER_TEMPLATE.format(
         channel_id=channel_id or "(none)",
         ts="",

@@ -23,7 +23,7 @@ from typing import Optional
 
 from langchain_core.tools import tool
 
-from .memory_tool import _MEMORY_STATE
+from .memory import _MEMORY_STATE
 
 
 @tool

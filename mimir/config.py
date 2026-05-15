@@ -112,6 +112,12 @@ def _parse_sources(raw: str) -> frozenset[str] | None:
 class Config:
     home: Path
     model: str
+    # Post-cutover model spec for the deepagents path:
+    #   - ``claude-code:<model>``  → ChatClaudeCode (Max OAuth subprocess)
+    #   - ``<provider>:<model>``   → init_chat_model via langchain
+    #   See ``mimir.agent._resolve_model``. Defaults to
+    #   ``claude-code:claude-sonnet-4-6`` (Max OAuth, no API-key billing).
+    model_spec: str
     effort: str
     embed_model: str
     saga_endpoint: str
@@ -390,6 +396,7 @@ class Config:
         return cls(
             home=home,
             model=_env("MIMIR_MODEL", "claude-opus-4-7"),
+            model_spec=_env("MIMIR_MODEL_SPEC", "claude-code:claude-sonnet-4-6"),
             effort=_env("MIMIR_EFFORT", "high"),
             embed_model=_env("MIMIR_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
             saga_endpoint=_env("SAGA_ENDPOINT", "http://localhost:3002"),
