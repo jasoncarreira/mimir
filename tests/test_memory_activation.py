@@ -224,3 +224,94 @@ def test_feedback_event_weight_round_trips():
         "SELECT source, weight FROM access_events WHERE atom_id='a1'"
     ).fetchone()
     assert row == ("feedback_positive", 2.0)
+
+
+# ── Petrov OL — feedback_negative cancellation ────────────────────────
+
+
+def test_feedback_negative_cancels_a_paired_retrieval_in_recent_window():
+    """A feedback_negative event (weight -1.0) co-occurring with a
+    retrieval event (weight +1.0) should net to zero activation
+    contribution for that pair, modulo the time-decay term they share.
+    With them both at the same timestamp, the contribution cancels
+    exactly — the atom has no recency boost left from that turn.
+    """
+    now = datetime.now(timezone.utc)
+    ten_min_ago = now - timedelta(minutes=10)
+    act = compute_activation(
+        recent_ts=[_iso(ten_min_ago), _iso(ten_min_ago)],
+        recent_weights=[1.0, -1.0],
+        old_count=0,
+        old_weight_sum=0.0,
+        old_oldest_ts=None,
+        now=now,
+    )
+    # Total contribution is 0 → activation must be -inf (no signal).
+    assert act == float("-inf")
+
+
+def test_feedback_negative_makes_atom_filterable_when_solo():
+    """An atom with only a single feedback_negative event (no
+    counter-balancing positives) has Σ ≤ 0 and lands at -inf, which
+    every finite threshold filters out — the documented contract in
+    activation.py:SOURCE_WEIGHTS."""
+    now = datetime.now(timezone.utc)
+    act = compute_activation(
+        recent_ts=[_iso(now - timedelta(minutes=5))],
+        recent_weights=[-1.0],
+        old_count=0,
+        old_weight_sum=0.0,
+        old_oldest_ts=None,
+        now=now,
+    )
+    assert act == float("-inf")
+
+
+def test_petrov_ol_mixed_displaced_weights_dont_corrupt_recent_signal():
+    """Petrov OL aggregates displaced events as ``old_weight_sum``
+    and ``old_count``, producing a mean-weight approximation. When
+    displaced events mix signs (feedback_negative cancellations of
+    earlier retrievals), the aggregate's mean weight can collapse
+    toward zero. The current closed-form path SHORT-CIRCUITS on
+    ``old_weight_sum > 0`` (activation.py:176), so a net-zero or
+    net-negative displaced aggregate contributes nothing — but the
+    recent-window signal must still register cleanly.
+
+    Pin this property: a recent feedback_positive (+2.0) on top of a
+    fully-cancelled displaced aggregate (mixed +/- summing to ~0)
+    produces a positive activation driven entirely by the recent
+    event. The approximation can't drag activation negative when the
+    aggregate is well-cancelled."""
+    now = datetime.now(timezone.utc)
+    # Recent: a single positive endorsement 1 minute ago.
+    recent_ts = [_iso(now - timedelta(minutes=1))]
+    recent_weights = [2.0]  # feedback_positive
+    # Displaced aggregate: 4 events at varying ages, weights sum to 0
+    # (two +1 retrievals cancelled by two -1 feedback_negatives).
+    # ``old_weight_sum=0`` should engage the short-circuit at line 176.
+    act = compute_activation(
+        recent_ts=recent_ts,
+        recent_weights=recent_weights,
+        old_count=4,
+        old_weight_sum=0.0,
+        old_oldest_ts=_iso(now - timedelta(days=7)),
+        now=now,
+    )
+    # Recent +2.0 contribution → finite activation (the log of a
+    # positive Σ). The absolute value depends on the time-decay term;
+    # what matters here is that the mixed displaced aggregate didn't
+    # drag Σ negative and force a -inf.
+    assert act > float("-inf")
+    assert math.isfinite(act)
+    # Should match a no-displaced computation since the displaced
+    # aggregate is short-circuited (old_weight_sum=0 fails the > 0
+    # gate).
+    act_only_recent = compute_activation(
+        recent_ts=recent_ts,
+        recent_weights=recent_weights,
+        old_count=0,
+        old_weight_sum=0.0,
+        old_oldest_ts=None,
+        now=now,
+    )
+    assert act == act_only_recent

@@ -54,8 +54,8 @@ def _patch_provider(monkeypatch):
             }.get((section, key), default)
         return cfg
 
-    monkeypatch.setattr("saga.embeddings.get_provider", fake_get_provider)
-    monkeypatch.setattr("saga.config.get_config", fake_get_config)
+    monkeypatch.setattr("mimir.memory.embeddings.get_provider", fake_get_provider)
+    monkeypatch.setattr("mimir.memory._config_io.get_config", fake_get_config)
 
 
 @pytest.mark.asyncio
@@ -144,16 +144,6 @@ async def test_client_forget_dry_run(client, monkeypatch):
     result = await client.forget(dry_run=True)
     assert result["dry_run"] is True
     # Returns count + preview ids without writing.
-
-
-@pytest.mark.asyncio
-async def test_client_decay_is_noop(client, monkeypatch):
-    """No decay cron in the new design — returns a no-op shape for
-    compat with saga's call sites."""
-    _patch_provider(monkeypatch)
-    result = await client.decay()
-    assert "transitions" in result
-    assert result["transitions"]["faded"] == 0
 
 
 @pytest.mark.asyncio

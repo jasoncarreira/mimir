@@ -22,9 +22,21 @@ def _atom_label(atom: dict[str, Any]) -> str:
     return base
 
 
-#: Per-atom content cap when rendering hits — bumped 240→1200 (2026-05-14)
-#: after LongMemEval surfaced answers buried at chars 200-400 of haystack
-#: turn transcripts. See PR #166 for the full diagnostic.
+#: Per-atom content cap when rendering hits into the pre-message hook
+#: prompt block. Was 240 (tuned for short conversational atoms) — bumped
+#: to 1200 on 2026-05-14 after LongMemEval bench surfaced answers buried
+#: at chars 200-400 of multi-sentence turn transcripts (e.g. "I created a
+#: Spotify playlist called Summer Vibes" sits at char ~250 of a single
+#: user turn that opens with a different question). The old cap cut
+#: those off mid-answer; the agent saw "…called Summer Vib…" and replied
+#: "I don't have that information."
+#:
+#: Cost: top_k=12 × 1200 chars × ~3.5 chars/token ≈ 4k input tokens
+#: per pre-message hook fire. Was 1k under the 240 cap. The 3k delta is
+#: a rounding error against the 100k+ context windows in flight today.
+#:
+#: Override at construction time / future config-key if you need to
+#: tune per-deployment.
 _ATOM_CONTENT_CAP = 1200
 
 
@@ -162,10 +174,4 @@ def _hits_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
             item["evidence_count"] = ec
         out.append(item)
     return out
-
-
-# ────────────────────────────────────────────────────────────────────
-# Stubs for compatibility with code that hasn't been updated yet.
-# ────────────────────────────────────────────────────────────────────
-
 

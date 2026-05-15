@@ -31,10 +31,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import struct
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 from .mark_access import AccessEvent, mark_access
 from .recall import recall as _recall
@@ -43,7 +47,6 @@ from .reflect import (
     reflect as _reflect,
     recent_session_boundaries as _recent_boundaries,
 )
-from .consolidate import consolidate as _consolidate
 from .forget import forget as _forget
 from .fts import fts_search
 from .vector_index import VectorIndex
@@ -58,8 +61,8 @@ def _embed_text_sync(text: str) -> tuple[bytes, str, str, int]:
     Returns (vec_bytes, provider_name, model, dim). Sync because the
     provider call is itself sync (network I/O is hidden inside).
     """
-    from saga.embeddings import get_provider
-    from saga.config import get_config
+    from .embeddings import get_provider
+    from ._config_io import get_config
 
     cfg = get_config()
     provider = get_provider()
@@ -73,14 +76,24 @@ def _embed_text_sync(text: str) -> tuple[bytes, str, str, int]:
 
 
 def _query_embed_sync(text: str) -> list[float]:
-    """Adapt for recall.QueryEmbedFn — returns float list (not bytes)."""
-    from saga.embeddings import get_provider
-    from saga.config import get_config
+    """Adapt for recall.QueryEmbedFn — returns float list (not bytes).
 
-    cfg = get_config()
-    provider = get_provider()
-    return provider.embed(text[:cfg("embedding", "max_input_chars", 2000)],
-                          input_type="query")
+    Returns ``[]`` (which downstream callers treat as "no semantic
+    pathway") when the embedding provider can't be loaded — e.g. tests
+    without a configured provider, or operators without local ONNX
+    model files. Matches saga.core.hybrid_retrieve's behavior of
+    skipping the semantic pathway rather than crashing the turn.
+    """
+    try:
+        from .embeddings import get_provider
+        from ._config_io import get_config
+
+        cfg = get_config()
+        provider = get_provider()
+        return provider.embed(text[:cfg("embedding", "max_input_chars", 2000)],
+                              input_type="query")
+    except Exception:
+        return []
 
 
 def _make_faiss_search_fn(index: VectorIndex | None):
@@ -129,14 +142,39 @@ class MemoryClient:
     equivalent ``mimir.memory.*`` operation.
 
     Connection lifecycle: the client opens one connection per process
-    on first use, applies the schema if the file is fresh, and reuses
-    that connection. Caller can also pass an open connection via
-    ``conn=...`` for tests.
+    on first use, applies the schema if the file is fresh, applies any
+    pending migrations, and reuses that connection. Caller can also
+    pass an open connection via ``conn=...`` for tests.
 
     All public methods are async to match SagaClient. CPU-bound work
     runs via ``asyncio.to_thread`` so mimir's event loop stays
     responsive during synthesis / consolidation passes.
+
+    **Threading contract**: the shared sqlite3 connection is opened
+    with ``check_same_thread=False`` to support ``asyncio.to_thread``
+    dispatch from a single event loop. SQLite under WAL allows
+    concurrent reads but serializes writes at the file level —
+    Python's ``sqlite3`` module is not thread-safe by default, so
+    write call sites that may race (consolidate cron firing while a
+    turn is mid-store) must hold ``_write_lock``. Reads don't need
+    the lock — WAL handles snapshot isolation. Production callers
+    going through a single agent event loop already serialize through
+    the asyncio scheduler; the lock is the belt-and-suspenders for
+    cross-task / cross-coroutine writes.
     """
+
+    # Schema version that ``schema.sql`` produces. Bump every time the
+    # greenfield DDL changes and add the migration that transforms an
+    # older DB to match. ``_apply_pending_migrations`` walks
+    # ``MIGRATIONS`` and applies any version > the DB's current.
+    CURRENT_SCHEMA_VERSION: int = 1
+
+    # Registry of post-greenfield schema changes. Keys are version
+    # numbers (must be > 1, must be contiguous, must equal
+    # ``CURRENT_SCHEMA_VERSION`` at the latest entry); values are raw
+    # SQL scripts executed via ``conn.executescript``. Empty until the
+    # first post-1.0 schema change.
+    MIGRATIONS: dict[int, str] = {}
 
     def __init__(
         self,
@@ -171,6 +209,26 @@ class MemoryClient:
         # of synthesize.py) so MemoryClient doesn't transitively pull in
         # the saga LLM transport at construction time.
         self._observation_synth_fn = None
+        # Write-serialization across threads. We open the connection
+        # with ``check_same_thread=False`` so each public method can
+        # run under ``asyncio.to_thread``; SQLite under WAL serializes
+        # writes at the file level, but the Python ``sqlite3`` module
+        # isn't thread-safe by default. Wrap writes in this lock so
+        # concurrent stores / consolidate passes / mark_access calls
+        # can't interleave a transaction. Readers don't need the lock
+        # — WAL handles snapshot isolation for them.
+        import threading as _threading
+        self._write_lock = _threading.Lock()
+
+    async def _write_locked(self, fn):
+        """Run a write-path callable in a worker thread, serialized via
+        the connection write lock. Use for any method that mutates the
+        DB. Reads should call ``asyncio.to_thread(fn)`` directly — they
+        rely on WAL snapshot isolation and don't need serialization."""
+        def _locked():
+            with self._write_lock:
+                return fn()
+        return await asyncio.to_thread(_locked)
 
     def _ensure_conn(self) -> sqlite3.Connection:
         if self._conn is not None:
@@ -189,7 +247,66 @@ class MemoryClient:
             schema_path = Path(__file__).parent / "schema.sql"
             self._conn.executescript(schema_path.read_text())
             self._conn.commit()
+        # Migration story: record the schema version we know how to
+        # serve so future MemoryClient builds can detect when an
+        # existing DB needs migration. ``CURRENT_SCHEMA_VERSION``
+        # bumps with every shipped schema change; ``MIGRATIONS`` is
+        # the pending-migrations registry (empty until the first
+        # post-greenfield change). Idempotent — re-runs only insert
+        # if the row is missing.
+        self._apply_pending_migrations(self._conn, fresh=fresh)
         return self._conn
+
+    def _apply_pending_migrations(
+        self, conn: sqlite3.Connection, *, fresh: bool,
+    ) -> None:
+        """Apply any pending schema migrations and stamp the version row.
+
+        First run on a fresh DB stamps ``CURRENT_SCHEMA_VERSION`` after
+        the greenfield ``schema.sql`` script has run. Subsequent opens
+        on an existing DB check the table; if the current version is
+        older than ``CURRENT_SCHEMA_VERSION``, every missing migration
+        in ``MIGRATIONS`` is applied in order. Tolerates the
+        pre-migration era (DBs that were created before this table
+        was populated): treats them as version 1 and stamps if absent.
+        """
+        applied: set[int] = set()
+        try:
+            for (v,) in conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchall():
+                applied.add(int(v))
+        except sqlite3.OperationalError:
+            # schema.sql guarantees the table exists, but a pre-1.0
+            # DB might be missing it. Create it lazily then stamp.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+
+        target = self.CURRENT_SCHEMA_VERSION
+        if not applied:
+            # Fresh DB or pre-migration era — stamp the current version.
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at) "
+                "VALUES (?, ?)",
+                (target, datetime.now(tz=timezone.utc).isoformat()),
+            )
+            conn.commit()
+            return
+
+        for version, ddl in sorted(self.MIGRATIONS.items()):
+            if version <= max(applied):
+                continue
+            if version > target:
+                break
+            conn.executescript(ddl)
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) "
+                "VALUES (?, ?)",
+                (version, datetime.now(tz=timezone.utc).isoformat()),
+            )
+        conn.commit()
 
     def _ensure_index(self, conn: sqlite3.Connection) -> VectorIndex | None:
         """Lazily build the FAISS index on first retrieval. After build,
@@ -228,15 +345,22 @@ class MemoryClient:
         context: list[dict[str, str]] | None = None,
         reference_date=None,
         enable_contextual_rewrite: bool = False,
+        pre_rewritten_query: str | None = None,
     ) -> dict[str, Any]:
-        # Opt-in contextual rewrite (saga's P-feature, off in bench).
-        # We only call the LLM when both the flag and a non-empty
-        # context are present — empty context is a no-op so the cost
-        # never pays for nothing. The rewritten form replaces the
-        # original for retrieval; the response includes both so the
-        # caller (turn viewer / metrics) can see what was done.
-        rewritten_query: str | None = None
-        if enable_contextual_rewrite and context:
+        # Two paths into the rewrite:
+        # 1. Caller pre-resolved the rewrite via ``contextual_rewrite()``
+        #    and passes ``pre_rewritten_query`` — we skip the inline
+        #    LLM call. This is the parallelization seam: the agent
+        #    runs ``contextual_rewrite`` once, then fans out
+        #    ``query(pre_rewritten_query=...)`` and the file_search
+        #    autopass against the same expanded query via
+        #    ``asyncio.gather`` (chainlink-spec #142, PR 166 followup).
+        # 2. Inline: caller passes ``enable_contextual_rewrite=True``
+        #    + ``context``, we call the LLM here. Preserves the
+        #    single-call ergonomics for callers that don't need
+        #    parallelism.
+        rewritten_query: str | None = pre_rewritten_query
+        if rewritten_query is None and enable_contextual_rewrite and context:
             from .query_rewrite import rewrite_query
             try:
                 rewritten_query = await rewrite_query(query, context)
@@ -252,9 +376,15 @@ class MemoryClient:
             # same provider). Pass dim through so triples with a stale
             # dim get filtered.
             triple_dim = self._embedding_dim
+            # Compute the query embedding ONCE per query() call —
+            # both _recall and top_triples_with_payload need it, and
+            # the underlying provider call (~50-300ms on voyage) is
+            # the heaviest non-LLM step. Cache it locally and feed
+            # both consumers from the same value.
+            query_emb = _query_embed_sync(effective_query)
             result = _recall(
                 conn, effective_query,
-                query_embed_fn=_query_embed_sync,
+                query_embed_fn=lambda _q: query_emb,
                 faiss_search_fn=_make_faiss_search_fn(index),
                 fts_search_fn=_make_fts_search_fn(
                     conn, agent_id=self._agent_id,
@@ -279,7 +409,7 @@ class MemoryClient:
             if self._include_triples_in_response:
                 from .triples import top_triples_with_payload
                 rich = top_triples_with_payload(
-                    conn, _query_embed_sync(effective_query),
+                    conn, query_emb,
                     top_n=self._triples_top_n, dim=triple_dim,
                 )
                 # Strip the internal _cosine field from the wire shape;
@@ -304,6 +434,38 @@ class MemoryClient:
                 ),
             }
         return await asyncio.to_thread(_do)
+
+    async def contextual_rewrite(
+        self,
+        query: str,
+        context: list[dict[str, str]] | None,
+    ) -> str | None:
+        """Pre-resolve saga's contextual rewrite as a standalone step.
+
+        Returns the rewritten query string when the rewrite ran and
+        actually changed the input. Returns ``None`` when:
+          - context is empty / None
+          - the rewrite LLM call failed / returned empty
+          - the LLM returned the input unchanged (no-op)
+
+        Exposes the rewrite as a separate API so callers that have
+        multiple retrieval surfaces (saga atoms + file_search) can
+        run them in parallel against the same expanded query via
+        ``asyncio.gather`` — see chainlink-spec #142 (PR 166 followup).
+        Pass the returned string back into ``query(pre_rewritten_query=...)``
+        to skip the inline rewrite there.
+
+        No-op cost when context is None — does not hit the LLM."""
+        if not context:
+            return None
+        try:
+            from .query_rewrite import rewrite_query
+            rewritten = await rewrite_query(query, context)
+        except Exception:
+            return None
+        if not rewritten or rewritten == query:
+            return None
+        return rewritten
 
     async def store(
         self, content: str, *, stream: str | None = None,
@@ -346,7 +508,7 @@ class MemoryClient:
                 "stored": False, "atom_id": result.atom_id,
                 "reason": result.reason or "duplicate",
             }
-        return await asyncio.to_thread(_do)
+        return await self._write_locked(_do)
 
     async def feedback(
         self, atom_ids: list[str], response_text: str, *,
@@ -363,7 +525,7 @@ class MemoryClient:
             conn = self._ensure_conn()
             n = _feedback(conn, atom_ids, signal=signal, session_id=session_id)
             return {"marked": n, "total": len(atom_ids)}
-        return await asyncio.to_thread(_do)
+        return await self._write_locked(_do)
 
     async def outcome(
         self, atom_ids: list[str], feedback: str, *,
@@ -406,7 +568,7 @@ class MemoryClient:
                     conn.rollback()
                     raise
                 return {"marked": n, "total": len(atom_ids), "signal": "negative"}
-            return await asyncio.to_thread(_do)
+            return await self._write_locked(_do)
         return {"marked": 0, "total": len(atom_ids), "signal": signal or "noop"}
 
     async def end_session(
@@ -460,7 +622,7 @@ class MemoryClient:
                 "boundary_created": result.boundary_created,
                 "session_member_count": result.session_member_count,
             }
-        return await asyncio.to_thread(_do)
+        return await self._write_locked(_do)
 
     async def consolidate(
         self, *, dry_run: bool = False, max_clusters: int | None = None,
@@ -529,7 +691,15 @@ class MemoryClient:
         # Reuses saga's call_llm transport (anthropic/openai_compat
         # plumbing already lives there).
         max_obs = max_clusters or MAX_OBSERVATIONS_PER_RUN
-        eligible = [c for c in clusters if len(c) >= min_cluster_size][:max_obs]
+        eligible_unbounded = [c for c in clusters if len(c) >= min_cluster_size]
+        eligible = eligible_unbounded[:max_obs]
+        if len(eligible_unbounded) > max_obs:
+            log.info(
+                "consolidate: max_clusters cap (%d) bound — %d cluster(s) "
+                "skipped this run; rerun with a higher max_clusters to "
+                "catch the remainder.",
+                max_obs, len(eligible_unbounded) - max_obs,
+            )
         sem = asyncio.Semaphore(4)
 
         # P47 / P48: build vocab_block once per run, prior_block per
@@ -729,8 +899,10 @@ class MemoryClient:
             return (emitted, superseded, triples_stored,
                     contradicts_stored, new_supersedes_from_contra)
 
+        # _restructure mutates atoms/observations/triples — write lock
+        # serializes it against any concurrent agent-loop store / feedback.
         emitted, superseded, n_triples, n_contra, n_supersedes_contra = (
-            await asyncio.to_thread(_restructure)
+            await self._write_locked(_restructure)
         )
         return {
             "candidates_scanned": len(raws),
@@ -743,12 +915,6 @@ class MemoryClient:
             "contradicts_stored": n_contra,
             "supersedes_from_contradictions": n_supersedes_contra,
         }
-
-    async def decay(self) -> dict[str, Any]:
-        # No decay cron in the new design — activation is computed
-        # on-demand, no state to transition. Return a no-op shape
-        # that matches saga's response so call sites don't break.
-        return {"transitions": {"faded": 0, "dormanted": 0}}
 
     async def forget(
         self, *,
@@ -774,7 +940,7 @@ class MemoryClient:
                 "preview_ids": result.tombstoned_ids if dry_run else [],
                 "dry_run": dry_run,
             }
-        return await asyncio.to_thread(_do)
+        return await self._write_locked(_do)
 
     async def recent_session_boundaries(
         self, *, channel_id: str | None = None, count: int = 3,
@@ -887,7 +1053,7 @@ class MemoryClient:
                 conn, retrieved_atoms, response_text,
                 session_id=session_id, threshold=thr,
             )
-        result = await asyncio.to_thread(_do)
+        result = await self._write_locked(_do)
         return {
             "contributed_count": len(result.contributed_atom_ids),
             "total": len(retrieved_atoms),
@@ -901,15 +1067,20 @@ class MemoryClient:
             conn = self._ensure_conn()
             conn.execute("SELECT 1 FROM atoms LIMIT 1")
             return True
-        except Exception:
+        except Exception as exc:
+            log.warning("MemoryClient.health check failed: %s", exc)
             return False
 
     async def close(self) -> None:
         if self._conn is not None:
             try:
                 self._conn.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                # Leaked file descriptor is worth knowing about even
+                # though we don't propagate the error (close() is
+                # called from shutdown / cleanup paths that shouldn't
+                # block on a misbehaving connection).
+                log.warning("MemoryClient.close failed: %s", exc)
             self._conn = None
 
 
