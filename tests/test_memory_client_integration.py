@@ -40,7 +40,7 @@ class _StubProvider:
 
 def _patch_provider(monkeypatch):
     monkeypatch.setattr(
-        "saga.embeddings.get_provider", lambda: _StubProvider(),
+        "mimir.memory.embeddings.get_provider", lambda: _StubProvider(),
     )
 
     def fake_get_config():
@@ -52,7 +52,7 @@ def _patch_provider(monkeypatch):
             }.get((section, key), default)
         return cfg
 
-    monkeypatch.setattr("saga.config.get_config", fake_get_config)
+    monkeypatch.setattr("mimir.memory._config_io.get_config", fake_get_config)
 
 
 @pytest.fixture

@@ -73,10 +73,10 @@ def _make_synthetic_question() -> dict:
 @pytest.mark.asyncio
 async def test_runner_completes_one_question(tmp_path, monkeypatch):
     # Stub embedding provider so we don't touch voyage / openai.
-    import saga.embeddings
-    monkeypatch.setattr(saga.embeddings, "get_provider", _stub_provider)
-    # saga.config.get_config is queried for embedding max_input_chars.
-    import saga.config
+    import mimir.memory.embeddings as _mm_embeddings
+    monkeypatch.setattr(_mm_embeddings, "get_provider", _stub_provider)
+    # mimir.memory._config_io.get_config is queried for embedding max_input_chars.
+    import mimir.memory._config_io as _mm_config
 
     def _fake_get_config():
         def cfg(section, key, default=None):
@@ -87,7 +87,7 @@ async def test_runner_completes_one_question(tmp_path, monkeypatch):
             }.get((section, key), default)
         return cfg
 
-    monkeypatch.setattr(saga.config, "get_config", _fake_get_config)
+    monkeypatch.setattr(_mm_config, "get_config", _fake_get_config)
 
     # Stub the reader — replace harness.read with a deterministic mock.
     import saga.benchmarks.longmemeval.harness as _h
@@ -107,11 +107,11 @@ async def test_runner_completes_one_question(tmp_path, monkeypatch):
     monkeypatch.setattr(_h, "read", _fake_read)
 
     # Stub the consolidate LLM call — synthesize.make_async_observation_synth_fn
-    # uses saga._llm.call_llm; replace with a deterministic stub.
-    import saga._llm
+    # uses mimir.memory._llm.call_llm; replace with a deterministic stub.
+    import mimir.memory._llm as _mm_llm
     async def _fake_call_llm(*args, **kwargs):
         return "OBSERVATION:\nAlice consistently prefers concise replies."
-    monkeypatch.setattr(saga._llm, "call_llm", _fake_call_llm)
+    monkeypatch.setattr(_mm_llm, "call_llm", _fake_call_llm)
 
     from mimir.memory.client import MemoryClient
     from benchmarks.longmemeval_via_memory import runner as r
@@ -147,9 +147,9 @@ async def test_runner_no_consolidate_path(tmp_path, monkeypatch):
     """The --no-consolidate path should skip the LLM call entirely.
     Verify the consolidate seconds is ~0 and no observations get
     created."""
-    import saga.embeddings
-    monkeypatch.setattr(saga.embeddings, "get_provider", _stub_provider)
-    import saga.config
+    import mimir.memory.embeddings as _mm_embeddings
+    monkeypatch.setattr(_mm_embeddings, "get_provider", _stub_provider)
+    import mimir.memory._config_io as _mm_config
     def _fake_cfg():
         def cfg(section, key, default=None):
             return {
@@ -158,7 +158,7 @@ async def test_runner_no_consolidate_path(tmp_path, monkeypatch):
                 ("embedding", "model"): "stub-4d",
             }.get((section, key), default)
         return cfg
-    monkeypatch.setattr(saga.config, "get_config", _fake_cfg)
+    monkeypatch.setattr(_mm_config, "get_config", _fake_cfg)
 
     import saga.benchmarks.longmemeval.harness as _h
     monkeypatch.setattr(_h, "read", lambda *a, **k: {
