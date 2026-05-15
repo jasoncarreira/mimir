@@ -21,6 +21,7 @@ from langchain_core.messages import HumanMessage
 
 from mimir.memory.client import MemoryClient
 from .memory_tool import memory_query, set_memory_client
+from .store_tool import memory_store
 
 
 def resolve_model(spec: str | BaseChatModel) -> str | BaseChatModel:
@@ -129,6 +130,6 @@ def make_agent(
         system_prompt = system_prompt + "\n\n" + extra_system
     return create_deep_agent(
         model=resolve_model(model),
-        tools=[memory_query],
+        tools=[memory_query, memory_store],
         system_prompt=system_prompt,
     )
