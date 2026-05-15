@@ -16,6 +16,8 @@ dependencies = [
     # v0.5 §2: saga is the in-process memory backend. Workspace member;
     # editable-installed via [tool.uv.sources] below.
     "saga",
+    "deepagents>=0.6.1",
+    "langchain-openai>=1.2.1",
 ]
 
 [project.optional-dependencies]
