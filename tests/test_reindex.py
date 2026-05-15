@@ -101,8 +101,8 @@ class _StubProvider:
 def patch_provider(monkeypatch):
     """Inject a stub provider with a chosen dimension."""
     def _install(dim: int, provider_name: str = "openai"):
-        import saga.embeddings as saga_emb
-        import saga.config as saga_cfg
+        import mimir.memory.embeddings as saga_emb
+        import mimir.memory._config_io as saga_cfg
         stub = _StubProvider(dim)
         monkeypatch.setattr(saga_emb, "get_provider", lambda: stub)
         # Also patch the config read for provider name
@@ -132,11 +132,12 @@ def test_atoms_delegates_to_saga_calibration_dry_run(tmp_path, patch_provider, m
     column + FAISS dirty flag.
     """
     patch_provider(dim=1024, provider_name="voyage")
-    import saga.calibration
+    import mimir.memory.calibration as _mm_cal
 
     captured: dict = {}
 
-    def fake_re_embed(target_provider_name, batch_size=50, dry_run=False):
+    def fake_re_embed(db_path, *, target_provider_name, batch_size=50, dry_run=False):
+        captured["db_path"] = db_path
         captured["provider"] = target_provider_name
         captured["batch_size"] = batch_size
         captured["dry_run"] = dry_run
@@ -148,10 +149,13 @@ def test_atoms_delegates_to_saga_calibration_dry_run(tmp_path, patch_provider, m
             "index_rebuild_needed": True,
         }
 
-    monkeypatch.setattr(saga.calibration, "re_embed", fake_re_embed)
+    monkeypatch.setattr(_mm_cal, "re_embed", fake_re_embed)
 
     report = reindex_saga_atoms(tmp_path / "saga.db", dry_run=True)
-    assert captured == {"provider": "voyage", "batch_size": 50, "dry_run": True}
+    assert captured["provider"] == "voyage"
+    assert captured["batch_size"] == 50
+    assert captured["dry_run"] is True
+    assert captured["db_path"] == tmp_path / "saga.db"
     assert report.total_rows == 10
     assert report.needs_reindex == 10
     assert report.reindexed == 0
@@ -160,12 +164,12 @@ def test_atoms_delegates_to_saga_calibration_dry_run(tmp_path, patch_provider, m
 
 
 def test_atoms_delegates_to_saga_calibration_apply(tmp_path, patch_provider, monkeypatch):
-    """In apply mode, saga.calibration.re_embed returns atoms_updated
+    """In apply mode, mimir.memory.calibration.re_embed returns atoms_updated
     > 0 and mimir's reindex maps that to ``reindexed`` in the report."""
     patch_provider(dim=1024, provider_name="voyage")
-    import saga.calibration
+    import mimir.memory.calibration as _mm_cal
 
-    def fake_re_embed(target_provider_name, batch_size=50, dry_run=False):
+    def fake_re_embed(db_path, *, target_provider_name, batch_size=50, dry_run=False):
         return {
             "target_provider": target_provider_name,
             "atoms_total": 7,
@@ -174,7 +178,7 @@ def test_atoms_delegates_to_saga_calibration_apply(tmp_path, patch_provider, mon
             "index_rebuild_needed": True,
         }
 
-    monkeypatch.setattr(saga.calibration, "re_embed", fake_re_embed)
+    monkeypatch.setattr(_mm_cal, "re_embed", fake_re_embed)
 
     report = reindex_saga_atoms(tmp_path / "saga.db", dry_run=False)
     assert report.total_rows == 7
@@ -183,16 +187,16 @@ def test_atoms_delegates_to_saga_calibration_apply(tmp_path, patch_provider, mon
 
 
 def test_atoms_handles_saga_calibration_exception(tmp_path, patch_provider, monkeypatch):
-    """If saga.calibration.re_embed raises, mimir's reindex counts a
+    """If mimir.memory.calibration.re_embed raises, mimir's reindex counts a
     failure rather than crashing — operator sees the error in the
     report instead of an uncaught traceback."""
     patch_provider(dim=1024)
-    import saga.calibration
+    import mimir.memory.calibration as _mm_cal
 
     def fake_re_embed(**kwargs):
         raise RuntimeError("simulated saga failure")
 
-    monkeypatch.setattr(saga.calibration, "re_embed", fake_re_embed)
+    monkeypatch.setattr(_mm_cal, "re_embed", fake_re_embed)
 
     report = reindex_saga_atoms(tmp_path / "saga.db", dry_run=False)
     assert report.failed == 1
