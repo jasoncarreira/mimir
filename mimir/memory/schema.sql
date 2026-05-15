@@ -291,6 +291,12 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- ──────────────────────────────────────────────────────────────────
 -- Schema version
 -- ──────────────────────────────────────────────────────────────────
+-- One row per applied migration. ``MemoryClient._ensure_conn`` writes
+-- version 1 on fresh-DB init via ``INSERT OR IGNORE``. Future schema
+-- changes should ship as ``mimir/memory/migrations/NNN_*.sql`` plus a
+-- ``MIGRATIONS = {N: "..."}`` registry entry in ``client.py``; the
+-- conn-init code applies any pending migrations whose version isn't
+-- yet in this table.
 
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY,

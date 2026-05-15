@@ -144,8 +144,8 @@ async def rewrite_query(
     if not rendered:
         return query
 
-    from saga._llm import call_llm
-    from saga.config import resolve_llm_config
+    from ._llm import call_llm
+    from ._config_io import resolve_llm_config
 
     cfg = llm_config or resolve_llm_config("retrieval_v2")
     prompt = REWRITE_PROMPT.format(context=rendered, question=query)

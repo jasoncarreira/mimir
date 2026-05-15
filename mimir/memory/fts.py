@@ -31,6 +31,7 @@ the cosine-similarity-driven scoring in recall.py.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 
 
@@ -82,7 +83,15 @@ def expand_query_for_keyword(
     for word, syns in synonyms.items():
         if not isinstance(word, str) or not isinstance(syns, list):
             continue
-        if word.lower() in q_lower:
+        # Match on word boundaries. Pre-fix, substring matching meant
+        # ``school`` in ``preschool`` triggered the college/university
+        # expansion, polluting recall on pre-K queries with K-12+
+        # synonyms. ``\bword\b`` requires a non-word char on each
+        # side so ``preschool`` no longer matches ``school`` but
+        # ``schools`` still does (boundary at the start, plural is
+        # the same root). Case-insensitive flag matches the
+        # ``.lower()`` we were doing before.
+        if re.search(rf"\b{re.escape(word)}\b", q_lower):
             extras.extend(s for s in syns if isinstance(s, str))
     if not extras:
         return query

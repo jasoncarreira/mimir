@@ -1,4 +1,20 @@
-"""Periodic cross-session consolidation.
+"""Periodic cross-session consolidation — TIER-2 internal helper.
+
+Production callers should use ``MemoryClient.consolidate`` (in
+client.py), which is the canonical async entry point. It handles:
+- concurrent LLM fan-out via a semaphore
+- rich synthesis (triples + contradictions + P47 prior_block + P48
+  vocab_block) via ``make_async_rich_synth_fn``
+- correct routing of outputs (observations / triples / supersedes)
+  through the per-cluster restructure pass
+
+This module's standalone ``consolidate()`` is the **tier-2** path —
+observation-only synthesis, sync orchestration, no triples / no rich
+prompt. It's retained for the ``test_memory_tier2b.py`` regression
+suite and for any future caller that genuinely wants only the
+observation tier. **Not exported** from the package's public
+``__init__`` for that reason: ``from mimir.memory import consolidate``
+would silently get the simpler path and miss tier-3 features.
 
 Complement to reflect():
 

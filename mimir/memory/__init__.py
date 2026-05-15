@@ -33,7 +33,13 @@ from .mark_access import mark_access, AccessEvent
 from .reflect import (
     reflect, recent_session_boundaries, ReflectResult,
 )
-from .consolidate import consolidate, ConsolidateResult
+from .consolidate import ConsolidateResult
+# Note: ``consolidate.consolidate()`` is intentionally NOT re-exported.
+# Production callers should use ``MemoryClient.consolidate()`` for the
+# tier-3 (triples + contradictions + P47/P48) path. The standalone
+# ``consolidate()`` is the tier-2 helper kept for the
+# test_memory_tier2b regression suite; tests that need it import via
+# ``from mimir.memory.consolidate import consolidate`` directly.
 from .forget import forget, forget_by_criteria, ForgetResult
 
 # Observation utilities
@@ -139,7 +145,7 @@ __all__ = [
     "mark_access", "AccessEvent",
     "feedback",
     "reflect", "recent_session_boundaries", "ReflectResult",
-    "consolidate", "ConsolidateResult",
+    "ConsolidateResult",
     "forget", "forget_by_criteria", "ForgetResult",
     # Observation utilities
     "classify_trend", "refresh_trend", "TrendResult",
