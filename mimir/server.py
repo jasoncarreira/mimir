@@ -255,6 +255,7 @@ def build_app(config: Config) -> web.Application:
     saga_client = make_saga_client(
         endpoint=config.saga_endpoint,
         api_key=config.saga_api_key or None,
+        db_path=config.home / ".mimir" / "memory.db",
     )
     sessions = SessionManager(idle_minutes=config.saga_session_idle_minutes)
     inbox = SubagentInbox()
