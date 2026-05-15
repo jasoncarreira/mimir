@@ -175,6 +175,7 @@ def build_turn_prompt(
     *,
     recent_messages: Iterable[Message] | None = None,
     saga_block: str | None = None,
+    file_block: str | None = None,
     subagent_block: str | None = None,
     recent_message_chars: int = 0,
     resolver: object | None = None,
@@ -285,6 +286,15 @@ def build_turn_prompt(
 
     if saga_block:
         _add_labeled("Possibly relevant memories (from SAGA)", saga_block)
+
+    # chainlink #139 (Sub A of #138): auto-pass file_search hits.
+    # Rendered as a sibling to the SAGA atoms block — the agent reads
+    # the two retrieval surfaces side-by-side and can cite either
+    # without an extra tool call. The producer (`Agent._run_file_search_autopass`)
+    # gates on flag + event-kind + min-length + non-empty results, so
+    # a non-None value here always carries useful content.
+    if file_block:
+        _add_labeled("Possibly relevant files", file_block)
 
     if subagent_block:
         _add_labeled("Subagent updates", subagent_block)
