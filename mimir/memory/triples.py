@@ -85,9 +85,15 @@ def _triple_text(subject: str, predicate: str, obj: str) -> str:
 
 # (subject, predicate, object[, valid_from=..., valid_until=...])
 # Captures three required slots and an optional trailing kv tail.
-# Permissive on whitespace around commas; strict on the parenthesis pair.
+# Each slot accepts EITHER ``"..."``/``'...'`` (quoted — commas
+# allowed inside) OR a bare token (no commas, no parens). The
+# quoted form unblocks the case where the LLM emits
+# ``(Alice, born_in, "Cambridge, MA")`` — pre-fix, the bare-token
+# branch's ``[^,()]+`` rejected the embedded comma and dropped the
+# whole triple silently.
+_SLOT = r'(?:"[^"]*"|\'[^\']*\'|[^,()]+)'
 _TRIPLE_LINE = re.compile(
-    r"\(([^,()]+),\s*([^,()]+),\s*([^,()]+?)(?:,([^()]+))?\)",
+    rf"\(({_SLOT}),\s*({_SLOT}),\s*({_SLOT}?)(?:,([^()]+))?\)",
 )
 
 # Predicate normalization: lowercase, anything not [a-z0-9_] becomes "_".

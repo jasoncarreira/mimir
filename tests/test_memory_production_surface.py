@@ -138,7 +138,7 @@ def _patch_provider(monkeypatch, *, dim=4):
             return [1.0, 0.0, 0.0, 0.0]
         def dimensions(self):
             return 4
-    monkeypatch.setattr("saga.embeddings.get_provider", lambda: _StubProvider())
+    monkeypatch.setattr("mimir.memory.embeddings.get_provider", lambda: _StubProvider())
     def fake_get_config():
         def cfg(section, key, default=None):
             return {
@@ -147,7 +147,7 @@ def _patch_provider(monkeypatch, *, dim=4):
                 ("embedding", "model"): "stub-4d",
             }.get((section, key), default)
         return cfg
-    monkeypatch.setattr("saga.config.get_config", fake_get_config)
+    monkeypatch.setattr("mimir.memory._config_io.get_config", fake_get_config)
 
 
 @pytest.mark.asyncio
@@ -252,9 +252,9 @@ async def test_min_confidence_tier_filter_drops_weak_atoms(monkeypatch, tmp_path
             return [0.0, 1.0, 0.0, 0.0]   # orthogonal → cosine 0.0
         def dimensions(self):
             return 4
-    monkeypatch.setattr("saga.embeddings.get_provider", lambda: _ContentProvider())
+    monkeypatch.setattr("mimir.memory.embeddings.get_provider", lambda: _ContentProvider())
     monkeypatch.setattr(
-        "saga.config.get_config",
+        "mimir.memory._config_io.get_config",
         lambda: lambda section, key, default=None: {
             ("embedding", "max_input_chars"): 2000,
             ("embedding", "provider"): "stub",
