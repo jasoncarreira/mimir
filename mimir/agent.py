@@ -314,7 +314,7 @@ class _PoolEntry:
         self.cell = _TurnCell()
 
 
-from saga.async_pool import BoundedAsyncPool
+from .memory.async_pool import BoundedAsyncPool
 
 
 class ClientPool(BoundedAsyncPool[_PoolEntry]):

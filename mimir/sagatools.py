@@ -58,6 +58,24 @@ def _atom_label(atom: dict[str, Any]) -> str:
     return base
 
 
+#: Per-atom content cap when rendering hits into the pre-message hook
+#: prompt block. Was 240 (tuned for short conversational atoms) — bumped
+#: to 1200 on 2026-05-14 after LongMemEval bench surfaced answers buried
+#: at chars 200-400 of multi-sentence turn transcripts (e.g. "I created a
+#: Spotify playlist called Summer Vibes" sits at char ~250 of a single
+#: user turn that opens with a different question). The old cap cut
+#: those off mid-answer; the agent saw "…called Summer Vib…" and replied
+#: "I don't have that information."
+#:
+#: Cost: top_k=12 × 1200 chars × ~3.5 chars/token ≈ 4k input tokens
+#: per pre-message hook fire. Was 1k under the 240 cap. The 3k delta is
+#: a rounding error against the 100k+ context windows in flight today.
+#:
+#: Override at construction time / future config-key if you need to
+#: tune per-deployment.
+_ATOM_CONTENT_CAP = 1200
+
+
 def _format_atoms(hits: list[dict[str, Any]]) -> str:
     """Render SAGA hits as a brief bullet list — tag + content, no IDs.
     Used by the pre-message hook (SPEC §9.3) and the saga_query tool result."""
@@ -68,8 +86,8 @@ def _format_atoms(hits: list[dict[str, Any]]) -> str:
         label = _atom_label(h)
         score = h.get("score") or h.get("similarity")
         content = (h.get("content") or "").strip().replace("\n", " ")
-        if len(content) > 240:
-            content = content[:240] + "…"
+        if len(content) > _ATOM_CONTENT_CAP:
+            content = content[:_ATOM_CONTENT_CAP] + "…"
         score_str = f" ({score:.3f})" if isinstance(score, (int, float)) else ""
         lines.append(f"- [{label}{score_str}] {content}")
     return "\n".join(lines)
