@@ -84,7 +84,7 @@ from .sagatools import (
 )
 from .prompts import build_system_prompt, build_turn_prompt
 from .scheduler import Scheduler
-from .search import Indexer
+from .search import Indexer, SearchResult
 from ._jsonl_tail import tail_jsonl_records
 from .jsonl_snapshot import JsonlSnapshot
 from .session_manager import SessionManager
@@ -116,6 +116,29 @@ log = logging.getLogger(__name__)
 
 def _utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _format_file_search_autopass(results: list[SearchResult]) -> str:
+    """Render Indexer search hits as a SAGA-atoms-style block.
+
+    Format mirrors ``_format_atoms`` (mimir/sagatools.py): one bullet
+    per hit, ``[<label> (score)] <preview>``. The label here is
+    ``<path>:#<chunk_index>`` rather than ``<memory_type/tier>`` so the
+    agent can read which file (and roughly where within it) the snippet
+    came from. Snippet preview is capped at 240 chars and single-line —
+    same shape as SAGA atoms so the two blocks read uniformly.
+    """
+    if not results:
+        return "(no files)"
+    lines: list[str] = []
+    for r in results:
+        snippet = (r.snippet or "").strip().replace("\n", " ")
+        if len(snippet) > 240:
+            snippet = snippet[:240] + "…"
+        lines.append(
+            f"- [{r.path}:#{r.chunk_index} ({r.score:.3f})] {snippet}"
+        )
+    return "\n".join(lines)
 
 
 def _filter_session_turns(
@@ -1826,6 +1849,68 @@ class Agent:
                 seen.add(aid)
         return _format_saga_payload(payload)
 
+    async def _run_file_search_autopass(
+        self, ctx: TurnContext, event: AgentEvent,
+    ) -> str | None:
+        """chainlink #139 (Sub A of #138): auto-run file_search against
+        the inbound user message text and return a rendered prompt block
+        for slotting next to the SAGA atoms block.
+
+        Returns ``None`` (no block in the prompt) when:
+        - ``config.file_search_autopass_enabled`` is False (the default —
+          load-bearing for Sub B's A/B harness; the flag MUST be the
+          binary on/off knob and produce no prompt mutation when off).
+        - the indexer isn't wired (tests / minimal Agent constructions).
+        - the event isn't a user_message (scheduled_tick / shell_job_complete /
+          react_received / system events). Scheduled-tick autopass is
+          intentionally deferred per Sub A spec — synthesizing a useful
+          query from the heartbeat backlog is a heuristic problem worth
+          its own decision; for now ticks just skip cleanly.
+        - the inbound text is shorter than ``min_chars``. Short acks
+          ("ok", "ty", "👍") don't carry retrieval signal and produce
+          noisy chunks ranked mostly by recency.
+        - the indexer returned zero results (e.g. fresh deployment with
+          an empty index, or queries that genuinely have no match in
+          memory/ or state/).
+
+        Otherwise returns a string in the SAGA-atoms-block style:
+
+            - [<path>:#<chunk_index> (score)] <snippet preview>
+            - [<path>:#<chunk_index> (score)] <snippet preview>
+            ...
+
+        ``chunk_index`` is the SQLite chunks table position (effectively
+        a coarse byte offset within the file). The Indexer's SearchResult
+        doesn't carry section headings — when Sub C swaps to a chunker
+        that emits section headings, the render here can adopt them
+        without a signature change.
+        """
+        if not self._config.file_search_autopass_enabled:
+            return None
+        if self._indexer is None:
+            return None
+        if event.trigger != "user_message":
+            return None
+        text = (event.content or "").strip()
+        if len(text) < self._config.file_search_autopass_min_chars:
+            return None
+        try:
+            results = await self._indexer.search(
+                text,
+                scope="all",
+                k=self._config.file_search_autopass_k,
+            )
+        except Exception as exc:  # noqa: BLE001 — never let retrieval crash a turn
+            await log_event(
+                "file_search_autopass_error",
+                turn_id=ctx.turn_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return None
+        if not results:
+            return None
+        return _format_file_search_autopass(results)
+
     # VSM: S3 — post-turn credit pass; saga's retrieval ranking learns
     #          which atoms helped (access_log.contributed boost).
     # loop_id: 1.1
@@ -2006,6 +2091,7 @@ class Agent:
         event: AgentEvent,
         saga_block: str | None,
         subagent_block: str | None,
+        file_block: str | None = None,
     ) -> tuple[str, list]:
         """Assemble the per-turn user-side prompt + the recent-message
         list. Synthesis turns get a dedicated synthesis prompt; everything
@@ -2057,6 +2143,7 @@ class Agent:
             event,
             recent_messages=recent,
             saga_block=saga_block,
+            file_block=file_block,
             subagent_block=subagent_block,
             recent_message_chars=self._config.recent_message_chars,
             resolver=self._buffer.resolver,
@@ -2334,6 +2421,12 @@ class Agent:
         # block to slot into the turn prompt — and drain any background-
         # subagent notifications (SPEC §4.4).
         saga_block = await self._pre_message_hook(ctx, event)
+        # chainlink #139 (Sub A of #138): sibling autopass against the
+        # file_search backend. Produces a "Possibly relevant files"
+        # block when the feature flag is on AND the event is a
+        # user_message of nontrivial length; None otherwise. The
+        # prompt builder no-ops on None (matches saga_block pattern).
+        file_block = await self._run_file_search_autopass(ctx, event)
         pending_subagents = await self._inbox.drain(event.channel_id)
         subagent_block = (
             render_subagent_updates(pending_subagents)
@@ -2341,7 +2434,7 @@ class Agent:
         )
 
         turn_prompt, recent = await self._build_turn_prompt(
-            ctx, event, saga_block, subagent_block,
+            ctx, event, saga_block, subagent_block, file_block,
         )
         system_prompt, core_block_count = self._build_system_prompt()
 
