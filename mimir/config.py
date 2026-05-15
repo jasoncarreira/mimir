@@ -172,6 +172,26 @@ class Config:
     # unset and got dropped at any floor ≥ low.
     saga_pre_message_min_tier: str
 
+    # chainlink #139 (Sub A of #138): auto-run file_search against the
+    # inbound message text and inject the top-K hits as a sibling block
+    # to ``Possibly relevant memories (from SAGA)``. Default OFF —
+    # Sub B's A/B harness flips this on; flipping the default to ON
+    # is a separate decision after that data lands.
+    # - ``file_search_autopass_enabled``: master flag. Load-bearing for
+    #   Sub B's harness — must produce a literal None for the file_block
+    #   (no empty section in the prompt) when False.
+    # - ``file_search_autopass_k``: top-K results to render. Mirrors
+    #   the file_search MCP tool's default and the SAGA pre-message
+    #   hook's top_k=12 in spirit — small enough to keep the block
+    #   under ~800 tokens.
+    # - ``file_search_autopass_min_chars``: skip-gate on inbound text
+    #   length. Short acks ("ok", "ty", "👍") don't carry retrieval
+    #   signal; running the indexer on them wastes embedding budget
+    #   and produces noisy hits.
+    file_search_autopass_enabled: bool
+    file_search_autopass_k: int
+    file_search_autopass_min_chars: int
+
     # send_message circuit breaker (§7.2.4)
     send_loop_soft_limit: int
     send_loop_hard_limit: int
@@ -431,6 +451,16 @@ class Config:
                 "MIMIR_INTROSPECTION_EMIT_ALGEDONIC", True,
             ),
             saga_pre_message_min_tier=_env("MIMIR_SAGA_PRE_MSG_MIN_TIER", ""),
+
+            file_search_autopass_enabled=_env_bool(
+                "MIMIR_FILE_SEARCH_AUTOPASS_ENABLED", False,
+            ),
+            file_search_autopass_k=_env_int(
+                "MIMIR_FILE_SEARCH_AUTOPASS_K", 5,
+            ),
+            file_search_autopass_min_chars=_env_int(
+                "MIMIR_FILE_SEARCH_AUTOPASS_MIN_CHARS", 20,
+            ),
 
             send_loop_soft_limit=_env_int("MIMIR_SEND_LOOP_SOFT_LIMIT", 5),
             send_loop_hard_limit=_env_int("MIMIR_SEND_LOOP_HARD_LIMIT", 10),
