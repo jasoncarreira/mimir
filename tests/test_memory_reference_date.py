@@ -17,11 +17,11 @@ from pathlib import Path
 
 import pytest
 
-from mimir.memory.activation import compute_activation
-from mimir.memory.recall import recall
+from mimir.saga.activation import compute_activation
+from mimir.saga.recall import recall
 
 
-SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "memory" / "schema.sql"
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"
 
 
 @pytest.fixture

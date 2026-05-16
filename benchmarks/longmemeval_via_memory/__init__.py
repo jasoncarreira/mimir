@@ -1,8 +1,8 @@
-"""LongMemEval harness wired against ``mimir.memory.MemoryClient``.
+"""LongMemEval harness wired against ``mimir.saga.MemoryClient``.
 
 Parallel to ``benchmarks/longmemeval_via_mimir/`` (which routes through
 mimir's full server + saga). This one bypasses saga entirely: per-
-question MemoryClient on a fresh mimir.memory.db, direct ingest +
+question MemoryClient on a fresh mimir.saga.db, direct ingest +
 consolidate + query, then saga's reader prompt synthesizes the
 hypothesis from the retrieved atoms.
 

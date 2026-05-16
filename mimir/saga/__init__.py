@@ -1,4 +1,4 @@
-"""mimir.memory — agent memory subsystem.
+"""mimir.saga — agent memory subsystem.
 
 Public API. Internal helpers (``_session_atoms``, ``_make_atom_id``,
 etc.) stay module-private; mimir's call sites use only the names
@@ -39,7 +39,7 @@ from .consolidate import ConsolidateResult
 # tier-3 (triples + contradictions + P47/P48) path. The standalone
 # ``consolidate()`` is the tier-2 helper kept for the
 # test_memory_tier2b regression suite; tests that need it import via
-# ``from mimir.memory.consolidate import consolidate`` directly.
+# ``from mimir.saga.consolidate import consolidate`` directly.
 from .forget import forget, forget_by_criteria, ForgetResult
 
 # Observation utilities

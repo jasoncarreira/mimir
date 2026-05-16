@@ -1103,7 +1103,7 @@ class Scheduler:
         entry; ``cron_expr`` here is the env-var-derived default."""
         async def _consolidate() -> None:
             # Saga's legacy state-transition decay (active → fading →
-            # dormant) is gone post-mimir.memory rewrite — activation
+            # dormant) is gone post-mimir.saga rewrite — activation
             # is computed on-demand from access_events, no state to
             # transition. Consolidation runs against the live event
             # stream directly. Load identities.yaml at FIRE TIME
