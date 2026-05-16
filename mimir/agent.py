@@ -118,16 +118,25 @@ def _supports_responses_api() -> bool:
     Real OpenAI implements the Responses API (``POST /responses``); drop-in
     proxies (Groq, Together, DeepSeek, GLM, …) usually only implement
     ``/chat/completions``, so defaulting to Responses would 404 every turn.
-    True when ``OPENAI_BASE_URL`` is unset or matches ``api.openai.com``.
-    ``MIMIR_USE_RESPONSES_API=1|0`` overrides.
+    True when ``OPENAI_BASE_URL`` is unset or its parsed hostname equals
+    ``api.openai.com``. ``MIMIR_USE_RESPONSES_API=1|0`` overrides.
+
+    Uses ``urlparse(...).hostname`` rather than substring containment so
+    a crafted env value like ``https://api.openai.com.evil.example/v1``
+    doesn't trip the flag — the hostname comparison is exact.
     """
+    from urllib.parse import urlparse as _urlparse
+
     override = os.environ.get("MIMIR_USE_RESPONSES_API", "").strip().lower()
     if override in ("1", "true", "yes", "on"):
         return True
     if override in ("0", "false", "no", "off"):
         return False
-    base_url = (os.environ.get("OPENAI_BASE_URL") or "").lower().strip()
-    return not base_url or "api.openai.com" in base_url
+    base_url = (os.environ.get("OPENAI_BASE_URL") or "").strip()
+    if not base_url:
+        return True
+    parsed_host = (_urlparse(base_url).hostname or "").lower()
+    return parsed_host == "api.openai.com"
 
 
 def _resolve_model(

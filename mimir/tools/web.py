@@ -23,18 +23,27 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
+import logging
 import os
 import re
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 
 import yaml
 from langchain_core.tools import tool
+
+log = logging.getLogger(__name__)
 
 DEFAULT_TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 FETCH_CHUNK_SIZE_BYTES = 64 * 1024
@@ -91,6 +100,96 @@ def _name_from_url(url: str) -> str:
     return name
 
 
+class SSRFBlocked(ValueError):
+    """Raised when a fetch target resolves to a non-public address.
+
+    Subclass of ValueError so the existing exception handling on
+    fetch_url / web_search picks it up — but distinct enough that
+    callers can re-raise / log specifically if needed.
+    """
+
+
+def _validate_public_host(hostname: str) -> None:
+    """Reject SSRF-shaped targets before any network call.
+
+    Resolves ``hostname`` via ``getaddrinfo`` and asserts every returned
+    address is a public unicast IP — private RFC1918, loopback,
+    link-local (``169.254.0.0/16`` covers AWS/GCP metadata),
+    site-local, multicast, reserved, and the literal ``localhost``
+    string all reject. Defends against prompt-controlled URLs pivoting
+    the agent into the operator's internal network.
+
+    Note on DNS rebinding: this call resolves the host once. The
+    subsequent ``urlopen`` re-resolves at connect time, so a TTL-0
+    record returning ``1.2.3.4`` here and ``127.0.0.1`` at connect
+    is a residual gap — fully closing it requires connecting to the
+    IP literal with a ``Host:`` header override, which breaks HTTPS
+    cert validation without significant urllib3 plumbing. The
+    redirect handler below re-validates each hop, so the practical
+    attack window is narrow. Documented; defer to a follow-up.
+    """
+    if not hostname or hostname.lower() in ("localhost", "localhost.localdomain"):
+        raise SSRFBlocked(f"fetch target host {hostname!r} is not allowed")
+    # Resolve. If the host is an IP literal getaddrinfo just echoes it.
+    try:
+        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise SSRFBlocked(f"DNS resolution failed for {hostname!r}: {exc}") from exc
+    for info in infos:
+        sockaddr = info[4]
+        ip_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            raise SSRFBlocked(
+                f"could not parse resolved address {ip_str!r} for {hostname!r}"
+            ) from None
+        # Reject every category that could land traffic inside the
+        # network perimeter or against a service-meta endpoint.
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise SSRFBlocked(
+                f"fetch target {hostname!r} resolves to non-public address {ip_str}"
+            )
+
+
+def _validate_fetch_url(url: str) -> None:
+    """Run SSRF + scheme checks on a candidate URL."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise SSRFBlocked(f"only http/https URLs are allowed (got {parsed.scheme!r})")
+    if not parsed.hostname:
+        raise SSRFBlocked("fetch target has no hostname")
+    _validate_public_host(parsed.hostname)
+
+
+class _SSRFCheckingRedirectHandler(HTTPRedirectHandler):
+    """``HTTPRedirectHandler`` that re-runs ``_validate_fetch_url`` on every hop.
+
+    Without this, a whitelisted public URL can ``Location:``-redirect to
+    ``http://169.254.169.254/...`` (AWS metadata service) — the initial
+    validation passed but the second hop is unchecked. Re-validating on
+    each redirect closes the cross-hop bypass.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        # Will raise SSRFBlocked if the redirect target is unsafe.
+        _validate_fetch_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_url(request: Request, timeout: int):
+    """Open a URL with the SSRF-checking redirect handler installed."""
+    opener = build_opener(_SSRFCheckingRedirectHandler())
+    return opener.open(request, timeout=timeout)  # noqa: S310
+
+
 def _download_url_bytes(
     *,
     url: str,
@@ -99,10 +198,27 @@ def _download_url_bytes(
     max_bytes: int,
 ) -> dict[str, Any]:
     request = Request(url=url, headers={"User-Agent": "mimir/fetch_url"})
-    with urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310
+    with _open_url(request, timeout=timeout_seconds) as response:
         status = int(response.getcode() or 0)
         final_url = str(response.geturl())
         content_type = str(response.headers.get("Content-Type", ""))
+        # Content-Length pre-check: refuse the download before writing
+        # a single byte if the server advertises a size beyond max_bytes.
+        # The streaming check below remains the source of truth for
+        # responses without Content-Length or with lying headers.
+        advertised_len = response.headers.get("Content-Length")
+        if advertised_len is not None:
+            try:
+                if int(advertised_len) > max_bytes:
+                    raise ValueError(
+                        f"server advertised Content-Length={advertised_len} > "
+                        f"max_bytes={max_bytes} for url={url}",
+                    )
+            except (TypeError, ValueError) as exc:
+                # Re-raise our own ValueError; ignore unparseable
+                # Content-Length headers and fall back to streaming check.
+                if isinstance(exc, ValueError) and "max_bytes" in str(exc):
+                    raise
         total_bytes = 0
         hasher = hashlib.sha256()
         with target_path.open("wb") as f:
@@ -140,8 +256,12 @@ def _post_json(
         "User-Agent": "mimir/web_search",
         **headers,
     }
+    # Tavily endpoint is a public API but we still gate it through the
+    # SSRF check — operator-overridden TAVILY_SEARCH_URL could point
+    # anywhere and the same defenses apply.
+    _validate_fetch_url(url)
     request = Request(url=url, data=request_bytes, headers=request_headers, method="POST")
-    with urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310
+    with _open_url(request, timeout=timeout_seconds) as response:
         status = int(response.getcode() or 0)
         body = response.read(max_bytes + 1)
         if len(body) > max_bytes:
@@ -287,9 +407,13 @@ async def fetch_url(
     if max_bytes <= 0:
         return "max_bytes must be > 0."
 
-    parsed = urlparse(normalized_url)
-    if parsed.scheme not in {"http", "https"}:
-        return "Only http:// and https:// URLs are supported."
+    # SSRF + scheme validation. Returns a friendly error string instead
+    # of letting the SSRFBlocked exception bubble out as a generic
+    # "ValueError: …" — the agent reads this back as a tool result.
+    try:
+        _validate_fetch_url(normalized_url)
+    except SSRFBlocked as exc:
+        return f"fetch_url failed: {exc}"
 
     cache_dir = _fetch_cache_dir()
     cache_dir.mkdir(parents=True, exist_ok=True)
