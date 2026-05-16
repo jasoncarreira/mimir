@@ -1,4 +1,4 @@
-"""Importer: saga.db (or MSAM-era snapshot) → mimir.memory.db.
+"""Importer: saga.db (or MSAM-era snapshot) → mimir.saga.db.
 
 Bootstrap policy: port saga's ``access_log`` to the new
 ``access_events`` table preserving timestamps. This carries forward
@@ -31,11 +31,11 @@ index from the populated embeddings. The first ``query()`` will also
 trigger a lazy build if rebuild_index wasn't called.
 
 Usage as a library:
-    >>> from mimir.memory.migrate import migrate
-    >>> stats = migrate(source=Path("saga.db"), dest=Path("mimir.memory.db"))
+    >>> from mimir.saga.migrate import migrate
+    >>> stats = migrate(source=Path("saga.db"), dest=Path("mimir.saga.db"))
 
 Usage from CLI:
-    $ mimir migrate-memory --source saga.db --dest mimir.memory.db
+    $ mimir migrate-memory --source saga.db --dest mimir.saga.db
 """
 
 from __future__ import annotations
@@ -70,7 +70,8 @@ SOURCE_WEIGHTS = {
 
 def _identify_msam_observations(src: sqlite3.Connection) -> set[str]:
     """MSAM-era observations (consolidation targets) — drop these.
-    saga's reflect will re-synthesize against voyage embeddings."""
+    ``mimir.saga.reflect`` will re-synthesize against the current
+    provider's embeddings post-migration."""
     try:
         rows = src.execute(
             "SELECT DISTINCT target_id FROM atom_relations "
@@ -143,9 +144,11 @@ def _migrate_atoms(
 def _migrate_access_log(
     src: sqlite3.Connection, dst: sqlite3.Connection,
 ) -> int:
-    """saga.access_log → mimir.memory.access_events.
+    """legacy ``saga.access_log`` (the workspace-member ``saga/`` package,
+    pre-rename) → ``mimir.saga.access_events`` (the new in-process
+    package after the ``mimir.memory`` → ``mimir.saga`` rename).
 
-    saga's access_log has (atom_id, accessed_at, activation_score,
+    The legacy table has (atom_id, accessed_at, activation_score,
     retrieval_mode, session_id, contributed). We map:
     - accessed_at → ts
     - retrieval_mode → metadata.mode
@@ -219,7 +222,7 @@ def _rebuild_summaries(dst: sqlite3.Connection) -> int:
     """Populate atom_access_summary for every atom that has events.
     Uses activation.rebuild_summary_from_events; emit in batches."""
     # Note: when this runs for real, import activation from
-    # mimir.memory. Sketch keeps the implementation inline.
+    # mimir.saga. Sketch keeps the implementation inline.
     rows = dst.execute(
         "SELECT atom_id, ts, weight FROM access_events ORDER BY atom_id, ts"
     ).fetchall()
@@ -287,7 +290,7 @@ def _migrate_topics(
 def _migrate_embeddings(
     src: sqlite3.Connection, dst: sqlite3.Connection,
 ) -> int:
-    """saga.atoms.embedding (blob on the atoms row) → mimir.memory's
+    """saga.atoms.embedding (blob on the atoms row) → mimir.saga's
     ``embeddings`` table (separate row keyed on atom_id).
 
     Provider/model/dim are read from the source's ``embedding_meta``
@@ -370,7 +373,7 @@ def _migrate_embeddings(
 def _migrate_atom_relations(
     src: sqlite3.Connection, dst: sqlite3.Connection,
 ) -> int:
-    """saga.atom_relations → mimir.memory.atom_relations. Filter to
+    """saga.atom_relations → mimir.saga.atom_relations. Filter to
     rows whose both endpoints survived the atom migration (i.e. both
     atom ids still exist in dst.atoms)."""
     kept = {r[0] for r in dst.execute("SELECT id FROM atoms")}
@@ -415,7 +418,7 @@ def _migrate_atom_relations(
 def _migrate_triples(
     src: sqlite3.Connection, dst: sqlite3.Connection,
 ) -> int:
-    """saga.triples → mimir.memory.triples. Skip if source doesn't have
+    """saga.triples → mimir.saga.triples. Skip if source doesn't have
     the triples table (MSAM-era snapshots)."""
     try:
         rows = src.execute(
@@ -556,10 +559,10 @@ def main():
     p.add_argument("--source", type=Path, required=True,
                    help="Path to source saga.db or MSAM snapshot")
     p.add_argument("--dest", type=Path, required=True,
-                   help="Output mimir.memory.db (must not exist or --force)")
+                   help="Output mimir.saga.db (must not exist or --force)")
     p.add_argument("--schema", type=Path,
                    default=Path(__file__).parent / "schema.sql",
-                   help="Path to mimir.memory schema DDL")
+                   help="Path to mimir.saga schema DDL")
     p.add_argument("--force", action="store_true")
     args = p.parse_args()
 

@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 
-SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "memory" / "schema.sql"
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"
 
 
 # ─── shared fixtures ────────────────────────────────────────────────
@@ -42,7 +42,7 @@ def _stub_provider(monkeypatch, dim_vec):
             return list(dim_vec(text))
         def dimensions(self):
             return len(dim_vec(""))
-    monkeypatch.setattr("mimir.memory.embeddings.get_provider", lambda: _StubProvider())
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: _StubProvider())
     def fake_get_config():
         def cfg(section, key, default=None):
             return {
@@ -51,14 +51,14 @@ def _stub_provider(monkeypatch, dim_vec):
                 ("embedding", "model"): "stub",
             }.get((section, key), default)
         return cfg
-    monkeypatch.setattr("mimir.memory._config_io.get_config", fake_get_config)
+    monkeypatch.setattr("mimir.saga._config_io.get_config", fake_get_config)
 
 
 # ─── mark_contributions ──────────────────────────────────────────────
 
 
 def test_mark_contributions_credits_overlapping_atoms(conn):
-    from mimir.memory.contributions import mark_contributions
+    from mimir.saga.contributions import mark_contributions
     _seed_atom(conn, "a1", "Alice graduated with a degree in Business Administration")
     _seed_atom(conn, "a2", "Bob enjoys verbose explanations of physics")
     response = (
@@ -79,7 +79,7 @@ def test_mark_contributions_credits_overlapping_atoms(conn):
 
 
 def test_mark_contributions_writes_feedback_positive_events(conn):
-    from mimir.memory.contributions import mark_contributions
+    from mimir.saga.contributions import mark_contributions
     _seed_atom(conn, "a1", "the daily commute takes 45 minutes each way")
     response = "The commute takes 45 minutes each way."
     mark_contributions(
@@ -98,7 +98,7 @@ def test_mark_contributions_writes_feedback_positive_events(conn):
 
 
 def test_mark_contributions_write_events_false_is_score_only(conn):
-    from mimir.memory.contributions import mark_contributions
+    from mimir.saga.contributions import mark_contributions
     _seed_atom(conn, "a1", "Alice has a degree in Business Administration")
     response = "She has a degree in Business Administration."
     result = mark_contributions(
@@ -118,7 +118,7 @@ def test_mark_contributions_write_events_false_is_score_only(conn):
 
 
 def test_mark_contributions_handles_empty_inputs(conn):
-    from mimir.memory.contributions import mark_contributions
+    from mimir.saga.contributions import mark_contributions
     r1 = mark_contributions(conn, [], "anything")
     r2 = mark_contributions(conn, [{"id": "x", "content": "y"}], "")
     assert r1.contribution_rate == 0.0
@@ -128,7 +128,7 @@ def test_mark_contributions_handles_empty_inputs(conn):
 def test_mark_contributions_filters_stopword_only_ngrams(conn):
     """If two atoms share only stopword n-grams ('and the of'), they
     shouldn't credit each other. Heuristic guard."""
-    from mimir.memory.contributions import mark_contributions
+    from mimir.saga.contributions import mark_contributions
     _seed_atom(conn, "a1", "and the of and the of and the of")
     result = mark_contributions(
         conn,
@@ -146,7 +146,7 @@ def test_mark_contributions_filters_stopword_only_ngrams(conn):
 def test_session_dedup_off_by_default(conn):
     """Without a threshold, near-duplicate within the same session is
     stored as a separate atom (only content-hash dedupe applies)."""
-    from mimir.memory.store import store
+    from mimir.saga.store import store
 
     def embed(text):
         # Two near-identical texts get vectors that differ slightly.
@@ -166,7 +166,7 @@ def test_session_dedup_off_by_default(conn):
 def test_session_dedup_collapses_near_duplicate(conn):
     """With threshold set, a near-identical paraphrase in the SAME
     session dedupes to the prior atom."""
-    from mimir.memory.store import store
+    from mimir.saga.store import store
 
     same_vec = struct.pack("4f", 1.0, 0.0, 0.0, 0.0)
 
@@ -188,7 +188,7 @@ def test_session_dedup_collapses_near_duplicate(conn):
 def test_session_dedup_does_not_cross_sessions(conn):
     """Near-duplicate in a DIFFERENT session is stored separately —
     dedup is scoped to one session."""
-    from mimir.memory.store import store
+    from mimir.saga.store import store
 
     same_vec = struct.pack("4f", 1.0, 0.0, 0.0, 0.0)
 
@@ -208,7 +208,7 @@ def test_session_dedup_does_not_cross_sessions(conn):
 
 def test_session_dedup_threshold_floor_not_crossed(conn):
     """If best match is BELOW threshold, no dedup happens."""
-    from mimir.memory.store import store
+    from mimir.saga.store import store
 
     def embed(text):
         if "concise" in text:
@@ -231,14 +231,14 @@ def test_session_dedup_threshold_floor_not_crossed(conn):
 
 @pytest.mark.asyncio
 async def test_rewrite_query_no_context_returns_original():
-    from mimir.memory.query_rewrite import rewrite_query
+    from mimir.saga.query_rewrite import rewrite_query
     out = await rewrite_query("what about him?", context=None)
     assert out == "what about him?"
 
 
 @pytest.mark.asyncio
 async def test_rewrite_query_empty_context_returns_original():
-    from mimir.memory.query_rewrite import rewrite_query
+    from mimir.saga.query_rewrite import rewrite_query
     out = await rewrite_query("what about him?", context=[])
     assert out == "what about him?"
 
@@ -247,16 +247,16 @@ async def test_rewrite_query_empty_context_returns_original():
 async def test_rewrite_query_uses_llm_when_context_present(monkeypatch):
     """With non-empty context, rewrite_query calls saga's call_llm
     and returns the cleaned LLM output."""
-    from mimir.memory import query_rewrite
+    from mimir.saga import query_rewrite
 
     async def fake_call_llm(cfg, *, prompt, max_tokens, temperature, system):
         # Simulate a clean rewrite.
         assert "Alice" in prompt
         return "What about Alice?\n"
 
-    monkeypatch.setattr("mimir.memory._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("mimir.saga._llm.call_llm", fake_call_llm)
     monkeypatch.setattr(
-        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.saga._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     out = await query_rewrite.rewrite_query(
@@ -272,14 +272,14 @@ async def test_rewrite_query_uses_llm_when_context_present(monkeypatch):
 @pytest.mark.asyncio
 async def test_rewrite_query_llm_failure_falls_back(monkeypatch):
     """LLM error → return original query."""
-    from mimir.memory import query_rewrite
+    from mimir.saga import query_rewrite
 
     async def boom(*a, **k):
         raise RuntimeError("transport down")
 
-    monkeypatch.setattr("mimir.memory._llm.call_llm", boom)
+    monkeypatch.setattr("mimir.saga._llm.call_llm", boom)
     monkeypatch.setattr(
-        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.saga._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     out = await query_rewrite.rewrite_query(
@@ -292,14 +292,14 @@ async def test_rewrite_query_llm_failure_falls_back(monkeypatch):
 @pytest.mark.asyncio
 async def test_rewrite_query_strips_preface_noise(monkeypatch):
     """LLM may echo 'Rewritten question:' or wrap in quotes."""
-    from mimir.memory import query_rewrite
+    from mimir.saga import query_rewrite
 
     async def fake_call_llm(*a, **k):
         return 'Rewritten question: "What did Alice say about Boston?"'
 
-    monkeypatch.setattr("mimir.memory._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("mimir.saga._llm.call_llm", fake_call_llm)
     monkeypatch.setattr(
-        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.saga._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     out = await query_rewrite.rewrite_query(
@@ -312,14 +312,14 @@ async def test_rewrite_query_strips_preface_noise(monkeypatch):
 @pytest.mark.asyncio
 async def test_rewrite_query_refusal_falls_back(monkeypatch):
     """If LLM says 'No change needed' / 'cannot rewrite', use original."""
-    from mimir.memory import query_rewrite
+    from mimir.saga import query_rewrite
 
     async def fake_call_llm(*a, **k):
         return "No change needed."
 
-    monkeypatch.setattr("mimir.memory._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("mimir.saga._llm.call_llm", fake_call_llm)
     monkeypatch.setattr(
-        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.saga._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     out = await query_rewrite.rewrite_query(
@@ -334,14 +334,14 @@ async def test_rewrite_query_strips_bare_rewritten_prefix(monkeypatch):
     """Updated 2026-05-13: the prompt now ends with literal ``Rewritten:``
     (matching saga), not ``Rewritten question:``. The LLM sometimes
     echoes the label verbatim — we strip either form."""
-    from mimir.memory import query_rewrite
+    from mimir.saga import query_rewrite
 
     async def fake_call_llm(*a, **k):
         return "Rewritten: look for my Sony headphones"
 
-    monkeypatch.setattr("mimir.memory._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("mimir.saga._llm.call_llm", fake_call_llm)
     monkeypatch.setattr(
-        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.saga._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     out = await query_rewrite.rewrite_query(
@@ -357,7 +357,7 @@ async def test_rewrite_query_truncates_long_message_content(monkeypatch):
     prompt. Long assistant explanations are the usual source of prompt
     bloat; pinning the per-turn cap keeps cost bounded as conversations
     grow. Matches saga's ``_resolve_contextual_query`` window."""
-    from mimir.memory import query_rewrite
+    from mimir.saga import query_rewrite
 
     captured_prompt: dict[str, str] = {}
 
@@ -365,9 +365,9 @@ async def test_rewrite_query_truncates_long_message_content(monkeypatch):
         captured_prompt["text"] = prompt
         return "rewritten message"
 
-    monkeypatch.setattr("mimir.memory._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("mimir.saga._llm.call_llm", fake_call_llm)
     monkeypatch.setattr(
-        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.saga._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     long_msg = "x" * 5000  # well above the 400-char cap
@@ -388,7 +388,7 @@ async def test_rewrite_query_caps_at_last_n_messages(monkeypatch):
     Saga uses last-10; we mirror that. Older context tends to be stale
     for reference resolution — the antecedent of a referential phrase
     is almost always within the recent window."""
-    from mimir.memory import query_rewrite
+    from mimir.saga import query_rewrite
 
     captured_prompt: dict[str, str] = {}
 
@@ -396,9 +396,9 @@ async def test_rewrite_query_caps_at_last_n_messages(monkeypatch):
         captured_prompt["text"] = prompt
         return "rewritten message"
 
-    monkeypatch.setattr("mimir.memory._llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("mimir.saga._llm.call_llm", fake_call_llm)
     monkeypatch.setattr(
-        "mimir.memory._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
+        "mimir.saga._config_io.resolve_llm_config", lambda subsystem: {"provider": "stub"},
     )
 
     # 20 turns — the cap should drop the oldest 10. We tag each turn
@@ -423,7 +423,7 @@ def test_rewrite_prompt_carries_saga_rules():
     instructions instead — examples, intent-preservation, single-line
     output constraint. Matches saga's contextual-rewrite prompt so
     behavior at the model is comparable."""
-    from mimir.memory.query_rewrite import REWRITE_PROMPT
+    from mimir.saga.query_rewrite import REWRITE_PROMPT
     # Concrete reference-resolution examples (saga's three).
     assert "Sony headphones" in REWRITE_PROMPT
     # Intent-shape preservation rule — without this the LLM happily

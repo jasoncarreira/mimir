@@ -10,7 +10,7 @@ Verifies that ``_apply_evidence_boost``:
 """
 from __future__ import annotations
 
-from mimir.memory.recall import (
+from mimir.saga.recall import (
     OBSERVATION_BOOST_MULTIPLIER,
     OBSERVATION_BOOST_CAP_RATIO,
     RecallCandidate,
