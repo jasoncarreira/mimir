@@ -86,10 +86,84 @@ class TestWriteGuardBackend:
             ("/state/ok.txt", b"a"),
             ("/logs/blocked.txt", b"b"),
         ])
-        # Any blocked path → entire batch is rejected (parity with
-        # open-strix); blocked path gets a permission_denied response.
+        # Any blocked path → entire batch is rejected (atomic semantics).
+        # Every input gets a ``permission_denied`` response so the caller
+        # can tell nothing was uploaded; allowed paths intentionally
+        # surface the same error rather than ambiguous silent success.
         errors = [getattr(r, "error", None) for r in results]
-        assert "permission_denied" in errors
+        assert errors == ["permission_denied", "permission_denied"]
+
+    def test_blocks_dotdot_traversal(self, home: Path) -> None:
+        # PurePosixPath alone doesn't collapse ``..`` — without explicit
+        # rejection, ``/state/../logs/evil.txt`` would have ``/state``
+        # in path.parents and slipped through.
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        r = b.write(file_path="/state/../logs/evil.txt", content="no")
+        assert "Write blocked" in (getattr(r, "error", "") or "")
+
+    def test_blocks_dotdot_nested(self, home: Path) -> None:
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        r = b.write(file_path="state/sub/../../.mimir/db.sqlite", content="no")
+        assert "Write blocked" in (getattr(r, "error", "") or "")
+
+    def test_blocks_absolute_path_outside_home(self, home: Path) -> None:
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        # Leading slash strips → resolved under home, so ``/etc/passwd``
+        # becomes ``<home>/etc/passwd`` which isn't in any writable root.
+        r = b.write(file_path="/etc/passwd", content="no")
+        assert "Write blocked" in (getattr(r, "error", "") or "")
+
+    def test_blocks_symlink_escape(self, home: Path) -> None:
+        # A symlink from inside a writable root pointing OUTSIDE
+        # the writable root must be blocked — even though the visible
+        # path passes the lexical check, ``Path.resolve()`` follows the
+        # link and the target lands outside.
+        target_dir = home / "logs"
+        link = home / "state" / "escape"
+        link.symlink_to(target_dir, target_is_directory=True)
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        r = b.write(file_path="/state/escape/evil.txt", content="no")
+        assert "Write blocked" in (getattr(r, "error", "") or "")
+
+    def test_allows_internal_symlink(self, home: Path) -> None:
+        # A symlink that points back into the same writable root is
+        # fine — the resolved target is still under ``state``.
+        (home / "state" / "sub").mkdir()
+        link = home / "state" / "alias"
+        link.symlink_to(home / "state" / "sub", target_is_directory=True)
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        r = b.write(file_path="/state/alias/note.txt", content="ok")
+        assert getattr(r, "error", None) is None
+
+    def test_prefix_collision_does_not_grant_access(self, home: Path) -> None:
+        # writable_dirs=["state"] must NOT match ``state-backup/`` — the
+        # lexical prefix string ``state`` is a prefix of ``state-backup``
+        # but ``state-backup`` is a sibling, not a descendant.
+        (home / "state-backup").mkdir()
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        r = b.write(file_path="/state-backup/x.txt", content="no")
+        assert "Write blocked" in (getattr(r, "error", "") or "")
+
+    def test_rejects_dot_writable_dir(self, home: Path) -> None:
+        # A bogus folder spec ``.:rw`` (or empty after strip) used to
+        # alias the root and make everything writable. We log + drop it.
+        b = WriteGuardBackend(root_dir=home, writable_dirs=[".", "..", "", "state"])
+        # Only ``state`` should survive.
+        assert len(b._writable_roots) == 1
+        r = b.write(file_path="/.mimir/db.sqlite", content="no")
+        assert "Write blocked" in (getattr(r, "error", "") or "")
+
+    def test_explicit_allowlist_blocks_unknown_method(self, home: Path) -> None:
+        # __getattr__ no longer passes through arbitrary attribute
+        # access — only methods on _ALLOWED_READS forward. A future
+        # deepagents release adding ``delete_file`` must AttributeError
+        # until we audit and wrap it.
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        with pytest.raises(AttributeError):
+            b.some_future_mutator  # noqa: B018
+        # Known read methods still forward.
+        assert callable(b.read)
+        assert callable(b.ls_info)
 
 
 class TestReadOnlyFilesystemBackend:

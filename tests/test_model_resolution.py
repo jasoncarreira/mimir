@@ -47,6 +47,15 @@ class TestSupportsResponsesAPI:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         assert _supports_responses_api() is False
 
+    def test_substring_attack_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Crafted host that contains ``api.openai.com`` as a substring of
+        # a different parent domain must NOT trigger the flag. The
+        # previous ``in`` check accepted this; the urlparse-based
+        # hostname comparison rejects it.
+        monkeypatch.delenv("MIMIR_USE_RESPONSES_API", raising=False)
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com.evil.example/v1")
+        assert _supports_responses_api() is False
+
 
 # ─── _resolve_model paths ──────────────────────────────────────────
 

@@ -136,6 +136,20 @@ class _FakeResponse:
         return out
 
 
+def _patch_safe_open(monkeypatch: pytest.MonkeyPatch, response_factory) -> None:
+    """Replace _open_url + _validate_fetch_url so tests don't hit network.
+
+    Real SSRF resolution depends on DNS; in CI we don't want test runs
+    to be load-bearing on the runner's resolver. ``response_factory`` is
+    a callable that returns the fake response each call (so tests can
+    drive different bodies per invocation).
+    """
+    monkeypatch.setattr(web_tools_mod, "_open_url", lambda req, timeout=0: response_factory())
+    # Treat every URL as public for the test (real SSRF tests below do
+    # NOT patch this — they exercise the actual guard).
+    monkeypatch.setattr(web_tools_mod, "_validate_fetch_url", lambda url: None)
+
+
 async def _drive_fetch_url(tmp_path: Path, body: bytes) -> dict[str, Any]:
     """Helper: call the underlying coroutine of fetch_url and return the parsed meta dict.
 
@@ -155,11 +169,7 @@ async def test_fetch_url_writes_body_and_meta(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     body = b"<html>hello</html>"
-
-    def _fake_urlopen(req: Any, timeout: int = 0) -> _FakeResponse:
-        return _FakeResponse(body)
-
-    monkeypatch.setattr(web_tools_mod, "urlopen", _fake_urlopen)
+    _patch_safe_open(monkeypatch, lambda: _FakeResponse(body))
     meta = await _drive_fetch_url(tmp_path, body)
 
     assert meta["url"] == "https://example.com/foo.html"
@@ -178,7 +188,10 @@ async def test_fetch_url_writes_body_and_meta(
 async def test_fetch_url_rejects_non_http(tmp_path: Path) -> None:
     web_tools_mod.set_home(tmp_path)
     msg = await web_tools_mod.fetch_url.ainvoke({"url": "file:///etc/passwd"})
-    assert "http://" in msg and "https://" in msg
+    # Either the SSRF guard ("http/https URLs allowed") or the legacy
+    # scheme check is sufficient — both indicate "non-http rejected".
+    lowered = msg.lower()
+    assert "http" in lowered and "https" in lowered
 
 
 @pytest.mark.asyncio
@@ -189,19 +202,130 @@ async def test_fetch_url_empty_url(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_url_rejects_localhost(tmp_path: Path) -> None:
+    web_tools_mod.set_home(tmp_path)
+    # Bare ``localhost`` is rejected at the name layer before DNS.
+    msg = await web_tools_mod.fetch_url.ainvoke({"url": "http://localhost/x"})
+    assert "fetch_url failed" in msg and "not allowed" in msg
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_rejects_private_ip(tmp_path: Path) -> None:
+    web_tools_mod.set_home(tmp_path)
+    msg = await web_tools_mod.fetch_url.ainvoke({"url": "http://10.0.0.1/x"})
+    assert "non-public address" in msg
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_rejects_link_local(tmp_path: Path) -> None:
+    # 169.254.169.254 is the AWS/GCP instance metadata service.
+    # If this URL slips through SSRF, the agent can exfiltrate
+    # cloud credentials from a compromised prompt.
+    web_tools_mod.set_home(tmp_path)
+    msg = await web_tools_mod.fetch_url.ainvoke({"url": "http://169.254.169.254/latest/meta-data/"})
+    assert "non-public address" in msg
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_rejects_loopback(tmp_path: Path) -> None:
+    web_tools_mod.set_home(tmp_path)
+    msg = await web_tools_mod.fetch_url.ainvoke({"url": "http://127.0.0.1/x"})
+    assert "non-public address" in msg
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_blocks_redirect_to_metadata_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An external URL passes initial validation but Location:-redirects
+    # to a metadata service URL. The custom redirect handler re-runs
+    # the SSRF check on each hop and rejects it.
+    web_tools_mod.set_home(tmp_path)
+    monkeypatch.setattr(web_tools_mod, "_validate_fetch_url",
+                        lambda url: web_tools_mod._validate_fetch_url.__wrapped__(url)
+                        if hasattr(web_tools_mod._validate_fetch_url, "__wrapped__")
+                        else None if "example.com" in url
+                        else (_ for _ in ()).throw(
+                            web_tools_mod.SSRFBlocked(f"non-public address (test) for {url}")
+                        ))
+
+    # Drive through the actual redirect handler by calling redirect_request directly.
+    from urllib.request import Request as _Req
+    handler = web_tools_mod._SSRFCheckingRedirectHandler()
+    req = _Req("https://example.com/")
+    with pytest.raises(web_tools_mod.SSRFBlocked):
+        handler.redirect_request(
+            req, None, 302, "Found", {}, "http://169.254.169.254/latest/meta-data/"
+        )
+
+
+@pytest.mark.asyncio
 async def test_fetch_url_max_bytes_exceeded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     web_tools_mod.set_home(tmp_path)
-
-    def _fake_urlopen(req: Any, timeout: int = 0) -> _FakeResponse:
-        return _FakeResponse(b"x" * 5_000_000)
-
-    monkeypatch.setattr(web_tools_mod, "urlopen", _fake_urlopen)
+    _patch_safe_open(monkeypatch, lambda: _FakeResponse(b"x" * 5_000_000))
     msg = await web_tools_mod.fetch_url.ainvoke(
         {"url": "https://example.com/big", "max_bytes": 1024}
     )
     assert "exceeded max_bytes" in msg
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_content_length_precheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Server advertises a body larger than max_bytes via Content-Length;
+    # we should reject BEFORE reading any of it.
+    web_tools_mod.set_home(tmp_path)
+
+    class _BigClaimer(_FakeResponse):
+        def __init__(self) -> None:
+            super().__init__(b"x")  # body is tiny; the header lies
+            self.headers = {"Content-Type": "text/plain", "Content-Length": "9999999"}
+
+    _patch_safe_open(monkeypatch, _BigClaimer)
+    msg = await web_tools_mod.fetch_url.ainvoke(
+        {"url": "https://example.com/big", "max_bytes": 1024}
+    )
+    assert "Content-Length" in msg or "max_bytes" in msg
+
+
+# ─── SSRF helper unit tests (the validator itself) ─────────────────
+
+
+class TestValidateFetchURL:
+    def test_passes_public_dns(self) -> None:
+        # example.com is a well-known public host.
+        web_tools_mod._validate_fetch_url("https://example.com/")
+
+    def test_blocks_non_http(self) -> None:
+        with pytest.raises(web_tools_mod.SSRFBlocked):
+            web_tools_mod._validate_fetch_url("file:///etc/passwd")
+
+    def test_blocks_localhost_string(self) -> None:
+        with pytest.raises(web_tools_mod.SSRFBlocked):
+            web_tools_mod._validate_fetch_url("http://localhost/x")
+
+    def test_blocks_loopback_ip(self) -> None:
+        with pytest.raises(web_tools_mod.SSRFBlocked):
+            web_tools_mod._validate_fetch_url("http://127.0.0.1/x")
+
+    def test_blocks_private_ip(self) -> None:
+        with pytest.raises(web_tools_mod.SSRFBlocked):
+            web_tools_mod._validate_fetch_url("http://10.0.0.1/x")
+
+    def test_blocks_metadata_service(self) -> None:
+        with pytest.raises(web_tools_mod.SSRFBlocked):
+            web_tools_mod._validate_fetch_url("http://169.254.169.254/latest/meta-data/")
+
+    def test_blocks_ipv6_loopback(self) -> None:
+        with pytest.raises(web_tools_mod.SSRFBlocked):
+            web_tools_mod._validate_fetch_url("http://[::1]/x")
+
+    def test_blocks_unspecified(self) -> None:
+        with pytest.raises(web_tools_mod.SSRFBlocked):
+            web_tools_mod._validate_fetch_url("http://0.0.0.0/x")
 
 
 # ─── web_search arg validation (no network) ────────────────────────
