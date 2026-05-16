@@ -285,6 +285,7 @@ class Agent:
         if self._agent is not None:
             return self._agent
         from deepagents import create_deep_agent
+        from .readonly_backend import WriteGuardBackend
         from .tools import all_mimir_tools
 
         # Config carries the operator-set model spec; env override
@@ -303,10 +304,20 @@ class Agent:
             "MIMIR_SYSTEM_PROMPT_OVERRIDE",
             self._build_system_prompt(),
         )
+        # Per-directory write-permission enforcement (Config.folders).
+        # Read tools (Glob/Grep/Read) stay unrestricted; Write/Edit/upload
+        # outside ``writable_dirs`` return a permission error instead of
+        # mutating the filesystem. ``.mimir/`` (saga db, metrics) is
+        # implicitly blocked because it's not in the folders dict.
+        backend = WriteGuardBackend(
+            root_dir=self._config.home,
+            writable_dirs=self._config.writable_dirs,
+        )
         self._agent = create_deep_agent(
             model=_resolve_model(model_spec),
             tools=all_mimir_tools(),
             system_prompt=system_prompt,
+            backend=backend,
         )
         return self._agent
 
