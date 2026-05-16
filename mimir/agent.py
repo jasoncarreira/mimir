@@ -266,6 +266,7 @@ class Agent:
         subagent_inbox: SubagentInbox | None = None,
         channel_registry: ChannelRegistry | None = None,
         dispatcher: Any = None,
+        commitments_store: Any = None,
     ) -> None:
         self._config = config
         self._turn_logger = turn_logger
@@ -278,6 +279,12 @@ class Agent:
         self._inbox = subagent_inbox or SubagentInbox()
         self._channels = channel_registry
         self._dispatcher = dispatcher
+        # Phase 2b due-check poller (server.py:_on_startup) reads this
+        # attribute via getattr. Pre-fix it was always None — every
+        # commitment_complete / _snooze / _dismiss / _list tool call
+        # also returned "no commitments store" because the registry
+        # setter was never invoked. Both paths now wired by build_app.
+        self._commitments = commitments_store
 
         # Stub for back-compat with any caller that still reads
         # ``agent._rate_limits``. Post-cutover the oauth_usage_poller
@@ -417,7 +424,17 @@ class Agent:
             result = await agent.ainvoke(
                 {"messages": [HumanMessage(content=prompt)]},
                 config={
-                    "configurable": {"thread_id": saga_session_id or session_id},
+                    "configurable": {
+                        "thread_id": saga_session_id or session_id,
+                        # Per-turn channel id so send_message / react /
+                        # fetch_channel_history can default to it when
+                        # the model doesn't supply ``channel_id``
+                        # explicitly. Threads through LangGraph instead
+                        # of the old process-global ``_STATE`` setter,
+                        # which raced across concurrent dispatcher turns
+                        # on different channels.
+                        "channel_id": event.channel_id,
+                    },
                 },
             )
             messages = result.get("messages", [])
