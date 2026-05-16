@@ -1,10 +1,10 @@
-# Bench config for mimir.memory's LongMemEval runner.
+# Bench config for mimir.saga's LongMemEval runner.
 #
 # Mirrors saga's saga_bench.toml shape but only the sections
-# mimir.memory actually reads:
+# mimir.saga actually reads:
 #   - [embedding] → saga.embeddings.get_provider()
 #   - [consolidation] → resolve_llm_config("consolidation") in
-#     mimir.memory.synthesize
+#     mimir.saga.synthesize
 #
 # Everything else from saga_bench.toml (triples / decay / world_model /
 # prediction / annotation) is saga-internal and not used by the

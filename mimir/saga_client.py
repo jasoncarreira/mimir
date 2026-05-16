@@ -3,7 +3,7 @@
 Mimir interacts with the memory store through a unified ``SagaClient``
 interface. Two implementations:
 
-- ``MemoryClient`` (in ``mimir.memory.client``) — the in-process
+- ``MemoryClient`` (in ``mimir.saga.client``) — the in-process
   retrieval/consolidation engine. Default for empty/localhost endpoints;
   same process, same SQLite directory, no HTTP loop. ``make_saga_client``
   constructs and returns one (wrapped in ``RecordingSagaClient``).
@@ -718,7 +718,7 @@ def make_saga_client(
     """Pick the right implementation based on ``endpoint``.
 
     - Empty/unset, ``localhost``, or ``127.0.0.1`` → in-process
-      ``MemoryClient`` (the mimir.memory clean-room rewrite of saga's
+      ``MemoryClient`` (the mimir.saga clean-room rewrite of saga's
       retrieval/consolidation engine). ``db_path`` defaults to
       ``$MIMIR_HOME/.mimir/memory.db``; pass explicitly to override
       (tests, alternative DB layouts).
@@ -735,7 +735,7 @@ def make_saga_client(
     import os
     from pathlib import Path
     if not endpoint or _is_localhost(endpoint):
-        from .memory.client import MemoryClient
+        from .saga.client import MemoryClient
         resolved_db: Path
         if db_path is not None:
             resolved_db = Path(db_path)

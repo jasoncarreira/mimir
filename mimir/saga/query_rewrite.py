@@ -7,7 +7,7 @@ nothing on their own — the antecedent lives in prior turns. Saga's
 because LongMemEval is single-turn) calls an LLM to rewrite the query
 into a self-contained form before retrieval.
 
-This module ports the same pattern to mimir.memory. Opt-in by call
+This module ports the same pattern to mimir.saga. Opt-in by call
 site: ``MemoryClient.query(context=[...])`` plumbs the conversation
 context through; only when a non-empty context is provided AND a
 flag is set do we actually call the LLM and use the rewritten form.
@@ -28,7 +28,7 @@ import re
 from typing import Any
 
 
-logger = logging.getLogger("mimir.memory.query_rewrite")
+logger = logging.getLogger("mimir.saga.query_rewrite")
 
 
 # Bounds matched to saga's _resolve_contextual_query — keep prompt

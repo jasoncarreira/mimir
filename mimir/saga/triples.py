@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 
-logger = logging.getLogger("mimir.memory.triples")
+logger = logging.getLogger("mimir.saga.triples")
 
 
 # ─── Constants ───────────────────────────────────────────────────────

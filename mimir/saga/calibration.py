@@ -11,7 +11,7 @@ another (e.g. voyage-4-lite → text-embedding-3-small or the reverse):
    embedding_dim themselves (the ``embedding_dim`` column lives on
    ``triples``, unrelated to atom embeddings).
 
-Compare with ``saga.calibration.re_embed`` (the ancestor): mimir.memory's
+Compare with ``saga.calibration.re_embed`` (the ancestor): mimir.saga's
 embeddings live in a sidecar ``embeddings`` table, not on the atom row,
 so the migration doesn't rewrite the atoms table. Also there's no
 ``state`` machine — ``tombstoned = 0`` selects every live atom.

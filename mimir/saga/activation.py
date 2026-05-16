@@ -276,7 +276,7 @@ def rebuild_summary_from_events(
     recent_k: int = RECENT_K,
 ) -> dict:
     """Build a summary from a list of (ts, weight) events. Used by the
-    migration importer (saga.db → mimir.memory.db) and by repair tools
+    migration importer (saga.db → mimir.saga.db) and by repair tools
     that detect a corrupt summary.
 
     ``events`` should be ordered oldest-first (insertion order).

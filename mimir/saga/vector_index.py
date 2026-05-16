@@ -1,4 +1,4 @@
-"""FAISS-backed approximate nearest-neighbor search for mimir.memory.
+"""FAISS-backed approximate nearest-neighbor search for mimir.saga.
 
 Reads vectors from the ``embeddings`` table (one row per atom) joined
 to ``atoms`` filtered on ``tombstoned=0``. No state-machine column;
@@ -38,7 +38,7 @@ import threading
 import numpy as np
 
 
-logger = logging.getLogger("mimir.memory.vector_index")
+logger = logging.getLogger("mimir.saga.vector_index")
 
 try:
     import faiss
@@ -46,7 +46,7 @@ try:
 except ImportError:
     FAISS_AVAILABLE = False
     logger.info(
-        "faiss-cpu not installed — mimir.memory.vector_index falls back to empty search. "
+        "faiss-cpu not installed — mimir.saga.vector_index falls back to empty search. "
         "Install faiss-cpu for ANN candidates; FTS5 still works without it."
     )
 
