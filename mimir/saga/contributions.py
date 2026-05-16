@@ -22,12 +22,12 @@ The heuristic is phrase-overlap, not semantic similarity. Reasoning:
 
 API: ``mark_contributions(retrieved_atoms, response_text)`` →
 fires events on contributing atoms + returns counts. Called from
-``MemoryClient.mark_contributions`` after the response is generated.
+``SagaStore.mark_contributions`` after the response is generated.
 
 Bench: saga's bench has ``enable_mark_contributions = false`` because
 per-question DB isolation means the contribution signal can't carry
-across questions. mimir.memory keeps the same default — calling
-``MemoryClient.mark_contributions`` is opt-in.
+across questions. mimir.saga keeps the same default — calling
+``SagaStore.mark_contributions`` is opt-in.
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from .mark_access import AccessEvent, mark_access
 
 
-logger = logging.getLogger("mimir.memory.contributions")
+logger = logging.getLogger("mimir.saga.contributions")
 
 
 # Below this share of atom-phrases reappearing in the response, we

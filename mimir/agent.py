@@ -281,23 +281,23 @@ class Agent:
         self._agent: Any | None = None
 
         # Memory-tool dep injection — only used if saga_client is a
-        # MemoryClient (post-saga cutover). Wires up the @tool's
-        # MemoryClient handle so deepagents can call into recall.
+        # SagaStore (post-saga cutover). Wires up the @tool's
+        # SagaStore handle so deepagents can call into recall.
         if saga_client is not None:
             self._try_inject_memory_client(saga_client)
 
     def _try_inject_memory_client(self, saga_client: SagaClient) -> None:
-        """If saga_client is a MemoryClient (or wraps one at any depth),
+        """If saga_client is a SagaStore (or wraps one at any depth),
         wire it into the memory_query / memory_store tools.
 
         Production saga_client is a RecordingSagaClient wrapping
-        either _InProcessSaga (legacy) or MemoryClient. Test harnesses
+        either _InProcessSaga (legacy) or SagaStore. Test harnesses
         and bench middleware may add additional wrappers (capture
         proxies, recording layers); we peel ``_inner`` until we find
-        a concrete MemoryClient or run out of layers.
+        a concrete SagaStore or run out of layers.
         """
         try:
-            from .memory.client import MemoryClient
+            from .saga.client import SagaStore
         except Exception:
             return
         candidate: Any = saga_client
@@ -306,7 +306,7 @@ class Agent:
         # any test/bench wrapper that follows the convention.
         while candidate is not None and id(candidate) not in seen:
             seen.add(id(candidate))
-            if isinstance(candidate, MemoryClient):
+            if isinstance(candidate, SagaStore):
                 from .tools import set_memory_client
                 set_memory_client(candidate)
                 return

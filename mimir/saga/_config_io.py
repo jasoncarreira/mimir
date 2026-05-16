@@ -1,9 +1,9 @@
-"""mimir.memory TOML config loader.
+"""mimir.saga TOML config loader.
 
 Brought in from saga.config during the saga-decoupling pass; renamed
-to ``mimir/memory/_config_io.py`` (underscore-prefix marks it
+to ``mimir/saga/_config_io.py`` (underscore-prefix marks it
 package-internal — callers should reach for ``get_config`` /
-``resolve_llm_config`` via the higher-level ``mimir.memory`` re-exports
+``resolve_llm_config`` via the higher-level ``mimir.saga`` re-exports
 once the rename pass to ``mimir.saga`` is done).
 
 The on-disk TOML filename + env-var names are unchanged from saga's
@@ -24,7 +24,7 @@ Data directory (for DB, caches) uses:
 Singleton: loads once on first import.
 
 Usage:
-    from mimir.memory._config_io import get_config
+    from mimir.saga._config_io import get_config
     cfg = get_config()
     value = cfg('section', 'key', default=fallback)
     # or:

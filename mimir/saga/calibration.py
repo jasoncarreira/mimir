@@ -5,17 +5,19 @@ another (e.g. voyage-4-lite → text-embedding-3-small or the reverse):
 
 1. Walk every non-tombstoned atom.
 2. Embed its content with the target provider.
-3. Replace the row in the ``embeddings`` table (atom_id-keyed) and bump
-   ``atoms.embedding_dim`` so the FAISS index loader knows to filter
-   stale-dim rows during rebuild.
+3. Replace the row in the ``embeddings`` table (atom_id-keyed). The
+   ``embeddings.dim`` column is what ``VectorIndex.build_from_db``
+   reads to filter stale-dim rows on rebuild — atoms don't carry
+   embedding_dim themselves (the ``embedding_dim`` column lives on
+   ``triples``, unrelated to atom embeddings).
 
-Compare with ``saga.calibration.re_embed`` (the ancestor): mimir.memory's
+Compare with ``saga.calibration.re_embed`` (the ancestor): mimir.saga's
 embeddings live in a sidecar ``embeddings`` table, not on the atom row,
 so the migration doesn't rewrite the atoms table. Also there's no
 ``state`` machine — ``tombstoned = 0`` selects every live atom.
 
 After ``re_embed`` completes, the caller should drop and rebuild the
-FAISS index (``MemoryClient.rebuild_index``) — the dim or provider may
+FAISS index (``SagaStore.rebuild_index``) — the dim or provider may
 have changed, and the in-memory index won't auto-detect that.
 """
 
@@ -45,7 +47,7 @@ def re_embed(
     embedding provider.
 
     Args:
-        db_path: Path to ``memory.db``.
+        db_path: Path to ``saga.db``.
         target_provider_name: Provider name override. ``None`` uses the
             saga.toml-resolved provider — the common case for cron-driven
             provider migrations where the operator edited the TOML
@@ -116,9 +118,14 @@ def re_embed(
                 conn.execute("BEGIN IMMEDIATE")
                 for atom_id, vec in zip(ids, vectors):
                     vec_bytes = struct.pack(f"{dim}f", *vec)
-                    # Upsert into the sidecar embeddings table, bump
-                    # the atom's embedding_dim so the FAISS index
-                    # loader filters mismatched-dim rows on rebuild.
+                    # Upsert into the sidecar embeddings table. The
+                    # ``embeddings`` row's ``dim`` is the source of truth
+                    # for FAISS index filtering — ``VectorIndex.build_from_db``
+                    # reads ``embeddings.dim`` to skip mismatched-dim rows
+                    # on rebuild. Atoms don't track dim themselves
+                    # (``atoms`` has no ``embedding_dim`` column —
+                    # ``triples`` does, but those are unrelated triple
+                    # embeddings).
                     conn.execute(
                         "INSERT INTO embeddings "
                         "(atom_id, provider, model, dim, vec, embedded_at) "
@@ -131,10 +138,6 @@ def re_embed(
                         "  embedded_at = excluded.embedded_at",
                         (atom_id, provider_name, model_name, dim,
                          vec_bytes, now_iso),
-                    )
-                    conn.execute(
-                        "UPDATE atoms SET embedding_dim = ? WHERE id = ?",
-                        (dim, atom_id),
                     )
                     updated += 1
                 conn.commit()

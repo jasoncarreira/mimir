@@ -1,4 +1,4 @@
-"""End-to-end integration tests for MemoryClient with real FAISS +
+"""End-to-end integration tests for SagaStore with real FAISS +
 FTS5 wiring. Verifies that query() returns relevant atoms — not just
 that the API contract is satisfied (covered by test_memory_client.py).
 
@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from mimir.memory.client import MemoryClient
-from mimir.memory.vector_index import FAISS_AVAILABLE
+from mimir.saga.client import SagaStore
+from mimir.saga.vector_index import FAISS_AVAILABLE
 
 
 # Deterministic 4d "embedding" derived from text hash. Tests that need
@@ -40,7 +40,7 @@ class _StubProvider:
 
 def _patch_provider(monkeypatch):
     monkeypatch.setattr(
-        "mimir.memory.embeddings.get_provider", lambda: _StubProvider(),
+        "mimir.saga.embeddings.get_provider", lambda: _StubProvider(),
     )
 
     def fake_get_config():
@@ -52,13 +52,13 @@ def _patch_provider(monkeypatch):
             }.get((section, key), default)
         return cfg
 
-    monkeypatch.setattr("mimir.memory._config_io.get_config", fake_get_config)
+    monkeypatch.setattr("mimir.saga._config_io.get_config", fake_get_config)
 
 
 @pytest.fixture
 def client(tmp_path):
-    db = tmp_path / "mimir.memory.db"
-    c = MemoryClient(db_path=db, embedding_dim=4)
+    db = tmp_path / "mimir.saga.db"
+    c = SagaStore(db_path=db, embedding_dim=4)
     yield c
 
 
@@ -140,7 +140,7 @@ async def test_tombstoned_atoms_dropped_from_recall(client, monkeypatch):
     _patch_provider(monkeypatch)
     r = await client.store("Alice prefers concise replies")
     # Tombstone the atom directly via forget().
-    from mimir.memory.forget import forget as _forget
+    from mimir.saga.forget import forget as _forget
     conn = client._ensure_conn()
     _forget(conn, [r["atom_id"]], reason="test")
     result = await client.query("alice concise", top_k=5)

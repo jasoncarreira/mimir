@@ -1,8 +1,8 @@
-"""LongMemEval runner that ingests + retrieves via mimir.memory.MemoryClient.
+"""LongMemEval runner that ingests + retrieves via mimir.saga.SagaStore.
 
 Pipeline per question:
 
-  1. Fresh per-question DB → ``MemoryClient(db_path=...)``.
+  1. Fresh per-question DB → ``SagaStore(db_path=...)``.
   2. Ingest every haystack turn as an atom (sync ``store()`` so we
      can backdate ``created_at`` to the session date afterward).
   3. ``consolidate()`` runs the cross-session pass: clustering + LLM-
@@ -62,13 +62,13 @@ INGEST_BATCH_SIZE = 256
 
 
 def _make_client(db_path: Path, *, embedding_dim: int | None = None):
-    """Construct a MemoryClient with a fresh per-question DB.
+    """Construct a SagaStore with a fresh per-question DB.
 
     Wires the bench-tuned P12 synonym dict (DEFAULT_LONGMEMEVAL_SYNONYMS)
     so the FTS5 keyword pathway gets the same query expansion saga's
     canonical bench used. RRF fusion is on by default in recall.py.
 
-    ``embedding_dim=None`` (the default) lets ``MemoryClient`` auto-
+    ``embedding_dim=None`` (the default) lets ``SagaStore`` auto-
     detect the dimension from the first embedding row on first
     ``query()``. Hardcoding the wrong dim is a silent FAISS-killer:
     ``VectorIndex.build_from_db`` filters rows where stored dim
@@ -76,12 +76,12 @@ def _make_client(db_path: Path, *, embedding_dim: int | None = None):
     against a 1024-dim index produced an empty FAISS index in the
     earlier 73.4% run — recall fell back to keyword-only.
     """
-    from mimir.memory.client import MemoryClient
-    from mimir.memory.fts import DEFAULT_LONGMEMEVAL_SYNONYMS
+    from mimir.saga.client import SagaStore
+    from mimir.saga.fts import DEFAULT_LONGMEMEVAL_SYNONYMS
     if db_path.exists():
         db_path.unlink()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    return MemoryClient(
+    return SagaStore(
         db_path=db_path,
         agent_id="longmemeval",
         embedding_dim=embedding_dim,
@@ -93,11 +93,11 @@ def _batch_embed_texts(texts: list[str]) -> list[tuple[bytes, str, str, int]]:
     """Batch-embed via the saga provider's ``batch_embed`` API (or fall
     back to per-text). Returns parallel list of
     ``(vec_bytes, provider, model, dim)`` tuples matching the shape
-    ``mimir.memory.store.EmbedFn`` would produce.
+    ``mimir.saga.store.EmbedFn`` would produce.
     """
     import struct as _struct
-    from mimir.memory.embeddings import get_provider
-    from mimir.memory._config_io import get_config
+    from mimir.saga.embeddings import get_provider
+    from mimir.saga._config_io import get_config
 
     cfg = get_config()
     provider = get_provider()
@@ -301,7 +301,7 @@ async def _run_one(
                 cresult = await client.consolidate()
                 n_clusters = cresult.get("clusters_consolidated", 0)
                 # P42 + contradiction telemetry (Tier 3). Older versions of
-                # MemoryClient.consolidate didn't return these keys, so
+                # SagaStore.consolidate didn't return these keys, so
                 # .get(key, 0) keeps the runner compatible with pre-Tier 3
                 # builds.
                 n_triples = cresult.get("triples_stored", 0)
@@ -507,7 +507,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         prog="benchmarks.longmemeval_via_memory.runner",
         description=(
-            "LongMemEval through mimir.memory.MemoryClient — bypasses "
+            "LongMemEval through mimir.saga.SagaStore — bypasses "
             "saga entirely. Parallel to longmemeval_via_mimir."
         ),
     )

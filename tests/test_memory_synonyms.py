@@ -1,4 +1,4 @@
-"""Tests for P12 synonym expansion in mimir.memory.fts.
+"""Tests for P12 synonym expansion in mimir.saga.fts.
 
 Validates the expand_query_for_keyword behavior and confirms the
 fts_search path picks up the synonyms argument.
@@ -11,14 +11,14 @@ from pathlib import Path
 
 import pytest
 
-from mimir.memory.fts import (
+from mimir.saga.fts import (
     DEFAULT_LONGMEMEVAL_SYNONYMS,
     expand_query_for_keyword,
     fts_search,
 )
 
 
-SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "memory" / "schema.sql"
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"
 
 
 @pytest.fixture

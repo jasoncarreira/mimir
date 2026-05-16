@@ -11,7 +11,7 @@ prompt code path can be deleted.
 
 The prompts here are pared-down versions of saga.consolidation's. The
 production prompt has triple extraction, contradiction detection, and
-canonical-subject vocab blocks — all P-features that mimir.memory
+canonical-subject vocab blocks — all P-features that mimir.saga
 defers to a Tier 3 follow-up (triples.py, contradictions.py). Keeping
 the v2 prompt small means: less LLM cost per cluster, simpler to
 parse, fewer ways to fail. We can grow it back once the bench numbers
@@ -43,7 +43,7 @@ import re
 from typing import Any, Callable
 
 
-logger = logging.getLogger("mimir.memory.synthesize")
+logger = logging.getLogger("mimir.saga.synthesize")
 
 
 # ─── Observation synthesis (consolidate) ─────────────────────────────
@@ -202,9 +202,11 @@ def build_vocab_block(
             if subj and subj not in seen_subjs:
                 subj_lines.append((subj, int(cnt or 0)))
                 seen_subjs.add(subj)
-    except Exception:
-        # DB read failed — fall back to seed-only.
-        pass
+    except Exception as exc:
+        # DB read failed — fall back to seed-only. Logged so it surfaces
+        # in operator logs rather than producing a silent quality drop
+        # on the consolidation pass.
+        logger.warning("vocab_block DB read failed; using seed-only: %s", exc)
     # Union with the static seed.
     for p in _CANONICAL_PREDICATE_SEED:
         if p not in seen_preds:
@@ -417,7 +419,7 @@ def make_async_rich_synth_fn(
     CONTRADICTIONS in a single LLM call.
 
     Signature: ``_do(cluster, *, prior_block="", vocab_block="")``.
-    Caller (e.g. ``MemoryClient.consolidate``) can inject:
+    Caller (e.g. ``SagaStore.consolidate``) can inject:
 
     - ``prior_block`` (P47): a per-cluster string surfacing existing
       observations whose evidence is a subset of this cluster, so the

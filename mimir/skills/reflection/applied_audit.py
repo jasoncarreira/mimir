@@ -85,13 +85,28 @@ class AuditRow:
 
 def _split_md_sections(body: str) -> list[tuple[str, str]]:
     """Return [(heading_text_without_##, section_body), ...] keeping
-    everything in document order. Section body excludes the heading."""
+    everything in document order. Section body excludes the heading.
+
+    Fence-aware: ``##`` lines inside fenced code blocks (``` ... ```) are
+    treated as part of the surrounding section body, not as new section
+    boundaries. Proposal bodies routinely contain fenced samples whose
+    own headings would otherwise mis-split the entry — chainlink #114.
+    """
     out: list[tuple[str, str]] = []
     cur_head: str | None = None
     cur_buf: list[str] = []
+    in_fence = False
     for line in body.splitlines():
         stripped = line.lstrip()
-        if stripped.startswith("## "):
+        # Toggle on any ``` line. Keep the fence line itself in whichever
+        # bucket (prelude is dropped before the first heading; section
+        # body otherwise).
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            if cur_head is not None:
+                cur_buf.append(line)
+            continue
+        if not in_fence and stripped.startswith("## "):
             if cur_head is not None:
                 out.append((cur_head, "\n".join(cur_buf).rstrip()))
             cur_head = stripped[3:].strip()
