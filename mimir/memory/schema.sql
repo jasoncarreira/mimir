@@ -55,6 +55,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_atoms_dedup
     ON atoms(content_hash, agent_id) WHERE tombstoned = 0;
 CREATE INDEX IF NOT EXISTS idx_atoms_created ON atoms(created_at);
 CREATE INDEX IF NOT EXISTS idx_atoms_tombstoned ON atoms(tombstoned);
+-- session_id index: reflect._session_atoms + recall's recent-session
+-- lookup both filter on this. Partial index (skips NULL session_id
+-- rows for pre-session atoms like boundaries / observations) keeps
+-- the index lean. Matters at 10k+ atoms.
+CREATE INDEX IF NOT EXISTS idx_atoms_session
+    ON atoms(session_id) WHERE session_id IS NOT NULL;
 
 -- ──────────────────────────────────────────────────────────────────
 -- Access events — Petrov OL backing
