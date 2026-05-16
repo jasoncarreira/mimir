@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 from .history import Message, render_identity_context, render_recent_activity
-from .memory import CoreBlock, render_core_section
+from .core_blocks import CoreBlock, render_core_section
 from .models import AgentEvent
 
 _DEFAULT_PERSONA = """You are Mimir, a memory-centric agent built on the Claude Agent SDK.

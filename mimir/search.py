@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Protocol
 
-from .memory import describe_file
+from .core_blocks import describe_file
 
 log = logging.getLogger(__name__)
 
@@ -146,7 +146,7 @@ class SagaProviderEmbedder:
         if self._provider is None:
             with self._lock:
                 if self._provider is None:
-                    from saga.embeddings import get_provider
+                    from .memory.embeddings import get_provider
 
                     provider = get_provider()
                     self._dim = provider.dimensions()
