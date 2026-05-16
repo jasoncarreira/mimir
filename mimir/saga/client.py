@@ -4,7 +4,7 @@ Adapts ``mimir.saga.*`` operations to the ``SagaClient`` Protocol
 (see ``mimir/saga_client.py``) so mimir's call sites — ``agent.py``,
 ``sagatools.py``, ``server.py`` — can flip from saga → memory atomically
 with one wiring change (``make_saga_client(..)`` returns a
-``MemoryClient`` instead of an ``_InProcessSaga``).
+``SagaStore`` instead of an ``_InProcessSaga``).
 
 Provider/index plumbing:
 
@@ -136,7 +136,7 @@ def _make_triple_search_fn(conn: sqlite3.Connection, *, dim: int | None):
 # ─── The facade ──────────────────────────────────────────────────────
 
 
-class MemoryClient:
+class SagaStore:
     """SagaClient-compatible facade. Holds a sqlite3 connection to
     mimir.saga.db and translates each saga-vocabulary method to the
     equivalent ``mimir.saga.*`` operation.
@@ -206,7 +206,7 @@ class MemoryClient:
         self._index: VectorIndex | None = None
         self._index_built = False
         # LLM synth callable for consolidate(). Late-bound (lazy import
-        # of synthesize.py) so MemoryClient doesn't transitively pull in
+        # of synthesize.py) so SagaStore doesn't transitively pull in
         # the LLM transport at construction time. Despite the name, this
         # holds the *rich* synth callable (returns content + triples +
         # contradictions); ``observation`` is historical from when the
@@ -239,8 +239,8 @@ class MemoryClient:
             return self._conn
         if self._db_path is None:
             raise RuntimeError(
-                "MemoryClient: no db_path and no conn provided. "
-                "Construct with MemoryClient(db_path=Path(...)) or pass conn=..."
+                "SagaStore: no db_path and no conn provided. "
+                "Construct with SagaStore(db_path=Path(...)) or pass conn=..."
             )
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         fresh = not self._db_path.exists()
@@ -252,7 +252,7 @@ class MemoryClient:
             self._conn.executescript(schema_path.read_text())
             self._conn.commit()
         # Migration story: record the schema version we know how to
-        # serve so future MemoryClient builds can detect when an
+        # serve so future SagaStore builds can detect when an
         # existing DB needs migration. ``CURRENT_SCHEMA_VERSION``
         # bumps with every shipped schema change; ``MIGRATIONS`` is
         # the pending-migrations registry (empty until the first
@@ -368,7 +368,7 @@ class MemoryClient:
         # silently wins, which could otherwise hide a misconfiguration.
         if pre_rewritten_query is not None and enable_contextual_rewrite:
             log.warning(
-                "MemoryClient.query: both pre_rewritten_query and "
+                "SagaStore.query: both pre_rewritten_query and "
                 "enable_contextual_rewrite=True supplied; "
                 "pre_rewritten_query wins (inline rewrite skipped). "
                 "Pick one — pre-resolved for parallelism, inline for "
@@ -1083,7 +1083,7 @@ class MemoryClient:
             conn.execute("SELECT 1 FROM atoms LIMIT 1")
             return True
         except Exception as exc:
-            log.warning("MemoryClient.health check failed: %s", exc)
+            log.warning("SagaStore.health check failed: %s", exc)
             return False
 
     async def close(self) -> None:
@@ -1095,7 +1095,7 @@ class MemoryClient:
                 # though we don't propagate the error (close() is
                 # called from shutdown / cleanup paths that shouldn't
                 # block on a misbehaving connection).
-                log.warning("MemoryClient.close failed: %s", exc)
+                log.warning("SagaStore.close failed: %s", exc)
             self._conn = None
 
 

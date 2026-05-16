@@ -454,7 +454,7 @@ def top_triples_with_payload(
     range/confidence — keyed on triple id rather than collapsing to one
     row per source atom.
 
-    Used by ``MemoryClient.query`` to surface a top-N triples block in
+    Used by ``SagaStore.query`` to surface a top-N triples block in
     the response payload (saga's P42 ``include_triples_in_response``
     shape). Distinct from ``triple_augment_search`` because the
     retrieval-pathway view wants the best-triple-per-atom (no
