@@ -131,24 +131,59 @@ def _parse_folders(raw: str) -> dict[str, str]:
     Format: ``name:mode`` pairs, comma-separated. Modes other than
     ``rw``/``ro`` are coerced to ``ro`` (fail safe). Empty/unset
     returns ``DEFAULT_FOLDERS``.
+
+    Unsafe names — ``""``, ``"."``, ``".."``, anything containing
+    traversal segments — are rejected with a warning. Pre-fix a bogus
+    spec like ``.:rw`` would alias the root and make EVERY directory
+    writable (including ``.mimir/db.sqlite``). Malformed input as a
+    whole (no parseable pairs) also logs at warning level rather than
+    silently restoring defaults — operator typo visibility matters
+    more than backwards compat with the silent fallback.
     """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
     raw = (raw or "").strip()
     if not raw:
         return dict(DEFAULT_FOLDERS)
     folders: dict[str, str] = {}
+    had_pairs = False
     for pair in raw.split(","):
         pair = pair.strip()
         if not pair or ":" not in pair:
             continue
+        had_pairs = True
         name, mode = pair.split(":", 1)
         name = name.strip().strip("/")
         mode = mode.strip().lower()
-        if not name:
+        if not name or name in (".", ".."):
+            _log.warning(
+                "MIMIR_FOLDERS: ignoring unsafe folder name %r "
+                "(empty or root-aliasing)", pair,
+            )
+            continue
+        # Reject any pathlike with traversal — ``a/../b``, ``../x``, etc.
+        if "/" in name or "\\" in name or name.startswith("."):
+            _log.warning(
+                "MIMIR_FOLDERS: ignoring suspicious folder name %r "
+                "(path separators or leading dot)", pair,
+            )
             continue
         if mode not in ("rw", "ro"):
+            _log.warning(
+                "MIMIR_FOLDERS: unknown mode %r for folder %r — "
+                "coercing to 'ro' (fail safe)", mode, name,
+            )
             mode = "ro"
         folders[name] = mode
-    return folders or dict(DEFAULT_FOLDERS)
+    if not folders:
+        if had_pairs:
+            _log.warning(
+                "MIMIR_FOLDERS=%r produced no valid folders — "
+                "falling back to DEFAULT_FOLDERS", raw,
+            )
+        return dict(DEFAULT_FOLDERS)
+    return folders
 
 
 def _parse_sources(raw: str) -> frozenset[str] | None:

@@ -420,9 +420,22 @@ async def fetch_url(
 
     base_name = _name_from_url(normalized_url)
     digest = hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()[:12]
-    stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
-    body_path = cache_dir / f"{stamp}-{digest}-{base_name}"
+    # Dedup on URL digest: the previous filename included a UTC stamp
+    # so repeat fetches of the same URL piled up on disk. Now the
+    # cache file is keyed solely on the digest + sanitized name, and
+    # we short-circuit if a cached body for this exact URL already
+    # exists (returning the existing metadata sidecar without
+    # re-downloading). Operators wanting forced refresh can delete the
+    # files manually.
+    body_path = cache_dir / f"{digest}-{base_name}"
     meta_path = cache_dir / f"{body_path.name}.meta.json"
+    if body_path.is_file() and meta_path.is_file():
+        try:
+            existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing_meta = None
+        if existing_meta and existing_meta.get("url") == normalized_url:
+            return yaml.safe_dump(existing_meta, sort_keys=False)
 
     try:
         fetched = await asyncio.to_thread(
