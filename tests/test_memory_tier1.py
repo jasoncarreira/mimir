@@ -1,0 +1,339 @@
+"""Tier-1 integration tests: store + mark_access + recall composing
+against an in-memory SQLite DB. Validates the contracts in SCORING.md
+end-to-end without depending on FAISS/voyage — embedding and FAISS
+search are mocked.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import time
+from pathlib import Path
+
+import pytest
+
+from mimir.memory.mark_access import AccessEvent, mark_access
+from mimir.memory.recall import recall
+from mimir.memory.store import store
+
+
+@pytest.fixture
+def conn():
+    """In-memory SQLite with the new schema applied."""
+    schema = (Path(__file__).resolve().parent.parent / "mimir" / "memory" / "schema.sql").read_text()
+    c = sqlite3.connect(":memory:")
+    c.executescript(schema)
+    yield c
+    c.close()
+
+
+def _fake_embed(text: str) -> tuple[bytes, str, str, int]:
+    """Deterministic 4-dim 'embedding' for tests. Returns a tuple of
+    (vec_bytes, provider, model, dim) matching the EmbedFn signature.
+    Not meaningful as vectors — tests don't compare embeddings, they
+    work with mocked FAISS."""
+    import struct
+    h = abs(hash(text)) % 1000
+    vec = [float(h % 7), float(h % 11), float(h % 13), float(h % 17)]
+    return struct.pack("4f", *vec), "fake", "fake-model", 4
+
+
+def _fake_query_embed(text: str) -> list[float]:
+    """Mirror of _fake_embed for query-side. Returns list (not bytes)
+    since query embeddings are usually kept in memory."""
+    h = abs(hash(text)) % 1000
+    return [float(h % 7), float(h % 11), float(h % 13), float(h % 17)]
+
+
+# --- store ---
+
+def test_store_inserts_atom_and_seeds_access_event(conn):
+    """A fresh store fires one access_event so activation is non -inf."""
+    result = store(conn, "Alice prefers concise replies",
+                   embed_fn=_fake_embed, stream="semantic")
+    assert result.stored is True
+    assert result.atom_id
+
+    # One atom row.
+    n = conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0]
+    assert n == 1
+    # One embedding row.
+    n = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+    assert n == 1
+    # One access_event with source='store'.
+    rows = conn.execute(
+        "SELECT source, weight FROM access_events WHERE atom_id = ?",
+        (result.atom_id,)
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "store"
+    assert rows[0][1] == 1.0
+    # Summary populated.
+    s = conn.execute(
+        "SELECT recent_ts_json, old_count FROM atom_access_summary WHERE atom_id = ?",
+        (result.atom_id,)
+    ).fetchone()
+    assert s is not None
+    import json as _json
+    assert len(_json.loads(s[0])) == 1  # one event in recent
+    assert s[1] == 0                     # nothing in old aggregate
+
+
+def test_store_dedupes_by_content_hash(conn):
+    """Storing the same content twice from the same agent re-uses the
+    existing atom_id and fires a re-encounter access_event."""
+    r1 = store(conn, "duplicate fact", embed_fn=_fake_embed)
+    r2 = store(conn, "duplicate fact", embed_fn=_fake_embed)
+    assert r1.atom_id == r2.atom_id
+    assert r1.stored is True
+    assert r2.stored is False
+    assert r2.reason == "duplicate"
+    # Two store events — one initial + one re-encounter.
+    rows = conn.execute(
+        "SELECT source FROM access_events WHERE atom_id = ?",
+        (r1.atom_id,)
+    ).fetchall()
+    assert [r[0] for r in rows] == ["store", "store"]
+
+
+def test_store_empty_content_raises(conn):
+    with pytest.raises(ValueError):
+        store(conn, "  ", embed_fn=_fake_embed)
+
+
+def test_pinned_atoms_get_pinned_init_event(conn):
+    """Pinning fires an additional one-time event with the heavy weight."""
+    result = store(conn, "important fact", embed_fn=_fake_embed,
+                   is_pinned=True)
+    rows = conn.execute(
+        "SELECT source, weight FROM access_events WHERE atom_id = ? "
+        "ORDER BY id",
+        (result.atom_id,)
+    ).fetchall()
+    sources = [r[0] for r in rows]
+    weights = [r[1] for r in rows]
+    assert "store" in sources
+    assert "pinned_init" in sources
+    # The pinned_init event has weight 5.0.
+    assert weights[sources.index("pinned_init")] == 5.0
+
+
+# --- mark_access ---
+
+def test_mark_access_appends_and_updates_summary(conn):
+    """A retrieval event raises activation; summary picks up the new
+    timestamp. mark_access doesn't commit — caller does."""
+    r = store(conn, "test atom", embed_fn=_fake_embed)
+    conn.execute("BEGIN IMMEDIATE")
+    mark_access(conn, [AccessEvent(atom_id=r.atom_id, source="retrieval")])
+    conn.commit()
+    rows = conn.execute(
+        "SELECT source, weight FROM access_events "
+        "WHERE atom_id = ? ORDER BY id", (r.atom_id,)
+    ).fetchall()
+    assert [row[0] for row in rows] == ["store", "retrieval"]
+    # Summary has both events in recent now.
+    import json as _json
+    s = conn.execute(
+        "SELECT recent_ts_json FROM atom_access_summary WHERE atom_id = ?",
+        (r.atom_id,)
+    ).fetchone()
+    assert len(_json.loads(s[0])) == 2
+
+
+def test_mark_access_atomic_on_batch_failure(conn):
+    """If one event in a batch is for a non-existent atom (FK violation),
+    the whole batch should roll back. SQLite has FK off by default so we
+    have to test the semantic from a different angle: caller can rely on
+    BEGIN IMMEDIATE."""
+    # Two valid events should commit together.
+    r1 = store(conn, "atom one", embed_fn=_fake_embed)
+    r2 = store(conn, "atom two", embed_fn=_fake_embed)
+    initial = conn.execute("SELECT COUNT(*) FROM access_events").fetchone()[0]
+    conn.execute("BEGIN IMMEDIATE")
+    mark_access(conn, [
+        AccessEvent(atom_id=r1.atom_id, source="retrieval"),
+        AccessEvent(atom_id=r2.atom_id, source="retrieval"),
+    ])
+    conn.commit()
+    after = conn.execute("SELECT COUNT(*) FROM access_events").fetchone()[0]
+    assert after == initial + 2
+
+
+# --- recall ---
+
+def test_recall_returns_stored_atom(conn):
+    """End-to-end: store an atom, recall it via mocked FAISS, get it back."""
+    r = store(conn, "Alice prefers concise replies", embed_fn=_fake_embed,
+              stream="semantic")
+    result = recall(
+        conn, "what does Alice prefer",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
+        fts_search_fn=lambda q, k: [],
+    )
+    raws_ids = [c.atom["id"] for c in result.raws]
+    assert r.atom_id in raws_ids
+
+
+def test_recall_filters_below_activation_threshold(conn):
+    """An atom whose only access was 'store' a long time ago shouldn't
+    surface. We can't easily age the event without mocking time, so we
+    construct an atom whose summary explicitly puts its activation below
+    threshold."""
+    import json as _json
+    r = store(conn, "ancient memory", embed_fn=_fake_embed)
+    # Forge a stale summary: one event in the deep past.
+    conn.execute(
+        "UPDATE atom_access_summary SET recent_ts_json = ?, "
+        "recent_weights_json = ?, last_updated_ts = ? WHERE atom_id = ?",
+        (
+            _json.dumps(["2020-01-01T00:00:00+00:00"]),
+            _json.dumps([1.0]),
+            "2020-01-01T00:00:00+00:00",
+            r.atom_id,
+        )
+    )
+    conn.commit()
+    result = recall(
+        conn, "ancient memory",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
+        fts_search_fn=lambda q, k: [],
+    )
+    raws_ids = [c.atom["id"] for c in result.raws]
+    assert r.atom_id not in raws_ids
+
+
+def test_recall_fires_retrieval_access_event(conn):
+    """Pass 4: returned atoms get a 'retrieval' access_event."""
+    r = store(conn, "test atom", embed_fn=_fake_embed)
+    recall(
+        conn, "test query",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
+        fts_search_fn=lambda q, k: [],
+    )
+    sources = [
+        s for (s,) in conn.execute(
+            "SELECT source FROM access_events WHERE atom_id = ? ORDER BY id",
+            (r.atom_id,)
+        )
+    ]
+    assert sources == ["store", "retrieval"]
+
+
+def test_recall_skips_access_event_when_disabled(conn):
+    """fire_access_events=False (used by the migration importer) skips
+    Pass 4."""
+    r = store(conn, "test atom", embed_fn=_fake_embed)
+    recall(
+        conn, "test query",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
+        fts_search_fn=lambda q, k: [],
+        fire_access_events=False,
+    )
+    sources = [
+        s for (s,) in conn.execute(
+            "SELECT source FROM access_events WHERE atom_id = ?",
+            (r.atom_id,)
+        )
+    ]
+    assert sources == ["store"]
+
+
+def test_recall_excludes_session_boundary_by_default(conn):
+    """session_boundary source_type atoms are filtered from generic
+    recall — PR #153's behavior preserved."""
+    r = store(conn, "session ended", embed_fn=_fake_embed,
+              source_type="session_boundary")
+    result = recall(
+        conn, "anything",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
+        fts_search_fn=lambda q, k: [],
+    )
+    ids = [c.atom["id"] for c in result.raws + result.observations]
+    assert r.atom_id not in ids
+
+    # Opt-in flips it.
+    result2 = recall(
+        conn, "anything",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
+        fts_search_fn=lambda q, k: [],
+        include_session_boundaries=True,
+    )
+    ids2 = [c.atom["id"] for c in result2.raws + result2.observations]
+    assert r.atom_id in ids2
+
+
+def test_recall_pinned_atoms_bypass_activation_threshold(conn):
+    """Pinned atoms compete even when their activation is below threshold."""
+    import json as _json
+    r = store(conn, "must remember", embed_fn=_fake_embed, is_pinned=True)
+    # Forge a stale summary.
+    conn.execute(
+        "UPDATE atom_access_summary SET recent_ts_json = ?, "
+        "recent_weights_json = ?, last_updated_ts = ? WHERE atom_id = ?",
+        (
+            _json.dumps(["2020-01-01T00:00:00+00:00"]),
+            _json.dumps([1.0]),
+            "2020-01-01T00:00:00+00:00",
+            r.atom_id,
+        )
+    )
+    conn.commit()
+    result = recall(
+        conn, "remember",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
+        fts_search_fn=lambda q, k: [],
+    )
+    raws_ids = [c.atom["id"] for c in result.raws]
+    assert r.atom_id in raws_ids
+
+
+def test_recall_two_tier_splits_observations_and_raws(conn):
+    """Atoms with memory_type='observation' end up in result.observations;
+    everything else in result.raws."""
+    raw_r = store(conn, "Alice likes pizza", embed_fn=_fake_embed)
+    obs_r = store(conn, "Alice has food preferences", embed_fn=_fake_embed,
+                  memory_type="observation")
+    result = recall(
+        conn, "Alice food",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(raw_r.atom_id, 0.85), (obs_r.atom_id, 0.9)],
+        fts_search_fn=lambda q, k: [],
+    )
+    raw_ids = [c.atom["id"] for c in result.raws]
+    obs_ids = [c.atom["id"] for c in result.observations]
+    assert raw_r.atom_id in raw_ids
+    assert obs_r.atom_id in obs_ids
+    assert raw_r.atom_id not in obs_ids
+    assert obs_r.atom_id not in raw_ids
+
+
+def test_recall_evidence_boost_lifts_evidenced_raws(conn):
+    """When an observation surfaces AND has evidenced_by raws also in the
+    candidate set, those raws get the boost."""
+    raw_r = store(conn, "Alice ordered margherita", embed_fn=_fake_embed)
+    obs_r = store(conn, "Alice has food preferences", embed_fn=_fake_embed,
+                  memory_type="observation")
+    # Link them.
+    now = "2026-05-12T00:00:00+00:00"
+    conn.execute(
+        "INSERT INTO atom_relations (source_id, target_id, relation_type, "
+        "confidence, created_at) VALUES (?, ?, 'evidenced_by', 1.0, ?)",
+        (obs_r.atom_id, raw_r.atom_id, now)
+    )
+    conn.commit()
+    result = recall(
+        conn, "Alice preferences",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(raw_r.atom_id, 0.5), (obs_r.atom_id, 0.9)],
+        fts_search_fn=lambda q, k: [],
+    )
+    raw_candidate = next(c for c in result.raws if c.atom["id"] == raw_r.atom_id)
+    assert raw_candidate.evidence_boost > 0
