@@ -297,7 +297,7 @@ class VoyageProvider(OpenAIProvider):
         # voyage saga.toml without an explicit ``url`` left
         # ``self.url`` pointing at nvidia-nim and the override never
         # fired. See issue #149.
-        from .config import was_set_in_toml
+        from ._config_io import was_set_in_toml
         if not was_set_in_toml("embedding", "url"):
             self.url = "https://api.voyageai.com/v1/embeddings"
         if not was_set_in_toml("embedding", "model"):
