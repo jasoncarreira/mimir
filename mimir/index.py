@@ -25,7 +25,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from .memory import describe_file
+from .core_blocks import describe_file
 
 log = logging.getLogger(__name__)
 

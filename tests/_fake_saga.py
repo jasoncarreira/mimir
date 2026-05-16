@@ -107,6 +107,7 @@ class FakeSaga:
         unfinished: list[str] | None = None,
         emotional_state: str | None = None,
         closed_since: list[str] | None = None,
+        channel_id: str | None = None,
     ) -> dict[str, Any]:
         self.calls.append(
             _Call(
@@ -119,10 +120,15 @@ class FakeSaga:
                     "unfinished": unfinished,
                     "emotional_state": emotional_state,
                     "closed_since": closed_since,
+                    "channel_id": channel_id,
                 },
             )
         )
-        return {"atom_id": self.end_session_atom_id, "session_id": session_id}
+        return {
+            "atom_id": self.end_session_atom_id,
+            "session_id": session_id,
+            "channel": channel_id,
+        }
 
     async def consolidate(self, *, dry_run: bool = False, max_clusters: int | None = None) -> dict[str, Any]:
         self.calls.append(
