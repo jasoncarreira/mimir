@@ -87,7 +87,7 @@ def test_re_embed_dry_run_counts_only(tmp_path: Path,
                                        monkeypatch: pytest.MonkeyPatch) -> None:
     """Dry-run reports atoms_total but doesn't write."""
     _install_stub_provider(monkeypatch)
-    db = tmp_path / "memory.db"
+    db = tmp_path / "saga.db"
     _seed_db(db, [
         ("atom1", "alpha content", 0),
         ("atom2", "beta content", 0),
@@ -113,7 +113,7 @@ def test_re_embed_apply_writes_embeddings_row(tmp_path: Path,
     ``UPDATE atoms SET embedding_dim = ?`` against a column that
     doesn't exist on atoms, crashing here."""
     stub = _install_stub_provider(monkeypatch, dim=4, provider_name="openai")
-    db = tmp_path / "memory.db"
+    db = tmp_path / "saga.db"
     _seed_db(db, [
         ("atom1", "alpha content", 0),
         ("atom2", "beta content", 0),
@@ -148,7 +148,7 @@ def test_re_embed_skips_tombstoned(tmp_path: Path,
                                      monkeypatch: pytest.MonkeyPatch) -> None:
     """Tombstoned atoms shouldn't burn embedding budget."""
     _install_stub_provider(monkeypatch)
-    db = tmp_path / "memory.db"
+    db = tmp_path / "saga.db"
     _seed_db(db, [
         ("live", "live content", 0),
         ("dead", "tombstoned content", 1),
@@ -171,7 +171,7 @@ def test_re_embed_empty_db_returns_zero(tmp_path: Path,
                                          monkeypatch: pytest.MonkeyPatch) -> None:
     """Empty corpus → atoms_total=0, no provider call, no rebuild needed."""
     stub = _install_stub_provider(monkeypatch)
-    db = tmp_path / "memory.db"
+    db = tmp_path / "saga.db"
     _seed_db(db, [])  # schema only, no atoms
     from mimir.saga.calibration import re_embed
     result = re_embed(db, dry_run=False)
@@ -186,7 +186,7 @@ def test_re_embed_target_provider_override(tmp_path: Path,
     """``target_provider_name`` overrides the TOML-resolved provider —
     useful for forced re-embeds without editing saga.toml."""
     _install_stub_provider(monkeypatch, dim=4, provider_name="voyage")
-    db = tmp_path / "memory.db"
+    db = tmp_path / "saga.db"
     _seed_db(db, [("a1", "content", 0)])
     from mimir.saga.calibration import re_embed
     # Override to "onnx" — that name should land in the embeddings row.
