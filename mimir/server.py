@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import signal
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -252,10 +253,22 @@ def build_app(config: Config) -> web.Application:
     home_saga_toml = config.home / "saga.toml"
     if home_saga_toml.is_file() and not os.environ.get("SAGA_CONFIG"):
         os.environ["SAGA_CONFIG"] = str(home_saga_toml)
+    # ``[storage].db_path`` from saga.toml — overridable by operators
+    # without touching code. Relative paths resolve under ``<home>/.mimir/``;
+    # absolute paths (e.g. mimirbot's ``/mimir-home/.mimir/saga.db``) are
+    # honored as-is. The default in ``mimir.saga._config_io._DEFAULTS`` is
+    # ``"saga.db"`` (relative) so a saga.toml without an explicit
+    # ``[storage]`` block lands at ``<home>/.mimir/saga.db`` — back to
+    # the historical naming after the brief ``memory.db`` interlude.
+    from .saga._config_io import get_config as _get_saga_config
+    _toml_db = _get_saga_config()("storage", "db_path", "saga.db")
+    _db_path = Path(_toml_db)
+    if not _db_path.is_absolute():
+        _db_path = config.home / ".mimir" / _db_path
     saga_client = make_saga_client(
         endpoint=config.saga_endpoint,
         api_key=config.saga_api_key or None,
-        db_path=config.home / ".mimir" / "memory.db",
+        db_path=_db_path,
     )
     sessions = SessionManager(idle_minutes=config.saga_session_idle_minutes)
     inbox = SubagentInbox()

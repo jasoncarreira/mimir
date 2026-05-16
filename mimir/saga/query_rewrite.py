@@ -8,7 +8,7 @@ because LongMemEval is single-turn) calls an LLM to rewrite the query
 into a self-contained form before retrieval.
 
 This module ports the same pattern to mimir.saga. Opt-in by call
-site: ``MemoryClient.query(context=[...])`` plumbs the conversation
+site: ``SagaStore.query(context=[...])`` plumbs the conversation
 context through; only when a non-empty context is provided AND a
 flag is set do we actually call the LLM and use the rewritten form.
 

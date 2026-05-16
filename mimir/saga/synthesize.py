@@ -419,7 +419,7 @@ def make_async_rich_synth_fn(
     CONTRADICTIONS in a single LLM call.
 
     Signature: ``_do(cluster, *, prior_block="", vocab_block="")``.
-    Caller (e.g. ``MemoryClient.consolidate``) can inject:
+    Caller (e.g. ``SagaStore.consolidate``) can inject:
 
     - ``prior_block`` (P47): a per-cluster string surfacing existing
       observations whose evidence is a subset of this cluster, so the

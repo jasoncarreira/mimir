@@ -22,12 +22,12 @@ The heuristic is phrase-overlap, not semantic similarity. Reasoning:
 
 API: ``mark_contributions(retrieved_atoms, response_text)`` →
 fires events on contributing atoms + returns counts. Called from
-``MemoryClient.mark_contributions`` after the response is generated.
+``SagaStore.mark_contributions`` after the response is generated.
 
 Bench: saga's bench has ``enable_mark_contributions = false`` because
 per-question DB isolation means the contribution signal can't carry
 across questions. mimir.saga keeps the same default — calling
-``MemoryClient.mark_contributions`` is opt-in.
+``SagaStore.mark_contributions`` is opt-in.
 """
 from __future__ import annotations
 

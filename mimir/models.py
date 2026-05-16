@@ -123,7 +123,7 @@ class SagaCallRecord:
     """One saga API call captured during a turn.
 
     Recorded by ``RecordingSagaClient`` (mimir/saga_client.py) which
-    wraps the underlying ``MemoryClient`` / ``_HttpSaga`` and appends
+    wraps the underlying ``SagaStore`` / ``_HttpSaga`` and appends
     to ``TurnContext.saga_calls`` on every method invocation. The
     rollup writes these into ``turns.jsonl`` so the turn viewer can
     display saga's per-turn behavior inline without joining to

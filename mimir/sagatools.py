@@ -537,7 +537,7 @@ def build_saga_tools(
         # Resolve the active TurnContext BEFORE the end_session call so
         # we can pass channel_id through. Previously we resolved ctx
         # only after the call (for the post-call log_event); but the
-        # MemoryClient's end_session needs channel_id to write the
+        # SagaStore's end_session needs channel_id to write the
         # sessions row with the right scope (review #5).
         ctx, resolution_path = resolve_active_ctx({"session_id": session_id})
 
