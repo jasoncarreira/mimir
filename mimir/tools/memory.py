@@ -1,8 +1,8 @@
-"""LangChain tool wrapping mimir.memory.MemoryClient for the PoC.
+"""LangChain tool wrapping mimir.saga.SagaStore for the PoC.
 
 Direct translation of the saga_query MCP tool to LangChain's @tool
 decorator. The function body remains essentially identical — we still
-call MemoryClient.query and render its response via _format_saga_payload.
+call SagaStore.query and render its response via _format_saga_payload.
 
 Surface change: the @tool decorator from langchain_core takes a
 docstring + type hints; deepagents picks these up via the standard
@@ -15,18 +15,18 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
-from mimir.memory.client import MemoryClient
+from mimir.saga.client import SagaStore
 from mimir.sagatools import _format_saga_payload
 
 
-# The PoC uses a single MemoryClient instance per-process. Production
+# The PoC uses a single SagaStore instance per-process. Production
 # would wire this via the agent's context_schema or a closure; for the
 # smoke we set it via _set_memory_client() before agent invocation.
-_MEMORY_STATE: dict[str, MemoryClient | None] = {"client": None}
+_MEMORY_STATE: dict[str, SagaStore | None] = {"client": None}
 
 
-def set_memory_client(client: MemoryClient) -> None:
-    """Inject the MemoryClient instance the tool will query against."""
+def set_memory_client(client: SagaStore) -> None:
+    """Inject the SagaStore instance the tool will query against."""
     _MEMORY_STATE["client"] = client
 
 
@@ -50,7 +50,7 @@ async def memory_query(query: str, top_k: int = 12) -> str:
     """
     client = _MEMORY_STATE["client"]
     if client is None:
-        return "memory_query failed: no MemoryClient configured"
+        return "memory_query failed: no SagaStore configured"
     try:
         payload = await client.query(query, top_k=top_k)
     except Exception as exc:
