@@ -291,10 +291,23 @@ def build_turn_prompt(
     # Rendered as a sibling to the SAGA atoms block — the agent reads
     # the two retrieval surfaces side-by-side and can cite either
     # without an extra tool call. The producer (`Agent._run_file_search_autopass`)
-    # gates on flag + event-kind + min-length + non-empty results, so
-    # a non-None value here always carries useful content.
+    # gates on flag + event-kind + min-length + min-score + non-empty
+    # results, so a non-None value here always carries useful content.
+    #
+    # Header reframing (chainlink #138 post-Sub-B): the original
+    # "Possibly relevant files" framing read as authoritative to the
+    # model — Sub B's A/B harness showed it crowded out the model's
+    # own search calls on partial-match probes. The "Candidate file
+    # matches (advisory — may not be relevant; verify before citing)"
+    # framing pushes the agent to treat the block as a hint to
+    # investigate rather than as an answer. Same render shape per-item
+    # — `_format_file_search_autopass` in agent.py produces the bullet
+    # list; only the section label changed here.
     if file_block:
-        _add_labeled("Possibly relevant files", file_block)
+        _add_labeled(
+            "Candidate file matches (advisory — may not be relevant; verify before citing)",
+            file_block,
+        )
 
     if subagent_block:
         _add_labeled("Subagent updates", subagent_block)

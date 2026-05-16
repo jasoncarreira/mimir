@@ -1947,9 +1947,30 @@ class Agent:
                 error=f"{type(exc).__name__}: {exc}",
             )
             return None
-        if not results:
+        # chainlink #138 post-Sub-B reframing: filter by min-score
+        # BEFORE rendering. Sub B's harness found partial-match
+        # near-clones (score ~0.40-0.50) crowded out the model's own
+        # search; the floor cuts them while leaving clean
+        # semantic+FTS matches (typically 0.65-0.75) intact. Per-turn
+        # observability: log how many hits got filtered out so future
+        # tuning has a signal.
+        min_score = self._config.file_search_autopass_min_score
+        filtered = [r for r in results if r.score >= min_score]
+        if len(filtered) < len(results):
+            await log_event(
+                "file_search_autopass_score_filtered",
+                turn_id=ctx.turn_id,
+                kept=len(filtered),
+                dropped=len(results) - len(filtered),
+                min_score=min_score,
+                top_dropped_score=(
+                    max(r.score for r in results if r.score < min_score)
+                    if any(r.score < min_score for r in results) else None
+                ),
+            )
+        if not filtered:
             return None
-        return _format_file_search_autopass(results)
+        return _format_file_search_autopass(filtered)
 
     # VSM: S3 — post-turn credit pass; saga's retrieval ranking learns
     #          which atoms helped (access_log.contributed boost).

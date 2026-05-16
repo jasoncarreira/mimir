@@ -52,6 +52,13 @@ def _cfg(tmp_path: Path, **overrides) -> Config:
         file_search_autopass_min_chars=overrides.get(
             "file_search_autopass_min_chars", 20,
         ),
+        # Tests default to 0.0 so HashEmbedder-driven indexer scores —
+        # which can land anywhere in [0,1] depending on seeded content
+        # — don't accidentally trip the post-Sub-B min-score floor.
+        # Tests that exercise the floor pass an explicit override.
+        file_search_autopass_min_score=overrides.get(
+            "file_search_autopass_min_score", 0.0,
+        ),
     )
 
 
@@ -495,6 +502,124 @@ async def test_autopass_respects_top_k_override(tmp_path: Path):
         await indexer.stop()
 
 
+# ---- min-score filter (chainlink #138 post-Sub-B reframing) -------------
+
+
+class _FakeIndexer:
+    """Minimal stand-in for Indexer that returns canned SearchResults
+    with controllable scores. The autopass code path only calls
+    ``await self._indexer.search(query, scope=..., k=...)`` — nothing
+    else from the real Indexer interface is touched, so a single-method
+    fake is enough to exercise the min-score filter deterministically."""
+
+    def __init__(self, results: list[SearchResult]):
+        self._results = results
+
+    async def search(self, query: str, *, scope: str, k: int) -> list[SearchResult]:
+        return self._results[:k]
+
+
+def _result(score: float, path: str = "memory/x.md", idx: int = 0) -> SearchResult:
+    """Build a SearchResult with the target hybrid score; cosine/bm25/recency
+    components don't matter for the min-score filter (it reads ``score`` only)."""
+    return SearchResult(
+        path=path,
+        scope="memory",
+        chunk_index=idx,
+        score=score,
+        cosine=score,  # placeholder
+        bm25=0.0,
+        recency=0.0,
+        snippet=f"snippet for {path}#{idx}",
+        description=f"desc-{idx}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_autopass_filters_results_below_min_score(tmp_path: Path):
+    """Results below ``file_search_autopass_min_score`` get dropped
+    before rendering — Sub B's partial-match crowders (~0.40-0.50)
+    are the target. A clean 0.70 hit survives a 0.55 floor; 0.50 and
+    0.30 hits get filtered out."""
+    fake = _FakeIndexer([
+        _result(0.70, path="memory/keep.md", idx=0),
+        _result(0.50, path="memory/drop1.md", idx=1),
+        _result(0.30, path="memory/drop2.md", idx=2),
+    ])
+    agent = await _build_agent(
+        tmp_path, indexer=fake, file_search_autopass_min_score=0.55,
+        # k high enough that the filter is what limits the block, not the cap
+        file_search_autopass_k=10,
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1",
+        content="this is a long enough message to pass the min-chars gate",
+        author="discord-99",
+    )
+    block = await agent._run_file_search_autopass(_ctx(), event)
+    assert block is not None
+    # Only the 0.70 hit survived; the rendered block has exactly one line
+    # and that line names the kept path.
+    lines = block.splitlines()
+    assert len(lines) == 1
+    assert "memory/keep.md:#0" in lines[0]
+    assert "memory/drop1.md" not in block
+    assert "memory/drop2.md" not in block
+
+
+@pytest.mark.asyncio
+async def test_autopass_returns_none_when_all_results_below_min_score(
+    tmp_path: Path,
+):
+    """All hits below floor → ``None`` (no orphan ``## Candidate file
+    matches`` section in the prompt). Same shape as the
+    ``not results: return None`` upstream gate."""
+    fake = _FakeIndexer([
+        _result(0.50, idx=0),
+        _result(0.40, idx=1),
+        _result(0.30, idx=2),
+    ])
+    agent = await _build_agent(
+        tmp_path, indexer=fake, file_search_autopass_min_score=0.55,
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1",
+        content="this is a long enough message to pass the min-chars gate",
+        author="discord-99",
+    )
+    block = await agent._run_file_search_autopass(_ctx(), event)
+    assert block is None
+
+
+@pytest.mark.asyncio
+async def test_autopass_min_score_zero_keeps_every_hit(tmp_path: Path):
+    """Floor of 0.0 is the "filter disabled" sentinel — every hit the
+    indexer returns survives. Confirms the filter is purely additive
+    and doesn't change behavior for callers that opt out of it (the
+    default for tests that don't care about the filter shape)."""
+    fake = _FakeIndexer([
+        _result(0.70, path="memory/a.md", idx=0),
+        _result(0.30, path="memory/b.md", idx=1),
+        _result(0.05, path="memory/c.md", idx=2),
+    ])
+    agent = await _build_agent(
+        tmp_path, indexer=fake, file_search_autopass_min_score=0.0,
+        file_search_autopass_k=10,
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1",
+        content="this is a long enough message to pass the min-chars gate",
+        author="discord-99",
+    )
+    block = await agent._run_file_search_autopass(_ctx(), event)
+    assert block is not None
+    lines = block.splitlines()
+    assert len(lines) == 3
+
+
 # ---- prompts.build_turn_prompt rendering --------------------------------
 
 
@@ -509,7 +634,10 @@ def test_turn_prompt_includes_file_block_when_provided():
     )
     file_block = "- [memory/topics/quantum.md:#0 (0.732)] Quantum mechanics…"
     prompt = build_turn_prompt(event, file_block=file_block)
-    assert "## Possibly relevant files" in prompt
+    # chainlink #138 post-Sub-B reframing: header changed from
+    # "Possibly relevant files" → "Candidate file matches (advisory — ...)".
+    assert "## Candidate file matches (advisory" in prompt
+    assert "verify before citing" in prompt
     assert "memory/topics/quantum.md:#0" in prompt
 
 
@@ -523,7 +651,10 @@ def test_turn_prompt_omits_file_block_when_none():
         author="discord-99",
     )
     prompt = build_turn_prompt(event)  # no file_block
+    # Post-Sub-B reframing: check for both the old and new label so
+    # this test doesn't regress if either ever leaks back in.
     assert "Possibly relevant files" not in prompt
+    assert "Candidate file matches" not in prompt
 
 
 def test_turn_prompt_renders_file_block_after_saga_block():
@@ -545,7 +676,7 @@ def test_turn_prompt_renders_file_block_after_saga_block():
         event, saga_block=saga_block, file_block=file_block,
     )
     saga_idx = prompt.index("## Possibly relevant memories (from SAGA)")
-    file_idx = prompt.index("## Possibly relevant files")
+    file_idx = prompt.index("## Candidate file matches")
     assert saga_idx < file_idx, (
         f"SAGA block ({saga_idx}) should land before files block ({file_idx})"
     )
@@ -556,20 +687,28 @@ def test_turn_prompt_renders_file_block_after_saga_block():
 
 def test_config_default_disables_autopass(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("MIMIR_FILE_SEARCH_AUTOPASS_ENABLED", raising=False)
+    monkeypatch.delenv("MIMIR_FILE_SEARCH_AUTOPASS_K", raising=False)
+    monkeypatch.delenv("MIMIR_FILE_SEARCH_AUTOPASS_MIN_CHARS", raising=False)
+    monkeypatch.delenv("MIMIR_FILE_SEARCH_AUTOPASS_MIN_SCORE", raising=False)
     cfg = Config.from_env()
     assert cfg.file_search_autopass_enabled is False
-    assert cfg.file_search_autopass_k == 5
+    # Post-Sub-B reframing: default K dropped 5 → 3 alongside the
+    # introduction of the min-score floor.
+    assert cfg.file_search_autopass_k == 3
     assert cfg.file_search_autopass_min_chars == 20
+    assert cfg.file_search_autopass_min_score == 0.55
 
 
 def test_config_reads_autopass_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MIMIR_FILE_SEARCH_AUTOPASS_ENABLED", "true")
     monkeypatch.setenv("MIMIR_FILE_SEARCH_AUTOPASS_K", "8")
     monkeypatch.setenv("MIMIR_FILE_SEARCH_AUTOPASS_MIN_CHARS", "30")
+    monkeypatch.setenv("MIMIR_FILE_SEARCH_AUTOPASS_MIN_SCORE", "0.72")
     cfg = Config.from_env()
     assert cfg.file_search_autopass_enabled is True
     assert cfg.file_search_autopass_k == 8
     assert cfg.file_search_autopass_min_chars == 30
+    assert cfg.file_search_autopass_min_score == 0.72
 
 
 # ---- end-to-end through Agent._build_turn_prompt ------------------------
@@ -600,7 +739,8 @@ async def test_build_turn_prompt_includes_file_block_when_enabled(
             ctx, event, saga_block=None, subagent_block=None,
             file_block=file_block,
         )
-        assert "## Possibly relevant files" in turn_prompt
+        assert "## Candidate file matches (advisory" in turn_prompt
+        assert "verify before citing" in turn_prompt
     finally:
         await indexer.stop()
 
@@ -630,6 +770,7 @@ async def test_build_turn_prompt_omits_file_block_for_short_message(
             file_block=file_block,
         )
         assert "Possibly relevant files" not in turn_prompt
+        assert "Candidate file matches" not in turn_prompt
     finally:
         await indexer.stop()
 
@@ -663,5 +804,6 @@ async def test_build_turn_prompt_omits_file_block_when_disabled(
             file_block=file_block,
         )
         assert "Possibly relevant files" not in turn_prompt
+        assert "Candidate file matches" not in turn_prompt
     finally:
         await indexer.stop()
