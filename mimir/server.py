@@ -319,11 +319,16 @@ def build_app(config: Config) -> web.Application:
     # handled inside Agent.__init__ (it requires unwrapping the
     # RecordingSagaClient chain), so it's not re-done here.
     from . import tools as _agent_tools
+    from .tools import web as _web_tools
     _agent_tools.set_indexer(indexer)
     _agent_tools.set_turns_log_path(config.turns_log)
     _agent_tools.set_channel_registry(channels)
     _agent_tools.set_dispatcher(dispatcher)
     _agent_tools.set_scheduler(scheduler)
+    # fetch_url caches downloaded bodies under <home>/attachments/fetch-cache/.
+    # The tool itself is only registered when the active provider isn't
+    # claude_code (see all_mimir_tools); set_home is harmless when unused.
+    _web_tools.set_home(config.home)
 
     # WebChatBridge needs the dispatcher (for inbound) — built after dispatcher
     # exists, registered before channels.connect_all() runs at startup.

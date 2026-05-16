@@ -423,11 +423,18 @@ def all_mimir_tools() -> list:
     this module. Production cutover would wire the dep-injection
     setters in mimir/server.py:build_app once and let the agent
     discover them all at construction time.
+
+    Web tools (Tavily ``web_search`` + ``fetch_url``) are appended
+    only when the active LLM provider is not ``claude_code`` — Claude
+    Code subprocesses ship native WebSearch/WebFetch and stacking
+    Tavily on top would duplicate the surface. See
+    ``mimir.tools.web.web_tools_enabled`` for the gating predicate.
     """
     from .memory import memory_query
     from .store import memory_store
     from .extra import file_search, mimir_get_turn, shell_exec
-    return [
+    from .web import web_tools_enabled
+    tools = [
         # Memory (read + write)
         memory_query, memory_store,
         # Indexer (file search)
@@ -446,3 +453,11 @@ def all_mimir_tools() -> list:
         # Spawn
         spawn_claude_code,
     ]
+    web_search_on, fetch_url_on = web_tools_enabled()
+    if web_search_on or fetch_url_on:
+        from .web import fetch_url, web_search
+        if web_search_on:
+            tools.append(web_search)
+        if fetch_url_on:
+            tools.append(fetch_url)
+    return tools
