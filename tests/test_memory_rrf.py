@@ -1,11 +1,11 @@
-"""Tests for mimir.memory.retrieval_fusion — Reciprocal Rank Fusion.
+"""Tests for mimir.saga.retrieval_fusion — Reciprocal Rank Fusion.
 
 Validates the canonical RRF formula and confirms the recall path
 exposes per-candidate rank diagnostics.
 """
 from __future__ import annotations
 
-from mimir.memory.retrieval_fusion import DEFAULT_K, reciprocal_rank_fusion
+from mimir.saga.retrieval_fusion import DEFAULT_K, reciprocal_rank_fusion
 
 
 # ─── Formula ─────────────────────────────────────────────────────────
@@ -78,7 +78,7 @@ def test_rrf_default_k_is_60():
 def test_recall_candidate_carries_rrf_diagnostics():
     """Per-candidate rrf_score, semantic_rank, keyword_rank must be
     populated so the turn viewer can show why an atom ranked where it did."""
-    from mimir.memory.recall import RecallCandidate
+    from mimir.saga.recall import RecallCandidate
     c = RecallCandidate(
         atom={"id": "x"}, activation=0.0, similarity=0.0,
         rrf_score=0.05, semantic_rank=1, keyword_rank=3,

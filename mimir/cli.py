@@ -1717,14 +1717,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     _reindex.add_argparse(reindex_p)
 
     # ``mimir migrate-memory`` — port saga.db (or MSAM snapshot) into
-    # the new mimir.memory.db schema. The new memory subsystem
-    # (mimir.memory.*) is a clean-room rewrite that drops saga's
+    # the new mimir.saga.db schema. The new memory subsystem
+    # (mimir.saga.*) is a clean-room rewrite that drops saga's
     # age-anchored retrievability / one-way state machine / consolidation-
     # halves-stability bugs. This subcommand carries the existing atom
     # corpus + access history forward without re-encoding from scratch.
     migrate_p = sub.add_parser(
         "migrate-memory",
-        help="Migrate saga.db (or MSAM snapshot) to mimir.memory.db. "
+        help="Migrate saga.db (or MSAM snapshot) to mimir.saga.db. "
              "One-way; new DB lives alongside the old until cutover.",
     )
     migrate_p.add_argument(
@@ -1733,7 +1733,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     migrate_p.add_argument(
         "--dest", type=Path, required=True,
-        help="Output mimir.memory.db (won't overwrite without --force)",
+        help="Output mimir.saga.db (won't overwrite without --force)",
     )
     migrate_p.add_argument(
         "--force", action="store_true",
@@ -1912,7 +1912,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(_reindex.dispatch(args))
 
     if args.command == "migrate-memory":
-        from .memory.migrate import migrate as _migrate_memory
+        from .saga.migrate import migrate as _migrate_memory
         try:
             _migrate_memory(
                 source=args.source,

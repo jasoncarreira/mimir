@@ -6,7 +6,7 @@ session_member relations that link the boundary to atoms accessed
 during the session.
 
 Observation synthesis is NOT done here — it lives in
-``mimir.memory.consolidate.consolidate()``, which runs on a cron over
+``mimir.saga.consolidate.consolidate()``, which runs on a cron over
 cross-session evidence. The within-session synthesis hook that lived
 here through earlier iterations was removed (2026-05-13): no
 production caller used it, and the cluster + synth + relations logic

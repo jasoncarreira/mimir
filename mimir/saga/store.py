@@ -34,7 +34,7 @@ from .mark_access import AccessEvent, mark_access
 
 # Callable signature for the embedding provider. Returns the raw float32
 # bytes ready to land in embeddings.vec, plus the metadata fields
-# (provider, model, dim). Injected by mimir.memory's __init__ wiring;
+# (provider, model, dim). Injected by mimir.saga's __init__ wiring;
 # the sketch uses a lambda placeholder.
 EmbedFn = Callable[[str], tuple[bytes, str, str, int]]
 
