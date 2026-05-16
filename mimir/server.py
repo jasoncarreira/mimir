@@ -310,6 +310,14 @@ def build_app(config: Config) -> web.Application:
         enqueue=dispatcher.enqueue,
         home=config.home,
     )
+    # Commitments store — Phase 2b due-check poller + the four
+    # commitment_* langchain tools both need this. Pre-fix it was
+    # never constructed, so getattr(agent, "_commitments", None) was
+    # always None and every commitment tool returned the "no store"
+    # error. Build once, hand to Agent + the tool registry.
+    from .commitments import CommitmentsStore
+    commitments_store = CommitmentsStore(path=config.commitments_log)
+
     agent = Agent(
         config,
         turn_logger,
@@ -322,6 +330,7 @@ def build_app(config: Config) -> web.Application:
         subagent_inbox=inbox,
         channel_registry=channels,
         dispatcher=dispatcher,
+        commitments_store=commitments_store,
     )
     dispatcher.set_run_turn(agent.run_turn)
 
@@ -338,6 +347,16 @@ def build_app(config: Config) -> web.Application:
     _agent_tools.set_channel_registry(channels)
     _agent_tools.set_dispatcher(dispatcher)
     _agent_tools.set_scheduler(scheduler)
+    # Pre-fix these setters existed but weren't called from build_app,
+    # so the four commitment_* tools all returned "no store" and
+    # spawn_claude_code had no resolved config. Wired now.
+    _agent_tools.set_commitments_store(commitments_store)
+    # spawn_claude_code reads ``.get("default_cwd")`` from this dict.
+    # The current Config dataclass doesn't fit that shape; we pass a
+    # purpose-built mapping rather than refactor the tool to accept
+    # the full Config. Keep this in sync if spawn_claude_code grows
+    # additional knobs.
+    _agent_tools.set_spawn_config({"default_cwd": config.home})
     # fetch_url caches downloaded bodies under <home>/attachments/fetch-cache/.
     # The tool itself is only registered when the active provider isn't
     # claude_code (see all_mimir_tools); set_home is harmless when unused.

@@ -25,9 +25,39 @@ to memory_tool.py's set_memory_client pattern.
 from __future__ import annotations
 
 import json
+import asyncio
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
+
+from langchain_core.runnables import RunnableConfig
+
+
+def _channel_from_config_or_state(
+    channel_id: str | None, config: RunnableConfig | None
+) -> str:
+    """Resolve the effective channel_id for a tool call.
+
+    Precedence (highest first):
+      1. Explicit ``channel_id`` argument from the model
+      2. LangGraph ``configurable["channel_id"]`` (set by run_turn)
+      3. Module-global ``_STATE["current_channel_id"]`` (legacy
+         dispatcher-set; back-compat path for callers that still
+         use ``set_current_channel_id``)
+
+    The LangGraph path is the new canonical route — ``_STATE`` is
+    process-global and races across concurrent dispatcher turns.
+    Returns ``""`` if no source supplies a channel.
+    """
+    cid = (channel_id or "").strip()
+    if cid:
+        return cid
+    if config is not None:
+        configurable = config.get("configurable") or {}
+        from_config = (configurable.get("channel_id") or "").strip()
+        if from_config:
+            return from_config
+    return (_STATE.get("current_channel_id") or "").strip()
 
 from langchain_core.tools import tool
 
@@ -77,7 +107,11 @@ def set_current_channel_id(channel_id: str | None) -> None:
 # ────────────────────────────────────────────────────────────────────
 
 @tool
-async def send_message(text: str, channel_id: Optional[str] = None) -> str:
+async def send_message(
+    text: str,
+    channel_id: Optional[str] = None,
+    config: RunnableConfig | None = None,
+) -> str:
     """Emit a message to a channel.
 
     If channel_id is omitted, uses the current turn's channel. Subject
@@ -93,7 +127,7 @@ async def send_message(text: str, channel_id: Optional[str] = None) -> str:
         return "send_message failed: no channel registry configured"
     if not text or not text.strip():
         return "send_message failed: text is required"
-    cid = (channel_id or "").strip() or _STATE["current_channel_id"]
+    cid = _channel_from_config_or_state(channel_id, config)
     if not cid:
         return "send_message failed: no channel_id and no current channel"
     bridge = channels.find(cid)
@@ -111,6 +145,7 @@ async def react(
     emoji: str,
     message_id: Optional[str] = None,
     channel_id: Optional[str] = None,
+    config: RunnableConfig | None = None,
 ) -> str:
     """React to a message with an emoji.
 
@@ -127,7 +162,7 @@ async def react(
     channels = _STATE["channel_registry"]
     if channels is None:
         return "react failed: no channel registry configured"
-    cid = (channel_id or "").strip() or _STATE["current_channel_id"]
+    cid = _channel_from_config_or_state(channel_id, config)
     if not cid:
         return "react failed: no channel_id and no current channel"
     bridge = channels.find(cid)
@@ -144,6 +179,7 @@ async def react(
 async def fetch_channel_history(
     channel_id: Optional[str] = None,
     limit: int = 20,
+    config: RunnableConfig | None = None,
 ) -> str:
     """Fetch recent messages from a channel.
 
@@ -154,7 +190,7 @@ async def fetch_channel_history(
     channels = _STATE["channel_registry"]
     if channels is None:
         return "fetch_channel_history failed: no channel registry"
-    cid = (channel_id or "").strip() or _STATE["current_channel_id"]
+    cid = _channel_from_config_or_state(channel_id, config)
     if not cid:
         return "fetch_channel_history failed: no channel_id and no current"
     try:
@@ -353,8 +389,27 @@ async def commitment_list(due_within_days: int = 7) -> str:
 # Spawn (mimir/spawn.py)
 # ────────────────────────────────────────────────────────────────────
 
+def _run_claude_subprocess(argv: list[str], cwd: str | None, timeout_s: int) -> tuple[int, str, str]:
+    """Sync subprocess.run wrapper — called from a thread via to_thread.
+
+    Keeping the blocking I/O in a helper that's invoked through
+    ``asyncio.to_thread`` keeps spawn_claude_code from freezing the
+    dispatcher's event loop for the duration of the subprocess (up to
+    ``timeout_s=1800`` by default). Returns (returncode, stdout, stderr)
+    or raises subprocess.TimeoutExpired / FileNotFoundError unchanged.
+    """
+    proc = subprocess.run(  # noqa: S603 — argv is constructed, not shell
+        argv,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
 @tool
-def spawn_claude_code(
+async def spawn_claude_code(
     prompt: str,
     cwd: Optional[str] = None,
     timeout_s: int = 1800,
@@ -366,6 +421,13 @@ def spawn_claude_code(
     multi-step plans, or independent execution from the parent agent.
     The subprocess runs ``claude -p <prompt>`` and captures its
     output, final cost, and modelUsage metrics.
+
+    Pre-fix this was a sync function that called ``subprocess.run``
+    directly. deepagents awaited the sync callable, freezing the
+    dispatcher's event loop for up to ``timeout_s=1800`` seconds —
+    every other channel's worker blocked until the spawn finished.
+    Now async, with the blocking subprocess call wrapped in
+    ``asyncio.to_thread``.
 
     Args:
         prompt: The task to hand to the spawned Claude Code instance.
@@ -381,26 +443,23 @@ def spawn_claude_code(
     cwd_path = Path(cwd).expanduser() if cwd else cfg.get("default_cwd")
     argv = ["claude", "-p", "--output-format", "json", prompt]
     try:
-        proc = subprocess.run(
+        returncode, stdout, stderr = await asyncio.to_thread(
+            _run_claude_subprocess,
             argv,
-            cwd=str(cwd_path) if cwd_path else None,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
+            str(cwd_path) if cwd_path else None,
+            timeout_s,
         )
     except subprocess.TimeoutExpired:
         return f"spawn_claude_code timed out after {timeout_s}s"
     except FileNotFoundError:
         return "spawn_claude_code failed: 'claude' CLI not on PATH"
-    if proc.returncode != 0:
+    if returncode != 0:
         return (
-            f"spawn_claude_code failed: exit={proc.returncode} "
-            f"stderr={proc.stderr[:500]}"
+            f"spawn_claude_code failed: exit={returncode} "
+            f"stderr={stderr[:500]}"
         )
-    # Production version writes spawn record to turns.jsonl with kind=
-    # "claude_code_spawn". PoC just returns the result text.
     try:
-        result = json.loads(proc.stdout)
+        result = json.loads(stdout)
         return json.dumps(
             {"result": result.get("result", "")[:2000],
              "cost_usd": result.get("total_cost_usd"),
@@ -409,7 +468,7 @@ def spawn_claude_code(
             indent=2,
         )
     except json.JSONDecodeError:
-        return f"spawn_claude_code: raw output: {proc.stdout[:2000]}"
+        return f"spawn_claude_code: raw output: {stdout[:2000]}"
 
 
 # ────────────────────────────────────────────────────────────────────
