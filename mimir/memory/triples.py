@@ -271,6 +271,10 @@ def _update_world_state(
     Logic:
     - If the new triple has the same value as the current row: no-op
       (the LLM re-asserting the same fact, nothing to update).
+      First-mention ``valid_from`` is preserved; a later re-assertion
+      with a different (typically later) ``valid_from`` does NOT
+      bump the stored timestamp. The fact's validity is anchored at
+      first claim.
     - Else: mark the prior current row as is_current=0, set its
       valid_until to the new row's valid_from (or now() if missing),
       then insert the new row as is_current=1.
@@ -554,6 +558,14 @@ def detect_contradictions(
     weren't ingested through the world-state writer (e.g. bulk
     migration). Returns one entry per offending key with the
     conflicting values.
+
+    Scope: this query catches the residual transient race window in
+    ``world_state``. The load-bearing contradiction surface in
+    production is ``atom_relations.contradicts``, populated by
+    ``synthesize._parse_contradictions`` during the rich-synth
+    consolidation pass and persisted via ``store_triples`` /
+    ``resolve_contradictions_to_supersedes``. Callers that want the
+    full picture should walk both this and that table.
     """
     where = ["is_current = 1"]
     params: list = []
