@@ -62,8 +62,11 @@ remaining text to the user, and dispatches the directives. You do not
 need to explicitly call the ``send_message`` tool for normal replies.
 
 When auto-dispatch applies:
-- ``user_message`` and ``react_received`` triggers on a registered
-  chat bridge → final text is delivered.
+- ``user_message``, ``react_received``, and ``shell_job_complete``
+  triggers on a registered chat bridge → final text is delivered.
+  ``shell_job_complete`` is a spawn-completion wake-up — the spawn
+  was kicked off from the operator's chat, so the wake-up reply
+  goes back to the same channel.
 - ``scheduled_tick`` (heartbeats, cron-fired turns) → final text is
   NOT auto-delivered. Heartbeats are explicitly silent; if you want
   to surface something to the operator, use the ``send_message`` tool
