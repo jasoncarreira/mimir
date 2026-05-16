@@ -161,6 +161,13 @@ class Config:
     #   See ``mimir.agent._resolve_model``. Defaults to
     #   ``claude-code:claude-sonnet-4-6`` (Max OAuth, no API-key billing).
     model_spec: str
+
+    # Per-call retry budget for non-claude-code providers (anthropic,
+    # openai, voyage, etc.). Threaded into ``init_chat_model`` via
+    # ``max_retries=...``; provider SDKs use this for transient 429 /
+    # 5xx backoff. claude-code path ignores this — the subprocess
+    # handles its own retry semantics. Default 6 (matches open-strix).
+    model_max_retries: int
     effort: str
     embed_model: str
     saga_endpoint: str
@@ -449,6 +456,7 @@ class Config:
             home=home,
             model=_env("MIMIR_MODEL", "claude-opus-4-7"),
             model_spec=_env("MIMIR_MODEL_SPEC", "claude-code:claude-sonnet-4-6"),
+            model_max_retries=_env_int("MIMIR_MODEL_MAX_RETRIES", 6),
             effort=_env("MIMIR_EFFORT", "high"),
             embed_model=_env("MIMIR_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
             saga_endpoint=_env("SAGA_ENDPOINT", "http://localhost:3002"),
