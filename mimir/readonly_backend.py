@@ -97,6 +97,33 @@ class WriteGuardBackend:
         ]
         # For error messages — the friendlier "/state/" form.
         self._writable_labels: list[str] = ["/" + d for d in cleaned]
+        # Recorded denials, one per blocked Write/Edit/upload. The agent
+        # drains this list at end-of-turn (``drain_denials()``) into
+        # TurnRecord.permission_denials so the audit trail is visible
+        # in the turn viewer instead of silently empty.
+        self._denials: list[dict[str, Any]] = []
+
+    def drain_denials(self) -> list[dict[str, Any]]:
+        """Return + clear recorded permission denials.
+
+        Called by Agent.run_turn after each turn so the next turn
+        starts with a fresh slate. Concurrent turns sharing the same
+        backend would race here; mimir's dispatcher serializes
+        turns per channel and the backend is process-global, so the
+        practical race window is narrow but real for cross-channel
+        turns. Acceptable for an audit trail (we'd rather log all
+        denials with possible attribution drift than lose some).
+        """
+        snapshot = list(self._denials)
+        self._denials.clear()
+        return snapshot
+
+    def _record_denial(self, op: str, file_path: str) -> None:
+        self._denials.append({
+            "op": op,
+            "file_path": file_path,
+            "writable_dirs": list(self._writable_labels),
+        })
 
     def __getattr__(self, name: str) -> Any:
         # Default-deny passthrough: only explicit reads forward.
@@ -140,6 +167,7 @@ class WriteGuardBackend:
 
     def write(self, file_path: str, content: str) -> WriteResult:
         if not self._is_write_allowed(file_path):
+            self._record_denial("write", file_path)
             return WriteResult(
                 error=f"Write blocked. Writable directories: {self._allowed_dirs_label()}",
             )
@@ -156,6 +184,7 @@ class WriteGuardBackend:
         replace_all: bool = False,
     ) -> EditResult:
         if not self._is_write_allowed(file_path):
+            self._record_denial("edit", file_path)
             return EditResult(
                 error=f"Edit blocked. Writable directories: {self._allowed_dirs_label()}",
             )
@@ -190,6 +219,8 @@ class WriteGuardBackend:
         # the batch cleanly.
         blocked_paths = {p for p, _ in files if not self._is_write_allowed(p)}
         if blocked_paths:
+            for p in blocked_paths:
+                self._record_denial("upload", p)
             return [
                 FileUploadResponse(path=p, error="permission_denied")
                 for p, _ in files

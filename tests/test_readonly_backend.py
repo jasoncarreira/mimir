@@ -153,6 +153,28 @@ class TestWriteGuardBackend:
         r = b.write(file_path="/.mimir/db.sqlite", content="no")
         assert "Write blocked" in (getattr(r, "error", "") or "")
 
+    def test_drain_denials_captures_blocked_writes(self, home: Path) -> None:
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        # Pre-fix permission_denials in TurnRecord was always empty —
+        # the SDK reported WriteGuard refusals via that field, but the
+        # deepagents cutover dropped the capture path. Now blocked
+        # write/edit/upload land in self._denials and run_turn drains
+        # them into the TurnRecord at end of turn.
+        b.write(file_path="/logs/blocked.txt", content="no")
+        b.edit(file_path="/logs/existing.txt", old_string="x", new_string="y")
+        b.upload_files([("/logs/up.txt", b"x")])
+        denials = b.drain_denials()
+        assert len(denials) == 3
+        ops = sorted(d["op"] for d in denials)
+        assert ops == ["edit", "upload", "write"]
+        # Drain clears, so the next call returns nothing.
+        assert b.drain_denials() == []
+
+    def test_denials_not_recorded_on_allowed_writes(self, home: Path) -> None:
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        b.write(file_path="/state/ok.txt", content="hi")
+        assert b.drain_denials() == []
+
     def test_explicit_allowlist_blocks_unknown_method(self, home: Path) -> None:
         # __getattr__ no longer passes through arbitrary attribute
         # access — only methods on _ALLOWED_READS forward. A future

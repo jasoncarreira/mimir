@@ -301,6 +301,7 @@ class Agent:
         # __init__ may run outside a running event loop (tests).
         self._agent: Any | None = None
         self._agent_lock: asyncio.Lock | None = None
+        self._backend: Any | None = None
 
         # Memory-tool dep injection — only used if saga_client is a
         # SagaStore (post-saga cutover). Wires up the @tool's
@@ -379,6 +380,9 @@ class Agent:
                 root_dir=self._config.home,
                 writable_dirs=self._config.writable_dirs,
             )
+            # Stored so run_turn can drain recorded denials into the
+            # TurnRecord.permission_denials field at end of turn.
+            self._backend = backend
             self._agent = create_deep_agent(
                 model=_resolve_model(
                     model_spec,
@@ -404,6 +408,58 @@ class Agent:
             sess = await self._sessions.touch(event.channel_id)
             saga_session_id = sess.saga_session_id
             self._sessions.increment_turn_count(event.channel_id)
+
+        # Typing indicator at turn start — Discord/Slack bridges expose
+        # ``send_typing_indicator`` so the user sees "mimir is typing…"
+        # while a multi-second LLM call runs. Pre-fix the indicator
+        # only fired on the post-turn ``bridge.send``; long turns
+        # appeared hung. Bridges that don't implement the method
+        # (Bluesky / Bench / WebChat) are silently skipped.
+        if (
+            self._channels is not None
+            and event.channel_id
+            and event.trigger == "user_message"
+        ):
+            bridge = self._channels.find(event.channel_id)
+            if bridge is not None and hasattr(bridge, "send_typing_indicator"):
+                try:
+                    await bridge.send_typing_indicator(event.channel_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("typing indicator failed: %s", exc)
+
+        # Set up TurnContext so RecordingSagaClient can populate
+        # ctx.saga_calls. Without this all saga calls — pre-message
+        # query, post-message feedback — were lost from the turn
+        # record. The context is reset in the finally block.
+        from .models import TurnContext as _TurnContext
+        from ._context import set_current_turn, reset_current_turn
+        ctx = _TurnContext(
+            turn_id=turn_id,
+            session_id=session_id,
+            trigger=event.trigger,
+            channel_id=event.channel_id,
+            started_at=t_total_start,
+            saga_session_id=saga_session_id,
+        )
+        ctx_token = set_current_turn(ctx)
+        try:
+            return await self._run_turn_body(
+                event, ctx, ctx_token, turn_id, session_id, saga_session_id,
+                t_total_start,
+            )
+        finally:
+            reset_current_turn(ctx_token)
+
+    async def _run_turn_body(
+        self,
+        event: AgentEvent,
+        ctx: Any,
+        ctx_token: Any,
+        turn_id: str,
+        session_id: str,
+        saga_session_id: str | None,
+        t_total_start: float,
+    ) -> TurnRecord:
 
         # Pre-message memory inject.
         memory_block = ""
@@ -499,6 +555,37 @@ class Agent:
                 log.warning("post-message saga.feedback failed: %s", exc)
 
         # Build and write TurnRecord — matches the SDK schema.
+        # Drain observability state captured during this turn:
+        #   - permission_denials from WriteGuardBackend (every blocked
+        #     write/edit/upload during the turn).
+        #   - saga_calls from TurnContext (populated by
+        #     RecordingSagaClient on every recorded saga method).
+        #   - kind detection: scan events for spawn_claude_code tool
+        #     calls; bench aggregate_usage keys on this for cost
+        #     attribution (claude_code_spawn vs other).
+        permission_denials: list = []
+        if self._backend is not None and hasattr(self._backend, "drain_denials"):
+            try:
+                permission_denials = self._backend.drain_denials()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("backend.drain_denials failed: %s", exc)
+        saga_calls = [
+            {
+                "call_type": c.call_type, "args": c.args, "result": c.result,
+                "latency_ms": c.latency_ms, "error": c.error, "t_ms": c.t_ms,
+            }
+            for c in ctx.saga_calls
+        ]
+        kind: str | None = None
+        for evt in events:
+            if (
+                isinstance(evt, dict)
+                and evt.get("type") == "tool_call"
+                and evt.get("name") == "spawn_claude_code"
+            ):
+                kind = "claude_code_spawn"
+                break
+
         record = TurnRecord(
             ts=_utc_now(),
             turn_id=turn_id,
@@ -512,6 +599,9 @@ class Agent:
             output=(output or "")[:2048],
             duration_ms=int((time.monotonic() - t_total_start) * 1000),
             error=error,
+            permission_denials=permission_denials,
+            saga_calls=saga_calls,
+            kind=kind,
             **result_fields,
         )
         await self._turn_logger.write(record)
