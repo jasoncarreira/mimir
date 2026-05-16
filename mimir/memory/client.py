@@ -18,7 +18,7 @@ Provider/index plumbing:
   virtual table. Triggers in schema.sql keep atoms_fts in sync with
   atoms; the client just calls the search.
 - LLM synth for consolidate: ``mimir.memory.synthesize.
-  make_async_observation_synth_fn`` — wraps saga's ``call_llm`` so
+  make_async_rich_synth_fn`` — wraps saga's ``call_llm`` so
   consolidate() can actually emit observations rather than no-op'ing.
 
 v2 is operationally complete: real FAISS over mimir.memory.db, real
@@ -207,8 +207,12 @@ class MemoryClient:
         self._index_built = False
         # LLM synth callable for consolidate(). Late-bound (lazy import
         # of synthesize.py) so MemoryClient doesn't transitively pull in
-        # the saga LLM transport at construction time.
-        self._observation_synth_fn = None
+        # the LLM transport at construction time. Despite the name, this
+        # holds the *rich* synth callable (returns content + triples +
+        # contradictions); ``observation`` is historical from when the
+        # earlier tier-2 path was the only consumer. TODO(rename-pass):
+        # ``_rich_synth_fn`` is the more accurate name.
+        self._rich_synth_fn = None
         # Write-serialization across threads. We open the connection
         # with ``check_same_thread=False`` so each public method can
         # run under ``asyncio.to_thread``; SQLite under WAL serializes
@@ -648,9 +652,9 @@ class MemoryClient:
         # into the right table. Cached on the client because
         # make_async_rich_synth_fn closes over llm_config (resolved
         # once per process is fine).
-        if self._observation_synth_fn is None:
+        if self._rich_synth_fn is None:
             from .synthesize import make_async_rich_synth_fn
-            self._observation_synth_fn = make_async_rich_synth_fn()
+            self._rich_synth_fn = make_async_rich_synth_fn()
 
         # Synth is async, but consolidate() runs synchronously under
         # to_thread (so transactions stay in one thread). We adapt: a
@@ -719,7 +723,7 @@ class MemoryClient:
         async def _synth(cluster, prior_block):
             async with sem:
                 try:
-                    return await self._observation_synth_fn(
+                    return await self._rich_synth_fn(
                         cluster,
                         prior_block=prior_block,
                         vocab_block=vocab_block,

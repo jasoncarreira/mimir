@@ -488,7 +488,7 @@ class RecordingSagaClient:
     # at runtime.
     _RECORDED_METHODS = frozenset({
         "query", "store", "feedback", "outcome", "end_session",
-        "consolidate", "decay", "forget",
+        "consolidate", "forget",
     })
 
     def __init__(self, inner: SagaClient) -> None:

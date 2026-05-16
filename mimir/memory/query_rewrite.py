@@ -112,9 +112,18 @@ def _clean_rewrite(raw: str, original: str) -> str:
     text = text.splitlines()[0].strip()
     text = text.strip("\"'`")
     # Refusal heuristics — if the LLM declined or said "no change
-    # needed", fall back to the original.
+    # needed", fall back to the original. Match on LLM-style refusal
+    # phrasing only ("i cannot", "i can't", "cannot rewrite") — a
+    # naked "no " prefix would misfire on legitimate queries like
+    # "No, I meant Tuesday" or "no Spotify recommendations?".
     lowered = text.lower()
-    if not text or lowered.startswith(("no ", "cannot", "i can't", "i cannot")):
+    refusal_prefixes = (
+        "i cannot", "i can't", "i can not",
+        "cannot rewrite", "can't rewrite",
+        "no change", "no rewrite",
+        "unable to",
+    )
+    if not text or lowered.startswith(refusal_prefixes):
         return original
     return text
 
