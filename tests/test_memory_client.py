@@ -1,4 +1,4 @@
-"""Smoke tests for mimir.memory.client.MemoryClient — the
+"""Smoke tests for mimir.saga.client.MemoryClient — the
 SagaClient-compatible facade.
 
 Validates that the public API methods all run without error against
@@ -16,12 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from mimir.memory.client import MemoryClient
+from mimir.saga.client import MemoryClient
 
 
 @pytest.fixture
 def client(tmp_path):
-    db_path = tmp_path / "mimir.memory.db"
+    db_path = tmp_path / "mimir.saga.db"
     c = MemoryClient(db_path=db_path)
     yield c
 
@@ -54,8 +54,8 @@ def _patch_provider(monkeypatch):
             }.get((section, key), default)
         return cfg
 
-    monkeypatch.setattr("mimir.memory.embeddings.get_provider", fake_get_provider)
-    monkeypatch.setattr("mimir.memory._config_io.get_config", fake_get_config)
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", fake_get_provider)
+    monkeypatch.setattr("mimir.saga._config_io.get_config", fake_get_config)
 
 
 @pytest.mark.asyncio

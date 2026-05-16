@@ -19,15 +19,15 @@ from pathlib import Path
 
 import pytest
 
-from mimir.memory.forget import ForgetResult, forget, forget_by_criteria
-from mimir.memory.mark_access import AccessEvent, mark_access
-from mimir.memory.recall import recall
-from mimir.memory.store import store
+from mimir.saga.forget import ForgetResult, forget, forget_by_criteria
+from mimir.saga.mark_access import AccessEvent, mark_access
+from mimir.saga.recall import recall
+from mimir.saga.store import store
 
 
 @pytest.fixture
 def conn():
-    schema = (Path(__file__).resolve().parent.parent / "mimir" / "memory" / "schema.sql").read_text()
+    schema = (Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql").read_text()
     c = sqlite3.connect(":memory:")
     c.executescript(schema)
     yield c
@@ -252,7 +252,7 @@ def test_forget_by_criteria_activation_below(conn):
 
 def test_feedback_positive_fires_event(conn):
     """The feedback() convenience writes a feedback_positive event."""
-    from mimir.memory import feedback  # importing the package __init__
+    from mimir.saga import feedback  # importing the package __init__
 
     r = store(conn, "atom", embed_fn=_fake_embed)
     n = feedback(conn, [r.atom_id], signal="positive")
@@ -269,7 +269,7 @@ def test_feedback_positive_fires_event(conn):
 def test_feedback_non_positive_is_noop(conn):
     """Negative/neutral signals don't fire access events (per
     SCORING.md: ACT-R has no negative-weight contribution)."""
-    from mimir.memory import feedback
+    from mimir.saga import feedback
 
     r = store(conn, "atom", embed_fn=_fake_embed)
     initial = conn.execute(
@@ -293,7 +293,7 @@ def test_feedback_non_positive_is_noop(conn):
 
 
 def test_default_config_has_expected_values():
-    from mimir.memory.config import DEFAULT, MemoryConfig
+    from mimir.saga.config import DEFAULT, MemoryConfig
 
     assert isinstance(DEFAULT, MemoryConfig)
     assert DEFAULT.activation.decay_d == 0.5
@@ -308,7 +308,7 @@ def test_default_config_has_expected_values():
 
 
 def test_config_from_toml_dict_overrides_defaults():
-    from mimir.memory.config import MemoryConfig
+    from mimir.saga.config import MemoryConfig
 
     cfg = MemoryConfig.from_toml_dict({
         "activation": {"decay_d": 0.6, "recent_k": 15},
@@ -326,7 +326,7 @@ def test_config_from_toml_dict_overrides_defaults():
 
 
 def test_config_unknown_keys_silently_skipped():
-    from mimir.memory.config import MemoryConfig
+    from mimir.saga.config import MemoryConfig
 
     cfg = MemoryConfig.from_toml_dict({
         "activation": {"decay_d": 0.4, "unknown_key": "garbage"},

@@ -101,8 +101,8 @@ class _StubProvider:
 def patch_provider(monkeypatch):
     """Inject a stub provider with a chosen dimension."""
     def _install(dim: int, provider_name: str = "openai"):
-        import mimir.memory.embeddings as saga_emb
-        import mimir.memory._config_io as saga_cfg
+        import mimir.saga.embeddings as saga_emb
+        import mimir.saga._config_io as saga_cfg
         stub = _StubProvider(dim)
         monkeypatch.setattr(saga_emb, "get_provider", lambda: stub)
         # Also patch the config read for provider name
@@ -132,7 +132,7 @@ def test_atoms_delegates_to_saga_calibration_dry_run(tmp_path, patch_provider, m
     column + FAISS dirty flag.
     """
     patch_provider(dim=1024, provider_name="voyage")
-    import mimir.memory.calibration as _mm_cal
+    import mimir.saga.calibration as _mm_cal
 
     captured: dict = {}
 
@@ -164,10 +164,10 @@ def test_atoms_delegates_to_saga_calibration_dry_run(tmp_path, patch_provider, m
 
 
 def test_atoms_delegates_to_saga_calibration_apply(tmp_path, patch_provider, monkeypatch):
-    """In apply mode, mimir.memory.calibration.re_embed returns atoms_updated
+    """In apply mode, mimir.saga.calibration.re_embed returns atoms_updated
     > 0 and mimir's reindex maps that to ``reindexed`` in the report."""
     patch_provider(dim=1024, provider_name="voyage")
-    import mimir.memory.calibration as _mm_cal
+    import mimir.saga.calibration as _mm_cal
 
     def fake_re_embed(db_path, *, target_provider_name, batch_size=50, dry_run=False):
         return {
@@ -187,11 +187,11 @@ def test_atoms_delegates_to_saga_calibration_apply(tmp_path, patch_provider, mon
 
 
 def test_atoms_handles_saga_calibration_exception(tmp_path, patch_provider, monkeypatch):
-    """If mimir.memory.calibration.re_embed raises, mimir's reindex counts a
+    """If mimir.saga.calibration.re_embed raises, mimir's reindex counts a
     failure rather than crashing — operator sees the error in the
     report instead of an uncaught traceback."""
     patch_provider(dim=1024)
-    import mimir.memory.calibration as _mm_cal
+    import mimir.saga.calibration as _mm_cal
 
     def fake_re_embed(**kwargs):
         raise RuntimeError("simulated saga failure")

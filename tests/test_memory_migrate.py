@@ -1,4 +1,4 @@
-"""Tests for mimir.memory.migrate — saga.db → mimir.memory.db importer.
+"""Tests for mimir.saga.migrate — saga.db → mimir.saga.db importer.
 
 Builds a synthetic source DB matching a recent-saga schema (atoms +
 access_log + atom_topics + atom_relations + triples + embeddings),
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.memory.migrate import migrate
+from mimir.saga.migrate import migrate
 
 
 def _build_saga_source(db_path: Path) -> None:
@@ -139,7 +139,7 @@ def _build_saga_source(db_path: Path) -> None:
 
 def test_migrate_basic_atoms(tmp_path: Path):
     src_db = tmp_path / "saga.db"
-    dst_db = tmp_path / "mimir.memory.db"
+    dst_db = tmp_path / "mimir.saga.db"
     _build_saga_source(src_db)
 
     stats = migrate(source=src_db, dest=dst_db, force=False)
@@ -156,7 +156,7 @@ def test_migrate_basic_atoms(tmp_path: Path):
 
 def test_migrate_access_events(tmp_path: Path):
     src_db = tmp_path / "saga.db"
-    dst_db = tmp_path / "mimir.memory.db"
+    dst_db = tmp_path / "mimir.saga.db"
     _build_saga_source(src_db)
 
     stats = migrate(source=src_db, dest=dst_db)
@@ -177,7 +177,7 @@ def test_migrate_seeds_store_events_for_atoms_with_no_history(tmp_path: Path):
     """a3 has no access_log entries in the fixture. The migrator should
     synthesize one 'store' event so activation isn't -inf."""
     src_db = tmp_path / "saga.db"
-    dst_db = tmp_path / "mimir.memory.db"
+    dst_db = tmp_path / "mimir.saga.db"
     _build_saga_source(src_db)
 
     stats = migrate(source=src_db, dest=dst_db)
@@ -193,7 +193,7 @@ def test_migrate_seeds_store_events_for_atoms_with_no_history(tmp_path: Path):
 
 def test_migrate_rebuilds_summaries(tmp_path: Path):
     src_db = tmp_path / "saga.db"
-    dst_db = tmp_path / "mimir.memory.db"
+    dst_db = tmp_path / "mimir.saga.db"
     _build_saga_source(src_db)
 
     stats = migrate(source=src_db, dest=dst_db)
@@ -213,7 +213,7 @@ def test_migrate_rebuilds_summaries(tmp_path: Path):
 
 def test_migrate_embeddings(tmp_path: Path):
     src_db = tmp_path / "saga.db"
-    dst_db = tmp_path / "mimir.memory.db"
+    dst_db = tmp_path / "mimir.saga.db"
     _build_saga_source(src_db)
 
     stats = migrate(source=src_db, dest=dst_db)
@@ -231,7 +231,7 @@ def test_migrate_embeddings(tmp_path: Path):
 
 def test_migrate_relations(tmp_path: Path):
     src_db = tmp_path / "saga.db"
-    dst_db = tmp_path / "mimir.memory.db"
+    dst_db = tmp_path / "mimir.saga.db"
     _build_saga_source(src_db)
 
     stats = migrate(source=src_db, dest=dst_db)
@@ -250,7 +250,7 @@ def test_migrate_relations(tmp_path: Path):
 
 def test_migrate_triples(tmp_path: Path):
     src_db = tmp_path / "saga.db"
-    dst_db = tmp_path / "mimir.memory.db"
+    dst_db = tmp_path / "mimir.saga.db"
     _build_saga_source(src_db)
 
     stats = migrate(source=src_db, dest=dst_db)
@@ -267,7 +267,7 @@ def test_migrate_triples(tmp_path: Path):
 
 def test_migrate_topics(tmp_path: Path):
     src_db = tmp_path / "saga.db"
-    dst_db = tmp_path / "mimir.memory.db"
+    dst_db = tmp_path / "mimir.saga.db"
     _build_saga_source(src_db)
 
     stats = migrate(source=src_db, dest=dst_db)
@@ -281,7 +281,7 @@ def test_migrate_topics(tmp_path: Path):
 
 def test_migrate_refuses_to_overwrite_without_force(tmp_path: Path):
     src_db = tmp_path / "saga.db"
-    dst_db = tmp_path / "mimir.memory.db"
+    dst_db = tmp_path / "mimir.saga.db"
     _build_saga_source(src_db)
     dst_db.write_text("not empty")
 
@@ -291,7 +291,7 @@ def test_migrate_refuses_to_overwrite_without_force(tmp_path: Path):
 
 def test_migrate_force_overwrites(tmp_path: Path):
     src_db = tmp_path / "saga.db"
-    dst_db = tmp_path / "mimir.memory.db"
+    dst_db = tmp_path / "mimir.saga.db"
     _build_saga_source(src_db)
     dst_db.write_text("not empty")
 

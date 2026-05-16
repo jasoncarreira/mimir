@@ -1,6 +1,6 @@
--- mimir.memory schema sketch
+-- mimir.saga schema
 --
--- Lands at mimir/memory/schema.sql when promoted.
+-- Lives at mimir/saga/schema.sql (formerly mimir/memory/schema.sql before the rename).
 --
 -- Key differences from current saga:
 -- - No `stability`, `retrievability` columns on atoms. Both subsumed

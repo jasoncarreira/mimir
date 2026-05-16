@@ -146,7 +146,7 @@ class SagaProviderEmbedder:
         if self._provider is None:
             with self._lock:
                 if self._provider is None:
-                    from .memory.embeddings import get_provider
+                    from .saga.embeddings import get_provider
 
                     provider = get_provider()
                     self._dim = provider.dimensions()
