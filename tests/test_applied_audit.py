@@ -106,6 +106,75 @@ def test_mark_applied_raises_when_no_match(tmp_path: Path):
         mark_applied(pc, log, "no-such-thing", now=NOW)
 
 
+def test_mark_applied_fence_aware_ignores_inner_headings(tmp_path: Path):
+    """Regression for chainlink #114.
+
+    A proposal body that contains a fenced code block with its own ``##``
+    heading must not be split mid-body. Triggered originally on
+    2026-05-11 by the 2026-05-09 non-goal proposal whose proposed body
+    started with ``## Don't accept the source frame uncritically`` inside
+    a fenced sample.
+    """
+    pc = tmp_path / "state" / "proposed-changes.md"
+    _seed_proposed_changes(pc, """
+        # Proposed Changes
+
+        ## Pending
+
+        ## 2026-05-09 — add non-goal: source-frame uncritical
+        Source: reflection 2026-05-09
+        Proposal: Add a new entry to memory/core/05-non-goals.md.
+        Predicted effect: Error rate would drop.
+
+        **Proposed file body:**
+
+        ```
+        ## Don't accept the source frame uncritically
+
+        When the user (or a tool, or a doc) sets up a frame, my first move
+        is checking whether the frame is right, not just answering within
+        it.
+        ```
+
+        ## 2026-05-10 — unrelated later entry
+        Source: reflection 2026-05-10
+        Proposal: Something else.
+        Predicted effect: Error rate would drop.
+
+        ## Applied
+
+        ## Rejected
+    """)
+    log = tmp_path / "state" / "applied-proposals.jsonl"
+
+    proposal = mark_applied(pc, log, "source-frame uncritical", now=NOW)
+
+    # The matched id must be the outer entry's full heading, not the
+    # inner fenced-block heading.
+    assert "source-frame uncritical" in proposal.id.lower()
+    assert "don't accept" not in proposal.id.lower()
+    # The Pending section retained the unrelated 2026-05-10 entry;
+    # the matched entry moved to Applied with its fenced body intact.
+    new_body = pc.read_text()
+    pending_idx = new_body.find("## Pending")
+    applied_idx = new_body.find("## Applied")
+    rejected_idx = new_body.find("## Rejected")
+    moved_idx = new_body.find("source-frame uncritical")
+    later_idx = new_body.find("unrelated later entry")
+    assert pending_idx < applied_idx < rejected_idx
+    # Moved entry now lives under Applied.
+    assert applied_idx < moved_idx < rejected_idx
+    # Unrelated entry is still under Pending.
+    assert pending_idx < later_idx < applied_idx
+    # Fenced inner content survived the move — the prose line from
+    # inside the fenced sample landed under Applied with its parent.
+    fenced_line = new_body.find("When the user (or a tool, or a doc)")
+    assert applied_idx < fenced_line < rejected_idx
+    # And the fenced inner ``## Don't accept`` heading is still present
+    # (the body wasn't split on it).
+    assert "## Don't accept the source frame uncritically" in new_body
+
+
 def test_mark_applied_creates_applied_section_when_missing(tmp_path: Path):
     pc = tmp_path / "state" / "proposed-changes.md"
     _seed_proposed_changes(pc, """

@@ -243,6 +243,78 @@ async def test_react_received_trigger_also_auto_dispatches(tmp_path: Path):
     assert bridge.sent == [("discord-987", "Thanks for the 👍.")]
 
 
+@pytest.mark.asyncio
+async def test_shell_job_complete_auto_dispatches_via_bridge(tmp_path: Path):
+    """Spawn-completion wake-ups deliver their reply to the chat that
+    kicked off the spawn (chainlink #133).
+
+    Pre-fix, ``shell_job_complete`` triggers were excluded from
+    auto-dispatch — same class as ``scheduled_tick`` — so wake-up
+    turns produced user-facing text that landed in turns.jsonl but
+    never reached the channel. Symptom from 2026-05-12 20:21 UTC:
+    a 2247-char spawn-completion summary was logged with no
+    ``auto_dispatch_ok`` event; operator had to re-ask "did it
+    finish?" 17 minutes later. The fix adds ``shell_job_complete``
+    to the eligible set.
+    """
+    bridge = _RecordingBridge()
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    agent = _make_agent(tmp_path, reg)
+
+    ctx = _ctx()
+    evt = _evt(trigger="shell_job_complete")
+    await agent._auto_dispatch_or_record(
+        ctx, evt, "Spawn j_abc done — PR #X opened, tests green.",
+    )
+
+    assert bridge.sent == [
+        ("discord-987", "Spawn j_abc done — PR #X opened, tests green."),
+    ]
+
+    import json
+    events_log = tmp_path / "logs" / "events.jsonl"
+    events = [json.loads(l) for l in events_log.read_text().splitlines()]
+    ok_events = [e for e in events if e.get("type") == "auto_dispatch_ok"]
+    assert len(ok_events) == 1
+    assert ok_events[0]["channel_id"] == "discord-987"
+    assert ok_events[0]["bridge"] == "discord"
+
+
+@pytest.mark.asyncio
+async def test_shell_job_complete_on_synthetic_channel_does_not_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Synthetic channels (``scheduler:*``, ``poller:*``) have no
+    registered bridge, so ``shell_job_complete`` falls through the
+    ``bridge is None`` guard even though the trigger is eligible.
+
+    This pins the layered safety: chainlink #133 broadens the trigger
+    set but the synthetic-channel guard at ``bridge is not None``
+    keeps spawn wake-ups on synthetic channels silent (which is what
+    we want — those exist for accounting, not delivery).
+    """
+    bridge = _RecordingBridge()  # Only registers discord-* prefixes.
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    agent = _make_agent(tmp_path, reg)
+
+    ctx = _ctx(channel_id="scheduler:heartbeat")
+    evt = _evt(channel_id="scheduler:heartbeat", trigger="shell_job_complete")
+    await agent._auto_dispatch_or_record(
+        ctx, evt, "Spawn finished on a synthetic channel — should NOT dispatch.",
+    )
+
+    assert bridge.sent == []  # synthetic channel → no auto-dispatch
+
+    import json
+    events_log = tmp_path / "logs" / "events.jsonl"
+    if events_log.exists():
+        events = [json.loads(l) for l in events_log.read_text().splitlines()]
+        ok_events = [e for e in events if e.get("type") == "auto_dispatch_ok"]
+        assert ok_events == []
+
+
 # ─── Streaming plan-flush directive dispatch (chainlink #5 follow-up) ──
 
 
