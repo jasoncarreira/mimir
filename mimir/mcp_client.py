@@ -38,6 +38,7 @@ from typing import Any
 from langchain_core.tools import StructuredTool, ToolException
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from pydantic import Field, create_model
 
 log = logging.getLogger(__name__)
 
@@ -275,6 +276,82 @@ class MCPManager:
         self.connections.clear()
 
 
+_JSON_TYPE_MAP: dict[str, type] = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+    "null": type(None),
+}
+
+
+def _python_type_for_schema(prop: dict[str, Any]) -> type:
+    """Best-effort JSON Schema → Python type for pydantic.create_model.
+
+    Handles primitives + the common ``["string","null"]`` union pattern.
+    Anything more exotic (anyOf/oneOf with multiple non-null branches,
+    enums, nested object schemas) falls back to ``Any`` so the tool
+    stays callable; the JSON Schema can still drive prose validation
+    via the description block.
+    """
+    schema_type = prop.get("type")
+    if isinstance(schema_type, list):
+        non_null = [t for t in schema_type if t != "null"]
+        if len(non_null) == 1:
+            return _JSON_TYPE_MAP.get(non_null[0], Any)  # type: ignore[arg-type]
+        return Any  # type: ignore[return-value]
+    if isinstance(schema_type, str):
+        return _JSON_TYPE_MAP.get(schema_type, Any)  # type: ignore[return-value]
+    return Any  # type: ignore[return-value]
+
+
+def _build_args_schema(
+    namespaced_name: str, input_schema: dict[str, Any]
+) -> Any:
+    """Build a pydantic BaseModel class from the remote JSON schema.
+
+    Pre-fix the schema was dumped into the description string and the
+    model got no typed validation. With ``args_schema=`` on the
+    StructuredTool, LangChain/LangGraph enforces required fields +
+    primitive coercion at call time, and surfaces the exact required
+    field list to the model in the tool-spec.
+
+    Returns ``None`` when the schema has no usable ``properties`` (the
+    StructuredTool then accepts arbitrary kwargs like before).
+    """
+    properties = input_schema.get("properties") or {}
+    if not isinstance(properties, dict) or not properties:
+        return None
+    required_fields = set(input_schema.get("required") or [])
+    fields: dict[str, Any] = {}
+    for prop_name, prop_info in properties.items():
+        if not isinstance(prop_info, dict):
+            continue
+        py_type = _python_type_for_schema(prop_info)
+        prop_desc = prop_info.get("description", "")
+        if prop_name in required_fields:
+            fields[prop_name] = (py_type, Field(..., description=prop_desc))
+        else:
+            default = prop_info.get("default", None)
+            fields[prop_name] = (
+                py_type | None if py_type is not Any else Any,  # type: ignore[operator]
+                Field(default=default, description=prop_desc),
+            )
+    try:
+        # The model name affects pydantic's repr + validation error
+        # paths; namespacing it on the tool name keeps multiple bridged
+        # MCP tools from sharing a class.
+        return create_model(f"{namespaced_name}_args", **fields)
+    except Exception:  # noqa: BLE001 — pydantic may reject exotic schemas
+        log.debug(
+            "args_schema build failed for %s; falling back to schema-in-description",
+            namespaced_name,
+        )
+        return None
+
+
 def _bridge_mcp_tool(
     *,
     server_name: str,
@@ -288,9 +365,11 @@ def _bridge_mcp_tool(
 
     Tool name is namespaced ``mcp_{server}_{tool}`` so collisions with
     mimir built-ins or other MCP servers are impossible. The remote
-    JSON Schema is summarized into the tool description; full typed
-    ``args_schema`` bridging via ``pydantic.create_model`` is tracked
-    as a follow-up (Mimir review item, deferred from this commit).
+    JSON Schema is converted to a pydantic ``args_schema`` where
+    possible — LangChain enforces required-field presence + primitive
+    coercion at call time. Falls back to schema-in-description when
+    the JSON schema uses constructs pydantic can't accept (nested
+    object schemas, complex anyOf unions, $ref).
     """
     properties = input_schema.get("properties", {})
     required_fields = set(input_schema.get("required", []))
@@ -306,6 +385,7 @@ def _bridge_mcp_tool(
         else description
     )
     namespaced_name = f"mcp_{server_name}_{tool_name}"
+    args_schema = _build_args_schema(namespaced_name, input_schema)
 
     async def _call_mcp_tool(**kwargs: Any) -> str:
         try:
@@ -333,12 +413,15 @@ def _bridge_mcp_tool(
                 parts.append(json.dumps(content.model_dump(), default=str))
         return "\n".join(parts) if parts else "(empty result)"
 
-    return StructuredTool.from_function(
-        coroutine=_call_mcp_tool,
-        name=namespaced_name,
-        description=full_description,
-        handle_tool_error=True,
-    )
+    kwargs: dict[str, Any] = {
+        "coroutine": _call_mcp_tool,
+        "name": namespaced_name,
+        "description": full_description,
+        "handle_tool_error": True,
+    }
+    if args_schema is not None:
+        kwargs["args_schema"] = args_schema
+    return StructuredTool.from_function(**kwargs)
 
 
 def parse_mcp_server_configs(raw: Any) -> list[MCPServerConfig]:
