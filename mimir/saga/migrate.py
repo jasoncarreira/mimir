@@ -70,7 +70,8 @@ SOURCE_WEIGHTS = {
 
 def _identify_msam_observations(src: sqlite3.Connection) -> set[str]:
     """MSAM-era observations (consolidation targets) — drop these.
-    saga's reflect will re-synthesize against voyage embeddings."""
+    ``mimir.saga.reflect`` will re-synthesize against the current
+    provider's embeddings post-migration."""
     try:
         rows = src.execute(
             "SELECT DISTINCT target_id FROM atom_relations "
@@ -143,9 +144,11 @@ def _migrate_atoms(
 def _migrate_access_log(
     src: sqlite3.Connection, dst: sqlite3.Connection,
 ) -> int:
-    """saga.access_log → mimir.saga.access_events.
+    """legacy ``saga.access_log`` (the workspace-member ``saga/`` package,
+    pre-rename) → ``mimir.saga.access_events`` (the new in-process
+    package after the ``mimir.memory`` → ``mimir.saga`` rename).
 
-    saga's access_log has (atom_id, accessed_at, activation_score,
+    The legacy table has (atom_id, accessed_at, activation_score,
     retrieval_mode, session_id, contributed). We map:
     - accessed_at → ts
     - retrieval_mode → metadata.mode
