@@ -202,9 +202,11 @@ def build_vocab_block(
             if subj and subj not in seen_subjs:
                 subj_lines.append((subj, int(cnt or 0)))
                 seen_subjs.add(subj)
-    except Exception:
-        # DB read failed — fall back to seed-only.
-        pass
+    except Exception as exc:
+        # DB read failed — fall back to seed-only. Logged so it surfaces
+        # in operator logs rather than producing a silent quality drop
+        # on the consolidation pass.
+        logger.warning("vocab_block DB read failed; using seed-only: %s", exc)
     # Union with the static seed.
     for p in _CANONICAL_PREDICATE_SEED:
         if p not in seen_preds:
