@@ -1934,11 +1934,21 @@ class Agent:
         # exactly as the original chainlink #139 implementation did.
         if len(query) < self._config.file_search_autopass_min_chars:
             return None
+        # Search wider than K so the min-score filter has headroom
+        # to find K above-floor hits before falling back. With K
+        # dropped to 3 (post-Sub-B default), a single below-floor
+        # partial-match at position 1-3 could otherwise push a good
+        # at-position-4 match out of the surfaced set. The compute
+        # cost is negligible — Indexer.search sorts ALL scored
+        # candidates and trims with `scored[:k]` (mimir/search.py),
+        # so k=6 vs k=3 is just a wider slice, not more work.
+        # Addresses PR #168 review nit 2.
+        k = self._config.file_search_autopass_k
         try:
             results = await self._indexer.search(
                 query,
                 scope="all",
-                k=self._config.file_search_autopass_k,
+                k=k * 2,
             )
         except Exception as exc:  # noqa: BLE001 — never let retrieval crash a turn
             await log_event(
@@ -1953,9 +1963,10 @@ class Agent:
         # search; the floor cuts them while leaving clean
         # semantic+FTS matches (typically 0.65-0.75) intact. Per-turn
         # observability: log how many hits got filtered out so future
-        # tuning has a signal.
+        # tuning has a signal. Trim to top-K after filtering so the
+        # original K-cap behavior is preserved.
         min_score = self._config.file_search_autopass_min_score
-        filtered = [r for r in results if r.score >= min_score]
+        filtered = [r for r in results if r.score >= min_score][:k]
         if len(filtered) < len(results):
             await log_event(
                 "file_search_autopass_score_filtered",

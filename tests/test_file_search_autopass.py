@@ -594,6 +594,52 @@ async def test_autopass_returns_none_when_all_results_below_min_score(
 
 
 @pytest.mark.asyncio
+async def test_autopass_widens_indexer_search_to_2k_then_trims(tmp_path: Path):
+    """PR #168 review nit 2: filter-before-K vs filter-after-K. The
+    autopass code asks the indexer for ``k * 2`` results so the
+    min-score filter has headroom; then trims to top-K after
+    filtering. Under current monotonic scoring (search.py sorts desc
+    + slices) this is functionally a no-op vs single-K retrieval —
+    but it's defensive against future non-monotonic ranking (RRF
+    fusion, reranking) and the trim preserves the K-cap behavior.
+
+    Test shape: `_FakeIndexer` honors the requested k (returns
+    ``self._results[:k]``). Pass 6 above-floor results with K=3.
+    Verify (a) the indexer's k=6 call surfaces all 6, (b) the
+    filter keeps all 6 (all above floor), (c) the final trim
+    surfaces exactly 3 (the K cap). Same surfaced count as
+    pre-widening; the path is what's pinned."""
+    fake = _FakeIndexer([
+        _result(0.90, path="memory/a.md", idx=0),
+        _result(0.85, path="memory/b.md", idx=1),
+        _result(0.80, path="memory/c.md", idx=2),
+        _result(0.75, path="memory/d.md", idx=3),
+        _result(0.70, path="memory/e.md", idx=4),
+        _result(0.65, path="memory/f.md", idx=5),
+    ])
+    agent = await _build_agent(
+        tmp_path, indexer=fake,
+        file_search_autopass_k=3,
+        file_search_autopass_min_score=0.55,
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1",
+        content="this is a long enough message to pass the min-chars gate",
+        author="discord-99",
+    )
+    block = await agent._run_file_search_autopass(_ctx(), event)
+    assert block is not None
+    # K=3 cap holds even though all 6 are above the floor.
+    lines = block.splitlines()
+    assert len(lines) == 3
+    # Top-3 by score (the indexer returned them sorted desc).
+    assert "memory/a.md" in lines[0]
+    assert "memory/b.md" in lines[1]
+    assert "memory/c.md" in lines[2]
+
+
+@pytest.mark.asyncio
 async def test_autopass_min_score_zero_keeps_every_hit(tmp_path: Path):
     """Floor of 0.0 is the "filter disabled" sentinel — every hit the
     indexer returns survives. Confirms the filter is purely additive
