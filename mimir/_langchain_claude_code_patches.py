@@ -35,7 +35,17 @@ _PATCH_MARKER = "_mimir_arun_config_patched"
 
 def apply_patches() -> None:
     """Apply the ``_arun`` config-kwarg patch to ChatClaudeCode.
-    Idempotent + import-safe."""
+    Idempotent + import-safe.
+
+    Detects when the upstream ``_wrap_langchain_tool`` has been
+    fixed (signature change or body no longer calling ``_arun``
+    without ``config``) and skips the patch in that case — pre-fix
+    the ``_PATCH_MARKER`` guard only handled re-running the patch,
+    not an upstream change that rendered it obsolete (or worse,
+    re-broken by us). On signature mismatch we bail out with a
+    warning rather than silently replacing the upstream fix with
+    our stale shim.
+    """
     try:
         from langchain_claude_code import claude_chat_model as ccm
     except ImportError:
@@ -47,6 +57,41 @@ def apply_patches() -> None:
         return
 
     _orig_wrap = ccm.ClaudeCodeChatModel._wrap_langchain_tool
+
+    # Upstream-fix detection: the original method we're patching had
+    # this exact signature when the bug existed: ``(self, tool, schema)``.
+    # If upstream renames the method, changes its parameters, or fixes
+    # the underlying ``_arun`` call to pass ``config`` itself, our
+    # shim is either irrelevant or actively harmful. Bail with a
+    # warning so the operator notices and removes this module.
+    import inspect as _inspect
+    try:
+        sig = _inspect.signature(_orig_wrap)
+        params = list(sig.parameters.keys())
+        expected = ["self", "tool", "schema"]
+        if params != expected:
+            log.warning(
+                "langchain-claude-code _wrap_langchain_tool signature "
+                "changed (got %s, expected %s) — skipping mimir's "
+                "stale patch. Remove _langchain_claude_code_patches.py "
+                "after verifying upstream behavior.", params, expected,
+            )
+            setattr(ccm.ClaudeCodeChatModel, _PATCH_MARKER, True)
+            return
+        # Heuristic: if upstream source already passes ``config=`` to
+        # ``_arun``, the bug is fixed; skip.
+        src = _inspect.getsource(_orig_wrap)
+        if "_arun" in src and "config=" in src and "_arun(**args, config=" in src:
+            log.info(
+                "langchain-claude-code already passes config= to _arun — "
+                "skipping mimir's now-redundant patch.",
+            )
+            setattr(ccm.ClaudeCodeChatModel, _PATCH_MARKER, True)
+            return
+    except (TypeError, OSError):
+        # signature/getsource may fail for C-extension or oddly-wrapped
+        # functions; fall through to apply the patch (current behavior).
+        pass
 
     def _patched_wrap_langchain_tool(self, tool, schema):
         from langchain_core.runnables import RunnableConfig

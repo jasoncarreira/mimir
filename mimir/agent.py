@@ -294,7 +294,13 @@ class Agent:
 
         # Build the deepagent singleton. Done lazily to keep import-time
         # fast and to let tests construct Agent without a real model.
+        # Lock-guarded against concurrent first turns racing in and
+        # constructing two CompiledStateGraphs — pre-fix the second
+        # would clobber the first (harmless but wasteful since each
+        # graph is heavyweight). asyncio.Lock created lazily because
+        # __init__ may run outside a running event loop (tests).
         self._agent: Any | None = None
+        self._agent_lock: asyncio.Lock | None = None
 
         # Memory-tool dep injection — only used if saga_client is a
         # SagaStore (post-saga cutover). Wires up the @tool's
@@ -328,48 +334,61 @@ class Agent:
                 return
             candidate = getattr(candidate, "_inner", None)
 
-    def _build_agent_if_needed(self) -> Any:
+    async def _build_agent_if_needed(self) -> Any:
+        # Double-checked init: fast path returns the cached agent
+        # without acquiring the lock; only the first-call window
+        # contends on the asyncio.Lock. Pre-fix two concurrent first
+        # turns each entered the ``is None`` branch and built their
+        # own CompiledStateGraph — the second one won, the first was
+        # GC'd, both paid the import cost.
         if self._agent is not None:
             return self._agent
-        from deepagents import create_deep_agent
-        from .readonly_backend import WriteGuardBackend
-        from .tools import all_mimir_tools
+        if self._agent_lock is None:
+            self._agent_lock = asyncio.Lock()
+        async with self._agent_lock:
+            # Re-check under the lock: a contending turn may have just
+            # finished construction while we waited.
+            if self._agent is not None:
+                return self._agent
+            from deepagents import create_deep_agent
+            from .readonly_backend import WriteGuardBackend
+            from .tools import all_mimir_tools
 
-        # Config carries the operator-set model spec; env override
-        # exists for ad-hoc bench / smoke runs that don't go through
-        # Config.from_env. See Config.model_spec for the format
-        # (``claude-code:<model>`` or ``<provider>:<model>``).
-        model_spec = os.environ.get(
-            "MIMIR_MODEL_SPEC",
-            getattr(self._config, "model_spec", "claude-code:claude-sonnet-4-6"),
-        )
-        # Assemble the real system prompt — core memory + memory index +
-        # operator alert channel + skill catalog. Built fresh per turn
-        # so skill bucket assignments / outcome aggregates stay current
-        # (chainlink #15: install-stable section comes first for cache).
-        system_prompt = os.environ.get(
-            "MIMIR_SYSTEM_PROMPT_OVERRIDE",
-            self._build_system_prompt(),
-        )
-        # Per-directory write-permission enforcement (Config.folders).
-        # Read tools (Glob/Grep/Read) stay unrestricted; Write/Edit/upload
-        # outside ``writable_dirs`` return a permission error instead of
-        # mutating the filesystem. ``.mimir/`` (saga db, metrics) is
-        # implicitly blocked because it's not in the folders dict.
-        backend = WriteGuardBackend(
-            root_dir=self._config.home,
-            writable_dirs=self._config.writable_dirs,
-        )
-        self._agent = create_deep_agent(
-            model=_resolve_model(
-                model_spec,
-                max_retries=getattr(self._config, "model_max_retries", 6),
-            ),
-            tools=all_mimir_tools(),
-            system_prompt=system_prompt,
-            backend=backend,
-        )
-        return self._agent
+            # Config carries the operator-set model spec; env override
+            # exists for ad-hoc bench / smoke runs that don't go through
+            # Config.from_env. See Config.model_spec for the format
+            # (``claude-code:<model>`` or ``<provider>:<model>``).
+            model_spec = os.environ.get(
+                "MIMIR_MODEL_SPEC",
+                getattr(self._config, "model_spec", "claude-code:claude-sonnet-4-6"),
+            )
+            # Assemble the real system prompt — core memory + memory index +
+            # operator alert channel + skill catalog. Built fresh per turn
+            # so skill bucket assignments / outcome aggregates stay current
+            # (chainlink #15: install-stable section comes first for cache).
+            system_prompt = os.environ.get(
+                "MIMIR_SYSTEM_PROMPT_OVERRIDE",
+                self._build_system_prompt(),
+            )
+            # Per-directory write-permission enforcement (Config.folders).
+            # Read tools (Glob/Grep/Read) stay unrestricted; Write/Edit/upload
+            # outside ``writable_dirs`` return a permission error instead of
+            # mutating the filesystem. ``.mimir/`` (saga db, metrics) is
+            # implicitly blocked because it's not in the folders dict.
+            backend = WriteGuardBackend(
+                root_dir=self._config.home,
+                writable_dirs=self._config.writable_dirs,
+            )
+            self._agent = create_deep_agent(
+                model=_resolve_model(
+                    model_spec,
+                    max_retries=getattr(self._config, "model_max_retries", 6),
+                ),
+                tools=all_mimir_tools(),
+                system_prompt=system_prompt,
+                backend=backend,
+            )
+            return self._agent
 
     async def run_turn(self, event: AgentEvent) -> TurnRecord:
         """Run one agent turn — preserves the SDK Agent.run_turn contract."""
@@ -415,7 +434,7 @@ class Agent:
             )
 
         # Build / reuse the agent singleton.
-        agent = self._build_agent_if_needed()
+        agent = await self._build_agent_if_needed()
 
         error: str | None = None
         messages: list[Any] = []
