@@ -230,6 +230,49 @@ def test_generate_on_real_bundled_skills_includes_known_skill() -> None:
     assert "### `introspection`" in output
 
 
+def test_extract_trigger_sentence_split_known_edge_cases() -> None:
+    """Pin the sentence-split regex's documented behavior on edge cases.
+
+    The regex ``(?<=[.!?])\\s+(?=[A-Z])`` is tolerant by design: it
+    correctly splits at end-of-sentence-followed-by-Capital but trips on
+    abbreviation-followed-by-Capital (``U.S. Department`` splits at the
+    abbreviation's terminal period). The skill_catalog.py module docs
+    document this failure mode and recommend rewriting descriptions to
+    avoid it rather than growing the regex. This test pins the
+    behavior so future regex tweaks notice if the failure-mode surface
+    changes.
+
+    PR #131 punch-list r3218670920.
+    """
+    # Failure mode: abbreviation followed by a capitalized word. The
+    # split happens inside the abbreviation; the first "sentence" gets
+    # truncated at the abbreviation's period.
+    assert _extract_trigger("U.S. Department of Whatever") == "U.S"
+
+    # Failure mode: ``e.g.`` followed by a capitalized word.
+    assert _extract_trigger("e.g. When X happens") == "e.g"
+
+    # Safe: ``e.g.`` followed by a lowercase word does NOT split.
+    assert _extract_trigger("e.g. when X happens") == "e.g. when X happens"
+
+    # Safe: digit-then-period-then-digit (decimal number) doesn't split
+    # because the next char isn't a capital letter.
+    assert _extract_trigger("8.5 million users.") == "8.5 million users"
+
+    # Safe: regular end-of-sentence splits as expected.
+    assert _extract_trigger("First sentence. Second sentence.") == "First sentence"
+
+
+def test_extract_trigger_trigger_phrase_wins_over_abbreviation_split() -> None:
+    """Even if an earlier sentence trips the abbreviation-split failure
+    mode, a later ``Use when ...`` sentence still wins the trigger.
+
+    Regression guard: ensures the preferred-phrase scan doesn't get
+    confused by an under-split first sentence."""
+    desc = "Built for U.S. East users. Use when serving traffic from us-east-1."
+    assert _extract_trigger(desc) == "Use when serving traffic from us-east-1"
+
+
 def test_generate_is_idempotent(tmp_path: Path) -> None:
     """Re-running generate() against the same root produces identical output.
     Required by the chainlink #81 acceptance criterion."""
