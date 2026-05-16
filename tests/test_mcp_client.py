@@ -82,6 +82,45 @@ class TestMCPServerConfigFromDict:
         # Missing → empty string (don't leak the ${VAR} placeholder).
         assert cfg.env == {"X": ""}
 
+    def test_env_var_expansion_in_compound_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Pre-fix the parser only matched ``^${VAR}$`` exactly —
+        # ``"Bearer ${TOKEN}"`` and ``"${A}${B}"`` were shipped to the
+        # subprocess literally. The regex-based expansion handles both.
+        monkeypatch.setenv("TOKEN", "ghp_secret")
+        monkeypatch.setenv("A", "alpha")
+        monkeypatch.setenv("B", "beta")
+        cfg = MCPServerConfig.from_dict(
+            {
+                "name": "x", "command": "y", "args": [],
+                "env": {
+                    "AUTH": "Bearer ${TOKEN}",
+                    "JOINED": "${A}${B}",
+                    "INFIX": "prefix-${A}-suffix",
+                },
+            }
+        )
+        assert cfg.env == {
+            "AUTH": "Bearer ghp_secret",
+            "JOINED": "alphabeta",
+            "INFIX": "prefix-alpha-suffix",
+        }
+
+    def test_env_var_compound_missing_var(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.delenv("MISSING", raising=False)
+        with caplog.at_level("WARNING"):
+            cfg = MCPServerConfig.from_dict(
+                {"name": "x", "command": "y", "args": [],
+                 "env": {"AUTH": "Bearer ${MISSING}"}}
+            )
+        # Missing var collapses to empty in compound contexts.
+        assert cfg.env == {"AUTH": "Bearer "}
+        # And we log so the operator sees it instead of failing silently.
+        assert any("MISSING" in r.message for r in caplog.records)
+
 
 # ─── parse_mcp_server_configs ──────────────────────────────────────
 
@@ -109,6 +148,43 @@ class TestParseMCPServerConfigs:
     def test_non_list_returns_empty(self) -> None:
         assert parse_mcp_server_configs("not a list") == []
         assert parse_mcp_server_configs(42) == []
+
+    def test_claude_desktop_dict_shape(self) -> None:
+        # The actual format Claude Desktop / Claude Code use: name is
+        # the dict key, body is the value. Pre-fix this silently
+        # produced zero servers; operators copying a working
+        # claude_desktop_config.json got no MCP wiring.
+        out = parse_mcp_server_configs(
+            {
+                "mcpServers": {
+                    "github": {"command": "uvx", "args": ["mcp-server-github"]},
+                    "filesystem": {"command": "npx", "args": ["@mcp/filesystem"]},
+                }
+            }
+        )
+        names = sorted(c.name for c in out)
+        assert names == ["filesystem", "github"]
+        # Verify the dict key was injected as the name field.
+        github = next(c for c in out if c.name == "github")
+        assert github.command == "uvx"
+
+    def test_dict_shape_without_wrapper(self) -> None:
+        # Just a top-level dict without ``mcpServers`` envelope.
+        out = parse_mcp_server_configs(
+            {"a": {"command": "x"}, "b": {"command": "y"}}
+        )
+        assert sorted(c.name for c in out) == ["a", "b"]
+
+    def test_dict_shape_skips_non_dict_bodies(self) -> None:
+        # If an entry's body is malformed, drop just that one, keep others.
+        out = parse_mcp_server_configs(
+            {
+                "good": {"command": "x"},
+                "broken": "not-a-dict",
+                "also_broken": {},  # no command → ValueError → skipped
+            }
+        )
+        assert [c.name for c in out] == ["good"]
 
     def test_skips_bad_entries(self) -> None:
         out = parse_mcp_server_configs(
@@ -245,3 +321,198 @@ def test_config_mcp_servers_default_empty(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv("MIMIR_MCP_SERVERS_PATH", raising=False)
     cfg = Config.from_env()
     assert cfg.mcp_servers == []
+
+
+# ─── MCPManager — mocked ClientSession paths ───────────────────────
+
+
+class _FakeMCPTool:
+    """Stand-in for an MCP tool descriptor returned by list_tools()."""
+
+    def __init__(self, name: str, description: str = "", schema: dict | None = None) -> None:
+        self.name = name
+        self.description = description
+        self.inputSchema = schema or {}
+
+
+class _FakeListResult:
+    def __init__(self, tools: list[_FakeMCPTool]) -> None:
+        self.tools = tools
+
+
+class _FakeSession:
+    """Just enough of mcp.ClientSession to drive MCPManager + discover_tools."""
+
+    def __init__(
+        self,
+        tools: list[_FakeMCPTool],
+        *,
+        initialize_delay: float = 0.0,
+        initialize_fails: bool = False,
+    ) -> None:
+        self._tools = tools
+        self._initialize_delay = initialize_delay
+        self._initialize_fails = initialize_fails
+
+    async def initialize(self) -> None:
+        if self._initialize_delay:
+            import asyncio as _asyncio
+            await _asyncio.sleep(self._initialize_delay)
+        if self._initialize_fails:
+            raise RuntimeError("initialize boom")
+
+    async def list_tools(self) -> _FakeListResult:
+        return _FakeListResult(self._tools)
+
+
+def _patch_connect(monkeypatch: pytest.MonkeyPatch, sessions: dict[str, _FakeSession]) -> None:
+    """Replace ``MCPManager._connect`` with a fake that uses provided sessions.
+
+    Wrapped in a closure rather than a callable class so Python's
+    method-binding doesn't get in the way — assigning a plain instance
+    to ``MCPManager._connect`` skips ``self`` injection.
+    """
+    from contextlib import AsyncExitStack
+    from mimir.mcp_client import MCPConnection, MCPManager
+
+    async def _fake_connect(self, config):  # type: ignore[no-untyped-def]
+        session = sessions[config.name]
+        import asyncio as _asyncio
+        await _asyncio.wait_for(session.initialize(), timeout=self._init_timeout)
+        return MCPConnection(config=config, session=session, exit_stack=AsyncExitStack())
+
+    monkeypatch.setattr(MCPManager, "_connect", _fake_connect)
+
+
+@pytest.mark.asyncio
+async def test_manager_starts_servers_and_bridges_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.mcp_client import MCPManager, MCPServerConfig
+
+    mgr = MCPManager()
+    cfg_a = MCPServerConfig(name="alpha", command="x", args=[])
+    cfg_b = MCPServerConfig(name="beta", command="y", args=[])
+    sessions = {
+        "alpha": _FakeSession([_FakeMCPTool("ping"), _FakeMCPTool("pong")]),
+        "beta": _FakeSession([_FakeMCPTool("status")]),
+    }
+    _patch_connect(monkeypatch, sessions)
+    tools = await mgr.start_servers([cfg_a, cfg_b])
+    names = sorted(t.name for t in tools)
+    assert names == ["mcp_alpha_ping", "mcp_alpha_pong", "mcp_beta_status"]
+
+
+@pytest.mark.asyncio
+async def test_manager_skips_collisions(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same server name registered twice (operator misconfig) → second
+    # set's tools all collide and get dropped with a warning.
+    from mimir.mcp_client import MCPManager, MCPServerConfig
+
+    mgr = MCPManager()
+    cfg_a = MCPServerConfig(name="dup", command="x", args=[])
+    cfg_b = MCPServerConfig(name="dup", command="y", args=[])
+    sessions = {"dup": _FakeSession([_FakeMCPTool("ping")])}
+    # _connect is called twice but both go through the same fake session
+    _patch_connect(monkeypatch, sessions)
+    tools = await mgr.start_servers([cfg_a, cfg_b])
+    assert [t.name for t in tools] == ["mcp_dup_ping"]
+
+
+@pytest.mark.asyncio
+async def test_manager_skips_failed_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    # One server fails to initialize; the other still loads.
+    from mimir.mcp_client import MCPManager, MCPServerConfig
+
+    mgr = MCPManager()
+    cfg_bad = MCPServerConfig(name="bad", command="x", args=[])
+    cfg_ok = MCPServerConfig(name="ok", command="y", args=[])
+    sessions = {
+        "bad": _FakeSession([], initialize_fails=True),
+        "ok": _FakeSession([_FakeMCPTool("ping")]),
+    }
+    _patch_connect(monkeypatch, sessions)
+    tools = await mgr.start_servers([cfg_bad, cfg_ok])
+    assert [t.name for t in tools] == ["mcp_ok_ping"]
+
+
+@pytest.mark.asyncio
+async def test_manager_initialize_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A server whose initialize() hangs past the timeout is skipped.
+    from mimir.mcp_client import MCPManager, MCPServerConfig
+
+    mgr = MCPManager(initialize_timeout_s=0.05)
+    cfg = MCPServerConfig(name="slow", command="x", args=[])
+    sessions = {"slow": _FakeSession([], initialize_delay=1.0)}
+    _patch_connect(monkeypatch, sessions)
+    tools = await mgr.start_servers([cfg])
+    assert tools == []
+
+
+@pytest.mark.asyncio
+async def test_bridge_tool_surfaces_call_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An MCP tool that hangs past call_timeout_s raises ToolException
+    # (LangGraph surfaces that as a recoverable tool-error to the model).
+    import asyncio as _asyncio
+    from mimir.mcp_client import _bridge_mcp_tool
+    from langchain_core.tools import ToolException
+
+    class _SlowSession:
+        async def call_tool(self, name, kwargs):  # type: ignore[no-untyped-def]
+            await _asyncio.sleep(1.0)
+
+    tool = _bridge_mcp_tool(
+        server_name="s", tool_name="t", description="",
+        input_schema={}, session=_SlowSession(), call_timeout_s=0.05,
+    )
+    with pytest.raises(ToolException, match="timed out"):
+        await tool.coroutine()
+
+
+@pytest.mark.asyncio
+async def test_bridge_tool_surfaces_is_error_result() -> None:
+    from mimir.mcp_client import _bridge_mcp_tool
+    from langchain_core.tools import ToolException
+
+    class _ErrContent:
+        text = "remote validation failed"
+
+    class _ErrResult:
+        isError = True
+        content = [_ErrContent()]
+
+    class _ErrSession:
+        async def call_tool(self, name, kwargs):  # type: ignore[no-untyped-def]
+            return _ErrResult()
+
+    tool = _bridge_mcp_tool(
+        server_name="s", tool_name="t", description="",
+        input_schema={}, session=_ErrSession(),
+    )
+    with pytest.raises(ToolException, match="remote validation failed"):
+        await tool.coroutine()
+
+
+@pytest.mark.asyncio
+async def test_bridge_tool_renders_text_content() -> None:
+    from mimir.mcp_client import _bridge_mcp_tool
+
+    class _TextContent:
+        text = "hello"
+
+    class _OKResult:
+        isError = False
+        content = [_TextContent()]
+
+    class _OKSession:
+        async def call_tool(self, name, kwargs):  # type: ignore[no-untyped-def]
+            return _OKResult()
+
+    tool = _bridge_mcp_tool(
+        server_name="s", tool_name="t", description="",
+        input_schema={}, session=_OKSession(),
+    )
+    out = await tool.coroutine()
+    assert out == "hello"
