@@ -12,13 +12,13 @@ Provider is configured via saga.toml [embedding] section.
 
 import logging
 import os
-import sys
 import threading
 import time
 from functools import lru_cache
-from pathlib import Path
 
 from ._config_io import get_config
+
+log = logging.getLogger(__name__)
 
 _cfg = get_config()
 
@@ -37,7 +37,10 @@ def _retry_with_backoff(fn, max_retries=3, base_delay=1.0):
             last_err = e
             if attempt < max_retries:
                 delay = base_delay * (2 ** attempt)
-                print(f"Embedding retry {attempt+1}/{max_retries} after {delay:.1f}s: {e}", file=sys.stderr)
+                log.warning(
+                    "embedding retry %d/%d after %.1fs: %s",
+                    attempt + 1, max_retries, delay, e,
+                )
                 time.sleep(delay)
     raise last_err
 
@@ -431,57 +434,21 @@ def get_provider() -> EmbeddingProvider:
 
 def embed_text(text: str) -> list[float]:
     """Embed text for storage (passage mode)."""
-    start = time.time()
-    success = True
     max_chars = _cfg('embedding', 'max_input_chars', 2000)
-    try:
-        result = get_provider().embed(text[:max_chars], input_type="passage")
-        return result
-    except Exception:
-        success = False
-        raise
-    finally:
-        latency_ms = (time.time() - start) * 1000
-        try:
-            from .metrics import log_embedding
-            log_embedding('embed_text', latency_ms, len(text[:max_chars]), success)
-        except Exception:
-            pass
+    return get_provider().embed(text[:max_chars], input_type="passage")
 
 
 def embed_query(text: str) -> list[float]:
     """Embed text for retrieval (query mode)."""
-    start = time.time()
-    success = True
     max_chars = _cfg('embedding', 'max_input_chars', 2000)
-    try:
-        result = get_provider().embed(text[:max_chars], input_type="query")
-        return result
-    except Exception:
-        success = False
-        raise
-    finally:
-        latency_ms = (time.time() - start) * 1000
-        try:
-            from .metrics import log_embedding
-            log_embedding('embed_query', latency_ms, len(text[:max_chars]), success)
-        except Exception:
-            pass
+    return get_provider().embed(text[:max_chars], input_type="query")
 
 
 def batch_embed_texts(texts: list[str]) -> list[list[float]]:
     """Batch embed texts for storage (passage mode)."""
-    start = time.time()
     max_chars = _cfg('embedding', 'max_input_chars', 2000)
     truncated = [t[:max_chars] for t in texts]
-    result = get_provider().batch_embed(truncated, input_type="passage")
-    latency_ms = (time.time() - start) * 1000
-    try:
-        from .metrics import log_embedding
-        log_embedding('batch_embed', latency_ms, sum(len(t) for t in truncated), True)
-    except Exception:
-        pass
-    return result
+    return get_provider().batch_embed(truncated, input_type="passage")
 
 
 @lru_cache(maxsize=64)

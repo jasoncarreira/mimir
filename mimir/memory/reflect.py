@@ -51,7 +51,11 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _session_atoms(conn: sqlite3.Connection, session_id: str) -> list[dict]:
+def _session_atoms(
+    conn: sqlite3.Connection,
+    session_id: str,
+    agent_id: str = "default",
+) -> list[dict]:
     """Atoms accessed or stored during the session. Distinct by atom_id.
 
     Two sources contribute:
@@ -65,29 +69,35 @@ def _session_atoms(conn: sqlite3.Connection, session_id: str) -> list[dict]:
                a.source_type, a.created_at, a.topics, a.metadata
         FROM atoms a
         WHERE a.tombstoned = 0
+          AND a.agent_id = ?
           AND (
             a.session_id = ?
             OR a.id IN (
                 SELECT atom_id FROM access_events WHERE session_id = ?
             )
           )
-    """, (session_id, session_id)).fetchall()
+    """, (agent_id, session_id, session_id)).fetchall()
     cols = ("id", "content", "stream", "memory_type",
             "source_type", "created_at", "topics", "metadata")
     return [dict(zip(cols, r)) for r in rows]
 
 
 def _existing_boundary(
-    conn: sqlite3.Connection, session_id: str,
+    conn: sqlite3.Connection,
+    session_id: str,
+    agent_id: str = "default",
 ) -> str | None:
     """Return atom_id of the session_boundary for this session if one
-    exists. Powers idempotency on reflect re-calls."""
+    exists. Powers idempotency on reflect re-calls. Scoped to agent_id
+    so multi-agent DBs sharing a session_id (rare but supported by the
+    schema) don't short-circuit each other's reflects."""
     row = conn.execute("""
         SELECT id FROM atoms
         WHERE source_type = 'session_boundary'
           AND session_id = ?
+          AND agent_id = ?
           AND tombstoned = 0
-    """, (session_id,)).fetchone()
+    """, (session_id, agent_id)).fetchone()
     return row[0] if row else None
 
 
@@ -139,7 +149,7 @@ def reflect(
     # with a freshly-resolved channel_id (e.g., the dispatcher learned
     # which channel the boundary belongs to between calls) should be
     # able to backfill that without us silently no-opping the row.
-    existing_bid = _existing_boundary(conn, session_id)
+    existing_bid = _existing_boundary(conn, session_id, agent_id=agent_id)
     if existing_bid is not None:
         if channel_id is not None:
             try:
@@ -160,7 +170,7 @@ def reflect(
             boundary_created=False,
         )
 
-    atoms = _session_atoms(conn, session_id)
+    atoms = _session_atoms(conn, session_id, agent_id=agent_id)
 
     # ─── Always: synthesize + store the session_boundary ──────────
     fields = boundary_synth_fn(atoms, boundary_context)
