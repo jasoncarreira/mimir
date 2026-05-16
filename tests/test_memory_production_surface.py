@@ -128,7 +128,7 @@ def test_top_triples_with_payload_respects_top_n(conn):
     assert len(results) == 2
 
 
-# ─── End-to-end via MemoryClient ─────────────────────────────────────
+# ─── End-to-end via SagaStore ─────────────────────────────────────
 
 
 def _patch_provider(monkeypatch, *, dim=4):
@@ -157,11 +157,11 @@ async def test_query_surfaces_triples_in_response(monkeypatch, tmp_path):
     response's ``triples`` field — populating the shape mimir's prod
     sagatools.py:_format_saga_payload expects."""
     _patch_provider(monkeypatch)
-    from mimir.saga.client import MemoryClient
+    from mimir.saga.client import SagaStore
     from mimir.saga.triples import store_triples
 
     db = tmp_path / "mimir.saga.db"
-    client = MemoryClient(db_path=db, embedding_dim=4)
+    client = SagaStore(db_path=db, embedding_dim=4)
 
     # Seed a raw and an extracted triple.
     r = await client.store("Alice prefers concise replies")
@@ -191,11 +191,11 @@ async def test_query_surfaces_triples_in_response(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_query_with_triples_disabled_returns_empty_list(monkeypatch, tmp_path):
     _patch_provider(monkeypatch)
-    from mimir.saga.client import MemoryClient
+    from mimir.saga.client import SagaStore
     from mimir.saga.triples import store_triples
 
     db = tmp_path / "mimir.saga.db"
-    client = MemoryClient(
+    client = SagaStore(
         db_path=db, embedding_dim=4,
         include_triples_in_response=False,
     )
@@ -220,10 +220,10 @@ async def test_atoms_carry_confidence_tier(monkeypatch, tmp_path):
     on every atom returned by ``query`` — what mimir's
     sagatools.py:_atom_label reads."""
     _patch_provider(monkeypatch)
-    from mimir.saga.client import MemoryClient
+    from mimir.saga.client import SagaStore
 
     db = tmp_path / "mimir.saga.db"
-    client = MemoryClient(db_path=db, embedding_dim=4)
+    client = SagaStore(db_path=db, embedding_dim=4)
     await client.store("Alice prefers concise replies")
     result = await client.query("alice", top_k=5)
     atoms = result["raws"] + result["observations"]
@@ -262,9 +262,9 @@ async def test_min_confidence_tier_filter_drops_weak_atoms(monkeypatch, tmp_path
         }.get((section, key), default),
     )
 
-    from mimir.saga.client import MemoryClient
+    from mimir.saga.client import SagaStore
     db = tmp_path / "mimir.saga.db"
-    client = MemoryClient(db_path=db, embedding_dim=4)
+    client = SagaStore(db_path=db, embedding_dim=4)
     # "alice" content → embeds to [1,0,0,0] → matches "alice" query at cosine=1.0 → high
     r_strong = await client.store("Alice prefers concise replies")
     # "bob" content → embeds to [0,1,0,0] → matches "alice" query at cosine=0.0 → none

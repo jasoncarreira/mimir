@@ -1,6 +1,6 @@
 """Periodic cross-session consolidation — TIER-2 internal helper.
 
-Production callers should use ``MemoryClient.consolidate`` (in
+Production callers should use ``SagaStore.consolidate`` (in
 client.py), which is the canonical async entry point. It handles:
 - concurrent LLM fan-out via a semaphore
 - rich synthesis (triples + contradictions + P47 prior_block + P48
