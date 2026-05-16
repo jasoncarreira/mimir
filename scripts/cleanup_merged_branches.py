@@ -191,16 +191,23 @@ def _print_buckets(buckets: dict[str, list], *, apply: bool) -> None:
 def _delete_branches(
     candidates: list[tuple[str, int | None, int | None]],
     *,
-    git_runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
+    proc_runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
 ) -> list[tuple[str, str]]:
-    """Force-delete each candidate branch. Returns list of (branch, stderr) failures."""
+    """Force-delete each candidate branch. Returns list of (branch, stderr) failures.
+
+    Note: ``proc_runner`` has a distinct signature from the ``git_runner``
+    parameter on ``_list_local_branches`` / ``_current_branch``: those expect
+    a ``Callable[[list[str]], str]`` mirroring ``_git`` (stdout-as-string),
+    while this one expects a CompletedProcess-returning callable so the
+    caller can inspect ``returncode`` and ``stderr`` on failure.
+    """
     failures: list[tuple[str, str]] = []
     for branch, pr_num, _also_open in candidates:
         result = subprocess.run(
             ["git", "branch", "-D", branch],
             capture_output=True,
             text=True,
-        ) if git_runner is None else git_runner(["branch", "-D", branch])
+        ) if proc_runner is None else proc_runner(["branch", "-D", branch])
         if result.returncode != 0:
             failures.append((branch, result.stderr.strip()))
             print(
@@ -226,6 +233,15 @@ def main(argv: list[str] | None = None) -> int:
         "--apply",
         action="store_true",
         help="delete the identified branches (default: dry-run only)",
+    )
+    parser.add_argument(
+        "--no-confirm",
+        action="store_true",
+        help=(
+            "skip the interactive 'are you sure?' prompt when --apply is set "
+            "(use for non-interactive sub-agent invocations where there's no "
+            "tty to answer the prompt)"
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -254,8 +270,33 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         return 0
 
-    failures = _delete_branches(buckets[MERGED])
+    merged_candidates = buckets[MERGED]
+    if merged_candidates and not args.no_confirm:
+        if not _confirm_delete(len(merged_candidates)):
+            print("aborted; no branches deleted.", file=sys.stderr)
+            return 0
+
+    failures = _delete_branches(merged_candidates)
     return 1 if failures else 0
+
+
+def _confirm_delete(count: int) -> bool:
+    """Prompt the user for confirmation before --apply destructive deletes.
+
+    Returns True if the user typed ``yes`` (case-insensitive). Any other
+    input — including empty / EOF (Ctrl-D, non-interactive stdin) — is
+    treated as a 'no' so we fail closed when run without a tty and
+    ``--no-confirm`` was not passed.
+    """
+    prompt = (
+        f"About to force-delete {count} local branch(es) "
+        f"(git branch -D, recoverable from origin). Type 'yes' to proceed: "
+    )
+    try:
+        answer = input(prompt)
+    except EOFError:
+        return False
+    return answer.strip().lower() == "yes"
 
 
 if __name__ == "__main__":

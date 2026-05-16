@@ -263,3 +263,191 @@ def test_print_buckets_omits_warning_when_no_also_open(capsys: pytest.CaptureFix
     assert "clean-merged" in out
     assert "PR #42" in out
     assert "ALSO has OPEN" not in out
+
+
+# -- _confirm_delete + main() --apply / --no-confirm gating ----------------
+
+
+def test_confirm_delete_accepts_yes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Typing 'yes' (any case, optional whitespace) returns True."""
+    for answer in ("yes", "YES", "  Yes  ", "yEs"):
+        monkeypatch.setattr("builtins.input", lambda _prompt, _a=answer: _a)
+        assert cmb._confirm_delete(3) is True
+
+
+def test_confirm_delete_rejects_anything_else(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Anything other than 'yes' — y, no, empty, garbage — returns False."""
+    for answer in ("y", "no", "", "n", "delete", "ok"):
+        monkeypatch.setattr("builtins.input", lambda _prompt, _a=answer: _a)
+        assert cmb._confirm_delete(3) is False
+
+
+def test_confirm_delete_treats_eof_as_no(monkeypatch: pytest.MonkeyPatch) -> None:
+    """EOF (Ctrl-D, non-interactive stdin) is a 'no' so we fail closed.
+
+    This is the load-bearing safety property: sub-agent invocations
+    without a tty must not silently proceed with destructive deletes
+    just because ``input()`` raised. Pass ``--no-confirm`` explicitly
+    to skip the prompt.
+    """
+    def raise_eof(_prompt: str) -> str:
+        raise EOFError()
+    monkeypatch.setattr("builtins.input", raise_eof)
+    assert cmb._confirm_delete(5) is False
+
+
+def test_main_apply_no_confirm_skips_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """``--apply --no-confirm`` does not call ``input()`` and proceeds to delete."""
+    monkeypatch.setattr(cmb, "_list_local_branches", lambda: ["old-feature"])
+    monkeypatch.setattr(cmb, "_current_branch", lambda: "main")
+    monkeypatch.setattr(
+        cmb,
+        "collect_branch_statuses",
+        lambda *a, **kw: {
+            cmb.MERGED: [("old-feature", 42, None)],
+            cmb.OPEN: [],
+            cmb.CLOSED_UNMERGED: [],
+            cmb.NO_PR: [],
+        },
+    )
+
+    delete_calls: list[list[tuple[str, int | None, int | None]]] = []
+
+    def fake_delete(candidates: list[tuple[str, int | None, int | None]]) -> list[tuple[str, str]]:
+        delete_calls.append(candidates)
+        return []
+
+    monkeypatch.setattr(cmb, "_delete_branches", fake_delete)
+
+    def raise_if_called(_prompt: str) -> str:
+        raise AssertionError("input() must not be called with --no-confirm")
+    monkeypatch.setattr("builtins.input", raise_if_called)
+
+    rc = cmb.main(["--apply", "--no-confirm"])
+    assert rc == 0
+    assert delete_calls == [[("old-feature", 42, None)]]
+
+
+def test_main_apply_prompts_and_aborts_on_no(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """``--apply`` without ``--no-confirm`` prompts; a non-yes answer aborts."""
+    monkeypatch.setattr(cmb, "_list_local_branches", lambda: ["old-feature"])
+    monkeypatch.setattr(cmb, "_current_branch", lambda: "main")
+    monkeypatch.setattr(
+        cmb,
+        "collect_branch_statuses",
+        lambda *a, **kw: {
+            cmb.MERGED: [("old-feature", 42, None)],
+            cmb.OPEN: [],
+            cmb.CLOSED_UNMERGED: [],
+            cmb.NO_PR: [],
+        },
+    )
+
+    delete_called = False
+
+    def fake_delete(_candidates: list[tuple[str, int | None, int | None]]) -> list[tuple[str, str]]:
+        nonlocal delete_called
+        delete_called = True
+        return []
+
+    monkeypatch.setattr(cmb, "_delete_branches", fake_delete)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+
+    rc = cmb.main(["--apply"])
+    assert rc == 0
+    assert delete_called is False
+    err = capsys.readouterr().err
+    assert "aborted" in err
+
+
+def test_main_apply_prompts_and_proceeds_on_yes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--apply`` without ``--no-confirm`` prompts; ``yes`` proceeds with deletes."""
+    monkeypatch.setattr(cmb, "_list_local_branches", lambda: ["old-feature"])
+    monkeypatch.setattr(cmb, "_current_branch", lambda: "main")
+    monkeypatch.setattr(
+        cmb,
+        "collect_branch_statuses",
+        lambda *a, **kw: {
+            cmb.MERGED: [("old-feature", 42, None)],
+            cmb.OPEN: [],
+            cmb.CLOSED_UNMERGED: [],
+            cmb.NO_PR: [],
+        },
+    )
+
+    delete_calls: list[list[tuple[str, int | None, int | None]]] = []
+
+    def fake_delete(candidates: list[tuple[str, int | None, int | None]]) -> list[tuple[str, str]]:
+        delete_calls.append(candidates)
+        return []
+
+    monkeypatch.setattr(cmb, "_delete_branches", fake_delete)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
+
+    rc = cmb.main(["--apply"])
+    assert rc == 0
+    assert delete_calls == [[("old-feature", 42, None)]]
+
+
+def test_main_apply_empty_merged_skips_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--apply`` with no merged candidates skips the prompt entirely.
+
+    No destructive action means no confirmation needed; treating it as a
+    silent zero-work return matches the dry-run path's behavior.
+    """
+    monkeypatch.setattr(cmb, "_list_local_branches", lambda: [])
+    monkeypatch.setattr(cmb, "_current_branch", lambda: "main")
+    monkeypatch.setattr(
+        cmb,
+        "collect_branch_statuses",
+        lambda *a, **kw: {
+            cmb.MERGED: [],
+            cmb.OPEN: [],
+            cmb.CLOSED_UNMERGED: [],
+            cmb.NO_PR: [],
+        },
+    )
+
+    def raise_if_called(_prompt: str) -> str:
+        raise AssertionError("input() must not be called when merged is empty")
+    monkeypatch.setattr("builtins.input", raise_if_called)
+
+    rc = cmb.main(["--apply"])
+    assert rc == 0
+
+
+def test_delete_branches_proc_runner_kwarg_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_delete_branches`` accepts ``proc_runner`` (renamed from ``git_runner``).
+
+    Pins the keyword name so a future-bot grepping for ``git_runner`` doesn't
+    accidentally collide with the str-returning runners on
+    ``_list_local_branches`` / ``_current_branch``.
+    """
+    seen_args: list[list[str]] = []
+
+    class _FakeResult:
+        returncode = 0
+        stderr = ""
+
+    def fake_runner(args: list[str]) -> _FakeResult:
+        seen_args.append(args)
+        return _FakeResult()
+
+    failures = cmb._delete_branches(
+        [("old-feature", 42, None)],
+        proc_runner=fake_runner,
+    )
+    assert failures == []
+    assert seen_args == [["branch", "-D", "old-feature"]]
