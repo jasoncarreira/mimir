@@ -73,10 +73,10 @@ def _make_synthetic_question() -> dict:
 @pytest.mark.asyncio
 async def test_runner_completes_one_question(tmp_path, monkeypatch):
     # Stub embedding provider so we don't touch voyage / openai.
-    import mimir.memory.embeddings as _mm_embeddings
+    import mimir.saga.embeddings as _mm_embeddings
     monkeypatch.setattr(_mm_embeddings, "get_provider", _stub_provider)
-    # mimir.memory._config_io.get_config is queried for embedding max_input_chars.
-    import mimir.memory._config_io as _mm_config
+    # mimir.saga._config_io.get_config is queried for embedding max_input_chars.
+    import mimir.saga._config_io as _mm_config
 
     def _fake_get_config():
         def cfg(section, key, default=None):
@@ -107,13 +107,13 @@ async def test_runner_completes_one_question(tmp_path, monkeypatch):
     monkeypatch.setattr(_h, "read", _fake_read)
 
     # Stub the consolidate LLM call — synthesize.make_async_observation_synth_fn
-    # uses mimir.memory._llm.call_llm; replace with a deterministic stub.
-    import mimir.memory._llm as _mm_llm
+    # uses mimir.saga._llm.call_llm; replace with a deterministic stub.
+    import mimir.saga._llm as _mm_llm
     async def _fake_call_llm(*args, **kwargs):
         return "OBSERVATION:\nAlice consistently prefers concise replies."
     monkeypatch.setattr(_mm_llm, "call_llm", _fake_call_llm)
 
-    from mimir.memory.client import MemoryClient
+    from mimir.saga.client import MemoryClient
     from benchmarks.longmemeval_via_memory import runner as r
 
     # Override the default embedding_dim to match the stub (4d).
@@ -147,9 +147,9 @@ async def test_runner_no_consolidate_path(tmp_path, monkeypatch):
     """The --no-consolidate path should skip the LLM call entirely.
     Verify the consolidate seconds is ~0 and no observations get
     created."""
-    import mimir.memory.embeddings as _mm_embeddings
+    import mimir.saga.embeddings as _mm_embeddings
     monkeypatch.setattr(_mm_embeddings, "get_provider", _stub_provider)
-    import mimir.memory._config_io as _mm_config
+    import mimir.saga._config_io as _mm_config
     def _fake_cfg():
         def cfg(section, key, default=None):
             return {

@@ -1,4 +1,4 @@
-"""LongMemEval runner that ingests + retrieves via mimir.memory.MemoryClient.
+"""LongMemEval runner that ingests + retrieves via mimir.saga.MemoryClient.
 
 Pipeline per question:
 
@@ -76,8 +76,8 @@ def _make_client(db_path: Path, *, embedding_dim: int | None = None):
     against a 1024-dim index produced an empty FAISS index in the
     earlier 73.4% run — recall fell back to keyword-only.
     """
-    from mimir.memory.client import MemoryClient
-    from mimir.memory.fts import DEFAULT_LONGMEMEVAL_SYNONYMS
+    from mimir.saga.client import MemoryClient
+    from mimir.saga.fts import DEFAULT_LONGMEMEVAL_SYNONYMS
     if db_path.exists():
         db_path.unlink()
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,11 +93,11 @@ def _batch_embed_texts(texts: list[str]) -> list[tuple[bytes, str, str, int]]:
     """Batch-embed via the saga provider's ``batch_embed`` API (or fall
     back to per-text). Returns parallel list of
     ``(vec_bytes, provider, model, dim)`` tuples matching the shape
-    ``mimir.memory.store.EmbedFn`` would produce.
+    ``mimir.saga.store.EmbedFn`` would produce.
     """
     import struct as _struct
-    from mimir.memory.embeddings import get_provider
-    from mimir.memory._config_io import get_config
+    from mimir.saga.embeddings import get_provider
+    from mimir.saga._config_io import get_config
 
     cfg = get_config()
     provider = get_provider()
@@ -507,7 +507,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         prog="benchmarks.longmemeval_via_memory.runner",
         description=(
-            "LongMemEval through mimir.memory.MemoryClient — bypasses "
+            "LongMemEval through mimir.saga.MemoryClient — bypasses "
             "saga entirely. Parallel to longmemeval_via_mimir."
         ),
     )

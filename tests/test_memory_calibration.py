@@ -1,4 +1,4 @@
-"""Tests for ``mimir.memory.calibration.re_embed``.
+"""Tests for ``mimir.saga.calibration.re_embed``.
 
 Coverage rationale: re_embed is the operator-facing ops tool for
 re-embedding every live atom under a new provider. The function
@@ -47,7 +47,7 @@ def _install_stub_provider(monkeypatch: pytest.MonkeyPatch, dim: int = 4,
                             provider_name: str = "openai") -> _StubProvider:
     stub = _StubProvider(dim)
     monkeypatch.setattr(
-        "mimir.memory.embeddings.get_provider", lambda: stub,
+        "mimir.saga.embeddings.get_provider", lambda: stub,
     )
 
     def _fake_get_config():
@@ -59,7 +59,7 @@ def _install_stub_provider(monkeypatch: pytest.MonkeyPatch, dim: int = 4,
             }.get((section, key), default)
         return cfg
     monkeypatch.setattr(
-        "mimir.memory._config_io.get_config", _fake_get_config,
+        "mimir.saga._config_io.get_config", _fake_get_config,
     )
     return stub
 
@@ -69,7 +69,7 @@ def _seed_db(db_path: Path, atoms: list[tuple[str, str, int]]) -> None:
 
     ``atoms`` is a list of (id, content, tombstoned) tuples.
     """
-    schema_path = Path(__file__).resolve().parents[1] / "mimir" / "memory" / "schema.sql"
+    schema_path = Path(__file__).resolve().parents[1] / "mimir" / "saga" / "schema.sql"
     conn = sqlite3.connect(str(db_path))
     conn.executescript(schema_path.read_text())
     for atom_id, content, tomb in atoms:
@@ -93,7 +93,7 @@ def test_re_embed_dry_run_counts_only(tmp_path: Path,
         ("atom2", "beta content", 0),
         ("atom3", "tombstoned", 1),
     ])
-    from mimir.memory.calibration import re_embed
+    from mimir.saga.calibration import re_embed
     result = re_embed(db, dry_run=True)
     assert result["atoms_total"] == 2  # tombstoned excluded
     assert result["atoms_updated"] == 0
@@ -119,7 +119,7 @@ def test_re_embed_apply_writes_embeddings_row(tmp_path: Path,
         ("atom2", "beta content", 0),
     ])
 
-    from mimir.memory.calibration import re_embed
+    from mimir.saga.calibration import re_embed
     result = re_embed(db, dry_run=False)
 
     assert result["atoms_total"] == 2
@@ -153,7 +153,7 @@ def test_re_embed_skips_tombstoned(tmp_path: Path,
         ("live", "live content", 0),
         ("dead", "tombstoned content", 1),
     ])
-    from mimir.memory.calibration import re_embed
+    from mimir.saga.calibration import re_embed
     result = re_embed(db, dry_run=False)
     assert result["atoms_total"] == 1
     assert result["atoms_updated"] == 1
@@ -173,7 +173,7 @@ def test_re_embed_empty_db_returns_zero(tmp_path: Path,
     stub = _install_stub_provider(monkeypatch)
     db = tmp_path / "memory.db"
     _seed_db(db, [])  # schema only, no atoms
-    from mimir.memory.calibration import re_embed
+    from mimir.saga.calibration import re_embed
     result = re_embed(db, dry_run=False)
     assert result["atoms_total"] == 0
     assert result["atoms_updated"] == 0
@@ -188,7 +188,7 @@ def test_re_embed_target_provider_override(tmp_path: Path,
     _install_stub_provider(monkeypatch, dim=4, provider_name="voyage")
     db = tmp_path / "memory.db"
     _seed_db(db, [("a1", "content", 0)])
-    from mimir.memory.calibration import re_embed
+    from mimir.saga.calibration import re_embed
     # Override to "onnx" — that name should land in the embeddings row.
     result = re_embed(db, target_provider_name="onnx", dry_run=False)
     assert result["target_provider"] == "onnx"

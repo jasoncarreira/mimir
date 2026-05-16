@@ -11,7 +11,7 @@ prompt code path can be deleted.
 
 The prompts here are pared-down versions of saga.consolidation's. The
 production prompt has triple extraction, contradiction detection, and
-canonical-subject vocab blocks — all P-features that mimir.memory
+canonical-subject vocab blocks — all P-features that mimir.saga
 defers to a Tier 3 follow-up (triples.py, contradictions.py). Keeping
 the v2 prompt small means: less LLM cost per cluster, simpler to
 parse, fewer ways to fail. We can grow it back once the bench numbers
@@ -43,7 +43,7 @@ import re
 from typing import Any, Callable
 
 
-logger = logging.getLogger("mimir.memory.synthesize")
+logger = logging.getLogger("mimir.saga.synthesize")
 
 
 # ─── Observation synthesis (consolidate) ─────────────────────────────

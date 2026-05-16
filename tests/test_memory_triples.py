@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.memory.triples import (
+from mimir.saga.triples import (
     detect_contradictions,
     get_current_value,
     get_history,
@@ -20,7 +20,7 @@ from mimir.memory.triples import (
 )
 
 
-SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "memory" / "schema.sql"
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"
 
 
 @pytest.fixture
@@ -356,7 +356,7 @@ def test_resolve_contradictions_is_idempotent(conn):
 
 
 def test_parse_contradictions_basic():
-    from mimir.memory.synthesize import _parse_contradictions
+    from mimir.saga.synthesize import _parse_contradictions
     raw = """OBSERVATION:
 Some observation.
 
@@ -375,13 +375,13 @@ CONTRADICTIONS:
 
 
 def test_parse_contradictions_handles_none():
-    from mimir.memory.synthesize import _parse_contradictions
+    from mimir.saga.synthesize import _parse_contradictions
     out = _parse_contradictions("CONTRADICTIONS:\nNONE")
     assert out == []
 
 
 def test_parse_contradictions_returns_empty_when_no_section():
-    from mimir.memory.synthesize import _parse_contradictions
+    from mimir.saga.synthesize import _parse_contradictions
     out = _parse_contradictions("OBSERVATION: just an observation.")
     assert out == []
 
@@ -394,7 +394,7 @@ def test_build_vocab_block_seed_only_on_cold_db(conn):
     Bench-OFF callers (and the first consolidate pass ever) hit this
     path. The non-empty seed guarantees the LLM always sees a canonical
     set, not an empty hint."""
-    from mimir.memory.synthesize import build_vocab_block
+    from mimir.saga.synthesize import build_vocab_block
     block = build_vocab_block(conn)
     # Seed predicates surface as bare names (no counts).
     assert "prefers" in block
@@ -413,7 +413,7 @@ def test_build_vocab_block_surfaces_db_top_n_with_counts(conn):
     """Predicates and subjects present in the live triples table land
     in the block annotated with their count, ordered most-frequent
     first. The seed unions in below."""
-    from mimir.memory.synthesize import build_vocab_block
+    from mimir.saga.synthesize import build_vocab_block
     _seed_atom(conn, "obs1", "obs1")
     _seed_atom(conn, "obs2", "obs2")
     _seed_atom(conn, "obs3", "obs3")
@@ -444,7 +444,7 @@ def test_build_vocab_block_includes_extra_subjects(conn):
     subject list as bare names, distinguishing them from DB-derived
     entries. Surface for production callers that want to inject custom
     canonical identities into the LLM's view."""
-    from mimir.memory.synthesize import build_vocab_block
+    from mimir.saga.synthesize import build_vocab_block
     block = build_vocab_block(conn, extra_subjects=["MyCompany", "MyTeam"])
     assert "MyCompany" in block
     assert "MyTeam" in block
@@ -454,7 +454,7 @@ def test_build_vocab_block_dedupes_extras_against_seed(conn):
     """Passing a subject that's already in the seed (e.g. ``User``)
     doesn't duplicate it. Defensive: operators shouldn't have to
     remember which subjects are seeded."""
-    from mimir.memory.synthesize import build_vocab_block
+    from mimir.saga.synthesize import build_vocab_block
     block = build_vocab_block(conn, extra_subjects=["User", "MyTeam"])
     subj_line = [l for l in block.split("\n") if l.startswith("Subjects:")][0]
     # Strip the "Subjects: " header before splitting by comma.
@@ -471,7 +471,7 @@ def test_build_vocab_block_dedupes_extras_against_seed(conn):
 def test_build_prior_block_empty_when_no_priors(conn):
     """Cluster with no subset observations → empty block. The prompt
     placeholder gracefully renders nothing."""
-    from mimir.memory.synthesize import build_prior_block
+    from mimir.saga.synthesize import build_prior_block
     _seed_atom(conn, "raw1", "raw1")
     _seed_atom(conn, "raw2", "raw2")
     assert build_prior_block(conn, ["raw1", "raw2"]) == ""
@@ -481,7 +481,7 @@ def test_build_prior_block_surfaces_strict_subset_observation_triples(conn):
     """An older observation built from raws ⊂ the new cluster's raws
     surfaces its triples in the prior block. Equal-evidence (not strict
     subset) is excluded — equal-evidence reuse is handled separately."""
-    from mimir.memory.synthesize import build_prior_block
+    from mimir.saga.synthesize import build_prior_block
     # Two raws — earlier observation evidenced by just raw1.
     _seed_atom(conn, "raw1", "raw1")
     _seed_atom(conn, "raw2", "raw2")
@@ -509,7 +509,7 @@ def test_build_prior_block_excludes_equal_and_superset_observations(conn):
     """Observations with evidence ⊇ the cluster (equal or superset)
     are NOT priors — they're either the equal-evidence-skip case or
     can't be revised by a smaller cluster. Only strict subsets count."""
-    from mimir.memory.synthesize import build_prior_block
+    from mimir.saga.synthesize import build_prior_block
     _seed_atom(conn, "raw1", "raw1")
     _seed_atom(conn, "raw2", "raw2")
     _seed_atom(conn, "raw3", "raw3")
@@ -552,7 +552,7 @@ def test_build_prior_block_skips_when_cluster_too_small(conn):
     """A 1-atom cluster can't have any strict-subset priors (subset of
     a 1-element set is the empty set, which we don't track as
     evidence). Guard returns empty without hitting the DB."""
-    from mimir.memory.synthesize import build_prior_block
+    from mimir.saga.synthesize import build_prior_block
     _seed_atom(conn, "raw1", "raw1")
     assert build_prior_block(conn, ["raw1"]) == ""
 
@@ -561,7 +561,7 @@ def test_rich_prompt_renders_with_blocks_populated():
     """End-to-end: ``RICH_PROMPT.format`` accepts vocab_block and
     prior_block as kwargs without KeyError or stray braces. Pins the
     template format-string contract."""
-    from mimir.memory.synthesize import RICH_PROMPT
+    from mimir.saga.synthesize import RICH_PROMPT
     out = RICH_PROMPT.format(
         n=2,
         indexed_atoms="[1] hello\n[2] world",
@@ -577,7 +577,7 @@ def test_rich_prompt_renders_with_blocks_empty():
     """Bench-neutrality: empty blocks render to literal empty in the
     template — no leftover placeholder strings, no double newlines that
     would change the prompt's structure for the bench-OFF path."""
-    from mimir.memory.synthesize import RICH_PROMPT
+    from mimir.saga.synthesize import RICH_PROMPT
     out = RICH_PROMPT.format(
         n=2, indexed_atoms="[1] hello\n[2] world",
         prior_block="", vocab_block="",

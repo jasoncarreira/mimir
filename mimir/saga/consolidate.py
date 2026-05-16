@@ -13,7 +13,7 @@ observation-only synthesis, sync orchestration, no triples / no rich
 prompt. It's retained for the ``test_memory_tier2b.py`` regression
 suite and for any future caller that genuinely wants only the
 observation tier. **Not exported** from the package's public
-``__init__`` for that reason: ``from mimir.memory import consolidate``
+``__init__`` for that reason: ``from mimir.saga import consolidate``
 would silently get the simpler path and miss tier-3 features.
 
 Complement to reflect():

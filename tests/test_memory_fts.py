@@ -1,4 +1,4 @@
-"""Tests for mimir.memory.fts — FTS5 keyword search.
+"""Tests for mimir.saga.fts — FTS5 keyword search.
 
 Validates: schema triggers keep atoms_fts in sync, BM25 ranking
 returns sensible order, fallback to LIKE works when FTS5 syntax is
@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from mimir.memory.fts import fts5_query, fts_search
+from mimir.saga.fts import fts5_query, fts_search
 
 
-SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "memory" / "schema.sql"
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"
 
 
 @pytest.fixture
