@@ -48,6 +48,11 @@ from .web import (
     web_search,
     web_tools_enabled,
 )
+from .mcp import (
+    clear_mcp_tools,
+    get_mcp_tools,
+    set_mcp_tools,
+)
 
 __all__ = [
     # Core tools (callable by the agent)
@@ -73,6 +78,10 @@ __all__ = [
     "fetch_url",
     "web_tools_enabled",
     "set_web_home",
+    # MCP tool bridge (populated at server startup)
+    "set_mcp_tools",
+    "get_mcp_tools",
+    "clear_mcp_tools",
     # Dep-injection setters (called by server.py:build_app)
     "set_memory_client",
     "set_indexer",

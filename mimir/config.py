@@ -107,6 +107,24 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _load_mcp_servers_from_env() -> list:
+    """Load MCP server configs from MIMIR_MCP_SERVERS_JSON / _PATH env.
+
+    Inline JSON wins over path. Returns an empty list if both unset
+    (MCP is opt-in). Import is local so config doesn't pay the mcp/
+    LangChain import cost when MCP isn't configured.
+    """
+    json_inline = os.environ.get("MIMIR_MCP_SERVERS_JSON", "").strip()
+    json_path = os.environ.get("MIMIR_MCP_SERVERS_PATH", "").strip()
+    if not json_inline and not json_path:
+        return []
+    from .mcp_client import load_mcp_server_configs
+    return load_mcp_server_configs(
+        json_inline=json_inline or None,
+        json_path=json_path or None,
+    )
+
+
 def _parse_folders(raw: str) -> dict[str, str]:
     """Parse a ``MIMIR_FOLDERS`` env value into a name→mode dict.
 
@@ -254,6 +272,16 @@ class Config:
     # ``state:rw,memory:rw,logs:ro``); falls back to ``DEFAULT_FOLDERS``
     # when unset. Unknown modes are coerced to ``"ro"`` (fail safe).
     folders: dict[str, str]
+
+    # MCP servers to spawn at startup. Each entry is an
+    # ``MCPServerConfig`` (name, command, args, env). Tools exposed by
+    # the servers are bridged as ``mcp_{server}_{tool}`` LangChain
+    # tools and appended to the agent's tool surface. Operator-supplied
+    # via ``MIMIR_MCP_SERVERS_JSON`` (inline JSON list) or
+    # ``MIMIR_MCP_SERVERS_PATH`` (path to a JSON file). Both forms
+    # accept the Claude-Code-style ``{"mcpServers": [...]}`` wrapper
+    # or a bare list. Empty by default — MCP is opt-in.
+    mcp_servers: list  # type: list[MCPServerConfig], avoiding the import
 
     # SDK gateway (§14.1)
     anthropic_api_key: str
@@ -509,6 +537,7 @@ class Config:
                 if p.strip()
             ],
             folders=_parse_folders(_env("MIMIR_FOLDERS", "") or ""),
+            mcp_servers=_load_mcp_servers_from_env(),
 
             anthropic_api_key=_env("ANTHROPIC_API_KEY"),
             anthropic_base_url=_env("ANTHROPIC_BASE_URL"),

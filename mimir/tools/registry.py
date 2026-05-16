@@ -460,4 +460,8 @@ def all_mimir_tools() -> list:
             tools.append(web_search)
         if fetch_url_on:
             tools.append(fetch_url)
+    # MCP-bridged tools (populated by server.py:_on_startup after the
+    # MCP servers come up; empty when MCP is unconfigured).
+    from .mcp import get_mcp_tools
+    tools.extend(get_mcp_tools())
     return tools

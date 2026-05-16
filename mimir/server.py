@@ -497,6 +497,32 @@ def build_app(config: Config) -> web.Application:
         await indexer.start(run_initial_sweep=False, sweep_loop=True)
         await channels.connect_all()
 
+        # MCP servers (opt-in via MIMIR_MCP_SERVERS_JSON / _PATH).
+        # Bridged tools are appended to the agent's surface via the
+        # mimir.tools.mcp setter. A single server failing to start is
+        # logged + skipped — the agent still boots with native tools.
+        # Lifecycle owner stored on app so _on_cleanup can shut it down.
+        if config.mcp_servers:
+            from .mcp_client import MCPManager
+            from .tools import set_mcp_tools
+
+            mcp_manager = MCPManager()
+            try:
+                mcp_tools = await mcp_manager.start_servers(config.mcp_servers)
+            except Exception as exc:  # noqa: BLE001 — log + continue
+                log.warning("MCP startup failed: %s", exc)
+                mcp_tools = []
+                await mcp_manager.shutdown()
+                mcp_manager = None
+            if mcp_tools:
+                set_mcp_tools(mcp_tools)
+                await log_event(
+                    "mcp_servers_ready",
+                    count=len(mcp_tools),
+                    tool_names=[t.name for t in mcp_tools],
+                )
+            app["mcp_manager"] = mcp_manager
+
         # Register SAGA weekly consolidation. Bad cron logs and continues.
         # Pass home so the closure can read identities.yaml at fire time
         # and thread canonical names into the consolidation prompt's
@@ -703,6 +729,9 @@ def build_app(config: Config) -> web.Application:
         await indexer.stop()
         await saga_client.close()
         await channels.disconnect_all()
+        mcp_manager = app.get("mcp_manager")
+        if mcp_manager is not None:
+            await mcp_manager.shutdown()
 
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
