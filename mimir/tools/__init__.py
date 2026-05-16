@@ -42,6 +42,12 @@ from .registry import (
     set_spawn_config,
     spawn_claude_code,
 )
+from .web import (
+    fetch_url,
+    set_home as set_web_home,
+    web_search,
+    web_tools_enabled,
+)
 
 __all__ = [
     # Core tools (callable by the agent)
@@ -62,6 +68,11 @@ __all__ = [
     "commitment_dismiss",
     "commitment_list",
     "spawn_claude_code",
+    # Web tools (gated on provider; see web_tools_enabled)
+    "web_search",
+    "fetch_url",
+    "web_tools_enabled",
+    "set_web_home",
     # Dep-injection setters (called by server.py:build_app)
     "set_memory_client",
     "set_indexer",
