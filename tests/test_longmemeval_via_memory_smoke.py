@@ -113,7 +113,7 @@ async def test_runner_completes_one_question(tmp_path, monkeypatch):
         return "OBSERVATION:\nAlice consistently prefers concise replies."
     monkeypatch.setattr(_mm_llm, "call_llm", _fake_call_llm)
 
-    from mimir.saga.client import MemoryClient
+    from mimir.saga.client import SagaStore
     from benchmarks.longmemeval_via_memory import runner as r
 
     # Override the default embedding_dim to match the stub (4d).
