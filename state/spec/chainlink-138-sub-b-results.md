@@ -1,5 +1,13 @@
-<!-- desc: A/B harness results for chainlink #140 (Sub B of #138). Run tag: full30. -->
+<!-- desc: A/B harness results for chainlink #140 (Sub B of #138). Run tag: full30. STATUS: SUPERSEDED — autopass infrastructure removed wholesale 2026-05-16; kept as historical evidence of why autopass was rejected. -->
 # chainlink #138 Sub B — file_search autopass A/B results
+
+> **Status (2026-05-16): SUPERSEDED.** Sub D's re-run with the
+> reframe+threshold knobs (PR #168 + PR #170) deepened the regression
+> to −13.33pp, confirming the diagnosis here. Jason closed the autopass
+> direction 2026-05-16 11:39 UTC ("we can remove the per-request file
+> search ... focus on trying out the ColBERT indexing on file search").
+> Autopass infrastructure removed wholesale; this doc preserved as
+> historical evidence.
 
 **Run tag:** `full30`  
 **Probe count:** 30 (on=30, off=30)
