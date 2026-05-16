@@ -20,7 +20,7 @@ Lifecycle:
   marked removed.
 - ``search(query_vec, top_k)`` — returns ``[(atom_id, similarity)]``.
 
-Per-SagaStore singleton (not module-global). Two MemoryClients
+Per-SagaStore singleton (not module-global). Two SagaStores
 pointing at different DBs each own their own index. Saga's module-
 global singletons assumed one process / one DB; the bench harness
 needs cross-question DB switching, so per-client is the right scope.

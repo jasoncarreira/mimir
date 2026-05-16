@@ -47,7 +47,7 @@ def re_embed(
     embedding provider.
 
     Args:
-        db_path: Path to ``memory.db``.
+        db_path: Path to ``saga.db``.
         target_provider_name: Provider name override. ``None`` uses the
             saga.toml-resolved provider — the common case for cron-driven
             provider migrations where the operator edited the TOML

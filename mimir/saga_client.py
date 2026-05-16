@@ -720,7 +720,7 @@ def make_saga_client(
     - Empty/unset, ``localhost``, or ``127.0.0.1`` → in-process
       ``SagaStore`` (the mimir.saga clean-room rewrite of saga's
       retrieval/consolidation engine). ``db_path`` defaults to
-      ``$MIMIR_HOME/.mimir/memory.db``; pass explicitly to override
+      ``$MIMIR_HOME/.mimir/saga.db``; pass explicitly to override
       (tests, alternative DB layouts).
     - Anything else → ``_HttpSaga(endpoint, api_key, timeout_s)``
       (kept for operators running a separate saga HTTP server; this
@@ -747,7 +747,7 @@ def make_saga_client(
                     "not supplied — cannot resolve in-process SagaStore "
                     "db path. Set MIMIR_HOME or pass db_path explicitly."
                 )
-            resolved_db = Path(home) / ".mimir" / "memory.db"
+            resolved_db = Path(home) / ".mimir" / "saga.db"
         resolved_db.parent.mkdir(parents=True, exist_ok=True)
         inner: SagaClient = SagaStore(
             db_path=resolved_db, embedding_dim=embedding_dim,
