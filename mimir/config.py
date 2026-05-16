@@ -172,34 +172,6 @@ class Config:
     # unset and got dropped at any floor ≥ low.
     saga_pre_message_min_tier: str
 
-    # chainlink #139 (Sub A of #138): auto-run file_search against the
-    # inbound message text and inject the top-K hits as a sibling block
-    # to ``Possibly relevant memories (from SAGA)``. Default OFF —
-    # Sub B's A/B harness flips this on; flipping the default to ON
-    # is a separate decision after that data lands.
-    # - ``file_search_autopass_enabled``: master flag. Load-bearing for
-    #   Sub B's harness — must produce a literal None for the file_block
-    #   (no empty section in the prompt) when False.
-    # - ``file_search_autopass_k``: top-K results to render. Mirrors
-    #   the file_search MCP tool's default and the SAGA pre-message
-    #   hook's top_k=12 in spirit — small enough to keep the block
-    #   under ~800 tokens.
-    # - ``file_search_autopass_min_chars``: skip-gate on inbound text
-    #   length. Short acks ("ok", "ty", "👍") don't carry retrieval
-    #   signal; running the indexer on them wastes embedding budget
-    #   and produces noisy hits.
-    # - ``file_search_autopass_min_score``: minimum hybrid retrieval
-    #   score (0.5*cosine + 0.2*bm25_norm + 0.3*recency, ∈ [0,1])
-    #   required for a hit to surface. Added post-Sub-B (chainlink
-    #   #138) to filter out the partial-match near-clones that caused
-    #   the autopass block to crowd out the model's own search; see
-    #   `state/spec/chainlink-138-sub-b-results.md` §"Caveats and
-    #   follow-on observations".
-    file_search_autopass_enabled: bool
-    file_search_autopass_k: int
-    file_search_autopass_min_chars: int
-    file_search_autopass_min_score: float
-
     # send_message circuit breaker (§7.2.4)
     send_loop_soft_limit: int
     send_loop_hard_limit: int
@@ -459,35 +431,6 @@ class Config:
                 "MIMIR_INTROSPECTION_EMIT_ALGEDONIC", True,
             ),
             saga_pre_message_min_tier=_env("MIMIR_SAGA_PRE_MSG_MIN_TIER", ""),
-
-            file_search_autopass_enabled=_env_bool(
-                "MIMIR_FILE_SEARCH_AUTOPASS_ENABLED", False,
-            ),
-            # K bumped down 5 → 3 (chainlink #138 post-Sub-B reframing):
-            # belt-and-suspenders alongside the min-score floor, so even
-            # past the floor we surface fewer matches and the block reads
-            # tighter. Sub B's measurement showed extra matches past the
-            # top 1-2 were dominantly the source of the crowding-out
-            # behavior (partial-match near-clones).
-            file_search_autopass_k=_env_int(
-                "MIMIR_FILE_SEARCH_AUTOPASS_K", 3,
-            ),
-            file_search_autopass_min_chars=_env_int(
-                "MIMIR_FILE_SEARCH_AUTOPASS_MIN_CHARS", 20,
-            ),
-            # Minimum hybrid retrieval score for an autopass hit to
-            # surface in the prompt (chainlink #138 post-Sub-B reframing).
-            # Score formula in mimir/search.py:
-            #   score = 0.5*cosine + 0.2*bm25_norm + 0.3*recency
-            # Components are each [0,1], so total ∈ [0,1].
-            # Default 0.55 sits in the gap between clean semantic+FTS
-            # matches (typically 0.65-0.75) and partial cosine-only
-            # near-matches (typically 0.40-0.50). The latter are the
-            # crowders identified in Sub B (PR #167 results doc), so
-            # filtering them out is the load-bearing behavior change.
-            file_search_autopass_min_score=_env_float(
-                "MIMIR_FILE_SEARCH_AUTOPASS_MIN_SCORE", 0.55,
-            ),
 
             send_loop_soft_limit=_env_int("MIMIR_SEND_LOOP_SOFT_LIMIT", 5),
             send_loop_hard_limit=_env_int("MIMIR_SEND_LOOP_HARD_LIMIT", 10),

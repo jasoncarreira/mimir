@@ -116,17 +116,6 @@ class TurnContext:
     # summary, latency_ms, error). Empty when no saga calls fired (e.g.
     # synthetic ticks with no inbound, scheduled callables).
     saga_calls: list[SagaCallRecord] = field(default_factory=list)
-    # SAGA's contextual rewrite of the inbound query, when one fired.
-    # Set by ``_pre_message_hook`` from ``payload.get("rewritten_query")``
-    # (saga's hybrid_retrieve two-tier path, see PR #157). None when
-    # rewrite was disabled, didn't fire, or returned the original query
-    # unchanged — saga only sets the key when rewrite changed the query.
-    # Read by ``_run_file_search_autopass`` (chainlink #139 follow-up):
-    # the file_search autopass should query against the same expanded
-    # text the SAGA block was retrieved with, not the raw user message,
-    # so the two retrieval surfaces sitting side-by-side in the prompt
-    # see consistent (and equally-expanded) queries.
-    saga_rewritten_query: str | None = None
 
 
 @dataclass

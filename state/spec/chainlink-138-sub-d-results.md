@@ -1,5 +1,12 @@
-<!-- desc: A/B harness results for chainlink #138 Sub D — re-run of the file_search autopass A/B harness on PR #168's branch with the post-Sub-B reframing (advisory header) + min-score-floor (0.55) + tighter K (5→3) defaults active. Run tag: reframe-and-threshold-30. -->
+<!-- desc: A/B harness results for chainlink #138 Sub D — re-run of the file_search autopass A/B harness on PR #168's branch with the post-Sub-B reframing (advisory header) + min-score-floor (0.55) + tighter K (5→3) defaults active. Run tag: reframe-and-threshold-30. STATUS: SUPERSEDED — autopass infrastructure removed wholesale 2026-05-16; this doc was the final evidence base that closed the autopass direction. -->
 # chainlink #138 Sub D — file_search autopass A/B results (reframe + threshold)
+
+> **Status (2026-05-16): SUPERSEDED.** This experiment's "don't ship"
+> conclusion is exactly what closed the autopass direction. Jason called
+> it 2026-05-16 11:39 UTC: "I think we can remove the per-request file
+> search. ... We should focus on trying out the ColBERT indexing on file
+> search." Autopass infrastructure removed wholesale; ColBERT direction
+> reopened via chainlink #141.
 
 **Run tag:** `reframe-and-threshold-30`
 **Probe count:** 30 (on=30, off=30)
