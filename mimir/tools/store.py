@@ -1,4 +1,4 @@
-"""LangChain tool wrapping MemoryClient.store — write surface.
+"""LangChain tool wrapping SagaStore.store — write surface.
 
 Migration target for ``saga_store`` (mimir/sagatools.py:337). Shape
 maps directly from the SDK's @tool decorator to LangChain's @tool:
@@ -14,7 +14,7 @@ no separate JSON schema definition needed. The docstring becomes the
 tool description shown to the model. This is meaningfully terser than
 the SDK's API; we lose nothing from the production tool definition.
 
-The actual storage call goes through the same MemoryClient instance
+The actual storage call goes through the same SagaStore instance
 the memory_tool.py uses (shared via _MEMORY_STATE).
 """
 from __future__ import annotations
@@ -54,7 +54,7 @@ async def memory_store(
         content: The fact / event / pattern, one self-contained sentence.
         stream: One of ``"semantic"``, ``"episodic"``, ``"procedural"``.
         session_id: Optional saga_session_id for scoping (informational
-            in this PoC — MemoryClient.store doesn't filter by it today).
+            in this PoC — SagaStore.store doesn't filter by it today).
         source_type: How this atom was created. Defaults to
             ``"agent_authored"``.
 
@@ -63,7 +63,7 @@ async def memory_store(
     """
     client = _MEMORY_STATE["client"]
     if client is None:
-        return "memory_store failed: no MemoryClient configured"
+        return "memory_store failed: no SagaStore configured"
     try:
         result = await client.store(
             content,

@@ -190,7 +190,7 @@ async def _handle_health(request: web.Request) -> web.Response:
 
 
 async def _handle_consolidate(request: web.Request) -> web.Response:
-    # Bench surface: trigger one MemoryClient.consolidate() pass on demand.
+    # Bench surface: trigger one SagaStore.consolidate() pass on demand.
     # Replaces the legacy MSAM-sidecar /v1/consolidate at port 3002.
     saga_client: SagaClient = request.app["saga_client"]
     try:
