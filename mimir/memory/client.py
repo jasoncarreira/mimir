@@ -363,6 +363,17 @@ class MemoryClient:
         #    + ``context``, we call the LLM here. Preserves the
         #    single-call ergonomics for callers that don't need
         #    parallelism.
+        # Surface the precedence ambiguity so a future call site that
+        # sets both kwargs gets a log line — the pre-resolved path
+        # silently wins, which could otherwise hide a misconfiguration.
+        if pre_rewritten_query is not None and enable_contextual_rewrite:
+            log.warning(
+                "MemoryClient.query: both pre_rewritten_query and "
+                "enable_contextual_rewrite=True supplied; "
+                "pre_rewritten_query wins (inline rewrite skipped). "
+                "Pick one — pre-resolved for parallelism, inline for "
+                "single-call ergonomics."
+            )
         rewritten_query: str | None = pre_rewritten_query
         if rewritten_query is None and enable_contextual_rewrite and context:
             from .query_rewrite import rewrite_query
