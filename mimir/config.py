@@ -41,6 +41,23 @@ _EVENTS_CAP_DEFAULT = _TURNS_CAP_DEFAULT * _EVENTS_PER_TURN_RATIO
 _EVENTS_CAP_MAX = _TURNS_CAP_MAX * _EVENTS_PER_TURN_RATIO
 
 
+# Per-directory write permissions under MIMIR_HOME. ``"rw"`` allows
+# Write/Edit/upload via deepagents' filesystem tools; ``"ro"`` blocks
+# them at the WriteGuardBackend layer (reads/grep/glob unrestricted).
+# Anything not in this dict — e.g. ``.mimir/`` (saga db, metrics) — is
+# implicitly blocked because it's not a writable root. Operators
+# override via MIMIR_FOLDERS.
+DEFAULT_FOLDERS: dict[str, str] = {
+    "state": "rw",       # Agent state files (commitments, sessions, etc.)
+    "memory": "rw",      # Long-form text journal
+    "attachments": "rw", # Agent-generated artifacts
+    "skills": "rw",      # Operator-supplied skill bundles (agent can refine)
+    "logs": "ro",        # System-managed event/turn logs
+    "messages": "ro",    # Channel history (read-only — never rewrite)
+    "prompts": "ro",     # Operator-managed prompt overrides
+}
+
+
 def _turns_cap() -> int:
     return min(_env_int("MIMIR_MAX_TURNS", _TURNS_CAP_DEFAULT), _TURNS_CAP_MAX)
 
@@ -88,6 +105,32 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None or raw == "":
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_folders(raw: str) -> dict[str, str]:
+    """Parse a ``MIMIR_FOLDERS`` env value into a name→mode dict.
+
+    Format: ``name:mode`` pairs, comma-separated. Modes other than
+    ``rw``/``ro`` are coerced to ``ro`` (fail safe). Empty/unset
+    returns ``DEFAULT_FOLDERS``.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return dict(DEFAULT_FOLDERS)
+    folders: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        name, mode = pair.split(":", 1)
+        name = name.strip().strip("/")
+        mode = mode.strip().lower()
+        if not name:
+            continue
+        if mode not in ("rw", "ro"):
+            mode = "ro"
+        folders[name] = mode
+    return folders or dict(DEFAULT_FOLDERS)
 
 
 def _parse_sources(raw: str) -> frozenset[str] | None:
@@ -195,6 +238,15 @@ class Config:
     # Configured via ``MIMIR_FILE_OP_ROOTS`` (colon-separated paths);
     # empty by default (just ``home``).
     file_op_extra_roots: list[Path]
+
+    # Per-directory write permissions under ``home``. Subdir name →
+    # ``"rw"`` or ``"ro"``. ``WriteGuardBackend`` enforces this at the
+    # filesystem-tool layer (Write/Edit/upload blocked outside writable
+    # roots; reads/grep/glob unrestricted). Operator-configurable via
+    # ``MIMIR_FOLDERS`` (``name:mode`` pairs, comma-separated, e.g.
+    # ``state:rw,memory:rw,logs:ro``); falls back to ``DEFAULT_FOLDERS``
+    # when unset. Unknown modes are coerced to ``"ro"`` (fail safe).
+    folders: dict[str, str]
 
     # SDK gateway (§14.1)
     anthropic_api_key: str
@@ -448,6 +500,7 @@ class Config:
                 for p in (_env("MIMIR_FILE_OP_ROOTS", "") or "").split(":")
                 if p.strip()
             ],
+            folders=_parse_folders(_env("MIMIR_FOLDERS", "") or ""),
 
             anthropic_api_key=_env("ANTHROPIC_API_KEY"),
             anthropic_base_url=_env("ANTHROPIC_BASE_URL"),
@@ -548,6 +601,21 @@ class Config:
         ``state/``) so the indexer doesn't walk it as searchable
         knowledge — it's internal lifecycle state, not content."""
         return self.home / ".mimir" / "commitments.jsonl"
+
+    @property
+    def writable_dirs(self) -> list[str]:
+        """Subdir names with ``"rw"`` mode in ``folders``. Passed to
+        ``WriteGuardBackend`` so deepagents' Write/Edit/upload tools
+        block paths outside these roots. Order preserves dict order
+        (insertion order from ``_parse_folders``)."""
+        return [name for name, mode in self.folders.items() if mode == "rw"]
+
+    @property
+    def all_dirs(self) -> list[str]:
+        """Every subdir named in ``folders``, both rw and ro. Useful
+        for surfacing the agent-visible workspace layout in the system
+        prompt or for diagnostics."""
+        return list(self.folders.keys())
 
     def sdk_env_overrides(self) -> dict[str, str]:
         """Env vars to forward via ClaudeAgentOptions.env (§14.1)."""
