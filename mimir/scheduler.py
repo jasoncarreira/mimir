@@ -1078,7 +1078,7 @@ class Scheduler:
 
     # VSM: S3 (saga-internal) — nightly cron triggers consolidation.
     #      Saga's hot path: clusters similar atoms, LLM-synthesizes
-    #      observations, decays source stability.
+    #      observations from clustered raws.
     # loop_id: 4.3
     def add_saga_consolidate_job(
         self,
@@ -1102,34 +1102,11 @@ class Scheduler:
         override ``cron_expr`` via a ``callable: saga-consolidate``
         entry; ``cron_expr`` here is the env-var-derived default."""
         async def _consolidate() -> None:
-            # Step 1: decay BEFORE consolidation. Decay recomputes
-            # retrievability, runs state transitions (active → fading →
-            # dormant), compacts profiles, and surfaces forgetting
-            # candidates. Running it first means consolidation sees
-            # the fresher stability signal when deciding which atoms
-            # to merge. Forgetting itself stays manual (/v1/forget) so
-            # an operator or the agent reviews candidates first.
-            try:
-                decay_payload = await saga_client.decay()
-                await log_event(
-                    "saga_decay_ok",
-                    result=_summarize_decay(decay_payload),
-                )
-            except SagaError as exc:
-                await log_event(
-                    "saga_decay_error",
-                    error=str(exc),
-                    status=getattr(exc, "status", None),
-                )
-                # Don't bail — consolidation can still run on the
-                # un-decayed state; we just log and continue.
-            except Exception as exc:  # noqa: BLE001
-                await log_event(
-                    "saga_decay_error",
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-
-            # Step 2: consolidation. Load identities.yaml at FIRE TIME
+            # Saga's legacy state-transition decay (active → fading →
+            # dormant) is gone post-mimir.memory rewrite — activation
+            # is computed on-demand from access_events, no state to
+            # transition. Consolidation runs against the live event
+            # stream directly. Load identities.yaml at FIRE TIME
             # so operator edits between runs propagate without a server
             # restart. Best effort: a missing / unparseable file just
             # means seed-only behavior for this run.
@@ -1537,32 +1514,3 @@ def _summarize_consolidate(payload: Any) -> dict:
     }
 
 
-def _summarize_decay(payload: Any) -> dict:
-    """Pick the salient fields out of saga.decay.run_decay_cycle's
-    return dict for the saga_decay_ok event payload. Forgetting
-    candidate counts surface here when present so the agent's
-    feedback block can hint at review-worthy items."""
-    if not isinstance(payload, dict):
-        return {"raw": str(payload)[:200]}
-    # Keys come from saga/decay.py:run_decay_cycle's `summary` dict.
-    keys = (
-        "atoms_retrievability_updated",
-        "atoms_faded", "atoms_dormanted", "atoms_protected",
-        "atoms_compacted", "tokens_freed",
-        "budget_before_pct", "budget_after_pct",
-        "total_active", "total_fading", "total_dormant",
-        "forgetting_candidates", "forgetting_actions",
-        "elapsed_seconds",
-    )
-    out: dict = {}
-    for k in keys:
-        if k in payload:
-            v = payload[k]
-            if isinstance(v, list):
-                out[k] = len(v)
-            elif isinstance(v, dict):
-                out[k] = {kk: vv for kk, vv in v.items()
-                          if not isinstance(vv, (list, dict))}
-            else:
-                out[k] = v
-    return out

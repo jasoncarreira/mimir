@@ -58,6 +58,24 @@ def _atom_label(atom: dict[str, Any]) -> str:
     return base
 
 
+#: Per-atom content cap when rendering hits into the pre-message hook
+#: prompt block. Was 240 (tuned for short conversational atoms) — bumped
+#: to 1200 on 2026-05-14 after LongMemEval bench surfaced answers buried
+#: at chars 200-400 of multi-sentence turn transcripts (e.g. "I created a
+#: Spotify playlist called Summer Vibes" sits at char ~250 of a single
+#: user turn that opens with a different question). The old cap cut
+#: those off mid-answer; the agent saw "…called Summer Vib…" and replied
+#: "I don't have that information."
+#:
+#: Cost: top_k=12 × 1200 chars × ~3.5 chars/token ≈ 4k input tokens
+#: per pre-message hook fire. Was 1k under the 240 cap. The 3k delta is
+#: a rounding error against the 100k+ context windows in flight today.
+#:
+#: Override at construction time / future config-key if you need to
+#: tune per-deployment.
+_ATOM_CONTENT_CAP = 1200
+
+
 def _format_atoms(hits: list[dict[str, Any]]) -> str:
     """Render SAGA hits as a brief bullet list — tag + content, no IDs.
     Used by the pre-message hook (SPEC §9.3) and the saga_query tool result."""
@@ -68,8 +86,8 @@ def _format_atoms(hits: list[dict[str, Any]]) -> str:
         label = _atom_label(h)
         score = h.get("score") or h.get("similarity")
         content = (h.get("content") or "").strip().replace("\n", " ")
-        if len(content) > 240:
-            content = content[:240] + "…"
+        if len(content) > _ATOM_CONTENT_CAP:
+            content = content[:_ATOM_CONTENT_CAP] + "…"
         score_str = f" ({score:.3f})" if isinstance(score, (int, float)) else ""
         lines.append(f"- [{label}{score_str}] {content}")
     return "\n".join(lines)
@@ -516,6 +534,13 @@ def build_saga_tools(
         closed_since = _opt_list("closed_since")
         emotional = (args.get("emotional_state") or "").strip() or None
 
+        # Resolve the active TurnContext BEFORE the end_session call so
+        # we can pass channel_id through. Previously we resolved ctx
+        # only after the call (for the post-call log_event); but the
+        # MemoryClient's end_session needs channel_id to write the
+        # sessions row with the right scope (review #5).
+        ctx, resolution_path = resolve_active_ctx({"session_id": session_id})
+
         try:
             payload = await client.end_session(
                 session_id=session_id,
@@ -525,6 +550,7 @@ def build_saga_tools(
                 unfinished=unfinished,
                 emotional_state=emotional,
                 closed_since=closed_since,
+                channel_id=ctx.channel_id if ctx is not None else None,
             )
         except SagaError as exc:
             return _content_block(f"saga_end_session failed: {exc}", is_error=True)
@@ -535,18 +561,12 @@ def build_saga_tools(
         # for non-synthesis callers (rare — operator manually closes a
         # session) it's harmless extra bookkeeping.
         #
-        # chainlink #23 subissue #25: the SDK dispatches MCP tool handlers
-        # on a fresh asyncio task forked at first connect. ``_current_turn``
-        # is invisible inside that task even when ``run_turn`` set it on
-        # its own task — same pattern as hooks (CR#18). Use the shared
-        # three-level lookup (saga_session_id → single_active → contextvar
-        # → missing). ``saga_session_id`` is the load-bearing path here;
-        # the middle step is harmless extra coverage when the model
-        # forgets to pass session_id (synthesis turns are serialized so
-        # single_active typically resolves to the right ctx).
-        # ``resolution_path`` mirrors CR#18's pattern so the rate of each
-        # path is visible in events.jsonl.
-        ctx, resolution_path = resolve_active_ctx({"session_id": session_id})
+        # Note: ``ctx`` was resolved above (before the end_session call)
+        # so channel_id could be threaded through. The lookup logic is
+        # the shared three-level (saga_session_id → single_active →
+        # contextvar → missing) used elsewhere; resolution_path is
+        # logged below so the rate of each path stays visible in
+        # events.jsonl.
         if ctx is not None:
             ctx.saga_end_session_called = True
         await log_event(
