@@ -76,12 +76,20 @@ def _gh_pr_list_for_branch(branch: str) -> list[dict]:
     return json.loads(out.stdout)
 
 
-def classify_branch(prs: list[dict]) -> tuple[str, int | None]:
+def classify_branch(prs: list[dict]) -> tuple[str, int | None, int | None]:
     """Classify a branch by its PR set.
 
-    Returns ``(status, pr_number)`` where status is one of MERGED, OPEN,
-    CLOSED_UNMERGED, NO_PR. The PR number is the chosen PR's number
-    (None for NO_PR).
+    Returns ``(status, pr_number, also_open_pr_number)`` where status is
+    one of MERGED, OPEN, CLOSED_UNMERGED, NO_PR. The PR number is the
+    chosen PR's number (None for NO_PR).
+
+    ``also_open_pr_number`` is the number of an OPEN PR using this same
+    head ref that was NOT chosen — meaningful only when ``status ==
+    MERGED`` and a reused-branch reincarnation has an in-flight PR
+    upstream. In that case the local branch is still safe to delete
+    (the squash-merged work is in main), but the operator should know
+    that pushing or recreating the branch name will collide with the
+    in-flight PR. None when no such situation applies.
 
     Precedence when multiple PRs share a head ref (rare but happens
     when a branch is reused): MERGED > OPEN > CLOSED_UNMERGED. We pick
@@ -90,17 +98,18 @@ def classify_branch(prs: list[dict]) -> tuple[str, int | None]:
     PR cycles.
     """
     if not prs:
-        return (NO_PR, None)
+        return (NO_PR, None, None)
 
     merged = [p for p in prs if p.get("state") == "MERGED"]
-    if merged:
-        return (MERGED, merged[0]["number"])
-
     open_ = [p for p in prs if p.get("state") == "OPEN"]
-    if open_:
-        return (OPEN, open_[0]["number"])
+    if merged:
+        also_open = open_[0]["number"] if open_ else None
+        return (MERGED, merged[0]["number"], also_open)
 
-    return (CLOSED_UNMERGED, prs[0]["number"])
+    if open_:
+        return (OPEN, open_[0]["number"], None)
+
+    return (CLOSED_UNMERGED, prs[0]["number"], None)
 
 
 def _list_local_branches(git_runner: Callable[[list[str]], str] = _git) -> list[str]:
@@ -132,15 +141,15 @@ def collect_branch_statuses(
     actually executing.
     """
     skip = set(skip_branches) | {current_branch}
-    buckets: dict[str, list[tuple[str, int | None]]] = {
+    buckets: dict[str, list[tuple[str, int | None, int | None]]] = {
         MERGED: [], OPEN: [], CLOSED_UNMERGED: [], NO_PR: [],
     }
     for branch in branches:
         if branch in skip or not branch:
             continue
         prs = pr_lister(branch)
-        status, pr_num = classify_branch(prs)
-        buckets[status].append((branch, pr_num))
+        status, pr_num, also_open = classify_branch(prs)
+        buckets[status].append((branch, pr_num, also_open))
     return buckets
 
 
@@ -151,19 +160,25 @@ def _print_buckets(buckets: dict[str, list], *, apply: bool) -> None:
     nopr = buckets[NO_PR]
 
     print(f"Squash-merged branches (safe to delete): {len(merged)}")
-    for branch, pr_num in sorted(merged):
-        print(f"  {branch}  (PR #{pr_num})")
+    for branch, pr_num, also_open in sorted(merged):
+        suffix = (
+            f"  [ALSO has OPEN PR #{also_open} — reused branch name; "
+            f"delete is safe but recreate-locally will collide upstream]"
+            if also_open is not None
+            else ""
+        )
+        print(f"  {branch}  (PR #{pr_num}){suffix}")
     if open_:
         print(f"\nOpen PRs (keep): {len(open_)}")
-        for branch, pr_num in sorted(open_):
+        for branch, pr_num, _ in sorted(open_):
             print(f"  {branch}  (PR #{pr_num})")
     if closed:
         print(f"\nClosed unmerged (keep, may need attention): {len(closed)}")
-        for branch, pr_num in sorted(closed):
+        for branch, pr_num, _ in sorted(closed):
             print(f"  {branch}  (PR #{pr_num})")
     if nopr:
         print(f"\nNo PR (local-only, keep): {len(nopr)}")
-        for branch in sorted(b for b, _ in nopr):
+        for branch in sorted(b for b, _, _ in nopr):
             print(f"  {branch}")
 
     if not apply:
@@ -174,13 +189,13 @@ def _print_buckets(buckets: dict[str, list], *, apply: bool) -> None:
 
 
 def _delete_branches(
-    candidates: list[tuple[str, int | None]],
+    candidates: list[tuple[str, int | None, int | None]],
     *,
     git_runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
 ) -> list[tuple[str, str]]:
     """Force-delete each candidate branch. Returns list of (branch, stderr) failures."""
     failures: list[tuple[str, str]] = []
-    for branch, pr_num in candidates:
+    for branch, pr_num, _also_open in candidates:
         result = subprocess.run(
             ["git", "branch", "-D", branch],
             capture_output=True,

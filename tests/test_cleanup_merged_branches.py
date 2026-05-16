@@ -30,33 +30,37 @@ import cleanup_merged_branches as cmb  # noqa: E402
 
 def test_classify_branch_no_prs_returns_no_pr() -> None:
     """Local-only experiment branches have no associated PRs."""
-    status, pr_num = cmb.classify_branch([])
+    status, pr_num, also_open = cmb.classify_branch([])
     assert status == cmb.NO_PR
     assert pr_num is None
+    assert also_open is None
 
 
 def test_classify_branch_single_merged_pr_returns_merged() -> None:
-    status, pr_num = cmb.classify_branch(
+    status, pr_num, also_open = cmb.classify_branch(
         [{"number": 42, "state": "MERGED", "mergedAt": "2026-05-12T14:33:10Z"}]
     )
     assert status == cmb.MERGED
     assert pr_num == 42
+    assert also_open is None
 
 
 def test_classify_branch_single_open_pr_returns_open() -> None:
-    status, pr_num = cmb.classify_branch(
+    status, pr_num, also_open = cmb.classify_branch(
         [{"number": 171, "state": "OPEN", "mergedAt": None}]
     )
     assert status == cmb.OPEN
     assert pr_num == 171
+    assert also_open is None
 
 
 def test_classify_branch_single_closed_unmerged_pr_returns_closed() -> None:
-    status, pr_num = cmb.classify_branch(
+    status, pr_num, also_open = cmb.classify_branch(
         [{"number": 99, "state": "CLOSED", "mergedAt": None}]
     )
     assert status == cmb.CLOSED_UNMERGED
     assert pr_num == 99
+    assert also_open is None
 
 
 def test_classify_branch_merged_wins_over_open() -> None:
@@ -65,14 +69,17 @@ def test_classify_branch_merged_wins_over_open() -> None:
     Rationale: 'the work is in main' is the safety-determining fact.
     A later reused-branch PR being open doesn't change that the
     branch's content is already in main (as a squash commit).
+    The also-open PR number is surfaced so the printer can warn the
+    operator that the branch name is in active use upstream.
     """
     prs = [
         {"number": 50, "state": "OPEN", "mergedAt": None},
         {"number": 30, "state": "MERGED", "mergedAt": "2026-05-01T00:00:00Z"},
     ]
-    status, pr_num = cmb.classify_branch(prs)
+    status, pr_num, also_open = cmb.classify_branch(prs)
     assert status == cmb.MERGED
     assert pr_num == 30
+    assert also_open == 50
 
 
 def test_classify_branch_open_wins_over_closed_unmerged() -> None:
@@ -80,9 +87,27 @@ def test_classify_branch_open_wins_over_closed_unmerged() -> None:
         {"number": 99, "state": "CLOSED", "mergedAt": None},
         {"number": 100, "state": "OPEN", "mergedAt": None},
     ]
-    status, pr_num = cmb.classify_branch(prs)
+    status, pr_num, also_open = cmb.classify_branch(prs)
     assert status == cmb.OPEN
     assert pr_num == 100
+    assert also_open is None
+
+
+def test_classify_branch_merged_without_open_has_no_warning() -> None:
+    """MERGED + CLOSED-unmerged (no OPEN) should NOT surface an also_open warning.
+
+    Only the MERGED + active-OPEN case is operator-relevant (the
+    upstream branch-name collision risk). A merged + later-closed
+    cycle is fully done and warrants no warning.
+    """
+    prs = [
+        {"number": 30, "state": "MERGED", "mergedAt": "2026-05-01T00:00:00Z"},
+        {"number": 31, "state": "CLOSED", "mergedAt": None},
+    ]
+    status, pr_num, also_open = cmb.classify_branch(prs)
+    assert status == cmb.MERGED
+    assert pr_num == 30
+    assert also_open is None
 
 
 def test_collect_branch_statuses_excludes_current_and_main() -> None:
@@ -110,7 +135,7 @@ def test_collect_branch_statuses_excludes_current_and_main() -> None:
     assert "main" not in seen_branches
     assert "current-feature" not in seen_branches
     assert sorted(seen_branches) == ["another-merged", "old-feature"]
-    assert sorted(b for b, _ in buckets[cmb.MERGED]) == [
+    assert sorted(b for b, _, _ in buckets[cmb.MERGED]) == [
         "another-merged",
         "old-feature",
     ]
@@ -137,10 +162,10 @@ def test_collect_branch_statuses_buckets_each_category() -> None:
         pr_lister=fake_pr_lister,
     )
 
-    assert buckets[cmb.MERGED] == [("feature-merged", 10)]
-    assert buckets[cmb.OPEN] == [("feature-open", 20)]
-    assert buckets[cmb.CLOSED_UNMERGED] == [("feature-closed", 30)]
-    assert buckets[cmb.NO_PR] == [("feature-local", None)]
+    assert buckets[cmb.MERGED] == [("feature-merged", 10, None)]
+    assert buckets[cmb.OPEN] == [("feature-open", 20, None)]
+    assert buckets[cmb.CLOSED_UNMERGED] == [("feature-closed", 30, None)]
+    assert buckets[cmb.NO_PR] == [("feature-local", None, None)]
 
 
 def test_collect_branch_statuses_respects_extra_skip_branches() -> None:
@@ -165,7 +190,7 @@ def test_collect_branch_statuses_respects_extra_skip_branches() -> None:
     assert "main" not in calls
     assert "release" not in calls
     assert calls == ["old-feature"]
-    assert [b for b, _ in buckets[cmb.MERGED]] == ["old-feature"]
+    assert [b for b, _, _ in buckets[cmb.MERGED]] == ["old-feature"]
 
 
 def test_collect_branch_statuses_ignores_empty_strings() -> None:
@@ -199,6 +224,42 @@ def test_classify_branch_unknown_state_falls_through_to_closed_unmerged() -> Non
     accidentally classifying as MERGED.
     """
     prs = [{"number": 200, "state": "DRAFT", "mergedAt": None}]
-    status, pr_num = cmb.classify_branch(prs)
+    status, pr_num, also_open = cmb.classify_branch(prs)
     assert status == cmb.CLOSED_UNMERGED
     assert pr_num == 200
+    assert also_open is None
+
+
+def test_print_buckets_surfaces_also_open_warning(capsys: pytest.CaptureFixture[str]) -> None:
+    """When a merged branch also has an OPEN PR upstream, the printer
+    emits a warning suffix so the operator sees the reused-branch
+    collision risk in the dry-run output."""
+    buckets = {
+        cmb.MERGED: [("reused-branch", 30, 50)],
+        cmb.OPEN: [],
+        cmb.CLOSED_UNMERGED: [],
+        cmb.NO_PR: [],
+    }
+    cmb._print_buckets(buckets, apply=False)
+    out = capsys.readouterr().out
+    assert "reused-branch" in out
+    assert "PR #30" in out
+    # The also-open warning surfaces both the upstream PR number and
+    # the collision rationale.
+    assert "ALSO has OPEN PR #50" in out
+    assert "reused branch name" in out
+
+
+def test_print_buckets_omits_warning_when_no_also_open(capsys: pytest.CaptureFixture[str]) -> None:
+    """The clean merged case (no other open PR) gets no suffix."""
+    buckets = {
+        cmb.MERGED: [("clean-merged", 42, None)],
+        cmb.OPEN: [],
+        cmb.CLOSED_UNMERGED: [],
+        cmb.NO_PR: [],
+    }
+    cmb._print_buckets(buckets, apply=False)
+    out = capsys.readouterr().out
+    assert "clean-merged" in out
+    assert "PR #42" in out
+    assert "ALSO has OPEN" not in out
