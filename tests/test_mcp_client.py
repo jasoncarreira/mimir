@@ -495,6 +495,58 @@ async def test_bridge_tool_surfaces_is_error_result() -> None:
         await tool.coroutine()
 
 
+def test_bridge_tool_builds_args_schema() -> None:
+    # Pre-fix the JSON schema was dumped into the description string
+    # only; args_schema was unset and LangChain skipped type validation.
+    # Now build a pydantic model so required fields are enforced at
+    # call time and the tool-spec shown to the LLM is properly typed.
+    from mimir.mcp_client import _bridge_mcp_tool
+
+    class _Dummy:
+        pass
+
+    tool = _bridge_mcp_tool(
+        server_name="s", tool_name="add", description="adds two numbers",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer", "description": "first addend"},
+                "b": {"type": "integer", "description": "second addend"},
+                "label": {"type": "string", "description": "optional label"},
+            },
+            "required": ["a", "b"],
+        },
+        session=_Dummy(),  # type: ignore[arg-type]
+    )
+    assert tool.args_schema is not None
+    fields = tool.args_schema.model_fields
+    assert set(fields.keys()) == {"a", "b", "label"}
+    assert fields["a"].is_required()
+    assert fields["b"].is_required()
+    assert not fields["label"].is_required()
+
+
+def test_bridge_tool_args_schema_fallback_on_no_properties() -> None:
+    from mimir.mcp_client import _bridge_mcp_tool
+
+    class _Dummy:
+        pass
+
+    # Empty/missing properties → args_schema is None (StructuredTool
+    # accepts arbitrary kwargs in that case).
+    tool = _bridge_mcp_tool(
+        server_name="s", tool_name="t", description="",
+        input_schema={"type": "object"},
+        session=_Dummy(),  # type: ignore[arg-type]
+    )
+    # langchain may auto-generate a schema from the function signature;
+    # what we're asserting is that ``_build_args_schema`` itself returned
+    # None for an empty properties block.
+    from mimir.mcp_client import _build_args_schema
+    assert _build_args_schema("x", {"type": "object"}) is None
+    assert _build_args_schema("x", {}) is None
+
+
 @pytest.mark.asyncio
 async def test_bridge_tool_renders_text_content() -> None:
     from mimir.mcp_client import _bridge_mcp_tool

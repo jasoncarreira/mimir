@@ -2,9 +2,6 @@
 
 Post-cutover (2026-05-14): replaces the 2459-LOC SDK-backed
 Agent class with a thin wrapper around LangGraph's deepagents.
-The legacy implementation is preserved at
-``mimir/agent_sdk_legacy.py.bak`` for reference; will be deleted
-in a follow-up cleanup pass.
 
 Public API preserved:
   - Agent(config, turn_logger, message_buffer, ..., dispatcher=)
