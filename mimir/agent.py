@@ -1361,22 +1361,42 @@ class Agent:
         ``<actions>`` directives the same way ``send_message`` does so
         the agent can react / send-file via natural-text directives too.
 
-        Only fires for user-visible inbound triggers (``user_message``,
-        ``react_received``, etc.) on bridge-routable chat channels.
+        Fires for user-initiated triggers (``user_message``,
+        ``react_received``, ``shell_job_complete``) on bridge-routable
+        chat channels. ``shell_job_complete`` is the spawn analog of
+        ``react_received`` — the operator kicked off a background spawn
+        and the wake-up turn's text is the natural reply venue (silent
+        drop here meant operators couldn't see spawn results without
+        digging through turn-viewer).
+
         Heartbeats and other ``scheduled_tick`` events are explicitly
         "end silently" — those still go through ``_record_outbound``
         only. Bench / web-stub bridges that don't actually deliver to
         a third-party service skip auto-dispatch and just record.
+        Synthetic channels (``scheduler:*``, ``poller:*``) skip via the
+        ``bridge is None`` guard below regardless of trigger eligibility.
 
         Always writes to chat_history regardless of dispatch outcome —
         so Recent activity reflects what the agent said even when
         delivery failed (the agent self-corrects when it sees a stale
         conversation that doesn't match what it thought it sent)."""
-        # Heartbeat / cron tick / synth turn → never auto-dispatch.
-        # Heartbeats are explicitly silent; scheduler:* channels would
-        # try to dispatch back through the dispatcher to a synthetic
-        # channel that has no bridge, generating noise.
-        auto_eligible = event.trigger in ("user_message", "react_received")
+        # Triggers eligible for auto-dispatch:
+        # - user_message / react_received: human-initiated inbound on a
+        #   chat bridge → reply is the canonical delivery.
+        # - shell_job_complete: spawn-completion wake-up, fires on the
+        #   channel that kicked off the spawn (which is the operator's
+        #   chat for ``spawn_claude_code``). Excluding this here meant
+        #   spawn results were silently dropped on the floor even though
+        #   the turn produced user-facing text. See chainlink #133 +
+        #   memory/issues/wake-up-turn-output-silently-dropped.md.
+        # Scheduled / cron triggers are explicitly silent; synthetic
+        # channels with no bridge fall through the ``bridge is None``
+        # guard below regardless of trigger.
+        auto_eligible = event.trigger in (
+            "user_message",
+            "react_received",
+            "shell_job_complete",
+        )
 
         dispatched = False
         clean_text = output
