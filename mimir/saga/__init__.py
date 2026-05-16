@@ -1,4 +1,4 @@
-"""mimir.memory — agent memory subsystem.
+"""mimir.saga — agent memory subsystem.
 
 Public API. Internal helpers (``_session_atoms``, ``_make_atom_id``,
 etc.) stay module-private; mimir's call sites use only the names
@@ -35,11 +35,11 @@ from .reflect import (
 )
 from .consolidate import ConsolidateResult
 # Note: ``consolidate.consolidate()`` is intentionally NOT re-exported.
-# Production callers should use ``MemoryClient.consolidate()`` for the
+# Production callers should use ``SagaStore.consolidate()`` for the
 # tier-3 (triples + contradictions + P47/P48) path. The standalone
 # ``consolidate()`` is the tier-2 helper kept for the
 # test_memory_tier2b regression suite; tests that need it import via
-# ``from mimir.memory.consolidate import consolidate`` directly.
+# ``from mimir.saga.consolidate import consolidate`` directly.
 from .forget import forget, forget_by_criteria, ForgetResult
 
 # Observation utilities
@@ -88,7 +88,7 @@ from .query_rewrite import rewrite_query
 
 # Config
 from .config import (
-    MemoryConfig, ActivationConfig, ThresholdConfig,
+    SagaConfig, ActivationConfig, ThresholdConfig,
     ScoringWeights, TrendModifiers, BoostsAndPenalties,
     SourceWeights, TrendConfig, ConsolidationConfig,
     DEFAULT as DEFAULT_CONFIG,
@@ -159,9 +159,19 @@ __all__ = [
     "fts_search", "fts5_query", "VectorIndex", "FAISS_AVAILABLE",
     # Synthesis
     "make_observation_synth_fn", "make_async_observation_synth_fn",
+    "make_async_rich_synth_fn",
     "make_boundary_synth_fn", "make_async_boundary_synth_fn",
+    # Triples + temporal world model (P42, P37)
+    "make_triple_id", "parse_triples", "store_triples",
+    "triple_augment_search", "retrieve_by_entity",
+    "get_current_value", "get_history", "WorldFact",
+    "detect_contradictions", "resolve_contradictions_to_supersedes",
+    # Credit-pass + contextual query rewrite
+    "mark_contributions_fn", "ContributionResult",
+    "DEFAULT_CONTRIBUTION_THRESHOLD",
+    "rewrite_query",
     # Config
-    "MemoryConfig", "ActivationConfig", "ThresholdConfig",
+    "SagaConfig", "ActivationConfig", "ThresholdConfig",
     "ScoringWeights", "TrendModifiers", "BoostsAndPenalties",
     "SourceWeights", "TrendConfig", "ConsolidationConfig",
     "DEFAULT_CONFIG",

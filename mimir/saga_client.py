@@ -3,7 +3,7 @@
 Mimir interacts with the memory store through a unified ``SagaClient``
 interface. Two implementations:
 
-- ``MemoryClient`` (in ``mimir.memory.client``) — the in-process
+- ``SagaStore`` (in ``mimir.saga.client``) — the in-process
   retrieval/consolidation engine. Default for empty/localhost endpoints;
   same process, same SQLite directory, no HTTP loop. ``make_saga_client``
   constructs and returns one (wrapped in ``RecordingSagaClient``).
@@ -89,7 +89,7 @@ class SagaError(RuntimeError):
 class SagaClient(Protocol):
     """The eight-method surface mimir uses against saga.
 
-    Both ``MemoryClient`` and ``_HttpSaga`` implement this. Most call
+    Both ``SagaStore`` and ``_HttpSaga`` implement this. Most call
     sites accept ``SagaClient | None`` — None disables the integration
     (e.g., when running mimir without saga at all).
     """
@@ -177,7 +177,7 @@ class _HttpSaga:
         # both saw ``self._session is None`` and both constructed a
         # ``ClientSession``, with the loser's session leaking and
         # producing aiohttp deprecation warnings in production logs.
-        # Mostly a multi-deployment edge case (default is ``MemoryClient``)
+        # Mostly a multi-deployment edge case (default is ``SagaStore``)
         # but the lock is cheap and the failure mode is silent.
         self._session_lock = asyncio.Lock()
 
@@ -483,12 +483,12 @@ class RecordingSagaClient:
     # Note: ``mark_contributions`` is intentionally NOT here — mimir
     # uses ``feedback()`` for the credit-pass call (see
     # ``agent.py:_post_message_hook``, line 1859). There's no
-    # ``mark_contributions`` method on ``MemoryClient`` or
+    # ``mark_contributions`` method on ``SagaStore`` or
     # ``_HttpSaga`` either; adding it to this set would AttributeError
     # at runtime.
     _RECORDED_METHODS = frozenset({
         "query", "store", "feedback", "outcome", "end_session",
-        "consolidate", "decay", "forget",
+        "consolidate", "forget",
     })
 
     def __init__(self, inner: SagaClient) -> None:
@@ -718,9 +718,9 @@ def make_saga_client(
     """Pick the right implementation based on ``endpoint``.
 
     - Empty/unset, ``localhost``, or ``127.0.0.1`` → in-process
-      ``MemoryClient`` (the mimir.memory clean-room rewrite of saga's
+      ``SagaStore`` (the mimir.saga clean-room rewrite of saga's
       retrieval/consolidation engine). ``db_path`` defaults to
-      ``$MIMIR_HOME/.mimir/memory.db``; pass explicitly to override
+      ``$MIMIR_HOME/.mimir/saga.db``; pass explicitly to override
       (tests, alternative DB layouts).
     - Anything else → ``_HttpSaga(endpoint, api_key, timeout_s)``
       (kept for operators running a separate saga HTTP server; this
@@ -735,7 +735,7 @@ def make_saga_client(
     import os
     from pathlib import Path
     if not endpoint or _is_localhost(endpoint):
-        from .memory.client import MemoryClient
+        from .saga.client import SagaStore
         resolved_db: Path
         if db_path is not None:
             resolved_db = Path(db_path)
@@ -744,12 +744,12 @@ def make_saga_client(
             if not home:
                 raise RuntimeError(
                     "make_saga_client(): MIMIR_HOME not set and db_path "
-                    "not supplied — cannot resolve in-process MemoryClient "
+                    "not supplied — cannot resolve in-process SagaStore "
                     "db path. Set MIMIR_HOME or pass db_path explicitly."
                 )
-            resolved_db = Path(home) / ".mimir" / "memory.db"
+            resolved_db = Path(home) / ".mimir" / "saga.db"
         resolved_db.parent.mkdir(parents=True, exist_ok=True)
-        inner: SagaClient = MemoryClient(
+        inner: SagaClient = SagaStore(
             db_path=resolved_db, embedding_dim=embedding_dim,
         )
     else:

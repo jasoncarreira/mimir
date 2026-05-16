@@ -16,18 +16,18 @@ from pathlib import Path
 
 import pytest
 
-from mimir.memory.cluster import cluster_by_similarity, make_default_cluster_fn
-from mimir.memory.consolidate import consolidate
-from mimir.memory.mark_access import AccessEvent, mark_access
-from mimir.memory.observations import refresh_trend
-from mimir.memory.recall import recall
-from mimir.memory.reflect import reflect
-from mimir.memory.store import store
+from mimir.saga.cluster import cluster_by_similarity, make_default_cluster_fn
+from mimir.saga.consolidate import consolidate
+from mimir.saga.mark_access import AccessEvent, mark_access
+from mimir.saga.observations import refresh_trend
+from mimir.saga.recall import recall
+from mimir.saga.reflect import reflect
+from mimir.saga.store import store
 
 
 @pytest.fixture
 def conn():
-    schema = (Path(__file__).resolve().parent.parent / "mimir" / "memory" / "schema.sql").read_text()
+    schema = (Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql").read_text()
     c = sqlite3.connect(":memory:")
     c.executescript(schema)
     yield c

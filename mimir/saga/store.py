@@ -34,7 +34,7 @@ from .mark_access import AccessEvent, mark_access
 
 # Callable signature for the embedding provider. Returns the raw float32
 # bytes ready to land in embeddings.vec, plus the metadata fields
-# (provider, model, dim). Injected by mimir.memory's __init__ wiring;
+# (provider, model, dim). Injected by mimir.saga's __init__ wiring;
 # the sketch uses a lambda placeholder.
 EmbedFn = Callable[[str], tuple[bytes, str, str, int]]
 
@@ -261,8 +261,11 @@ def _find_session_near_duplicate(
     threshold: float,
 ) -> str | None:
     """Cosine-scan every atom in ``session_id`` for one whose embedding
-    is ≥ threshold similar to ``cand_vec_bytes``. Returns the best
-    matching atom_id, or None if no atom clears the threshold.
+    is **strictly greater than** ``threshold`` similar to ``cand_vec_bytes``.
+    Returns the best matching atom_id, or None if no atom clears the
+    threshold. (At sim == threshold the candidate is treated as
+    not-duplicate — the threshold itself is the line that must be
+    crossed, not touched.)
 
     Scoped per-session because the bench / production case for this is
     "the user is paraphrasing the same fact within a single conversation."

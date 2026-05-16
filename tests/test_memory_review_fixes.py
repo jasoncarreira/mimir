@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.memory.client import MemoryClient
+from mimir.saga.client import SagaStore
 
 
 # Stub provider so we don't need real voyage credentials in unit tests.
@@ -27,7 +27,7 @@ def _patch_provider(monkeypatch):
             return [float(h % 7), float(h % 11), float(h % 13), float(h % 17)]
         def dimensions(self):
             return 4
-    monkeypatch.setattr("mimir.memory.embeddings.get_provider", lambda: _StubProvider())
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: _StubProvider())
     def fake_get_config():
         def cfg(section, key, default=None):
             return {
@@ -36,13 +36,13 @@ def _patch_provider(monkeypatch):
                 ("embedding", "model"): "stub-4d",
             }.get((section, key), default)
         return cfg
-    monkeypatch.setattr("mimir.memory._config_io.get_config", fake_get_config)
+    monkeypatch.setattr("mimir.saga._config_io.get_config", fake_get_config)
 
 
 @pytest.fixture
 def client(tmp_path):
-    db = tmp_path / "mimir.memory.db"
-    return MemoryClient(db_path=db, embedding_dim=4)
+    db = tmp_path / "mimir.saga.db"
+    return SagaStore(db_path=db, embedding_dim=4)
 
 
 # ─── #10 + #9: schema columns dropped ────────────────────────────────
@@ -212,7 +212,7 @@ async def test_outcome_negative_cancels_retrieval_boost(client, monkeypatch):
     of -1.5). Atom whose only event is store (Σ=1.0) → mark negative
     → Σ=0 → B=-inf → filtered. Pins the subtractive-weight semantic."""
     _patch_provider(monkeypatch)
-    from mimir.memory.activation import compute_activation
+    from mimir.saga.activation import compute_activation
     import json as _json
 
     r = await client.store("test atom")

@@ -54,7 +54,7 @@ async def run(args: argparse.Namespace) -> int:
     client = make_saga_client(
         endpoint=cfg.saga_endpoint,
         api_key=cfg.saga_api_key or None,
-        db_path=cfg.home / ".mimir" / "memory.db",
+        db_path=cfg.home / ".mimir" / "saga.db",
     )
     try:
         atoms = await client.most_retrieved_atoms(

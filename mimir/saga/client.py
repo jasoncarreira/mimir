@@ -1,27 +1,27 @@
 """SagaClient-compatible facade over the new memory subsystem.
 
-Adapts ``mimir.memory.*`` operations to the ``SagaClient`` Protocol
+Adapts ``mimir.saga.*`` operations to the ``SagaClient`` Protocol
 (see ``mimir/saga_client.py``) so mimir's call sites — ``agent.py``,
 ``sagatools.py``, ``server.py`` — can flip from saga → memory atomically
 with one wiring change (``make_saga_client(..)`` returns a
-``MemoryClient`` instead of an ``_InProcessSaga``).
+``SagaStore`` instead of an ``_InProcessSaga``).
 
 Provider/index plumbing:
 
 - Embedding provider: ``saga.embeddings.get_provider()`` — reused
   as-is. Configurable via saga.toml (voyage / openai / onnx).
-- FAISS index: ``mimir.memory.vector_index.VectorIndex`` — owns its
-  own index keyed on ``mimir.memory.db``'s embeddings table. Built
+- FAISS index: ``mimir.saga.vector_index.VectorIndex`` — owns its
+  own index keyed on ``mimir.saga.db``'s embeddings table. Built
   lazily on first ``query()``; incrementally updated after each
   ``store()`` via ``on_atom_stored``.
-- FTS5: ``mimir.memory.fts.fts_search`` — BM25 over the ``atoms_fts``
+- FTS5: ``mimir.saga.fts.fts_search`` — BM25 over the ``atoms_fts``
   virtual table. Triggers in schema.sql keep atoms_fts in sync with
   atoms; the client just calls the search.
-- LLM synth for consolidate: ``mimir.memory.synthesize.
-  make_async_observation_synth_fn`` — wraps saga's ``call_llm`` so
+- LLM synth for consolidate: ``mimir.saga.synthesize.
+  make_async_rich_synth_fn`` — wraps saga's ``call_llm`` so
   consolidate() can actually emit observations rather than no-op'ing.
 
-v2 is operationally complete: real FAISS over mimir.memory.db, real
+v2 is operationally complete: real FAISS over mimir.saga.db, real
 FTS5, real LLM-backed consolidation. Embeddings still flow through
 saga's provider — that stays until the final mimir/memory →
 mimir/saga rename, at which point we move the provider too.
@@ -136,10 +136,10 @@ def _make_triple_search_fn(conn: sqlite3.Connection, *, dim: int | None):
 # ─── The facade ──────────────────────────────────────────────────────
 
 
-class MemoryClient:
+class SagaStore:
     """SagaClient-compatible facade. Holds a sqlite3 connection to
-    mimir.memory.db and translates each saga-vocabulary method to the
-    equivalent ``mimir.memory.*`` operation.
+    mimir.saga.db and translates each saga-vocabulary method to the
+    equivalent ``mimir.saga.*`` operation.
 
     Connection lifecycle: the client opens one connection per process
     on first use, applies the schema if the file is fresh, applies any
@@ -206,9 +206,13 @@ class MemoryClient:
         self._index: VectorIndex | None = None
         self._index_built = False
         # LLM synth callable for consolidate(). Late-bound (lazy import
-        # of synthesize.py) so MemoryClient doesn't transitively pull in
-        # the saga LLM transport at construction time.
-        self._observation_synth_fn = None
+        # of synthesize.py) so SagaStore doesn't transitively pull in
+        # the LLM transport at construction time. Despite the name, this
+        # holds the *rich* synth callable (returns content + triples +
+        # contradictions); ``observation`` is historical from when the
+        # earlier tier-2 path was the only consumer. TODO(rename-pass):
+        # ``_rich_synth_fn`` is the more accurate name.
+        self._rich_synth_fn = None
         # Write-serialization across threads. We open the connection
         # with ``check_same_thread=False`` so each public method can
         # run under ``asyncio.to_thread``; SQLite under WAL serializes
@@ -235,8 +239,8 @@ class MemoryClient:
             return self._conn
         if self._db_path is None:
             raise RuntimeError(
-                "MemoryClient: no db_path and no conn provided. "
-                "Construct with MemoryClient(db_path=Path(...)) or pass conn=..."
+                "SagaStore: no db_path and no conn provided. "
+                "Construct with SagaStore(db_path=Path(...)) or pass conn=..."
             )
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         fresh = not self._db_path.exists()
@@ -248,7 +252,7 @@ class MemoryClient:
             self._conn.executescript(schema_path.read_text())
             self._conn.commit()
         # Migration story: record the schema version we know how to
-        # serve so future MemoryClient builds can detect when an
+        # serve so future SagaStore builds can detect when an
         # existing DB needs migration. ``CURRENT_SCHEMA_VERSION``
         # bumps with every shipped schema change; ``MIGRATIONS`` is
         # the pending-migrations registry (empty until the first
@@ -359,6 +363,17 @@ class MemoryClient:
         #    + ``context``, we call the LLM here. Preserves the
         #    single-call ergonomics for callers that don't need
         #    parallelism.
+        # Surface the precedence ambiguity so a future call site that
+        # sets both kwargs gets a log line — the pre-resolved path
+        # silently wins, which could otherwise hide a misconfiguration.
+        if pre_rewritten_query is not None and enable_contextual_rewrite:
+            log.warning(
+                "SagaStore.query: both pre_rewritten_query and "
+                "enable_contextual_rewrite=True supplied; "
+                "pre_rewritten_query wins (inline rewrite skipped). "
+                "Pick one — pre-resolved for parallelism, inline for "
+                "single-call ergonomics."
+            )
         rewritten_query: str | None = pre_rewritten_query
         if rewritten_query is None and enable_contextual_rewrite and context:
             from .query_rewrite import rewrite_query
@@ -648,9 +663,9 @@ class MemoryClient:
         # into the right table. Cached on the client because
         # make_async_rich_synth_fn closes over llm_config (resolved
         # once per process is fine).
-        if self._observation_synth_fn is None:
+        if self._rich_synth_fn is None:
             from .synthesize import make_async_rich_synth_fn
-            self._observation_synth_fn = make_async_rich_synth_fn()
+            self._rich_synth_fn = make_async_rich_synth_fn()
 
         # Synth is async, but consolidate() runs synchronously under
         # to_thread (so transactions stay in one thread). We adapt: a
@@ -719,7 +734,7 @@ class MemoryClient:
         async def _synth(cluster, prior_block):
             async with sem:
                 try:
-                    return await self._observation_synth_fn(
+                    return await self._rich_synth_fn(
                         cluster,
                         prior_block=prior_block,
                         vocab_block=vocab_block,
@@ -1036,7 +1051,7 @@ class MemoryClient:
     ) -> dict[str, Any]:
         """Credit-pass: identify which retrieved atoms contributed to a
         response and fire ``feedback_positive`` events on them. See
-        ``mimir.memory.contributions.mark_contributions`` for the
+        ``mimir.saga.contributions.mark_contributions`` for the
         heuristic. Returns a dict the bench harness can log
         (``contribution_rate``, ``contributed_count``, ``total``).
 
@@ -1068,7 +1083,7 @@ class MemoryClient:
             conn.execute("SELECT 1 FROM atoms LIMIT 1")
             return True
         except Exception as exc:
-            log.warning("MemoryClient.health check failed: %s", exc)
+            log.warning("SagaStore.health check failed: %s", exc)
             return False
 
     async def close(self) -> None:
@@ -1080,7 +1095,7 @@ class MemoryClient:
                 # though we don't propagate the error (close() is
                 # called from shutdown / cleanup paths that shouldn't
                 # block on a misbehaving connection).
-                log.warning("MemoryClient.close failed: %s", exc)
+                log.warning("SagaStore.close failed: %s", exc)
             self._conn = None
 
 
