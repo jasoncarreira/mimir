@@ -1,4 +1,4 @@
-"""Tests for mimir.memory.vector_index — FAISS-backed ANN.
+"""Tests for mimir.saga.vector_index — FAISS-backed ANN.
 
 If faiss-cpu isn't available these tests skip — the recall fallback
 path is exercised by test_memory_tier2.py instead.
@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from mimir.memory.vector_index import FAISS_AVAILABLE, VectorIndex
+from mimir.saga.vector_index import FAISS_AVAILABLE, VectorIndex
 
 
 pytestmark = pytest.mark.skipif(
@@ -21,7 +21,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "memory" / "schema.sql"
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"
 
 
 @pytest.fixture

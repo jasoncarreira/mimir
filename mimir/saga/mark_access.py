@@ -1,6 +1,6 @@
 """Append access_events and update the per-atom summary cache.
 
-The lowest-level building block in mimir.memory. Both ``store()`` (which
+The lowest-level building block in mimir.saga. Both ``store()`` (which
 fires a 'store' event) and ``recall()`` (which fires 'retrieval' events
 for returned atoms) call into here. ``reflect()`` fires 'consolidation'
 events. The agent's explicit ``mark_contributions()`` fires
