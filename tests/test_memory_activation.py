@@ -17,7 +17,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta, timezone
 
-from mimir.memory.activation import (
+from mimir.saga.activation import (
     DECAY_D,
     RECENT_K,
     activation_exact,
@@ -206,10 +206,10 @@ def test_feedback_event_weight_round_trips():
     """
     import sqlite3
     from pathlib import Path
-    from mimir.memory.mark_access import AccessEvent, mark_access
+    from mimir.saga.mark_access import AccessEvent, mark_access
 
     schema = (Path(__file__).resolve().parent.parent
-              / "mimir" / "memory" / "schema.sql").read_text()
+              / "mimir" / "saga" / "schema.sql").read_text()
     conn = sqlite3.connect(":memory:")
     conn.executescript(schema)
     conn.execute(

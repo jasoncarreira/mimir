@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 
-SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "memory" / "schema.sql"
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"
 
 
 @pytest.fixture
@@ -39,7 +39,7 @@ def _seed_atom(conn, atom_id: str, content: str):
 
 
 def test_tier_for_similarity_buckets():
-    from mimir.memory.recall import _tier_for_similarity
+    from mimir.saga.recall import _tier_for_similarity
     assert _tier_for_similarity(0.50) == "high"
     assert _tier_for_similarity(0.45) == "high"      # boundary
     assert _tier_for_similarity(0.44) == "medium"
@@ -51,7 +51,7 @@ def test_tier_for_similarity_buckets():
 
 
 def test_tier_passes_min_tier():
-    from mimir.memory.recall import _passes_min_tier
+    from mimir.saga.recall import _passes_min_tier
     # No filter accepts everything
     assert _passes_min_tier("none", None) is True
     assert _passes_min_tier("high", None) is True
@@ -72,7 +72,7 @@ def test_tier_passes_min_tier():
 
 
 def test_top_triples_with_payload_returns_rich_data(conn):
-    from mimir.memory.triples import store_triples, top_triples_with_payload
+    from mimir.saga.triples import store_triples, top_triples_with_payload
 
     _seed_atom(conn, "obs1", "obs")
     # Use a stub embed_fn that returns the same vector for every triple
@@ -104,7 +104,7 @@ def test_top_triples_with_payload_returns_rich_data(conn):
 
 
 def test_top_triples_with_payload_skips_no_embedding(conn):
-    from mimir.memory.triples import store_triples, top_triples_with_payload
+    from mimir.saga.triples import store_triples, top_triples_with_payload
     _seed_atom(conn, "obs1", "obs")
     store_triples(conn, [
         {"subject": "Alice", "predicate": "prefers", "object": "concise"},
@@ -114,7 +114,7 @@ def test_top_triples_with_payload_skips_no_embedding(conn):
 
 
 def test_top_triples_with_payload_respects_top_n(conn):
-    from mimir.memory.triples import store_triples, top_triples_with_payload
+    from mimir.saga.triples import store_triples, top_triples_with_payload
     _seed_atom(conn, "obs1", "obs")
     vec_bytes = struct.pack("4f", 1.0, 0.0, 0.0, 0.0)
     def embed(text):
@@ -138,7 +138,7 @@ def _patch_provider(monkeypatch, *, dim=4):
             return [1.0, 0.0, 0.0, 0.0]
         def dimensions(self):
             return 4
-    monkeypatch.setattr("mimir.memory.embeddings.get_provider", lambda: _StubProvider())
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: _StubProvider())
     def fake_get_config():
         def cfg(section, key, default=None):
             return {
@@ -147,7 +147,7 @@ def _patch_provider(monkeypatch, *, dim=4):
                 ("embedding", "model"): "stub-4d",
             }.get((section, key), default)
         return cfg
-    monkeypatch.setattr("mimir.memory._config_io.get_config", fake_get_config)
+    monkeypatch.setattr("mimir.saga._config_io.get_config", fake_get_config)
 
 
 @pytest.mark.asyncio
@@ -157,10 +157,10 @@ async def test_query_surfaces_triples_in_response(monkeypatch, tmp_path):
     response's ``triples`` field — populating the shape mimir's prod
     sagatools.py:_format_saga_payload expects."""
     _patch_provider(monkeypatch)
-    from mimir.memory.client import MemoryClient
-    from mimir.memory.triples import store_triples
+    from mimir.saga.client import MemoryClient
+    from mimir.saga.triples import store_triples
 
-    db = tmp_path / "mimir.memory.db"
+    db = tmp_path / "mimir.saga.db"
     client = MemoryClient(db_path=db, embedding_dim=4)
 
     # Seed a raw and an extracted triple.
@@ -191,10 +191,10 @@ async def test_query_surfaces_triples_in_response(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_query_with_triples_disabled_returns_empty_list(monkeypatch, tmp_path):
     _patch_provider(monkeypatch)
-    from mimir.memory.client import MemoryClient
-    from mimir.memory.triples import store_triples
+    from mimir.saga.client import MemoryClient
+    from mimir.saga.triples import store_triples
 
-    db = tmp_path / "mimir.memory.db"
+    db = tmp_path / "mimir.saga.db"
     client = MemoryClient(
         db_path=db, embedding_dim=4,
         include_triples_in_response=False,
@@ -220,9 +220,9 @@ async def test_atoms_carry_confidence_tier(monkeypatch, tmp_path):
     on every atom returned by ``query`` — what mimir's
     sagatools.py:_atom_label reads."""
     _patch_provider(monkeypatch)
-    from mimir.memory.client import MemoryClient
+    from mimir.saga.client import MemoryClient
 
-    db = tmp_path / "mimir.memory.db"
+    db = tmp_path / "mimir.saga.db"
     client = MemoryClient(db_path=db, embedding_dim=4)
     await client.store("Alice prefers concise replies")
     result = await client.query("alice", top_k=5)
@@ -252,9 +252,9 @@ async def test_min_confidence_tier_filter_drops_weak_atoms(monkeypatch, tmp_path
             return [0.0, 1.0, 0.0, 0.0]   # orthogonal → cosine 0.0
         def dimensions(self):
             return 4
-    monkeypatch.setattr("mimir.memory.embeddings.get_provider", lambda: _ContentProvider())
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: _ContentProvider())
     monkeypatch.setattr(
-        "mimir.memory._config_io.get_config",
+        "mimir.saga._config_io.get_config",
         lambda: lambda section, key, default=None: {
             ("embedding", "max_input_chars"): 2000,
             ("embedding", "provider"): "stub",
@@ -262,8 +262,8 @@ async def test_min_confidence_tier_filter_drops_weak_atoms(monkeypatch, tmp_path
         }.get((section, key), default),
     )
 
-    from mimir.memory.client import MemoryClient
-    db = tmp_path / "mimir.memory.db"
+    from mimir.saga.client import MemoryClient
+    db = tmp_path / "mimir.saga.db"
     client = MemoryClient(db_path=db, embedding_dim=4)
     # "alice" content → embeds to [1,0,0,0] → matches "alice" query at cosine=1.0 → high
     r_strong = await client.store("Alice prefers concise replies")

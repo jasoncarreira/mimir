@@ -2,7 +2,7 @@
 
 Single source of truth for every parameter the memory subsystem
 exposes. Each module that currently has inline constants will be
-refactored to import from here during the mimir/memory/ integration
+refactored to import from here during the mimir/saga/ integration
 pass. For the sketch phase the inline constants still exist; this
 module documents them and provides the override mechanism.
 

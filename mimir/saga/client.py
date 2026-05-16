@@ -1,6 +1,6 @@
 """SagaClient-compatible facade over the new memory subsystem.
 
-Adapts ``mimir.memory.*`` operations to the ``SagaClient`` Protocol
+Adapts ``mimir.saga.*`` operations to the ``SagaClient`` Protocol
 (see ``mimir/saga_client.py``) so mimir's call sites — ``agent.py``,
 ``sagatools.py``, ``server.py`` — can flip from saga → memory atomically
 with one wiring change (``make_saga_client(..)`` returns a
@@ -10,18 +10,18 @@ Provider/index plumbing:
 
 - Embedding provider: ``saga.embeddings.get_provider()`` — reused
   as-is. Configurable via saga.toml (voyage / openai / onnx).
-- FAISS index: ``mimir.memory.vector_index.VectorIndex`` — owns its
-  own index keyed on ``mimir.memory.db``'s embeddings table. Built
+- FAISS index: ``mimir.saga.vector_index.VectorIndex`` — owns its
+  own index keyed on ``mimir.saga.db``'s embeddings table. Built
   lazily on first ``query()``; incrementally updated after each
   ``store()`` via ``on_atom_stored``.
-- FTS5: ``mimir.memory.fts.fts_search`` — BM25 over the ``atoms_fts``
+- FTS5: ``mimir.saga.fts.fts_search`` — BM25 over the ``atoms_fts``
   virtual table. Triggers in schema.sql keep atoms_fts in sync with
   atoms; the client just calls the search.
-- LLM synth for consolidate: ``mimir.memory.synthesize.
+- LLM synth for consolidate: ``mimir.saga.synthesize.
   make_async_rich_synth_fn`` — wraps saga's ``call_llm`` so
   consolidate() can actually emit observations rather than no-op'ing.
 
-v2 is operationally complete: real FAISS over mimir.memory.db, real
+v2 is operationally complete: real FAISS over mimir.saga.db, real
 FTS5, real LLM-backed consolidation. Embeddings still flow through
 saga's provider — that stays until the final mimir/memory →
 mimir/saga rename, at which point we move the provider too.
@@ -138,8 +138,8 @@ def _make_triple_search_fn(conn: sqlite3.Connection, *, dim: int | None):
 
 class MemoryClient:
     """SagaClient-compatible facade. Holds a sqlite3 connection to
-    mimir.memory.db and translates each saga-vocabulary method to the
-    equivalent ``mimir.memory.*`` operation.
+    mimir.saga.db and translates each saga-vocabulary method to the
+    equivalent ``mimir.saga.*`` operation.
 
     Connection lifecycle: the client opens one connection per process
     on first use, applies the schema if the file is fresh, applies any
@@ -1051,7 +1051,7 @@ class MemoryClient:
     ) -> dict[str, Any]:
         """Credit-pass: identify which retrieved atoms contributed to a
         response and fire ``feedback_positive`` events on them. See
-        ``mimir.memory.contributions.mark_contributions`` for the
+        ``mimir.saga.contributions.mark_contributions`` for the
         heuristic. Returns a dict the bench harness can log
         (``contribution_rate``, ``contributed_count``, ``total``).
 

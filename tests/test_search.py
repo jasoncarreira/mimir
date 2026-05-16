@@ -474,7 +474,7 @@ def test_saga_provider_embedder_dimensions_lazy(monkeypatch):
     """``SagaProviderEmbedder.dim`` defers provider construction until
     first access — matches FastEmbedder's lazy-load semantics."""
     from mimir.search import SagaProviderEmbedder
-    import mimir.memory.embeddings as saga_emb
+    import mimir.saga.embeddings as saga_emb
 
     construction_count = [0]
 
@@ -496,7 +496,7 @@ def test_saga_provider_embedder_passes_input_type(monkeypatch):
     saga provider's batch_embed — the load-bearing fix that lets
     voyage produce different query-vs-document embeddings."""
     from mimir.search import SagaProviderEmbedder
-    import mimir.memory.embeddings as saga_emb
+    import mimir.saga.embeddings as saga_emb
 
     mock = _MockSagaProvider(dim=4)
     monkeypatch.setattr(saga_emb, "get_provider", lambda: mock)
@@ -514,7 +514,7 @@ def test_saga_provider_embedder_empty_input_skips_provider(monkeypatch):
     """Empty input list short-circuits before touching the provider —
     avoids needlessly initializing voyage/openai/fastembed on a no-op."""
     from mimir.search import SagaProviderEmbedder
-    import mimir.memory.embeddings as saga_emb
+    import mimir.saga.embeddings as saga_emb
 
     construction_count = [0]
 

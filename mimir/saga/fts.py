@@ -1,4 +1,4 @@
-"""FTS5 keyword search over mimir.memory atoms.
+"""FTS5 keyword search over mimir.saga atoms.
 
 Includes P12 query expansion (synonym substitution) on the FTS-only
 path. Per saga's canonical bench (saga_bench.toml line 67), P12 is

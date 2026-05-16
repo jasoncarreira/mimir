@@ -12,7 +12,7 @@ Two-tier observation/raw split preserved from saga (the orthogonal
 
 The infrastructure pieces (FAISS index access, FTS5 query, embedding
 provider) are injected via callables so this module is testable in
-isolation. Wiring happens in mimir.memory's __init__.
+isolation. Wiring happens in mimir.saga's __init__.
 """
 
 from __future__ import annotations
