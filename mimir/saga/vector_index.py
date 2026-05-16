@@ -13,14 +13,14 @@ Lifecycle:
   index. Picks IndexFlatIP (exact) for <50k vectors, IndexIVFFlat
   (approximate) above that.
 - ``add(atom_id, vec_bytes)`` — incremental add after each ``store()``.
-  Called from the MemoryClient hook, not from store.py itself
+  Called from the SagaStore hook, not from store.py itself
   (store stays pure-SQL).
 - ``remove(atom_id)`` — soft-mark a position as removed; filtered out
   of search results. Triggers full rebuild when >10% of positions are
   marked removed.
 - ``search(query_vec, top_k)`` — returns ``[(atom_id, similarity)]``.
 
-Per-MemoryClient singleton (not module-global). Two MemoryClients
+Per-SagaStore singleton (not module-global). Two SagaStores
 pointing at different DBs each own their own index. Saga's module-
 global singletons assumed one process / one DB; the bench harness
 needs cross-question DB switching, so per-client is the right scope.

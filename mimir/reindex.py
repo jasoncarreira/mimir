@@ -125,7 +125,7 @@ def reindex_saga_atoms(
     - Bumps ``atoms.embedding_dim`` so the FAISS index loader filters
       mismatched-dim rows on rebuild
 
-    After completion the caller should ``MemoryClient.rebuild_index``
+    After completion the caller should ``SagaStore.rebuild_index``
     — the dim or provider may have changed.
 
     Note on the ``sentence_embeddings`` table: if the operator has

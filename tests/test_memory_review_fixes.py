@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.saga.client import MemoryClient
+from mimir.saga.client import SagaStore
 
 
 # Stub provider so we don't need real voyage credentials in unit tests.
@@ -42,7 +42,7 @@ def _patch_provider(monkeypatch):
 @pytest.fixture
 def client(tmp_path):
     db = tmp_path / "mimir.saga.db"
-    return MemoryClient(db_path=db, embedding_dim=4)
+    return SagaStore(db_path=db, embedding_dim=4)
 
 
 # ─── #10 + #9: schema columns dropped ────────────────────────────────

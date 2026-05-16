@@ -1,4 +1,4 @@
-"""Smoke tests for mimir.saga.client.MemoryClient — the
+"""Smoke tests for mimir.saga.client.SagaStore — the
 SagaClient-compatible facade.
 
 Validates that the public API methods all run without error against
@@ -16,13 +16,13 @@ from pathlib import Path
 
 import pytest
 
-from mimir.saga.client import MemoryClient
+from mimir.saga.client import SagaStore
 
 
 @pytest.fixture
 def client(tmp_path):
     db_path = tmp_path / "mimir.saga.db"
-    c = MemoryClient(db_path=db_path)
+    c = SagaStore(db_path=db_path)
     yield c
 
 

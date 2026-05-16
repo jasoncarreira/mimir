@@ -223,7 +223,7 @@ def recall(
     # Third pathway: triple-augment. Embed query → cosine-match against
     # extracted triples → follow source_atom_id back to the atom. Off
     # by default (triple_search_fn=None); the bench wires it via
-    # MemoryClient when triples are populated.
+    # SagaStore when triples are populated.
     triple_candidates: list[tuple[str, float]] = []
     if triple_search_fn is not None:
         try:
