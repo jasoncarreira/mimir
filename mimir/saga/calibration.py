@@ -17,7 +17,7 @@ so the migration doesn't rewrite the atoms table. Also there's no
 ``state`` machine — ``tombstoned = 0`` selects every live atom.
 
 After ``re_embed`` completes, the caller should drop and rebuild the
-FAISS index (``MemoryClient.rebuild_index``) — the dim or provider may
+FAISS index (``SagaStore.rebuild_index``) — the dim or provider may
 have changed, and the in-memory index won't auto-detect that.
 """
 
@@ -47,7 +47,7 @@ def re_embed(
     embedding provider.
 
     Args:
-        db_path: Path to ``memory.db``.
+        db_path: Path to ``saga.db``.
         target_provider_name: Provider name override. ``None`` uses the
             saga.toml-resolved provider — the common case for cron-driven
             provider migrations where the operator edited the TOML

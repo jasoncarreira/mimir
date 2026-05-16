@@ -26,7 +26,7 @@ What's preserved alongside atoms:
 - atom_topics
 - triples (saga.db only — MSAM didn't have this table)
 
-After the import: ``MemoryClient.rebuild_index()`` rebuilds the FAISS
+After the import: ``SagaStore.rebuild_index()`` rebuilds the FAISS
 index from the populated embeddings. The first ``query()`` will also
 trigger a lazy build if rebuild_index wasn't called.
 
