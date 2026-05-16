@@ -112,14 +112,40 @@ _PROVIDER_EXTRAS: dict[str, str] = {
 }
 
 
-def _resolve_model(spec: str | BaseChatModel) -> str | BaseChatModel:
-    """Translate a mimir-friendly model spec to a deepagents-acceptable form.
+def _supports_responses_api() -> bool:
+    """Heuristic for whether to flip ``use_responses_api=True`` on OpenAI.
+
+    Real OpenAI implements the Responses API (``POST /responses``); drop-in
+    proxies (Groq, Together, DeepSeek, GLM, …) usually only implement
+    ``/chat/completions``, so defaulting to Responses would 404 every turn.
+    True when ``OPENAI_BASE_URL`` is unset or matches ``api.openai.com``.
+    ``MIMIR_USE_RESPONSES_API=1|0`` overrides.
+    """
+    override = os.environ.get("MIMIR_USE_RESPONSES_API", "").strip().lower()
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if override in ("0", "false", "no", "off"):
+        return False
+    base_url = (os.environ.get("OPENAI_BASE_URL") or "").lower().strip()
+    return not base_url or "api.openai.com" in base_url
+
+
+def _resolve_model(
+    spec: str | BaseChatModel,
+    *,
+    max_retries: int = 6,
+) -> BaseChatModel:
+    """Translate a mimir-friendly model spec into a constructed BaseChatModel.
 
     Supported:
       - ``claude-code:<model>`` → ChatClaudeCode (Max OAuth subprocess)
-      - ``<provider>:<model>``  → init_chat_model via langchain (deepagents
-                                  resolves the provider package at call time)
+      - ``<provider>:<model>``  → init_chat_model with ``max_retries`` (and,
+                                  for OpenAI hitting api.openai.com,
+                                  ``use_responses_api=True``)
       - BaseChatModel instance  → pass-through (Bedrock/Vertex/custom)
+
+    ``max_retries`` only applies to the non-claude-code path — ChatClaudeCode
+    spawns a Claude Code subprocess which handles its own retry semantics.
 
     The model-provider package (``langchain-claude-code``,
     ``langchain-anthropic``, etc.) is a pip extra (see pyproject.toml's
@@ -145,9 +171,14 @@ def _resolve_model(spec: str | BaseChatModel) -> str | BaseChatModel:
         return ChatClaudeCode(model=model_name)
     # langchain ``init_chat_model`` resolves provider extras at call time
     # (``anthropic:`` → langchain-anthropic, ``openai:`` → langchain-openai).
-    # We pass the spec through; if the extra isn't installed, deepagents
-    # raises its own ImportError with the right hint.
-    return spec
+    # We wrap it here so we can thread max_retries + the responses-API flag
+    # through; if the extra isn't installed, init_chat_model raises with
+    # the right hint.
+    from langchain.chat_models import init_chat_model
+    init_params: dict[str, Any] = {"max_retries": max(0, int(max_retries))}
+    if spec.startswith("openai:") and _supports_responses_api():
+        init_params["use_responses_api"] = True
+    return init_chat_model(spec, **init_params)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -314,7 +345,10 @@ class Agent:
             writable_dirs=self._config.writable_dirs,
         )
         self._agent = create_deep_agent(
-            model=_resolve_model(model_spec),
+            model=_resolve_model(
+                model_spec,
+                max_retries=getattr(self._config, "model_max_retries", 6),
+            ),
             tools=all_mimir_tools(),
             system_prompt=system_prompt,
             backend=backend,
