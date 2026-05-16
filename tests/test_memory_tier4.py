@@ -293,9 +293,9 @@ def test_feedback_non_positive_is_noop(conn):
 
 
 def test_default_config_has_expected_values():
-    from mimir.saga.config import DEFAULT, MemoryConfig
+    from mimir.saga.config import DEFAULT, SagaConfig
 
-    assert isinstance(DEFAULT, MemoryConfig)
+    assert isinstance(DEFAULT, SagaConfig)
     assert DEFAULT.activation.decay_d == 0.5
     assert DEFAULT.activation.recent_k == 10
     assert DEFAULT.thresholds.get("episodic") == -2.5
@@ -308,9 +308,9 @@ def test_default_config_has_expected_values():
 
 
 def test_config_from_toml_dict_overrides_defaults():
-    from mimir.saga.config import MemoryConfig
+    from mimir.saga.config import SagaConfig
 
-    cfg = MemoryConfig.from_toml_dict({
+    cfg = SagaConfig.from_toml_dict({
         "activation": {"decay_d": 0.6, "recent_k": 15},
         "thresholds": {"episodic": -3.0},
         "consolidation": {"similarity_threshold": 0.75},
@@ -326,9 +326,9 @@ def test_config_from_toml_dict_overrides_defaults():
 
 
 def test_config_unknown_keys_silently_skipped():
-    from mimir.saga.config import MemoryConfig
+    from mimir.saga.config import SagaConfig
 
-    cfg = MemoryConfig.from_toml_dict({
+    cfg = SagaConfig.from_toml_dict({
         "activation": {"decay_d": 0.4, "unknown_key": "garbage"},
         "no_such_section": {"x": 1},
     })

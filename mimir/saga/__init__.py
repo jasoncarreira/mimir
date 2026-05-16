@@ -35,7 +35,7 @@ from .reflect import (
 )
 from .consolidate import ConsolidateResult
 # Note: ``consolidate.consolidate()`` is intentionally NOT re-exported.
-# Production callers should use ``MemoryClient.consolidate()`` for the
+# Production callers should use ``SagaStore.consolidate()`` for the
 # tier-3 (triples + contradictions + P47/P48) path. The standalone
 # ``consolidate()`` is the tier-2 helper kept for the
 # test_memory_tier2b regression suite; tests that need it import via
@@ -88,7 +88,7 @@ from .query_rewrite import rewrite_query
 
 # Config
 from .config import (
-    MemoryConfig, ActivationConfig, ThresholdConfig,
+    SagaConfig, ActivationConfig, ThresholdConfig,
     ScoringWeights, TrendModifiers, BoostsAndPenalties,
     SourceWeights, TrendConfig, ConsolidationConfig,
     DEFAULT as DEFAULT_CONFIG,
@@ -171,7 +171,7 @@ __all__ = [
     "DEFAULT_CONTRIBUTION_THRESHOLD",
     "rewrite_query",
     # Config
-    "MemoryConfig", "ActivationConfig", "ThresholdConfig",
+    "SagaConfig", "ActivationConfig", "ThresholdConfig",
     "ScoringWeights", "TrendModifiers", "BoostsAndPenalties",
     "SourceWeights", "TrendConfig", "ConsolidationConfig",
     "DEFAULT_CONFIG",

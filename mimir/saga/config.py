@@ -164,7 +164,7 @@ class ConsolidationConfig:
 # ───────────────────────────────────────────────────────────────────
 
 @dataclass
-class MemoryConfig:
+class SagaConfig:
     """Aggregate config object passed around. mimir's bootstrap
     constructs one from saga.toml and threads it through."""
     activation: ActivationConfig = field(default_factory=ActivationConfig)
@@ -177,8 +177,8 @@ class MemoryConfig:
     consolidation: ConsolidationConfig = field(default_factory=ConsolidationConfig)
 
     @classmethod
-    def from_toml_dict(cls, data: dict[str, Any]) -> "MemoryConfig":
-        """Build a MemoryConfig from a parsed saga.toml-style dict.
+    def from_toml_dict(cls, data: dict[str, Any]) -> "SagaConfig":
+        """Build a SagaConfig from a parsed saga.toml-style dict.
 
         Missing sections fall back to defaults. Unknown keys within a
         section emit a warning (matching saga's _warn_unknown_keys
@@ -206,5 +206,5 @@ class MemoryConfig:
 
 #: Module-level default. Modules import this for their inline-constant
 #: behavior; mimir's bootstrap replaces it via
-#: ``config.DEFAULT = MemoryConfig.from_toml_dict(...)``.
-DEFAULT = MemoryConfig()
+#: ``config.DEFAULT = SagaConfig.from_toml_dict(...)``.
+DEFAULT = SagaConfig()
