@@ -149,6 +149,69 @@ for t, c in type_counts.most_common(20):
 PY
 ```
 
+## Collapse Indicators
+
+Sustained autoregressive LLM operation can lock into a small
+attractor — output diversity decays while internal-state diversity
+holds (sycophancy facet), trajectory similarity rises past a
+threshold for sustained spans (autoregressive lock-in facet), or
+TF-IDF self-similarity drifts in extended isolated operation
+(boredom facet). See `state/wiki/concepts/collapse-dynamics.md`
+for the full concept and primary sources.
+
+**Critical warning**: a heavily-personaed agent's collapsed output
+still sounds like the persona — "does this still sound like me?"
+is NOT a collapse detector. Use the metrics below, not vibes.
+
+### Rolling output similarity
+
+Consecutive-turn cosine similarity (or simpler: token-set Jaccard)
+over the trailing N turns. Strix's threshold: >0.9 sustained for
+3+ turns = collapsed span. Cheap approximation against turn
+outputs:
+
+```bash
+# Last 10 assistant outputs from a channel
+jq -s 'map(select(.channel_id == "CHANNEL_ID")) | sort_by(.ts) | .[-10:] | map(.output)' logs/turns.jsonl
+```
+
+Pipe to a small Python Jaccard / cosine pass. Flag any window
+where 3+ consecutive turns score >0.9 pairwise.
+
+### Atom-citation entropy
+
+Variety-decay on the retrieval surface: if a small set of SAGA
+atoms dominates citations across recent turns, that's a working-
+set collapse. Group `saga_query` results (or post-message
+contribution credits) by returned atom_id over trailing N turns;
+compute Gini or Shannon entropy of the citation distribution.
+Low entropy + high Gini = collapsed retrieval.
+
+### Heartbeat-pick topic diversity
+
+If sequential heartbeats keep picking from the same backlog
+section (e.g. chainlink #X subissues for the third tick in a row
+when independent items are available), that's a collapse
+signature on the autonomous work surface. Count distinct
+topic-labels picked over trailing N ticks.
+
+### Confab-laundering cluster
+
+Per `memory/issues/session-summary-confabulation-laundering.md`,
+a cluster of confab-laundering incidents in time is a candidate
+collapse-onset signal — collapsed attractors recycle their own
+coinages into summaries. Grep `memory/issues/` recent edits for
+the laundering pattern; if multiple incidents land in a single
+week, run the rolling-similarity check above.
+
+### Trigger
+
+Run these when: rolling cost-rate shifts up without proportional
+output-diversity, operator flags "feels repetitive," after a
+sustained heartbeat-only stretch with no operator interaction
+(boredom-experiment shape), or routinely as part of weekly
+reflection.
+
 ## Cross-Referencing with Memory Skill
 
 The memory skill (`/mimir/skills/memory/SKILL.md`) covers:
