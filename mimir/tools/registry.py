@@ -533,6 +533,7 @@ def all_mimir_tools() -> list:
     from .store import memory_store
     from .extra import file_search, mimir_get_turn, shell_exec
     from .web import web_tools_enabled
+    from .shell_async import bash_async, bash_job_output, bash_jobs_list
     tools = [
         # Memory (read + write)
         memory_query, memory_store,
@@ -540,8 +541,12 @@ def all_mimir_tools() -> list:
         file_search,
         # Turn-history lookup
         mimir_get_turn,
-        # Shell exec (allowlist-scoped)
+        # Shell exec (allowlist-scoped, sync — fine for sub-second cmds)
         shell_exec,
+        # Async shell — long-running jobs that wake the agent via
+        # ``shell_job_complete`` on exit. The companion list/output
+        # tools query the per-process ShellJobRegistry.
+        bash_async, bash_jobs_list, bash_job_output,
         # Channel ops
         send_message, react, fetch_channel_history,
         # Scheduler
