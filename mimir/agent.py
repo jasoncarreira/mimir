@@ -995,6 +995,27 @@ class Agent:
             extract_commitments,
         )
 
+        # Synthetic channels (``scheduler:*`` / ``poller:*``) are never
+        # delivery targets for the commitment poller or prompt-block
+        # surfacing. If a saga_session_end fires on a synthetic channel
+        # (e.g. a heartbeat tick that called saga_end_session) and the
+        # LLM marks any item ``channel_bound=True``, the resulting record
+        # would be bound to ``scheduler:heartbeat`` / ``poller:X`` —
+        # permanently unreachable because _assemble_commitments_block
+        # suppresses rendering on synthetic channels entirely.
+        # Fix: nullify the channel before passing to the extractor.
+        # All commitments from synthetic-channel sessions become unbound
+        # (channel_id=None) and surface cross-channel as intended.
+        # Log events below keep ctx.channel_id for observability (origin
+        # channel), not for binding — no change there.
+        from .history import SYNTHETIC_CHANNEL_PREFIXES
+        effective_channel_id = ctx.channel_id
+        if (
+            effective_channel_id
+            and effective_channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES)
+        ):
+            effective_channel_id = None
+
         if len(output) < MIN_OUTPUT_LEN:
             await log_event(
                 "commitments_extraction_no_op",
@@ -1010,7 +1031,7 @@ class Agent:
         try:
             extracted = await extract_commitments(
                 output,
-                channel_id=ctx.channel_id,
+                channel_id=effective_channel_id,
                 saga_session_id=getattr(ctx, "saga_session_id", None),
                 source_turn_id=ctx.turn_id,
             )

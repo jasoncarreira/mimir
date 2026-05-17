@@ -336,3 +336,86 @@ async def test_no_commitments_store_skips_silently(
     record = _make_record("a" * 5000)
     await agent._maybe_extract_commitments(ctx, event, record)
     assert called == []
+
+
+@pytest.mark.asyncio
+async def test_commitment_extraction_forces_unbound_on_synthetic_channel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bug fix: ``channel_bound=True`` commitments extracted from a
+    synthetic channel (``scheduler:*`` / ``poller:*``) must be stored
+    as unbound (channel_id=None), not bound to the synthetic channel.
+
+    A commitment bound to ``scheduler:heartbeat`` is permanently
+    orphaned — ``_assemble_commitments_block`` suppresses rendering on
+    synthetic channels, so it never surfaces to the operator. The fix
+    nullifies the channel_id passed to ``extract_commitments`` when
+    the source channel is synthetic.
+
+    Two assertions:
+    1. ``extract_commitments`` receives ``channel_id=None`` (not the
+       raw synthetic channel), so ``channel_bound=True`` records in
+       the extractor's output can't accidentally bind to a dead channel.
+    2. The resulting store record has ``channel_id=None`` (unbound),
+       confirming end-to-end the commitment surfaces cross-channel.
+    """
+    from mimir.commitments import CommitmentsStore
+    from mimir.commitments.models import make_commitment_id
+
+    agent = _make_agent(tmp_path)
+
+    captured: list[str | None] = []
+
+    async def fake_extract(
+        output: str,
+        *,
+        channel_id: str | None,
+        saga_session_id: str | None,
+        source_turn_id: str,
+    ) -> list[CommitmentRecord]:
+        captured.append(channel_id)
+        # Simulate a channel_bound=True extraction — the LLM bound this
+        # commitment to the source channel. With the bug, this would land
+        # as channel_id="scheduler:heartbeat"; after the fix it must land
+        # as channel_id=None (unbound).
+        return [CommitmentRecord(
+            id=make_commitment_id(),
+            channel_id=channel_id,  # mirrors what _coerce_to_record does
+            text="Follow up on Jason's sequencing pick",
+            kind="open_loop",
+            confidence=0.9,
+            source_turn_id=source_turn_id,
+            saga_session_id=saga_session_id,
+        )]
+
+    monkeypatch.setattr(
+        "mimir.commitments.extractor.extract_commitments", fake_extract,
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def _capture(event_type: str, **kw: Any) -> None:
+        events.append((event_type, kw))
+
+    monkeypatch.setattr("mimir.agent.log_event", _capture)
+
+    # Fire on a heartbeat channel — the common source of this bug.
+    event = AgentEvent(trigger="saga_session_end", channel_id="scheduler:heartbeat")
+    ctx = _make_ctx(event, saga_session_id="sess-synth-1")
+    record = _make_record("x" * 5000)
+
+    await agent._maybe_extract_commitments(ctx, event, record)
+
+    # (1) The extractor received channel_id=None, not the synthetic channel.
+    assert captured == [None], (
+        f"expected channel_id=None passed to extractor; got {captured}"
+    )
+
+    # (2) The stored commitment is unbound (channel_id=None) so it
+    #     surfaces cross-channel rather than being orphaned.
+    state = agent._commitments.current_state()
+    assert len(state) == 1
+    rec = next(iter(state.values()))
+    assert rec.channel_id is None, (
+        f"commitment must be unbound after synthetic-channel extraction; "
+        f"got channel_id={rec.channel_id!r}"
+    )
