@@ -161,19 +161,16 @@ def build_system_prompt(
     # ``## Agent home`` sits between persona and core memory so it's
     # one of the first things the model reads — before any core block
     # that might reference ``memory/...`` or ``state/...`` relative
-    # paths. Cheap (~150 chars), install-stable, cache-friendly.
+    # paths. Cheap (~110 chars), install-stable, cache-friendly.
     if home_dir:
         parts.append(
             "## Agent home\n\n"
             f"`MIMIR_HOME={home_dir}`\n\n"
-            "All `memory/...` and `state/...` paths in this prompt — "
-            "and in your filing rules — resolve under this root. When "
-            "you write files, use either relative paths "
-            "(`memory/issues/<slug>.md`) or absolute paths prefixed "
-            f"with `{home_dir}/`. Do not infer the home from any other "
-            "location (claude-code's default workspace, your shell's "
-            "`$HOME`, or convention) — this value is the source of "
-            "truth."
+            "All `memory/...` and `state/...` paths resolve under this "
+            f"root. Use relative paths or absolute paths prefixed with "
+            f"`{home_dir}/`. This value is the source of truth — do "
+            "not infer from `$HOME`, claude-code's default workspace, "
+            "or any prose in subsequent blocks."
         )
 
     if core_blocks:
