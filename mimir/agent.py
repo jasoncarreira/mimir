@@ -908,6 +908,21 @@ class Agent:
                         await bridge.send(event.channel_id, send_text)
                     except Exception as exc:
                         log.warning("bridge.send failed: %s", exc)
+                elif streaming.streamed_plan:
+                    # Edge case: a plan was flushed mid-turn with
+                    # final=False (typing indicator held), but the
+                    # model produced no result text after the last
+                    # tool call. Without an end-of-turn send the
+                    # indicator dangles in "still working" forever
+                    # (~9s on Discord, then auto-expires; longer on
+                    # Slack). Release it explicitly via the bridge's
+                    # cancel_typing API. Failures swallowed — typing
+                    # state is observability, not load-bearing.
+                    if hasattr(bridge, "cancel_typing"):
+                        try:
+                            await bridge.cancel_typing(event.channel_id)
+                        except Exception as exc:
+                            log.debug("bridge.cancel_typing failed: %s", exc)
 
         await log_event(
             "turn_finished",
