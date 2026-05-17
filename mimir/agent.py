@@ -747,6 +747,16 @@ class Agent:
         )
         await self._turn_logger.write(record)
 
+        # Phase 2a commitment extraction — on saga_session_end synthesis
+        # turns, extract structured commitments from the synthesis output
+        # via a haiku-tier ``query()`` call and persist net-new ones to
+        # ``CommitmentsStore``. Pre-181-I this lived in
+        # ``CommitmentExtractionHook`` on the SDK turn-lifecycle chain;
+        # the deepagents agent has no equivalent hook chain so the call
+        # is inlined here. Best-effort: failures log + continue, the
+        # turn record is unaffected.
+        await self._maybe_extract_commitments(ctx, event, record)
+
         # Bridge to channel out (send_message). Default sends the
         # reply text to the originating channel. Bridge-specific
         # logic that lived in the SDK Agent (typing indicator,
@@ -773,6 +783,133 @@ class Agent:
             stop_reason=result_fields.get("stop_reason"),
         )
         return record
+
+    async def _maybe_extract_commitments(
+        self, ctx: Any, event: AgentEvent, record: TurnRecord,
+    ) -> None:
+        """Phase 2a: extract commitments from a saga_session_end synthesis
+        output and persist net-new records to the CommitmentsStore.
+
+        Direct port of ``CommitmentExtractionHook.finalize`` from main —
+        the SDK-era hook chain is gone, so the deepagents agent runs
+        this inline after writing the TurnRecord. Best-effort throughout:
+        every failure path logs + returns; the synthesis turn's own
+        record is unaffected.
+
+        Events emitted:
+          - ``commitments_extracted`` on ≥1 added record (carries count,
+            skipped_dedupe, prompt_version)
+          - ``commitments_extraction_no_op`` with reason in
+            {short_output, llm_returned_zero, all_dedupe_skipped} when
+            the path ran but added nothing — distinguishable in
+            backtests from "skipped extraction entirely."
+
+        Suppressed when:
+          - ``ctx.trigger != "saga_session_end"`` (this hook is
+            synthesis-only — the per-message extraction path is a
+            different design).
+          - ``self._commitments is None`` (test harnesses construct
+            the Agent without a store).
+          - ``record.output`` is empty (LLM returned nothing or the
+            ainvoke errored).
+        """
+        if ctx.trigger != "saga_session_end":
+            return
+        if self._commitments is None:
+            return
+        output = getattr(record, "output", "") or ""
+        if not output:
+            return
+
+        from .commitments.extractor import (
+            EXTRACTION_PROMPT_VERSION,
+            MIN_OUTPUT_LEN,
+            extract_commitments,
+        )
+
+        if len(output) < MIN_OUTPUT_LEN:
+            await log_event(
+                "commitments_extraction_no_op",
+                reason="short_output",
+                output_len=len(output),
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+            )
+            return
+
+        try:
+            extracted = await extract_commitments(
+                output,
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+            )
+        except Exception:  # noqa: BLE001 — best-effort, never crash a turn
+            log.exception(
+                "commitment extraction failed for turn %s; skipping",
+                ctx.turn_id,
+            )
+            return
+
+        if not extracted:
+            await log_event(
+                "commitments_extraction_no_op",
+                reason="llm_returned_zero",
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+            )
+            return
+
+        # Snapshot dedupe keys once — N×|JSONL| in the prior shape,
+        # N + |JSONL| this way. ``current_state`` returns active records
+        # only, matching the find_by_dedupe_key semantics.
+        state = self._commitments.current_state()
+        existing_keys = {
+            r.dedupe_key
+            for r in state.values()
+            if r.dedupe_key and not r.is_terminal()
+        }
+
+        added = 0
+        skipped_dedupe = 0
+        for rec in extracted:
+            if rec.dedupe_key in existing_keys:
+                skipped_dedupe += 1
+                continue
+            try:
+                await self._commitments.add(rec)
+                added += 1
+                existing_keys.add(rec.dedupe_key)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "commitments store.add failed for record %s", rec.id,
+                )
+
+        if added > 0:
+            await log_event(
+                "commitments_extracted",
+                count=added,
+                skipped_dedupe=skipped_dedupe,
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+            )
+        else:
+            await log_event(
+                "commitments_extraction_no_op",
+                reason="all_dedupe_skipped",
+                extracted_count=len(extracted),
+                skipped_dedupe=skipped_dedupe,
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+            )
 
     # ────────────────────────────────────────────────────────────
     # System prompt assembly
