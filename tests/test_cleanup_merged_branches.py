@@ -30,33 +30,37 @@ import cleanup_merged_branches as cmb  # noqa: E402
 
 def test_classify_branch_no_prs_returns_no_pr() -> None:
     """Local-only experiment branches have no associated PRs."""
-    status, pr_num = cmb.classify_branch([])
+    status, pr_num, also_open = cmb.classify_branch([])
     assert status == cmb.NO_PR
     assert pr_num is None
+    assert also_open is None
 
 
 def test_classify_branch_single_merged_pr_returns_merged() -> None:
-    status, pr_num = cmb.classify_branch(
+    status, pr_num, also_open = cmb.classify_branch(
         [{"number": 42, "state": "MERGED", "mergedAt": "2026-05-12T14:33:10Z"}]
     )
     assert status == cmb.MERGED
     assert pr_num == 42
+    assert also_open is None
 
 
 def test_classify_branch_single_open_pr_returns_open() -> None:
-    status, pr_num = cmb.classify_branch(
+    status, pr_num, also_open = cmb.classify_branch(
         [{"number": 171, "state": "OPEN", "mergedAt": None}]
     )
     assert status == cmb.OPEN
     assert pr_num == 171
+    assert also_open is None
 
 
 def test_classify_branch_single_closed_unmerged_pr_returns_closed() -> None:
-    status, pr_num = cmb.classify_branch(
+    status, pr_num, also_open = cmb.classify_branch(
         [{"number": 99, "state": "CLOSED", "mergedAt": None}]
     )
     assert status == cmb.CLOSED_UNMERGED
     assert pr_num == 99
+    assert also_open is None
 
 
 def test_classify_branch_merged_wins_over_open() -> None:
@@ -65,14 +69,17 @@ def test_classify_branch_merged_wins_over_open() -> None:
     Rationale: 'the work is in main' is the safety-determining fact.
     A later reused-branch PR being open doesn't change that the
     branch's content is already in main (as a squash commit).
+    The also-open PR number is surfaced so the printer can warn the
+    operator that the branch name is in active use upstream.
     """
     prs = [
         {"number": 50, "state": "OPEN", "mergedAt": None},
         {"number": 30, "state": "MERGED", "mergedAt": "2026-05-01T00:00:00Z"},
     ]
-    status, pr_num = cmb.classify_branch(prs)
+    status, pr_num, also_open = cmb.classify_branch(prs)
     assert status == cmb.MERGED
     assert pr_num == 30
+    assert also_open == 50
 
 
 def test_classify_branch_open_wins_over_closed_unmerged() -> None:
@@ -80,9 +87,27 @@ def test_classify_branch_open_wins_over_closed_unmerged() -> None:
         {"number": 99, "state": "CLOSED", "mergedAt": None},
         {"number": 100, "state": "OPEN", "mergedAt": None},
     ]
-    status, pr_num = cmb.classify_branch(prs)
+    status, pr_num, also_open = cmb.classify_branch(prs)
     assert status == cmb.OPEN
     assert pr_num == 100
+    assert also_open is None
+
+
+def test_classify_branch_merged_without_open_has_no_warning() -> None:
+    """MERGED + CLOSED-unmerged (no OPEN) should NOT surface an also_open warning.
+
+    Only the MERGED + active-OPEN case is operator-relevant (the
+    upstream branch-name collision risk). A merged + later-closed
+    cycle is fully done and warrants no warning.
+    """
+    prs = [
+        {"number": 30, "state": "MERGED", "mergedAt": "2026-05-01T00:00:00Z"},
+        {"number": 31, "state": "CLOSED", "mergedAt": None},
+    ]
+    status, pr_num, also_open = cmb.classify_branch(prs)
+    assert status == cmb.MERGED
+    assert pr_num == 30
+    assert also_open is None
 
 
 def test_collect_branch_statuses_excludes_current_and_main() -> None:
@@ -110,7 +135,7 @@ def test_collect_branch_statuses_excludes_current_and_main() -> None:
     assert "main" not in seen_branches
     assert "current-feature" not in seen_branches
     assert sorted(seen_branches) == ["another-merged", "old-feature"]
-    assert sorted(b for b, _ in buckets[cmb.MERGED]) == [
+    assert sorted(b for b, _, _ in buckets[cmb.MERGED]) == [
         "another-merged",
         "old-feature",
     ]
@@ -137,10 +162,10 @@ def test_collect_branch_statuses_buckets_each_category() -> None:
         pr_lister=fake_pr_lister,
     )
 
-    assert buckets[cmb.MERGED] == [("feature-merged", 10)]
-    assert buckets[cmb.OPEN] == [("feature-open", 20)]
-    assert buckets[cmb.CLOSED_UNMERGED] == [("feature-closed", 30)]
-    assert buckets[cmb.NO_PR] == [("feature-local", None)]
+    assert buckets[cmb.MERGED] == [("feature-merged", 10, None)]
+    assert buckets[cmb.OPEN] == [("feature-open", 20, None)]
+    assert buckets[cmb.CLOSED_UNMERGED] == [("feature-closed", 30, None)]
+    assert buckets[cmb.NO_PR] == [("feature-local", None, None)]
 
 
 def test_collect_branch_statuses_respects_extra_skip_branches() -> None:
@@ -165,7 +190,7 @@ def test_collect_branch_statuses_respects_extra_skip_branches() -> None:
     assert "main" not in calls
     assert "release" not in calls
     assert calls == ["old-feature"]
-    assert [b for b, _ in buckets[cmb.MERGED]] == ["old-feature"]
+    assert [b for b, _, _ in buckets[cmb.MERGED]] == ["old-feature"]
 
 
 def test_collect_branch_statuses_ignores_empty_strings() -> None:
@@ -199,6 +224,230 @@ def test_classify_branch_unknown_state_falls_through_to_closed_unmerged() -> Non
     accidentally classifying as MERGED.
     """
     prs = [{"number": 200, "state": "DRAFT", "mergedAt": None}]
-    status, pr_num = cmb.classify_branch(prs)
+    status, pr_num, also_open = cmb.classify_branch(prs)
     assert status == cmb.CLOSED_UNMERGED
     assert pr_num == 200
+    assert also_open is None
+
+
+def test_print_buckets_surfaces_also_open_warning(capsys: pytest.CaptureFixture[str]) -> None:
+    """When a merged branch also has an OPEN PR upstream, the printer
+    emits a warning suffix so the operator sees the reused-branch
+    collision risk in the dry-run output."""
+    buckets = {
+        cmb.MERGED: [("reused-branch", 30, 50)],
+        cmb.OPEN: [],
+        cmb.CLOSED_UNMERGED: [],
+        cmb.NO_PR: [],
+    }
+    cmb._print_buckets(buckets, apply=False)
+    out = capsys.readouterr().out
+    assert "reused-branch" in out
+    assert "PR #30" in out
+    # The also-open warning surfaces both the upstream PR number and
+    # the collision rationale.
+    assert "ALSO has OPEN PR #50" in out
+    assert "reused branch name" in out
+
+
+def test_print_buckets_omits_warning_when_no_also_open(capsys: pytest.CaptureFixture[str]) -> None:
+    """The clean merged case (no other open PR) gets no suffix."""
+    buckets = {
+        cmb.MERGED: [("clean-merged", 42, None)],
+        cmb.OPEN: [],
+        cmb.CLOSED_UNMERGED: [],
+        cmb.NO_PR: [],
+    }
+    cmb._print_buckets(buckets, apply=False)
+    out = capsys.readouterr().out
+    assert "clean-merged" in out
+    assert "PR #42" in out
+    assert "ALSO has OPEN" not in out
+
+
+# -- _confirm_delete + main() --apply / --no-confirm gating ----------------
+
+
+def test_confirm_delete_accepts_yes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Typing 'yes' (any case, optional whitespace) returns True."""
+    for answer in ("yes", "YES", "  Yes  ", "yEs"):
+        monkeypatch.setattr("builtins.input", lambda _prompt, _a=answer: _a)
+        assert cmb._confirm_delete(3) is True
+
+
+def test_confirm_delete_rejects_anything_else(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Anything other than 'yes' — y, no, empty, garbage — returns False."""
+    for answer in ("y", "no", "", "n", "delete", "ok"):
+        monkeypatch.setattr("builtins.input", lambda _prompt, _a=answer: _a)
+        assert cmb._confirm_delete(3) is False
+
+
+def test_confirm_delete_treats_eof_as_no(monkeypatch: pytest.MonkeyPatch) -> None:
+    """EOF (Ctrl-D, non-interactive stdin) is a 'no' so we fail closed.
+
+    This is the load-bearing safety property: sub-agent invocations
+    without a tty must not silently proceed with destructive deletes
+    just because ``input()`` raised. Pass ``--no-confirm`` explicitly
+    to skip the prompt.
+    """
+    def raise_eof(_prompt: str) -> str:
+        raise EOFError()
+    monkeypatch.setattr("builtins.input", raise_eof)
+    assert cmb._confirm_delete(5) is False
+
+
+def test_main_apply_no_confirm_skips_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """``--apply --no-confirm`` does not call ``input()`` and proceeds to delete."""
+    monkeypatch.setattr(cmb, "_list_local_branches", lambda: ["old-feature"])
+    monkeypatch.setattr(cmb, "_current_branch", lambda: "main")
+    monkeypatch.setattr(
+        cmb,
+        "collect_branch_statuses",
+        lambda *a, **kw: {
+            cmb.MERGED: [("old-feature", 42, None)],
+            cmb.OPEN: [],
+            cmb.CLOSED_UNMERGED: [],
+            cmb.NO_PR: [],
+        },
+    )
+
+    delete_calls: list[list[tuple[str, int | None, int | None]]] = []
+
+    def fake_delete(candidates: list[tuple[str, int | None, int | None]]) -> list[tuple[str, str]]:
+        delete_calls.append(candidates)
+        return []
+
+    monkeypatch.setattr(cmb, "_delete_branches", fake_delete)
+
+    def raise_if_called(_prompt: str) -> str:
+        raise AssertionError("input() must not be called with --no-confirm")
+    monkeypatch.setattr("builtins.input", raise_if_called)
+
+    rc = cmb.main(["--apply", "--no-confirm"])
+    assert rc == 0
+    assert delete_calls == [[("old-feature", 42, None)]]
+
+
+def test_main_apply_prompts_and_aborts_on_no(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """``--apply`` without ``--no-confirm`` prompts; a non-yes answer aborts."""
+    monkeypatch.setattr(cmb, "_list_local_branches", lambda: ["old-feature"])
+    monkeypatch.setattr(cmb, "_current_branch", lambda: "main")
+    monkeypatch.setattr(
+        cmb,
+        "collect_branch_statuses",
+        lambda *a, **kw: {
+            cmb.MERGED: [("old-feature", 42, None)],
+            cmb.OPEN: [],
+            cmb.CLOSED_UNMERGED: [],
+            cmb.NO_PR: [],
+        },
+    )
+
+    delete_called = False
+
+    def fake_delete(_candidates: list[tuple[str, int | None, int | None]]) -> list[tuple[str, str]]:
+        nonlocal delete_called
+        delete_called = True
+        return []
+
+    monkeypatch.setattr(cmb, "_delete_branches", fake_delete)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+
+    rc = cmb.main(["--apply"])
+    assert rc == 0
+    assert delete_called is False
+    err = capsys.readouterr().err
+    assert "aborted" in err
+
+
+def test_main_apply_prompts_and_proceeds_on_yes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--apply`` without ``--no-confirm`` prompts; ``yes`` proceeds with deletes."""
+    monkeypatch.setattr(cmb, "_list_local_branches", lambda: ["old-feature"])
+    monkeypatch.setattr(cmb, "_current_branch", lambda: "main")
+    monkeypatch.setattr(
+        cmb,
+        "collect_branch_statuses",
+        lambda *a, **kw: {
+            cmb.MERGED: [("old-feature", 42, None)],
+            cmb.OPEN: [],
+            cmb.CLOSED_UNMERGED: [],
+            cmb.NO_PR: [],
+        },
+    )
+
+    delete_calls: list[list[tuple[str, int | None, int | None]]] = []
+
+    def fake_delete(candidates: list[tuple[str, int | None, int | None]]) -> list[tuple[str, str]]:
+        delete_calls.append(candidates)
+        return []
+
+    monkeypatch.setattr(cmb, "_delete_branches", fake_delete)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
+
+    rc = cmb.main(["--apply"])
+    assert rc == 0
+    assert delete_calls == [[("old-feature", 42, None)]]
+
+
+def test_main_apply_empty_merged_skips_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--apply`` with no merged candidates skips the prompt entirely.
+
+    No destructive action means no confirmation needed; treating it as a
+    silent zero-work return matches the dry-run path's behavior.
+    """
+    monkeypatch.setattr(cmb, "_list_local_branches", lambda: [])
+    monkeypatch.setattr(cmb, "_current_branch", lambda: "main")
+    monkeypatch.setattr(
+        cmb,
+        "collect_branch_statuses",
+        lambda *a, **kw: {
+            cmb.MERGED: [],
+            cmb.OPEN: [],
+            cmb.CLOSED_UNMERGED: [],
+            cmb.NO_PR: [],
+        },
+    )
+
+    def raise_if_called(_prompt: str) -> str:
+        raise AssertionError("input() must not be called when merged is empty")
+    monkeypatch.setattr("builtins.input", raise_if_called)
+
+    rc = cmb.main(["--apply"])
+    assert rc == 0
+
+
+def test_delete_branches_proc_runner_kwarg_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_delete_branches`` accepts ``proc_runner`` (renamed from ``git_runner``).
+
+    Pins the keyword name so a future-bot grepping for ``git_runner`` doesn't
+    accidentally collide with the str-returning runners on
+    ``_list_local_branches`` / ``_current_branch``.
+    """
+    seen_args: list[list[str]] = []
+
+    class _FakeResult:
+        returncode = 0
+        stderr = ""
+
+    def fake_runner(args: list[str]) -> _FakeResult:
+        seen_args.append(args)
+        return _FakeResult()
+
+    failures = cmb._delete_branches(
+        [("old-feature", 42, None)],
+        proc_runner=fake_runner,
+    )
+    assert failures == []
+    assert seen_args == [["branch", "-D", "old-feature"]]
