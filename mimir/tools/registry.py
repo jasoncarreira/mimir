@@ -531,7 +531,7 @@ def all_mimir_tools() -> list:
     """
     from .memory import memory_query
     from .store import memory_store
-    from .extra import file_search, mimir_get_turn, shell_exec
+    from .extra import file_search, get_turn, mimir_get_turn, shell_exec
     from .web import web_tools_enabled
     from .shell_async import bash_async, bash_job_output, bash_jobs_list
     from .saga_ops import (
@@ -547,8 +547,10 @@ def all_mimir_tools() -> list:
         saga_feedback, saga_mark_contributions, saga_end_session, saga_forget,
         # Indexer (file search)
         file_search,
-        # Turn-history lookup
-        mimir_get_turn,
+        # Turn-history lookup (mimir_get_turn is canonical; get_turn
+        # is a back-compat alias for skill prompts that reference the
+        # pre-rename name)
+        mimir_get_turn, get_turn,
         # Shell exec (allowlist-scoped, sync — fine for sub-second cmds)
         shell_exec,
         # Async shell — long-running jobs that wake the agent via
@@ -576,4 +578,10 @@ def all_mimir_tools() -> list:
     # MCP servers come up; empty when MCP is unconfigured).
     from .mcp import get_mcp_tools
     tools.extend(get_mcp_tools())
+    # Per-turn tool-call budget gate (181-N). Each tool gets a thin
+    # wrapper that increments TurnContext.tool_call_count and refuses
+    # invocations past Config.tool_call_budget. Idempotent — wrapping
+    # an already-wrapped tool is a no-op.
+    from .budget_gate import apply_budget_gate
+    tools = [apply_budget_gate(t) for t in tools]
     return tools

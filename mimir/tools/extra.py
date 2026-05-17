@@ -90,6 +90,35 @@ def set_turns_log_path(path: Path) -> None:
     _TURN_STATE["turns_log_path"] = path
 
 
+def _read_turn_record(turn_id: str) -> str:
+    """Implementation shared between ``mimir_get_turn`` and its
+    ``get_turn`` alias. Reads turns.jsonl, returns the matching record
+    JSON-formatted with large derived fields stripped, or an error
+    string."""
+    if not turn_id or not turn_id.strip():
+        return "get_turn failed: turn_id is required"
+    path = _TURN_STATE["turns_log_path"]
+    if path is None:
+        return "get_turn failed: turns log path not configured"
+    if not path.exists():
+        return f"get_turn failed: turns log not found at {path}"
+    target = turn_id.strip()
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("turn_id") == target:
+                for k in ("input", "saga_atom_ids", "usage"):
+                    row.pop(k, None)
+                return json.dumps(row, indent=2, ensure_ascii=False)
+    return f"get_turn: no turn found with id {target!r}"
+
+
 @tool
 def mimir_get_turn(turn_id: str) -> str:
     """Retrieve the full record for one previous agent turn by its ID.
@@ -106,30 +135,20 @@ def mimir_get_turn(turn_id: str) -> str:
         (it's a derived prompt-render — preserve context budget). Or
         an error if not found.
     """
-    if not turn_id or not turn_id.strip():
-        return "mimir_get_turn failed: turn_id is required"
-    path = _TURN_STATE["turns_log_path"]
-    if path is None:
-        return "mimir_get_turn failed: turns log path not configured"
-    if not path.exists():
-        return f"mimir_get_turn failed: turns log not found at {path}"
-    target = turn_id.strip()
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # skip malformed lines
-            if row.get("turn_id") == target:
-                # Strip input + saga_atom_ids + usage (large fields not
-                # needed for the agent's debugging use case)
-                for k in ("input", "saga_atom_ids", "usage"):
-                    row.pop(k, None)
-                return json.dumps(row, indent=2, ensure_ascii=False)
-    return f"mimir_get_turn: no turn found with id {target!r}"
+    return _read_turn_record(turn_id)
+
+
+@tool
+def get_turn(turn_id: str) -> str:
+    """Alias of ``mimir_get_turn`` for back-compat with skill prompts.
+
+    Pre-181-N the tool was named ``get_turn`` on main; the deepagents
+    cutover renamed it to ``mimir_get_turn`` without leaving a shim.
+    Skill markdowns + system prompts that reference the old name would
+    silently fail with "tool not found." Both names work now; prefer
+    ``mimir_get_turn`` going forward (it's namespaced to mimir).
+    """
+    return _read_turn_record(turn_id)
 
 
 # ────────────────────────────────────────────────────────────────────

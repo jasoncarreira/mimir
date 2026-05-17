@@ -15,6 +15,7 @@ from .memory import memory_query, set_memory_client
 from .store import memory_store
 from .extra import (
     file_search,
+    get_turn,
     mimir_get_turn,
     set_indexer,
     set_shell_allowlist,
@@ -72,6 +73,7 @@ __all__ = [
     "memory_store",
     "file_search",
     "mimir_get_turn",
+    "get_turn",
     "shell_exec",
     "send_message",
     "react",

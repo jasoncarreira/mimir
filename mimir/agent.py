@@ -586,6 +586,11 @@ class Agent:
                 hard_limit=self._config.send_loop_hard_limit,
                 similarity_threshold=self._config.send_loop_similarity,
             ),
+            # Tool-call budget (181-N). The langchain @tool wrappers
+            # installed by ``apply_budget_gate`` in registry.py read
+            # this off the TurnContext and refuse tool calls past
+            # the cap. 0 disables (matches main's contract).
+            tool_call_budget=self._config.tool_call_budget,
         )
         # WikiBacklinksHook pre-snapshot — capture mtimes of every
         # state/wiki/ content page BEFORE the model loop runs so the
