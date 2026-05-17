@@ -15,7 +15,6 @@ from pathlib import Path
 
 import pytest
 
-from mimir.hooks import make_post_tool_use_hook
 from mimir.search import (
     HashEmbedder,
     Indexer,
@@ -24,7 +23,21 @@ from mimir.search import (
     _classify_scope,
     _to_fts_query,
 )
-from mimir.searchtools import build_search_tools
+
+# ``mimir.hooks`` and ``mimir.searchtools`` were retired in the
+# deepagents migration (post-PR #185 merge target). Tests that use
+# them are skipped when the modules aren't importable; the remaining
+# tests (including the PR #185 _to_fts_query regression coverage)
+# still exercise mimir.search directly.
+try:
+    from mimir.hooks import make_post_tool_use_hook  # type: ignore[import-not-found]
+except ImportError:
+    make_post_tool_use_hook = None  # type: ignore[assignment]
+
+try:
+    from mimir.searchtools import build_search_tools  # type: ignore[import-not-found]
+except ImportError:
+    build_search_tools = None  # type: ignore[assignment]
 
 
 def _seed(home: Path) -> None:
@@ -374,6 +387,11 @@ def test_query_embedding_cache_returns_immutable_tuple(tmp_path: Path):
 # ---- file_search tool wrapper --------------------------------------------
 
 
+@pytest.mark.skipif(
+    build_search_tools is None,
+    reason="mimir.searchtools retired in deepagents migration; tool surface "
+    "is now mimir.tools.* (covered by separate tests).",
+)
 @pytest.mark.asyncio
 async def test_file_search_tool_returns_json(tmp_path: Path):
     _seed(tmp_path)
@@ -389,6 +407,10 @@ async def test_file_search_tool_returns_json(tmp_path: Path):
     assert any("boids.md" in r["path"] for r in payload)
 
 
+@pytest.mark.skipif(
+    build_search_tools is None,
+    reason="mimir.searchtools retired in deepagents migration",
+)
 @pytest.mark.asyncio
 async def test_file_search_tool_invalid_scope(tmp_path: Path):
     idx = _make_indexer(tmp_path)
@@ -398,6 +420,10 @@ async def test_file_search_tool_invalid_scope(tmp_path: Path):
     assert out.get("is_error") is True
 
 
+@pytest.mark.skipif(
+    build_search_tools is None,
+    reason="mimir.searchtools retired in deepagents migration",
+)
 @pytest.mark.asyncio
 async def test_rebuild_index_tool_reports_counts(tmp_path: Path):
     _seed(tmp_path)
@@ -415,6 +441,12 @@ async def test_rebuild_index_tool_reports_counts(tmp_path: Path):
 # ---- PostToolUse hook → indexer reindex ---------------------------------
 
 
+@pytest.mark.skipif(
+    make_post_tool_use_hook is None,
+    reason="mimir.hooks retired in deepagents migration; reindex-on-write is "
+    "wired via WikiBacklinksHook + post-turn hooks in mimir/agent.py "
+    "(covered by separate tests).",
+)
 @pytest.mark.asyncio
 async def test_post_tool_use_hook_reindexes_after_write(tmp_path: Path):
     """SDK preset Write fires PostToolUse; the hook calls indexer.reindex_path."""

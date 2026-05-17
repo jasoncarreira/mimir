@@ -1,24 +1,47 @@
 [project]
 name = "mimir"
 version = "0.1.0"
-description = "Memory-centric agent harness on the Claude Agent SDK"
+description = "Memory-centric agent harness on deepagents / LangGraph"
 requires-python = ">=3.11"
 authors = [{ name = "jcarreira" }]
 license = { text = "MIT" }
 
 dependencies = [
-    "claude-agent-sdk>=0.1.58",
+    # Core: agent loop + memory backend.
+    # claude-agent-sdk was removed post-cutover (2026-05-14); the agent
+    # loop now runs through deepagents (LangGraph). Model adapters are
+    # optional extras — see [project.optional-dependencies] below.
     "aiohttp>=3.12",
     "apscheduler>=3.11",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "fastembed>=0.4",
-    # v0.5 §2: saga is the in-process memory backend. Workspace member;
-    # editable-installed via [tool.uv.sources] below.
+    # saga is the in-process memory backend. Workspace member;
+    # editable-installed via [tool.uv.sources] below. Will fold into
+    # ``mimir.memory`` on the rename pass; flag is the
+    # MIMIR_LEGACY_INPROCESS_SAGA escape hatch (also retiring then).
     "saga",
+    "deepagents>=0.6.1",
+    "langchain>=1.3",
+    "requests>=2.33.1",
 ]
 
 [project.optional-dependencies]
+# Model-provider extras — install the one(s) you'll actually use.
+# Agent.resolve_model dispatches on the ``MIMIR_MODEL_SPEC`` prefix
+# (``claude-code:``, ``anthropic:``, ``openai:`` etc.) and lazy-imports
+# the matching package, so installing only one keeps the dep graph
+# small. Pick at least one or the agent can't build a model.
+claude-code = [
+    "langchain-claude-code>=0.1.0",
+]
+anthropic = [
+    "langchain-anthropic>=1.4",
+]
+openai = [
+    "langchain-openai>=1.2.1",
+]
+# Bridge extras — install if you want that bridge.
 discord = [
     "discord-py>=2.6",
 ]
@@ -26,11 +49,15 @@ slack = [
     "slack-bolt>=1.18",
 ]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
     "pytest-aiohttp>=1.0",
     "discord-py>=2.6",
     "slack-bolt>=1.18",
+    # Tests touch all three model adapters at the import level.
+    "langchain-claude-code>=0.1.0",
+    "langchain-anthropic>=1.4",
+    "langchain-openai>=1.2.1",
 ]
 
 [project.scripts]
@@ -53,6 +80,14 @@ include = [
     "mimir/templates/**/*",
     "mimir/turn_viewer.html",
 ]
+# Belt-and-suspenders: nothing under ``deepagent_poc/`` (deleted in
+# the cutover, but the exclude prevents accidental re-add from sneaking
+# into a wheel), no smoke-artifact SQLite dumps, no transient bench logs.
+exclude = [
+    "mimir/deepagent_poc/**",
+    "mimir/**/_smoke_*",
+    "mimir/**/_bench_*.log",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -70,3 +105,19 @@ members = ["saga"]
 # saga.core / saga.benchmarks are importable from anywhere in the workspace.
 [tool.uv.sources]
 saga = { workspace = true }
+
+[dependency-groups]
+# uv-native dependency group (PEP 735). Mirrors
+# ``[project.optional-dependencies].dev`` so ``uv sync`` and
+# ``pip install -e ".[dev]"`` both pull the same test toolchain
+# plus all three model adapters (tests import each at module level).
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "pytest-aiohttp>=1.0",
+    "discord-py>=2.6",
+    "slack-bolt>=1.18",
+    "langchain-claude-code>=0.1.0",
+    "langchain-anthropic>=1.4",
+    "langchain-openai>=1.2.1",
+]

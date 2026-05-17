@@ -10,7 +10,8 @@ unfinished items into 100-1100 chars of prose; this module asks Claude
 - Not the agent loop: the session-end synthesis turn is already an
   LLM call; we don't want to wrap that in another LLM call from the
   same loop. The extraction runs in the finalize hook on a separate
-  ``claude_agent_sdk.query()`` (one-shot, OAuth path, haiku-tier).
+  one-shot LLM call via ``langchain.chat_models.init_chat_model``
+  (haiku-tier by default; configurable via the ``model`` kwarg).
 - Not a poller: session-end output is event-driven, not time-driven.
   A poller would either miss output (debounced) or re-extract the
   same content (idempotent only via the store's dedupe-key gate).
@@ -285,40 +286,37 @@ async def extract_commitments(
     if not session_end_output or len(session_end_output) < MIN_OUTPUT_LEN:
         return []
 
-    # Import the SDK at call time (not module load) so the test path
-    # can monkeypatch ``claude_agent_sdk.query`` without dragging in
-    # the live transport.
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        TextBlock,
-        query,
-    )
-
+    # Single-shot LLM call via langchain. Tests patch
+    # ``langchain.chat_models.init_chat_model`` to substitute a
+    # stub chat model — see test_commitments_extractor.py.
     user_msg = USER_TEMPLATE.format(
         channel_id=channel_id or "(none)",
-        ts="",  # injected at the LLM's discretion if it needs it
+        ts="",
         saga_session_id=saga_session_id or "(none)",
         output=session_end_output,
-    )
-    options = ClaudeAgentOptions(
-        system_prompt=EXTRACTION_SYSTEM,
-        model=model,
-        # No tools — text-only extraction. Constrains the loop to a
-        # single assistant turn.
-        allowed_tools=[],
-        max_turns=1,
     )
 
     raw_text = ""
     try:
-        async for msg in query(prompt=user_msg, options=options):
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        raw_text += block.text
+        from langchain.chat_models import init_chat_model
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        chat = init_chat_model(model or "anthropic:claude-haiku-4-5")
+        msgs = [
+            SystemMessage(content=EXTRACTION_SYSTEM),
+            HumanMessage(content=user_msg),
+        ]
+        response = await chat.ainvoke(msgs)
+        content = response.content
+        if isinstance(content, str):
+            raw_text = content
+        elif isinstance(content, list):
+            raw_text = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b)
+                for b in content
+            )
     except Exception:  # noqa: BLE001
-        log.exception("commitments extractor: SDK query failed")
+        log.exception("commitments extractor: LLM call failed")
         return []
 
     parsed = _parse_extraction_json(raw_text)

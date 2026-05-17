@@ -1,125 +1,109 @@
-"""Claude Agent SDK driver (SPEC §4.2, §9.3, §5.6).
+"""mimir.Agent — deepagents-backed.
 
-Run-turn flow:
-1. ``session_manager.touch(channel_id)`` — ensure an active SAGA session,
-   reset its idle timer, attach ``saga_session_id`` to the TurnContext.
-2. Append inbound to chat_history.jsonl + deques.
-3. Flush any pending INDEX.md rebuilds.
-4. Pre-message SAGA hook (skipped on ``trigger="saga_session_end"``):
-   query SAGA, format hits into the turn prompt, stash atom_ids.
-5. Build system + turn prompts. The synthesis turn uses a special template.
-6. Set the ``contextvars`` TurnContext so SAGA tools can auto-credit.
-7. Invoke ``query()``, collect messages, extract events.
-8. Append outbound to chat_history.jsonl.
-9. Post-message SAGA hook (skipped on ``trigger="saga_session_end"``):
-   call ``mark_contributions`` with the union of pre-injected and
-   mid-turn-queried atom_ids, scoped to the active session.
-10. End-of-turn INDEX.md rebuild (debounced, SPEC §3.4).
-11. Write the turns.jsonl record.
+Post-cutover (2026-05-14): replaces the 2459-LOC SDK-backed
+Agent class with a thin wrapper around LangGraph's deepagents.
 
-The TurnContext is the only mutable per-turn state. Subagent isolation
-is enforced by the SDK spawning each Task as a separate Claude Code
-subprocess — that's the load-bearing boundary, not asyncio ContextVars
-(which would copy the parent's *reference* to the same TurnContext
-object on ``create_task``, not a deep copy). The subprocess gets its
-own contextvars from a fresh process. Don't rely on ContextVar
-isolation for any in-process subagent that ever materializes; reset
-the contextvar at the task boundary if that case arrives.
+Public API preserved:
+  - Agent(config, turn_logger, message_buffer, ..., dispatcher=)
+  - agent.run_turn(event) -> TurnRecord
+  - dispatcher.set_run_turn(agent.run_turn)
+
+What's gone:
+  - ClientPool + _PoolEntry + _AcquireContext (~370 LOC) —
+    CompiledStateGraph is thread-safe; one shared singleton.
+  - SDK message-type handling — turn_logger walks LangChain
+    messages instead.
+  - HookMatcher chains — replaced by the external wrapper
+    pattern (memory pre-inject + post-message credit pass).
+  - InMemorySessionStore.delete() per turn — LangGraph handles
+    per-call state isolation via the ``thread_id`` config key.
+  - claude_agent_sdk dependency at the import level.
+
+What's kept:
+  - mimir.SessionManager / SubagentInbox / ChannelRegistry /
+    Dispatcher constructor wiring (runtime-agnostic infrastructure).
+  - TurnRecord schema (mimir/models.py).
+  - The Agent class shape so server.py + tests don't need
+    constructor-call rewrites.
+
+Subagent ``task`` tool: deepagents has one built-in. mimir's
+spawn-claude-code is a separate runtime concern (subprocess spawn);
+currently stubbed — re-wire in a follow-up.
 """
-
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import Any
 
-if TYPE_CHECKING:
-    from .dispatcher import Dispatcher
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage
 
-from claude_agent_sdk import (
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    HookMatcher,
-    InMemorySessionStore,
-    RateLimitEvent,
-    ResultMessage,
-    StreamEvent,
-    TaskNotificationMessage,
-    TaskProgressMessage,
-    TaskStartedMessage,
-    project_key_for_directory,
-)
-
-from . import _context
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .event_logger import log_event
 from .feedback import FeedbackLog
-from . import git_tracking
 from . import health
 from .history import MessageBuffer
-from .rate_limits import (
-    RateLimitStore,
-    record_api_usage,
-    running_on_claude_max,
-    snapshot_from_response_bucket,
-    snapshot_from_sdk_event,
-)
-from .session_boundary_log import SessionBoundaryLog, render_session_summaries
-from .usage_stats import event_recently_emitted
-from .hooks import make_post_tool_use_hook, make_pre_tool_use_hook
 from .index import IndexGenerator
-from .loop_detector import LoopDetector
-from .core_blocks import load_core
-from .models import AgentEvent, TurnContext, TurnRecord, make_turn_id
-from .saga_client import SagaClient, SagaError
+from . import _langchain_claude_code_patches as _lcc_patches
+from ._jsonl_tail import tail_jsonl_records
+from .jsonl_snapshot import JsonlSnapshot
+from .models import AgentEvent, TurnRecord
+from .prompts import build_system_prompt, build_turn_prompt
+from .rate_limits import RateLimitStore
+from .saga_client import SagaClient
+from .session_boundary_log import (
+    SessionBoundaryLog,
+    count_turns_since,
+    render_session_summaries,
+)
+from .subagent_inbox import SubagentInbox, render_subagent_updates
+from .templates import render_saga_session_end
+from .usage_stats import event_recently_emitted
+
+# Idempotent runtime patch for langchain-claude-code's ``_arun`` call —
+# see the module docstring for the bug + upstream PR. No-op if the
+# claude-code extra isn't installed.
+_lcc_patches.apply_patches()
+# Empty out deepagents' BASE_AGENT_PROMPT so it isn't appended to
+# mimir's system prompt. Mimir's prompt is the complete contract
+# (persona + memory layers + conventions + skills); the deepagents
+# generic framing competes with it. Match the SDK-era invariant of
+# "mimir's system_prompt is the only one." No-op when deepagents
+# isn't installed.
+_lcc_patches.strip_deepagents_base_prompt()
 from .sagatools import (
     _atom_ids_from_response,
-    _atoms_in_payload,
-    _format_atoms,
     _format_saga_payload,
     _source_atom_ids_from_triples,
 )
-from .prompts import build_system_prompt, build_turn_prompt
-from .scheduler import Scheduler
 from .search import Indexer
-from ._jsonl_tail import tail_jsonl_records
-from .jsonl_snapshot import JsonlSnapshot
 from .session_manager import SessionManager
-from .turn_hooks import (
-    CancelTypingHook,
-    CommitmentExtractionHook,
-    GitCommitHook,
-    IndexRebuildHook,
-    PlanQuotaCaptureHook,
-    PostMessageSagaHook,
-    RateLimitObserverHook,
-    SubagentLifecycleHook,
-    TurnLifecycleHook,
-    WikiBacklinksHook,
-    fire_finalize,
-    fire_on_message,
-    fire_post_query,
-    fire_pre_query,
+from .turn_logger import (
+    TurnLogger,
+    derive_result_fields,
+    extract_turn_events,
+    make_turn_id,
+    truncate_input,
 )
-from .shell_jobs import ShellJob, ShellJobRegistry
-from .subagent_inbox import SubagentInbox, SubagentResult, render_subagent_updates
-from .templates import render_saga_session_end
-from .tools import SDK_PRESET_TOOLS, allowed_tool_names, build_mcp_server
-from ._streaming_dispatch import StreamingAutoDispatcher
-from .turn_logger import TurnLogger, extract_turn_events, truncate_input
 
 log = logging.getLogger(__name__)
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(tz=timezone.utc).isoformat()
+# ────────────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────────────
 
 
 def _filter_session_turns(
-    turns_path,
+    turns_path: Path,
     saga_session_id: str,
     *,
     idle_minutes: int = 10,
@@ -127,36 +111,13 @@ def _filter_session_turns(
     """Read turns.jsonl tail-first and return records with the given
     saga_session_id, in chronological order.
 
-    Pre-2026-05-10 this forward-read the whole file. Synthesis turns
-    fire on session-idle (an operator-visible pause point) and the
-    file caps at ~250 MB; the read could block the to_thread worker
-    for seconds. Now we tail-read newest-first, accumulate matches,
-    and break once we've crossed past the saga session's natural
-    boundary.
-
-    **Bound shape (post-PR-105 review fix).** A previous version of
-    this function used a 200-record count-based break ("stop after
-    200 non-matching records past the first match"). That assumed the
-    target session's turns are contiguous in append-order, which is
-    *not* generally true: turns.jsonl is a single file shared across
-    channels and a long-lived session can interleave with hundreds
-    of other-session turns. The count heuristic could silently drop
-    older session turns from the synthesis prompt.
-
-    Replaced with a **time-based break**: saga ends a session after
-    ``idle_minutes`` of no activity, so any record older than
-    ``newest_match_ts - 2 * idle_minutes`` cannot belong to this
-    session. The 2× margin tolerates clock skew + a single
-    out-of-order record at the boundary. Walks back at most
-    ``2 * idle_minutes`` worth of file activity past the last match —
-    O(session_window) rather than O(file_size).
-
-    Caller (``Agent._render_saga_session_end_prompt``) passes
-    ``self._config.saga_session_idle_minutes`` so the bound matches
-    saga's actual session policy. The function-level default
-    (``idle_minutes=10``) mirrors ``MIMIR_SAGA_SESSION_IDLE_MINUTES``'s
-    config default — defensive only; production callers always
-    override.
+    Time-based break: saga ends a session after ``idle_minutes`` of no
+    activity, so any record older than ``newest_match_ts - 2 *
+    idle_minutes`` cannot belong to this session. The 2× margin
+    tolerates clock skew + a single out-of-order record at the
+    boundary. Walks back at most ``2 * idle_minutes`` worth of file
+    activity past the last match — O(session_window) rather than
+    O(file_size). (Ported verbatim from main.)
     """
     if not turns_path.is_file():
         return []
@@ -196,531 +157,170 @@ def _filter_session_turns(
     return out
 
 
-# ─── ClaudeSDKClient pool (migration stages 1-4) ────────────────────
-#
-# Stage 1 of CLAUDE_SDK_CLIENT_MIGRATION.md: route the agent loop through
-# a persistent ``ClaudeSDKClient`` instead of one-shot
-# ``claude_agent_sdk.query()``. The persistent client keeps the Claude
-# Code subprocess warm across turns.
-#
-# Stage 2: pass ``session_id=ctx.turn_id`` per call so each turn is
-# scoped to its own session inside the persistent client. Prior-turn
-# history can't leak into the next turn's input — the SDK's session
-# store keys conversation state by ``session_id``.
-#
-# Stage 3: an explicit ``InMemorySessionStore`` is attached to
-# ``ClaudeAgentOptions`` and ``Agent`` calls ``store.delete()`` after
-# each turn completes. The store is owned by ``Agent`` (not the
-# wrapper) because it has to survive client recycles — recycling the
-# client when options drift would otherwise reset all in-flight
-# session state. Per-turn delete bounds the store size so memory
-# stays flat across long-lived processes.
-#
-# Stage 4 (chainlink #11, this revision): a pool of warm
-# ``ClaudeSDKClient`` instances replaces the single-shared-client +
-# global ``asyncio.Lock``. The dispatcher allows up to
-# ``max_concurrent_turns`` turns to run concurrently, but every turn
-# previously serialized on a single SDK lock — undoing the parallelism.
-# The pool fixes that.
-#
-# Pool semantics (locked design):
-#   - Lazy fill, max size 10. No pre-warming.
-#   - Acquire: hand out an idle client if one is available; else if
-#     pool size < max, construct + connect a new client; else await a
-#     release.
-#   - Fingerprint-tracked drain: the pool tracks a single "current"
-#     fingerprint. When ``acquire(options)`` arrives with a different
-#     fingerprint, the pool flips its fingerprint, disconnects all
-#     idle clients immediately, and marks all in-flight clients
-#     stale. In-flight clients finish their current request, then on
-#     ``release`` see the stale flag and disconnect rather than
-#     re-pooling. New acquires after the flip create fresh clients
-#     with the new fingerprint. Net effect: mixed-fingerprint clients
-#     are never concurrently in use, and in-flight work is never
-#     abruptly disconnected.
-#   - ``get_context_usage()`` rides the pool — no dedicated client.
-#   - ``shutdown_sdk_client()`` disconnects every client in the pool
-#     (idle and in-flight); concurrent acquires after shutdown
-#     construct fresh clients (idempotent for tests / repeat startup).
-#
-# The original Stage 4 spec (CLAUDE_SDK_CLIENT_MIGRATION.md) prescribed
-# a ``threading.local`` cache, mirroring saga's old ``_PersistentClaudeCode``
-# (a daemon-thread + run_coroutine_threadsafe bridge — itself retired
-# in chainlink #47 / Phase 3 of #20 in favor of saga's async-native
-# ``_AsyncClaudeRunner``). ``threading.local`` was the wrong shape for
-# mimir regardless: mimir runs all turns on a single asyncio event loop
-# in a single OS thread, so ``threading.local`` would hand every coroutine
-# the same client — same serialization, just without the lock to make
-# it visible. The asyncio-aware pool here is the right shape for mimir's
-# runtime. The retired threading.local note in CLAUDE_SDK_CLIENT_MIGRATION.md
-# captures the reasoning.
-#
-# Test shape:
-#   The module-level ``query`` and ``get_context_usage`` names + their
-#   signatures are preserved so existing tests that
-#   ``patch("mimir.agent.query", ...)`` keep working unchanged. Tests
-#   that exercise the wrapper itself patch ``mimir.agent.ClaudeSDKClient``.
-
-import hashlib
+# ────────────────────────────────────────────────────────────────────
+# Model / tool resolution helpers
+# ────────────────────────────────────────────────────────────────────
 
 
-def _options_fingerprint(options: ClaudeAgentOptions) -> str:
-    """Hash the options fields that, if changed, require recycling the
-    underlying ClaudeSDKClient. Things bound to the client at connect
-    time go in here; per-call data (the prompt) does not.
+_PROVIDER_EXTRAS: dict[str, str] = {
+    "claude-code": "claude-code",  # → pip install 'mimir[claude-code]'
+    "anthropic": "anthropic",
+    "openai": "openai",
+}
 
-    Hooks/mcp_servers/tools are object references — they don't get
-    hashed (mimir's are stable across an Agent's lifetime). The
-    fingerprint is conservative: false-positive recycles are cheap,
-    false-negatives stale a connected client against new options.
+
+def _supports_responses_api() -> bool:
+    """Heuristic for whether to flip ``use_responses_api=True`` on OpenAI.
+
+    Real OpenAI implements the Responses API (``POST /responses``); drop-in
+    proxies (Groq, Together, DeepSeek, GLM, …) usually only implement
+    ``/chat/completions``, so defaulting to Responses would 404 every turn.
+    True when ``OPENAI_BASE_URL`` is unset or its parsed hostname equals
+    ``api.openai.com``. ``MIMIR_USE_RESPONSES_API=1|0`` overrides.
+
+    Uses ``urlparse(...).hostname`` rather than substring containment so
+    a crafted env value like ``https://api.openai.com.evil.example/v1``
+    doesn't trip the flag — the hostname comparison is exact.
     """
-    h = hashlib.sha256()
-    h.update((options.system_prompt or "").encode("utf-8"))
-    h.update(b"|")
-    h.update((options.model or "").encode("utf-8"))
-    h.update(b"|")
-    h.update((str(getattr(options, "effort", "")) or "").encode("utf-8"))
-    h.update(b"|")
-    h.update(str(options.permission_mode).encode("utf-8"))
-    h.update(b"|")
-    h.update(str(getattr(options, "include_partial_messages", False)).encode("utf-8"))
-    h.update(b"|")
-    h.update(str(options.cwd or "").encode("utf-8"))
-    return h.hexdigest()
+    from urllib.parse import urlparse as _urlparse
+
+    override = os.environ.get("MIMIR_USE_RESPONSES_API", "").strip().lower()
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if override in ("0", "false", "no", "off"):
+        return False
+    base_url = (os.environ.get("OPENAI_BASE_URL") or "").strip()
+    if not base_url:
+        return True
+    parsed_host = (_urlparse(base_url).hostname or "").lower()
+    return parsed_host == "api.openai.com"
 
 
-_POOL_MAX_SIZE = 10
-
-
-class _PoolEntry:
-    """A pool member: a connected (or pending-connect) ClaudeSDKClient
-    plus the fingerprint it was constructed with. ``stale`` is set when
-    the pool's current fingerprint flips while this client is in use —
-    on release the client disconnects instead of being returned.
-
-    ``cell`` is a ``_TurnCell`` whose reference is captured by the
-    SDK's forked hook task at first connect. Mutating ``cell.turn_id``
-    is how the budget hook learns which turn is currently using THIS
-    client (as opposed to some other client serving a different
-    channel concurrently)."""
-
-    __slots__ = ("client", "fingerprint", "stale", "cell")
-
-    def __init__(self, client: ClaudeSDKClient, fingerprint: str) -> None:
-        self.client = client
-        self.fingerprint = fingerprint
-        self.stale = False
-        from ._context import _TurnCell
-        self.cell = _TurnCell()
-
-
-from .saga.async_pool import BoundedAsyncPool
-
-
-class ClientPool(BoundedAsyncPool[_PoolEntry]):
-    """Asyncio-aware pool of ``ClaudeSDKClient`` instances. Replaces
-    the single-shared-client + global ``asyncio.Lock`` so concurrent
-    turns can run in parallel.
-
-    Inherits the bookkeeping skeleton (max-size validation, lazy
-    condition binding, idle stack) from ``saga.async_pool.BoundedAsyncPool``;
-    adds mimir-specific policy: fingerprint-keyed drain-on-flip, an
-    ``_in_flight`` set for size accounting (so ``size`` reflects both
-    idle and in-flight clients), and the release-during-connect lock
-    dance for async cold-start.
-
-    Not thread-safe — assumes a single asyncio event loop, which is
-    mimir's runtime model. The internal ``asyncio.Condition`` binds to
-    the running loop on first use.
-    """
-
-    def __init__(self, *, max_size: int = _POOL_MAX_SIZE) -> None:
-        super().__init__(max_size)
-        self._in_flight: set[_PoolEntry] = set()
-        # Pool's "current" fingerprint. None when empty (first acquire
-        # sets it). When acquire arrives with a different fingerprint,
-        # flips here and the drain happens.
-        self._current_fingerprint: str | None = None
-
-    @property
-    def size(self) -> int:
-        return len(self._idle) + len(self._in_flight)
-
-    async def _drain_idle_for_fingerprint_change(
-        self,
-        old_fingerprint: str,
-        new_fingerprint: str,
-    ) -> None:
-        """Disconnect every idle client; mark every in-flight client
-        stale so it disconnects on release. Caller holds the lock.
-
-        Emits a ``client_pool_drained`` event with both fingerprints
-        (truncated to the first 8 chars for readability) and the counts
-        of clients affected so an unstable system prompt — the most
-        common cause of repeated fingerprint flips — surfaces in
-        events.jsonl rather than only as latency drift. See CR#20."""
-        idle = self._idle
-        self._idle = []
-        idle_disconnected = len(idle)
-        in_flight_marked_stale = len(self._in_flight)
-        for entry in idle:
-            try:
-                await entry.client.disconnect()
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "ClaudeSDKClient disconnect failed during pool drain "
-                    "(continuing — fresh clients will replace it)"
-                )
-        for entry in self._in_flight:
-            entry.stale = True
-        await log_event(
-            "client_pool_drained",
-            old_fingerprint_8=old_fingerprint[:8],
-            new_fingerprint_8=new_fingerprint[:8],
-            idle_disconnected=idle_disconnected,
-            in_flight_marked_stale=in_flight_marked_stale,
-        )
-
-    async def acquire(self, options: ClaudeAgentOptions) -> _PoolEntry:
-        """Claim a client for an exclusive request. Caller MUST call
-        ``release(entry)`` when done (use ``acquire_ctx`` for
-        ``async with`` form)."""
-        fingerprint = _options_fingerprint(options)
-        cond = self._condition()
-        async with cond:
-            while True:
-                # Fingerprint flip: drain idle clients and mark in-flight
-                # ones stale. Re-evaluated on every loop iteration so a
-                # late-arriving flip while we're waiting is handled.
-                if (
-                    self._current_fingerprint is not None
-                    and self._current_fingerprint != fingerprint
-                ):
-                    await self._drain_idle_for_fingerprint_change(
-                        self._current_fingerprint, fingerprint
-                    )
-                    self._current_fingerprint = fingerprint
-                elif self._current_fingerprint is None:
-                    self._current_fingerprint = fingerprint
-
-                # Hand out an idle client if one is at the current
-                # fingerprint. Drained-but-not-yet-disconnected entries
-                # would only land here if the drain code path missed
-                # them — guard defensively.
-                while self._idle:
-                    entry = self._idle.pop()
-                    if entry.fingerprint == fingerprint and not entry.stale:
-                        self._in_flight.add(entry)
-                        return entry
-                    # Defensive: disconnect a stale/mismatched idle.
-                    try:
-                        await entry.client.disconnect()
-                    except Exception:  # noqa: BLE001
-                        log.exception(
-                            "ClaudeSDKClient disconnect of stale idle entry failed"
-                        )
-
-                # No idle client at current fingerprint; grow if room.
-                if self.size < self.max_size:
-                    client = ClaudeSDKClient(options=options)
-                    entry = _PoolEntry(client, fingerprint)
-                    # Reserve the slot before releasing the lock so
-                    # size accounting is correct during connect (other
-                    # waiters won't double-grow past max_size).
-                    self._in_flight.add(entry)
-                    cond.release()
-                    # Bind THIS client's ``_TurnCell`` to the contextvar
-                    # before connect. The SDK forks the hook control
-                    # task during ``connect()`` and that task captures
-                    # the contextvar value at fork time — capturing the
-                    # cell reference means later mutations of
-                    # ``entry.cell.turn_id`` (on each acquire/release)
-                    # remain visible to the hook task.
-                    #
-                    # CR2 (agent runtime) fix: capture the Token from
-                    # ``set()`` and ``reset()`` it after connect returns.
-                    # Pre-fix the binding leaked: every ``asyncio.create_task``
-                    # the acquiring task spawned afterward (e.g.
-                    # ``_spawn_bg_task`` for log_event) inherited this
-                    # cell — so any code that read the contextvar from
-                    # the agent's own task would see whichever client
-                    # was most recently constructed, not the one
-                    # currently in use. The hook task itself is
-                    # unaffected: it captured the cell reference at
-                    # fork time, so the reset on our side doesn't take
-                    # the binding away from the SDK's hook task.
-                    from ._context import _current_client_cell
-                    cell_token = _current_client_cell.set(entry.cell)
-                    try:
-                        try:
-                            await client.connect()
-                        except BaseException:
-                            # Connect failed — back out the reservation,
-                            # then propagate. We re-acquire the lock so the
-                            # bookkeeping mutation is safe and notify any
-                            # peer waiting at ``cond.wait()`` below that the
-                            # in-flight count went down. Do NOT manually
-                            # release here: the surrounding ``async with
-                            # cond:`` block's ``__aexit__`` releases when
-                            # the exception unwinds. A manual release would
-                            # leave the lock unheld and ``__aexit__`` would
-                            # then raise ``RuntimeError: Lock is not
-                            # acquired`` — masking the real connect failure.
-                            await cond.acquire()
-                            self._in_flight.discard(entry)
-                            cond.notify_all()
-                            raise
-                        await cond.acquire()
-                    finally:
-                        # Reset whether connect succeeded or failed. The
-                        # SDK's forked hook task already captured the
-                        # cell reference at fork time, so the reset
-                        # here doesn't take the binding away from it.
-                        _current_client_cell.reset(cell_token)
-                    # If a fingerprint flip raced our connect, the
-                    # current fingerprint has moved on. Mark stale —
-                    # the caller will use the client for one request
-                    # and on release it'll be disconnected. (We don't
-                    # disconnect here because the caller is about to
-                    # use the client; mid-acquire-disconnect would
-                    # surface as a different error than connect-fail.)
-                    if self._current_fingerprint != fingerprint:
-                        entry.stale = True
-                    return entry
-
-                # At max size, all in flight. Wait for a release.
-                await cond.wait()
-
-    async def release(self, entry: _PoolEntry) -> None:
-        """Return a client to the pool. If the entry was marked stale
-        (fingerprint flipped while it was in flight) or its fingerprint
-        no longer matches the pool's current fingerprint, disconnect
-        instead of re-pooling."""
-        cond = self._condition()
-        async with cond:
-            self._in_flight.discard(entry)
-            stale = entry.stale or entry.fingerprint != self._current_fingerprint
-            if not stale:
-                # Healthy and current — return to idle.
-                self._idle.append(entry)
-                cond.notify_all()
-                return
-            # Stale — wake any waiters (a slot just freed) and fall
-            # through to disconnect outside the lock.
-            cond.notify_all()
-        try:
-            await entry.client.disconnect()
-        except Exception:  # noqa: BLE001
-            log.exception(
-                "ClaudeSDKClient disconnect of stale in-flight "
-                "entry failed during release (continuing)"
-            )
-
-    def acquire_ctx(
-        self,
-        options: ClaudeAgentOptions,
-        *,
-        turn_id: str | None = None,
-    ) -> "_AcquireContext":
-        """Async context manager wrapping ``acquire`` / ``release``.
-
-        ``turn_id`` (optional) is stamped onto the entry's
-        ``_TurnCell.turn_id`` while the client is checked out and
-        cleared on release. The budget hook reads this to identify
-        which turn the calling client belongs to in multi-channel
-        concurrent setups (where ``get_only_active_turn`` returns None
-        because >1 turn is in flight)."""
-        return _AcquireContext(self, options, turn_id=turn_id)
-
-    async def shutdown(self) -> None:
-        """Disconnect every client in the pool (idle and in-flight).
-        After return, the pool is empty and ready to be re-used (next
-        acquire constructs fresh clients). Idempotent — safe to call
-        when the pool has never been used.
-
-        In-flight clients are disconnected here as well: graceful
-        shutdown means no further work is in flight at the call site
-        (server.py awaits ``dispatcher.drain()`` before invoking us),
-        so an in-flight entry at this point is unusual but the right
-        thing is still to disconnect it."""
-        cond = self._condition()
-        async with cond:
-            idle = self._idle
-            in_flight = list(self._in_flight)
-            self._idle = []
-            self._in_flight = set()
-            self._current_fingerprint = None
-            entries = idle + in_flight
-            cond.notify_all()
-        # Disconnect outside the lock so a slow disconnect doesn't
-        # block waiters that just got cancelled.
-        for entry in entries:
-            try:
-                await entry.client.disconnect()
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "ClaudeSDKClient disconnect failed during pool shutdown"
-                )
-
-
-class _AcquireContext:
-    """Async context manager returned by ``ClientPool.acquire_ctx``. The
-    body runs with an exclusive ``ClaudeSDKClient``; on exit (success
-    or exception) the client is released back to the pool."""
-
-    def __init__(
-        self,
-        pool: ClientPool,
-        options: ClaudeAgentOptions,
-        *,
-        turn_id: str | None = None,
-    ) -> None:
-        self._pool = pool
-        self._options = options
-        self._turn_id = turn_id
-        self._entry: _PoolEntry | None = None
-
-    async def __aenter__(self) -> ClaudeSDKClient:
-        self._entry = await self._pool.acquire(self._options)
-        # Stamp the cell so the budget hook can correlate this client's
-        # tool calls to the current turn. ``cell`` is a per-client
-        # holder captured by the SDK's hook task at first connect; live
-        # mutations remain visible across the task boundary.
-        self._entry.cell.turn_id = self._turn_id
-        return self._entry.client
-
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        entry = self._entry
-        self._entry = None
-        if entry is not None:
-            entry.cell.turn_id = None
-            await self._pool.release(entry)
-
-
-# Module-level singleton pool. Lazy-init so module import doesn't need
-# an event loop. Tests reset via ``_reset_pool_for_tests`` (or the
-# legacy ``_sdk_client = None`` poke, retained for back-compat with
-# fixtures that pre-date the pool — see ``_sdk_client`` shim below).
-_pool: ClientPool | None = None
-
-
-def _get_pool() -> ClientPool:
-    global _pool
-    if _pool is None:
-        _pool = ClientPool()
-    return _pool
-
-
-def _reset_pool_for_tests() -> None:
-    """Reset the pool singleton. Tests use this between cases so
-    state doesn't leak. Production code never calls this."""
-    global _pool
-    _pool = None
-
-
-# Back-compat shims for tests that poke at the pre-pool module-level
-# names (``_sdk_client`` / ``_sdk_options_fingerprint`` / ``_sdk_lock``).
-# These are now derived views over the pool — assigning ``None`` to
-# ``_sdk_client`` resets the pool. Reads return a representative idle
-# client when the pool has one, else None. The legacy names are kept
-# only for the tests in ``tests/test_agent_sdk_client.py`` that pre-date
-# this work; new code reads/writes the pool directly.
-class _LegacyClientProxy:
-    """Module-level descriptor that maps the old singleton names onto
-    pool state. ``agent_mod._sdk_client = None`` clears the pool;
-    reading returns the first idle client (or None)."""
-
-    def __get__(self, obj, objtype=None):
-        if _pool is None:
-            return None
-        if _pool._idle:
-            return _pool._idle[0].client
-        if _pool._in_flight:
-            return next(iter(_pool._in_flight)).client
-        return None
-
-
-# Plain module-level None-defaults; tests that read these get the same
-# semantics they did pre-pool (None when nothing's connected). Tests
-# that write None to reset are handled by the autouse fixture which
-# also calls _reset_pool_for_tests when present.
-_sdk_client = None
-_sdk_options_fingerprint = None
-_sdk_lock = None
-
-
-async def query(
+def _resolve_model(
+    spec: str | BaseChatModel,
     *,
-    prompt: str,
-    options: ClaudeAgentOptions,
-    session_id: str = "default",
-    transport=None,
-):
-    """ClaudeSDKClient pool wrapper. Async-generator API matches the
-    old ``claude_agent_sdk.query()`` shape so call sites and patched
-    tests don't have to change.
+    max_retries: int = 6,
+) -> BaseChatModel:
+    """Translate a mimir-friendly model spec into a constructed BaseChatModel.
 
-    ``session_id`` is per-call. The agent loop passes ``ctx.turn_id``
-    so each turn gets its own session inside the persistent client —
-    prior-turn history can't bleed into the next turn's input.
-    Defaults to ``"default"`` so other callers (and tests) that don't
-    care keep their stage-1 behavior of a single accumulating session.
+    Supported:
+      - ``claude-code:<model>`` → ChatClaudeCode (Max OAuth subprocess)
+      - ``<provider>:<model>``  → init_chat_model with ``max_retries`` (and,
+                                  for OpenAI hitting api.openai.com,
+                                  ``use_responses_api=True``)
+      - BaseChatModel instance  → pass-through (Bedrock/Vertex/custom)
 
-    The ``transport`` parameter is accepted but unused — kept for
-    signature compatibility with tests that may pass it.
+    ``max_retries`` only applies to the non-claude-code path — ChatClaudeCode
+    spawns a Claude Code subprocess which handles its own retry semantics.
+
+    The model-provider package (``langchain-claude-code``,
+    ``langchain-anthropic``, etc.) is a pip extra (see pyproject.toml's
+    ``[project.optional-dependencies]``). We lazy-import here so installing
+    only the extras you'll use keeps the dep graph small — raising a
+    clear hint on ImportError tells the operator exactly which extra
+    they're missing.
     """
-    pool = _get_pool()
-    # ``session_id`` here is ``ctx.turn_id`` (the agent loop passes it),
-    # so it doubles as the cell-stamp value the budget hook uses to
-    # find the right TurnContext under concurrent multi-channel use.
-    async with pool.acquire_ctx(options, turn_id=session_id) as client:
-        await client.query(prompt, session_id=session_id)
-        async for msg in client.receive_response():
-            yield msg
+    if isinstance(spec, BaseChatModel):
+        return spec
+    if not isinstance(spec, str):
+        raise TypeError(f"unexpected model spec type: {type(spec).__name__}")
+    if spec.startswith("claude-code:"):
+        try:
+            from langchain_claude_code import ChatClaudeCode  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ImportError(
+                "MIMIR_MODEL_SPEC=claude-code:* requires the 'claude-code' extra. "
+                "Install via `pip install 'mimir[claude-code]'` "
+                "(or `uv pip install langchain-claude-code`)."
+            ) from exc
+        model_name = spec.split(":", 1)[1]
+        # ``permission_mode="bypassPermissions"`` matches SDK-era
+        # mimir's ClaudeAgentOptions setting — without it the claude
+        # CLI subprocess gates Write/Bash on user approval and the
+        # agent reports "the Write tool is pending approval" instead
+        # of actually writing. There's no human in the loop for any
+        # mimir deployment (bench / production mimirbot / future
+        # daemons), so the approval gate is pure friction. Match the
+        # SDK invariant.
+        return ChatClaudeCode(
+            model=model_name,
+            permission_mode="bypassPermissions",
+        )
+    # langchain ``init_chat_model`` resolves provider extras at call time
+    # (``anthropic:`` → langchain-anthropic, ``openai:`` → langchain-openai).
+    # We wrap it here so we can thread max_retries + the responses-API flag
+    # through; if the extra isn't installed, init_chat_model raises with
+    # the right hint.
+    from langchain.chat_models import init_chat_model
+    init_params: dict[str, Any] = {"max_retries": max(0, int(max_retries))}
+    if spec.startswith("openai:") and _supports_responses_api():
+        init_params["use_responses_api"] = True
+    return init_chat_model(spec, **init_params)
 
 
-async def get_context_usage(options: ClaudeAgentOptions) -> dict | None:
-    """Query a pooled persistent client for plan-window utilization.
-    Returns the raw response dict (typically containing an ``apiUsage``
-    key) or None on failure.
-
-    Rides the same pool as ``query()`` so the probe reuses a warm
-    client when one is available. Failures are caught and logged;
-    never propagate. Plan-window capture is observability, not
-    load-bearing.
-    """
-    pool = _get_pool()
-    try:
-        async with pool.acquire_ctx(options) as client:
-            try:
-                return await client.get_context_usage()
-            except Exception:  # noqa: BLE001
-                log.exception("client.get_context_usage() raised")
-                return None
-    except Exception:  # noqa: BLE001
-        # Connect failure during acquire (the slot has been backed
-        # out by the pool already).
-        log.exception("ClaudeSDKClient connect failed in get_context_usage")
-        return None
+# ────────────────────────────────────────────────────────────────────
+# Memory injection (pre-message hook equivalent)
+# ────────────────────────────────────────────────────────────────────
 
 
-async def shutdown_sdk_client() -> None:
-    """Disconnect every ClaudeSDKClient in the pool (called from server
-    cleanup). Idempotent — safe to call when no client was ever
-    connected."""
-    global _pool
-    if _pool is None:
-        return
-    pool = _pool
-    await pool.shutdown()
-    # After shutdown the pool is reusable, but for parity with the old
-    # singleton behavior (``_sdk_client = None`` post-shutdown), drop
-    # the singleton so the next acquire gets a fresh, definitively-
-    # empty pool.
-    _pool = None
+# Match atom-id-shaped strings in tool result text (16-char hex).
+_ATOM_ID_RE = re.compile(r"\b[0-9a-f]{16}\b")
+
+
+def _extract_atom_ids_from_tool_results(messages: list[Any]) -> list[str]:
+    from langchain_core.messages import ToolMessage
+    found: set[str] = set()
+    out: list[str] = []
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            for match in _ATOM_ID_RE.findall(content):
+                if match not in found:
+                    found.add(match)
+                    out.append(match)
+    return out
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# Default system prompt — production cutover replaces this with mimir's
+# full system-prompt assembly (core memory + skills + persona).
+_DEFAULT_SYSTEM_PROMPT = """\
+You are a memory-augmented assistant. The user is asking about facts \
+from their past conversations.
+
+Use the ``memory_query`` tool to search the user's persistent memory. \
+The tool returns observations (synthesized beliefs), evidence (raw \
+chat history with dates — prefer for specifics), and triples \
+(structured facts with valid-date ranges).
+
+When the memory tool's result is truncated or incomplete, call \
+``memory_query`` again with a more specific query.
+
+Think step by step:
+1. Which atoms / triples answer the question?
+2. If multiple conflict, which is most recent?
+3. If no evidence answers, say so plainly.
+
+Then give the final answer on its own line. Be concise."""
+
+
+# ────────────────────────────────────────────────────────────────────
+# Agent class — public API surface preserved
+# ────────────────────────────────────────────────────────────────────
 
 
 class Agent:
+    """Deepagents-backed mimir Agent.
+
+    Constructor signature matches the legacy SDK-backed Agent so
+    server.py + tests don't need rewrites at the call site. Internally
+    builds a deepagents CompiledStateGraph singleton and dispatches
+    each event through ``run_turn``.
+    """
+
     def __init__(
         self,
         config: Config,
@@ -730,10 +330,11 @@ class Agent:
         indexer: Indexer | None = None,
         saga_client: SagaClient | None = None,
         session_manager: SessionManager | None = None,
-        scheduler: Scheduler | None = None,
+        scheduler: Any = None,
         subagent_inbox: SubagentInbox | None = None,
         channel_registry: ChannelRegistry | None = None,
-        dispatcher: "Dispatcher | None" = None,
+        dispatcher: Any = None,
+        commitments_store: Any = None,
     ) -> None:
         self._config = config
         self._turn_logger = turn_logger
@@ -745,25 +346,26 @@ class Agent:
         self._scheduler = scheduler
         self._inbox = subagent_inbox or SubagentInbox()
         self._channels = channel_registry
-        # Used by the shell-job completion bridge to enqueue
-        # ``shell_job_complete`` events from the waiter thread back into
-        # the originating channel's queue. Optional — tests construct an
-        # Agent without a dispatcher and shell jobs simply complete
-        # silently in that case.
         self._dispatcher = dispatcher
-        # Captured at first turn (when we know we're on the asyncio
-        # loop). Worker threads use this to schedule coroutines back
-        # onto the loop via ``run_coroutine_threadsafe``.
-        self._loop: "asyncio.AbstractEventLoop | None" = None
-        # CR#10: per-Agent JsonlSnapshot caches for events.jsonl + turns.jsonl.
-        # Six per-turn call sites used to re-read these files from scratch each
-        # time (feedback assembly, usage block, self-state block, session
-        # summaries, subagent aggregate, budget partition). The snapshot wraps
-        # ``tail_jsonl_records`` with an mtime-checked TTL so within a single
-        # turn (~1s wall-clock) those reads share one cached parse instead of
-        # 6+ independent stream-and-decode passes.
+        # Phase 2b due-check poller (server.py:_on_startup) reads this
+        # attribute via getattr. Pre-fix it was always None — every
+        # commitment_complete / _snooze / _dismiss / _list tool call
+        # also returned "no commitments store" because the registry
+        # setter was never invoked. Both paths now wired by build_app.
+        self._commitments = commitments_store
+
+        # CR#10: per-Agent JsonlSnapshot caches for events.jsonl +
+        # turns.jsonl. Six per-turn call sites (feedback, usage, self-
+        # state, session summaries, subagent aggregate, budget
+        # partition) used to re-stream both files each time. The
+        # snapshot wraps tail_jsonl_records with an mtime-checked TTL so
+        # within one turn (~1s wall-clock) all those readers share one
+        # cached parse.
         self._events_snapshot = JsonlSnapshot(config.events_log)
         self._turns_snapshot = JsonlSnapshot(config.turns_log)
+
+        # Recent feedback signals block — algedonic surface for the
+        # turn prompt (v0.4 §2).
         self._feedback = FeedbackLog(
             events_path=config.events_log,
             turns_path=config.turns_log,
@@ -775,32 +377,18 @@ class Agent:
         self._session_boundary_log = SessionBoundaryLog(
             path=config.home / ".mimir" / "session_boundaries.jsonl",
         )
-        # Plan-window rate-limit state from RateLimitEvent (5h rolling,
-        # 7d plan / Opus / Sonnet, overage). Single JSON file, replaces
-        # on each transition.
+        # Plan-window rate-limit state — real RateLimitStore (replaces
+        # the deprecated _RateLimitStub). The oauth_usage_poller writes
+        # to this same JSON file from server.py's wiring; per-turn
+        # readers (usage block, self-state, upcoming) read through here.
         self._rate_limits = RateLimitStore(
             path=config.home / ".mimir" / "rate_limits.json",
         )
 
-        # Stage 3: explicit SessionStore + per-turn delete. The store
-        # is owned by ``Agent`` (not the SDK-client wrapper) so it
-        # survives options-fingerprint client recycles — otherwise
-        # recycling the client would reset all session state and
-        # break the per-turn delete contract for in-flight turns.
-        # ``project_key`` is derived once from ``config.home`` so
-        # ``run_turn`` can target the right namespace without
-        # re-deriving on every turn.
-        self._session_store = InMemorySessionStore()
-        self._session_project_key = project_key_for_directory(str(config.home))
-
-        # §12.4: S3-S4 homeostat. Constructed once so the scheduler
-        # consults the same instance the prompt's `## Self-state` block
-        # is rendered from. Wire into the scheduler immediately so
-        # heartbeats fired before the first turn are still arbitrated.
-        # chainlink #13: billing-mode aware. Quota-mode installs get a
-        # provider list (today: AnthropicQuotaProvider only); pay-as-
-        # you-go gets an empty list and the arbiter routes through the
-        # existing spike_ratio path.
+        # §12.4: S3-S4 homeostat. Constructed once so scheduler heart-
+        # beats and per-turn ``## Self-state`` render share the same
+        # instance. Wire into the scheduler immediately so heartbeats
+        # fired before the first turn are still arbitrated.
         from .billing import AnthropicQuotaProvider, BillingMode, QuotaProvider
         from .budget import HomeostaticArbiter
         quota_providers: list[QuotaProvider] = []
@@ -816,229 +404,825 @@ class Agent:
             cost_spike_ratio=config.cost_rate_spike_ratio or None,
             cost_spike_floor_usd=config.cost_rate_spike_floor_usd or None,
             fallback_model=config.model,
-            # CR#10 follow-up (#79 review): without these the homeostat
-            # path (called every turn from _assemble_self_state_block)
-            # falls through to direct tail_jsonl_records, defeating the
-            # cache. Threading the per-Agent snapshots in here makes
-            # both _partition_turns and pending_forget_candidates_count
-            # share the same parsed list as the rest of the per-turn
-            # readers.
             events_snapshot=self._events_snapshot,
             turns_snapshot=self._turns_snapshot,
         )
         if scheduler is not None:
             scheduler._arbiter = self._arbiter
 
-        # Async shell-job registry — backs the bash_async / bash_jobs_list /
-        # bash_job_output MCP tools. Constructed once; threads spawned by
-        # ``spawn()`` live for the duration of the subprocess they wrap.
-        # Files land in ``<home>/logs/bash-jobs/<job_id>.{out,err}``.
-        self._shell_jobs = ShellJobRegistry(
+        # Bounded set for fire-and-forget background tasks. Without
+        # retaining a reference, the asyncio task can be GC'd before
+        # the coroutine body runs. add+discard idiom from PEP 458 /
+        # asyncio docs.
+        self._bg_tasks: set[asyncio.Task] = set()
+
+        # Async-shell job registry — backs the bash_async /
+        # bash_jobs_list / bash_job_output tools. One registry per
+        # Agent (process-scoped); waiter threads spawned by
+        # ``spawn()`` live for the duration of the subprocess they
+        # wrap. Files land in ``<home>/logs/bash-jobs/<job_id>.{out,err}``.
+        # Wired into the tool surface from server.py:build_app via
+        # ``mimir.tools.set_shell_job_registry(...)``.
+        from .shell_jobs import ShellJobRegistry as _ShellJobRegistry
+        self._shell_jobs = _ShellJobRegistry(
             jobs_dir=config.home / "logs" / "bash-jobs",
         )
 
-        # Commitments store (Phase 1) — instantiated BEFORE the MCP
-        # server build so the Phase 2c agent-facing tools
-        # (commitment_complete/snooze/dismiss/list) get wired in.
-        # The extraction hook (Phase 2a) reuses this same instance
-        # below in the turn-hook list.
-        from .commitments.store import CommitmentsStore
-        self._commitments = CommitmentsStore(path=self._config.commitments_log)
+        # Captured at first turn (when we know we're on the asyncio
+        # loop). The shell-job waiter threads use this to schedule
+        # the completion handler back onto the loop via
+        # ``run_coroutine_threadsafe``.
+        self._loop: asyncio.AbstractEventLoop | None = None
 
-        self._mcp_server = build_mcp_server(
-            config.home,
-            indexer=indexer,
-            saga_client=saga_client,
-            scheduler=scheduler,
-            channel_registry=channel_registry,
-            message_buffer=message_buffer,
-            session_boundary_log=self._session_boundary_log,
-            turns_log=config.turns_log,
-            turn_logger=self._turn_logger,
-            shell_jobs=self._shell_jobs,
-            on_shell_job_complete=self._handle_shell_job_complete,
-            schedule_from_thread=self._schedule_from_thread,
-            mimir_home=config.home,
-            commitments_store=self._commitments,
-        )
+        # Build the deepagent singleton. Done lazily to keep import-time
+        # fast and to let tests construct Agent without a real model.
+        # Lock-guarded against concurrent first turns racing in and
+        # constructing two CompiledStateGraphs — pre-fix the second
+        # would clobber the first (harmless but wasteful since each
+        # graph is heavyweight). asyncio.Lock created lazily because
+        # __init__ may run outside a running event loop (tests).
+        self._agent: Any | None = None
+        self._agent_lock: asyncio.Lock | None = None
+        self._backend: Any | None = None
 
-        # Hooks layer mimir's path confinement + post-write reindex onto the
-        # SDK preset tools (Read/Write/Edit/Bash/Glob).
-        async def _reindex(rel: str) -> None:
-            if self._indexer is not None:
-                await self._indexer.reindex_path(rel)
+        # Memory-tool dep injection — only used if saga_client is a
+        # SagaStore (post-saga cutover). Wires up the @tool's
+        # SagaStore handle so deepagents can call into recall.
+        if saga_client is not None:
+            self._try_inject_memory_client(saga_client)
 
-        # Auto-include Claude Code's persisted-output dir in the
-        # file-op roots when it exists. The CLI writes overflow
-        # bash output (>~32KB) to ``~/.claude/projects/.../tool-results/``
-        # and instructs the agent to ``Read`` it; without this root
-        # the Read is denied and the agent loses access to its own
-        # tool output. See ``_paths.claude_code_persisted_output_root``
-        # for the full rationale.
-        from ._paths import claude_code_persisted_output_root
+    def _try_inject_memory_client(self, saga_client: SagaClient) -> None:
+        """If saga_client is a SagaStore (or wraps one at any depth),
+        wire it into the memory_query / memory_store tools.
 
-        extra_roots = list(config.file_op_extra_roots)
-        cc_overflow = claude_code_persisted_output_root()
-        if cc_overflow not in extra_roots:
-            extra_roots.append(cc_overflow)
+        Production saga_client is a RecordingSagaClient wrapping
+        either _InProcessSaga (legacy) or SagaStore. Test harnesses
+        and bench middleware may add additional wrappers (capture
+        proxies, recording layers); we peel ``_inner`` until we find
+        a concrete SagaStore or run out of layers.
+        """
+        try:
+            from .saga.client import SagaStore
+        except Exception:
+            return
+        candidate: Any = saga_client
+        seen: set[int] = set()
+        # Peel ``_inner`` chains — RecordingSagaClient, _MemoryStateProxy,
+        # any test/bench wrapper that follows the convention.
+        while candidate is not None and id(candidate) not in seen:
+            seen.add(id(candidate))
+            if isinstance(candidate, SagaStore):
+                from .tools import set_memory_client
+                set_memory_client(candidate)
+                return
+            candidate = getattr(candidate, "_inner", None)
 
-        self._pre_tool_hook = make_pre_tool_use_hook(
-            config.home,
-            extra_roots=extra_roots,
-        )
-        self._post_tool_hook = make_post_tool_use_hook(
-            config.home, _reindex if indexer is not None else None
-        )
+    async def _build_agent_if_needed(self) -> Any:
+        # Double-checked init: fast path returns the cached agent
+        # without acquiring the lock; only the first-call window
+        # contends on the asyncio.Lock. Pre-fix two concurrent first
+        # turns each entered the ``is None`` branch and built their
+        # own CompiledStateGraph — the second one won, the first was
+        # GC'd, both paid the import cost.
+        if self._agent is not None:
+            return self._agent
+        if self._agent_lock is None:
+            self._agent_lock = asyncio.Lock()
+        async with self._agent_lock:
+            # Re-check under the lock: a contending turn may have just
+            # finished construction while we waited.
+            if self._agent is not None:
+                return self._agent
+            from deepagents import create_deep_agent
+            from .readonly_backend import WriteGuardBackend
+            from .tools import all_mimir_tools
 
-        # Per-turn lifecycle hooks (CR#15). Each fires at one of four
-        # seams in run_turn: pre_query / on_message / post_query /
-        # finalize. Order matters — finalize hooks run sequentially, so
-        # IndexRebuild must precede GitCommit (the commit needs the
-        # regenerated INDEX.md files in the working tree). New
-        # extensible behaviors register here rather than editing
-        # run_turn directly.
-        self._turn_hooks: list[TurnLifecycleHook] = [
-            RateLimitObserverHook(
-                rate_limits=self._rate_limits,
-                is_max_oauth=running_on_claude_max,
+            # Config carries the operator-set model spec; env override
+            # exists for ad-hoc bench / smoke runs that don't go through
+            # Config.from_env. See Config.model_spec for the format
+            # (``claude-code:<model>`` or ``<provider>:<model>``).
+            model_spec = os.environ.get(
+                "MIMIR_MODEL_SPEC",
+                getattr(self._config, "model_spec", "claude-code:claude-sonnet-4-6"),
+            )
+            # Assemble the real system prompt — core memory + memory index +
+            # operator alert channel + skill catalog. Built fresh per turn
+            # so skill bucket assignments / outcome aggregates stay current
+            # (chainlink #15: install-stable section comes first for cache).
+            system_prompt = os.environ.get(
+                "MIMIR_SYSTEM_PROMPT_OVERRIDE",
+                self._build_system_prompt(),
+            )
+            # Per-directory write-permission enforcement (Config.folders).
+            # Read tools (Glob/Grep/Read) stay unrestricted; Write/Edit/upload
+            # outside ``writable_dirs`` return a permission error instead of
+            # mutating the filesystem. ``.mimir/`` (saga db, metrics) is
+            # implicitly blocked because it's not in the folders dict.
+            backend = WriteGuardBackend(
+                root_dir=self._config.home,
+                writable_dirs=self._config.writable_dirs,
+            )
+            # Stored so run_turn can drain recorded denials into the
+            # TurnRecord.permission_denials field at end of turn.
+            self._backend = backend
+            self._agent = create_deep_agent(
+                model=_resolve_model(
+                    model_spec,
+                    max_retries=getattr(self._config, "model_max_retries", 6),
+                ),
+                tools=all_mimir_tools(),
+                system_prompt=system_prompt,
+                backend=backend,
+            )
+            return self._agent
+
+    async def run_turn(self, event: AgentEvent) -> TurnRecord:
+        """Run one agent turn — preserves the SDK Agent.run_turn contract."""
+        turn_id = make_turn_id()
+        t_total_start = time.monotonic()
+        # Capture the asyncio loop once so shell-job waiter threads
+        # can schedule their completion handlers back onto it via
+        # ``asyncio.run_coroutine_threadsafe``.
+        if self._loop is None:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+
+        # Session attach — same as the SDK path.
+        session_id = event.channel_id or "default"
+        saga_session_id: str | None = None
+        if event.trigger == "saga_session_end":
+            saga_session_id = (event.extra or {}).get("saga_session_id")
+        elif self._sessions is not None:
+            sess = await self._sessions.touch(event.channel_id)
+            saga_session_id = sess.saga_session_id
+            self._sessions.increment_turn_count(event.channel_id)
+
+        # Typing indicator at turn start — Discord/Slack bridges expose
+        # ``send_typing_indicator`` so the user sees "mimir is typing…"
+        # while a multi-second LLM call runs. Pre-fix the indicator
+        # only fired on the post-turn ``bridge.send``; long turns
+        # appeared hung. Bridges that don't implement the method
+        # (Bluesky / Bench / WebChat) are silently skipped.
+        if (
+            self._channels is not None
+            and event.channel_id
+            and event.trigger == "user_message"
+        ):
+            bridge = self._channels.find(event.channel_id)
+            if bridge is not None and hasattr(bridge, "send_typing_indicator"):
+                try:
+                    await bridge.send_typing_indicator(event.channel_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("typing indicator failed: %s", exc)
+
+        # Set up TurnContext so RecordingSagaClient can populate
+        # ctx.saga_calls. Without this all saga calls — pre-message
+        # query, post-message feedback — were lost from the turn
+        # record. The context is reset in the finally block.
+        from .models import TurnContext as _TurnContext
+        from ._context import set_current_turn, reset_current_turn
+        from .loop_detector import LoopDetector
+        ctx = _TurnContext(
+            turn_id=turn_id,
+            session_id=session_id,
+            trigger=event.trigger,
+            channel_id=event.channel_id,
+            started_at=t_total_start,
+            saga_session_id=saga_session_id,
+            # Per-turn send-loop circuit breaker (SPEC §7.2.4). Attached
+            # to the TurnContext so send_message can reach it via
+            # ``_context.get_current_turn()`` without a separate
+            # parameter-passing path. Soft/hard limits + similarity
+            # threshold come from Config (mimir/config.py default 5/10/0.9).
+            # Pre-181-J the detector wasn't constructed at all; the
+            # circuit breaker was disarmed and the agent could ship
+            # near-duplicate sends indefinitely.
+            loop_detector=LoopDetector(
+                soft_limit=self._config.send_loop_soft_limit,
+                hard_limit=self._config.send_loop_hard_limit,
+                similarity_threshold=self._config.send_loop_similarity,
             ),
-            SubagentLifecycleHook(inbox=self._inbox),
-            PlanQuotaCaptureHook(
-                capture_fn=self._capture_plan_quota_from_client,
+            # Tool-call budget (181-N). The langchain @tool wrappers
+            # installed by ``apply_budget_gate`` in registry.py read
+            # this off the TurnContext and refuse tool calls past
+            # the cap. 0 disables (matches main's contract).
+            tool_call_budget=self._config.tool_call_budget,
+        )
+        # WikiBacklinksHook pre-snapshot — capture mtimes of every
+        # state/wiki/ content page BEFORE the model loop runs so the
+        # finalize step can tell if any wiki page was edited this turn.
+        # Stored on ctx (NOT on self) so concurrent turns on different
+        # channels don't share state — multi-channel-correctness
+        # invariant from the SDK build. Empty dict when the wiki dir
+        # doesn't exist; finalize early-returns in that case.
+        ctx.wiki_mtime_snapshot = self._snapshot_wiki_mtimes()
+
+        ctx_token = set_current_turn(ctx)
+        # Populate the module-global current_channel_id as a fallback
+        # for the claude-code path. ChatClaudeCode dispatches tools
+        # via the ClaudeSDKClient subprocess; the SDK round-trips back
+        # through ``_langchain_claude_code_patches`` which calls
+        # ``tool._arun(**args, config=RunnableConfig())`` — a fresh
+        # empty config. The RunnableConfig route added in 181-B
+        # therefore can't see ``configurable["channel_id"]`` on that
+        # path, and send_message / react / fetch_channel_history would
+        # fail with "no channel_id and no current channel" when the
+        # model omits the arg. Setting _STATE here closes the gap; the
+        # helper still prefers configurable when present, so direct
+        # LangGraph tool dispatch (anthropic/openai providers) keeps
+        # the race-free route. The dispatcher serializes turns per-
+        # channel, so the cross-channel race Mimir originally flagged
+        # is constrained to the moment between set and reset here.
+        from .tools.registry import set_current_channel_id as _set_cid
+        _set_cid(event.channel_id)
+        try:
+            return await self._run_turn_body(
+                event, ctx, ctx_token, turn_id, session_id, saga_session_id,
+                t_total_start,
+            )
+        finally:
+            reset_current_turn(ctx_token)
+            _set_cid(None)
+
+    async def _run_turn_body(
+        self,
+        event: AgentEvent,
+        ctx: Any,
+        ctx_token: Any,
+        turn_id: str,
+        session_id: str,
+        saga_session_id: str | None,
+        t_total_start: float,
+    ) -> TurnRecord:
+
+        # Pre-message memory inject. Builds the "Possibly relevant
+        # memories" block + collects atom_ids for the post-turn
+        # feedback credit pass. Skipped on saga_session_end turns
+        # (synthesis owns its own prompt).
+        memory_block: str | None = None
+        saga_atom_ids: list[str] = []
+        if self._saga is not None and event.trigger != "saga_session_end":
+            try:
+                payload = await self._saga.query(
+                    event.content,
+                    top_k=12,
+                    session_id=saga_session_id,
+                )
+                raw_block = _format_saga_payload(payload)
+                if raw_block and raw_block != "(no atoms)":
+                    memory_block = raw_block
+                ids = _atom_ids_from_response(payload)
+                triple_ids = _source_atom_ids_from_triples(payload)
+                seen: set[str] = set()
+                for aid in list(ids) + list(triple_ids):
+                    if aid not in seen:
+                        seen.add(aid)
+                        saga_atom_ids.append(aid)
+            except Exception as exc:
+                log.warning("pre-message saga.query failed: %s", exc)
+
+        # Drain any pending subagent completion notifications from
+        # prior turns on this channel — SPEC §4.4. Empty list → block
+        # is None (build_turn_prompt skips the section).
+        pending_subagents = await self._inbox.drain(event.channel_id or "")
+        subagent_block = (
+            render_subagent_updates(pending_subagents)
+            if pending_subagents else None
+        )
+
+        # Per-turn prompt assembly — Recent activity, Recent feedback,
+        # Session summaries, Resource usage, Upcoming, Upcoming
+        # commitments, Self-state, etc. Synthesis turns
+        # (saga_session_end) get a dedicated template instead.
+        turn_prompt, recent = await self._build_turn_prompt(
+            ctx, event,
+            saga_block=memory_block,
+            subagent_block=subagent_block,
+        )
+
+        # Build / reuse the agent singleton.
+        agent = await self._build_agent_if_needed()
+
+        # Streaming auto-dispatcher (181-O / chainlink #5): observes
+        # AIMessages as they stream in and flushes the "plan" text to
+        # the channel at the first tool_call boundary. Bench / no-
+        # bridge channels skip; explicit ``send_message`` tool calls
+        # disable streaming entirely. The result text is flushed at
+        # end of turn via the existing bridge.send path below — when
+        # streaming was active we use ``dispatcher.result_text()``
+        # instead of the canonical ``output`` so intermediate text
+        # between tool calls is correctly suppressed from the user.
+        bridge_for_streaming = None
+        if self._channels is not None and event.channel_id:
+            bridge_for_streaming = self._channels.find(event.channel_id)
+        from ._streaming_dispatch import StreamingAutoDispatcher
+        streaming = StreamingAutoDispatcher(
+            channel_id=event.channel_id or "",
+            bridge=bridge_for_streaming,
+            eligible=(
+                event.channel_id is not None
+                and event.trigger == "user_message"
             ),
-            PostMessageSagaHook(hook_fn=self._post_message_hook),
-            # Phase 2a — runs on saga_session_end finalize. Reads the
-            # synthesis output, extracts structured commitments via
-            # a haiku-tier ``query()`` call, dedupes against existing
-            # store entries, persists net-new ones. Best-effort.
-            CommitmentExtractionHook(store=self._commitments),
-            WikiBacklinksHook(home=self._config.home),
-            IndexRebuildHook(indexes=self._indexes),
-            GitCommitHook(
+        )
+
+        error: str | None = None
+        messages: list[Any] = []
+        output = ""
+        try:
+            # ``stream_mode="values"`` yields the full state snapshot
+            # after each graph step; ``state.get("messages", [])`` is
+            # the canonical message list. Feed each NEW AIMessage
+            # through the streaming state machine so mid-turn plan
+            # flushes happen at the first tool_call boundary —
+            # NOT at end of turn.
+            invoke_config = {
+                "configurable": {
+                    "thread_id": saga_session_id or session_id,
+                    # Per-turn channel id so send_message / react /
+                    # fetch_channel_history can default to it when
+                    # the model doesn't supply ``channel_id``
+                    # explicitly. Threads through LangGraph instead
+                    # of the old process-global ``_STATE`` setter,
+                    # which raced across concurrent dispatcher turns
+                    # on different channels.
+                    "channel_id": event.channel_id,
+                },
+            }
+            # Track the count of AIMessages we've already streamed
+            # into the state machine. ``stream_mode="values"``
+            # re-emits the cumulative messages list on every step,
+            # so without slice-past-observed we'd feed the same
+            # AIMessages in multiple times. The state machine's
+            # ``observed_count`` is bumped per-call, so we feed
+            # only the new AIMessages each iteration.
+            ai_observed = 0
+            async for chunk in agent.astream(
+                {"messages": [HumanMessage(content=turn_prompt)]},
+                config=invoke_config,
+                stream_mode="values",
+            ):
+                messages = list(chunk.get("messages", []))
+                if streaming.enabled:
+                    # Walk messages, ignore any non-AIMessage, slice
+                    # past the ones already observed.
+                    ai_count = 0
+                    for msg in messages:
+                        if isinstance(msg, AIMessage):
+                            ai_count += 1
+                            if ai_count > ai_observed:
+                                await streaming.observe(msg)
+                    ai_observed = ai_count
+            events, output = extract_turn_events(messages)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            events = []
+            log.exception("agent.astream failed: %s", exc)
+
+        # Result fields drive both the TurnRecord and the feedback-signal
+        # branch below, so compute once and reuse.
+        result_fields = derive_result_fields(messages)
+
+        # Post-message credit pass. Branch on result: a successful turn
+        # contributes positive evidence ("these atoms helped the agent
+        # answer"); an errored or max_turns-truncated turn is negative
+        # evidence ("retrieval surfaced these but the agent couldn't
+        # land an answer"). Saga's record_outcome routes the signal to
+        # the activation-log weight accordingly.
+        if saga_atom_ids and self._saga is not None:
+            stop_reason = result_fields.get("stop_reason")
+            is_failure = (
+                error is not None
+                or result_fields.get("result_is_error")
+                or stop_reason in ("max_turns", "max_tokens")
+            )
+            feedback_signal = "negative" if is_failure else "positive"
+            try:
+                # Union: pre-message atoms + atom IDs surfaced in tool results
+                tool_atom_ids = _extract_atom_ids_from_tool_results(messages)
+                seen2 = set(saga_atom_ids)
+                for aid in tool_atom_ids:
+                    if aid not in seen2:
+                        seen2.add(aid)
+                        saga_atom_ids.append(aid)
+                await self._saga.feedback(
+                    saga_atom_ids,
+                    output,
+                    session_id=saga_session_id,
+                    feedback=feedback_signal,
+                )
+            except Exception as exc:
+                log.warning("post-message saga.feedback failed: %s", exc)
+
+        # Build and write TurnRecord — matches the SDK schema.
+        # Drain observability state captured during this turn:
+        #   - permission_denials from WriteGuardBackend (every blocked
+        #     write/edit/upload during the turn).
+        #   - saga_calls from TurnContext (populated by
+        #     RecordingSagaClient on every recorded saga method).
+        #   - kind detection: scan events for spawn_claude_code tool
+        #     calls; bench aggregate_usage keys on this for cost
+        #     attribution (claude_code_spawn vs other).
+        permission_denials: list = []
+        if self._backend is not None and hasattr(self._backend, "drain_denials"):
+            try:
+                permission_denials = self._backend.drain_denials()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("backend.drain_denials failed: %s", exc)
+        saga_calls = [
+            {
+                "call_type": c.call_type, "args": c.args, "result": c.result,
+                "latency_ms": c.latency_ms, "error": c.error, "t_ms": c.t_ms,
+            }
+            for c in ctx.saga_calls
+        ]
+        kind: str | None = None
+        for evt in events:
+            if (
+                isinstance(evt, dict)
+                and evt.get("type") == "tool_call"
+                and evt.get("name") == "spawn_claude_code"
+            ):
+                kind = "claude_code_spawn"
+                break
+
+        record = TurnRecord(
+            ts=_utc_now(),
+            turn_id=turn_id,
+            session_id=session_id,
+            saga_session_id=saga_session_id,
+            trigger=event.trigger,
+            channel_id=event.channel_id,
+            input=truncate_input(turn_prompt),
+            saga_atom_ids=saga_atom_ids,
+            events=events,
+            output=(output or "")[:2048],
+            duration_ms=int((time.monotonic() - t_total_start) * 1000),
+            error=error,
+            permission_denials=permission_denials,
+            saga_calls=saga_calls,
+            kind=kind,
+            **result_fields,
+        )
+        await self._turn_logger.write(record)
+
+        # Phase 2a commitment extraction — on saga_session_end synthesis
+        # turns, extract structured commitments from the synthesis output
+        # via a haiku-tier ``query()`` call and persist net-new ones to
+        # ``CommitmentsStore``. Pre-181-I this lived in
+        # ``CommitmentExtractionHook`` on the SDK turn-lifecycle chain;
+        # the deepagents agent has no equivalent hook chain so the call
+        # is inlined here. Best-effort: failures log + continue, the
+        # turn record is unaffected.
+        await self._maybe_extract_commitments(ctx, event, record)
+
+        # Post-turn observability hooks (181-M). Order matters:
+        #   1. wiki_backlinks: regenerates state/wiki/{orphans,
+        #      dangling-links,backlinks-index}.md when a wiki content
+        #      page was modified this turn. Must run BEFORE index
+        #      rebuild so INDEX.md picks up the freshly-regen'd outputs.
+        #   2. index_rebuild: regen state/INDEX.md + memory/INDEX.md
+        #      via the per-Agent IndexGenerator (debounced internally).
+        #   3. git_commit: post-turn commit gated on
+        #      MIMIR_GIT_TRACKING_ENABLED — runs last so all regen'd
+        #      outputs are part of the same commit as the writes that
+        #      triggered them.
+        # Each is best-effort: failures log + return; turn record stays.
+        await self._post_turn_wiki_backlinks(ctx)
+        await self._post_turn_index_rebuild()
+        await self._post_turn_git_commit(ctx)
+
+        # End-of-turn bridge dispatch. Three cases:
+        #   1. Streaming was active AND a plan was already flushed
+        #      mid-turn (``streamed_plan=True``): send the result text
+        #      via ``dispatcher.result_text()`` — intermediate text
+        #      between tool calls is correctly suppressed from the
+        #      user, captured only as reasoning in turns.jsonl.
+        #   2. Streaming was disabled by an explicit ``send_message``
+        #      tool call (the canonical-delivery path): skip the
+        #      end-of-turn send entirely; the model already shipped.
+        #   3. Otherwise (no tool calls, or streaming disabled because
+        #      bench/no-bridge): single canonical ``output`` flush —
+        #      matches pre-181-O behavior.
+        if (
+            self._channels is not None
+            and event.channel_id
+            and event.trigger == "user_message"
+        ):
+            bridge = self._channels.find(event.channel_id)
+            if bridge is not None and hasattr(bridge, "send"):
+                # Pick the right text + decide whether to send at all.
+                send_text: str | None = None
+                if streaming.disabled_by_explicit_send:
+                    send_text = None  # already delivered via tool call
+                elif streaming.streamed_plan:
+                    candidate = streaming.result_text()
+                    send_text = candidate if candidate else None
+                elif output:
+                    send_text = output
+                if send_text:
+                    try:
+                        await bridge.send(event.channel_id, send_text)
+                    except Exception as exc:
+                        log.warning("bridge.send failed: %s", exc)
+                elif streaming.streamed_plan:
+                    # Edge case: a plan was flushed mid-turn with
+                    # final=False (typing indicator held), but the
+                    # model produced no result text after the last
+                    # tool call. Without an end-of-turn send the
+                    # indicator dangles in "still working" forever
+                    # (~9s on Discord, then auto-expires; longer on
+                    # Slack). Release it explicitly via the bridge's
+                    # cancel_typing API. Failures swallowed — typing
+                    # state is observability, not load-bearing.
+                    if hasattr(bridge, "cancel_typing"):
+                        try:
+                            await bridge.cancel_typing(event.channel_id)
+                        except Exception as exc:
+                            log.debug("bridge.cancel_typing failed: %s", exc)
+
+        await log_event(
+            "turn_finished",
+            turn_id=turn_id,
+            channel_id=event.channel_id,
+            duration_ms=record.duration_ms,
+            error=error,
+            stop_reason=result_fields.get("stop_reason"),
+        )
+        return record
+
+    async def _maybe_extract_commitments(
+        self, ctx: Any, event: AgentEvent, record: TurnRecord,
+    ) -> None:
+        """Phase 2a: extract commitments from a saga_session_end synthesis
+        output and persist net-new records to the CommitmentsStore.
+
+        Direct port of ``CommitmentExtractionHook.finalize`` from main —
+        the SDK-era hook chain is gone, so the deepagents agent runs
+        this inline after writing the TurnRecord. Best-effort throughout:
+        every failure path logs + returns; the synthesis turn's own
+        record is unaffected.
+
+        Events emitted:
+          - ``commitments_extracted`` on ≥1 added record (carries count,
+            skipped_dedupe, prompt_version)
+          - ``commitments_extraction_no_op`` with reason in
+            {short_output, llm_returned_zero, all_dedupe_skipped} when
+            the path ran but added nothing — distinguishable in
+            backtests from "skipped extraction entirely."
+
+        Suppressed when:
+          - ``ctx.trigger != "saga_session_end"`` (this hook is
+            synthesis-only — the per-message extraction path is a
+            different design).
+          - ``self._commitments is None`` (test harnesses construct
+            the Agent without a store).
+          - ``record.output`` is empty (LLM returned nothing or the
+            ainvoke errored).
+        """
+        if ctx.trigger != "saga_session_end":
+            return
+        if self._commitments is None:
+            return
+        output = getattr(record, "output", "") or ""
+        if not output:
+            return
+
+        from .commitments.extractor import (
+            EXTRACTION_PROMPT_VERSION,
+            MIN_OUTPUT_LEN,
+            extract_commitments,
+        )
+
+        if len(output) < MIN_OUTPUT_LEN:
+            await log_event(
+                "commitments_extraction_no_op",
+                reason="short_output",
+                output_len=len(output),
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+            )
+            return
+
+        try:
+            extracted = await extract_commitments(
+                output,
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+            )
+        except Exception:  # noqa: BLE001 — best-effort, never crash a turn
+            log.exception(
+                "commitment extraction failed for turn %s; skipping",
+                ctx.turn_id,
+            )
+            return
+
+        if not extracted:
+            await log_event(
+                "commitments_extraction_no_op",
+                reason="llm_returned_zero",
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+            )
+            return
+
+        # Snapshot dedupe keys once — N×|JSONL| in the prior shape,
+        # N + |JSONL| this way. ``current_state`` returns active records
+        # only, matching the find_by_dedupe_key semantics.
+        state = self._commitments.current_state()
+        existing_keys = {
+            r.dedupe_key
+            for r in state.values()
+            if r.dedupe_key and not r.is_terminal()
+        }
+
+        added = 0
+        skipped_dedupe = 0
+        for rec in extracted:
+            if rec.dedupe_key in existing_keys:
+                skipped_dedupe += 1
+                continue
+            try:
+                await self._commitments.add(rec)
+                added += 1
+                existing_keys.add(rec.dedupe_key)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "commitments store.add failed for record %s", rec.id,
+                )
+
+        if added > 0:
+            await log_event(
+                "commitments_extracted",
+                count=added,
+                skipped_dedupe=skipped_dedupe,
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+            )
+        else:
+            await log_event(
+                "commitments_extraction_no_op",
+                reason="all_dedupe_skipped",
+                extracted_count=len(extracted),
+                skipped_dedupe=skipped_dedupe,
+                channel_id=ctx.channel_id,
+                saga_session_id=getattr(ctx, "saga_session_id", None),
+                source_turn_id=ctx.turn_id,
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+            )
+
+    # ────────────────────────────────────────────────────────────
+    # Post-turn hooks (181-M)
+    # ────────────────────────────────────────────────────────────
+
+    # Generated wiki outputs — the WikiBacklinksHook regenerates these
+    # itself, so changes to them must NOT trigger another regeneration
+    # (otherwise the hook would loop on its own writes).
+    _WIKI_GENERATED_OUTPUTS = frozenset({
+        "orphans.md",
+        "dangling-links.md",
+        "backlinks-index.md",
+    })
+
+    def _snapshot_wiki_mtimes(self) -> dict[str, float]:
+        """Walk ``<home>/state/wiki``, return ``{abs_path_str: st_mtime}``
+        for every non-generated content page. Empty dict when the wiki
+        dir doesn't exist."""
+        wiki = self._config.home / "state" / "wiki"
+        snapshot: dict[str, float] = {}
+        if not wiki.is_dir():
+            return snapshot
+        for page in wiki.rglob("*.md"):
+            if page.name in self._WIKI_GENERATED_OUTPUTS:
+                continue
+            try:
+                snapshot[str(page)] = page.stat().st_mtime
+            except OSError:
+                continue
+        return snapshot
+
+    async def _post_turn_wiki_backlinks(self, ctx: Any) -> None:
+        """Regenerate the wiki backlinks/orphans/dangling outputs when
+        ANY non-generated state/wiki/*.md page changed mtime relative
+        to the pre-turn snapshot. Edit-triggered (not periodic) so
+        orphan / dangling regressions surface on the turn that
+        introduced them. Direct port of ``WikiBacklinksHook.finalize``."""
+        wiki = self._config.home / "state" / "wiki"
+        if not wiki.is_dir():
+            return
+        before: dict[str, float] = getattr(ctx, "wiki_mtime_snapshot", {}) or {}
+        after = self._snapshot_wiki_mtimes()
+
+        touched = False
+        for path_str, mtime in after.items():
+            if before.get(path_str) != mtime:
+                touched = True
+                break
+        if not touched:
+            for path_str in before:
+                if path_str not in after:
+                    touched = True
+                    break
+        if not touched:
+            return
+
+        from . import wiki_backlinks
+        try:
+            await wiki_backlinks.run(self._config.home)
+        except FileNotFoundError:
+            # Wiki dir disappeared between snapshot and run — benign race.
+            return
+        except Exception:  # noqa: BLE001 — never crash a turn for this
+            log.exception("wiki_backlinks regen failed; continuing")
+
+    async def _post_turn_index_rebuild(self) -> None:
+        """Mark INDEX.md dirty + flush the IndexGenerator. Debounced
+        internally so consecutive turns within the debounce window
+        share a single rebuild. Direct port of
+        ``IndexRebuildHook.finalize``."""
+        try:
+            self._indexes.mark_dirty("all")
+            await self._indexes.flush()
+        except Exception:  # noqa: BLE001
+            log.exception("INDEX rebuild flush failed; continuing")
+
+    async def _post_turn_git_commit(self, ctx: Any) -> None:
+        """Post-turn commit of memory/state changes, gated on
+        ``MIMIR_GIT_TRACKING_ENABLED``. Runs after the index rebuild
+        so auto-regenerated INDEX.md / wiki outputs are part of the
+        same commit as the writes that triggered them. Failures inside
+        ``commit_turn_changes`` are swallowed there and surfaced via
+        ``git_commit_failed`` / ``git_push_failed`` algedonic events;
+        we still wrap in try/except for defense in depth."""
+        try:
+            from . import git_tracking
+            await git_tracking.commit_turn_changes(
+                turn_id=ctx.turn_id,
+                trigger=ctx.trigger,
                 home=self._config.home,
                 enabled=self._config.git_tracking_enabled,
-            ),
-            CancelTypingHook(channels=self._channels),
-        ]
-
-        # Bounded set for fire-and-forget background tasks (event-log
-        # writes, etc.). CPython warns that the result of asyncio.
-        # create_task() may be GC'd before it has run; without retaining
-        # a reference, short events.jsonl writes can vanish under load
-        # before the task body executes. Adding to the set + a discard
-        # callback is the standard idiom from PEP 458 / asyncio docs.
-        self._bg_tasks: set[asyncio.Task] = set()
-
-    def _spawn_bg_task(self, coro) -> asyncio.Task:
-        """Schedule a fire-and-forget coroutine while keeping a reference.
-
-        The set membership prevents the task from being garbage-collected
-        mid-run; ``add_done_callback`` removes it once the coroutine
-        finishes (success or error) so the set bound stays at the
-        in-flight count.
-        """
-        task = asyncio.create_task(coro)
-        self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
-        return task
-
-    # ─── Async shell-job completion bridge ──────────────────────────────
-
-    def _schedule_from_thread(self, coro) -> bool:
-        """Late-bound bridge for code running in non-loop threads.
-
-        ``spawn_claude_code``'s completion handler runs on the registry's
-        waiter thread and needs to ``log_event`` / ``turn_logger.write``
-        from there. Mirrors ``_handle_shell_job_complete``.
-
-        **CR2-#5 fix.** Returns True when the coroutine was successfully
-        scheduled, False when it was dropped (no loop, loop closed, or
-        ``run_coroutine_threadsafe`` raised). On drop, the coroutine
-        is explicitly ``close()``-d to suppress Python's
-        "coroutine was never awaited" RuntimeWarning, and a structured
-        ``log.warning`` is emitted so the silent drop is observable.
-        Callers that need to persist accounting beyond the in-process
-        log (e.g. spawn completion's synthetic TurnRecord) can check
-        the return value and fall back to a sync write path.
-        """
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            try:
-                coro.close()
-            except Exception:  # noqa: BLE001
-                pass
-            log.warning(
-                "schedule_from_thread dropped coroutine (loop unavailable);"
-                " caller should persist via fallback path",
             )
-            return False
-        try:
-            asyncio.run_coroutine_threadsafe(coro, loop)
-            return True
-        except Exception:
-            try:
-                coro.close()
-            except Exception:  # noqa: BLE001
-                pass
-            log.exception(
-                "schedule_from_thread failed to dispatch coroutine"
-            )
-            return False
+        except Exception:  # noqa: BLE001
+            log.exception("git commit_turn_changes raised; continuing")
 
-    def _handle_shell_job_complete(self, job: ShellJob) -> None:
-        """Thread-safe bridge: a shell-job waiter thread invokes this when
-        the subprocess exits. Schedules the async handler onto the
-        captured asyncio loop so we can enqueue a ``shell_job_complete``
-        AgentEvent without crossing thread boundaries unsafely.
+    # ────────────────────────────────────────────────────────────
+    # Shell-job completion bridge
+    # ────────────────────────────────────────────────────────────
 
-        **Loop-unavailable path (PR #109 follow-up).** When the loop is
-        None / closed (shutdown / pre-first-turn / no dispatcher), the
-        spawning channel won't receive a wake event — same silent-
-        no-op shape that bit ``spawn_claude_code`` (CR2-#5). For shell
-        jobs the practical impact is smaller: there's no synthetic
-        TurnRecord to lose, just the wake-up event for the spawning
-        channel. Operators eventually notice via ``bash_jobs_list``
-        showing the completed job. We emit a ``log.warning`` so the
-        drop is at least observable in logs; building a sidecar
-        analogous to spawn-orphans.jsonl was considered overkill for
-        this case (no accounting to preserve).
+    def _handle_shell_job_complete(self, job: Any) -> None:
+        """Thread-safe bridge: a shell-job waiter thread invokes this
+        when its subprocess exits. Schedules the async handler onto
+        the captured asyncio loop so we can enqueue a
+        ``shell_job_complete`` AgentEvent without crossing thread
+        boundaries unsafely.
+
+        Loop-unavailable path: shutdown / pre-first-turn / no
+        dispatcher → log + drop. Operator eventually notices via
+        ``bash_jobs_list``. No synthetic TurnRecord at risk; only
+        the wake-up event for the spawning channel is lost.
         """
         loop = self._loop
         if loop is None or loop.is_closed():
             log.warning(
-                "shell_job_complete dropped (loop unavailable): job_id=%s "
-                "channel_id=%s — spawning channel will not be woken",
-                job.job_id, job.channel_id,
+                "shell_job_complete dropped (loop unavailable): "
+                "job_id=%s channel_id=%s",
+                getattr(job, "job_id", "?"),
+                getattr(job, "channel_id", None),
             )
             return
         if self._dispatcher is None:
             log.warning(
                 "shell_job_complete dropped (no dispatcher wired): "
                 "job_id=%s channel_id=%s",
-                job.job_id, job.channel_id,
+                getattr(job, "job_id", "?"),
+                getattr(job, "channel_id", None),
             )
             return
         try:
             asyncio.run_coroutine_threadsafe(
-                self._on_shell_job_complete(job),
-                loop,
+                self._on_shell_job_complete(job), loop,
             )
-        except Exception:
-            # Last-resort guard. Never let a daemon-thread invocation
-            # crash the registry.
+        except Exception:  # noqa: BLE001
+            # Never let a daemon-thread invocation crash the registry.
             log.exception("schedule of shell-job-complete handler failed")
 
-    async def _on_shell_job_complete(self, job: ShellJob) -> None:
-        """Async handler that runs on the asyncio loop. Builds a turn
-        prompt summarizing the job's exit state + output tails and
-        enqueues a ``shell_job_complete`` AgentEvent into the dispatcher.
-
-        Routes back to the channel that spawned the job. When channel_id
-        is None (job spawned from a bare scheduled tick that lacked a
-        channel reference), the event is silently dropped — there's no
+    async def _on_shell_job_complete(self, job: Any) -> None:
+        """Async handler: build a turn-prompt summary of the job's exit
+        state + bounded output tails and enqueue a
+        ``shell_job_complete`` AgentEvent into the dispatcher. Routes
+        back to the channel that spawned the job. No-channel jobs
+        (e.g. spawned from a bare scheduled tick) are dropped — no
         sensible default routing target.
         """
-        if job.channel_id is None:
+        if getattr(job, "channel_id", None) is None:
             await log_event(
                 "shell_job_complete_no_channel",
                 job_id=job.job_id,
@@ -1050,7 +1234,7 @@ class Agent:
             data = self._shell_jobs.read_output(
                 job.job_id, tail_lines=100, stream="both",
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             data = {"stdout_tail": "", "stderr_tail": ""}
 
         stdout_tail = (data.get("stdout_tail") or "").strip()
@@ -1062,7 +1246,7 @@ class Agent:
         if len(stderr_tail) > max_chars:
             stderr_tail = stderr_tail[-max_chars:]
 
-        elapsed = round(job.elapsed_seconds, 1)
+        elapsed = round(getattr(job, "elapsed_seconds", 0.0), 1)
         body_lines = [
             f"Shell job {job.job_id} complete (status={job.status}, "
             f"exit_code={job.exit_code}, elapsed={elapsed}s).",
@@ -1093,24 +1277,7 @@ class Agent:
                 error=str(exc)[:500],
             )
             return
-        # chainlink #65 (sub B): paired-positive emit for the cross-
-        # thread bridge. Surfaces alongside any sticky
-        # ``shell_job_complete_enqueue_failed`` line so the operator
-        # can read recovery against the 24h failure line. First-
-        # occurrence-only at the feedback layer. Distinct from
-        # ``shell_job_complete_routed`` below, which is the broader
-        # success-path observability record (carries channel_id,
-        # exit_code, accepted-state) — the _ok event is the algedonic
-        # surface signal, the _routed event is the audit record.
-        await log_event(
-            "shell_job_complete_enqueue_ok",
-            job_id=job.job_id,
-        )
-        # Success path observability: closes the loop for "did the
-        # wake-up actually go out?" without making the operator
-        # cross-reference the next turn's prompt against the
-        # _spawned event. ``accepted=False`` means the dispatcher
-        # rejected (queue full / closed) — distinct from a raise.
+        await log_event("shell_job_complete_enqueue_ok", job_id=job.job_id)
         await log_event(
             "shell_job_complete_routed",
             job_id=job.job_id,
@@ -1119,575 +1286,66 @@ class Agent:
             accepted=accepted,
         )
 
-    def _build_options(self, system_prompt: str) -> ClaudeAgentOptions:
-        effort = self._config.effort
-        if effort not in ("low", "medium", "high", "max"):
-            effort = "high"
-        # ``betas``: Anthropic beta headers passed through the SDK to
-        # the API. Currently a list of one — the 1M-context flag — when
-        # the operator hasn't opted out via MIMIR_CONTEXT_1M=false.
-        betas: list = []
-        if self._config.context_1m:
-            from .usage_stats import CONTEXT_1M_BETA
-            betas.append(CONTEXT_1M_BETA)
-        return ClaudeAgentOptions(
-            system_prompt=system_prompt,
-            tools=list(SDK_PRESET_TOOLS),
-            mcp_servers={"mimir": self._mcp_server},
-            betas=betas,
-            allowed_tools=allowed_tool_names(
-                include_search=self._indexer is not None,
-                include_saga=self._saga is not None,
-                include_scheduler=self._scheduler is not None,
-                include_channels=self._channels is not None,
-            ),
-            permission_mode="bypassPermissions",
-            hooks={
-                "PreToolUse": [
-                    HookMatcher(
-                        # MultiEdit / NotebookEdit kept in the regex so the
-                        # path-confinement hook still fires if either becomes
-                        # available later; dropping them costs nothing today.
-                        matcher="Read|Write|Edit|MultiEdit|Glob|Grep|NotebookEdit",
-                        hooks=[self._pre_tool_hook],
-                    )
-                ],
-                "PostToolUse": [
-                    HookMatcher(
-                        matcher="Write|Edit|MultiEdit",
-                        hooks=[self._post_tool_hook],
-                    )
-                ],
-            },
-            model=self._config.model,
-            effort=effort,
-            thinking={"type": "adaptive", "display": "summarized"},
-            env=self._config.sdk_env_overrides(),
-            cwd=str(self._config.home),
-            # Stage 3: per-turn session_id (Stage 2) writes into this
-            # store; ``run_turn`` deletes by ``ctx.turn_id`` after the
-            # turn completes so memory stays bounded across long-lived
-            # processes.
-            session_store=self._session_store,
-            # Streaming chunks needed when capture_rate_limits is on —
-            # the message_start event carries the per-response
-            # rate_limits block we want. The extra deltas are cheap
-            # (filtered out in the run_turn message loop).
-            include_partial_messages=self._config.capture_rate_limits,
-        )
+    # ────────────────────────────────────────────────────────────
+    # System prompt assembly
+    # ────────────────────────────────────────────────────────────
 
-    # ---- chat history --------------------------------------------------
+    def _build_system_prompt(self) -> str:
+        """Assemble the per-turn system prompt: persona + core memory +
+        memory index + operator alert channel + skill catalog. Rebuilt
+        each turn so skill bucket assignments / outcome counters stay
+        current (chainlink #15: install-stable section comes first so
+        the prompt cache prefix extends through it).
 
-    async def _record_inbound(self, event: AgentEvent) -> None:
-        if not event.content or event.trigger == "saga_session_end":
-            return
-        # Shell-job completion wake-ups are payload-shaped (multi-line
-        # status + tails), not message-shaped. Skip recording them in
-        # chat_history so the recent-activity block doesn't fill with
-        # shell dumps; the wake-up turn still sees them in its prompt
-        # via build_turn_prompt's shell_job_complete branch.
-        if event.trigger == "shell_job_complete":
-            return
-        kind = "user_message" if event.trigger == "user_message" else "system_note"
-        msg = self._buffer.make_message(
-            channel_id=event.channel_id,
-            kind=kind,
-            content=event.content,
-            author=event.author,
-            author_display=event.author_display or event.author,
-            msg_id=event.source_id,
-            source=event.source,
-        )
-        await self._buffer.append(msg)
-
-    async def _record_outbound(
-        self, channel_id: str, output: str, *, source: str | None = None
-    ) -> None:
-        if not output:
-            return
-        msg = self._buffer.make_message(
-            channel_id=channel_id,
-            kind="assistant_message",
-            content=output,
-            source=source,
-        )
-        await self._buffer.append(msg)
-
-    # chainlink #5 — streaming auto-dispatch callbacks.
-    #
-    # The streaming dispatcher (mimir._streaming_dispatch) handles the
-    # "plan" flush — text emitted before the first tool_use, sent
-    # mid-turn so the user sees forward progress. The result flush
-    # still goes through _auto_dispatch_or_record at end-of-turn. The
-    # callbacks below glue the dispatcher to the standard observability
-    # surfaces: events.jsonl + last_assistant_message_id tracking on
-    # the TurnContext (so reactions defaulting to "the message I just
-    # delivered" land on the plan flush, not on a stale prior reply).
-    def _on_streaming_plan_dispatched(
-        self,
-        ctx: TurnContext,
-        event: AgentEvent,
-        bridge,
-    ):
-        async def _cb(plan_text: str, result, directives: tuple) -> None:
-            # ``plan_text`` is the *cleaned* plan (actions stripped) —
-            # what the user actually saw on the bridge send. Recording
-            # this to chat_history keeps Recent-activity consistent
-            # with delivery; the raw plan_buffer (with <actions>
-            # markup) never makes it into chat_history.
-            #
-            # ``result`` is None when the plan was directives-only —
-            # there was no cleaned text to send via the bridge, but
-            # we still need to dispatch the parsed directives so
-            # things like an inline ack-react actually fire.
-            send_msg_id: str | None = None
-            if result is not None:
-                send_msg_id = result.message_id
-                ctx.last_assistant_message_id = send_msg_id
-                text_for_log = (
-                    plan_text if len(plan_text) <= 4096
-                    else plan_text[:4096] + "…[truncated]"
-                )
-                await log_event(
-                    "auto_dispatch_streamed_plan",
-                    channel_id=event.channel_id,
-                    bridge=getattr(bridge, "name", None),
-                    message_id=result.message_id,
-                    chunks=result.chunks,
-                    text=text_for_log,
-                    actions_in_plan=len(directives),
-                )
-                # Record the plan chunk to chat_history immediately so
-                # Recent activity reflects what was sent. The result
-                # chunk is appended later by _auto_dispatch_or_record.
-                await self._record_outbound(
-                    event.channel_id, plan_text, source=event.source,
-                )
-
-            if directives and self._channels is not None:
-                from .channeltools import _dispatch_action_directives
-
-                outbound_root = (
-                    self._config.home / "attachments" / "outbound"
-                )
-                # default_message_id: prefer the just-sent plan flush
-                # so a bare ``<react>`` lands on it; otherwise fall
-                # back to whatever was last delivered on this turn.
-                # When the agent emits the inline ack-react pattern
-                # (``<react message="<inbound-id>" />``) the explicit
-                # message id wins anyway.
-                try:
-                    directive_results = await _dispatch_action_directives(
-                        self._channels,
-                        fallback_channel_id=event.channel_id,
-                        directives=directives,
-                        default_message_id=(
-                            send_msg_id or ctx.last_assistant_message_id
-                        ),
-                        outbound_root=outbound_root,
-                    )
-                    await log_event(
-                        "auto_dispatch_streamed_plan_actions",
-                        channel_id=event.channel_id,
-                        bridge=getattr(bridge, "name", None),
-                        message_id=send_msg_id,
-                        directives=directive_results,
-                    )
-                except Exception:  # noqa: BLE001
-                    log.exception(
-                        "streaming plan-flush directive dispatch failed",
-                    )
-
-        return _cb
-
-    def _on_streaming_plan_failed(self, event: AgentEvent, bridge):
-        async def _cb(plan_text: str, error: str) -> None:
-            await log_event(
-                "auto_dispatch_streamed_plan_failed",
-                channel_id=event.channel_id,
-                bridge=getattr(bridge, "name", None),
-                error=error,
-                plan_chars=len(plan_text),
-            )
-
-        return _cb
-
-    # VSM: S1 outbound — auto-dispatch the SDK's final assistant text
-    #                    when the agent didn't call send_message. Without
-    #                    this, the natural-text reply is recorded only to
-    #                    chat_history (lettabot/muninnbot pattern: the
-    #                    final text IS the reply).
-    # loop_id: outbound-auto
-    async def _auto_dispatch_or_record(
-        self, ctx: TurnContext, event: AgentEvent, output: str,
-    ) -> None:
-        """When the agent emits final text without calling send_message
-        explicitly, deliver the text via the channel bridge. Parses
-        ``<actions>`` directives the same way ``send_message`` does so
-        the agent can react / send-file via natural-text directives too.
-
-        Fires for user-initiated triggers (``user_message``,
-        ``react_received``, ``shell_job_complete``) on bridge-routable
-        chat channels. ``shell_job_complete`` is the spawn analog of
-        ``react_received`` — the operator kicked off a background spawn
-        and the wake-up turn's text is the natural reply venue (silent
-        drop here meant operators couldn't see spawn results without
-        digging through turn-viewer).
-
-        Heartbeats and other ``scheduled_tick`` events are explicitly
-        "end silently" — those still go through ``_record_outbound``
-        only. Bench / web-stub bridges that don't actually deliver to
-        a third-party service skip auto-dispatch and just record.
-        Synthetic channels (``scheduler:*``, ``poller:*``) skip via the
-        ``bridge is None`` guard below regardless of trigger eligibility.
-
-        Always writes to chat_history regardless of dispatch outcome —
-        so Recent activity reflects what the agent said even when
-        delivery failed (the agent self-corrects when it sees a stale
-        conversation that doesn't match what it thought it sent)."""
-        # Triggers eligible for auto-dispatch:
-        # - user_message / react_received: human-initiated inbound on a
-        #   chat bridge → reply is the canonical delivery.
-        # - shell_job_complete: spawn-completion wake-up, fires on the
-        #   channel that kicked off the spawn (which is the operator's
-        #   chat for ``spawn_claude_code``). Excluding this here meant
-        #   spawn results were silently dropped on the floor even though
-        #   the turn produced user-facing text. See chainlink #133 +
-        #   memory/issues/wake-up-turn-output-silently-dropped.md.
-        # Scheduled / cron triggers are explicitly silent; synthetic
-        # channels with no bridge fall through the ``bridge is None``
-        # guard below regardless of trigger.
-        auto_eligible = event.trigger in (
-            "user_message",
-            "react_received",
-            "shell_job_complete",
-        )
-
-        dispatched = False
-        clean_text = output
-        if auto_eligible and self._channels is not None:
-            bridge = self._channels.find(event.channel_id)
-            # Skip auto-dispatch on benchmark + bench-bridge channels —
-            # the bench harness reads the SDK's final text directly.
-            if bridge is not None and bridge.name not in ("bench",):
-                from .bridges._directives import parse_directives
-                from .channeltools import _dispatch_action_directives
-
-                parsed = parse_directives(output)
-                clean_text = parsed.clean_text or ""
-                outbound_root = (
-                    self._config.home / "attachments" / "outbound"
-                )
-                # Send the cleaned text first so reactions land on the
-                # just-sent message id by default. When clean_text is
-                # empty (the agent emitted an actions-only reply), skip
-                # the main send — directives still fire.
-                send_msg_id: str | None = None
-                if clean_text.strip():
-                    try:
-                        result = await self._channels.send(
-                            event.channel_id, clean_text,
-                        )
-                        if result.sent:
-                            dispatched = True
-                            send_msg_id = result.message_id
-                            ctx.last_assistant_message_id = send_msg_id
-                            # Cap logged text at 4KB to keep events.jsonl
-                            # tight; same threshold the send_message
-                            # tool uses (channeltools.py).
-                            text_for_log = (
-                                clean_text if len(clean_text) <= 4096
-                                else clean_text[:4096] + "…[truncated]"
-                            )
-                            await log_event(
-                                "auto_dispatch_ok",
-                                channel_id=event.channel_id,
-                                bridge=bridge.name,
-                                message_id=send_msg_id,
-                                chunks=result.chunks,
-                                text=text_for_log,
-                            )
-                        else:
-                            log.warning(
-                                "auto-dispatch: bridge %r returned sent=False: %s",
-                                bridge.name, result.error,
-                            )
-                            await log_event(
-                                "auto_dispatch_failed",
-                                channel_id=event.channel_id,
-                                bridge=bridge.name,
-                                error=result.error,
-                            )
-                    except Exception as exc:  # noqa: BLE001
-                        log.exception("auto-dispatch send failed")
-                        await log_event(
-                            "auto_dispatch_failed",
-                            channel_id=event.channel_id,
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                if parsed.directives and (dispatched or not clean_text.strip()):
-                    try:
-                        directive_results = await _dispatch_action_directives(
-                            self._channels,
-                            fallback_channel_id=event.channel_id,
-                            directives=parsed.directives,
-                            default_message_id=send_msg_id
-                            or ctx.last_assistant_message_id,
-                            outbound_root=outbound_root,
-                        )
-                        # Directives-only path (no main text) doesn't
-                        # land an auto_dispatch_ok above — emit one
-                        # here so the audit log captures the activity.
-                        if not dispatched and directive_results:
-                            await log_event(
-                                "auto_dispatch_ok",
-                                channel_id=event.channel_id,
-                                bridge=bridge.name,
-                                message_id=None,
-                                chunks=0,
-                                text="",
-                                directives=directive_results,
-                            )
-                    except Exception:  # noqa: BLE001
-                        log.exception("auto-dispatch directives failed")
-
-        # Always record the cleaned text to chat_history so Recent
-        # activity reflects what was sent (or what would have been
-        # sent on dispatch failure). Empty cleaned text — directive-
-        # only response — still gets a placeholder so the turn
-        # registers in history.
-        record_text = clean_text if clean_text.strip() else output
-        await self._record_outbound(
-            event.channel_id, record_text, source=event.source,
-        )
-
-    # ---- SAGA hooks ----------------------------------------------------
-
-    def _assemble_usage_block(
-        self,
-    ) -> tuple[str | None, list[tuple[str, dict]]]:
-        """Read turns.jsonl tail-first, aggregate over 1h / 5h / 7d,
-        evaluate the cost-rate alert, render the Resource usage prompt
-        section. Returns ``(block_text, deferred_events)`` where
-        ``block_text`` is None when disabled via config or when no
-        turns have been recorded yet, and ``deferred_events`` is a list
-        of ``(event_kind, kwargs)`` pairs the caller should ``log_event``
-        on the running loop.
-
-        Side effects (deferred): a ``cost_rate_alert`` /
-        ``cost_rate_advisory`` entry when a threshold is currently
-        tripped AND no prior alert lies within the cooldown window;
-        a ``rate_limit_off_pace`` entry under the same shape. The
-        annotated alert is included in the rendered block regardless
-        of cooldown — the agent should keep seeing the warning while
-        the spike persists.
-
-        Note on deferred-vs-immediate: this method runs inside
-        ``asyncio.to_thread`` (CR#5 — keeps JSONL scans off the event
-        loop). The worker thread has no running loop, so we can't
-        ``asyncio.create_task`` from here. The caller flushes
-        ``deferred_events`` on the dispatcher loop after the
-        to_thread returns."""
-        deferred: list[tuple[str, dict]] = []
-        if not self._config.usage_block_enabled:
-            return None, deferred
-
-        from .stats_block import assemble_stats_block
-
+        Falls back to the minimal default prompt on any failure — a
+        broken core-block read or skill-catalog crash should NEVER
+        prevent a turn from running."""
         try:
-            result = assemble_stats_block(
-                self._config,
-                self._rate_limits,
-                turns_snapshot=self._turns_snapshot,
-                events_snapshot=self._events_snapshot,
+            from .core_blocks import load_core
+            from .prompts import build_system_prompt
+            core_blocks = load_core(self._config.home)
+            memory_index_body = (
+                self._indexes.read_memory_index()
+                if self._indexes is not None else None
             )
-        except Exception:  # noqa: BLE001
-            # aggregate() / evaluate_cost_rate() bubble through the
-            # shared helper; partial failures (rate-limits .current()
-            # raise OR projection raise, subagent stats) degrade
-            # gracefully INSIDE assemble_stats_block so they don't
-            # nuke the whole block (PR #116 review-fix).
-            log.exception("assemble_stats_block failed; skipping block")
-            return None, deferred
-
-        if result.alert is not None:
-            # chainlink #13: under quota mode, cost-rate spikes are
-            # advisory (logged but not suppressing — the binding
-            # constraint is plan-window utilization, which costs
-            # nothing to respect). Emit a separate ``cost_rate_advisory``
-            # kind so the algedonic feedback renderer can phrase it as
-            # "FYI" rather than "scheduled work suppressed".
-            from .billing import BillingMode
-            advisory = self._config.billing_mode is BillingMode.QUOTA
-            event_kind = "cost_rate_advisory" if advisory else "cost_rate_alert"
-            if not event_recently_emitted(
-                self._config.events_log,
-                event_kind,
-                cooldown_minutes=self._config.cost_alert_cooldown_minutes,
-                snapshot=self._events_snapshot,
-            ):
-                deferred.append(
-                    (
-                        event_kind,
-                        {
-                            "reason": result.alert.reason,
-                            "rate_now_usd_per_hour": round(result.alert.rate_now_usd_per_hour, 4),
-                            "threshold_usd_per_hour": round(result.alert.threshold_usd_per_hour, 4),
-                            "baseline_usd_per_hour": (
-                                round(result.alert.baseline_usd_per_hour, 4)
-                                if result.alert.baseline_usd_per_hour is not None
-                                else None
-                            ),
-                        },
-                    )
-                )
-
-        # Cooldown-gated rate_limit_off_pace event. Sustained spikes
-        # only re-emit once per cooldown window so the firehose stays
-        # clean; the resource block keeps showing the warning every
-        # turn while it's tripped (off_pace lines are baked into
-        # ``result.body``).
-        if result.off_pace and not event_recently_emitted(
-            self._config.events_log,
-            "rate_limit_off_pace",
-            cooldown_minutes=self._config.cost_alert_cooldown_minutes,
-            snapshot=self._events_snapshot,
-        ):
-            worst_key, worst_snap, worst_proj = result.off_pace[0]
-            deferred.append(
-                (
-                    "rate_limit_off_pace",
-                    {
-                        "rate_limit_type": worst_key,
-                        "utilization": worst_snap.utilization,
-                        "on_pace_utilization": round(worst_proj.on_pace_utilization, 4),
-                        "hours_until_reset": round(worst_proj.hours_until_reset, 2),
-                        "resets_at": worst_snap.resets_at,
-                    },
-                )
+            skill_block = self._assemble_skill_block()
+            return build_system_prompt(
+                core_blocks=core_blocks,
+                memory_index_body=memory_index_body,
+                operator_alert_channel=getattr(
+                    self._config, "operator_alert_channel", "",
+                ),
+                skill_block=skill_block,
+                home_dir=str(self._config.home),
             )
-
-        return result.body, deferred
-
-    def _assemble_upcoming_block(self) -> str | None:
-        """v0.5+ §12.1: feedforward — render the `## Upcoming` block from
-        the scheduler's next-N firings + the plan-window reset times.
-        Returns None when both sources are empty."""
-        try:
-            from .upcoming import render_upcoming_block
-            return render_upcoming_block(
-                scheduler=self._scheduler,
-                rate_limit_store=self._rate_limits,
-            )
-        except Exception:  # noqa: BLE001 — never crash a turn for this
-            log.exception("_assemble_upcoming_block failed; skipping")
-            return None
-
-    def _assemble_commitments_block(
-        self, channel_id: str | None,
-    ) -> str | None:
-        """Phase 3: ``## Upcoming commitments`` block — active records
-        for this channel (+ unbound). Suppressed on synthetic
-        ``scheduler:*`` / ``poller:*`` channels (the agent doesn't act
-        on commitments from a heartbeat tick context).
-
-        ``None`` when no active records to surface."""
-        if channel_id is None:
-            return None
-        from .history import SYNTHETIC_CHANNEL_PREFIXES
-        if channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES):
-            return None
-        try:
-            from .commitments.render import render_commitments_block
-            records = self._commitments.list(
-                channel_id=channel_id,
-                include_unbound=True,
-            )
-            return render_commitments_block(records)
-        except Exception:  # noqa: BLE001 — never crash a turn for this
-            log.exception(
-                "_assemble_commitments_block failed; skipping"
-            )
-            return None
-
-    def _assemble_self_state_block(self) -> str | None:
-        """v0.5+ §12.4: render the `## Self-state` block — homeostat's
-        view of the four layered constraints (plan window / cost rate /
-        S3-S4 share / tokens), plus the PR 4b ``uncommitted in
-        /mimir-home`` line and per-turn skill bucket telemetry
-        (chainlink #15 — moved out of the system prompt's `## Skills`
-        block so a skill invocation doesn't bust the prompt-cache
-        prefix). Returns None when the homeostat has nothing useful to
-        surface yet (fresh agent, no signal) AND no skill telemetry
-        either."""
-        try:
-            arbiter_body = self._arbiter.render_self_state_block()
-        except Exception:  # noqa: BLE001
-            log.exception("_assemble_self_state_block (arbiter) failed; skipping")
-            arbiter_body = None
-        git_line = self._assemble_git_status_line()
-        skill_body = self._assemble_skill_telemetry_lines()
-        parts = [s for s in (arbiter_body, git_line, skill_body) if s]
-        if not parts:
-            return None
-        return "\n".join(parts)
-
-    def _assemble_git_status_line(self) -> str | None:
-        """PR 4b: ``- uncommitted in /mimir-home: <count> file(s) — <topN>``
-        line for the Self-state block. Catches the case where commits
-        failed (secret-scan refused, push outage during operator
-        intervention, manual edits left the tree dirty). Suppressed when:
-
-        - ``MIMIR_GIT_TRACKING_ENABLED`` is False (tracking off entirely)
-        - count == 0 (the common case — clean tree)
-        - ``health.git_status_summary`` errored (returns (0, []))
-
-        Synchronous: runs on the prompt-render path, which is itself
-        synchronous. ``git_status_summary`` blocks the caller for ~5-10ms.
-        Rendering lives in ``health.render_git_status_line`` so other
-        surfaces (CLI, web UI) can reuse the exact same output.
-        """
-        if not self._config.git_tracking_enabled:
-            return None
-        try:
-            return health.render_git_status_line(self._config.home)
-        except Exception:  # noqa: BLE001
-            log.exception("_assemble_git_status_line failed; skipping")
-            return None
+        except Exception:
+            log.exception("_build_system_prompt failed; using minimal default")
+            return _DEFAULT_SYSTEM_PROMPT
 
     def _assemble_skill_block(self) -> str | None:
-        """v0.5+ §12.3: render the system-prompt `## Skills` block —
-        the **install-stable** catalog of skill names. Volatile
-        success-rate telemetry (Proven/Risky buckets, ``N/M in window``
-        counts) lives in `_assemble_skill_telemetry_lines` and gets
-        composed into the per-turn `## Self-state` block instead, so
-        the system prompt stays cacheable across turns (chainlink #15).
+        """v0.5+ §12.3: render the install-stable skill catalog for the
+        system prompt. Returns None when no skills are seeded; volatile
+        per-turn telemetry (success/total counts) is handled separately
+        via the self-state block (deferred to Phase D).
 
-        Returns None when no skills are seeded.
-
-        Skills enumerated via ``installed_skill_names(home)`` so user-
-        installed skills under ``<home>/.claude/skills/`` appear
-        alongside bundled ones."""
+        Each rendered line is ``- <name> — <one-line trigger>`` when
+        SKILL.md frontmatter declares one; otherwise bare ``- <name>``.
+        Trigger phrases come from the home-seeded ``<home>/.claude/
+        skills/`` copy first, with a fallback to the bundled root for
+        any skill not yet copied — covers fresh-install homes before
+        ``seed_skills`` runs. SKILL.md frontmatter is install-stable,
+        so description content doesn't perturb the prompt cache
+        (chainlink #15)."""
         try:
-            from .skill_outcomes import (
-                SkillPinConfig, render_skill_catalog,
-            )
+            from .skill_outcomes import SkillPinConfig, render_skill_catalog
             from .skill_defs import installed_skill_names
             from .skill_catalog import load_catalog, DEFAULT_SKILLS_ROOT
             seeded = installed_skill_names(self._config.home)
             if not seeded:
                 return None
             pin = SkillPinConfig.load(
-                self._config.home / "state" / "skill-pin.yaml"
+                self._config.home / "state" / "skill-pin.yaml",
             )
-            # Load per-skill descriptions from SKILL.md frontmatter so
-            # the system-prompt block reads as `- name — trigger` instead
-            # of bare names. Source-of-truth: the home's seeded copy
-            # under ``<home>/.claude/skills/``; fall back to the bundled
-            # root for any skill missing from the home dir (covers
-            # fresh-install homes before ``seed_skills`` runs and any
-            # bundled skill not yet copied). Frontmatter is install-
-            # stable so this doesn't perturb the prompt cache.
             descriptions: dict[str, str] = {}
             try:
                 home_skills = self._config.home / ".claude" / "skills"
@@ -1709,19 +1367,182 @@ class Agent:
                 log.exception("skill description load failed; rendering names only")
                 descriptions = {}
             return render_skill_catalog(seeded, pin, descriptions=descriptions)
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("_assemble_skill_block failed; skipping")
             return None
 
-    def _assemble_skill_telemetry_lines(self) -> str | None:
-        """Per-turn skill bucket telemetry (Proven/Risky with
-        ``N/M in window`` counts) for inclusion in the
-        ``## Self-state`` block. The install-stable skill catalog
-        lives in the system prompt (`_assemble_skill_block`); this
-        is the volatile half — pulled out so a skill invocation
-        doesn't perturb the system-prompt cache prefix.
+    # ────────────────────────────────────────────────────────────
+    # Per-turn block assembly (ported from main)
+    # ────────────────────────────────────────────────────────────
 
-        Returns None when no skills have in-window activity."""
+    def _spawn_bg_task(self, coro):
+        """Schedule a fire-and-forget coroutine on the running loop.
+
+        No-op when there is no running loop (turns invoked from a sync
+        test path) — caller's deferred event simply doesn't fire,
+        which is fine because the per-turn block readers are
+        non-essential.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    def _assemble_usage_block(
+        self,
+    ) -> tuple[str | None, list[tuple[str, dict]]]:
+        """Aggregate over 1h / 5h / 7d, render the Resource usage prompt
+        section, return ``(block_text, deferred_events)``.
+
+        Side effects (deferred): cost_rate_alert / cost_rate_advisory
+        + rate_limit_off_pace events under cooldown. Caller flushes
+        deferred_events on the running loop because this method runs
+        inside ``asyncio.to_thread``.
+        """
+        deferred: list[tuple[str, dict]] = []
+        if not self._config.usage_block_enabled:
+            return None, deferred
+
+        from .stats_block import assemble_stats_block
+
+        try:
+            result = assemble_stats_block(
+                self._config,
+                self._rate_limits,
+                turns_snapshot=self._turns_snapshot,
+                events_snapshot=self._events_snapshot,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("assemble_stats_block failed; skipping block")
+            return None, deferred
+
+        if result.alert is not None:
+            from .billing import BillingMode
+            advisory = self._config.billing_mode is BillingMode.QUOTA
+            event_kind = "cost_rate_advisory" if advisory else "cost_rate_alert"
+            if not event_recently_emitted(
+                self._config.events_log,
+                event_kind,
+                cooldown_minutes=self._config.cost_alert_cooldown_minutes,
+                snapshot=self._events_snapshot,
+            ):
+                deferred.append(
+                    (
+                        event_kind,
+                        {
+                            "reason": result.alert.reason,
+                            "rate_now_usd_per_hour": round(
+                                result.alert.rate_now_usd_per_hour, 4,
+                            ),
+                            "threshold_usd_per_hour": round(
+                                result.alert.threshold_usd_per_hour, 4,
+                            ),
+                            "baseline_usd_per_hour": (
+                                round(result.alert.baseline_usd_per_hour, 4)
+                                if result.alert.baseline_usd_per_hour is not None
+                                else None
+                            ),
+                        },
+                    )
+                )
+
+        if result.off_pace and not event_recently_emitted(
+            self._config.events_log,
+            "rate_limit_off_pace",
+            cooldown_minutes=self._config.cost_alert_cooldown_minutes,
+            snapshot=self._events_snapshot,
+        ):
+            worst_key, worst_snap, worst_proj = result.off_pace[0]
+            deferred.append(
+                (
+                    "rate_limit_off_pace",
+                    {
+                        "rate_limit_type": worst_key,
+                        "utilization": worst_snap.utilization,
+                        "on_pace_utilization": round(
+                            worst_proj.on_pace_utilization, 4,
+                        ),
+                        "hours_until_reset": round(
+                            worst_proj.hours_until_reset, 2,
+                        ),
+                        "resets_at": worst_snap.resets_at,
+                    },
+                )
+            )
+
+        return result.body, deferred
+
+    def _assemble_upcoming_block(self) -> str | None:
+        """v0.5+ §12.1: render the ``## Upcoming`` block."""
+        try:
+            from .upcoming import render_upcoming_block
+            return render_upcoming_block(
+                scheduler=self._scheduler,
+                rate_limit_store=self._rate_limits,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("_assemble_upcoming_block failed; skipping")
+            return None
+
+    def _assemble_commitments_block(
+        self, channel_id: str | None,
+    ) -> str | None:
+        """Phase 3: ``## Upcoming commitments`` block — active records
+        for this channel (+ unbound). Suppressed on synthetic
+        scheduler:* / poller:* channels and when no store is wired."""
+        if channel_id is None or self._commitments is None:
+            return None
+        from .history import SYNTHETIC_CHANNEL_PREFIXES
+        if channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES):
+            return None
+        try:
+            from .commitments.render import render_commitments_block
+            records = self._commitments.list(
+                channel_id=channel_id,
+                include_unbound=True,
+            )
+            return render_commitments_block(records)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "_assemble_commitments_block failed; skipping",
+            )
+            return None
+
+    def _assemble_self_state_block(self) -> str | None:
+        """v0.5+ §12.4: render the ``## Self-state`` block — homeostat
+        view + uncommitted-files line + per-turn skill telemetry."""
+        try:
+            arbiter_body = self._arbiter.render_self_state_block()
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "_assemble_self_state_block (arbiter) failed; skipping",
+            )
+            arbiter_body = None
+        git_line = self._assemble_git_status_line()
+        skill_body = self._assemble_skill_telemetry_lines()
+        parts = [s for s in (arbiter_body, git_line, skill_body) if s]
+        if not parts:
+            return None
+        return "\n".join(parts)
+
+    def _assemble_git_status_line(self) -> str | None:
+        """``- uncommitted in /mimir-home: <count> file(s) — <topN>`` line.
+        Suppressed when tracking is off, count==0, or summary errored.
+        """
+        if not self._config.git_tracking_enabled:
+            return None
+        try:
+            return health.render_git_status_line(self._config.home)
+        except Exception:  # noqa: BLE001
+            log.exception("_assemble_git_status_line failed; skipping")
+            return None
+
+    def _assemble_skill_telemetry_lines(self) -> str | None:
+        """Per-turn skill bucket telemetry lines for ``## Self-state``."""
         try:
             from .skill_outcomes import (
                 SkillPinConfig, aggregate, render_skill_telemetry,
@@ -1736,36 +1557,32 @@ class Agent:
             )
             return render_skill_telemetry(seeded, aggs, pin)
         except Exception:  # noqa: BLE001
-            log.exception("_assemble_skill_telemetry_lines failed; skipping")
+            log.exception(
+                "_assemble_skill_telemetry_lines failed; skipping",
+            )
             return None
 
     async def _assemble_session_summaries(
-        self, *, channel_id: str | None
+        self, *, channel_id: str | None,
     ) -> str | None:
         """Render the Recent session summaries block. Tries SAGA first
         (chronological recall via /v1/sessions/recent); falls back to
-        the local mirror on empty / failure. Returns None when both are
-        empty or the section is disabled.
-
-        chainlink #63: each boundary header gets ``(~Xh ago, N turns
-        this channel)`` markers; Unfinished sub-bullets get a
-        ``[verify before quoting]`` suffix past either staleness
-        threshold; later boundaries' ``closed_since`` corrective lists
-        drop resolved items from earlier Unfinished renderings.
-        """
+        the local mirror on empty / failure."""
         count = self._config.recent_boundaries
         if count <= 0:
             return None
         boundaries: list[dict] = []
         if self._saga is not None:
-            # CR2-#3: a transient SAGA outage at prompt-assembly time
-            # must not crash the turn — degrade to the local-mirror
-            # fallback the same way an empty result does. Mirrors the
-            # try/except pattern in _assemble_self_state_block.
             try:
-                boundaries = await self._saga.recent_session_boundaries(
-                    channel_id=channel_id, count=count,
+                # Best-effort — SAGA client may not implement this. We
+                # don't want to crash a turn over an optional method.
+                recent_fn = getattr(
+                    self._saga, "recent_session_boundaries", None,
                 )
+                if recent_fn is not None:
+                    boundaries = await recent_fn(
+                        channel_id=channel_id, count=count,
+                    )
             except Exception:  # noqa: BLE001
                 log.exception(
                     "_assemble_session_summaries: SAGA "
@@ -1777,13 +1594,8 @@ class Agent:
             boundaries = self._session_boundary_log.recent(
                 channel_id=channel_id, count=count,
             )
-        # Per-boundary turn-count: walk the cached turns snapshot once
-        # per render. Boundaries are typically 3 — counting from each
-        # is cheap (the snapshot iterator is in-memory after the first
-        # call within the TTL window).
         turn_counts: dict[str, int] = {}
         if channel_id is not None and boundaries:
-            from .session_boundary_log import count_turns_since
             snapshot_records = self._turns_snapshot.records
             for b in boundaries:
                 ts = str(b.get("ts") or b.get("timestamp") or "")
@@ -1804,226 +1616,16 @@ class Agent:
             stale_turns=self._config.unfinished_stale_turns,
         )
 
-    # VSM: S3 — pre-turn retrieval; saga.query feeds likely-relevant
-    #          atoms into the prompt before the agent runs. Precondition
-    #          for the post-turn credit pass (loop 1.1).
-    # loop_id: pre-message
-    async def _pre_message_hook(self, ctx: TurnContext, event: AgentEvent) -> str | None:
-        """Query SAGA, stash atom_ids on ctx, return a formatted prompt block
-        (or None if nothing relevant). Skipped on synthesis turns.
-
-        Floors the per-atom confidence tier at the configured threshold
-        (default "medium") because auto-fetched atoms cost system-prompt
-        budget every turn — low-confidence noise here is net-negative.
-
-        Passes the last few same-channel messages as ``context`` so SAGA
-        can rewrite referential queries ("yes, look for that") into
-        self-contained form when its
-        ``[retrieval] enable_contextual_rewrite`` flag is on. Filtered by
-        the same source allowlist as Recent activity so bench / API /
-        scheduler traffic stays out of the rewrite path."""
-        if self._saga is None or ctx.trigger == "saga_session_end":
-            return None
-        if not event.content:
-            return None
-        min_tier = (self._config.saga_pre_message_min_tier or "").strip() or None
-        # Pull last 11 same-channel messages and drop the just-recorded
-        # inbound (step 2 of run_turn appended it); SAGA uses up to 10.
-        recent = self._buffer.recent_for_channel(
-            event.channel_id,
-            11,
-            source_allowlist=self._config.recent_sources,
-        )
-        if recent and recent[-1].kind == "user_message" and recent[-1].content == event.content:
-            recent = recent[:-1]
-        context = [
-            {
-                "role": "user" if m.kind == "user_message" else "assistant",
-                "content": m.content[:400],
-            }
-            for m in recent[-10:]
-            if m.kind in ("user_message", "assistant_message")
-        ] or None
-        try:
-            payload = await self._saga.query(
-                event.content,
-                top_k=12,
-                session_id=ctx.saga_session_id,
-                min_confidence_tier=min_tier,
-                context=context,
-            )
-        except SagaError as exc:
-            await log_event(
-                "saga_query_error",
-                where="pre_message_hook",
-                error=str(exc),
-                turn_id=ctx.turn_id,
-            )
-            return None
-        ids = _atom_ids_from_response(payload)
-        # P42: also credit the atoms whose triples were surfaced — when
-        # the agent grounds its reply in a triple, the originating atom
-        # earned its keep. Same mark_contributions path as for raw atom
-        # hits; the post-message hook treats both identically.
-        triple_source_ids = _source_atom_ids_from_triples(payload)
-        if not ids and not triple_source_ids:
-            return None
-        seen = set(ctx.saga_atom_ids)
-        for aid in list(ids) + triple_source_ids:
-            if aid not in seen:
-                ctx.saga_atom_ids.append(aid)
-                seen.add(aid)
-        return _format_saga_payload(payload)
-
-    # VSM: S3 — post-turn credit pass; saga's retrieval ranking learns
-    #          which atoms helped (access_log.contributed boost).
-    # loop_id: 1.1
-    async def _post_message_hook(self, ctx: TurnContext, output: str) -> None:
-        """Credit pre-injected ∪ mid-turn-queried atoms via mark_contributions.
-
-        Fallback path: ``send_message`` is the primary credit hook (it
-        carries the actual delivered text — see channeltools.py). This hook
-        only fires when the turn produced no send_message (e.g. scheduled
-        ticks that wrote to memory but didn't reply, or background work).
-        Skipped on synthesis turns (the agent already called saga_feedback
-        per atom in step 2 of the synthesis prompt).
-
-        CR#19: synthesis turns get a *different* post-check before the
-        early return — verify step 3 of the synthesis prompt ran (the
-        ``saga_end_session`` tool call). When missing, emit a
-        ``saga_synthesis_skipped_boundary`` algedonic so the operator
-        sees silent contract failures and the next turn's prompt
-        surfaces it as a negative signal."""
-        if ctx.trigger == "saga_session_end":
-            await self._check_synthesis_boundary_called(ctx)
-        if self._saga is None or ctx.trigger == "saga_session_end":
-            return
-        if ctx.send_message_count > 0:
-            # send_message already credited the atoms with the real reply.
-            return
-        if not ctx.saga_atom_ids or not output:
-            return
-        atom_ids_for_feedback = list(dict.fromkeys(ctx.saga_atom_ids))
-        try:
-            await self._saga.feedback(
-                atom_ids_for_feedback,  # de-dup, preserve order
-                output,
-                session_id=ctx.saga_session_id,
-            )
-            await log_event(
-                "saga_feedback_sent",
-                where="post_message_hook",
-                turn_id=ctx.turn_id,
-                n_atoms=len(atom_ids_for_feedback),
-                text_len=len(output),
-            )
-        except SagaError as exc:
-            await log_event(
-                "saga_feedback_error",
-                where="post_message_hook",
-                error=str(exc),
-                turn_id=ctx.turn_id,
-            )
-
-    async def _check_synthesis_boundary_called(self, ctx: TurnContext) -> None:
-        """CR#19: synthesis-turn post-check. The synthesis prompt asks
-        the agent to call ``saga_end_session`` (step 3); the tool
-        handler flips ``ctx.saga_end_session_called`` on success. If
-        the flag is still False at end of turn, the agent skipped step
-        3 and the next session has no boundary atom — a silent
-        contract failure the operator only notices days later via empty
-        ``Recent session summaries`` blocks. Emit an algedonic event so
-        the failure surfaces immediately and the agent's next turn
-        prompt carries it as a negative signal."""
-        if ctx.saga_end_session_called:
-            return
-        await log_event(
-            "saga_synthesis_skipped_boundary",
-            turn_id=ctx.turn_id,
-            saga_session_id=ctx.saga_session_id,
-            channel_id=ctx.channel_id,
-        )
-
-    # ---- plan-window capture (Stage 5) ------------------------------
-
-    async def _capture_plan_quota_from_client(
-        self, options: ClaudeAgentOptions,
-    ) -> None:
-        """Stage 5 of CLAUDE_SDK_CLIENT_MIGRATION.md: query the shared
-        persistent ``ClaudeSDKClient`` for ``apiUsage`` and write each
-        window bucket into ``self._rate_limits``. Replaces the
-        throwaway-subprocess cron poller (mimir/quota_poller.py) with
-        per-turn capture off the warm client we already have.
-
-        ``options`` must be the same options object used for this
-        turn's ``query()`` call so the fingerprint matches and the
-        warm client is reused — passing fresh options would force a
-        disconnect+reconnect, defeating the persistence win.
-
-        No-op when the agent isn't on Claude Max OAuth — direct API
-        keys / OpenRouter / Minimax don't surface useful per-window
-        utilization, so the probe would just waste an IPC roundtrip.
-
-        Best-effort: failures are caught + logged via
-        ``quota_capture_failed`` events and do not propagate. Logs
-        ``quota_capture_ok`` on success so the audit trail is the same
-        shape the cron poller used (``quota_poll_ok`` / ``quota_poll_failed``
-        renamed to ``quota_capture_*`` to mark the new code path).
-        """
-        if not running_on_claude_max():
-            return
-        try:
-            response = await get_context_usage(options)
-        except Exception as exc:  # noqa: BLE001
-            await log_event(
-                "quota_capture_failed",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            return
-        api_usage: dict | None = None
-        if isinstance(response, dict):
-            api_usage = response.get("apiUsage")
-        if not isinstance(api_usage, dict) or not api_usage:
-            # Daemon doesn't have plan-window data yet (fresh OAuth
-            # session before any messages flow), or the user is on a
-            # non-Max plan that doesn't surface this data.
-            await log_event(
-                "quota_capture_ok",
-                windows={},
-                note="apiUsage empty",
-            )
-            return
-        try:
-            recorded = await record_api_usage(self._rate_limits, api_usage)
-        except Exception as exc:  # noqa: BLE001
-            await log_event(
-                "quota_capture_failed",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            return
-        await log_event("quota_capture_ok", windows=recorded)
-
-    # ---- synthesis turn ------------------------------------------------
-
-    async def _build_synthesis_prompt(self, ctx: TurnContext, event: AgentEvent) -> str:
+    async def _build_synthesis_prompt(
+        self, ctx: Any, event: AgentEvent,
+    ) -> str:
         """For trigger='saga_session_end' — load the synthesis template,
-        embed the session's turn window from turns.jsonl.
-
-        When the window is empty (turns.jsonl was rotated past the
-        session's records — e.g. a long-idle session with high turn
-        throughput in the meantime), the synthesis would produce a
-        meaningless boundary atom with no content. Log a warning event
-        so the algedonic surface and the operator can see it; the turn
-        still runs (the agent gets a chance to write a "no record"
-        boundary rather than crash)."""
-        saga_session_id = ctx.saga_session_id or event.extra.get("saga_session_id", "")
+        embed the session's turn window from turns.jsonl. Off-loops the
+        turns.jsonl scan via to_thread."""
+        saga_session_id = ctx.saga_session_id or (event.extra or {}).get(
+            "saga_session_id", "",
+        )
         idle_minutes = self._config.saga_session_idle_minutes
-        # CR#4: synchronous read of turns.jsonl off the event loop. The file
-        # can grow to ~250MB at MIMIR_MAX_TURNS=5000 (the default) with large
-        # event lists per row; reading it on the loop blocked dispatcher
-        # workers (typing
-        # indicators, oauth poller cron, scheduled-tick dispatch) for
-        # 100-500ms during synthesis. Same pattern as scheduler.list_jobs.
         turns_window = await asyncio.to_thread(
             _filter_session_turns,
             self._config.turns_log,
@@ -2040,18 +1642,16 @@ class Agent:
                 )
             )
         return render_saga_session_end(
-            channel_id=event.channel_id,
+            channel_id=event.channel_id or "",
             saga_session_id=saga_session_id,
             idle_minutes=idle_minutes,
             turns_window=turns_window,
             prompts_dir=self._config.prompts_dir,
         )
 
-    # ---- run_turn ------------------------------------------------------
-
     async def _build_turn_prompt(
         self,
-        ctx: TurnContext,
+        ctx: Any,
         event: AgentEvent,
         saga_block: str | None,
         subagent_block: str | None,
@@ -2068,7 +1668,7 @@ class Agent:
             return await self._build_synthesis_prompt(ctx, event), []
 
         recent = self._buffer.assemble_recent_activity(
-            channel_id=event.channel_id,
+            channel_id=event.channel_id or "",
             author=event.author,
             recent_per_channel=self._config.recent_per_channel,
             recent_author_cross=self._config.recent_author_cross,
@@ -2083,16 +1683,10 @@ class Agent:
         session_summaries_block = await self._assemble_session_summaries(
             channel_id=event.channel_id,
         )
-        # CR#5: _assemble_usage_block walks turns.jsonl via aggregate_usage;
-        # _assemble_self_state_block walks the same file plus events.jsonl
-        # via the homeostat snapshot. Move both off the event loop so other
-        # tasks (saga writes, message buffering, log_event flushes) aren't
-        # blocked during the per-turn JSONL scans.
         usage_block, deferred_usage_events = await asyncio.to_thread(
             self._assemble_usage_block
         )
-        # Flush deferred events on the running loop. Can't spawn tasks
-        # inside the to_thread worker — it has no loop.
+        # Flush deferred events on the running loop.
         for event_kind, event_kwargs in deferred_usage_events:
             self._spawn_bg_task(log_event(event_kind, **event_kwargs))
         upcoming_block = self._assemble_upcoming_block()
@@ -2115,395 +1709,6 @@ class Agent:
             upcoming_block=upcoming_block,
             commitments_block=commitments_block,
             self_state_block=self_state_block,
-            # chainlink #23 #26 Option P: surface this turn's
-            # saga_session_id so the model can pass it as ``session_id``
-            # on saga_query / saga_store / saga_feedback /
-            # saga_mark_contributions tool calls. Required because the
-            # SDK's MCP dispatch path runs handlers on a fresh task that
-            # can't see ``_current_turn``
-            # (state/wiki/concepts/mcp-tool-contextvar-stale.md).
             saga_session_id=ctx.saga_session_id,
         )
         return turn_prompt, recent
-
-    def _build_system_prompt(self) -> tuple[str, int]:
-        """Assemble the system prompt. Returns ``(prompt, core_block_count)``
-        — core_block_count goes into the turn_started event."""
-        core_blocks = load_core(self._config.home)
-        memory_index_body = self._indexes.read_memory_index()
-        skill_block = self._assemble_skill_block()
-        return (
-            build_system_prompt(
-                core_blocks=core_blocks,
-                memory_index_body=memory_index_body,
-                operator_alert_channel=self._config.operator_alert_channel,
-                skill_block=skill_block,
-                home_dir=str(self._config.home),
-            ),
-            len(core_blocks),
-        )
-
-    def _make_streaming_dispatcher(
-        self, ctx: TurnContext, event: AgentEvent,
-    ) -> StreamingAutoDispatcher:
-        """chainlink #5: streaming auto-dispatcher. Eligibility matches
-        ``_auto_dispatch_or_record`` exactly — user-facing inbound on a
-        registered, non-bench bridge. On heartbeat / scheduler ticks
-        the dispatcher is created disabled and ``observe()`` is a no-op."""
-        streaming_eligible = (
-            event.trigger in ("user_message", "react_received")
-            and self._channels is not None
-        )
-        streaming_bridge = (
-            self._channels.find(event.channel_id)
-            if streaming_eligible and self._channels is not None
-            else None
-        )
-        return StreamingAutoDispatcher(
-            channel_id=event.channel_id,
-            bridge=streaming_bridge,
-            on_plan_dispatched=self._on_streaming_plan_dispatched(
-                ctx, event, streaming_bridge,
-            ),
-            on_plan_failed=self._on_streaming_plan_failed(
-                event, streaming_bridge,
-            ),
-            eligible=streaming_eligible,
-        )
-
-    async def _run_query_loop(
-        self,
-        ctx: TurnContext,
-        event: AgentEvent,
-        *,
-        prompt: str,
-        options: ClaudeAgentOptions,
-        streaming_dispatcher: StreamingAutoDispatcher,
-    ) -> tuple[list, str | None]:
-        """Drive the SDK ``query()`` async-generator. Manages the
-        ``_current_turn`` contextvar binding, fires per-message hooks +
-        the streaming dispatcher, and ensures the per-turn
-        SessionStore entry is dropped on exit (success OR crash).
-
-        Returns ``(messages, error)``. ``error`` is non-None when the
-        query loop raised; downstream phases (post_query, finalize) can
-        still run on a None ctx but generally short-circuit on error.
-
-        The ``_current_turn`` contextvar + ``_active_turns`` registry
-        are bound by ``run_turn``, not here — ``RecordingSagaClient`` /
-        ``resolve_active_ctx`` need the ctx to be findable during
-        ``_pre_message_hook`` (which fires before this method) and
-        during ``_post_message_hook`` (which fires after).
-        """
-        messages: list = []
-        # Parallel list — per-message wall-clock offset from
-        # ``ctx.started_at``, in ms. Threaded into ``extract_turn_events``
-        # so each emitted event carries its arrival time; the turn viewer
-        # uses this together with ``saga_calls[i].t_ms`` to render one
-        # interleaved chronological timeline rather than two siloed
-        # sections.
-        message_t_ms: list[float] = []
-        error: str | None = None
-        try:
-            try:
-                async for msg in query(
-                    prompt=prompt,
-                    options=options,
-                    session_id=ctx.turn_id,
-                ):
-                    messages.append(msg)
-                    message_t_ms.append((time.monotonic() - ctx.started_at) * 1000.0)
-                    # observe() is best-effort — failures inside the
-                    # streaming dispatcher must never break the main
-                    # message loop. Logged inside the dispatcher.
-                    try:
-                        await streaming_dispatcher.observe(msg)
-                    except Exception:  # noqa: BLE001
-                        log.exception(
-                            "streaming_dispatcher.observe failed; "
-                            "continuing message loop",
-                        )
-                    # Per-message turn-lifecycle hooks (rate-limit
-                    # observer, subagent lifecycle). These are
-                    # exception-isolated by ``fire_on_message``; a
-                    # broken hook can't sink the loop.
-                    await fire_on_message(
-                        self._turn_hooks, ctx, event, msg,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                error = f"{type(exc).__name__}: {exc}"
-                log.exception("query() failed for turn %s", ctx.turn_id)
-        finally:
-            # Stage 3: drop this turn's session entries from the store
-            # so memory stays flat across long-lived processes. Runs
-            # in finally so a query() crash still cleans up. Adapter
-            # delete failures are logged but don't propagate — the
-            # turn record + observability path matters more than a
-            # leaked session entry.
-            try:
-                await self._session_store.delete(
-                    {
-                        "project_key": self._session_project_key,
-                        "session_id": ctx.turn_id,
-                    }
-                )
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "session_store.delete failed for turn %s "
-                    "(continuing — entry will be evicted on next process restart)",
-                    ctx.turn_id,
-                )
-        return messages, error, message_t_ms
-
-    async def _record_turn_outbound(
-        self,
-        ctx: TurnContext,
-        event: AgentEvent,
-        output: str,
-        streaming_dispatcher: StreamingAutoDispatcher,
-        streaming_active_for_log: bool,
-    ) -> None:
-        """Outbound chat_history write. Skipped on synthesis turns
-        (no user-facing reply) and when send_message already attempted
-        a dispatch (success OR failure — failure stays in events.jsonl
-        rather than being claimed in chat_history).
-
-        chainlink #5: when the streaming dispatcher already flushed a
-        "plan" chunk, this delivers only the "result" half (text after
-        the first tool_use). Plan-only replies emit a diagnostic event
-        instead of double-recording.
-        """
-        if not (
-            output
-            and event.trigger != "saga_session_end"
-            and ctx.send_message_attempts == 0
-        ):
-            return
-        if streaming_active_for_log:
-            result_text = streaming_dispatcher.result_text()
-            if result_text:
-                await self._auto_dispatch_or_record(ctx, event, result_text)
-            else:
-                # Plan was streamed but the result chunk is empty
-                # (no post-tool text, or the only text was an
-                # actions-only plan). Audit the case so the log
-                # shows the streamed plan was the entire reply.
-                #
-                # No _record_outbound here: the streaming-plan
-                # callback already wrote the cleaned plan text to
-                # chat_history when there was a real bridge send,
-                # and writing the raw plan_buffer here would
-                # double-record (and would inject raw <actions>
-                # markup the user never saw on the directives-only
-                # plan path). Bridge-failure / directives-only
-                # cases have nothing user-visible left to record.
-                await log_event(
-                    "auto_dispatch_streamed_only_plan",
-                    channel_id=event.channel_id,
-                    plan_chars=len(streaming_dispatcher.state.plan_text()),
-                )
-            return
-        await self._auto_dispatch_or_record(ctx, event, output)
-
-    async def run_turn(self, event: AgentEvent) -> TurnRecord:
-        # Capture the running loop on first turn — worker threads (shell
-        # job waiters, etc.) use this to schedule coroutines back onto
-        # the loop via run_coroutine_threadsafe. Idempotent: subsequent
-        # calls re-bind to the same loop, which is fine.
-        #
-        # CR#10: invalidate the snapshots at the start of every turn so
-        # this turn's prompt-assembly reads pick up the previous turn's
-        # writes (TurnRecord + log_events) regardless of whether the
-        # snapshot's TTL has elapsed. Cheaper than tracking writes in
-        # log_event / turn_logger directly; the within-turn reads share
-        # one parse, the across-turn writes are visible immediately.
-        self._events_snapshot.invalidate()
-        self._turns_snapshot.invalidate()
-
-        if self._loop is None:
-            try:
-                self._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass  # not on a loop (shouldn't happen, but the guard is cheap)
-
-        ctx = TurnContext(
-            turn_id=make_turn_id(),
-            session_id=event.channel_id,
-            trigger=event.trigger,
-            channel_id=event.channel_id,
-            started_at=time.monotonic(),
-            tool_call_budget=self._config.tool_call_budget,
-            loop_detector=LoopDetector(
-                soft_limit=self._config.send_loop_soft_limit,
-                hard_limit=self._config.send_loop_hard_limit,
-                similarity_threshold=self._config.send_loop_similarity,
-            ),
-        )
-
-        # SAGA session attach. Synthesis turns already carry the closed
-        # session's id; for everything else we touch (creating if needed).
-        if event.trigger == "saga_session_end":
-            ctx.saga_session_id = event.extra.get("saga_session_id")
-        elif self._sessions is not None:
-            session = await self._sessions.touch(event.channel_id)
-            ctx.saga_session_id = session.saga_session_id
-            self._sessions.increment_turn_count(event.channel_id)
-
-        # Register the turn for the whole run_turn body — both the
-        # ``_current_turn`` contextvar and the ``_active_turns``
-        # registry. Was previously scoped to ``_run_query_loop`` only,
-        # which left ``_pre_message_hook``'s ``saga.query`` and the
-        # post-query ``saga.feedback`` call invisible to
-        # ``RecordingSagaClient`` — ``resolve_active_ctx`` couldn't find
-        # the ctx, so per-turn ``saga_calls`` records were dropped.
-        # Hoisting registration to cover the full turn fixes that
-        # without changing SDK fork semantics (the SDK's hook task is
-        # forked once at first connect; it still relies on the
-        # ``saga_session_id``-keyed lookup chain via ``args``).
-        _turn_token = _context.set_current_turn(ctx)
-        try:
-            return await self._run_turn_body(ctx, event)
-        finally:
-            _context.reset_current_turn(_turn_token)
-
-    async def _run_turn_body(
-        self, ctx: TurnContext, event: AgentEvent,
-    ) -> TurnRecord:
-        """The body of ``run_turn`` — extracted so the contextvar /
-        ``_active_turns`` registration in ``run_turn`` can wrap the
-        whole thing in one try/finally without indenting the method
-        by another level."""
-        # Inbound → chat_history (skipped for synthesis turns; their
-        # "input" is the turn-window block, not a real user message).
-        await self._record_inbound(event)
-
-        # Flush any out-of-band INDEX changes before reading the index.
-        await self._indexes.flush()
-
-        # Pre-message SAGA hook — produces a "Possibly relevant memories"
-        # block to slot into the turn prompt — and drain any background-
-        # subagent notifications (SPEC §4.4).
-        saga_block = await self._pre_message_hook(ctx, event)
-        pending_subagents = await self._inbox.drain(event.channel_id)
-        subagent_block = (
-            render_subagent_updates(pending_subagents)
-            if pending_subagents else None
-        )
-
-        turn_prompt, recent = await self._build_turn_prompt(
-            ctx, event, saga_block, subagent_block,
-        )
-        system_prompt, core_block_count = self._build_system_prompt()
-
-        await log_event(
-            "turn_started",
-            turn_id=ctx.turn_id,
-            channel_id=ctx.channel_id,
-            trigger=ctx.trigger,
-            saga_session_id=ctx.saga_session_id,
-            core_block_count=core_block_count,
-            recent_message_count=len(recent),
-            saga_atoms_pre_injected=len(ctx.saga_atom_ids),
-        )
-
-        # Build options once — the same object is passed to query() and
-        # then reused for the post-turn plan-quota capture so the
-        # ClaudeSDKClient fingerprint matches and the warm client is
-        # reused (see _capture_plan_quota_from_client).
-        options = self._build_options(system_prompt)
-        streaming_dispatcher = self._make_streaming_dispatcher(ctx, event)
-
-        await fire_pre_query(self._turn_hooks, ctx, event)
-
-        messages, error, message_t_ms = await self._run_query_loop(
-            ctx, event,
-            prompt=turn_prompt,
-            options=options,
-            streaming_dispatcher=streaming_dispatcher,
-        )
-
-        # chainlink #5: when streaming was active and a plan flush
-        # already went out, pass streaming_active=True so intermediate
-        # text is demoted to reasoning events (turns.jsonl mirrors what
-        # the user actually saw). For all other turns this is a no-op
-        # — same single-flush behavior as before.
-        streaming_active_for_log = (
-            streaming_dispatcher.streamed_plan
-            and not streaming_dispatcher.disabled_by_explicit_send
-        )
-        events_list, output = extract_turn_events(
-            messages, streaming_active=streaming_active_for_log,
-            message_t_ms=message_t_ms,
-        )
-        duration_ms = int((time.monotonic() - ctx.started_at) * 1000)
-
-        # ResultMessage extraction — last-wins so retries that emit more
-        # than one ResultMessage in the same turn keep the final value.
-        result_msg: ResultMessage | None = None
-        for msg in messages:
-            if isinstance(msg, ResultMessage):
-                result_msg = msg
-
-        # Post-query lifecycle hooks: plan-quota capture, post-message
-        # saga hook, and any §12-shaped follow-ons that read the
-        # completed message stream.
-        await fire_post_query(
-            self._turn_hooks, ctx, event,
-            messages=messages, output=output, error=error, options=options,
-        )
-
-        # Outbound chat_history write — happens here (between
-        # post_query hooks and finalize) because the post-message saga
-        # hook may consume the output text without persisting it.
-        # ``_record_turn_outbound`` short-circuits on synthesis turns
-        # and on any prior send_message attempt.
-        await self._record_turn_outbound(
-            ctx, event, output,
-            streaming_dispatcher=streaming_dispatcher,
-            streaming_active_for_log=streaming_active_for_log,
-        )
-
-        record = TurnRecord(
-            ts=_utc_now_iso(),
-            turn_id=ctx.turn_id,
-            session_id=ctx.session_id,
-            saga_session_id=ctx.saga_session_id,
-            trigger=ctx.trigger,
-            channel_id=ctx.channel_id,
-            input=truncate_input(turn_prompt),
-            saga_atom_ids=list(dict.fromkeys(ctx.saga_atom_ids)),
-            events=events_list,
-            output=output,
-            duration_ms=duration_ms,
-            error=error,
-            result_subtype=result_msg.subtype if result_msg else None,
-            result_is_error=result_msg.is_error if result_msg else None,
-            stop_reason=result_msg.stop_reason if result_msg else None,
-            num_turns=result_msg.num_turns if result_msg else None,
-            total_cost_usd=result_msg.total_cost_usd if result_msg else None,
-            usage=result_msg.usage if result_msg else None,
-            permission_denials=list(result_msg.permission_denials or []) if result_msg else [],
-            saga_calls=[r.to_dict() for r in ctx.saga_calls],
-        )
-        await self._turn_logger.write(record)
-
-        await log_event(
-            "turn_finished",
-            turn_id=ctx.turn_id,
-            channel_id=ctx.channel_id,
-            duration_ms=duration_ms,
-            error=error,
-            result_subtype=result_msg.subtype if result_msg else None,
-            result_is_error=result_msg.is_error if result_msg else None,
-            total_cost_usd=result_msg.total_cost_usd if result_msg else None,
-            event_count=len(events_list),
-            output_chars=len(output),
-            saga_atoms_total=len(record.saga_atom_ids),
-        )
-
-        # Finalize lifecycle hooks: index rebuild, git commit,
-        # cancel-typing. Order matters — IndexRebuild precedes
-        # GitCommit so auto-regenerated INDEX.md files are part of the
-        # same commit as the writes that triggered them.
-        await fire_finalize(self._turn_hooks, ctx, event, record)
-        return record
