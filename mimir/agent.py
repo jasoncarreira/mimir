@@ -72,6 +72,13 @@ from .usage_stats import event_recently_emitted
 # see the module docstring for the bug + upstream PR. No-op if the
 # claude-code extra isn't installed.
 _lcc_patches.apply_patches()
+# Empty out deepagents' BASE_AGENT_PROMPT so it isn't appended to
+# mimir's system prompt. Mimir's prompt is the complete contract
+# (persona + memory layers + conventions + skills); the deepagents
+# generic framing competes with it. Match the SDK-era invariant of
+# "mimir's system_prompt is the only one." No-op when deepagents
+# isn't installed.
+_lcc_patches.strip_deepagents_base_prompt()
 from .sagatools import (
     _atom_ids_from_response,
     _format_saga_payload,
