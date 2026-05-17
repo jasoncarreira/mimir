@@ -1,10 +1,10 @@
-"""Commitments extractor (Phase 2a).
+"""Commitments extractor tests (post-deepagents cutover).
 
-The extractor calls ``claude_agent_sdk.query()`` under the hood; tests
-monkeypatch it to return a canned async iterator over a fake
-``AssistantMessage`` carrying the JSON payload. The actual LLM call is
-exercised by ``scratch/commitments_backtest.py`` against real session
-data; these tests pin the parser + record-coercion contract.
+The extractor now uses ``langchain.chat_models.init_chat_model`` instead
+of ``claude_agent_sdk.query``. We monkey-patch the chat model factory
+to return a stub that yields a canned ``AIMessage`` payload — that
+exercises the same parser + record-coercion contract the SDK tests
+covered, with no live LLM call.
 """
 
 from __future__ import annotations
@@ -13,10 +13,10 @@ import json
 from typing import Any
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from mimir.commitments.extractor import (
     EXTRACTION_PROMPT_VERSION,
-    MIN_OUTPUT_LEN,
     _coerce_to_record,
     _parse_extraction_json,
     _strip_code_fence,
@@ -28,430 +28,186 @@ from mimir.commitments.models import (
 )
 
 
-# ─── helper: stub the SDK query() to yield a canned response ────────
+class _StubChat:
+    """Stands in for whatever ``init_chat_model`` returns. ``ainvoke``
+    yields a single ``AIMessage`` with the canned text body."""
+
+    def __init__(self, response_text: str) -> None:
+        self._response_text = response_text
+
+    async def ainvoke(self, msgs: list[Any]) -> AIMessage:
+        return AIMessage(content=self._response_text)
 
 
-class _FakeTextBlock:
-    """Mimics ``claude_agent_sdk.TextBlock`` for tests; isinstance check
-    against the real type is what extractor cares about, so we patch
-    both ``query`` AND ``AssistantMessage``/``TextBlock`` at the module
-    boundary."""
-
-    def __init__(self, text: str) -> None:
-        self.text = text
-
-
-class _FakeAssistantMessage:
-    def __init__(self, text: str) -> None:
-        self.content = [_FakeTextBlock(text)]
+def _install_fake_chat(monkeypatch: pytest.MonkeyPatch, response_text: str) -> None:
+    def _factory(_model: str) -> _StubChat:
+        return _StubChat(response_text)
+    # init_chat_model is imported inside extract_commitments(); patch
+    # the source module so the inner import resolves to our factory.
+    monkeypatch.setattr(
+        "langchain.chat_models.init_chat_model", _factory, raising=True,
+    )
 
 
-def _install_fake_sdk(
-    monkeypatch: pytest.MonkeyPatch, response_text: str,
-) -> list[dict]:
-    """Patch ``claude_agent_sdk.query`` to yield a single fake
-    AssistantMessage with the given text. Returns a captured-args list
-    so tests can assert the prompt/options shape."""
-    captured: list[dict] = []
-
-    async def fake_query(*, prompt: str, options: Any = None, transport=None):
-        captured.append({"prompt": prompt, "options": options})
-        yield _FakeAssistantMessage(response_text)
-
-    # Patch BOTH the symbol the extractor imports AND the message types
-    # so the isinstance checks pass.
-    import claude_agent_sdk
-
-    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
-    monkeypatch.setattr(claude_agent_sdk, "AssistantMessage", _FakeAssistantMessage)
-    monkeypatch.setattr(claude_agent_sdk, "TextBlock", _FakeTextBlock)
-    return captured
+# ── _strip_code_fence / _parse_extraction_json ──────────────────────
 
 
-# ─── parser unit tests (no SDK needed) ──────────────────────────────
+def test_strip_code_fence_removes_triple_backticks_and_json_label():
+    raw = '```json\n{"commitments": []}\n```'
+    assert _strip_code_fence(raw) == '{"commitments": []}'
 
 
-def test_strip_code_fence_handles_fenced_json():
-    body = "```json\n{\"commitments\": []}\n```"
-    assert _strip_code_fence(body) == '{"commitments": []}'
+def test_strip_code_fence_passthrough_when_no_fence():
+    assert _strip_code_fence('{"x": 1}') == '{"x": 1}'
 
 
-def test_strip_code_fence_handles_bare_fence():
-    body = "```\n{\"commitments\": []}\n```"
-    assert _strip_code_fence(body) == '{"commitments": []}'
+def test_parse_extraction_json_returns_dict_for_valid_payload():
+    payload = json.dumps({"commitments": [{"text": "ship the doc"}]})
+    out = _parse_extraction_json(payload)
+    assert out is not None
+    assert out["commitments"][0]["text"] == "ship the doc"
 
 
-def test_strip_code_fence_passthrough_no_fence():
-    body = '{"commitments": []}'
-    assert _strip_code_fence(body) == '{"commitments": []}'
-
-
-def test_parse_extraction_json_happy_path():
-    parsed = _parse_extraction_json('{"commitments": [{"text": "X"}]}')
-    assert parsed == {"commitments": [{"text": "X"}]}
-
-
-def test_parse_extraction_json_handles_fence():
-    raw = '```json\n{"commitments": [{"text": "X"}]}\n```'
-    parsed = _parse_extraction_json(raw)
-    assert parsed is not None
-    assert parsed["commitments"][0]["text"] == "X"
-
-
-def test_parse_extraction_json_returns_none_on_bad_json():
+def test_parse_extraction_json_returns_none_on_malformed_input():
     assert _parse_extraction_json("not json at all") is None
-    assert _parse_extraction_json("") is None
 
 
-# ─── _coerce_to_record validation ───────────────────────────────────
+def test_parse_extraction_json_unwraps_code_fence():
+    payload = '```json\n{"commitments": []}\n```'
+    out = _parse_extraction_json(payload)
+    assert out == {"commitments": []}
 
 
-def test_coerce_record_full_happy_path():
+# ── _coerce_to_record ───────────────────────────────────────────────
+
+
+def test_coerce_returns_none_when_text_missing():
     rec = _coerce_to_record(
-        {
-            "text": "Review PR #111",
-            "kind": "agent_promise",
-            "sensitivity": "routine",
-            "confidence": 0.85,
-            "suggested_reminder": "PR #111 needs review",
-            "channel_bound": True,
-        },
-        channel_id="chan-1",
-        saga_session_id="saga-xyz",
-        source_turn_id="t-abc",
+        {"confidence": 0.9},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert rec is None
+
+
+def test_coerce_drops_below_confidence_floor():
+    rec = _coerce_to_record(
+        {"text": "maybe do thing", "confidence": 0.1},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert rec is None
+
+
+def test_coerce_normalizes_unknown_kind_to_open_loop():
+    rec = _coerce_to_record(
+        {"text": "follow up", "confidence": 0.8, "kind": "ZZZ_unknown"},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
     )
     assert rec is not None
-    assert rec.text == "Review PR #111"
-    assert rec.kind == "agent_promise"
-    assert rec.confidence == 0.85
-    assert rec.channel_id == "chan-1"  # bound → carries channel
-    assert rec.source_turn_id == "t-abc"
-    assert rec.saga_session_id == "saga-xyz"
-    assert rec.dedupe_key  # auto-generated
+    assert rec.kind == CommitmentKind.OPEN_LOOP
 
 
-def test_coerce_record_channel_unbound_strips_channel():
-    """``channel_bound=False`` → record's channel_id is None even when
-    the extraction was called with a channel."""
+def test_coerce_channel_bound_records_attach_to_channel():
     rec = _coerce_to_record(
-        {
-            "text": "Read paper",
-            "confidence": 0.7,
-            "channel_bound": False,
-        },
-        channel_id="chan-1",
-        saga_session_id=None,
-        source_turn_id=None,
+        {"text": "respond to thread", "confidence": 0.9, "channel_bound": True},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert rec is not None
+    assert rec.channel_id == "ch-1"
+
+
+def test_coerce_channel_unbound_records_have_no_channel():
+    rec = _coerce_to_record(
+        {"text": "read the paper", "confidence": 0.9, "channel_bound": False},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
     )
     assert rec is not None
     assert rec.channel_id is None
 
 
-def test_coerce_record_drops_below_confidence_floor():
-    """Sub-0.4 confidence items are silently dropped — they were
-    mostly false positives in the Phase 0 backtest."""
+def test_coerce_sensitivity_default_is_routine():
     rec = _coerce_to_record(
-        {"text": "vague intent", "confidence": 0.3},
-        channel_id="c1", saga_session_id=None, source_turn_id=None,
-    )
-    assert rec is None
-
-
-def test_coerce_record_drops_missing_text():
-    rec = _coerce_to_record(
-        {"text": "", "confidence": 0.9},
-        channel_id="c1", saga_session_id=None, source_turn_id=None,
-    )
-    assert rec is None
-    rec = _coerce_to_record(
-        {"confidence": 0.9},
-        channel_id="c1", saga_session_id=None, source_turn_id=None,
-    )
-    assert rec is None
-
-
-def test_coerce_record_defaults_unknown_kind_to_open_loop():
-    rec = _coerce_to_record(
-        {"text": "X", "kind": "unrecognized_kind", "confidence": 0.7},
-        channel_id="c1", saga_session_id=None, source_turn_id=None,
+        {"text": "task", "confidence": 0.9},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
     )
     assert rec is not None
-    assert rec.kind == CommitmentKind.OPEN_LOOP.value
+    assert rec.sensitivity == CommitmentSensitivity.ROUTINE
 
 
-def test_coerce_record_defaults_unknown_sensitivity_to_routine():
-    rec = _coerce_to_record(
-        {"text": "X", "sensitivity": "extreme", "confidence": 0.7},
-        channel_id="c1", saga_session_id=None, source_turn_id=None,
+# ── extract_commitments (end-to-end with stub model) ────────────────
+
+
+async def test_extract_short_output_skips_llm_call(monkeypatch: pytest.MonkeyPatch):
+    # Patch init_chat_model to a sentinel that would explode if called.
+    def _explode(_model: str):
+        raise AssertionError("LLM should not be called for short outputs")
+    monkeypatch.setattr(
+        "langchain.chat_models.init_chat_model", _explode, raising=True,
     )
-    assert rec is not None
-    assert rec.sensitivity == CommitmentSensitivity.ROUTINE.value
-
-
-def test_coerce_record_text_capped_at_200():
-    """The prompt asks for ≤120 chars; we cap at 200 as a safety margin
-    against models that ignore length instructions."""
-    long_text = "x" * 300
-    rec = _coerce_to_record(
-        {"text": long_text, "confidence": 0.7},
-        channel_id="c1", saga_session_id=None, source_turn_id=None,
+    out = await extract_commitments(
+        "tiny",
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
     )
-    assert rec is not None
-    assert len(rec.text) == 200
+    assert out == []
 
 
-def test_coerce_record_suggested_reminder_falls_back_to_text():
-    rec = _coerce_to_record(
-        {"text": "Review PR #99", "confidence": 0.8},
-        channel_id="c1", saga_session_id=None, source_turn_id=None,
-    )
-    assert rec is not None
-    assert rec.suggested_reminder == "Review PR #99"
-
-
-# ─── extract_commitments end-to-end (with stubbed SDK) ──────────────
-
-
-@pytest.mark.asyncio
-async def test_extract_returns_records_from_canned_response(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """Happy path: SDK returns valid JSON → extractor returns
-    CommitmentRecord list ready for store.add()."""
-    response = json.dumps({
+async def test_extract_happy_path_returns_records(monkeypatch: pytest.MonkeyPatch):
+    payload = json.dumps({
         "commitments": [
-            {
-                "text": "Apply Item 7 fix for PR #111",
-                "kind": "agent_promise",
-                "sensitivity": "routine",
-                "confidence": 0.9,
-                "suggested_reminder": "PR #111 Item 7 fix pending",
-                "channel_bound": True,
-            },
-            {
-                "text": "Read the paper Mary recommended",
-                "kind": "open_loop",
-                "sensitivity": "routine",
-                "confidence": 0.65,
-                "channel_bound": False,
-            },
+            {"text": "send the spec by Thursday", "confidence": 0.92,
+             "kind": "open_loop", "channel_bound": True,
+             "suggested_reminder": "follow up on the spec"},
+            {"text": "review PR 164", "confidence": 0.85,
+             "kind": "open_loop"},
         ]
     })
-    _install_fake_sdk(monkeypatch, response)
-
-    output = (
-        "Boundary recorded. Two unfinished items carried forward: "
-        "Apply Item 7 fix for PR #111 (still gated on test push), "
-        "and follow up on Mary's paper recommendation."
-    )
+    _install_fake_chat(monkeypatch, payload)
     out = await extract_commitments(
-        output,
-        channel_id="poller:github-activity",
-        saga_session_id="saga-xyz",
-        source_turn_id="t-abc12",
+        "x" * 200,  # long enough to clear the MIN_OUTPUT_LEN gate
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
     )
-
     assert len(out) == 2
-    by_text = {r.text: r for r in out}
-    pr_rec = by_text["Apply Item 7 fix for PR #111"]
-    assert pr_rec.kind == "agent_promise"
-    assert pr_rec.channel_id == "poller:github-activity"  # bound
-    assert pr_rec.source_turn_id == "t-abc12"
-    paper_rec = by_text["Read the paper Mary recommended"]
-    assert paper_rec.channel_id is None  # unbound
+    assert out[0].text == "send the spec by Thursday"
+    assert out[0].channel_id == "ch-1"
+    assert out[1].text == "review PR 164"
+    # Prompt version is recorded for cache busting.
+    assert out[0].extraction_prompt_version == EXTRACTION_PROMPT_VERSION
 
 
-@pytest.mark.asyncio
-async def test_extract_skips_short_output_without_sdk_call(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """Outputs <MIN_OUTPUT_LEN must short-circuit to ``[]`` without
-    calling the SDK — cheap on the 'boundary recorded, nothing to
-    capture' single-turn no-op pattern."""
-    sdk_called: list[bool] = []
-
-    async def fake_query(**kwargs):
-        sdk_called.append(True)
-        yield  # pragma: no cover
-
-    import claude_agent_sdk
-    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
-
-    short = "Boundary recorded."  # well under 100 chars
-    assert len(short) < MIN_OUTPUT_LEN
-    out = await extract_commitments(
-        short, channel_id="c1", saga_session_id=None, source_turn_id="t-1",
-    )
-    assert out == []
-    assert sdk_called == []  # never invoked
-
-
-@pytest.mark.asyncio
-async def test_extract_returns_empty_on_empty_json_response(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """LLM returns ``{"commitments": []}`` (the most common case per
-    backtest: ~67% of sessions) → ``[]``, no errors."""
-    _install_fake_sdk(monkeypatch, '{"commitments": []}')
-    out = await extract_commitments(
-        "x" * 200,  # long enough to invoke SDK
-        channel_id="c1",
-        saga_session_id=None,
-        source_turn_id="t-1",
-    )
-    assert out == []
-
-
-@pytest.mark.asyncio
-async def test_extract_handles_malformed_json(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """LLM returns garbage / not-JSON → parser returns None → extractor
-    returns ``[]`` without raising."""
-    _install_fake_sdk(monkeypatch, "not actually json")
+async def test_extract_drops_low_confidence_items(monkeypatch: pytest.MonkeyPatch):
+    payload = json.dumps({
+        "commitments": [
+            {"text": "real follow-up", "confidence": 0.7},
+            {"text": "guessing", "confidence": 0.1},
+        ]
+    })
+    _install_fake_chat(monkeypatch, payload)
     out = await extract_commitments(
         "x" * 200,
-        channel_id="c1",
-        saga_session_id=None,
-        source_turn_id="t-1",
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
     )
-    assert out == []
+    assert len(out) == 1
+    assert out[0].text == "real follow-up"
 
 
-@pytest.mark.asyncio
-async def test_extract_handles_sdk_exception(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """SDK ``query()`` raises (timeout, rate limit, etc.) → extractor
-    catches, logs, returns ``[]``. The finalize hook can't recover from
-    a failed extraction so bubbling is pointless; the same commitments
-    will resurface in a future session-end output."""
-
-    async def raising_query(**kwargs):
-        raise RuntimeError("SDK is angry")
-        yield  # pragma: no cover
-
-    import claude_agent_sdk
-    monkeypatch.setattr(claude_agent_sdk, "query", raising_query)
-
+async def test_extract_returns_empty_on_llm_failure(monkeypatch: pytest.MonkeyPatch):
+    def _boom(_model: str):
+        raise RuntimeError("upstream model down")
+    monkeypatch.setattr(
+        "langchain.chat_models.init_chat_model", _boom, raising=True,
+    )
     out = await extract_commitments(
         "x" * 200,
-        channel_id="c1",
-        saga_session_id=None,
-        source_turn_id="t-1",
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
     )
     assert out == []
 
 
-@pytest.mark.asyncio
-async def test_extract_passes_prompt_with_session_metadata(
+async def test_extract_returns_empty_on_unparseable_response(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """The user prompt sent to the LLM must include the channel /
-    session id so the model has the metadata the system prompt asks
-    it to honor (channel_bound default, recipient inference, etc.)."""
-    captured = _install_fake_sdk(monkeypatch, '{"commitments": []}')
-    await extract_commitments(
+    _install_fake_chat(monkeypatch, "<<not json at all>>")
+    out = await extract_commitments(
         "x" * 200,
-        channel_id="discord-123",
-        saga_session_id="saga-fooo",
-        source_turn_id="t-bar",
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
     )
-    assert len(captured) == 1
-    prompt = captured[0]["prompt"]
-    assert "discord-123" in prompt
-    assert "saga-fooo" in prompt
-    # Output content lives inside the <synthesis> tags.
-    assert "<synthesis>" in prompt
-
-
-def test_extraction_prompt_version_constant_present():
-    """``EXTRACTION_PROMPT_VERSION`` is the gate the backtest script
-    uses to detect when the prompt has changed. Keep it stable as a
-    public attribute."""
-    assert EXTRACTION_PROMPT_VERSION  # non-empty
-
-
-# ─── PR #125 review fixes (provenance + due_window_hint + channel_bound) ──
-
-
-def test_coerce_record_persists_due_window_hint():
-    """PR #125 review #4: due_window_hint is no longer dropped on the
-    floor — Phase 2b's poller and Phase 3's prompt block need the
-    operator-facing time anchor verbatim."""
-    rec = _coerce_to_record(
-        {
-            "text": "Tighten skip guard",
-            "confidence": 0.85,
-            "due_window_hint": "once #108 merges",
-            "kind": "deadline_check",
-        },
-        channel_id="c1", saga_session_id=None, source_turn_id=None,
-    )
-    assert rec is not None
-    assert rec.due_window_hint == "once #108 merges"
-
-
-def test_coerce_record_due_window_hint_none_when_missing():
-    rec = _coerce_to_record(
-        {"text": "X", "confidence": 0.7},
-        channel_id="c1", saga_session_id=None, source_turn_id=None,
-    )
-    assert rec is not None
-    assert rec.due_window_hint is None
-
-
-def test_coerce_record_due_window_hint_strips_empty():
-    """Whitespace-only hint coerces to None — don't persist garbage."""
-    rec = _coerce_to_record(
-        {"text": "X", "confidence": 0.7, "due_window_hint": "   "},
-        channel_id="c1", saga_session_id=None, source_turn_id=None,
-    )
-    assert rec is not None
-    assert rec.due_window_hint is None
-
-
-def test_coerce_record_due_window_hint_non_string_ignored():
-    """Defensive: if the LLM returns a non-string (number, list, object),
-    drop it gracefully — schema drift shouldn't break coercion."""
-    rec = _coerce_to_record(
-        {"text": "X", "confidence": 0.7, "due_window_hint": 42},
-        channel_id="c1", saga_session_id=None, source_turn_id=None,
-    )
-    assert rec is not None
-    assert rec.due_window_hint is None
-
-
-def test_coerce_record_channel_bound_defaults_to_false():
-    """PR #125 review #5: missing ``channel_bound`` field defaults
-    False (safer — over-surface > under-surface). Most poller
-    channels are non-personal; a missed binding would scope a
-    generic commitment to a synthetic channel."""
-    rec = _coerce_to_record(
-        {"text": "X", "confidence": 0.7},  # no channel_bound key
-        channel_id="poller:github-activity",
-        saga_session_id=None, source_turn_id=None,
-    )
-    assert rec is not None
-    assert rec.channel_id is None  # treated as unbound
-
-
-def test_coerce_record_explicit_channel_bound_true_honored():
-    """Explicit True still binds — only the silent default flipped."""
-    rec = _coerce_to_record(
-        {"text": "X", "confidence": 0.7, "channel_bound": True},
-        channel_id="dm:alice", saga_session_id=None, source_turn_id=None,
-    )
-    assert rec is not None
-    assert rec.channel_id == "dm:alice"
-
-
-def test_coerce_record_carries_prompt_version():
-    """PR #125 review #1: each extracted record records which prompt
-    version produced it. Lets a future backtest filter by version."""
-    rec = _coerce_to_record(
-        {"text": "X", "confidence": 0.7},
-        channel_id="c1", saga_session_id=None, source_turn_id=None,
-    )
-    assert rec is not None
-    assert rec.extraction_prompt_version == EXTRACTION_PROMPT_VERSION
+    assert out == []

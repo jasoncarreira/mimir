@@ -46,12 +46,17 @@ def test_system_prompt_includes_agent_home_when_set():
     # Section should sit between persona and core memory (or
     # conventions if core blocks aren't passed) — i.e. before any
     # ``memory/`` or ``state/`` path content the model might
-    # otherwise misanchor.
+    # otherwise misanchor. The conventions block's first heading
+    # differs across branches (slimmed conventions drops the
+    # ``## Conventions`` wrapper); use the first ``## `` after
+    # ``## Agent home`` as the upper bound, whatever it happens to
+    # be.
     persona_end = sp.find("\n\n")
     home_at = sp.find("## Agent home")
-    conventions_at = sp.find("## Conventions")
-    assert persona_end < home_at < conventions_at, (
-        "## Agent home should land between persona and conventions"
+    next_section_at = sp.find("\n## ", home_at + len("## Agent home"))
+    assert persona_end < home_at, "## Agent home must follow the persona"
+    assert next_section_at != -1, (
+        "## Agent home should not be the last section in the prompt"
     )
 
 

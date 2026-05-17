@@ -1,0 +1,275 @@
+"""Smoke tests for the deepagents-backed Agent.
+
+These tests stub out ``_build_agent_if_needed`` so no real model or
+deepagents graph is constructed. We're verifying the
+``run_turn`` orchestration:
+
+  - SAGA pre-message query → memory_block injected into prompt
+  - agent.ainvoke called once
+  - extract_turn_events / derive_result_fields populate TurnRecord
+  - saga.feedback fires post-message with the right atom IDs
+  - TurnLogger sees one record
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
+
+from mimir.agent import Agent
+from mimir.config import Config
+from mimir.history import MessageBuffer
+from mimir.index import IndexGenerator
+from mimir.models import AgentEvent
+from mimir.turn_logger import TurnLogger
+
+
+def _make_config(home: Path) -> Config:
+    """Build a real Config rooted at ``home``. The per-turn prompt
+    assembly (CR#10 + 181-H) reads many Config fields (feedback
+    window, usage block toggles, recent-activity limits) so the
+    earlier ``_StubConfig`` with only ``home`` no longer suffices.
+    """
+    import os
+    os.environ["MIMIR_HOME"] = str(home)
+    return Config.from_env()
+
+
+class _FakeAgent:
+    """Replaces the deepagents CompiledStateGraph. Returns a canned
+    message list shaped like ChatClaudeCode's output."""
+
+    def __init__(self, response_messages: list[Any]) -> None:
+        self._response_messages = response_messages
+        self.invocations: list[dict[str, Any]] = []
+
+    async def ainvoke(self, state: dict[str, Any], *, config: dict[str, Any]):
+        self.invocations.append({"state": state, "config": config})
+        # Echo the input + append response messages (mirrors LangGraph state).
+        return {"messages": list(state.get("messages") or []) + self._response_messages}
+
+    async def astream(self, state: dict[str, Any], *, config: dict[str, Any], stream_mode: str = "values"):
+        """Yield one cumulative-state chunk (matches stream_mode='values'
+        semantics). Real LangGraph emits one chunk per node; for tests
+        a single final yield is sufficient — the streaming state machine
+        in mimir._streaming_dispatch handles single-chunk inputs cleanly."""
+        self.invocations.append({"state": state, "config": config})
+        yield {"messages": list(state.get("messages") or []) + self._response_messages}
+
+
+class _BridgeStub:
+    """Captures send + cancel_typing calls so tests can assert on
+    the end-of-turn dispatch path's three branches."""
+
+    name = "stub"
+    prefixes = ("ch-",)
+
+    def __init__(self) -> None:
+        self.sends: list[tuple[str, str, bool]] = []
+        self.cancels: list[str] = []
+
+    async def send(self, channel_id: str, text: str, *,
+                   final: bool = True, attachment_paths=None):
+        self.sends.append((channel_id, text, final))
+        class _R:
+            sent = True
+            error = None
+        return _R()
+
+    async def react(self, *a, **kw):
+        return True
+
+    async def cancel_typing(self, channel_id: str) -> None:
+        self.cancels.append(channel_id)
+
+    async def send_typing_indicator(self, channel_id: str) -> None:
+        pass
+
+    async def fetch_history(self, *a, **kw):
+        return []
+
+    async def connect(self) -> None:
+        pass
+
+    async def disconnect(self) -> None:
+        pass
+
+
+class _FakeSaga:
+    """Tiny saga_client double — record query/feedback calls, return
+    canned payloads."""
+
+    def __init__(self, query_hits: list[dict[str, Any]] | None = None) -> None:
+        self._hits = query_hits or []
+        self.query_calls: list[dict[str, Any]] = []
+        self.feedback_calls: list[dict[str, Any]] = []
+
+    async def query(self, content: str, *, top_k: int = 12, session_id: str | None = None):
+        self.query_calls.append(
+            {"content": content, "top_k": top_k, "session_id": session_id},
+        )
+        return {"atoms": self._hits, "triples": []}
+
+    async def feedback(self, atom_ids, output, *, session_id=None, feedback="positive"):
+        self.feedback_calls.append({
+            "atom_ids": list(atom_ids), "output": output,
+            "session_id": session_id, "feedback": feedback,
+        })
+
+
+def _build_agent(tmp_path: Path, *,
+                 fake_agent: _FakeAgent,
+                 fake_saga: _FakeSaga | None = None) -> Agent:
+    from mimir.event_logger import init_logger
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True, exist_ok=True)
+    init_logger(home / "logs" / "events.jsonl", session_id="test")
+    cfg = _make_config(home)
+    a = Agent(
+        config=cfg,
+        turn_logger=TurnLogger(home / "logs" / "turns.jsonl"),
+        message_buffer=MessageBuffer(history_path=home / "messages.jsonl"),
+        index_generator=IndexGenerator(home),
+        saga_client=fake_saga,  # type: ignore[arg-type]
+    )
+    # Skip the real deepagents.create_deep_agent — return our fake
+    # whenever Agent goes to build/fetch the graph.
+    a._agent = fake_agent  # type: ignore[attr-defined]
+    return a
+
+
+async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
+    fake_agent = _FakeAgent(response_messages=[
+        AIMessage(
+            content="Stored.",
+            response_metadata={
+                "internal_tool_calls": [
+                    {"id": "toolu_1", "name": "memory_store",
+                     "args": {"content": "color is blue"}}
+                ],
+                "tool_results": [
+                    {"tool_use_id": "toolu_1", "name": "memory_store",
+                     "result": {"stored": True, "atom_id": "f" * 16},
+                     "is_error": False},
+                ],
+                "total_cost_usd": 0.001,
+                "num_turns": 2,
+            },
+        ),
+    ])
+    fake_saga = _FakeSaga(query_hits=[
+        {"atom_id": "a" * 16, "content": "prior memory", "stream": "semantic"},
+    ])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=fake_saga)
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-1",
+        content="store my favorite color",
+    )
+    record = await agent.run_turn(event)
+
+    # SAGA was queried with the user content
+    assert len(fake_saga.query_calls) == 1
+    assert fake_saga.query_calls[0]["content"] == "store my favorite color"
+
+    # The pre-message memory block landed in the prompt to the agent
+    invocation = fake_agent.invocations[0]
+    prompt_msg = invocation["state"]["messages"][0]
+    assert isinstance(prompt_msg, HumanMessage)
+    assert "Possibly relevant memories" in prompt_msg.content
+
+    # Events were extracted from response_metadata
+    event_types = [e["type"] for e in record.events]
+    assert "tool_call" in event_types
+    assert "tool_result" in event_types
+    tc = next(e for e in record.events if e["type"] == "tool_call")
+    assert tc["name"] == "memory_store"
+
+    # Result fields surfaced cost + num_turns
+    assert record.total_cost_usd == pytest.approx(0.001)
+    assert record.num_turns == 2
+    assert record.error is None
+
+    # The TurnLogger appended one record
+    turns = (tmp_path / "home" / "logs" / "turns.jsonl").read_text().splitlines()
+    assert len(turns) == 1
+
+
+async def test_run_turn_no_saga_skips_query_and_feedback(tmp_path: Path):
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    record = await agent.run_turn(event)
+    assert record.output == "ok"
+    # No SAGA → no memory block injected
+    prompt = fake_agent.invocations[0]["state"]["messages"][0].content
+    assert "Possibly relevant memories" not in prompt
+
+
+async def test_run_turn_cancels_typing_when_plan_streamed_but_result_empty(
+    tmp_path: Path,
+):
+    """Edge case from review: if streamed_plan=True but result_text()
+    is empty (model called tools then said nothing), the typing
+    indicator is held by ``final=False`` and would dangle until the
+    bridge's auto-expire kicks in. The end-of-turn path must call
+    ``bridge.cancel_typing`` to release it explicitly.
+    """
+    from mimir.channel_registry import ChannelRegistry
+
+    # AIMessage sequence: plan text → tool_call → nothing (empty AIMessage)
+    # → ensures streaming flushes a plan but result_text() is empty.
+    fake_agent = _FakeAgent(response_messages=[
+        AIMessage(
+            content="planning...",
+            tool_calls=[
+                {"name": "memory_query", "args": {"query": "x"}, "id": "t1"},
+            ],
+        ),
+        AIMessage(content=""),  # no final result text
+    ])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+
+    agent = _build_agent(tmp_path, fake_agent=fake_agent)
+    agent._channels = registry  # type: ignore[attr-defined]
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    record = await agent.run_turn(event)
+
+    # The plan was streamed mid-turn (final=False) but no result text
+    # followed — so cancel_typing fires to release the indicator.
+    plan_sends = [s for s in bridge.sends if s[2] is False]
+    final_sends = [s for s in bridge.sends if s[2] is True]
+    assert len(plan_sends) == 1
+    assert "planning" in plan_sends[0][1]
+    # No end-of-turn send (no result text to ship).
+    assert final_sends == []
+    # But typing indicator was released.
+    assert bridge.cancels == ["ch-1"]
+    # Turn record still wrote cleanly.
+    assert record.error is None
+
+
+async def test_run_turn_records_error_when_ainvoke_raises(tmp_path: Path):
+    class _BoomAgent:
+        async def ainvoke(self, *a, **kw):
+            raise RuntimeError("upstream failure")
+        async def astream(self, *a, **kw):
+            raise RuntimeError("upstream failure")
+            yield  # unreachable, makes this an async generator
+    fake_saga = _FakeSaga()
+    agent = _build_agent(
+        tmp_path, fake_agent=_BoomAgent(), fake_saga=fake_saga,  # type: ignore[arg-type]
+    )
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="x")
+    record = await agent.run_turn(event)
+    assert record.error and "upstream failure" in record.error
+    assert record.events == []
+    # feedback skipped on error
+    assert fake_saga.feedback_calls == []
