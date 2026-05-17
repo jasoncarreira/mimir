@@ -1673,13 +1673,42 @@ class Agent:
                 SkillPinConfig, render_skill_catalog,
             )
             from .skill_defs import installed_skill_names
+            from .skill_catalog import load_catalog, DEFAULT_SKILLS_ROOT
             seeded = installed_skill_names(self._config.home)
             if not seeded:
                 return None
             pin = SkillPinConfig.load(
                 self._config.home / "state" / "skill-pin.yaml"
             )
-            return render_skill_catalog(seeded, pin)
+            # Load per-skill descriptions from SKILL.md frontmatter so
+            # the system-prompt block reads as `- name — trigger` instead
+            # of bare names. Source-of-truth: the home's seeded copy
+            # under ``<home>/.claude/skills/``; fall back to the bundled
+            # root for any skill missing from the home dir (covers
+            # fresh-install homes before ``seed_skills`` runs and any
+            # bundled skill not yet copied). Frontmatter is install-
+            # stable so this doesn't perturb the prompt cache.
+            descriptions: dict[str, str] = {}
+            try:
+                home_skills = self._config.home / ".claude" / "skills"
+                for entry in load_catalog(home_skills):
+                    if entry.trigger:
+                        descriptions[entry.name] = entry.trigger
+                    elif entry.description:
+                        descriptions[entry.name] = entry.description
+                for entry in load_catalog(DEFAULT_SKILLS_ROOT):
+                    if entry.name in descriptions:
+                        continue
+                    if entry.trigger:
+                        descriptions[entry.name] = entry.trigger
+                    elif entry.description:
+                        descriptions[entry.name] = entry.description
+            except Exception:  # noqa: BLE001
+                # Description load is best-effort; on any failure fall
+                # back to the bare-names rendering.
+                log.exception("skill description load failed; rendering names only")
+                descriptions = {}
+            return render_skill_catalog(seeded, pin, descriptions=descriptions)
         except Exception:  # noqa: BLE001
             log.exception("_assemble_skill_block failed; skipping")
             return None

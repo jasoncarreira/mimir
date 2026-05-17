@@ -174,6 +174,68 @@ def test_render_skill_catalog_returns_none_when_empty():
     assert render_skill_catalog(["x"], SkillPinConfig(hide=["x"])) is None
 
 
+def test_render_skill_catalog_renders_descriptions_when_provided():
+    """When ``descriptions`` is passed, each line renders as
+    ``- name — desc`` so the model can dispatch on what each skill
+    is for without round-tripping through find-skills."""
+    pin = SkillPinConfig()
+    descs = {
+        "memory": "Criteria for deciding when, where and how to remember information",
+        "wiki": "Maintain a structured wiki under state/wiki/",
+    }
+    out = render_skill_catalog(["memory", "wiki"], pin, descriptions=descs)
+    assert out is not None
+    assert "- memory — Criteria for deciding when, where and how to remember information" in out
+    assert "- wiki — Maintain a structured wiki under state/wiki/" in out
+
+
+def test_render_skill_catalog_falls_back_to_bare_name_when_desc_missing():
+    """A skill present in ``seeded`` but absent from ``descriptions``
+    (or with an empty desc) renders as bare ``- name`` — never blocks
+    a skill from showing up."""
+    pin = SkillPinConfig()
+    out = render_skill_catalog(
+        ["alpha", "beta"], pin, descriptions={"alpha": "first skill"}
+    )
+    assert out is not None
+    lines = out.split("\n")
+    assert lines == ["- alpha — first skill", "- beta"]
+
+
+def test_render_skill_catalog_truncates_long_descriptions():
+    """Long triggers/descriptions (frontmatter is often 100-300 chars)
+    truncate to a single-line budget so the system-prompt block stays
+    one terminal-row per skill."""
+    pin = SkillPinConfig()
+    long_desc = (
+        "Use when something has gone very wrong and you need to walk a long "
+        "diagnostic checklist across multiple subsystems including pollers, "
+        "scheduled ticks, the dispatcher, and the bridge layer to figure "
+        "out where the message actually got dropped"
+    )
+    out = render_skill_catalog(
+        ["introspection"], pin, descriptions={"introspection": long_desc}
+    )
+    assert out is not None
+    line = out.split("\n")[0]
+    # Truncation produces a single line under a reasonable bound and
+    # ends with the ellipsis sentinel.
+    assert line.startswith("- introspection — ")
+    assert line.endswith("…")
+    assert len(line) < 110  # name + " — " + ~80 char desc + ellipsis
+
+
+def test_render_skill_catalog_filters_hidden_with_descriptions():
+    """Hidden skills don't get descriptions rendered either."""
+    pin = SkillPinConfig(hide=["legacy"])
+    out = render_skill_catalog(
+        ["legacy", "memory"], pin, descriptions={"legacy": "x", "memory": "y"}
+    )
+    assert out is not None
+    assert "legacy" not in out
+    assert "- memory — y" in out
+
+
 def test_render_skill_telemetry_emits_proven_and_risky_only():
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     aggs = {
