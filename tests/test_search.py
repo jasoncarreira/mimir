@@ -127,8 +127,12 @@ def test_classify_scope_excludes_skip_prefixes():
 def test_fts_query_strips_operators():
     # Parentheses get stripped to nothing; alnum tokens kept and OR-joined.
     assert _to_fts_query("foo (bar) baz") == "foo OR bar OR baz"
-    # Hyphen and underscore are preserved as part of identifiers.
-    assert _to_fts_query("hello-world_v2") == "hello-world_v2"
+    # Dashes split into separate OR-joined tokens — FTS5 parses
+    # ``-foo`` as the unary NOT operator on a column named ``foo``,
+    # which raises OperationalError for chunks_fts (no such column).
+    # Underscores stay intact (they're term-internal for FTS5
+    # tokenizers).
+    assert _to_fts_query("hello-world_v2") == "hello OR world_v2"
     assert _to_fts_query("") == ""
     assert _to_fts_query("   ") == ""
 
