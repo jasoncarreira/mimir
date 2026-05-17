@@ -25,12 +25,37 @@ discord = [
 slack = [
     "slack-bolt>=1.18",
 ]
+# chainlink #141 Slice 2: opt-in ColBERT late-interaction retrieval
+# (LiquidAI/LFM2-ColBERT-350M) as an additive third channel in
+# file_search. Default install stays slim — users pull this extra
+# when they want the higher-recall fusion. Version pins are LOAD-
+# BEARING and aarch64-Linux-validated (see
+# memory/issues/pylate-lfm2-aarch64-install-gotchas.md):
+#
+#   * pylate==1.2.0 is the last release that doesn't depend on
+#     fast-plaid (no aarch64 Linux wheel for fast-plaid yet).
+#   * transformers==4.56.2 — pylate 1.2.0 hard-pins 4.48.2 which
+#     lacks the lfm2 model type; 4.56.2 is the last pre-5.x with
+#     lfm2 support. 5.x breaks sentence-transformers 4.0.2's
+#     tokenize call shape.
+#   * sentence-transformers==4.0.2 is what the combo is empirically
+#     stable on.
+#   * voyager is a transitive dep of pylate 1.2.0; pinned here so a
+#     pylate refactor that drops it doesn't break the HNSW sidecar.
+colbert = [
+    "pylate==1.2.0",
+    "transformers==4.56.2",
+    "sentence-transformers==4.0.2",
+    "voyager==2.1.0",
+    "numpy>=1.26",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "pytest-aiohttp>=1.0",
     "discord-py>=2.6",
     "slack-bolt>=1.18",
+    "numpy>=1.26",
 ]
 
 [project.scripts]
@@ -64,6 +89,19 @@ testpaths = ["tests"]
 # commit; renamed to ``saga`` in V0.5.md §6.
 [tool.uv.workspace]
 members = ["saga"]
+
+# chainlink #141 Slice 2: override pylate 1.2.0's hard pin on
+# transformers==4.48.2. The pinned 4.48.2 lacks the lfm2 model
+# type (added in 4.55+), so LiquidAI/LFM2-ColBERT-350M can't load.
+# 4.56.2 is the last pre-5.x release with lfm2 support;
+# sentence-transformers 4.0.2 stays compatible. See
+# memory/issues/pylate-lfm2-aarch64-install-gotchas.md §2.
+# Override mechanism keeps both the colbert extra installable
+# AND respects the harness's actual runtime requirements.
+[tool.uv]
+override-dependencies = [
+    "transformers==4.56.2",
+]
 
 # Resolve the ``saga`` dependency declared in [project.dependencies]
 # from the workspace member rather than PyPI. uv installs it editable so

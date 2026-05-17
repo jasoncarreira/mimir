@@ -1716,6 +1716,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     from . import reindex as _reindex
     _reindex.add_argparse(reindex_p)
 
+    # chainlink #141 Slice 2: opt-in ColBERT late-interaction
+    # retrieval. ``mimir colbert build`` rebuilds the sidecar index
+    # under ``<home>/.colbert-index/``. Requires the optional
+    # ``colbert`` extra (``pip install -e ".[colbert]"``) — the
+    # subcommand registers regardless, but ``dispatch`` returns a
+    # clear ImportError-formatted message if pylate isn't there.
+    colbert_p = sub.add_parser(
+        "colbert",
+        help=(
+            "ColBERT late-interaction index management (opt-in extra). "
+            "Currently only ``mimir colbert build`` — one-shot rebuild "
+            "of the sidecar index over memory/ + state/."
+        ),
+    )
+    from . import colbert as _colbert
+    _colbert.add_argparse(colbert_p)
+
     # ``mimir migrate-memory`` — port saga.db (or MSAM snapshot) into
     # the new mimir.saga.db schema. The new memory subsystem
     # (mimir.saga.*) is a clean-room rewrite that drops saga's
@@ -1910,6 +1927,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "reindex":
         from . import reindex as _reindex
         sys.exit(_reindex.dispatch(args))
+
+    if args.command == "colbert":
+        from . import colbert as _colbert
+        sys.exit(_colbert.dispatch(args))
 
     if args.command == "migrate-memory":
         from .saga.migrate import migrate as _migrate_memory
