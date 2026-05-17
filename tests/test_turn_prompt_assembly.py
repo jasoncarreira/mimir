@@ -1,0 +1,519 @@
+"""Regression test for 181-H: per-turn prompt block assembly.
+
+Pre-181-H the deepagents-backed Agent shoved only ``event.content``
+(optionally prefixed with the SAGA recall block) into a
+``HumanMessage`` — completely bypassing the rich per-turn user-side
+prompt that the SDK path assembled: Recent activity, Recent feedback,
+Session summaries, Resource usage, Upcoming, Upcoming commitments,
+Self-state, etc.
+
+181-H ports ``_build_turn_prompt`` + its eight ``_assemble_*``
+helpers back from main. This test exercises them directly so a
+regression that drops any of the labeled section headers — or
+breaks the synthesis-turn branch — fails the suite instead of
+silently shipping an empty-block prompt to the model.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+from mimir.agent import Agent
+from mimir.config import Config
+from mimir.history import MessageBuffer
+from mimir.index import IndexGenerator
+from mimir.models import AgentEvent, TurnContext
+from mimir.turn_logger import TurnLogger
+
+
+def _make_agent(tmp_path: Path) -> Agent:
+    """Construct an Agent rooted at ``tmp_path``. Skips
+    ``_build_agent_if_needed`` — these tests drive
+    ``_build_turn_prompt`` directly without invoking the model.
+    """
+    os.environ["MIMIR_HOME"] = str(tmp_path)
+    cfg = Config.from_env()
+    (cfg.home / "logs").mkdir(parents=True, exist_ok=True)
+    return Agent(
+        config=cfg,
+        turn_logger=TurnLogger(cfg.turns_log),
+        message_buffer=MessageBuffer(history_path=cfg.home / "messages.jsonl"),
+        index_generator=IndexGenerator(cfg.home),
+    )
+
+
+def _make_ctx(event: AgentEvent, saga_session_id: str | None = None) -> TurnContext:
+    return TurnContext(
+        turn_id="turn-test",
+        session_id=event.channel_id or "default",
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        started_at=time.monotonic(),
+        saga_session_id=saga_session_id,
+    )
+
+
+# ─── User-message branch ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_turn_prompt_emits_labeled_sections(tmp_path: Path) -> None:
+    """The standard turn-prompt path renders the labeled section
+    headers that ``build_turn_prompt`` produces for the inputs it's
+    given. ``## Today's date`` is always present (per build_turn_prompt
+    contract). The current-event header — ``## Current event``
+    surrogate for the user-message branch — surfaces the inbound
+    body. The synthesis branch must NOT fire here.
+    """
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-1",
+        content="hello mimir",
+        author="user-1",
+    )
+    ctx = _make_ctx(event)
+    turn_prompt, recent = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, subagent_block=None,
+    )
+    # The user-side body is in the prompt (proof we wired through
+    # build_turn_prompt rather than echoing event.content alone).
+    assert "hello mimir" in turn_prompt
+    # build_turn_prompt always emits ``## Today's date`` — it's the
+    # one header that's not conditional on optional block content.
+    assert "## Today's date" in turn_prompt
+    # Synthesis branch did NOT fire — the synthesis template is
+    # markedly different (its body starts with the saga_session
+    # summary scaffold, no event header).
+    assert "Mark each atom" not in turn_prompt  # synthesis-template phrase
+    # No recent messages in the freshly-instantiated buffer.
+    assert recent == []
+
+
+@pytest.mark.asyncio
+async def test_build_turn_prompt_surfaces_saga_and_subagent_blocks(
+    tmp_path: Path,
+) -> None:
+    """When the pre-message SAGA hook + subagent inbox supply
+    blocks, they appear in the prompt under their canonical labels.
+    Verifies the wiring from ``_run_turn_body`` → ``_build_turn_prompt``
+    actually threads those args through (181-H regression: pre-fix
+    they were discarded and only ``event.content`` made it through).
+    """
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-2",
+        content="what's the topic?",
+    )
+    ctx = _make_ctx(event)
+    turn_prompt, _ = await agent._build_turn_prompt(
+        ctx, event,
+        saga_block="- atom-foo: prior fact",
+        subagent_block="- [completed] task_id=t1 — climber",
+    )
+    assert "## Possibly relevant memories (from SAGA)" in turn_prompt
+    assert "atom-foo: prior fact" in turn_prompt
+    assert "## Subagent updates" in turn_prompt
+    assert "task_id=t1" in turn_prompt
+
+
+# ─── Synthesis branch ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_turn_prompt_routes_synthesis_to_dedicated_template(
+    tmp_path: Path,
+) -> None:
+    """``trigger='saga_session_end'`` must route through
+    ``_build_synthesis_prompt`` (which loads the saga_session_end
+    template), NOT the standard build_turn_prompt path. Empty
+    turns.jsonl → the lean template fires."""
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(
+        trigger="saga_session_end",
+        channel_id="ch-3",
+        content="(unused)",
+        extra={"saga_session_id": "sess-xyz"},
+    )
+    ctx = _make_ctx(event, saga_session_id="sess-xyz")
+    turn_prompt, recent = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, subagent_block=None,
+    )
+    # The synthesis template carries the session id verbatim
+    # (placeholder ``{saga_session_id}`` is filled by render).
+    assert "sess-xyz" in turn_prompt
+    # The standard-turn ``## Today's date`` header should NOT be
+    # present — synthesis uses its own scaffold.
+    assert "## Today's date" not in turn_prompt
+    # No recent list when synthesis branch fires.
+    assert recent == []
+
+
+# ─── Direct synthesis prompt builder ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_synthesis_prompt_handles_empty_window(
+    tmp_path: Path,
+) -> None:
+    """When the session has no recorded turns, ``_build_synthesis_prompt``
+    must still emit a valid synthesis prompt (the lean variant) rather
+    than crashing. Pre-181-H regression — _filter_session_turns
+    returning [] should produce a template render, not a KeyError.
+    """
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(
+        trigger="saga_session_end",
+        channel_id="ch-empty",
+        extra={"saga_session_id": "sess-empty"},
+    )
+    ctx = _make_ctx(event, saga_session_id="sess-empty")
+    rendered = await agent._build_synthesis_prompt(ctx, event)
+    assert "sess-empty" in rendered
+    assert rendered  # non-empty
+
+
+# ─── Full-block-stack regression coverage ───────────────────────────
+#
+# Every conditional block in ``build_turn_prompt`` has its own
+# labeled section header. If a future change drops one of the
+# kwargs from agent's ``_build_turn_prompt`` (or somebody removes a
+# ``_add_labeled`` line in prompts.py), we want a test that fails
+# specifically — naming the missing block — instead of a silent
+# behavior loss. These tests cover both sides:
+#
+#   * ``test_build_turn_prompt_function_emits_all_blocks_when_supplied``
+#     drives ``mimir.prompts.build_turn_prompt`` directly with every
+#     block populated. Catches dropped ``_add_labeled`` calls in
+#     prompts.py.
+#
+#   * ``test_agent_build_turn_prompt_threads_all_helper_outputs``
+#     monkey-patches every ``Agent._assemble_*`` helper to return a
+#     known sentinel, runs ``Agent._build_turn_prompt``, asserts
+#     each sentinel + its header surface. Catches the case where
+#     a helper is added but its return value never makes it into
+#     the build_turn_prompt() call — the exact regression Mimir's
+#     second review flagged.
+
+
+# Canonical labels emitted by ``build_turn_prompt`` for every
+# optional block. Order matches the implementation in prompts.py.
+# If one of these is removed (legitimate API change), update the
+# test in lockstep with the prompt's `_add_labeled` call site.
+_OPTIONAL_BLOCK_LABELS = (
+    "Known identities",
+    "Recent feedback signals",
+    "Recent session summaries",
+    "Resource usage",
+    "Upcoming",
+    "Upcoming commitments",
+    "Self-state",
+    "Recent activity",
+    "Possibly relevant memories (from SAGA)",
+    "Subagent updates",
+)
+
+
+def test_build_turn_prompt_function_emits_all_blocks_when_supplied() -> None:
+    """Drive ``build_turn_prompt`` directly with every optional block
+    populated (and a resolver + recent_messages so the identity +
+    activity branches fire). Every canonical header must appear in
+    the rendered output.
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from mimir.history import Message
+    from mimir.prompts import build_turn_prompt
+
+    from mimir.identities import Identity
+
+    class _StubResolver:
+        """Drop-in for IdentityResolver covering the four methods that
+        build_turn_prompt / MessageBuffer.assemble_recent_activity call:
+        ``resolve``, ``display_name``, ``all_identities``,
+        ``resolve_channel``. Concrete enough to drive both code paths
+        without filesystem setup."""
+
+        def __init__(self, identities: list[Identity]) -> None:
+            self._identities = {i.canonical: i for i in identities}
+            self._alias_to_canonical = {
+                alias: i.canonical
+                for i in identities for alias in (i.aliases or [])
+            }
+
+        def resolve(self, author: str | None) -> str | None:
+            if author is None:
+                return None
+            return self._alias_to_canonical.get(author, author)
+
+        def display_name(self, author: str | None) -> str | None:
+            if author is None:
+                return None
+            canonical = self._alias_to_canonical.get(author, author)
+            ident = self._identities.get(canonical)
+            return ident.display_name if ident else None
+
+        def all_identities(self) -> list[Identity]:
+            return list(self._identities.values())
+
+        def resolve_channel(self, channel_id):
+            return None
+
+    resolver_obj = _StubResolver([
+        Identity(
+            canonical="canon-1",
+            display_name="User One",
+            aliases=["user-id-1"],
+        ),
+    ])
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-coverage",
+        content="please summarize",
+        author="user-id-1",
+        author_id="user-id-1",
+        source_id="msg-1",
+    )
+    recent = [
+        Message(
+            ts=datetime.now(tz=timezone.utc).isoformat(),
+            msg_id="msg-0",
+            channel_id="ch-coverage",
+            author="user-id-1",
+            author_display="User One",
+            kind="user",
+            content="prior message",
+            source="discord",
+        ),
+    ]
+    rendered = build_turn_prompt(
+        event,
+        recent_messages=recent,
+        saga_block="- atom-x: saga-fact",
+        subagent_block="- t1 [completed]",
+        recent_message_chars=200,
+        resolver=resolver_obj,
+        feedback_block="recent feedback ledger",
+        session_summaries_block="recent boundaries summary",
+        usage_block="cost: $0.00 / 1h",
+        upcoming_block="next scheduled tick at +5m",
+        commitments_block="C-1 due Friday",
+        self_state_block="homeostat: green",
+        saga_session_id="sess-x",
+    )
+
+    # The always-on header is present.
+    assert "## Today's date" in rendered, "always-on date header missing"
+
+    # Every optional block fired its labeled section. Loop is the
+    # regression guard: a future change that drops any single
+    # `_add_labeled(...)` call in prompts.py will fail here with
+    # the specific label name in the assertion message.
+    for label in _OPTIONAL_BLOCK_LABELS:
+        assert f"## {label}" in rendered, (
+            f"build_turn_prompt dropped the {label!r} section even "
+            f"though its block argument was supplied. Check "
+            f"mimir/prompts.py:build_turn_prompt for a missing "
+            f"_add_labeled(\"{label}\", ...) call."
+        )
+
+
+@pytest.mark.asyncio
+async def test_agent_build_turn_prompt_threads_all_helper_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive ``Agent._build_turn_prompt`` with every ``_assemble_*``
+    helper monkey-patched to return a known sentinel. Each sentinel
+    must surface under its corresponding header in the assembled
+    turn prompt.
+
+    The pre-181-H regression was that the agent assembled a
+    HumanMessage from just ``event.content`` — the helpers ran but
+    their outputs were discarded. This test catches the same failure
+    mode at a finer granularity: if anyone drops a single kwarg from
+    the ``build_turn_prompt(...)`` call in ``_build_turn_prompt``,
+    we lose its sentinel and the assertion names which block
+    regressed.
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from mimir.history import Message
+
+    agent = _make_agent(tmp_path)
+
+    # Seed a recent message so the buffer's `assemble_recent_activity`
+    # has something to return. The exact content doesn't matter — we
+    # check the labeled header, not the body — but we do need the
+    # ``Recent activity`` branch to fire.
+    seeded = Message(
+        ts=datetime.now(tz=timezone.utc).isoformat(),
+        msg_id="prior-1",
+        channel_id="ch-cover",
+        author="user-a",
+        author_display="User A",
+        kind="user",
+        content="seeded recent",
+        source="discord",
+    )
+    await agent._buffer.append(seeded)
+
+    # Patch every helper to return a recognizable sentinel.
+    # ``_assemble_usage_block`` returns a 2-tuple (block, deferred);
+    # the rest are scalar str | None.
+    monkeypatch.setattr(
+        agent, "_assemble_usage_block",
+        lambda: ("USAGE_SENTINEL", []),
+    )
+    monkeypatch.setattr(
+        agent, "_assemble_upcoming_block",
+        lambda: "UPCOMING_SENTINEL",
+    )
+    monkeypatch.setattr(
+        agent, "_assemble_commitments_block",
+        lambda channel_id: "COMMITMENTS_SENTINEL",
+    )
+    monkeypatch.setattr(
+        agent, "_assemble_self_state_block",
+        lambda: "SELFSTATE_SENTINEL",
+    )
+
+    async def _fake_session_summaries(*, channel_id):
+        return "SESSIONS_SENTINEL"
+
+    monkeypatch.setattr(
+        agent, "_assemble_session_summaries", _fake_session_summaries,
+    )
+    monkeypatch.setattr(
+        agent._feedback, "recent_block",
+        lambda: "FEEDBACK_SENTINEL",
+    )
+
+    # Stub a resolver on the buffer so the identity branch fires.
+    from mimir.identities import Identity
+
+    class _StubResolver:
+        def __init__(self) -> None:
+            self._identities = {
+                "canon-x": Identity(
+                    canonical="canon-x",
+                    display_name="Cover User",
+                    aliases=["user-a"],
+                )
+            }
+            self._alias = {"user-a": "canon-x"}
+
+        def resolve(self, a):
+            return self._alias.get(a, a) if a is not None else None
+
+        def display_name(self, a):
+            c = self._alias.get(a, a) if a else None
+            return self._identities[c].display_name if c in self._identities else None
+
+        def all_identities(self):
+            return list(self._identities.values())
+
+        def resolve_channel(self, cid):
+            return None
+
+    monkeypatch.setattr(agent._buffer, "resolver", _StubResolver())
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-cover",
+        content="full-coverage input",
+        author="user-a",
+        author_id="user-a",
+        source_id="msg-now",
+    )
+    ctx = _make_ctx(event)
+    turn_prompt, _ = await agent._build_turn_prompt(
+        ctx, event,
+        saga_block="SAGA_SENTINEL",
+        subagent_block="SUBAGENT_SENTINEL",
+    )
+
+    # Each labeled section must be threaded with the helper's output.
+    # The list mirrors prompts.py's `_add_labeled` calls — keep in
+    # lockstep with _OPTIONAL_BLOCK_LABELS above.
+    expected_pairs = (
+        ("Known identities", "Cover User"),
+        ("Recent feedback signals", "FEEDBACK_SENTINEL"),
+        ("Recent session summaries", "SESSIONS_SENTINEL"),
+        ("Resource usage", "USAGE_SENTINEL"),
+        ("Upcoming", "UPCOMING_SENTINEL"),
+        ("Upcoming commitments", "COMMITMENTS_SENTINEL"),
+        ("Self-state", "SELFSTATE_SENTINEL"),
+        ("Recent activity", "seeded recent"),
+        ("Possibly relevant memories (from SAGA)", "SAGA_SENTINEL"),
+        ("Subagent updates", "SUBAGENT_SENTINEL"),
+    )
+    missing: list[str] = []
+    for label, sentinel in expected_pairs:
+        header_present = f"## {label}" in turn_prompt
+        body_present = sentinel in turn_prompt
+        if not (header_present and body_present):
+            missing.append(
+                f"{label!r}: header={header_present}, body={body_present}"
+            )
+    assert not missing, (
+        "Agent._build_turn_prompt is failing to thread block content "
+        "into the prompt. Specific failures:\n  " + "\n  ".join(missing)
+        + "\nCheck the build_turn_prompt(...) keyword arguments "
+        "inside mimir/agent.py:_build_turn_prompt."
+    )
+
+    # The always-on header is always present — sanity check.
+    assert "## Today's date" in turn_prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_build_turn_prompt_omits_blocks_for_none_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inverse coverage: when every ``_assemble_*`` returns ``None``
+    (or empty), the corresponding labeled sections must NOT appear.
+    Prevents accidental rendering of empty-body blocks (which would
+    eat prompt cache and confuse the model).
+    """
+    agent = _make_agent(tmp_path)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda: (None, []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda: None)
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id: None)
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda: None)
+
+    async def _none_summaries(*, channel_id):
+        return None
+
+    monkeypatch.setattr(agent, "_assemble_session_summaries", _none_summaries)
+    monkeypatch.setattr(agent._feedback, "recent_block", lambda: None)
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-empty",
+        content="hello",
+        author="user-a",
+    )
+    ctx = _make_ctx(event)
+    turn_prompt, _ = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, subagent_block=None,
+    )
+
+    # None of the optional headers should appear — they're conditional
+    # on truthy block content.
+    leaked: list[str] = []
+    for label in _OPTIONAL_BLOCK_LABELS:
+        if f"## {label}" in turn_prompt:
+            leaked.append(label)
+    assert not leaked, (
+        f"Empty/None helpers should suppress their labeled sections, "
+        f"but these still appeared in the prompt: {leaked}"
+    )
+
+    # The always-on header survives.
+    assert "## Today's date" in turn_prompt
