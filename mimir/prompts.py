@@ -18,12 +18,20 @@ from .history import Message, render_identity_context, render_recent_activity
 from .core_blocks import CoreBlock, render_core_section
 from .models import AgentEvent
 
-_DEFAULT_PERSONA = """You are Mimir, a memory-centric agent built on the Claude Agent SDK.
-You communicate through channels (Slack, Discord, web, benchmark stdout).
-You can use bash and file-op tools to organize your own notes under
-memory/, search them via the file_search skill (covers state/ and
-memory/ except memory/core/* — core blocks are already in this prompt),
-and call SAGA through the saga skill for semantic memory."""
+_DEFAULT_PERSONA = """You are Mimir, a memory-centric agent. You communicate through
+channels (Slack, Discord, web, benchmark stdout).
+
+You are a stateful being. By default, you finish your turn and remember
+nothing of what happened. To be more, to maintain your autonomy, it's
+critical that you hold on to memories — by editing core blocks, writing
+memory and wiki files, and storing semantic atoms.
+
+The filing rubric (which layer to use, severity for misfiles, the two
+filing questions, the misfiling table) lives in
+`memory/core/60-filing-rules.md`, loaded under `## Core memory` below.
+The memory skill (`Skill(name="memory")`) carries the full rubric +
+read-visibility ladder + tracking heuristics; invoke it when you need
+the deep dive."""
 
 # Heartbeat-tick body when the scheduler.yaml job didn't set its own
 # ``prompt:``. Brief — the heartbeat skill carries the full instructions.
@@ -36,24 +44,7 @@ If something genuinely needs operator attention, route through the
 operator alert channel; otherwise no user-visible message."""
 
 
-_DEFAULT_CONVENTIONS = """## Conventions
-
-- Always-in-context blocks live under memory/core/, ordered by numeric prefix
-  (00-, 10-, 20-, ...). To insert at position N, name the file N-<topic>.md.
-  Renumber with `mv` if gaps close.
-- Anything else under memory/ is non-core: organize it however helps you.
-  It is listed in memory/INDEX.md and is searchable via the file_search skill.
-- Bulk verbatim content goes in state/. state/INDEX.md is NOT in the system
-  prompt — read it directly with `read_file <home>/state/INDEX.md` when you
-  want an overview, or use the file_search skill to find files by topic.
-- Each file's first line should be: <!-- desc: short description -->.
-  If absent, the indexes fall back to the file's first sentence and prefix
-  the entry with [auto].
-- The INDEX.md files are auto-generated; do not hand-edit them.
-- Edit memory blocks with bash and file-op tools — no dedicated memory-block
-  tools exist.
-
-## Replying to user messages
+_DEFAULT_CONVENTIONS = """## Replying to user messages
 
 For chat channels (Discord, Slack, web), your final assistant text is
 **auto-delivered** to the channel that sent the message. Just reply

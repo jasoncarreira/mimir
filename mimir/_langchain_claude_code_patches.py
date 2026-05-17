@@ -143,3 +143,33 @@ def apply_patches() -> None:
     ccm.ClaudeCodeChatModel._wrap_langchain_tool = _patched_wrap_langchain_tool
     setattr(ccm.ClaudeCodeChatModel, _PATCH_MARKER, True)
     log.debug("applied langchain-claude-code _arun config-kwarg patch")
+
+
+_DEEPAGENTS_BASE_PROMPT_MARKER = "_mimir_base_prompt_stripped"
+
+
+def strip_deepagents_base_prompt() -> None:
+    """Empty out ``deepagents.graph.BASE_AGENT_PROMPT`` so it is NOT
+    appended to mimir's system prompt.
+
+    ``create_deep_agent`` composes the final system prompt as
+    ``user_system_prompt + "\\n\\n" + BASE_AGENT_PROMPT`` (graph.py:754).
+    The base block is a generic "be concise, do tasks well" framing
+    that competes with mimir's own persona + filing-rules guidance.
+    For mimir the user-supplied prompt is the entire contract: core
+    memory blocks, memory-index, conventions, skill catalog, operator
+    config — there is no value to bolting a second agent-shape framing
+    onto the end of it. Match the SDK-era invariant where mimir's
+    system_prompt was the only system_prompt the model saw.
+
+    Idempotent + import-safe: a no-op when deepagents isn't installed
+    (operators on the anthropic-only extra path don't pull it in)."""
+    try:
+        from deepagents import graph as _dg_graph
+    except ImportError:
+        return
+    if getattr(_dg_graph, _DEEPAGENTS_BASE_PROMPT_MARKER, False):
+        return
+    _dg_graph.BASE_AGENT_PROMPT = ""
+    setattr(_dg_graph, _DEEPAGENTS_BASE_PROMPT_MARKER, True)
+    log.debug("stripped deepagents BASE_AGENT_PROMPT (mimir owns system prompt)")
