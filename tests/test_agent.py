@@ -60,6 +60,44 @@ class _FakeAgent:
         yield {"messages": list(state.get("messages") or []) + self._response_messages}
 
 
+class _BridgeStub:
+    """Captures send + cancel_typing calls so tests can assert on
+    the end-of-turn dispatch path's three branches."""
+
+    name = "stub"
+    prefixes = ("ch-",)
+
+    def __init__(self) -> None:
+        self.sends: list[tuple[str, str, bool]] = []
+        self.cancels: list[str] = []
+
+    async def send(self, channel_id: str, text: str, *,
+                   final: bool = True, attachment_paths=None):
+        self.sends.append((channel_id, text, final))
+        class _R:
+            sent = True
+            error = None
+        return _R()
+
+    async def react(self, *a, **kw):
+        return True
+
+    async def cancel_typing(self, channel_id: str) -> None:
+        self.cancels.append(channel_id)
+
+    async def send_typing_indicator(self, channel_id: str) -> None:
+        pass
+
+    async def fetch_history(self, *a, **kw):
+        return []
+
+    async def connect(self) -> None:
+        pass
+
+    async def disconnect(self) -> None:
+        pass
+
+
 class _FakeSaga:
     """Tiny saga_client double — record query/feedback calls, return
     canned payloads."""
@@ -170,6 +208,52 @@ async def test_run_turn_no_saga_skips_query_and_feedback(tmp_path: Path):
     # No SAGA → no memory block injected
     prompt = fake_agent.invocations[0]["state"]["messages"][0].content
     assert "Possibly relevant memories" not in prompt
+
+
+async def test_run_turn_cancels_typing_when_plan_streamed_but_result_empty(
+    tmp_path: Path,
+):
+    """Edge case from review: if streamed_plan=True but result_text()
+    is empty (model called tools then said nothing), the typing
+    indicator is held by ``final=False`` and would dangle until the
+    bridge's auto-expire kicks in. The end-of-turn path must call
+    ``bridge.cancel_typing`` to release it explicitly.
+    """
+    from mimir.channel_registry import ChannelRegistry
+
+    # AIMessage sequence: plan text → tool_call → nothing (empty AIMessage)
+    # → ensures streaming flushes a plan but result_text() is empty.
+    fake_agent = _FakeAgent(response_messages=[
+        AIMessage(
+            content="planning...",
+            tool_calls=[
+                {"name": "memory_query", "args": {"query": "x"}, "id": "t1"},
+            ],
+        ),
+        AIMessage(content=""),  # no final result text
+    ])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+
+    agent = _build_agent(tmp_path, fake_agent=fake_agent)
+    agent._channels = registry  # type: ignore[attr-defined]
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    record = await agent.run_turn(event)
+
+    # The plan was streamed mid-turn (final=False) but no result text
+    # followed — so cancel_typing fires to release the indicator.
+    plan_sends = [s for s in bridge.sends if s[2] is False]
+    final_sends = [s for s in bridge.sends if s[2] is True]
+    assert len(plan_sends) == 1
+    assert "planning" in plan_sends[0][1]
+    # No end-of-turn send (no result text to ship).
+    assert final_sends == []
+    # But typing indicator was released.
+    assert bridge.cancels == ["ch-1"]
+    # Turn record still wrote cleanly.
+    assert record.error is None
 
 
 async def test_run_turn_records_error_when_ainvoke_raises(tmp_path: Path):
