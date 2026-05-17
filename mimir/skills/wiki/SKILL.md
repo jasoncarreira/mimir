@@ -152,7 +152,11 @@ many sources. The mapping is many-to-many.
 
 ### Query: search wiki first
 
-Before doing new research or going to raw sources:
+This section is the wiki-shaped expression of the search-first lookup
+rule in `memory/core/60-filing-rules.md` §"Search-first lookup"
+(default order: `file_search` → `Read` of known path → external
+web fetch / web search). Before doing new research or going to raw
+sources:
 
 1. **Paraphrased query** — `mcp__mimir__file_search(query="...", scope="state")`
    does hybrid keyword + vector search over the whole wiki (and raw/).
@@ -168,6 +172,9 @@ Before doing new research or going to raw sources:
    are also indexed (`scope="state"` covers both wiki and raw), so a
    broad query may surface raw content the wiki hasn't synthesized
    yet — that's a signal to ingest.
+5. External web fetch / web search is the last rung — only when the
+   content is provably not internal. Skipping the earlier rungs lands
+   as drift-amplifier per the core filing-rules severity rubric.
 
 ### Lint: periodic health check
 
