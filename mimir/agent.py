@@ -2138,6 +2138,7 @@ class Agent:
                 memory_index_body=memory_index_body,
                 operator_alert_channel=self._config.operator_alert_channel,
                 skill_block=skill_block,
+                home_dir=str(self._config.home),
             ),
             len(core_blocks),
         )

@@ -33,6 +33,54 @@ def test_system_prompt_omits_operator_alert_channel_when_empty():
     assert "Operator alert channel" not in sp
 
 
+# ---- Agent home ---------------------------------------------------------
+
+
+def test_system_prompt_includes_agent_home_when_set():
+    """``home_dir`` materializes an ``## Agent home`` section so the
+    model has the absolute MIMIR_HOME path without having to infer it
+    from prose in core blocks or from claude-code's default workspace."""
+    sp = build_system_prompt(home_dir="/mimir-home")
+    assert "## Agent home" in sp
+    assert "MIMIR_HOME=/mimir-home" in sp
+    # Section should sit between persona and core memory (or
+    # conventions if core blocks aren't passed) — i.e. before any
+    # ``memory/`` or ``state/`` path content the model might
+    # otherwise misanchor.
+    persona_end = sp.find("\n\n")
+    home_at = sp.find("## Agent home")
+    conventions_at = sp.find("## Conventions")
+    assert persona_end < home_at < conventions_at, (
+        "## Agent home should land between persona and conventions"
+    )
+
+
+def test_system_prompt_omits_agent_home_when_unset():
+    sp = build_system_prompt()
+    assert "## Agent home" not in sp
+
+
+def test_system_prompt_omits_agent_home_when_empty_string():
+    """Empty string is falsy and reflects ``home_dir=""`` from a config
+    that hasn't resolved a path. Treat as unset rather than emitting a
+    misleading ``MIMIR_HOME=`` line."""
+    sp = build_system_prompt(home_dir="")
+    assert "## Agent home" not in sp
+    assert "MIMIR_HOME=" not in sp
+
+
+def test_system_prompt_agent_home_uses_provided_path_in_guidance():
+    """The instruction text inside the section uses the *provided*
+    path, not a hardcoded ``/mimir-home`` — so deployments that set
+    MIMIR_HOME to anything else get accurate guidance."""
+    sp = build_system_prompt(home_dir="/var/lib/mimir")
+    # Both the env-var line AND the absolute-path-prefix instruction
+    # should reflect the actual value.
+    assert "MIMIR_HOME=/var/lib/mimir" in sp
+    assert "/var/lib/mimir/" in sp
+    assert "/mimir-home" not in sp
+
+
 # ---- Config env wiring ---------------------------------------------------
 
 
