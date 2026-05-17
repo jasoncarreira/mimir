@@ -1,0 +1,320 @@
+{
+  "_comment": [
+    "Probe set for chainlink #141 Slice 2 A/B: main (BM25+dense) vs",
+    "ColBERT-fused vs ColBERT-fused-with-recency.",
+    "",
+    "First 30 probes carry over verbatim from chainlink #140 Sub B",
+    "(state/spec/chainlink-138-sub-b-recon.md + the probes.yaml that",
+    "shipped with PR #167). Categorized as 'path-citation' since the",
+    "scoring metric here is 'is the expected_path a substring of any",
+    "returned path in the top-10'.",
+    "",
+    "Probes 31-49 are new additions targeting ColBERT's predicted",
+    "advantage on rare-token / fingerprint / symbol-reference",
+    "queries. 'colbert-favorable' = error fingerprints + function",
+    "symbol refs; 'rare-token' = exact path / PR / chainlink-ID refs.",
+    "",
+    "Each probe scores 1/0 based on whether ANY of its expected_paths",
+    "is a substring of ANY top-10 returned path. Hit-rate@10 is the",
+    "primary metric; MRR@10 is computed against the FIRST matching",
+    "expected_path's rank."
+  ],
+  "probes": [
+    {
+      "id": 1,
+      "query": "fixture 'aiohttp_server' not found, what do I do?",
+      "expected_paths": ["memory/issues/pytest-aiohttp-dev-extras.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 2,
+      "query": "how do git credentials get truncated on 401?",
+      "expected_paths": ["memory/issues/git-credential-store-erase-on-auth-failure.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 3,
+      "query": "events.jsonl retention window — how long do events survive?",
+      "expected_paths": ["memory/issues/events-jsonl-retention.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 4,
+      "query": "where do I put an operational gotcha file?",
+      "expected_paths": ["memory/core/60-filing-rules.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 5,
+      "query": "what's the notability gate for new wiki pages?",
+      "expected_paths": ["memory/core/60-filing-rules.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 6,
+      "query": "how does the reflection turn promote learnings to core?",
+      "expected_paths": ["memory/core/30-reflection-policy.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 7,
+      "query": "what did Jason decide about the ColBERT backend choice?",
+      "expected_paths": ["state/spec/chainlink-138-file-search-colbert.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 8,
+      "query": "what's the heartbeat work pattern when item finishes fast?",
+      "expected_paths": ["memory/core/50-heartbeat-patterns.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 9,
+      "query": "stale local feature branches — what's the cleanup plan?",
+      "expected_paths": ["state/spec/chainlink-136"],
+      "category": "path-citation"
+    },
+    {
+      "id": 10,
+      "query": "PR #166 — what did that ship?",
+      "expected_paths": ["chainlink-138"],
+      "category": "path-citation"
+    },
+    {
+      "id": 11,
+      "query": "how do I file a chainlink subissue?",
+      "expected_paths": ["mimir/skills/chainlink/SKILL.md", "skills/chainlink"],
+      "category": "path-citation"
+    },
+    {
+      "id": 12,
+      "query": "how should heartbeats surface operator-attention items?",
+      "expected_paths": ["memory/core/50-heartbeat-patterns.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 13,
+      "query": "what's the per-channel pattern for storing operator info?",
+      "expected_paths": ["memory/channels/discord-1500672382166110321/jason.md", "memory/channels"],
+      "category": "path-citation"
+    },
+    {
+      "id": 14,
+      "query": "MCP tools rejecting xml-in-json — what's the issue?",
+      "expected_paths": ["memory/issues/saga-end-session-xml-in-json-smuggle.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 15,
+      "query": "what's the cost shape for a code-review PR?",
+      "expected_paths": ["memory/core/50-heartbeat-patterns.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 16,
+      "query": "subagent left scratch files behind in git add — how do I avoid it?",
+      "expected_paths": ["memory/issues/subagent-scratch-leaks-into-git-add.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 17,
+      "query": "bench runner sent a message to real Discord — what went wrong?",
+      "expected_paths": ["memory/issues/bench-runner-live-bridge-leak.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 18,
+      "query": "Read/Write tool rejected my /tmp path — what's allowed?",
+      "expected_paths": ["memory/issues/file-op-path-confinement.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 19,
+      "query": "claude code spawn returned no output — known failure modes?",
+      "expected_paths": ["memory/issues/claude-code-spawn-failure-modes.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 20,
+      "query": "what's the identity-document policy for mimir-the-agent?",
+      "expected_paths": ["memory/core/00-identity.md", "memory/core/identity.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 21,
+      "query": "what counts as a non-goal — explicit ones we won't pursue?",
+      "expected_paths": ["memory/core/05-non-goals.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 22,
+      "query": "what was the autopass file_search decision from chainlink 139?",
+      "expected_paths": ["state/spec/chainlink-138-file-search-colbert.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 23,
+      "query": "what's the Sub B recon doc for chainlink 138?",
+      "expected_paths": ["state/spec/chainlink-138-sub-b-recon.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 24,
+      "query": "where did the file_search ColBERT spec land?",
+      "expected_paths": ["state/spec/chainlink-138-file-search-colbert.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 25,
+      "query": "what did the Anthropic 5-hour bucket discussion conclude?",
+      "expected_paths": ["memory/issues/anthropic-5h-bucket-pegged.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 26,
+      "query": "how do I run the reflection skill end-to-end?",
+      "expected_paths": ["mimir/skills/reflection", "skills/reflection"],
+      "category": "path-citation"
+    },
+    {
+      "id": 27,
+      "query": "what's the procedure for the heartbeat skill at the top of the loop?",
+      "expected_paths": ["mimir/skills/heartbeat", "skills/heartbeat", "50-heartbeat-patterns.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 28,
+      "query": "how do I add a new poller — what skill covers that?",
+      "expected_paths": ["mimir/skills/pollers", "skills/pollers", "skill-setup-github-poller.md"],
+      "category": "path-citation"
+    },
+    {
+      "id": 29,
+      "query": "what's the procedure for spawning an async-task?",
+      "expected_paths": ["mimir/skills/async-tasks", "skills/async-tasks"],
+      "category": "path-citation"
+    },
+    {
+      "id": 30,
+      "query": "how do I run the find-skills skill — when should it fire?",
+      "expected_paths": ["mimir/skills/find-skills", "skills/find-skills"],
+      "category": "path-citation"
+    },
+
+    {
+      "id": 31,
+      "query": "ValueError: Asking to pad but the tokenizer does not have a padding token",
+      "expected_paths": ["memory/issues/pylate-lfm2-aarch64-install-gotchas.md", "pylate-lfm2"],
+      "category": "colbert-favorable"
+    },
+    {
+      "id": 32,
+      "query": "fast-plaid no aarch64 wheel — what's the pylate version pin?",
+      "expected_paths": ["memory/issues/pylate-lfm2-aarch64-install-gotchas.md", "chainlink-141-pylate-recon.md"],
+      "category": "colbert-favorable"
+    },
+    {
+      "id": 33,
+      "query": "voyager HNSW MaxSim re-rank with InnerProduct space",
+      "expected_paths": ["state/spec/chainlink-138-file-search-colbert.md", "chainlink-141-pylate-recon.md"],
+      "category": "colbert-favorable"
+    },
+    {
+      "id": 34,
+      "query": "LiquidAI/LFM2-ColBERT-350M model name pin",
+      "expected_paths": ["memory/issues/pylate-lfm2-aarch64-install-gotchas.md", "chainlink-141-pylate-recon.md"],
+      "category": "colbert-favorable"
+    },
+    {
+      "id": 35,
+      "query": "saga.calibration.re_embed embedding_provider column migration",
+      "expected_paths": ["state/spec/chainlink-138-file-search-colbert.md", "memory/issues/voyage-embedding-input-type-required.md"],
+      "category": "colbert-favorable"
+    },
+    {
+      "id": 36,
+      "query": "transformers 4.56.2 hard-pin for lfm2 model type",
+      "expected_paths": ["memory/issues/pylate-lfm2-aarch64-install-gotchas.md", "chainlink-141-pylate-recon.md"],
+      "category": "colbert-favorable"
+    },
+    {
+      "id": 37,
+      "query": "git credential.helper store erase on auth failure",
+      "expected_paths": ["memory/issues/git-credential-store-erase-on-auth-failure.md"],
+      "category": "colbert-favorable"
+    },
+    {
+      "id": 38,
+      "query": "context-1m-2025-08-07 beta header for Anthropic 1M window",
+      "expected_paths": ["memory/issues/context-window-over-model-max.md", "memory/issues"],
+      "category": "colbert-favorable"
+    },
+    {
+      "id": 39,
+      "query": "subagent scratch leaks into git add staging",
+      "expected_paths": ["memory/issues/subagent-scratch-leaks-into-git-add.md"],
+      "category": "colbert-favorable"
+    },
+    {
+      "id": 40,
+      "query": "VirtioFS stale inode bind-mount health probe",
+      "expected_paths": ["memory/issues", "mimir/health_probe"],
+      "category": "colbert-favorable"
+    },
+
+    {
+      "id": 41,
+      "query": "memory/issues/pylate-lfm2-aarch64-install-gotchas.md",
+      "expected_paths": ["memory/issues/pylate-lfm2-aarch64-install-gotchas.md"],
+      "category": "rare-token"
+    },
+    {
+      "id": 42,
+      "query": "chainlink #138 Sub B autopass A/B harness",
+      "expected_paths": ["state/spec/chainlink-138-sub-b-recon.md", "chainlink-138-sub-b"],
+      "category": "rare-token"
+    },
+    {
+      "id": 43,
+      "query": "PR #174 autopass removal",
+      "expected_paths": ["state/spec/chainlink-138-file-search-colbert.md", "memory/issues"],
+      "category": "rare-token"
+    },
+    {
+      "id": 44,
+      "query": "PR #166 file_search autopass",
+      "expected_paths": ["state/spec/chainlink-138", "memory/issues"],
+      "category": "rare-token"
+    },
+    {
+      "id": 45,
+      "query": "RRF_K=60 reciprocal rank fusion constant",
+      "expected_paths": ["state/spec/chainlink-138-file-search-colbert.md", "state/spec/chainlink-141"],
+      "category": "rare-token"
+    },
+    {
+      "id": 46,
+      "query": "voyage-4-lite 1024 dimensions",
+      "expected_paths": ["memory/issues/voyage-embedding-input-type-required.md", "state/spec/chainlink"],
+      "category": "rare-token"
+    },
+    {
+      "id": 47,
+      "query": "saga_pre_message_min_tier confidence floor",
+      "expected_paths": ["memory/issues", "memory/core"],
+      "category": "rare-token"
+    },
+    {
+      "id": 48,
+      "query": "MIMIR_FILE_SEARCH_RECENCY_FUSE_ALPHA env flag",
+      "expected_paths": ["state/spec/chainlink-141", "state/spec"],
+      "category": "rare-token"
+    },
+    {
+      "id": 49,
+      "query": "MaxSim late-interaction over masked chunk tokens",
+      "expected_paths": ["state/spec/chainlink-138-file-search-colbert.md", "state/spec/chainlink-141-pylate-recon.md"],
+      "category": "colbert-favorable"
+    }
+  ]
+}
