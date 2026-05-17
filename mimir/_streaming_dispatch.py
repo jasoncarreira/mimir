@@ -47,8 +47,35 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 
-# Native @tool name from mimir.tools.registry. The SDK-era namespaced
-# form (``mcp__mimir__send_message``) no longer applies.
+# Native @tool name from mimir.tools.registry. Routed through the
+# ``claude-code:*`` provider, langchain-claude-code's MCP bridge wraps
+# every @tool as ``mcp__langchain-tools__<name>`` before handing it to
+# the claude subprocess — so by the time tool_calls come back on an
+# AIMessage they carry the namespaced form, not the bare name. We
+# detect either suffix so streaming dispatch self-disables on explicit
+# send regardless of which provider path the model took.
+EXPLICIT_SEND_TOOL_NAMES = frozenset({
+    "send_message",                         # native langchain @tool
+    "mcp__langchain-tools__send_message",   # claude-code MCP bridge
+    "mcp__mimir__send_message",             # legacy SDK MCP-server form
+})
+
+
+def _is_explicit_send(tool_call: Any) -> bool:
+    """True iff this tool_call is the operator-chose-canonical-delivery
+    send_message path. Matches across native / claude-code-bridged /
+    legacy-MCP-bridged tool names."""
+    name = tool_call.get("name") if isinstance(tool_call, dict) else None
+    if not name:
+        return False
+    if name in EXPLICIT_SEND_TOOL_NAMES:
+        return True
+    # Tolerant suffix match — future bridge renames that keep the
+    # trailing ``send_message`` token still self-disable.
+    return name.endswith("__send_message") or name == "send_message"
+
+
+# Kept for legacy callers / tests that compared against this constant.
 EXPLICIT_SEND_TOOL = "send_message"
 
 
@@ -134,8 +161,9 @@ def advance_state(state: StreamingState, msg: BaseMessage) -> str | None:
 
     # Explicit send_message → operator chose the canonical-delivery
     # path. Disable streaming entirely; everything we've buffered
-    # so far is moot.
-    if any(tc.get("name") == EXPLICIT_SEND_TOOL for tc in tool_uses):
+    # so far is moot. ``_is_explicit_send`` matches across native,
+    # claude-code-bridged, and legacy-MCP-bridged tool names.
+    if any(_is_explicit_send(tc) for tc in tool_uses):
         state.disabled_by_explicit_send = True
         state.plan_buffer.clear()
         state.candidate_result_buffer.clear()
