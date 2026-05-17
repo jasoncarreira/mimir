@@ -78,6 +78,20 @@ class TestChannelFromConfigOrState:
         set_current_channel_id(None)
         assert _channel_from_config_or_state(None, None) == ""
 
+    def test_state_resolves_when_config_is_empty_runnableconfig(self) -> None:
+        # Regression guard for the claude-code path: the langchain-
+        # claude-code SDK shim calls ``tool._arun(**args,
+        # config=RunnableConfig())`` with an empty config, so the
+        # RunnableConfig route can't see channel_id. _STATE must
+        # carry the channel through that gap. Pre-181-G run_turn
+        # never set _STATE under the new RunnableConfig design;
+        # send_message would fail with "no channel_id".
+        set_current_channel_id("from-state")
+        # Simulate the patch's empty RunnableConfig: a dict with no
+        # ``configurable`` key (or an empty configurable).
+        for empty_cfg in ({}, {"configurable": {}}, None):
+            assert _channel_from_config_or_state(None, empty_cfg) == "from-state"
+
 
 # ─── Agent.__init__ stores commitments_store ───────────────────────
 

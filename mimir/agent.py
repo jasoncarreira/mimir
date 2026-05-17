@@ -439,6 +439,23 @@ class Agent:
             saga_session_id=saga_session_id,
         )
         ctx_token = set_current_turn(ctx)
+        # Populate the module-global current_channel_id as a fallback
+        # for the claude-code path. ChatClaudeCode dispatches tools
+        # via the ClaudeSDKClient subprocess; the SDK round-trips back
+        # through ``_langchain_claude_code_patches`` which calls
+        # ``tool._arun(**args, config=RunnableConfig())`` — a fresh
+        # empty config. The RunnableConfig route added in 181-B
+        # therefore can't see ``configurable["channel_id"]`` on that
+        # path, and send_message / react / fetch_channel_history would
+        # fail with "no channel_id and no current channel" when the
+        # model omits the arg. Setting _STATE here closes the gap; the
+        # helper still prefers configurable when present, so direct
+        # LangGraph tool dispatch (anthropic/openai providers) keeps
+        # the race-free route. The dispatcher serializes turns per-
+        # channel, so the cross-channel race Mimir originally flagged
+        # is constrained to the moment between set and reset here.
+        from .tools.registry import set_current_channel_id as _set_cid
+        _set_cid(event.channel_id)
         try:
             return await self._run_turn_body(
                 event, ctx, ctx_token, turn_id, session_id, saga_session_id,
@@ -446,6 +463,7 @@ class Agent:
             )
         finally:
             reset_current_turn(ctx_token)
+            _set_cid(None)
 
     async def _run_turn_body(
         self,
