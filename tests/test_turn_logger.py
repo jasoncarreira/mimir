@@ -45,8 +45,35 @@ def test_plain_ai_message_with_no_tools_becomes_output():
     assert output == "Hello there."
 
 
-def test_langchain_native_tool_calls_emit_reasoning_plus_tool_call():
-    # langchain-anthropic / -openai populate AIMessage.tool_calls directly.
+def test_intermediate_aimessage_with_tools_is_reasoning_only():
+    """AIMessages with content + tool_calls that are NOT the final
+    AIMessage in the turn are pure reasoning — the model is thinking
+    aloud before a tool call, with more turns expected after."""
+    msgs = [
+        AIMessage(
+            content="I'll look that up.",
+            tool_calls=[
+                {"id": "tc_1", "name": "memory_query", "args": {"query": "x"}},
+            ],
+        ),
+        # A second AIMessage makes the first one intermediate.
+        AIMessage(content="The answer is 42."),
+    ]
+    events, output = extract_turn_events(msgs)
+    # Intermediate AIMessage's text goes to reasoning, not output;
+    # the final AIMessage's text is the output.
+    assert output == "The answer is 42."
+    types = [e["type"] for e in events]
+    assert types == ["reasoning", "tool_call"]
+    assert events[0]["content"] == "I'll look that up."
+
+
+def test_final_aimessage_with_tool_calls_promotes_content_to_output():
+    """Regression for the 50-q bluesky bench finding: when the model
+    runs through ChatClaudeCode and emits ONE AIMessage with content
+    (the answer) AND internal_tool_calls (the tools it used to find
+    it), the content must land in ``output`` so bench adapters that
+    poll ``turn.output`` for the canonical reply can read it."""
     msg = AIMessage(
         content="I'll look that up.",
         tool_calls=[
@@ -54,11 +81,13 @@ def test_langchain_native_tool_calls_emit_reasoning_plus_tool_call():
         ],
     )
     events, output = extract_turn_events([msg])
-    assert output == ""
-    assert [e["type"] for e in events] == ["reasoning", "tool_call"]
-    assert events[0]["content"] == "I'll look that up."
+    # Single AIMessage = it IS the final → content is output.
+    assert output == "I'll look that up."
+    types = [e["type"] for e in events]
+    # Reasoning event still fires alongside output so turn_viewer can
+    # show the pre-tool commentary.
+    assert types == ["reasoning", "tool_call"]
     assert events[1]["name"] == "memory_query"
-    assert events[1]["args"] == {"query": "x"}
 
 
 def test_chat_claude_code_internal_tool_calls_are_captured():

@@ -129,6 +129,44 @@ class TestAdvanceStateDisable:
         assert s.plan_text() == ""
         assert s.result_text() == ""
 
+    def test_namespaced_send_message_also_disables_streaming(self) -> None:
+        """Regression for the 50-q bluesky bench finding: under the
+        ``claude-code:*`` provider, langchain-claude-code's MCP bridge
+        renames our @tool to ``mcp__langchain-tools__send_message``.
+        Pre-fix the bare-string match missed it, streaming dispatch
+        stayed enabled, plan flushed mid-turn for every probe
+        (double-send risk). Now match either form."""
+        for ns_name in (
+            "mcp__langchain-tools__send_message",
+            "mcp__mimir__send_message",
+            "some_future_wrapper__send_message",
+        ):
+            s = StreamingState()
+            advance_state(s, _ai("planning"))
+            plan = advance_state(s, _ai(
+                "",
+                tool_calls=[{"name": ns_name, "args": {"text": "hi"}, "id": "t1"}],
+            ))
+            assert plan is None, f"plan flushed despite namespaced send: {ns_name}"
+            assert s.disabled_by_explicit_send is True, (
+                f"streaming should disable on {ns_name}"
+            )
+
+    def test_unrelated_namespaced_tool_does_not_disable(self) -> None:
+        """Sanity check on the suffix-match: only tool names ending in
+        ``__send_message`` (or the bare name) trigger the disable.
+        ``mcp__langchain-tools__memory_query`` doesn't."""
+        s = StreamingState()
+        advance_state(s, _ai("planning"))
+        plan = advance_state(s, _ai(
+            "calling tool",
+            tool_calls=[{"name": "mcp__langchain-tools__memory_query",
+                         "args": {}, "id": "t1"}],
+        ))
+        # This is a regular tool call → plan flushes, streaming stays on.
+        assert plan == "planning\ncalling tool"
+        assert s.disabled_by_explicit_send is False
+
     def test_disabled_state_returns_none_for_subsequent_messages(self) -> None:
         s = StreamingState(disabled_by_explicit_send=True)
         assert advance_state(s, _ai("more text")) is None

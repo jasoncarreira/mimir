@@ -70,17 +70,40 @@ def extract_turn_events(
 ) -> tuple[list[dict[str, Any]], str]:
     """Walk a LangChain message list, return ``(events, output)``.
 
-    Schema (matches the SDK version's output):
+    Schema:
       AIMessage with content + tool_calls  → reasoning + tool_call events
+                                              (UNLESS it's the final
+                                              AIMessage of the turn —
+                                              then content is output AND
+                                              tool_calls still emit)
       AIMessage with only content          → appended to output
       ToolMessage                          → tool_result event
+
+    Why the "final AIMessage is output even with tool_calls" rule:
+    when the model runs through ChatClaudeCode, the claude subprocess
+    executes tools INSIDE the subprocess and returns ONE AIMessage with
+    {final answer text, internal_tool_calls, internal_tool_results}. If
+    we treat that as pure reasoning, ``output`` ends up empty even
+    though the agent actually answered. Bench adapters poll ``output``
+    for the canonical reply; without this rule every turn looks like a
+    no-op. Pre-181-P regression: the bluesky_recall bench scored
+    near-zero because every probe's ``output`` field was blank — the
+    answer text was sitting in a reasoning event.
 
     streaming_active + message_t_ms are accepted for back-compat
     with the SDK version's call sites; ignored in this build.
     """
+    # Find the index of the final AIMessage so we can promote its
+    # content to ``output`` even when it carries tool_calls. Other
+    # AIMessages with content + tool_calls remain reasoning.
+    last_ai_idx = -1
+    for i, msg in enumerate(messages):
+        if isinstance(msg, AIMessage):
+            last_ai_idx = i
+
     events: list[dict[str, Any]] = []
     output_parts: list[str] = []
-    for msg in messages:
+    for i, msg in enumerate(messages):
         if isinstance(msg, AIMessage):
             content_text = _coerce_content(msg.content)
             # ChatClaudeCode executes tools inside the ``claude`` CLI
@@ -94,10 +117,22 @@ def extract_turn_events(
             internal_tcs = rmd.get("internal_tool_calls") or []
             internal_trs = rmd.get("tool_results") or []
             tcs = list(msg.tool_calls or []) + list(internal_tcs)
-            if content_text and tcs:
+            is_final_ai = i == last_ai_idx
+            if content_text and tcs and not is_final_ai:
+                # Intermediate "thinking out loud" between tool calls.
                 events.append({"type": "reasoning", "content": content_text})
             elif content_text:
+                # Either a text-only AIMessage OR the final AIMessage
+                # (whose content is the agent's answer even if it also
+                # carries internal_tool_calls).
                 output_parts.append(content_text)
+                if tcs:
+                    # Still record the reasoning trace alongside output
+                    # so turn_viewer can render the model's pre-tool
+                    # commentary on the final AIMessage. The output
+                    # field carries the user-visible reply; this gives
+                    # operators the full picture in the turn log.
+                    events.append({"type": "reasoning", "content": content_text})
             for tc in tcs:
                 events.append({
                     "type": "tool_call",
