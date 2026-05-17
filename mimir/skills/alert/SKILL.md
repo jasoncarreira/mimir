@@ -1,6 +1,6 @@
 ---
 name: alert
-description: When and how to use the operator alert channel for high-priority signals that don't fit the current conversation. Pair with MIMIR_OPERATOR_ALERT_CHANNEL in your system prompt's Operator config section.
+description: Use when a high-priority signal needs to reach the operator but doesn't fit the current conversation (off-hours wake, urgent error needing eyes, scheduled-tick discovery worth surfacing now). Routes via MIMIR_OPERATOR_ALERT_CHANNEL.
 allowed-tools:
   - Read
   - send_message

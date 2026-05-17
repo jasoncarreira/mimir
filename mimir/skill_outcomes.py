@@ -231,9 +231,11 @@ def order_skills(
 # frontmatter are often 100-300 chars — that's fine for the catalog
 # page, but in the every-turn system prompt we want one terminal-line
 # of signal per skill, not three. Truncate with an ellipsis past this
-# many chars. Width chosen so name + " — " + desc fits well under a
-# soft-wrap boundary on most viewers.
-_SKILL_DESC_MAX_CHARS = 80
+# many chars. 120 is wide enough that "Use when X (a, b, c, ...)" -
+# style descriptions retain their disambiguating examples; the earlier
+# 80 cap routinely cut mid-list (flagged 2026-05-17 after PR #186
+# rendered the block in the live prompt for the first time).
+_SKILL_DESC_MAX_CHARS = 120
 
 
 def _truncate_desc(text: str, limit: int = _SKILL_DESC_MAX_CHARS) -> str:
