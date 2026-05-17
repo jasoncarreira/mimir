@@ -226,9 +226,37 @@ def order_skills(
     return proven_names, sorted(untried), sorted(risky)
 
 
+# Hard cap on the per-skill description we render into the system
+# prompt's `## Skills` block. Triggers/descriptions in SKILL.md
+# frontmatter are often 100-300 chars — that's fine for the catalog
+# page, but in the every-turn system prompt we want one terminal-line
+# of signal per skill, not three. Truncate with an ellipsis past this
+# many chars. Width chosen so name + " — " + desc fits well under a
+# soft-wrap boundary on most viewers.
+_SKILL_DESC_MAX_CHARS = 80
+
+
+def _truncate_desc(text: str, limit: int = _SKILL_DESC_MAX_CHARS) -> str:
+    """One-line truncate. Strips newlines, collapses inner whitespace,
+    trims trailing punctuation, appends an ellipsis if the source
+    exceeded ``limit``."""
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= limit:
+        return cleaned.rstrip(".")
+    # Reserve one char for the ellipsis. Try to break at a word
+    # boundary inside the limit; fall back to a hard cut if no space.
+    cut = cleaned[: limit - 1]
+    space = cut.rfind(" ")
+    if space > limit // 2:
+        cut = cut[:space]
+    return cut.rstrip(",;:- ") + "…"
+
+
 def render_skill_catalog(
     seeded: list[str],
     pin: SkillPinConfig,
+    *,
+    descriptions: dict[str, str] | None = None,
 ) -> str | None:
     """Render the install-stable `## Skills` section for the system
     prompt — alphabetical list of every seeded skill name, with
@@ -236,6 +264,12 @@ def render_skill_catalog(
     here (pinning is a per-turn ranking concern, not a catalog
     concern); rendered as a plain alphabetic list so the system prompt
     stays cacheable across turns.
+
+    If ``descriptions`` is provided, each line is rendered as
+    ``- <name> — <one-line description>`` (truncated to
+    ``_SKILL_DESC_MAX_CHARS``); skills missing from the map render as
+    bare ``- <name>``. SKILL.md frontmatter is install-stable, so
+    descriptions don't bust the prompt cache.
 
     Volatile bucket assignment + ``(N/M in window)`` counts live in
     ``render_skill_telemetry`` (rendered into the per-turn
@@ -248,7 +282,15 @@ def render_skill_catalog(
     visible = sorted(name for name in seeded if name not in hidden)
     if not visible:
         return None
-    return "\n".join(f"- {name}" for name in visible)
+    descs = descriptions or {}
+    lines: list[str] = []
+    for name in visible:
+        desc = descs.get(name, "").strip()
+        if desc:
+            lines.append(f"- {name} — {_truncate_desc(desc)}")
+        else:
+            lines.append(f"- {name}")
+    return "\n".join(lines)
 
 
 def render_skill_telemetry(

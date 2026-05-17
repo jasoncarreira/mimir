@@ -1307,17 +1307,47 @@ class Agent:
         """v0.5+ §12.3: render the install-stable skill catalog for the
         system prompt. Returns None when no skills are seeded; volatile
         per-turn telemetry (success/total counts) is handled separately
-        via the self-state block (deferred to Phase D)."""
+        via the self-state block (deferred to Phase D).
+
+        Each rendered line is ``- <name> — <one-line trigger>`` when
+        SKILL.md frontmatter declares one; otherwise bare ``- <name>``.
+        Trigger phrases come from the home-seeded ``<home>/.claude/
+        skills/`` copy first, with a fallback to the bundled root for
+        any skill not yet copied — covers fresh-install homes before
+        ``seed_skills`` runs. SKILL.md frontmatter is install-stable,
+        so description content doesn't perturb the prompt cache
+        (chainlink #15)."""
         try:
             from .skill_outcomes import SkillPinConfig, render_skill_catalog
             from .skill_defs import installed_skill_names
+            from .skill_catalog import load_catalog, DEFAULT_SKILLS_ROOT
             seeded = installed_skill_names(self._config.home)
             if not seeded:
                 return None
             pin = SkillPinConfig.load(
                 self._config.home / "state" / "skill-pin.yaml",
             )
-            return render_skill_catalog(seeded, pin)
+            descriptions: dict[str, str] = {}
+            try:
+                home_skills = self._config.home / ".claude" / "skills"
+                for entry in load_catalog(home_skills):
+                    if entry.trigger:
+                        descriptions[entry.name] = entry.trigger
+                    elif entry.description:
+                        descriptions[entry.name] = entry.description
+                for entry in load_catalog(DEFAULT_SKILLS_ROOT):
+                    if entry.name in descriptions:
+                        continue
+                    if entry.trigger:
+                        descriptions[entry.name] = entry.trigger
+                    elif entry.description:
+                        descriptions[entry.name] = entry.description
+            except Exception:  # noqa: BLE001
+                # Description load is best-effort; on any failure fall
+                # back to the bare-names rendering.
+                log.exception("skill description load failed; rendering names only")
+                descriptions = {}
+            return render_skill_catalog(seeded, pin, descriptions=descriptions)
         except Exception:
             log.exception("_assemble_skill_block failed; skipping")
             return None
