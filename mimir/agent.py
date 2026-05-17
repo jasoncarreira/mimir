@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from .channel_registry import ChannelRegistry
 from .config import Config
@@ -687,32 +687,80 @@ class Agent:
         # Build / reuse the agent singleton.
         agent = await self._build_agent_if_needed()
 
+        # Streaming auto-dispatcher (181-O / chainlink #5): observes
+        # AIMessages as they stream in and flushes the "plan" text to
+        # the channel at the first tool_call boundary. Bench / no-
+        # bridge channels skip; explicit ``send_message`` tool calls
+        # disable streaming entirely. The result text is flushed at
+        # end of turn via the existing bridge.send path below — when
+        # streaming was active we use ``dispatcher.result_text()``
+        # instead of the canonical ``output`` so intermediate text
+        # between tool calls is correctly suppressed from the user.
+        bridge_for_streaming = None
+        if self._channels is not None and event.channel_id:
+            bridge_for_streaming = self._channels.find(event.channel_id)
+        from ._streaming_dispatch import StreamingAutoDispatcher
+        streaming = StreamingAutoDispatcher(
+            channel_id=event.channel_id or "",
+            bridge=bridge_for_streaming,
+            eligible=(
+                event.channel_id is not None
+                and event.trigger == "user_message"
+            ),
+        )
+
         error: str | None = None
         messages: list[Any] = []
         output = ""
         try:
-            result = await agent.ainvoke(
-                {"messages": [HumanMessage(content=turn_prompt)]},
-                config={
-                    "configurable": {
-                        "thread_id": saga_session_id or session_id,
-                        # Per-turn channel id so send_message / react /
-                        # fetch_channel_history can default to it when
-                        # the model doesn't supply ``channel_id``
-                        # explicitly. Threads through LangGraph instead
-                        # of the old process-global ``_STATE`` setter,
-                        # which raced across concurrent dispatcher turns
-                        # on different channels.
-                        "channel_id": event.channel_id,
-                    },
+            # ``stream_mode="values"`` yields the full state snapshot
+            # after each graph step; ``state.get("messages", [])`` is
+            # the canonical message list. Feed each NEW AIMessage
+            # through the streaming state machine so mid-turn plan
+            # flushes happen at the first tool_call boundary —
+            # NOT at end of turn.
+            invoke_config = {
+                "configurable": {
+                    "thread_id": saga_session_id or session_id,
+                    # Per-turn channel id so send_message / react /
+                    # fetch_channel_history can default to it when
+                    # the model doesn't supply ``channel_id``
+                    # explicitly. Threads through LangGraph instead
+                    # of the old process-global ``_STATE`` setter,
+                    # which raced across concurrent dispatcher turns
+                    # on different channels.
+                    "channel_id": event.channel_id,
                 },
-            )
-            messages = result.get("messages", [])
+            }
+            # Track the count of AIMessages we've already streamed
+            # into the state machine. ``stream_mode="values"``
+            # re-emits the cumulative messages list on every step,
+            # so without slice-past-observed we'd feed the same
+            # AIMessages in multiple times. The state machine's
+            # ``observed_count`` is bumped per-call, so we feed
+            # only the new AIMessages each iteration.
+            ai_observed = 0
+            async for chunk in agent.astream(
+                {"messages": [HumanMessage(content=turn_prompt)]},
+                config=invoke_config,
+                stream_mode="values",
+            ):
+                messages = list(chunk.get("messages", []))
+                if streaming.enabled:
+                    # Walk messages, ignore any non-AIMessage, slice
+                    # past the ones already observed.
+                    ai_count = 0
+                    for msg in messages:
+                        if isinstance(msg, AIMessage):
+                            ai_count += 1
+                            if ai_count > ai_observed:
+                                await streaming.observe(msg)
+                    ai_observed = ai_count
             events, output = extract_turn_events(messages)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             events = []
-            log.exception("agent.ainvoke failed: %s", exc)
+            log.exception("agent.astream failed: %s", exc)
 
         # Result fields drive both the TurnRecord and the feedback-signal
         # branch below, so compute once and reuse.
@@ -827,22 +875,39 @@ class Agent:
         await self._post_turn_index_rebuild()
         await self._post_turn_git_commit(ctx)
 
-        # Bridge to channel out (send_message). Default sends the
-        # reply text to the originating channel. Bridge-specific
-        # logic that lived in the SDK Agent (typing indicator,
-        # streaming dispatch) is dropped for now — Phase D re-add.
+        # End-of-turn bridge dispatch. Three cases:
+        #   1. Streaming was active AND a plan was already flushed
+        #      mid-turn (``streamed_plan=True``): send the result text
+        #      via ``dispatcher.result_text()`` — intermediate text
+        #      between tool calls is correctly suppressed from the
+        #      user, captured only as reasoning in turns.jsonl.
+        #   2. Streaming was disabled by an explicit ``send_message``
+        #      tool call (the canonical-delivery path): skip the
+        #      end-of-turn send entirely; the model already shipped.
+        #   3. Otherwise (no tool calls, or streaming disabled because
+        #      bench/no-bridge): single canonical ``output`` flush —
+        #      matches pre-181-O behavior.
         if (
             self._channels is not None
             and event.channel_id
-            and output
             and event.trigger == "user_message"
         ):
             bridge = self._channels.find(event.channel_id)
             if bridge is not None and hasattr(bridge, "send"):
-                try:
-                    await bridge.send(event.channel_id, output)
-                except Exception as exc:
-                    log.warning("bridge.send failed: %s", exc)
+                # Pick the right text + decide whether to send at all.
+                send_text: str | None = None
+                if streaming.disabled_by_explicit_send:
+                    send_text = None  # already delivered via tool call
+                elif streaming.streamed_plan:
+                    candidate = streaming.result_text()
+                    send_text = candidate if candidate else None
+                elif output:
+                    send_text = output
+                if send_text:
+                    try:
+                        await bridge.send(event.channel_id, send_text)
+                    except Exception as exc:
+                        log.warning("bridge.send failed: %s", exc)
 
         await log_event(
             "turn_finished",

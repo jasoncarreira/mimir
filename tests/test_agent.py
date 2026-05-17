@@ -51,6 +51,14 @@ class _FakeAgent:
         # Echo the input + append response messages (mirrors LangGraph state).
         return {"messages": list(state.get("messages") or []) + self._response_messages}
 
+    async def astream(self, state: dict[str, Any], *, config: dict[str, Any], stream_mode: str = "values"):
+        """Yield one cumulative-state chunk (matches stream_mode='values'
+        semantics). Real LangGraph emits one chunk per node; for tests
+        a single final yield is sufficient — the streaming state machine
+        in mimir._streaming_dispatch handles single-chunk inputs cleanly."""
+        self.invocations.append({"state": state, "config": config})
+        yield {"messages": list(state.get("messages") or []) + self._response_messages}
+
 
 class _FakeSaga:
     """Tiny saga_client double — record query/feedback calls, return
@@ -168,6 +176,9 @@ async def test_run_turn_records_error_when_ainvoke_raises(tmp_path: Path):
     class _BoomAgent:
         async def ainvoke(self, *a, **kw):
             raise RuntimeError("upstream failure")
+        async def astream(self, *a, **kw):
+            raise RuntimeError("upstream failure")
+            yield  # unreachable, makes this an async generator
     fake_saga = _FakeSaga()
     agent = _build_agent(
         tmp_path, fake_agent=_BoomAgent(), fake_saga=fake_saga,  # type: ignore[arg-type]
