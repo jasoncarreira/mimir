@@ -1305,6 +1305,7 @@ class Agent:
                     self._config, "operator_alert_channel", "",
                 ),
                 skill_block=skill_block,
+                home_dir=str(self._config.home),
             )
         except Exception:
             log.exception("_build_system_prompt failed; using minimal default")

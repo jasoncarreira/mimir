@@ -122,9 +122,21 @@ def build_system_prompt(
     memory_index_body: str | None = None,
     operator_alert_channel: str = "",
     skill_block: str | None = None,
+    home_dir: str | None = None,
 ) -> str:
     """Assemble the system prompt. ``state/INDEX.md`` is intentionally absent —
     it's read on demand (SPEC §9.1).
+
+    ``home_dir`` — when set, emit an ``## Agent home`` section between
+    persona and core memory exposing the absolute path of ``MIMIR_HOME``.
+    Without this, the agent must infer its filesystem root from prose
+    in core blocks (or from claude-code's default workspace pattern,
+    which produces wrong paths like ``/home/user/.claude/<id>/state/...``
+    when the actual root is something else). The section gives the
+    model ground truth for absolute-path writes without forcing every
+    core block to hardcode the deployment-specific value. Install-
+    stable per deployment, so the prompt-cache prefix is preserved
+    (chainlink #15).
 
     ``operator_alert_channel`` (v0.4 §6) — when set, append a one-line
     Operator config section so the agent knows the channel id to use for
@@ -136,6 +148,21 @@ def build_system_prompt(
     each turn (run_turn calls build_system_prompt every dispatch), so
     bucket assignment stays current as outcome aggregates evolve."""
     parts: list[str] = [persona or _DEFAULT_PERSONA]
+
+    # ``## Agent home`` sits between persona and core memory so it's
+    # one of the first things the model reads — before any core block
+    # that might reference ``memory/...`` or ``state/...`` relative
+    # paths. Cheap (~110 chars), install-stable, cache-friendly.
+    if home_dir:
+        parts.append(
+            "## Agent home\n\n"
+            f"`MIMIR_HOME={home_dir}`\n\n"
+            "All `memory/...` and `state/...` paths resolve under this "
+            f"root. Use relative paths or absolute paths prefixed with "
+            f"`{home_dir}/`. This value is the source of truth — do "
+            "not infer from `$HOME`, claude-code's default workspace, "
+            "or any prose in subsequent blocks."
+        )
 
     if core_blocks:
         rendered = render_core_section(core_blocks)
