@@ -50,6 +50,13 @@ RECENCY_HALF_LIFE_DAYS = 30.0
 W_COSINE = 0.5
 W_BM25 = 0.2
 W_RECENCY = 0.3
+# RRF (reciprocal rank fusion) constant. The standard k=60 from
+# Cormack/Clarke/Buettcher 2009 — empirically robust across IR
+# datasets and what every "RRF" reference uses. Only activated
+# when the ColBERT channel is in play (chainlink #141 Slice 2);
+# the no-ColBERT path still uses the weighted-sum scoring above
+# to avoid regressing the existing two-channel behavior.
+RRF_K = 60
 # Mirrors saga's ``cached_embed_query`` LRU (saga/saga/embeddings.py:340).
 # A single turn issues a handful of ``file_search`` calls and benchmarks
 # replay the same queries; 64 is plenty without bloating worker memory.
@@ -376,6 +383,7 @@ class Indexer:
         db_path: Path | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+        colbert_provider: "ColBERTChannel | None" = None,
     ) -> None:
         self._home = home
         # Default routes through saga's configured provider so file_search
@@ -389,6 +397,14 @@ class Indexer:
         self._db_lock = threading.Lock()
         self._sweep_task: asyncio.Task | None = None
         self._closed = False
+        # chainlink #141 Slice 2: optional ColBERT third channel.
+        # Default-lazy: ``_LazyColBERTChannel`` probes for the index
+        # on disk on first ``.search()`` call and only imports
+        # pylate then. Operators / tests can inject a different
+        # provider (mock, prebuilt, disabled) by passing
+        # ``colbert_provider`` explicitly.
+        self._colbert: ColBERTChannel = colbert_provider \
+            if colbert_provider is not None else _LazyColBERTChannel(home)
         # Per-instance LRU for query embeddings — file_search call patterns
         # repeat the same query string several times per turn (mirror of
         # saga's ``cached_embed_query``). Wrapping the bound method here
@@ -499,8 +515,18 @@ class Indexer:
         # Cached embedding lookup — repeats within a turn (semantic +
         # keyword + variations) skip the ONNX call.
         query_vec_t = await asyncio.to_thread(self._embed_query, query)
+        # chainlink #141 Slice 2: pull ColBERT hits off-loop on a
+        # worker thread. The channel may no-op (returns []) when
+        # the index isn't built or pylate isn't installed — that
+        # path is intentionally indistinguishable from "ColBERT
+        # ran but found nothing", so the downstream RRF/weighted
+        # branch in ``_search_sync`` just sees an empty list.
+        colbert_hits = await asyncio.to_thread(
+            self._colbert.search, query, max(k, 10),
+        )
         return await asyncio.to_thread(
-            self._search_sync, query, list(query_vec_t), scope, k, candidate_pool
+            self._search_sync, query, list(query_vec_t), scope, k,
+            candidate_pool, colbert_hits,
         )
 
     def _embed_query_uncached(self, text: str) -> tuple[float, ...]:
@@ -662,6 +688,7 @@ class Indexer:
         scope: str,
         k: int,
         candidate_pool: int,
+        colbert_hits: list["ColBERTHit"] | None = None,
     ) -> list[SearchResult]:
         # Sanitize FTS5 query — strip operators that would otherwise raise.
         fts_query = _to_fts_query(query)
@@ -740,39 +767,262 @@ class Indexer:
                         "description": row[6],
                     }
 
-        if not candidates:
+        if not candidates and not colbert_hits:
             return []
 
         now = time.time()
-        scored: list[SearchResult] = []
-        for c in candidates.values():
+        # Per-channel raw signals for every candidate. ``c["bm25"]``
+        # is the FTS5 score (lower = better); ``cos`` is dot
+        # product over normalized vectors when both are unit.
+        cand_keys: list[tuple[str, int]] = []
+        cand_payload: dict[tuple[str, int], dict] = {}
+        for key, c in candidates.items():
             cos = _cosine(query_vec, c["embedding"])
-            cos_norm = max(0.0, cos)
-            bm25_norm = _bm25_norm(c["bm25"]) if c["bm25"] else 0.0
-            recency = _recency(c["mtime"], now)
-            score = W_COSINE * cos_norm + W_BM25 * bm25_norm + W_RECENCY * recency
-            snippet = _make_snippet(c["content"], query)
-            scored.append(
+            cand_keys.append(key)
+            cand_payload[key] = {
+                **c,
+                "cos": cos,
+                "recency": _recency(c["mtime"], now),
+            }
+
+        # When ColBERT didn't fire (no index / no extra installed),
+        # preserve the legacy weighted-sum scoring exactly — no
+        # behavior change for the default no-extra install.
+        if not colbert_hits:
+            scored: list[SearchResult] = []
+            for key in cand_keys:
+                c = cand_payload[key]
+                cos_norm = max(0.0, c["cos"])
+                bm25_norm = _bm25_norm(c["bm25"]) if c["bm25"] else 0.0
+                score = (
+                    W_COSINE * cos_norm
+                    + W_BM25 * bm25_norm
+                    + W_RECENCY * c["recency"]
+                )
+                scored.append(
+                    SearchResult(
+                        path=c["path"],
+                        scope=c["scope"],
+                        chunk_index=c["chunk_index"],
+                        score=score,
+                        cosine=c["cos"],
+                        bm25=c["bm25"],
+                        recency=c["recency"],
+                        snippet=_make_snippet(c["content"], query),
+                        description=c["description"],
+                    )
+                )
+            scored.sort(key=lambda r: r.score, reverse=True)
+            return scored[:k]
+
+        # ColBERT is in play — fuse three channels via RRF.
+        #
+        # Ranks per channel:
+        # - BM25 rank by ascending bm25 (lower = better in FTS5)
+        # - Dense rank by descending cosine
+        # - ColBERT rank by descending MaxSim
+        #
+        # RRF score = sum_channel 1 / (RRF_K + rank). All channels
+        # are equal-weighted; weighting belongs in Slice 3's
+        # measurement harness. Recency drops out of the fused score
+        # because it's a tie-breaker, not a relevance signal; the
+        # weighted-sum branch above keeps it.
+        bm25_ranked = sorted(
+            (k_ for k_ in cand_keys if cand_payload[k_]["bm25"]),
+            key=lambda k_: cand_payload[k_]["bm25"],  # ascending
+        )
+        dense_ranked = sorted(
+            cand_keys, key=lambda k_: cand_payload[k_]["cos"], reverse=True,
+        )
+
+        # ColBERT hits keyed off (path, chunk_no). The colbert
+        # chunker emits a different chunk granularity than mimir's
+        # SQLite indexer (heading-aware vs character-stride). To
+        # fuse rankings into the SQLite candidate set we collapse
+        # ColBERT hits to the path level: take the best score per
+        # path and fuse that against (path, chunk_index) by
+        # matching on path. The single-vector channel still
+        # surfaces the right chunk_index inside the path.
+        colbert_by_path: dict[str, float] = {}
+        for hit in colbert_hits:
+            existing = colbert_by_path.get(hit.path)
+            if existing is None or hit.score > existing:
+                colbert_by_path[hit.path] = hit.score
+        colbert_ranked_paths = sorted(
+            colbert_by_path.keys(),
+            key=lambda p: colbert_by_path[p],
+            reverse=True,
+        )
+        # Map each candidate (path, chunk_index) → its path's
+        # ColBERT rank (1-based). Candidates whose path isn't in
+        # colbert_by_path get no ColBERT contribution.
+        colbert_path_rank: dict[str, int] = {
+            p: i + 1 for i, p in enumerate(colbert_ranked_paths)
+        }
+
+        # Pull in any ColBERT-only paths that the BM25+dense
+        # candidate set missed entirely — RRF should reflect
+        # ColBERT's recall, not just be a re-ranker. We synthesize
+        # SQLite candidates from chunks rows on demand for those
+        # paths so downstream snippet rendering works.
+        missing_paths = [
+            p for p in colbert_by_path
+            if not any(k_[0] == p for k_ in cand_keys)
+        ]
+        if missing_paths:
+            with self._db_lock, self._connect() as conn:
+                placeholders = ",".join(["?"] * len(missing_paths))
+                rows = conn.execute(
+                    f"""
+                    SELECT c.path, c.chunk_index, c.content, c.embedding,
+                           f.mtime, f.scope, f.description
+                      FROM chunks AS c
+                      JOIN files AS f ON f.path = c.path
+                     WHERE c.path IN ({placeholders})
+                     ORDER BY c.path, c.chunk_index
+                    """,
+                    missing_paths,
+                ).fetchall()
+            # Take the first chunk of each missing path — ColBERT
+            # ranks at the path level here, so any chunk is fine
+            # for the snippet anchor.
+            seen_path: set[str] = set()
+            for row in rows:
+                p = row[0]
+                if p in seen_path:
+                    continue
+                seen_path.add(p)
+                key = (row[0], row[1])
+                cand_keys.append(key)
+                cand_payload[key] = {
+                    "path": row[0],
+                    "chunk_index": row[1],
+                    "content": row[2],
+                    "embedding": _unpack_vec(row[3]),
+                    "bm25": 0.0,
+                    "mtime": row[4],
+                    "scope": row[5],
+                    "description": row[6],
+                    "cos": _cosine(query_vec, _unpack_vec(row[3])),
+                    "recency": _recency(row[4], now),
+                }
+
+        bm25_rank: dict[tuple[str, int], int] = {
+            k_: i + 1 for i, k_ in enumerate(bm25_ranked)
+        }
+        dense_rank: dict[tuple[str, int], int] = {
+            k_: i + 1 for i, k_ in enumerate(dense_ranked)
+        }
+
+        rrf_scored: list[SearchResult] = []
+        for key in cand_keys:
+            c = cand_payload[key]
+            s = 0.0
+            if key in bm25_rank:
+                s += 1.0 / (RRF_K + bm25_rank[key])
+            if key in dense_rank:
+                s += 1.0 / (RRF_K + dense_rank[key])
+            pr = colbert_path_rank.get(c["path"])
+            if pr is not None:
+                s += 1.0 / (RRF_K + pr)
+            rrf_scored.append(
                 SearchResult(
                     path=c["path"],
                     scope=c["scope"],
                     chunk_index=c["chunk_index"],
-                    score=score,
-                    cosine=cos,
+                    score=s,
+                    cosine=c["cos"],
                     bm25=c["bm25"],
-                    recency=recency,
-                    snippet=snippet,
+                    recency=c["recency"],
+                    snippet=_make_snippet(c["content"], query),
                     description=c["description"],
                 )
             )
-
-        scored.sort(key=lambda r: r.score, reverse=True)
-        return scored[:k]
+        rrf_scored.sort(key=lambda r: r.score, reverse=True)
+        return rrf_scored[:k]
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# ColBERT third channel (chainlink #141 Slice 2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ColBERTHit:
+    """Minimal channel-output shape: a path + chunk identity + score.
+
+    Distinct from ``SearchResult`` because the ColBERT chunk
+    granularity (heading-aware) doesn't match the SQLite indexer's
+    character-stride chunks; we collapse to path-level for RRF
+    fusion in ``_search_sync``.
+    """
+    path: str
+    chunk_no: int
+    score: float
+
+
+class ColBERTChannel(Protocol):
+    """Provider interface for the third RRF channel. The real
+    implementation lives in ``mimir.colbert``; the search module
+    only depends on this protocol so the colbert extra stays
+    fully optional. Tests inject mock channels by providing
+    something with the same ``.search()`` shape.
+    """
+
+    def search(self, query: str, k: int = 10) -> list[ColBERTHit]:
+        ...
+
+
+class _LazyColBERTChannel:
+    """Default channel implementation. Probes for a built ColBERT
+    index at ``<home>/.colbert-index/`` on first ``.search()`` call;
+    silently returns ``[]`` if the index doesn't exist or pylate
+    isn't installed. The cost-to-no-op is one stat()-equivalent
+    check per query.
+    """
+
+    def __init__(self, home: Path) -> None:
+        self._home = home
+        self._tried = False
+        self._index: object | None = None
+
+    def _ensure(self) -> object | None:
+        if self._tried:
+            return self._index
+        self._tried = True
+        try:
+            from . import colbert as _colbert
+        except ImportError:
+            return None
+        if not _colbert.index_available(self._home):
+            return None
+        try:
+            self._index = _colbert.ColBERTIndex.open(_colbert.default_index_dir(self._home))
+        except Exception:  # noqa: BLE001
+            log.exception("colbert: failed to open index; disabling third channel")
+            self._index = None
+        return self._index
+
+    def search(self, query: str, k: int = 10) -> list[ColBERTHit]:
+        idx = self._ensure()
+        if idx is None:
+            return []
+        try:
+            raw = idx.search(query, k=k)  # type: ignore[attr-defined]
+        except ImportError:
+            return []
+        except Exception:  # noqa: BLE001
+            log.exception("colbert: search failed; falling back to two-channel")
+            return []
+        return [
+            ColBERTHit(path=row[0].path, chunk_no=row[0].chunk_no, score=row[1])
+            for row in raw
+        ]
 
 
 def _to_fts_query(text: str) -> str:
