@@ -48,11 +48,25 @@ from langchain_core.messages import HumanMessage
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .event_logger import log_event
+from .feedback import FeedbackLog
+from . import health
 from .history import MessageBuffer
 from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
+from ._jsonl_tail import tail_jsonl_records
+from .jsonl_snapshot import JsonlSnapshot
 from .models import AgentEvent, TurnRecord
+from .prompts import build_system_prompt, build_turn_prompt
+from .rate_limits import RateLimitStore
 from .saga_client import SagaClient
+from .session_boundary_log import (
+    SessionBoundaryLog,
+    count_turns_since,
+    render_session_summaries,
+)
+from .subagent_inbox import SubagentInbox, render_subagent_updates
+from .templates import render_saga_session_end
+from .usage_stats import event_recently_emitted
 
 # Idempotent runtime patch for langchain-claude-code's ``_arun`` call —
 # see the module docstring for the bug + upstream PR. No-op if the
@@ -65,7 +79,6 @@ from .sagatools import (
 )
 from .search import Indexer
 from .session_manager import SessionManager
-from .subagent_inbox import SubagentInbox
 from .turn_logger import (
     TurnLogger,
     derive_result_fields,
@@ -78,23 +91,63 @@ log = logging.getLogger(__name__)
 
 
 # ────────────────────────────────────────────────────────────────────
-# Stubs for legacy server.py reads
+# Helpers
 # ────────────────────────────────────────────────────────────────────
 
 
-class _RateLimitStub:
-    """No-op replacement for agent._rate_limits, which used to capture
-    SDK RateLimitEvent stream events. Post-cutover the oauth_usage_poller
-    owns its own RateLimitStore; this stub keeps server.py wiring code
-    from KeyError'ing during build_app."""
-    async def update_from_event(self, *args, **kwargs) -> None:
-        return None
+def _filter_session_turns(
+    turns_path: Path,
+    saga_session_id: str,
+    *,
+    idle_minutes: int = 10,
+) -> list[dict]:
+    """Read turns.jsonl tail-first and return records with the given
+    saga_session_id, in chronological order.
 
-    def snapshot(self) -> dict:
-        return {}
-
-    async def append(self, *args, **kwargs) -> None:
-        return None
+    Time-based break: saga ends a session after ``idle_minutes`` of no
+    activity, so any record older than ``newest_match_ts - 2 *
+    idle_minutes`` cannot belong to this session. The 2× margin
+    tolerates clock skew + a single out-of-order record at the
+    boundary. Walks back at most ``2 * idle_minutes`` worth of file
+    activity past the last match — O(session_window) rather than
+    O(file_size). (Ported verbatim from main.)
+    """
+    if not turns_path.is_file():
+        return []
+    margin_seconds = 2 * idle_minutes * 60
+    out: list[dict] = []
+    newest_match_ts: datetime | None = None
+    try:
+        for rec in tail_jsonl_records(turns_path):
+            if rec.get("saga_session_id") == saga_session_id:
+                out.append(rec)
+                ts_str = rec.get("timestamp")
+                if isinstance(ts_str, str):
+                    try:
+                        rec_ts = datetime.fromisoformat(
+                            ts_str.replace("Z", "+00:00")
+                        )
+                        if newest_match_ts is None or rec_ts > newest_match_ts:
+                            newest_match_ts = rec_ts
+                    except ValueError:
+                        pass
+            elif newest_match_ts is not None:
+                ts_str = rec.get("timestamp")
+                if isinstance(ts_str, str):
+                    try:
+                        rec_ts = datetime.fromisoformat(
+                            ts_str.replace("Z", "+00:00")
+                        )
+                        if (newest_match_ts - rec_ts).total_seconds() > margin_seconds:
+                            break
+                    except ValueError:
+                        # Malformed ts on a non-match — keep scanning;
+                        # don't break on a record we can't reason about.
+                        pass
+    except OSError:
+        return []
+    out.reverse()  # tail yields newest-first; restore chronological
+    return out
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -283,11 +336,67 @@ class Agent:
         # setter was never invoked. Both paths now wired by build_app.
         self._commitments = commitments_store
 
-        # Stub for back-compat with any caller that still reads
-        # ``agent._rate_limits``. Post-cutover the oauth_usage_poller
-        # owns the real RateLimitStore directly (server.py wires it).
-        # When all callers are updated, drop this entirely.
-        self._rate_limits = _RateLimitStub()
+        # CR#10: per-Agent JsonlSnapshot caches for events.jsonl +
+        # turns.jsonl. Six per-turn call sites (feedback, usage, self-
+        # state, session summaries, subagent aggregate, budget
+        # partition) used to re-stream both files each time. The
+        # snapshot wraps tail_jsonl_records with an mtime-checked TTL so
+        # within one turn (~1s wall-clock) all those readers share one
+        # cached parse.
+        self._events_snapshot = JsonlSnapshot(config.events_log)
+        self._turns_snapshot = JsonlSnapshot(config.turns_log)
+
+        # Recent feedback signals block — algedonic surface for the
+        # turn prompt (v0.4 §2).
+        self._feedback = FeedbackLog(
+            events_path=config.events_log,
+            turns_path=config.turns_log,
+            default_window_hours=config.feedback_window_hours,
+            default_limit_per_polarity=config.feedback_limit_per_polarity,
+            events_snapshot=self._events_snapshot,
+            turns_snapshot=self._turns_snapshot,
+        )
+        self._session_boundary_log = SessionBoundaryLog(
+            path=config.home / ".mimir" / "session_boundaries.jsonl",
+        )
+        # Plan-window rate-limit state — real RateLimitStore (replaces
+        # the deprecated _RateLimitStub). The oauth_usage_poller writes
+        # to this same JSON file from server.py's wiring; per-turn
+        # readers (usage block, self-state, upcoming) read through here.
+        self._rate_limits = RateLimitStore(
+            path=config.home / ".mimir" / "rate_limits.json",
+        )
+
+        # §12.4: S3-S4 homeostat. Constructed once so scheduler heart-
+        # beats and per-turn ``## Self-state`` render share the same
+        # instance. Wire into the scheduler immediately so heartbeats
+        # fired before the first turn are still arbitrated.
+        from .billing import AnthropicQuotaProvider, BillingMode, QuotaProvider
+        from .budget import HomeostaticArbiter
+        quota_providers: list[QuotaProvider] = []
+        if config.billing_mode is BillingMode.QUOTA:
+            quota_providers.append(AnthropicQuotaProvider(self._rate_limits))
+        self._arbiter = HomeostaticArbiter(
+            home=config.home,
+            rate_limit_store=self._rate_limits,
+            turns_log=config.turns_log,
+            billing_mode=config.billing_mode,
+            quota_providers=quota_providers,
+            cost_hourly_limit_usd=config.cost_hourly_limit_usd or None,
+            cost_spike_ratio=config.cost_rate_spike_ratio or None,
+            cost_spike_floor_usd=config.cost_rate_spike_floor_usd or None,
+            fallback_model=config.model,
+            events_snapshot=self._events_snapshot,
+            turns_snapshot=self._turns_snapshot,
+        )
+        if scheduler is not None:
+            scheduler._arbiter = self._arbiter
+
+        # Bounded set for fire-and-forget background tasks. Without
+        # retaining a reference, the asyncio task can be GC'd before
+        # the coroutine body runs. add+discard idiom from PEP 458 /
+        # asyncio docs.
+        self._bg_tasks: set[asyncio.Task] = set()
 
         # Build the deepagent singleton. Done lazily to keep import-time
         # fast and to let tests construct Agent without a real model.
@@ -476,17 +585,22 @@ class Agent:
         t_total_start: float,
     ) -> TurnRecord:
 
-        # Pre-message memory inject.
-        memory_block = ""
+        # Pre-message memory inject. Builds the "Possibly relevant
+        # memories" block + collects atom_ids for the post-turn
+        # feedback credit pass. Skipped on saga_session_end turns
+        # (synthesis owns its own prompt).
+        memory_block: str | None = None
         saga_atom_ids: list[str] = []
-        if self._saga is not None:
+        if self._saga is not None and event.trigger != "saga_session_end":
             try:
                 payload = await self._saga.query(
                     event.content,
                     top_k=12,
                     session_id=saga_session_id,
                 )
-                memory_block = _format_saga_payload(payload)
+                raw_block = _format_saga_payload(payload)
+                if raw_block and raw_block != "(no atoms)":
+                    memory_block = raw_block
                 ids = _atom_ids_from_response(payload)
                 triple_ids = _source_atom_ids_from_triples(payload)
                 seen: set[str] = set()
@@ -497,12 +611,24 @@ class Agent:
             except Exception as exc:
                 log.warning("pre-message saga.query failed: %s", exc)
 
-        prompt = event.content
-        if memory_block and memory_block != "(no atoms)":
-            prompt = (
-                f"## Possibly relevant memories (from SAGA)\n\n{memory_block}\n\n"
-                f"---\n\n{event.content}"
-            )
+        # Drain any pending subagent completion notifications from
+        # prior turns on this channel — SPEC §4.4. Empty list → block
+        # is None (build_turn_prompt skips the section).
+        pending_subagents = await self._inbox.drain(event.channel_id or "")
+        subagent_block = (
+            render_subagent_updates(pending_subagents)
+            if pending_subagents else None
+        )
+
+        # Per-turn prompt assembly — Recent activity, Recent feedback,
+        # Session summaries, Resource usage, Upcoming, Upcoming
+        # commitments, Self-state, etc. Synthesis turns
+        # (saga_session_end) get a dedicated template instead.
+        turn_prompt, recent = await self._build_turn_prompt(
+            ctx, event,
+            saga_block=memory_block,
+            subagent_block=subagent_block,
+        )
 
         # Build / reuse the agent singleton.
         agent = await self._build_agent_if_needed()
@@ -512,7 +638,7 @@ class Agent:
         output = ""
         try:
             result = await agent.ainvoke(
-                {"messages": [HumanMessage(content=prompt)]},
+                {"messages": [HumanMessage(content=turn_prompt)]},
                 config={
                     "configurable": {
                         "thread_id": saga_session_id or session_id,
@@ -608,7 +734,7 @@ class Agent:
             saga_session_id=saga_session_id,
             trigger=event.trigger,
             channel_id=event.channel_id,
-            input=truncate_input(prompt),
+            input=truncate_input(turn_prompt),
             saga_atom_ids=saga_atom_ids,
             events=events,
             output=(output or "")[:2048],
@@ -701,3 +827,345 @@ class Agent:
         except Exception:
             log.exception("_assemble_skill_block failed; skipping")
             return None
+
+    # ────────────────────────────────────────────────────────────
+    # Per-turn block assembly (ported from main)
+    # ────────────────────────────────────────────────────────────
+
+    def _spawn_bg_task(self, coro):
+        """Schedule a fire-and-forget coroutine on the running loop.
+
+        No-op when there is no running loop (turns invoked from a sync
+        test path) — caller's deferred event simply doesn't fire,
+        which is fine because the per-turn block readers are
+        non-essential.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    def _assemble_usage_block(
+        self,
+    ) -> tuple[str | None, list[tuple[str, dict]]]:
+        """Aggregate over 1h / 5h / 7d, render the Resource usage prompt
+        section, return ``(block_text, deferred_events)``.
+
+        Side effects (deferred): cost_rate_alert / cost_rate_advisory
+        + rate_limit_off_pace events under cooldown. Caller flushes
+        deferred_events on the running loop because this method runs
+        inside ``asyncio.to_thread``.
+        """
+        deferred: list[tuple[str, dict]] = []
+        if not self._config.usage_block_enabled:
+            return None, deferred
+
+        from .stats_block import assemble_stats_block
+
+        try:
+            result = assemble_stats_block(
+                self._config,
+                self._rate_limits,
+                turns_snapshot=self._turns_snapshot,
+                events_snapshot=self._events_snapshot,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("assemble_stats_block failed; skipping block")
+            return None, deferred
+
+        if result.alert is not None:
+            from .billing import BillingMode
+            advisory = self._config.billing_mode is BillingMode.QUOTA
+            event_kind = "cost_rate_advisory" if advisory else "cost_rate_alert"
+            if not event_recently_emitted(
+                self._config.events_log,
+                event_kind,
+                cooldown_minutes=self._config.cost_alert_cooldown_minutes,
+                snapshot=self._events_snapshot,
+            ):
+                deferred.append(
+                    (
+                        event_kind,
+                        {
+                            "reason": result.alert.reason,
+                            "rate_now_usd_per_hour": round(
+                                result.alert.rate_now_usd_per_hour, 4,
+                            ),
+                            "threshold_usd_per_hour": round(
+                                result.alert.threshold_usd_per_hour, 4,
+                            ),
+                            "baseline_usd_per_hour": (
+                                round(result.alert.baseline_usd_per_hour, 4)
+                                if result.alert.baseline_usd_per_hour is not None
+                                else None
+                            ),
+                        },
+                    )
+                )
+
+        if result.off_pace and not event_recently_emitted(
+            self._config.events_log,
+            "rate_limit_off_pace",
+            cooldown_minutes=self._config.cost_alert_cooldown_minutes,
+            snapshot=self._events_snapshot,
+        ):
+            worst_key, worst_snap, worst_proj = result.off_pace[0]
+            deferred.append(
+                (
+                    "rate_limit_off_pace",
+                    {
+                        "rate_limit_type": worst_key,
+                        "utilization": worst_snap.utilization,
+                        "on_pace_utilization": round(
+                            worst_proj.on_pace_utilization, 4,
+                        ),
+                        "hours_until_reset": round(
+                            worst_proj.hours_until_reset, 2,
+                        ),
+                        "resets_at": worst_snap.resets_at,
+                    },
+                )
+            )
+
+        return result.body, deferred
+
+    def _assemble_upcoming_block(self) -> str | None:
+        """v0.5+ §12.1: render the ``## Upcoming`` block."""
+        try:
+            from .upcoming import render_upcoming_block
+            return render_upcoming_block(
+                scheduler=self._scheduler,
+                rate_limit_store=self._rate_limits,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("_assemble_upcoming_block failed; skipping")
+            return None
+
+    def _assemble_commitments_block(
+        self, channel_id: str | None,
+    ) -> str | None:
+        """Phase 3: ``## Upcoming commitments`` block — active records
+        for this channel (+ unbound). Suppressed on synthetic
+        scheduler:* / poller:* channels and when no store is wired."""
+        if channel_id is None or self._commitments is None:
+            return None
+        from .history import SYNTHETIC_CHANNEL_PREFIXES
+        if channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES):
+            return None
+        try:
+            from .commitments.render import render_commitments_block
+            records = self._commitments.list(
+                channel_id=channel_id,
+                include_unbound=True,
+            )
+            return render_commitments_block(records)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "_assemble_commitments_block failed; skipping",
+            )
+            return None
+
+    def _assemble_self_state_block(self) -> str | None:
+        """v0.5+ §12.4: render the ``## Self-state`` block — homeostat
+        view + uncommitted-files line + per-turn skill telemetry."""
+        try:
+            arbiter_body = self._arbiter.render_self_state_block()
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "_assemble_self_state_block (arbiter) failed; skipping",
+            )
+            arbiter_body = None
+        git_line = self._assemble_git_status_line()
+        skill_body = self._assemble_skill_telemetry_lines()
+        parts = [s for s in (arbiter_body, git_line, skill_body) if s]
+        if not parts:
+            return None
+        return "\n".join(parts)
+
+    def _assemble_git_status_line(self) -> str | None:
+        """``- uncommitted in /mimir-home: <count> file(s) — <topN>`` line.
+        Suppressed when tracking is off, count==0, or summary errored.
+        """
+        if not self._config.git_tracking_enabled:
+            return None
+        try:
+            return health.render_git_status_line(self._config.home)
+        except Exception:  # noqa: BLE001
+            log.exception("_assemble_git_status_line failed; skipping")
+            return None
+
+    def _assemble_skill_telemetry_lines(self) -> str | None:
+        """Per-turn skill bucket telemetry lines for ``## Self-state``."""
+        try:
+            from .skill_outcomes import (
+                SkillPinConfig, aggregate, render_skill_telemetry,
+            )
+            from .skill_defs import installed_skill_names
+            seeded = installed_skill_names(self._config.home)
+            if not seeded:
+                return None
+            aggs = aggregate(self._config.turns_log)
+            pin = SkillPinConfig.load(
+                self._config.home / "state" / "skill-pin.yaml"
+            )
+            return render_skill_telemetry(seeded, aggs, pin)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "_assemble_skill_telemetry_lines failed; skipping",
+            )
+            return None
+
+    async def _assemble_session_summaries(
+        self, *, channel_id: str | None,
+    ) -> str | None:
+        """Render the Recent session summaries block. Tries SAGA first
+        (chronological recall via /v1/sessions/recent); falls back to
+        the local mirror on empty / failure."""
+        count = self._config.recent_boundaries
+        if count <= 0:
+            return None
+        boundaries: list[dict] = []
+        if self._saga is not None:
+            try:
+                # Best-effort — SAGA client may not implement this. We
+                # don't want to crash a turn over an optional method.
+                recent_fn = getattr(
+                    self._saga, "recent_session_boundaries", None,
+                )
+                if recent_fn is not None:
+                    boundaries = await recent_fn(
+                        channel_id=channel_id, count=count,
+                    )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "_assemble_session_summaries: SAGA "
+                    "recent_session_boundaries failed; falling back to "
+                    "local mirror"
+                )
+                boundaries = []
+        if not boundaries:
+            boundaries = self._session_boundary_log.recent(
+                channel_id=channel_id, count=count,
+            )
+        turn_counts: dict[str, int] = {}
+        if channel_id is not None and boundaries:
+            snapshot_records = self._turns_snapshot.records
+            for b in boundaries:
+                ts = str(b.get("ts") or b.get("timestamp") or "")
+                if not ts:
+                    continue
+                turn_counts[ts] = count_turns_since(
+                    self._config.turns_log,
+                    channel_id=channel_id,
+                    since_ts=ts,
+                    snapshot_records=snapshot_records,
+                )
+        now = datetime.now(tz=timezone.utc)
+        return render_session_summaries(
+            boundaries,
+            now=now,
+            turn_counts=turn_counts,
+            stale_age_hours=self._config.unfinished_stale_age_hours,
+            stale_turns=self._config.unfinished_stale_turns,
+        )
+
+    async def _build_synthesis_prompt(
+        self, ctx: Any, event: AgentEvent,
+    ) -> str:
+        """For trigger='saga_session_end' — load the synthesis template,
+        embed the session's turn window from turns.jsonl. Off-loops the
+        turns.jsonl scan via to_thread."""
+        saga_session_id = ctx.saga_session_id or (event.extra or {}).get(
+            "saga_session_id", "",
+        )
+        idle_minutes = self._config.saga_session_idle_minutes
+        turns_window = await asyncio.to_thread(
+            _filter_session_turns,
+            self._config.turns_log,
+            saga_session_id,
+            idle_minutes=idle_minutes,
+        )
+        if not turns_window:
+            self._spawn_bg_task(
+                log_event(
+                    "saga_synthesis_empty_window",
+                    saga_session_id=saga_session_id,
+                    channel_id=event.channel_id,
+                    reason="turns.jsonl rotated past this session's records",
+                )
+            )
+        return render_saga_session_end(
+            channel_id=event.channel_id or "",
+            saga_session_id=saga_session_id,
+            idle_minutes=idle_minutes,
+            turns_window=turns_window,
+            prompts_dir=self._config.prompts_dir,
+        )
+
+    async def _build_turn_prompt(
+        self,
+        ctx: Any,
+        event: AgentEvent,
+        saga_block: str | None,
+        subagent_block: str | None,
+    ) -> tuple[str, list]:
+        """Assemble the per-turn user-side prompt + the recent-message
+        list. Synthesis turns get a dedicated synthesis prompt; everything
+        else builds the standard turn prompt with the algedonic /
+        session-summary / usage / upcoming / self-state blocks.
+
+        Returns ``(turn_prompt, recent)`` — recent is needed for the
+        ``turn_started`` event's ``recent_message_count``.
+        """
+        if event.trigger == "saga_session_end":
+            return await self._build_synthesis_prompt(ctx, event), []
+
+        recent = self._buffer.assemble_recent_activity(
+            channel_id=event.channel_id or "",
+            author=event.author,
+            recent_per_channel=self._config.recent_per_channel,
+            recent_author_cross=self._config.recent_author_cross,
+            cross_hours=self._config.recent_cross_hours,
+            source_allowlist=self._config.recent_sources,
+        )
+        feedback_block = (
+            self._feedback.recent_block()
+            if self._config.feedback_limit_per_polarity > 0
+            else None
+        )
+        session_summaries_block = await self._assemble_session_summaries(
+            channel_id=event.channel_id,
+        )
+        usage_block, deferred_usage_events = await asyncio.to_thread(
+            self._assemble_usage_block
+        )
+        # Flush deferred events on the running loop.
+        for event_kind, event_kwargs in deferred_usage_events:
+            self._spawn_bg_task(log_event(event_kind, **event_kwargs))
+        upcoming_block = self._assemble_upcoming_block()
+        commitments_block = self._assemble_commitments_block(
+            channel_id=event.channel_id,
+        )
+        self_state_block = await asyncio.to_thread(
+            self._assemble_self_state_block,
+        )
+        turn_prompt = build_turn_prompt(
+            event,
+            recent_messages=recent,
+            saga_block=saga_block,
+            subagent_block=subagent_block,
+            recent_message_chars=self._config.recent_message_chars,
+            resolver=self._buffer.resolver,
+            feedback_block=feedback_block,
+            session_summaries_block=session_summaries_block,
+            usage_block=usage_block,
+            upcoming_block=upcoming_block,
+            commitments_block=commitments_block,
+            self_state_block=self_state_block,
+            saga_session_id=ctx.saga_session_id,
+        )
+        return turn_prompt, recent
