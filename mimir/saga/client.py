@@ -167,14 +167,41 @@ class SagaStore:
     # greenfield DDL changes and add the migration that transforms an
     # older DB to match. ``_apply_pending_migrations`` walks
     # ``MIGRATIONS`` and applies any version > the DB's current.
-    CURRENT_SCHEMA_VERSION: int = 1
+    CURRENT_SCHEMA_VERSION: int = 2
 
     # Registry of post-greenfield schema changes. Keys are version
     # numbers (must be > 1, must be contiguous, must equal
     # ``CURRENT_SCHEMA_VERSION`` at the latest entry); values are raw
-    # SQL scripts executed via ``conn.executescript``. Empty until the
-    # first post-1.0 schema change.
-    MIGRATIONS: dict[int, str] = {}
+    # SQL scripts executed via ``conn.executescript``.
+    MIGRATIONS: dict[int, str] = {
+        2: """
+-- Ensure sessions table exists on DBs created before schema.sql included it.
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    channel_id TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    summary TEXT,
+    reflected_at TEXT
+);
+
+-- Backfill sessions rows from existing session_boundary atoms that have
+-- a non-NULL session_id and no corresponding sessions row.
+-- started_at / ended_at fall back to the atom's created_at (best available).
+INSERT OR IGNORE INTO sessions (id, channel_id, started_at, ended_at, summary, reflected_at)
+SELECT
+    a.session_id,
+    NULL,
+    a.created_at,
+    a.created_at,
+    a.content,
+    a.created_at
+FROM atoms a
+WHERE a.source_type = 'session_boundary'
+  AND a.session_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id = a.session_id);
+""",
+    }
 
     def __init__(
         self,
@@ -1076,6 +1103,136 @@ class SagaStore:
             "contributed": result.contributed_atom_ids,
             "threshold": result.threshold,
         }
+
+    async def search_sessions(
+        self,
+        query: str,
+        *,
+        channel_id: str | None = None,
+        alpha: float = 0.7,
+        limit: int = 10,
+    ) -> list[dict]:
+        """Return sessions relevant to *query*, ranked by a semantic + recency blend.
+
+        Score = alpha * cosine_similarity + (1 - alpha) * recency_score
+
+        Where recency_score uses a 30-day exponential half-life:
+            recency_score = exp(-ln(2) / 30 * age_days)
+
+        Cosine similarity comes from the session's paired ``session_boundary``
+        atom (which carries the embedding). Sessions without a session_boundary
+        atom are not returned — they have no semantic signal.
+
+        Args:
+            query: Natural-language query to match against session summaries.
+            channel_id: Optional channel filter; when set only sessions on
+                that channel are considered.
+            alpha: Weight on semantic similarity vs recency (default 0.7).
+                0.0 = recency-only, 1.0 = semantic-only.
+            limit: Maximum number of sessions to return.
+
+        Returns:
+            List of dicts with keys:
+                session_id, channel_id, started_at, ended_at, summary,
+                similarity_score, recency_score, blended_score
+            Sorted descending by blended_score.
+        """
+        import math
+
+        query_emb: list[float] = await asyncio.to_thread(_query_embed_sync, query)
+
+        def _do() -> list[dict]:
+            conn = self._ensure_conn()
+            index = self._ensure_index(conn)
+
+            # ── Step 1: build a cosine-similarity map for session_boundary atoms ──
+            # Two paths: FAISS (fast, already built) → Python-side cosine fallback.
+            sim_map: dict[str, float] = {}  # atom_id → cosine similarity
+
+            if query_emb and index is not None:
+                # index.search() expects a float list; returns [(atom_id, score), ...]
+                # Over-fetch (4×) so we have enough session_boundary hits after
+                # filtering by source_type.
+                for atom_id, score in index.search(query_emb, top_k=min(limit * 4, 200)):
+                    sim_map[atom_id] = float(score)
+
+            elif query_emb:
+                # Python-side cosine on stored embedding blobs (FAISS unavailable).
+                q_norm = math.sqrt(sum(x * x for x in query_emb)) + 1e-9
+                dim = len(query_emb)
+                for (atom_id, emb_blob) in conn.execute(
+                    "SELECT atom_id, embedding FROM embeddings LIMIT 1000"
+                ).fetchall():
+                    if not emb_blob:
+                        continue
+                    try:
+                        e_arr = struct.unpack(f"{dim}f", emb_blob[:dim * 4])
+                        dot = sum(a * b for a, b in zip(query_emb, e_arr))
+                        e_norm = math.sqrt(sum(x * x for x in e_arr)) + 1e-9
+                        sim_map[atom_id] = dot / (q_norm * e_norm)
+                    except Exception:
+                        continue
+
+            # ── Step 2: fetch session_boundary atoms joined to sessions ──
+            channel_clause = "AND s.channel_id = ?" if channel_id else ""
+            params: list = [channel_id] if channel_id else []
+
+            rows = conn.execute(
+                f"""
+                SELECT a.id        AS atom_id,
+                       a.session_id,
+                       s.channel_id,
+                       s.started_at,
+                       s.ended_at,
+                       s.summary,
+                       a.created_at
+                FROM atoms a
+                JOIN sessions s ON s.id = a.session_id
+                WHERE a.source_type = 'session_boundary'
+                  AND (a.tombstoned IS NULL OR a.tombstoned = 0)
+                  AND a.session_id IS NOT NULL
+                  {channel_clause}
+                ORDER BY COALESCE(s.ended_at, a.created_at) DESC
+                LIMIT 500
+                """,
+                params,
+            ).fetchall()
+
+            # ── Step 3: score each session ──
+            now_ts = datetime.now(tz=timezone.utc).timestamp()
+            results: list[dict] = []
+            for (atom_id, sess_id, ch_id, started_at, ended_at,
+                 summary, created_at) in rows:
+                # Cosine similarity — 0.0 when no embedding path was available.
+                sim = sim_map.get(atom_id, 0.0)
+
+                # Recency: 30-day half-life exponential decay off ended_at.
+                ref_str = ended_at or created_at or ""
+                try:
+                    if ref_str.endswith("Z"):
+                        ref_str = ref_str[:-1] + "+00:00"
+                    ref_ts = datetime.fromisoformat(ref_str).timestamp()
+                except (ValueError, AttributeError):
+                    ref_ts = now_ts
+                age_days = max(0.0, (now_ts - ref_ts) / 86400.0)
+                recency = math.exp(-math.log(2) / 30.0 * age_days)
+
+                blended = alpha * sim + (1.0 - alpha) * recency
+                results.append({
+                    "session_id": sess_id,
+                    "channel_id": ch_id,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "summary": summary,
+                    "similarity_score": round(sim, 6),
+                    "recency_score": round(recency, 6),
+                    "blended_score": round(blended, 6),
+                })
+
+            results.sort(key=lambda r: r["blended_score"], reverse=True)
+            return results[:limit]
+
+        return await asyncio.to_thread(_do)
 
     async def health(self) -> bool:
         try:
