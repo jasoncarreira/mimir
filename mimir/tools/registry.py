@@ -130,6 +130,46 @@ async def send_message(
     cid = _channel_from_config_or_state(channel_id, config)
     if not cid:
         return "send_message failed: no channel_id and no current channel"
+
+    # Loop-detection circuit breaker (SPEC §7.2.4). The per-turn
+    # LoopDetector lives on the active TurnContext; agent.run_turn
+    # attaches it at the start of every turn. Pre-181-J this hook
+    # was missing — repeated near-duplicate sends would ship
+    # indefinitely. Now: HARD_STOP refuses the send with a recovery
+    # hint; SOFT_WARN allows but logs a one-time per-turn warning
+    # event so operator dashboards can flag the near-loop.
+    from .._context import get_current_turn
+    from ..event_logger import log_event as _log_event
+    from ..loop_detector import BreakerVerdict
+
+    detector = None
+    ctx = get_current_turn()
+    if ctx is not None:
+        detector = getattr(ctx, "loop_detector", None)
+    if detector is not None:
+        decision = detector.check(text)
+        if decision.verdict == BreakerVerdict.HARD_STOP:
+            await _log_event(
+                "send_message_loop_hard_stop",
+                channel_id=cid,
+                streak=decision.streak,
+                similarity=round(decision.similarity, 4),
+            )
+            return (
+                "send_message hard stop: repeated near-duplicate loop. "
+                "This send is refused. Reflect on what's wrong with the "
+                "approach before sending again — try a completely "
+                "different tactic or finish the turn."
+            )
+        if decision.verdict == BreakerVerdict.SOFT_WARN:
+            if detector.mark_warning_emitted():
+                await _log_event(
+                    "send_message_loop_warning",
+                    channel_id=cid,
+                    streak=decision.streak,
+                    similarity=round(decision.similarity, 4),
+                )
+
     bridge = channels.find(cid)
     if bridge is None:
         return f"send_message failed: no bridge for channel {cid!r}"
