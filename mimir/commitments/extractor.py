@@ -136,10 +136,17 @@ Extract commitments per the rules. Return only the JSON object."""
 MIN_OUTPUT_LEN = 100
 
 
-# Default model. ``haiku`` is the current cheapest tier; the extraction
-# is well within haiku's reasoning band per the backtest. The CLI test
-# in scratch/ used the full ``haiku`` alias which routes to the latest.
-DEFAULT_EXTRACTOR_MODEL = "haiku"
+# Default model. Haiku is the cheapest tier and the extraction is well
+# within haiku's reasoning band per the backtest. Post-deepagents
+# migration (PR #181), ``langchain.chat_models.init_chat_model``
+# requires a provider prefix — the SDK-era bare ``"haiku"`` alias now
+# raises ``ValueError: Unable to infer model provider for
+# model='haiku'`` because langchain's resolver no longer routes
+# unprefixed names. The ``anthropic:claude-haiku-4-5`` form is
+# explicit; the provider segment selects langchain-anthropic
+# (installed by the ``anthropic`` extra) and routes through
+# ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN like the SDK era did.
+DEFAULT_EXTRACTOR_MODEL = "anthropic:claude-haiku-4-5"
 
 
 def _strip_code_fence(body: str) -> str:
