@@ -4,6 +4,7 @@ description: Diagnose your own behavior by reading the structured logs you leave
 allowed-tools:
   - Bash
   - Read
+  - saga_query
 ---
 
 # Introspection
