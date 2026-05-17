@@ -222,7 +222,7 @@ def test_render_skill_catalog_truncates_long_descriptions():
     # ends with the ellipsis sentinel.
     assert line.startswith("- introspection — ")
     assert line.endswith("…")
-    assert len(line) < 110  # name + " — " + ~80 char desc + ellipsis
+    assert len(line) < 150  # name + " — " + ~120 char desc + ellipsis
 
 
 def test_render_skill_catalog_filters_hidden_with_descriptions():
