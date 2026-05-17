@@ -518,7 +518,13 @@ class ColBERTIndex:
                 "transitively via pylate."
             ) from exc
 
-        self._db = sqlite3.connect(str(self.index_dir / "sidecar.db"))
+        # check_same_thread=False — search() is invoked via asyncio.to_thread
+        # in mimir/search.py (run_in_executor worker thread), so the connection
+        # must outlive the main-thread loader. Access is read-only and serialized
+        # per query at the search() entry point; no concurrent-writer hazard.
+        self._db = sqlite3.connect(
+            str(self.index_dir / "sidecar.db"), check_same_thread=False
+        )
         self._embeddings = np.load(self.index_dir / "embeddings.npy")
         self._offsets = np.load(self.index_dir / "offsets.npy")
         self._token_to_chunk = np.load(self.index_dir / "token_to_chunk.npy")
