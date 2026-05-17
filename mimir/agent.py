@@ -587,6 +587,15 @@ class Agent:
                 similarity_threshold=self._config.send_loop_similarity,
             ),
         )
+        # WikiBacklinksHook pre-snapshot — capture mtimes of every
+        # state/wiki/ content page BEFORE the model loop runs so the
+        # finalize step can tell if any wiki page was edited this turn.
+        # Stored on ctx (NOT on self) so concurrent turns on different
+        # channels don't share state — multi-channel-correctness
+        # invariant from the SDK build. Empty dict when the wiki dir
+        # doesn't exist; finalize early-returns in that case.
+        ctx.wiki_mtime_snapshot = self._snapshot_wiki_mtimes()
+
         ctx_token = set_current_turn(ctx)
         # Populate the module-global current_channel_id as a fallback
         # for the claude-code path. ChatClaudeCode dispatches tools
@@ -797,6 +806,22 @@ class Agent:
         # turn record is unaffected.
         await self._maybe_extract_commitments(ctx, event, record)
 
+        # Post-turn observability hooks (181-M). Order matters:
+        #   1. wiki_backlinks: regenerates state/wiki/{orphans,
+        #      dangling-links,backlinks-index}.md when a wiki content
+        #      page was modified this turn. Must run BEFORE index
+        #      rebuild so INDEX.md picks up the freshly-regen'd outputs.
+        #   2. index_rebuild: regen state/INDEX.md + memory/INDEX.md
+        #      via the per-Agent IndexGenerator (debounced internally).
+        #   3. git_commit: post-turn commit gated on
+        #      MIMIR_GIT_TRACKING_ENABLED — runs last so all regen'd
+        #      outputs are part of the same commit as the writes that
+        #      triggered them.
+        # Each is best-effort: failures log + return; turn record stays.
+        await self._post_turn_wiki_backlinks(ctx)
+        await self._post_turn_index_rebuild()
+        await self._post_turn_git_commit(ctx)
+
         # Bridge to channel out (send_message). Default sends the
         # reply text to the originating channel. Bridge-specific
         # logic that lived in the SDK Agent (typing indicator,
@@ -950,6 +975,100 @@ class Agent:
                 source_turn_id=ctx.turn_id,
                 prompt_version=EXTRACTION_PROMPT_VERSION,
             )
+
+    # ────────────────────────────────────────────────────────────
+    # Post-turn hooks (181-M)
+    # ────────────────────────────────────────────────────────────
+
+    # Generated wiki outputs — the WikiBacklinksHook regenerates these
+    # itself, so changes to them must NOT trigger another regeneration
+    # (otherwise the hook would loop on its own writes).
+    _WIKI_GENERATED_OUTPUTS = frozenset({
+        "orphans.md",
+        "dangling-links.md",
+        "backlinks-index.md",
+    })
+
+    def _snapshot_wiki_mtimes(self) -> dict[str, float]:
+        """Walk ``<home>/state/wiki``, return ``{abs_path_str: st_mtime}``
+        for every non-generated content page. Empty dict when the wiki
+        dir doesn't exist."""
+        wiki = self._config.home / "state" / "wiki"
+        snapshot: dict[str, float] = {}
+        if not wiki.is_dir():
+            return snapshot
+        for page in wiki.rglob("*.md"):
+            if page.name in self._WIKI_GENERATED_OUTPUTS:
+                continue
+            try:
+                snapshot[str(page)] = page.stat().st_mtime
+            except OSError:
+                continue
+        return snapshot
+
+    async def _post_turn_wiki_backlinks(self, ctx: Any) -> None:
+        """Regenerate the wiki backlinks/orphans/dangling outputs when
+        ANY non-generated state/wiki/*.md page changed mtime relative
+        to the pre-turn snapshot. Edit-triggered (not periodic) so
+        orphan / dangling regressions surface on the turn that
+        introduced them. Direct port of ``WikiBacklinksHook.finalize``."""
+        wiki = self._config.home / "state" / "wiki"
+        if not wiki.is_dir():
+            return
+        before: dict[str, float] = getattr(ctx, "wiki_mtime_snapshot", {}) or {}
+        after = self._snapshot_wiki_mtimes()
+
+        touched = False
+        for path_str, mtime in after.items():
+            if before.get(path_str) != mtime:
+                touched = True
+                break
+        if not touched:
+            for path_str in before:
+                if path_str not in after:
+                    touched = True
+                    break
+        if not touched:
+            return
+
+        from . import wiki_backlinks
+        try:
+            await wiki_backlinks.run(self._config.home)
+        except FileNotFoundError:
+            # Wiki dir disappeared between snapshot and run — benign race.
+            return
+        except Exception:  # noqa: BLE001 — never crash a turn for this
+            log.exception("wiki_backlinks regen failed; continuing")
+
+    async def _post_turn_index_rebuild(self) -> None:
+        """Mark INDEX.md dirty + flush the IndexGenerator. Debounced
+        internally so consecutive turns within the debounce window
+        share a single rebuild. Direct port of
+        ``IndexRebuildHook.finalize``."""
+        try:
+            self._indexes.mark_dirty("all")
+            await self._indexes.flush()
+        except Exception:  # noqa: BLE001
+            log.exception("INDEX rebuild flush failed; continuing")
+
+    async def _post_turn_git_commit(self, ctx: Any) -> None:
+        """Post-turn commit of memory/state changes, gated on
+        ``MIMIR_GIT_TRACKING_ENABLED``. Runs after the index rebuild
+        so auto-regenerated INDEX.md / wiki outputs are part of the
+        same commit as the writes that triggered them. Failures inside
+        ``commit_turn_changes`` are swallowed there and surfaced via
+        ``git_commit_failed`` / ``git_push_failed`` algedonic events;
+        we still wrap in try/except for defense in depth."""
+        try:
+            from . import git_tracking
+            await git_tracking.commit_turn_changes(
+                turn_id=ctx.turn_id,
+                trigger=ctx.trigger,
+                home=self._config.home,
+                enabled=self._config.git_tracking_enabled,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("git commit_turn_changes raised; continuing")
 
     # ────────────────────────────────────────────────────────────
     # Shell-job completion bridge
