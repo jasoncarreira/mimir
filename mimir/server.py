@@ -357,6 +357,14 @@ def build_app(config: Config) -> web.Application:
     # the full Config. Keep this in sync if spawn_claude_code grows
     # additional knobs.
     _agent_tools.set_spawn_config({"default_cwd": config.home})
+    # Async shell-job tools (bash_async / bash_jobs_list / bash_job_output)
+    # share the Agent's ShellJobRegistry; the on_complete bridge fires
+    # ``shell_job_complete`` AgentEvents back through the dispatcher
+    # so the spawning channel wakes when the subprocess exits.
+    _agent_tools.set_shell_job_registry(
+        agent._shell_jobs,
+        on_complete=agent._handle_shell_job_complete,
+    )
     # fetch_url caches downloaded bodies under <home>/attachments/fetch-cache/.
     # The tool itself is only registered when the active provider isn't
     # claude_code (see all_mimir_tools); set_home is harmless when unused.

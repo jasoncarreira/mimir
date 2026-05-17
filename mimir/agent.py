@@ -398,6 +398,24 @@ class Agent:
         # asyncio docs.
         self._bg_tasks: set[asyncio.Task] = set()
 
+        # Async-shell job registry — backs the bash_async /
+        # bash_jobs_list / bash_job_output tools. One registry per
+        # Agent (process-scoped); waiter threads spawned by
+        # ``spawn()`` live for the duration of the subprocess they
+        # wrap. Files land in ``<home>/logs/bash-jobs/<job_id>.{out,err}``.
+        # Wired into the tool surface from server.py:build_app via
+        # ``mimir.tools.set_shell_job_registry(...)``.
+        from .shell_jobs import ShellJobRegistry as _ShellJobRegistry
+        self._shell_jobs = _ShellJobRegistry(
+            jobs_dir=config.home / "logs" / "bash-jobs",
+        )
+
+        # Captured at first turn (when we know we're on the asyncio
+        # loop). The shell-job waiter threads use this to schedule
+        # the completion handler back onto the loop via
+        # ``run_coroutine_threadsafe``.
+        self._loop: asyncio.AbstractEventLoop | None = None
+
         # Build the deepagent singleton. Done lazily to keep import-time
         # fast and to let tests construct Agent without a real model.
         # Lock-guarded against concurrent first turns racing in and
@@ -504,6 +522,14 @@ class Agent:
         """Run one agent turn — preserves the SDK Agent.run_turn contract."""
         turn_id = make_turn_id()
         t_total_start = time.monotonic()
+        # Capture the asyncio loop once so shell-job waiter threads
+        # can schedule their completion handlers back onto it via
+        # ``asyncio.run_coroutine_threadsafe``.
+        if self._loop is None:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
 
         # Session attach — same as the SDK path.
         session_id = event.channel_id or "default"
@@ -924,6 +950,119 @@ class Agent:
                 source_turn_id=ctx.turn_id,
                 prompt_version=EXTRACTION_PROMPT_VERSION,
             )
+
+    # ────────────────────────────────────────────────────────────
+    # Shell-job completion bridge
+    # ────────────────────────────────────────────────────────────
+
+    def _handle_shell_job_complete(self, job: Any) -> None:
+        """Thread-safe bridge: a shell-job waiter thread invokes this
+        when its subprocess exits. Schedules the async handler onto
+        the captured asyncio loop so we can enqueue a
+        ``shell_job_complete`` AgentEvent without crossing thread
+        boundaries unsafely.
+
+        Loop-unavailable path: shutdown / pre-first-turn / no
+        dispatcher → log + drop. Operator eventually notices via
+        ``bash_jobs_list``. No synthetic TurnRecord at risk; only
+        the wake-up event for the spawning channel is lost.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            log.warning(
+                "shell_job_complete dropped (loop unavailable): "
+                "job_id=%s channel_id=%s",
+                getattr(job, "job_id", "?"),
+                getattr(job, "channel_id", None),
+            )
+            return
+        if self._dispatcher is None:
+            log.warning(
+                "shell_job_complete dropped (no dispatcher wired): "
+                "job_id=%s channel_id=%s",
+                getattr(job, "job_id", "?"),
+                getattr(job, "channel_id", None),
+            )
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._on_shell_job_complete(job), loop,
+            )
+        except Exception:  # noqa: BLE001
+            # Never let a daemon-thread invocation crash the registry.
+            log.exception("schedule of shell-job-complete handler failed")
+
+    async def _on_shell_job_complete(self, job: Any) -> None:
+        """Async handler: build a turn-prompt summary of the job's exit
+        state + bounded output tails and enqueue a
+        ``shell_job_complete`` AgentEvent into the dispatcher. Routes
+        back to the channel that spawned the job. No-channel jobs
+        (e.g. spawned from a bare scheduled tick) are dropped — no
+        sensible default routing target.
+        """
+        if getattr(job, "channel_id", None) is None:
+            await log_event(
+                "shell_job_complete_no_channel",
+                job_id=job.job_id,
+                exit_code=job.exit_code,
+            )
+            return
+
+        try:
+            data = self._shell_jobs.read_output(
+                job.job_id, tail_lines=100, stream="both",
+            )
+        except Exception:  # noqa: BLE001
+            data = {"stdout_tail": "", "stderr_tail": ""}
+
+        stdout_tail = (data.get("stdout_tail") or "").strip()
+        stderr_tail = (data.get("stderr_tail") or "").strip()
+        # Bound each stream so a runaway job doesn't blow the prompt budget.
+        max_chars = 4000
+        if len(stdout_tail) > max_chars:
+            stdout_tail = stdout_tail[-max_chars:]
+        if len(stderr_tail) > max_chars:
+            stderr_tail = stderr_tail[-max_chars:]
+
+        elapsed = round(getattr(job, "elapsed_seconds", 0.0), 1)
+        body_lines = [
+            f"Shell job {job.job_id} complete (status={job.status}, "
+            f"exit_code={job.exit_code}, elapsed={elapsed}s).",
+            f"Command: {job.command}",
+            "",
+            "--- stdout tail ---",
+            stdout_tail or "(empty)",
+            "",
+            "--- stderr tail ---",
+            stderr_tail or "(empty)",
+        ]
+        body = "\n".join(body_lines)
+
+        event = AgentEvent(
+            trigger="shell_job_complete",
+            channel_id=job.channel_id,
+            content=body,
+            source_id=f"shell_job:{job.job_id}",
+            source="system",
+            extra={"job_id": job.job_id, "exit_code": job.exit_code},
+        )
+        try:
+            accepted = await self._dispatcher.enqueue(event)
+        except Exception as exc:  # noqa: BLE001
+            await log_event(
+                "shell_job_complete_enqueue_failed",
+                job_id=job.job_id,
+                error=str(exc)[:500],
+            )
+            return
+        await log_event("shell_job_complete_enqueue_ok", job_id=job.job_id)
+        await log_event(
+            "shell_job_complete_routed",
+            job_id=job.job_id,
+            channel_id=job.channel_id,
+            exit_code=job.exit_code,
+            accepted=accepted,
+        )
 
     # ────────────────────────────────────────────────────────────
     # System prompt assembly

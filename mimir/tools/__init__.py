@@ -53,6 +53,12 @@ from .mcp import (
     get_mcp_tools,
     set_mcp_tools,
 )
+from .shell_async import (
+    bash_async,
+    bash_job_output,
+    bash_jobs_list,
+    set_shell_job_registry,
+)
 
 __all__ = [
     # Core tools (callable by the agent)
@@ -82,6 +88,11 @@ __all__ = [
     "set_mcp_tools",
     "get_mcp_tools",
     "clear_mcp_tools",
+    # Async-shell tools (long-running jobs, wake-up via shell_job_complete)
+    "bash_async",
+    "bash_jobs_list",
+    "bash_job_output",
+    "set_shell_job_registry",
     # Dep-injection setters (called by server.py:build_app)
     "set_memory_client",
     "set_indexer",
