@@ -534,9 +534,17 @@ def all_mimir_tools() -> list:
     from .extra import file_search, mimir_get_turn, shell_exec
     from .web import web_tools_enabled
     from .shell_async import bash_async, bash_job_output, bash_jobs_list
+    from .saga_ops import (
+        saga_end_session,
+        saga_feedback,
+        saga_forget,
+        saga_mark_contributions,
+    )
     tools = [
         # Memory (read + write)
         memory_query, memory_store,
+        # SAGA ops (outcome marker, manual credit, session boundary, forget)
+        saga_feedback, saga_mark_contributions, saga_end_session, saga_forget,
         # Indexer (file search)
         file_search,
         # Turn-history lookup

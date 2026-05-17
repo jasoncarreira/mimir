@@ -59,6 +59,12 @@ from .shell_async import (
     bash_jobs_list,
     set_shell_job_registry,
 )
+from .saga_ops import (
+    saga_end_session,
+    saga_feedback,
+    saga_forget,
+    saga_mark_contributions,
+)
 
 __all__ = [
     # Core tools (callable by the agent)
@@ -93,6 +99,11 @@ __all__ = [
     "bash_jobs_list",
     "bash_job_output",
     "set_shell_job_registry",
+    # SAGA agent-callable ops (read+write covered by memory_query/store)
+    "saga_feedback",
+    "saga_mark_contributions",
+    "saga_end_session",
+    "saga_forget",
     # Dep-injection setters (called by server.py:build_app)
     "set_memory_client",
     "set_indexer",
