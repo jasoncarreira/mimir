@@ -777,12 +777,30 @@ class Indexer:
 
 def _to_fts_query(text: str) -> str:
     """Sanitize a free-form query for FTS5 MATCH. Operators and parens are
-    stripped; tokens are OR-joined. Empty input → empty string."""
+    stripped; tokens are OR-joined. Empty input → empty string.
+
+    Dashes are dropped from tokens (not just trimmed) because FTS5
+    parses ``-attention`` as the unary NOT operator on the
+    ``attention`` column — and chunks_fts has no such column, so
+    the query raises ``sqlite3.OperationalError: no such column:
+    attention`` and the whole search blows up. This pre-existed
+    the chainlink #141 Slice 2 A/B harness; the harness just
+    surfaced it by including probes with hyphenated phrases like
+    "operator-attention" and "context-1m-2025-08-07". Underscores
+    are still safe (they're treated as part of the term by FTS5
+    tokenizers) so identifier-shaped tokens like ``file_search``
+    survive intact.
+    """
     safe: list[str] = []
     for tok in text.split():
-        clean = "".join(ch for ch in tok if ch.isalnum() or ch in "-_")
-        if clean:
-            safe.append(clean)
+        # Replace `-` with space FIRST so a single hyphenated token
+        # like ``operator-attention`` splits into two tokens. Then
+        # drop any chars beyond alnum + `_`.
+        normalized = tok.replace("-", " ")
+        for sub in normalized.split():
+            clean = "".join(ch for ch in sub if ch.isalnum() or ch == "_")
+            if clean:
+                safe.append(clean)
     return " OR ".join(safe)
 
 
