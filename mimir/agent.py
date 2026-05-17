@@ -234,7 +234,18 @@ def _resolve_model(
                 "(or `uv pip install langchain-claude-code`)."
             ) from exc
         model_name = spec.split(":", 1)[1]
-        return ChatClaudeCode(model=model_name)
+        # ``permission_mode="bypassPermissions"`` matches SDK-era
+        # mimir's ClaudeAgentOptions setting — without it the claude
+        # CLI subprocess gates Write/Bash on user approval and the
+        # agent reports "the Write tool is pending approval" instead
+        # of actually writing. There's no human in the loop for any
+        # mimir deployment (bench / production mimirbot / future
+        # daemons), so the approval gate is pure friction. Match the
+        # SDK invariant.
+        return ChatClaudeCode(
+            model=model_name,
+            permission_mode="bypassPermissions",
+        )
     # langchain ``init_chat_model`` resolves provider extras at call time
     # (``anthropic:`` → langchain-anthropic, ``openai:`` → langchain-openai).
     # We wrap it here so we can thread max_retries + the responses-API flag
