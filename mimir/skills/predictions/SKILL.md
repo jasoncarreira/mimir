@@ -1,6 +1,6 @@
 ---
 name: predictions
-description: Write structured predictions when speculating about future outcomes — Tim will reply within 24h, this skill will be invoked more, errors of kind X will drop. The CLI records to state/predictions.jsonl with a review horizon; reflection (or operator) marks them correct/wrong later. Closes the in-the-moment double-loop.
+description: Use when making a forward-looking claim with a checkable outcome (reply within 24h, error rate will drop, this skill will see more use) — record to state/predictions.jsonl with a review horizon so reflection can grade you later. Closes the in-the-moment double-loop.
 allowed-tools:
   - Bash
   - Read
