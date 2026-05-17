@@ -243,7 +243,10 @@ def build_app(config: Config) -> web.Application:
     indexes = IndexGenerator(config.home)
     indexes.mark_dirty("all")
 
-    indexer = Indexer(config.home)
+    indexer = Indexer(
+        config.home,
+        recency_fuse_alpha=config.file_search_recency_fuse_alpha,
+    )
     # v0.5 §2: point saga at the per-home saga.toml. saga's config search
     # checks ``$SAGA_CONFIG`` first (then ``$SAGA_DATA_DIR/saga.toml``,
     # ``~/.saga/saga.toml``, package-default). mimir setup writes

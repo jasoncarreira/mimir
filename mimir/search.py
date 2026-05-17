@@ -22,6 +22,29 @@ Lifecycle:
 
 The ``Embedder`` interface is split so tests can plug in a deterministic fake
 without paying the cold-start cost.
+
+Recency fusion (chainlink #141 Slice 2, Option A)
+-------------------------------------------------
+
+When the third (ColBERT) channel fires, the fused ranking is the
+sum of reciprocal-rank scores across BM25, dense, and ColBERT —
+recency drops out of that score by design (it's a tie-breaker in
+the legacy weighted-sum branch, not a relevance signal). Option A
+adds a single optional post-RRF multiplier so recent files get a
+small nudge above stale ones at the same content-relevance tier
+**without** changing what each channel ranks. The shape:
+
+    final_score_i = rrf_score_i × (1 + α × exp(-age_days_i / 30))
+
+``α`` is read from ``Config.file_search_recency_fuse_alpha`` and
+plumbed through the ``Indexer`` constructor as
+``recency_fuse_alpha``. **Default 0.0** — when α=0 the multiplier
+collapses to 1.0 and the path is short-circuited entirely, so the
+fused ranking is byte-identical to PR #184 as shipped. Operators
+opt in via ``MIMIR_FILE_SEARCH_RECENCY_FUSE_ALPHA=0.3`` (the value
+we measured in ``state/spec/chainlink-141-slice2-ab-results.md``).
+The no-ColBERT weighted-sum branch is untouched — it already folds
+recency in via the ``W_RECENCY`` term.
 """
 
 from __future__ import annotations
@@ -384,6 +407,7 @@ class Indexer:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
         colbert_provider: "ColBERTChannel | None" = None,
+        recency_fuse_alpha: float = 0.0,
     ) -> None:
         self._home = home
         # Default routes through saga's configured provider so file_search
@@ -405,6 +429,16 @@ class Indexer:
         # ``colbert_provider`` explicitly.
         self._colbert: ColBERTChannel = colbert_provider \
             if colbert_provider is not None else _LazyColBERTChannel(home)
+        # chainlink #141 Slice 2 Option A: optional post-RRF
+        # recency multiplier. 0.0 (default) preserves the PR #184
+        # fused ranking byte-for-byte; positive values multiply
+        # each RRF score by (1 + alpha * exp(-age_days/30)) and
+        # re-sort. Only applied on the ColBERT-fused branch — the
+        # legacy weighted-sum branch already includes recency via
+        # W_RECENCY. Negative alphas are clamped to 0.0 (no
+        # behavior change) so a misconfiguration can't invert the
+        # recency direction silently.
+        self._recency_fuse_alpha = max(0.0, float(recency_fuse_alpha))
         # Per-instance LRU for query embeddings — file_search call patterns
         # repeat the same query string several times per turn (mirror of
         # saga's ``cached_embed_query``). Wrapping the bound method here
@@ -824,9 +858,11 @@ class Indexer:
         #
         # RRF score = sum_channel 1 / (RRF_K + rank). All channels
         # are equal-weighted; weighting belongs in Slice 3's
-        # measurement harness. Recency drops out of the fused score
-        # because it's a tie-breaker, not a relevance signal; the
-        # weighted-sum branch above keeps it.
+        # measurement harness. Recency is folded in **post-fusion**
+        # via the Option-A multiplier below (alpha=0.0 default → no
+        # change, byte-identical to PR #184 as shipped). The
+        # weighted-sum branch above still folds recency in via the
+        # W_RECENCY term — different mechanism, same intent.
         bm25_ranked = sorted(
             (k_ for k_ in cand_keys if cand_payload[k_]["bm25"]),
             key=lambda k_: cand_payload[k_]["bm25"],  # ascending
@@ -915,6 +951,7 @@ class Indexer:
         }
 
         rrf_scored: list[SearchResult] = []
+        alpha = self._recency_fuse_alpha
         for key in cand_keys:
             c = cand_payload[key]
             s = 0.0
@@ -925,6 +962,15 @@ class Indexer:
             pr = colbert_path_rank.get(c["path"])
             if pr is not None:
                 s += 1.0 / (RRF_K + pr)
+            # Option A recency fuse: post-RRF multiplier. alpha=0.0
+            # short-circuits to a no-op (no float drift, no sort
+            # tie-break inversion) so the PR #184 behavior is
+            # byte-identical when the flag is unset. ``c["recency"]``
+            # is ``exp(-age_days/30)`` already (see ``_recency``)
+            # so the formula is just ``score * (1 + alpha *
+            # recency)``.
+            if alpha > 0.0:
+                s *= 1.0 + alpha * c["recency"]
             rrf_scored.append(
                 SearchResult(
                     path=c["path"],

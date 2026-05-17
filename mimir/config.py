@@ -368,6 +368,19 @@ class Config:
     git_state_repo: str | None
     git_state_token: str | None
 
+    # chainlink #141 Slice 2: post-RRF recency multiplier for the
+    # three-channel (BM25 + dense + ColBERT) fused ranking in
+    # ``mimir/search.py``. ``0.0`` (default) preserves the PR #184
+    # behavior byte-for-byte — the fused score is just the RRF sum,
+    # no recency adjustment applied. When set above 0.0 (we ship a
+    # measurement at ``0.3``), each candidate's RRF score is
+    # multiplied by ``(1 + alpha * exp(-age_days/30))`` and the list
+    # is re-sorted; recent files get a small nudge above stale ones
+    # at the same content-relevance tier. The no-ColBERT (legacy
+    # weighted-sum) path is unaffected — that branch already folds
+    # recency in via the W_RECENCY term.
+    file_search_recency_fuse_alpha: float
+
     # Logging — JSONL caps clamped to [1, _LOG_CAP_MAX]. Default 1000.
     # Both files are tail-streamed at read time, so the cap is mostly
     # about cumulative on-disk size; the trim logic uses 10% hysteresis
@@ -517,6 +530,10 @@ class Config:
             git_tracking_enabled=_env_bool("MIMIR_GIT_TRACKING_ENABLED", True),
             git_state_repo=_env("MIMIR_STATE_REPO"),
             git_state_token=_env("GITHUB_TOKEN"),
+
+            file_search_recency_fuse_alpha=_env_float(
+                "MIMIR_FILE_SEARCH_RECENCY_FUSE_ALPHA", 0.0,
+            ),
 
             max_turns_kept=_turns_cap(),
             max_events_kept=_events_cap(),
