@@ -1,92 +1,82 @@
-"""Per-turn streaming auto-dispatcher (chainlink #5).
+"""Per-turn streaming auto-dispatcher (chainlink #5, ported to LangChain).
 
-Pairs with the learned-behavior 'plan → work → result, no play-by-play':
-the *content* shape (Jason 2026-05-04 21:54, refined 2026-05-05 17:43).
+Restores mimir's "plan / work / result" chunking under the deepagents
+runtime. The default agent loop is all-or-nothing — ``agent.ainvoke``
+accumulates every step's output and we ship one big bridge.send at
+end of turn. On multi-tool turns the user sees nothing until the
+final wall lands.
 
-The default agent loop is all-or-nothing — every AssistantMessage
-accumulates, then ``extract_turn_events`` and ``_auto_dispatch_or_record``
-fire ONCE at end-of-turn. On multi-tool turns the user sees nothing
-until the final wall lands.
+This module observes LangChain ``AIMessage`` chunks as they stream in
+(via ``agent.astream(stream_mode="values")``) and flushes on a single
+semantic boundary: **the first tool_call** ends the "plan" phase. Text
+accumulated before that boundary is sent immediately with
+``final=False`` (Discord typing indicator stays held — the bot is
+still working). Text between tool calls becomes ``suppressed
+intermediate`` (captured as reasoning in turns.jsonl, NOT shown to
+the user). Text after the last tool call is the ``result`` flush.
 
-This module observes ``AssistantMessage`` blocks as they stream in and
-flushes on a single semantic boundary: **the first tool_use** ends the
-"plan" phase. After that, any text accumulated before the next tool_use
-is *intermediate* (suppressed from the user, captured as reasoning in
-turns.jsonl). Text after the *last* tool_use becomes the "result" flush.
+Special case: if the agent invokes ``send_message`` explicitly as a
+tool call, streaming dispatch self-disables — explicit send is the
+canonical delivery and we don't want to double-ship.
 
-State machine
-=============
-
-phase ∈ {pre_tool, post_tool}, starts pre_tool
-
-per AssistantMessage observed (top-level only; subagent-internal ones
-have ``parent_tool_use_id != None`` and are skipped — they don't drive
-user-visible chunking):
-
-- text-only blocks:
-  - pre_tool  → append text to ``plan_buffer``
-  - post_tool → append text to ``candidate_result_buffer``
-                (any prior candidate moves to ``suppressed_intermediate``;
-                tool_use observations also drain candidate → suppressed)
-
-- mixed (text + tool_use blocks):
-  - text in pre_tool with first tool_use here → text goes into plan
-    flush, tool_use ends pre_tool, plan flushes immediately
-  - text in post_tool → text goes straight to ``suppressed_intermediate``
-    (a tool_use will follow in the same message, so this text is
-    by definition intermediate)
-  - tool_use named ``mcp__mimir__send_message`` → operator chose
-    explicit delivery; disable streaming (the existing send_message
-    path is the canonical reply, no plan or result flush)
-  - any other tool_use in post_tool → drain ``candidate_result_buffer``
-    into ``suppressed_intermediate`` (those words turned out to be
-    intermediate, not result)
-
-end of turn
-===========
-
-- ``disabled`` (explicit send_message) or never reached post_tool
-  (zero-tool turn): ``streamed_plan`` is False; the caller falls
-  through to the single-flush path. Identical to current behavior.
-
-- ``streamed_plan`` is True: caller takes ``result_text()`` and
-  dispatches via the existing parse_directives + ``<actions>``
-  pipeline as ``final=True``.
-
-Boundary picked
-===============
-
-The boundary is **the SDK's tool_use block**, not a regex on
-``**Plan:**`` / ``**Result:**`` text markers. The SDK already gives
-us the semantic boundary for free; relying on text markers couples
-content shape to delivery shape and breaks when the agent forgets
-to use the markers. (Considered + rejected during design — see
-chainlink #5 comment 17:59.)
+Adaptation from main's SDK version:
+  - ``AssistantMessage`` → LangChain ``AIMessage``
+  - ``TextBlock`` / ``ToolUseBlock`` content blocks → ``.content`` (str)
+    + ``.tool_calls`` (list[dict])
+  - ``EXPLICIT_SEND_TOOL`` = ``"send_message"`` (native @tool name,
+    not the SDK-era ``mcp__mimir__send_message`` namespaced form)
+  - Subagent filter (``parent_tool_use_id``) dropped — LangGraph
+    flattens sub-tool calls into the parent AIMessage; no nested
+    "internal" AssistantMessages to skip.
+  - ``<actions>`` directive parsing dropped — bridges-specific markup
+    that lived in the SDK pipeline; deepagents tool calls don't emit
+    that shape. Plan text ships verbatim.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    Message,
-    TextBlock,
-    ToolUseBlock,
-)
+from langchain_core.messages import AIMessage, BaseMessage
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .bridges._directives import Directive
     from .bridges.base import Bridge, SendResult
 
 log = logging.getLogger(__name__)
 
-# Tool name that disables streaming when invoked. The agent calling
-# send_message explicitly is choosing the canonical-delivery path; the
-# auto-dispatcher (streaming or otherwise) must not also try to send.
-EXPLICIT_SEND_TOOL = "mcp__mimir__send_message"
+
+# Native @tool name from mimir.tools.registry. Routed through the
+# ``claude-code:*`` provider, langchain-claude-code's MCP bridge wraps
+# every @tool as ``mcp__langchain-tools__<name>`` before handing it to
+# the claude subprocess — so by the time tool_calls come back on an
+# AIMessage they carry the namespaced form, not the bare name. We
+# detect either suffix so streaming dispatch self-disables on explicit
+# send regardless of which provider path the model took.
+EXPLICIT_SEND_TOOL_NAMES = frozenset({
+    "send_message",                         # native langchain @tool
+    "mcp__langchain-tools__send_message",   # claude-code MCP bridge
+    "mcp__mimir__send_message",             # legacy SDK MCP-server form
+})
+
+
+def _is_explicit_send(tool_call: Any) -> bool:
+    """True iff this tool_call is the operator-chose-canonical-delivery
+    send_message path. Matches across native / claude-code-bridged /
+    legacy-MCP-bridged tool names."""
+    name = tool_call.get("name") if isinstance(tool_call, dict) else None
+    if not name:
+        return False
+    if name in EXPLICIT_SEND_TOOL_NAMES:
+        return True
+    # Tolerant suffix match — future bridge renames that keep the
+    # trailing ``send_message`` token still self-disable.
+    return name.endswith("__send_message") or name == "send_message"
+
+
+# Kept for legacy callers / tests that compared against this constant.
+EXPLICIT_SEND_TOOL = "send_message"
 
 
 @dataclass
@@ -104,6 +94,13 @@ class StreamingState:
     suppressed_intermediate: list[str] = field(default_factory=list)
     streamed_plan: bool = False
     disabled_by_explicit_send: bool = False
+    # Count of AIMessages already passed to advance_state. The caller
+    # (agent.py during astream) bumps a parallel counter and only
+    # forwards messages past this index, since astream(stream_mode=
+    # "values") re-emits the cumulative messages list every step.
+    # We don't use ``id(msg)`` because Python recycles ids for
+    # garbage-collected temporaries — caused a real test-flake.
+    observed_count: int = 0
 
     def plan_text(self) -> str:
         return "\n".join(self.plan_buffer).strip()
@@ -115,42 +112,59 @@ class StreamingState:
         return "\n\n".join(s.strip() for s in self.suppressed_intermediate if s.strip())
 
 
-def _split_blocks(msg: AssistantMessage) -> tuple[list[str], list[ToolUseBlock]]:
-    text_parts: list[str] = []
-    tool_uses: list[ToolUseBlock] = []
-    for block in msg.content:
-        if isinstance(block, TextBlock):
-            if block.text:
-                text_parts.append(block.text)
-        elif isinstance(block, ToolUseBlock):
-            tool_uses.append(block)
-    return text_parts, tool_uses
+def _split_blocks(msg: AIMessage) -> tuple[str, list[dict[str, Any]]]:
+    """Extract (text, tool_calls) from a LangChain AIMessage.
+
+    ``msg.content`` may be a plain string OR a list of content-block
+    dicts (provider-dependent). We coerce both to a single text string
+    so the state machine can stay shape-agnostic. ``msg.tool_calls``
+    is the canonical tool-call list; ``response_metadata`` may carry
+    internal_tool_calls (from claude-code) which we also fold in.
+    """
+    content = msg.content
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") == "text" and block.get("text"):
+                    parts.append(block["text"])
+        text = "\n".join(parts)
+    else:
+        text = str(content) if content else ""
+
+    tool_calls = list(msg.tool_calls or [])
+    rmd = getattr(msg, "response_metadata", None) or {}
+    for internal in rmd.get("internal_tool_calls") or []:
+        if internal not in tool_calls:
+            tool_calls.append(internal)
+    return text.strip(), tool_calls
 
 
-def advance_state(state: StreamingState, msg: Message) -> str | None:
+def advance_state(state: StreamingState, msg: BaseMessage) -> str | None:
     """Pure state-machine step. Returns the plan text to flush, or None.
 
-    Caller is responsible for actually invoking the bridge with the
-    returned plan text. Splitting the side effect out of the state
-    machine keeps it unit-testable without async/IO.
+    Caller invokes the bridge with the returned plan text. Splitting
+    the side effect out of the state machine keeps it unit-testable
+    without async/IO.
     """
     if not state.enabled or state.disabled_by_explicit_send:
         return None
-    if not isinstance(msg, AssistantMessage):
+    if not isinstance(msg, AIMessage):
         return None
-    # Subagent-internal messages don't drive user-visible chunking.
-    if getattr(msg, "parent_tool_use_id", None) is not None:
-        return None
+    state.observed_count += 1
 
-    text_parts, tool_uses = _split_blocks(msg)
-    text = "\n".join(text_parts) if text_parts else ""
+    text, tool_uses = _split_blocks(msg)
 
     # Explicit send_message → operator chose the canonical-delivery
-    # path. Disable streaming entirely; the existing send_message_attempts
-    # gate skips _auto_dispatch_or_record on the caller side.
-    if any(tu.name == EXPLICIT_SEND_TOOL for tu in tool_uses):
+    # path. Disable streaming entirely; everything we've buffered
+    # so far is moot. ``_is_explicit_send`` matches across native,
+    # claude-code-bridged, and legacy-MCP-bridged tool names.
+    if any(_is_explicit_send(tc) for tc in tool_uses):
         state.disabled_by_explicit_send = True
-        # Anything we'd buffered up to here is moot — drop it.
         state.plan_buffer.clear()
         state.candidate_result_buffer.clear()
         return None
@@ -162,25 +176,20 @@ def advance_state(state: StreamingState, msg: Message) -> str | None:
             state.plan_buffer.append(text)
         if tool_uses:
             # First tool_use boundary — flush plan and transition.
+            # Note: ``streamed_plan`` is NOT set here. The dispatcher
+            # sets it AFTER the bridge confirms sent=True (otherwise
+            # a directives-only plan or a bridge crash would mislead
+            # downstream telemetry into claiming text was suppressed
+            # when in fact nothing reached the user).
             candidate_plan = "\n".join(state.plan_buffer).strip()
             if candidate_plan:
                 plan_to_flush = candidate_plan
-                # CR2 (agent runtime) fix: do NOT set
-                # ``state.streamed_plan = True`` here. The plan flush
-                # may still be reduced to nothing by directive
-                # stripping, may fail at the bridge, or may produce
-                # ``sent=False``. Setting the flag pre-delivery would
-                # mislead downstream telemetry into claiming text was
-                # "suppressed from the user" when in fact the user got
-                # nothing. ``observe()`` flips the flag after the
-                # bridge confirms ``sent=True``.
             state.phase = "post_tool"
     else:  # post_tool
         if tool_uses:
             # New tool_use → any text in this message precedes the
-            # tool_use within the AssistantMessage (SDK ordering),
-            # so it's by definition intermediate. Send it to
-            # suppressed.
+            # tool_use within the AIMessage, so it's by definition
+            # intermediate. Send it to suppressed.
             if text:
                 state.suppressed_intermediate.append(text)
             # And the prior candidate result was also intermediate.
@@ -190,10 +199,10 @@ def advance_state(state: StreamingState, msg: Message) -> str | None:
                 )
                 state.candidate_result_buffer.clear()
         elif text:
-            # Text-only AssistantMessage in post_tool. Could be the
-            # final result, or could turn out to be intermediate if
-            # another tool_use arrives. Buffer as candidate; the
-            # next tool_use (if any) will demote it.
+            # Text-only AIMessage in post_tool. Could be the final
+            # result, or could turn out to be intermediate if another
+            # tool_use arrives. Buffer as candidate; the next tool_use
+            # (if any) will demote it.
             state.candidate_result_buffer.append(text)
 
     return plan_to_flush
@@ -202,16 +211,16 @@ def advance_state(state: StreamingState, msg: Message) -> str | None:
 class StreamingAutoDispatcher:
     """Owns the plan flush during a streaming turn.
 
-    Wired into ``Agent._run_turn`` between message arrival and
-    end-of-turn. When eligible, observes each ``AssistantMessage`` as
-    it streams in; on the first tool_use boundary, flushes the
-    accumulated plan text via the bridge with ``final=False`` (so the
-    Discord typing indicator stays held — the bot is still working).
+    Wired into ``Agent._run_turn_body`` between message arrival and
+    end-of-turn. When eligible, observes each ``AIMessage`` as it
+    streams in; on the first tool_call boundary, flushes the
+    accumulated plan text via the bridge with ``final=False`` (so
+    the Discord typing indicator stays held — the bot is still
+    working).
 
-    The result flush is the caller's job — ``Agent._run_turn`` calls
-    ``_auto_dispatch_or_record`` with ``result_text()`` after the
-    message loop ends, treating it like the existing single-flush
-    path but with the plan already delivered.
+    The result flush is the caller's job — the run_turn end-of-turn
+    bridge.send picks up ``result_text()`` when streaming was active,
+    or falls through to the canonical output flush otherwise.
     """
 
     def __init__(
@@ -219,23 +228,13 @@ class StreamingAutoDispatcher:
         *,
         channel_id: str,
         bridge: "Bridge | None",
-        on_plan_dispatched: (
-            Callable[
-                [str, "SendResult | None", "tuple[Directive, ...]"],
-                Awaitable[None],
-            ]
-            | None
-        ) = None,
-        on_plan_failed: Callable[[str, str], Awaitable[None]] | None = None,
         eligible: bool = True,
     ) -> None:
         self._channel_id = channel_id
         self._bridge = bridge
-        self._on_plan_dispatched = on_plan_dispatched
-        self._on_plan_failed = on_plan_failed
-        # Bench / no-bridge channels skip streaming. The eligibility
-        # gate matches the existing _auto_dispatch_or_record gate so
-        # every channel gets one consistent answer.
+        # Bench / no-bridge / non-user-facing channels skip streaming.
+        # ``BenchBridge`` has name="bench"; tests / smoke runs that
+        # invoke without a bridge also fall through cleanly here.
         enabled = (
             eligible
             and bridge is not None
@@ -261,150 +260,57 @@ class StreamingAutoDispatcher:
     def suppressed_text(self) -> str:
         return self.state.suppressed_text()
 
-    async def observe(self, msg: Message) -> None:
-        """Advance the state machine and (if needed) flush the plan.
-
-        On a flush, ``<actions>`` directives present in the plan text
-        are parsed out and forwarded to ``on_plan_dispatched`` so the
-        caller can dispatch them mid-turn (against the just-sent plan
-        message). The plan-flush bridge send carries only the cleaned
-        text; raw ``<actions>`` markup never reaches the channel."""
+    async def observe(self, msg: BaseMessage) -> None:
+        """Advance the state machine and (if needed) flush the plan."""
         plan_text = advance_state(self.state, msg)
         if plan_text is None:
             return
-        # Plan flush — final=False so the Discord typing indicator
-        # stays held: the bot is in the middle of work, not done.
         if self._bridge is None:
             return
-
-        # Parse directives out of the plan text. Directives are
-        # dispatched alongside the plan flush (so an inline ack-react
-        # in the plan actually lands on the user's message); the bridge
-        # send carries only the cleaned remainder so raw markup never
-        # reaches the channel.
-        cleaned_plan, directives = _parse_plan_directives(plan_text)
-
-        send_result: "SendResult | None" = None
-        if cleaned_plan.strip():
-            try:
-                send_result = await self._bridge.send(
-                    self._channel_id, cleaned_plan, final=False,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.exception("streaming plan flush failed")
-                if self._on_plan_failed is not None:
-                    try:
-                        await self._on_plan_failed(
-                            cleaned_plan, f"{type(exc).__name__}: {exc}"
-                        )
-                    except Exception:  # noqa: BLE001
-                        log.exception("on_plan_failed callback raised")
-                return
-            if not send_result.sent:
-                if self._on_plan_failed is not None:
-                    try:
-                        await self._on_plan_failed(
-                            cleaned_plan,
-                            send_result.error or "bridge returned sent=False",
-                        )
-                    except Exception:  # noqa: BLE001
-                        log.exception("on_plan_failed callback raised")
-                return
-            # CR2 (agent runtime) fix: only NOW — after the bridge
-            # confirmed ``sent=True`` — flip ``streamed_plan``. The
-            # downstream ``streaming_active_for_log`` reads this flag
-            # to decide whether intermediate text should be demoted
-            # from ``output`` to ``reasoning`` in turns.jsonl. Pre-fix,
-            # the flag was set in ``advance_state`` before the bridge
-            # was even called, so a directives-only plan, a bridge
-            # crash, or ``sent=False`` would all still cause
-            # turns.jsonl to claim text was suppressed from the user
-            # when in fact nothing reached them.
+        try:
+            result = await self._bridge.send(
+                self._channel_id, plan_text, final=False,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("streaming plan flush failed")
+            return
+        # Only flip ``streamed_plan`` after the bridge confirms
+        # sent=True — otherwise turns.jsonl could claim text was
+        # suppressed from the user when in fact the bridge dropped it.
+        if getattr(result, "sent", False):
             self.state.streamed_plan = True
 
-        # Notify the dispatched callback when there's something for it
-        # to act on: either a successful bridge send, or directives that
-        # still need dispatching even though the cleaned plan text was
-        # empty (e.g. an actions-only plan ack). When both are absent,
-        # nothing to report.
-        if send_result is None and not directives:
-            return
-        if self._on_plan_dispatched is not None:
-            try:
-                await self._on_plan_dispatched(
-                    cleaned_plan, send_result, directives,
-                )
-            except Exception:  # noqa: BLE001
-                log.exception("on_plan_dispatched callback raised")
 
+def intermediate_text_segments(messages: list[BaseMessage]) -> list[str]:
+    """Return text segments that streaming would have suppressed as
+    intermediate (between first and last tool_call).
 
-def _parse_plan_directives(
-    text: str,
-) -> tuple[str, "tuple[Directive, ...]"]:
-    """Return ``(cleaned_text, directives_tuple)``.
-
-    Wraps the bridges' parse_directives. The plan flush sends the
-    cleaned text only; the parsed directives are forwarded to the
-    on_plan_dispatched callback so the caller can dispatch them
-    against the just-sent plan flush. (Previously these were
-    silently dropped — see chainlink #5 follow-up.)
+    Used by ``extract_turn_events(streaming_active=True)`` (when wired)
+    to demote those segments from ``output`` → ``reasoning`` in
+    turns.jsonl so the log reflects what the user actually saw.
     """
-    try:
-        from .bridges._directives import parse_directives
-
-        parsed = parse_directives(text)
-        return (parsed.clean_text or "", tuple(parsed.directives))
-    except Exception:  # noqa: BLE001
-        log.exception("parse_directives raised in plan-flush parser")
-        return text, ()
-
-
-def intermediate_text_segments(messages: list[Message]) -> list[str]:
-    """Return the list of text segments that streaming would have
-    suppressed as intermediate (between first and last tool_use).
-
-    Used by ``extract_turn_events(streaming_active=True)`` to demote
-    those segments from output → reasoning so turns.jsonl reflects
-    what the user actually saw.
-
-    Walks top-level AssistantMessages only (subagent-internal
-    messages are filtered upstream).
-    """
-    # Find indices of the first and last AssistantMessages that
-    # contain a tool_use. Text in messages strictly between those
-    # indices is intermediate. Text in mixed messages with tool_use
-    # at the same position is also intermediate when the position
-    # is post-first-tool-use.
+    # Find indices of AIMessages with tool_calls.
     tool_indices: list[int] = []
     for i, msg in enumerate(messages):
-        if not isinstance(msg, AssistantMessage):
+        if not isinstance(msg, AIMessage):
             continue
-        if getattr(msg, "parent_tool_use_id", None) is not None:
-            continue
-        if any(isinstance(b, ToolUseBlock) for b in msg.content):
+        _text, tcs = _split_blocks(msg)
+        if tcs:
             tool_indices.append(i)
 
-    if not tool_indices:
+    if not tool_indices or len(tool_indices) == 1:
         return []
 
     first_tool = tool_indices[0]
     last_tool = tool_indices[-1]
-    if first_tool == last_tool:
-        return []
-
     suppressed: list[str] = []
     for i in range(first_tool + 1, last_tool + 1):
         msg = messages[i]
-        if not isinstance(msg, AssistantMessage):
+        if not isinstance(msg, AIMessage):
             continue
-        if getattr(msg, "parent_tool_use_id", None) is not None:
-            continue
-        text_parts, tool_uses = _split_blocks(msg)
-        if not text_parts:
-            continue
-        # Text in a mixed message at index i precedes the tool_use
-        # within the message — intermediate either way.
-        suppressed.append("\n".join(text_parts))
+        text, _ = _split_blocks(msg)
+        if text:
+            suppressed.append(text)
     return suppressed
 
 

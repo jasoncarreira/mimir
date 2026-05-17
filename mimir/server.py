@@ -32,6 +32,7 @@ from .history import MessageBuffer
 from .identities import IdentityResolver
 from .index import IndexGenerator
 from .models import AgentEvent, make_process_session_id
+from .rate_limits import RateLimitStore
 from .saga_client import SagaClient, make_saga_client
 from .scheduler import Scheduler
 from .search import Indexer
@@ -188,6 +189,24 @@ async def _handle_health(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def _handle_consolidate(request: web.Request) -> web.Response:
+    # Bench surface: trigger one SagaStore.consolidate() pass on demand.
+    # Replaces the legacy MSAM-sidecar /v1/consolidate at port 3002.
+    saga_client: SagaClient = request.app["saga_client"]
+    try:
+        body: dict[str, Any] = await request.json()
+    except json.JSONDecodeError:
+        body = {}
+    try:
+        result = await saga_client.consolidate(
+            dry_run=bool(body.get("dry_run", False)),
+        )
+    except Exception as exc:
+        log.exception("consolidate failed: %s", exc)
+        return web.json_response({"error": str(exc)}, status=500)
+    return web.json_response(result or {})
+
+
 def build_app(config: Config) -> web.Application:
     # 10MB body cap (aiohttp default is 1MB). Mimir takes JSON-only bodies on
     # /event and /chat — long bluesky transcripts and seed payloads can run
@@ -291,6 +310,14 @@ def build_app(config: Config) -> web.Application:
         enqueue=dispatcher.enqueue,
         home=config.home,
     )
+    # Commitments store — Phase 2b due-check poller + the four
+    # commitment_* langchain tools both need this. Pre-fix it was
+    # never constructed, so getattr(agent, "_commitments", None) was
+    # always None and every commitment tool returned the "no store"
+    # error. Build once, hand to Agent + the tool registry.
+    from .commitments import CommitmentsStore
+    commitments_store = CommitmentsStore(path=config.commitments_log)
+
     agent = Agent(
         config,
         turn_logger,
@@ -303,8 +330,45 @@ def build_app(config: Config) -> web.Application:
         subagent_inbox=inbox,
         channel_registry=channels,
         dispatcher=dispatcher,
+        commitments_store=commitments_store,
     )
     dispatcher.set_run_turn(agent.run_turn)
+
+    # Wire dep-injection setters on the production tool surface so
+    # langchain @tool functions can reach the same singletons the SDK
+    # tool builders received as args. Each setter is idempotent and
+    # process-scoped (module-level state). Memory-client injection is
+    # handled inside Agent.__init__ (it requires unwrapping the
+    # RecordingSagaClient chain), so it's not re-done here.
+    from . import tools as _agent_tools
+    from .tools import web as _web_tools
+    _agent_tools.set_indexer(indexer)
+    _agent_tools.set_turns_log_path(config.turns_log)
+    _agent_tools.set_channel_registry(channels)
+    _agent_tools.set_dispatcher(dispatcher)
+    _agent_tools.set_scheduler(scheduler)
+    # Pre-fix these setters existed but weren't called from build_app,
+    # so the four commitment_* tools all returned "no store" and
+    # spawn_claude_code had no resolved config. Wired now.
+    _agent_tools.set_commitments_store(commitments_store)
+    # spawn_claude_code reads ``.get("default_cwd")`` from this dict.
+    # The current Config dataclass doesn't fit that shape; we pass a
+    # purpose-built mapping rather than refactor the tool to accept
+    # the full Config. Keep this in sync if spawn_claude_code grows
+    # additional knobs.
+    _agent_tools.set_spawn_config({"default_cwd": config.home})
+    # Async shell-job tools (bash_async / bash_jobs_list / bash_job_output)
+    # share the Agent's ShellJobRegistry; the on_complete bridge fires
+    # ``shell_job_complete`` AgentEvents back through the dispatcher
+    # so the spawning channel wakes when the subprocess exits.
+    _agent_tools.set_shell_job_registry(
+        agent._shell_jobs,
+        on_complete=agent._handle_shell_job_complete,
+    )
+    # fetch_url caches downloaded bodies under <home>/attachments/fetch-cache/.
+    # The tool itself is only registered when the active provider isn't
+    # claude_code (see all_mimir_tools); set_home is harmless when unused.
+    _web_tools.set_home(config.home)
 
     # WebChatBridge needs the dispatcher (for inbound) — built after dispatcher
     # exists, registered before channels.connect_all() runs at startup.
@@ -419,6 +483,7 @@ def build_app(config: Config) -> web.Application:
 
     app.router.add_post("/event", _handle_event)
     app.router.add_get("/health", _handle_health)
+    app.router.add_post("/api/memory/consolidate", _handle_consolidate)
     # Turn viewer + log API (SPEC §11).
     web_ui.register_routes(
         app,
@@ -471,6 +536,32 @@ def build_app(config: Config) -> web.Application:
 
         await indexer.start(run_initial_sweep=False, sweep_loop=True)
         await channels.connect_all()
+
+        # MCP servers (opt-in via MIMIR_MCP_SERVERS_JSON / _PATH).
+        # Bridged tools are appended to the agent's surface via the
+        # mimir.tools.mcp setter. A single server failing to start is
+        # logged + skipped — the agent still boots with native tools.
+        # Lifecycle owner stored on app so _on_cleanup can shut it down.
+        if config.mcp_servers:
+            from .mcp_client import MCPManager
+            from .tools import set_mcp_tools
+
+            mcp_manager = MCPManager()
+            try:
+                mcp_tools = await mcp_manager.start_servers(config.mcp_servers)
+            except Exception as exc:  # noqa: BLE001 — log + continue
+                log.warning("MCP startup failed: %s", exc)
+                mcp_tools = []
+                await mcp_manager.shutdown()
+                mcp_manager = None
+            if mcp_tools:
+                set_mcp_tools(mcp_tools)
+                await log_event(
+                    "mcp_servers_ready",
+                    count=len(mcp_tools),
+                    tool_names=[t.name for t in mcp_tools],
+                )
+            app["mcp_manager"] = mcp_manager
 
         # Register SAGA weekly consolidation. Bad cron logs and continues.
         # Pass home so the closure can read identities.yaml at fire time
@@ -561,13 +652,17 @@ def build_app(config: Config) -> web.Application:
         oauth_poll_registered = False
         if config.oauth_credentials_path is not None:
             try:
-                # Share the agent's RateLimitStore instance so the
-                # poller's writes coordinate with the per-turn message-
-                # stream capture path through a single asyncio.Lock.
-                # Two stores at the same path would race on read-modify-
-                # write of the JSON file.
+                # Post-cutover (2026-05-15): agent._rate_limits is a no-op stub
+                # because the deepagents path no longer streams SDK
+                # RateLimitEvent messages. The poller owns its own
+                # RateLimitStore here — single writer, single asyncio.Lock,
+                # no race. The path is the same JSON file the SDK-era
+                # agent wrote to so operators get continuity.
+                rate_limit_store = RateLimitStore(
+                    path=config.home / ".mimir" / "rate_limits.json",
+                )
                 oauth_poll_registered = scheduler.add_oauth_usage_poll_job(
-                    agent._rate_limits,
+                    rate_limit_store,
                     config.oauth_usage_poll_cron,
                     config.oauth_credentials_path,
                     refresh_warn_days=config.oauth_refresh_warn_days,
@@ -674,12 +769,9 @@ def build_app(config: Config) -> web.Application:
         await indexer.stop()
         await saga_client.close()
         await channels.disconnect_all()
-        # Stage 1 of CLAUDE_SDK_CLIENT_MIGRATION.md: release the shared
-        # ClaudeSDKClient subprocess on graceful shutdown. No-op if no
-        # client was ever connected (test shutdowns, query()-failed
-        # bring-up, etc.).
-        from .agent import shutdown_sdk_client
-        await shutdown_sdk_client()
+        mcp_manager = app.get("mcp_manager")
+        if mcp_manager is not None:
+            await mcp_manager.shutdown()
 
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
