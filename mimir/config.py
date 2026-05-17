@@ -41,6 +41,23 @@ _EVENTS_CAP_DEFAULT = _TURNS_CAP_DEFAULT * _EVENTS_PER_TURN_RATIO
 _EVENTS_CAP_MAX = _TURNS_CAP_MAX * _EVENTS_PER_TURN_RATIO
 
 
+# Per-directory write permissions under MIMIR_HOME. ``"rw"`` allows
+# Write/Edit/upload via deepagents' filesystem tools; ``"ro"`` blocks
+# them at the WriteGuardBackend layer (reads/grep/glob unrestricted).
+# Anything not in this dict — e.g. ``.mimir/`` (saga db, metrics) — is
+# implicitly blocked because it's not a writable root. Operators
+# override via MIMIR_FOLDERS.
+DEFAULT_FOLDERS: dict[str, str] = {
+    "state": "rw",       # Agent state files (commitments, sessions, etc.)
+    "memory": "rw",      # Long-form text journal
+    "attachments": "rw", # Agent-generated artifacts
+    "skills": "rw",      # Operator-supplied skill bundles (agent can refine)
+    "logs": "ro",        # System-managed event/turn logs
+    "messages": "ro",    # Channel history (read-only — never rewrite)
+    "prompts": "ro",     # Operator-managed prompt overrides
+}
+
+
 def _turns_cap() -> int:
     return min(_env_int("MIMIR_MAX_TURNS", _TURNS_CAP_DEFAULT), _TURNS_CAP_MAX)
 
@@ -90,6 +107,85 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _load_mcp_servers_from_env() -> list:
+    """Load MCP server configs from MIMIR_MCP_SERVERS_JSON / _PATH env.
+
+    Inline JSON wins over path. Returns an empty list if both unset
+    (MCP is opt-in). Import is local so config doesn't pay the mcp/
+    LangChain import cost when MCP isn't configured.
+    """
+    json_inline = os.environ.get("MIMIR_MCP_SERVERS_JSON", "").strip()
+    json_path = os.environ.get("MIMIR_MCP_SERVERS_PATH", "").strip()
+    if not json_inline and not json_path:
+        return []
+    from .mcp_client import load_mcp_server_configs
+    return load_mcp_server_configs(
+        json_inline=json_inline or None,
+        json_path=json_path or None,
+    )
+
+
+def _parse_folders(raw: str) -> dict[str, str]:
+    """Parse a ``MIMIR_FOLDERS`` env value into a name→mode dict.
+
+    Format: ``name:mode`` pairs, comma-separated. Modes other than
+    ``rw``/``ro`` are coerced to ``ro`` (fail safe). Empty/unset
+    returns ``DEFAULT_FOLDERS``.
+
+    Unsafe names — ``""``, ``"."``, ``".."``, anything containing
+    traversal segments — are rejected with a warning. Pre-fix a bogus
+    spec like ``.:rw`` would alias the root and make EVERY directory
+    writable (including ``.mimir/db.sqlite``). Malformed input as a
+    whole (no parseable pairs) also logs at warning level rather than
+    silently restoring defaults — operator typo visibility matters
+    more than backwards compat with the silent fallback.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    raw = (raw or "").strip()
+    if not raw:
+        return dict(DEFAULT_FOLDERS)
+    folders: dict[str, str] = {}
+    had_pairs = False
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        had_pairs = True
+        name, mode = pair.split(":", 1)
+        name = name.strip().strip("/")
+        mode = mode.strip().lower()
+        if not name or name in (".", ".."):
+            _log.warning(
+                "MIMIR_FOLDERS: ignoring unsafe folder name %r "
+                "(empty or root-aliasing)", pair,
+            )
+            continue
+        # Reject any pathlike with traversal — ``a/../b``, ``../x``, etc.
+        if "/" in name or "\\" in name or name.startswith("."):
+            _log.warning(
+                "MIMIR_FOLDERS: ignoring suspicious folder name %r "
+                "(path separators or leading dot)", pair,
+            )
+            continue
+        if mode not in ("rw", "ro"):
+            _log.warning(
+                "MIMIR_FOLDERS: unknown mode %r for folder %r — "
+                "coercing to 'ro' (fail safe)", mode, name,
+            )
+            mode = "ro"
+        folders[name] = mode
+    if not folders:
+        if had_pairs:
+            _log.warning(
+                "MIMIR_FOLDERS=%r produced no valid folders — "
+                "falling back to DEFAULT_FOLDERS", raw,
+            )
+        return dict(DEFAULT_FOLDERS)
+    return folders
+
+
 def _parse_sources(raw: str) -> frozenset[str] | None:
     """Parse a comma-separated source allowlist for Recent activity.
 
@@ -112,6 +208,19 @@ def _parse_sources(raw: str) -> frozenset[str] | None:
 class Config:
     home: Path
     model: str
+    # Post-cutover model spec for the deepagents path:
+    #   - ``claude-code:<model>``  → ChatClaudeCode (Max OAuth subprocess)
+    #   - ``<provider>:<model>``   → init_chat_model via langchain
+    #   See ``mimir.agent._resolve_model``. Defaults to
+    #   ``claude-code:claude-sonnet-4-6`` (Max OAuth, no API-key billing).
+    model_spec: str
+
+    # Per-call retry budget for non-claude-code providers (anthropic,
+    # openai, voyage, etc.). Threaded into ``init_chat_model`` via
+    # ``max_retries=...``; provider SDKs use this for transient 429 /
+    # 5xx backoff. claude-code path ignores this — the subprocess
+    # handles its own retry semantics. Default 6 (matches open-strix).
+    model_max_retries: int
     effort: str
     embed_model: str
     saga_endpoint: str
@@ -189,6 +298,25 @@ class Config:
     # Configured via ``MIMIR_FILE_OP_ROOTS`` (colon-separated paths);
     # empty by default (just ``home``).
     file_op_extra_roots: list[Path]
+
+    # Per-directory write permissions under ``home``. Subdir name →
+    # ``"rw"`` or ``"ro"``. ``WriteGuardBackend`` enforces this at the
+    # filesystem-tool layer (Write/Edit/upload blocked outside writable
+    # roots; reads/grep/glob unrestricted). Operator-configurable via
+    # ``MIMIR_FOLDERS`` (``name:mode`` pairs, comma-separated, e.g.
+    # ``state:rw,memory:rw,logs:ro``); falls back to ``DEFAULT_FOLDERS``
+    # when unset. Unknown modes are coerced to ``"ro"`` (fail safe).
+    folders: dict[str, str]
+
+    # MCP servers to spawn at startup. Each entry is an
+    # ``MCPServerConfig`` (name, command, args, env). Tools exposed by
+    # the servers are bridged as ``mcp_{server}_{tool}`` LangChain
+    # tools and appended to the agent's tool surface. Operator-supplied
+    # via ``MIMIR_MCP_SERVERS_JSON`` (inline JSON list) or
+    # ``MIMIR_MCP_SERVERS_PATH`` (path to a JSON file). Both forms
+    # accept the Claude-Code-style ``{"mcpServers": [...]}`` wrapper
+    # or a bare list. Empty by default — MCP is opt-in.
+    mcp_servers: list  # type: list[MCPServerConfig], avoiding the import
 
     # SDK gateway (§14.1)
     anthropic_api_key: str
@@ -390,6 +518,8 @@ class Config:
         return cls(
             home=home,
             model=_env("MIMIR_MODEL", "claude-opus-4-7"),
+            model_spec=_env("MIMIR_MODEL_SPEC", "claude-code:claude-sonnet-4-6"),
+            model_max_retries=_env_int("MIMIR_MODEL_MAX_RETRIES", 6),
             effort=_env("MIMIR_EFFORT", "high"),
             embed_model=_env("MIMIR_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
             saga_endpoint=_env("SAGA_ENDPOINT", "http://localhost:3002"),
@@ -441,6 +571,8 @@ class Config:
                 for p in (_env("MIMIR_FILE_OP_ROOTS", "") or "").split(":")
                 if p.strip()
             ],
+            folders=_parse_folders(_env("MIMIR_FOLDERS", "") or ""),
+            mcp_servers=_load_mcp_servers_from_env(),
 
             anthropic_api_key=_env("ANTHROPIC_API_KEY"),
             anthropic_base_url=_env("ANTHROPIC_BASE_URL"),
@@ -541,6 +673,21 @@ class Config:
         ``state/``) so the indexer doesn't walk it as searchable
         knowledge — it's internal lifecycle state, not content."""
         return self.home / ".mimir" / "commitments.jsonl"
+
+    @property
+    def writable_dirs(self) -> list[str]:
+        """Subdir names with ``"rw"`` mode in ``folders``. Passed to
+        ``WriteGuardBackend`` so deepagents' Write/Edit/upload tools
+        block paths outside these roots. Order preserves dict order
+        (insertion order from ``_parse_folders``)."""
+        return [name for name, mode in self.folders.items() if mode == "rw"]
+
+    @property
+    def all_dirs(self) -> list[str]:
+        """Every subdir named in ``folders``, both rw and ro. Useful
+        for surfacing the agent-visible workspace layout in the system
+        prompt or for diagnostics."""
+        return list(self.folders.keys())
 
     def sdk_env_overrides(self) -> dict[str, str]:
         """Env vars to forward via ClaudeAgentOptions.env (§14.1)."""
