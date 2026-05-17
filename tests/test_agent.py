@@ -20,18 +20,22 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from mimir.agent import Agent
+from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
 from mimir.models import AgentEvent
 from mimir.turn_logger import TurnLogger
 
 
-class _StubConfig:
-    """The Agent stores a config reference but never reads it in
-    run_turn — pass a tiny placeholder rather than building a full
-    Config (which has 30+ required fields)."""
-    def __init__(self, home: Path) -> None:
-        self.home = home
+def _make_config(home: Path) -> Config:
+    """Build a real Config rooted at ``home``. The per-turn prompt
+    assembly (CR#10 + 181-H) reads many Config fields (feedback
+    window, usage block toggles, recent-activity limits) so the
+    earlier ``_StubConfig`` with only ``home`` no longer suffices.
+    """
+    import os
+    os.environ["MIMIR_HOME"] = str(home)
+    return Config.from_env()
 
 
 class _FakeAgent:
@@ -77,9 +81,9 @@ def _build_agent(tmp_path: Path, *,
     home = tmp_path / "home"
     (home / "logs").mkdir(parents=True, exist_ok=True)
     init_logger(home / "logs" / "events.jsonl", session_id="test")
-    cfg = _StubConfig(home)
+    cfg = _make_config(home)
     a = Agent(
-        config=cfg,  # type: ignore[arg-type]
+        config=cfg,
         turn_logger=TurnLogger(home / "logs" / "turns.jsonl"),
         message_buffer=MessageBuffer(history_path=home / "messages.jsonl"),
         index_generator=IndexGenerator(home),
