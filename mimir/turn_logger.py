@@ -1,9 +1,21 @@
-"""turns.jsonl writer + Claude Agent SDK message → events extractor (SPEC §10).
+"""turns.jsonl writer + LangChain message → events extractor.
 
-Schema is open-strix's ``TurnRecord`` plus two mimir additions: ``saga_session_id``
-and ``saga_atom_ids`` (SPEC §10.2). The ``events`` list shape — reasoning /
-tool_call / tool_result entries — is identical so existing tooling
-(benchmark/scripts/collate_turns.py, benchmark/overview_turns.py) keeps working.
+Walks a list of ``langchain_core.messages`` (AIMessage, ToolMessage,
+HumanMessage) and produces:
+  - a list of events (``reasoning``, ``tool_call``, ``tool_result``)
+  - a final-output string (assistant text not associated with tool use)
+  - SDK-equivalent result fields (cost / usage / stop_reason /
+    num_turns) derived from ``response_metadata`` and ``usage_metadata``
+
+The schema is unchanged from the SDK era — bench tooling
+(``benchmark/scripts/collate_turns.py``, ``benchmark/overview_turns.py``,
+the turn viewer) reads this output without modification.
+
+Three message shapes are supported:
+  - ``AIMessage.tool_calls`` (langchain-anthropic, langchain-openai)
+  - ``AIMessage.response_metadata["internal_tool_calls"]`` +
+    ``["tool_results"]`` (ChatClaudeCode / Max OAuth subprocess)
+  - ``ToolMessage`` (standard LangGraph tool-call roundtrip)
 """
 
 from __future__ import annotations
@@ -15,15 +27,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    Message,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
-)
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from ._jsonl_tail import _tail_lines, count_lines_chunked
 from .models import TurnRecord
@@ -41,13 +45,13 @@ def truncate_input(prompt: str) -> str:
     return prompt[:MAX_INPUT_BYTES] + "…[truncated]"
 
 
-def _coerce_tool_result_content(content: Any) -> str:
+def _coerce_content(content: Any) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        # MCP can return [{"type": "text", "text": "..."}, ...]
+        # LangChain can return [{"type": "text", "text": "..."}, ...]
         parts: list[str] = []
         for item in content:
             if isinstance(item, dict):
@@ -59,191 +63,203 @@ def _coerce_tool_result_content(content: Any) -> str:
 
 
 def extract_turn_events(
-    messages: list[Message],
+    messages: list[Any],
     *,
-    streaming_active: bool = False,
-    message_t_ms: list[float] | None = None,
+    streaming_active: bool = False,    # kept for API compat; ignored
+    message_t_ms: list[float] | None = None,  # kept for API compat; ignored
 ) -> tuple[list[dict[str, Any]], str]:
-    """Walk a Claude Agent SDK message stream and produce ``(events, output)``.
+    """Walk a LangChain message list, return ``(events, output)``.
 
-    Mapping (SPEC §10.3):
-      AssistantMessage with TextBlock + ToolUseBlocks → reasoning + tool_call
-      AssistantMessage with only TextBlock(s)         → appended to output
-      AssistantMessage with ThinkingBlock             → reasoning event
-      UserMessage with ToolResultBlock(s)             → tool_result events
+    Schema:
+      AIMessage with content + tool_calls  → reasoning + tool_call events
+                                              (UNLESS it's the final
+                                              AIMessage of the turn —
+                                              then content is output AND
+                                              tool_calls still emit)
+      AIMessage with only content          → appended to output
+      ToolMessage                          → tool_result event
 
-    Subagent messages (``parent_tool_use_id`` is set) are skipped — only the
-    parent's ``Agent`` tool_call and its tool_result land in the parent log.
-    The subagent's internal tool calls are visible to the SDK but not
-    flattened here. (Per-subagent log files are a Phase 5 stretch.)
+    Why the "final AIMessage is output even with tool_calls" rule:
+    when the model runs through ChatClaudeCode, the claude subprocess
+    executes tools INSIDE the subprocess and returns ONE AIMessage with
+    {final answer text, internal_tool_calls, internal_tool_results}. If
+    we treat that as pure reasoning, ``output`` ends up empty even
+    though the agent actually answered. Bench adapters poll ``output``
+    for the canonical reply; without this rule every turn looks like a
+    no-op. Pre-181-P regression: the bluesky_recall bench scored
+    near-zero because every probe's ``output`` field was blank — the
+    answer text was sitting in a reasoning event.
 
-    Tool-result ``name`` is filled by correlating ``tool_use_id`` against the
-    preceding ``tool_call`` events; the SDK's ``ToolResultBlock`` carries only
-    the id.
-
-    streaming_active (chainlink #5)
-    -------------------------------
-
-    When True, intermediate text — text-only AssistantMessages strictly
-    between the first and last ``tool_use`` — is demoted from
-    ``output`` to a ``reasoning`` event. This mirrors what the
-    streaming auto-dispatcher delivered to the user: only the "plan"
-    (text before the first tool_use) and the "result" (text after
-    the last tool_use) hit the channel; intermediate narration is
-    suppressed. Without this flag, all text-only AssistantMessages
-    would be joined into ``output``, which would no longer match
-    what the user actually saw.
-
-    Behaves identically to the default for turns with zero or one
-    tool_use AssistantMessage — there's no "intermediate" range
-    when there's at most one boundary.
-
-    message_t_ms
-    ------------
-
-    Optional parallel list, same length as ``messages``, carrying the
-    wall-clock offset (ms from ``ctx.started_at``) at which each
-    message was received. When provided, each event derived from
-    ``messages[i]`` gets ``t_ms = message_t_ms[i]``. Lets the turn
-    viewer interleave events with ``saga_calls`` (which carry their
-    own ``t_ms``) on one chronological timeline. When ``None``, events
-    are emitted without ``t_ms`` and the viewer falls back to the
-    legacy two-section layout.
+    streaming_active + message_t_ms are accepted for back-compat
+    with the SDK version's call sites; ignored in this build.
     """
+    # Find the index of the final AIMessage so we can promote its
+    # content to ``output`` even when it carries tool_calls. Other
+    # AIMessages with content + tool_calls remain reasoning.
+    last_ai_idx = -1
+    for i, msg in enumerate(messages):
+        if isinstance(msg, AIMessage):
+            last_ai_idx = i
+
     events: list[dict[str, Any]] = []
     output_parts: list[str] = []
-    tool_name_by_id: dict[str, str] = {}
-
-    def _now_t_ms(idx: int) -> float | None:
-        """Look up ``message_t_ms[idx]`` defensively. Returns None when
-        the caller didn't supply timestamps OR when ``idx`` overruns
-        the list (defensive against drift between ``messages`` and
-        ``message_t_ms`` lengths)."""
-        if message_t_ms is None or idx >= len(message_t_ms):
-            return None
-        return message_t_ms[idx]
-
-    def _stamp(ev: dict[str, Any], t_ms: float | None) -> dict[str, Any]:
-        """Attach ``t_ms`` to an event dict in-place when non-None.
-        Keeps the event JSON shape stable for legacy turns (no t_ms
-        key at all) while letting timestamped turns surface the
-        chronology to the viewer."""
-        if t_ms is not None:
-            ev["t_ms"] = round(t_ms, 2)
-        return ev
-
-    # Pre-compute the "intermediate" range when streaming was active,
-    # so each AssistantMessage knows whether its text-only payload is
-    # post-tool intermediate (→ reasoning) or pre/post boundary (→
-    # output). The set holds indices into ``messages``.
-    intermediate_indices: set[int] = set()
-    if streaming_active:
-        tool_indices: list[int] = []
-        for i, msg in enumerate(messages):
-            if not isinstance(msg, AssistantMessage):
-                continue
-            if getattr(msg, "parent_tool_use_id", None) is not None:
-                continue
-            if any(isinstance(b, ToolUseBlock) for b in msg.content):
-                tool_indices.append(i)
-        if len(tool_indices) >= 2:
-            first_tool, last_tool = tool_indices[0], tool_indices[-1]
-            for i in range(first_tool + 1, last_tool + 1):
-                intermediate_indices.add(i)
-
-    for idx, msg in enumerate(messages):
-        # Skip subagent-internal turns. Top-level messages have parent_tool_use_id=None.
-        if getattr(msg, "parent_tool_use_id", None) is not None:
-            continue
-        if isinstance(msg, AssistantMessage):
-            text_parts: list[str] = []
-            thinking_parts: list[str] = []
-            tool_uses: list[ToolUseBlock] = []
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    text_parts.append(block.text)
-                elif isinstance(block, ThinkingBlock):
-                    thinking_parts.append(block.thinking)
-                elif isinstance(block, ToolUseBlock):
-                    tool_uses.append(block)
-
-            t_ms = _now_t_ms(idx)
-
-            if thinking_parts:
-                events.append(_stamp(
-                    {"type": "reasoning", "content": "\n".join(thinking_parts)},
-                    t_ms,
-                ))
-
-            if text_parts and tool_uses:
-                # Text alongside tool calls reads as reasoning that precedes the call.
-                events.append(_stamp(
-                    {"type": "reasoning", "content": "\n".join(text_parts)},
-                    t_ms,
-                ))
-            elif text_parts:
-                if idx in intermediate_indices:
-                    # chainlink #5: streaming would have suppressed
-                    # this text from the user; record it as reasoning
-                    # so turns.jsonl mirrors what was delivered.
-                    events.append(_stamp(
-                        {"type": "reasoning", "content": "\n".join(text_parts)},
-                        t_ms,
-                    ))
-                else:
-                    output_parts.extend(text_parts)
-
-            for tu in tool_uses:
-                tool_name_by_id[tu.id] = tu.name
-                events.append(_stamp(
-                    {
-                        "type": "tool_call",
-                        "id": tu.id,
-                        "name": tu.name,
-                        "args": tu.input,
-                    },
-                    t_ms,
-                ))
-
-        elif isinstance(msg, UserMessage):
-            t_ms = _now_t_ms(idx)
-            content = msg.content
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, ToolResultBlock):
-                        body = _coerce_tool_result_content(block.content)
-                        if len(body) > MAX_TOOL_RESULT_BYTES:
-                            body = body[:MAX_TOOL_RESULT_BYTES] + "…[truncated]"
-                        events.append(_stamp(
-                            {
-                                "type": "tool_result",
-                                "id": block.tool_use_id,
-                                "name": tool_name_by_id.get(block.tool_use_id, ""),
-                                "content": body,
-                                "is_error": bool(block.is_error),
-                            },
-                            t_ms,
-                        ))
-
+    for i, msg in enumerate(messages):
+        if isinstance(msg, AIMessage):
+            content_text = _coerce_content(msg.content)
+            # ChatClaudeCode executes tools inside the ``claude`` CLI
+            # subprocess and stashes the parsed ToolUseBlocks under
+            # ``response_metadata["internal_tool_calls"]`` (NOT on
+            # ``msg.tool_calls``, to keep LangGraph from re-executing
+            # them). Tool results land in ``response_metadata["tool_results"]``.
+            # Fold both shapes into one stream so the turn log captures
+            # tool activity regardless of provider.
+            rmd = getattr(msg, "response_metadata", None) or {}
+            internal_tcs = rmd.get("internal_tool_calls") or []
+            internal_trs = rmd.get("tool_results") or []
+            tcs = list(msg.tool_calls or []) + list(internal_tcs)
+            is_final_ai = i == last_ai_idx
+            if content_text and tcs and not is_final_ai:
+                # Intermediate "thinking out loud" between tool calls.
+                events.append({"type": "reasoning", "content": content_text})
+            elif content_text:
+                # Either a text-only AIMessage OR the final AIMessage
+                # (whose content is the agent's answer even if it also
+                # carries internal_tool_calls).
+                output_parts.append(content_text)
+                if tcs:
+                    # Still record the reasoning trace alongside output
+                    # so turn_viewer can render the model's pre-tool
+                    # commentary on the final AIMessage. The output
+                    # field carries the user-visible reply; this gives
+                    # operators the full picture in the turn log.
+                    events.append({"type": "reasoning", "content": content_text})
+            for tc in tcs:
+                events.append({
+                    "type": "tool_call",
+                    "id": tc.get("id", ""),
+                    "name": tc.get("name", "unknown"),
+                    "args": tc.get("args") or tc.get("input"),
+                })
+            for tr in internal_trs:
+                body = _coerce_content(tr.get("content") or tr.get("result"))
+                if len(body) > MAX_TOOL_RESULT_BYTES:
+                    body = body[:MAX_TOOL_RESULT_BYTES] + "…[truncated]"
+                events.append({
+                    "type": "tool_result",
+                    "id": tr.get("tool_use_id", "") or "",
+                    "name": tr.get("name", "") or "",
+                    "content": body,
+                    "is_error": bool(tr.get("is_error")),
+                })
+        elif isinstance(msg, ToolMessage):
+            body = _coerce_content(msg.content)
+            if len(body) > MAX_TOOL_RESULT_BYTES:
+                body = body[:MAX_TOOL_RESULT_BYTES] + "…[truncated]"
+            events.append({
+                "type": "tool_result",
+                "id": getattr(msg, "tool_call_id", ""),
+                "name": getattr(msg, "name", ""),
+                "content": body,
+                "is_error": getattr(msg, "status", None) == "error",
+            })
     return events, "\n".join(output_parts)
 
 
+def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
+    """Pull SDK-equivalent ResultMessage fields from LangChain messages.
+
+    LangChain stores stop_reason in response_metadata, usage in
+    usage_metadata. langchain-anthropic / langchain-openai populate
+    these; some providers populate them inconsistently. Returns None
+    for fields we can't resolve — matches mimir's existing nullable
+    contract for these fields.
+    """
+    final_ai: AIMessage | None = None
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            final_ai = msg
+
+    if final_ai is None:
+        return {
+            "result_subtype": None,
+            "result_is_error": None,
+            "stop_reason": None,
+            "num_turns": None,
+            "total_cost_usd": None,
+            "usage": None,
+        }
+
+    md = final_ai.response_metadata or {}
+    stop_reason = md.get("stop_reason") or md.get("finish_reason")
+
+    # Aggregate usage_metadata across all AI messages.
+    agg_in = agg_out = agg_cache_read = agg_cache_create = 0
+    has_usage = False
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.usage_metadata:
+            has_usage = True
+            u = msg.usage_metadata
+            agg_in += u.get("input_tokens", 0)
+            agg_out += u.get("output_tokens", 0)
+            details = u.get("input_token_details", {}) or {}
+            agg_cache_read += details.get("cache_read", 0)
+            agg_cache_create += details.get("cache_creation", 0)
+    usage = None
+    if has_usage:
+        usage = {
+            "input_tokens": agg_in,
+            "output_tokens": agg_out,
+            "cache_read_input_tokens": agg_cache_read,
+            "cache_creation_input_tokens": agg_cache_create,
+        }
+
+    # ChatClaudeCode is the LangChain provider that wraps the Claude
+    # Code CLI subprocess. It mirrors the CLI's final ResultMessage
+    # into ``response_metadata`` — pick up the cost, turn count,
+    # usage, and is_error signals it surfaces there. The native
+    # langchain providers (anthropic / openai) populate
+    # ``usage_metadata`` instead, handled above.
+    cc_usage = md.get("usage")
+    if usage is None and cc_usage:
+        usage = cc_usage
+    cc_num_turns = md.get("num_turns")
+    cc_total_cost = md.get("total_cost_usd")
+    cc_is_error = md.get("is_error")
+
+    num_turns = cc_num_turns if cc_num_turns is not None else (
+        sum(1 for m in messages if isinstance(m, AIMessage)) or None
+    )
+    result_subtype = "success"
+    result_is_error = bool(cc_is_error) if cc_is_error is not None else False
+    if stop_reason in ("max_turns", "max_tokens"):
+        result_subtype = "error_max_turns"
+        result_is_error = True
+
+    return {
+        "result_subtype": result_subtype,
+        "result_is_error": result_is_error,
+        "stop_reason": stop_reason,
+        "num_turns": num_turns,
+        "total_cost_usd": cc_total_cost,
+        "usage": usage,
+    }
+
+
 class TurnLogger:
-    """Append-only JSONL with bounded retention. Lock-serialized writes."""
+    """Append-only JSONL with bounded retention. Lock-serialized writes.
+
+    Identical surface to the SDK-side TurnLogger — same TurnRecord
+    schema, same _jsonl_tail helpers. The only change is the
+    underlying event extractor lives in this module instead of
+    consuming SDK message types.
+    """
 
     def __init__(self, path: Path, max_turns: int = DEFAULT_MAX_TURNS) -> None:
         self._path = path
         self._max_turns = max(1, max_turns)
         self._line_count = 0
         self._lock: asyncio.Lock | None = None
-
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Pre-2026-05-10 this read the entire file via ``read_text()``
-        # then ``splitlines()``. On a 250 MB cap, every process start
-        # paid hundreds of MB of memory + the GC churn for a single
-        # integer (the line count). ``count_lines_chunked`` reads in
-        # 64 KB chunks and counts ``\n`` bytes — O(1) memory, same
-        # answer.
         self._line_count = count_lines_chunked(path)
 
     async def write(self, record: TurnRecord) -> None:
@@ -253,68 +269,34 @@ class TurnLogger:
             await self._write(record)
 
     async def _write(self, record: TurnRecord) -> None:
-        # CR2 (agent runtime) fix: the per-turn append was previously
-        # ``open("a"); f.write(...)`` directly inside an ``async``
-        # method. PR #105 fixed init + _trim but left ``_write``
-        # blocking the event loop on every turn for the duration of
-        # the disk write. Now the small JSON-serialize stays on the
-        # loop (negligible cost) but the actual file IO goes through
-        # ``asyncio.to_thread`` — same shape as ``_trim_sync``.
         line = json.dumps(asdict(record), ensure_ascii=True, default=str)
         try:
             await asyncio.to_thread(self._append_line, line)
             self._line_count += 1
-            # Hysteresis: trim only when over cap by ≥10%. Same rationale
-            # as event_logger — avoids O(file) rewrite on every write past
-            # the cap.
-            if self._line_count > self._max_turns + max(self._max_turns // 10, 1):
+            # Hysteresis: trim only when over cap by ≥10%.
+            if self._line_count > int(self._max_turns * 1.1):
                 await self._trim()
         except OSError as exc:
-            log.warning("turns.jsonl write failed: %s", exc)
+            log.warning("Failed to write turn record: %s", exc)
 
     def _append_line(self, line: str) -> None:
-        # Sync — runs in a worker thread via ``asyncio.to_thread``.
-        # Recreate the parent dir if it was removed out-of-band
-        # (e.g. a benchmark cleanup script wiped logs/ while we ran).
-        self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
 
     async def _trim(self) -> None:
-        # Pre-2026-05-10 this read the entire file via ``read_text()``
-        # then sliced the tail and rewrote. On a hot file the read could
-        # block the asyncio loop for hundreds of ms (we're inside
-        # ``await self._write`` from ``run_turn``, so this stalls every
-        # other channel's worker too). Now we tail-stream up to
-        # ``max_turns`` records, write them out atomically, and update
-        # the line count. The tail-read is bounded by ``max_turns`` so
-        # memory is O(max_turns × avg_record_size) — independent of
-        # how big the on-disk file got.
-        try:
-            await asyncio.to_thread(self._trim_sync)
-        except OSError as exc:
-            log.warning("turns.jsonl trim failed: %s", exc)
+        await asyncio.to_thread(self._trim_sync)
 
     def _trim_sync(self) -> None:
-        kept_reversed: list[str] = []
         try:
-            for line in _tail_lines(self._path):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                kept_reversed.append(stripped)
-                if len(kept_reversed) >= self._max_turns:
-                    break
+            keep = _tail_lines(self._path, self._max_turns)
+            tmp = self._path.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+            tmp.rename(self._path)
+            self._line_count = len(keep)
         except OSError as exc:
-            log.warning("turns.jsonl trim tail-read failed: %s", exc)
-            return
-        # If file already at-or-below cap, no rewrite needed.
-        if not kept_reversed:
-            return
-        # tail yields newest-first; reverse to chronological for the
-        # rewritten file.
-        kept = list(reversed(kept_reversed))
-        tmp = self._path.with_suffix(".jsonl.tmp")
-        tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
-        tmp.rename(self._path)
-        self._line_count = len(kept)
+            log.warning("Failed to trim turn log: %s", exc)
+
+
+def make_turn_id() -> str:
+    import uuid
+    return uuid.uuid4().hex[:12]
