@@ -539,6 +539,7 @@ class Agent:
         # record. The context is reset in the finally block.
         from .models import TurnContext as _TurnContext
         from ._context import set_current_turn, reset_current_turn
+        from .loop_detector import LoopDetector
         ctx = _TurnContext(
             turn_id=turn_id,
             session_id=session_id,
@@ -546,6 +547,19 @@ class Agent:
             channel_id=event.channel_id,
             started_at=t_total_start,
             saga_session_id=saga_session_id,
+            # Per-turn send-loop circuit breaker (SPEC §7.2.4). Attached
+            # to the TurnContext so send_message can reach it via
+            # ``_context.get_current_turn()`` without a separate
+            # parameter-passing path. Soft/hard limits + similarity
+            # threshold come from Config (mimir/config.py default 5/10/0.9).
+            # Pre-181-J the detector wasn't constructed at all; the
+            # circuit breaker was disarmed and the agent could ship
+            # near-duplicate sends indefinitely.
+            loop_detector=LoopDetector(
+                soft_limit=self._config.send_loop_soft_limit,
+                hard_limit=self._config.send_loop_hard_limit,
+                similarity_threshold=self._config.send_loop_similarity,
+            ),
         )
         ctx_token = set_current_turn(ctx)
         # Populate the module-global current_channel_id as a fallback
