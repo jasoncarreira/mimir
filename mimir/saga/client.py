@@ -747,7 +747,7 @@ WHERE a.source_type = 'session_boundary'
         min_cluster_size: int = 3,
         dedup_first: bool = True,
         dedup_threshold: float | None = None,
-        dedup_max_merges: int | None = None,
+        dedup_max_clusters: int | None = None,
     ) -> dict[str, Any]:
         """Two-pass cross-session consolidation.
 
@@ -755,11 +755,23 @@ WHERE a.source_type = 'session_boundary'
         tight-threshold near-duplicate collapse — picks one canonical
         per cluster by ACT-R activation, folds the rest's access history
         and relations into it, and tombstones with reason='merged'. No
-        LLM cost. ``dedup_threshold`` defaults to the per-provider
-        ``_PROVIDER_AUTO_THRESHOLDS`` value (0.92 for voyage / onnx,
-        0.80 for openai / nim) — voyage's tighter distribution at the
-        tail means 0.92 cleanly catches templated near-dups without
-        false positives.
+        LLM cost.
+
+        ``dedup_threshold`` defaults to **0.92 floor for all providers**
+        (``max(_PROVIDER_AUTO_THRESHOLDS[provider], 0.92)``) — the
+        per-corpus calibration on mimir's saga.db showed the OpenAI
+        and Voyage pair-similarity distributions both place 0.92 at
+        the ~99.98th percentile, where mean-cosine merges are
+        template-level similar. The floor protects providers whose
+        thematic threshold sits at 0.80 (openai / nim) from over-merging
+        substantively-distinct atoms during the dedup pass. Caller
+        override always wins.
+
+        ``dedup_max_clusters`` caps the number of clusters processed,
+        NOT the number of atoms tombstoned — a cluster of 5
+        near-duplicates counts as one against the cap but tombstones
+        four. Set this to bound LLM-free runtime on cold-start runs;
+        leave None for unbounded.
 
         Pass 2 (thematic): runs the LLM-backed observation synthesizer
         over the (now-deduped) recent raw atoms. Same contract as
@@ -800,6 +812,7 @@ WHERE a.source_type = 'session_boundary'
             "clusters_formed": 0,
             "canonicals_kept": [],
             "duplicates_tombstoned": [],
+            "threshold": None,
         }
         if dedup_first:
             from .dedup import dedup_pass, DEFAULT_DEDUP_THRESHOLD
@@ -807,11 +820,14 @@ WHERE a.source_type = 'session_boundary'
             from ._config_io import get_config
             cfg = get_config()
             provider_name = cfg("embedding", "provider", "unknown")
-            # Per-provider auto: providers whose pair distribution is
-            # tighter (voyage, onnx) need a higher dedup cutoff to keep
-            # the canonical-only set free of substantively-distinct
-            # near-dups; broader-distribution providers (openai, nim)
-            # use their own auto threshold. Caller override always wins.
+            # 0.92 floor for all providers. The per-provider thematic
+            # threshold (0.80 openai / 0.80 nim / 0.92 voyage / 0.92 onnx)
+            # is too loose for the dedup pass on openai/nim — calibration
+            # against mimir's saga.db (693 atoms, voyage + openai-3-large)
+            # showed 0.92 sits at the ~99.98th percentile of pair similarity
+            # for both providers. The max() acts as a floor that overrides
+            # any provider whose thematic threshold is below 0.92. Caller
+            # override always wins.
             effective_dedup_threshold = (
                 dedup_threshold
                 if dedup_threshold is not None
@@ -831,7 +847,7 @@ WHERE a.source_type = 'session_boundary'
                     lookback_days=lookback_days,
                     min_cluster_size=2,
                     dry_run=dry_run,
-                    max_merges=dedup_max_merges,
+                    max_clusters=dedup_max_clusters,
                 )
             dedup_result = await self._write_locked(_do_dedup)
             dedup_payload = {

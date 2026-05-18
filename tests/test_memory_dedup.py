@@ -191,8 +191,11 @@ def test_dedup_pass_preserves_activation_sum(conn):
     })
     a = store(conn, "alpha", embed_fn=embed_fn).atom_id
     b = store(conn, "beta", embed_fn=embed_fn).atom_id
-    # `a` gets 2 retrievals, `b` gets 1 — so total events = 3+1+1+1=6
-    # (2 stores + 3 retrievals total).
+    # 2 stores + 2 retrievals on `a` + 1 retrieval on `b` = 5 access
+    # events total. Test the count survives the merge (sum-linearity of
+    # Petrov OL means the canonical's activation rises by the duplicate's
+    # exact contribution); the actual number doesn't matter — only that
+    # post-merge count == pre-merge count.
     for _ in range(2):
         mark_access(conn, [AccessEvent(atom_id=a, source="retrieval")])
     mark_access(conn, [AccessEvent(atom_id=b, source="retrieval")])
@@ -204,9 +207,8 @@ def test_dedup_pass_preserves_activation_sum(conn):
     cluster_fn = make_default_cluster_fn(conn, threshold=0.92)
     result = dedup_pass(conn, cluster_fn=cluster_fn, min_cluster_size=2)
 
-    # After merge: all 6 events should now belong to one of the two
-    # atoms (whichever is canonical). The duplicate's events were
-    # redirected.
+    # After merge: every access_event should now belong to the canonical
+    # — the duplicate's events were redirected, so count is preserved.
     canonical = result.canonicals_kept[0]
     post_count = conn.execute(
         "SELECT COUNT(*) FROM access_events WHERE atom_id = ?", (canonical,),

@@ -70,12 +70,14 @@ from .activation import (
 
 
 # Default similarity threshold for dedup pass. Stricter than the
-# thematic-consolidation default (0.80). Voyage's 1024d distribution is
-# tighter at the tail; 0.92 maps to the ~99.98th percentile of pairs on
-# the calibration corpus. Per-provider override comes from the same
-# _PROVIDER_AUTO_THRESHOLDS table used by consolidation, with the dedup
-# pass adding a fixed 0.12 above the thematic threshold for providers
-# below 0.85; otherwise dedup ≈ thematic.
+# thematic-consolidation default (0.80). Acts as a **floor for all
+# providers** when ``SagaStore.consolidate`` resolves the effective
+# threshold (``max(_PROVIDER_AUTO_THRESHOLDS[provider], 0.92)``).
+# Calibration: on mimir's saga.db (693 atoms), 0.92 sits at the
+# ~99.98th percentile of pair similarity for both Voyage 4-lite (1024d)
+# and OpenAI text-embedding-3-large (3072d). Provider distributions
+# differ at the head but converge at this tail. Per-corpus tuning may
+# warrant lifting or lowering this; treat as a starting point.
 DEFAULT_DEDUP_THRESHOLD = 0.92
 
 # Source-types we never dedup across. session_boundary atoms are
@@ -153,22 +155,24 @@ def _atom_score_key(
         }.get(row[0], 0)
 
     created_at = atom.get("created_at") or ""
-    # Older is better → negate the lexicographic comparison by
-    # flipping to most-negative-wins via tuple. We can't negate a
-    # string directly; instead invert using a reverse comparable
-    # surrogate (None sorts as "everything") — simplest is to compare
-    # negated unix timestamp.
+    # Older is better → use -unix so older (smaller unix) → larger
+    # -unix and wins ``max(...)``. Fallback when created_at is missing
+    # or unparseable: malformed atoms should LOSE to any well-formed
+    # one, so we emit -inf (smallest possible -unix). Every store()
+    # writes a real ISO ts so this only fires on legacy/corrupted rows;
+    # demoting them keeps a real, dateable atom as canonical.
     try:
         created_unix = datetime.fromisoformat(created_at).timestamp()
+        recency_key = -created_unix
     except (ValueError, TypeError):
-        created_unix = 0.0
+        recency_key = float("-inf")
 
     return (
         activation,
         pinned,
         tier_rank,
         ev_count,
-        -created_unix,   # older atom wins (smaller unix → larger -unix)
+        recency_key,   # older atom wins (smaller unix → larger -unix)
         # No id tiebreaker via -str; if all else ties, leave to
         # max()'s stability across calls (insertion order).
     )
@@ -450,7 +454,7 @@ def dedup_pass(
     lookback_days: int | None = None,
     min_cluster_size: int = 2,
     dry_run: bool = False,
-    max_merges: int | None = None,
+    max_clusters: int | None = None,
 ) -> DedupResult:
     """Run the dedup pass over recent raws for one agent.
 
@@ -461,6 +465,11 @@ def dedup_pass(
     ``min_cluster_size=2`` is the lowest meaningful value — a cluster
     of two is one duplicate to merge. Setting higher requires more
     evidence before collapsing.
+
+    ``max_clusters`` caps the number of CLUSTERS processed, not the
+    number of atoms tombstoned. A cluster of N near-duplicates counts
+    as one against the cap and tombstones (N-1) atoms. Use this to
+    bound runtime on cold-start passes; leave None for unbounded.
 
     Returns a DedupResult with counts + per-canonical merge lists.
     """
@@ -475,7 +484,7 @@ def dedup_pass(
     clusters = cluster_fn(raws)
     result.clusters_formed = len(clusters)
 
-    merge_count = 0
+    clusters_processed = 0
     for cluster in clusters:
         if len(cluster) < min_cluster_size:
             continue
@@ -483,13 +492,13 @@ def dedup_pass(
         duplicates = [a for a in cluster if a["id"] != canonical["id"]]
         if not duplicates:
             continue
-        if max_merges is not None and merge_count >= max_merges:
+        if max_clusters is not None and clusters_processed >= max_clusters:
             break
 
         result.canonicals_kept.append(canonical["id"])
         result.merges[canonical["id"]] = [d["id"] for d in duplicates]
         result.duplicates_tombstoned.extend(d["id"] for d in duplicates)
-        merge_count += 1
+        clusters_processed += 1
 
         if dry_run:
             continue
