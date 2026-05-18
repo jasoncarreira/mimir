@@ -84,6 +84,39 @@ def _utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+# ── Process-global buffer accessor ──────────────────────────────────
+#
+# Single ``MessageBuffer`` per process (created by ``server.py`` at
+# startup). Outbound paths that don't have a direct handle to the Agent
+# instance — the ``send_message`` tool (``mimir/tools/registry.py``),
+# the streaming dispatcher (``mimir/_streaming_dispatch.py``), and the
+# bridge-level send — look up the buffer here so they can append to
+# the conversational record without needing buffer plumbed through
+# every call path.
+#
+# Was lost in PR #181 (deepagents migration) — the SDK-era code
+# inlined ``buffer.append`` in the agent's pre/post hooks; the
+# LangGraph rewrite dropped those calls. As a result, ``chat_history.jsonl``
+# stopped being appended to on 2026-05-17; the agent's "Recent activity"
+# block in the prompt was whatever was on disk at last process start.
+
+_global_buffer: "MessageBuffer | None" = None
+
+
+def set_global_buffer(buf: "MessageBuffer") -> None:
+    """Register the process's single ``MessageBuffer``. Called once by
+    ``server.py`` after the buffer is constructed + replayed."""
+    global _global_buffer
+    _global_buffer = buf
+
+
+def get_global_buffer() -> "MessageBuffer | None":
+    """Resolve the registered ``MessageBuffer``. Returns ``None`` when
+    nothing has registered yet (test paths that don't go through
+    ``server.serve``) — callers must handle the ``None`` case."""
+    return _global_buffer
+
+
 def _is_private_channel(channel_id: str) -> bool:
     """SPEC §5.4 privacy rule — any ``dm-*`` channel is private."""
     return channel_id.startswith("dm-")

@@ -51,7 +51,7 @@ from .config import Config
 from .event_logger import log_event
 from .feedback import FeedbackLog
 from . import health
-from .history import MessageBuffer
+from .history import Message, MessageBuffer
 from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
 from ._jsonl_tail import tail_jsonl_records
@@ -508,6 +508,92 @@ class Agent:
                 return
             candidate = getattr(candidate, "_inner", None)
 
+    # ── Conversational buffer (chat_history) append helpers ────────
+    # Restored after PR #181 (deepagents migration) — the SDK-era code
+    # called ``buffer.append`` inline in the pre/post hooks; the rewrite
+    # dropped those calls. As a result ``chat_history.jsonl`` stopped
+    # being appended to (last entry 2026-05-17T21:48) and the agent's
+    # ``## Recent activity`` block was whatever the buffer's ``replay()``
+    # loaded at last process start. Restoring inbound (here) + outbound
+    # (at every ``bridge.send`` site) puts the conversation back on
+    # disk and in the deques.
+
+    # Triggers that produce a real conversational message worth
+    # logging. ``scheduled_tick`` / ``saga_session_end`` /
+    # ``shell_job_complete`` are internal wakes with no inbound text
+    # the agent would want to see in its Recent-activity window —
+    # filtered to keep the buffer focused on actual conversation.
+    _INBOUND_LOGGABLE_TRIGGERS: frozenset[str] = frozenset({"user_message", "poller"})
+
+    @staticmethod
+    def _kind_for_trigger(trigger: str) -> str:
+        """Map an ``AgentEvent.trigger`` to a ``MessageKind``."""
+        if trigger == "user_message":
+            return "user_message"
+        # Poller events (github-activity, etc.) are synthetic — they're
+        # not from a human author but they ARE conversation the agent
+        # should reflect on. The SDK era logged them as system_note.
+        return "system_note"
+
+    async def _append_inbound_to_buffer(self, event: AgentEvent) -> None:
+        """Append an inbound event to the ``MessageBuffer`` so future
+        ``assemble_recent_activity`` calls see it. Skips synthetic /
+        contentless triggers and DM-channel privacy-sensitive cases
+        the buffer itself rejects.
+        """
+        if event.trigger not in self._INBOUND_LOGGABLE_TRIGGERS:
+            return
+        if not event.content or not event.channel_id:
+            return
+        try:
+            msg = Message(
+                ts=datetime.now(tz=timezone.utc).isoformat(),
+                msg_id=event.source_id,
+                channel_id=event.channel_id,
+                author=event.author,
+                author_display=event.author_display,
+                kind=self._kind_for_trigger(event.trigger),
+                content=event.content,
+                source=event.source,
+            )
+            await self._buffer.append(msg)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "inbound buffer append failed for event trigger=%r channel=%r",
+                event.trigger, event.channel_id,
+            )
+
+    async def _append_outbound_to_buffer(
+        self,
+        channel_id: str,
+        content: str,
+        *,
+        msg_id: str | None = None,
+        source: str | None = None,
+    ) -> None:
+        """Append an outbound assistant message to the buffer. Called
+        from every ``bridge.send`` site (agent-fallback, ``send_message``
+        tool, streaming dispatcher) so the agent sees its own prior
+        replies in ``## Recent activity`` on the next turn."""
+        if not channel_id or not content:
+            return
+        try:
+            msg = Message(
+                ts=datetime.now(tz=timezone.utc).isoformat(),
+                msg_id=msg_id,
+                channel_id=channel_id,
+                author=None,
+                author_display=None,
+                kind="assistant_message",
+                content=content,
+                source=source,
+            )
+            await self._buffer.append(msg)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "outbound buffer append failed for channel=%r", channel_id,
+            )
+
     async def _build_agent_if_needed(self) -> Any:
         # Double-checked init: fast path returns the cached agent
         # without acquiring the lock; only the first-call window
@@ -688,6 +774,13 @@ class Agent:
         t_total_start: float,
     ) -> TurnRecord:
 
+        # Persist the inbound event to the chat-history buffer + JSONL
+        # BEFORE any other turn work so ``assemble_recent_activity``
+        # in ``_build_turn_prompt`` sees this turn's own trigger as
+        # context. No-op for triggers that don't represent conversation
+        # (scheduled_tick / saga_session_end / shell_job_complete).
+        await self._append_inbound_to_buffer(event)
+
         # Pre-message memory inject. Builds the "Possibly relevant
         # memories" block + collects atom_ids for the post-turn
         # feedback credit pass. Skipped for triggers in
@@ -755,6 +848,11 @@ class Agent:
         streaming = StreamingAutoDispatcher(
             channel_id=event.channel_id or "",
             bridge=bridge_for_streaming,
+            # Mid-turn plan flushes append to the chat-history buffer
+            # so the agent sees its own streamed reply in the next
+            # turn's Recent activity (just like the end-of-turn send).
+            outbound_appender=self._append_outbound_to_buffer,
+            channel_source=ctx.channel_source,
             eligible=(
                 event.channel_id is not None
                 and event.trigger == "user_message"
@@ -962,6 +1060,17 @@ class Agent:
                     try:
                         if clean:
                             sent_result = await bridge.send(event.channel_id, clean)
+                            # Append outbound to chat-history buffer so the
+                            # agent's own reply shows up in the next turn's
+                            # Recent activity. Dropped in PR #181's deepagents
+                            # migration; restoring here closes the regression
+                            # for the agent-fallback send path.
+                            await self._append_outbound_to_buffer(
+                                event.channel_id,
+                                clean,
+                                msg_id=getattr(sent_result, "message_id", None),
+                                source=ctx.channel_source,
+                            )
                     except Exception as exc:
                         log.warning("bridge.send failed: %s", exc)
                     for _directive in parsed.directives:

@@ -229,9 +229,19 @@ class StreamingAutoDispatcher:
         channel_id: str,
         bridge: "Bridge | None",
         eligible: bool = True,
+        outbound_appender: Any = None,
+        channel_source: str | None = None,
     ) -> None:
         self._channel_id = channel_id
         self._bridge = bridge
+        # ``outbound_appender(channel_id, content, *, msg_id, source)``
+        # — optional async callback to record the flushed text into
+        # ``chat_history`` so the agent sees its own streamed reply
+        # in the next turn's Recent activity. The agent passes
+        # ``Agent._append_outbound_to_buffer``; tests / bench paths
+        # leave it ``None`` and the dispatcher is a no-op on this axis.
+        self._outbound_appender = outbound_appender
+        self._channel_source = channel_source
         # Bench / no-bridge / non-user-facing channels skip streaming.
         # ``BenchBridge`` has name="bench"; tests / smoke runs that
         # invoke without a bridge also fall through cleanly here.
@@ -279,6 +289,18 @@ class StreamingAutoDispatcher:
         # suppressed from the user when in fact the bridge dropped it.
         if getattr(result, "sent", False):
             self.state.streamed_plan = True
+            # Record the flushed text in chat_history so the agent's
+            # next turn sees its own streamed reply in Recent activity.
+            if self._outbound_appender is not None:
+                try:
+                    await self._outbound_appender(
+                        self._channel_id,
+                        plan_text,
+                        msg_id=getattr(result, "message_id", None),
+                        source=self._channel_source,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("streaming outbound buffer append failed")
 
 
 def intermediate_text_segments(messages: list[BaseMessage]) -> list[str]:

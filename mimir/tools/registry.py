@@ -188,6 +188,33 @@ async def send_message(
         except Exception as exc:
             return f"send_message failed: {exc}"
 
+        # Append outbound to chat-history buffer so the agent's next
+        # turn sees its own reply in Recent activity. Dropped in PR
+        # #181's deepagents migration; restoring here closes the
+        # regression for the send_message-tool path (the most common
+        # outbound path in production). No-op when no buffer is
+        # registered (test paths that bypass ``server.serve``).
+        from ..history import Message, get_global_buffer
+        _buf = get_global_buffer()
+        if _buf is not None and result is not None:
+            from datetime import datetime, timezone
+            try:
+                msg = Message(
+                    ts=datetime.now(tz=timezone.utc).isoformat(),
+                    msg_id=getattr(result, "message_id", None),
+                    channel_id=cid,
+                    author=None,
+                    author_display=None,
+                    kind="assistant_message",
+                    content=clean_text,
+                    source=None,
+                )
+                await _buf.append(msg)
+            except Exception:  # noqa: BLE001
+                # Append is best-effort — don't fail the tool call
+                # if the buffer hiccups.
+                pass
+
     for _directive in parsed.directives:
         if isinstance(_directive, ReactDirective):
             _target = _directive.message_id or (
