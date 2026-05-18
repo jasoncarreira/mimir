@@ -238,3 +238,41 @@ async def test_commitment_extraction_hook_skips_when_store_is_none():
 
     # Should not raise.
     await hook.finalize(_Ctx(), None, _Record())
+
+
+# ── Agent.add_hook registration path ─────────────────────────────────
+
+
+def test_agent_add_hook_appends_to_chain(tmp_path):
+    """``Agent.add_hook(hook)`` appends to the existing hook chain
+    without rebuilding the constructor's list. Muninnbot will use
+    this to layer its own finalize hook on top of the default
+    ``CommitmentExtractionHook`` without re-passing the whole
+    list."""
+    from mimir.agent import Agent
+    from mimir.config import Config
+    from mimir.history import MessageBuffer
+    from mimir.index import IndexGenerator
+    from mimir.turn_logger import TurnLogger
+    import os
+    os.environ["MIMIR_HOME"] = str(tmp_path)
+    cfg = Config.from_env()
+    (cfg.home / "logs").mkdir(parents=True, exist_ok=True)
+    agent = Agent(
+        config=cfg,
+        turn_logger=TurnLogger(cfg.turns_log),
+        message_buffer=MessageBuffer(history_path=cfg.home / "messages.jsonl"),
+        index_generator=IndexGenerator(cfg.home),
+        # Explicit empty list so we start fresh.
+        turn_hooks=[],
+    )
+    assert agent._hooks == []
+
+    class _Custom(TurnHook):
+        pass
+
+    h1 = _Custom()
+    h2 = _Custom()
+    agent.add_hook(h1)
+    agent.add_hook(h2)
+    assert agent._hooks == [h1, h2]

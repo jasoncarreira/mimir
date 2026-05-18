@@ -125,6 +125,10 @@ async def fire_hooks(
         method = getattr(hook, stage, None)
         if method is None:
             # Hook doesn't implement this stage — skip silently.
+            # (Defensive: subclasses inherit no-op stubs from
+            # ``TurnHook``, so a strictly-conforming hook never hits
+            # this branch. Guards against duck-typed hook objects
+            # that don't subclass ``TurnHook`` at all.)
             continue
         try:
             await method(*args, **kwargs)

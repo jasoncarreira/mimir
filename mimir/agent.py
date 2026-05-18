@@ -104,6 +104,7 @@ from .sagatools import (
 )
 from .search import Indexer
 from .session_manager import SessionManager
+from .turn_hooks import TurnHook, fire_hooks
 from .turn_logger import (
     TurnLogger,
     derive_result_fields,
@@ -402,9 +403,10 @@ class Agent:
         # commitments-extraction hook so single-agent deployments
         # get the same finalize behavior they had pre-refactor.
         # Pass ``turn_hooks=[]`` to opt out entirely (test paths).
+        # Use ``Agent.add_hook(...)`` to append after construction.
         if turn_hooks is None:
             from .turn_hooks import CommitmentExtractionHook
-            self._hooks: list[Any] = [
+            self._hooks: list[TurnHook] = [
                 CommitmentExtractionHook(commitments_store),
             ]
         else:
@@ -554,6 +556,16 @@ class Agent:
     _INBOUND_SKIP_TRIGGERS: frozenset[str] = frozenset(
         {"saga_session_end", "shell_job_complete"}
     )
+
+    def add_hook(self, hook: TurnHook) -> None:
+        """Register an additional ``TurnHook`` to fire during the
+        turn lifecycle. Hooks run in registration order; pass-through
+        post-construction registration path for callers that want to
+        layer extra behavior on top of the default chain (e.g.
+        Muninnbot adding its own ``finalize``-stage knowledge-graph
+        sync without rebuilding the constructor's hook list).
+        """
+        self._hooks.append(hook)
 
     @staticmethod
     def _kind_for_trigger(trigger: str) -> str:
@@ -1041,9 +1053,9 @@ class Agent:
         # restoring the SDK-era ``CommitmentExtractionHook.finalize``
         # behavior. Additional hooks (muninnbot-specific finalize logic,
         # wiki backlinks, etc.) can be registered via the
-        # ``Agent(turn_hooks=...)`` constructor parameter. Per-hook
-        # exception isolation — see ``mimir.turn_hooks.fire_hooks``.
-        from .turn_hooks import fire_hooks
+        # ``Agent(turn_hooks=...)`` constructor parameter or
+        # ``Agent.add_hook(...)``. Per-hook exception isolation —
+        # see ``mimir.turn_hooks.fire_hooks``.
         await fire_hooks("finalize", self._hooks, ctx, event, record)
 
         # Post-turn observability hooks (181-M). Order matters:
