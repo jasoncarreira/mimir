@@ -465,7 +465,16 @@ async def commitment_dismiss(commitment_id: str, reason: Optional[str] = None) -
     return f"commitment_dismiss ok: id={commitment_id}"
 
 
-_ACTIVE_STATUSES = {"pending", "delivered", "snoozed"}
+from ..commitments.models import CommitmentStatus as _CommitmentStatus
+
+# Non-terminal statuses worth surfacing to ``commitment_list``. Sourced
+# from the ``CommitmentStatus`` enum so a future rename can't silently
+# drift this set out of sync with the real state machine.
+_ACTIVE_STATUSES = frozenset({
+    _CommitmentStatus.PENDING.value,
+    _CommitmentStatus.DELIVERED.value,
+    _CommitmentStatus.SNOOZED.value,
+})
 
 
 @tool
