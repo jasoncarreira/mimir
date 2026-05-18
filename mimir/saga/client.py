@@ -336,6 +336,16 @@ WHERE a.source_type = 'session_boundary'
         target = self.CURRENT_SCHEMA_VERSION
         if not applied:
             # Fresh DB or pre-migration era — stamp the current version.
+            #
+            # KNOWN LIMITATION (deferred): a DB that was created by old
+            # code with old-shape tables AND somehow lacks schema_version
+            # rows (operator manually cleared, mid-rename data import,
+            # etc.) would land here and silently skip migrations. Per
+            # operator deployment posture (no historic DBs in play),
+            # this is accepted. A complete fix would require introspecting
+            # ``PRAGMA table_info`` to infer the actual schema state and
+            # walk from the inferred version, which is more work than the
+            # one-deploy situation warrants.
             conn.execute(
                 "INSERT OR IGNORE INTO schema_version (version, applied_at) "
                 "VALUES (?, ?)",
@@ -1031,7 +1041,17 @@ WHERE a.source_type = 'session_boundary'
         confidence_floor: float | None = None,
         grace_days: int | None = None,
     ) -> dict[str, Any]:
-        # Map saga's criteria-based forget to forget_by_criteria.
+        # Map saga's criteria-based forget to forget_by_criteria. Also
+        # synchronizes the in-memory FAISS index — ``forget_by_criteria``
+        # tombstones the SQLite rows but doesn't know about the index,
+        # so without explicit removal here the index accumulates
+        # orphaned positions: retrieval still works (the SQL-side
+        # ``WHERE tombstoned = 0`` filter in ``recall.py`` masks them
+        # out), but index fragmentation grows until
+        # ``VectorIndex.rebuild_if_needed`` (>10% removed) kicks in.
+        # That's a long time on low-churn deployments — meanwhile
+        # over-fetches climb and FAISS top_k starts missing the real
+        # top results past the removal noise.
         from .forget import forget_by_criteria
         def _do():
             conn = self._ensure_conn()
@@ -1041,6 +1061,25 @@ WHERE a.source_type = 'session_boundary'
                 activation_below=confidence_floor,
                 dry_run=dry_run,
             )
+            # Remove tombstoned atoms from the FAISS index (not a dry-run,
+            # and the index has been built — otherwise there's nothing
+            # to remove). Failures are logged but non-fatal: the SQL
+            # filter still masks tombstones at retrieval time, so a
+            # missed index-side removal degrades gracefully.
+            if (
+                not result.dry_run
+                and result.tombstoned_ids
+                and self._index is not None
+                and self._index.built
+            ):
+                for atom_id in result.tombstoned_ids:
+                    try:
+                        self._index.remove(atom_id)
+                    except Exception:  # noqa: BLE001
+                        log.warning(
+                            "FAISS index remove failed for atom_id=%r",
+                            atom_id, exc_info=True,
+                        )
             return {
                 "tombstoned_count": result.tombstoned_count,
                 "preview_ids": result.tombstoned_ids if dry_run else [],
