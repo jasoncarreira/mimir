@@ -32,6 +32,8 @@ from typing import Any, Optional
 
 from langchain_core.runnables import RunnableConfig
 
+from ..bridges._directives import parse_directives, ReactDirective
+
 
 def _channel_from_config_or_state(
     channel_id: str | None, config: RunnableConfig | None
@@ -173,10 +175,30 @@ async def send_message(
     bridge = channels.find(cid)
     if bridge is None:
         return f"send_message failed: no bridge for channel {cid!r}"
-    try:
-        result = await bridge.send(cid, text)
-    except Exception as exc:
-        return f"send_message failed: {exc}"
+
+    # Strip <actions>...</actions> directive blocks from the outbound
+    # text and dispatch parsed directives (react, send-file) after send.
+    parsed = parse_directives(text)
+    clean_text = parsed.clean_text
+
+    result = None
+    if clean_text:
+        try:
+            result = await bridge.send(cid, clean_text)
+        except Exception as exc:
+            return f"send_message failed: {exc}"
+
+    for _directive in parsed.directives:
+        if isinstance(_directive, ReactDirective):
+            _target = _directive.message_id or (
+                result.message_id if result else None
+            )
+            try:
+                await bridge.react(cid, _target, _directive.emoji)
+            except Exception:
+                pass  # non-fatal; directive failures don't abort the send
+        # SendFileDirective: not yet implemented via this path
+
     return f"send_message ok: channel={cid} message_id={result}"
 
 
