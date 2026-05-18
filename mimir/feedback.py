@@ -38,9 +38,7 @@ class FeedbackSignal:
 
 
 # Event-type → (polarity, short-tag) mapping. Anything not listed is
-# ignored. ``react_received`` is plumbed but not currently emitted by
-# the bridges (FUTURE: wire reaction handlers in slack/discord — see
-# V0.4.md §2 open question).
+# ignored.
 _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "error": ("negative", "error"),
     "tool_call_denied": ("negative", "tool_denied"),
