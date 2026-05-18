@@ -79,6 +79,62 @@ async def file_search(
 
 
 # ────────────────────────────────────────────────────────────────────
+# rebuild_index — mid-turn manual INDEX.md trigger
+# ────────────────────────────────────────────────────────────────────
+
+_INDEX_GEN_STATE: dict[str, Any] = {"generator": None}
+
+_VALID_SCOPES = frozenset({"memory", "state", "wiki", "all"})
+
+
+def set_index_generator(generator: Any) -> None:
+    """Inject the IndexGenerator the rebuild_index tool will call.
+
+    The IndexGenerator (``mimir.index.IndexGenerator``) manages the
+    human-readable ``memory/INDEX.md``, ``state/INDEX.md``, and
+    ``state/wiki/index.md`` files. It is distinct from the search
+    Indexer (``mimir.search.Indexer``) injected via ``set_indexer``.
+
+    Called once at server startup by ``server.py:build_app``, the same
+    way ``set_indexer`` is called for the search Indexer.
+    """
+    _INDEX_GEN_STATE["generator"] = generator
+
+
+@tool
+async def rebuild_index(scope: str = "all") -> str:
+    """Force-rebuild memory/INDEX.md and/or state/INDEX.md mid-turn.
+
+    The post-turn hook rebuilds all indexes automatically after each
+    turn completes. Use this when a multi-step workflow writes a file
+    in one step and needs the updated INDEX immediately in a later step
+    of the *same* turn — e.g. writing a new wiki concept page and then
+    cross-linking it within the same turn.
+
+    Args:
+        scope: Which index(es) to rebuild. One of ``"memory"``,
+            ``"state"``, ``"wiki"``, or ``"all"`` (default). ``"all"``
+            rebuilds all three.
+
+    Returns:
+        Confirmation string (``rebuild_index ok: scope=<scope>``), or
+        an error string on misconfiguration.
+    """
+    generator = _INDEX_GEN_STATE["generator"]
+    if generator is None:
+        return "rebuild_index failed: no IndexGenerator configured"
+    scope_clean = (scope or "all").strip().lower()
+    if scope_clean not in _VALID_SCOPES:
+        return (
+            f"rebuild_index failed: scope must be one of "
+            f"memory/state/wiki/all (got {scope_clean!r})"
+        )
+    generator.mark_dirty(scope_clean)
+    await generator.flush()
+    return f"rebuild_index ok: scope={scope_clean}"
+
+
+# ────────────────────────────────────────────────────────────────────
 # Pattern 2: mimir_get_turn — JSONL read, structured return
 # ────────────────────────────────────────────────────────────────────
 
