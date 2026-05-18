@@ -37,6 +37,7 @@ from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
 from mimir.models import AgentEvent, TurnContext, TurnRecord
+from mimir.turn_hooks import CommitmentExtractionHook
 from mimir.turn_logger import TurnLogger
 
 
@@ -54,6 +55,17 @@ def _make_agent(tmp_path: Path) -> Agent:
         index_generator=IndexGenerator(cfg.home),
         commitments_store=store,
     )
+
+
+async def _fire_extraction(agent: Agent, ctx: TurnContext, event: AgentEvent,
+                            record: TurnRecord) -> None:
+    """Drive the migrated CommitmentExtractionHook. Pre-#213 these tests
+    called ``agent._maybe_extract_commitments(ctx, event, record)`` —
+    the inlined method is now the hook's ``finalize`` method. This
+    helper preserves the test surface so each test still exercises
+    the same finalize behavior, just through the hook abstraction."""
+    hook = CommitmentExtractionHook(agent._commitments)
+    await hook.finalize(ctx, event, record)
 
 
 def _make_ctx(event: AgentEvent, saga_session_id: str | None = None) -> TurnContext:
@@ -119,7 +131,7 @@ async def test_non_synthesis_trigger_skips_extraction(
     event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
     ctx = _make_ctx(event)
     record = _make_record("x" * 5000, trigger="user_message")
-    await agent._maybe_extract_commitments(ctx, event, record)
+    await _fire_extraction(agent, ctx, event, record)
     assert called == []
 
 
@@ -136,7 +148,7 @@ async def test_empty_output_skips_extraction(
     event = AgentEvent(trigger="saga_session_end", channel_id="ch-1")
     ctx = _make_ctx(event, saga_session_id="sess-1")
     record = _make_record("", trigger="saga_session_end")
-    await agent._maybe_extract_commitments(ctx, event, record)
+    await _fire_extraction(agent, ctx, event, record)
     assert called == []
 
 
@@ -157,7 +169,7 @@ async def test_short_output_emits_no_op_short_output(
     async def _capture(kind: str, **kw: Any) -> None:
         events.append((kind, kw))
 
-    monkeypatch.setattr("mimir.agent.log_event", _capture)
+    monkeypatch.setattr("mimir.turn_hooks.log_event", _capture)
     # The extractor must NOT be invoked on the short-output path.
     monkeypatch.setattr(
         "mimir.commitments.extractor.extract_commitments",
@@ -169,7 +181,7 @@ async def test_short_output_emits_no_op_short_output(
     event = AgentEvent(trigger="saga_session_end", channel_id="ch-1")
     ctx = _make_ctx(event, saga_session_id="sess-1")
     record = _make_record("x" * (MIN_OUTPUT_LEN - 1))
-    await agent._maybe_extract_commitments(ctx, event, record)
+    await _fire_extraction(agent, ctx, event, record)
 
     kinds = [k for k, _ in events]
     assert "commitments_extraction_no_op" in kinds
@@ -192,7 +204,7 @@ async def test_llm_returns_zero_emits_no_op_llm_returned_zero(
     async def _empty_extract(*args: Any, **kwargs: Any) -> list:
         return []
 
-    monkeypatch.setattr("mimir.agent.log_event", _capture)
+    monkeypatch.setattr("mimir.turn_hooks.log_event", _capture)
     monkeypatch.setattr(
         "mimir.commitments.extractor.extract_commitments", _empty_extract,
     )
@@ -200,7 +212,7 @@ async def test_llm_returns_zero_emits_no_op_llm_returned_zero(
     event = AgentEvent(trigger="saga_session_end", channel_id="ch-1")
     ctx = _make_ctx(event, saga_session_id="sess-1")
     record = _make_record("y" * (MIN_OUTPUT_LEN + 100))
-    await agent._maybe_extract_commitments(ctx, event, record)
+    await _fire_extraction(agent, ctx, event, record)
 
     kinds_with_reasons = [
         (k, kw.get("reason")) for k, kw in events
@@ -225,7 +237,7 @@ async def test_added_emits_commitments_extracted(
     async def _extract_one(*args: Any, **kwargs: Any) -> list:
         return [record_to_add]
 
-    monkeypatch.setattr("mimir.agent.log_event", _capture)
+    monkeypatch.setattr("mimir.turn_hooks.log_event", _capture)
     monkeypatch.setattr(
         "mimir.commitments.extractor.extract_commitments", _extract_one,
     )
@@ -233,7 +245,7 @@ async def test_added_emits_commitments_extracted(
     event = AgentEvent(trigger="saga_session_end", channel_id="ch-1")
     ctx = _make_ctx(event, saga_session_id="sess-1")
     record = _make_record("z" * (MIN_OUTPUT_LEN + 100))
-    await agent._maybe_extract_commitments(ctx, event, record)
+    await _fire_extraction(agent, ctx, event, record)
 
     kinds = [k for k, _ in events]
     assert "commitments_extracted" in kinds
@@ -276,7 +288,7 @@ async def test_all_dedupe_skipped_emits_no_op_all_dedupe(
     async def _extract_dup(*args: Any, **kwargs: Any) -> list:
         return [re_emerged]
 
-    monkeypatch.setattr("mimir.agent.log_event", _capture)
+    monkeypatch.setattr("mimir.turn_hooks.log_event", _capture)
     monkeypatch.setattr(
         "mimir.commitments.extractor.extract_commitments", _extract_dup,
     )
@@ -284,7 +296,7 @@ async def test_all_dedupe_skipped_emits_no_op_all_dedupe(
     event = AgentEvent(trigger="saga_session_end", channel_id="ch-1")
     ctx = _make_ctx(event, saga_session_id="sess-1")
     record = _make_record("w" * (MIN_OUTPUT_LEN + 100))
-    await agent._maybe_extract_commitments(ctx, event, record)
+    await _fire_extraction(agent, ctx, event, record)
 
     no_op = [kw for k, kw in events if k == "commitments_extraction_no_op"]
     assert any(kw.get("reason") == "all_dedupe_skipped" for kw in no_op)
@@ -313,7 +325,7 @@ async def test_extractor_raises_does_not_crash_turn(
     ctx = _make_ctx(event, saga_session_id="sess-1")
     record = _make_record("v" * (MIN_OUTPUT_LEN + 100))
     # Must not raise.
-    await agent._maybe_extract_commitments(ctx, event, record)
+    await _fire_extraction(agent, ctx, event, record)
 
 
 @pytest.mark.asyncio
@@ -334,7 +346,7 @@ async def test_no_commitments_store_skips_silently(
     event = AgentEvent(trigger="saga_session_end", channel_id="ch-1")
     ctx = _make_ctx(event, saga_session_id="sess-1")
     record = _make_record("a" * 5000)
-    await agent._maybe_extract_commitments(ctx, event, record)
+    await _fire_extraction(agent, ctx, event, record)
     assert called == []
 
 
@@ -396,14 +408,14 @@ async def test_commitment_extraction_forces_unbound_on_synthetic_channel(
     async def _capture(event_type: str, **kw: Any) -> None:
         events.append((event_type, kw))
 
-    monkeypatch.setattr("mimir.agent.log_event", _capture)
+    monkeypatch.setattr("mimir.turn_hooks.log_event", _capture)
 
     # Fire on a heartbeat channel — the common source of this bug.
     event = AgentEvent(trigger="saga_session_end", channel_id="scheduler:heartbeat")
     ctx = _make_ctx(event, saga_session_id="sess-synth-1")
     record = _make_record("x" * 5000)
 
-    await agent._maybe_extract_commitments(ctx, event, record)
+    await _fire_extraction(agent, ctx, event, record)
 
     # (1) The extractor received channel_id=None, not the synthetic channel.
     assert captured == [None], (

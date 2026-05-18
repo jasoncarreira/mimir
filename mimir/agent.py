@@ -374,6 +374,7 @@ class Agent:
         channel_registry: ChannelRegistry | None = None,
         dispatcher: Any = None,
         commitments_store: Any = None,
+        turn_hooks: list[Any] | None = None,
     ) -> None:
         self._config = config
         self._turn_logger = turn_logger
@@ -392,6 +393,22 @@ class Agent:
         # also returned "no commitments store" because the registry
         # setter was never invoked. Both paths now wired by build_app.
         self._commitments = commitments_store
+        # Turn lifecycle hooks (re-introduced in PR #213 after the
+        # SDK-era chain was dropped in #181). Fired by
+        # ``mimir.turn_hooks.fire_hooks(stage, self._hooks, ...)``
+        # with per-hook exception isolation; failures emit a
+        # ``turn_hook_failed`` event. When the caller passes
+        # ``turn_hooks=None``, the agent installs the default
+        # commitments-extraction hook so single-agent deployments
+        # get the same finalize behavior they had pre-refactor.
+        # Pass ``turn_hooks=[]`` to opt out entirely (test paths).
+        if turn_hooks is None:
+            from .turn_hooks import CommitmentExtractionHook
+            self._hooks: list[Any] = [
+                CommitmentExtractionHook(commitments_store),
+            ]
+        else:
+            self._hooks = list(turn_hooks)
 
         # CR#10: per-Agent JsonlSnapshot caches for events.jsonl +
         # turns.jsonl. Six per-turn call sites (feedback, usage, self-
@@ -1018,15 +1035,16 @@ class Agent:
         )
         await self._turn_logger.write(record)
 
-        # Phase 2a commitment extraction — on saga_session_end synthesis
-        # turns, extract structured commitments from the synthesis output
-        # via a haiku-tier ``query()`` call and persist net-new ones to
-        # ``CommitmentsStore``. Pre-181-I this lived in
-        # ``CommitmentExtractionHook`` on the SDK turn-lifecycle chain;
-        # the deepagents agent has no equivalent hook chain so the call
-        # is inlined here. Best-effort: failures log + continue, the
-        # turn record is unaffected.
-        await self._maybe_extract_commitments(ctx, event, record)
+        # Fire the finalize stage of the turn hook chain. The default
+        # ``CommitmentExtractionHook`` runs Phase 2a commitment
+        # extraction (saga_session_end → structured commitment records),
+        # restoring the SDK-era ``CommitmentExtractionHook.finalize``
+        # behavior. Additional hooks (muninnbot-specific finalize logic,
+        # wiki backlinks, etc.) can be registered via the
+        # ``Agent(turn_hooks=...)`` constructor parameter. Per-hook
+        # exception isolation — see ``mimir.turn_hooks.fire_hooks``.
+        from .turn_hooks import fire_hooks
+        await fire_hooks("finalize", self._hooks, ctx, event, record)
 
         # Post-turn observability hooks (181-M). Order matters:
         #   1. wiki_backlinks: regenerates state/wiki/{orphans,
@@ -1167,157 +1185,16 @@ class Agent:
 
         return record
 
-    async def _maybe_extract_commitments(
-        self, ctx: Any, event: AgentEvent, record: TurnRecord,
-    ) -> None:
-        """Phase 2a: extract commitments from a saga_session_end synthesis
-        output and persist net-new records to the CommitmentsStore.
-
-        Direct port of ``CommitmentExtractionHook.finalize`` from main —
-        the SDK-era hook chain is gone, so the deepagents agent runs
-        this inline after writing the TurnRecord. Best-effort throughout:
-        every failure path logs + returns; the synthesis turn's own
-        record is unaffected.
-
-        Events emitted:
-          - ``commitments_extracted`` on ≥1 added record (carries count,
-            skipped_dedupe, prompt_version)
-          - ``commitments_extraction_no_op`` with reason in
-            {short_output, llm_returned_zero, all_dedupe_skipped} when
-            the path ran but added nothing — distinguishable in
-            backtests from "skipped extraction entirely."
-
-        Suppressed when:
-          - ``ctx.trigger != "saga_session_end"`` (this hook is
-            synthesis-only — the per-message extraction path is a
-            different design).
-          - ``self._commitments is None`` (test harnesses construct
-            the Agent without a store).
-          - ``record.output`` is empty (LLM returned nothing or the
-            ainvoke errored).
-        """
-        if ctx.trigger != "saga_session_end":
-            return
-        if self._commitments is None:
-            return
-        output = getattr(record, "output", "") or ""
-        if not output:
-            return
-
-        from .commitments.extractor import (
-            EXTRACTION_PROMPT_VERSION,
-            MIN_OUTPUT_LEN,
-            extract_commitments,
-        )
-
-        # Synthetic channels (``scheduler:*`` / ``poller:*``) are never
-        # delivery targets for the commitment poller or prompt-block
-        # surfacing. If a saga_session_end fires on a synthetic channel
-        # (e.g. a heartbeat tick that called saga_end_session) and the
-        # LLM marks any item ``channel_bound=True``, the resulting record
-        # would be bound to ``scheduler:heartbeat`` / ``poller:X`` —
-        # permanently unreachable because _assemble_commitments_block
-        # suppresses rendering on synthetic channels entirely.
-        # Fix: nullify the channel before passing to the extractor.
-        # All commitments from synthetic-channel sessions become unbound
-        # (channel_id=None) and surface cross-channel as intended.
-        # Log events below keep ctx.channel_id for observability (origin
-        # channel), not for binding — no change there.
-        from .history import SYNTHETIC_CHANNEL_PREFIXES
-        effective_channel_id = ctx.channel_id
-        if (
-            effective_channel_id
-            and effective_channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES)
-        ):
-            effective_channel_id = None
-
-        if len(output) < MIN_OUTPUT_LEN:
-            await log_event(
-                "commitments_extraction_no_op",
-                reason="short_output",
-                output_len=len(output),
-                channel_id=ctx.channel_id,
-                saga_session_id=getattr(ctx, "saga_session_id", None),
-                source_turn_id=ctx.turn_id,
-                prompt_version=EXTRACTION_PROMPT_VERSION,
-            )
-            return
-
-        try:
-            extracted = await extract_commitments(
-                output,
-                channel_id=effective_channel_id,
-                saga_session_id=getattr(ctx, "saga_session_id", None),
-                source_turn_id=ctx.turn_id,
-            )
-        except Exception:  # noqa: BLE001 — best-effort, never crash a turn
-            log.exception(
-                "commitment extraction failed for turn %s; skipping",
-                ctx.turn_id,
-            )
-            return
-
-        if not extracted:
-            await log_event(
-                "commitments_extraction_no_op",
-                reason="llm_returned_zero",
-                channel_id=ctx.channel_id,
-                saga_session_id=getattr(ctx, "saga_session_id", None),
-                source_turn_id=ctx.turn_id,
-                prompt_version=EXTRACTION_PROMPT_VERSION,
-            )
-            return
-
-        # Snapshot dedupe keys once — N×|JSONL| in the prior shape,
-        # N + |JSONL| this way. ``current_state`` returns active records
-        # only, matching the find_by_dedupe_key semantics.
-        state = self._commitments.current_state()
-        existing_keys = {
-            r.dedupe_key
-            for r in state.values()
-            if r.dedupe_key and not r.is_terminal()
-        }
-
-        added = 0
-        skipped_dedupe = 0
-        for rec in extracted:
-            if rec.dedupe_key in existing_keys:
-                skipped_dedupe += 1
-                continue
-            try:
-                await self._commitments.add(rec)
-                added += 1
-                existing_keys.add(rec.dedupe_key)
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "commitments store.add failed for record %s", rec.id,
-                )
-
-        if added > 0:
-            await log_event(
-                "commitments_extracted",
-                count=added,
-                skipped_dedupe=skipped_dedupe,
-                channel_id=ctx.channel_id,
-                saga_session_id=getattr(ctx, "saga_session_id", None),
-                source_turn_id=ctx.turn_id,
-                prompt_version=EXTRACTION_PROMPT_VERSION,
-            )
-        else:
-            await log_event(
-                "commitments_extraction_no_op",
-                reason="all_dedupe_skipped",
-                extracted_count=len(extracted),
-                skipped_dedupe=skipped_dedupe,
-                channel_id=ctx.channel_id,
-                saga_session_id=getattr(ctx, "saga_session_id", None),
-                source_turn_id=ctx.turn_id,
-                prompt_version=EXTRACTION_PROMPT_VERSION,
-            )
-
     # ────────────────────────────────────────────────────────────
     # Post-turn hooks (181-M)
     # ────────────────────────────────────────────────────────────
+    #
+    # ``_maybe_extract_commitments`` lived here pre-#213; it was
+    # migrated to ``mimir.turn_hooks.CommitmentExtractionHook`` and
+    # is now fired via the ``finalize`` stage of the turn hook chain
+    # (see the ``await fire_hooks("finalize", ...)`` call above).
+    # Other inlined finalize logic (wiki backlinks, etc.) can migrate
+    # to hooks following the same pattern in follow-up PRs.
 
     # Generated wiki outputs — the WikiBacklinksHook regenerates these
     # itself, so changes to them must NOT trigger another regeneration
