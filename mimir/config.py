@@ -207,6 +207,13 @@ def _parse_sources(raw: str) -> frozenset[str] | None:
 @dataclass
 class Config:
     home: Path
+    # Logical agent name — tags every TurnRecord + event record so a
+    # cross-process operator running two agents (e.g. "mimir" +
+    # "muninnbot") on the same infrastructure can disambiguate output
+    # by agent without grepping by MIMIR_HOME path. Default "mimir";
+    # second-agent deployments override via MIMIR_AGENT_ID. Has no
+    # effect on a single-agent deployment.
+    agent_id: str
     model: str
     # Post-cutover model spec for the deepagents path:
     #   - ``claude-code:<model>``  → ChatClaudeCode (Max OAuth subprocess)
@@ -517,6 +524,7 @@ class Config:
 
         return cls(
             home=home,
+            agent_id=_env("MIMIR_AGENT_ID", "mimir"),
             model=_env("MIMIR_MODEL", "claude-opus-4-7"),
             model_spec=_env("MIMIR_MODEL_SPEC", "claude-code:claude-sonnet-4-6"),
             model_max_retries=_env_int("MIMIR_MODEL_MAX_RETRIES", 6),
