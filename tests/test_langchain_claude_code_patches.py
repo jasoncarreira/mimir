@@ -1,10 +1,17 @@
 """Tests for the runtime patches in
 ``mimir/_langchain_claude_code_patches.py``.
 
-Covers the two monkey-patches:
-  - ``apply_patches`` (the ``_arun`` config-kwarg fix; primary
-    coverage is implicit via the rest of the suite — every tool
-    invocation relies on it).
+Covers the monkey-patches:
+  - ``apply_patches``:
+    - ``_get_tool_schema`` fix: uses ``tool_call_schema`` (excludes
+      ``InjectedToolArg`` params like ``config``) instead of
+      ``args_schema`` (includes them). Prevents the MCP schema from
+      exposing ``config`` to Claude Code, which caused the "got multiple
+      values for keyword argument 'config'" collision on
+      ``send_message``, ``react``, and ``fetch_channel_history``.
+    - ``_wrap_langchain_tool`` fix: passes ``config=RunnableConfig()``
+      to ``_arun`` (langchain-core 1.x required-kwarg). Also strips
+      ``config`` from caller ``args`` defensively.
   - ``enrich_streaming_metadata`` (preserves ``stop_reason`` /
     ``num_turns`` / ``is_error`` on the result chunk that upstream
     ``_astream`` drops).
@@ -26,6 +33,7 @@ from mimir._langchain_claude_code_patches import (
     _post_tool_use_hook,
     _pre_tool_use_hook,
     _tool_events_var,
+    apply_patches,
     enrich_streaming_metadata,
     install_tool_event_hooks,
 )
@@ -747,3 +755,206 @@ async def test_enrich_and_hooks_both_land_on_final_chunk():
         assert gi["total_cost_usd"] == 0.0
     finally:
         ccm.ClaudeCodeChatModel = _orig
+
+
+# ── apply_patches: _get_tool_schema fix ────────────────────────────
+#
+# The root cause of the algedonic-tool config-collision:
+#   _get_tool_schema used args_schema.model_json_schema() which INCLUDES
+#   InjectedToolArg params like `config`. Claude Code saw `config` in the
+#   MCP schema, passed it in args, and _wrap_langchain_tool then also
+#   passed config=RunnableConfig() → "got multiple values for 'config'".
+#
+# The fix: _get_tool_schema now uses tool_call_schema.model_json_schema()
+# which correctly excludes InjectedToolArg params. The three affected tools
+# are send_message, react, and fetch_channel_history.
+
+
+def _make_apply_patches_fake_class() -> tuple[type, type]:
+    """Build a minimal ChatClaudeCode stand-in for apply_patches tests.
+
+    Provides the two methods apply_patches monkey-patches:
+    _get_tool_schema and _wrap_langchain_tool.
+    """
+    import langchain_claude_code.claude_chat_model as ccm
+
+    class _FakeChatClaudeCode:
+        _tool_results_var = None
+
+        def _get_tool_schema(self, tool: Any) -> dict[str, Any]:
+            # Simulate the upstream bug: use args_schema, which includes
+            # InjectedToolArg params.
+            if hasattr(tool, "args_schema") and tool.args_schema:
+                try:
+                    return tool.args_schema.model_json_schema()
+                except Exception:
+                    pass
+            return {"type": "object", "properties": {}, "required": []}
+
+        def _wrap_langchain_tool(
+            self, tool: Any, schema: dict[str, Any]
+        ) -> Any:
+            # Upstream stub — not needed for schema tests.
+            return None
+
+    _orig = ccm.ClaudeCodeChatModel
+    ccm.ClaudeCodeChatModel = _FakeChatClaudeCode
+    return _FakeChatClaudeCode, _orig
+
+
+def _clear_apply_patches_marker(cls: type) -> None:
+    if hasattr(cls, "_mimir_arun_config_patched"):
+        delattr(cls, "_mimir_arun_config_patched")
+
+
+def test_apply_patches_get_tool_schema_uses_tool_call_schema() -> None:
+    """After apply_patches(), _get_tool_schema must return the schema from
+    tool_call_schema (which excludes InjectedToolArg fields like 'config'),
+    not from args_schema (which includes them).
+
+    Uses the real send_message, react, fetch_channel_history tools —
+    the three tools with InjectedToolArg on their 'config' parameter.
+    """
+    from mimir.tools.registry import fetch_channel_history, react, send_message
+
+    fake_cls, orig = _make_apply_patches_fake_class()
+    try:
+        _clear_apply_patches_marker(fake_cls)
+        apply_patches()
+
+        instance = fake_cls()
+        for tool in (send_message, react, fetch_channel_history):
+            schema = instance._get_tool_schema(tool)
+            props = schema.get("properties", {})
+            assert "config" not in props, (
+                f"{tool.name}: 'config' must not appear in MCP schema after "
+                f"apply_patches() — InjectedToolArg params should be hidden "
+                f"from the caller. Got props: {list(props)}"
+            )
+    finally:
+        import langchain_claude_code.claude_chat_model as ccm
+        ccm.ClaudeCodeChatModel = orig
+
+
+def test_apply_patches_get_tool_schema_args_schema_had_config() -> None:
+    """Regression guard: confirm that args_schema DOES include 'config'
+    (the pre-fix bug we're defending against). If this fails, InjectedToolArg
+    behaviour changed upstream and the fix may be unnecessary.
+    """
+    from mimir.tools.registry import fetch_channel_history, react, send_message
+
+    for tool in (send_message, react, fetch_channel_history):
+        schema = tool.args_schema.model_json_schema()
+        props = schema.get("properties", {})
+        assert "config" in props, (
+            f"{tool.name}: expected args_schema to include 'config' "
+            f"(regression guard — if InjectedToolArg now excludes it from "
+            f"args_schema too, the _get_tool_schema patch may be removable). "
+            f"Got props: {list(props)}"
+        )
+
+
+def test_apply_patches_get_tool_schema_falls_back_when_no_tool_call_schema() -> None:
+    """When a tool has no tool_call_schema attribute (or it is None),
+    _get_tool_schema must fall back to the original (args_schema) path
+    rather than returning an empty schema.
+
+    Simulates this with a plain object that has args_schema but no
+    tool_call_schema, avoiding Pydantic's read-only property restriction.
+    """
+    import langchain_claude_code.claude_chat_model as ccm
+
+    class _FakeArgsSchema:
+        @staticmethod
+        def model_json_schema() -> dict[str, Any]:
+            return {
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+                "required": ["x"],
+            }
+
+    class _NoCallSchemaTool:
+        """Simulates a tool without tool_call_schema (e.g. older LangChain)."""
+        name = "_no_call_schema"
+        description = "test"
+        args_schema = _FakeArgsSchema()
+        # Deliberately no tool_call_schema attribute.
+
+    fake_cls, orig = _make_apply_patches_fake_class()
+    try:
+        _clear_apply_patches_marker(fake_cls)
+        apply_patches()
+
+        instance = fake_cls()
+        schema = instance._get_tool_schema(_NoCallSchemaTool())
+        # Must fall through to args_schema, not return empty dict.
+        assert isinstance(schema, dict)
+        props = schema.get("properties", {})
+        assert "x" in props, (
+            f"Fallback to args_schema should include 'x'; got {list(props)}"
+        )
+    finally:
+        ccm.ClaudeCodeChatModel = orig
+
+
+@pytest.mark.asyncio
+async def test_apply_patches_wrap_strips_config_from_args() -> None:
+    """_wrap_langchain_tool's inner wrapped_tool must strip 'config' from
+    caller args before passing to _arun (belt-and-suspenders for the
+    _get_tool_schema fix). Even if the MCP schema somehow still includes
+    'config', passing it in args must not cause 'got multiple values'.
+
+    We bypass sdk_tool's SdkMcpTool wrapper (not directly callable) by
+    mocking sdk_tool to be a transparent identity decorator so we can
+    directly await the inner async function.
+    """
+    import langchain_claude_code.claude_chat_model as ccm
+    from langchain_core.runnables import RunnableConfig
+    from langchain_core.tools import tool as lc_tool
+    import unittest.mock as mock
+
+    calls: list[dict[str, Any]] = []
+
+    @lc_tool
+    async def _recording_tool(x: str) -> str:
+        """Records the kwargs _arun receives — should NOT include config."""
+        calls.append({"x": x})
+        return f"got:{x}"
+
+    fake_cls, orig = _make_apply_patches_fake_class()
+    try:
+        _clear_apply_patches_marker(fake_cls)
+
+        # Patch sdk_tool to be a transparent decorator so wrapped_tool
+        # is returned as a plain async callable we can await directly.
+        import claude_agent_sdk as sdk_mod
+        _orig_sdk_tool = sdk_mod.tool
+
+        def _transparent_sdk_tool(name: str, description: str, param_types: dict) -> Any:
+            def _decorator(fn: Any) -> Any:
+                return fn
+            return _decorator
+
+        with mock.patch.object(sdk_mod, "tool", _transparent_sdk_tool):
+            apply_patches()
+
+            instance = fake_cls()
+            schema = {"properties": {
+                "x": {"type": "string"},
+                "config": {"type": "object"},  # simulate leaky schema
+            }}
+            wrapped = instance._wrap_langchain_tool(_recording_tool, schema)
+
+            # Pass config in args — simulating pre-fix MCP call with config.
+            result = await wrapped({"x": "hello", "config": {}})
+
+        # Must succeed (no "got multiple values for 'config'" error).
+        assert "is_error" not in result or not result.get("is_error"), (
+            f"Expected clean result, got error: {result}"
+        )
+        assert "got:hello" in result["content"][0]["text"]
+        # _arun received 'x' but NOT 'config' (stripped by the patch).
+        assert len(calls) == 1
+        assert calls[0] == {"x": "hello"}
+    finally:
+        ccm.ClaudeCodeChatModel = orig
