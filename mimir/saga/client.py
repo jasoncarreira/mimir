@@ -1354,6 +1354,29 @@ WHERE a.source_type = 'session_boundary'
                 log.warning("SagaStore.close failed: %s", exc)
             self._conn = None
 
+    async def __aenter__(self) -> "SagaStore":
+        """Async context manager entry — opens the SQLite connection
+        eagerly so ``async with SagaStore(...) as store:`` blocks fail
+        fast on bad db paths instead of waiting for the first method
+        call. Test ergonomics fix: tests that need a SagaStore for a
+        single fixture lifetime can write::
+
+            async with SagaStore(db_path=tmp_path / "t.db") as store:
+                ...
+
+        instead of remembering to call ``await store.close()`` in
+        their teardown.
+        """
+        self._ensure_conn()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        """Async context manager exit — closes the connection. Mirrors
+        ``close()`` and absorbs the same exceptions. Does NOT suppress
+        caller exceptions; returns ``None`` so any raise in the ``with``
+        body propagates."""
+        await self.close()
+
 
 def _candidate_to_atom(c) -> dict[str, Any]:
     """Map a RecallCandidate to saga's atom-response shape."""
