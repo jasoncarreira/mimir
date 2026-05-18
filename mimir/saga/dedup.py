@@ -1,11 +1,10 @@
 """Dedup pass — collapse near-duplicate raws before thematic consolidation.
 
 Pass 1 of the two-pass consolidator. Clusters raws at a TIGHTER threshold
-than the observation-synthesis pass (default 0.92 voyage / 0.92 openai
-on calibrated mimir-corpus distributions — see /tmp/voyage_calibration/
-percentile_map.py), picks one canonical per cluster by ACT-R activation,
-folds the rest's history into the canonical, and tombstones them with
-reason='merged'.
+than the observation-synthesis pass (default 0.92 floor for all providers —
+see ``DEFAULT_DEDUP_THRESHOLD`` below for the calibration rationale),
+picks one canonical per cluster by ACT-R activation, folds the rest's
+history into the canonical, and tombstones them with reason='merged'.
 
 Why this is its own pass:
 
@@ -133,10 +132,18 @@ def _atom_score_key(
     """Sort key for canonical selection. Higher = preferred.
 
     Returns a tuple of (activation, pinned, confidence_tier_rank,
-    evidence_count, -created_at_unix, -id_lex). The negation on the
-    last two reverses the natural sort so the older atom and the
-    lexicographically smaller id win their respective tiebreakers
-    when we take ``max(...)``.
+    evidence_count, recency_key) where ``recency_key`` is
+    ``-created_at_unix`` so older atoms (smaller unix → larger ``-unix``)
+    win the recency tiebreaker under ``max(...)``. Malformed/missing
+    ``created_at`` falls back to ``float('-inf')`` so well-formed atoms
+    always win the recency tiebreaker — see the inline note where
+    ``recency_key`` is computed.
+
+    If all five keys tie, ``max()`` returns the first occurrence (Python
+    docs: stable on ties). Across runs the canonical may differ if the
+    input list ordering differs; this is a very low-probability edge
+    case (six other criteria tied) and the consequence is benign
+    (different equally-valid canonicals across reruns).
     """
     aid = atom["id"]
     activation = _atom_activation(conn, aid)
