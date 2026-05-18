@@ -24,6 +24,10 @@ import pytest
 from mimir.tools.registry import (
     _STATE,
     _channel_from_config_or_state,
+    fetch_channel_history,
+    react,
+    send_message,
+    set_channel_registry,
     set_commitments_store,
     set_current_channel_id,
     set_spawn_config,
@@ -238,3 +242,79 @@ async def test_spawn_claude_code_handles_missing_claude_cli(
     monkeypatch.setattr(registry, "_run_claude_subprocess", _missing_cli)
     msg = await spawn_claude_code.ainvoke({"prompt": "x"})
     assert "not on PATH" in msg
+
+
+# ─── InjectedToolArg schema fix (chainlink #147) ───────────────────
+
+
+class TestChannelToolsInjectedToolArg:
+    """``config: Annotated[RunnableConfig | None, InjectedToolArg]`` on the
+    three channel tools must exclude ``config`` from the tool_call_schema
+    that the LangChain / LangGraph agent sends to the LLM.  Without the
+    annotation the LLM can include ``config`` in its tool call args, which
+    then collides with LangChain's internal ``config`` injection inside
+    ``StructuredTool.arun`` → "got multiple values for keyword argument
+    'config'" (observed post-PR-#181, filed as chainlink #147).
+    """
+
+    def test_send_message_config_not_in_tool_call_schema(self) -> None:
+        # tool_call_schema is what LangChain exposes to the LLM. config must
+        # be absent so the model never includes it in its tool call args.
+        schema = send_message.tool_call_schema.model_json_schema()
+        props = list(schema.get("properties", {}).keys())
+        assert "config" not in props, f"config leaked into tool_call_schema: {props}"
+        assert "text" in props
+        assert "channel_id" in props
+
+    def test_react_config_not_in_tool_call_schema(self) -> None:
+        schema = react.tool_call_schema.model_json_schema()
+        props = list(schema.get("properties", {}).keys())
+        assert "config" not in props, f"config leaked into tool_call_schema: {props}"
+        assert "emoji" in props
+
+    def test_fetch_channel_history_config_not_in_tool_call_schema(self) -> None:
+        schema = fetch_channel_history.tool_call_schema.model_json_schema()
+        props = list(schema.get("properties", {}).keys())
+        assert "config" not in props, f"config leaked into tool_call_schema: {props}"
+        assert "limit" in props
+
+    def test_send_message_filter_injected_args_removes_config(self) -> None:
+        # _filter_injected_args is used in StructuredTool.arun for callbacks
+        # and also confirms InjectedToolArg is properly recognized.
+        raw = {"text": "hello", "channel_id": "test", "config": None}
+        filtered = send_message._filter_injected_args(raw)
+        assert "config" not in filtered
+        assert filtered["text"] == "hello"
+        assert filtered["channel_id"] == "test"
+
+    @pytest.mark.asyncio
+    async def test_send_message_ainvoke_without_config_in_args(self) -> None:
+        # Normal invocation: model never passes config (correct post-fix behavior).
+        # Should succeed (or return a diagnostic string from the tool itself),
+        # not raise TypeError about missing required argument.
+        from mimir.channel_registry import ChannelRegistry
+
+        set_channel_registry(ChannelRegistry())
+        set_current_channel_id("test-chan")
+        result = await send_message.ainvoke({"text": "hello"})
+        # Tool returns a string result (no bridge configured → diagnostic msg)
+        assert isinstance(result, str)
+
+    @pytest.mark.asyncio
+    async def test_send_message_ainvoke_with_config_in_args_no_collision(self) -> None:
+        # Guard against regression: if config somehow ends up in the tool call
+        # args (e.g., from an old schema cached by the LLM), ainvoke must not
+        # raise "got multiple values for keyword argument 'config'".
+        from langchain_core.runnables import RunnableConfig
+        from mimir.channel_registry import ChannelRegistry
+
+        set_channel_registry(ChannelRegistry())
+        set_current_channel_id("test-chan")
+        # Pass config=None explicitly in the args dict (simulates a model that
+        # was trained on the old schema). Must not collide with LangChain's
+        # internal config injection in StructuredTool.arun.
+        result = await send_message.ainvoke(
+            {"text": "hello", "config": None},
+            config=RunnableConfig(),
+        )
+        assert isinstance(result, str)
