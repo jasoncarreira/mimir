@@ -28,7 +28,7 @@ import json
 import asyncio
 import subprocess
 from pathlib import Path
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 from langchain_core.runnables import RunnableConfig
 
@@ -61,7 +61,7 @@ def _channel_from_config_or_state(
             return from_config
     return (_STATE.get("current_channel_id") or "").strip()
 
-from langchain_core.tools import tool
+from langchain_core.tools import InjectedToolArg, tool
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -112,7 +112,7 @@ def set_current_channel_id(channel_id: str | None) -> None:
 async def send_message(
     text: str,
     channel_id: Optional[str] = None,
-    config: RunnableConfig | None = None,
+    config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
 ) -> str:
     """Emit a message to a channel.
 
@@ -207,7 +207,7 @@ async def react(
     emoji: str,
     message_id: Optional[str] = None,
     channel_id: Optional[str] = None,
-    config: RunnableConfig | None = None,
+    config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
 ) -> str:
     """React to a message with an emoji.
 
@@ -241,7 +241,7 @@ async def react(
 async def fetch_channel_history(
     channel_id: Optional[str] = None,
     limit: int = 20,
-    config: RunnableConfig | None = None,
+    config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
 ) -> str:
     """Fetch recent messages from a channel.
 
