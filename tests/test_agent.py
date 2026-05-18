@@ -238,6 +238,34 @@ async def test_run_turn_scheduled_tick_skips_saga_query(tmp_path: Path):
     assert "Possibly relevant memories" not in prompt
 
 
+async def test_run_turn_poller_skips_saga_query(tmp_path: Path):
+    """poller turns (github-activity, oauth-usage-poll, etc.) have no
+    meaningful user-authored query anchor — saga.query() must be skipped
+    even when a saga client is present."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="poll done")])
+    fake_saga = _FakeSaga(query_hits=[
+        {"atom_id": "c" * 16, "content": "some memory", "stream": "semantic"},
+    ])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=fake_saga)
+
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="github-activity poll body",
+    )
+    record = await agent.run_turn(event)
+
+    assert record.output == "poll done"
+    # saga.query() must NOT have been called
+    assert fake_saga.query_calls == [], (
+        "saga.query() was called for a poller turn — "
+        "this is wasteful; there's no meaningful user query to anchor retrieval"
+    )
+    # "Possibly relevant memories" block must be absent from the prompt
+    prompt = fake_agent.invocations[0]["state"]["messages"][0].content
+    assert "Possibly relevant memories" not in prompt
+
+
 async def test_run_turn_cancels_typing_when_plan_streamed_but_result_empty(
     tmp_path: Path,
 ):
