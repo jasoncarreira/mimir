@@ -10,8 +10,10 @@ unfinished items into 100-1100 chars of prose; this module asks Claude
 - Not the agent loop: the session-end synthesis turn is already an
   LLM call; we don't want to wrap that in another LLM call from the
   same loop. The extraction runs in the finalize hook on a separate
-  one-shot LLM call via ``langchain.chat_models.init_chat_model``
-  (haiku-tier by default; configurable via the ``model`` kwarg).
+  one-shot LLM call via saga's ``call_llm`` (same provider-dispatch
+  chain as query rewrite, consolidation, atom annotation, etc.).
+  Operators control via ``[commitments]`` section in saga.toml,
+  falling back to ``[llm]`` for the global default.
 - Not a poller: session-end output is event-driven, not time-driven.
   A poller would either miss output (debounced) or re-extract the
   same content (idempotent only via the store's dedupe-key gate).
