@@ -619,21 +619,116 @@ async def test_run_turn_appends_outbound_via_fallback_bridge_send(tmp_path: Path
     assert outbound[0].msg_id == "msg-out-42"
 
 
-async def test_inbound_buffer_append_skips_synthetic_triggers(tmp_path: Path):
-    """``scheduled_tick`` / ``saga_session_end`` / ``shell_job_complete``
-    are internal wakes with no conversational content — they must NOT
-    pollute the buffer (would render as noise in Recent activity)."""
+async def test_inbound_buffer_append_skips_internal_wake_triggers(tmp_path: Path):
+    """``saga_session_end`` + ``shell_job_complete`` are internal wakes
+    with no conversational content the agent would want in Recent
+    activity. Pre-#181 explicitly skipped both in ``_record_inbound``;
+    keep parity."""
     fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
     agent = _build_agent(
         tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
     )
 
-    # Manually exercise the helper for all three skip-triggers.
-    for trig in ("scheduled_tick", "saga_session_end", "shell_job_complete"):
+    for trig in ("saga_session_end", "shell_job_complete"):
         await agent._append_inbound_to_buffer(AgentEvent(
             trigger=trig, channel_id="ch-1", content="ignore me",
         ))
     assert agent._buffer.total_count() == 0
+
+
+async def test_inbound_buffer_append_logs_scheduled_tick_as_system_note(
+    tmp_path: Path,
+):
+    """Pre-#181 logged ``scheduled_tick`` as kind=system_note so the
+    agent saw "I was woken at 10:00 with prompt X" in its next
+    Recent activity. Allow-list scoping (an earlier mistake in this
+    PR) silently dropped these; explicit regression guard."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
+    )
+    await agent._append_inbound_to_buffer(AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        content="Heartbeat — check for new commitments due.",
+    ))
+    msgs = list(agent._buffer._all)
+    assert len(msgs) == 1
+    assert msgs[0].kind == "system_note"
+    assert "Heartbeat" in msgs[0].content
+
+
+async def test_inbound_buffer_append_falls_back_to_author_for_display(
+    tmp_path: Path,
+):
+    """Pre-#181: ``author_display=event.author_display or event.author``
+    — display falls back to the platform-prefixed author key when the
+    bridge didn't resolve a friendlier name. Locks in that parity."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
+    )
+    await agent._append_inbound_to_buffer(AgentEvent(
+        trigger="user_message", channel_id="ch-1",
+        content="hi", author="discord-99",
+        author_display=None,  # bridge didn't supply one
+    ))
+    msgs = list(agent._buffer._all)
+    assert len(msgs) == 1
+    assert msgs[0].author == "discord-99"
+    assert msgs[0].author_display == "discord-99"
+
+
+async def test_outbound_buffer_append_runs_even_when_bridge_send_fails(
+    tmp_path: Path,
+):
+    """Pre-#181's ``_auto_dispatch_or_record``: "Always writes to
+    chat_history regardless of dispatch outcome — so Recent activity
+    reflects what the agent said even when delivery failed (the
+    agent self-corrects when it sees a stale conversation that
+    doesn't match what it thought it sent)."
+
+    Verify the append fires even when ``bridge.send`` raises.
+    """
+
+    class _ExplodingBridge:
+        name = "fake"
+        async def send_typing_indicator(self, *a, **kw):
+            return None
+        async def cancel_typing(self, *a, **kw):
+            return None
+        async def send(self, *a, **kw):
+            raise RuntimeError("network down")
+
+    class _Channels:
+        def __init__(self, bridge):
+            self._bridge = bridge
+        def find(self, channel_id):
+            return self._bridge
+
+    bridge = _ExplodingBridge()
+    fake_agent = _FakeAgent(response_messages=[
+        AIMessage(content="reply that won't reach the user"),
+    ])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
+    )
+    agent._channels = _Channels(bridge)  # type: ignore[attr-defined]
+
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1",
+        content="hi", author="jason", source="discord",
+    )
+    record = await agent.run_turn(event)
+    # run_turn doesn't fail just because bridge.send did
+    assert record.error is None
+    # ...and the outbound IS in the buffer for the agent to reconcile.
+    msgs = list(agent._buffer._all)
+    outbound = [m for m in msgs if m.kind == "assistant_message"]
+    assert len(outbound) == 1
+    assert outbound[0].content == "reply that won't reach the user"
+    # msg_id is None when send failed (no SendResult to read from)
+    assert outbound[0].msg_id is None
 
 
 async def test_send_message_tool_appends_outbound_via_global_buffer(tmp_path: Path):

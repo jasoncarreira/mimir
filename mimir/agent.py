@@ -518,42 +518,50 @@ class Agent:
     # (at every ``bridge.send`` site) puts the conversation back on
     # disk and in the deques.
 
-    # Triggers that produce a real conversational message worth
-    # logging. ``scheduled_tick`` / ``saga_session_end`` /
-    # ``shell_job_complete`` are internal wakes with no inbound text
-    # the agent would want to see in its Recent-activity window —
-    # filtered to keep the buffer focused on actual conversation.
-    _INBOUND_LOGGABLE_TRIGGERS: frozenset[str] = frozenset({"user_message", "poller"})
+    # Triggers that are internal wakes with no conversational content;
+    # logging them would pollute Recent activity with system noise
+    # the agent doesn't need to re-read. Matches the pre-#181 deny-list
+    # in ``_record_inbound``. Everything else — ``user_message``,
+    # ``poller``, ``scheduled_tick``, ``react_received``, etc. — IS
+    # logged (``user_message`` → kind=user_message, all others →
+    # kind=system_note) so the agent's view of "what just happened on
+    # this channel" stays accurate.
+    _INBOUND_SKIP_TRIGGERS: frozenset[str] = frozenset(
+        {"saga_session_end", "shell_job_complete"}
+    )
 
     @staticmethod
     def _kind_for_trigger(trigger: str) -> str:
         """Map an ``AgentEvent.trigger`` to a ``MessageKind``."""
         if trigger == "user_message":
             return "user_message"
-        # Poller events (github-activity, etc.) are synthetic — they're
-        # not from a human author but they ARE conversation the agent
-        # should reflect on. The SDK era logged them as system_note.
+        # Pollers (github-activity etc.), scheduled ticks, and other
+        # synthetic events are author-less but still conversation-
+        # adjacent — agent reads them in Recent activity to understand
+        # what woke it up. Pre-#181 logged them as system_note.
         return "system_note"
 
     async def _append_inbound_to_buffer(self, event: AgentEvent) -> None:
         """Append an inbound event to the ``MessageBuffer`` so future
-        ``assemble_recent_activity`` calls see it. Skips synthetic /
-        contentless triggers and DM-channel privacy-sensitive cases
-        the buffer itself rejects.
+        ``assemble_recent_activity`` calls see it. Skip rules match
+        pre-#181's ``_record_inbound``: drop empty-content events
+        and internal-wake triggers (``saga_session_end``,
+        ``shell_job_complete``); log everything else.
         """
-        if event.trigger not in self._INBOUND_LOGGABLE_TRIGGERS:
-            return
         if not event.content or not event.channel_id:
             return
+        if event.trigger in self._INBOUND_SKIP_TRIGGERS:
+            return
         try:
-            msg = Message(
-                ts=datetime.now(tz=timezone.utc).isoformat(),
-                msg_id=event.source_id,
+            msg = self._buffer.make_message(
                 channel_id=event.channel_id,
-                author=event.author,
-                author_display=event.author_display,
                 kind=self._kind_for_trigger(event.trigger),
                 content=event.content,
+                author=event.author,
+                # Fall back to ``author`` when display is unset so the
+                # render layer never has to display a raw platform key.
+                author_display=event.author_display or event.author,
+                msg_id=event.source_id,
                 source=event.source,
             )
             await self._buffer.append(msg)
@@ -574,18 +582,21 @@ class Agent:
         """Append an outbound assistant message to the buffer. Called
         from every ``bridge.send`` site (agent-fallback, ``send_message``
         tool, streaming dispatcher) so the agent sees its own prior
-        replies in ``## Recent activity`` on the next turn."""
+        replies in ``## Recent activity`` on the next turn.
+
+        Called whether or not delivery succeeded — pre-#181's
+        ``_auto_dispatch_or_record`` recorded outbound regardless of
+        dispatch outcome so the agent self-corrects when a stale
+        conversation doesn't match what it thought it sent.
+        """
         if not channel_id or not content:
             return
         try:
-            msg = Message(
-                ts=datetime.now(tz=timezone.utc).isoformat(),
-                msg_id=msg_id,
+            msg = self._buffer.make_message(
                 channel_id=channel_id,
-                author=None,
-                author_display=None,
                 kind="assistant_message",
                 content=content,
+                msg_id=msg_id,
                 source=source,
             )
             await self._buffer.append(msg)
@@ -1057,22 +1068,24 @@ class Agent:
                     parsed = parse_directives(send_text)
                     clean = parsed.clean_text
                     sent_result = None
-                    try:
-                        if clean:
+                    if clean:
+                        try:
                             sent_result = await bridge.send(event.channel_id, clean)
-                            # Append outbound to chat-history buffer so the
-                            # agent's own reply shows up in the next turn's
-                            # Recent activity. Dropped in PR #181's deepagents
-                            # migration; restoring here closes the regression
-                            # for the agent-fallback send path.
-                            await self._append_outbound_to_buffer(
-                                event.channel_id,
-                                clean,
-                                msg_id=getattr(sent_result, "message_id", None),
-                                source=ctx.channel_source,
-                            )
-                    except Exception as exc:
-                        log.warning("bridge.send failed: %s", exc)
+                        except Exception as exc:
+                            log.warning("bridge.send failed: %s", exc)
+                        # Append to chat-history buffer regardless of
+                        # send outcome — pre-#181's _auto_dispatch_or_record
+                        # explicitly recorded outbound even on bridge
+                        # failure so the agent self-corrects when a
+                        # stale conversation doesn't match what it
+                        # thought it sent (matches what was attempted,
+                        # not what was confirmed delivered).
+                        await self._append_outbound_to_buffer(
+                            event.channel_id,
+                            clean,
+                            msg_id=getattr(sent_result, "message_id", None),
+                            source=ctx.channel_source,
+                        )
                     for _directive in parsed.directives:
                         if isinstance(_directive, ReactDirective):
                             _target = _directive.message_id or (
