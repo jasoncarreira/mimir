@@ -235,22 +235,54 @@ def reflect(
     # removed 2026-05-13 — no production caller used it and the
     # cluster + synth logic duplicated consolidate's path.
 
+    # ─── Compute session embedding ────────────────────────────────
+    # Used by search_sessions() for semantic retrieval. Embedding is
+    # best-effort — a failed embed doesn't abort the session close.
+    summary = fields.get("summary", "")
+    closed_since = fields.get("closed_since") or []
+    emb_bytes: bytes | None = None
+    emb_dim: int | None = None
+    if embed_fn is not None and summary:
+        try:
+            emb_result = embed_fn(summary)
+            if emb_result:
+                emb_bytes, _, _, emb_dim = emb_result
+        except Exception:
+            pass  # non-fatal; session closes with NULL embedding
+
     # ─── Update sessions table ────────────────────────────────────
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("""
-            INSERT INTO sessions (id, channel_id, started_at, ended_at, summary, reflected_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions
+                (id, channel_id, started_at, ended_at, summary, reflected_at,
+                 topics_discussed, decisions_made, unfinished,
+                 emotional_state, closed_since, embedding, embedding_dim)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                ended_at = excluded.ended_at,
-                summary = excluded.summary,
-                reflected_at = excluded.reflected_at
+                ended_at         = excluded.ended_at,
+                summary          = excluded.summary,
+                reflected_at     = excluded.reflected_at,
+                topics_discussed = excluded.topics_discussed,
+                decisions_made   = excluded.decisions_made,
+                unfinished       = excluded.unfinished,
+                emotional_state  = excluded.emotional_state,
+                closed_since     = excluded.closed_since,
+                embedding        = COALESCE(excluded.embedding, sessions.embedding),
+                embedding_dim    = COALESCE(excluded.embedding_dim, sessions.embedding_dim)
         """, (
             session_id, channel_id,
             atoms[0]["created_at"] if atoms else _utc_now_iso(),
             _utc_now_iso(),
-            fields.get("summary", ""),
+            summary,
             _utc_now_iso(),
+            json.dumps(topics),
+            json.dumps(decisions),
+            json.dumps(unfinished),
+            emotional_state,
+            json.dumps(closed_since),
+            emb_bytes,
+            emb_dim,
         ))
         conn.commit()
     except Exception:

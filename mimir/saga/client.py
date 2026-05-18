@@ -167,7 +167,7 @@ class SagaStore:
     # greenfield DDL changes and add the migration that transforms an
     # older DB to match. ``_apply_pending_migrations`` walks
     # ``MIGRATIONS`` and applies any version > the DB's current.
-    CURRENT_SCHEMA_VERSION: int = 2
+    CURRENT_SCHEMA_VERSION: int = 4
 
     # Registry of post-greenfield schema changes. Keys are version
     # numbers (must be > 1, must be contiguous, must equal
@@ -201,6 +201,19 @@ WHERE a.source_type = 'session_boundary'
   AND a.session_id IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id = a.session_id);
 """,
+        3: """
+            -- Add structured boundary fields to sessions table (chainlink #63).
+            ALTER TABLE sessions ADD COLUMN topics_discussed TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE sessions ADD COLUMN decisions_made   TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE sessions ADD COLUMN unfinished       TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE sessions ADD COLUMN emotional_state  TEXT;
+            ALTER TABLE sessions ADD COLUMN closed_since     TEXT NOT NULL DEFAULT '[]';
+        """,
+        4: """
+            -- Add embedding columns to sessions for search_sessions() (chainlink #148).
+            ALTER TABLE sessions ADD COLUMN embedding BLOB;
+            ALTER TABLE sessions ADD COLUMN embedding_dim INTEGER;
+        """,
     }
 
     def __init__(
@@ -232,6 +245,11 @@ WHERE a.source_type = 'session_boundary'
         self._triples_top_n = triples_top_n
         self._index: VectorIndex | None = None
         self._index_built = False
+        # Dedicated index for sessions (search_sessions). Separate from the
+        # atoms index because sessions store their own embeddings on the
+        # sessions table rather than in the embeddings table.
+        self._sessions_index: VectorIndex | None = None
+        self._sessions_index_built: bool = False
         # LLM synth callable for consolidate(). Late-bound (lazy import
         # of synthesize.py) so SagaStore doesn't transitively pull in
         # the LLM transport at construction time. Despite the name, this
@@ -366,6 +384,35 @@ WHERE a.source_type = 'session_boundary'
             self._ensure_index(conn)
         else:
             self._index.build_from_db(conn)
+
+    def _ensure_sessions_index(self, conn: sqlite3.Connection) -> VectorIndex | None:
+        """Lazily build the sessions FAISS index from sessions.embedding.
+
+        Separate from _ensure_index (atoms index) — sessions have their own
+        embedding column; no join to the embeddings table needed.
+        Invalidated by end_session() writes so the next search picks up new
+        sessions.
+        """
+        if self._sessions_index_built:
+            return self._sessions_index
+        dim = self._embedding_dim
+        if dim is None:
+            row = conn.execute(
+                "SELECT embedding_dim FROM sessions "
+                "WHERE embedding_dim IS NOT NULL LIMIT 1"
+            ).fetchone()
+            if row:
+                dim = row[0]
+            else:
+                # Fall back to atoms embedding dim, then voyage default.
+                row2 = conn.execute("SELECT dim FROM embeddings LIMIT 1").fetchone()
+                dim = row2[0] if row2 else 1024
+            self._embedding_dim = dim
+        idx = VectorIndex(dimension=dim)
+        idx.build_from_sessions(conn)
+        self._sessions_index = idx
+        self._sessions_index_built = True
+        return idx
 
     # ── SagaClient surface ──────────────────────────────────────────
 
@@ -651,6 +698,9 @@ WHERE a.source_type = 'session_boundary'
                 # consolidate() (cron-driven, cross-session). reflect's
                 # within-session synth hook was removed 2026-05-13.
             )
+            # Invalidate sessions index so the next search_sessions() call
+            # picks up the newly-written session and its embedding.
+            self._sessions_index_built = False
             # Return BOTH the saga-compatible ``atom_id`` (consumed by
             # mimir/sagatools.py:583/603 for the local boundary mirror +
             # the user-facing success message) AND the
@@ -992,6 +1042,126 @@ WHERE a.source_type = 'session_boundary'
             return _recent_boundaries(
                 conn, channel_id=channel_id, count=count,
             )
+        return await asyncio.to_thread(_do)
+
+    async def search_sessions(
+        self,
+        query: str,
+        *,
+        channel_id: str | None = None,
+        alpha: float = 0.7,
+        limit: int = 10,
+    ) -> list[dict]:
+        """Return sessions relevant to *query*, ranked by semantic + recency blend.
+
+        Score = alpha * cosine_similarity + (1 - alpha) * recency_score
+
+        Recency uses a 30-day exponential half-life:
+            recency_score = exp(-ln(2) / 30 * age_days)
+
+        Queries ``sessions`` directly — no atoms join, no source_type filter.
+        Sessions without an embedding receive similarity_score=0.0 and are
+        ranked by recency only (still returned when alpha < 1.0).
+
+        Two semantic paths:
+        1. Sessions FAISS index (``_ensure_sessions_index``), built lazily.
+        2. Python-side cosine over ``sessions.embedding`` when FAISS is
+           unavailable or the index is empty.
+
+        Args:
+            query: Natural-language search query.
+            channel_id: Restrict results to a single channel.
+            alpha: Semantic weight. 0.0 = recency-only, 1.0 = semantic-only.
+            limit: Maximum sessions to return.
+
+        Returns:
+            List of dicts with keys:
+                session_id, channel_id, started_at, ended_at, summary,
+                similarity_score, recency_score, blended_score
+            Sorted descending by blended_score.
+        """
+        import math
+
+        query_emb: list[float] = await asyncio.to_thread(_query_embed_sync, query)
+
+        def _do() -> list[dict]:
+            conn = self._ensure_conn()
+
+            # ── Step 1: build similarity map from sessions FAISS index ──
+            sim_map: dict[str, float] = {}  # session_id → cosine similarity
+
+            if query_emb:
+                index = self._ensure_sessions_index(conn)
+                if index is not None:
+                    for sess_id, score in index.search(
+                        query_emb, top_k=min(limit * 4, 200)
+                    ):
+                        sim_map[sess_id] = float(score)
+
+                if not sim_map:
+                    # Python cosine fallback (FAISS unavailable or empty).
+                    import struct as _struct
+                    q_norm = math.sqrt(sum(x * x for x in query_emb)) + 1e-9
+                    dim = len(query_emb)
+                    for (sess_id, emb_blob) in conn.execute(
+                        "SELECT id, embedding FROM sessions WHERE embedding IS NOT NULL"
+                    ).fetchall():
+                        if not emb_blob:
+                            continue
+                        try:
+                            e_arr = _struct.unpack(f"{dim}f", emb_blob[: dim * 4])
+                            dot = sum(a * b for a, b in zip(query_emb, e_arr))
+                            e_norm = math.sqrt(sum(x * x for x in e_arr)) + 1e-9
+                            sim_map[sess_id] = dot / (q_norm * e_norm)
+                        except Exception:
+                            continue
+
+            # ── Step 2: fetch sessions rows ──
+            channel_clause = "WHERE channel_id = ?" if channel_id else ""
+            params: list = [channel_id] if channel_id else []
+
+            rows = conn.execute(
+                f"""
+                SELECT id, channel_id, started_at, ended_at, summary
+                FROM sessions
+                {channel_clause}
+                ORDER BY COALESCE(ended_at, reflected_at) DESC
+                LIMIT 500
+                """,
+                params,
+            ).fetchall()
+
+            # ── Step 3: score each session ──
+            now_ts = datetime.now(tz=timezone.utc).timestamp()
+            results: list[dict] = []
+            for (sess_id, ch_id, started_at, ended_at, summary) in rows:
+                sim = sim_map.get(sess_id, 0.0)
+
+                ref_str = ended_at or ""
+                try:
+                    if ref_str.endswith("Z"):
+                        ref_str = ref_str[:-1] + "+00:00"
+                    ref_ts = datetime.fromisoformat(ref_str).timestamp()
+                except (ValueError, AttributeError):
+                    ref_ts = now_ts
+                age_days = max(0.0, (now_ts - ref_ts) / 86400.0)
+                recency = math.exp(-math.log(2) / 30.0 * age_days)
+
+                blended = alpha * sim + (1.0 - alpha) * recency
+                results.append({
+                    "session_id": sess_id,
+                    "channel_id": ch_id,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "summary": summary or "",
+                    "similarity_score": round(sim, 6),
+                    "recency_score": round(recency, 6),
+                    "blended_score": round(blended, 6),
+                })
+
+            results.sort(key=lambda r: r["blended_score"], reverse=True)
+            return results[:limit]
+
         return await asyncio.to_thread(_do)
 
     async def most_retrieved_atoms(
