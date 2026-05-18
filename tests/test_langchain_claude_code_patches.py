@@ -638,3 +638,112 @@ async def test_hooks_capture_built_in_bash_tool_integration():
     for tid, phases in by_id.items():
         assert phases["tool_call"]["tool_use_id"] == tid
         assert phases["tool_result"]["tool_use_id"] == tid
+
+
+# ── combined-patch interaction (enrich + hooks both applied) ────────
+
+
+@pytest.mark.asyncio
+async def test_enrich_and_hooks_both_land_on_final_chunk():
+    """When ``enrich_streaming_metadata`` AND ``install_tool_event_hooks``
+    are both applied (the actual production wiring — see ``agent.py``'s
+    import-time patch invocations), the final result chunk must carry
+    BOTH the ResultMessage enrichments (``stop_reason``/``num_turns``/
+    ``is_error``) AND the captured ``tool_events`` list.
+
+    Both patches wrap ``_astream``. Order of application matters: the
+    one applied LAST runs first (its wrapper sees the other's wrapped
+    method as ``_orig_astream``). Either ordering should yield the
+    same final result chunk if both patches' mutations are purely
+    additive (they are), but this test pins that invariant.
+    """
+    import langchain_claude_code.claude_chat_model as ccm
+    from mimir._langchain_claude_code_patches import (
+        enrich_streaming_metadata,
+        install_tool_event_hooks,
+    )
+
+    class _Chunk:
+        def __init__(self, content: str, generation_info: dict | None):
+            class _M:
+                def __init__(self, c: str):
+                    self.content = c
+            self.message = _M(content)
+            self.generation_info = generation_info
+
+    class _FakeOptions:
+        def __init__(self):
+            self.hooks: dict | None = None
+
+    class _FakeResult:
+        stop_reason = "max_turns"
+        num_turns = 7
+        is_error = False
+
+    class _FakeChatClaudeCode:
+        def _build_options(self, **_kw):
+            return _FakeOptions()
+
+        async def _aquery(self, *args, **kwargs):
+            # Hooks patch wraps this method too; provide a stub so the
+            # patch can grab it. Not exercised by this test (we only
+            # iterate _astream).
+            return "", [], {}
+
+        async def _astream(self, *args, **kwargs):
+            self._last_result = _FakeResult()
+            # Drive a hook (would normally come from the SDK) so the
+            # hooks-side capture list is non-empty when we reach the
+            # final chunk.
+            opts = self._build_options()
+            pre = opts.hooks["PreToolUse"][0].hooks[0]
+            await pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                "toolu_combo", None,
+            )
+            yield _Chunk(content="streaming text", generation_info=None)
+            yield _Chunk(
+                content="",
+                generation_info={
+                    "finish_reason": "stop",
+                    "total_cost_usd": 0.0,
+                },
+            )
+
+    _orig = ccm.ClaudeCodeChatModel
+    ccm.ClaudeCodeChatModel = _FakeChatClaudeCode
+    try:
+        _clear_patch_marker(_FakeChatClaudeCode)
+        _clear_tool_event_marker(_FakeChatClaudeCode)
+
+        # Apply BOTH patches. Order chosen to match the production
+        # wiring in ``agent.py``: enrich first, hooks second. The
+        # outer (hooks) wrapper runs first; it must call through to
+        # enrich's wrapper which then calls the original.
+        enrich_streaming_metadata()
+        install_tool_event_hooks()
+
+        instance = _FakeChatClaudeCode()
+        chunks = [c async for c in instance._astream()]
+
+        # First chunk is text — untouched by either patch.
+        assert chunks[0].generation_info is None
+        assert chunks[0].message.content == "streaming text"
+
+        # Final chunk MUST have both enriched ResultMessage fields...
+        gi = chunks[-1].generation_info
+        assert gi is not None
+        assert gi["stop_reason"] == "max_turns"  # from enrich
+        assert gi["num_turns"] == 7               # from enrich
+        assert gi["is_error"] is False            # from enrich
+        # ...AND the captured tool_events list.
+        assert "tool_events" in gi                # from hooks
+        assert len(gi["tool_events"]) == 1
+        assert gi["tool_events"][0]["type"] == "tool_call"
+        assert gi["tool_events"][0]["name"] == "Bash"
+        assert gi["tool_events"][0]["tool_use_id"] == "toolu_combo"
+        # Original keys preserved.
+        assert gi["finish_reason"] == "stop"
+        assert gi["total_cost_usd"] == 0.0
+    finally:
+        ccm.ClaudeCodeChatModel = _orig

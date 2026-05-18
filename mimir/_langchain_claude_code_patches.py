@@ -269,7 +269,11 @@ def enrich_streaming_metadata() -> None:
 _TOOL_EVENT_HOOKS_MARKER = "_mimir_tool_event_hooks_installed"
 
 
-async def _pre_tool_use_hook(input_data: dict, tool_use_id: str, signal: Any) -> dict:
+# Third hook-callback param is the SDK's ``HookContext`` TypedDict —
+# currently just ``{"signal": None}`` (reserved for future abort-signal
+# support, see claude_agent_sdk/types.py:508). We don't use it; the
+# leading-underscore name signals "unused" to future readers.
+async def _pre_tool_use_hook(input_data: dict, tool_use_id: str, _ctx: Any) -> dict:
     """Append a tool_call event to the active capture list."""
     events = _tool_events_var.get()
     if events is None:
@@ -284,7 +288,7 @@ async def _pre_tool_use_hook(input_data: dict, tool_use_id: str, signal: Any) ->
     return {}
 
 
-async def _post_tool_use_hook(input_data: dict, tool_use_id: str, signal: Any) -> dict:
+async def _post_tool_use_hook(input_data: dict, tool_use_id: str, _ctx: Any) -> dict:
     """Append a tool_result event (success) to the active capture list."""
     events = _tool_events_var.get()
     if events is None:
@@ -301,7 +305,7 @@ async def _post_tool_use_hook(input_data: dict, tool_use_id: str, signal: Any) -
 
 
 async def _post_tool_use_failure_hook(
-    input_data: dict, tool_use_id: str, signal: Any,
+    input_data: dict, tool_use_id: str, _ctx: Any,
 ) -> dict:
     """Append a tool_result event (failure) to the active capture list."""
     events = _tool_events_var.get()
