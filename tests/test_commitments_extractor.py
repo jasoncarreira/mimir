@@ -211,3 +211,65 @@ async def test_extract_returns_empty_on_unparseable_response(
         channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
     )
     assert out == []
+
+
+# ── v4 self-containment property tests ─────────────────────────────
+
+
+async def test_extract_preserves_artifact_identifiers_in_text(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Artifact identifiers (PR #, chainlink #) in LLM output survive
+    coercion into the CommitmentRecord unchanged.
+
+    This pins the v4 requirement: source bullets that contain PR/issue/
+    chainlink numbers must have those numbers in the extracted text so
+    a future turn can evaluate 'done/not done?' without backtracking.
+    """
+    payload = json.dumps({
+        "commitments": [
+            {
+                "text": "Cluster B subissues #115/#116/#117 under chainlink #29 unimplemented",
+                "confidence": 0.9,
+                "kind": "open_loop",
+            }
+        ]
+    })
+    _install_fake_chat(monkeypatch, payload)
+    out = await extract_commitments(
+        "x" * 200,
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert len(out) == 1
+    assert "chainlink #29" in out[0].text
+    assert "#115" in out[0].text
+    assert "#116" in out[0].text
+    assert "#117" in out[0].text
+
+
+async def test_extract_preserves_disposition_flag_in_text(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Disposition flags ("Optional") in LLM output survive coercion.
+
+    Pins the v4 requirement that "Optional", "blocker", and similar
+    qualifiers from source bullets appear in the stored text, so the
+    commitment can be correctly evaluated without source-turn backtrack.
+    """
+    payload = json.dumps({
+        "commitments": [
+            {
+                "text": "Optional: file chainlink for --no-bridges flag on mimir run",
+                "confidence": 0.75,
+                "kind": "open_loop",
+            }
+        ]
+    })
+    _install_fake_chat(monkeypatch, payload)
+    out = await extract_commitments(
+        "x" * 200,
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert len(out) == 1
+    assert "Optional" in out[0].text
+    assert "--no-bridges" in out[0].text
