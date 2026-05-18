@@ -299,6 +299,56 @@ def test_recent_session_boundaries_returns_in_recency_order(conn):
     assert {"s1", "s2"} <= ids
 
 
+def test_recent_session_boundaries_pipeline_renders_correctly(conn):
+    """End-to-end pipeline test: reflect() → sessions row →
+    recent_session_boundaries() → render_session_summaries().
+
+    Mimir flagged a shape regression in #219 where the new
+    recent_session_boundaries returned ``summary`` / ``unfinished`` /
+    ``ts`` under ``metadata`` instead of at the top level — breaking
+    render_session_summaries, which reads ``b.get("summary")``,
+    ``b.get("unfinished")``, ``b.get("ts")``, etc. at the top level.
+    This test pipes the full chain and asserts the rendered output
+    contains the summary text and Unfinished items, catching any
+    future shape drift.
+    """
+    from mimir.session_boundary_log import render_session_summaries
+
+    def _synth_with_unfinished(atoms, context):
+        return {
+            "summary": "Refactored auth module; tests green.",
+            "topics_discussed": ["auth", "tokens"],
+            "decisions_made": ["use JWT"],
+            "unfinished": ["refresh-token rotation"],
+            "emotional_state": "satisfied",
+            "closed_since": [],
+        }
+
+    reflect(conn, session_id="s_pipeline", channel_id="c1",
+            embed_fn=_fake_embed,
+            boundary_synth_fn=_synth_with_unfinished)
+
+    boundaries = recent_session_boundaries(conn, channel_id="c1", count=10)
+    assert len(boundaries) == 1
+    b = boundaries[0]
+
+    # Top-level fields that render_session_summaries reads.
+    assert b.get("summary") == "Refactored auth module; tests green."
+    assert b.get("unfinished") == ["refresh-token rotation"]
+    assert b.get("ts"), "ts must be non-empty for turn_counts keying"
+    assert b.get("channel_id") == "c1"
+
+    rendered = render_session_summaries(
+        boundaries, now=None, turn_counts={}, stale_age_hours=999, stale_turns=999,
+    )
+    assert rendered is not None
+    assert "Refactored auth module" in rendered
+    assert "refresh-token rotation" in rendered
+    # The "(no summary)" fallback must NOT appear — that would indicate
+    # the shape regression Mimir caught.
+    assert "(no summary)" not in rendered
+
+
 def test_recent_session_boundaries_filters_by_channel(conn):
     """channel_id filter scopes results."""
     reflect(conn, session_id="s1", channel_id="c1",

@@ -294,7 +294,8 @@ WHERE a.source_type = 'session_boundary'
             );
 
             -- Delete all dependents in dependency order:
-            -- 1. access_events → 2. embeddings → 3. atom_relations → 4. atoms
+            -- 1. atom_access_summary → 2. access_events → 3. embeddings
+            -- → 4. atom_relations → 5. atoms
             DELETE FROM atom_access_summary
             WHERE atom_id IN (
                 SELECT id FROM atoms WHERE source_type = 'session_boundary'

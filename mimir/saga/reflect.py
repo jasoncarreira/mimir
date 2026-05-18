@@ -240,14 +240,27 @@ def recent_session_boundaries(
     not "what's semantically related to a query." Use
     ``SagaStore.search_sessions()`` for the semantic path.
 
-    Return dict shape (compatible with prior atom-shape callers):
-        id              — session_id
-        content         — rendered summary block (summary + topics + decisions + ...)
-        created_at      — sessions.ended_at (falls back to reflected_at)
-        metadata        — {summary, topics_discussed, decisions_made,
-                           unfinished, emotional_state, closed_since}
-        session_id      — same as id
-        channel_id      — from sessions row
+    Return dict shape (matches the pre-migration prompt-build contract —
+    ``mimir/agent.py`` and ``session_boundary_log.render_session_summaries``
+    read fields from the top level, not from ``metadata``):
+        id, atom_id, session_id  — all equal to session_id (atom_id is
+                                   the historical key the local mirror
+                                   used; preserved for compatibility)
+        ts                       — sessions.ended_at (falls back to reflected_at);
+                                   the prompt builder keys turn_counts on this
+        created_at               — alias of ts
+        content                  — rendered summary block (summary + topics + ...)
+        summary                  — sessions.summary
+        topics_discussed         — list (parsed from JSON)
+        decisions_made           — list
+        unfinished               — list — render_session_summaries reads this
+                                   for the Unfinished section
+        closed_since             — list — render_session_summaries reads this
+                                   for cross-boundary unfinished suppression
+        emotional_state          — string | None
+        channel_id, channel      — both populated from sessions row
+        metadata                 — dict echoing the structured fields, for
+                                   callers that prefer the nested shape
     """
     if channel_id is not None:
         rows = conn.execute("""
@@ -303,10 +316,35 @@ def recent_session_boundaries(
         if not content.strip():
             content = "[session ended; no significant activity]"
 
+        ts = ended_at or reflected_at
         out.append({
+            # Identity — multiple aliases match the pre-migration shape.
+            # ``atom_id`` was the SAGA atom id of the boundary atom; that
+            # atom no longer exists, but local-mirror code keys on it and
+            # the session_id serves the same identity role.
             "id": sid,
+            "atom_id": sid,
+            "session_id": sid,
+            # Timestamp keys: render_session_summaries reads ``ts``;
+            # agent._assemble_session_summaries reads it for turn_counts.
+            # ``created_at`` is the post-migration alias.
+            "ts": ts,
+            "created_at": ts,
+            # Channel: both spellings populated.
+            "channel_id": ch,
+            "channel": ch,
+            # Rendered + raw content. ``summary`` MUST be at the top level
+            # — render_session_summaries reads it there, not from metadata.
             "content": content,
-            "created_at": ended_at or reflected_at,
+            "summary": summary or "",
+            # Structured fields at the top level (top-level reads in
+            # render_session_summaries + cross-boundary closed_since
+            # suppression). Mirrored in ``metadata`` for nested callers.
+            "topics_discussed": topics,
+            "decisions_made": decisions,
+            "unfinished": unfinished,
+            "emotional_state": emotional_state,
+            "closed_since": closed_since,
             "metadata": {
                 "summary": summary or "",
                 "topics_discussed": topics,
@@ -315,7 +353,5 @@ def recent_session_boundaries(
                 "emotional_state": emotional_state,
                 "closed_since": closed_since,
             },
-            "session_id": sid,
-            "channel_id": ch,
         })
     return out
