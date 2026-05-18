@@ -10,8 +10,10 @@ unfinished items into 100-1100 chars of prose; this module asks Claude
 - Not the agent loop: the session-end synthesis turn is already an
   LLM call; we don't want to wrap that in another LLM call from the
   same loop. The extraction runs in the finalize hook on a separate
-  one-shot LLM call via ``langchain.chat_models.init_chat_model``
-  (haiku-tier by default; configurable via the ``model`` kwarg).
+  one-shot LLM call via saga's ``call_llm`` (same provider-dispatch
+  chain as query rewrite, consolidation, atom annotation, etc.).
+  Operators control via ``[commitments]`` section in saga.toml,
+  falling back to ``[llm]`` for the global default.
 - Not a poller: session-end output is event-driven, not time-driven.
   A poller would either miss output (debounced) or re-extract the
   same content (idempotent only via the store's dedupe-key gate).
@@ -155,17 +157,19 @@ Extract commitments per the rules. Return only the JSON object."""
 MIN_OUTPUT_LEN = 100
 
 
-# Default model. Haiku is the cheapest tier and the extraction is well
-# within haiku's reasoning band per the backtest. Post-deepagents
-# migration (PR #181), ``langchain.chat_models.init_chat_model``
-# requires a provider prefix — the SDK-era bare ``"haiku"`` alias now
-# raises ``ValueError: Unable to infer model provider for
-# model='haiku'`` because langchain's resolver no longer routes
-# unprefixed names. The ``anthropic:claude-haiku-4-5`` form is
-# explicit; the provider segment selects langchain-anthropic
-# (installed by the ``anthropic`` extra) and routes through
-# ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN like the SDK era did.
-DEFAULT_EXTRACTOR_MODEL = "anthropic:claude-haiku-4-5"
+# Default model name (no provider prefix). Provider dispatch comes from
+# saga's resolved llm config — same path as consolidation, query rewrite,
+# atom annotation, and the rest of saga's LLM call sites. Operators set
+# per-subsystem overrides via ``[commitments] provider = ...`` in
+# saga.toml, falling back to ``[llm] provider`` for the global default.
+#
+# Pre-fix this was ``"anthropic:claude-haiku-4-5"`` and the extractor
+# called ``langchain.chat_models.init_chat_model`` directly — which
+# requires ``ANTHROPIC_API_KEY`` even when the rest of the deploy is
+# running on OAuth via Claude Code (mimirbot's setup). That bypassed
+# saga's whole config system. Now we route through ``saga._llm.call_llm``
+# so the same provider selection chain governs the extractor's call.
+DEFAULT_EXTRACTOR_MODEL: str | None = None
 
 
 def _strip_code_fence(body: str) -> str:
@@ -291,10 +295,15 @@ async def extract_commitments(
     channel_id: str | None,
     saga_session_id: str | None,
     source_turn_id: str | None,
-    model: str = DEFAULT_EXTRACTOR_MODEL,
+    model: str | None = DEFAULT_EXTRACTOR_MODEL,
 ) -> list[CommitmentRecord]:
     """Run the LLM extraction on a session-end synthesis output, return
     a list of ``CommitmentRecord``s ready for ``store.add()``.
+
+    Provider dispatch follows saga's ``call_llm`` selection chain —
+    same path as query rewrite, consolidation, and the rest of saga's
+    LLM call sites. Operators control via ``saga.toml`` (per-subsystem
+    ``[commitments]`` section overrides global ``[llm]``).
 
     Best-effort:
     - Short outputs (<100 chars) → skip without LLM call (no commitments
@@ -308,13 +317,17 @@ async def extract_commitments(
     Caller (the ``CommitmentExtractionHook``) is responsible for
     dedupe gating via ``store.find_by_dedupe_key()`` before adding.
     Each record's ``dedupe_key`` is filled in by ``_coerce_to_record``.
+
+    Args:
+        model: Optional override for the resolved llm config's ``model``
+            field. Accepts a bare name (``"claude-haiku-4-5"``); a
+            ``provider:`` prefix is stripped if present (the provider
+            still comes from saga's resolved config). ``None`` uses
+            the configured model verbatim.
     """
     if not session_end_output or len(session_end_output) < MIN_OUTPUT_LEN:
         return []
 
-    # Single-shot LLM call via langchain. Tests patch
-    # ``langchain.chat_models.init_chat_model`` to substitute a
-    # stub chat model — see test_commitments_extractor.py.
     user_msg = USER_TEMPLATE.format(
         channel_id=channel_id or "(none)",
         ts="",
@@ -324,23 +337,26 @@ async def extract_commitments(
 
     raw_text = ""
     try:
-        from langchain.chat_models import init_chat_model
-        from langchain_core.messages import HumanMessage, SystemMessage
+        from mimir.saga._llm import call_llm
+        from mimir.saga._config_io import resolve_llm_config
 
-        chat = init_chat_model(model or "anthropic:claude-haiku-4-5")
-        msgs = [
-            SystemMessage(content=EXTRACTION_SYSTEM),
-            HumanMessage(content=user_msg),
-        ]
-        response = await chat.ainvoke(msgs)
-        content = response.content
-        if isinstance(content, str):
-            raw_text = content
-        elif isinstance(content, list):
-            raw_text = "".join(
-                b.get("text", "") if isinstance(b, dict) else str(b)
-                for b in content
-            )
+        cfg = dict(resolve_llm_config("commitments"))
+        if model:
+            # Strip a ``provider:`` prefix if present — provider always
+            # comes from saga config, model name from the override.
+            cfg["model"] = model.split(":", 1)[-1]
+
+        raw_text = await call_llm(
+            cfg,
+            prompt=user_msg,
+            system=EXTRACTION_SYSTEM,
+            # Extraction is JSON; deterministic output wanted.
+            temperature=0.0,
+            # Multiple commitments per session = a few hundred tokens
+            # of JSON. 2000 leaves headroom for long sessions without
+            # blowing the budget.
+            max_tokens=2000,
+        )
     except Exception:  # noqa: BLE001
         log.exception("commitments extractor: LLM call failed")
         return []

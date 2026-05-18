@@ -312,3 +312,15 @@ default_confidence = 1.0                   # default confidence for world model 
 tracking_enabled = true                    # enable agreement rate tracking
 warning_threshold = 0.85                   # agreement rate above this triggers sycophancy warning
 window_size = 20                           # number of recent signals to compute rate over
+
+# Commitments extraction (mimir/commitments/extractor.py) runs at
+# session boundaries to surface follow-ups from the synthesis output.
+# Routes through saga's call_llm — falls back to [llm] when this
+# section is absent. Override only if you want a different provider
+# or model for commitments specifically (e.g. cheaper model since
+# the task is short JSON extraction).
+# [commitments]
+# provider = "anthropic"                   # anthropic | openai_compat | claude_code
+# model    = "claude-haiku-4-5"            # bare model name; provider above selects the SDK
+# api_key  = "..."                         # provider-specific; usually picked up from env
+# timeout  = 30
