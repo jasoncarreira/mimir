@@ -229,7 +229,8 @@ async def call_llm(
     failure — every existing caller already handles empty gracefully."""
     import asyncio
 
-    provider = (llm.get("provider") or "openai_compat").lower()
+    raw_provider = llm.get("provider") or "openai_compat"
+    provider = raw_provider.lower()
     if provider == "claude_code":
         return await _call_claude_code_async(
             llm, prompt=prompt, max_tokens=max_tokens,
@@ -240,6 +241,18 @@ async def call_llm(
             _call_anthropic, llm,
             prompt=prompt, max_tokens=max_tokens,
             temperature=temperature, system=system,
+        )
+    # ``openai_compat`` is the documented fallback name. Anything else
+    # is a typo or stale enum value — warn so the operator can spot it
+    # in the log. Pre-fix, ``provider="anthropic-sdk"`` (missing
+    # underscore) silently called api.openai.com under a different
+    # cost + token-accounting regime; that footgun stays exactly as
+    # silent as the operator's eyes are sharp without this warning.
+    if provider != "openai_compat":
+        log.warning(
+            "call_llm: unknown provider %r — falling back to openai_compat. "
+            "Recognized: 'claude_code', 'anthropic', 'openai_compat'.",
+            raw_provider,
         )
     return await asyncio.to_thread(
         _call_openai_compat, llm,
