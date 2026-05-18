@@ -45,17 +45,28 @@ _tool_events_var: contextvars.ContextVar[list[dict[str, Any]] | None] = (
 
 
 def apply_patches() -> None:
-    """Apply the ``_arun`` config-kwarg patch to ChatClaudeCode.
-    Idempotent + import-safe.
+    """Apply runtime patches to ``ChatClaudeCode``. Idempotent + import-safe.
 
-    Detects when the upstream ``_wrap_langchain_tool`` has been
-    fixed (signature change or body no longer calling ``_arun``
-    without ``config``) and skips the patch in that case — pre-fix
-    the ``_PATCH_MARKER`` guard only handled re-running the patch,
-    not an upstream change that rendered it obsolete (or worse,
-    re-broken by us). On signature mismatch we bail out with a
-    warning rather than silently replacing the upstream fix with
-    our stale shim.
+    Patches applied:
+
+    1. **``_wrap_langchain_tool``** — passes an empty ``RunnableConfig`` to
+       ``tool._arun`` so langchain-core 1.x's required-kwarg validation
+       doesn't raise on every tool invocation.
+
+    2. **``_get_tool_schema``** — uses ``tool.tool_call_schema`` (which
+       correctly excludes ``InjectedToolArg`` parameters like ``config``)
+       instead of ``tool.args_schema`` (which includes them). Without this,
+       the MCP schema exposed to Claude Code lists ``config`` as a callable
+       parameter; the model passes it; ``_arun`` then receives ``config``
+       from both the caller args AND from patch #1's explicit injection →
+       "got multiple values for keyword argument 'config'". The three
+       affected tools are ``send_message``, ``react``, and
+       ``fetch_channel_history`` (all use ``InjectedToolArg`` for their
+       ``config: RunnableConfig`` parameter).
+
+    Detects when the upstream ``_wrap_langchain_tool`` has been fixed
+    (signature change or body no longer calling ``_arun`` without ``config``)
+    and skips the patch in that case.
     """
     try:
         from langchain_claude_code import claude_chat_model as ccm
@@ -68,6 +79,7 @@ def apply_patches() -> None:
         return
 
     _orig_wrap = ccm.ClaudeCodeChatModel._wrap_langchain_tool
+    _orig_get_schema = ccm.ClaudeCodeChatModel._get_tool_schema
 
     # Upstream-fix detection: the original method we're patching had
     # this exact signature when the bug existed: ``(self, tool, schema)``.
@@ -104,7 +116,23 @@ def apply_patches() -> None:
         # functions; fall through to apply the patch (current behavior).
         pass
 
-    def _patched_wrap_langchain_tool(self, tool, schema):
+    # ── Patch 1: _get_tool_schema ────────────────────────────────────
+    # Use tool_call_schema (excludes InjectedToolArg fields) instead of
+    # args_schema (includes them). This prevents config from appearing in
+    # the MCP schema that Claude Code sees — Claude Code won't pass it,
+    # so _arun won't receive it twice.
+    def _patched_get_tool_schema(self, tool: Any) -> dict[str, Any]:
+        if hasattr(tool, "tool_call_schema") and tool.tool_call_schema is not None:
+            try:
+                return tool.tool_call_schema.model_json_schema()
+            except Exception:
+                pass
+        return _orig_get_schema(self, tool)
+
+    ccm.ClaudeCodeChatModel._get_tool_schema = _patched_get_tool_schema
+
+    # ── Patch 2: _wrap_langchain_tool ────────────────────────────────
+    def _patched_wrap_langchain_tool(self, tool: Any, schema: dict[str, Any]) -> Any:
         from langchain_core.runnables import RunnableConfig
         try:
             from claude_agent_sdk import tool as sdk_tool
@@ -128,10 +156,13 @@ def apply_patches() -> None:
         async def wrapped_tool(args: dict[str, Any]) -> dict[str, Any]:
             try:
                 if hasattr(tool, "_arun") and asyncio.iscoroutinefunction(tool._arun):
-                    # The patch — pass an empty RunnableConfig so the
-                    # required-kwarg validation in langchain-core 1.x
-                    # doesn't raise.
-                    result = await tool._arun(**args, config=RunnableConfig())
+                    # Strip InjectedToolArg params that may have leaked
+                    # through the schema (belt-and-suspenders for the
+                    # _get_tool_schema fix above). If config is already in
+                    # args, passing it again via config=RunnableConfig()
+                    # raises "got multiple values for keyword argument".
+                    clean_args = {k: v for k, v in args.items() if k != "config"}
+                    result = await tool._arun(**clean_args, config=RunnableConfig())
                 else:
                     result = tool._run(**args)
 
@@ -153,7 +184,10 @@ def apply_patches() -> None:
 
     ccm.ClaudeCodeChatModel._wrap_langchain_tool = _patched_wrap_langchain_tool
     setattr(ccm.ClaudeCodeChatModel, _PATCH_MARKER, True)
-    log.debug("applied langchain-claude-code _arun config-kwarg patch")
+    log.debug(
+        "applied langchain-claude-code patches: "
+        "_get_tool_schema (tool_call_schema) + _wrap_langchain_tool (config-kwarg)"
+    )
 
 
 _DEEPAGENTS_BASE_PROMPT_MARKER = "_mimir_base_prompt_stripped"
