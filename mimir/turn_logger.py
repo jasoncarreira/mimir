@@ -129,6 +129,47 @@ def extract_turn_events(
             # only 2 tool_results — every result captured was the
             # LangGraph-native path.
             rmd = getattr(msg, "response_metadata", None) or {}
+            # Hooks-based capture path (preferred when present): the
+            # ``install_tool_event_hooks`` patch in
+            # ``_langchain_claude_code_patches.py`` registers SDK
+            # PreToolUse/PostToolUse/PostToolUseFailure hooks that record
+            # every tool invocation — built-in, bridged, MCP — into a
+            # single ordered list paired by ``tool_use_id``. When that
+            # list is present, walk it directly: events arrive in the
+            # actual call→result→call→result order the model executed
+            # (vs. the bunched call-list-then-result-list shape produced
+            # by the legacy ``internal_tool_calls`` / ``internal_tool_results``
+            # split). Falls through to the legacy path when the hooks
+            # patch isn't loaded (e.g. anthropic-only operator).
+            tool_events = rmd.get("tool_events")
+            if tool_events:
+                is_final_ai = i == last_ai_idx
+                if content_text and not is_final_ai:
+                    events.append({"type": "reasoning", "content": content_text})
+                elif content_text:
+                    output_parts.append(content_text)
+                    events.append({"type": "reasoning", "content": content_text})
+                for te in tool_events:
+                    te_type = te.get("type")
+                    if te_type == "tool_call":
+                        events.append({
+                            "type": "tool_call",
+                            "id": te.get("tool_use_id", ""),
+                            "name": te.get("name", "unknown"),
+                            "args": te.get("input"),
+                        })
+                    elif te_type == "tool_result":
+                        body = _coerce_content(te.get("result") or te.get("error"))
+                        if len(body) > MAX_TOOL_RESULT_BYTES:
+                            body = body[:MAX_TOOL_RESULT_BYTES] + "…[truncated]"
+                        events.append({
+                            "type": "tool_result",
+                            "id": te.get("tool_use_id", ""),
+                            "name": te.get("name", ""),
+                            "content": body,
+                            "is_error": bool(te.get("is_error")),
+                        })
+                continue  # AIMessage handled via tool_events; skip legacy path
             internal_tcs = rmd.get("internal_tool_calls") or []
             internal_trs = (
                 rmd.get("internal_tool_results")
