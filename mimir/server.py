@@ -241,7 +241,12 @@ def build_app(config: Config) -> web.Application:
     seeded = seed_subagent_defs(config.home)
     seeded_skills_map = seed_skills(config.home)
 
-    init_logger(config.events_log, make_process_session_id(), max_events=config.max_events_kept)
+    init_logger(
+        config.events_log,
+        make_process_session_id(),
+        max_events=config.max_events_kept,
+        agent_id=config.agent_id,
+    )
     turn_logger = TurnLogger(config.turns_log, max_turns=config.max_turns_kept)
 
     # Identity reconciliation (FUTURE_WORK §6.1). Loads
