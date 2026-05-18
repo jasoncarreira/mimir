@@ -1507,10 +1507,27 @@ class Scheduler:
 def _summarize_consolidate(payload: Any) -> dict:
     if not isinstance(payload, dict):
         return {"raw": str(payload)[:200]}
-    return {
+    summary = {
         k: payload[k]
-        for k in ("clusters_processed", "atoms_merged", "atoms_retired", "duration_s")
+        for k in (
+            "clusters_processed", "atoms_merged", "atoms_retired",
+            "duration_s", "candidates_scanned", "clusters_found",
+            "clusters_consolidated", "observations_created",
+            "triples_stored", "contradicts_stored",
+        )
         if k in payload
     }
+    dedup = payload.get("dedup")
+    if isinstance(dedup, dict):
+        summary["dedup"] = {
+            "candidates_scanned": dedup.get("candidates_scanned", 0),
+            "clusters_formed": dedup.get("clusters_formed", 0),
+            "canonicals_kept": len(dedup.get("canonicals_kept", []) or []),
+            "duplicates_tombstoned": len(
+                dedup.get("duplicates_tombstoned", []) or []
+            ),
+            "threshold": dedup.get("threshold"),
+        }
+    return summary
 
 
