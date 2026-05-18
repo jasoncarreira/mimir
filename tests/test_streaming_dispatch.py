@@ -339,3 +339,94 @@ async def test_dispatcher_result_and_suppressed_after_full_turn() -> None:
     # One mid-turn send (the plan); the result is the caller's job
     # to flush at end of turn.
     assert len(bridge.sends) == 1
+
+
+# ─── Action-directive stripping (pre-#181 parity) ─────────────────
+
+
+class _ReactingBridge(_FakeBridge):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reacts: list[tuple[str, str | None, str]] = []
+
+    async def react(self, channel_id: str, message_id, emoji: str):
+        self.reacts.append((channel_id, message_id, emoji))
+        return True
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_strips_actions_markup_before_bridge_send() -> None:
+    """Pre-#181 dispatcher parsed ``<actions>`` directives out of
+    plan_text before sending — bridge received cleaned text only.
+    The deepagents migration kept the streaming machinery but dropped
+    the cleaning step; this test pins the parity invariant so raw
+    ``<actions>`` markup can never reach the user mid-stream again.
+    """
+    bridge = _ReactingBridge()
+    d = StreamingAutoDispatcher(channel_id="ch-1", bridge=bridge)
+    plan_with_directive = (
+        "Got it, looking into this now.\n"
+        '<actions><react emoji="👀" /></actions>'
+    )
+    await d.observe(_ai(plan_with_directive))
+    await d.observe(_ai(
+        "", tool_calls=[{"name": "memory_query", "args": {}, "id": "t1"}],
+    ))
+    # Cleaned text reached the bridge — no <actions> markup.
+    assert len(bridge.sends) == 1
+    sent_text = bridge.sends[0][1]
+    assert "<actions>" not in sent_text
+    assert "<react" not in sent_text
+    assert "Got it" in sent_text
+    # The directive WAS dispatched against the just-sent plan flush.
+    assert bridge.reacts == [("ch-1", None, "👀")]
+    assert d.streamed_plan is True
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_actions_only_plan_no_bridge_send_but_directives_fire() -> None:
+    """Edge case: plan is directives-only. After stripping ``<actions>``
+    there's nothing left to send to the bridge — but the directives
+    must still dispatch (e.g. an ack-react with no accompanying text).
+    Pre-#181 invariant: ``cleaned_plan.strip()`` empty → no send,
+    but directives are still forwarded."""
+    bridge = _ReactingBridge()
+    d = StreamingAutoDispatcher(channel_id="ch-1", bridge=bridge)
+    directives_only = '<actions><react emoji="✅" /></actions>'
+    await d.observe(_ai(directives_only))
+    await d.observe(_ai(
+        "", tool_calls=[{"name": "memory_query", "args": {}, "id": "t1"}],
+    ))
+    # No bridge send (nothing left after stripping).
+    assert bridge.sends == []
+    # But the react fired.
+    assert bridge.reacts == [("ch-1", None, "✅")]
+    # streamed_plan stays False — we never confirmed a send.
+    assert d.streamed_plan is False
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_appends_cleaned_text_to_buffer_not_raw() -> None:
+    """The outbound_appender callback must receive the CLEANED text
+    (no ``<actions>`` markup) so chat_history reflects what the user
+    actually saw, not the raw model output. Pre-#181 invariant."""
+    bridge = _FakeBridge()
+    captured: list[tuple[str, str]] = []
+
+    async def _appender(channel_id, content, *, msg_id, source):
+        captured.append((channel_id, content))
+
+    d = StreamingAutoDispatcher(
+        channel_id="ch-1", bridge=bridge,
+        outbound_appender=_appender,
+    )
+    await d.observe(_ai(
+        "Reply.\n<actions><react emoji=\"👍\" /></actions>"
+    ))
+    await d.observe(_ai(
+        "", tool_calls=[{"name": "memory_query", "args": {}, "id": "t1"}],
+    ))
+    assert len(captured) == 1
+    appended_content = captured[0][1]
+    assert appended_content == "Reply."
+    assert "<actions>" not in appended_content

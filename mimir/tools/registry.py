@@ -26,9 +26,12 @@ from __future__ import annotations
 
 import json
 import asyncio
+import logging
 import subprocess
 from pathlib import Path
 from typing import Annotated, Any, Optional
+
+log = logging.getLogger(__name__)
 
 from langchain_core.runnables import RunnableConfig
 
@@ -187,6 +190,42 @@ async def send_message(
             result = await bridge.send(cid, clean_text)
         except Exception as exc:
             return f"send_message failed: {exc}"
+
+        # Append outbound to chat-history buffer so the agent's next
+        # turn sees its own reply in Recent activity. Dropped in PR
+        # #181's deepagents migration; restoring here closes the
+        # regression for the send_message-tool path (the most common
+        # outbound path in production). No-op when no buffer is
+        # registered (test paths that bypass ``server.serve``).
+        #
+        # ``source`` is left ``None`` here — unlike the agent-fallback
+        # path which threads ``ctx.channel_source``, the tool runs
+        # detached from the active TurnContext. Render code treats
+        # missing source the same as a non-allowlisted source for
+        # the cross-author cross-pull check; in practice every
+        # cross-channel render path filters on the inbound channel's
+        # source, so an empty source on outbound just means it stays
+        # scoped to its own channel (which is the right default).
+        from ..history import get_global_buffer
+        _buf = get_global_buffer()
+        if _buf is not None and result is not None:
+            try:
+                msg = _buf.make_message(
+                    channel_id=cid,
+                    kind="assistant_message",
+                    content=clean_text,
+                    msg_id=getattr(result, "message_id", None),
+                    source=None,
+                )
+                await _buf.append(msg)
+            except Exception:  # noqa: BLE001
+                # Best-effort — don't fail the tool call if the
+                # buffer hiccups. Log a warning rather than swallowing
+                # silently so disk-full / permission-denied issues
+                # are visible in events.jsonl downstream.
+                log.warning(
+                    "send_message: chat_history append failed", exc_info=True,
+                )
 
     for _directive in parsed.directives:
         if isinstance(_directive, ReactDirective):

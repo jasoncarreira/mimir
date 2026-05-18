@@ -520,3 +520,258 @@ async def test_run_turn_records_error_when_ainvoke_raises(tmp_path: Path):
     assert record.events == []
     # feedback skipped on error
     assert fake_saga.feedback_calls == []
+
+
+# ── chat-history buffer append (regression for PR #181 drop) ────────
+
+
+async def test_run_turn_appends_inbound_to_message_buffer(tmp_path: Path):
+    """user_message event must land in the chat-history buffer
+    BEFORE prompt assembly so ``assemble_recent_activity`` sees the
+    inbound on this very turn. Regression for PR #181's deepagents
+    migration which silently dropped the SDK-era inline append calls
+    (last chat_history.jsonl write was 2026-05-17T21:48; mimirbot
+    operated for ~19h with frozen Recent activity)."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    fake_saga = _FakeSaga()
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=fake_saga,
+    )
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1",
+        content="hello there", author="jason", author_display="Jason",
+        source="discord",
+    )
+    record = await agent.run_turn(event)
+    assert record.error is None
+
+    # Both the inbound (user_message) and the outbound (assistant_message
+    # via the fallback bridge.send) should be in the buffer. This
+    # build_agent has no _channels, so only the inbound lands.
+    msgs = list(agent._buffer._all)
+    assert any(m.content == "hello there" and m.kind == "user_message"
+               for m in msgs), (
+        f"inbound user_message missing from buffer; got: "
+        f"{[(m.kind, m.content[:30]) for m in msgs]}"
+    )
+
+
+async def test_run_turn_appends_outbound_via_fallback_bridge_send(tmp_path: Path):
+    """When the end-of-turn fallback ``bridge.send`` fires, the sent
+    text must be appended to the chat-history buffer as an
+    ``assistant_message`` so the agent's next turn sees its own reply
+    in Recent activity. Mirrors what the SDK-era post-hook did before
+    PR #181."""
+
+    class _CapturingBridge:
+        name = "fake"
+        def __init__(self) -> None:
+            self.sends: list[tuple[str, str, bool]] = []
+
+        async def send_typing_indicator(self, *a, **kw):
+            return None
+
+        async def cancel_typing(self, *a, **kw):
+            return None
+
+        async def send(self, channel_id, text, attachment_paths=None, *, final=True):
+            self.sends.append((channel_id, text, final))
+            class _R:
+                sent = True
+                message_id = "msg-out-42"
+            return _R()
+
+    class _Channels:
+        def __init__(self, bridge):
+            self._bridge = bridge
+
+        def find(self, channel_id):
+            return self._bridge
+
+    bridge = _CapturingBridge()
+    fake_agent = _FakeAgent(response_messages=[
+        AIMessage(content="here is my reply"),
+    ])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
+    )
+    agent._channels = _Channels(bridge)  # type: ignore[attr-defined]
+
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1",
+        content="hi", author="jason", source="discord",
+    )
+    record = await agent.run_turn(event)
+    assert record.error is None
+    # Bridge actually sent the reply (via the agent fallback path,
+    # since this fake agent doesn't trigger streaming).
+    assert ("ch-1", "here is my reply", True) in bridge.sends
+
+    # The outbound must be in the buffer.
+    msgs = list(agent._buffer._all)
+    outbound = [m for m in msgs if m.kind == "assistant_message"]
+    assert len(outbound) == 1, (
+        f"expected 1 assistant_message; got "
+        f"{[(m.kind, m.content[:30]) for m in msgs]}"
+    )
+    assert outbound[0].content == "here is my reply"
+    assert outbound[0].channel_id == "ch-1"
+    assert outbound[0].msg_id == "msg-out-42"
+
+
+async def test_inbound_buffer_append_skips_internal_wake_triggers(tmp_path: Path):
+    """``saga_session_end`` + ``shell_job_complete`` are internal wakes
+    with no conversational content the agent would want in Recent
+    activity. Pre-#181 explicitly skipped both in ``_record_inbound``;
+    keep parity."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
+    )
+
+    for trig in ("saga_session_end", "shell_job_complete"):
+        await agent._append_inbound_to_buffer(AgentEvent(
+            trigger=trig, channel_id="ch-1", content="ignore me",
+        ))
+    assert agent._buffer.total_count() == 0
+
+
+async def test_inbound_buffer_append_logs_scheduled_tick_as_system_note(
+    tmp_path: Path,
+):
+    """Pre-#181 logged ``scheduled_tick`` as kind=system_note so the
+    agent saw "I was woken at 10:00 with prompt X" in its next
+    Recent activity. Allow-list scoping (an earlier mistake in this
+    PR) silently dropped these; explicit regression guard."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
+    )
+    await agent._append_inbound_to_buffer(AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        content="Heartbeat — check for new commitments due.",
+    ))
+    msgs = list(agent._buffer._all)
+    assert len(msgs) == 1
+    assert msgs[0].kind == "system_note"
+    assert "Heartbeat" in msgs[0].content
+
+
+async def test_inbound_buffer_append_falls_back_to_author_for_display(
+    tmp_path: Path,
+):
+    """Pre-#181: ``author_display=event.author_display or event.author``
+    — display falls back to the platform-prefixed author key when the
+    bridge didn't resolve a friendlier name. Locks in that parity."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
+    )
+    await agent._append_inbound_to_buffer(AgentEvent(
+        trigger="user_message", channel_id="ch-1",
+        content="hi", author="discord-99",
+        author_display=None,  # bridge didn't supply one
+    ))
+    msgs = list(agent._buffer._all)
+    assert len(msgs) == 1
+    assert msgs[0].author == "discord-99"
+    assert msgs[0].author_display == "discord-99"
+
+
+async def test_outbound_buffer_append_runs_even_when_bridge_send_fails(
+    tmp_path: Path,
+):
+    """Pre-#181's ``_auto_dispatch_or_record``: "Always writes to
+    chat_history regardless of dispatch outcome — so Recent activity
+    reflects what the agent said even when delivery failed (the
+    agent self-corrects when it sees a stale conversation that
+    doesn't match what it thought it sent)."
+
+    Verify the append fires even when ``bridge.send`` raises.
+    """
+
+    class _ExplodingBridge:
+        name = "fake"
+        async def send_typing_indicator(self, *a, **kw):
+            return None
+        async def cancel_typing(self, *a, **kw):
+            return None
+        async def send(self, *a, **kw):
+            raise RuntimeError("network down")
+
+    class _Channels:
+        def __init__(self, bridge):
+            self._bridge = bridge
+        def find(self, channel_id):
+            return self._bridge
+
+    bridge = _ExplodingBridge()
+    fake_agent = _FakeAgent(response_messages=[
+        AIMessage(content="reply that won't reach the user"),
+    ])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
+    )
+    agent._channels = _Channels(bridge)  # type: ignore[attr-defined]
+
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1",
+        content="hi", author="jason", source="discord",
+    )
+    record = await agent.run_turn(event)
+    # run_turn doesn't fail just because bridge.send did
+    assert record.error is None
+    # ...and the outbound IS in the buffer for the agent to reconcile.
+    msgs = list(agent._buffer._all)
+    outbound = [m for m in msgs if m.kind == "assistant_message"]
+    assert len(outbound) == 1
+    assert outbound[0].content == "reply that won't reach the user"
+    # msg_id is None when send failed (no SendResult to read from)
+    assert outbound[0].msg_id is None
+
+
+async def test_send_message_tool_appends_outbound_via_global_buffer(tmp_path: Path):
+    """The ``send_message`` tool reads the buffer from
+    ``mimir.history.get_global_buffer`` (set by ``server.py`` at
+    startup) and appends every successful send. Regression guard
+    for the tool-path side of the PR #181 regression."""
+    from mimir.history import MessageBuffer, set_global_buffer
+    from mimir.tools import registry as tools_reg
+
+    class _CapBridge:
+        name = "fake"
+        async def send(self, channel_id, text, attachment_paths=None, *, final=True):
+            class _R:
+                sent = True
+                message_id = "msg-tool-1"
+            return _R()
+        async def react(self, *a, **kw):
+            return True
+
+    class _Channels:
+        def __init__(self, bridge):
+            self._bridge = bridge
+        def find(self, channel_id):
+            return self._bridge
+
+    buf = MessageBuffer(history_path=tmp_path / "chat_history.jsonl")
+    set_global_buffer(buf)
+    tools_reg.set_channel_registry(_Channels(_CapBridge()))
+    tools_reg.set_current_channel_id("ch-tool")
+    try:
+        send_message = tools_reg.send_message
+        # Call the @tool wrapper's underlying coro directly.
+        result = await send_message.ainvoke({"text": "outbound from tool"})
+        assert "send_message ok" in result
+        # Buffer got the append.
+        msgs = list(buf._all)
+        assert len(msgs) == 1
+        assert msgs[0].kind == "assistant_message"
+        assert msgs[0].content == "outbound from tool"
+        assert msgs[0].channel_id == "ch-tool"
+        assert msgs[0].msg_id == "msg-tool-1"
+    finally:
+        set_global_buffer(None)  # type: ignore[arg-type]
+        tools_reg.set_channel_registry(None)
+        tools_reg.set_current_channel_id(None)

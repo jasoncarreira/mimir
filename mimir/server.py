@@ -347,6 +347,12 @@ def build_app(config: Config) -> web.Application:
     _agent_tools.set_channel_registry(channels)
     _agent_tools.set_dispatcher(dispatcher)
     _agent_tools.set_scheduler(scheduler)
+    # Register the process's MessageBuffer globally so the
+    # ``send_message`` tool can append outbound replies. Restored
+    # after PR #181 (deepagents migration) lost the inline
+    # ``buffer.append`` calls from the SDK-era pre/post hooks.
+    from .history import set_global_buffer
+    set_global_buffer(message_buffer)
     # Pre-fix these setters existed but weren't called from build_app,
     # so the four commitment_* tools all returned "no store" and
     # spawn_claude_code had no resolved config. Wired now.
