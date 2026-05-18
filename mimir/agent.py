@@ -106,6 +106,14 @@ from .turn_logger import (
 
 log = logging.getLogger(__name__)
 
+# Triggers for which saga.query() adds no value — the turn has no
+# meaningful user-authored query anchor, so the memory-inject pass
+# is skipped entirely. Extraction as a frozenset constant keeps the
+# condition readable and easy to extend.
+NON_USER_QUERY_TRIGGERS: frozenset[str] = frozenset(
+    {"saga_session_end", "scheduled_tick", "poller"}
+)
+
 
 # ────────────────────────────────────────────────────────────────────
 # Helpers
@@ -669,11 +677,14 @@ class Agent:
 
         # Pre-message memory inject. Builds the "Possibly relevant
         # memories" block + collects atom_ids for the post-turn
-        # feedback credit pass. Skipped on saga_session_end turns
-        # (synthesis owns its own prompt).
+        # feedback credit pass. Skipped for triggers in
+        # NON_USER_QUERY_TRIGGERS (saga_session_end, scheduled_tick,
+        # poller) — these turns have no user-authored query anchor so
+        # retrieval is wasteful noise; session summaries still fire
+        # via _assemble_session_summaries for all trigger types.
         memory_block: str | None = None
         saga_atom_ids: list[str] = []
-        if self._saga is not None and event.trigger != "saga_session_end":
+        if self._saga is not None and event.trigger not in NON_USER_QUERY_TRIGGERS:
             try:
                 payload = await self._saga.query(
                     event.content,
