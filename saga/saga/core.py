@@ -125,6 +125,24 @@ CREATE INDEX IF NOT EXISTS idx_access_log_atom ON access_log(atom_id);
 CREATE INDEX IF NOT EXISTS idx_atoms_agent ON atoms(agent_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_atoms_dedup ON atoms(content_hash, agent_id) WHERE state IN ('active', 'fading');
 CREATE INDEX IF NOT EXISTS idx_atoms_memory_type ON atoms(memory_type);
+
+-- ─── Sessions (first-class continuity beacons) ────────────────────
+-- Session boundaries live here, NOT in the atoms table. Each session
+-- gets exactly one row (session_id is the PK). get_last_sessions()
+-- queries this table; retrieval, consolidation, and FTS all ignore it.
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id       TEXT PRIMARY KEY,
+    channel          TEXT,
+    created_at       TEXT NOT NULL,
+    summary          TEXT NOT NULL DEFAULT '',
+    topics_discussed TEXT NOT NULL DEFAULT '[]',
+    decisions_made   TEXT NOT NULL DEFAULT '[]',
+    unfinished       TEXT NOT NULL DEFAULT '[]',
+    emotional_state  TEXT,
+    closed_since     TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_channel ON sessions(channel);
 """
 
 
@@ -926,12 +944,8 @@ def retrieve(
         sql += " AND a.memory_type = ?" if topic_filter else " AND memory_type = ?"
         params.append(memory_type)
 
-    # Continuity beacons (session_boundary atoms) are excluded by default —
-    # they're for get_last_sessions(), not generic similarity retrieval.
-    if not include_session_boundaries:
-        sql += (" AND (a.source_type IS NULL OR a.source_type != 'session_boundary')"
-                if topic_filter else
-                " AND (source_type IS NULL OR source_type != 'session_boundary')")
+    # session_boundary atoms no longer live in atoms — they're in the
+    # sessions table (migration 11). No exclusion clause needed here.
 
     # Get query embedding (cached)
     query_emb = cached_embed_query(query)
@@ -971,8 +985,6 @@ def retrieve(
                     if memory_type:
                         faiss_sql += " AND memory_type = ?"
                         faiss_params.append(memory_type)
-                    if not include_session_boundaries:
-                        faiss_sql += " AND (source_type IS NULL OR source_type != 'session_boundary')"
                     rows = conn.execute(faiss_sql, faiss_params).fetchall()
 
                     scored = []
@@ -1223,10 +1235,9 @@ def keyword_search(query: str, top_k: int = None, memory_type: str = None,
         top_k = _cfg('retrieval', 'keyword_top_k', 10)
     conn = get_db()
 
-    # Build the optional source_type filter for session boundaries.
+    # session_boundary atoms no longer live in atoms (migration 11);
+    # no exclusion clause needed for FTS retrieval.
     boundary_clause = ""
-    if not include_session_boundaries:
-        boundary_clause = " AND (a.source_type IS NULL OR a.source_type != 'session_boundary')"
 
     # Try FTS5 first (fast path)
     fts_query = _fts5_query(query)
@@ -3741,7 +3752,7 @@ def merge_atoms(atom_id_keep: str, atom_id_remove: str, merged_content: str = No
 
 # ─── Feature: Schema Migration ───────────────────────────────────
 
-SCHEMA_VERSION = 8  # Increment when schema changes
+SCHEMA_VERSION = 11  # Increment when schema changes
 
 MIGRATIONS = {
     1: [
@@ -3880,6 +3891,26 @@ MIGRATIONS = {
         "ALTER TABLE access_log ADD COLUMN session_id TEXT",
         "CREATE INDEX IF NOT EXISTS idx_access_log_session ON access_log(session_id)",
     ],
+    11: [
+        # Sessions table: session_boundary atoms move out of atoms and into
+        # this first-class table. Each session has exactly one row. Retrieval,
+        # consolidation, and FTS no longer need source_type exclusion clauses.
+        # Data migration (existing session_boundary atoms → sessions rows) runs
+        # as a post-migration hook in run_migrations() below.
+        """CREATE TABLE IF NOT EXISTS sessions (
+            session_id       TEXT PRIMARY KEY,
+            channel          TEXT,
+            created_at       TEXT NOT NULL,
+            summary          TEXT NOT NULL DEFAULT '',
+            topics_discussed TEXT NOT NULL DEFAULT '[]',
+            decisions_made   TEXT NOT NULL DEFAULT '[]',
+            unfinished       TEXT NOT NULL DEFAULT '[]',
+            emotional_state  TEXT,
+            closed_since     TEXT NOT NULL DEFAULT '[]'
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_channel ON sessions(channel)",
+    ],
 }
 
 
@@ -3898,6 +3929,57 @@ def get_schema_version(conn=None) -> int:
     if close:
         conn.close()
     return version
+
+
+def _migrate_boundary_atoms_to_sessions(conn) -> int:
+    """One-time migration: move session_boundary atoms from atoms table → sessions.
+
+    Reads every atom with source_type='session_boundary', extracts its
+    structured metadata fields, inserts a sessions row (INSERT OR IGNORE so
+    idempotent re-runs are safe), then tombstones the atom so it doesn't
+    appear in any future retrieval. Returns the count of atoms migrated.
+    """
+    rows = conn.execute(
+        "SELECT id, created_at, session_id, metadata "
+        "FROM atoms WHERE source_type = 'session_boundary'"
+    ).fetchall()
+
+    migrated = 0
+    for atom_id, created_at, sid, metadata_json in rows:
+        try:
+            meta = json.loads(metadata_json or '{}')
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+
+        effective_session_id = sid or meta.get("session_id") or atom_id
+        summary = meta.get("summary") or ""
+        channel = meta.get("channel")
+        topics_discussed = json.dumps(meta.get("topics_discussed") or [])
+        decisions_made = json.dumps(meta.get("decisions_made") or [])
+        unfinished = json.dumps(meta.get("unfinished") or [])
+        emotional_state = meta.get("emotional_state")
+        closed_since = json.dumps(meta.get("closed_since") or [])
+
+        conn.execute("""
+            INSERT OR IGNORE INTO sessions
+                (session_id, channel, created_at, summary,
+                 topics_discussed, decisions_made, unfinished,
+                 emotional_state, closed_since)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (effective_session_id, channel, created_at, summary,
+              topics_discussed, decisions_made, unfinished,
+              emotional_state, closed_since))
+
+        # Tombstone the atom so retrieval, FTS, and consolidation skip it.
+        # Hard delete is cleaner but tombstone preserves audit history and
+        # avoids FK constraint failures from atom_relations rows that point
+        # at the boundary atom (session_member edges from reflect.py).
+        conn.execute(
+            "UPDATE atoms SET state = 'tombstone' WHERE id = ?", (atom_id,)
+        )
+        migrated += 1
+
+    return migrated
 
 
 def run_migrations(conn=None) -> dict:
@@ -3931,6 +4013,10 @@ def run_migrations(conn=None) -> dict:
             )
         except Exception:
             pass
+
+    if 11 in applied:
+        # Migrate existing session_boundary atoms → sessions table.
+        _migrate_boundary_atoms_to_sessions(conn)
 
     conn.commit()
     if close:
@@ -5238,10 +5324,9 @@ def retrieve_diverse(query: str, mode: str = "task", top_k: int = 10,
 
 # ─── Feature: Cross-Session Continuity ────────────────────────────
 
-# VSM: S3* (cross-session audit) — writes a session_boundary atom
-#      summarizing the session at end. recent_session_boundaries()
-#      retrieves them for surfacing in the next turn's prompt
-#      (## Recent session summaries section).
+# VSM: S3* (cross-session audit) — writes a sessions row summarising
+#      the session at end. get_last_sessions() retrieves them for the
+#      "## Recent session summaries" block in the per-turn prompt.
 # loop_id: 2.2
 def store_session_boundary(session_id: str, summary: str,
                            topics_discussed: list[str] = None,
@@ -5250,141 +5335,121 @@ def store_session_boundary(session_id: str, summary: str,
                            emotional_state: str = None,
                            channel: str = None,
                            closed_since: list[str] = None) -> str:
-    """Store a session boundary atom when a session ends.
+    """Store a session boundary in the sessions table when a session ends.
 
-    Creates a structured episodic atom capturing:
+    Captures:
     - What was discussed
     - What was decided
     - What was left unfinished
     - Emotional state at close
-    - ``closed_since``: refs of items from prior boundaries' ``unfinished``
-      lists that have been resolved during this session (chainlink #63
-      corrective overrides — used by the prompt builder to drop stale
-      Unfinished items in earlier boundaries' renderings).
+    - ``closed_since``: refs from prior boundaries' unfinished lists that
+      were resolved during this session (chainlink #63 corrective overrides —
+      the prompt builder uses these to drop resolved items from earlier
+      boundaries' renderings).
 
-    The agent calls this at session end. Next session can query for continuity:
-    'What were we doing last time?'
+    Returns ``session_id`` (the primary key for the created/updated row).
 
-    The atom is tagged ``source_type='session_boundary'`` so generic semantic
-    retrieval excludes it by default — these are continuity beacons, not
-    primary content. Use ``get_last_sessions()`` for the continuity query, or
-    pass ``include_session_boundaries=True`` to retrieve()/hybrid_retrieve().
-
-    All structured fields (summary, topics, decisions, unfinished,
-    emotional_state, closed_since) are persisted to atom metadata so
-    ``get_last_sessions()`` can return the canonical render shape without
-    re-parsing the markdown content blob. session_id auto-denormalizes to
-    the ``atoms.session_id`` column.
+    Session boundaries live in the ``sessions`` table, NOT in ``atoms``.
+    Use ``get_last_sessions()`` to retrieve them; retrieval, FTS, and
+    consolidation paths are clean of boundary exclusion logic.
     """
-    boundary_content = f"Session Boundary [{session_id}]: {summary}"
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO sessions
+            (session_id, channel, created_at, summary,
+             topics_discussed, decisions_made, unfinished,
+             emotional_state, closed_since)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            channel          = excluded.channel,
+            summary          = excluded.summary,
+            topics_discussed = excluded.topics_discussed,
+            decisions_made   = excluded.decisions_made,
+            unfinished       = excluded.unfinished,
+            emotional_state  = excluded.emotional_state,
+            closed_since     = excluded.closed_since
+    """, (
+        session_id,
+        channel,
+        now,
+        summary or "",
+        json.dumps(list(topics_discussed) if topics_discussed else []),
+        json.dumps(list(decisions_made) if decisions_made else []),
+        json.dumps(list(unfinished) if unfinished else []),
+        emotional_state,
+        json.dumps(list(closed_since) if closed_since else []),
+    ))
+    conn.commit()
 
-    if topics_discussed:
-        boundary_content += f"\nTopics: {', '.join(topics_discussed)}"
-    if decisions_made:
-        boundary_content += f"\nDecisions: {'; '.join(decisions_made)}"
-    if unfinished:
-        boundary_content += f"\nUnfinished: {'; '.join(unfinished)}"
-    if closed_since:
-        boundary_content += f"\nClosed since: {'; '.join(closed_since)}"
-    if emotional_state:
-        boundary_content += f"\nMood at close: {emotional_state}"
-
-    # Persist structured fields in metadata so get_last_sessions can
-    # surface them as separate keys without re-parsing the markdown.
-    # chainlink #63: closed_since is the corrective-override list.
-    metadata: dict = {"session_id": session_id, "summary": summary}
-    if channel:
-        metadata["channel"] = channel
-    if topics_discussed:
-        metadata["topics_discussed"] = list(topics_discussed)
-    if decisions_made:
-        metadata["decisions_made"] = list(decisions_made)
-    if unfinished:
-        metadata["unfinished"] = list(unfinished)
-    if closed_since:
-        metadata["closed_since"] = list(closed_since)
-    if emotional_state:
-        metadata["emotional_state"] = emotional_state
-
-    atom_id = store_atom(
-        content=boundary_content,
-        stream="episodic",
-        profile="standard",
-        arousal=0.3,
-        valence=0.0,
-        topics=topics_discussed or ["session_boundary"],
-        source_type="session_boundary",
-        encoding_confidence=0.9,
-        metadata=metadata,
-    )
-
-    log_provenance("atom", atom_id, "session_boundary",
-                   metadata={"session_id": session_id,
-                             "channel": channel,
+    log_provenance("session", session_id, "session_boundary",
+                   metadata={"channel": channel,
                              "unfinished_count": len(unfinished or []),
                              "closed_since_count": len(closed_since or [])})
 
-    return atom_id
+    return session_id
 
 
 def get_last_sessions(count: int = 3, channel: str = None,
                       session_id: str = None) -> list[dict]:
-    """Get the most recent session boundary atoms. 'What were we doing?'
+    """Get the most recent session boundaries. 'What were we doing?'
 
-    Filters:
-        channel: only boundaries tagged with this channel (matched against
-                 metadata.channel via json_extract).
-        session_id: only the boundary for this exact session. Matched on the
-                    denormalized session_id column.
+    Queries the ``sessions`` table (not atoms). Filters:
+        channel: only rows with this channel value.
+        session_id: only the row for this exact session.
 
     Return shape matches the local-mirror canonical layout (chainlink #63):
     ``ts``, ``channel_id``, ``summary``, ``unfinished``, ``topics_discussed``,
-    ``decisions_made``, ``emotional_state``, ``closed_since`` extracted from
-    metadata so the prompt-render path doesn't care which source supplied
-    the boundary. Legacy keys (``timestamp``, ``channel``, ``content``) are
-    retained for any downstream caller that depended on them.
+    ``decisions_made``, ``emotional_state``, ``closed_since``. Legacy keys
+    (``id``, ``atom_id``, ``timestamp``, ``channel``, ``content``) are
+    retained for any downstream caller that depended on the old shape.
     """
     conn = get_db()
-    sql = ("SELECT id, content, created_at, topics, session_id, metadata "
-           "FROM atoms "
-           "WHERE source_type = 'session_boundary' AND state = 'active'")
+    sql = ("SELECT session_id, channel, created_at, summary, "
+           "topics_discussed, decisions_made, unfinished, "
+           "emotional_state, closed_since "
+           "FROM sessions WHERE 1=1")
     params: list = []
     if session_id:
         sql += " AND session_id = ?"
         params.append(session_id)
     if channel:
-        sql += " AND json_extract(metadata, '$.channel') = ?"
+        sql += " AND channel = ?"
         params.append(channel)
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(count)
 
     rows = conn.execute(sql, tuple(params)).fetchall()
-    conn.close()
 
     out = []
     for r in rows:
-        try:
-            meta = json.loads(r[5] or '{}')
-        except (json.JSONDecodeError, TypeError):
-            meta = {}
+        sid, ch, created_at, summary, topics_j, decisions_j, unfinished_j, es, closed_j = r
+
+        def _parse(v):
+            try:
+                return json.loads(v or '[]')
+            except (json.JSONDecodeError, TypeError):
+                return []
+
+        topics = _parse(topics_j)
         record = {
             # Canonical render-shape keys (chainlink #63):
-            "ts": r[2],
-            "channel_id": meta.get("channel"),
-            "summary": meta.get("summary"),
-            "unfinished": meta.get("unfinished") or [],
-            "topics_discussed": meta.get("topics_discussed") or [],
-            "decisions_made": meta.get("decisions_made") or [],
-            "emotional_state": meta.get("emotional_state"),
-            "closed_since": meta.get("closed_since") or [],
-            # Legacy / saga-internal keys retained for back-compat:
-            "id": r[0],
-            "atom_id": r[0],
-            "content": r[1],
-            "timestamp": r[2],
-            "topics": json.loads(r[3] or '[]'),
-            "session_id": r[4],
-            "channel": meta.get("channel"),
+            "ts": created_at,
+            "channel_id": ch,
+            "summary": summary or "",
+            "unfinished": _parse(unfinished_j),
+            "topics_discussed": topics,
+            "decisions_made": _parse(decisions_j),
+            "emotional_state": es,
+            "closed_since": _parse(closed_j),
+            # Legacy keys retained for back-compat:
+            "id": sid,
+            "atom_id": sid,
+            "content": f"Session Boundary [{sid}]: {summary or ''}",
+            "timestamp": created_at,
+            "topics": topics,
+            "session_id": sid,
+            "channel": ch,
         }
         out.append(record)
     return out

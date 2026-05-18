@@ -169,41 +169,43 @@ class TestConsolidate:
         assert result["clusters_found"] == 0
 
     @pytest.mark.asyncio
-    async def test_skips_session_boundaries(self):
-        """Session-boundary atoms (source_type='session_boundary') are
-        already-summarized session synthesis — re-consolidating them
-        produces meta-summaries-of-summaries (mimir 2026-05-11 finding:
-        28 noisy observation atoms generated from 228 boundaries). The
-        cluster-phase query must exclude them even when they would
-        otherwise satisfy the cluster shape (active, embedded, raw).
+    async def test_session_boundaries_not_in_atoms(self):
+        """Session boundaries live in the sessions table (migration 11), not
+        in the atoms table. Consolidation never sees them — there's nothing
+        to exclude because they were never added as atoms.
+
+        This test verifies that store_session_boundary writes to sessions, and
+        that consolidation on an otherwise-empty DB finds zero clusters.
         """
-        from saga.core import get_db, run_migrations
+        from saga.core import get_db, run_migrations, store_session_boundary
         from saga.consolidation import ConsolidationEngine
 
         conn = get_db()
         run_migrations(conn)
 
-        # Five atoms with identical embeddings so they would cluster if
-        # not filtered. Mark all as session_boundary via source_type.
-        same_emb = struct.pack('1024f', *np.random.randn(1024).astype(np.float32))
+        # Write five session boundaries — these now land in sessions, not atoms.
         for i in range(5):
-            content = f"Session Boundary [s_{i}]: synthesis text {i}"
-            content_hash = hashlib.sha256(content.encode()).hexdigest()[:32]
-            conn.execute("""
-                INSERT OR IGNORE INTO atoms (id, content, content_hash, created_at, state,
-                    is_pinned, embedding, topics, metadata, encoding_confidence, stream,
-                    profile, access_count, stability, source_type, memory_type)
-                VALUES (?, ?, ?, datetime('now'), 'active', 0, ?, '[]', '{}', 0.7,
-                    'episodic', 'standard', 0, 1.0, 'session_boundary', 'raw')
-            """, (f"bound_{i}", content, content_hash, same_emb))
-        conn.commit()
-        conn.close()
+            store_session_boundary(
+                session_id=f"test-session-{i}",
+                summary=f"Session {i} synthesis text",
+                topics_discussed=["planning"],
+            )
 
+        # Atoms table should have zero session_boundary typed rows.
+        count = conn.execute(
+            "SELECT COUNT(*) FROM atoms WHERE source_type = 'session_boundary'"
+        ).fetchone()[0]
+        assert count == 0, "session_boundary atoms must NOT be in the atoms table"
+
+        # Sessions table should have the rows.
+        scount = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        assert scount >= 5
+
+        # Consolidation on an otherwise-empty DB finds zero clusters.
         engine = ConsolidationEngine(similarity_threshold=0.5, min_cluster_size=3)
         result = await engine.consolidate(dry_run=True)
         assert result["clusters_found"] == 0, (
-            "session_boundary atoms must be excluded from consolidation "
-            "input — they're already-summarized synthesis, not raw evidence"
+            "No raw atoms to cluster — sessions table rows are not consolidation input"
         )
 
 

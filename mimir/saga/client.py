@@ -167,14 +167,29 @@ class SagaStore:
     # greenfield DDL changes and add the migration that transforms an
     # older DB to match. ``_apply_pending_migrations`` walks
     # ``MIGRATIONS`` and applies any version > the DB's current.
-    CURRENT_SCHEMA_VERSION: int = 1
+    CURRENT_SCHEMA_VERSION: int = 2
 
     # Registry of post-greenfield schema changes. Keys are version
     # numbers (must be > 1, must be contiguous, must equal
     # ``CURRENT_SCHEMA_VERSION`` at the latest entry); values are raw
     # SQL scripts executed via ``conn.executescript``. Empty until the
     # first post-1.0 schema change.
-    MIGRATIONS: dict[int, str] = {}
+    MIGRATIONS: dict[int, str] = {
+        2: """
+            -- Add structured boundary fields to sessions table.
+            -- Session boundaries moved from atoms → sessions (migration 11 in
+            -- the saga/saga/core.py schema; parallel change here for the
+            -- mimir-layer DB). ALTER TABLE is idempotent-by-convention
+            -- because SQLite has no IF NOT EXISTS on ALTER TABLE; the
+            -- executescript call here is wrapped in try/except in
+            -- _apply_pending_migrations.
+            ALTER TABLE sessions ADD COLUMN topics_discussed TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE sessions ADD COLUMN decisions_made   TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE sessions ADD COLUMN unfinished       TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE sessions ADD COLUMN emotional_state  TEXT;
+            ALTER TABLE sessions ADD COLUMN closed_since     TEXT NOT NULL DEFAULT '[]';
+        """,
+    }
 
     def __init__(
         self,

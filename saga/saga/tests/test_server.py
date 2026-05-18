@@ -443,7 +443,8 @@ class TestSessionsEnd:
         captured = {}
         def fake_store(**kwargs):
             captured.update(kwargs)
-            return "boundary_atom_id_xyz"
+            # store_session_boundary now returns the session_id as confirmation.
+            return kwargs["session_id"]
         monkeypatch.setattr(saga.core, "store_session_boundary", fake_store)
 
         rv = client.post("/v1/sessions/end", json={
@@ -452,7 +453,8 @@ class TestSessionsEnd:
         })
         assert rv.status_code == 200
         data = rv.json()
-        assert data["atom_id"] == "boundary_atom_id_xyz"
+        # atom_id is a legacy alias for session_id post-migration.
+        assert data["atom_id"] == "abc"
         assert data["session_id"] == "abc"
         assert captured["session_id"] == "abc"
         assert captured["summary"] == "Discussed Q2 roadmap"
@@ -465,7 +467,7 @@ class TestSessionsEnd:
         captured = {}
         def fake_store(**kwargs):
             captured.update(kwargs)
-            return "boundary_atom_id_xyz"
+            return kwargs["session_id"]
         monkeypatch.setattr(saga.core, "store_session_boundary", fake_store)
 
         rv = client.post("/v1/sessions/end", json={

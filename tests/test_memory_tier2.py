@@ -241,22 +241,26 @@ def test_not_superseded_when_evidence_set_equals(conn):
 # ────────────────────────────────────────────────────────────────────
 
 
-def test_reflect_creates_boundary_atom(conn):
-    """Quiet session — reflect still emits one session_boundary."""
+def test_reflect_creates_sessions_row(conn):
+    """Quiet session — reflect emits one sessions table row (not an atom)."""
     result = reflect(
         conn, session_id="s1", channel_id="c1",
         embed_fn=_fake_embed,
         boundary_synth_fn=_stub_boundary_synth,
     )
     assert result.boundary_created is True
-    assert result.boundary_atom_id is not None
-    # Check the atom landed with source_type='session_boundary'.
+    assert result.boundary_atom_id is not None  # equals session_id post-migration
+    # Check the sessions row was created.
     row = conn.execute(
-        "SELECT source_type, session_id FROM atoms WHERE id = ?",
-        (result.boundary_atom_id,)
+        "SELECT id, channel_id FROM sessions WHERE id = ?", ("s1",)
     ).fetchone()
-    assert row[0] == "session_boundary"
-    assert row[1] == "s1"
+    assert row is not None
+    assert row[1] == "c1"
+    # Confirm no session_boundary atom was written.
+    atom_row = conn.execute(
+        "SELECT id FROM atoms WHERE source_type = 'session_boundary'",
+    ).fetchone()
+    assert atom_row is None, "session_boundary should not be in atoms"
 
 
 def test_reflect_is_idempotent(conn):
@@ -272,10 +276,10 @@ def test_reflect_is_idempotent(conn):
     assert r2.boundary_created is False
 
 
-def test_reflect_links_session_members(conn):
-    """Every atom touched in the session gets a session_member relation
-    from the boundary."""
-    # Three atoms in session s1.
+def test_reflect_session_member_count_is_zero(conn):
+    """session_member atom_relations are no longer written — session_member_count
+    is always 0 on the ReflectResult (session boundaries live in sessions table,
+    not as atoms with outbound relations)."""
     for i in range(3):
         store(conn, f"session atom {i}", embed_fn=_fake_embed,
               session_id="s1")
@@ -284,25 +288,12 @@ def test_reflect_links_session_members(conn):
         embed_fn=_fake_embed,
         boundary_synth_fn=_stub_boundary_synth,
     )
-    # Boundary is also stored with session_id='s1', so _session_atoms
-    # picks it up after the boundary lands. The session_member_count
-    # therefore includes the boundary itself plus the 3 raws.
-    rows = conn.execute(
-        "SELECT target_id FROM atom_relations "
-        "WHERE source_id = ? AND relation_type = 'session_member'",
-        (result.boundary_atom_id,)
-    ).fetchall()
-    target_ids = {r[0] for r in rows}
-    # All three raws should be linked. (The boundary may or may not link
-    # to itself depending on ordering; we don't test that.)
-    raw_atom_ids = {
-        r[0] for r in conn.execute(
-            "SELECT id FROM atoms WHERE session_id = ? "
-            "AND source_type != 'session_boundary'",
-            ("s1",),
-        )
-    }
-    assert raw_atom_ids.issubset(target_ids)
+    # No session_member relations written.
+    assert result.session_member_count == 0
+    member_rows = conn.execute(
+        "SELECT COUNT(*) FROM atom_relations WHERE relation_type = 'session_member'"
+    ).fetchone()[0]
+    assert member_rows == 0
 
 
 # ────────────────────────────────────────────────────────────────────

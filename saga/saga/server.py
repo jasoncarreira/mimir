@@ -543,10 +543,16 @@ async def api_feedback(req: FeedbackRequest):
 
 @app.post("/v1/sessions/end", dependencies=[Depends(verify_api_key)])
 async def api_session_end(req: SessionEndRequest):
-    """Write a session_boundary atom marking the close of a session."""
+    """Write a sessions row marking the close of a session.
+
+    Session boundaries live in the sessions table, not in atoms (migration 11).
+    Returns session_id as the canonical identifier; atom_id is included as a
+    legacy alias pointing at the same session_id value so older callers that
+    read payload["atom_id"] keep working.
+    """
     def _end():
         from .core import store_session_boundary
-        atom_id = store_session_boundary(
+        session_id = store_session_boundary(
             session_id=req.session_id,
             summary=req.summary,
             topics_discussed=req.topics_discussed,
@@ -556,7 +562,9 @@ async def api_session_end(req: SessionEndRequest):
             channel=req.channel,
             closed_since=req.closed_since,
         )
-        return {"atom_id": atom_id, "session_id": req.session_id, "channel": req.channel}
+        # atom_id kept as a legacy alias — callers that read payload["atom_id"]
+        # get the session_id, which is the correct identifier post-migration.
+        return {"session_id": session_id, "atom_id": session_id, "channel": req.channel}
     return await asyncio.to_thread(_end)
 
 

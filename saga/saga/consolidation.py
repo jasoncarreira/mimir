@@ -372,15 +372,8 @@ class ConsolidationEngine:
         - Only active atoms with embeddings
         - Never cluster pinned atoms
         - memory_type='raw' only (observations are consolidation output, not input)
-        - source_type != 'session_boundary' — boundaries are continuity
-          beacons (already-summarized session synthesis), not raw evidence.
-          Re-consolidating them produces meta-summaries-of-summaries that
-          are noise rather than signal (mimir 2026-05-11 finding: 28
-          observation atoms generated from consolidating 228 boundary
-          atoms were "chronology retell" rather than structural pattern).
-          Generic semantic retrieval already excludes boundaries via the
-          same predicate (see core.py:932); this aligns the consolidation
-          input with that exclusion.
+        - Session boundaries are not in the atoms table (migration 11 moved them
+          to the sessions table), so no source_type exclusion is needed here.
         - Same stream only
         - Minimum cluster size
         """
@@ -390,7 +383,6 @@ class ConsolidationEngine:
             FROM atoms
             WHERE state = 'active' AND embedding IS NOT NULL AND is_pinned = 0
               AND (memory_type IS NULL OR memory_type = 'raw')
-              AND (source_type IS NULL OR source_type != 'session_boundary')
         """).fetchall()
 
         if not rows:

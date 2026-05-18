@@ -173,10 +173,11 @@ def fts_search(
     expanded = expand_query_for_keyword(query, synonyms)
     fts_q = fts5_query(expanded)
 
+    # session_boundary atoms no longer live in atoms (migration 11);
+    # no source_type exclusion needed here. include_session_boundaries
+    # parameter is kept for signature compatibility but is a no-op.
     where = ["a.tombstoned = 0", "a.agent_id = ?"]
     params: list = [fts_q, agent_id]
-    if not include_session_boundaries:
-        where.append("(a.source_type IS NULL OR a.source_type != 'session_boundary')")
     if memory_type:
         where.append("a.memory_type = ?")
         params.append(memory_type)
@@ -227,8 +228,7 @@ def _fts_fallback(
 
     like_clauses = " AND ".join(["LOWER(a.content) LIKE ?"] * len(terms))
     where = [like_clauses, "a.tombstoned = 0", "a.agent_id = ?"]
-    if not include_session_boundaries:
-        where.append("(a.source_type IS NULL OR a.source_type != 'session_boundary')")
+    # session_boundary atoms not in atoms table (migration 11); no exclusion.
     if memory_type:
         where.append("a.memory_type = ?")
     where_sql = " AND ".join(where)

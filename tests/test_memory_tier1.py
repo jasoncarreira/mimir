@@ -243,11 +243,14 @@ def test_recall_skips_access_event_when_disabled(conn):
     assert sources == ["store"]
 
 
-def test_recall_excludes_session_boundary_by_default(conn):
-    """session_boundary source_type atoms are filtered from generic
-    recall — PR #153's behavior preserved."""
-    r = store(conn, "session ended", embed_fn=_fake_embed,
-              source_type="session_boundary")
+def test_recall_excludes_session_boundary_type_atoms(conn):
+    """session_boundary typed atoms stored in atoms are not retrieved.
+    Post-migration these don't land in atoms at all (they go to sessions),
+    but if one were forced in (e.g. pre-migration atom) the recall
+    include_session_boundaries=False parameter (now a no-op) was the old
+    gate. Test that regular atoms still recall fine."""
+    # Regular atom — should be retrievable.
+    r = store(conn, "normal atom content", embed_fn=_fake_embed)
     result = recall(
         conn, "anything",
         query_embed_fn=_fake_query_embed,
@@ -255,9 +258,9 @@ def test_recall_excludes_session_boundary_by_default(conn):
         fts_search_fn=lambda q, k: [],
     )
     ids = [c.atom["id"] for c in result.raws + result.observations]
-    assert r.atom_id not in ids
+    assert r.atom_id in ids
 
-    # Opt-in flips it.
+    # include_session_boundaries is a no-op now; just ensure it doesn't error.
     result2 = recall(
         conn, "anything",
         query_embed_fn=_fake_query_embed,

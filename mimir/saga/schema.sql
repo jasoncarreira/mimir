@@ -286,12 +286,18 @@ END;
 -- ──────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY,          -- session_id
     channel_id TEXT,
     started_at TEXT NOT NULL,
     ended_at TEXT,
     summary TEXT,
-    reflected_at TEXT
+    reflected_at TEXT,
+    -- Structured boundary fields (populated by reflect/end_session)
+    topics_discussed TEXT NOT NULL DEFAULT '[]',   -- JSON array
+    decisions_made   TEXT NOT NULL DEFAULT '[]',   -- JSON array
+    unfinished       TEXT NOT NULL DEFAULT '[]',   -- JSON array
+    emotional_state  TEXT,
+    closed_since     TEXT NOT NULL DEFAULT '[]'    -- JSON array (chainlink #63)
 );
 
 -- ──────────────────────────────────────────────────────────────────

@@ -281,14 +281,25 @@ class TestNegativeKnowledge:
 
 class TestSessionWorkingMemory:
     def test_store_session_boundary(self):
-        from saga.core import store_session_boundary
-        aid = store_session_boundary(
+        from saga.core import store_session_boundary, get_db
+        sid = store_session_boundary(
             session_id="test-session-1",
             summary="Discussed project planning",
             topics_discussed=["project", "planning"],
         )
-        assert isinstance(aid, str)
-        assert len(aid) > 0
+        # Returns the session_id (sessions table PK), not an atom_id.
+        assert sid == "test-session-1"
+        # Confirm the row landed in sessions, NOT in atoms.
+        conn = get_db()
+        row = conn.execute(
+            "SELECT session_id FROM sessions WHERE session_id = ?", ("test-session-1",)
+        ).fetchone()
+        assert row is not None
+        atom_row = conn.execute(
+            "SELECT id FROM atoms WHERE source_type = 'session_boundary' AND session_id = ?",
+            ("test-session-1",),
+        ).fetchone()
+        assert atom_row is None, "session_boundary should not be in atoms table"
 
     def test_get_last_sessions(self):
         from saga.core import store_session_boundary, get_last_sessions
@@ -355,10 +366,10 @@ class TestSessionWorkingMemory:
         # summary IS persisted to metadata now, so it round-trips.
         assert rec["summary"] == "No metadata."
 
-    def test_session_boundary_excluded_from_retrieve(self):
-        """Continuity beacons must not pollute generic semantic retrieval."""
-        from saga.core import store_session_boundary, store_atom, retrieve
-        # Write a regular atom and a session boundary covering similar ground.
+    def test_session_boundary_not_in_atoms(self):
+        """Session boundaries live in the sessions table, not atoms.
+        retrieve() should never return them regardless of query content."""
+        from saga.core import store_session_boundary, store_atom, retrieve, get_db
         regular_id = store_atom("user discussed project planning today")
         store_session_boundary(
             session_id="ssn-x", summary="discussed project planning",
@@ -366,18 +377,17 @@ class TestSessionWorkingMemory:
         )
         results = retrieve("project planning")
         ids = {r["id"] for r in results}
+        # Regular atom is retrievable.
         assert regular_id in ids
+        # Sessions table row is NOT in atoms; no atom should have session_boundary source_type.
+        conn = get_db()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM atoms WHERE source_type = 'session_boundary'"
+        ).fetchone()[0]
+        assert count == 0, "session_boundary atoms should have been migrated out"
+        # retrieve() never returns session_boundary typed records.
         for r in results:
             assert r.get("source_type") != "session_boundary"
-
-    def test_session_boundary_included_when_opt_in(self):
-        from saga.core import store_session_boundary, retrieve
-        store_session_boundary(
-            session_id="ssn-y", summary="weekend retro",
-            topics_discussed=["retro"],
-        )
-        results = retrieve("retro", include_session_boundaries=True)
-        assert any(r.get("source_type") == "session_boundary" for r in results)
 
     def test_get_last_sessions_legacy_signature(self):
         # The original signature get_last_sessions(count) still works.
