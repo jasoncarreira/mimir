@@ -400,6 +400,60 @@ def test_legacy_path_still_works_without_tool_events_key():
     assert trs[0]["name"] == "Bash"
 
 
+def test_tool_events_path_empty_string_result_not_treated_as_falsy():
+    """Empty-string tool results (e.g. Bash with no output) must be
+    preserved as ``content=""`` rather than falling through to the
+    ``error`` field. Regression guard for the ``result or error``
+    truthiness trap fixed in chainlink #149 — ``or`` evaluates ``""``
+    as falsy and would silently substitute the error text."""
+    msg = AIMessage(
+        content="",
+        response_metadata={
+            "tool_events": [
+                {"type": "tool_call", "tool_use_id": "toolu_silent",
+                 "name": "Bash", "input": {"command": ": # no-op"}},
+                {"type": "tool_result", "tool_use_id": "toolu_silent",
+                 "name": "Bash",
+                 "result": "",           # empty-string — the truthiness trap target
+                 "error": "should not appear",
+                 "is_error": False},
+            ],
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    trs = [e for e in events if e["type"] == "tool_result"]
+    assert len(trs) == 1
+    assert trs[0]["content"] == ""        # empty preserved, not "should not appear"
+    assert trs[0]["is_error"] is False
+
+
+def test_legacy_path_empty_string_content_not_treated_as_falsy():
+    """Same truthiness-trap regression guard for the legacy path
+    (``internal_tool_results`` with a ``content`` key). An empty-string
+    ``content`` must be preserved rather than falling through to
+    ``result``."""
+    msg = AIMessage(
+        content="",
+        response_metadata={
+            "internal_tool_calls": [
+                {"id": "toolu_empty", "name": "Bash",
+                 "args": {"command": ": # no-op"}},
+            ],
+            "internal_tool_results": [
+                {"tool_use_id": "toolu_empty",
+                 "content": "",            # empty — truthiness trap target
+                 "result": "should not appear",
+                 "is_error": False},
+            ],
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    trs = [e for e in events if e["type"] == "tool_result"]
+    assert len(trs) == 1
+    assert trs[0]["content"] == ""        # empty preserved, not "should not appear"
+    assert trs[0]["is_error"] is False
+
+
 # ── End-to-end native-provider paths ────────────────────────────────
 # Coverage for non-claude-code providers (langchain-anthropic /
 # langchain-openai / etc., resolved via ``init_chat_model`` in
