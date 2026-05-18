@@ -28,6 +28,7 @@ import json
 import asyncio
 import logging
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -404,18 +405,18 @@ async def reload_pollers() -> str:
 # ────────────────────────────────────────────────────────────────────
 
 @tool
-async def commitment_complete(commitment_id: str, note: Optional[str] = None) -> str:
+async def commitment_complete(commitment_id: str, message_id: Optional[str] = None) -> str:
     """Mark a tracked commitment as completed.
 
     Args:
         commitment_id: The commitment to close out.
-        note: Optional completion note recorded in the commitment log.
+        message_id: Optional message ID that triggered the completion (for audit).
     """
     store = _STATE["commitments_store"]
     if store is None:
         return "commitment_complete failed: no commitments store"
     try:
-        result = await store.mark_complete(commitment_id, note=note)
+        result = await store.complete(commitment_id, message_id=message_id)
     except Exception as exc:
         return f"commitment_complete failed: {exc}"
     return f"commitment_complete ok: id={commitment_id} result={result}"
@@ -431,14 +432,16 @@ async def commitment_snooze(
 
     Args:
         commitment_id: The commitment to snooze.
-        until_iso: ISO-8601 datetime when the commitment reactivates.
+        until_iso: ISO-8601 datetime when the commitment reactivates (e.g. "2026-05-20T10:00:00Z").
         reason: Optional snooze reason recorded in the log.
     """
     store = _STATE["commitments_store"]
     if store is None:
         return "commitment_snooze failed: no commitments store"
     try:
-        result = await store.snooze(commitment_id, until_iso=until_iso, reason=reason)
+        dt = datetime.fromisoformat(until_iso.replace("Z", "+00:00"))
+        until_unix = dt.timestamp()
+        result = await store.snooze(commitment_id, until_unix=until_unix, reason=reason)
     except Exception as exc:
         return f"commitment_snooze failed: {exc}"
     return f"commitment_snooze ok: id={commitment_id} until={until_iso}"
@@ -462,26 +465,53 @@ async def commitment_dismiss(commitment_id: str, reason: Optional[str] = None) -
     return f"commitment_dismiss ok: id={commitment_id}"
 
 
+_ACTIVE_STATUSES = {"pending", "delivered", "snoozed"}
+
+
 @tool
 async def commitment_list(due_within_days: int = 7) -> str:
-    """List active commitments due within the given window.
+    """List active (non-terminal) commitments, optionally filtered by due window.
 
     Args:
-        due_within_days: Window size (default 7).
+        due_within_days: Only include commitments whose due window ends within
+            this many days from now. Pass 0 to list all active commitments
+            regardless of due date (default 7 days).
     """
+    import time as _time
     store = _STATE["commitments_store"]
     if store is None:
         return "commitment_list failed: no commitments store"
     try:
-        items = await store.list_active(due_within_days=due_within_days)
+        # store.list() is synchronous
+        all_items = store.list()
     except Exception as exc:
         return f"commitment_list failed: {exc}"
+    now = _time.time()
+    cutoff = now + due_within_days * 86400 if due_within_days > 0 else None
+    items = [
+        c for c in all_items
+        if c.status in _ACTIVE_STATUSES
+        and (
+            cutoff is None
+            or c.due_window_end_unix is None  # unbound — always include
+            or c.due_window_end_unix <= cutoff
+        )
+    ]
     if not items:
-        return f"(no active commitments due within {due_within_days} days)"
+        label = "all active" if due_within_days == 0 else f"due within {due_within_days} days"
+        return f"(no active commitments — {label})"
     return json.dumps(
-        [{"id": c.id, "title": c.title, "due": str(c.due),
-          "status": c.status, "channel_id": c.channel_id}
-         for c in items],
+        [
+            {
+                "id": c.id,
+                "text": c.text,
+                "status": c.status,
+                "channel_id": c.channel_id,
+                "due_window_hint": c.due_window_hint,
+                "due_window_end_unix": c.due_window_end_unix,
+            }
+            for c in items
+        ],
         indent=2, ensure_ascii=False, default=str,
     )
 
