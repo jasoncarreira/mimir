@@ -110,11 +110,51 @@ def _iter_turns(path: Path) -> Iterable[dict]:
 
 def _classify_skill_calls(
     events: list[dict], turn_ts: datetime,
+    *,
+    turn_succeeded: bool | None = None,
 ) -> Iterable[tuple[str, str, datetime]]:
     """Walk a single turn's events list, pair Skill tool_call ↔
     tool_result by id, yield (skill_name, outcome, ts) tuples.
 
-    Outcome ∈ {"success", "failure", "abandoned"}."""
+    Outcome ∈ {"success", "failure", "abandoned"}.
+
+    ``turn_succeeded`` is the overall turn success signal (False when
+    ``result_is_error`` is True). When a Skill call has no matching
+    tool_result — which happens systematically on the ChatClaudeCode /
+    deepagents streaming path because ToolResultBlocks for built-in
+    Claude Code tools (Skill, Bash, Read …) are never surfaced in the
+    Python-layer events list — we fall back to ``turn_succeeded``
+    instead of always emitting "abandoned". Without this fallback,
+    every Skill invocation on a heartbeat/reflection/poller turn
+    lands in the risky bucket even when the turn completed cleanly.
+
+    Resolution:
+      - Matching tool_result present → use is_error (exact)
+      - No tool_result + turn_succeeded=True  → "success" (inferred)
+      - No tool_result + turn_succeeded=False → "failure" (inferred)
+      - No tool_result + turn_succeeded=None  → "abandoned" (legacy /
+        turn outcome unavailable)
+
+    **Inference imprecision (aggregate-level correct, per-call-level
+    imprecise).** When a turn has both a Skill call AND a later
+    non-Skill tool call (Bash, Read, …), this fallback can't
+    distinguish which tool drove the turn-level error. If the Skill
+    succeeded but a later Bash crashed the turn, the Skill gets
+    attributed "failure" via the fallback. Inverse case (Skill itself
+    drove the failure) is correctly attributed. Heartbeat /
+    reflection / poller turns are usually Skill-dominated so the
+    bucket telemetry trends right in aggregate; rare turns with
+    mixed tool-call patterns may misattribute.
+
+    **Backfill vs forward-looking.** Once the
+    ``enrich_streaming_metadata`` patch (PR #193) is live for new
+    turns, ChatClaudeCode emits matching tool_result events for
+    built-in tools and the exact-match branch above takes over. The
+    inferred-from-turn fallback's value then shifts from "working
+    around current breakage" to "working around historical
+    breakage" — old turns in turns.jsonl from before #193 landed
+    keep flowing through this path indefinitely.
+    """
     pending: dict[str, str] = {}   # tool_use_id → skill name
     for ev in events:
         if not isinstance(ev, dict):
@@ -133,9 +173,17 @@ def _classify_skill_calls(
                 is_error = bool(ev.get("is_error"))
                 yield skill, ("failure" if is_error else "success"), turn_ts
 
-    # Anything left in pending is abandoned (no matching tool_result).
+    # Anything left in pending has no matching tool_result.
+    # In ChatClaudeCode turns the streaming path never surfaces
+    # tool_result events for built-in tools, so ALL Skill calls
+    # land here. Use the turn-level signal as a fallback.
     for skill in pending.values():
-        yield skill, "abandoned", turn_ts
+        if turn_succeeded is True:
+            yield skill, "success", turn_ts
+        elif turn_succeeded is False:
+            yield skill, "failure", turn_ts
+        else:
+            yield skill, "abandoned", turn_ts
 
 
 def aggregate(
@@ -162,7 +210,17 @@ def aggregate(
         events = record.get("events") or []
         if not isinstance(events, list):
             continue
-        for skill, outcome, _ in _classify_skill_calls(events, ts):
+        # Derive turn-level success signal for the ChatClaudeCode fallback
+        # (see _classify_skill_calls docstring). result_is_error=False means
+        # the turn completed cleanly; None means the field is absent (older
+        # records or error before model response — treat as unknown).
+        raw_is_error = record.get("result_is_error")
+        turn_succeeded: bool | None = (
+            None if raw_is_error is None else not bool(raw_is_error)
+        )
+        for skill, outcome, _ in _classify_skill_calls(
+            events, ts, turn_succeeded=turn_succeeded
+        ):
             entry = out[skill]
             entry.skill = skill
             if outcome == "success":
