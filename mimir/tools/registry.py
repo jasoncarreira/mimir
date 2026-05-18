@@ -553,7 +553,7 @@ def all_mimir_tools() -> list:
     """
     from .memory import memory_query
     from .store import memory_store
-    from .extra import file_search, get_turn, mimir_get_turn, shell_exec
+    from .extra import file_search, get_turn, mimir_get_turn, rebuild_index, shell_exec
     from .web import web_tools_enabled
     from .shell_async import bash_async, bash_job_output, bash_jobs_list
     from .saga_ops import (
@@ -567,8 +567,9 @@ def all_mimir_tools() -> list:
         memory_query, memory_store,
         # SAGA ops (outcome marker, manual credit, session boundary, forget)
         saga_feedback, saga_mark_contributions, saga_end_session, saga_forget,
-        # Indexer (file search)
+        # Indexer (file search + mid-turn index rebuild)
         file_search,
+        rebuild_index,
         # Turn-history lookup (mimir_get_turn is canonical; get_turn
         # is a back-compat alias for skill prompts that reference the
         # pre-rename name)
