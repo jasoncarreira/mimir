@@ -79,6 +79,15 @@ _lcc_patches.apply_patches()
 # "mimir's system_prompt is the only one." No-op when deepagents
 # isn't installed.
 _lcc_patches.strip_deepagents_base_prompt()
+# Preserve SDK ``ResultMessage`` fields (``stop_reason``, ``num_turns``,
+# ``is_error``) that langchain-claude-code's streaming wrapper drops —
+# without this patch ``derive_result_fields`` loses granular stop-reason
+# semantics ("max_turns" / "max_tokens" collapse to binary "stop"/"error")
+# and has to approximate ``num_turns`` via ``count(AIMessage)``. Wraps
+# ``_astream`` to copy the missing fields from the instance's
+# ``_last_result`` (which the upstream code does store) into the result
+# chunk's ``generation_info``. No-op when claude-code extra not installed.
+_lcc_patches.enrich_streaming_metadata()
 from .sagatools import (
     _atom_ids_from_response,
     _format_saga_payload,

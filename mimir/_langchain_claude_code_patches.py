@@ -173,3 +173,83 @@ def strip_deepagents_base_prompt() -> None:
     _dg_graph.BASE_AGENT_PROMPT = ""
     setattr(_dg_graph, _DEEPAGENTS_BASE_PROMPT_MARKER, True)
     log.debug("stripped deepagents BASE_AGENT_PROMPT (mimir owns system prompt)")
+
+
+_STREAMING_METADATA_MARKER = "_mimir_streaming_metadata_enriched"
+
+
+def enrich_streaming_metadata() -> None:
+    """Monkey-patch ``ChatClaudeCode._astream`` to preserve SDK
+    ``ResultMessage`` fields that the upstream streaming code drops.
+
+    The original ``_astream`` (``claude_chat_model.py:_astream``)
+    builds the final result chunk's ``generation_info`` from
+    ``msg.total_cost_usd``, ``duration_ms``, ``session_id``, and a
+    BINARY ``finish_reason`` (``"stop"`` or ``"error"``). It DROPS:
+
+      - ``msg.stop_reason`` — the granular SDK reason (``"max_turns"``,
+        ``"max_tokens"``, ``"end_turn"``, etc). Collapsed to binary
+        ``finish_reason``, losing the distinction.
+      - ``msg.is_error`` — collapsed into ``finish_reason`` and never
+        surfaced as its own field.
+      - ``msg.num_turns`` — the SDK's per-request model-turn count.
+        Not preserved at all; downstream code falls back to counting
+        AIMessage chunks (different value, different semantics).
+
+    ``mimir.turn_logger.derive_result_fields`` reads all three. Without
+    this patch:
+      - ``result_subtype`` defaults to ``"success"`` even on
+        ``max_turns`` truncation (we'd need ``stop_reason`` to detect).
+      - ``result_is_error`` is ``False`` on subprocess errors that
+        manifested as ``is_error=True`` in the original ``ResultMessage``
+        (the binary ``finish_reason="error"`` is at least recoverable;
+        see fallback in ``derive_result_fields``).
+      - ``num_turns`` is approximated by ``count(AIMessage)``.
+
+    The streaming code DOES store the original ``ResultMessage`` on
+    ``self._last_result`` (line 504 of ``_astream``). We wrap the
+    method to detect the result chunk (identified by ``finish_reason``
+    in ``generation_info``) and copy the missing fields from
+    ``_last_result`` into the chunk's ``generation_info``. Pure
+    additive enrichment — no behavior change for callers that don't
+    read the new keys.
+
+    Idempotent + import-safe: a no-op when ``langchain-claude-code``
+    isn't installed. The class-attribute marker prevents double-
+    wrapping on repeated calls.
+    """
+    try:
+        from langchain_claude_code import claude_chat_model as ccm
+    except ImportError:
+        return
+
+    if getattr(ccm.ClaudeCodeChatModel, _STREAMING_METADATA_MARKER, False):
+        return
+
+    _orig_astream = ccm.ClaudeCodeChatModel._astream
+
+    async def _patched_astream(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        async for chunk in _orig_astream(self, *args, **kwargs):
+            # The result chunk is the only one with ``finish_reason``
+            # in generation_info (set inside the ``elif isinstance(msg,
+            # ResultMessage):`` branch of the upstream loop). Other
+            # chunks carry text content with no generation_info.
+            gi = getattr(chunk, "generation_info", None)
+            if gi and "finish_reason" in gi:
+                last = getattr(self, "_last_result", None)
+                if last is not None:
+                    for fld in ("stop_reason", "num_turns", "is_error"):
+                        if fld in gi:
+                            continue
+                        val = getattr(last, fld, None)
+                        if val is not None:
+                            gi[fld] = val
+                    chunk.generation_info = gi
+            yield chunk
+
+    ccm.ClaudeCodeChatModel._astream = _patched_astream
+    setattr(ccm.ClaudeCodeChatModel, _STREAMING_METADATA_MARKER, True)
+    log.debug(
+        "patched ChatClaudeCode._astream to preserve "
+        "stop_reason/num_turns/is_error from ResultMessage",
+    )
