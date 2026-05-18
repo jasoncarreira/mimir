@@ -130,7 +130,10 @@ async def rebuild_index(scope: str = "all") -> str:
             f"memory/state/wiki/all (got {scope_clean!r})"
         )
     generator.mark_dirty(scope_clean)
-    await generator.flush()
+    try:
+        await generator.flush()
+    except Exception as exc:  # noqa: BLE001
+        return f"rebuild_index failed during flush: {type(exc).__name__}: {exc}"
     return f"rebuild_index ok: scope={scope_clean}"
 
 
