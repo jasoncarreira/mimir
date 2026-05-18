@@ -1,20 +1,27 @@
 """Runtime patches for the vendored ``langchain-claude-code`` package.
 
-The version we depend on (0.1.0) was written against langchain-core 0.x.
-In langchain-core 1.x, ``StructuredTool._arun`` made its ``config`` kwarg
-required — so the upstream tool-wrapper call
+Upstream repo: https://github.com/thehumanworks/langchain-claude-code
+(transferred from agentmish/langchain-claude-code)
 
-    result = await tool._arun(**args)
+Patches applied:
 
-now raises ``TypeError: _arun() missing 1 required keyword-only argument:
-'config'`` on every tool invocation. The bench / production agent can't
-call ANY langchain tool until this is patched.
+1. **_wrap_langchain_tool (config kwarg)** — langchain-core 1.x made
+   ``_arun``'s ``config`` kwarg required. Upstream issue #1, open.
 
-This module monkey-patches the upstream ``_wrap_langchain_tool`` to pass
-an empty ``RunnableConfig`` when calling ``_arun``. Applied at import
-time when the ``langchain_claude_code`` package is present. Removable
-once upstream lands the fix (PR filed at
-https://github.com/agentmish/langchain-claude-code).
+2. **_get_tool_schema (InjectedToolArg / args_schema)** — upstream uses
+   ``args_schema.model_json_schema()``, which includes ``InjectedToolArg``
+   params like ``config``. Claude Code then passes ``config`` in call args;
+   ``_wrap_langchain_tool`` also injects ``config=RunnableConfig()`` →
+   "got multiple values" crash on every tool that uses InjectedToolArg.
+   Fix: use ``tool_call_schema`` (the view that correctly excludes injected
+   params) with ``args_schema`` as fallback. Upstream issue #5, open.
+
+3. **_astream enrichment** — preserves ``stop_reason``, ``num_turns``,
+   ``is_error`` from ``ResultMessage`` in ``generation_info``.
+
+4. **Tool event hooks** — installs SDK PreToolUse/PostToolUse hooks so
+   every tool invocation (built-in, bridged, MCP) is captured as a
+   ``tool_events`` list in ``generation_info``. Upstream issue #3 / PR #4.
 
 Idempotent: re-running ``apply_patches()`` after the first call is a
 no-op. Safe to import unconditionally — if langchain-claude-code isn't
