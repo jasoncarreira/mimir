@@ -28,7 +28,6 @@ import json
 import asyncio
 import logging
 import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -207,18 +206,15 @@ async def send_message(
         # cross-channel render path filters on the inbound channel's
         # source, so an empty source on outbound just means it stays
         # scoped to its own channel (which is the right default).
-        from ..history import Message, get_global_buffer
+        from ..history import get_global_buffer
         _buf = get_global_buffer()
         if _buf is not None and result is not None:
             try:
-                msg = Message(
-                    ts=datetime.now(tz=timezone.utc).isoformat(),
-                    msg_id=getattr(result, "message_id", None),
+                msg = _buf.make_message(
                     channel_id=cid,
-                    author=None,
-                    author_display=None,
                     kind="assistant_message",
                     content=clean_text,
+                    msg_id=getattr(result, "message_id", None),
                     source=None,
                 )
                 await _buf.append(msg)
