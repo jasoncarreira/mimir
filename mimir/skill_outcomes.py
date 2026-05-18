@@ -134,6 +134,26 @@ def _classify_skill_calls(
       - No tool_result + turn_succeeded=False → "failure" (inferred)
       - No tool_result + turn_succeeded=None  → "abandoned" (legacy /
         turn outcome unavailable)
+
+    **Inference imprecision (aggregate-level correct, per-call-level
+    imprecise).** When a turn has both a Skill call AND a later
+    non-Skill tool call (Bash, Read, …), this fallback can't
+    distinguish which tool drove the turn-level error. If the Skill
+    succeeded but a later Bash crashed the turn, the Skill gets
+    attributed "failure" via the fallback. Inverse case (Skill itself
+    drove the failure) is correctly attributed. Heartbeat /
+    reflection / poller turns are usually Skill-dominated so the
+    bucket telemetry trends right in aggregate; rare turns with
+    mixed tool-call patterns may misattribute.
+
+    **Backfill vs forward-looking.** Once the
+    ``enrich_streaming_metadata`` patch (PR #193) is live for new
+    turns, ChatClaudeCode emits matching tool_result events for
+    built-in tools and the exact-match branch above takes over. The
+    inferred-from-turn fallback's value then shifts from "working
+    around current breakage" to "working around historical
+    breakage" — old turns in turns.jsonl from before #193 landed
+    keep flowing through this path indefinitely.
     """
     pending: dict[str, str] = {}   # tool_use_id → skill name
     for ev in events:
