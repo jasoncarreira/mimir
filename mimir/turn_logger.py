@@ -289,7 +289,17 @@ def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
     )
     result_subtype = "success"
     result_is_error = bool(cc_is_error) if cc_is_error is not None else False
-    if stop_reason in ("max_turns", "max_tokens"):
+    # Truncation reasons across all model providers — model ran out of
+    # budget mid-response. Provider-specific names:
+    #   - claude-code SDK: ``"max_turns"`` (per-request loop cap) +
+    #     ``"max_tokens"`` (per-response token cap)
+    #   - langchain-anthropic native: ``"max_tokens"``
+    #   - langchain-openai native: ``"length"`` (the canonical OpenAI
+    #     finish_reason for max-tokens truncation)
+    # All land in ``result_subtype="error_max_turns"`` — the name is
+    # SDK-era legacy; the semantic is "model hit a budget cap and
+    # the response is truncated."
+    if stop_reason in ("max_turns", "max_tokens", "length"):
         result_subtype = "error_max_turns"
         result_is_error = True
 
