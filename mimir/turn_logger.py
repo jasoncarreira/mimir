@@ -159,7 +159,14 @@ def extract_turn_events(
                             "args": te.get("input"),
                         })
                     elif te_type == "tool_result":
-                        body = _coerce_content(te.get("result") or te.get("error"))
+                        # Use ``is not None`` rather than truthiness so an
+                        # empty-string result (e.g. a Bash call with no
+                        # output) is preserved rather than falling through
+                        # to the error field.
+                        _te_result = te.get("result")
+                        body = _coerce_content(
+                            _te_result if _te_result is not None else te.get("error")
+                        )
                         if len(body) > MAX_TOOL_RESULT_BYTES:
                             body = body[:MAX_TOOL_RESULT_BYTES] + "…[truncated]"
                         events.append({
@@ -215,7 +222,13 @@ def extract_turn_events(
                     "args": tc.get("args") or tc.get("input"),
                 })
             for tr in internal_trs:
-                body = _coerce_content(tr.get("content") or tr.get("result"))
+                # Use ``is not None`` rather than truthiness — empty-string
+                # content (a tool that returns "") is a valid result and
+                # must not fall through to the ``result`` fallback field.
+                _tr_content = tr.get("content")
+                body = _coerce_content(
+                    _tr_content if _tr_content is not None else tr.get("result")
+                )
                 if len(body) > MAX_TOOL_RESULT_BYTES:
                     body = body[:MAX_TOOL_RESULT_BYTES] + "…[truncated]"
                 tr_id = tr.get("tool_use_id", "") or ""
