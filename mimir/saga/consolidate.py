@@ -120,7 +120,6 @@ def _candidate_raws(
     Selection criteria:
     - memory_type = 'raw'
     - tombstoned = 0
-    - source_type != 'session_boundary' (boundaries aren't evidence)
     - At least one access_event in the lookback window
 
     **Already-cited raws are NOT filtered out.** A raw that's already
@@ -146,7 +145,6 @@ def _candidate_raws(
         JOIN access_events e ON e.atom_id = a.id
         WHERE a.memory_type = 'raw'
           AND a.tombstoned = 0
-          AND a.source_type != 'session_boundary'
           AND a.agent_id = ?
           AND e.ts >= ?
     """, (agent_id, cutoff)).fetchall()

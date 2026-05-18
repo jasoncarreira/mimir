@@ -243,30 +243,11 @@ def test_recall_skips_access_event_when_disabled(conn):
     assert sources == ["store"]
 
 
-def test_recall_excludes_session_boundary_by_default(conn):
-    """session_boundary source_type atoms are filtered from generic
-    recall — PR #153's behavior preserved."""
-    r = store(conn, "session ended", embed_fn=_fake_embed,
-              source_type="session_boundary")
-    result = recall(
-        conn, "anything",
-        query_embed_fn=_fake_query_embed,
-        faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
-        fts_search_fn=lambda q, k: [],
-    )
-    ids = [c.atom["id"] for c in result.raws + result.observations]
-    assert r.atom_id not in ids
-
-    # Opt-in flips it.
-    result2 = recall(
-        conn, "anything",
-        query_embed_fn=_fake_query_embed,
-        faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
-        fts_search_fn=lambda q, k: [],
-        include_session_boundaries=True,
-    )
-    ids2 = [c.atom["id"] for c in result2.raws + result2.observations]
-    assert r.atom_id in ids2
+# Session-boundary exclusion test removed: session boundaries live in
+# the ``sessions`` table now, not as atoms with source_type='session_boundary'.
+# The source_type filter in recall (and ``include_session_boundaries``
+# parameter) was dropped because no atom has that source_type
+# post-migration. Sessions are queried via ``SagaStore.search_sessions()``.
 
 
 def test_recall_pinned_atoms_bypass_activation_threshold(conn):
