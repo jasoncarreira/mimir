@@ -156,3 +156,41 @@ async def test_client_most_retrieved_atoms(client, monkeypatch):
         await client.query("atom to retrieve")
     top = await client.most_retrieved_atoms(days=7, count=5)
     assert isinstance(top, list)
+
+
+@pytest.mark.asyncio
+async def test_saga_store_async_context_manager(tmp_path, monkeypatch):
+    """``async with SagaStore(...) as store:`` opens the connection
+    eagerly and closes it on exit — operator + test-fixture
+    ergonomics fix so callers don't have to remember
+    ``await store.close()`` manually."""
+    from mimir.saga.client import SagaStore
+    _patch_provider(monkeypatch)
+    db_path = tmp_path / "ctx_mgr.db"
+
+    async with SagaStore(db_path=db_path) as store:
+        # Connection was opened eagerly on __aenter__.
+        assert store._conn is not None
+        # Real method call still works.
+        await store.store("atom in async-with body")
+
+    # On exit, the connection is closed.
+    assert store._conn is None
+
+
+@pytest.mark.asyncio
+async def test_saga_store_async_context_manager_propagates_exceptions(
+    tmp_path, monkeypatch,
+):
+    """An exception raised in the ``async with`` body propagates —
+    ``__aexit__`` must not suppress. Defends against accidentally
+    introducing exception swallow in close-on-exit."""
+    from mimir.saga.client import SagaStore
+    _patch_provider(monkeypatch)
+    db_path = tmp_path / "ctx_mgr_exc.db"
+
+    with pytest.raises(ValueError, match="from body"):
+        async with SagaStore(db_path=db_path) as store:
+            raise ValueError("from body")
+    # And the connection still got closed.
+    assert store._conn is None

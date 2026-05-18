@@ -53,10 +53,6 @@ DEFAULT_SCORING_WEIGHTS = {
     "w_rrf":    20.0,  # RRF base contribution (see calibration above)
     "w_topic":  0.1,
     "w_act":    0.3,
-    # Legacy keys preserved so callers passing v1 weight dicts still
-    # work; the recall path no longer reads them under fusion="rrf".
-    "w_sim":   0.7,
-    "w_kw":    0.2,
 }
 
 # Per-pathway RRF weights. Saga's bench used equal weights since v0;
