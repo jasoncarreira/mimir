@@ -70,14 +70,17 @@ async def test_search_sessions_basic_result_shape(store):
 
     results = await store.search_sessions("programming patterns")
     assert isinstance(results, list)
-    if results:
-        r = results[0]
-        for key in ("session_id", "channel_id", "started_at", "ended_at",
-                    "summary", "similarity_score", "recency_score", "blended_score"):
-            assert key in r, f"missing key: {key}"
-        assert 0.0 <= r["similarity_score"] <= 1.0
-        assert 0.0 <= r["recency_score"] <= 1.0
-        assert 0.0 <= r["blended_score"] <= 1.0
+    assert len(results) >= 1, (
+        "expected at least one result after two end_session calls; "
+        "got [] — likely a silent regression in search_sessions"
+    )
+    r = results[0]
+    for key in ("session_id", "channel_id", "started_at", "ended_at",
+                "summary", "similarity_score", "recency_score", "blended_score"):
+        assert key in r, f"missing key: {key}"
+    assert 0.0 <= r["similarity_score"] <= 1.0
+    assert 0.0 <= r["recency_score"] <= 1.0
+    assert 0.0 <= r["blended_score"] <= 1.0
 
 
 @pytest.mark.asyncio
@@ -135,47 +138,96 @@ async def test_search_sessions_limit(store):
 
 
 @pytest.mark.asyncio
-async def test_search_sessions_schema_v3_migration(tmp_path, monkeypatch):
-    """Schema v3 migration adds embedding columns to an existing sessions table.
+async def test_search_sessions_schema_migration_adds_embedding_columns(
+    tmp_path, monkeypatch
+):
+    """Embedding-columns ALTER TABLE migration genuinely runs on a pre-migration DB.
 
-    Simulate: sessions row exists but was created before schema v3
-    (embedding column absent). Opening a fresh SagaStore triggers
-    migration v3 and adds the columns. search_sessions should still
-    work — alpha=0.0 (recency-only) returns the session even with
-    NULL embedding.
+    Builds a DB without the embedding columns by: (1) letting SagaStore create
+    the full schema, (2) using SQLite's table-swap pattern to recreate ``sessions``
+    without the embedding columns, (3) removing the embedding-migration version
+    stamp so SagaStore re-applies it on next open.  Verifies via
+    ``PRAGMA table_info(sessions)`` that the columns are present after migration —
+    a broken ALTER TABLE would not be caught by the old NULL-and-rollback approach.
     """
     _patch_provider(monkeypatch, dim=4)
-    db_path = tmp_path / "v3_migration.saga.db"
+    db_path = tmp_path / "pre_emb.saga.db"
 
-    # Step 1: create at current schema version (v3).
+    # Step 1: Initialize via SagaStore so all tables and full schema exist.
     s1 = SagaStore(db_path=db_path, embedding_dim=4)
     await s1.end_session("sess-migrate", "Migration test session",
                          channel_id="ch-mig")
 
-    # Step 2: simulate pre-v3 state — NULL out the embedding columns
-    # and roll schema_version back to v2.
+    # Step 2: Drop the embedding columns by recreating the sessions table without
+    # them.  SQLite doesn't support DROP COLUMN before 3.35, so use the
+    # portable rename-recreate pattern.
     conn = s1._ensure_conn()
-    conn.execute("UPDATE sessions SET embedding = NULL, embedding_dim = NULL "
-                 "WHERE id = 'sess-migrate'")
-    conn.execute("DELETE FROM schema_version WHERE version = 3")
+    conn.executescript("""
+        BEGIN;
+        CREATE TABLE sessions_pre_emb (
+            id               TEXT PRIMARY KEY,
+            channel_id       TEXT,
+            started_at       TEXT NOT NULL,
+            ended_at         TEXT,
+            summary          TEXT,
+            reflected_at     TEXT,
+            topics_discussed TEXT NOT NULL DEFAULT '[]',
+            decisions_made   TEXT NOT NULL DEFAULT '[]',
+            unfinished       TEXT NOT NULL DEFAULT '[]',
+            emotional_state  TEXT,
+            closed_since     TEXT NOT NULL DEFAULT '[]'
+        );
+        INSERT INTO sessions_pre_emb
+            SELECT id, channel_id, started_at, ended_at, summary, reflected_at,
+                   topics_discussed, decisions_made, unfinished,
+                   emotional_state, closed_since
+            FROM sessions;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_pre_emb RENAME TO sessions;
+        COMMIT;
+    """)
+
+    # Step 3: Remove the embedding-migration version stamp and insert the
+    # predecessor version so _apply_pending_migrations sees a non-empty
+    # `applied` set with max(applied) < CURRENT_SCHEMA_VERSION and
+    # actually runs the embedding-columns migration.
+    # (Removing the only entry would leave `applied` empty, triggering the
+    # "fresh DB" stamp-and-return path that skips all migration DDL.)
+    emb_migration_version = SagaStore.CURRENT_SCHEMA_VERSION
+    prev_version = emb_migration_version - 1
+    conn.execute("DELETE FROM schema_version WHERE version = ?",
+                 (emb_migration_version,))
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+        (prev_version, "2000-01-01T00:00:00+00:00"),
+    )
     conn.commit()
 
-    # Step 3: open a fresh SagaStore — triggers migration v3 (no-op DDL
-    # since columns already exist from the greenfield schema.sql, but
-    # the migration runner stamps v3 correctly).
+    # Verify the columns are genuinely absent before the migration runs.
+    pre_cols = {row[1] for row in conn.execute(
+        "PRAGMA table_info(sessions)"
+    ).fetchall()}
+    assert "embedding" not in pre_cols, \
+        "test setup failed: 'embedding' column still present before migration"
+    assert "embedding_dim" not in pre_cols, \
+        "test setup failed: 'embedding_dim' column still present before migration"
+
+    # Step 4: Open a fresh SagaStore — triggers the embedding-columns migration.
     s2 = SagaStore(db_path=db_path, embedding_dim=4)
-
-    # Verify the sessions row is still there.
     conn2 = s2._ensure_conn()
-    row = conn2.execute(
-        "SELECT id FROM sessions WHERE id = 'sess-migrate'"
-    ).fetchone()
-    assert row is not None, "sessions row should survive migration"
 
-    # search_sessions with alpha=0 (recency-only) should return it even
-    # with a NULL embedding.
+    # Step 5: Verify ALTER TABLE added the columns.
+    post_cols = {row[1] for row in conn2.execute(
+        "PRAGMA table_info(sessions)"
+    ).fetchall()}
+    assert "embedding" in post_cols, \
+        "migration should have added 'embedding' column via ALTER TABLE"
+    assert "embedding_dim" in post_cols, \
+        "migration should have added 'embedding_dim' column via ALTER TABLE"
+
+    # Step 6: Verify the original session row survived and is searchable
+    # (recency path, alpha=0 avoids needing an embedding).
     results = await s2.search_sessions("migration test", alpha=0.0)
     session_ids = {r["session_id"] for r in results}
-    assert "sess-migrate" in session_ids, (
-        "search_sessions should return the session (recency path, alpha=0)"
-    )
+    assert "sess-migrate" in session_ids, \
+        "search_sessions should return the session via the recency path after migration"

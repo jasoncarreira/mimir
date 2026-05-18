@@ -261,13 +261,17 @@ def reflect(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 ended_at         = excluded.ended_at,
-                summary          = excluded.summary,
+                -- Structured extraction fields: COALESCE(NULLIF(..., '[]'), existing)
+                -- so a re-run where LLM extraction failed ('[]') doesn't nuke the
+                -- first run's data. NULLIF treats '[]' as absent (same as NULL) so
+                -- COALESCE falls back to the existing row value.
+                summary          = COALESCE(NULLIF(excluded.summary, ''), sessions.summary),
                 reflected_at     = excluded.reflected_at,
-                topics_discussed = excluded.topics_discussed,
-                decisions_made   = excluded.decisions_made,
-                unfinished       = excluded.unfinished,
-                emotional_state  = excluded.emotional_state,
-                closed_since     = excluded.closed_since,
+                topics_discussed = COALESCE(NULLIF(excluded.topics_discussed, '[]'), sessions.topics_discussed),
+                decisions_made   = COALESCE(NULLIF(excluded.decisions_made, '[]'), sessions.decisions_made),
+                unfinished       = COALESCE(NULLIF(excluded.unfinished, '[]'), sessions.unfinished),
+                emotional_state  = COALESCE(excluded.emotional_state, sessions.emotional_state),
+                closed_since     = COALESCE(NULLIF(excluded.closed_since, '[]'), sessions.closed_since),
                 embedding        = COALESCE(excluded.embedding, sessions.embedding),
                 embedding_dim    = COALESCE(excluded.embedding_dim, sessions.embedding_dim)
         """, (

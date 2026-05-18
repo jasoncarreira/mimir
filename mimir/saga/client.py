@@ -404,9 +404,23 @@ WHERE a.source_type = 'session_boundary'
             if row:
                 dim = row[0]
             else:
-                # Fall back to atoms embedding dim, then voyage default.
+                # Fall back to atoms embedding dim; then ask the provider.
+                # Never guess a magic constant — a wrong dim silently builds
+                # an index that filters out every real embedding on arrival.
                 row2 = conn.execute("SELECT dim FROM embeddings LIMIT 1").fetchone()
-                dim = row2[0] if row2 else 1024
+                if row2:
+                    dim = row2[0]
+                else:
+                    try:
+                        from .embeddings import get_provider
+                        dim = get_provider().dimensions()
+                    except Exception:
+                        # Provider unavailable and DB is genuinely empty.
+                        # Return None so search_sessions falls back to recency-only
+                        # rather than building an index at the wrong dimension.
+                        self._sessions_index_built = True  # cache the miss
+                        self._sessions_index = None
+                        return None
             self._embedding_dim = dim
         idx = VectorIndex(dimension=dim)
         idx.build_from_sessions(conn)
@@ -1082,7 +1096,13 @@ WHERE a.source_type = 'session_boundary'
         """
         import math
 
-        query_emb: list[float] = await asyncio.to_thread(_query_embed_sync, query)
+        # Skip the embed round-trip when alpha=0 (pure recency — cosine score
+        # is never consulted).  The downstream _do() handles query_emb==[] via
+        # the existing ``if query_emb:`` guard, so the recency path still works.
+        if alpha > 0.0:
+            query_emb: list[float] = await asyncio.to_thread(_query_embed_sync, query)
+        else:
+            query_emb = []
 
         def _do() -> list[dict]:
             conn = self._ensure_conn()
