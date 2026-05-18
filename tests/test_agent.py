@@ -775,3 +775,80 @@ async def test_send_message_tool_appends_outbound_via_global_buffer(tmp_path: Pa
         set_global_buffer(None)  # type: ignore[arg-type]
         tools_reg.set_channel_registry(None)
         tools_reg.set_current_channel_id(None)
+
+
+# ── agent_id plumbing (Shape B multi-agent observability) ──────────
+
+
+async def test_run_turn_threads_agent_id_into_turn_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Config.agent_id (MIMIR_AGENT_ID) must land on TurnRecord so
+    a cross-process operator running two agents on the same host
+    can filter merged turns.jsonl output by agent. Locks in the
+    Shape B observability invariant."""
+    monkeypatch.setenv("MIMIR_AGENT_ID", "muninnbot")
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="hello")])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
+    )
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1",
+        content="hi", author="jason",
+    )
+    record = await agent.run_turn(event)
+    assert record.error is None
+    assert record.agent_id == "muninnbot", (
+        f"expected agent_id='muninnbot' on TurnRecord; got {record.agent_id!r}"
+    )
+
+
+async def test_run_turn_default_agent_id_is_mimir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """When MIMIR_AGENT_ID is unset, the default is ``"mimir"`` —
+    every record gets the tag, single-agent deployments stay
+    unaffected. Pre-existing turns.jsonl readers will see the new
+    field and tolerate it."""
+    monkeypatch.delenv("MIMIR_AGENT_ID", raising=False)
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
+    )
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="x",
+    ))
+    assert record.agent_id == "mimir"
+
+
+async def test_event_logger_stamps_agent_id_on_records(tmp_path: Path):
+    """The EventLogger stamps every record with the agent_id passed
+    at init time. ``None`` (the pre-existing shape) omits the key
+    so downstream readers don't see a spurious agent_id=None on
+    legacy operator runs."""
+    from mimir.event_logger import EventLogger
+    import json as _json
+
+    path = tmp_path / "events.jsonl"
+
+    # With agent_id set: key appears in every record.
+    logger_with = EventLogger(
+        path, session_id="sess-x", agent_id="muninnbot",
+    )
+    await logger_with.log("test_event", foo="bar")
+    line = path.read_text().splitlines()[0]
+    rec = _json.loads(line)
+    assert rec["agent_id"] == "muninnbot"
+    assert rec["session_id"] == "sess-x"
+    assert rec["type"] == "test_event"
+    assert rec["foo"] == "bar"
+
+    # Without agent_id: key absent (not present-but-null).
+    path2 = tmp_path / "events_no_agent.jsonl"
+    logger_no = EventLogger(path2, session_id="sess-y")
+    await logger_no.log("test_event")
+    rec2 = _json.loads(path2.read_text().splitlines()[0])
+    assert "agent_id" not in rec2, (
+        "agent_id should be absent (not None) when not set, "
+        "to keep the legacy record shape exactly"
+    )
