@@ -726,6 +726,7 @@ class Agent:
             trigger=event.trigger,
             channel_id=event.channel_id,
             started_at=t_total_start,
+            agent_id=self._config.agent_id,
             saga_session_id=saga_session_id,
             # Per-turn send-loop circuit breaker (SPEC §7.2.4). Attached
             # to the TurnContext so send_message can reach it via
@@ -1006,6 +1007,7 @@ class Agent:
             trigger=event.trigger,
             channel_id=event.channel_id,
             input=truncate_input(turn_prompt),
+            agent_id=self._config.agent_id,
             saga_atom_ids=saga_atom_ids,
             events=events,
             output=(output or "")[:2048],
