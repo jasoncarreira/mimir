@@ -114,6 +114,19 @@ NON_USER_QUERY_TRIGGERS: frozenset[str] = frozenset(
     {"saga_session_end", "scheduled_tick", "poller"}
 )
 
+# Autonomous-work triggers — cron-fired and poller-fired turns that
+# don't anchor a back-and-forth conversation. After one of these turns
+# completes, force-end the saga session immediately instead of letting
+# the standard idle-minutes countdown run: the channel won't see more
+# turns on the same session anyway (the next cron fire / poller batch
+# creates its own session via ``SessionManager.touch``), so a 10-minute
+# idle wait just defers the synthesis with no recall benefit.
+# ``saga_session_end`` is excluded — that IS the synthesis turn; ending
+# the session that just produced it would loop.
+IMMEDIATE_SESSION_END_TRIGGERS: frozenset[str] = frozenset(
+    {"scheduled_tick", "poller"}
+)
+
 
 # ────────────────────────────────────────────────────────────────────
 # Helpers
@@ -986,6 +999,42 @@ class Agent:
             error=error,
             stop_reason=result_fields.get("stop_reason"),
         )
+
+        # Autonomous-work triggers (cron + poller) don't anchor a
+        # conversation, so the standard ``MIMIR_SAGA_SESSION_IDLE_MINUTES``
+        # countdown would just defer the synthesis turn by 10 minutes with
+        # no recall benefit (no more turns will fire on the same session
+        # — the next cron tick / poller batch creates its own session via
+        # ``SessionManager.touch``). Force-end the session now so the
+        # synthesis turn runs immediately after the autonomous work.
+        # ``end_now`` enqueues a ``saga_session_end`` turn via the registered
+        # on-idle callback (see ``server.py:_on_session_idle``), which the
+        # per-channel dispatcher will pick up after this turn returns and
+        # the worker frees up.
+        if (
+            self._sessions is not None
+            and event.channel_id
+            and event.trigger in IMMEDIATE_SESSION_END_TRIGGERS
+        ):
+            try:
+                await self._sessions.end_now(event.channel_id)
+            except Exception:  # noqa: BLE001
+                # Synthesis enqueue failure shouldn't crash the just-
+                # completed autonomous turn — log + swallow. Note:
+                # end_now pops the session from the registry under its
+                # internal lock BEFORE calling _dispatch_idle, so an
+                # exception here means the session is already ended
+                # in-process state but the synthesis turn never got
+                # enqueued. Recovery: the next event on the channel
+                # creates a fresh session via touch() — the autonomous
+                # work's session boundary atom is lost for this tick,
+                # but the channel keeps functioning.
+                log.exception(
+                    "immediate session-end failed for trigger=%r channel_id=%r",
+                    event.trigger,
+                    event.channel_id,
+                )
+
         return record
 
     async def _maybe_extract_commitments(
