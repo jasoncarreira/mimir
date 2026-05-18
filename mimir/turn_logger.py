@@ -284,6 +284,19 @@ def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
         elif fr == "stop":
             cc_is_error = False
 
+    # num_turns fallback chain:
+    #   1. ``response_metadata["num_turns"]`` — populated by
+    #      ``ChatClaudeCode`` (both call modes; non-streaming directly
+    #      and streaming via ``enrich_streaming_metadata``'s patch).
+    #      This is the SDK's per-request model-turn count.
+    #   2. ``count(AIMessage in messages)`` — fallback for native
+    #      providers (langchain-anthropic / -openai) which don't emit
+    #      ``num_turns`` in response_metadata. Counts how many model
+    #      invocations produced this turn — close-enough proxy for
+    #      "internal turns" since each tool-call cycle yields one
+    #      AIMessage chunk and the final reply yields one more.
+    #   3. ``None`` when there are no AIMessages at all (empty turn /
+    #      error before any model response).
     num_turns = cc_num_turns if cc_num_turns is not None else (
         sum(1 for m in messages if isinstance(m, AIMessage)) or None
     )
