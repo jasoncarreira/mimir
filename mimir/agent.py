@@ -670,10 +670,13 @@ class Agent:
         # Pre-message memory inject. Builds the "Possibly relevant
         # memories" block + collects atom_ids for the post-turn
         # feedback credit pass. Skipped on saga_session_end turns
-        # (synthesis owns its own prompt).
+        # (synthesis owns its own prompt) and on scheduled_tick turns
+        # (no meaningful user query to anchor retrieval — wasteful and
+        # confusing; session summaries still fire via _assemble_session_summaries).
         memory_block: str | None = None
         saga_atom_ids: list[str] = []
-        if self._saga is not None and event.trigger != "saga_session_end":
+        _skip_saga_query = event.trigger in ("saga_session_end", "scheduled_tick")
+        if self._saga is not None and not _skip_saga_query:
             try:
                 payload = await self._saga.query(
                     event.content,
