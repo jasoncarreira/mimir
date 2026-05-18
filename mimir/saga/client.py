@@ -745,16 +745,42 @@ WHERE a.source_type = 'session_boundary'
         extra_canonical_subjects: list[str] | None = None,
         lookback_days: int = 30,
         min_cluster_size: int = 3,
+        dedup_first: bool = True,
+        dedup_threshold: float | None = None,
+        dedup_max_clusters: int | None = None,
     ) -> dict[str, Any]:
-        """Cross-session consolidation pass. Runs the LLM-backed
-        observation synthesizer over recent raw atoms; emits one
-        observation per cluster that survives the supersession/equal-
-        evidence checks. See ``consolidate.consolidate()`` for the
-        per-cluster contract.
+        """Two-pass cross-session consolidation.
 
-        ``dry_run=True`` walks the candidate set and reports cluster
-        counts without paying any LLM cost — useful for the bench
-        harness's pre-flight check.
+        Pass 1 (dedup): if ``dedup_first`` (default True), runs a
+        tight-threshold near-duplicate collapse — picks one canonical
+        per cluster by ACT-R activation, folds the rest's access history
+        and relations into it, and tombstones with reason='merged'. No
+        LLM cost.
+
+        ``dedup_threshold`` defaults to **0.92 floor for all providers**
+        (``max(_PROVIDER_AUTO_THRESHOLDS[provider], 0.92)``) — the
+        per-corpus calibration on mimir's saga.db showed the OpenAI
+        and Voyage pair-similarity distributions both place 0.92 at
+        the ~99.98th percentile, where mean-cosine merges are
+        template-level similar. The floor protects providers whose
+        thematic threshold sits at 0.80 (openai / nim) from over-merging
+        substantively-distinct atoms during the dedup pass. Caller
+        override always wins.
+
+        ``dedup_max_clusters`` caps the number of clusters processed,
+        NOT the number of atoms tombstoned — a cluster of 5
+        near-duplicates counts as one against the cap but tombstones
+        four. Set this to bound LLM-free runtime on cold-start runs;
+        leave None for unbounded.
+
+        Pass 2 (thematic): runs the LLM-backed observation synthesizer
+        over the (now-deduped) recent raw atoms. Same contract as
+        before — emits one observation per cluster surviving
+        supersession/equal-evidence checks.
+
+        ``dry_run=True`` walks the candidate set for both passes and
+        reports counts without paying any LLM cost or doing any writes.
+        Useful for the bench harness's pre-flight check.
         """
         from .cluster import make_default_cluster_fn
 
@@ -777,7 +803,64 @@ WHERE a.source_type = 'session_boundary'
         # pre-computed lookup into a sync consolidate variant.
         conn = self._ensure_conn()
 
+        # 0. Pass 1 (dedup): tighter clusterer collapses near-duplicate
+        # raws into one canonical each, tombstoning the rest. Reads ACT-R
+        # activation to pick the canonical so we keep the retrieval-
+        # validated copy. Empty result if dedup_first is False.
+        dedup_payload: dict[str, Any] = {
+            "candidates_scanned": 0,
+            "clusters_formed": 0,
+            "canonicals_kept": [],
+            "duplicates_tombstoned": [],
+            "threshold": None,
+        }
+        if dedup_first:
+            from .dedup import dedup_pass, DEFAULT_DEDUP_THRESHOLD
+            from .embeddings import resolve_auto_threshold
+            from ._config_io import get_config
+            cfg = get_config()
+            provider_name = cfg("embedding", "provider", "unknown")
+            # 0.92 floor for all providers. The per-provider thematic
+            # threshold (0.80 openai / 0.80 nim / 0.92 voyage / 0.92 onnx)
+            # is too loose for the dedup pass on openai/nim — calibration
+            # against mimir's saga.db (693 atoms, voyage + openai-3-large)
+            # showed 0.92 sits at the ~99.98th percentile of pair similarity
+            # for both providers. The max() acts as a floor that overrides
+            # any provider whose thematic threshold is below 0.92. Caller
+            # override always wins.
+            effective_dedup_threshold = (
+                dedup_threshold
+                if dedup_threshold is not None
+                else max(
+                    resolve_auto_threshold(provider_name),
+                    DEFAULT_DEDUP_THRESHOLD,
+                )
+            )
+            dedup_cluster_fn = make_default_cluster_fn(
+                conn, threshold=effective_dedup_threshold,
+            )
+            def _do_dedup():
+                return dedup_pass(
+                    conn,
+                    cluster_fn=dedup_cluster_fn,
+                    agent_id=self._agent_id,
+                    lookback_days=lookback_days,
+                    min_cluster_size=2,
+                    dry_run=dry_run,
+                    max_clusters=dedup_max_clusters,
+                )
+            dedup_result = await self._write_locked(_do_dedup)
+            dedup_payload = {
+                "candidates_scanned": dedup_result.candidates_scanned,
+                "clusters_formed": dedup_result.clusters_formed,
+                "canonicals_kept": dedup_result.canonicals_kept,
+                "duplicates_tombstoned": dedup_result.duplicates_tombstoned,
+                "threshold": effective_dedup_threshold,
+            }
+
         # 1. Candidate selection + clustering (sync; reads only).
+        # Re-fetches raws so the tombstoned duplicates from pass 1
+        # don't appear as candidates for thematic clustering.
         from .consolidate import (
             _candidate_raws, MIN_CLUSTER_SIZE_FOR_OBSERVATION,
             MAX_OBSERVATIONS_PER_RUN,
@@ -789,7 +872,11 @@ WHERE a.source_type = 'session_boundary'
             agent_id=self._agent_id,
         )
         if len(raws) < min_cluster_size:
-            return {"clusters_formed": 0, "observations_emitted": []}
+            return {
+                "clusters_formed": 0,
+                "observations_emitted": [],
+                "dedup": dedup_payload,
+            }
 
         cluster_fn = make_default_cluster_fn(conn)
         clusters = await asyncio.to_thread(cluster_fn, raws)
@@ -800,6 +887,7 @@ WHERE a.source_type = 'session_boundary'
                 "candidates_scanned": len(raws),
                 "clusters_found": len(clusters),
                 "total_atoms_in_clusters": sum(len(c) for c in clusters),
+                "dedup": dedup_payload,
             }
 
         # 2. LLM synthesis fan-out — concurrent calls, bounded by a
@@ -1030,6 +1118,7 @@ WHERE a.source_type = 'session_boundary'
             "triples_stored": n_triples,
             "contradicts_stored": n_contra,
             "supersedes_from_contradictions": n_supersedes_contra,
+            "dedup": dedup_payload,
         }
 
     async def forget(
