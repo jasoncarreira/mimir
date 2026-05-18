@@ -506,6 +506,61 @@ def test_derive_marks_max_turns_as_error_subtype():
     assert rf["stop_reason"] == "max_turns"
 
 
+def test_derive_marks_anthropic_max_tokens_as_truncation():
+    """Anthropic native: ``response_metadata["stop_reason"] = "max_tokens"``
+    when the response hit the per-message token cap. Same shape as
+    claude-code SDK's max_tokens — should map to error_max_turns."""
+    msg = AIMessage(
+        content="cut off mid-",
+        response_metadata={"stop_reason": "max_tokens"},
+    )
+    rf = derive_result_fields([msg])
+    assert rf["result_subtype"] == "error_max_turns"
+    assert rf["result_is_error"] is True
+    assert rf["stop_reason"] == "max_tokens"
+
+
+def test_derive_marks_openai_length_as_truncation():
+    """OpenAI native: ``response_metadata["finish_reason"] = "length"``
+    when the model hit max_tokens and the response is truncated. The
+    canonical OpenAI signal — semantically identical to Anthropic's
+    ``max_tokens`` and claude-code's ``max_turns``. Should map to
+    ``result_subtype="error_max_turns"`` and ``result_is_error=True``
+    so operators reading bench/audit metrics can distinguish a
+    successful end-of-turn reply from a length-truncated one regardless
+    of which provider produced the turn."""
+    # finish_reason flows through the ``stop_reason or finish_reason``
+    # fallback in derive_result_fields, so stop_reason resolves to
+    # "length" and the truncation check picks it up.
+    msg = AIMessage(
+        content="this answer was cut off because",
+        response_metadata={"finish_reason": "length"},
+        usage_metadata={
+            "input_tokens": 500,
+            "output_tokens": 4096,  # hit the cap
+            "total_tokens": 4596,
+        },
+    )
+    rf = derive_result_fields([msg])
+    assert rf["stop_reason"] == "length"
+    assert rf["result_subtype"] == "error_max_turns"
+    assert rf["result_is_error"] is True
+
+
+def test_derive_marks_openai_length_via_explicit_stop_reason_field():
+    """Symmetric: if a provider happens to populate
+    ``stop_reason="length"`` directly (e.g. an OpenAI-compatible
+    endpoint that uses langchain-anthropic's key name), the same
+    truncation classification applies."""
+    msg = AIMessage(
+        content="truncated",
+        response_metadata={"stop_reason": "length"},
+    )
+    rf = derive_result_fields([msg])
+    assert rf["result_subtype"] == "error_max_turns"
+    assert rf["result_is_error"] is True
+
+
 def test_derive_is_error_falls_back_to_finish_reason_when_streaming():
     """``ChatClaudeCode._astream`` (the path mimir uses) collapses
     ``msg.is_error`` into a binary ``finish_reason`` and never emits
