@@ -45,6 +45,7 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 
+from .bridges._directives import parse_directives, ReactDirective
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .event_logger import log_event
@@ -931,10 +932,25 @@ class Agent:
                 elif output:
                     send_text = output
                 if send_text:
+                    parsed = parse_directives(send_text)
+                    clean = parsed.clean_text
+                    sent_result = None
                     try:
-                        await bridge.send(event.channel_id, send_text)
+                        if clean:
+                            sent_result = await bridge.send(event.channel_id, clean)
                     except Exception as exc:
                         log.warning("bridge.send failed: %s", exc)
+                    for _directive in parsed.directives:
+                        if isinstance(_directive, ReactDirective):
+                            _target = _directive.message_id or (
+                                sent_result.message_id if sent_result else None
+                            )
+                            try:
+                                await bridge.react(
+                                    event.channel_id, _target, _directive.emoji
+                                )
+                            except Exception as exc:
+                                log.debug("bridge.react (directive) failed: %s", exc)
                 elif streaming.streamed_plan:
                     # Edge case: a plan was flushed mid-turn with
                     # final=False (typing indicator held), but the
