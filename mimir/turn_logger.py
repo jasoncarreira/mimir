@@ -110,13 +110,46 @@ def extract_turn_events(
             # subprocess and stashes the parsed ToolUseBlocks under
             # ``response_metadata["internal_tool_calls"]`` (NOT on
             # ``msg.tool_calls``, to keep LangGraph from re-executing
-            # them). Tool results land in ``response_metadata["tool_results"]``.
-            # Fold both shapes into one stream so the turn log captures
-            # tool activity regardless of provider.
+            # them). Tool results land under one of two keys depending
+            # on how the message reached us:
+            #   - ``"tool_results"``           — non-streaming
+            #     ``_generate`` path (``ChatClaudeCode.invoke``).
+            #   - ``"internal_tool_results"``  — streaming ``_stream``
+            #     path (``ChatClaudeCode.astream``), which is what
+            #     ``Agent._run_turn_body`` uses via ``agent.astream``.
+            # Read both so we capture results regardless of provider /
+            # call mode. Pre-fix the streaming path silently dropped
+            # results from every claude-code built-in tool
+            # (Bash/Read/Edit/Grep/Glob): only the LangGraph-native
+            # ``ToolMessage`` path was captured, while the subprocess-
+            # executed Bash/Read/Edit/Grep/Glob ToolResultBlocks
+            # surfaced under ``internal_tool_results`` and we missed
+            # them all. mimirbot's turn 24a1a8858209 (2026-05-17,
+            # commitment-store-bug fix) recorded 63 tool_calls but
+            # only 2 tool_results — every result captured was the
+            # LangGraph-native path.
             rmd = getattr(msg, "response_metadata", None) or {}
             internal_tcs = rmd.get("internal_tool_calls") or []
-            internal_trs = rmd.get("tool_results") or []
+            internal_trs = (
+                rmd.get("internal_tool_results")
+                or rmd.get("tool_results")
+                or []
+            )
             tcs = list(msg.tool_calls or []) + list(internal_tcs)
+            # Build a tool_use_id → name lookup so tool_result events
+            # can carry a usable ``name``. The records produced by
+            # langchain-claude-code's ``_parse_assistant_message``
+            # include ``tool_use_id``, ``content``, and ``is_error``
+            # but NOT ``name`` — that has to come from the matching
+            # tool_call's ``id``. Without this lookup, every captured
+            # tool_result rendered with ``name=""`` even when the
+            # streaming-keys fix above let them through.
+            tc_name_by_id: dict[str, str] = {}
+            for tc in tcs:
+                tc_id = tc.get("id")
+                tc_name = tc.get("name")
+                if tc_id and tc_name:
+                    tc_name_by_id[tc_id] = tc_name
             is_final_ai = i == last_ai_idx
             if content_text and tcs and not is_final_ai:
                 # Intermediate "thinking out loud" between tool calls.
@@ -144,10 +177,16 @@ def extract_turn_events(
                 body = _coerce_content(tr.get("content") or tr.get("result"))
                 if len(body) > MAX_TOOL_RESULT_BYTES:
                     body = body[:MAX_TOOL_RESULT_BYTES] + "…[truncated]"
+                tr_id = tr.get("tool_use_id", "") or ""
+                # Reverse-lookup name via the tool_use_id ↔ tool_call.id
+                # match; fall back to the record's own ``name`` (the
+                # non-streaming key shape used to include it) if the
+                # lookup misses.
+                tr_name = tc_name_by_id.get(tr_id) or tr.get("name", "") or ""
                 events.append({
                     "type": "tool_result",
-                    "id": tr.get("tool_use_id", "") or "",
-                    "name": tr.get("name", "") or "",
+                    "id": tr_id,
+                    "name": tr_name,
                     "content": body,
                     "is_error": bool(tr.get("is_error")),
                 })
@@ -219,12 +258,31 @@ def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
     # usage, and is_error signals it surfaces there. The native
     # langchain providers (anthropic / openai) populate
     # ``usage_metadata`` instead, handled above.
+    #
+    # Streaming-path note (``ChatClaudeCode._astream``): the upstream
+    # code DROPS ``stop_reason`` / ``num_turns`` / ``is_error`` from
+    # generation_info, emitting only a binary ``finish_reason``
+    # (``"stop"`` / ``"error"``). ``enrich_streaming_metadata()`` in
+    # ``_langchain_claude_code_patches`` patches that to preserve the
+    # original fields, so production reads work normally. The
+    # fallbacks below are defense-in-depth for deployments where the
+    # patch didn't apply (claude-code extra absent, upstream version
+    # incompatible with the wrapper, etc.).
     cc_usage = md.get("usage")
     if usage is None and cc_usage:
         usage = cc_usage
     cc_num_turns = md.get("num_turns")
     cc_total_cost = md.get("total_cost_usd")
     cc_is_error = md.get("is_error")
+    if cc_is_error is None:
+        # Streaming path collapses ``msg.is_error`` into
+        # ``finish_reason``. Recover the binary signal — granular
+        # error categories are lost without the patch above.
+        fr = md.get("finish_reason")
+        if fr == "error":
+            cc_is_error = True
+        elif fr == "stop":
+            cc_is_error = False
 
     num_turns = cc_num_turns if cc_num_turns is not None else (
         sum(1 for m in messages if isinstance(m, AIMessage)) or None
