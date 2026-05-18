@@ -258,12 +258,31 @@ def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
     # usage, and is_error signals it surfaces there. The native
     # langchain providers (anthropic / openai) populate
     # ``usage_metadata`` instead, handled above.
+    #
+    # Streaming-path note (``ChatClaudeCode._astream``): the upstream
+    # code DROPS ``stop_reason`` / ``num_turns`` / ``is_error`` from
+    # generation_info, emitting only a binary ``finish_reason``
+    # (``"stop"`` / ``"error"``). ``enrich_streaming_metadata()`` in
+    # ``_langchain_claude_code_patches`` patches that to preserve the
+    # original fields, so production reads work normally. The
+    # fallbacks below are defense-in-depth for deployments where the
+    # patch didn't apply (claude-code extra absent, upstream version
+    # incompatible with the wrapper, etc.).
     cc_usage = md.get("usage")
     if usage is None and cc_usage:
         usage = cc_usage
     cc_num_turns = md.get("num_turns")
     cc_total_cost = md.get("total_cost_usd")
     cc_is_error = md.get("is_error")
+    if cc_is_error is None:
+        # Streaming path collapses ``msg.is_error`` into
+        # ``finish_reason``. Recover the binary signal — granular
+        # error categories are lost without the patch above.
+        fr = md.get("finish_reason")
+        if fr == "error":
+            cc_is_error = True
+        elif fr == "stop":
+            cc_is_error = False
 
     num_turns = cc_num_turns if cc_num_turns is not None else (
         sum(1 for m in messages if isinstance(m, AIMessage)) or None
