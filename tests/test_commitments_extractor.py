@@ -211,3 +211,72 @@ async def test_extract_returns_empty_on_unparseable_response(
         channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
     )
     assert out == []
+
+
+# ── coercion-pipeline regression tests ─────────────────────────────
+# These tests guard the JSON-parse + _coerce_to_record pipeline against
+# future regressions that would silently strip artifact identifiers or
+# disposition flags from whatever text the LLM emits.  They do NOT
+# validate that the v4 prompt convinces the LLM to include identifiers
+# (that requires a live-LLM backtest; see PR #197 body).
+
+
+async def test_coercion_preserves_artifact_identifiers_when_present(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Artifact identifiers (PR #, chainlink #) in LLM output survive
+    coercion into the CommitmentRecord unchanged.
+
+    Guards the coercion pipeline: if the LLM emits text containing
+    PR/issue/chainlink numbers, those numbers must reach
+    CommitmentRecord.text intact so future evaluations don't need to
+    backtrack to the source turn.
+    """
+    payload = json.dumps({
+        "commitments": [
+            {
+                "text": "Cluster B subissues #115/#116/#117 under chainlink #29 unimplemented",
+                "confidence": 0.9,
+                "kind": "open_loop",
+            }
+        ]
+    })
+    _install_fake_chat(monkeypatch, payload)
+    out = await extract_commitments(
+        "x" * 200,
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert len(out) == 1
+    assert "chainlink #29" in out[0].text
+    assert "#115" in out[0].text
+    assert "#116" in out[0].text
+    assert "#117" in out[0].text
+
+
+async def test_coercion_preserves_disposition_flags_when_present(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Disposition flags ("Optional") in LLM output survive coercion.
+
+    Guards the coercion pipeline: if the LLM emits text containing
+    "Optional", "blocker", or similar qualifiers, those strings must
+    reach CommitmentRecord.text intact so the commitment can be
+    evaluated correctly without backtracking to the source turn.
+    """
+    payload = json.dumps({
+        "commitments": [
+            {
+                "text": "Optional: file chainlink for --no-bridges flag on mimir run",
+                "confidence": 0.75,
+                "kind": "open_loop",
+            }
+        ]
+    })
+    _install_fake_chat(monkeypatch, payload)
+    out = await extract_commitments(
+        "x" * 200,
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert len(out) == 1
+    assert "Optional" in out[0].text
+    assert "--no-bridges" in out[0].text
