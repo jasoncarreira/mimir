@@ -36,6 +36,7 @@ Adaptation from main's SDK version:
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -43,6 +44,14 @@ from langchain_core.messages import AIMessage, BaseMessage
 
 if TYPE_CHECKING:  # pragma: no cover
     from .bridges.base import Bridge, SendResult
+
+# Callback shape for chat-history outbound appends. The agent's
+# ``Agent._append_outbound_to_buffer`` matches this signature; tests
+# pass ``None`` to skip the append. ``msg_id`` is the bridge's
+# delivered message id (None when the bridge failed); ``source`` is
+# the inbound trigger's source (e.g. ``"discord"``) so outbound rows
+# inherit the same provenance tag.
+OutboundAppender = Callable[..., Awaitable[None]]
 
 log = logging.getLogger(__name__)
 
@@ -229,9 +238,19 @@ class StreamingAutoDispatcher:
         channel_id: str,
         bridge: "Bridge | None",
         eligible: bool = True,
+        outbound_appender: "OutboundAppender | None" = None,
+        channel_source: str | None = None,
     ) -> None:
         self._channel_id = channel_id
         self._bridge = bridge
+        # ``outbound_appender(channel_id, content, *, msg_id, source)``
+        # — optional async callback to record the flushed text into
+        # ``chat_history`` so the agent sees its own streamed reply
+        # in the next turn's Recent activity. The agent passes
+        # ``Agent._append_outbound_to_buffer``; tests / bench paths
+        # leave it ``None`` and the dispatcher is a no-op on this axis.
+        self._outbound_appender = outbound_appender
+        self._channel_source = channel_source
         # Bench / no-bridge / non-user-facing channels skip streaming.
         # ``BenchBridge`` has name="bench"; tests / smoke runs that
         # invoke without a bridge also fall through cleanly here.
@@ -261,24 +280,90 @@ class StreamingAutoDispatcher:
         return self.state.suppressed_text()
 
     async def observe(self, msg: BaseMessage) -> None:
-        """Advance the state machine and (if needed) flush the plan."""
+        """Advance the state machine and (if needed) flush the plan.
+
+        Parses ``<actions>`` directives out of the plan text before
+        sending — the bridge receives only the cleaned remainder so
+        raw markup never reaches the channel. Pre-#181's dispatcher
+        did this same cleaning + directive dispatch; the deepagents
+        migration kept the streaming machinery but dropped the
+        cleaning step, so raw ``<actions>...</actions>`` blocks were
+        being sent to users mid-stream. Restoring matches the
+        agent-fallback ``bridge.send`` path (``agent.py``) which has
+        always parsed directives.
+        """
         plan_text = advance_state(self.state, msg)
         if plan_text is None:
             return
         if self._bridge is None:
             return
+
+        # Strip directives. ``parse_directives`` failure is non-fatal —
+        # if the bridges' parser raises, send the raw text rather than
+        # blocking the flush; the agent fallback at end of turn has
+        # the same fallback shape.
         try:
-            result = await self._bridge.send(
-                self._channel_id, plan_text, final=False,
-            )
+            from .bridges._directives import parse_directives, ReactDirective
+            parsed = parse_directives(plan_text)
+            clean_plan = parsed.clean_text or ""
+            directives = list(parsed.directives)
         except Exception:  # noqa: BLE001
-            log.exception("streaming plan flush failed")
-            return
-        # Only flip ``streamed_plan`` after the bridge confirms
-        # sent=True — otherwise turns.jsonl could claim text was
-        # suppressed from the user when in fact the bridge dropped it.
-        if getattr(result, "sent", False):
-            self.state.streamed_plan = True
+            log.exception("parse_directives raised in plan-flush parser")
+            clean_plan = plan_text
+            directives = []
+
+        result = None
+        if clean_plan.strip():
+            try:
+                result = await self._bridge.send(
+                    self._channel_id, clean_plan, final=False,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("streaming plan flush failed")
+                # Continue to directive dispatch + buffer append below
+                # — the cleaned plan still represents what the agent
+                # intended to say, and inline directives (e.g. an
+                # ack-react) may still be worth firing.
+                result = None
+            else:
+                # Only flip ``streamed_plan`` after the bridge confirms
+                # ``sent=True`` — otherwise turns.jsonl could claim text
+                # was suppressed from the user when in fact the bridge
+                # dropped it. Pre-#181 invariant.
+                if getattr(result, "sent", False):
+                    self.state.streamed_plan = True
+
+        # Dispatch parsed directives. Currently only ReactDirective is
+        # actionable in this path; the agent-fallback at end of turn
+        # has the same partial coverage. SendFileDirective is not yet
+        # implemented anywhere.
+        for d in directives:
+            if isinstance(d, ReactDirective):
+                target = d.message_id or (
+                    getattr(result, "message_id", None) if result else None
+                )
+                try:
+                    await self._bridge.react(
+                        self._channel_id, target, d.emoji,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.debug("streaming react directive failed", exc_info=True)
+
+        # Record the CLEANED text in chat_history so the agent's next
+        # turn sees its own streamed reply in Recent activity — and so
+        # the raw ``<actions>`` markup the user never saw doesn't leak
+        # into the conversation record either. Mirrors pre-#181's
+        # ``_record_outbound(plan_text=cleaned_plan, …)`` invariant.
+        if clean_plan and self._outbound_appender is not None:
+            try:
+                await self._outbound_appender(
+                    self._channel_id,
+                    clean_plan,
+                    msg_id=getattr(result, "message_id", None) if result else None,
+                    source=self._channel_source,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("streaming outbound buffer append failed")
 
 
 def intermediate_text_segments(messages: list[BaseMessage]) -> list[str]:
