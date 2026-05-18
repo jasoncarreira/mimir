@@ -19,9 +19,14 @@ unfinished items into 100-1100 chars of prose; this module asks Claude
 **Prompt design**: see ``scratch/commitments_backtest_report.md`` for
 the Phase 0 backtest (~95% precision / ~85% recall over 30 historical
 session-ends with the v3 prompt). The system prompt + user template
-below are the v3 verbatim, with the dynamic fields filled at extraction
-time. Future-tuning lands here; bump the constant version comment so
-the backtest can be rerun on the new prompt against the same corpus.
+below are the v4 verbatim, with the dynamic fields filled at extraction
+time. v4 adds the self-containment rubric: every ``text`` value must
+preserve concrete artifact identifiers (PR/issue/chainlink numbers,
+file paths, branch names) and disposition flags ("Optional", "blocker",
+"deferred-until-X") from the source bullet. The 120-char budget should
+be used, not minimised. See chainlink #137 for the v3→v4 motivation
+and the backtest plan. Future-tuning lands here; bump the constant
+version comment so the backtest can be rerun on the new prompt.
 """
 
 from __future__ import annotations
@@ -42,10 +47,13 @@ from .models import (
 log = logging.getLogger(__name__)
 
 
-# v3 — validated 2026-05-10 against the last 30 saga_session_end turns
-# from /mimir-home/logs/turns.jsonl. ~95% precision, ~85% recall.
+# v4 — adds self-containment rubric (chainlink #137): text must preserve
+# artifact identifiers and disposition flags from the source bullet so
+# a future turn can evaluate "done/not done?" without backtracking to
+# the source turn. v3 baseline: ~95% precision / ~85% recall (validated
+# 2026-05-10 against 30 saga_session_end turns from turns.jsonl).
 # Bump this version + re-run the backtest on any non-trivial edit.
-EXTRACTION_PROMPT_VERSION = "v3"
+EXTRACTION_PROMPT_VERSION = "v4"
 
 
 EXTRACTION_SYSTEM = """\
@@ -70,7 +78,7 @@ Output strictly-valid JSON matching this schema:
 {
   "commitments": [
     {
-      "text": "natural-language description, <=120 chars",
+      "text": "self-contained description <=120 chars — include artifact refs (PR#, chainlink#, file path) and disposition flags from source",
       "kind": "agent_promise | user_request | deadline_check | open_loop",
       "sensitivity": "routine | personal | care",
       "due_window_hint": "ISO 8601 datetime OR relative phrase OR null",
@@ -109,6 +117,17 @@ say what action will be taken. EXCEPTIONS that make them valid commitments:
 Without one of those, skip. Prefer concrete verbs (apply, write, send,
 review, fix, merge, tighten, resolve, complete, add) or a specific
 deliverable as evidence of a real commitment.
+
+text self-containment (REQUIRED): a future turn must be able to decide
+"done/not done?" from the text field alone, without looking at the source
+turn. Preserve every concrete artifact identifier in the source bullet —
+PR #N, issue #N, chainlink #N, file paths, branch names, function names —
+and every disposition flag ("Optional", "blocker", "deferred-until-X",
+"wontfix-candidate"). You have 120 characters — USE them; do not
+over-compress. Under-truncation example to avoid: source says "Cluster B
+subissues #115/#116/#117 under chainlink #29 still unimplemented" → do NOT
+emit "Cluster B subissues" (stripped identifiers); DO emit "Cluster B
+subissues #115/#116/#117 under chainlink #29 unimplemented" (self-contained).
 
 Output ONLY the JSON object. No prose, no code fences.
 """
