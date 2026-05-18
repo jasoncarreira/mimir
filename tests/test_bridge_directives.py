@@ -281,3 +281,122 @@ def test_has_incomplete_actions_tag_partial_close():
 def test_has_incomplete_actions_tag_no_partial():
     # Last `<` is followed by `>` — no partial tag pending.
     assert has_incomplete_actions_tag("body <p>text</p>") is False
+
+
+# ─── send_message tool directive dispatch ───────────────────────────
+
+
+import asyncio
+from dataclasses import dataclass, field
+
+import pytest
+
+from mimir.bridges.base import Bridge, SendResult
+from mimir.channel_registry import ChannelRegistry
+from mimir.tools.registry import send_message, set_channel_registry
+
+
+@dataclass
+class _CaptureBridge(Bridge):
+    name: str = "cap"
+    prefixes: tuple = ("cap-",)
+    sent: list[tuple[str, str]] = field(default_factory=list)
+    reacted: list[tuple] = field(default_factory=list)
+    _last_id: str = "msg-001"
+
+    async def connect(self) -> None: ...
+    async def disconnect(self) -> None: ...
+
+    async def send(self, channel_id, text, attachment_paths=None, *, final=True):
+        self.sent.append((channel_id, text))
+        return SendResult(sent=True, message_id=self._last_id, chunks=1)
+
+    async def react(self, channel_id, message_id, emoji):
+        self.reacted.append((channel_id, message_id, emoji))
+        return True
+
+
+def _make_registry(bridge: _CaptureBridge) -> ChannelRegistry:
+    reg = ChannelRegistry()
+    reg.register(bridge)
+    return reg
+
+
+def test_send_message_strips_actions_and_reacts():
+    """send_message strips <actions> block from outbound text and calls
+    bridge.react() for each ReactDirective."""
+    bridge = _CaptureBridge()
+    set_channel_registry(_make_registry(bridge))
+    try:
+        from mimir.tools.registry import _STATE
+        _STATE["current_channel_id"] = "cap-test"
+
+        result = asyncio.get_event_loop().run_until_complete(
+            send_message.ainvoke(
+                {
+                    "text": (
+                        'Done.\n\n<actions>'
+                        '<react emoji="✅" message="999" />'
+                        '</actions>'
+                    )
+                }
+            )
+        )
+
+        # Only clean text went to Discord — no <actions> in the sent body.
+        assert len(bridge.sent) == 1
+        assert bridge.sent[0][1] == "Done."
+
+        # React was dispatched with the explicit message_id.
+        assert len(bridge.reacted) == 1
+        assert bridge.reacted[0] == ("cap-test", "999", "✅")
+
+        assert "send_message ok" in result
+    finally:
+        set_channel_registry(None)
+
+
+def test_send_message_react_defaults_to_sent_message_id():
+    """When <react> has no message attribute, react targets the just-sent
+    message (bridge.send's returned message_id)."""
+    bridge = _CaptureBridge()
+    bridge._last_id = "auto-id-42"
+    set_channel_registry(_make_registry(bridge))
+    try:
+        from mimir.tools.registry import _STATE
+        _STATE["current_channel_id"] = "cap-test"
+
+        asyncio.get_event_loop().run_until_complete(
+            send_message.ainvoke(
+                {
+                    "text": (
+                        'ACK.\n\n<actions>'
+                        '<react emoji="👍" />'
+                        '</actions>'
+                    )
+                }
+            )
+        )
+
+        assert bridge.reacted[0][1] == "auto-id-42"
+    finally:
+        set_channel_registry(None)
+
+
+def test_send_message_without_actions_unchanged():
+    """Plain text with no <actions> block is unaffected — no stripping,
+    no extra react calls."""
+    bridge = _CaptureBridge()
+    set_channel_registry(_make_registry(bridge))
+    try:
+        from mimir.tools.registry import _STATE
+        _STATE["current_channel_id"] = "cap-test"
+
+        asyncio.get_event_loop().run_until_complete(
+            send_message.ainvoke({"text": "just a normal reply"})
+        )
+
+        assert bridge.sent[0][1] == "just a normal reply"
+        assert bridge.reacted == []
+    finally:
+        set_channel_registry(None)
