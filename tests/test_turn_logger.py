@@ -133,6 +133,95 @@ def test_chat_claude_code_tool_results_are_captured():
     assert "deadbeef" in tr["content"]
 
 
+def test_streaming_path_tool_results_captured_under_internal_key():
+    """``ChatClaudeCode.astream`` (the path mimir actually uses)
+    surfaces tool results under ``response_metadata["internal_tool_results"]``
+    rather than ``"tool_results"``. Without reading both keys, every
+    streaming-path tool_result silently dropped — most damaging for
+    claude-code built-in tools (Bash/Read/Edit/Grep/Glob) whose
+    results only ever come back this way.
+
+    mimirbot turn 24a1a8858209 (2026-05-17) captured 63 tool_calls but
+    only 2 tool_results because of this — every Bash/Read/Edit/Grep
+    result was lost from the audit trail.
+    """
+    msg = AIMessage(
+        content="Done.",
+        response_metadata={
+            "internal_tool_calls": [
+                {"id": "toolu_42", "name": "Bash",
+                 "args": {"command": "ls /tmp"}},
+            ],
+            # NOTE: key is ``internal_tool_results`` (streaming shape),
+            # records do NOT carry ``name`` — that has to be reverse-
+            # looked-up from the matching tool_call's ``id``.
+            "internal_tool_results": [
+                {"tool_use_id": "toolu_42",
+                 "content": "foo\nbar\nbaz\n",
+                 "is_error": False},
+            ],
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    trs = [e for e in events if e["type"] == "tool_result"]
+    assert len(trs) == 1
+    tr = trs[0]
+    assert tr["id"] == "toolu_42"
+    # Reverse-lookup populates the name from the matching tool_call.
+    assert tr["name"] == "Bash"
+    assert "bar" in tr["content"]
+    assert tr["is_error"] is False
+
+
+def test_tool_result_name_reverse_looked_up_from_id():
+    """``langchain-claude-code._parse_assistant_message`` produces
+    ToolResult records with ``tool_use_id`` + ``content`` + ``is_error``
+    but NO ``name`` field — the name has to be cross-referenced from
+    the matching tool_call's ``id``. Verify the lookup populates the
+    name on the emitted event."""
+    msg = AIMessage(
+        content="",
+        response_metadata={
+            "internal_tool_calls": [
+                {"id": "toolu_a", "name": "Read", "args": {"file_path": "/x"}},
+                {"id": "toolu_b", "name": "Edit", "args": {"file_path": "/y"}},
+            ],
+            "internal_tool_results": [
+                {"tool_use_id": "toolu_b", "content": "edited", "is_error": False},
+                {"tool_use_id": "toolu_a", "content": "file body", "is_error": False},
+            ],
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    trs = [e for e in events if e["type"] == "tool_result"]
+    by_id = {e["id"]: e for e in trs}
+    assert by_id["toolu_a"]["name"] == "Read"
+    assert by_id["toolu_b"]["name"] == "Edit"
+
+
+def test_tool_result_falls_back_to_record_name_when_lookup_misses():
+    """Defensive: if the tool_use_id doesn't match any known tool_call
+    (e.g. truncation, out-of-order delivery), fall back to whatever
+    ``name`` field the record itself carries (non-streaming shape).
+    Worst case ``name=""`` rather than raising."""
+    msg = AIMessage(
+        content="",
+        response_metadata={
+            "internal_tool_calls": [
+                {"id": "toolu_1", "name": "memory_store", "args": {}},
+            ],
+            "tool_results": [
+                {"tool_use_id": "orphan_id", "name": "fallback_name",
+                 "content": "x", "is_error": False},
+            ],
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    tr = next(e for e in events if e["type"] == "tool_result")
+    assert tr["id"] == "orphan_id"
+    assert tr["name"] == "fallback_name"
+
+
 def test_tool_message_emits_tool_result():
     msgs = [
         AIMessage(
@@ -219,6 +308,97 @@ def test_derive_picks_up_chat_claude_code_result_metadata():
 
 def test_derive_marks_max_turns_as_error_subtype():
     msg = AIMessage(content="halted", response_metadata={"stop_reason": "max_turns"})
+    rf = derive_result_fields([msg])
+    assert rf["result_subtype"] == "error_max_turns"
+    assert rf["result_is_error"] is True
+    assert rf["stop_reason"] == "max_turns"
+
+
+def test_derive_is_error_falls_back_to_finish_reason_when_streaming():
+    """``ChatClaudeCode._astream`` (the path mimir uses) collapses
+    ``msg.is_error`` into a binary ``finish_reason`` and never emits
+    ``is_error`` as its own response_metadata field. Without a fallback,
+    every streaming-mode subprocess error rendered as
+    ``result_is_error=False``. The ``enrich_streaming_metadata``
+    patch in ``_langchain_claude_code_patches`` is the primary fix
+    (restores the original ``is_error``); this test covers the
+    defense-in-depth path for deployments where the patch didn't
+    apply."""
+    # finish_reason="error" with no explicit is_error → recover True
+    msg_err = AIMessage(
+        content="oops",
+        response_metadata={"finish_reason": "error"},
+    )
+    rf = derive_result_fields([msg_err])
+    assert rf["result_is_error"] is True
+
+    # finish_reason="stop" → recover False
+    msg_ok = AIMessage(
+        content="done",
+        response_metadata={"finish_reason": "stop"},
+    )
+    rf_ok = derive_result_fields([msg_ok])
+    assert rf_ok["result_is_error"] is False
+
+
+def test_derive_is_error_explicit_field_wins_over_finish_reason():
+    """When the patch DID apply (or upstream preserves both), the
+    explicit ``is_error`` field is authoritative; the finish_reason
+    fallback only kicks in when ``is_error`` is None."""
+    # Explicit is_error=False overrides finish_reason="error"
+    msg = AIMessage(
+        content="",
+        response_metadata={"is_error": False, "finish_reason": "error"},
+    )
+    rf = derive_result_fields([msg])
+    assert rf["result_is_error"] is False
+
+
+def test_derive_picks_up_streaming_enriched_metadata():
+    """When the ``enrich_streaming_metadata`` patch is active (the
+    expected production path for claude-code subprocess turns), the
+    result chunk's response_metadata carries the full ResultMessage
+    field set: stop_reason / num_turns / is_error preserved alongside
+    the binary finish_reason. derive_result_fields should pick these
+    up just like the non-streaming path."""
+    msg = AIMessage(
+        content="done",
+        response_metadata={
+            # Streaming-shape generation_info as enriched by the patch
+            "finish_reason": "stop",
+            "total_cost_usd": 0.0042,
+            "session_id": "sess-abc",
+            # Patched-in fields (from ResultMessage):
+            "stop_reason": "end_turn",
+            "num_turns": 7,
+            "is_error": False,
+            "usage": {"input_tokens": 2400, "output_tokens": 180},
+        },
+    )
+    rf = derive_result_fields([msg])
+    assert rf["stop_reason"] == "end_turn"
+    assert rf["num_turns"] == 7
+    assert rf["result_is_error"] is False
+    assert rf["result_subtype"] == "success"
+    assert rf["total_cost_usd"] == pytest.approx(0.0042)
+
+
+def test_derive_max_turns_recoverable_via_streaming_patch():
+    """End-to-end: when the patch preserves the granular ``stop_reason``
+    on a max-turns truncation, derive_result_fields correctly emits
+    ``result_subtype="error_max_turns"`` even though the streaming
+    finish_reason was just the binary ``"error"``. Without the patch,
+    that distinction would be lost (only finish_reason="error"
+    survives, which maps to result_subtype=success-but-is_error path)."""
+    msg = AIMessage(
+        content="truncated",
+        response_metadata={
+            "finish_reason": "error",       # streaming binary
+            "stop_reason": "max_turns",     # preserved by patch
+            "is_error": True,               # preserved by patch
+            "num_turns": 50,                # preserved by patch
+        },
+    )
     rf = derive_result_fields([msg])
     assert rf["result_subtype"] == "error_max_turns"
     assert rf["result_is_error"] is True
