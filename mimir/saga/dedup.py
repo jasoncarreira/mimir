@@ -93,6 +93,12 @@ class DedupResult:
     duplicates_tombstoned: list[str] = field(default_factory=list)
     # cluster id (canonical id) → list of duplicate ids merged into it
     merges: dict[str, list[str]] = field(default_factory=dict)
+    # Observations whose ``evidenced_by`` set was modified during the pass
+    # (an evidence atom got merged into a canonical). Their
+    # ``observations_metadata.evidence_count`` is rebuilt from the live
+    # relation table at end-of-pass — without that sweep the cached
+    # count drifts above the actual count by one per collapsed edge.
+    evidence_counts_rebuilt: list[str] = field(default_factory=list)
 
 
 def _utc_now_iso() -> str:
@@ -279,7 +285,11 @@ def _rebuild_summary(conn: sqlite3.Connection, atom_id: str) -> None:
 
 
 def _rewrite_relations(
-    conn: sqlite3.Connection, duplicate_id: str, canonical_id: str,
+    conn: sqlite3.Connection,
+    duplicate_id: str,
+    canonical_id: str,
+    *,
+    touched_observations: set[str] | None = None,
 ) -> int:
     """Redirect atom_relations rows where ``duplicate_id`` is either
     endpoint to ``canonical_id``. Dedupes on (source_id, target_id,
@@ -289,6 +299,13 @@ def _rewrite_relations(
     Skips self-loops created by the rewrite (e.g. an existing
     canonical→duplicate relation would become canonical→canonical;
     drop those).
+
+    If ``touched_observations`` is provided, every observation atom_id
+    whose ``evidenced_by`` evidence set was modified (either by losing
+    a duplicate-evidence row that collapsed into an existing edge, or
+    by gaining one via redirection) is added to it. Caller uses this
+    to rebuild ``observations_metadata.evidence_count`` after the pass —
+    otherwise the cached count drifts above the live relation count.
     """
     affected = 0
     # First, collect existing relations involving the duplicate.
@@ -300,6 +317,13 @@ def _rewrite_relations(
     ).fetchall()
     if not rows:
         return 0
+    # Note any observation whose evidenced_by set is about to change —
+    # we redirect rows below, which may collapse two evidenced_by edges
+    # (obs→dup + obs→canonical) into one via INSERT OR IGNORE.
+    if touched_observations is not None:
+        for src, tgt, rtype, *_ in rows:
+            if rtype == "evidenced_by" and tgt == duplicate_id:
+                touched_observations.add(src)
     # Delete the old rows; re-insert with redirection.
     conn.execute(
         "DELETE FROM atom_relations WHERE source_id = ? OR target_id = ?",
@@ -326,6 +350,7 @@ def merge_duplicate_into_canonical(
     canonical: dict,
     duplicate: dict,
     now_iso: str | None = None,
+    touched_observations: set[str] | None = None,
 ) -> None:
     """Apply the merge of ``duplicate`` into ``canonical``. The atoms
     table row for ``duplicate`` is tombstoned with reason='merged' and a
@@ -335,6 +360,12 @@ def merge_duplicate_into_canonical(
     Pre-conditions enforced here:
     - duplicate is not already tombstoned
     - duplicate and canonical share an agent_id
+
+    If ``touched_observations`` is provided, any observation whose
+    ``evidenced_by`` edge set was redirected during this merge is added
+    to it. Caller uses the accumulated set to rebuild
+    ``observations_metadata.evidence_count`` once at the end of the
+    dedup pass.
     """
     now = now_iso or _utc_now_iso()
     can_id = canonical["id"]
@@ -369,8 +400,11 @@ def merge_duplicate_into_canonical(
         "DELETE FROM atom_access_summary WHERE atom_id = ?", (dup_id,),
     )
 
-    # 3. Redirect atom_relations.
-    _rewrite_relations(conn, dup_id, can_id)
+    # 3. Redirect atom_relations. Observations whose evidenced_by edges
+    # touched the duplicate get noted for evidence_count rebuild.
+    _rewrite_relations(
+        conn, dup_id, can_id, touched_observations=touched_observations,
+    )
 
     # 4. Add a fresh consolidated_into edge (duplicate → canonical) so
     # retrieval's evidenced_by lookups can find the canonical even if a
@@ -484,6 +518,11 @@ def dedup_pass(
     clusters = cluster_fn(raws)
     result.clusters_formed = len(clusters)
 
+    # Accumulates across all merges in this pass. Each merge of a
+    # duplicate that was someone's evidence adds the parent observation
+    # id here; the post-pass sweep rebuilds evidence_count for each.
+    touched_observations: set[str] = set()
+
     clusters_processed = 0
     for cluster in clusters:
         if len(cluster) < min_cluster_size:
@@ -528,6 +567,7 @@ def dedup_pass(
                     canonical=canonical_dict,
                     duplicate=dup,
                     now_iso=now,
+                    touched_observations=touched_observations,
                 )
                 # Re-read canonical so the next dup sees merged
                 # topics+metadata (so dedup_merged_ids accumulates).
@@ -541,6 +581,34 @@ def dedup_pass(
                         "id": row[0], "topics": row[1],
                         "metadata": row[2], "agent_id": row[3],
                     }
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    # ── Evidence-count rebuild sweep ──────────────────────────────────
+    # Observations whose evidenced_by edges had a duplicate folded into
+    # a canonical end up with a live edge count below their cached
+    # ``observations_metadata.evidence_count``. Recompute the cached
+    # value for each touched observation so ``find_superseded_observations``
+    # and any display surface stays consistent. One short transaction
+    # so the rebuild is atomic vs concurrent reads.
+    if touched_observations and not dry_run:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for obs_id in touched_observations:
+                live_count = conn.execute(
+                    "SELECT COUNT(*) FROM atom_relations "
+                    "WHERE source_id = ? AND relation_type = 'evidenced_by'",
+                    (obs_id,),
+                ).fetchone()[0]
+                cur = conn.execute(
+                    "UPDATE observations_metadata SET evidence_count = ? "
+                    "WHERE atom_id = ? AND evidence_count != ?",
+                    (live_count, obs_id, live_count),
+                )
+                if cur.rowcount > 0:
+                    result.evidence_counts_rebuilt.append(obs_id)
             conn.commit()
         except Exception:
             conn.rollback()
