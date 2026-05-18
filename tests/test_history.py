@@ -651,3 +651,30 @@ async def test_assemble_recent_activity_real_channel_still_pulls(tmp_path: Path)
     )
     assert len(out) == 1
     assert out[0].content == "hello"
+
+
+# ── Global-buffer accessor (used by send_message + streaming) ───────
+
+
+def test_get_global_buffer_returns_none_before_set():
+    """Default: no buffer registered → ``get_global_buffer`` returns
+    None. The send_message tool + streaming dispatcher both have to
+    handle the unregistered case (test paths that don't go through
+    ``server.serve``)."""
+    from mimir.history import get_global_buffer, set_global_buffer
+
+    set_global_buffer(None)  # type: ignore[arg-type]
+    assert get_global_buffer() is None
+
+
+def test_set_global_buffer_makes_it_resolvable(tmp_path: Path):
+    """After ``set_global_buffer`` runs, ``get_global_buffer`` returns
+    the same instance. Server registers this once at startup."""
+    from mimir.history import get_global_buffer, set_global_buffer
+
+    buf = _make_buffer(tmp_path)
+    set_global_buffer(buf)
+    try:
+        assert get_global_buffer() is buf
+    finally:
+        set_global_buffer(None)  # type: ignore[arg-type]
