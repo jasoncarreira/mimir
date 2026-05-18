@@ -244,6 +244,198 @@ def test_tool_message_error_status_flagged():
     assert events[0]["is_error"] is True
 
 
+# ── End-to-end native-provider paths ────────────────────────────────
+# Coverage for non-claude-code providers (langchain-anthropic /
+# langchain-openai / etc., resolved via ``init_chat_model`` in
+# ``_resolve_model``). These providers populate ``msg.tool_calls``
+# directly and emit ``ToolMessage`` records for results — the
+# claude-code-specific ``response_metadata["internal_tool_calls"]``
+# / ``["internal_tool_results"]`` paths are no-ops for them. These
+# tests verify the audit trail captures everything correctly for
+# native shapes too, so the recent claude-code-specific additions
+# (PR #193) don't drop coverage for Anthropic / OpenAI deployments.
+
+
+def test_anthropic_native_full_turn_shape():
+    """End-to-end LangGraph-native turn shape (langchain-anthropic
+    via ``init_chat_model("anthropic:claude-...")``). The audit trail
+    should populate reasoning + tool_call + tool_result + output
+    cleanly with no claude-code-specific keys in play."""
+    msgs = [
+        HumanMessage(content="what was alice's last post"),
+        AIMessage(
+            content="Let me look that up.",
+            tool_calls=[
+                {"id": "call_anthropic_1", "name": "memory_query",
+                 "args": {"query": "alice last post"}},
+            ],
+            response_metadata={
+                # Anthropic populates ``stop_reason`` for tool_use turns.
+                "stop_reason": "tool_use",
+                "model_name": "claude-sonnet-4-6",
+            },
+            usage_metadata={"input_tokens": 120, "output_tokens": 18, "total_tokens": 138},
+        ),
+        ToolMessage(
+            content='{"posts": ["alice posted about boids"]}',
+            tool_call_id="call_anthropic_1",
+            name="memory_query",
+        ),
+        AIMessage(
+            content="Alice posted about boids.",
+            response_metadata={"stop_reason": "end_turn"},
+            usage_metadata={"input_tokens": 180, "output_tokens": 8, "total_tokens": 188},
+        ),
+    ]
+    events, output = extract_turn_events(msgs)
+
+    # Final AIMessage is the canonical reply.
+    assert output == "Alice posted about boids."
+
+    types = [e["type"] for e in events]
+    # Intermediate AIMessage with tool_calls → reasoning + tool_call.
+    assert types.count("reasoning") == 1
+    assert types.count("tool_call") == 1
+    assert types.count("tool_result") == 1
+
+    tc = next(e for e in events if e["type"] == "tool_call")
+    assert tc["id"] == "call_anthropic_1"
+    assert tc["name"] == "memory_query"
+
+    tr = next(e for e in events if e["type"] == "tool_result")
+    # ToolMessage carries name directly — no reverse-lookup needed.
+    assert tr["name"] == "memory_query"
+    assert tr["id"] == "call_anthropic_1"
+    assert "boids" in tr["content"]
+    assert tr["is_error"] is False
+
+
+def test_openai_native_full_turn_shape():
+    """OpenAI shape (langchain-openai): ``response_metadata`` carries
+    ``finish_reason`` rather than ``stop_reason``; tool_calls again
+    live on ``msg.tool_calls`` and results come as ``ToolMessage``.
+    The existing ``stop_reason or finish_reason`` fallback handles
+    the stop_reason gap."""
+    msgs = [
+        HumanMessage(content="hi"),
+        AIMessage(
+            content="checking",
+            tool_calls=[
+                {"id": "call_openai_1", "name": "memory_store",
+                 "args": {"content": "hello", "stream": "semantic"}},
+            ],
+            response_metadata={
+                # OpenAI uses ``finish_reason="tool_calls"`` for tool-use turns.
+                "finish_reason": "tool_calls",
+                "model_name": "gpt-4o",
+            },
+            usage_metadata={"input_tokens": 80, "output_tokens": 12, "total_tokens": 92},
+        ),
+        ToolMessage(
+            content='{"stored": true, "atom_id": "abc123"}',
+            tool_call_id="call_openai_1",
+            name="memory_store",
+        ),
+        AIMessage(
+            content="Stored.",
+            response_metadata={"finish_reason": "stop"},
+            usage_metadata={"input_tokens": 100, "output_tokens": 1, "total_tokens": 101},
+        ),
+    ]
+    events, output = extract_turn_events(msgs)
+
+    assert output == "Stored."
+    tcs = [e for e in events if e["type"] == "tool_call"]
+    trs = [e for e in events if e["type"] == "tool_result"]
+    assert len(tcs) == 1
+    assert len(trs) == 1
+    assert tcs[0]["name"] == "memory_store"
+    assert trs[0]["name"] == "memory_store"
+    assert "abc123" in trs[0]["content"]
+
+
+def test_native_anthropic_derive_result_fields():
+    """Anthropic-shape AIMessage: ``stop_reason`` populated, no
+    ``finish_reason`` / ``is_error`` / ``num_turns`` /
+    ``total_cost_usd``. derive_result_fields should produce sensible
+    defaults: stop_reason captured directly, usage from
+    ``usage_metadata``, num_turns falls back to AIMessage count,
+    total_cost_usd None, result_is_error False."""
+    msg = AIMessage(
+        content="done",
+        response_metadata={"stop_reason": "end_turn"},
+        usage_metadata={
+            "input_tokens": 200, "output_tokens": 10, "total_tokens": 210,
+            "input_token_details": {"cache_read": 50, "cache_creation": 5},
+        },
+    )
+    rf = derive_result_fields([msg])
+    assert rf["stop_reason"] == "end_turn"
+    assert rf["result_subtype"] == "success"
+    assert rf["result_is_error"] is False
+    assert rf["num_turns"] == 1  # falls back to AIMessage count
+    assert rf["total_cost_usd"] is None
+    assert rf["usage"]["input_tokens"] == 200
+    assert rf["usage"]["output_tokens"] == 10
+    assert rf["usage"]["cache_read_input_tokens"] == 50
+    assert rf["usage"]["cache_creation_input_tokens"] == 5
+
+
+def test_native_openai_derive_result_fields():
+    """OpenAI-shape AIMessage: ``finish_reason`` (not ``stop_reason``).
+    The existing ``stop_reason or finish_reason`` or-chain in
+    derive_result_fields picks up ``finish_reason`` as the effective
+    stop_reason; result_is_error falls back from finish_reason as
+    well via PR #193's defense-in-depth path."""
+    msg = AIMessage(
+        content="done",
+        response_metadata={"finish_reason": "stop"},
+        usage_metadata={"input_tokens": 50, "output_tokens": 5, "total_tokens": 55},
+    )
+    rf = derive_result_fields([msg])
+    # stop_reason resolved from finish_reason fallback.
+    assert rf["stop_reason"] == "stop"
+    # finish_reason="stop" → result_is_error=False via PR #193 fallback.
+    assert rf["result_is_error"] is False
+    assert rf["result_subtype"] == "success"
+    assert rf["num_turns"] == 1
+    assert rf["usage"]["input_tokens"] == 50
+
+
+def test_native_provider_path_ignores_missing_internal_tool_results():
+    """Defensive: the new ``internal_tool_results`` lookup (PR #193's
+    streaming-path fix) is a no-op for native providers — they don't
+    populate that key. Verify extract_turn_events doesn't crash and
+    doesn't synthesize phantom tool_result events for them."""
+    msg = AIMessage(
+        content="just text, no tools",
+        response_metadata={"stop_reason": "end_turn"},
+        usage_metadata={"input_tokens": 10, "output_tokens": 3, "total_tokens": 13},
+    )
+    events, output = extract_turn_events([msg])
+    assert output == "just text, no tools"
+    # No tool_result events — neither claude-code nor LangGraph-native
+    # path fired.
+    assert not any(e["type"] == "tool_result" for e in events)
+
+
+def test_native_provider_path_with_no_response_metadata():
+    """Some langchain providers populate response_metadata sparsely
+    (e.g. when streaming via ``ainvoke`` without an upstream-supplied
+    metadata dict). extract_turn_events should still handle a None /
+    empty response_metadata gracefully."""
+    msg = AIMessage(content="hi", response_metadata={})
+    events, output = extract_turn_events([msg])
+    assert output == "hi"
+    assert not events  # no tool calls, no results, no reasoning
+
+    # Also no exceptions when response_metadata is missing entirely.
+    msg2 = AIMessage(content="hi2")
+    events2, output2 = extract_turn_events([msg2])
+    assert output2 == "hi2"
+    assert not events2
+
+
 def test_oversized_tool_result_truncated():
     body = "x" * 100_000
     msg = ToolMessage(content=body, tool_call_id="tc_x", name="big")
@@ -312,6 +504,61 @@ def test_derive_marks_max_turns_as_error_subtype():
     assert rf["result_subtype"] == "error_max_turns"
     assert rf["result_is_error"] is True
     assert rf["stop_reason"] == "max_turns"
+
+
+def test_derive_marks_anthropic_max_tokens_as_truncation():
+    """Anthropic native: ``response_metadata["stop_reason"] = "max_tokens"``
+    when the response hit the per-message token cap. Same shape as
+    claude-code SDK's max_tokens — should map to error_max_turns."""
+    msg = AIMessage(
+        content="cut off mid-",
+        response_metadata={"stop_reason": "max_tokens"},
+    )
+    rf = derive_result_fields([msg])
+    assert rf["result_subtype"] == "error_max_turns"
+    assert rf["result_is_error"] is True
+    assert rf["stop_reason"] == "max_tokens"
+
+
+def test_derive_marks_openai_length_as_truncation():
+    """OpenAI native: ``response_metadata["finish_reason"] = "length"``
+    when the model hit max_tokens and the response is truncated. The
+    canonical OpenAI signal — semantically identical to Anthropic's
+    ``max_tokens`` and claude-code's ``max_turns``. Should map to
+    ``result_subtype="error_max_turns"`` and ``result_is_error=True``
+    so operators reading bench/audit metrics can distinguish a
+    successful end-of-turn reply from a length-truncated one regardless
+    of which provider produced the turn."""
+    # finish_reason flows through the ``stop_reason or finish_reason``
+    # fallback in derive_result_fields, so stop_reason resolves to
+    # "length" and the truncation check picks it up.
+    msg = AIMessage(
+        content="this answer was cut off because",
+        response_metadata={"finish_reason": "length"},
+        usage_metadata={
+            "input_tokens": 500,
+            "output_tokens": 4096,  # hit the cap
+            "total_tokens": 4596,
+        },
+    )
+    rf = derive_result_fields([msg])
+    assert rf["stop_reason"] == "length"
+    assert rf["result_subtype"] == "error_max_turns"
+    assert rf["result_is_error"] is True
+
+
+def test_derive_marks_openai_length_via_explicit_stop_reason_field():
+    """Symmetric: if a provider happens to populate
+    ``stop_reason="length"`` directly (e.g. an OpenAI-compatible
+    endpoint that uses langchain-anthropic's key name), the same
+    truncation classification applies."""
+    msg = AIMessage(
+        content="truncated",
+        response_metadata={"stop_reason": "length"},
+    )
+    rf = derive_result_fields([msg])
+    assert rf["result_subtype"] == "error_max_turns"
+    assert rf["result_is_error"] is True
 
 
 def test_derive_is_error_falls_back_to_finish_reason_when_streaming():

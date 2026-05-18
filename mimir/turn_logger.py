@@ -284,12 +284,35 @@ def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
         elif fr == "stop":
             cc_is_error = False
 
+    # num_turns fallback chain:
+    #   1. ``response_metadata["num_turns"]`` — populated by
+    #      ``ChatClaudeCode`` (both call modes; non-streaming directly
+    #      and streaming via ``enrich_streaming_metadata``'s patch).
+    #      This is the SDK's per-request model-turn count.
+    #   2. ``count(AIMessage in messages)`` — fallback for native
+    #      providers (langchain-anthropic / -openai) which don't emit
+    #      ``num_turns`` in response_metadata. Counts how many model
+    #      invocations produced this turn — close-enough proxy for
+    #      "internal turns" since each tool-call cycle yields one
+    #      AIMessage chunk and the final reply yields one more.
+    #   3. ``None`` when there are no AIMessages at all (empty turn /
+    #      error before any model response).
     num_turns = cc_num_turns if cc_num_turns is not None else (
         sum(1 for m in messages if isinstance(m, AIMessage)) or None
     )
     result_subtype = "success"
     result_is_error = bool(cc_is_error) if cc_is_error is not None else False
-    if stop_reason in ("max_turns", "max_tokens"):
+    # Truncation reasons across all model providers — model ran out of
+    # budget mid-response. Provider-specific names:
+    #   - claude-code SDK: ``"max_turns"`` (per-request loop cap) +
+    #     ``"max_tokens"`` (per-response token cap)
+    #   - langchain-anthropic native: ``"max_tokens"``
+    #   - langchain-openai native: ``"length"`` (the canonical OpenAI
+    #     finish_reason for max-tokens truncation)
+    # All land in ``result_subtype="error_max_turns"`` — the name is
+    # SDK-era legacy; the semantic is "model hit a budget cap and
+    # the response is truncated."
+    if stop_reason in ("max_turns", "max_tokens", "length"):
         result_subtype = "error_max_turns"
         result_is_error = True
 
