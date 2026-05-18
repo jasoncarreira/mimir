@@ -1,4 +1,4 @@
-"""Regression tests for PR #209 — observability for silent failures.
+"""Regression tests for PR #210 — observability for silent failures.
 
 Two narrow fixes:
 
@@ -119,9 +119,15 @@ async def test_streaming_dispatcher_emits_event_on_parse_directives_failure(
     async def _capture_log_event(kind, **kwargs):
         captured_events.append({"kind": kind, **kwargs})
 
-    # Patch the log_event referenced inside the dispatcher's import.
-    import mimir.event_logger
-    monkeypatch.setattr(mimir.event_logger, "log_event", _capture_log_event)
+    # Patch the module-level ``log_event`` binding inside the
+    # dispatcher. Patching ``mimir.event_logger.log_event`` (the
+    # source module) would NOT reach the cached binding created by
+    # ``from .event_logger import log_event`` at dispatcher
+    # module-load time — Python binds the name at the import site,
+    # not at each call.
+    monkeypatch.setattr(
+        "mimir._streaming_dispatch.log_event", _capture_log_event,
+    )
 
     # Force parse_directives to raise.
     def _broken_parse(_text):

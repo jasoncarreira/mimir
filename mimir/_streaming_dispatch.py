@@ -42,6 +42,8 @@ from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import AIMessage, BaseMessage
 
+from .event_logger import log_event
+
 if TYPE_CHECKING:  # pragma: no cover
     from .bridges.base import Bridge, SendResult
 
@@ -311,10 +313,8 @@ class StreamingAutoDispatcher:
             log.exception("parse_directives raised in plan-flush parser")
             # Emit a visible event so a regression here doesn't stay
             # silent until someone sees raw ``<actions>`` markup on
-            # the channel. Best-effort import to avoid pulling in
-            # event_logger at module load.
+            # the channel.
             try:
-                from .event_logger import log_event
                 await log_event(
                     "directive_parse_error",
                     where="streaming_plan_flush",
