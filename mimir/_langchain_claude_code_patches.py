@@ -25,12 +25,23 @@ function silently returns.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
+import time
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 _PATCH_MARKER = "_mimir_arun_config_patched"
+
+
+# ContextVar carrying the per-call ``tool_events`` list. The hook
+# callbacks installed by ``install_tool_event_hooks`` look up this
+# value to know where to record events. ``None`` (the default) means
+# "no active capture context" — hooks silently no-op.
+_tool_events_var: contextvars.ContextVar[list[dict[str, Any]] | None] = (
+    contextvars.ContextVar("mimir_claude_code_tool_events", default=None)
+)
 
 
 def apply_patches() -> None:
@@ -252,4 +263,197 @@ def enrich_streaming_metadata() -> None:
     log.debug(
         "patched ChatClaudeCode._astream to preserve "
         "stop_reason/num_turns/is_error from ResultMessage",
+    )
+
+
+_TOOL_EVENT_HOOKS_MARKER = "_mimir_tool_event_hooks_installed"
+
+
+# Third hook-callback param is the SDK's ``HookContext`` TypedDict —
+# currently just ``{"signal": None}`` (reserved for future abort-signal
+# support, see claude_agent_sdk/types.py:508). We don't use it; the
+# leading-underscore name signals "unused" to future readers.
+async def _pre_tool_use_hook(input_data: dict, tool_use_id: str, _ctx: Any) -> dict:
+    """Append a tool_call event to the active capture list."""
+    events = _tool_events_var.get()
+    if events is None:
+        return {}
+    events.append({
+        "type": "tool_call",
+        "ts_mono_ns": time.monotonic_ns(),
+        "tool_use_id": tool_use_id,
+        "name": input_data.get("tool_name", ""),
+        "input": input_data.get("tool_input", {}),
+    })
+    return {}
+
+
+async def _post_tool_use_hook(input_data: dict, tool_use_id: str, _ctx: Any) -> dict:
+    """Append a tool_result event (success) to the active capture list."""
+    events = _tool_events_var.get()
+    if events is None:
+        return {}
+    events.append({
+        "type": "tool_result",
+        "ts_mono_ns": time.monotonic_ns(),
+        "tool_use_id": tool_use_id,
+        "name": input_data.get("tool_name", ""),
+        "result": input_data.get("tool_response"),
+        "is_error": False,
+    })
+    return {}
+
+
+async def _post_tool_use_failure_hook(
+    input_data: dict, tool_use_id: str, _ctx: Any,
+) -> dict:
+    """Append a tool_result event (failure) to the active capture list."""
+    events = _tool_events_var.get()
+    if events is None:
+        return {}
+    events.append({
+        "type": "tool_result",
+        "ts_mono_ns": time.monotonic_ns(),
+        "tool_use_id": tool_use_id,
+        "name": input_data.get("tool_name", ""),
+        "error": input_data.get("error"),
+        "is_error": True,
+    })
+    return {}
+
+
+def install_tool_event_hooks() -> None:
+    """Monkey-patch ``ChatClaudeCode`` so every tool invocation —
+    built-in (Bash/Read/Edit/Write/Glob/ToolSearch), langchain-bridged,
+    or MCP — is recorded as a ``tool_events`` list in the result's
+    ``generation_info``, ordered by arrival, paired by ``tool_use_id``.
+
+    Three upstream gaps motivate this patch:
+
+    * **Built-in tools never surface results.**  ``_aquery``/``_astream``
+      only handle ``AssistantMessage`` + ``ResultMessage`` from the
+      SDK. ``UserMessage`` — which carries ``ToolResultBlock``s for
+      built-in tools — is dropped on the floor. The downstream
+      ``turn_logger.extract_turn_events`` then records 60 ``tool_call``
+      events with 0 corresponding ``tool_result`` events for a typical
+      Bash/Read/Edit-heavy autonomous turn.
+
+    * **Langchain-bridged tools pair by name, not id.**  The bridged
+      tool wrapper (``_wrap_langchain_tool``) records results via a
+      ContextVar with the bare ``@tool`` name (``"saga_feedback"``);
+      the tool_call event carries the claude-code-bridged name
+      (``"mcp__langchain-tools__saga_feedback"``). The ``tc_name_by_id``
+      reverse-lookup added in turn_logger relies on ``tool_use_id`` —
+      but the bridged capture path doesn't include one.
+
+    * **Events arrive bunched, not interleaved.**  Within a single
+      ``AssistantMessage``, ``_parse_assistant_message`` splits content
+      blocks into parallel ``tool_calls`` / ``tool_results`` lists,
+      losing the original block order.
+
+    The SDK has explicit ``PreToolUse`` / ``PostToolUse`` /
+    ``PostToolUseFailure`` hooks (claude_agent_sdk/types.py:265-292).
+    Each hook fires from the CLI subprocess via control_protocol
+    (``_internal/query.py:389``) for EVERY tool invocation regardless of
+    origin, and carries ``tool_name``, ``tool_input``/``tool_response``,
+    and ``tool_use_id``. Registering them gives us:
+
+    * Full coverage: built-in + bridged + MCP tools all fire hooks.
+    * Authoritative pairing: ``tool_use_id`` is on both pre and post.
+    * Correct order: events are appended at arrival time, monotonic.
+
+    Implementation:
+
+    1. A ``ContextVar`` (``_tool_events_var``) carries the per-call
+       events list. Set by the patched ``_aquery``/``_astream`` at entry,
+       reset at exit. The hook callbacks look up the active list via
+       ``ContextVar.get`` — no global state, no cross-call leakage.
+    2. ``_build_options`` is wrapped to merge our three hook callbacks
+       into ``options.hooks`` whenever an active capture context exists.
+       User-provided hooks (e.g. permission gates) are preserved and
+       appended to, not replaced.
+    3. ``_aquery`` and ``_astream`` are wrapped: each call creates a
+       fresh events list, runs the original method, and attaches the
+       list to ``generation_info["tool_events"]`` on completion.
+       ``_astream`` injects on the final chunk (the one carrying
+       ``finish_reason``) so the result chunk's metadata is complete.
+
+    Idempotent + import-safe: no-op when ``langchain-claude-code`` or
+    ``claude-agent-sdk`` isn't installed. Re-running ``apply_patches``
+    skips application via the class-attribute marker.
+    """
+    try:
+        from langchain_claude_code import claude_chat_model as ccm
+        from claude_agent_sdk import HookMatcher
+    except ImportError:
+        return
+
+    if getattr(ccm.ClaudeCodeChatModel, _TOOL_EVENT_HOOKS_MARKER, False):
+        return
+
+    _orig_build_options = ccm.ClaudeCodeChatModel._build_options
+    _orig_aquery = ccm.ClaudeCodeChatModel._aquery
+    _orig_astream = ccm.ClaudeCodeChatModel._astream
+
+    def _patched_build_options(self, **overrides: Any):  # type: ignore[no-untyped-def]
+        options = _orig_build_options(self, **overrides)
+        # Only inject hooks when there's an active capture context — keeps
+        # behavior unchanged for any caller that builds options without
+        # going through our patched _aquery / _astream.
+        if _tool_events_var.get() is None:
+            return options
+
+        our_hooks: dict[str, list[Any]] = {
+            "PreToolUse": [HookMatcher(hooks=[_pre_tool_use_hook])],
+            "PostToolUse": [HookMatcher(hooks=[_post_tool_use_hook])],
+            "PostToolUseFailure": [
+                HookMatcher(hooks=[_post_tool_use_failure_hook])
+            ],
+        }
+
+        # Preserve any user-supplied hooks (e.g. permission gates); our
+        # callbacks always return ``{}`` so they don't influence control
+        # flow even when chained with others.
+        existing = dict(options.hooks) if options.hooks else {}
+        for event, matchers in our_hooks.items():
+            existing[event] = list(existing.get(event, [])) + matchers
+        options.hooks = existing
+        return options
+
+    async def _patched_aquery(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        events: list[dict[str, Any]] = []
+        token = _tool_events_var.set(events)
+        try:
+            content, tool_calls, generation_info = await _orig_aquery(
+                self, *args, **kwargs,
+            )
+            if events:
+                generation_info["tool_events"] = events
+            return content, tool_calls, generation_info
+        finally:
+            _tool_events_var.reset(token)
+
+    async def _patched_astream(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        events: list[dict[str, Any]] = []
+        token = _tool_events_var.set(events)
+        try:
+            async for chunk in _orig_astream(self, *args, **kwargs):
+                gi = getattr(chunk, "generation_info", None)
+                # The result chunk is the one with ``finish_reason``; by
+                # the time it's yielded, all hooks for this stream have
+                # fired (SDK emits ResultMessage after the tool loop).
+                if gi and "finish_reason" in gi and events:
+                    gi["tool_events"] = events
+                    chunk.generation_info = gi
+                yield chunk
+        finally:
+            _tool_events_var.reset(token)
+
+    ccm.ClaudeCodeChatModel._build_options = _patched_build_options
+    ccm.ClaudeCodeChatModel._aquery = _patched_aquery
+    ccm.ClaudeCodeChatModel._astream = _patched_astream
+    setattr(ccm.ClaudeCodeChatModel, _TOOL_EVENT_HOOKS_MARKER, True)
+    log.debug(
+        "installed tool-event hooks on ChatClaudeCode "
+        "(_build_options, _aquery, _astream)",
     )

@@ -89,6 +89,14 @@ _lcc_patches.strip_deepagents_base_prompt()
 # ``_last_result`` (which the upstream code does store) into the result
 # chunk's ``generation_info``. No-op when claude-code extra not installed.
 _lcc_patches.enrich_streaming_metadata()
+# Register PreToolUse/PostToolUse/PostToolUseFailure SDK hooks so every
+# tool invocation (built-in Bash/Read/Edit/etc, bridged langchain tools,
+# MCP tools) is captured into ``generation_info["tool_events"]`` as an
+# ordered list paired by ``tool_use_id``. Without this patch, built-in
+# tools never surface results, and bridged-tool calls/results can't be
+# paired (call uses the prefixed name, result the bare name). No-op
+# when claude-code extra not installed.
+_lcc_patches.install_tool_event_hooks()
 from .sagatools import (
     _atom_ids_from_response,
     _format_saga_payload,
