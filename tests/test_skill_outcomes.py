@@ -37,7 +37,8 @@ def test_classify_pairs_call_and_result():
     assert out == [("memory", "success", base), ("wiki", "failure", base)]
 
 
-def test_classify_unmatched_call_is_abandoned():
+def test_classify_unmatched_call_is_abandoned_when_turn_outcome_unknown():
+    """No tool_result + no turn_succeeded → "abandoned" (legacy path)."""
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     events = [
         {"type": "tool_call", "id": "tool_1", "name": "Skill",
@@ -46,6 +47,51 @@ def test_classify_unmatched_call_is_abandoned():
     ]
     out = list(_classify_skill_calls(events, base))
     assert out == [("alert", "abandoned", base)]
+
+
+def test_classify_unmatched_call_infers_success_from_turn():
+    """ChatClaudeCode gap: no tool_result, but turn succeeded → "success".
+
+    Heartbeat/reflection/poller turns run via ChatClaudeCode streaming
+    which never captures tool_result events for built-in Claude Code
+    tools (Skill, Bash, Read, …). Without turn_succeeded, every Skill
+    invocation would be "abandoned" (treated as failure). Passing
+    turn_succeeded=True lets us infer the positive outcome from the
+    turn's own result_is_error=False signal.
+    """
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    events = [
+        {"type": "tool_call", "id": "tool_1", "name": "Skill",
+         "args": {"skill": "heartbeat"}},
+        # No tool_result — ChatClaudeCode streaming gap
+    ]
+    out = list(_classify_skill_calls(events, base, turn_succeeded=True))
+    assert out == [("heartbeat", "success", base)]
+
+
+def test_classify_unmatched_call_infers_failure_from_turn():
+    """No tool_result + turn errored → "failure"."""
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    events = [
+        {"type": "tool_call", "id": "tool_1", "name": "Skill",
+         "args": {"skill": "heartbeat"}},
+    ]
+    out = list(_classify_skill_calls(events, base, turn_succeeded=False))
+    assert out == [("heartbeat", "failure", base)]
+
+
+def test_classify_exact_result_takes_precedence_over_turn_success():
+    """When a tool_result IS present, its is_error wins even if
+    turn_succeeded says otherwise — exact beats inferred."""
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    events = [
+        {"type": "tool_call", "id": "tool_1", "name": "Skill",
+         "args": {"skill": "memory"}},
+        # Explicit error result despite turn_succeeded=True
+        {"type": "tool_result", "id": "tool_1", "is_error": True, "content": "boom"},
+    ]
+    out = list(_classify_skill_calls(events, base, turn_succeeded=True))
+    assert out == [("memory", "failure", base)]
 
 
 def test_classify_ignores_non_skill_tools():
@@ -111,6 +157,73 @@ def test_aggregate_accumulates_across_turns(tmp_path):
     assert aggs["memory"].success == 2
     assert aggs["memory"].failure == 1
     assert aggs["memory"].success_rate == pytest.approx(2 / 3)
+
+
+def test_aggregate_chatclaudecode_gap_infers_from_result_is_error(tmp_path):
+    """Turn records with result_is_error=False but no tool_results
+    (ChatClaudeCode streaming gap) should count Skill invocations as
+    success, not abandoned → heartbeat/reflection/github skills land
+    in the proven bucket instead of risky.
+    """
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    turns = tmp_path / "turns.jsonl"
+    # Simulate 3 heartbeat turns: Skill call, no tool_result, turn ok
+    records = [
+        {
+            "ts": _ts(60 * i, base),
+            "result_is_error": False,
+            "events": [
+                {"type": "tool_call", "id": f"id{i}", "name": "Skill",
+                 "args": {"skill": "heartbeat"}},
+                # No matching tool_result — ChatClaudeCode gap
+            ],
+        }
+        for i in range(1, 4)
+    ]
+    turns.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    aggs = aggregate(turns, now=base)
+    hb = aggs["heartbeat"]
+    assert hb.success == 3
+    assert hb.failure == 0
+    assert hb.abandoned == 0
+
+
+def test_aggregate_chatclaudecode_gap_failed_turn_counts_as_failure(tmp_path):
+    """When result_is_error=True and no tool_result, Skill is failure."""
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    turns = tmp_path / "turns.jsonl"
+    record = {
+        "ts": _ts(30, base),
+        "result_is_error": True,
+        "events": [
+            {"type": "tool_call", "id": "x1", "name": "Skill",
+             "args": {"skill": "heartbeat"}},
+        ],
+    }
+    turns.write_text(json.dumps(record) + "\n")
+    aggs = aggregate(turns, now=base)
+    assert aggs["heartbeat"].failure == 1
+    assert aggs["heartbeat"].success == 0
+
+
+def test_aggregate_result_is_error_absent_falls_back_to_abandoned(tmp_path):
+    """Old records without result_is_error get "abandoned" (backward compat)."""
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    turns = tmp_path / "turns.jsonl"
+    record = {
+        "ts": _ts(30, base),
+        # no result_is_error field
+        "events": [
+            {"type": "tool_call", "id": "x1", "name": "Skill",
+             "args": {"skill": "heartbeat"}},
+        ],
+    }
+    turns.write_text(json.dumps(record) + "\n")
+    aggs = aggregate(turns, now=base)
+    hb = aggs["heartbeat"]
+    assert hb.abandoned == 1
+    assert hb.success == 0
+    assert hb.failure == 0
 
 
 def test_order_skills_buckets_correctly():
