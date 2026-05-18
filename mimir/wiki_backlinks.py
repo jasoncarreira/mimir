@@ -444,7 +444,9 @@ def cmd_backlinks(args: argparse.Namespace) -> int:
     # firehose the agent's pre-message hook reads.
     from .config import Config as _Config
     cfg = _Config.from_env()
-    init_logger(cfg.events_log, session_id="wiki-backlinks")
+    init_logger(
+        cfg.events_log, session_id="wiki-backlinks", agent_id=cfg.agent_id,
+    )
 
     try:
         summary = asyncio.run(run(home))

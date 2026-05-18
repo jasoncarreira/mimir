@@ -23,9 +23,21 @@ def _utc_now_iso() -> str:
 
 
 class EventLogger:
-    def __init__(self, path: Path, session_id: str, max_events: int | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        session_id: str,
+        max_events: int | None = None,
+        *,
+        agent_id: str | None = None,
+    ) -> None:
         self._path = path
         self._session_id = session_id
+        # Stamped on every event record below. ``None`` keeps the
+        # pre-existing record shape (the key is omitted), so the
+        # turn-viewer's existing schema-tolerance covers operators
+        # who haven't set MIMIR_AGENT_ID.
+        self._agent_id = agent_id
         self._max_events = max_events
         self._lock: asyncio.Lock | None = None
         self._line_count = 0
@@ -74,12 +86,15 @@ class EventLogger:
                 log.warning("events.jsonl write failed: %s", exc)
 
     def _record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return {
+        rec: dict[str, Any] = {
             "timestamp": _utc_now_iso(),
             "type": event_type,
             "session_id": self._session_id,
-            **payload,
         }
+        if self._agent_id is not None:
+            rec["agent_id"] = self._agent_id
+        rec.update(payload)
+        return rec
 
     async def _trim(self) -> None:
         # CR2-#6: tail-stream up to ``max_events`` records and rewrite,
@@ -121,9 +136,17 @@ class EventLogger:
 _logger: EventLogger | None = None
 
 
-def init_logger(path: Path, session_id: str, max_events: int | None = None) -> EventLogger:
+def init_logger(
+    path: Path,
+    session_id: str,
+    max_events: int | None = None,
+    *,
+    agent_id: str | None = None,
+) -> EventLogger:
     global _logger
-    _logger = EventLogger(path, session_id, max_events=max_events)
+    _logger = EventLogger(
+        path, session_id, max_events=max_events, agent_id=agent_id,
+    )
     return _logger
 
 

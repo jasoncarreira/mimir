@@ -55,6 +55,13 @@ class TurnContext:
     trigger: str
     channel_id: str | None
     started_at: float
+    # Logical agent name — sourced from ``Config.agent_id`` at run_turn
+    # entry. Threaded into TurnRecord + emitted with every event so a
+    # cross-process operator running two agents on the same hardware
+    # (Shape B: mimir + muninnbot in their own processes) can filter
+    # the merged log streams by agent. ``None`` only in tests that
+    # construct TurnContext directly without going through Agent.
+    agent_id: str | None = None
     saga_session_id: str | None = None
     saga_atom_ids: list[str] = field(default_factory=list)
     # Tool-call budget tracking (SPEC §4.5 follow-on / FUTURE_WORK).
@@ -183,6 +190,14 @@ class TurnRecord:
     trigger: str
     channel_id: str | None
     input: str
+    # Logical agent name — sourced from ``Config.agent_id``. Tagging
+    # every turn record lets a cross-process operator running two
+    # agents (Shape B: mimir + muninnbot) filter merged turns.jsonl
+    # output by agent without grepping by MIMIR_HOME path. ``None``
+    # on records written by code paths predating this field — the
+    # turn viewer treats absent agent_id as "unknown / single-agent
+    # legacy run".
+    agent_id: str | None = None
     saga_atom_ids: list[str] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     output: str = ""
