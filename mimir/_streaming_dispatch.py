@@ -307,8 +307,24 @@ class StreamingAutoDispatcher:
             parsed = parse_directives(plan_text)
             clean_plan = parsed.clean_text or ""
             directives = list(parsed.directives)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log.exception("parse_directives raised in plan-flush parser")
+            # Emit a visible event so a regression here doesn't stay
+            # silent until someone sees raw ``<actions>`` markup on
+            # the channel. Best-effort import to avoid pulling in
+            # event_logger at module load.
+            try:
+                from .event_logger import log_event
+                await log_event(
+                    "directive_parse_error",
+                    where="streaming_plan_flush",
+                    channel_id=self._channel_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                    plan_chars=len(plan_text),
+                )
+            except Exception:  # noqa: BLE001
+                # Don't let event logging itself block the flush.
+                pass
             clean_plan = plan_text
             directives = []
 
