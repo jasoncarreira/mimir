@@ -120,9 +120,63 @@ class _FakeSaga:
         })
 
 
+class _FakeChannelSession:
+    """Tiny ChannelSession stand-in. Real ChannelSession is a dataclass
+    in session_manager.py; we only need the ``saga_session_id`` attribute
+    for the agent to read."""
+
+    def __init__(self, channel_id: str) -> None:
+        self.saga_session_id = f"saga-{channel_id}-test-id"
+        self.channel_id = channel_id
+        self.turn_count = 0
+        self.ended = False
+
+
+class _FakeSessionManager:
+    """Captures the three SessionManager methods Agent.run_turn calls.
+
+    - ``touch`` returns a stub ChannelSession (with a ``saga_session_id``).
+    - ``increment_turn_count`` is a no-op (recorded for assertions).
+    - ``end_now`` records the call (the focus of this PR) — does NOT
+      actually fire an on_idle callback, since we're asserting the call
+      itself was made by Agent, not that the downstream synthesis turn
+      was enqueued (which is a SessionManager responsibility tested in
+      test_session_manager.py).
+    """
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, _FakeChannelSession] = {}
+        self.touch_calls: list[str] = []
+        self.end_now_calls: list[str] = []
+        self.increment_calls: list[str] = []
+
+    async def touch(self, channel_id: str) -> _FakeChannelSession:
+        self.touch_calls.append(channel_id)
+        sess = self._sessions.get(channel_id)
+        if sess is None or sess.ended:
+            sess = _FakeChannelSession(channel_id)
+            self._sessions[channel_id] = sess
+        return sess
+
+    def increment_turn_count(self, channel_id: str) -> None:
+        self.increment_calls.append(channel_id)
+        sess = self._sessions.get(channel_id)
+        if sess and not sess.ended:
+            sess.turn_count += 1
+
+    async def end_now(self, channel_id: str) -> _FakeChannelSession | None:
+        self.end_now_calls.append(channel_id)
+        sess = self._sessions.pop(channel_id, None)
+        if sess is None or sess.ended:
+            return None
+        sess.ended = True
+        return sess
+
+
 def _build_agent(tmp_path: Path, *,
                  fake_agent: _FakeAgent,
-                 fake_saga: _FakeSaga | None = None) -> Agent:
+                 fake_saga: _FakeSaga | None = None,
+                 session_manager=None) -> Agent:
     from mimir.event_logger import init_logger
     home = tmp_path / "home"
     (home / "logs").mkdir(parents=True, exist_ok=True)
@@ -134,6 +188,7 @@ def _build_agent(tmp_path: Path, *,
         message_buffer=MessageBuffer(history_path=home / "messages.jsonl"),
         index_generator=IndexGenerator(home),
         saga_client=fake_saga,  # type: ignore[arg-type]
+        session_manager=session_manager,  # type: ignore[arg-type]
     )
     # Skip the real deepagents.create_deep_agent — return our fake
     # whenever Agent goes to build/fetch the graph.
@@ -264,6 +319,142 @@ async def test_run_turn_poller_skips_saga_query(tmp_path: Path):
     # "Possibly relevant memories" block must be absent from the prompt
     prompt = fake_agent.invocations[0]["state"]["messages"][0].content
     assert "Possibly relevant memories" not in prompt
+
+
+# ─── IMMEDIATE_SESSION_END_TRIGGERS — end_now called immediately ────
+
+
+async def test_run_turn_scheduled_tick_ends_session_immediately(tmp_path: Path):
+    """After a ``scheduled_tick`` turn completes, the session manager's
+    ``end_now`` must fire — synthesis turn enqueued immediately,
+    bypassing the standard ``MIMIR_SAGA_SESSION_IDLE_MINUTES`` countdown.
+
+    Cron-fired heartbeats don't anchor a conversation; the next cron tick
+    creates its own session. Waiting 10 minutes to synthesize is just
+    deferred work.
+    """
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="heartbeat done")])
+    fake_sessions = _FakeSessionManager()
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=None,
+        session_manager=fake_sessions,
+    )
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        content="## Scheduled tick\nchannel: heartbeat",
+    )
+    await agent.run_turn(event)
+
+    # touch fires at turn start, end_now fires after turn finished.
+    assert fake_sessions.touch_calls == ["scheduler:heartbeat"]
+    assert fake_sessions.end_now_calls == ["scheduler:heartbeat"], (
+        "end_now must be called for scheduled_tick — without it the "
+        "synthesis turn waits MIMIR_SAGA_SESSION_IDLE_MINUTES (default 10)"
+    )
+
+
+async def test_run_turn_poller_ends_session_immediately(tmp_path: Path):
+    """Same as scheduled_tick: poller-fired turns trigger immediate
+    session end. Pollers (github-activity, ntfy, oauth-usage) fire
+    autonomously and don't sustain a conversation either."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="poller batch processed")])
+    fake_sessions = _FakeSessionManager()
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=None,
+        session_manager=fake_sessions,
+    )
+
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="## github-activity\nNew comment on jasoncarreira/mimir#100: ...",
+    )
+    await agent.run_turn(event)
+
+    assert fake_sessions.end_now_calls == ["poller:github-activity"]
+
+
+async def test_run_turn_user_message_does_not_end_session_immediately(tmp_path: Path):
+    """``user_message`` triggers a real conversation. The session must
+    stay alive so follow-up messages on the same channel keep adding to
+    it — synthesis fires only after MIMIR_SAGA_SESSION_IDLE_MINUTES of
+    silence. end_now must NOT be called."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="hi back")])
+    fake_sessions = _FakeSessionManager()
+    fake_saga = _FakeSaga()
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=fake_saga,
+        session_manager=fake_sessions,
+    )
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-123",
+        content="hello",
+    )
+    await agent.run_turn(event)
+
+    assert fake_sessions.touch_calls == ["discord-123"]
+    assert fake_sessions.end_now_calls == [], (
+        "end_now must NOT be called for user_message — the conversation "
+        "is live; synthesis should wait for the idle timer"
+    )
+
+
+async def test_run_turn_saga_session_end_does_not_recurse(tmp_path: Path):
+    """``saga_session_end`` IS the synthesis turn — ending the session
+    that just produced it would loop. end_now must NOT fire here even
+    though saga_session_end is in NON_USER_QUERY_TRIGGERS (because the
+    NON_USER set is about saga.query skipping, not session lifecycle)."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="session summarized")])
+    fake_sessions = _FakeSessionManager()
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=None,
+        session_manager=fake_sessions,
+    )
+
+    event = AgentEvent(
+        trigger="saga_session_end",
+        channel_id="scheduler:heartbeat",
+        content="## Saga session end synthesis\n...",
+    )
+    await agent.run_turn(event)
+
+    assert fake_sessions.end_now_calls == [], (
+        "end_now must NOT be called for saga_session_end — that's the "
+        "synthesis turn; ending its own session would recurse"
+    )
+
+
+async def test_run_turn_immediate_end_failure_does_not_crash_turn(tmp_path: Path):
+    """If end_now raises (e.g. dispatcher queue full when enqueueing
+    saga_session_end), the autonomous turn that just finished should
+    still return cleanly — the error is logged + swallowed, the record
+    is returned to the dispatcher."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+
+    class _BrokenSessionManager(_FakeSessionManager):
+        async def end_now(self, channel_id: str):
+            self.end_now_calls.append(channel_id)
+            raise RuntimeError("dispatcher queue full")
+
+    fake_sessions = _BrokenSessionManager()
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=None,
+        session_manager=fake_sessions,
+    )
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        content="tick",
+    )
+    # Must NOT raise.
+    record = await agent.run_turn(event)
+    assert record.output == "ok"
+    assert fake_sessions.end_now_calls == ["scheduler:heartbeat"]
 
 
 async def test_run_turn_cancels_typing_when_plan_streamed_but_result_empty(
