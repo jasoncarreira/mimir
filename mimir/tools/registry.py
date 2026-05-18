@@ -26,9 +26,13 @@ from __future__ import annotations
 
 import json
 import asyncio
+import logging
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Optional
+
+log = logging.getLogger(__name__)
 
 from langchain_core.runnables import RunnableConfig
 
@@ -194,10 +198,18 @@ async def send_message(
         # regression for the send_message-tool path (the most common
         # outbound path in production). No-op when no buffer is
         # registered (test paths that bypass ``server.serve``).
+        #
+        # ``source`` is left ``None`` here — unlike the agent-fallback
+        # path which threads ``ctx.channel_source``, the tool runs
+        # detached from the active TurnContext. Render code treats
+        # missing source the same as a non-allowlisted source for
+        # the cross-author cross-pull check; in practice every
+        # cross-channel render path filters on the inbound channel's
+        # source, so an empty source on outbound just means it stays
+        # scoped to its own channel (which is the right default).
         from ..history import Message, get_global_buffer
         _buf = get_global_buffer()
         if _buf is not None and result is not None:
-            from datetime import datetime, timezone
             try:
                 msg = Message(
                     ts=datetime.now(tz=timezone.utc).isoformat(),
@@ -211,9 +223,13 @@ async def send_message(
                 )
                 await _buf.append(msg)
             except Exception:  # noqa: BLE001
-                # Append is best-effort — don't fail the tool call
-                # if the buffer hiccups.
-                pass
+                # Best-effort — don't fail the tool call if the
+                # buffer hiccups. Log a warning rather than swallowing
+                # silently so disk-full / permission-denied issues
+                # are visible in events.jsonl downstream.
+                log.warning(
+                    "send_message: chat_history append failed", exc_info=True,
+                )
 
     for _directive in parsed.directives:
         if isinstance(_directive, ReactDirective):
