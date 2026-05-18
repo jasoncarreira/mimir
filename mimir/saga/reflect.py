@@ -182,6 +182,7 @@ def reflect(
     decisions = fields.get("decisions_made") or []
     unfinished = fields.get("unfinished") or []
     emotional_state = fields.get("emotional_state")
+    closed_since = fields.get("closed_since") or []
     if topics:
         content_parts.append("Topics: " + "; ".join(topics))
     if decisions:
@@ -207,10 +208,16 @@ def reflect(
         source_type="session_boundary",
         topics=topics,
         metadata={
+            # Canonical render-shape fields (chainlink #63 / PR #86 fix).
+            # recent_session_boundaries() reads these back out so the
+            # prompt renderer gets ts/summary/unfinished/closed_since
+            # without needing to parse the content blob.
+            "summary": fields.get("summary", ""),
             "topics_discussed": topics,
             "decisions_made": decisions,
             "unfinished": unfinished,
             "emotional_state": emotional_state,
+            "closed_since": closed_since,
         },
         agent_id=agent_id,
         session_id=session_id,
@@ -239,7 +246,8 @@ def reflect(
     # Used by search_sessions() for semantic retrieval. Embedding is
     # best-effort — a failed embed doesn't abort the session close.
     summary = fields.get("summary", "")
-    closed_since = fields.get("closed_since") or []
+    # ``closed_since`` already bound above for the boundary-atom metadata;
+    # this scope reuses it for the sessions-table INSERT VALUES below.
     emb_bytes: bytes | None = None
     emb_dim: int | None = None
     if embed_fn is not None and summary:
@@ -342,11 +350,43 @@ def recent_session_boundaries(
     out = []
     for r in rows:
         d = dict(zip(cols, r))
-        # Decode metadata JSON for the caller.
+        # Decode metadata JSON.
+        meta: dict = {}
         if d.get("metadata"):
             try:
-                d["metadata"] = json.loads(d["metadata"])
+                meta = json.loads(d["metadata"])
             except (TypeError, ValueError):
                 pass
-        out.append(d)
+        # Return canonical render-shape (matching local-mirror layout,
+        # chainlink #63 / PR #86). ``render_session_summaries`` looks for
+        # ``ts``/``channel_id``/``summary``/``unfinished``/``closed_since``;
+        # raw column names (``created_at``, ``content``) silently produced
+        # "(no summary) / 0 turns" before this mapping was added back.
+        #
+        # Fallback for older atoms that predate the metadata fix: extract
+        # the summary from the first paragraph of content. The atom's
+        # content is built as ``"<summary>\n\nTopics: ...\n\n[session=<id>]"``
+        # (see ``reflect()`` ~line 202 — the ``[session=...]`` discriminator
+        # is appended for content-hash uniqueness). Skip the marker if it
+        # somehow lands first (atoms with no summary at all).
+        summary = meta.get("summary") or ""
+        if not summary:
+            first_para = (d.get("content") or "").split("\n\n")[0].strip()
+            if not first_para.startswith("[session="):
+                summary = first_para
+        out.append({
+            # Canonical render keys:
+            "ts": d.get("created_at") or "",
+            "channel_id": d.get("channel_id") or "",
+            "summary": summary,
+            "unfinished": meta.get("unfinished") or [],
+            "topics_discussed": meta.get("topics_discussed") or [],
+            "decisions_made": meta.get("decisions_made") or [],
+            "emotional_state": meta.get("emotional_state") or "",
+            "closed_since": meta.get("closed_since") or [],
+            # Passthrough for callers that want raw fields:
+            "id": d.get("id") or "",
+            "atom_id": d.get("id") or "",
+            "session_id": d.get("session_id") or "",
+        })
     return out
