@@ -167,14 +167,41 @@ class SagaStore:
     # greenfield DDL changes and add the migration that transforms an
     # older DB to match. ``_apply_pending_migrations`` walks
     # ``MIGRATIONS`` and applies any version > the DB's current.
-    CURRENT_SCHEMA_VERSION: int = 1
+    CURRENT_SCHEMA_VERSION: int = 2
 
     # Registry of post-greenfield schema changes. Keys are version
     # numbers (must be > 1, must be contiguous, must equal
     # ``CURRENT_SCHEMA_VERSION`` at the latest entry); values are raw
-    # SQL scripts executed via ``conn.executescript``. Empty until the
-    # first post-1.0 schema change.
-    MIGRATIONS: dict[int, str] = {}
+    # SQL scripts executed via ``conn.executescript``.
+    MIGRATIONS: dict[int, str] = {
+        2: """
+-- Ensure sessions table exists on DBs created before schema.sql included it.
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    channel_id TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    summary TEXT,
+    reflected_at TEXT
+);
+
+-- Backfill sessions rows from existing session_boundary atoms that have
+-- a non-NULL session_id and no corresponding sessions row.
+-- started_at / ended_at fall back to the atom's created_at (best available).
+INSERT OR IGNORE INTO sessions (id, channel_id, started_at, ended_at, summary, reflected_at)
+SELECT
+    a.session_id,
+    NULL,
+    a.created_at,
+    a.created_at,
+    a.content,
+    a.created_at
+FROM atoms a
+WHERE a.source_type = 'session_boundary'
+  AND a.session_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id = a.session_id);
+""",
+    }
 
     def __init__(
         self,
