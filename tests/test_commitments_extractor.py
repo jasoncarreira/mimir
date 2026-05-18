@@ -213,18 +213,24 @@ async def test_extract_returns_empty_on_unparseable_response(
     assert out == []
 
 
-# ── v4 self-containment property tests ─────────────────────────────
+# ── coercion-pipeline regression tests ─────────────────────────────
+# These tests guard the JSON-parse + _coerce_to_record pipeline against
+# future regressions that would silently strip artifact identifiers or
+# disposition flags from whatever text the LLM emits.  They do NOT
+# validate that the v4 prompt convinces the LLM to include identifiers
+# (that requires a live-LLM backtest; see PR #197 body).
 
 
-async def test_extract_preserves_artifact_identifiers_in_text(
+async def test_coercion_preserves_artifact_identifiers_when_present(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Artifact identifiers (PR #, chainlink #) in LLM output survive
     coercion into the CommitmentRecord unchanged.
 
-    This pins the v4 requirement: source bullets that contain PR/issue/
-    chainlink numbers must have those numbers in the extracted text so
-    a future turn can evaluate 'done/not done?' without backtracking.
+    Guards the coercion pipeline: if the LLM emits text containing
+    PR/issue/chainlink numbers, those numbers must reach
+    CommitmentRecord.text intact so future evaluations don't need to
+    backtrack to the source turn.
     """
     payload = json.dumps({
         "commitments": [
@@ -247,14 +253,15 @@ async def test_extract_preserves_artifact_identifiers_in_text(
     assert "#117" in out[0].text
 
 
-async def test_extract_preserves_disposition_flag_in_text(
+async def test_coercion_preserves_disposition_flags_when_present(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Disposition flags ("Optional") in LLM output survive coercion.
 
-    Pins the v4 requirement that "Optional", "blocker", and similar
-    qualifiers from source bullets appear in the stored text, so the
-    commitment can be correctly evaluated without source-turn backtrack.
+    Guards the coercion pipeline: if the LLM emits text containing
+    "Optional", "blocker", or similar qualifiers, those strings must
+    reach CommitmentRecord.text intact so the commitment can be
+    evaluated correctly without backtracking to the source turn.
     """
     payload = json.dumps({
         "commitments": [
