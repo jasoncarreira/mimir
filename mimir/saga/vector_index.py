@@ -165,6 +165,67 @@ class VectorIndex:
             "IVFFlat" if n >= APPROX_THRESHOLD else "FlatIP",
         )
 
+    def build_from_sessions(self, conn: sqlite3.Connection) -> None:
+        """Bulk-load session embeddings from the sessions table.
+
+        Sessions without an embedding (NULL embedding column) or with a
+        mismatched dimension are silently skipped — they remain reachable
+        via the recency pathway in search_sessions().
+        """
+        if not FAISS_AVAILABLE:
+            self._built = True
+            return
+
+        rows = conn.execute("""
+            SELECT id, embedding, embedding_dim
+            FROM sessions
+            WHERE embedding IS NOT NULL
+        """).fetchall()
+
+        ids: list[str] = []
+        vecs: list[np.ndarray] = []
+        for sess_id, blob, dim in rows:
+            if blob is None or dim is None or dim != self.dimension:
+                continue
+            if len(blob) < self.dimension * 4:
+                continue
+            vec = np.frombuffer(blob, dtype=np.float32).copy()
+            if vec.shape[0] != self.dimension:
+                continue
+            ids.append(sess_id)
+            vecs.append(vec)
+
+        if not vecs:
+            with self._lock:
+                self._index = None
+                self._id_to_pos.clear()
+                self._pos_to_id.clear()
+                self._removed.clear()
+                self._next_pos = 0
+                self._built = True
+            return
+
+        matrix = np.vstack(vecs).astype(np.float32)
+        faiss.normalize_L2(matrix)
+        n = len(vecs)
+
+        with self._lock:
+            # Sessions are always small — IndexFlatIP is fast enough forever.
+            self._index = faiss.IndexFlatIP(self.dimension)
+            self._index.add(matrix)
+            self._id_to_pos = {}
+            self._pos_to_id = {}
+            for i, sid in enumerate(ids):
+                self._id_to_pos[sid] = i
+                self._pos_to_id[i] = sid
+            self._next_pos = n
+            self._removed.clear()
+            self._built = True
+
+        logger.info(
+            "Sessions VectorIndex built: %d vectors, dim=%d", n, self.dimension,
+        )
+
     def add(self, atom_id: str, vec_bytes: bytes) -> None:
         """Incremental add after a successful store. No-op if the
         index hasn't been built yet — the next build_from_db will pick

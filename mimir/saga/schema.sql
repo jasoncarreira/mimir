@@ -291,7 +291,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at TEXT NOT NULL,
     ended_at TEXT,
     summary TEXT,
-    reflected_at TEXT
+    reflected_at TEXT,
+    -- Structured boundary fields (populated by reflect/end_session)
+    topics_discussed TEXT NOT NULL DEFAULT '[]',   -- JSON array
+    decisions_made   TEXT NOT NULL DEFAULT '[]',   -- JSON array
+    unfinished       TEXT NOT NULL DEFAULT '[]',   -- JSON array
+    emotional_state  TEXT,
+    closed_since     TEXT NOT NULL DEFAULT '[]',   -- JSON array (chainlink #63)
+    embedding        BLOB,                          -- session summary embedding (chainlink #148)
+    embedding_dim    INTEGER                        -- embedding dimension (chainlink #148)
 );
 
 -- ──────────────────────────────────────────────────────────────────
