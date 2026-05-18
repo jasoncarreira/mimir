@@ -583,6 +583,13 @@ Two SAGA-side changes; both flagged for the SAGA maintainer. The `/v1/outcome` a
 
 `mimir/scheduler.py` runs a hard-coded periodic SAGA consolidation job — `MIMIR_SAGA_CONSOLIDATE_CRON` (default `"0 4 * * *"`, daily at 04:00 UTC) POSTs `/v1/consolidate` directly, bypassing the LLM. This is *not* a `scheduler.yaml` entry — those are LLM ticks, this is an out-of-band SAGA control call. Set `MIMIR_SAGA_CONSOLIDATE_CRON=""` to disable. Errors log to events.jsonl as `saga_consolidate_error`. Decay (`/v1/decay`) and forgetting (`/v1/forget`) are deferred to a later spec revision — SAGA's internal defaults are good enough for v1.
 
+**Two-pass consolidation.** Since the in-process `SagaStore` (mimir/saga rewrite) replaced the HTTP `/v1/consolidate` call, the consolidate job runs two passes per fire:
+
+1. **Pass 1 — dedup.** Tight-threshold clustering (**0.92 floor for all providers** — computed as `max(_PROVIDER_AUTO_THRESHOLDS[provider], 0.92)`, so providers whose thematic threshold is below 0.92 like openai / nim get bumped up to 0.92 for dedup) collapses near-duplicate raws into a canonical chosen by **ACT-R activation** (Petrov OL — see `mimir/saga/activation.py`), with tiebreaks pinned > observation trend > evidence_count > older-created. The floor is calibrated against mimir's saga.db where Voyage 0.92 and OpenAI 0.92 both sit at the ~99.98th percentile of pair similarity. Duplicates are tombstoned with `reason='merged'`; their `access_events` are redirected to the canonical (activation history preserved by sum-linearity), their `atom_relations` are redirected with dedup, and a `consolidated_into` edge is added. No LLM cost.
+2. **Pass 2 — thematic.** The original observation-synthesis pass (default 0.80 voyage / 0.80 openai-NIM, per-provider via `_PROVIDER_AUTO_THRESHOLDS`) runs on the now-deduped candidate set and emits one observation per surviving cluster.
+
+The `saga_consolidate_ok` event payload now includes a `dedup` block with `candidates_scanned`, `clusters_formed`, `canonicals_kept`, `duplicates_tombstoned`, `threshold` so operators can read off what each pass did. Callers wanting to skip pass 1 (e.g. one-off bench reproductions) pass `dedup_first=False` to `SagaStore.consolidate(...)`; thresholds override via `dedup_threshold=...`. `dedup_max_clusters=N` caps the number of dedup clusters processed (not atoms tombstoned — one cluster of 5 counts as 1 against the cap and tombstones 4).
+
 ---
 
 ## 6. Indexing pipeline
@@ -1005,7 +1012,7 @@ Event types ported from open-strix (`open-strix-base/docs/events.md`):
 | `bridge_connecting` / `bridge_ready` / `bridge_error` | `bridge, source, error?` — bridge lifecycle |
 | `bridge_stub_called` | `bridge, channel_id, method` — stubbed bridges (§15 Phase 6.3) log instead of sending |
 | `saga_session_started` / `saga_session_ended` | `channel_id, saga_session_id, duration_s?, turn_count?, synthesis_ok?, feedback_count?, memory_writes?` — per-channel session lifecycle (§5.6) |
-| `saga_consolidate_ok` / `saga_consolidate_error` | `dry_run, max_clusters?, error?` — weekly cron (§5.6) |
+| `saga_consolidate_ok` / `saga_consolidate_error` | `dry_run, max_clusters?, error?, result.dedup{candidates_scanned, clusters_formed, canonicals_kept, duplicates_tombstoned, threshold}` — weekly cron, two-pass dedup + thematic (§5.6) |
 | `poller_stderr` / `poller_nonzero_exit` | `poller, exit_code, stderr` — pollers (§7.2.2) |
 | `send_message_loop_warning` / `send_message_loop_hard_stop` / `send_message_loop_detected` | `tool, channel_id, streak, similarity_ratio, reacted?` — circuit breaker (§7.2.4) |
 
