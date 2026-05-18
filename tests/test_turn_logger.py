@@ -244,6 +244,162 @@ def test_tool_message_error_status_flagged():
     assert events[0]["is_error"] is True
 
 
+# ── hooks-based tool_events path (preferred when present) ───────────
+
+
+def test_tool_events_path_preserves_interleaved_order():
+    """``response_metadata["tool_events"]`` (populated by the hooks
+    patch in ``_langchain_claude_code_patches.py``) carries an ALREADY-
+    interleaved list of call→result→call→result events. ``extract_turn_events``
+    must walk it in order and produce matching events — not bunch
+    calls before results like the legacy ``internal_tool_calls`` /
+    ``internal_tool_results`` split path does."""
+    msg = AIMessage(
+        content="Did two things.",
+        response_metadata={
+            "tool_events": [
+                {"type": "tool_call", "tool_use_id": "toolu_a",
+                 "name": "Read", "input": {"file_path": "/x"}},
+                {"type": "tool_result", "tool_use_id": "toolu_a",
+                 "name": "Read", "result": "contents-of-x",
+                 "is_error": False},
+                {"type": "tool_call", "tool_use_id": "toolu_b",
+                 "name": "Bash", "input": {"command": "ls"}},
+                {"type": "tool_result", "tool_use_id": "toolu_b",
+                 "name": "Bash", "result": {"output": "a\nb"},
+                 "is_error": False},
+            ],
+        },
+    )
+    events, output = extract_turn_events([msg])
+    tool_event_types = [e["type"] for e in events if e["type"] != "reasoning"]
+    # Interleaved order preserved, NOT bunched.
+    assert tool_event_types == [
+        "tool_call", "tool_result", "tool_call", "tool_result",
+    ]
+    # IDs/names paired correctly.
+    by_id = {e["id"]: e for e in events if e["type"] == "tool_result"}
+    assert by_id["toolu_a"]["name"] == "Read"
+    assert "contents-of-x" in by_id["toolu_a"]["content"]
+    assert by_id["toolu_b"]["name"] == "Bash"
+    assert by_id["toolu_b"]["is_error"] is False
+    # Final AIMessage's content goes to output.
+    assert "Did two things" in output
+
+
+def test_tool_events_path_captures_built_in_tool_results():
+    """The hooks path is the only one that surfaces built-in tool
+    results (Bash/Read/Edit/Write/Glob/ToolSearch). Pre-fix mimirbot
+    turns showed 60 Bash/Read calls with 0 results because UserMessage
+    ToolResultBlocks were dropped by langchain-claude-code. The
+    tool_events list — populated by ``PostToolUse`` hook regardless of
+    tool origin — is the audit-trail fix."""
+    msg = AIMessage(
+        content="",
+        response_metadata={
+            "tool_events": [
+                {"type": "tool_call", "tool_use_id": "toolu_bash1",
+                 "name": "Bash", "input": {"command": "echo hi"}},
+                {"type": "tool_result", "tool_use_id": "toolu_bash1",
+                 "name": "Bash", "result": {"output": "hi\n"},
+                 "is_error": False},
+            ],
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    tcs = [e for e in events if e["type"] == "tool_call"]
+    trs = [e for e in events if e["type"] == "tool_result"]
+    assert len(tcs) == 1
+    assert len(trs) == 1  # ← this is what was 0 before the hooks patch
+    assert tcs[0]["name"] == "Bash"
+    assert trs[0]["name"] == "Bash"
+    assert tcs[0]["id"] == trs[0]["id"] == "toolu_bash1"
+
+
+def test_tool_events_path_preserves_is_error_for_failures():
+    """``PostToolUseFailure`` hook records produce events with
+    ``is_error=True`` and an ``error`` string instead of ``result``.
+    ``extract_turn_events`` must surface that as a tool_result with
+    is_error=True; the body content comes from the error string."""
+    msg = AIMessage(
+        content="",
+        response_metadata={
+            "tool_events": [
+                {"type": "tool_call", "tool_use_id": "toolu_fail",
+                 "name": "Bash", "input": {"command": "/bin/false"}},
+                {"type": "tool_result", "tool_use_id": "toolu_fail",
+                 "name": "Bash", "error": "exited with status 1",
+                 "is_error": True},
+            ],
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    trs = [e for e in events if e["type"] == "tool_result"]
+    assert len(trs) == 1
+    assert trs[0]["is_error"] is True
+    assert "status 1" in trs[0]["content"]
+
+
+def test_tool_events_path_skips_legacy_internal_tool_calls():
+    """When ``tool_events`` is present, the legacy ``internal_tool_calls`` /
+    ``internal_tool_results`` keys MUST NOT be walked — otherwise we'd
+    double-count every event. The hooks path is authoritative."""
+    msg = AIMessage(
+        content="Done.",
+        response_metadata={
+            "tool_events": [
+                {"type": "tool_call", "tool_use_id": "toolu_x",
+                 "name": "Read", "input": {"file_path": "/y"}},
+                {"type": "tool_result", "tool_use_id": "toolu_x",
+                 "name": "Read", "result": "y-content", "is_error": False},
+            ],
+            # Legacy keys also populated — patch must IGNORE these when
+            # tool_events is present (they'd duplicate the events).
+            "internal_tool_calls": [
+                {"id": "toolu_LEGACY", "name": "ShouldNotAppear",
+                 "args": {}},
+            ],
+            "internal_tool_results": [
+                {"tool_use_id": "toolu_LEGACY",
+                 "content": "should-not-appear", "is_error": False},
+            ],
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    names = {e.get("name") for e in events if e["type"] != "reasoning"}
+    assert "ShouldNotAppear" not in names
+    assert names == {"Read"}
+
+
+def test_legacy_path_still_works_without_tool_events_key():
+    """Backward compat: when ``tool_events`` is absent (operator on the
+    anthropic-only path, or hooks patch not loaded), the legacy
+    ``internal_tool_calls`` + ``internal_tool_results`` parsing remains
+    the path. This locks in the fallback so the hooks patch can be
+    introduced without breaking anyone."""
+    msg = AIMessage(
+        content="",
+        response_metadata={
+            "internal_tool_calls": [
+                {"id": "toolu_legacy", "name": "Bash",
+                 "args": {"command": "ls"}},
+            ],
+            "internal_tool_results": [
+                {"tool_use_id": "toolu_legacy",
+                 "content": "a\nb", "is_error": False},
+            ],
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    tcs = [e for e in events if e["type"] == "tool_call"]
+    trs = [e for e in events if e["type"] == "tool_result"]
+    assert len(tcs) == 1 and len(trs) == 1
+    assert tcs[0]["name"] == "Bash"
+    # #193's reverse-lookup still populates the result name from
+    # the matching call.
+    assert trs[0]["name"] == "Bash"
+
+
 # ── End-to-end native-provider paths ────────────────────────────────
 # Coverage for non-claude-code providers (langchain-anthropic /
 # langchain-openai / etc., resolved via ``init_chat_model`` in
