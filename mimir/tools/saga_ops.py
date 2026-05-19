@@ -181,8 +181,14 @@ async def saga_end_session(
     if ctx is not None:
         ctx.saga_end_session_called = True
 
-    atom_id = payload.get("atom_id") if isinstance(payload, dict) else None
-    return f"saga_end_session ok: session_id={session_id} atom_id={atom_id}"
+    written = (
+        payload.get("session_summary_written")
+        if isinstance(payload, dict) else None
+    )
+    return (
+        f"saga_end_session ok: session_id={session_id} "
+        f"summary_written={bool(written)}"
+    )
 
 
 @tool

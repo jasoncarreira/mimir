@@ -23,7 +23,7 @@ class FakeSaga:
 
     calls: list[_Call] = field(default_factory=list)
     query_response: dict[str, Any] = field(default_factory=dict)
-    end_session_atom_id: str = "atom-boundary-1"
+    end_session_summary_written: bool = True
     fail_on: set[str] = field(default_factory=set)
 
     async def health(self) -> bool:
@@ -125,9 +125,9 @@ class FakeSaga:
             )
         )
         return {
-            "atom_id": self.end_session_atom_id,
             "session_id": session_id,
             "channel": channel_id,
+            "session_summary_written": self.end_session_summary_written,
         }
 
     async def consolidate(self, *, dry_run: bool = False, max_clusters: int | None = None) -> dict[str, Any]:

@@ -95,7 +95,7 @@ async def test_end_session_without_channel_id_still_works(client, monkeypatch):
     _patch_provider(monkeypatch)
     result = await client.end_session("s2", "summary")
     assert result["channel"] is None
-    assert result["atom_id"] is not None
+    assert result["session_summary_written"] is True
 
 
 @pytest.mark.asyncio

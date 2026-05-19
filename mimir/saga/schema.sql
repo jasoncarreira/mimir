@@ -149,10 +149,6 @@ CREATE TABLE IF NOT EXISTS atom_relations (
     target_id TEXT NOT NULL,
     -- 'evidenced_by'      : observation ←- raw (semantic claim of support)
     -- 'consolidated_into' : raw -→ observation (reverse-index of evidenced_by)
-    -- 'session_member'    : session_boundary ←- raw (structural — "this raw
-    --                       was accessed/stored during the session this
-    --                       boundary closes"). Distinct from evidenced_by;
-    --                       session_member is scope, evidenced_by is claim.
     -- 'supersedes'        : newer observation -→ older observation it replaces
     -- 'contradicts'       : symmetric — two atoms make incompatible claims
     -- 'corrects'          : explicit user-driven correction (atom_b corrects atom_a)

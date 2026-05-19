@@ -167,7 +167,7 @@ class SagaStore:
     # greenfield DDL changes and add the migration that transforms an
     # older DB to match. ``_apply_pending_migrations`` walks
     # ``MIGRATIONS`` and applies any version > the DB's current.
-    CURRENT_SCHEMA_VERSION: int = 4
+    CURRENT_SCHEMA_VERSION: int = 5
 
     # Registry of post-greenfield schema changes. Keys are version
     # numbers (must be > 1, must be contiguous, must equal
@@ -213,6 +213,116 @@ WHERE a.source_type = 'session_boundary'
             -- Add embedding columns to sessions for search_sessions() (chainlink #148).
             ALTER TABLE sessions ADD COLUMN embedding BLOB;
             ALTER TABLE sessions ADD COLUMN embedding_dim INTEGER;
+        """,
+        5: """
+            -- Sessions migration final step: delete session_boundary atoms
+            -- entirely. They've been backfilled into the sessions table since
+            -- migration 2; the structured fields landed in 3; embeddings in 4.
+            -- This migration completes the move by deleting the redundant
+            -- atom rows + all their dependents (access_events, embeddings,
+            -- atom_relations). After this runs, no atom has
+            -- source_type='session_boundary'.
+            --
+            -- Migration 2 already backfilled most rows with the bare summary
+            -- (atom.content); we top up the structured fields from
+            -- atom.metadata here in case the row was inserted with empty
+            -- topics_discussed/decisions_made/etc.
+            UPDATE sessions
+            SET
+                topics_discussed = COALESCE(
+                    NULLIF(topics_discussed, '[]'),
+                    (
+                        SELECT json_extract(a.metadata, '$.topics_discussed')
+                        FROM atoms a
+                        WHERE a.source_type = 'session_boundary'
+                          AND a.session_id = sessions.id
+                          AND json_extract(a.metadata, '$.topics_discussed') IS NOT NULL
+                        LIMIT 1
+                    ),
+                    topics_discussed
+                ),
+                decisions_made = COALESCE(
+                    NULLIF(decisions_made, '[]'),
+                    (
+                        SELECT json_extract(a.metadata, '$.decisions_made')
+                        FROM atoms a
+                        WHERE a.source_type = 'session_boundary'
+                          AND a.session_id = sessions.id
+                          AND json_extract(a.metadata, '$.decisions_made') IS NOT NULL
+                        LIMIT 1
+                    ),
+                    decisions_made
+                ),
+                unfinished = COALESCE(
+                    NULLIF(unfinished, '[]'),
+                    (
+                        SELECT json_extract(a.metadata, '$.unfinished')
+                        FROM atoms a
+                        WHERE a.source_type = 'session_boundary'
+                          AND a.session_id = sessions.id
+                          AND json_extract(a.metadata, '$.unfinished') IS NOT NULL
+                        LIMIT 1
+                    ),
+                    unfinished
+                ),
+                emotional_state = COALESCE(
+                    emotional_state,
+                    (
+                        SELECT json_extract(a.metadata, '$.emotional_state')
+                        FROM atoms a
+                        WHERE a.source_type = 'session_boundary'
+                          AND a.session_id = sessions.id
+                        LIMIT 1
+                    )
+                ),
+                closed_since = COALESCE(
+                    NULLIF(closed_since, '[]'),
+                    (
+                        SELECT json_extract(a.metadata, '$.closed_since')
+                        FROM atoms a
+                        WHERE a.source_type = 'session_boundary'
+                          AND a.session_id = sessions.id
+                          AND json_extract(a.metadata, '$.closed_since') IS NOT NULL
+                        LIMIT 1
+                    ),
+                    closed_since
+                )
+            WHERE EXISTS (
+                SELECT 1 FROM atoms a
+                WHERE a.source_type = 'session_boundary'
+                  AND a.session_id = sessions.id
+            );
+
+            -- Delete all dependents in dependency order:
+            -- 1. atom_access_summary → 2. access_events → 3. embeddings
+            -- → 4. atom_relations → 5. atoms
+            DELETE FROM atom_access_summary
+            WHERE atom_id IN (
+                SELECT id FROM atoms WHERE source_type = 'session_boundary'
+            );
+
+            DELETE FROM access_events
+            WHERE atom_id IN (
+                SELECT id FROM atoms WHERE source_type = 'session_boundary'
+            );
+
+            DELETE FROM embeddings
+            WHERE atom_id IN (
+                SELECT id FROM atoms WHERE source_type = 'session_boundary'
+            );
+
+            -- atom_relations: source_id OR target_id pointing at a boundary
+            -- atom. All session_member edges (boundary→raw) are caught here.
+            DELETE FROM atom_relations
+            WHERE source_id IN (
+                SELECT id FROM atoms WHERE source_type = 'session_boundary'
+            ) OR target_id IN (
+                SELECT id FROM atoms WHERE source_type = 'session_boundary'
+            );
+
+            -- Finally drop the atoms themselves. atoms_fts is kept in sync
+            -- by the DELETE trigger in schema.sql.
+            DELETE FROM atoms WHERE source_type = 'session_boundary';
         """,
     }
 
@@ -725,18 +835,10 @@ WHERE a.source_type = 'session_boundary'
             # Invalidate sessions index so the next search_sessions() call
             # picks up the newly-written session and its embedding.
             self._sessions_index_built = False
-            # Return BOTH the saga-compatible ``atom_id`` (consumed by
-            # mimir/sagatools.py:583/603 for the local boundary mirror +
-            # the user-facing success message) AND the
-            # ``boundary_atom_id`` alias for clarity. Dropping either
-            # breaks an existing call site silently.
             return {
-                "atom_id": result.boundary_atom_id,
-                "boundary_atom_id": result.boundary_atom_id,
                 "session_id": session_id,
                 "channel": channel_id,
-                "boundary_created": result.boundary_created,
-                "session_member_count": result.session_member_count,
+                "session_summary_written": result.session_summary_written,
             }
         return await self._write_locked(_do)
 
