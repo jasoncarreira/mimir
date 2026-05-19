@@ -24,9 +24,11 @@ batch_size = 50                                # max texts per API batch request
 # provider = "onnx"
 # model = "BAAI/bge-small-en-v1.5"         # auto-downloads from HuggingFace
 # dimensions = 384
-# # NOTE: bge-small's tighter cosine distribution cap-saturates saga's
-# # consolidator at the default threshold. See `[consolidation]
-# # similarity_threshold` below — recommend 0.92 with this provider.
+# # NOTE: bge-small's tighter cosine distribution would cap-saturate
+# # saga's consolidator at 0.80 — but mimir's pass-1 dedup
+# # (DEFAULT_DEDUP_THRESHOLD=0.92) absorbs the template-near-dup noise
+# # before the thematic pass runs, so the per-provider auto for bge
+# # stays at 0.80 alongside everyone else.
 
 # OpenAI text-embedding-3-small (1536d, hosted, $0.02/1M tokens):
 # [embedding]
@@ -47,8 +49,12 @@ batch_size = 50                                # max texts per API batch request
 # send_input_type = true                    # REQUIRED — voyage's models need
 #                                           # input_type ("query" / "document")
 #                                           # for retrieval-quality embeddings.
-# # NOTE: also bump [consolidation] similarity_threshold to 0.92 — voyage's
-# # tight retrieval-tuned distribution cap-saturates at 0.80.
+# # NOTE: leave [consolidation] similarity_threshold at the 0.80 default.
+# # Voyage's tighter distribution would historically cap-saturate at 0.80,
+# # but mimir's pass-1 dedup (DEFAULT_DEDUP_THRESHOLD=0.92) absorbs the
+# # template-near-dup noise before the thematic pass — re-calibration on
+# # muninn + mimir showed 0.80 forms COHERENT thematic clusters on voyage
+# # too (Phase 2 bench tracking, heartbeat chains, etc.).
 
 [storage]
 db_path = "db/saga.db"                      # relative to saga/ directory
