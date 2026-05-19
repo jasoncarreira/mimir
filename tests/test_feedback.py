@@ -756,3 +756,34 @@ def test_commitments_polarity_dynamic_invariant_holds():
     }
     assert new_kinds.issubset(_FIRST_OCCURRENCE_ONLY_KINDS)
     assert _POLARITY_DYNAMIC_KINDS.isdisjoint(new_kinds)
+
+
+# ─── Algedonic pipeline gaps (PR algedonic-gaps-5) ──────────────────
+
+
+def test_tool_call_budget_denied_renders_as_negative(tmp_path: Path):
+    """Gap 4 fix: budget_gate.py emits ``tool_call_budget_denied`` but
+    _EVENT_RULES previously only had ``tool_call_budget_warning``.
+    The two actual event names must now surface as negatives."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(1.0), "type": "tool_call_budget_denied",
+         "channel_id": "c", "tool": "bash_exec", "limit": 10, "used": 11},
+    ])
+    negatives, positives = log.recent()
+    assert any("tool_budget" in s.kind for s in negatives), (
+        "tool_call_budget_denied should surface as a tool_budget negative"
+    )
+    assert len(positives) == 0
+
+
+def test_tool_call_budget_soft_warning_renders_as_negative(tmp_path: Path):
+    """Gap 4 fix: ``tool_call_budget_soft_warning`` (the other event name
+    emitted by budget_gate.py) must also render as a negative."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(1.0), "type": "tool_call_budget_soft_warning",
+         "channel_id": "c", "tool": "shell_exec", "limit": 20, "used": 18},
+    ])
+    negatives, _ = log.recent()
+    assert any("tool_budget" in s.kind for s in negatives), (
+        "tool_call_budget_soft_warning should surface as a tool_budget negative"
+    )
