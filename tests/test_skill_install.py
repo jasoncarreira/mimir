@@ -258,3 +258,197 @@ def test_cmd_list_optional_walks_optional_skills(
     assert "fake-poller" in out
     assert "fake-skill" in out
     assert "[poller]" in out
+
+
+# ─── Follow-ups from issue #226 ─────────────────────────────────────
+
+
+def test_list_available_and_installed_share_helper(fake_optional_root: Path, tmp_path):
+    """Both listing paths funnel through ``_walk_skills_dir`` — sanity
+    check by giving each the same input and asserting they produce
+    equivalent output (same shape, same content, modulo the path field
+    which differs by definition)."""
+    # Build an agent home that has the same two skills installed.
+    home = tmp_path / "home"
+    skills = home / ".claude" / "skills"
+    skills.mkdir(parents=True)
+    import shutil as _sh
+    _sh.copytree(fake_optional_root / "fake-poller", skills / "fake-poller")
+    _sh.copytree(fake_optional_root / "fake-skill", skills / "fake-skill")
+
+    avail = list_available(fake_optional_root)
+    installed = list_installed(home)
+    # Same names, descriptions, poller-flags.
+    assert [s.name for s in avail] == [s.name for s in installed]
+    assert [s.description for s in avail] == [s.description for s in installed]
+    assert [s.has_pollers_json for s in avail] == [s.has_pollers_json for s in installed]
+
+
+def test_cmd_list_optional_pip_install_hint(tmp_path: Path, capsys, monkeypatch):
+    """When the optional-skills tree doesn't exist (wheel install
+    case), ``list-optional`` must emit a clear pointer to a source-tree
+    install — NOT the silent "no optional skills available" footgun.
+    """
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT",
+        tmp_path / "does-not-exist",
+    )
+    rc = cmd_list_optional(Namespace())
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "optional-skills/ not found" in out
+    assert "git clone" in out  # the actionable hint
+
+
+def test_install_raises_pip_install_hint_when_tree_missing(tmp_path: Path):
+    """``install()`` raises FileNotFoundError with the pip-install
+    hint, not the per-skill "skill not found" message, when the
+    optional-skills tree doesn't exist at all."""
+    with pytest.raises(FileNotFoundError) as ei:
+        install(
+            "anything", tmp_path / "home",
+            optional_skills_root=tmp_path / "does-not-exist",
+        )
+    assert "optional-skills/ not found" in str(ei.value)
+    assert "git clone" in str(ei.value)
+
+
+def test_poller_flag_alignment_in_listings(fake_optional_root: Path, capsys, monkeypatch):
+    """Issue #226 nit 3: rows with and without the [poller] flag must
+    keep the description column vertically aligned. The pre-fix
+    f"{name:<width}{flag}" appended flag AFTER name padding, shifting
+    description right on every poller row.
+    """
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT",
+        fake_optional_root,
+    )
+    cmd_list_optional(Namespace())
+    out = capsys.readouterr().out
+    # Find the two skill rows and verify their description offset
+    # within the row is identical.
+    poller_line = next(l for l in out.splitlines() if "fake-poller" in l)
+    skill_line = next(l for l in out.splitlines() if "fake-skill" in l)
+    # The description text starts at the same column index in both.
+    poller_desc_idx = poller_line.find("A test poller")
+    skill_desc_idx = skill_line.find("A plain non-poller")
+    assert poller_desc_idx == skill_desc_idx, (
+        f"poller row desc at col {poller_desc_idx}, "
+        f"non-poller row desc at col {skill_desc_idx} — not aligned"
+    )
+    # Both lines should be present.
+    assert poller_desc_idx > 0
+    assert skill_desc_idx > 0
+
+
+def test_truncate_desc_helper():
+    """The truncation logic is centralized (issue #226 nit 4). Spot-check
+    boundary behavior."""
+    from mimir.skill_install import _truncate_desc, _DESC_BUDGET
+    # Shorter than budget: untouched.
+    assert _truncate_desc("hello") == "hello"
+    # Exactly at budget: untouched.
+    s = "x" * _DESC_BUDGET
+    assert _truncate_desc(s) == s
+    # Over budget: truncates with "..." suffix, total length = budget.
+    s = "x" * (_DESC_BUDGET + 50)
+    truncated = _truncate_desc(s)
+    assert len(truncated) == _DESC_BUDGET
+    assert truncated.endswith("...")
+    # Custom budget.
+    assert _truncate_desc("abcdefghij", budget=5) == "ab..."
+
+
+# ─── Test gaps Mimir flagged on #224 ─────────────────────────────────
+
+
+def test_cmd_list_no_skills_dir_emits_setup_hint(tmp_path: Path, capsys):
+    """``mimir skills list`` on a home that exists but has no
+    .claude/skills/ subdir should emit the "Did you run mimir setup?"
+    hint, not crash."""
+    home = tmp_path / "home"
+    home.mkdir()
+    rc = cmd_list(Namespace(home=home))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no skills installed" in out
+    assert "mimir setup" in out
+
+
+def test_cmd_install_returns_2_for_missing_home_dir(tmp_path: Path, capsys):
+    """The if-not-home.is_dir() early-exit in ``cmd_install`` — distinct
+    from the inner ``install()`` FileNotFoundError path. Both should
+    return exit code 2 but via different code paths."""
+    args = Namespace(
+        name="anything",
+        home=tmp_path / "does-not-exist-as-dir",
+        force=False,
+    )
+    rc = cmd_install(args)
+    assert rc == 2
+    assert "home not a directory" in capsys.readouterr().out
+
+
+def test_cmd_install_with_force_via_cli(
+    fake_optional_root: Path, tmp_path, capsys, monkeypatch,
+):
+    """The --force semantics are tested at the library level (in
+    test_install_force_overwrites_existing) but not via the CLI path.
+    This covers the args.force=True branch of cmd_install."""
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT",
+        fake_optional_root,
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    # First install.
+    args1 = Namespace(name="fake-skill", home=home, force=False)
+    assert cmd_install(args1) == 0
+    # Second without force → conflict (exit 3).
+    assert cmd_install(args1) == 3
+    # Second with force → success.
+    args2 = Namespace(name="fake-skill", home=home, force=True)
+    out_before = capsys.readouterr().out  # consume prior stdout
+    assert cmd_install(args2) == 0
+    out = capsys.readouterr().out
+    assert "overwrote" in out
+
+
+def test_cmd_install_emits_poller_hint_for_pollers_json(
+    fake_optional_root: Path, tmp_path, capsys, monkeypatch,
+):
+    """Pollers-hint output line ("this skill ships a pollers.json...")
+    must fire for any skill whose source has a pollers.json. Was not
+    asserted in any test pre-#226."""
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT",
+        fake_optional_root,
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    rc = cmd_install(Namespace(
+        name="fake-poller", home=home, force=False,
+    ))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ships a pollers.json" in out
+    assert "reload_pollers" in out
+
+
+def test_cmd_install_no_poller_hint_for_plain_skill(
+    fake_optional_root: Path, tmp_path, capsys, monkeypatch,
+):
+    """Complement to the prior test: a non-poller skill (no
+    pollers.json) must NOT emit the pollers hint."""
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT",
+        fake_optional_root,
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    rc = cmd_install(Namespace(
+        name="fake-skill", home=home, force=False,
+    ))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ships a pollers.json" not in out
