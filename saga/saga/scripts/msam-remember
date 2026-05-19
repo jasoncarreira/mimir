@@ -1,5 +1,0 @@
-#!/bin/bash
-# DEPRECATED: 'msam-remember' is the previous name of this script. Use 'saga-remember'
-# going forward. This shim will be removed in a future release. It forwards to the
-# saga-named binary.
-exec "$(dirname "$0")/saga-remember" "$@"

@@ -1,5 +1,0 @@
-#!/bin/bash
-# DEPRECATED: 'msam-backup' is the previous name of this script. Use 'saga-backup'
-# going forward. This shim will be removed in a future release. It forwards to the
-# saga-named binary.
-exec "$(dirname "$0")/saga-backup" "$@"
