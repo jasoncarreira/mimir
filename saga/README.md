@@ -195,7 +195,10 @@ fresh installs via `mimir setup`.
 
 ```toml
 [consolidation]
-similarity_threshold = "auto"   # 0.92 for voyage/fastembed, 0.80 otherwise
+similarity_threshold = "auto"   # resolves to 0.80 for every provider —
+                                # mimir's pass-1 dedup absorbs the
+                                # template noise that drove the older
+                                # voyage=0.92 / fastembed=0.92 picks.
 ```
 
 ### `[embedding] provider = "voyage"` — first-class Voyage shortcut
