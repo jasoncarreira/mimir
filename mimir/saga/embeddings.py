@@ -332,23 +332,33 @@ _PROVIDERS = {
 }
 
 #: Per-provider recommended ``[consolidation] similarity_threshold``
-#: values, picked from offline cosine-distribution sweeps against
-#: LongMemEval-S DBs. Used when ``[consolidation] similarity_threshold
-#: = "auto"`` is set in saga.toml — the value resolves to the entry
-#: matching the configured embedding provider. See saga README for the
-#: full sweep methodology.
+#: values for the THEMATIC pass (pass 2). Used when ``[consolidation]
+#: similarity_threshold = "auto"`` is set in saga.toml — the value
+#: resolves to the entry matching the configured embedding provider.
+#:
+#: **All providers now resolve to 0.80.** The earlier voyage=0.92 /
+#: onnx=0.92 entries were picked by the "lowest threshold where the
+#: 20-cluster cap stops firing" heuristic on Phase 1's kept DBs. But
+#: re-calibration on muninn (n=1789) + mimir-saga (n=693) showed that
+#: 0.80 forms the COHERENT thematic clusters (Phase 2 bench tracking,
+#: heartbeat chains, Hailey-Tim-blog motifs) — the cap-saturation at
+#: 0.80 isn't a noise problem, it's "more eligible clusters than the
+#: pass-2 cap can absorb." The new pass-1 dedup at the 0.92 floor
+#: (see ``DEFAULT_DEDUP_THRESHOLD`` in dedup.py) absorbs the template
+#: near-duplicate noise BEFORE pass 2 runs, so the cap doesn't bind
+#: against real thematic clusters.
+#:
+#: OpenAI 3-small calibration confirms 0.80 sits at the ~99.98th
+#: percentile on conversational corpora (muninn-shape), exactly where
+#: the historical 0.88 LongMemEval baseline scored.
 #:
 #: Falls back to 0.80 (saga's historical default) for providers without
-#: an explicit entry — that's the right value for any embedding model
-#: whose cosine distribution sits in the OpenAI/NIM range (1024-1536d
-#: general-purpose). Providers like voyage and fastembed-bge-small
-#: produce tighter distributions and need 0.92 to keep saga's
-#: consolidator from cap-saturating.
+#: an explicit entry.
 _PROVIDER_AUTO_THRESHOLDS: dict[str, float] = {
     "nvidia-nim": 0.80,
     "openai": 0.80,
-    "voyage": 0.92,
-    "onnx": 0.92,
+    "voyage": 0.80,
+    "onnx": 0.80,
     "local": 0.80,
 }
 

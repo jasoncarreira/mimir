@@ -335,17 +335,19 @@ _PROVIDERS = {
 #: matching the configured embedding provider. See saga README for the
 #: full sweep methodology.
 #:
-#: Falls back to 0.80 (saga's historical default) for providers without
-#: an explicit entry — that's the right value for any embedding model
-#: whose cosine distribution sits in the OpenAI/NIM range (1024-1536d
-#: general-purpose). Providers like voyage and fastembed-bge-small
-#: produce tighter distributions and need 0.92 to keep saga's
-#: consolidator from cap-saturating.
+#: All providers now resolve to 0.80. The earlier voyage=0.92 / onnx=0.92
+#: entries were picked by the "lowest threshold where the 20-cluster cap
+#: stops firing" heuristic, but re-calibration on muninn (n=1789) +
+#: mimir-saga (n=693) showed 0.80 is where coherent thematic clusters
+#: form for every provider. The 0.92 cap-saturation pressure is
+#: relieved by mimir's pass-1 dedup (in ``mimir.saga.dedup`` —
+#: ``DEFAULT_DEDUP_THRESHOLD = 0.92``) which absorbs template
+#: near-duplicate noise BEFORE the thematic pass runs.
 _PROVIDER_AUTO_THRESHOLDS: dict[str, float] = {
     "nvidia-nim": 0.80,
     "openai": 0.80,
-    "voyage": 0.92,
-    "onnx": 0.92,
+    "voyage": 0.80,
+    "onnx": 0.80,
     "local": 0.80,
 }
 
