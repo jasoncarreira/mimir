@@ -1,0 +1,19 @@
+# chainlink — install the chainlink-tracker CLI from
+# https://github.com/dollspace-gay/chainlink. Heavy (Rust toolchain
+# build, ~10–20 min, ~1.5 GB intermediate state, ~30 MB final binary)
+# so it's a fragment rather than base — installs only get the cost
+# when the chainlink skill is seeded.
+#
+# CARGO_BUILD_JOBS=1 keeps the build from saturating CPU on shared
+# Docker Desktop VMs. The toolchain is removed after install to keep
+# the final image lean.
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal \
+ && . $HOME/.cargo/env \
+ && CARGO_BUILD_JOBS=1 cargo install \
+        --git https://github.com/dollspace-gay/chainlink.git \
+        --root /usr/local \
+        chainlink-tracker \
+ && rustup self uninstall -y \
+ && rm -rf $HOME/.cargo $HOME/.rustup
