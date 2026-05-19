@@ -1696,6 +1696,34 @@ def main(argv: Sequence[str] | None = None) -> None:
     from . import skill_catalog as _skill_catalog
     _skill_catalog.add_argparse(skills_cat_p)
 
+    # mimir skills list — installed skills in a home
+    from . import skill_install as _skill_install
+    skills_list_p = skills_sub.add_parser(
+        "list",
+        help="List skills installed in an agent home "
+             "(walks <home>/.claude/skills/). Shows name, [poller] flag "
+             "when a pollers.json is present, and the SKILL.md description.",
+    )
+    _skill_install.add_argparse_list(skills_list_p)
+
+    # mimir skills list-optional — opt-in skills shipped with mimir
+    skills_list_opt_p = skills_sub.add_parser(
+        "list-optional",
+        help="List skills available for opt-in install (walks "
+             "<repo>/optional-skills/). Use `mimir skills install <name>` "
+             "to copy one into an agent home.",
+    )
+    _skill_install.add_argparse_list_optional(skills_list_opt_p)
+
+    # mimir skills install — copy an opt-in skill into an agent home
+    skills_install_p = skills_sub.add_parser(
+        "install",
+        help="Install an opt-in skill from optional-skills/ into an agent "
+             "home's .claude/skills/. Pollers (skills with pollers.json) "
+             "register on next `reload_pollers` or `mimir run` boot.",
+    )
+    _skill_install.add_argparse_install(skills_install_p)
+
     commitments_p = sub.add_parser(
         "commitments",
         help="Manage durable commitments (list/add/complete/snooze/"
@@ -1889,6 +1917,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.skills_action == "catalog":
             from . import skill_catalog as _skill_catalog
             sys.exit(_skill_catalog.cmd(args))
+        # list / list-optional / install all set ``skill_install_cmd``
+        # via their respective ``add_argparse_*`` helpers in
+        # ``mimir.skill_install``.
+        skill_install_cmd = getattr(args, "skill_install_cmd", None)
+        if skill_install_cmd is not None:
+            sys.exit(skill_install_cmd(args))
         skills_p.print_help()
         sys.exit(1)
 
