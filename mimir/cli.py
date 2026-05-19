@@ -1724,6 +1724,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     _skill_install.add_argparse_install(skills_install_p)
 
+    # mimir scaffold-docker — generate container-deploy files
+    # (Dockerfile, compose.yml, compose.env, start.sh) into an agent
+    # home. Inspects <home>/.claude/skills/ for per-skill OS-deps
+    # (dockerfile.fragment) and env vars (pollers.json pass_env).
+    # Idempotent — re-run after installing pollers to pick up their
+    # fragments + env-var requirements.
+    scaffold_docker_p = sub.add_parser(
+        "scaffold-docker",
+        help="Generate Dockerfile + compose.yml + compose.env + start.sh "
+             "into an agent home. Pulls per-skill dockerfile.fragment "
+             "snippets so installed pollers' system deps (gog, social-cli, "
+             "etc.) get baked into the image. Idempotent — re-run after "
+             "skills change to refresh.",
+    )
+    from . import scaffold_docker as _scaffold_docker
+    _scaffold_docker.add_argparse(scaffold_docker_p)
+
     commitments_p = sub.add_parser(
         "commitments",
         help="Manage durable commitments (list/add/complete/snooze/"
@@ -1925,6 +1942,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             sys.exit(skill_install_cmd(args))
         skills_p.print_help()
         sys.exit(1)
+
+    if args.command == "scaffold-docker":
+        # _scaffold_docker was already imported at subparser-registration
+        # time (parser.add_argument requires the module to wire ``cmd``).
+        # Reuse the existing scaffold_docker_cmd reference set via
+        # ``parser.set_defaults`` rather than re-importing here.
+        sys.exit(args.scaffold_docker_cmd(args))
 
     if args.command == "commitments":
         # chainlink #82 sub #87: bare ``mimir commitments`` (no

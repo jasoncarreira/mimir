@@ -1,0 +1,23 @@
+# social-cli-poller — install social-cli (Bluesky / X notifications
+# CLI from https://github.com/letta-ai/social-cli). The poller calls
+# `social-cli` from PATH unless SOCIAL_CLI_BIN overrides.
+#
+# social-cli is a Node project; we clone, pnpm install + build, then
+# symlink the binary to /usr/local/bin. The base image is expected to
+# have Node 20 + npm already (the scaffolder bakes that into the base
+# Dockerfile when ANY poller is installed). pnpm is installed via
+# corepack which ships with Node 20.
+#
+# Pinned to a clone of main because letta-ai/social-cli is still
+# pre-tag. Bump to a release tag when one lands.
+
+# Clones letta-ai/social-cli's main branch (no tags published yet).
+# When upstream stabilizes + cuts tagged releases, pin to a commit hash
+# (``git clone ... && git -C /opt/social-cli checkout <sha>``) or a
+# release tag for build reproducibility. Until then, ``--depth 1`` on
+# main is the trade-off — fast clone, but the build is non-deterministic
+# across rebuilds.
+RUN corepack enable && corepack prepare pnpm@latest --activate \
+ && git clone --depth 1 https://github.com/letta-ai/social-cli.git /opt/social-cli \
+ && cd /opt/social-cli && pnpm install --frozen-lockfile && pnpm build \
+ && ln -sf /opt/social-cli/bin/social-cli /usr/local/bin/social-cli
