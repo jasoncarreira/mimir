@@ -130,7 +130,8 @@ async def saga_end_session(
     emotional_state: Optional[str] = None,
     closed_since: Optional[list[str]] = None,
 ) -> str:
-    """Write a session_boundary atom for a SAGA session.
+    """Close a SAGA session by writing the rendered boundary fields to
+    the ``sessions`` table (replaces the legacy session_boundary atom).
 
     Auto-invoked by the synthesis turn at idle timeout (SPEC §5.6);
     call explicitly if you know a session is wrapping ("talk later").

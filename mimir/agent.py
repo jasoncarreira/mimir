@@ -61,7 +61,6 @@ from .prompts import build_system_prompt, build_turn_prompt
 from .rate_limits import RateLimitStore
 from .saga_client import SagaClient
 from .session_boundary_log import (
-    SessionBoundaryLog,
     count_turns_since,
     render_session_summaries,
 )
@@ -431,9 +430,6 @@ class Agent:
             default_limit_per_polarity=config.feedback_limit_per_polarity,
             events_snapshot=self._events_snapshot,
             turns_snapshot=self._turns_snapshot,
-        )
-        self._session_boundary_log = SessionBoundaryLog(
-            path=config.home / ".mimir" / "session_boundaries.jsonl",
         )
         # Plan-window rate-limit state — real RateLimitStore (replaces
         # the deprecated _RateLimitStub). The oauth_usage_poller writes
@@ -1737,9 +1733,8 @@ class Agent:
     async def _assemble_session_summaries(
         self, *, channel_id: str | None,
     ) -> str | None:
-        """Render the Recent session summaries block. Tries SAGA first
-        (chronological recall via /v1/sessions/recent); falls back to
-        the local mirror on empty / failure."""
+        """Render the Recent session summaries block from SagaStore's
+        ``recent_session_boundaries()``."""
         count = self._config.recent_boundaries
         if count <= 0:
             return None
@@ -1758,14 +1753,9 @@ class Agent:
             except Exception:  # noqa: BLE001
                 log.exception(
                     "_assemble_session_summaries: SAGA "
-                    "recent_session_boundaries failed; falling back to "
-                    "local mirror"
+                    "recent_session_boundaries failed"
                 )
                 boundaries = []
-        if not boundaries:
-            boundaries = self._session_boundary_log.recent(
-                channel_id=channel_id, count=count,
-            )
         turn_counts: dict[str, int] = {}
         if channel_id is not None and boundaries:
             snapshot_records = self._turns_snapshot.records
