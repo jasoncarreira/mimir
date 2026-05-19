@@ -34,6 +34,7 @@ custom edits.
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,7 +45,24 @@ from mimir.skill_md import parse_frontmatter
 #: ``mimir/skill_install.py`` lives at ``<repo>/mimir/skill_install.py``;
 #: optional-skills lives at ``<repo>/optional-skills/``. One level up
 #: from this file gives the repo root.
+#:
+#: Caveat: this resolves correctly only from a source-tree install (uv
+#: editable install, git clone). A pip-installed mimir wheel doesn't
+#: package the ``optional-skills/`` tree at all — callers that hit this
+#: path get a clear error message via ``_resolve_optional_skills_root``
+#: rather than the silent "no optional skills available" footgun.
 DEFAULT_OPTIONAL_SKILLS_ROOT = Path(__file__).parent.parent / "optional-skills"
+
+#: Maximum width of the description column in CLI listings before we
+#: truncate with an ellipsis. Tuned so a single line stays under ~140
+#: cols when combined with name + [poller] flag.
+_DESC_BUDGET = 100
+
+#: Fixed width for the ``[poller]`` flag column in listings, so rows
+#: with and without the flag stay vertically aligned (issue #226 nit 3).
+#: " [poller]" is 9 chars; pad to 10 for a 1-space gutter before the
+#: description column.
+_FLAG_COL_WIDTH = 10
 
 
 @dataclass(frozen=True)
@@ -52,23 +70,26 @@ class OptionalSkill:
     name: str
     description: str  # one-line from SKILL.md frontmatter ``description:``
     has_pollers_json: bool
-    path: Path  # source path under optional-skills/
+    path: Path  # path on disk (source for list_available, installed for list_installed)
 
 
-# ─── Inventory ───────────────────────────────────────────────────────
+# ─── Shared inventory helper ─────────────────────────────────────────
 
 
-def list_available(root: Path | None = None) -> list[OptionalSkill]:
-    """Walk ``optional-skills/`` and return one entry per installable skill.
+def _walk_skills_dir(root: Path) -> list[OptionalSkill]:
+    """Walk a directory of skills and return one ``OptionalSkill`` per
+    valid subdir. Shared between ``list_available`` (walks
+    ``optional-skills/``) and ``list_installed`` (walks
+    ``<home>/.claude/skills/``) so the two listing paths stay in lockstep.
 
-    Skills without a ``SKILL.md`` are skipped (the framework's contract
-    is that every skill has frontmatter — anything else is an
-    in-progress draft that shouldn't be installable).
+    Skipped:
+    - Hidden entries (``.foo``)
+    - Non-directories
+    - Directories without ``SKILL.md`` (in-progress drafts, not skills)
+    - Skills whose ``SKILL.md`` frontmatter fails to parse
     """
-    root = root or DEFAULT_OPTIONAL_SKILLS_ROOT
     if not root.is_dir():
         return []
-
     out: list[OptionalSkill] = []
     for entry in sorted(root.iterdir()):
         if not entry.is_dir() or entry.name.startswith("."):
@@ -80,9 +101,8 @@ def list_available(root: Path | None = None) -> list[OptionalSkill]:
             meta = parse_frontmatter(skill_md.read_text())
         except Exception:
             continue
-        desc = (meta.get("description") or "").strip()
         # Collapse whitespace; descriptions are often multi-line folded.
-        desc = " ".join(desc.split())
+        desc = " ".join((meta.get("description") or "").strip().split())
         out.append(OptionalSkill(
             name=entry.name,
             description=desc,
@@ -90,6 +110,48 @@ def list_available(root: Path | None = None) -> list[OptionalSkill]:
             path=entry,
         ))
     return out
+
+
+def _resolve_optional_skills_root(
+    explicit: Path | None = None,
+) -> Path | None:
+    """Return the optional-skills root if it exists on disk, or None.
+
+    Caller code uses the None return to emit a clear "this requires a
+    source-tree mimir install" message rather than silently producing
+    "no optional skills available" — the latter behavior was the
+    pip-install footgun Mimir's #224 re-review flagged.
+    """
+    root = explicit or DEFAULT_OPTIONAL_SKILLS_ROOT
+    return root if root.is_dir() else None
+
+
+_PIP_INSTALL_HINT = (
+    "optional-skills/ not found at {expected}.\n"
+    "This usually means mimir was installed from a wheel (pip / pipx) — "
+    "optional skills aren't packaged for wheel distribution. To use "
+    "`mimir skills install` / `list-optional`, run from a source-tree "
+    "install:\n"
+    "  git clone https://github.com/jasoncarreira/mimir.git\n"
+    "  cd mimir && uv sync\n"
+    "  uv run mimir skills list-optional"
+)
+
+
+# ─── Inventory ───────────────────────────────────────────────────────
+
+
+def list_available(root: Path | None = None) -> list[OptionalSkill]:
+    """Walk ``optional-skills/`` and return one entry per installable skill.
+
+    Returns ``[]`` when the optional-skills tree isn't on disk (e.g.,
+    wheel install). Callers wanting to distinguish "no tree" from "tree
+    but no skills" should call ``_resolve_optional_skills_root`` directly.
+    """
+    resolved = _resolve_optional_skills_root(root)
+    if resolved is None:
+        return []
+    return _walk_skills_dir(resolved)
 
 
 # ─── Install ────────────────────────────────────────────────────────
@@ -114,10 +176,16 @@ def install(
     """Copy an opt-in skill into the agent home.
 
     Raises:
-        FileNotFoundError: source skill doesn't exist.
+        FileNotFoundError: source skill doesn't exist (either the
+            optional-skills root is missing entirely, or the named skill
+            isn't under it).
         FileExistsError: destination exists and ``force`` is False.
     """
-    root = optional_skills_root or DEFAULT_OPTIONAL_SKILLS_ROOT
+    root = _resolve_optional_skills_root(optional_skills_root)
+    if root is None:
+        expected = optional_skills_root or DEFAULT_OPTIONAL_SKILLS_ROOT
+        raise FileNotFoundError(_PIP_INSTALL_HINT.format(expected=expected))
+
     src = root / name
     if not src.is_dir() or not (src / "SKILL.md").is_file():
         raise FileNotFoundError(
@@ -163,34 +231,43 @@ def install(
 def list_installed(home: Path) -> list[OptionalSkill]:
     """Walk ``<home>/.claude/skills/`` and return one entry per skill.
 
-    Same shape as ``list_available`` so the CLI can format both
-    listings the same way. ``has_pollers_json`` is computed from the
-    installed copy.
+    Same shape as ``list_available`` (both reuse ``_walk_skills_dir``)
+    so the CLI can format both listings the same way.
     """
-    skills_root = home / ".claude" / "skills"
-    if not skills_root.is_dir():
-        return []
+    return _walk_skills_dir(home / ".claude" / "skills")
 
-    out: list[OptionalSkill] = []
-    for entry in sorted(skills_root.iterdir()):
-        if not entry.is_dir() or entry.name.startswith("."):
-            continue
-        skill_md = entry / "SKILL.md"
-        if not skill_md.is_file():
-            continue
-        try:
-            meta = parse_frontmatter(skill_md.read_text())
-        except Exception:
-            continue
-        desc = (meta.get("description") or "").strip()
-        desc = " ".join(desc.split())
-        out.append(OptionalSkill(
-            name=entry.name,
-            description=desc,
-            has_pollers_json=(entry / "pollers.json").is_file(),
-            path=entry,
-        ))
-    return out
+
+# ─── Listing-format helpers ─────────────────────────────────────────
+
+
+def _truncate_desc(desc: str, budget: int = _DESC_BUDGET) -> str:
+    """Truncate ``desc`` to ``budget`` chars with an ellipsis suffix.
+
+    Used by both ``cmd_list`` and ``cmd_list_optional`` so the
+    description column has consistent width. Was previously copy-pasted
+    in both; centralized per issue #226 nit 4.
+    """
+    if len(desc) <= budget:
+        return desc
+    # Reserve 3 chars for the "..." suffix.
+    return desc[: budget - 3] + "..."
+
+
+def _format_skill_row(skill: OptionalSkill, name_width: int) -> str:
+    """Format one OptionalSkill as a listing row with fixed-width name
+    + fixed-width [poller] flag + description columns.
+
+    Both name AND flag get their own padding so rows with and without
+    the flag stay vertically aligned (issue #226 nit 3). Without this,
+    "[poller]" appended to the name column shifted the description
+    column right on every poller row.
+    """
+    flag = "[poller]" if skill.has_pollers_json else ""
+    return (
+        f"  {skill.name:<{name_width}}  "
+        f"{flag:<{_FLAG_COL_WIDTH}}  "
+        f"{_truncate_desc(skill.description)}"
+    )
 
 
 # ─── CLI wiring (mimir skills install / mimir skills list-optional) ──
@@ -225,7 +302,6 @@ def add_argparse_list_optional(parser) -> None:
 
 def _resolve_home(home_arg: Path | None) -> Path:
     """Same precedence as the rest of the mimir CLI: --home > $MIMIR_HOME > cwd."""
-    import os
     if home_arg is not None:
         return home_arg.resolve()
     env = os.environ.get("MIMIR_HOME")
@@ -268,20 +344,24 @@ def cmd_install(args) -> int:
 
 def cmd_list_optional(args) -> int:
     """``mimir skills list-optional`` entry point."""
+    # Distinguish the wheel-install case ("optional-skills tree doesn't
+    # exist") from the source-tree empty-listing case so operators know
+    # what to do.
+    resolved = _resolve_optional_skills_root()
+    if resolved is None:
+        print(_PIP_INSTALL_HINT.format(expected=DEFAULT_OPTIONAL_SKILLS_ROOT))
+        return 2
+
     skills = list_available()
     if not skills:
-        print("no optional skills available (looked in: "
-              f"{DEFAULT_OPTIONAL_SKILLS_ROOT})")
+        print(f"no optional skills found under {resolved}")
         return 0
     width = max(len(s.name) for s in skills)
     for s in skills:
-        flag = " [poller]" if s.has_pollers_json else ""
-        # Truncate description to keep the listing readable.
-        desc = s.description if len(s.description) <= 100 else s.description[:97] + "..."
-        print(f"  {s.name:<{width}}{flag}  {desc}")
+        print(_format_skill_row(s, width))
     print(
         f"\ninstall: mimir skills install <name> [--home PATH]\n"
-        f"source:  {DEFAULT_OPTIONAL_SKILLS_ROOT}"
+        f"source:  {resolved}"
     )
     return 0
 
@@ -314,9 +394,7 @@ def cmd_list(args) -> int:
     print(f"installed skills in {home}/.claude/skills/  "
           f"(n={len(skills)}, pollers={len(pollers)}):\n")
     for s in skills:
-        flag = " [poller]" if s.has_pollers_json else ""
-        desc = s.description if len(s.description) <= 100 else s.description[:97] + "..."
-        print(f"  {s.name:<{width}}{flag}  {desc}")
+        print(_format_skill_row(s, width))
     print(
         f"\nadd more:    mimir skills install <name> [--home PATH]\n"
         f"available:   mimir skills list-optional"
