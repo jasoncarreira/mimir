@@ -557,3 +557,143 @@ def test_render_dockerfile_handles_sentinel_in_fragment(tmp_path: Path):
     # The fragment contents (including the embedded sentinel literal)
     # should be present somewhere.
     assert "RUN echo evil" in out
+
+
+# ── Re-review (#225 second round) regression tests ───────────────────
+
+
+def test_dockerfile_header_does_not_falsely_claim_preservation(home_with_two_skills):
+    """Mimir #225 re-review caught the Dockerfile header comment
+    promising "operator edits OUTSIDE the sentinel-marked blocks are
+    preserved" — but scaffold() does df_path.write_text() (full regen)
+    so the claim was false and would silently lose operator edits.
+    Header must now warn that the file is fully regenerated.
+    """
+    scaffold(home_with_two_skills)
+    df = (home_with_two_skills / "Dockerfile").read_text()
+    # Regression: must not promise preservation.
+    assert "are preserved across regenerations" not in df
+    # Must warn about regeneration.
+    assert "REGENERATED IN" in df
+    assert "do NOT edit" in df
+
+
+def test_compose_yml_header_warns_about_regen(home_with_two_skills):
+    scaffold(home_with_two_skills)
+    cy = (home_with_two_skills / "compose.yml").read_text()
+    assert "REGENERATED IN" in cy
+    assert "WILL be lost" in cy
+
+
+def test_start_sh_header_warns_about_regen(home_with_two_skills):
+    scaffold(home_with_two_skills)
+    ss = (home_with_two_skills / "start.sh").read_text()
+    assert "REGENERATED IN" in ss
+    assert "do NOT edit" in ss
+
+
+def test_scaffold_idempotent_reporting_no_changes(home_with_two_skills):
+    """Mimir #225 re-review: ``files_written`` was reporting Dockerfile
+    / compose.yml / start.sh on EVERY run, even when the rendered
+    content was byte-identical to what was already on disk. For an
+    idempotent tool, "written" should mean "something changed."
+    """
+    # First run — everything is new.
+    r1 = scaffold(home_with_two_skills)
+    assert "Dockerfile" in r1.files_written
+    assert "compose.yml" in r1.files_written
+    assert "start.sh" in r1.files_written
+
+    # Second run — no inputs changed → nothing should be reported as written.
+    r2 = scaffold(home_with_two_skills)
+    assert r2.files_written == [], (
+        f"expected no files written on re-run, got: {r2.files_written}"
+    )
+    # All three should land in skipped instead.
+    skipped_labels = {s.split(" ")[0] for s in r2.files_skipped}
+    for f in ("Dockerfile", "compose.yml", "start.sh"):
+        assert f in skipped_labels, f"{f} should be in skipped on idempotent re-run"
+
+
+def test_scaffold_reports_only_changed_files(home_with_two_skills):
+    """If only one input changes between runs, only that file should
+    appear in ``files_written`` — the others stay in ``files_skipped``.
+    """
+    scaffold(home_with_two_skills)
+    # Install a new skill with a fragment → Dockerfile changes; others don't.
+    new = home_with_two_skills / ".claude" / "skills" / "newcomer"
+    new.mkdir()
+    (new / "SKILL.md").write_text("---\nname: newcomer\n---\n")
+    (new / "dockerfile.fragment").write_text("RUN echo newcomer")
+
+    r = scaffold(home_with_two_skills)
+    assert "Dockerfile" in r.files_written
+    assert "compose.yml" not in r.files_written
+    assert "start.sh" not in r.files_written
+
+
+def test_start_sh_chmod_persists_through_no_change_runs(home_with_two_skills):
+    """The chmod call is unconditional (separate from write_if_changed)
+    so a previously-corrupted mode bit gets restored even when content
+    is unchanged. Sanity check: after an idempotent re-run, start.sh
+    is still executable.
+    """
+    import stat
+    scaffold(home_with_two_skills)
+    ss = home_with_two_skills / "start.sh"
+    # Drop the exec bit manually.
+    ss.chmod(0o644)
+    assert not (ss.stat().st_mode & stat.S_IXUSR)
+    # Re-run with no input changes — content stays same, mode bit gets restored.
+    scaffold(home_with_two_skills)
+    assert ss.stat().st_mode & stat.S_IXUSR
+
+
+def test_baseline_env_includes_mimir_git_url(home_with_two_skills, capsys):
+    """Mimir #225 re-review: MIMIR_GIT_URL is referenced in start.sh
+    via ${MIMIR_GIT_URL:-default} so non-mimir agent homes (Muninn,
+    forks) can override the clone source — but it wasn't in the
+    baseline keys list, so compose.env never templated a placeholder
+    for it. Operators got a silent footgun.
+    """
+    scaffold(home_with_two_skills)
+    env = (home_with_two_skills / "compose.env").read_text()
+    assert "MIMIR_GIT_URL" in env, (
+        "MIMIR_GIT_URL must be in compose.env's baseline placeholders "
+        "so operators forking the source can find the env var to set."
+    )
+
+
+def test_start_sh_has_mimir_git_url_inline_doc(home_with_two_skills):
+    """The MIMIR_GIT_URL reference in start.sh should carry an inline
+    comment explaining when to override (e.g. for Muninn-like forks)."""
+    scaffold(home_with_two_skills)
+    ss = (home_with_two_skills / "start.sh").read_text()
+    # The line right before the REPO_URL assignment should mention
+    # MIMIR_GIT_URL and forks.
+    assert "MIMIR_GIT_URL" in ss
+    assert "fork" in ss.lower() or "override" in ss.lower()
+
+
+def test_gmail_fragment_has_bump_comment():
+    """Mimir nit: hardcoded Go version should carry a bump-this comment
+    so future maintainers know it's a pin, not a load-bearing constant."""
+    frag_path = (
+        Path(__file__).parent.parent
+        / "optional-skills" / "gmail-poller" / "dockerfile.fragment"
+    )
+    text = frag_path.read_text()
+    # Some form of "bump" / "update" / "check" guidance near the version.
+    assert "Go version" in text
+    assert "Bump" in text or "bump" in text
+
+
+def test_social_cli_fragment_has_pin_comment():
+    """Mimir nit: cloning untagged main is non-deterministic — flag it
+    so a future maintainer pins when upstream stabilizes."""
+    frag_path = (
+        Path(__file__).parent.parent
+        / "optional-skills" / "social-cli-poller" / "dockerfile.fragment"
+    )
+    text = frag_path.read_text()
+    assert "pin" in text.lower() or "tag" in text.lower()

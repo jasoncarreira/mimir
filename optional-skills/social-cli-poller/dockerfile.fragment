@@ -11,6 +11,12 @@
 # Pinned to a clone of main because letta-ai/social-cli is still
 # pre-tag. Bump to a release tag when one lands.
 
+# Clones letta-ai/social-cli's main branch (no tags published yet).
+# When upstream stabilizes + cuts tagged releases, pin to a commit hash
+# (``git clone ... && git -C /opt/social-cli checkout <sha>``) or a
+# release tag for build reproducibility. Until then, ``--depth 1`` on
+# main is the trade-off — fast clone, but the build is non-deterministic
+# across rebuilds.
 RUN corepack enable && corepack prepare pnpm@latest --activate \
  && git clone --depth 1 https://github.com/letta-ai/social-cli.git /opt/social-cli \
  && cd /opt/social-cli && pnpm install --frozen-lockfile && pnpm build \
