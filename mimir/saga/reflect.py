@@ -1,22 +1,26 @@
 """reflect — session-end bookkeeping.
 
 Triggered at session_boundary turn (mimir's synthesis-turn mechanism).
-Emits exactly one session_boundary atom per session, plus the
-session_member relations that link the boundary to atoms accessed
-during the session.
+Writes exactly one ``sessions`` row per session with the full structured
+boundary (summary, topics, decisions, unfinished, emotional_state,
+closed_since) plus an embedding of the summary so ``search_sessions()``
+can do semantic retrieval over past sessions.
+
+Sessions live in the dedicated ``sessions`` table — NOT in ``atoms``.
+The old path that stored ``source_type='session_boundary'`` atoms with
+``session_member`` relations was removed: it added an 80%-bulk atom
+class that retrieval / FTS / consolidate / dedup all filtered out and
+that wasted FAISS slots. The ``sessions`` table holds the same
+information without the indirection.
 
 Observation synthesis is NOT done here — it lives in
 ``mimir.saga.consolidate.consolidate()``, which runs on a cron over
-cross-session evidence. The within-session synthesis hook that lived
-here through earlier iterations was removed (2026-05-13): no
-production caller used it, and the cluster + synth + relations logic
-duplicated consolidate.py's path. Cross-session evidence accumulates
-into tighter, more reliable clusters than single-session snapshots.
+cross-session evidence.
 
-Idempotency: reflect(session_id) called twice returns the existing
-session_boundary atom and skips re-synthesis. The agent can call
-saga_end_session multiple times during one session_end turn (e.g. via
-retries) without re-doing the work.
+Idempotency: ``reflect(session_id)`` called twice detects the existing
+sessions row and short-circuits. The lifecycle layer can re-call after
+a freshly-resolved channel_id and we backfill that column without
+re-synthesizing.
 """
 
 from __future__ import annotations
@@ -27,24 +31,23 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
-from .store import store
-
 
 # Injected callables — same pattern as store.EmbedFn.
 
 # Boundary synthesis: agent + atoms → boundary content fields.
-# Saga's current saga_end_session tool's contract (mimir's synthesis
-# turn renders these). Returns a dict with summary, topics_discussed,
-# decisions_made, unfinished, emotional_state.
+# Mimir's synthesis turn renders these. Returns a dict with summary,
+# topics_discussed, decisions_made, unfinished, emotional_state,
+# closed_since.
 BoundarySynthFn = Callable[[list[dict], dict | None], dict]
 
 
 @dataclass
 class ReflectResult:
     session_id: str
-    boundary_atom_id: str | None = None
-    boundary_created: bool = False         # False = pre-existing (idempotent re-run)
-    session_member_count: int = 0
+    #: ``True`` if a new sessions row was written this call; ``False`` if
+    #: a row already existed (idempotent re-run — channel_id backfill may
+    #: still have applied but no synthesis fired).
+    session_summary_written: bool = False
 
 
 def _utc_now_iso() -> str:
@@ -82,45 +85,31 @@ def _session_atoms(
     return [dict(zip(cols, r)) for r in rows]
 
 
-def _existing_boundary(
+def _parse_json_list(v: str | None) -> list:
+    """Parse a JSON-encoded list column from the sessions table. Returns
+    [] for NULL / empty / malformed input — sessions rows may have
+    missing structured fields when the boundary synth produced an empty
+    extraction."""
+    if not v:
+        return []
+    try:
+        return json.loads(v)
+    except (TypeError, ValueError):
+        return []
+
+
+def _existing_session_summary(
     conn: sqlite3.Connection,
     session_id: str,
-    agent_id: str = "default",
-) -> str | None:
-    """Return atom_id of the session_boundary for this session if one
-    exists. Powers idempotency on reflect re-calls. Scoped to agent_id
-    so multi-agent DBs sharing a session_id (rare but supported by the
-    schema) don't short-circuit each other's reflects."""
-    row = conn.execute("""
-        SELECT id FROM atoms
-        WHERE source_type = 'session_boundary'
-          AND session_id = ?
-          AND agent_id = ?
-          AND tombstoned = 0
-    """, (session_id, agent_id)).fetchone()
-    return row[0] if row else None
-
-
-def _link_session_members(
-    conn: sqlite3.Connection,
-    boundary_id: str,
-    atom_ids: list[str],
-) -> int:
-    """Insert session_member relations from boundary → each session
-    atom. Caller-controlled transaction; this just runs statements.
-
-    Idempotent via INSERT OR IGNORE (the PK includes relation_type,
-    so duplicate boundary→atom pairs are no-ops)."""
-    if not atom_ids:
-        return 0
-    now = _utc_now_iso()
-    conn.executemany(
-        "INSERT OR IGNORE INTO atom_relations "
-        "(source_id, target_id, relation_type, confidence, created_at) "
-        "VALUES (?, ?, 'session_member', 1.0, ?)",
-        [(boundary_id, aid, now) for aid in atom_ids],
-    )
-    return len(atom_ids)
+) -> bool:
+    """True if a sessions row with this id has already been written
+    by reflect (reflected_at IS NOT NULL means the row has structured
+    fields beyond the lifecycle-only stub)."""
+    row = conn.execute(
+        "SELECT 1 FROM sessions WHERE id = ? AND reflected_at IS NOT NULL",
+        (session_id,),
+    ).fetchone()
+    return row is not None
 
 
 def reflect(
@@ -133,24 +122,26 @@ def reflect(
     boundary_context: dict | None = None,
     agent_id: str = "default",
 ) -> ReflectResult:
-    """Session-end bookkeeping. See module docstring.
+    """Session-end bookkeeping.
 
-    Writes the session_boundary atom + session_member relations + the
-    sessions table row. Does NOT synthesize observations — that's
-    consolidate.py's job (cron-driven, cross-session).
+    Writes a sessions row capturing the full structured boundary
+    (summary, topics_discussed, decisions_made, unfinished,
+    emotional_state, closed_since) plus an embedding of the summary
+    for ``search_sessions()``. Does NOT write atoms.
+
+    Does NOT synthesize observations — that's consolidate.py's job
+    (cron-driven, cross-session).
 
     ``boundary_context`` is optional state from mimir's lifecycle layer
-    (e.g., recent boundaries to chain from, the agent's running
-    emotional_state). Passed through to ``boundary_synth_fn`` so the
-    synthesis can stitch sessions together coherently.
+    (recent sessions to chain from, the agent's running emotional_state).
+    Passed through to ``boundary_synth_fn`` so the synthesis can stitch
+    sessions together coherently.
     """
-    # Idempotency: short-circuit if a boundary already exists. Still
-    # upsert the sessions row though — a caller re-ending a session
-    # with a freshly-resolved channel_id (e.g., the dispatcher learned
-    # which channel the boundary belongs to between calls) should be
-    # able to backfill that without us silently no-opping the row.
-    existing_bid = _existing_boundary(conn, session_id, agent_id=agent_id)
-    if existing_bid is not None:
+    # Idempotency: short-circuit if reflect has already written this
+    # session. Still backfill channel_id when a caller re-ends with a
+    # freshly-resolved channel — the dispatcher sometimes learns the
+    # channel after the first reflect call.
+    if _existing_session_summary(conn, session_id):
         if channel_id is not None:
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -162,92 +153,28 @@ def reflect(
                 conn.commit()
             except Exception:
                 conn.rollback()
-                # Non-fatal — the boundary still resolves; the
-                # channel_id backfill is best-effort.
+                # Non-fatal — the session row still resolves; channel_id
+                # backfill is best-effort.
         return ReflectResult(
             session_id=session_id,
-            boundary_atom_id=existing_bid,
-            boundary_created=False,
+            session_summary_written=False,
         )
 
     atoms = _session_atoms(conn, session_id, agent_id=agent_id)
 
-    # ─── Always: synthesize + store the session_boundary ──────────
+    # ─── Synthesize boundary fields ───────────────────────────────
     fields = boundary_synth_fn(atoms, boundary_context)
-    # Render the boundary content as a single coherent block. The
-    # individual fields land in metadata so the prompt-build path can
-    # render them structured if desired.
-    content_parts = [fields.get("summary", "").strip()]
+    summary = (fields.get("summary") or "").strip()
     topics = fields.get("topics_discussed") or []
     decisions = fields.get("decisions_made") or []
     unfinished = fields.get("unfinished") or []
     emotional_state = fields.get("emotional_state")
     closed_since = fields.get("closed_since") or []
-    if topics:
-        content_parts.append("Topics: " + "; ".join(topics))
-    if decisions:
-        content_parts.append("Decisions: " + "; ".join(decisions))
-    if unfinished:
-        content_parts.append("Unfinished: " + "; ".join(unfinished))
-    if emotional_state:
-        content_parts.append(f"Emotional state: {emotional_state}")
-    content = "\n\n".join(p for p in content_parts if p)
-    if not content.strip():
-        content = "[session ended; no significant activity]"
-    # Append a session-unique discriminator so two boundaries with
-    # otherwise-identical synthesis text don't collide on the UNIQUE
-    # (content_hash, agent_id) index. The discriminator is visible in
-    # the content (rendered to the agent) but small enough to ignore;
-    # it could be hidden in metadata instead if we ever care.
-    content = f"{content}\n\n[session={session_id}]"
 
-    boundary_result = store(
-        conn, content,
-        embed_fn=embed_fn,
-        memory_type="raw",   # session_boundary is a raw with a marker source_type
-        source_type="session_boundary",
-        topics=topics,
-        metadata={
-            # Canonical render-shape fields (chainlink #63 / PR #86 fix).
-            # recent_session_boundaries() reads these back out so the
-            # prompt renderer gets ts/summary/unfinished/closed_since
-            # without needing to parse the content blob.
-            "summary": fields.get("summary", ""),
-            "topics_discussed": topics,
-            "decisions_made": decisions,
-            "unfinished": unfinished,
-            "emotional_state": emotional_state,
-            "closed_since": closed_since,
-        },
-        agent_id=agent_id,
-        session_id=session_id,
-    )
-    boundary_id = boundary_result.atom_id
-
-    # ─── Always: link session_member relations from boundary → raws ──
-    # One short transaction for the relation inserts.
-    member_ids = [a["id"] for a in atoms]
-    member_count = 0
-    if member_ids:
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            member_count = _link_session_members(conn, boundary_id, member_ids)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-
-    # Observation synthesis is handled separately by consolidate.py
-    # (cron-driven, cross-session). Within-session synthesis was
-    # removed 2026-05-13 — no production caller used it and the
-    # cluster + synth logic duplicated consolidate's path.
-
-    # ─── Compute session embedding ────────────────────────────────
-    # Used by search_sessions() for semantic retrieval. Embedding is
-    # best-effort — a failed embed doesn't abort the session close.
-    summary = fields.get("summary", "")
-    # ``closed_since`` already bound above for the boundary-atom metadata;
-    # this scope reuses it for the sessions-table INSERT VALUES below.
+    # ─── Embed the summary ────────────────────────────────────────
+    # Used by search_sessions() for semantic retrieval. Best-effort —
+    # a failed embed doesn't abort the session close; the row lands
+    # with NULL embedding and search_sessions() falls back to recency.
     emb_bytes: bytes | None = None
     emb_dim: int | None = None
     if embed_fn is not None and summary:
@@ -256,9 +183,11 @@ def reflect(
             if emb_result:
                 emb_bytes, _, _, emb_dim = emb_result
         except Exception:
-            pass  # non-fatal; session closes with NULL embedding
+            pass
 
-    # ─── Update sessions table ────────────────────────────────────
+    now = _utc_now_iso()
+
+    # ─── Write sessions row ───────────────────────────────────────
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("""
@@ -284,10 +213,10 @@ def reflect(
                 embedding_dim    = COALESCE(excluded.embedding_dim, sessions.embedding_dim)
         """, (
             session_id, channel_id,
-            atoms[0]["created_at"] if atoms else _utc_now_iso(),
-            _utc_now_iso(),
+            atoms[0]["created_at"] if atoms else now,
+            now,
             summary,
-            _utc_now_iso(),
+            now,
             json.dumps(topics),
             json.dumps(decisions),
             json.dumps(unfinished),
@@ -303,9 +232,7 @@ def reflect(
 
     return ReflectResult(
         session_id=session_id,
-        boundary_atom_id=boundary_id,
-        boundary_created=True,
-        session_member_count=member_count,
+        session_summary_written=True,
     )
 
 
@@ -314,79 +241,129 @@ def recent_session_boundaries(
     *,
     channel_id: str | None = None,
     count: int = 3,
-    agent_id: str = "default",
+    agent_id: str = "default",  # noqa: ARG001 — see note below
 ) -> list[dict]:
-    """Return the most recent session_boundary atoms (by created_at),
+    """Return the most recent session summaries (by ``reflected_at``),
     optionally scoped to a channel. Used by the prompt-build path to
     render cross-session continuity.
 
-    Bypasses activation-based recall entirely — boundaries are ordered
-    by recency, not relevance. Their job is "what happened recently in
-    this channel," not "what's semantically related to a query."
+    Reads from the ``sessions`` table directly — no atoms involved.
+    Bypasses activation-based recall: sessions are ordered by recency,
+    not relevance. Their job is "what happened recently in this channel,"
+    not "what's semantically related to a query." Use
+    ``SagaStore.search_sessions()`` for the semantic path.
+
+    Return dict shape (matches the pre-migration prompt-build contract —
+    ``mimir/agent.py`` and ``session_boundary_log.render_session_summaries``
+    read fields from the top level, not from ``metadata``):
+        id, atom_id, session_id  — all equal to session_id (atom_id is
+                                   the historical key the local mirror
+                                   used; preserved for compatibility)
+        ts                       — sessions.ended_at (falls back to reflected_at);
+                                   the prompt builder keys turn_counts on this
+        created_at               — alias of ts
+        content                  — rendered summary block (summary + topics + ...)
+        summary                  — sessions.summary
+        topics_discussed         — list (parsed from JSON)
+        decisions_made           — list
+        unfinished               — list — render_session_summaries reads this
+                                   for the Unfinished section
+        closed_since             — list — render_session_summaries reads this
+                                   for cross-boundary unfinished suppression
+        emotional_state          — string | None
+        channel_id, channel      — both populated from sessions row
+        metadata                 — dict echoing the structured fields, for
+                                   callers that prefer the nested shape
+
+    ``agent_id`` is accepted for caller-signature compatibility
+    (saga_client surface, ``mimir/agent.py``, tests) but intentionally
+    NOT used in the query — the sessions table is agent-agnostic. A
+    multi-agent deployment sharing one sessions table would see all
+    agents' sessions here. Non-issue under the single-agent-per-DB
+    posture; revisit if a multi-agent DB shape lands.
     """
     if channel_id is not None:
         rows = conn.execute("""
-            SELECT a.id, a.content, a.created_at, a.metadata, a.session_id, s.channel_id
-            FROM atoms a
-            LEFT JOIN sessions s ON s.id = a.session_id
-            WHERE a.source_type = 'session_boundary'
-              AND a.tombstoned = 0
-              AND a.agent_id = ?
-              AND s.channel_id = ?
-            ORDER BY a.created_at DESC LIMIT ?
-        """, (agent_id, channel_id, count)).fetchall()
+            SELECT id, channel_id, ended_at, reflected_at, summary,
+                   topics_discussed, decisions_made, unfinished,
+                   emotional_state, closed_since
+            FROM sessions
+            WHERE channel_id = ?
+              AND reflected_at IS NOT NULL
+            ORDER BY reflected_at DESC LIMIT ?
+        """, (channel_id, count)).fetchall()
     else:
         rows = conn.execute("""
-            SELECT a.id, a.content, a.created_at, a.metadata, a.session_id, s.channel_id
-            FROM atoms a
-            LEFT JOIN sessions s ON s.id = a.session_id
-            WHERE a.source_type = 'session_boundary'
-              AND a.tombstoned = 0
-              AND a.agent_id = ?
-            ORDER BY a.created_at DESC LIMIT ?
-        """, (agent_id, count)).fetchall()
-    cols = ("id", "content", "created_at", "metadata",
-            "session_id", "channel_id")
-    out = []
+            SELECT id, channel_id, ended_at, reflected_at, summary,
+                   topics_discussed, decisions_made, unfinished,
+                   emotional_state, closed_since
+            FROM sessions
+            WHERE reflected_at IS NOT NULL
+            ORDER BY reflected_at DESC LIMIT ?
+        """, (count,)).fetchall()
+
+    out: list[dict] = []
     for r in rows:
-        d = dict(zip(cols, r))
-        # Decode metadata JSON.
-        meta: dict = {}
-        if d.get("metadata"):
-            try:
-                meta = json.loads(d["metadata"])
-            except (TypeError, ValueError):
-                pass
-        # Return canonical render-shape (matching local-mirror layout,
-        # chainlink #63 / PR #86). ``render_session_summaries`` looks for
-        # ``ts``/``channel_id``/``summary``/``unfinished``/``closed_since``;
-        # raw column names (``created_at``, ``content``) silently produced
-        # "(no summary) / 0 turns" before this mapping was added back.
-        #
-        # Fallback for older atoms that predate the metadata fix: extract
-        # the summary from the first paragraph of content. The atom's
-        # content is built as ``"<summary>\n\nTopics: ...\n\n[session=<id>]"``
-        # (see ``reflect()`` ~line 202 — the ``[session=...]`` discriminator
-        # is appended for content-hash uniqueness). Skip the marker if it
-        # somehow lands first (atoms with no summary at all).
-        summary = meta.get("summary") or ""
-        if not summary:
-            first_para = (d.get("content") or "").split("\n\n")[0].strip()
-            if not first_para.startswith("[session="):
-                summary = first_para
+        (sid, ch, ended_at, reflected_at, summary,
+         topics_json, decisions_json, unfinished_json,
+         emotional_state, closed_since_json) = r
+
+        topics = _parse_json_list(topics_json)
+        decisions = _parse_json_list(decisions_json)
+        unfinished = _parse_json_list(unfinished_json)
+        closed_since = _parse_json_list(closed_since_json)
+
+        # Render the same content shape reflect() used to produce so
+        # prompt-build callers that read ``content`` keep working.
+        parts = [summary.strip() if summary else ""]
+        if topics:
+            parts.append("Topics: " + "; ".join(topics))
+        if decisions:
+            parts.append("Decisions: " + "; ".join(decisions))
+        if unfinished:
+            parts.append("Unfinished: " + "; ".join(unfinished))
+        if emotional_state:
+            parts.append(f"Emotional state: {emotional_state}")
+        content = "\n\n".join(p for p in parts if p)
+        if not content.strip():
+            content = "[session ended; no significant activity]"
+
+        ts = ended_at or reflected_at
         out.append({
-            # Canonical render keys:
-            "ts": d.get("created_at") or "",
-            "channel_id": d.get("channel_id") or "",
-            "summary": summary,
-            "unfinished": meta.get("unfinished") or [],
-            "topics_discussed": meta.get("topics_discussed") or [],
-            "decisions_made": meta.get("decisions_made") or [],
-            "emotional_state": meta.get("emotional_state") or "",
-            "closed_since": meta.get("closed_since") or [],
-            # Passthrough for callers that want raw fields:
-            "id": d.get("id") or "",
-            "atom_id": d.get("id") or "",
-            "session_id": d.get("session_id") or "",
+            # Identity — multiple aliases match the pre-migration shape.
+            # ``atom_id`` was the SAGA atom id of the boundary atom; that
+            # atom no longer exists, but local-mirror code keys on it and
+            # the session_id serves the same identity role.
+            "id": sid,
+            "atom_id": sid,
+            "session_id": sid,
+            # Timestamp keys: render_session_summaries reads ``ts``;
+            # agent._assemble_session_summaries reads it for turn_counts.
+            # ``created_at`` is the post-migration alias.
+            "ts": ts,
+            "created_at": ts,
+            # Channel: both spellings populated.
+            "channel_id": ch,
+            "channel": ch,
+            # Rendered + raw content. ``summary`` MUST be at the top level
+            # — render_session_summaries reads it there, not from metadata.
+            "content": content,
+            "summary": summary or "",
+            # Structured fields at the top level (top-level reads in
+            # render_session_summaries + cross-boundary closed_since
+            # suppression). Mirrored in ``metadata`` for nested callers.
+            "topics_discussed": topics,
+            "decisions_made": decisions,
+            "unfinished": unfinished,
+            "emotional_state": emotional_state,
+            "closed_since": closed_since,
+            "metadata": {
+                "summary": summary or "",
+                "topics_discussed": topics,
+                "decisions_made": decisions,
+                "unfinished": unfinished,
+                "emotional_state": emotional_state,
+                "closed_since": closed_since,
+            },
         })
     return out

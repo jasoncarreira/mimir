@@ -152,23 +152,10 @@ def test_fts_search_excludes_tombstoned(conn):
     assert "a2" in ids
 
 
-def test_fts_search_excludes_session_boundaries_by_default(conn):
-    _insert_atom(conn, "a1", "Alice prefers concise replies")
-    _insert_atom(conn, "b1", "Session ended; discussed concise replies",
-                 source_type="session_boundary")
-    results = fts_search(conn, "concise", top_k=10)
-    ids = [aid for aid, _ in results]
-    assert "a1" in ids
-    assert "b1" not in ids
-
-
-def test_fts_search_can_include_session_boundaries(conn):
-    _insert_atom(conn, "b1", "Session ended; discussed concise",
-                 source_type="session_boundary")
-    results = fts_search(conn, "concise", top_k=10,
-                          include_session_boundaries=True)
-    ids = [aid for aid, _ in results]
-    assert "b1" in ids
+# Session-boundary FTS filter tests removed: session boundaries live in
+# the ``sessions`` table now, not as atoms with source_type='session_boundary'.
+# The FTS exclusion filter (and ``include_session_boundaries`` parameter)
+# was dropped because no atom has that source_type post-migration.
 
 
 def test_fts_search_returns_positive_scores(conn):

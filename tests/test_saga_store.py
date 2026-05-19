@@ -108,14 +108,14 @@ async def test_client_feedback_records_event(client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_client_end_session_creates_boundary(client, monkeypatch):
+async def test_client_end_session_writes_summary(client, monkeypatch):
     _patch_provider(monkeypatch)
     result = await client.end_session(
         "s1", "we discussed PR review",
         topics_discussed=["pr-review"],
     )
-    assert result["boundary_atom_id"] is not None
-    assert result["boundary_created"] is True
+    assert result["session_id"] == "s1"
+    assert result["session_summary_written"] is True
 
 
 @pytest.mark.asyncio
@@ -123,9 +123,9 @@ async def test_client_end_session_idempotent(client, monkeypatch):
     _patch_provider(monkeypatch)
     r1 = await client.end_session("s1", "first call")
     r2 = await client.end_session("s1", "second call")
-    assert r1["boundary_atom_id"] == r2["boundary_atom_id"]
-    assert r1["boundary_created"] is True
-    assert r2["boundary_created"] is False
+    assert r1["session_id"] == r2["session_id"] == "s1"
+    assert r1["session_summary_written"] is True
+    assert r2["session_summary_written"] is False
 
 
 @pytest.mark.asyncio

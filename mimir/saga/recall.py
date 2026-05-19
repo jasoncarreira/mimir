@@ -186,7 +186,6 @@ def recall(
     agent_id: str = "default",
     stream_filter: str | None = None,
     topic_filter: list[str] | None = None,
-    include_session_boundaries: bool = False,
     session_id: str | None = None,
     weights: dict[str, float] | None = None,
     fire_access_events: bool = True,
@@ -273,13 +272,10 @@ def recall(
             "created_at", "session_id")
     atoms = {row[0]: dict(zip(cols, row)) for row in atom_rows}
 
-    # Apply agent_id filter + source_type filter (session_boundary)
-    # + optional stream filter at this stage.
+    # Apply agent_id filter + optional stream filter at this stage.
     filtered: dict[str, dict] = {}
     for atom_id, atom in atoms.items():
         if atom["agent_id"] != agent_id and atom["agent_id"] != "shared":
-            continue
-        if not include_session_boundaries and atom["source_type"] == "session_boundary":
             continue
         if stream_filter and atom["stream"] != stream_filter:
             continue

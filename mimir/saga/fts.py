@@ -147,7 +147,6 @@ def fts_search(
     query: str,
     *,
     top_k: int = 20,
-    include_session_boundaries: bool = False,
     memory_type: str | None = None,
     agent_id: str = "default",
     synonyms: dict[str, list[str]] | None = None,
@@ -175,8 +174,6 @@ def fts_search(
 
     where = ["a.tombstoned = 0", "a.agent_id = ?"]
     params: list = [fts_q, agent_id]
-    if not include_session_boundaries:
-        where.append("(a.source_type IS NULL OR a.source_type != 'session_boundary')")
     if memory_type:
         where.append("a.memory_type = ?")
         params.append(memory_type)
@@ -198,7 +195,6 @@ def fts_search(
         return _fts_fallback(
             conn, expanded,
             top_k=top_k,
-            include_session_boundaries=include_session_boundaries,
             memory_type=memory_type,
             agent_id=agent_id,
         )
@@ -211,7 +207,6 @@ def _fts_fallback(
     query: str,
     *,
     top_k: int,
-    include_session_boundaries: bool,
     memory_type: str | None,
     agent_id: str,
 ) -> list[tuple[str, float]]:
@@ -227,8 +222,6 @@ def _fts_fallback(
 
     like_clauses = " AND ".join(["LOWER(a.content) LIKE ?"] * len(terms))
     where = [like_clauses, "a.tombstoned = 0", "a.agent_id = ?"]
-    if not include_session_boundaries:
-        where.append("(a.source_type IS NULL OR a.source_type != 'session_boundary')")
     if memory_type:
         where.append("a.memory_type = ?")
     where_sql = " AND ".join(where)
