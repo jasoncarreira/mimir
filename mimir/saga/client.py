@@ -293,9 +293,24 @@ WHERE a.source_type = 'session_boundary'
                   AND a.session_id = sessions.id
             );
 
-            -- Delete all dependents in dependency order:
-            -- 1. atom_access_summary → 2. access_events → 3. embeddings
-            -- → 4. atom_relations → 5. atoms
+            -- Delete all dependents BEFORE deleting the atoms themselves.
+            -- Every table with a FK to atoms(id) **in mimir.saga's schema**
+            -- must be cleaned here or the final ``DELETE FROM atoms`` fails
+            -- with ``FOREIGN KEY constraint failed`` and the whole migration
+            -- rolls back. The original v5 missed ``atom_topics`` — a
+            -- production DB with 1756 boundary-atom rows there caught it
+            -- (silently, because ``_ensure_conn`` was caching the
+            -- half-init connection — fixed below in this same commit).
+            --
+            -- ``triples`` is also in our schema (boundary atoms shouldn't
+            -- normally have triples but the FK exists). Tables like
+            -- ``access_log`` / ``corrections`` come from saga's vendored
+            -- schema and aren't referenced here; if they exist on a
+            -- legacy-migrated DB and have boundary refs, that's handled
+            -- by saga's own migration toolchain, not this v5 step.
+            --
+            -- Order is enforced by SQLite FK semantics: dependents first,
+            -- then the atoms.
             DELETE FROM atom_access_summary
             WHERE atom_id IN (
                 SELECT id FROM atoms WHERE source_type = 'session_boundary'
@@ -308,6 +323,22 @@ WHERE a.source_type = 'session_boundary'
 
             DELETE FROM embeddings
             WHERE atom_id IN (
+                SELECT id FROM atoms WHERE source_type = 'session_boundary'
+            );
+
+            -- atom_topics — many-to-many table; production saw 1756
+            -- boundary-atom rows here, which is what caused the original
+            -- v5 to FK-fail.
+            DELETE FROM atom_topics
+            WHERE atom_id IN (
+                SELECT id FROM atoms WHERE source_type = 'session_boundary'
+            );
+
+            -- triples — observation/raw atoms can be the source_atom_id
+            -- of extracted triples. Boundary atoms shouldn't have triples
+            -- in normal flow but a stray one would FK-fail.
+            DELETE FROM triples
+            WHERE source_atom_id IN (
                 SELECT id FROM atoms WHERE source_type = 'session_boundary'
             );
 
@@ -399,21 +430,42 @@ WHERE a.source_type = 'session_boundary'
             )
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         fresh = not self._db_path.exists()
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        if fresh:
-            schema_path = Path(__file__).parent / "schema.sql"
-            self._conn.executescript(schema_path.read_text())
-            self._conn.commit()
-        # Migration story: record the schema version we know how to
-        # serve so future SagaStore builds can detect when an
-        # existing DB needs migration. ``CURRENT_SCHEMA_VERSION``
-        # bumps with every shipped schema change; ``MIGRATIONS`` is
-        # the pending-migrations registry (empty until the first
-        # post-greenfield change). Idempotent — re-runs only insert
-        # if the row is missing.
-        self._apply_pending_migrations(self._conn, fresh=fresh)
+        # Assign to a LOCAL variable first; only promote to ``self._conn``
+        # after schema setup + pending migrations succeed. If we assign
+        # ``self._conn`` first and the migration then raises, the next
+        # ``_ensure_conn`` call returns the cached half-initialized
+        # connection without retrying the migration — the failure is
+        # silent and the migration never lands. (Hit on a v5 migration
+        # bug: missing ``DELETE FROM atom_topics`` caused FK failures
+        # that mimir kept working through with a stale schema.)
+        conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            if fresh:
+                schema_path = Path(__file__).parent / "schema.sql"
+                conn.executescript(schema_path.read_text())
+                conn.commit()
+            # Migration story: record the schema version we know how to
+            # serve so future SagaStore builds can detect when an
+            # existing DB needs migration. ``CURRENT_SCHEMA_VERSION``
+            # bumps with every shipped schema change; ``MIGRATIONS`` is
+            # the pending-migrations registry (empty until the first
+            # post-greenfield change). Idempotent — re-runs only insert
+            # if the row is missing.
+            self._apply_pending_migrations(conn, fresh=fresh)
+        except Exception:
+            # Migration / schema apply failed: close the connection so
+            # the next ``_ensure_conn`` reopens fresh and retries. We
+            # close even on caller-side bugs (the next attempt re-raises
+            # with the same error) — silent half-init was the worse
+            # failure mode.
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        self._conn = conn
         return self._conn
 
     def _apply_pending_migrations(
