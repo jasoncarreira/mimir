@@ -852,3 +852,125 @@ async def test_event_logger_stamps_agent_id_on_records(tmp_path: Path):
         "agent_id should be absent (not None) when not set, "
         "to keep the legacy record shape exactly"
     )
+
+
+# ─── Algedonic pipeline gaps (algedonic-gaps-5 PR) ──────────────────
+
+
+async def test_run_turn_emits_saga_feedback_sent_event(tmp_path: Path):
+    """Gap 1 fix: a ``saga_feedback_sent`` event must land in events.jsonl
+    after a turn whose saga.feedback() call succeeds. Pre-fix the call
+    happened but nothing logged it, leaving the positive algedonic bucket
+    empty each turn."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="done")])
+    fake_saga = _FakeSaga(query_hits=[
+        {"atom_id": "a" * 16, "content": "prior memory", "stream": "semantic"},
+    ])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=fake_saga)
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hello")
+    await agent.run_turn(event)
+
+    import json as _json
+    events_path = tmp_path / "home" / "logs" / "events.jsonl"
+    event_types = [_json.loads(l)["type"] for l in events_path.read_text().splitlines() if l]
+    assert "saga_feedback_sent" in event_types, (
+        "saga_feedback_sent must be emitted when saga.feedback() succeeds"
+    )
+
+
+async def test_run_turn_emits_tool_call_denied_per_denial(tmp_path: Path):
+    """Gap 3 fix: each entry drained from ``backend.drain_denials()`` must
+    produce a ``tool_call_denied`` event in events.jsonl so write-guard
+    denials surface in the algedonic block."""
+    import json as _json
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
+
+    # Inject a fake backend with two pre-populated denials.
+    class _FakeBackend:
+        def drain_denials(self):
+            return [
+                {"op": "write", "file_path": "/etc/passwd", "writable_dirs": []},
+                {"op": "edit", "file_path": "/proc/sys/x", "writable_dirs": []},
+            ]
+
+    agent._backend = _FakeBackend()  # type: ignore[attr-defined]
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="do bad thing")
+    await agent.run_turn(event)
+
+    events_path = tmp_path / "home" / "logs" / "events.jsonl"
+    denied = [
+        _json.loads(l) for l in events_path.read_text().splitlines() if l
+        if _json.loads(l)["type"] == "tool_call_denied"
+    ]
+    assert len(denied) == 2, (
+        "one tool_call_denied event expected per denial; got: "
+        + str([e.get("file_path") for e in denied])
+    )
+    ops = {e.get("op") for e in denied}
+    assert ops == {"write", "edit"}
+
+
+async def test_run_turn_emits_synthesis_skipped_boundary_when_not_called(tmp_path: Path):
+    """Gap 2 fix: on a ``saga_session_end`` (synthesis) turn, if
+    ``saga_end_session`` was never called, a
+    ``saga_synthesis_skipped_boundary`` event must land in events.jsonl
+    so the next turn's algedonic block flags the missed step 3."""
+    import json as _json
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="synthesis done")])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
+
+    # Synthesis trigger; ctx.saga_end_session_called stays False (no tool called).
+    event = AgentEvent(
+        trigger="saga_session_end", channel_id="ch-1",
+        content="## Session synthesis\n",
+    )
+    await agent.run_turn(event)
+
+    events_path = tmp_path / "home" / "logs" / "events.jsonl"
+    event_types = [_json.loads(l)["type"] for l in events_path.read_text().splitlines() if l]
+    assert "saga_synthesis_skipped_boundary" in event_types, (
+        "saga_synthesis_skipped_boundary must fire when the synthesis turn "
+        "completes without calling saga_end_session"
+    )
+
+
+async def test_run_turn_no_synthesis_skipped_when_session_called(tmp_path: Path):
+    """Complementary guard: if ``ctx.saga_end_session_called`` is True
+    (the tool DID fire during the synthesis turn), the
+    ``saga_synthesis_skipped_boundary`` event must NOT appear."""
+    import json as _json
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="synthesis done")])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
+
+    # Simulate the agent calling saga_end_session by patching the ctx after
+    # it's created. We intercept the SessionManager.touch call to flip the flag.
+    original_touch = agent._sessions.touch if agent._sessions else None
+
+    # Patch run_turn to flip ctx.saga_end_session_called inside the turn.
+    # Easiest: override the ctx creation path by patching TurnContext.
+    from mimir.models import TurnContext
+    original_init = TurnContext.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # Immediately mark it as called — simulates the tool firing.
+        self.saga_end_session_called = True
+
+    import unittest.mock as mock
+    with mock.patch.object(TurnContext, "__init__", _patched_init):
+        event = AgentEvent(
+            trigger="saga_session_end", channel_id="ch-1",
+            content="## Session synthesis\n",
+        )
+        await agent.run_turn(event)
+
+    events_path = tmp_path / "home" / "logs" / "events.jsonl"
+    event_types = [_json.loads(l)["type"] for l in events_path.read_text().splitlines() if l]
+    assert "saga_synthesis_skipped_boundary" not in event_types, (
+        "saga_synthesis_skipped_boundary must NOT fire when saga_end_session was called"
+    )
