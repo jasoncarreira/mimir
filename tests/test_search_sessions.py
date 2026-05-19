@@ -187,19 +187,18 @@ async def test_search_sessions_schema_migration_adds_embedding_columns(
         COMMIT;
     """)
 
-    # Step 3: Remove the embedding-migration version stamp and insert the
-    # predecessor version so _apply_pending_migrations sees a non-empty
-    # `applied` set with max(applied) < CURRENT_SCHEMA_VERSION and
-    # actually runs the embedding-columns migration.
-    # (Removing the only entry would leave `applied` empty, triggering the
-    # "fresh DB" stamp-and-return path that skips all migration DDL.)
-    emb_migration_version = SagaStore.CURRENT_SCHEMA_VERSION
-    prev_version = emb_migration_version - 1
-    conn.execute("DELETE FROM schema_version WHERE version = ?",
-                 (emb_migration_version,))
+    # Step 3: Stamp the schema_version table at v3 (post-structured-fields,
+    # pre-embedding-columns) so _apply_pending_migrations runs migration 4
+    # (the embedding-columns ALTER TABLE) and any later migrations the
+    # framework has registered. Hardcoded to 3 because this test
+    # specifically verifies migration 4's ALTER TABLE shape — bumping
+    # CURRENT_SCHEMA_VERSION shouldn't change what this test exercises.
+    # (Removing all stamps would trigger the fresh-DB stamp-and-return
+    # path that skips DDL entirely.)
+    conn.execute("DELETE FROM schema_version")
     conn.execute(
-        "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
-        (prev_version, "2000-01-01T00:00:00+00:00"),
+        "INSERT INTO schema_version (version, applied_at) VALUES (3, ?)",
+        ("2000-01-01T00:00:00+00:00",),
     )
     conn.commit()
 
