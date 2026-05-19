@@ -993,6 +993,14 @@ class Agent:
                     session_id=saga_session_id,
                     feedback=feedback_signal,
                 )
+                # Gap 1 fix: positive algedonic signal so the per-turn
+                # block shows at least one positive when feedback runs.
+                await log_event(
+                    "saga_feedback_sent",
+                    atom_count=len(saga_atom_ids),
+                    feedback=feedback_signal,
+                    session_id=saga_session_id,
+                )
             except Exception as exc:
                 log.warning("post-message saga.feedback failed: %s", exc)
 
@@ -1011,6 +1019,32 @@ class Agent:
                 permission_denials = self._backend.drain_denials()
             except Exception as exc:  # noqa: BLE001
                 log.debug("backend.drain_denials failed: %s", exc)
+        # Gap 3 fix: emit one algedonic negative per denied write/edit/upload
+        # so the per-turn feedback block surfaces write-guard denials. The
+        # backend only records them (sync); we emit here where we're async.
+        for _denial in permission_denials:
+            try:
+                await log_event(
+                    "tool_call_denied",
+                    op=_denial.get("op"),
+                    file_path=_denial.get("file_path"),
+                    session_id=session_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("log_event tool_call_denied failed: %s", exc)
+        # Gap 2 fix: if this is a synthesis turn (saga_session_end trigger)
+        # and the model didn't call saga_end_session, emit the boundary-skip
+        # signal so the next turn's algedonic block surfaces it for
+        # self-correction.
+        if event.trigger == "saga_session_end" and not ctx.saga_end_session_called:
+            try:
+                await log_event(
+                    "saga_synthesis_skipped_boundary",
+                    session_id=saga_session_id,
+                    trigger=event.trigger,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("log_event saga_synthesis_skipped_boundary failed: %s", exc)
         saga_calls = [
             {
                 "call_type": c.call_type, "args": c.args, "result": c.result,
@@ -1113,6 +1147,17 @@ class Agent:
                             sent_result = await bridge.send(event.channel_id, clean)
                         except Exception as exc:
                             log.warning("bridge.send failed: %s", exc)
+                            # Gap 5 fix: emit algedonic negative so the
+                            # per-turn block surfaces auto-dispatch failures.
+                            try:
+                                await log_event(
+                                    "auto_dispatch_failed",
+                                    channel_id=event.channel_id,
+                                    error=str(exc),
+                                    session_id=session_id,
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
                         # Append to chat-history buffer regardless of
                         # send outcome — pre-#181's _auto_dispatch_or_record
                         # explicitly recorded outbound even on bridge
