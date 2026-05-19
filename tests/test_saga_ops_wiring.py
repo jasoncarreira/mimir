@@ -77,7 +77,10 @@ class _StubStore:
             "closed_since": closed_since,
             "channel_id": channel_id,
         })
-        return {"atom_id": "atom-abc"}
+        return {
+            "session_id": session_id,
+            "session_summary_written": True,
+        }
 
     async def forget(self, **kwargs):
         if self.raise_on == "forget":
@@ -227,7 +230,7 @@ async def test_end_session_threads_args_and_flags_ctx(
         "closed_since": ["#41"],
     })
     assert "ok" in out.lower()
-    assert "atom_id=atom-abc" in out
+    assert "summary_written=True" in out
     assert store.end_session_calls[0]["session_id"] == "sess-abc"
     assert store.end_session_calls[0]["topics_discussed"] == ["auth", "tokens"]
     assert store.end_session_calls[0]["channel_id"] == "ch-1"

@@ -115,47 +115,34 @@ def store(
     # Dedupe check FIRST. The UNIQUE index would catch it on insert,
     # but explicit check lets us emit a clean access_event on the
     # existing atom and report stored=False without an exception path.
-    #
-    # Exception: session_boundary atoms are always distinct events
-    # even when the synthesized content collides. Two quiet sessions
-    # both producing "[session ended; no significant activity]"
-    # deserve separate boundary atoms — they mark different moments
-    # in conversation history. Bypass dedupe for the boundary path.
-    # The UNIQUE index on (content_hash, agent_id) WHERE tombstoned=0
-    # would still trip if the contents truly collide; we mitigate by
-    # rendering a unique discriminator into the content at the
-    # reflect.py layer (session_id + timestamp).
-    skip_dedupe = source_type == "session_boundary"
-    if not skip_dedupe:
-        existing = conn.execute(
-            "SELECT id FROM atoms WHERE content_hash = ? "
-            "AND agent_id = ? AND tombstoned = 0",
-            (content_hash, agent_id),
-        ).fetchone()
-        if existing is not None:
-            atom_id = existing[0]
-            # Fire a 'store' access_event on the existing atom in its
-            # own transaction.
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                mark_access(conn, [AccessEvent(
-                    atom_id=atom_id,
-                    source="store",
-                    session_id=session_id,
-                    metadata={"dedupe": True},
-                )])
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            return StoreResult(atom_id=atom_id, stored=False, reason="duplicate")
+    existing = conn.execute(
+        "SELECT id FROM atoms WHERE content_hash = ? "
+        "AND agent_id = ? AND tombstoned = 0",
+        (content_hash, agent_id),
+    ).fetchone()
+    if existing is not None:
+        atom_id = existing[0]
+        # Fire a 'store' access_event on the existing atom in its
+        # own transaction.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            mark_access(conn, [AccessEvent(
+                atom_id=atom_id,
+                source="store",
+                session_id=session_id,
+                metadata={"dedupe": True},
+            )])
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return StoreResult(atom_id=atom_id, stored=False, reason="duplicate")
 
     # Session near-duplicate dedup (saga's session_dedup, pre-storage).
     # Only fires when caller supplies BOTH a session_id and a threshold;
     # default behavior is unchanged.
     if (
-        not skip_dedupe
-        and session_id is not None
+        session_id is not None
         and session_dedup_threshold is not None
     ):
         # Need an embedding to compare. If the caller already has one

@@ -241,68 +241,42 @@ def test_not_superseded_when_evidence_set_equals(conn):
 # ────────────────────────────────────────────────────────────────────
 
 
-def test_reflect_creates_boundary_atom(conn):
-    """Quiet session — reflect still emits one session_boundary."""
+def test_reflect_writes_session_summary(conn):
+    """Quiet session — reflect writes a sessions row with the synthesized
+    summary. No atom is created (sessions live in the sessions table now)."""
     result = reflect(
         conn, session_id="s1", channel_id="c1",
         embed_fn=_fake_embed,
         boundary_synth_fn=_stub_boundary_synth,
     )
-    assert result.boundary_created is True
-    assert result.boundary_atom_id is not None
-    # Check the atom landed with source_type='session_boundary'.
+    assert result.session_summary_written is True
+    # Sessions row populated.
     row = conn.execute(
-        "SELECT source_type, session_id FROM atoms WHERE id = ?",
-        (result.boundary_atom_id,)
+        "SELECT channel_id, summary, reflected_at FROM sessions WHERE id = ?",
+        ("s1",),
     ).fetchone()
-    assert row[0] == "session_boundary"
-    assert row[1] == "s1"
+    assert row is not None
+    assert row[0] == "c1"
+    assert row[1]   # summary non-empty
+    assert row[2]   # reflected_at set
+    # No session_boundary atom should exist.
+    boundary_count = conn.execute(
+        "SELECT COUNT(*) FROM atoms WHERE source_type = 'session_boundary'",
+    ).fetchone()[0]
+    assert boundary_count == 0
 
 
 def test_reflect_is_idempotent(conn):
-    """Re-calling reflect on the same session returns the same boundary."""
+    """Re-calling reflect on the same session is a no-op."""
     r1 = reflect(conn, session_id="s1", channel_id="c1",
                  embed_fn=_fake_embed,
                  boundary_synth_fn=_stub_boundary_synth)
     r2 = reflect(conn, session_id="s1", channel_id="c1",
                  embed_fn=_fake_embed,
                  boundary_synth_fn=_stub_boundary_synth)
-    assert r1.boundary_atom_id == r2.boundary_atom_id
-    assert r1.boundary_created is True
-    assert r2.boundary_created is False
-
-
-def test_reflect_links_session_members(conn):
-    """Every atom touched in the session gets a session_member relation
-    from the boundary."""
-    # Three atoms in session s1.
-    for i in range(3):
-        store(conn, f"session atom {i}", embed_fn=_fake_embed,
-              session_id="s1")
-    result = reflect(
-        conn, session_id="s1", channel_id="c1",
-        embed_fn=_fake_embed,
-        boundary_synth_fn=_stub_boundary_synth,
-    )
-    # Boundary is also stored with session_id='s1', so _session_atoms
-    # picks it up after the boundary lands. The session_member_count
-    # therefore includes the boundary itself plus the 3 raws.
-    rows = conn.execute(
-        "SELECT target_id FROM atom_relations "
-        "WHERE source_id = ? AND relation_type = 'session_member'",
-        (result.boundary_atom_id,)
-    ).fetchall()
-    target_ids = {r[0] for r in rows}
-    # All three raws should be linked. (The boundary may or may not link
-    # to itself depending on ordering; we don't test that.)
-    raw_atom_ids = {
-        r[0] for r in conn.execute(
-            "SELECT id FROM atoms WHERE session_id = ? "
-            "AND source_type != 'session_boundary'",
-            ("s1",),
-        )
-    }
-    assert raw_atom_ids.issubset(target_ids)
+    assert r1.session_summary_written is True
+    assert r2.session_summary_written is False
+    assert r1.session_id == r2.session_id == "s1"
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -312,20 +286,67 @@ def test_reflect_links_session_members(conn):
 
 def test_recent_session_boundaries_returns_in_recency_order(conn):
     """Two reflect calls; recent_session_boundaries returns them
-    newest-first."""
-    r1 = reflect(conn, session_id="s1", channel_id="c1",
-                 embed_fn=_fake_embed,
-                 boundary_synth_fn=_stub_boundary_synth)
-    # Force second session's boundary to be created strictly after
-    # the first (sleep would slow the test; instead we just store +
-    # check ordering via insertion order).
-    r2 = reflect(conn, session_id="s2", channel_id="c1",
-                 embed_fn=_fake_embed,
-                 boundary_synth_fn=_stub_boundary_synth)
+    newest-first by session id."""
+    reflect(conn, session_id="s1", channel_id="c1",
+            embed_fn=_fake_embed,
+            boundary_synth_fn=_stub_boundary_synth)
+    reflect(conn, session_id="s2", channel_id="c1",
+            embed_fn=_fake_embed,
+            boundary_synth_fn=_stub_boundary_synth)
     boundaries = recent_session_boundaries(conn, channel_id="c1", count=10)
     assert len(boundaries) == 2
     ids = {b["id"] for b in boundaries}
-    assert {r1.boundary_atom_id, r2.boundary_atom_id} <= ids
+    assert {"s1", "s2"} <= ids
+
+
+def test_recent_session_boundaries_pipeline_renders_correctly(conn):
+    """End-to-end pipeline test: reflect() → sessions row →
+    recent_session_boundaries() → render_session_summaries().
+
+    Mimir flagged a shape regression in #219 where the new
+    recent_session_boundaries returned ``summary`` / ``unfinished`` /
+    ``ts`` under ``metadata`` instead of at the top level — breaking
+    render_session_summaries, which reads ``b.get("summary")``,
+    ``b.get("unfinished")``, ``b.get("ts")``, etc. at the top level.
+    This test pipes the full chain and asserts the rendered output
+    contains the summary text and Unfinished items, catching any
+    future shape drift.
+    """
+    from mimir.session_boundary_log import render_session_summaries
+
+    def _synth_with_unfinished(atoms, context):
+        return {
+            "summary": "Refactored auth module; tests green.",
+            "topics_discussed": ["auth", "tokens"],
+            "decisions_made": ["use JWT"],
+            "unfinished": ["refresh-token rotation"],
+            "emotional_state": "satisfied",
+            "closed_since": [],
+        }
+
+    reflect(conn, session_id="s_pipeline", channel_id="c1",
+            embed_fn=_fake_embed,
+            boundary_synth_fn=_synth_with_unfinished)
+
+    boundaries = recent_session_boundaries(conn, channel_id="c1", count=10)
+    assert len(boundaries) == 1
+    b = boundaries[0]
+
+    # Top-level fields that render_session_summaries reads.
+    assert b.get("summary") == "Refactored auth module; tests green."
+    assert b.get("unfinished") == ["refresh-token rotation"]
+    assert b.get("ts"), "ts must be non-empty for turn_counts keying"
+    assert b.get("channel_id") == "c1"
+
+    rendered = render_session_summaries(
+        boundaries, now=None, turn_counts={}, stale_age_hours=999, stale_turns=999,
+    )
+    assert rendered is not None
+    assert "Refactored auth module" in rendered
+    assert "refresh-token rotation" in rendered
+    # The "(no summary)" fallback must NOT appear — that would indicate
+    # the shape regression Mimir caught.
+    assert "(no summary)" not in rendered
 
 
 def test_recent_session_boundaries_filters_by_channel(conn):
@@ -346,18 +367,24 @@ def test_recent_session_boundaries_filters_by_channel(conn):
 
 def test_recent_session_boundaries_excluded_from_generic_recall(conn):
     """Re-check the contract from Tier 1: even with the new
-    reflect-generated boundary atoms, generic recall doesn't surface them."""
-    r = reflect(conn, session_id="s1", channel_id="c1",
-                embed_fn=_fake_embed,
-                boundary_synth_fn=_stub_boundary_synth)
-    boundary_id = r.boundary_atom_id
-    # Query for the boundary content — even with similarity match,
-    # source_type filter should drop it.
+    reflect-generated session summaries, generic recall doesn't surface them.
+    Sessions live in their own table and are never atoms, so recall (which
+    only reads atoms) can't return them at all."""
+    reflect(conn, session_id="s1", channel_id="c1",
+            embed_fn=_fake_embed,
+            boundary_synth_fn=_stub_boundary_synth)
+    # No source_type='session_boundary' atom exists post-migration.
+    boundary_count = conn.execute(
+        "SELECT COUNT(*) FROM atoms WHERE source_type = 'session_boundary'",
+    ).fetchone()[0]
+    assert boundary_count == 0
+    # Generic recall on an unrelated query returns zero results — there
+    # are no atoms beyond the (excluded) session_boundary case.
     result = recall(
         conn, "session",
         query_embed_fn=lambda t: [0.0, 0.0, 0.0, 0.0],
-        faiss_search_fn=lambda emb, k: [(boundary_id, 0.9)],
+        faiss_search_fn=lambda emb, k: [],
         fts_search_fn=lambda q, k: [],
     )
-    ids = [c.atom["id"] for c in result.raws + result.observations]
-    assert boundary_id not in ids
+    assert len(result.raws) == 0
+    assert len(result.observations) == 0
