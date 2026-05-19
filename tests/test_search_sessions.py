@@ -230,3 +230,150 @@ async def test_search_sessions_schema_migration_adds_embedding_columns(
     session_ids = {r["session_id"] for r in results}
     assert "sess-migrate" in session_ids, \
         "search_sessions should return the session via the recency path after migration"
+
+
+@pytest.mark.asyncio
+async def test_migration_v5_clears_atom_topics_before_deleting_boundaries(
+    tmp_path, monkeypatch
+):
+    """Regression: migration v5 must delete from EVERY FK-referencing
+    table before ``DELETE FROM atoms WHERE source_type='session_boundary'``.
+
+    The original v5 missed ``atom_topics`` (and the defensive set
+    ``triples`` / ``access_log`` / ``corrections``). On a production DB
+    with 1756 atom_topics rows pointing at boundary atoms, the migration
+    raised ``sqlite3.IntegrityError: FOREIGN KEY constraint failed`` and
+    rolled back. Combined with ``_ensure_conn``'s half-init caching
+    (separate fix in this PR), the failure was silent — saga calls kept
+    working but boundary atoms never got cleaned.
+
+    This test reproduces by inserting a boundary atom with rows in every
+    FK-referencing table, stamping the DB at v4, then opening a fresh
+    SagaStore and asserting migration v5 lands successfully.
+    """
+    _patch_provider(monkeypatch, dim=4)
+    db_path = tmp_path / "boundary_cleanup.saga.db"
+
+    # Step 1: SagaStore creates the full schema.
+    s1 = SagaStore(db_path=db_path, embedding_dim=4)
+    conn = s1._ensure_conn()
+
+    # Step 2: Insert a boundary atom plus a row in every FK-referencing
+    # table — the migration's deletes must clear all of these before
+    # the final ``DELETE FROM atoms``.
+    now = "2026-05-19T00:00:00+00:00"
+    conn.executescript(f"""
+        BEGIN;
+        INSERT INTO atoms (id, content, content_hash, source_type, agent_id, created_at)
+            VALUES ('boundary-1', 'session ended', 'h1', 'session_boundary', 'default', '{now}');
+        INSERT INTO atoms (id, content, content_hash, source_type, agent_id, created_at)
+            VALUES ('raw-1',      'normal atom',  'h2', 'conversation',     'default', '{now}');
+        INSERT INTO sessions (id, channel_id, started_at, ended_at, summary, reflected_at)
+            VALUES ('sess-1', 'ch-1', '{now}', '{now}', 'existing summary', '{now}');
+
+        -- One row per FK-referencing table that points at the boundary.
+        INSERT INTO atom_access_summary (atom_id, recent_ts_json, recent_weights_json)
+            VALUES ('boundary-1', '[]', '[]');
+        INSERT INTO access_events (atom_id, ts, source)
+            VALUES ('boundary-1', '{now}', 'store');
+        INSERT INTO embeddings (atom_id, provider, model, dim, vec, embedded_at)
+            VALUES ('boundary-1', 'stub', 'stub-4d', 4, x'00000000000000000000000000000000', '{now}');
+        INSERT INTO atom_topics (atom_id, topic) VALUES ('boundary-1', 'test_topic');
+        INSERT INTO triples (id, subject, predicate, object, source_atom_id, created_at)
+            VALUES ('t1', 's', 'p', 'o', 'boundary-1', '{now}');
+        INSERT INTO atom_relations (source_id, target_id, relation_type, created_at)
+            VALUES ('raw-1', 'boundary-1', 'session_member', '{now}');
+        COMMIT;
+    """)
+
+    # Step 3: Stamp at v4 so opening a fresh store reruns migration 5.
+    conn.execute("DELETE FROM schema_version")
+    conn.execute(
+        "INSERT INTO schema_version (version, applied_at) VALUES (4, ?)",
+        ("2000-01-01T00:00:00+00:00",),
+    )
+    conn.commit()
+    s1._conn = None  # force re-open path
+
+    # Step 4: Open a fresh SagaStore — migration v5 should land cleanly.
+    s2 = SagaStore(db_path=db_path, embedding_dim=4)
+    conn2 = s2._ensure_conn()  # would raise on the original buggy v5
+
+    # Step 5: Verify the boundary atom + its FK refs are all gone.
+    counts = {}
+    for table, where in [
+        ("atoms",                "id = 'boundary-1'"),
+        ("atom_access_summary",  "atom_id = 'boundary-1'"),
+        ("access_events",        "atom_id = 'boundary-1'"),
+        ("embeddings",           "atom_id = 'boundary-1'"),
+        ("atom_topics",          "atom_id = 'boundary-1'"),
+        ("triples",              "source_atom_id = 'boundary-1'"),
+        ("atom_relations",       "source_id = 'boundary-1' OR target_id = 'boundary-1'"),
+    ]:
+        counts[table] = conn2.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {where}"
+        ).fetchone()[0]
+    assert counts == {t: 0 for t in counts}, (
+        f"every FK-referencing table should be empty for the boundary atom; "
+        f"residuals: {counts}"
+    )
+
+    # Step 6: Verify migration was actually stamped at v5.
+    v = conn2.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+    assert v == 5, f"schema_version should be 5 post-migration, got {v}"
+
+    # Step 7: Non-boundary atom survives untouched.
+    raw_exists = conn2.execute(
+        "SELECT COUNT(*) FROM atoms WHERE id = 'raw-1'"
+    ).fetchone()[0]
+    assert raw_exists == 1, "non-boundary atoms must survive the migration"
+
+
+def test_ensure_conn_does_not_cache_half_initialized_connection(tmp_path):
+    """Regression: if ``_apply_pending_migrations`` raises, ``_ensure_conn``
+    must NOT leave ``self._conn`` populated. Otherwise the next call
+    short-circuits to a cached half-initialized connection without
+    retrying the migration — the failure becomes silent.
+
+    Reproduces by monkey-patching ``_apply_pending_migrations`` to raise,
+    asserting the first ``_ensure_conn`` re-raises, asserting ``self._conn``
+    is reset to None, and asserting the second ``_ensure_conn`` re-raises
+    again instead of returning a stale connection.
+    """
+    import sqlite3
+    db_path = tmp_path / "halfinit.saga.db"
+    store = SagaStore(db_path=db_path)
+
+    boom_calls: list[int] = []
+    orig_apply = store._apply_pending_migrations
+
+    def _boom(conn, *, fresh):
+        boom_calls.append(1)
+        raise sqlite3.IntegrityError("simulated FK failure during migration")
+
+    store._apply_pending_migrations = _boom  # type: ignore[method-assign]
+
+    # First call: must raise the migration error.
+    with pytest.raises(sqlite3.IntegrityError):
+        store._ensure_conn()
+    assert store._conn is None, (
+        "after a failed migration _ensure_conn must NOT cache the "
+        "half-initialized connection — caching would silently mask the "
+        "failure on subsequent calls"
+    )
+
+    # Second call: must re-attempt and raise again. (Previously it would
+    # have returned the cached connection and the migration would never
+    # land.)
+    with pytest.raises(sqlite3.IntegrityError):
+        store._ensure_conn()
+    assert len(boom_calls) == 2, (
+        "_apply_pending_migrations must be called on every _ensure_conn "
+        "until it succeeds; got " + str(len(boom_calls)) + " calls"
+    )
+
+    # After restoring the real apply, _ensure_conn must succeed.
+    store._apply_pending_migrations = orig_apply  # type: ignore[method-assign]
+    conn = store._ensure_conn()
+    assert conn is not None
+    assert store._conn is conn
