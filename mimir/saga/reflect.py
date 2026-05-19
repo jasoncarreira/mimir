@@ -85,6 +85,19 @@ def _session_atoms(
     return [dict(zip(cols, r)) for r in rows]
 
 
+def _parse_json_list(v: str | None) -> list:
+    """Parse a JSON-encoded list column from the sessions table. Returns
+    [] for NULL / empty / malformed input — sessions rows may have
+    missing structured fields when the boundary synth produced an empty
+    extraction."""
+    if not v:
+        return []
+    try:
+        return json.loads(v)
+    except (TypeError, ValueError):
+        return []
+
+
 def _existing_session_summary(
     conn: sqlite3.Connection,
     session_id: str,
@@ -228,7 +241,7 @@ def recent_session_boundaries(
     *,
     channel_id: str | None = None,
     count: int = 3,
-    agent_id: str = "default",  # kept for signature compat; sessions table is agent-agnostic
+    agent_id: str = "default",  # noqa: ARG001 — see note below
 ) -> list[dict]:
     """Return the most recent session summaries (by ``reflected_at``),
     optionally scoped to a channel. Used by the prompt-build path to
@@ -261,6 +274,13 @@ def recent_session_boundaries(
         channel_id, channel      — both populated from sessions row
         metadata                 — dict echoing the structured fields, for
                                    callers that prefer the nested shape
+
+    ``agent_id`` is accepted for caller-signature compatibility
+    (saga_client surface, ``mimir/agent.py``, tests) but intentionally
+    NOT used in the query — the sessions table is agent-agnostic. A
+    multi-agent deployment sharing one sessions table would see all
+    agents' sessions here. Non-issue under the single-agent-per-DB
+    posture; revisit if a multi-agent DB shape lands.
     """
     if channel_id is not None:
         rows = conn.execute("""
@@ -288,18 +308,10 @@ def recent_session_boundaries(
          topics_json, decisions_json, unfinished_json,
          emotional_state, closed_since_json) = r
 
-        def _parse_list(v):
-            if not v:
-                return []
-            try:
-                return json.loads(v)
-            except (TypeError, ValueError):
-                return []
-
-        topics = _parse_list(topics_json)
-        decisions = _parse_list(decisions_json)
-        unfinished = _parse_list(unfinished_json)
-        closed_since = _parse_list(closed_since_json)
+        topics = _parse_json_list(topics_json)
+        decisions = _parse_json_list(decisions_json)
+        unfinished = _parse_json_list(unfinished_json)
+        closed_since = _parse_json_list(closed_since_json)
 
         # Render the same content shape reflect() used to produce so
         # prompt-build callers that read ``content`` keep working.
