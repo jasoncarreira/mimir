@@ -327,3 +327,233 @@ def test_scaffold_picks_up_new_skill_after_install(
 def test_scaffold_missing_home_raises(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         scaffold(tmp_path / "does-not-exist")
+
+
+# ── Dockerfile blocker — broken PATH ─────────────────────────────────
+
+
+def test_dockerfile_has_valid_path_env(home_with_two_skills: Path):
+    """Mimir #225 review caught ``${{PATH}}`` shipping literally in
+    the Dockerfile (because the template was rendered via .replace()
+    not .format()). Docker doesn't understand ${{VAR}}; the resulting
+    container had a broken PATH. Regression: no double-braces.
+    """
+    scaffold(home_with_two_skills)
+    df = (home_with_two_skills / "Dockerfile").read_text()
+    assert "${{PATH}}" not in df, (
+        "Dockerfile shipped literal ${{PATH}} — Docker doesn't parse "
+        "that as a variable reference; container PATH ends up broken."
+    )
+    assert "${PATH}" in df, "expected Docker-style ${PATH} expansion"
+
+
+# ── render_compose_yml() ─────────────────────────────────────────────
+
+
+def test_render_compose_yml_substitutes_service_name():
+    from mimir.scaffold_docker import render_compose_yml
+    out = render_compose_yml(service_name="muninn-mimir", web_port=8091)
+    assert "container_name: muninn-mimir" in out
+    assert "muninn-mimir:" in out  # service key line
+    assert "127.0.0.1:8091:8080" in out
+
+
+def test_render_compose_yml_no_unresolved_placeholders():
+    from mimir.scaffold_docker import render_compose_yml
+    out = render_compose_yml(service_name="x", web_port=1234)
+    # No leftover template tokens like {SERVICE_NAME} / {WEB_PORT}.
+    assert "{SERVICE_NAME}" not in out
+    assert "{WEB_PORT}" not in out
+
+
+# ── render_start_sh() ────────────────────────────────────────────────
+
+
+def test_render_start_sh_no_extras_by_default():
+    from mimir.scaffold_docker import render_start_sh
+    out = render_start_sh()
+    # Empty UV_EXTRAS = no --extra flags expanded.
+    assert "UV_EXTRAS=\"\"" in out
+    assert "{UV_EXTRAS}" not in out
+
+
+def test_render_start_sh_expands_extras():
+    from mimir.scaffold_docker import render_start_sh
+    out = render_start_sh(uv_extras=["discord", "claude-code"])
+    assert "UV_EXTRAS=\"--extra discord --extra claude-code\"" in out
+
+
+# ── _resolve_home() precedence ───────────────────────────────────────
+
+
+def test_resolve_home_arg_wins(tmp_path: Path, monkeypatch):
+    from mimir.scaffold_docker import _resolve_home
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "from-env"))
+    arg_home = tmp_path / "from-arg"
+    arg_home.mkdir()
+    assert _resolve_home(arg_home) == arg_home.resolve()
+
+
+def test_resolve_home_env_used_when_no_arg(tmp_path: Path, monkeypatch):
+    from mimir.scaffold_docker import _resolve_home
+    env_home = tmp_path / "from-env"
+    env_home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(env_home))
+    assert _resolve_home(None) == env_home.resolve()
+
+
+def test_resolve_home_cwd_fallback(tmp_path: Path, monkeypatch):
+    from mimir.scaffold_docker import _resolve_home
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert _resolve_home(None) == tmp_path.resolve()
+
+
+# ── cmd() CLI handler ────────────────────────────────────────────────
+
+
+def test_cmd_rejects_invalid_web_port(home_with_two_skills: Path, capsys):
+    """--web-port 99999 must error cleanly, not silently emit a broken
+    compose.yml."""
+    from argparse import Namespace
+    from mimir.scaffold_docker import cmd
+    args = Namespace(
+        home=home_with_two_skills, service_name=None,
+        web_port=99999, uv_extras="",
+    )
+    rc = cmd(args)
+    assert rc == 2
+    assert "out of range" in capsys.readouterr().out
+
+
+def test_cmd_returns_2_for_missing_home(tmp_path: Path, capsys):
+    from argparse import Namespace
+    from mimir.scaffold_docker import cmd
+    args = Namespace(
+        home=tmp_path / "does-not-exist", service_name=None,
+        web_port=8090, uv_extras="",
+    )
+    rc = cmd(args)
+    assert rc == 2
+    assert "not a directory" in capsys.readouterr().out
+
+
+def test_cmd_passes_extras_through(home_with_two_skills: Path, capsys):
+    """--uv-extras csv parses correctly and lands in start.sh."""
+    from argparse import Namespace
+    from mimir.scaffold_docker import cmd
+    args = Namespace(
+        home=home_with_two_skills, service_name=None,
+        web_port=8090, uv_extras="discord, claude-code",
+    )
+    rc = cmd(args)
+    assert rc == 0
+    start_sh = (home_with_two_skills / "start.sh").read_text()
+    assert "--extra discord --extra claude-code" in start_sh
+
+
+# ── Service name sanitization ────────────────────────────────────────
+
+
+def test_scaffold_sanitizes_home_dir_name_for_service_name(tmp_path: Path):
+    """Home dir with spaces / special chars → safe container name."""
+    weird = tmp_path / "My Weird Home!"
+    (weird / ".claude" / "skills").mkdir(parents=True)
+    result = scaffold(weird)
+    cy = (weird / "compose.yml").read_text()
+    # Allowed chars: alnum + hyphen + underscore; spaces / ! become hyphens.
+    assert "container_name: My-Weird-Home-" in cy
+    # No raw spaces in the service name.
+    for line in cy.splitlines():
+        if line.lstrip().startswith("container_name"):
+            assert " " not in line.split(":", 1)[1].strip()
+
+
+def test_scaffold_explicit_service_name_overrides_sanitization(tmp_path: Path):
+    weird = tmp_path / "My Weird Home!"
+    (weird / ".claude" / "skills").mkdir(parents=True)
+    scaffold(weird, service_name="muninn")
+    cy = (weird / "compose.yml").read_text()
+    assert "container_name: muninn" in cy
+
+
+# ── .gitignore belt-and-suspenders ───────────────────────────────────
+
+
+def test_scaffold_appends_compose_env_to_gitignore(home_with_two_skills: Path):
+    """compose.env contains secrets and should never be committed.
+    The scaffolder adds a never-track entry as belt-and-suspenders for
+    operators who switch from the default allowlist to a blocklist."""
+    home = home_with_two_skills
+    scaffold(home)
+    gi = (home / ".gitignore").read_text()
+    assert "compose.env" in gi
+    assert "mimir-scaffold-docker" in gi  # sentinel comment
+
+
+def test_scaffold_does_not_double_append_gitignore(home_with_two_skills: Path):
+    """Re-running must not duplicate the .gitignore entry."""
+    home = home_with_two_skills
+    scaffold(home)
+    gi_first = (home / ".gitignore").read_text()
+    scaffold(home)
+    gi_second = (home / ".gitignore").read_text()
+    assert gi_first == gi_second
+    assert gi_second.count("mimir-scaffold-docker") == 1
+
+
+# ── Malformed pollers.json defensive handling ────────────────────────
+
+
+def test_collect_required_env_vars_survives_malformed_pollers_json(tmp_path: Path):
+    """A pollers.json that's valid JSON but wrong-shape must not
+    crash collection. Mimir #225 review flagged: ``"pollers": "oops"``
+    would raise TypeError on the next ``.get()`` chain."""
+    home = tmp_path / "home"
+    skills = home / ".claude" / "skills"
+    skills.mkdir(parents=True)
+    s = skills / "broken-skill"
+    s.mkdir()
+    (s / "SKILL.md").write_text("---\nname: broken\n---\n")
+    (s / "pollers.json").write_text('{"pollers": "oops"}')
+    keys = collect_required_env_vars(home)
+    # Must still return the baseline keys, not crash.
+    assert "MIMIR_API_KEY" in keys
+
+
+def test_collect_required_env_vars_skips_non_string_pass_env(tmp_path: Path):
+    """If pass_env is a list but contains non-strings, those entries
+    are skipped (not crashed-on)."""
+    home = tmp_path / "home"
+    skills = home / ".claude" / "skills"
+    skills.mkdir(parents=True)
+    s = skills / "weird-skill"
+    s.mkdir()
+    (s / "SKILL.md").write_text("---\nname: weird\n---\n")
+    (s / "pollers.json").write_text(
+        '{"pollers": [{"name": "w", "pass_env": ["GOOD_KEY", 42, null]}]}'
+    )
+    keys = collect_required_env_vars(home)
+    assert "GOOD_KEY" in keys
+    # 42 and null shouldn't crash and shouldn't end up in the list.
+    assert 42 not in keys
+
+
+# ── Sentinel-split fragment-insert robustness ────────────────────────
+
+
+def test_render_dockerfile_handles_sentinel_in_fragment(tmp_path: Path):
+    """A fragment containing the literal sentinel string must not
+    corrupt the insertion (sentinel split + partition is robust)."""
+    sentinel = "<!-- mimir-scaffold-docker:FRAGMENTS -->"
+    frag = Fragment(
+        skill_name="evil",
+        content=f"# Has the sentinel: {sentinel}\nRUN echo evil",
+    )
+    out = render_dockerfile([frag])
+    # Output should still have ONE BEGIN/END pair, not multiple.
+    assert out.count("BEGIN mimir-scaffold-docker") == 1
+    assert out.count("END mimir-scaffold-docker") == 1
+    # The fragment contents (including the embedded sentinel literal)
+    # should be present somewhere.
+    assert "RUN echo evil" in out

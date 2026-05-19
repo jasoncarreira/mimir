@@ -1944,8 +1944,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(1)
 
     if args.command == "scaffold-docker":
-        from . import scaffold_docker as _scaffold_docker
-        sys.exit(_scaffold_docker.cmd(args))
+        # _scaffold_docker was already imported at subparser-registration
+        # time (parser.add_argument requires the module to wire ``cmd``).
+        # Reuse the existing scaffold_docker_cmd reference set via
+        # ``parser.set_defaults`` rather than re-importing here.
+        sys.exit(args.scaffold_docker_cmd(args))
 
     if args.command == "commitments":
         # chainlink #82 sub #87: bare ``mimir commitments`` (no
