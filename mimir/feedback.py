@@ -43,6 +43,12 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "error": ("negative", "error"),
     "tool_call_denied": ("negative", "tool_denied"),
     "tool_call_budget_warning": ("negative", "tool_budget"),
+    # Gap 4 fix: budget_gate.py emits these two names, not the legacy
+    # "tool_call_budget_warning". All three are aliased to the same
+    # short-tag so the algedonic block surfaces budget pressure
+    # regardless of which path fired.
+    "tool_call_budget_denied": ("negative", "tool_budget"),
+    "tool_call_budget_soft_warning": ("negative", "tool_budget"),
     "send_message_loop_hard_stop": ("negative", "loop_stop"),
     "send_message_loop_warning": ("negative", "loop_warn"),
     "saga_query_error": ("negative", "saga_query_error"),
