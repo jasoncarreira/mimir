@@ -130,6 +130,23 @@ falling back to `claude_code` — see
 [`saga/saga.example.toml`](./saga/saga.example.toml) for the
 provider options + per-section documentation.
 
+## Scheduler timezone
+
+`scheduler.yaml` cron expressions are interpreted in UTC by default —
+e.g., `cron: "0 8 * * *"` means 08:00 UTC, not 08:00 in your local
+time. Set `MIMIR_SCHEDULER_TZ` to a IANA zone to author crons in
+local wall-clock time (DST-aware via system tzdata):
+
+```bash
+MIMIR_SCHEDULER_TZ=America/New_York   # ET-shaped crons
+```
+
+Affects every cron in the agent home: `scheduler.yaml` LLM-tick jobs,
+auto-installed `saga-consolidate` and `introspection-report`,
+commitments-due-check, and every poller from
+`.claude/skills/*/pollers.json`. Invalid zone names fall back to UTC
+with a logged warning rather than crashing the scheduler.
+
 ## Development
 
 ```bash

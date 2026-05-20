@@ -39,6 +39,7 @@ import yaml
 from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .event_logger import log_event
 from .models import AgentEvent
@@ -48,6 +49,25 @@ from .saga_client import SagaClient, SagaError
 log = logging.getLogger(__name__)
 
 UTC = timezone.utc
+
+
+def _resolve_tz(name: str) -> ZoneInfo:
+    """Look up ``name`` as a ZoneInfo, falling back to UTC with a
+    warning when the name is unknown / tzdata is missing the entry.
+
+    Returning UTC on misconfiguration is safer than crashing the
+    scheduler entirely — a wrong-but-functioning schedule degrades
+    gracefully (jobs still fire, just offset), while a crashed
+    scheduler takes the agent offline."""
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+        log.warning(
+            "invalid MIMIR_SCHEDULER_TZ=%r (%s); falling back to UTC",
+            name, exc,
+        )
+        return ZoneInfo("UTC")
+
 
 #: Channel-id prefix for synthetic scheduler-tick channels. Each named
 #: scheduler job (heartbeat, reflect, saga-consolidate, etc.) without a
@@ -222,15 +242,27 @@ def _resolve_prompt_file(home: Path | None, prompt_file: str) -> Path | None:
     return candidate
 
 
-def _build_trigger(job: SchedulerJob) -> CronTrigger:
+def _build_trigger(
+    job: SchedulerJob, tz: ZoneInfo | None = None,
+) -> CronTrigger:
     """Convert ``cron`` / ``time_of_day`` to an APScheduler trigger.
-    Raises ``ValueError`` for malformed expressions."""
+    Raises ``ValueError`` for malformed expressions.
+
+    ``tz`` controls the timezone APScheduler interprets the cron
+    expression in. Defaults to UTC for back-compat with bench / test
+    call sites that construct triggers without a Scheduler instance.
+    Production wiring threads through ``Scheduler._tz`` (from
+    ``MIMIR_SCHEDULER_TZ``) so operators deploying in a non-UTC
+    timezone don't have to mentally convert every cron expression.
+    """
+    if tz is None:
+        tz = ZoneInfo("UTC")
     if job.cron:
-        return CronTrigger.from_crontab(job.cron, timezone=UTC)
+        return CronTrigger.from_crontab(job.cron, timezone=tz)
     if job.time_of_day:
         try:
             hh, mm = str(job.time_of_day).split(":")
-            return CronTrigger(hour=int(hh), minute=int(mm), timezone=UTC)
+            return CronTrigger(hour=int(hh), minute=int(mm), timezone=tz)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"invalid time_of_day {job.time_of_day!r}: {exc}") from exc
     raise ValueError("job must have cron or time_of_day")
@@ -312,8 +344,17 @@ class Scheduler:
         *,
         arbiter: HomeostaticArbiter | None = None,
         home: Path | None = None,
+        scheduler_tz: str = "UTC",
     ) -> None:
-        self._scheduler = AsyncIOScheduler(timezone="UTC")
+        # APScheduler interprets cron expressions in the scheduler's
+        # timezone. Default UTC keeps back-compat for mimirbot + bench
+        # harnesses that don't set MIMIR_SCHEDULER_TZ. Operators
+        # deploying in a non-UTC region (e.g., Muninn on ET) set this
+        # via env so they can author scheduler.yaml in local-wall-
+        # clock terms instead of mentally subtracting hours twice a
+        # year for DST.
+        self._tz = _resolve_tz(scheduler_tz)
+        self._scheduler = AsyncIOScheduler(timezone=self._tz)
         self._yaml_path = scheduler_yaml
         self._enqueue = enqueue
         self._arbiter = arbiter
@@ -460,7 +501,7 @@ class Scheduler:
                     )
                 continue
             try:
-                trigger = _build_trigger(job)
+                trigger = _build_trigger(job, self._tz)
             except ValueError:
                 invalid += 1
                 continue
@@ -571,13 +612,13 @@ class Scheduler:
             # if non-empty.
             if job.cron:
                 try:
-                    CronTrigger.from_crontab(job.cron, timezone=UTC)
+                    CronTrigger.from_crontab(job.cron, timezone=self._tz)
                 except (ValueError, KeyError) as exc:
                     raise ValueError(
                         f"invalid cron expression {job.cron!r}: {exc}"
                     ) from exc
         else:
-            _build_trigger(job)  # validate up front
+            _build_trigger(job, self._tz)  # validate up front
         async with self._mutate_lock:
             current = await asyncio.to_thread(load_jobs, self._yaml_path)
             current = [j for j in current if j.name != job.name]
@@ -677,7 +718,7 @@ class Scheduler:
             return False
 
         try:
-            trigger = CronTrigger.from_crontab(effective_cron, timezone=UTC)
+            trigger = CronTrigger.from_crontab(effective_cron, timezone=self._tz)
         except (ValueError, KeyError) as exc:
             raise ValueError(
                 f"invalid cron expression {effective_cron!r} for "
@@ -924,7 +965,7 @@ class Scheduler:
         installed = 0
         for poller in discovered:
             try:
-                trigger = CronTrigger.from_crontab(poller.cron, timezone=UTC)
+                trigger = CronTrigger.from_crontab(poller.cron, timezone=self._tz)
             except (ValueError, KeyError) as exc:
                 log.warning(
                     "poller_invalid_cron: %s — cron=%r error=%s",
