@@ -8,7 +8,10 @@
       "pass_env": [
         "GITHUB_TOKEN",
         "GITHUB_REPOS",
-        "MIMIR_GITHUB_SELF_LOGIN"
+        "MIMIR_GITHUB_SELF_LOGIN",
+        "MIMIR_HOME",
+        "MIMIR_GITHUB_PRELOAD_REVIEW_SKILL",
+        "MIMIR_GITHUB_REVIEW_SKILL_PATH"
       ]
     }
   ]

@@ -98,6 +98,15 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # sees recurring failures even when the poller didn't classify the
     # root cause itself.
     "poller_nonzero_exit":   ("negative", "poller_nonzero_exit"),
+    # github-poller review-missed-submission (Mimir's PR #234 / #235
+    # post-mortem). Fires when a PR-review-needed event reached the
+    # agent (``pr_opened`` / ``pr_synchronize``) but the turn ended
+    # without ``gh pr review`` (or the MCP equivalent) — usually because
+    # the /review skill loaded after reasoning had already committed
+    # to "write prose, don't submit." Negative so the operator sees
+    # the failure mode in introspection-report; no auto-re-fire (would
+    # burn quota for ambiguous benefit).
+    "poller_review_missed_submission": ("negative", "review_missed_submission"),
     # OAuth usage poller — plan-window quota probe runs on a cron and
     # surfaces refresh / logged-out / age-warn signals algedonically so
     # the agent can route operator-actionable alerts through.

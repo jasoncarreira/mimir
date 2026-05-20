@@ -362,6 +362,56 @@ def _rewrite_context_from_buffer(
 
 
 # Default system prompt — production cutover replaces this with mimir's
+def _turn_matched_expected_tool_call(events: list, markers: dict) -> bool:
+    """Generic "did the turn satisfy an expected-tool-call expectation?"
+
+    ``markers`` is a dict declared by the event source (e.g. a poller
+    putting an entry in its emitted JSONL's ``expected_tool_call``
+    field). Shape:
+
+      {
+        "tool_names":      ["pull_request_review_write", ...],   # exact match
+        "bash_substrings": ["gh pr review"],                       # substr in Bash arg.command
+        "signal_on_missing": "poller_review_missed_submission",     # event_type to emit
+      }
+
+    Returns ``True`` if any ``tool_call`` event in ``events`` matches
+    any declared tool name OR any declared Bash substring. Designed
+    so policy (which tool calls count as "done") lives with the
+    source — adding a new expectation for a different poller is a
+    poller-side change, not an agent-core change.
+
+    Conservative on substring match: a passing reference to a
+    declared substring in some other context (echo, sed, grep) would
+    false-positive. Realistic exposure is low — the only way a
+    substring lands in a tool_call is if the model actually invoked
+    that command. The cost asymmetry (missed signal vs over-counted
+    success) favors over-counting.
+    """
+    if not isinstance(markers, dict):
+        return False
+    tool_names = set(markers.get("tool_names") or [])
+    bash_substrings = list(markers.get("bash_substrings") or [])
+    if not tool_names and not bash_substrings:
+        return False
+    for ev in events or []:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") != "tool_call":
+            continue
+        name = ev.get("name") or ""
+        if name and name in tool_names:
+            return True
+        if name == "Bash" and bash_substrings:
+            args = ev.get("args") or {}
+            command = args.get("command") if isinstance(args, dict) else ""
+            if not isinstance(command, str):
+                continue
+            if any(s in command for s in bash_substrings):
+                return True
+    return False
+
+
 # full system-prompt assembly (core memory + skills + persona).
 _DEFAULT_SYSTEM_PROMPT = """\
 You are a memory-augmented assistant. The user is asking about facts \
@@ -1084,6 +1134,34 @@ class Agent:
                 session_id=saga_session_id,
                 trigger=event.trigger,
             )
+        # Expected-tool-call check: when the inbound event declared
+        # an ``expected_tool_call`` markers dict (typically a poller
+        # that needs the turn to call a specific submission tool —
+        # github-poller's review-needed events expect ``gh pr review``),
+        # check whether the turn actually called the expected tool.
+        # Emit the declared signal when missing so the operator sees
+        # the failure mode in the algedonic block / introspection
+        # report. Generic on this side so a new poller adding its own
+        # expectation doesn't need to touch agent.py — it just emits
+        # the ``expected_tool_call`` marker in its JSONL.
+        # See Mimir's PR #234 / #235 investigation for the
+        # reasoning-before-Skill-loads root cause this detects.
+        markers = (event.extra or {}).get("expected_tool_call")
+        if (
+            isinstance(markers, dict)
+            and not _turn_matched_expected_tool_call(events, markers)
+        ):
+            signal_type = markers.get("signal_on_missing")
+            if isinstance(signal_type, str) and signal_type.strip():
+                await safe_log_event(
+                    signal_type.strip(),
+                    channel_id=event.channel_id,
+                    event_type=(event.extra or {}).get("event_type"),
+                    expected_tool_names=list(markers.get("tool_names") or []),
+                    expected_bash_substrings=list(
+                        markers.get("bash_substrings") or []
+                    ),
+                )
         saga_calls = [
             {
                 "call_type": c.call_type, "args": c.args, "result": c.result,
