@@ -343,9 +343,9 @@ _START_SH_TEMPLATE = """\
 # GH_USER_EMAIL, etc.). For deeper customization, replace this
 # entrypoint with your own COPY in a Dockerfile override layer.
 #
-#   1. First run: clone mimir into /workspace/mimir. Subsequent runs
-#      leave the worktree alone — the agent owns its branches +
-#      uncommitted state.
+#   1. First run: clone the runtime source (derived from MIMIR_GIT_URL)
+#      into /workspace/<repo-name>. Subsequent runs leave the worktree
+#      alone — the agent owns its branches + uncommitted state.
 #   2. git + gh auth from GITHUB_TOKEN (clone of private upstreams).
 #   3. uv sync (idempotent).
 #   4. mimir setup --home /mimir-home (idempotent; only writes missing
@@ -357,7 +357,11 @@ set -euo pipefail
 # compose.env if you're running a Muninn-like fork or pinning to a
 # private fork; defaults to upstream mimir's main branch.
 REPO_URL="${MIMIR_GIT_URL:-https://github.com/jasoncarreira/mimir.git}"
-REPO_DIR="/workspace/mimir"
+# Derive the local clone dir from the URL so non-mimir forks (Muninn,
+# etc.) land at /workspace/<their-repo-name> instead of being mis-named
+# /workspace/mimir.
+REPO_NAME="$(basename "${REPO_URL}" .git)"
+REPO_DIR="/workspace/${REPO_NAME}"
 DEFAULT_BRANCH="${MIMIR_DEFAULT_BRANCH:-main}"
 
 # ─── git + gh auth ─────────────────────────────────────────────────
@@ -527,6 +531,16 @@ def _ensure_compose_env_gitignored(home: Path) -> bool:
     return True
 
 
+def _sanitize_service_name(raw: str) -> str:
+    """Replace any char outside [A-Za-z0-9_-] with '-'.
+
+    Used for both auto-derived (home dir name) and explicit
+    (``--service-name``) inputs so compose never sees an invalid
+    service / container name.
+    """
+    return re.sub(r"[^a-zA-Z0-9_-]", "-", raw)
+
+
 def scaffold(
     home: Path,
     *,
@@ -551,8 +565,20 @@ def scaffold(
     if service_name is None:
         # Use the agent's home dir name (sanitized) as the container
         # name. Keeps multiple agents on one host from colliding.
-        raw = home.name or "mimir-agent"
-        service_name = re.sub(r"[^a-zA-Z0-9_-]", "-", raw)
+        service_name = _sanitize_service_name(home.name or "mimir-agent")
+    else:
+        # An explicit --service-name still goes through the sanitizer
+        # so an operator typo (spaces, slashes) can't produce an
+        # invalid compose service name. Compose silently accepts some
+        # of these and then errors deep in the container runtime.
+        sanitized = _sanitize_service_name(service_name)
+        if sanitized != service_name:
+            print(
+                f"[scaffold-docker] --service-name {service_name!r} "
+                f"contained chars outside [A-Za-z0-9_-]; using "
+                f"{sanitized!r} instead."
+            )
+            service_name = sanitized
 
     result = ScaffoldResult()
     fragments = collect_fragments(home)
@@ -561,8 +587,6 @@ def scaffold(
 
     # Helper: write only when content actually changes, so an idempotent
     # re-run reports "no changes" instead of "+ Dockerfile" three times.
-    # Returns (wrote, exec_bit_changed) so the caller can stamp chmod
-    # bits without flagging "wrote" when only mode-bit work happened.
     def _write_if_changed(path: Path, content: str, label: str) -> None:
         if path.is_file() and path.read_text() == content:
             result.files_skipped.append(f"{label} (no changes)")
