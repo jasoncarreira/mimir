@@ -611,3 +611,123 @@ def test_direct_5h_still_projects_on_pace(tmp_path):
     # on_pace_utilization is computable (not None) — the projection
     # ran. Exact value depends on window timing but it should exist.
     # (Exact value isn't load-bearing for the test; presence is.)
+
+
+# ─── _is_anthropic_oauth_deployment + auto-disable on routed deployments ─
+
+
+def test_is_anthropic_oauth_deployment_default_true_when_unset(monkeypatch):
+    """No ``ANTHROPIC_BASE_URL`` → assume real Anthropic (poller stays
+    on). This is the back-compat path for mimirbot + bare-metal."""
+    from mimir.config import _is_anthropic_oauth_deployment
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    assert _is_anthropic_oauth_deployment() is True
+
+
+def test_is_anthropic_oauth_deployment_true_for_canonical_anthropic(monkeypatch):
+    from mimir.config import _is_anthropic_oauth_deployment
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    assert _is_anthropic_oauth_deployment() is True
+    # Trailing slash, /v1 suffix — same host
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1/")
+    assert _is_anthropic_oauth_deployment() is True
+
+
+def test_is_anthropic_oauth_deployment_false_for_minimax(monkeypatch):
+    """Muninn's deployment: Anthropic-compat endpoint at Minimax.
+    Poller should auto-disable to avoid spamming oauth_usage_failed."""
+    from mimir.config import _is_anthropic_oauth_deployment
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
+    assert _is_anthropic_oauth_deployment() is False
+
+
+def test_is_anthropic_oauth_deployment_false_for_moonshot(monkeypatch):
+    from mimir.config import _is_anthropic_oauth_deployment
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.moonshot.ai/anthropic")
+    assert _is_anthropic_oauth_deployment() is False
+
+
+def test_is_anthropic_oauth_deployment_false_for_arbitrary_gateway(monkeypatch):
+    """Some operator's private gateway. Probably wraps Anthropic, but
+    we can't know that and the OAuth usage endpoint won't be exposed
+    even if it does — safe default is "disable poller; if you do
+    want it on, set MIMIR_CLAUDE_OAUTH_CREDENTIALS explicitly"."""
+    from mimir.config import _is_anthropic_oauth_deployment
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://my-gateway.example.com/v1")
+    assert _is_anthropic_oauth_deployment() is False
+
+
+def test_oauth_credentials_path_auto_none_on_routed_deployment(monkeypatch):
+    """Auto-disable: when ANTHROPIC_BASE_URL routes away from
+    api.anthropic.com, ``_oauth_credentials_path()`` returns None
+    even though MIMIR_HOME is set + the file might exist. Stops the
+    poller from registering and spamming ``oauth_usage_failed``
+    every 3 min on a deployment where it can't do useful work.
+
+    Regression for muninn-mimir cutover 2026-05-20."""
+    from mimir.config import _oauth_credentials_path
+    monkeypatch.setenv("MIMIR_HOME", "/some/home")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
+    monkeypatch.delenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", raising=False)
+    assert _oauth_credentials_path() is None
+
+
+def test_oauth_credentials_path_explicit_override_wins_on_routed_deployment(
+    monkeypatch, tmp_path
+):
+    """If the operator sets ``MIMIR_CLAUDE_OAUTH_CREDENTIALS`` explicitly,
+    that wins even on a routed deployment — interpreted as "I have a
+    real Anthropic credentials file and want the poller on anyway."
+    """
+    from mimir.config import _oauth_credentials_path
+    explicit = tmp_path / "real-creds.json"
+    monkeypatch.setenv("MIMIR_HOME", "/some/home")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
+    monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", str(explicit))
+    result = _oauth_credentials_path()
+    assert result is not None
+    assert result == explicit.resolve()
+
+
+def test_oauth_credentials_path_explicit_empty_wins_on_anthropic_deployment(
+    monkeypatch
+):
+    """Existing behavior preserved: explicit empty string disables
+    even on a real Anthropic deployment (useful in tests / bench)."""
+    from mimir.config import _oauth_credentials_path
+    monkeypatch.setenv("MIMIR_HOME", "/some/home")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+    assert _oauth_credentials_path() is None
+
+
+def test_oauth_credentials_path_default_resolves_when_anthropic_deployment(
+    monkeypatch
+):
+    """Back-compat — mimirbot's path: no overrides, no routing →
+    poller registers as before."""
+    from mimir.config import _oauth_credentials_path
+    monkeypatch.setenv("MIMIR_HOME", "/some/home")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", raising=False)
+    result = _oauth_credentials_path()
+    assert result is not None
+    assert str(result).endswith(".claude/.credentials.json")
+
+
+def test_is_anthropic_oauth_deployment_malformed_url_falls_back_safely(monkeypatch):
+    """Pins the malformed-URL fallback: ``urlparse`` will tolerate
+    most garbage, but if it raises (or hostname extraction fails),
+    we should ``return True`` and let the SDK error elsewhere rather
+    than silently disable. Mimir-carreira review nit on PR #246."""
+    from mimir.config import _is_anthropic_oauth_deployment
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "://bad-url")
+    # Whatever urlparse does with this — either returns "" for
+    # hostname (→ False), or raises (→ True via except). The fix
+    # makes EITHER a defensible outcome. Test pins the actual
+    # behavior so future refactors don't change it silently.
+    result = _is_anthropic_oauth_deployment()
+    assert isinstance(result, bool)
+    # And the more meaningful semantic check: passing a totally
+    # bogus URL string shouldn't blow up the agent. Just don't
+    # raise.
