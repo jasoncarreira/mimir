@@ -92,14 +92,14 @@ work:
     until the projection appears.
 - **Subagent spend** (under "Subagent spend") tells you *where* the
   budget is going. If plan windows are tight AND the subagent block
-  shows an active climber/researcher burning hundreds of thousands of
-  tokens, that's likely the cause — decide whether to let it finish or
-  kill it via the subagent inbox / Task tool. A long mountaineering
-  climb that's been running for hours can quietly consume most of the
-  weekly Opus quota; the subagent block is your visibility into that.
-  When deciding "let it finish vs. kill," weigh: how close is it to
-  done (per its progress notes), what was the climb optimizing
-  (program.md), and how much of the quota has it eaten.
+  shows an active researcher / long-running task burning hundreds of
+  thousands of tokens, that's likely the cause — decide whether to
+  let it finish or kill it via the subagent inbox / Task tool. A
+  long-running subagent that's been running for hours can quietly
+  consume most of the weekly Opus quota; the subagent block is your
+  visibility into that. When deciding "let it finish vs. kill," weigh:
+  how close is it to done (per its progress notes), what was it
+  optimizing, and how much of the quota has it eaten.
 - **Cost rate alert** (⚠ marker in the section) — current $/hr is
   unusually high, either against an absolute ceiling or against your
   rolling-week baseline. Take this seriously: pick a small or

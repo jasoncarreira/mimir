@@ -59,9 +59,10 @@ jq -s 'map(select(.type | startswith("scheduler"))) | sort_by(.timestamp) | .[-2
 
 2. **Verify actual fire times:**
    ```bash
-   jq -s 'map(select(.type == "tool_call" and .tool == "journal")) | sort_by(.timestamp) | map({ts: .timestamp, session: .session_id})' logs/events.jsonl | tail -20
+   jq -s 'map(select(.type == "scheduled_tick")) | sort_by(.timestamp) | map({ts: .timestamp, channel: .channel_id, session: .session_id})' logs/events.jsonl | tail -20
    ```
-   Cross-reference journal timestamps with expected schedule.
+   Cross-reference scheduled-tick timestamps with the cron in
+   `scheduler.yaml` to confirm jobs are firing when expected.
 
 3. **Cron field confusion:**
    ```
