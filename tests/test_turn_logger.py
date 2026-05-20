@@ -899,3 +899,183 @@ async def test_turn_logger_writes_appendable_jsonl(tmp_path: Path):
     first = json.loads(lines[0])
     assert first["turn_id"] == "t1"
     assert first["events"][0]["type"] == "reasoning"
+
+
+# ─── _coerce_content content-block filtering (Anthropic extended thinking) ──
+
+
+def test_coerce_content_drops_thinking_block_keeps_text():
+    """Anthropic-style content list with a thinking block (Anthropic
+    extended thinking + Minimax via Anthropic-compat) must produce
+    only the visible-text reply. The thinking block's signature +
+    reasoning text MUST NOT leak into the output.
+
+    Regression for 2026-05-20 muninn-mimir cutover: a Discord message
+    showed up with the literal JSON ``{"signature": "...",
+    "thinking": "...", "type": "thinking"}`` JSON-dumped above the
+    real reply text. Root cause: ``_coerce_content`` fell back to
+    ``json.dumps(item)`` when an item lacked a ``text`` key. The fix
+    is an explicit allowlist on the ``type`` field.
+    """
+    from mimir.turn_logger import _coerce_content
+
+    content = [
+        {
+            "type": "thinking",
+            "thinking": "Jason says I'm up. Let me self-check.",
+            "signature": "11dd7a398010bbf76252acae6ebfb6ccc01c5c4b535f73db4",
+        },
+        {"type": "text", "text": "Okay, cutover complete. Quick sanity check:"},
+    ]
+    out = _coerce_content(content)
+    assert out == "Okay, cutover complete. Quick sanity check:"
+    # Specifically: NONE of the thinking-block fields should appear.
+    assert "thinking" not in out
+    assert "signature" not in out
+    assert "Jason says" not in out
+
+
+def test_coerce_content_drops_redacted_thinking_block():
+    """Anthropic's tamper-evident redacted-thinking shape — same
+    drop semantics as visible thinking."""
+    from mimir.turn_logger import _coerce_content
+
+    content = [
+        {"type": "redacted_thinking", "data": "opaque-base64-here"},
+        {"type": "text", "text": "Visible reply."},
+    ]
+    assert _coerce_content(content) == "Visible reply."
+
+
+def test_coerce_content_drops_tool_use_and_tool_result_in_content():
+    """``extract_turn_events`` walks tool_calls / ToolMessage separately
+    and emits its own tool_call / tool_result events. The string we
+    build here is for the AIMessage's user-visible OUTPUT only; tool
+    structure in content blocks would double-count if we included it."""
+    from mimir.turn_logger import _coerce_content
+
+    content = [
+        {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"cmd": "ls"}},
+        {"type": "text", "text": "I ran a command."},
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "result"},
+    ]
+    assert _coerce_content(content) == "I ran a command."
+
+
+def test_coerce_content_legacy_no_type_falls_through_as_text():
+    """Back-compat: a content block with no ``type`` key but a ``text``
+    key (the pre-typed-block LangChain shape) still gets its text
+    included. This is the shape some non-Anthropic providers emit."""
+    from mimir.turn_logger import _coerce_content
+
+    content = [{"text": "legacy text block, no type field"}]
+    assert _coerce_content(content) == "legacy text block, no type field"
+
+
+def test_coerce_content_multiple_text_blocks_joined_by_newline():
+    """When the model emits multiple text blocks (e.g., separated by
+    a thinking interlude), they're concatenated with a newline — same
+    as the prior behavior modulo the thinking drop."""
+    from mimir.turn_logger import _coerce_content
+
+    content = [
+        {"type": "text", "text": "First paragraph."},
+        {"type": "thinking", "thinking": "let me elaborate", "signature": "s"},
+        {"type": "text", "text": "Second paragraph."},
+    ]
+    assert _coerce_content(content) == "First paragraph.\nSecond paragraph."
+
+
+def test_coerce_content_unknown_type_is_silently_dropped():
+    """Pre-fix: an unknown ``type`` (e.g. a future provider's new block
+    kind) would get JSON-dumped into the output. Post-fix: silently
+    skipped. This is the right default — leaking raw internal state
+    into a user-visible reply is a worse failure than dropping a
+    block we don't know how to render."""
+    from mimir.turn_logger import _coerce_content
+
+    content = [
+        {"type": "future_unknown_block", "data": {"foo": "bar"}},
+        {"type": "text", "text": "Visible part."},
+    ]
+    out = _coerce_content(content)
+    assert out == "Visible part."
+    assert "future_unknown" not in out
+    assert "foo" not in out
+
+
+def test_thinking_blocks_surface_as_reasoning_events_in_turns_jsonl():
+    """The flip side of ``_coerce_content`` dropping thinking blocks
+    from user-visible output: ``extract_turn_events`` must capture
+    them as ``reasoning`` events with ``source:
+    "model_thinking_block"`` so introspection / turn replay can still
+    see the model's chain of thought.
+
+    Without this, the thinking content would be DROPPED entirely
+    (gone from output, gone from events) and the agent's reasoning
+    would be invisible to operators reviewing turns.jsonl.
+    """
+    msg = AIMessage(content=[
+        {
+            "type": "thinking",
+            "thinking": "Jason says I'm up. Let me self-check the soul doc.",
+            "signature": "sig-abc-123",
+        },
+        {"type": "text", "text": "Okay, cutover complete. Sanity check:"},
+    ])
+    events, output = extract_turn_events([msg])
+    # Output: only the visible text — thinking dropped.
+    assert output == "Okay, cutover complete. Sanity check:"
+    # Events: the thinking surfaces as a typed reasoning entry.
+    assert len(events) >= 1
+    thinking_events = [
+        e for e in events
+        if e.get("type") == "reasoning"
+        and e.get("source") == "model_thinking_block"
+    ]
+    assert len(thinking_events) == 1
+    assert thinking_events[0]["content"] == (
+        "Jason says I'm up. Let me self-check the soul doc."
+    )
+    # The signature field MUST NOT appear in the reasoning content —
+    # we extract only the ``thinking`` text, not the whole block.
+    assert "sig-abc-123" not in thinking_events[0]["content"]
+
+
+def test_redacted_thinking_blocks_surface_as_reasoning_placeholder():
+    """Anthropic's ``redacted_thinking`` blocks are server-encrypted
+    base64 — the content is opaque to us. We still emit a reasoning
+    event so turns.jsonl records that the model produced reasoning,
+    even when we can't see what it was. Pre-fix: dropped silently."""
+    msg = AIMessage(content=[
+        {"type": "redacted_thinking", "data": "opaque-base64-here"},
+        {"type": "text", "text": "Visible reply."},
+    ])
+    events, output = extract_turn_events([msg])
+    assert output == "Visible reply."
+    redacted = [
+        e for e in events
+        if e.get("type") == "reasoning"
+        and e.get("source") == "model_thinking_block"
+        and "redacted" in e.get("content", "")
+    ]
+    assert len(redacted) == 1
+
+
+def test_multiple_thinking_blocks_preserve_order():
+    """The model can emit multiple thinking interludes within a single
+    turn (e.g., reason → reply paragraph → reason more → reply more).
+    Each becomes its own reasoning event, in document order."""
+    msg = AIMessage(content=[
+        {"type": "thinking", "thinking": "first thought", "signature": "s1"},
+        {"type": "text", "text": "First paragraph."},
+        {"type": "thinking", "thinking": "second thought", "signature": "s2"},
+        {"type": "text", "text": "Second paragraph."},
+    ])
+    events, output = extract_turn_events([msg])
+    assert output == "First paragraph.\nSecond paragraph."
+    thinking_texts = [
+        e["content"] for e in events
+        if e.get("source") == "model_thinking_block"
+    ]
+    assert thinking_texts == ["first thought", "second thought"]
