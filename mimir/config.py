@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .billing import BillingMode, detect_billing_mode
 
@@ -78,12 +79,14 @@ def _is_anthropic_oauth_deployment() -> bool:
     at ``api.anthropic.com`` → real Anthropic. Anything else → a
     proxy / compat endpoint where the OAuth usage poller has no
     useful work to do."""
-    from urllib.parse import urlparse
     raw = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
     if not raw:
         return True
     try:
-        host = (urlparse(raw).hostname or "").lower()
+        # ``urlparse().hostname`` already lowercases the host, so no
+        # extra ``.lower()`` needed (mimir-carreira review note on PR
+        # #246).
+        host = urlparse(raw).hostname or ""
     except (ValueError, AttributeError):
         return True  # malformed → assume Anthropic; the SDK will error elsewhere
     return host == "api.anthropic.com"

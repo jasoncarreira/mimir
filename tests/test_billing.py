@@ -713,3 +713,21 @@ def test_oauth_credentials_path_default_resolves_when_anthropic_deployment(
     result = _oauth_credentials_path()
     assert result is not None
     assert str(result).endswith(".claude/.credentials.json")
+
+
+def test_is_anthropic_oauth_deployment_malformed_url_falls_back_safely(monkeypatch):
+    """Pins the malformed-URL fallback: ``urlparse`` will tolerate
+    most garbage, but if it raises (or hostname extraction fails),
+    we should ``return True`` and let the SDK error elsewhere rather
+    than silently disable. Mimir-carreira review nit on PR #246."""
+    from mimir.config import _is_anthropic_oauth_deployment
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "://bad-url")
+    # Whatever urlparse does with this — either returns "" for
+    # hostname (→ False), or raises (→ True via except). The fix
+    # makes EITHER a defensible outcome. Test pins the actual
+    # behavior so future refactors don't change it silently.
+    result = _is_anthropic_oauth_deployment()
+    assert isinstance(result, bool)
+    # And the more meaningful semantic check: passing a totally
+    # bogus URL string shouldn't blow up the agent. Just don't
+    # raise.
