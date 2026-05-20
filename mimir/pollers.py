@@ -620,11 +620,26 @@ async def run_poller(
         # it surfaces algedonically. Unknown signal types still land
         # in events.jsonl (grep-able for operator debugging) but
         # don't enter the algedonic block.
+        #
+        # Strip-list rationale:
+        #   ``signal``      — discriminator, becomes the event_type arg
+        #   ``poller``      — re-stamped explicitly below
+        #   ``prompt``      — defensive: a record carrying both
+        #                     ``signal`` and ``prompt`` routes as
+        #                     signal-only; the ``prompt`` would be
+        #                     misleading in the payload
+        #   ``event_type``  — collides with ``log_event``'s positional
+        #                     parameter; without stripping, a payload
+        #                     key called ``event_type`` (e.g. a poller
+        #                     surfacing ``"event_type": "invalid_grant"``)
+        #                     would raise TypeError on the **payload
+        #                     expansion and the signal would drop
+        #                     silently. Mimir PR #235 nit.
         signal_type = parsed.get("signal")
         if isinstance(signal_type, str) and signal_type.strip():
             payload = {
                 k: v for k, v in parsed.items()
-                if k not in ("signal", "poller", "prompt")
+                if k not in ("signal", "poller", "prompt", "event_type")
             }
             try:
                 await log_event(

@@ -1709,7 +1709,104 @@ print(json.dumps({
     by_type = {e["type"]: e for e in events}
     assert "poller_signal" in by_type
     # The ``prompt`` field is stripped from the signal payload (the
-    # framework drops ``signal``, ``poller``, and ``prompt`` to
-    # avoid both noise and accidental rehydration).
+    # framework drops ``signal``, ``poller``, ``prompt``, and
+    # ``event_type`` to avoid noise and the log_event kwarg collision).
     assert "prompt" not in by_type["poller_signal"]
     assert by_type["poller_signal"]["note"] == "operator's choice but signal wins"
+
+
+@pytest.mark.asyncio
+async def test_signal_payload_event_type_key_does_not_collide(tmp_path, home):
+    """Regression for Mimir PR #235 nit: a payload key named
+    ``event_type`` would collide with ``log_event(event_type, **payload)``
+    on the kwarg expansion (``TypeError: got multiple values for
+    keyword argument 'event_type'``) and the signal would drop silently
+    via the catch-all warning.
+
+    Post-fix: ``event_type`` is on the strip list, so the signal
+    surfaces normally and the original collision-key is dropped.
+    """
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({
+    "poller": "gmail-inbox",
+    "signal": "poller_oauth_expired",
+    "event_type": "invalid_grant",
+    "account": "muninn@muninnai.ai"
+}))
+""")
+    cfg = PollerConfig(
+        name="gmail-inbox", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 0
+
+    events = _read_events(home)
+    by_type = {e["type"]: e for e in events}
+    # The signal landed (didn't get silently dropped by the
+    # TypeError-via-catchall).
+    assert "poller_oauth_expired" in by_type
+    sig = by_type["poller_oauth_expired"]
+    # The payload-side ``event_type`` is stripped — only the
+    # framework's outer ``type`` matters. Useful unique fields survive.
+    assert sig["account"] == "muninn@muninnai.ai"
+    # Confirm there's no payload-side ``event_type`` key sneaking
+    # through (would imply a future regression).
+    payload_keys = {k for k in sig.keys() if k != "type"}
+    assert "event_type" not in payload_keys
+    # The complete-event signal counter caught it.
+    complete = [e for e in events if e.get("type") == "poller_complete"]
+    assert complete[0]["signals_emitted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_signal_type_lands_in_events_jsonl(tmp_path, home):
+    """Regression for Mimir PR #235 nit: an unrecognized signal
+    event_type (not in ``feedback._EVENT_RULES``) must still land
+    in events.jsonl so the operator can grep for it during
+    debugging — it just won't surface in the algedonic block.
+
+    Pins the docstring contract: "Unknown signal types still land
+    in events.jsonl (grep-able for operator debugging) but don't
+    enter the algedonic block."
+    """
+    from mimir.feedback import _EVENT_RULES
+
+    unknown_signal = "some_skill_specific_signal_not_in_rules"
+    # Sanity: confirm the test's chosen name is genuinely unknown so
+    # adding a future rule with this name doesn't quietly weaken the
+    # test.
+    assert unknown_signal not in _EVENT_RULES, (
+        "test name collision: this signal type is now classified — "
+        "pick a different unknown name"
+    )
+
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"""
+import json
+print(json.dumps({{
+    "poller": "x",
+    "signal": "{unknown_signal}",
+    "detail": "an unclassified pain signal"
+}}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+
+    events = _read_events(home)
+    by_type = {e["type"]: e for e in events}
+    # The unknown signal IS in events.jsonl with its declared type.
+    assert unknown_signal in by_type
+    assert by_type[unknown_signal]["detail"] == "an unclassified pain signal"
+    assert by_type[unknown_signal]["poller"] == "x"
+    # poller_complete tracks it in signals_emitted just like a
+    # recognized signal — the framework doesn't gate on classification.
+    complete = [e for e in events if e.get("type") == "poller_complete"]
+    assert complete[0]["signals_emitted"] == 1
