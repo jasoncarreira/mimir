@@ -40,18 +40,67 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
    cp -r mimir/optional-skills/gmail-poller <home>/.claude/skills/
    ```
 
-4. **Configure env vars** (export in mimir's process environment, e.g.
-   via the container's env file):
+4. **Configure accounts** — pick ONE of the two modes:
+
+   ### Mode A: Multi-account with per-account prompt routing (preferred)
+
+   Drop `config.json` alongside `poller.py` in the skill directory
+   (i.e. `<home>/.claude/skills/gmail-poller/config.json`):
+
+   ```json
+   {
+     "accounts": [
+       {
+         "name":        "home",
+         "email":       "you@gmail.com",
+         "prompt-file": "email-home.md"
+       },
+       {
+         "name":   "work",
+         "email":  "you@employer.com",
+         "prompt": "Triage work email. High-signal senders only — drop newsletters and notifications. Reply only when explicitly addressed."
+       },
+       {
+         "name":        "agent",
+         "email":       "agent@example.com",
+         "prompt-file": "email-agent.md"
+       }
+     ]
+   }
+   ```
+
+   **Per-account schema:**
+
+   | Field | Required | Description |
+   |---|---|---|
+   | `name` | yes | Friendly label — surfaces in the emitted event as `account_name` for downstream routing. |
+   | `email` | yes | Gmail address `gog` should query (`gog --account <email>`). Must already be authed via `gog auth add`. |
+   | `prompt-file` | no | Filename under `<home>/prompts/` to load as the per-message prompt. Path traversal (`..`, absolute paths) is rejected. |
+   | `prompt` | no | Inline prompt body. Used when `prompt-file` is absent or its target is missing. |
+
+   **Prompt resolution per account:** `prompt-file` > inline `prompt` >
+   built-in default template (the original `[gmail] new message from …`
+   shape). Missing `prompt-file` does NOT error — falls through to
+   `prompt` if set, else to the default.
+
+   ### Mode B: Legacy single-account (backwards-compat)
+
+   Set `GOG_ACCOUNT=you@gmail.com` in the env and skip `config.json`.
+   Every email uses the built-in default prompt template.
+
+   ### Other env vars (apply to both modes)
 
    | Variable | Required | Description |
    |---|---|---|
-   | `GOG_ACCOUNT` | yes | Gmail address to poll. Must match an account from `gog auth add`. |
-   | `MIMIR_GMAIL_QUERY` | no | Gmail search override. Default: `in:inbox newer_than:1d`. Use Gmail's search language: `is:unread`, `from:`, `to:`, `subject:`, `label:`, `-from:` (exclude), `category:primary`, etc. |
-   | `MIMIR_GMAIL_MAX_FETCH` | no | Per-poll fetch cap. Default 50, clamp 1–200. |
+   | `MIMIR_GMAIL_QUERY` | no | Gmail search override. Default: `in:inbox newer_than:1d`. Use Gmail's search language: `is:unread`, `from:`, `to:`, `subject:`, `label:`, `-from:` (exclude), `category:primary`, etc. Applies to every account. |
+   | `MIMIR_GMAIL_MAX_FETCH` | no | Per-account fetch cap. Default 50, clamp 1–200. |
+   | `MIMIR_HOME` | no (yes if any `prompt-file` is set) | Agent home root. Used to resolve `prompt-file` entries against `<MIMIR_HOME>/prompts/`. |
+   | `GOG_ACCOUNT` | only in Mode B | Gmail address for single-account legacy mode. Ignored when `config.json` is present. |
 
-   All three are declared in `pollers.json` `pass_env`. `GOG_ACCOUNT`
-   and `MIMIR_*`-prefixed keys would otherwise be stripped by the env
-   filter — explicit `pass_env` bypasses both gates.
+   All env vars listed above (including `MIMIR_HOME`) are declared in
+   `pollers.json` `pass_env`. `MIMIR_*`-prefixed keys would otherwise
+   be stripped by the env filter — explicit `pass_env` bypasses both
+   gates.
 
 5. **Bring it live:**
 
@@ -71,16 +120,21 @@ One JSONL line per never-before-seen message ID:
 ```json
 {
   "poller": "gmail-inbox",
-  "prompt": "[gmail] new message from Alice <alice@example.com>: 'PR review feedback'\n  > Looked over your changes — three small comments inline, otherwise…\n  URL: https://mail.google.com/mail/u/0/#inbox/19483abc...\n  message_id: 19483abc...",
+  "prompt": "<account-specific prompt body resolved from prompt-file / prompt / default>",
   "source_platform": "gmail",
   "message_id": "19483abc...",
   "thread_id": "19483abc...",
   "from": "Alice <alice@example.com>",
   "subject": "PR review feedback",
   "snippet": "Looked over your changes — three small comments inline, otherwise…",
-  "url": "https://mail.google.com/mail/u/0/#inbox/19483abc..."
+  "url": "https://mail.google.com/mail/u/0/#inbox/19483abc...",
+  "account": "you@gmail.com",
+  "account_name": "home"
 }
 ```
+
+`account` and `account_name` reflect the matched entry from `config.json`
+(or `legacy@x.com` / `"default"` in single-account mode).
 
 The framework wraps the JSONL into an `AgentEvent` per item (or per
 `batch_size` items if you bump that in `pollers.json` — default here
