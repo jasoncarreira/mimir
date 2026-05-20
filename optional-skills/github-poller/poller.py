@@ -173,8 +173,11 @@ _REVIEW_EXPECTED_TOOL_CALL: dict = {
         "mcp__claude_ai_GitHub_remote__submit_pending_pull_request_review",
     ],
     "bash_substrings": [
-        # /review skill's documented path
-        "gh pr review",
+        # /review skill's documented path. Trailing space discriminates
+        # from ``gh pr review-comment`` (the standalone-comment
+        # subcommand), which is NOT a review submission — Mimir's PR
+        # #236 review nit.
+        "gh pr review ",
     ],
     "signal_on_missing": "poller_review_missed_submission",
 }
@@ -227,9 +230,10 @@ def _emit(prompt: str, **extras: object) -> None:
     function appends a submission rule (always) and, when
     ``MIMIR_GITHUB_PRELOAD_REVIEW_SKILL`` is set to ``1``/``true``,
     inlines the full review SKILL.md body. The emitted event also
-    carries ``requires_review_submission: true`` so the framework's
-    post-turn check can detect "wrote a review, didn't submit" and
-    emit ``poller_review_missed_submission`` algedonically.
+    carries an ``expected_tool_call`` marker dict so the framework's
+    post-turn check (``agent.py::_turn_matched_expected_tool_call``)
+    can detect "wrote a review, didn't submit" and emit
+    ``poller_review_missed_submission`` algedonically.
     """
     event_type = extras.get("event_type")
     if isinstance(event_type, str) and event_type in REVIEW_NEEDED_EVENT_TYPES:

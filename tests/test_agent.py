@@ -1211,3 +1211,36 @@ def test_turn_matched_expected_tool_call_ignores_non_tool_call_events():
          "result": "gh pr review succeeded"},
     ]
     assert _turn_matched_expected_tool_call(events, markers) is False
+
+
+def test_turn_matched_expected_tool_call_discriminates_review_from_review_comment():
+    """``gh pr review-comment`` is a distinct GitHub-CLI subcommand for
+    standalone review comments — it is NOT a review submission. The
+    github-poller's marker uses ``"gh pr review "`` (trailing space)
+    to discriminate from ``gh pr review-comment``. Pin the contract:
+    a marker with the trailing-space substring must NOT match a Bash
+    call to ``gh pr review-comment``. Mimir PR #236 review nit.
+    """
+    from mimir.agent import _turn_matched_expected_tool_call
+
+    markers = {
+        "bash_substrings": ["gh pr review "],
+        "tool_names": [],
+        "signal_on_missing": "x",
+    }
+    # NOT a submission — standalone comment subcommand.
+    review_comment_events = [
+        {"type": "tool_call", "name": "Bash",
+         "args": {"command": "gh pr review-comment --body 'a thought'"}},
+    ]
+    assert _turn_matched_expected_tool_call(
+        review_comment_events, markers,
+    ) is False
+    # IS a submission — real review with --approve.
+    review_submit_events = [
+        {"type": "tool_call", "name": "Bash",
+         "args": {"command": "gh pr review 123 --approve --body 'lgtm'"}},
+    ]
+    assert _turn_matched_expected_tool_call(
+        review_submit_events, markers,
+    ) is True

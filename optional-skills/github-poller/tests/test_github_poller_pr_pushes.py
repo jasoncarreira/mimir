@@ -238,7 +238,11 @@ def test_review_needed_event_carries_submission_rule_and_marker(monkeypatch):
     assert isinstance(marker, dict)
     assert marker["signal_on_missing"] == "poller_review_missed_submission"
     assert "pull_request_review_write" in marker["tool_names"]
-    assert "gh pr review" in marker["bash_substrings"]
+    # Trailing space discriminates ``gh pr review <args>`` (real
+    # submission) from ``gh pr review-comment`` (standalone comment —
+    # NOT a submission). Mimir PR #236 review nit.
+    assert "gh pr review " in marker["bash_substrings"]
+    assert "gh pr review" not in marker["bash_substrings"]
 
 
 def test_non_review_events_carry_no_marker(monkeypatch):
