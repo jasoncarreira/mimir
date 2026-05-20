@@ -253,44 +253,24 @@ def _write_bench_saga_toml(home: Path) -> None:
     (home / "saga.toml").write_text(body)
 
 
-_BENCH_REFERENCE_DATE = None  # set per-question in _run_one_question
-_BENCH_TOP_K = 20  # match saga.benchmarks.longmemeval.config.RETRIEVAL_TOP_K
+_BENCH_TOP_K = 20  # match the RETRIEVAL_TOP_K saga's longmemeval bench used
 
 
 def _install_saga_bench_overrides() -> None:
-    """Bench-only monkey-patches that match saga's run_eval.py shape:
+    """Bench-only monkey-patch: ``mimir.saga_client._InProcessSaga.query``
+    bumps any caller-supplied ``top_k`` to ``_BENCH_TOP_K`` (20). saga's
+    bench used RETRIEVAL_TOP_K=20; mimir's pre-message hook hardcodes
+    12. The agent gets more retrieved-atom context this way — same
+    shape the Minimax reader had in saga's run_eval.
 
-    1. ``saga.core.hybrid_retrieve`` injects per-question
-       ``reference_date`` (parsed from ``q["question_date"]``) when the
-       caller doesn't supply one. mimir's pre-message hook calls
-       ``saga.query()`` without ref_date — production gets ``now()``,
-       which is correct for live agents but wrong for a 2023-dated
-       LongMemEval haystack run from 2026 (every "2 weeks ago" probe
-       computes against the wrong "now"). saga's run_eval parses the
-       question_date and threads it through; we replicate that here
-       without touching the SagaClient API.
+    Idempotent. Scoped to the bench process; production mimir is
+    untouched.
 
-    2. ``mimir.saga_client._InProcessSaga.query`` bumps any caller-
-       supplied ``top_k`` to ``_BENCH_TOP_K`` (20). saga's bench used
-       RETRIEVAL_TOP_K=20; mimir's pre-message hook hardcodes 12. The
-       agent gets more retrieved-atom context this way — same shape the
-       Minimax reader had in saga's run_eval.
-
-    Both patches are idempotent — calling this twice is safe. Both are
-    scoped to the bench process; production mimir is untouched.
+    Historical: the prior `saga.core.hybrid_retrieve` reference-date
+    patch was removed alongside the vendored saga deletion. mimir's
+    SagaStore.query has its own reference_date threading; the old
+    patch was a no-op against the actual mimir.saga call chain.
     """
-    import saga.core as _saga_core
-    if not getattr(_saga_core, "_bench_patched", False):
-        _orig_retrieve = _saga_core.hybrid_retrieve
-
-        async def _patched_retrieve(*args, reference_date=None, **kwargs):
-            if reference_date is None and _BENCH_REFERENCE_DATE is not None:
-                reference_date = _BENCH_REFERENCE_DATE
-            return await _orig_retrieve(*args, reference_date=reference_date, **kwargs)
-
-        _saga_core.hybrid_retrieve = _patched_retrieve
-        _saga_core._bench_patched = True
-
     from mimir import saga_client as _sc
     if not getattr(_sc._InProcessSaga, "_bench_patched", False):
         _orig_query = _sc._InProcessSaga.query
@@ -300,47 +280,6 @@ def _install_saga_bench_overrides() -> None:
 
         _sc._InProcessSaga.query = _patched_query
         _sc._InProcessSaga._bench_patched = True
-
-
-def _parse_question_date(question: dict) -> Any:
-    from datetime import datetime, timezone
-    try:
-        return datetime.strptime(
-            question["question_date"], "%Y/%m/%d (%a) %H:%M",
-        ).replace(tzinfo=timezone.utc)
-    except (ValueError, KeyError, TypeError):
-        return None
-
-
-def _switch_saga_db(db_path: Path) -> None:
-    """Point the in-process saga at a fresh SQLite file for this question.
-
-    Mirrors saga.benchmarks.longmemeval.run_eval._switch_db; saga's bench
-    tooling is the source of truth for the per-question DB lifecycle. We
-    repeat it here because the integration runner doesn't go through
-    run_eval — mimir's BenchBridge owns the dispatch loop, and it would
-    be confusing to import the saga runner just for this one helper."""
-    import saga.core
-    import saga.triples
-    saga.core.DB_PATH = db_path
-    saga.triples.DB_PATH = db_path
-    if db_path.exists():
-        db_path.unlink()
-    from saga.core import get_db, run_migrations
-    conn = get_db()
-    conn.close()
-    run_migrations()
-    from saga.triples import init_triples_schema
-    init_triples_schema()
-    # Reset FAISS singletons so they're rebuilt against the fresh DB.
-    # saga.vector_index._atoms_index is module-level; without reset, the
-    # index built for question N persists into N+1 (and grows unbounded
-    # via on_atom_stored hooks during the next ingest). Cross-question
-    # cluster lookups still produce the right answer because atom_map
-    # filters out N-1's IDs, but memory + search work grows linearly
-    # with question count for no benefit.
-    from saga.vector_index import reset_indexes
-    reset_indexes()
 
 
 async def _run_one_question(
@@ -371,42 +310,24 @@ async def _run_one_question(
     starting and tearing down the dispatcher worker — only the LAST
     question's turn actually completed because the worker shut down
     between iterations.
-    """
-    from saga.benchmarks.longmemeval.ingest import ingest_question
 
+    NOTE: This runner no longer performs per-question ingest +
+    consolidation. Those steps used to go through the vendored
+    ``saga.core`` / ``saga.benchmarks.longmemeval.ingest`` paths which
+    set state on modules outside mimir.saga's call chain (effectively
+    no-ops for the actual retrieval path) and were removed alongside
+    the vendored saga deletion. For a working modern bench, use
+    ``benchmarks.longmemeval_via_memory.runner`` (SagaStore-direct) or
+    the in-progress ``runner_memory.py`` (BenchBridge backed by
+    ``mimir.saga.SagaStore``).
+    """
     qid = question["question_id"]
     import time as _time
 
-    # Per-question saga DB (replicates saga's bench isolation).
-    work_dir = Path(os.environ.get("SAGA_DATA_DIR", "."))
-    db_path = work_dir / f"q_{qid}.db"
-    _switch_saga_db(db_path)
-    # Anchor saga's temporal pathway to the question's contemporaneous
-    # date; otherwise temporal-reasoning probes ("2 weeks ago", "last
-    # spring") compute against system clock and miss every time on a
-    # 2023-haystack-from-2026 bench.
-    global _BENCH_REFERENCE_DATE
-    _BENCH_REFERENCE_DATE = _parse_question_date(question)
-
-    t_phase = _time.time()
-    stats = ingest_question(question)
-    t_ingest = _time.time() - t_phase
-
-    # Consolidate. saga's run_eval.py runs this between ingest and
-    # retrieve so the observation-bonus + two-tier observations have
-    # material to surface; without it, the agent only sees raw atoms.
-    from saga.config import get_config as _saga_get_config
+    t_ingest = 0.0
     t_consolidate = 0.0
     n_clusters = 0
-    if _saga_get_config()('consolidation', 'enabled', False):
-        from saga.consolidation import ConsolidationEngine
-        t_phase = _time.time()
-        try:
-            cresult = await ConsolidationEngine().consolidate() or {}
-            n_clusters = cresult.get("clusters_consolidated", 0) if isinstance(cresult, dict) else 0
-        except Exception as exc:  # noqa: BLE001 — don't kill the run
-            print(f"  consolidation failed for {qid}: {exc}", file=sys.stderr)
-        t_consolidate = _time.time() - t_phase
+    stats: dict[str, Any] = {}
 
     # Snapshot turn-log size + bench stream position so we can read just
     # the new content after this question's turn finishes.
@@ -637,7 +558,31 @@ async def _amain(argv: list[str] | None = None) -> int:
     return 0 if not failed else 1
 
 
+_DEPRECATED_MSG = """\
+benchmarks.longmemeval_via_mimir.runner is unsupported post saga-decoupling.
+
+This runner used to drive per-question ingest + consolidation through the
+vendored saga.core engine. After the vendored saga deletion, those steps
+were no-ops against the actual mimir.saga retrieval path; the runner is
+now retained only for the dispatch scaffolding that
+``tests/test_bench_via_mimir.py`` exercises (route / score / hypothesis
+extraction helpers).
+
+For a working LongMemEval run:
+  - SagaStore-direct: benchmarks.longmemeval_via_memory.runner
+  - mimir BenchBridge (in-progress):
+    benchmarks.longmemeval_via_mimir.runner_memory
+
+Pass ``--allow-deprecated`` to bypass this guard (the dispatch loop
+will still run but ingest no atoms; useful only for harness debugging).
+"""
+
+
 def main() -> None:
+    if "--allow-deprecated" not in sys.argv:
+        print(_DEPRECATED_MSG, file=sys.stderr)
+        sys.exit(2)
+    sys.argv = [a for a in sys.argv if a != "--allow-deprecated"]
     sys.exit(asyncio.run(_amain()))
 
 
