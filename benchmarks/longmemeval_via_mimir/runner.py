@@ -497,8 +497,9 @@ async def _amain(argv: list[str] | None = None) -> int:
 
     # Install bench-only monkey-patches AFTER saga and mimir are
     # importable but BEFORE the app builds. _install_saga_bench_overrides
-    # patches saga.core.hybrid_retrieve (per-question reference_date)
-    # and _InProcessSaga.query (top_k bump to 20 to match saga's bench).
+    # patches _InProcessSaga.query (top_k bump to 20 to match saga's
+    # bench). The historical saga.core.hybrid_retrieve patch was removed
+    # alongside the vendored saga deletion.
     _install_saga_bench_overrides()
     from mimir.config import Config
     cfg = Config.from_env()
