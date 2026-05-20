@@ -641,3 +641,247 @@ async def test_no_warning_when_dims_match(tmp_path: Path, caplog):
         await idx_b.start(run_initial_sweep=False, sweep_loop=False)
     matching = [r for r in caplog.records if "dim mismatch" in r.message]
     assert matching == []
+
+
+# ---- path_prefix + dynamic weights (file_search enhancements) ----------
+
+
+def _seed_state_subdirs(home: Path) -> None:
+    """Seed state/journal, state/research, state/reflections — three
+    subtrees with the same keyword so path_prefix can be exercised."""
+    for sub in ("journal", "research", "reflections"):
+        d = home / "state" / sub
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{sub}-note.md").write_text(
+            f"<!-- desc: {sub} note about flocking -->\n"
+            f"# {sub.title()} entry\n"
+            "Flocking emerges from local rules. "
+            "Boids by Craig Reynolds: separation, alignment, cohesion. "
+            f"Filed under state/{sub}/.\n"
+        )
+
+
+@pytest.mark.asyncio
+async def test_path_prefix_filters_to_subdir(tmp_path: Path):
+    """``path_prefix='state/journal'`` returns only journal results."""
+    _seed_state_subdirs(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    results = await idx.search(
+        "flocking", scope="all", k=10, path_prefix="state/journal",
+    )
+    paths = {r.path for r in results}
+    assert paths, "expected at least one match"
+    assert all(p.startswith("state/journal/") for p in paths), paths
+    assert "state/research/research-note.md" not in paths
+    assert "state/reflections/reflections-note.md" not in paths
+
+
+@pytest.mark.asyncio
+async def test_path_prefix_trailing_slash_normalized(tmp_path: Path):
+    """Trailing ``/`` on prefix shouldn't change behavior."""
+    _seed_state_subdirs(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    with_slash = await idx.search(
+        "flocking", scope="all", k=10, path_prefix="state/research/",
+    )
+    without_slash = await idx.search(
+        "flocking", scope="all", k=10, path_prefix="state/research",
+    )
+    assert {r.path for r in with_slash} == {r.path for r in without_slash}
+
+
+@pytest.mark.asyncio
+async def test_path_prefix_composes_with_scope(tmp_path: Path):
+    """Passing ``scope='state'`` + ``path_prefix='state/journal'`` is a
+    valid narrower filter — not an error."""
+    _seed(tmp_path)  # also seeds memory/topics/quantum.md etc.
+    _seed_state_subdirs(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    results = await idx.search(
+        "flocking", scope="state", k=10, path_prefix="state/journal",
+    )
+    paths = {r.path for r in results}
+    # Non-empty: the journal-note hit must survive. (Issubset alone
+    # would false-pass on an empty result set — Mimir's PR #233 review.)
+    assert paths, "expected at least one state/journal match"
+    # And it's the only file that survives both filters: the boids.md
+    # memory file is excluded by scope=state, and journal/ is narrower
+    # than the rest of state/.
+    assert paths == {"state/journal/journal-note.md"}
+
+
+@pytest.mark.asyncio
+async def test_scope_and_path_prefix_contradictory_combo_returns_empty(tmp_path: Path):
+    """``scope="memory"`` + ``path_prefix="state/journal"`` is logically
+    inconsistent (the prefix lives in a different scope) — the filters
+    AND together, so we return []. Pins the docstring contract.
+    """
+    _seed(tmp_path)
+    _seed_state_subdirs(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    results = await idx.search(
+        "flocking", scope="memory", k=10, path_prefix="state/journal",
+    )
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_all_zero_weights_yields_zero_score(tmp_path: Path):
+    """``semantic_weight=0, keyword_weight=0, recency_weight=0`` is
+    accepted (non-negative is the contract) but produces score=0 for
+    every result. Order is candidate-pool order, not a meaningful
+    ranking — pin the docstring claim."""
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    results = await idx.search(
+        "Boids", scope="all", k=10,
+        semantic_weight=0.0, keyword_weight=0.0, recency_weight=0.0,
+    )
+    assert results, "expected matches"
+    assert all(r.score == 0.0 for r in results)
+
+
+@pytest.mark.asyncio
+async def test_negative_weight_validated_before_embed(tmp_path: Path, monkeypatch):
+    """Negative weights raise ValueError BEFORE the embed call so the
+    error path doesn't pay the ONNX cost of an embed we'd discard.
+    Pins Mimir's PR #233 review fix.
+    """
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    embed_calls: list[str] = []
+    orig = idx._embed_query
+
+    def tracking_embed(text):
+        embed_calls.append(text)
+        return orig(text)
+
+    monkeypatch.setattr(idx, "_embed_query", tracking_embed)
+    with pytest.raises(ValueError, match="non-negative"):
+        await idx.search("Boids", scope="all", k=5, recency_weight=-0.5)
+    assert embed_calls == [], "embed must not run when weights fail validation"
+
+
+@pytest.mark.asyncio
+async def test_path_prefix_no_match_returns_empty(tmp_path: Path):
+    """Prefix pointing at a path that doesn't exist returns []."""
+    _seed_state_subdirs(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    results = await idx.search(
+        "flocking", scope="all", k=10, path_prefix="state/no-such-dir",
+    )
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_path_prefix_escapes_like_wildcards(tmp_path: Path):
+    """``%`` and ``_`` in path_prefix shouldn't act as SQL LIKE wildcards.
+    A prefix like ``state/jou_nal`` must NOT accidentally match
+    ``state/journal/``.
+    """
+    _seed_state_subdirs(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    results = await idx.search(
+        "flocking", scope="all", k=10, path_prefix="state/jou_nal",
+    )
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_dynamic_weights_propagate_to_scoring(tmp_path: Path):
+    """The score returned with explicit weights reflects exactly the
+    formula ``w_sem·cosine + w_kw·bm25_norm + w_rec·recency`` — same
+    cosine / bm25 / recency components, different weights, different
+    composite. Verifies the kwargs hit the math (not just that they're
+    silently ignored).
+    """
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    default = await idx.search("Boids", scope="all", k=5)
+    semantic_heavy = await idx.search(
+        "Boids", scope="all", k=5,
+        semantic_weight=1.0, keyword_weight=0.0, recency_weight=0.0,
+    )
+    keyword_heavy = await idx.search(
+        "Boids", scope="all", k=5,
+        semantic_weight=0.0, keyword_weight=1.0, recency_weight=0.0,
+    )
+    recency_heavy = await idx.search(
+        "Boids", scope="all", k=5,
+        semantic_weight=0.0, keyword_weight=0.0, recency_weight=1.0,
+    )
+    assert default and semantic_heavy and keyword_heavy and recency_heavy
+
+    # Pure-semantic score equals max(0, cosine) for the same hit.
+    top = semantic_heavy[0]
+    assert top.score == max(0.0, top.cosine)
+    # Pure-recency score equals the recency component.
+    assert recency_heavy[0].score == recency_heavy[0].recency
+    # Three different weight vectors → three different top scores.
+    scores = {
+        round(default[0].score, 4),
+        round(semantic_heavy[0].score, 4),
+        round(keyword_heavy[0].score, 4),
+        round(recency_heavy[0].score, 4),
+    }
+    assert len(scores) >= 3, scores
+
+
+@pytest.mark.asyncio
+async def test_weights_default_to_module_constants_when_none(tmp_path: Path):
+    """Passing all weights as ``None`` matches passing nothing (i.e. the
+    module-level 0.5/0.2/0.3 defaults take effect).
+
+    Score equality is approximate — recency decays continuously via
+    ``time.time()``, so back-to-back searches see ~microsecond drift
+    in the recency component. Path ordering and per-component values
+    must match exactly; the composite score is compared within a
+    tight tolerance.
+    """
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    without_kwargs = await idx.search("Boids", scope="all", k=5)
+    with_none = await idx.search(
+        "Boids", scope="all", k=5,
+        semantic_weight=None, keyword_weight=None, recency_weight=None,
+    )
+    assert [r.path for r in without_kwargs] == [r.path for r in with_none]
+    if without_kwargs:
+        # Cosine + BM25 are deterministic from index state, so they
+        # must match exactly. Recency drifts microscopically between
+        # calls — assert score-equality within a tight tolerance.
+        assert without_kwargs[0].cosine == with_none[0].cosine
+        assert without_kwargs[0].bm25 == with_none[0].bm25
+        assert abs(without_kwargs[0].score - with_none[0].score) < 1e-4
+
+
+@pytest.mark.asyncio
+async def test_negative_weight_raises(tmp_path: Path):
+    """Negative weights are rejected with a clear error so a typo in the
+    tool call doesn't silently flip sign on the ranking."""
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    with pytest.raises(ValueError, match="non-negative"):
+        await idx.search("Boids", scope="all", k=5, semantic_weight=-0.1)
