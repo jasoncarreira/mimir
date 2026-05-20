@@ -132,10 +132,129 @@ def _truncate(text: str, n: int = BODY_PREVIEW_CHARS) -> str:
     return text[:n].rstrip() + "…"
 
 
+#: Event types where a PR review action is expected from the agent.
+#: For these, the framework appends a short submission rule to the
+#: emitted prompt so the reasoning-before-Skill-loads issue (Mimir's
+#: post-#234 investigation) doesn't leave the review unsubmitted —
+#: rule arrives in context before the model's reasoning commits.
+REVIEW_NEEDED_EVENT_TYPES = frozenset({
+    "pr_opened",                # brand-new PR
+    "pr_synchronize",           # push to an existing PR (re-review)
+    "pr_review_requested",      # the agent's login was added to
+                                # ``requested_reviewers`` on an open PR
+})
+
+
+_REVIEW_SUBMISSION_RULE = (
+    "\n\n──── REVIEW SUBMISSION RULE ────\n"
+    "This event needs a review. After drafting your review prose, "
+    "you MUST submit it via `gh pr review` (or "
+    "`pull_request_review_write` MCP tool). Review prose alone — "
+    "left in turn output and never sent — is a non-review. The "
+    "/review skill spells out the full flow; this rule is restated "
+    "here so it's present in your context before the Skill call "
+    "fires."
+)
+
+
+#: Marker dict the framework reads at turn finalization. When the
+#: turn's tool_calls don't match any of these tool names / Bash
+#: substrings, ``signal_on_missing`` is emitted into events.jsonl
+#: where ``feedback._EVENT_RULES`` classifies it algedonically.
+#: Lives on the poller side (not in agent.py) so the policy "what
+#: counts as 'review submitted'" belongs to this skill — Mimir's
+#: PR #234 / #235 nit about coupling.
+_REVIEW_EXPECTED_TOOL_CALL: dict = {
+    "tool_names": [
+        # MCP path (GitHub MCP server)
+        "pull_request_review_write",
+        "submit_pending_pull_request_review",
+        "mcp__claude_ai_GitHub_remote__pull_request_review_write",
+        "mcp__claude_ai_GitHub_remote__submit_pending_pull_request_review",
+    ],
+    "bash_substrings": [
+        # /review skill's documented path. Trailing space discriminates
+        # from ``gh pr review-comment`` (the standalone-comment
+        # subcommand), which is NOT a review submission — Mimir's PR
+        # #236 review nit.
+        "gh pr review ",
+    ],
+    "signal_on_missing": "poller_review_missed_submission",
+}
+
+
+def _load_review_skill_body(mimir_home: str, skill_path_override: str = "") -> str:
+    """Load and return the review skill's SKILL.md body for inlining.
+
+    Returns ``""`` (empty) on any failure — the submission rule alone
+    is sufficient when the full skill can't be loaded; we'd rather
+    surface a small in-prompt note than crash the poll.
+
+    ``mimir_home`` is the agent home root; ``skill_path_override`` is
+    an absolute path that wins if non-empty (operator escape hatch
+    for non-standard layouts).
+    """
+    candidate = skill_path_override.strip()
+    if not candidate:
+        if not mimir_home:
+            return ""
+        candidate = str(
+            Path(mimir_home) / ".claude" / "skills" / "review" / "SKILL.md"
+        )
+    try:
+        body = Path(candidate).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        _eprint(
+            f"github-poller: review-skill preload disabled — "
+            f"could not read {candidate} ({exc})"
+        )
+        return ""
+    if not body:
+        return ""
+    return (
+        "\n\n──── /review SKILL.md (pre-loaded) ────\n" + body
+    )
+
+
+def _eprint(*args: object, **kwargs: object) -> None:
+    """Stderr printer (captured by framework into poller_stderr)."""
+    print(*args, file=sys.stderr, **kwargs)
+
+
 def _emit(prompt: str, **extras: object) -> None:
     """One JSONL event line — framework parses + delivers as
     AgentEvent. ``source_platform`` flows through for prompt
-    rendering."""
+    rendering.
+
+    For ``event_type`` values in ``REVIEW_NEEDED_EVENT_TYPES`` the
+    function appends a submission rule (always) and, when
+    ``MIMIR_GITHUB_PRELOAD_REVIEW_SKILL`` is set to ``1``/``true``,
+    inlines the full review SKILL.md body. The emitted event also
+    carries an ``expected_tool_call`` marker dict so the framework's
+    post-turn check (``agent.py::_turn_matched_expected_tool_call``)
+    can detect "wrote a review, didn't submit" and emit
+    ``poller_review_missed_submission`` algedonically.
+    """
+    event_type = extras.get("event_type")
+    if isinstance(event_type, str) and event_type in REVIEW_NEEDED_EVENT_TYPES:
+        prompt = prompt + _REVIEW_SUBMISSION_RULE
+        preload = os.environ.get("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL", "").strip().lower()
+        if preload in ("1", "true", "yes"):
+            body = _load_review_skill_body(
+                os.environ.get("MIMIR_HOME", ""),
+                os.environ.get("MIMIR_GITHUB_REVIEW_SKILL_PATH", ""),
+            )
+            if body:
+                prompt = prompt + body
+        # Generic framework hook (Mimir PR #234/#235 follow-up): the
+        # poller declares which tool calls satisfy "review submitted"
+        # and which signal to emit when none of them fired. agent.py
+        # reads this marker at turn finalization and emits the
+        # declared signal algedonically. The list lives here (in the
+        # skill closest to the domain) rather than hardcoded in
+        # agent.py so adding a new poller's expectation is a skill-
+        # side change.
+        extras["expected_tool_call"] = _REVIEW_EXPECTED_TOOL_CALL
     event = {
         "poller": POLLER_NAME,
         "source_platform": "github",
@@ -284,18 +403,22 @@ def _check_pr_pushes(
     token: str,
     me: str,
     pr_heads: dict[str, str],
-) -> tuple[int, dict[str, str]]:
-    """Detect new commits pushed to existing open PRs.
+    pr_review_requests: set[str] | None = None,
+) -> tuple[int, dict[str, str], set[str]]:
+    """Detect new commits pushed to existing open PRs AND new
+    review-requests addressed to ``me`` on those same PRs.
 
-    Different signature from the sibling checks: takes ``pr_heads``
-    (the per-repo ``{number_str: sha}`` snapshot from the previous
-    poll, possibly empty) instead of a ``since`` timestamp, and
-    returns ``(emit_count, new_pr_heads)``. The cleanup model is
-    "rebuild ``pr_heads`` from the current ``state=open`` set on
-    every poll" — closed/merged PRs and PRs in repos no longer in
-    the watch list naturally drop out because they're never copied
-    into the new dict the caller saves.
+    Different signature from the sibling checks: takes the per-repo
+    cursors directly (``pr_heads`` for push-detection,
+    ``pr_review_requests`` for review-request-detection) and returns
+    them rebuilt from the current ``state=open`` snapshot. The
+    cleanup model is "rebuild on every poll" — closed/merged PRs and
+    PRs in repos no longer in the watch list naturally drop out
+    because they're never copied into the new cursor.
 
+    Return shape: ``(emit_count, new_pr_heads, new_review_requests)``.
+
+    ── Push detection ──
     First sighting of a PR: record its head sha, do NOT emit.
     ``_check_prs`` already fires ``pr_opened`` for genuinely-new PRs;
     the first poll after this feature ships would otherwise bulk-fire
@@ -307,6 +430,18 @@ def _check_pr_pushes(
     base will still advance ``head.sha``, so we'll fire on it. That's
     a known false-positive; the alternative (compare diffs) is too
     expensive to run on every poll.
+
+    ── Review-request detection ──
+    Each PR's ``requested_reviewers`` list is checked against ``me``.
+    On the **transition** from "not requested" to "requested", emits
+    a ``pr_review_requested`` event. Tracked via
+    ``pr_review_requests`` (set of PR-number strings currently
+    flagged for ``me``). When ``me`` is removed from the list — review
+    submitted, PR closed, or operator un-requests — the PR drops out
+    of the set naturally so a later re-request fires again.
+
+    Empty ``me`` (no agent login configured) → review-request
+    detection is silently skipped; push detection still runs.
     """
     # ``per_page=100`` (vs GitHub's 30 default) gives ~3× headroom against
     # the active-prune pitfall: a repo with >page-size open PRs would
@@ -319,48 +454,87 @@ def _check_pr_pushes(
         token,
     )
     new_heads: dict[str, str] = {}
+    prior_review_requests = pr_review_requests or set()
+    new_review_requests: set[str] = set()
     if not isinstance(data, list):
-        # On API failure, preserve prior heads so we don't false-fire
+        # On API failure, preserve prior cursors so we don't false-fire
         # on the next successful poll. (If the poll truly missed a
-        # push, we'll catch it next time.)
-        return 0, dict(pr_heads)
+        # push or review-request, we'll catch it next time.)
+        return 0, dict(pr_heads), set(prior_review_requests)
     count = 0
     for pr in data:
-        if me and pr.get("user", {}).get("login") == me:
-            continue
+        # Push-detection self-filter: skip PRs the agent authored.
+        # NOTE: this filter does NOT apply to review-request detection
+        # below — the agent CAN be added as a reviewer to a PR it
+        # authored (rare, but legal) and we'd want to surface that.
+        pr_author = pr.get("user", {}).get("login")
         number = pr.get("number")
         if not number:
             continue
-        current_sha = (pr.get("head") or {}).get("sha")
-        if not current_sha:
-            continue
         key = str(number)
-        prev_sha = pr_heads.get(key)
-        if prev_sha is None:
-            # First sighting — record, do not emit.
-            new_heads[key] = current_sha
-            continue
-        if prev_sha != current_sha:
-            author = pr.get("user", {}).get("login", "unknown")
-            title = pr.get("title", "")
-            url = pr.get("html_url", "")
-            prompt = (
-                f"PR #{number} updated on {repo}: {title} (by @{author})\n"
-                f"Previous head: {prev_sha[:8]}, new head: "
-                f"{current_sha[:8]}\n{url}"
+
+        # ─── pr_synchronize (push detection) ───
+        current_sha = (pr.get("head") or {}).get("sha")
+        if current_sha and (not me or pr_author != me):
+            prev_sha = pr_heads.get(key)
+            if prev_sha is None:
+                # First sighting — record, do not emit.
+                new_heads[key] = current_sha
+            elif prev_sha != current_sha:
+                title = pr.get("title", "")
+                url = pr.get("html_url", "")
+                prompt = (
+                    f"PR #{number} updated on {repo}: {title} "
+                    f"(by @{pr_author or 'unknown'})\n"
+                    f"Previous head: {prev_sha[:8]}, new head: "
+                    f"{current_sha[:8]}\n{url}"
+                )
+                _emit(
+                    prompt,
+                    event_type="pr_synchronize",
+                    repo=repo,
+                    number=number,
+                    url=url,
+                    previous_head=prev_sha,
+                    new_head=current_sha,
+                )
+                count += 1
+                new_heads[key] = current_sha
+            else:
+                new_heads[key] = current_sha
+
+        # ─── pr_review_requested (reviewer added) ───
+        # Skip if no agent login configured — nothing to match against.
+        if me:
+            requested = pr.get("requested_reviewers") or []
+            currently_requested = any(
+                isinstance(r, dict) and r.get("login") == me
+                for r in requested
             )
-            _emit(
-                prompt,
-                event_type="pr_synchronize",
-                repo=repo,
-                number=number,
-                url=url,
-                previous_head=prev_sha,
-                new_head=current_sha,
-            )
-            count += 1
-        new_heads[key] = current_sha
-    return count, new_heads
+            if currently_requested:
+                new_review_requests.add(key)
+                if key not in prior_review_requests:
+                    # Transition: ``me`` was just added (or this is the
+                    # first sighting of the PR). Emit.
+                    title = pr.get("title", "")
+                    url = pr.get("html_url", "")
+                    prompt = (
+                        f"Review requested on {repo} PR #{number}: "
+                        f"{title} (by @{pr_author or 'unknown'})\n"
+                        f"You (@{me}) were added to the reviewers list.\n"
+                        f"{url}"
+                    )
+                    _emit(
+                        prompt,
+                        event_type="pr_review_requested",
+                        repo=repo,
+                        number=number,
+                        url=url,
+                        requested_reviewer=me,
+                        author=pr_author,
+                    )
+                    count += 1
+    return count, new_heads, new_review_requests
 
 
 def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
@@ -464,6 +638,10 @@ def main() -> None:
 
     pr_heads_all: dict[str, dict[str, str]] = cursor.get("pr_heads", {}) or {}
     new_pr_heads_all: dict[str, dict[str, str]] = {}
+    # Review-request cursor: ``{repo: [pr_number, ...]}``. JSON has no
+    # set type so we store as a list and convert at the boundaries.
+    rr_all: dict[str, list[str]] = cursor.get("pr_review_requests", {}) or {}
+    new_rr_all: dict[str, list[str]] = {}
 
     total = 0
     for repo in repos:
@@ -474,14 +652,17 @@ def main() -> None:
         total += _check_pr_review_comments(repo, since, token, me)
         total += _check_pr_reviews(repo, since, token, me)
         repo_heads = pr_heads_all.get(repo, {}) or {}
-        push_count, new_repo_heads = _check_pr_pushes(
-            repo, token, me, repo_heads,
+        repo_rr = set(rr_all.get(repo, []) or [])
+        push_count, new_repo_heads, new_repo_rr = _check_pr_pushes(
+            repo, token, me, repo_heads, pr_review_requests=repo_rr,
         )
         total += push_count
         new_pr_heads_all[repo] = new_repo_heads
+        new_rr_all[repo] = sorted(new_repo_rr)
 
     cursor["last_checked"] = new_cursor_ts
     cursor["pr_heads"] = new_pr_heads_all
+    cursor["pr_review_requests"] = new_rr_all
     _save_cursor(cursor)
     print(
         f"Emitted {total} event(s) across {len(repos)} repo(s)",
