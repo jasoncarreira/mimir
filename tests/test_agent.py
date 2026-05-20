@@ -107,9 +107,17 @@ class _FakeSaga:
         self.query_calls: list[dict[str, Any]] = []
         self.feedback_calls: list[dict[str, Any]] = []
 
-    async def query(self, content: str, *, top_k: int = 12, session_id: str | None = None):
+    async def query(
+        self, content: str, *, top_k: int = 12,
+        session_id: str | None = None,
+        context: list[dict[str, str]] | None = None,
+        **_ignored: object,
+    ):
         self.query_calls.append(
-            {"content": content, "top_k": top_k, "session_id": session_id},
+            {
+                "content": content, "top_k": top_k,
+                "session_id": session_id, "context": context,
+            },
         )
         return {"atoms": self._hits, "triples": []}
 

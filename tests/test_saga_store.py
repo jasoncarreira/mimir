@@ -194,3 +194,106 @@ async def test_saga_store_async_context_manager_propagates_exceptions(
             raise ValueError("from body")
     # And the connection still got closed.
     assert store._conn is None
+
+
+# ─── contextual-rewrite default-from-config ──────────────────────────
+
+
+def _patch_provider_with_rewrite_flag(monkeypatch, *, rewrite_enabled: bool):
+    """Like ``_patch_provider`` but the stubbed saga.toml config also
+    reports ``[retrieval].enable_contextual_rewrite``."""
+    class _StubProvider:
+        def embed(self, text, *, input_type="passage"):
+            return [0.1, 0.2, 0.3, 0.4]
+
+        def dimensions(self):
+            return 4
+
+    def fake_get_provider():
+        return _StubProvider()
+
+    def fake_get_config():
+        def cfg(section, key, default=None):
+            return {
+                ("embedding", "max_input_chars"): 2000,
+                ("embedding", "provider"): "stub",
+                ("embedding", "model"): "stub-4d",
+                ("retrieval", "enable_contextual_rewrite"): rewrite_enabled,
+            }.get((section, key), default)
+        return cfg
+
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", fake_get_provider)
+    monkeypatch.setattr("mimir.saga._config_io.get_config", fake_get_config)
+
+
+@pytest.mark.asyncio
+async def test_query_reads_rewrite_flag_from_config_when_kwarg_omitted(
+    client, monkeypatch,
+):
+    """When the caller omits ``enable_contextual_rewrite=`` and passes
+    ``context=``, SagaStore.query consults saga.toml's
+    ``[retrieval].enable_contextual_rewrite`` — so the agent doesn't
+    have to thread the toml flag through every call site.
+    """
+    _patch_provider_with_rewrite_flag(monkeypatch, rewrite_enabled=True)
+    rewrite_calls: list = []
+
+    async def fake_rewrite(query, context):
+        rewrite_calls.append((query, context))
+        return "anchor for X"
+
+    monkeypatch.setattr(
+        "mimir.saga.query_rewrite.rewrite_query", fake_rewrite,
+    )
+    payload = await client.query(
+        "what about that?",
+        context=[{"role": "user", "content": "tell me about X"}],
+    )
+    assert len(rewrite_calls) == 1
+    assert payload.get("rewritten_query") == "anchor for X"
+
+
+@pytest.mark.asyncio
+async def test_query_skips_rewrite_when_config_disabled(client, monkeypatch):
+    """Config flag OFF + caller passes context= → rewrite must NOT fire.
+    The toml flag is the authoritative gate when the caller defers.
+    """
+    _patch_provider_with_rewrite_flag(monkeypatch, rewrite_enabled=False)
+    rewrite_calls: list = []
+
+    async def fake_rewrite(query, context):
+        rewrite_calls.append((query, context))
+        return "should not be used"
+
+    monkeypatch.setattr(
+        "mimir.saga.query_rewrite.rewrite_query", fake_rewrite,
+    )
+    payload = await client.query(
+        "what about that?",
+        context=[{"role": "user", "content": "tell me about X"}],
+    )
+    assert rewrite_calls == []
+    # No rewrite happened — rewritten_query stays empty in the response.
+    assert not payload.get("rewritten_query")
+
+
+@pytest.mark.asyncio
+async def test_query_explicit_kwarg_overrides_config_flag(client, monkeypatch):
+    """Explicit ``enable_contextual_rewrite=False`` wins over a toml
+    flag set to True. Lets bench / test code force-off."""
+    _patch_provider_with_rewrite_flag(monkeypatch, rewrite_enabled=True)
+    rewrite_calls: list = []
+
+    async def fake_rewrite(query, context):
+        rewrite_calls.append((query, context))
+        return "anchor"
+
+    monkeypatch.setattr(
+        "mimir.saga.query_rewrite.rewrite_query", fake_rewrite,
+    )
+    await client.query(
+        "what about that?",
+        context=[{"role": "user", "content": "tell me about X"}],
+        enable_contextual_rewrite=False,
+    )
+    assert rewrite_calls == []

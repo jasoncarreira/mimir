@@ -417,20 +417,32 @@ async def test_rewrite_query_caps_at_last_n_messages(monkeypatch):
     assert "RECENT_TURN_9" in captured_prompt["text"]
 
 
-def test_rewrite_prompt_carries_saga_rules():
-    """Prompt structure pinning: when the LLM never runs (bench/prod
-    default), no behavior to verify. Pin the prompt's load-bearing
-    instructions instead — examples, intent-preservation, single-line
-    output constraint. Matches saga's contextual-rewrite prompt so
-    behavior at the model is comparable."""
+def test_rewrite_prompt_carries_anchor_shape_rules():
+    """Prompt structure pinning. Atoms are stored as declarative
+    statements; the rewrite produces a statement-form retrieval anchor
+    so embedding + FTS cosine against atom text isn't penalized by
+    question-vs-statement shape mismatch. Pin the load-bearing pieces
+    of that shape contract:
+      - "Retrieval anchor" framing
+      - Declarative-statement justification (why)
+      - At least one question-to-noun-phrase example
+      - One reference-resolution example
+      - Single-line output discipline
+      - The "never shown to the user" cue that licenses non-prose
+    """
     from mimir.saga.query_rewrite import REWRITE_PROMPT
-    # Concrete reference-resolution examples (saga's three).
+    # Anchor framing (replaces "Rewritten:" label).
+    assert "retrieval anchor" in REWRITE_PROMPT.lower()
+    assert "Retrieval anchor:" in REWRITE_PROMPT
+    # Atoms-are-statements justification — without this the LLM has no
+    # reason to flatten questions/commands into noun-phrase form.
+    assert "declarative statements" in REWRITE_PROMPT
+    # Question → noun-phrase shape transform — at least one concrete
+    # example so the LLM sees the pattern.
+    assert "favorite pizza topping" in REWRITE_PROMPT
+    # Reference-resolution still in scope.
     assert "Sony headphones" in REWRITE_PROMPT
-    # Intent-shape preservation rule — without this the LLM happily
-    # rewrites statements as questions.
-    assert "Do not turn statements into questions" in REWRITE_PROMPT
     # Single-line output discipline.
     assert "single line" in REWRITE_PROMPT
-    # Broad framing — question, statement, or command (vs saga's
-    # earlier question-only framing which we used to share).
-    assert "question, a statement, or a command" in REWRITE_PROMPT
+    # Non-prose license — the value never reaches the user.
+    assert "never shown to the user" in REWRITE_PROMPT
