@@ -67,13 +67,18 @@ async def file_search(
         k: Max results to return (1-20, default 5).
         path_prefix: Optional subdir under ``scope`` to anchor results
             (e.g. ``"state/journal"`` or ``"state/research"``). Composes
-            with ``scope`` — passing both narrows further.
+            with ``scope`` — passing both narrows further. If
+            ``path_prefix`` is inconsistent with ``scope`` (e.g.
+            ``scope="memory", path_prefix="state/journal"``) the
+            result is silently empty — the two filters AND together.
         semantic_weight: Weight on cosine similarity. ``None`` → use
             production default (0.5). Must be non-negative.
         keyword_weight: Weight on BM25 keyword match. ``None`` → 0.2.
             Must be non-negative.
         recency_weight: Weight on file-mtime recency decay. ``None`` →
-            0.3. Must be non-negative.
+            0.3. Must be non-negative. Passing all three weights as
+            zero is accepted but yields ``score=0`` for every match,
+            producing arbitrary candidate-pool ordering.
 
     Returns:
         JSON-formatted list of matches, or "(no matches)" if empty.

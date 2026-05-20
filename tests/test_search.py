@@ -707,9 +707,71 @@ async def test_path_prefix_composes_with_scope(tmp_path: Path):
         "flocking", scope="state", k=10, path_prefix="state/journal",
     )
     paths = {r.path for r in results}
-    # Only state/journal/ files survive; the boids.md memory file is
-    # excluded by scope=state, and journal/ is narrower than that.
-    assert paths.issubset({"state/journal/journal-note.md"})
+    # Non-empty: the journal-note hit must survive. (Issubset alone
+    # would false-pass on an empty result set — Mimir's PR #233 review.)
+    assert paths, "expected at least one state/journal match"
+    # And it's the only file that survives both filters: the boids.md
+    # memory file is excluded by scope=state, and journal/ is narrower
+    # than the rest of state/.
+    assert paths == {"state/journal/journal-note.md"}
+
+
+@pytest.mark.asyncio
+async def test_scope_and_path_prefix_contradictory_combo_returns_empty(tmp_path: Path):
+    """``scope="memory"`` + ``path_prefix="state/journal"`` is logically
+    inconsistent (the prefix lives in a different scope) — the filters
+    AND together, so we return []. Pins the docstring contract.
+    """
+    _seed(tmp_path)
+    _seed_state_subdirs(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    results = await idx.search(
+        "flocking", scope="memory", k=10, path_prefix="state/journal",
+    )
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_all_zero_weights_yields_zero_score(tmp_path: Path):
+    """``semantic_weight=0, keyword_weight=0, recency_weight=0`` is
+    accepted (non-negative is the contract) but produces score=0 for
+    every result. Order is candidate-pool order, not a meaningful
+    ranking — pin the docstring claim."""
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    results = await idx.search(
+        "Boids", scope="all", k=10,
+        semantic_weight=0.0, keyword_weight=0.0, recency_weight=0.0,
+    )
+    assert results, "expected matches"
+    assert all(r.score == 0.0 for r in results)
+
+
+@pytest.mark.asyncio
+async def test_negative_weight_validated_before_embed(tmp_path: Path, monkeypatch):
+    """Negative weights raise ValueError BEFORE the embed call so the
+    error path doesn't pay the ONNX cost of an embed we'd discard.
+    Pins Mimir's PR #233 review fix.
+    """
+    _seed(tmp_path)
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    embed_calls: list[str] = []
+    orig = idx._embed_query
+
+    def tracking_embed(text):
+        embed_calls.append(text)
+        return orig(text)
+
+    monkeypatch.setattr(idx, "_embed_query", tracking_embed)
+    with pytest.raises(ValueError, match="non-negative"):
+        await idx.search("Boids", scope="all", k=5, recency_weight=-0.5)
+    assert embed_calls == [], "embed must not run when weights fail validation"
 
 
 @pytest.mark.asyncio
