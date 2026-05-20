@@ -218,8 +218,25 @@ class Config:
     # Post-cutover model spec for the deepagents path:
     #   - ``claude-code:<model>``  → ChatClaudeCode (Max OAuth subprocess)
     #   - ``<provider>:<model>``   → init_chat_model via langchain
-    #   See ``mimir.agent._resolve_model``. Defaults to
-    #   ``claude-code:claude-sonnet-4-6`` (Max OAuth, no API-key billing).
+    #
+    # Common forms:
+    #   claude-code:claude-sonnet-4-6     (default; free under Max plan)
+    #   anthropic:claude-haiku-4-5        (direct API, paid)
+    #   openai:gpt-5.4-nano               (direct OpenAI)
+    #
+    # Non-Anthropic / non-OpenAI providers that expose an
+    # Anthropic-compat endpoint (Minimax, Moonshot Kimi) ride the
+    # ``anthropic:`` provider with ``ANTHROPIC_BASE_URL`` overridden:
+    #   ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic
+    #   ANTHROPIC_API_KEY=<minimax key>
+    #   MIMIR_MODEL_SPEC=anthropic:MiniMax-M2.7
+    # Anthropic-compat is preferred over OpenAI-compat for reasoning
+    # models because the provider converts reasoning to proper
+    # ``thinking`` content blocks server-side, vs. the OAI-compat
+    # path's inline ``<think>...</think>`` tags in content.
+    #
+    # See ``mimir.agent._resolve_model``. Defaults to
+    # ``claude-code:claude-sonnet-4-6`` (Max OAuth, no API-key billing).
     model_spec: str
 
     # Per-call retry budget for non-claude-code providers (anthropic,
