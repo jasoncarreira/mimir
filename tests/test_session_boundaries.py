@@ -1,72 +1,16 @@
-"""v0.4 §3a: session boundary surfacing.
+"""Session-summary rendering for the prompt-assembly path.
 
-Local mirror append/read, render_session_summaries layout, and the
-agent-level fallback path (SAGA empty → mirror)."""
+Covers ``render_session_summaries`` layout, the chainlink #63 staleness
+markers, the ``closed_since`` corrective-overrides applier, and
+``count_turns_since`` arithmetic.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 
-import pytest
-
-from mimir.session_boundary_log import (
-    SessionBoundaryLog,
-    render_session_summaries,
-)
-
-
-# ---- SessionBoundaryLog: append + read ---------------------------------
-
-
-@pytest.mark.asyncio
-async def test_append_creates_file_and_writes_record(tmp_path: Path):
-    path = tmp_path / ".mimir" / "session_boundaries.jsonl"
-    log = SessionBoundaryLog(path=path)
-    await log.append(
-        {
-            "channel_id": "slack-eng",
-            "saga_session_id": "saga-slack-eng-1",
-            "atom_id": "atom-1",
-            "summary": "Helped Alice debug deploy.",
-            "unfinished": ["heap config Monday"],
-        }
-    )
-    assert path.is_file()
-    body = path.read_text()
-    rec = json.loads(body.splitlines()[0])
-    assert rec["channel_id"] == "slack-eng"
-    assert rec["summary"] == "Helped Alice debug deploy."
-    # ``ts`` is auto-stamped by append at write time.
-    assert "ts" in rec
-
-
-@pytest.mark.asyncio
-async def test_recent_returns_reverse_chronological(tmp_path: Path):
-    log = SessionBoundaryLog(path=tmp_path / ".mimir" / "sb.jsonl")
-    await log.append({"channel_id": "c", "summary": "first"})
-    await log.append({"channel_id": "c", "summary": "second"})
-    await log.append({"channel_id": "c", "summary": "third"})
-
-    out = log.recent(count=2)
-    assert [r["summary"] for r in out] == ["third", "second"]
-
-
-@pytest.mark.asyncio
-async def test_recent_filters_by_channel(tmp_path: Path):
-    log = SessionBoundaryLog(path=tmp_path / ".mimir" / "sb.jsonl")
-    await log.append({"channel_id": "slack-eng", "summary": "A"})
-    await log.append({"channel_id": "discord-99", "summary": "B"})
-    await log.append({"channel_id": "slack-eng", "summary": "C"})
-
-    out = log.recent(channel_id="slack-eng", count=5)
-    assert [r["summary"] for r in out] == ["C", "A"]
-
-
-def test_recent_empty_when_file_missing(tmp_path: Path):
-    log = SessionBoundaryLog(path=tmp_path / "no" / "such" / "file.jsonl")
-    assert log.recent() == []
+from mimir.session_boundary_log import render_session_summaries
 
 
 # ---- render_session_summaries -----------------------------------------
@@ -713,40 +657,36 @@ def test_count_turns_since_uses_snapshot_callable_when_supplied(tmp_path: Path):
 # ---- end-to-end T0/T1/T2 acceptance scenario ---------------------------
 
 
-@pytest.mark.asyncio
-async def test_acceptance_t0_t1_t2_drops_resolved_items(tmp_path: Path):
+def test_acceptance_t0_t1_t2_drops_resolved_items():
     """Acceptance criterion from chainlink #63:
        T0:    boundary written with Unfinished=[#X]
        T0+1h: turn closes #X
-       T0+2h: synthesis turn calls saga_end_session(closed_since=[#X])
+       T0+2h: synthesis writes a closed_since=[#X] corrective override.
        Subsequent prompt: #X must NOT appear as unfinished.
 
-    Drives the local mirror end-to-end (the in-process path that
-    production currently hits). Verifies both: the closed_since flows
-    through to the next boundary and the renderer drops the item."""
-    path = tmp_path / ".mimir" / "session_boundaries.jsonl"
-    log = SessionBoundaryLog(path=path)
-
-    # T0: first session ended; Unfinished=[#X].
-    await log.append({
-        "channel_id": "c",
-        "saga_session_id": "s1",
-        "summary": "Worked on #X.",
-        "unfinished": ["PR #X awaiting operator merge"],
-    })
-    # T0+2h: synthesis writes corrective override.
-    await log.append({
-        "channel_id": "c",
-        "saga_session_id": "s2",
-        "summary": "Followed up; #X merged.",
-        "unfinished": [],
-        "closed_since": ["#X"],
-    })
-
-    boundaries = log.recent(channel_id="c", count=10)
-    # recent() returns newest-first. The renderer accepts whatever
-    # ordering the source supplies; closed_since aggregation walks
-    # all boundaries regardless of order.
+    Feeds the renderer the same boundary shape SagaStore's
+    ``recent_session_boundaries()`` returns; verifies closed_since
+    aggregation flows across boundaries and drops the resolved item."""
+    # Newest-first ordering matches what recent_session_boundaries()
+    # produces. The renderer accepts whatever order the source supplies;
+    # closed_since aggregation walks all boundaries regardless of order.
+    boundaries = [
+        {
+            "ts": "2026-05-09T16:00:00+00:00",  # T0+2h, newer
+            "channel_id": "c",
+            "saga_session_id": "s2",
+            "summary": "Followed up; #X merged.",
+            "unfinished": [],
+            "closed_since": ["#X"],
+        },
+        {
+            "ts": "2026-05-09T14:00:00+00:00",  # T0, older
+            "channel_id": "c",
+            "saga_session_id": "s1",
+            "summary": "Worked on #X.",
+            "unfinished": ["PR #X awaiting operator merge"],
+        },
+    ]
     out = render_session_summaries(boundaries, now=_NOW)
     assert out is not None
     # The T0 Unfinished item containing "#X" must not appear.
