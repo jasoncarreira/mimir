@@ -229,3 +229,341 @@ def test_max_fetch_clamped(fresh_poller, monkeypatch, capsys):
     monkeypatch.setattr(fresh_poller, "_gog_search", fake_search)
     fresh_poller.main()
     assert captured["max"] == 200  # upper clamp
+
+
+# ──────────────────────────────────────────────────────────────────
+# Structured config.json (multi-account, per-account prompt routing)
+# ──────────────────────────────────────────────────────────────────
+
+
+def _write_config(tmp_path: Path, accounts: list[dict]) -> None:
+    """Drop a ``config.json`` at the STATE_DIR root."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"accounts": accounts}), encoding="utf-8",
+    )
+
+
+def _write_prompt(home: Path, name: str, body: str) -> Path:
+    """Write a prompt file under ``<home>/prompts/`` and return its path."""
+    prompts_dir = home / "prompts"
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+    p = prompts_dir / name
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def test_config_json_multi_account_each_uses_own_prompt(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """Two accounts, two different ``prompt-file`` entries. Each
+    account's messages must carry that account's prompt body + the
+    account email/name fields in extras."""
+    mimir_home = tmp_path / "mimir-home"
+    monkeypatch.setenv("MIMIR_HOME", str(mimir_home))
+    _write_prompt(mimir_home, "home.md", "HOME ACCOUNT PROMPT")
+    _write_prompt(mimir_home, "work.md", "WORK ACCOUNT PROMPT")
+    _write_config(tmp_path, [
+        {"name": "home", "email": "me@gmail.com", "prompt-file": "home.md"},
+        {"name": "work", "email": "me@employer.com", "prompt-file": "work.md"},
+    ])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+
+    def fake_search(account, query, max_fetch):
+        if account == "me@gmail.com":
+            return [_msg("home-msg-1", sender="alice@example.com")]
+        if account == "me@employer.com":
+            return [_msg("work-msg-1", sender="bob@employer.com")]
+        return []
+
+    monkeypatch.setattr(fresh_poller, "_gog_search", fake_search)
+    rc = fresh_poller.main()
+    assert rc == 0
+
+    events = _capture_emits(capsys)
+    assert len(events) == 2
+    by_id = {e["message_id"]: e for e in events}
+
+    assert by_id["home-msg-1"]["prompt"] == "HOME ACCOUNT PROMPT"
+    assert by_id["home-msg-1"]["account"] == "me@gmail.com"
+    assert by_id["home-msg-1"]["account_name"] == "home"
+
+    assert by_id["work-msg-1"]["prompt"] == "WORK ACCOUNT PROMPT"
+    assert by_id["work-msg-1"]["account"] == "me@employer.com"
+    assert by_id["work-msg-1"]["account_name"] == "work"
+
+
+def test_config_json_inline_prompt(fresh_poller, tmp_path, monkeypatch, capsys):
+    """Inline ``prompt`` field is used verbatim — no file lookup."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    _write_config(tmp_path, [
+        {"name": "agent", "email": "agent@bot.ai",
+         "prompt": "Triage agent-account email."},
+    ])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+    monkeypatch.setattr(
+        fresh_poller, "_gog_search",
+        lambda account, q, m: [_msg("m1")] if account == "agent@bot.ai" else [],
+    )
+    rc = fresh_poller.main()
+    assert rc == 0
+    events = _capture_emits(capsys)
+    assert events[0]["prompt"] == "Triage agent-account email."
+
+
+def test_config_json_prompt_file_wins_over_inline(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """When BOTH ``prompt-file`` and ``prompt`` are set, the file wins
+    and a warning lands on stderr."""
+    mimir_home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(mimir_home))
+    _write_prompt(mimir_home, "wins.md", "FILE WINS")
+    _write_config(tmp_path, [
+        {"name": "x", "email": "x@y.com",
+         "prompt-file": "wins.md",
+         "prompt": "this should be overridden"},
+    ])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+    monkeypatch.setattr(
+        fresh_poller, "_gog_search",
+        lambda *_a, **_k: [_msg("m1")],
+    )
+    rc = fresh_poller.main()
+    assert rc == 0
+    # Capture stdout + stderr in one readout — both share the buffer.
+    captured = capsys.readouterr()
+    events = [json.loads(l) for l in captured.out.splitlines() if l.strip()]
+    assert events[0]["prompt"] == "FILE WINS"
+    assert "both prompt-file and prompt" in captured.err
+
+
+def test_config_json_missing_prompt_file_falls_back_to_inline(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """``prompt-file`` points at a nonexistent file but ``prompt`` is
+    also set — the inline value takes over."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    _write_config(tmp_path, [
+        {"name": "x", "email": "x@y.com",
+         "prompt-file": "no-such-file.md",
+         "prompt": "inline fallback"},
+    ])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+    monkeypatch.setattr(
+        fresh_poller, "_gog_search",
+        lambda *_a, **_k: [_msg("m1")],
+    )
+    rc = fresh_poller.main()
+    assert rc == 0
+    events = _capture_emits(capsys)
+    assert events[0]["prompt"] == "inline fallback"
+
+
+def test_config_json_no_prompt_fields_uses_default_template(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """An account with NEITHER ``prompt-file`` nor ``prompt`` falls
+    back to the built-in default prompt template (the legacy shape)."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    _write_config(tmp_path, [
+        {"name": "default", "email": "d@e.com"},
+    ])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+    monkeypatch.setattr(
+        fresh_poller, "_gog_search",
+        lambda *_a, **_k: [_msg("m1", sender="alice@example.com", subject="Hi")],
+    )
+    rc = fresh_poller.main()
+    assert rc == 0
+    events = _capture_emits(capsys)
+    # Default template includes the "[gmail] new message from" prefix.
+    assert events[0]["prompt"].startswith("[gmail] new message from alice@example.com")
+
+
+def test_config_json_prompt_file_path_traversal_rejected(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """``prompt-file`` containing ``..`` must NOT resolve outside
+    ``<MIMIR_HOME>/prompts/`` — falls back to default template +
+    warns on stderr."""
+    mimir_home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(mimir_home))
+    (mimir_home / "prompts").mkdir(parents=True)
+    # Decoy file outside the prompts/ dir that we DO NOT want loaded.
+    (mimir_home / "secret.md").write_text("SECRET")
+    _write_config(tmp_path, [
+        {"name": "x", "email": "x@y.com",
+         "prompt-file": "../secret.md"},
+    ])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+    monkeypatch.setattr(
+        fresh_poller, "_gog_search",
+        lambda *_a, **_k: [_msg("m1")],
+    )
+    rc = fresh_poller.main()
+    assert rc == 0
+    captured = capsys.readouterr()
+    events = [json.loads(l) for l in captured.out.splitlines() if l.strip()]
+    assert "SECRET" not in events[0]["prompt"]
+    assert "escapes" in captured.err
+
+
+def test_config_json_one_account_failure_others_still_emit(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """Per-account gog failure must not kill the whole poll — the other
+    accounts still emit, cursor advances for those, exit 0."""
+    import subprocess as _sp
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    _write_config(tmp_path, [
+        {"name": "broken", "email": "broken@x.com",
+         "prompt": "broken account prompt"},
+        {"name": "working", "email": "working@x.com",
+         "prompt": "working account prompt"},
+    ])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+
+    def fake_search(account, q, m):
+        if account == "broken@x.com":
+            raise _sp.CalledProcessError(1, ["gog"], "", "boom")
+        return [_msg("ok-1")]
+
+    monkeypatch.setattr(fresh_poller, "_gog_search", fake_search)
+    rc = fresh_poller.main()
+    assert rc == 0
+    events = _capture_emits(capsys)
+    assert len(events) == 1
+    assert events[0]["account_name"] == "working"
+
+
+def test_config_json_all_accounts_failed_returns_2(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """When EVERY account errors AND we emitted nothing, exit 2 so the
+    framework drops any partial events."""
+    import subprocess as _sp
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    _write_config(tmp_path, [
+        {"name": "a", "email": "a@x.com", "prompt": "a"},
+        {"name": "b", "email": "b@x.com", "prompt": "b"},
+    ])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+
+    def fake_search(*_a, **_k):
+        raise _sp.CalledProcessError(1, ["gog"], "", "auth")
+
+    monkeypatch.setattr(fresh_poller, "_gog_search", fake_search)
+    rc = fresh_poller.main()
+    assert rc == 2
+    assert _capture_emits(capsys) == []
+
+
+def test_config_json_partial_failure_with_empty_inbox_exits_0(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """Regression for the Mimir PR #234 nit: one account errors, the
+    OTHER succeeds but returns zero new messages (empty inbox is the
+    normal silence-as-filter case).
+
+    Pre-fix this incorrectly returned exit 2 because the condition
+    was ``any_account_failed and not new_ids`` — true when EITHER
+    side of the AND holds, even though intent was "all accounts
+    failed AND nothing emitted." Post-fix uses ``successful_accounts``
+    counter so this case correctly exits 0.
+    """
+    import subprocess as _sp
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    _write_config(tmp_path, [
+        {"name": "broken", "email": "broken@x.com", "prompt": "p1"},
+        {"name": "empty-inbox", "email": "empty@x.com", "prompt": "p2"},
+    ])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+
+    def fake_search(account, q, m):
+        if account == "broken@x.com":
+            raise _sp.CalledProcessError(1, ["gog"], "", "auth")
+        # 'empty-inbox' account succeeds but returns no messages.
+        return []
+
+    monkeypatch.setattr(fresh_poller, "_gog_search", fake_search)
+    rc = fresh_poller.main()
+    assert rc == 0, (
+        "partial failure with at least one successful (empty) account "
+        "should exit 0; pre-fix this was wrongly exit 2"
+    )
+    assert _capture_emits(capsys) == []
+
+
+def test_config_json_empty_accounts_list_exits_1(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """config.json with empty accounts list — no usable source."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    _write_config(tmp_path, [])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+    rc = fresh_poller.main()
+    assert rc == 1
+
+
+def test_config_json_malformed_does_not_fall_back_to_gog_account(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """A malformed config.json yields an empty accounts list — caller
+    sees the file as 'present but unusable' and exits 1 (does NOT
+    silently fall back to GOG_ACCOUNT — that would hide an operator
+    config error).
+
+    (Previously named ``..._falls_through_to_gog_account`` — the
+    body's assertion contradicts that wording; Mimir PR #234 nit.)
+    """
+    (tmp_path / "config.json").write_text("not valid json {")
+    monkeypatch.setenv("GOG_ACCOUNT", "fallback@x.com")
+    rc = fresh_poller.main()
+    assert rc == 1
+
+
+def test_cursor_shared_across_accounts(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """Same message id arriving on two accounts emits only once
+    (cursor is global). Defends the invariant that gmail message IDs
+    are unique across accounts."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    _write_config(tmp_path, [
+        {"name": "a", "email": "a@x.com", "prompt": "a"},
+        {"name": "b", "email": "b@x.com", "prompt": "b"},
+    ])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+    # Both accounts return the SAME message id (shouldn't happen in
+    # practice, but defends the dedup contract).
+    monkeypatch.setattr(
+        fresh_poller, "_gog_search",
+        lambda *_a, **_k: [_msg("shared-id")],
+    )
+    rc = fresh_poller.main()
+    assert rc == 0
+    events = _capture_emits(capsys)
+    assert len(events) == 1
+    # Cursor has just the one ID.
+    cursor = json.loads(fresh_poller.CURSOR_FILE.read_text())
+    assert cursor == ["shared-id"]
+
+
+def test_legacy_gog_account_still_works(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """No config.json + GOG_ACCOUNT set → legacy single-account mode.
+    The emitted prompt uses the built-in default template; account
+    fields point at the legacy account / 'default' name."""
+    # config.json absent — fresh_poller fixture's tmp_path has no file.
+    monkeypatch.setenv("GOG_ACCOUNT", "legacy@x.com")
+    monkeypatch.setattr(
+        fresh_poller, "_gog_search",
+        lambda *_a, **_k: [_msg("m1", sender="bob@y.com")],
+    )
+    rc = fresh_poller.main()
+    assert rc == 0
+    events = _capture_emits(capsys)
+    assert events[0]["account"] == "legacy@x.com"
+    assert events[0]["account_name"] == "default"
+    assert events[0]["prompt"].startswith("[gmail] new message from bob@y.com")
