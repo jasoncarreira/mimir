@@ -43,6 +43,10 @@ async def file_search(
     query: str,
     scope: str = "all",
     k: int = 5,
+    path_prefix: Optional[str] = None,
+    semantic_weight: Optional[float] = None,
+    keyword_weight: Optional[float] = None,
+    recency_weight: Optional[float] = None,
 ) -> str:
     """Hybrid semantic + keyword search over memory/ and state/ files.
 
@@ -50,10 +54,31 @@ async def file_search(
     you know the path, call read_file directly instead. Returns up
     to k results with path, score, snippet, description.
 
+    Scoring: ``score = w_sem·cosine + w_kw·bm25 + w_rec·recency``.
+    Default weights match production tuning (0.5 / 0.2 / 0.3). Override
+    via the weight kwargs to bias a search — e.g. ``recency_weight=0.6``
+    when looking for the latest version of something, or
+    ``semantic_weight=0.8, keyword_weight=0.0`` for pure paraphrase
+    match.
+
     Args:
         query: Natural-language search query.
         scope: One of ``"memory"``, ``"state"``, or ``"all"`` (default).
         k: Max results to return (1-20, default 5).
+        path_prefix: Optional subdir under ``scope`` to anchor results
+            (e.g. ``"state/journal"`` or ``"state/research"``). Composes
+            with ``scope`` — passing both narrows further. If
+            ``path_prefix`` is inconsistent with ``scope`` (e.g.
+            ``scope="memory", path_prefix="state/journal"``) the
+            result is silently empty — the two filters AND together.
+        semantic_weight: Weight on cosine similarity. ``None`` → use
+            production default (0.5). Must be non-negative.
+        keyword_weight: Weight on BM25 keyword match. ``None`` → 0.2.
+            Must be non-negative.
+        recency_weight: Weight on file-mtime recency decay. ``None`` →
+            0.3. Must be non-negative. Passing all three weights as
+            zero is accepted but yields ``score=0`` for every match,
+            producing arbitrary candidate-pool ordering.
 
     Returns:
         JSON-formatted list of matches, or "(no matches)" if empty.
@@ -71,7 +96,18 @@ async def file_search(
         k_clean = max(1, min(int(k), 20))
     except (TypeError, ValueError):
         k_clean = 5
-    results = await indexer.search(query, scope=scope_clean, k=k_clean)
+    try:
+        results = await indexer.search(
+            query, scope=scope_clean, k=k_clean,
+            path_prefix=path_prefix,
+            semantic_weight=semantic_weight,
+            keyword_weight=keyword_weight,
+            recency_weight=recency_weight,
+        )
+    except ValueError as exc:
+        # Negative-weight rejection from the indexer surfaces as a
+        # readable tool error rather than a generic failure.
+        return f"file_search failed: {exc}"
     if not results:
         return "(no matches)"
     payload = [r.to_dict() for r in results]
