@@ -19,9 +19,9 @@ The name is from Norse myth — Mímir, the keeper of memory and counsel.
   relevant prior context into the prompt automatically.
 - **Skills, not just tools.** Skills are markdown files an agent
   loads on demand to learn a workflow (the librarian protocol, the
-  five-whys debugging skill, the reflection skill, etc.). The
-  `mountaineering` skill turns the agent into a hill-climbing
-  optimizer for any task with a `score.sh`.
+  five-whys debugging skill, the reflection skill, etc.) — decision-
+  framework and failure-mode docs that the tool description alone
+  can't carry.
 - **Scheduled work.** Cron-backed scheduler fires per-channel ticks
   (heartbeat, reflection, custom). The §12.4 homeostat suppresses
   ticks when the plan window saturates or cost-rate trips.
