@@ -80,6 +80,24 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "predictions_pending_review": ("negative", "predictions_pending"),
     "send_message_unknown_channel": ("negative", "unknown_channel"),
     "auto_dispatch_failed": ("negative", "auto_dispatch_failed"),
+    # Poller framework — health signals emitted by skill-side poller
+    # subprocesses (via the ``"signal": "<event_type>"`` JSONL shape;
+    # see ``mimir/pollers.py`` output contract). These surface
+    # external-state breakage (OAuth token revoked, upstream service
+    # outage, rate-limit cliff) algedonically without spawning a turn
+    # per signal. ``poller_signal`` is the generic catch-all when the
+    # poller doesn't have a more specific classification.
+    "poller_oauth_expired":  ("negative", "poller_oauth_expired"),
+    "poller_auth_failed":    ("negative", "poller_auth_failed"),
+    "poller_service_outage": ("negative", "poller_service_outage"),
+    "poller_rate_limited":   ("negative", "poller_rate_limited"),
+    "poller_signal":         ("negative", "poller_signal"),
+    # Framework-emitted: ``poller_nonzero_exit`` fires whenever a poller
+    # subprocess exits non-zero. Independent of skill-emitted signals
+    # (those can fire WITH a successful exit). Negative so the operator
+    # sees recurring failures even when the poller didn't classify the
+    # root cause itself.
+    "poller_nonzero_exit":   ("negative", "poller_nonzero_exit"),
     # OAuth usage poller — plan-window quota probe runs on a cron and
     # surfaces refresh / logged-out / age-warn signals algedonically so
     # the agent can route operator-actionable alerts through.

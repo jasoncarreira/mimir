@@ -1520,3 +1520,293 @@ print('{"poller": "x", "prompt": "ok"}')
     # Value must NOT leak into the event payload.
     payload = json.dumps(passthrough_events[0])
     assert "ghp_secret_should_not_appear_in_event" not in payload
+
+
+# ─── Algedonic signals from pollers ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_signal_record_routed_to_log_event_not_enqueued(tmp_path, home):
+    """A stdout line carrying ``"signal": "<event_type>"`` must NOT
+    become an AgentEvent. It must land in events.jsonl with the
+    declared event_type so the algedonic block picks it up next turn.
+    """
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({
+    "poller": "gmail-inbox",
+    "signal": "poller_oauth_expired",
+    "account": "agent@example.com",
+    "detail": "token refresh failed (invalid_grant)"
+}))
+""")
+    cfg = PollerConfig(
+        name="gmail-inbox", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+
+    # Zero AgentEvents created — signal does not spawn a turn.
+    assert n == 0
+    assert enq.events == []
+
+    # The signal landed in events.jsonl with its declared event_type +
+    # payload + the framework's ``poller`` stamp.
+    events = _read_events(home)
+    by_type = {e["type"]: e for e in events}
+    assert "poller_oauth_expired" in by_type, (
+        f"expected poller_oauth_expired in {sorted(by_type)}"
+    )
+    sig = by_type["poller_oauth_expired"]
+    assert sig["poller"] == "gmail-inbox"
+    assert sig["account"] == "agent@example.com"
+    assert sig["detail"] == "token refresh failed (invalid_grant)"
+
+
+def test_signal_event_types_classified_algedonically():
+    """The pre-registered signal event types
+    (``poller_oauth_expired`` / ``poller_auth_failed`` /
+    ``poller_service_outage`` / ``poller_rate_limited`` /
+    ``poller_signal`` / ``poller_nonzero_exit``) must all match a
+    rule in ``feedback._EVENT_RULES`` so they surface in the
+    algedonic block.
+    """
+    from mimir.feedback import _EVENT_RULES
+
+    expected = {
+        "poller_oauth_expired",
+        "poller_auth_failed",
+        "poller_service_outage",
+        "poller_rate_limited",
+        "poller_signal",
+        "poller_nonzero_exit",
+    }
+    missing = expected - set(_EVENT_RULES.keys())
+    assert not missing, f"signal event types not classified: {missing}"
+    # All must be 'negative' polarity — these are pain signals.
+    for evtype in expected:
+        polarity, _slug = _EVENT_RULES[evtype]
+        assert polarity == "negative", (
+            f"{evtype} should be negative, got {polarity}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_signal_and_event_records_can_mix(tmp_path, home):
+    """A poller run can emit MIXED records: some signals + some
+    events. Signals route to log_event, events become AgentEvents,
+    both flow through the same stdout JSONL stream."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+# A rate-limit signal + an actionable event in the same run.
+print(json.dumps({"poller": "x", "signal": "poller_rate_limited", "service": "gmail", "retry_after_s": 60}))
+print(json.dumps({"poller": "x", "prompt": "new message"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+
+    assert n == 1
+    assert len(enq.events) == 1
+    assert "new message" in enq.events[0].content
+
+    events = _read_events(home)
+    by_type = {e["type"]: e for e in events}
+    assert "poller_rate_limited" in by_type
+    assert by_type["poller_rate_limited"]["service"] == "gmail"
+    assert by_type["poller_rate_limited"]["retry_after_s"] == 60
+
+
+@pytest.mark.asyncio
+async def test_signal_only_run_still_reports_in_poller_complete(tmp_path, home):
+    """A poller that emits ONLY signals (no actionable events) must
+    still produce a ``poller_complete`` event, with the signal count
+    reflected in ``signals_emitted``. Without that, the operator
+    audit ledger would say 'nothing happened' on a run that was
+    actually meaningful."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "signal": "poller_service_outage", "service": "gmail", "http_status": 503}))
+print(json.dumps({"poller": "x", "signal": "poller_auth_failed", "account": "y@z.com"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+
+    events = _read_events(home)
+    complete = [e for e in events if e.get("type") == "poller_complete"]
+    assert len(complete) == 1
+    assert complete[0]["signals_emitted"] == 2
+    assert complete[0]["events_emitted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_signal_with_empty_string_is_dropped(tmp_path, home):
+    """Empty / whitespace ``signal`` value is not a valid event type —
+    drop the record rather than emit a malformed events.jsonl entry."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+# Empty + whitespace-only signals — both must be dropped.
+print(json.dumps({"poller": "x", "signal": ""}))
+print(json.dumps({"poller": "x", "signal": "   "}))
+print(json.dumps({"poller": "x", "prompt": "actionable"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+
+    # Only the actionable event survived.
+    assert n == 1
+    events = _read_events(home)
+    # poller_complete still fires; signals_emitted should be 0.
+    complete = [e for e in events if e.get("type") == "poller_complete"]
+    assert complete[0]["signals_emitted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_signal_record_with_both_signal_and_prompt_routes_as_signal(
+    tmp_path, home,
+):
+    """A defensive contract: if a single JSONL line has BOTH
+    ``signal`` and ``prompt``, route as signal (the prompt is
+    ignored). Documents the precedence so skill authors don't depend
+    on dual-emit behavior — they should emit ONE record per shape.
+    """
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({
+    "poller": "x",
+    "signal": "poller_signal",
+    "prompt": "this should NOT spawn an AgentEvent",
+    "note": "operator's choice but signal wins"
+}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+
+    assert n == 0
+    assert enq.events == []
+    events = _read_events(home)
+    by_type = {e["type"]: e for e in events}
+    assert "poller_signal" in by_type
+    # The ``prompt`` field is stripped from the signal payload (the
+    # framework drops ``signal``, ``poller``, ``prompt``, and
+    # ``event_type`` to avoid noise and the log_event kwarg collision).
+    assert "prompt" not in by_type["poller_signal"]
+    assert by_type["poller_signal"]["note"] == "operator's choice but signal wins"
+
+
+@pytest.mark.asyncio
+async def test_signal_payload_event_type_key_does_not_collide(tmp_path, home):
+    """Regression for Mimir PR #235 nit: a payload key named
+    ``event_type`` would collide with ``log_event(event_type, **payload)``
+    on the kwarg expansion (``TypeError: got multiple values for
+    keyword argument 'event_type'``) and the signal would drop silently
+    via the catch-all warning.
+
+    Post-fix: ``event_type`` is on the strip list, so the signal
+    surfaces normally and the original collision-key is dropped.
+    """
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({
+    "poller": "gmail-inbox",
+    "signal": "poller_oauth_expired",
+    "event_type": "invalid_grant",
+    "account": "agent@example.com"
+}))
+""")
+    cfg = PollerConfig(
+        name="gmail-inbox", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 0
+
+    events = _read_events(home)
+    by_type = {e["type"]: e for e in events}
+    # The signal landed (didn't get silently dropped by the
+    # TypeError-via-catchall).
+    assert "poller_oauth_expired" in by_type
+    sig = by_type["poller_oauth_expired"]
+    # The payload-side ``event_type`` is stripped — only the
+    # framework's outer ``type`` matters. Useful unique fields survive.
+    assert sig["account"] == "agent@example.com"
+    # Confirm there's no payload-side ``event_type`` key sneaking
+    # through (would imply a future regression).
+    payload_keys = {k for k in sig.keys() if k != "type"}
+    assert "event_type" not in payload_keys
+    # The complete-event signal counter caught it.
+    complete = [e for e in events if e.get("type") == "poller_complete"]
+    assert complete[0]["signals_emitted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_signal_type_lands_in_events_jsonl(tmp_path, home):
+    """Regression for Mimir PR #235 nit: an unrecognized signal
+    event_type (not in ``feedback._EVENT_RULES``) must still land
+    in events.jsonl so the operator can grep for it during
+    debugging — it just won't surface in the algedonic block.
+
+    Pins the docstring contract: "Unknown signal types still land
+    in events.jsonl (grep-able for operator debugging) but don't
+    enter the algedonic block."
+    """
+    from mimir.feedback import _EVENT_RULES
+
+    unknown_signal = "some_skill_specific_signal_not_in_rules"
+    # Sanity: confirm the test's chosen name is genuinely unknown so
+    # adding a future rule with this name doesn't quietly weaken the
+    # test.
+    assert unknown_signal not in _EVENT_RULES, (
+        "test name collision: this signal type is now classified — "
+        "pick a different unknown name"
+    )
+
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"""
+import json
+print(json.dumps({{
+    "poller": "x",
+    "signal": "{unknown_signal}",
+    "detail": "an unclassified pain signal"
+}}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+
+    events = _read_events(home)
+    by_type = {e["type"]: e for e in events}
+    # The unknown signal IS in events.jsonl with its declared type.
+    assert unknown_signal in by_type
+    assert by_type[unknown_signal]["detail"] == "an unclassified pain signal"
+    assert by_type[unknown_signal]["poller"] == "x"
+    # poller_complete tracks it in signals_emitted just like a
+    # recognized signal — the framework doesn't gate on classification.
+    complete = [e for e in events if e.get("type") == "poller_complete"]
+    assert complete[0]["signals_emitted"] == 1
