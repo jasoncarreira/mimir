@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.event_logger import EventLogger, _safe_log_event, init_logger
+from mimir.event_logger import EventLogger, safe_log_event, init_logger
 
 
 @pytest.mark.asyncio
@@ -68,11 +68,11 @@ async def test_max_events_trims(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_safe_log_event_writes_when_logger_is_initialized(tmp_path: Path):
-    """_safe_log_event delegates to log_event when the logger is initialized."""
+    """safe_log_event delegates to log_event when the logger is initialized."""
     path = tmp_path / "events.jsonl"
     init_logger(path, session_id="proc-safe")
 
-    await _safe_log_event("test_event", key="value")
+    await safe_log_event("test_event", key="value")
 
     lines = [json.loads(l) for l in path.read_text().strip().splitlines()]
     assert len(lines) == 1
@@ -82,7 +82,7 @@ async def test_safe_log_event_writes_when_logger_is_initialized(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_safe_log_event_swallows_errors_when_logger_not_initialized():
-    """_safe_log_event must not raise even if the global logger is not set up.
+    """safe_log_event must not raise even if the global logger is not set up.
 
     This is the core contract: monitoring side-channels must never crash
     the primary work path regardless of logger state.
@@ -92,7 +92,7 @@ async def test_safe_log_event_swallows_errors_when_logger_not_initialized():
     try:
         _el._logger = None  # force the "not initialized" path
         # Should not raise — swallowed at DEBUG level
-        await _safe_log_event("orphan_event", x=1)
+        await safe_log_event("orphan_event", x=1)
     finally:
         _el._logger = original  # restore so other tests aren't affected
 

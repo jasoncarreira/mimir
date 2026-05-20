@@ -48,7 +48,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from .bridges._directives import parse_directives, ReactDirective
 from .channel_registry import ChannelRegistry
 from .config import Config
-from .event_logger import log_event, _safe_log_event
+from .event_logger import log_event, safe_log_event
 from .feedback import FeedbackLog
 from . import health
 from .history import Message, MessageBuffer
@@ -995,7 +995,7 @@ class Agent:
                 )
                 # Gap 1 fix: positive algedonic signal so the per-turn
                 # block shows at least one positive when feedback runs.
-                await _safe_log_event(
+                await safe_log_event(
                     "saga_feedback_sent",
                     atom_count=len(saga_atom_ids),
                     feedback=feedback_signal,
@@ -1023,7 +1023,7 @@ class Agent:
         # so the per-turn feedback block surfaces write-guard denials. The
         # backend only records them (sync); we emit here where we're async.
         for _denial in permission_denials:
-            await _safe_log_event(
+            await safe_log_event(
                 "tool_call_denied",
                 op=_denial.get("op"),
                 file_path=_denial.get("file_path"),
@@ -1034,7 +1034,7 @@ class Agent:
         # signal so the next turn's algedonic block surfaces it for
         # self-correction.
         if event.trigger == "saga_session_end" and not ctx.saga_end_session_called:
-            await _safe_log_event(
+            await safe_log_event(
                 "saga_synthesis_skipped_boundary",
                 session_id=saga_session_id,
                 trigger=event.trigger,
@@ -1143,7 +1143,7 @@ class Agent:
                             log.warning("bridge.send failed: %s", exc)
                             # Gap 5 fix: emit algedonic negative so the
                             # per-turn block surfaces auto-dispatch failures.
-                            await _safe_log_event(
+                            await safe_log_event(
                                 "auto_dispatch_failed",
                                 channel_id=event.channel_id,
                                 error=str(exc),
