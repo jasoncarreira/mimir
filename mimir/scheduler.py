@@ -68,6 +68,7 @@ def _resolve_tz(name: str) -> ZoneInfo:
         )
         return ZoneInfo("UTC")
 
+
 #: Channel-id prefix for synthetic scheduler-tick channels. Each named
 #: scheduler job (heartbeat, reflect, saga-consolidate, etc.) without a
 #: real channel uses ``scheduler:<job_name>`` as its event key. Exported
