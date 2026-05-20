@@ -59,10 +59,10 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "saga_synthesis_dispatch_failed": ("negative", "synth_dispatch_fail"),
     "saga_synthesis_empty_window": ("negative", "synth_empty_window"),
     # CR#19: synthesis-turn post-check; agent ran the synthesis turn
-    # but skipped step 3 (saga_end_session). Without the boundary
-    # atom the next session has no "what were we doing last time?"
-    # record. Negative so the agent's next turn surfaces it and the
-    # behavior self-corrects.
+    # but skipped step 3 (saga_end_session). Without the sessions row
+    # the next session has no "what were we doing last time?" record.
+    # Negative so the agent's next turn surfaces it and the behavior
+    # self-corrects.
     "saga_synthesis_skipped_boundary": ("negative", "synth_skip_boundary"),
     "cost_rate_alert": ("negative", "cost_rate"),
     # chainlink #13: under billing-mode=quota, cost spikes don't
