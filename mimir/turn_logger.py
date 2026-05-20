@@ -30,6 +30,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from ._jsonl_tail import _tail_lines, count_lines_chunked
+from ._think_blocks import extract_think_blocks
 from .models import TurnRecord
 
 log = logging.getLogger(__name__)
@@ -105,7 +106,25 @@ def extract_turn_events(
     output_parts: list[str] = []
     for i, msg in enumerate(messages):
         if isinstance(msg, AIMessage):
-            content_text = _coerce_content(msg.content)
+            content_text_raw = _coerce_content(msg.content)
+            # Some model families (Minimax M2, DeepSeek-R1, QwQ) emit
+            # reasoning tokens inline as literal ``<think>…</think>``
+            # blocks inside ``message.content``. Strip them here so
+            # the downstream output / reasoning-event paths only see
+            # user-visible text, and emit each captured think block
+            # as its own reasoning event with the source marker so
+            # operators can tell think-tag reasoning apart from
+            # claude-code's native reasoning blocks. Unclosed trailing
+            # ``<think>…EOF`` (model hit max_tokens mid-reasoning) is
+            # captured the same way — see ``_think_blocks``.
+            content_text, _think_blocks = extract_think_blocks(content_text_raw)
+            for _tb in _think_blocks:
+                if _tb:
+                    events.append({
+                        "type": "reasoning",
+                        "source": "model_think_tag",
+                        "content": _tb,
+                    })
             # ChatClaudeCode executes tools inside the ``claude`` CLI
             # subprocess and stashes the parsed ToolUseBlocks under
             # ``response_metadata["internal_tool_calls"]`` (NOT on

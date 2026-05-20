@@ -45,6 +45,7 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 
+from ._think_blocks import strip_think_blocks
 from .bridges._directives import parse_directives, ReactDirective
 from .channel_registry import ChannelRegistry
 from .config import Config
@@ -354,7 +355,13 @@ def _rewrite_context_from_buffer(
             role = "assistant"
         else:
             continue  # skip system_note
-        content = (msg.content or "").strip()
+        # Defense in depth: ``_record_outbound`` already strips
+        # ``<think>…</think>`` before writing to the buffer, but older
+        # ``messages.jsonl`` entries written prior to that strip still
+        # exist on disk and get loaded back here. Strip again so the
+        # rewrite LLM never sees the agent's own prior scratchpad in
+        # the context window.
+        content = strip_think_blocks((msg.content or "").strip())
         if not content:
             continue
         out.append({"role": role, "content": content})
@@ -710,6 +717,16 @@ class Agent:
         conversation doesn't match what it thought it sent.
         """
         if not channel_id or not content:
+            return
+        # Strip any ``<think>…</think>`` reasoning the model emitted
+        # inline (Minimax / DeepSeek-R1 / QwQ family). messages.jsonl
+        # is the user-visible chat history AND the source of the
+        # next turn's ``## Recent activity`` / contextual-rewrite
+        # context — neither should carry the model's prior scratchpad.
+        # The reasoning is preserved separately in turns.jsonl via
+        # ``turn_logger.extract_turn_events``.
+        content = strip_think_blocks(content)
+        if not content:
             return
         try:
             msg = self._buffer.make_message(

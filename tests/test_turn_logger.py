@@ -45,6 +45,41 @@ def test_plain_ai_message_with_no_tools_becomes_output():
     assert output == "Hello there."
 
 
+def test_think_tag_block_splits_into_reasoning_event_and_clean_output():
+    """Minimax / DeepSeek-R1 / QwQ family emit ``<think>...</think>``
+    reasoning inline in ``message.content``. The think block must
+    surface as its own reasoning event (with ``source`` marker so
+    introspection can distinguish it from claude-code native
+    reasoning), and ``output`` must hold the user-visible reply
+    only — no leakage of the model's scratchpad into ``output``
+    means messages.jsonl + the bridge see only the clean reply too.
+    """
+    msg = AIMessage(
+        content="<think>The user asked for X. I should reply Y.</think>"
+                "Here is Y."
+    )
+    events, output = extract_turn_events([msg])
+    assert output == "Here is Y."
+    assert len(events) == 1
+    assert events[0]["type"] == "reasoning"
+    assert events[0]["source"] == "model_think_tag"
+    assert events[0]["content"] == "The user asked for X. I should reply Y."
+
+
+def test_unclosed_think_tag_is_captured_with_empty_output():
+    """Model hit max_tokens mid-reasoning — open ``<think>`` with no
+    close. Everything after the tag is reasoning; visible output
+    is empty (so bridge.send / messages.jsonl get nothing — which
+    is correct: the model produced no actual reply)."""
+    msg = AIMessage(content="<think>The user wants a reply that is")
+    events, output = extract_turn_events([msg])
+    assert output == ""
+    assert len(events) == 1
+    assert events[0]["type"] == "reasoning"
+    assert events[0]["source"] == "model_think_tag"
+    assert events[0]["content"] == "The user wants a reply that is"
+
+
 def test_intermediate_aimessage_with_tools_is_reasoning_only():
     """AIMessages with content + tool_calls that are NOT the final
     AIMessage in the turn are pure reasoning — the model is thinking
