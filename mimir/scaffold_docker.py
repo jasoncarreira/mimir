@@ -396,7 +396,7 @@ git config --global --add safe.directory "${REPO_DIR}"
 # different extras (slack, etc.).
 UV_EXTRAS="{UV_EXTRAS}"
 echo "[start.sh] uv sync (extras: ${UV_EXTRAS:-(none)})"
-uv sync ${UV_EXTRAS}
+uv sync $UV_EXTRAS
 
 # ─── home seed (idempotent — only writes missing files) ────────────
 mkdir -p "${MIMIR_HOME}"
