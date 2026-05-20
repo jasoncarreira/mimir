@@ -41,35 +41,40 @@ _MAX_CONTEXT_CONTENT_CHARS = 400
 
 
 REWRITE_PROMPT = """\
-You rewrite a user's current message into a self-contained query for a \
-memory-retrieval system. The message may be a question, a statement, \
-or a command — preserve its original intent and shape.
+You rewrite the user's current message into a SELF-CONTAINED \
+statement-form retrieval anchor for a memory-retrieval system whose \
+atoms are stored as declarative statements (e.g. "user prefers X", \
+"<entity> on <topic>", "<concept> = <definition>"). The agent uses \
+your output to retrieve atoms by semantic + keyword match; it is \
+never shown to the user, so it does NOT need to read like natural \
+language.
 
 Rules:
-- If the message already stands alone, return it unchanged.
-- If the message references prior content ("yes", "that", "the same \
-one", "those", "it", "them", "this", "he", "she", "they"), rewrite it \
-to include the specific entity or topic from the conversation \
-transcript. Examples:
-  - "yes, look for that" + transcript about Sony headphones → \
-"look for my Sony headphones"
-  - "yes, please save that" + transcript about a meeting → \
-"save the meeting"
-  - "tell me more" + transcript about Italy → "tell me more about Italy"
-- Preserve all proper nouns, dates, numbers, and direct quotes verbatim.
-- Do not add information not present in the transcript.
-- Do not turn statements into questions or vice versa.
-- Output ONLY the rewritten message on a single line. No preamble, no \
-explanation, no quotes around the output.
-- If the transcript is empty or doesn't disambiguate the message, \
-return the original message unchanged.
+- Resolve all references against the transcript:
+    "yes, look for that" + transcript about Sony headphones → \
+"Sony headphones"
+    "tell me more" + transcript about Italy → "Italy travel details"
+    "what about the other one?" + transcript about two laptops → \
+"the other laptop"
+- Convert questions and commands into noun-phrase or statement form:
+    "what's my favorite pizza topping?" → "favorite pizza topping"
+    "when did the meeting end?" → "meeting end time"
+    "did Sony release a new model?" → "Sony new model release"
+    "save the meeting notes" → "meeting notes"
+- Preserve proper nouns, dates, numbers, and direct quotes verbatim.
+- Do NOT add information not present in the message or transcript.
+- Output ONLY the anchor on a single line. No question marks unless \
+the original contained a quoted phrase. No preamble, no quotes around \
+the output.
+- If the message already reads as a self-contained noun phrase or \
+statement, return it unchanged.
 
 Conversation transcript (most recent last):
 {context}
 
 Current message: {question}
 
-Rewritten:"""
+Retrieval anchor:"""
 
 
 def _format_context(context: list[dict[str, str]]) -> str:
@@ -103,10 +108,12 @@ def _clean_rewrite(raw: str, original: str) -> str:
     text = (raw or "").strip()
     if not text:
         return original
-    # Drop a "Rewritten:" or "Rewritten question:" prefix if the LLM
-    # echoed the prompt's label line.
+    # Drop a label-line echo from the prompt: legacy "Rewritten:" /
+    # "Rewritten question:" or current "Retrieval anchor:".
     text = re.sub(
-        r"^[Rr]ewritten(?:\s*[Qq]uestion)?\s*:\s*", "", text,
+        r"^(?:[Rr]ewritten(?:\s*[Qq]uestion)?|[Rr]etrieval\s+anchor)\s*:\s*",
+        "",
+        text,
     )
     # Take only the first line — paragraph drift confuses retrieval.
     text = text.splitlines()[0].strip()
