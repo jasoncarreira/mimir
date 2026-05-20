@@ -982,3 +982,142 @@ async def test_run_turn_no_synthesis_skipped_when_session_called(tmp_path: Path)
     assert "saga_synthesis_skipped_boundary" not in event_types, (
         "saga_synthesis_skipped_boundary must NOT fire when saga_end_session was called"
     )
+
+
+# ── _rewrite_context_from_buffer ──────────────────────────────────────
+
+
+async def _seed_buffer(
+    buf: MessageBuffer, channel: str, items: list[tuple[str, str, str]],
+) -> None:
+    """Append ``(kind, author, content)`` triples to the buffer."""
+    from mimir.history import Message
+    from datetime import datetime, timezone
+    for i, (kind, author, content) in enumerate(items):
+        msg = Message(
+            ts=datetime(2026, 5, 20, 12, 0, i, tzinfo=timezone.utc).isoformat(),
+            msg_id=f"m-{i}",
+            channel_id=channel,
+            author=author,
+            author_display=author,
+            kind=kind,
+            content=content,
+            thread_id=None,
+            source=channel,
+        )
+        await buf.append(msg)
+
+
+@pytest.mark.asyncio
+async def test_rewrite_context_from_buffer_maps_kind_to_role(tmp_path: Path):
+    """Normal user/assistant messages become {role, content} dicts in
+    arrival order. Pin the shape SagaStore.contextual_rewrite expects.
+    """
+    from mimir.agent import _rewrite_context_from_buffer
+
+    buf = MessageBuffer(history_path=tmp_path / "chat.jsonl")
+    await _seed_buffer(buf, "ch-1", [
+        ("user_message",      "alice", "I just bought new Sony headphones"),
+        ("assistant_message", "muninn", "Nice — the WH-1000XM6?"),
+        ("user_message",      "alice", "yes, please save that"),
+    ])
+    ctx = _rewrite_context_from_buffer(buf, "ch-1")
+    assert ctx == [
+        {"role": "user",      "content": "I just bought new Sony headphones"},
+        {"role": "assistant", "content": "Nice — the WH-1000XM6?"},
+        {"role": "user",      "content": "yes, please save that"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rewrite_context_from_buffer_drops_system_notes(tmp_path: Path):
+    """``system_note`` is algedonic-signal scaffolding, not a reference
+    antecedent — must not poison the rewrite context."""
+    from mimir.agent import _rewrite_context_from_buffer
+
+    buf = MessageBuffer(history_path=tmp_path / "chat.jsonl")
+    await _seed_buffer(buf, "ch-1", [
+        ("system_note",       "system", "saga.feedback_sent (atom_count=3)"),
+        ("user_message",      "alice", "tell me more about Italy"),
+        ("system_note",       "system", "cost_rate_advisory"),
+        ("assistant_message", "muninn", "Italy is varied — North vs South..."),
+    ])
+    ctx = _rewrite_context_from_buffer(buf, "ch-1")
+    assert ctx == [
+        {"role": "user",      "content": "tell me more about Italy"},
+        {"role": "assistant", "content": "Italy is varied — North vs South..."},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rewrite_context_from_buffer_all_system_notes_returns_none(tmp_path: Path):
+    """When the whole window is system_note, return ``None`` so
+    SagaStore.query short-circuits the rewrite LLM call.
+    """
+    from mimir.agent import _rewrite_context_from_buffer
+
+    buf = MessageBuffer(history_path=tmp_path / "chat.jsonl")
+    await _seed_buffer(buf, "ch-1", [
+        ("system_note", "system", "saga.feedback_sent"),
+        ("system_note", "system", "rate_limit_warning"),
+        ("system_note", "system", "heartbeat_health_degraded"),
+    ])
+    ctx = _rewrite_context_from_buffer(buf, "ch-1")
+    assert ctx is None
+
+
+@pytest.mark.asyncio
+async def test_rewrite_context_from_buffer_empty_buffer_returns_none(tmp_path: Path):
+    """Empty channel → ``None`` (not an empty list). SagaStore.query
+    treats ``None`` and ``[]`` differently if it ever does positional
+    truthiness checks; pin the None contract explicitly.
+    """
+    from mimir.agent import _rewrite_context_from_buffer
+
+    buf = MessageBuffer(history_path=tmp_path / "chat.jsonl")
+    ctx = _rewrite_context_from_buffer(buf, "ch-1")
+    assert ctx is None
+
+
+@pytest.mark.asyncio
+async def test_rewrite_context_from_buffer_drops_empty_content(tmp_path: Path):
+    """Messages whose ``content`` is empty/whitespace are dropped — they
+    can't anchor a reference. Mixed empty + populated must yield only
+    the populated ones (NOT empty-string slots)."""
+    from mimir.agent import _rewrite_context_from_buffer
+
+    buf = MessageBuffer(history_path=tmp_path / "chat.jsonl")
+    await _seed_buffer(buf, "ch-1", [
+        ("user_message",      "alice", ""),
+        ("user_message",      "alice", "   "),
+        ("user_message",      "alice", "tell me about Italy"),
+        ("assistant_message", "muninn", ""),
+        ("assistant_message", "muninn", "Italy spans many regions."),
+    ])
+    ctx = _rewrite_context_from_buffer(buf, "ch-1")
+    assert ctx == [
+        {"role": "user",      "content": "tell me about Italy"},
+        {"role": "assistant", "content": "Italy spans many regions."},
+    ]
+    # Nothing in the result has empty content.
+    assert all(c["content"].strip() for c in ctx)
+
+
+@pytest.mark.asyncio
+async def test_rewrite_context_from_buffer_respects_window(tmp_path: Path):
+    """The 10-msg window is what ``_REWRITE_CONTEXT_MESSAGES`` caps at —
+    older entries don't leak in. Seed 15, expect the last 10 (in
+    arrival order)."""
+    from mimir.agent import _rewrite_context_from_buffer, _REWRITE_CONTEXT_MESSAGES
+
+    buf = MessageBuffer(history_path=tmp_path / "chat.jsonl")
+    items = [
+        ("user_message", "alice", f"msg-{i}") for i in range(15)
+    ]
+    await _seed_buffer(buf, "ch-1", items)
+    ctx = _rewrite_context_from_buffer(buf, "ch-1")
+    assert ctx is not None
+    # _REWRITE_CONTEXT_MESSAGES is 10 — only the last 10 survive.
+    assert len(ctx) == _REWRITE_CONTEXT_MESSAGES == 10
+    # And they are the most-recent 10, in chronological order.
+    assert [c["content"] for c in ctx] == [f"msg-{i}" for i in range(5, 15)]
