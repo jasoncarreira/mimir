@@ -383,6 +383,31 @@ def test_render_start_sh_expands_extras():
     assert "UV_EXTRAS=\"--extra discord --extra claude-code\"" in out
 
 
+def test_render_start_sh_uv_sync_line_is_valid_shell_with_no_extras():
+    """Regression: the prior template had ``uv sync ${UV_EXTRAS}`` on
+    the invocation line. The Python renderer's
+    ``.replace("{UV_EXTRAS}", flags)`` matched the ``{UV_EXTRAS}``
+    substring INSIDE ``${UV_EXTRAS}`` and replaced it with the empty
+    string when no extras were configured — producing ``uv sync $``
+    (literal stray dollar, no variable). That crashed every
+    container at boot with ``error: unexpected argument '$' found``.
+
+    The fix uses bare ``$UV_EXTRAS`` shell expansion on the
+    invocation line so the ``{UV_EXTRAS}`` substring never appears
+    next to a leading ``$`` for the renderer to clobber.
+
+    Caught during muninn-mimir cutover on 2026-05-20."""
+    from mimir.scaffold_docker import render_start_sh
+    out = render_start_sh()
+    # The stray-$ bug would produce this exact line; if it shows up
+    # we've regressed.
+    assert "uv sync $\n" not in out
+    assert "uv sync $ " not in out
+    # The fix renders the invocation as bare shell expansion which
+    # still works correctly when UV_EXTRAS is empty.
+    assert "uv sync $UV_EXTRAS" in out
+
+
 # ── _resolve_home() precedence ───────────────────────────────────────
 
 
