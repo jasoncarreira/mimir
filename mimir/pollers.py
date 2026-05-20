@@ -21,9 +21,34 @@ Ported from open-strix's ``open_strix.scheduler._discover_pollers`` /
 ``_on_poller_fire`` (2026-04 vintage).
 
 Output contract (matches open-strix):
-- **stdout**: JSONL, one ``{"poller": str, "prompt": str, ...}`` per
-  actionable event. Other keys (``source_platform``, etc.) flow
-  through to the AgentEvent's ``extra``.
+- **stdout**: JSONL, one record per actionable event OR algedonic
+  signal. Two record shapes share the channel:
+
+  *Event records* — ``{"poller": str, "prompt": str, ...extras}``.
+  Each becomes one ``AgentEvent``. Other keys flow through to the
+  event's ``extra``.
+
+  *Signal records* — ``{"poller": str, "signal": "<event_type>",
+  ...extras}``. These DO NOT spawn an AgentEvent; instead the
+  framework writes them to ``events.jsonl`` via ``log_event``, where
+  ``feedback._EVENT_RULES`` classifies recognized signal types into
+  the algedonic block of the next turn's prompt. Used for
+  external-state health signals (auth-token expiry, upstream
+  service outages, rate-limit hits) that the agent should see but
+  that shouldn't each fire a turn of their own.
+
+  Recognized signal event types (algedonic-classified — see
+  ``mimir/feedback.py``):
+    ``poller_oauth_expired``       — OAuth token expired/revoked
+    ``poller_auth_failed``         — Non-OAuth auth failure
+    ``poller_service_outage``      — Upstream service unreachable (5xx, DNS, refused)
+    ``poller_rate_limited``        — Upstream rate-limit hit
+    ``poller_signal``              — Generic / unclassified poller signal
+
+  A record with neither ``prompt`` nor ``signal`` is silently
+  dropped. A record with BOTH is treated as a signal-only record
+  (the ``prompt`` is ignored; emit a separate record per shape).
+
 - **stderr**: free-form diagnostic output. Captured and emitted as
   a ``poller_stderr`` event for observability; not forwarded to the
   agent.
@@ -571,6 +596,7 @@ async def run_poller(
         )
     else:
         per_item_cap = None
+    signals_emitted = 0
     for line in stdout_text.splitlines():
         line = line.strip()
         if not line:
@@ -587,6 +613,36 @@ async def run_poller(
 
         if not isinstance(parsed, dict):
             continue
+
+        # Signal-shaped record? Route to events.jsonl via log_event
+        # instead of building an AgentEvent. The ``signal`` value is
+        # the event_type; ``feedback._EVENT_RULES`` decides whether
+        # it surfaces algedonically. Unknown signal types still land
+        # in events.jsonl (grep-able for operator debugging) but
+        # don't enter the algedonic block.
+        signal_type = parsed.get("signal")
+        if isinstance(signal_type, str) and signal_type.strip():
+            payload = {
+                k: v for k, v in parsed.items()
+                if k not in ("signal", "poller", "prompt")
+            }
+            try:
+                await log_event(
+                    signal_type.strip(),
+                    poller=poller.name,
+                    **payload,
+                )
+                signals_emitted += 1
+            except Exception as exc:  # noqa: BLE001
+                # log_event should be best-effort but defend against
+                # an unexpected payload shape (non-string keys, etc.)
+                # tripping the JSONL writer.
+                log.warning(
+                    "poller %r: signal emit failed (%s); record dropped",
+                    poller.name, exc,
+                )
+            continue
+
         prompt = str(parsed.get("prompt", "")).strip()
         if not prompt:
             continue
@@ -625,6 +681,7 @@ async def run_poller(
             events_rejected=0,
             items_collected=0,
             batches_emitted=0,
+            signals_emitted=signals_emitted,
         )
         return 0
 
@@ -728,6 +785,7 @@ async def run_poller(
         events_rejected=rejected_count,
         items_collected=len(items),
         batches_emitted=len(batches),
+        signals_emitted=signals_emitted,
     )
     return event_count
 
