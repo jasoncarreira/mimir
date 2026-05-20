@@ -71,7 +71,16 @@ def test_setup_is_idempotent_and_preserves_user_edits(tmp_path: Path):
     (custom / "SKILL.md").write_text("custom")
     # Re-run setup — must not clobber existing values.
     setup_home(home)
-    assert (home / ".env").read_text() == user_env
+    body = (home / ".env").read_text()
+    # Operator's set values must survive untouched.
+    assert "ANTHROPIC_API_KEY=user-key" in body
+    assert "MIMIR_API_KEY=user-token" in body
+    assert "SAGA_API_KEY=user-saga-token" in body
+    # Setup IS allowed to append missing keys that the agent needs
+    # (MIMIR_MODEL_SPEC, MIMIR_COST_HOURLY_LIMIT_USD for API-mode
+    # cost monitoring). Operators get a working agent on re-run
+    # rather than a silently-broken one that depends on env vars the
+    # template forgot to seed.
     assert (custom / "SKILL.md").read_text() == "custom"
 
 
@@ -712,3 +721,150 @@ def test_print_setup_report_omits_upstream_lines_when_absent(capsys):
     out = capsys.readouterr().out
     assert "upstream tracking" not in out
     assert "initial push" not in out
+
+
+
+
+# ─── --model flag (auto-routing via model_registry) ─────────────────────
+
+
+def test_setup_default_model_routes_to_anthropic_api(tmp_path: Path):
+    """No ``--model`` → default to direct Anthropic API
+    (``anthropic:claude-sonnet-4-6``). Forward-looking default since
+    Anthropic is sunsetting claude-code subscription plans."""
+    home = tmp_path / "h"
+    status = setup_home(home)
+    env = (home / ".env").read_text()
+    assert "MIMIR_MODEL_SPEC=anthropic:claude-sonnet-4-6" in env
+    assert status["model_spec"] == "anthropic:claude-sonnet-4-6"
+    assert status["provider_name"] == "anthropic-api"
+    assert status["billing_mode"] == "api"
+
+
+def test_setup_max_oauth_routes_claude_to_claude_code(tmp_path: Path):
+    """``--subscription`` opts INTO the legacy Max OAuth path for
+    operators with active Max plans."""
+    home = tmp_path / "h"
+    status = setup_home(home, subscription=True)
+    env = (home / ".env").read_text()
+    assert "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6" in env
+    assert status["model_spec"] == "claude-code:claude-sonnet-4-6"
+    assert status["provider_name"] == "anthropic-max"
+    assert status["billing_mode"] == "subscription"
+
+
+def test_setup_minimax_model_injects_anthropic_compat_base_url(tmp_path: Path):
+    home = tmp_path / "h"
+    status = setup_home(home, model="MiniMax-M2.7")
+    env = (home / ".env").read_text()
+    assert "MIMIR_MODEL_SPEC=anthropic:MiniMax-M2.7" in env
+    assert "ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic" in env
+    assert status["provider_name"] == "minimax"
+    assert status["billing_mode"] == "api"
+
+
+def test_setup_kimi_model_injects_moonshot_base_url(tmp_path: Path):
+    home = tmp_path / "h"
+    status = setup_home(home, model="kimi-k2-0905-preview")
+    env = (home / ".env").read_text()
+    assert "ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic" in env
+    assert status["provider_name"] == "moonshot"
+
+
+def test_setup_openai_model_no_base_url_override(tmp_path: Path):
+    home = tmp_path / "h"
+    status = setup_home(home, model="gpt-4.1-mini")
+    env = (home / ".env").read_text()
+    assert "MIMIR_MODEL_SPEC=openai:gpt-4.1-mini" in env
+    assert status["provider_name"] == "openai"
+
+
+def test_setup_model_preserves_operator_value_on_rerun(tmp_path: Path):
+    """Idempotent — operator's manual MIMIR_MODEL_SPEC edit survives
+    a re-run with the original ``--model``."""
+    home = tmp_path / "h"
+    setup_home(home, model="claude-sonnet-4-6")
+    env_path = home / ".env"
+    body = env_path.read_text().replace(
+        "MIMIR_MODEL_SPEC=anthropic:claude-sonnet-4-6",
+        "MIMIR_MODEL_SPEC=openai:gpt-5-nano",
+    )
+    env_path.write_text(body)
+    setup_home(home, model="claude-sonnet-4-6")
+    final = env_path.read_text()
+    assert "MIMIR_MODEL_SPEC=openai:gpt-5-nano" in final
+    assert "MIMIR_MODEL_SPEC=anthropic:claude-sonnet-4-6" not in final
+
+
+# ─── usage-monitor auto-wiring (no --quota flag needed) ─────────────────
+
+
+def test_setup_api_route_writes_cost_ceiling(tmp_path: Path):
+    """API-mode routes get the default ``MIMIR_COST_HOURLY_LIMIT_USD``
+    written automatically (no --quota flag needed). Spike-ratio check
+    is always-on by default in cost_tracking.py — this gives operators
+    a sensible alert threshold so unexpected $/hr spikes fire."""
+    home = tmp_path / "h"
+    status = setup_home(home, model="MiniMax-M2.7")
+    env = (home / ".env").read_text()
+    assert "MIMIR_COST_HOURLY_LIMIT_USD=5.0" in env
+    assert "cost monitoring" in status["monitor_status"]
+
+
+def test_setup_subscription_route_writes_quota_poll_flag(tmp_path: Path):
+    """Subscription-mode routes get ``MIMIR_QUOTA_POLL_ENABLED=1`` so
+    the runtime registers the OAuth usage poller at boot."""
+    home = tmp_path / "h"
+    status = setup_home(home, subscription=True)
+    env = (home / ".env").read_text()
+    assert "MIMIR_QUOTA_POLL_ENABLED=1" in env
+    assert "quota poller" in status["monitor_status"]
+
+
+def test_setup_preserves_operator_monitor_override_on_rerun(tmp_path: Path):
+    """Operator manually set MIMIR_COST_HOURLY_LIMIT_USD=25.0 to a
+    higher ceiling. A re-run mustn't clobber that operator value."""
+    home = tmp_path / "h"
+    setup_home(home, model="claude-sonnet-4-6")
+    env_path = home / ".env"
+    body = env_path.read_text().replace(
+        "MIMIR_COST_HOURLY_LIMIT_USD=5.0",
+        "MIMIR_COST_HOURLY_LIMIT_USD=25.0",
+    )
+    env_path.write_text(body)
+    setup_home(home, model="claude-sonnet-4-6")
+    final = env_path.read_text()
+    assert "MIMIR_COST_HOURLY_LIMIT_USD=25.0" in final
+    assert "MIMIR_COST_HOURLY_LIMIT_USD=5.0" not in final
+
+
+def test_setup_overrides_zero_default_to_active_ceiling(tmp_path: Path):
+    """The .env template ships with ``MIMIR_COST_HOURLY_LIMIT_USD=`` empty.
+    Setup treats empty / 0 / 0.0 as "not set" and writes the active
+    default — otherwise operators would have to manually bump it from
+    zero (which disables the alert)."""
+    home = tmp_path / "h"
+    # Empty .env (post-template) has MIMIR_COST_HOURLY_LIMIT_USD= empty.
+    setup_home(home, model="claude-sonnet-4-6")
+    env = (home / ".env").read_text()
+    # Setup wrote the active default.
+    assert "MIMIR_COST_HOURLY_LIMIT_USD=5.0" in env
+
+
+# ─── dead-env removal sanity ────────────────────────────────────────────
+
+
+def test_setup_does_not_write_dead_MIMIR_MODEL_env_var(tmp_path: Path):
+    """``MIMIR_MODEL`` is SDK-era; deepagents path reads only
+    ``MIMIR_MODEL_SPEC``. The .env template used to write
+    ``MIMIR_MODEL=claude-opus-4-7`` which silently confused operators
+    (the value didn't do anything). Make sure it's gone."""
+    home = tmp_path / "h"
+    setup_home(home)
+    env = (home / ".env").read_text()
+    for line in env.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("MIMIR_MODEL=") and not stripped.startswith(
+            "MIMIR_MODEL_SPEC"
+        ):
+            pytest.fail(f"unexpected dead env line: {stripped!r}")

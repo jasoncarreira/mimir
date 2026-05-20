@@ -35,15 +35,29 @@ DEFAULT_ENV_TEMPLATE = dedent(
     """\
     # mimir environment — fill in what you use, leave the rest blank.
 
+    # ---- Agent chat model ------------------------------------------------
+    # MIMIR_MODEL_SPEC has the form ``<provider>:<model>``. Examples:
+    #
+    #   claude-code:claude-sonnet-4-6     (default — Max OAuth subprocess)
+    #   anthropic:claude-haiku-4-5        (direct Anthropic API + paid key)
+    #   anthropic:MiniMax-M2.7            (Minimax via Anthropic-compat —
+    #                                      also set ANTHROPIC_BASE_URL)
+    #   anthropic:kimi-k2-0905-preview    (Moonshot Kimi)
+    #   openai:gpt-4.1-mini               (direct OpenAI)
+    #
+    # ``mimir setup --model <name>`` auto-detects the right prefix +
+    # writes ANTHROPIC_BASE_URL when the provider needs one (Minimax,
+    # Moonshot). Without --model, mimir uses ``claude-code:claude-sonnet-4-6``.
+    MIMIR_MODEL_SPEC=
+
     # ---- LLM gateway (Anthropic-compatible) ------------------------------
     # For Claude direct: set ANTHROPIC_API_KEY.
     # For Minimax / Moonshot / other gateways: set ANTHROPIC_BASE_URL +
-    # ANTHROPIC_AUTH_TOKEN (and ANTHROPIC_MODEL if the gateway needs it).
+    # ANTHROPIC_API_KEY (the gateway's key under that name; mimir's
+    # langchain-anthropic provider reads both env vars).
     ANTHROPIC_API_KEY=
     ANTHROPIC_BASE_URL=
     ANTHROPIC_AUTH_TOKEN=
-    ANTHROPIC_MODEL=
-    ANTHROPIC_CUSTOM_MODEL_OPTION=
 
     # ---- SAGA sidecar (memory) -------------------------------------------
     SAGA_ENDPOINT=http://localhost:3002
@@ -65,7 +79,6 @@ DEFAULT_ENV_TEMPLATE = dedent(
 
     # ---- Server tuning ---------------------------------------------------
     MIMIR_WEB_PORT=8080
-    MIMIR_MODEL=claude-opus-4-7
     MIMIR_EFFORT=high
     # API key for the public injection endpoint (POST /event). When set,
     # requests must carry a matching ``X-API-Key`` header. The server
@@ -997,6 +1010,15 @@ def _generate_api_key() -> str:
 # operator's indentation in their .env stays intact.
 _API_KEY_LINE_RE = re.compile(r"^(\s*)MIMIR_API_KEY\s*=.*$", re.MULTILINE)
 _SAGA_API_KEY_LINE_RE = re.compile(r"^(\s*)SAGA_API_KEY\s*=.*$", re.MULTILINE)
+_MIMIR_MODEL_SPEC_LINE_RE = re.compile(
+    r"^(\s*)MIMIR_MODEL_SPEC\s*=.*$", re.MULTILINE,
+)
+_ANTHROPIC_BASE_URL_LINE_RE = re.compile(
+    r"^(\s*)ANTHROPIC_BASE_URL\s*=.*$", re.MULTILINE,
+)
+_MIMIR_QUOTA_POLL_LINE_RE = re.compile(
+    r"^(\s*)MIMIR_QUOTA_POLL_ENABLED\s*=.*$", re.MULTILINE,
+)
 
 
 def _env_set_var(env_path: Path, var_name: str, value: str, line_re: re.Pattern[str]) -> None:
@@ -1041,14 +1063,36 @@ def _env_get_api_key(env_path: Path) -> str | None:
 
 
 def setup_home(
-    home: Path, *, embedding: str = DEFAULT_EMBEDDING_PRESET,
+    home: Path,
+    *,
+    embedding: str = DEFAULT_EMBEDDING_PRESET,
+    model: str | None = None,
+    subscription: bool = False,
 ) -> dict[str, object]:
     """Scaffold an agent home directory. Returns a status dict for printing.
 
     ``embedding`` selects the saga.toml ``[embedding]`` preset (one of
     ``EMBEDDING_PRESETS``). Default: voyage (see
     ``DEFAULT_EMBEDDING_PRESET`` for rationale).
+
+    ``model`` is a bare model name (no provider prefix); setup uses
+    ``mimir.model_registry.detect_route`` to resolve to the right
+    ``MIMIR_MODEL_SPEC`` + any provider-specific env vars. ``None``
+    falls back to ``DEFAULT_MODEL_NAME``.
+
+    ``subscription`` declares the deployment is on a subscription
+    plan (not pay-per-token). Effect is provider-polymorphic — see
+    ``detect_route``.
+
+    Setup always writes the usage monitor env vars matching the
+    route's billing mode:
+
+    * subscription routes → ``MIMIR_QUOTA_POLL_ENABLED=1``
+    * API routes → ``MIMIR_COST_HOURLY_LIMIT_USD=5.0`` (sane default
+      for per-turn cost-tracker alerts; operators tune post-setup).
     """
+    from .model_registry import detect_route
+    route = detect_route(model, subscription=subscription)
     home = home.resolve()
     if home.exists() and not home.is_dir():
         raise ValueError(
@@ -1083,6 +1127,44 @@ def setup_home(
     saga_api_key_action: str | None = None
     if _write_if_missing(home / ".env", DEFAULT_ENV_TEMPLATE):
         files_created.append(".env")
+    # Inject the resolved model spec + provider env vars. Preserves any
+    # existing operator value on re-run (don't clobber if the operator
+    # already filled it in). This is idempotent in the same shape as
+    # the API key generation below.
+    if (_env_get_var(home / ".env", _MIMIR_MODEL_SPEC_LINE_RE) or "") == "":
+        _env_set_var(
+            home / ".env", "MIMIR_MODEL_SPEC", route.model_spec,
+            _MIMIR_MODEL_SPEC_LINE_RE,
+        )
+    # Provider-specific env (e.g., ``ANTHROPIC_BASE_URL`` for Minimax /
+    # Moonshot routed deployments). Same idempotency: only write when
+    # the line is empty.
+    for var_name, var_value in route.env.items():
+        # Use a per-var regex by-name so this generalizes to any future
+        # provider that adds a different env var (OPENAI_BASE_URL, etc.).
+        line_re = re.compile(
+            rf"^(\s*){re.escape(var_name)}\s*=.*$", re.MULTILINE,
+        )
+        if (_env_get_var(home / ".env", line_re) or "") == "":
+            _env_set_var(home / ".env", var_name, var_value, line_re)
+    # Usage-monitor env vars matching the route's billing mode:
+    # subscription routes get the quota-poller-enabled flag; API
+    # routes get a default per-turn cost ceiling. Always written
+    # (no opt-in flag) because the right monitor for the chosen
+    # billing model should just work. Idempotent: don't clobber an
+    # operator-set value on re-run.
+    for var_name, var_value in route.monitor_env.items():
+        line_re = re.compile(
+            rf"^(\s*){re.escape(var_name)}\s*=.*$", re.MULTILINE,
+        )
+        existing = _env_get_var(home / ".env", line_re)
+        # ``None`` = key missing; empty string = key present but blank.
+        # Both treated as "no operator override yet" → write our value.
+        # Non-empty non-default values stay untouched.
+        if existing in (None, "", "0", "0.0"):
+            _env_set_var(home / ".env", var_name, var_value, line_re)
+    monitor_status = route.monitor_label or "no monitor configured"
+
     # Generate a fresh MIMIR_API_KEY on first setup (or if the operator
     # left the value blank). Existing non-empty keys are preserved on
     # re-run — operators can rotate via `mimir regenerate-api-key`.
@@ -1221,6 +1303,10 @@ def setup_home(
         "saga_api_key_action": saga_api_key_action,
         "git_bootstrap": git_bootstrap_status,
         "embedding_preset": embedding,
+        "model_spec": route.model_spec,
+        "provider_name": route.provider_name,
+        "billing_mode": route.billing_mode,
+        "monitor_status": monitor_status,
     }
 
 
@@ -1245,6 +1331,19 @@ def _print_setup_report(status: dict[str, object]) -> None:
         print("  MIMIR_API_KEY:  generated (see .env; rotate via `mimir regenerate-api-key`)")
     if status.get("saga_api_key_action") == "generated":
         print("  SAGA_API_KEY:   generated (unused in in-process mode; preserved for external-saga use)")
+    # Model + usage-monitor routing — surface what setup decided so
+    # the operator can confirm or override.
+    model_spec = status.get("model_spec")
+    provider = status.get("provider_name")
+    billing_mode = status.get("billing_mode")
+    if model_spec:
+        print(
+            f"  model spec:    {model_spec}   "
+            f"(provider: {provider}; billing: {billing_mode})"
+        )
+    monitor_status = status.get("monitor_status")
+    if monitor_status:
+        print(f"  usage monitor: {monitor_status}")
     git_st = status.get("git_bootstrap")
     if isinstance(git_st, dict):
         if "error" in git_st:
@@ -1521,6 +1620,38 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"fully local. saga's [consolidation] similarity_threshold "
             f"automatically tunes to the matching value (0.92 for "
             f"voyage/fastembed, 0.80 for openai/nvidia-nim)."
+        ),
+    )
+    setup_p.add_argument(
+        "--model", type=str, default=None,
+        help=(
+            "Bare model name (no provider prefix needed). Setup "
+            "auto-routes based on the name: ``MiniMax-M2.7`` → Minimax "
+            "(via Anthropic-compat endpoint); ``kimi-k2-*`` → "
+            "Moonshot; ``gpt-*`` / ``o[1-4]-*`` → OpenAI; ``claude-*`` "
+            "→ direct Anthropic API. Generates the right "
+            "``MIMIR_MODEL_SPEC`` + ``ANTHROPIC_BASE_URL`` entries in "
+            ".env. Also wires the usage monitor that matches the "
+            "provider's billing model — subscription routes get quota "
+            "polling; API routes get per-turn cost tracking with a "
+            "default $/hr ceiling. Default model: claude-sonnet-4-6 "
+            "via direct API. See ``mimir/model_registry.py`` for the "
+            "full mapping."
+        ),
+    )
+    setup_p.add_argument(
+        "--subscription", action="store_true",
+        help=(
+            "Declare this deployment runs on a subscription plan for "
+            "the chosen provider (not pay-per-token API billing). "
+            "Effect is provider-polymorphic: Claude family swaps to "
+            "``claude-code:`` (Max OAuth via subprocess — the "
+            "protocol IS different); OpenAI / Minimax / Moonshot keep "
+            "the same model_spec (same HTTP endpoint, just a "
+            "different API token tier). Either way the usage monitor "
+            "flips from cost-tracking to quota-polling. Without this "
+            "flag, every route defaults to pay-per-token + cost "
+            "monitoring."
         ),
     )
 
@@ -1810,7 +1941,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.command == "setup":
-        status = setup_home(args.home, embedding=args.embedding)
+        status = setup_home(
+            args.home,
+            embedding=args.embedding,
+            model=args.model,
+            subscription=args.subscription,
+        )
         _print_setup_report(status)
         return
 
