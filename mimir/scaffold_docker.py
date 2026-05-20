@@ -418,6 +418,17 @@ def render_start_sh(*, uv_extras: list[str] | None = None) -> str:
     the renderer expands them to the ``--extra <name>`` flags ``uv sync``
     expects. Default is empty (no extras) — caller picks what bridges they
     need.
+
+    **Maintenance constraint** — the template uses two superimposed
+    substitution layers: this Python ``.replace()`` at scaffold time
+    *and* bash variable expansion at container boot. When adding a new
+    Python placeholder (e.g. ``{NEW_VAR}``), use **bare ``$NEW_VAR``,
+    NOT ``${NEW_VAR}``** in any shell reference to the same value
+    elsewhere in the template — otherwise ``.replace("{NEW_VAR}", "")``
+    matches the substring inside ``${NEW_VAR}`` and leaves a stray
+    ``$`` that crashes the container at boot. See the regression
+    test ``test_render_start_sh_uv_sync_line_is_valid_shell_with_no_extras``
+    for the failure shape this constraint prevents.
     """
     extras = uv_extras or []
     flags = " ".join(f"--extra {e}" for e in extras)
