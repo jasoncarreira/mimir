@@ -4,67 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "saga"
-version = "2026.02.24"
-description = "Saga (formerly MSAM) -- cognitive memory system for AI agents"
-readme = "README.md"
+version = "2026.05.19"
+description = "Vendored LongMemEval bench shell. The runtime saga is now `mimir.saga`."
 license = "MIT"
 requires-python = ">=3.11"
 authors = [
     {name = "Jaden Schwab"},
 ]
-keywords = ["memory", "ai", "agents", "cognitive-architecture", "knowledge-graph"]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
+
+# Bench harness deps only. The full saga runtime moved into mimir.saga;
+# this shell exists so the LongMemEval bench runners under
+# benchmarks/longmemeval_via_*/ can still import the ingest + reader
+# helpers without pulling in the full vendored package.
 dependencies = [
-    "fastapi>=0.110",
-    "uvicorn[standard]>=0.27",
-    "pydantic>=2.5",
-    "requests>=2.31",
-    "numpy>=1.24",
-    "faiss-cpu>=1.7",
-    # v0.5 §7: anthropic SDK is the default LLM transport. The
-    # ``[llm].provider = "openai_compat"`` config knob keeps the
-    # ``requests`` path live for bench parity against the gpt-5.4-nano
-    # baseline — that's why ``requests`` stays above.
-    "anthropic>=0.40",
+    "openai>=1.0",  # harness.call_reader (OpenAI-compatible reader)
 ]
-
-[project.optional-dependencies]
-grafana = [
-    "flask>=3.0",
-    "flask-cors>=4.0",
-]
-onnx = [
-    "onnxruntime>=1.16",
-    "tokenizers>=0.15",
-]
-local = [
-    "sentence-transformers>=2.2",
-]
-dev = [
-    "pytest>=8.0",
-    "pytest-cov",
-    "pytest-asyncio>=0.23",
-    "httpx>=0.27",
-]
-
-[project.urls]
-Homepage = "https://github.com/jasoncarreira/mimir/tree/main/saga"
-Documentation = "https://github.com/jasoncarreira/mimir/blob/main/saga/SPEC.md"
-Issues = "https://github.com/jasoncarreira/mimir/issues"
-
-[project.scripts]
-saga = "saga.remember:main"
 
 [tool.setuptools.packages.find]
 include = ["saga*"]
-
-[tool.setuptools.package-data]
-saga = ["scripts/*"]

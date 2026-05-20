@@ -7,7 +7,6 @@ DATASET_PATH = REPO_ROOT / "data" / "longmemeval" / "longmemeval_s_cleaned.json"
 WORK_DIR = REPO_ROOT / "data" / "longmemeval" / "work"
 RESULTS_DIR = REPO_ROOT / "results" / "longmemeval"
 UPSTREAM_DIR = REPO_ROOT / "external" / "longmemeval"
-BENCH_SAGA_CONFIG = Path(__file__).parent / "saga_bench.toml"
 
 READER_BASE_URL = "https://api.minimax.io/v1"
 READER_MODEL = "MiniMax-M2.7"
