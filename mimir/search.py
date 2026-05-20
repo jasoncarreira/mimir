@@ -493,6 +493,11 @@ class Indexer:
         scope: str = "all",
         k: int = 5,
         candidate_pool: int = 50,
+        *,
+        path_prefix: str | None = None,
+        semantic_weight: float | None = None,
+        keyword_weight: float | None = None,
+        recency_weight: float | None = None,
     ) -> list[SearchResult]:
         if not query.strip():
             return []
@@ -500,7 +505,9 @@ class Indexer:
         # keyword + variations) skip the ONNX call.
         query_vec_t = await asyncio.to_thread(self._embed_query, query)
         return await asyncio.to_thread(
-            self._search_sync, query, list(query_vec_t), scope, k, candidate_pool
+            self._search_sync, query, list(query_vec_t),
+            scope, k, candidate_pool,
+            path_prefix, semantic_weight, keyword_weight, recency_weight,
         )
 
     def _embed_query_uncached(self, text: str) -> tuple[float, ...]:
@@ -662,6 +669,10 @@ class Indexer:
         scope: str,
         k: int,
         candidate_pool: int,
+        path_prefix: str | None = None,
+        semantic_weight: float | None = None,
+        keyword_weight: float | None = None,
+        recency_weight: float | None = None,
     ) -> list[SearchResult]:
         # Sanitize FTS5 query — strip operators that would otherwise raise.
         fts_query = _to_fts_query(query)
@@ -670,6 +681,31 @@ class Indexer:
         if scope in ("memory", "state"):
             scope_filter = " AND f.scope = ?"
             params.append(scope)
+        # Finer-grained filter: anchor results to a subdirectory under
+        # the chosen scope (e.g. ``state/journal``). Composes with
+        # ``scope`` rather than replacing it — passing both is fine.
+        # LIKE-escapes the prefix so wildcard characters in path names
+        # don't accidentally match extra files.
+        if path_prefix:
+            normalized = path_prefix.strip().rstrip("/")
+            if normalized:
+                escaped = (
+                    normalized.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                scope_filter += " AND f.path LIKE ? ESCAPE '\\'"
+                params.append(f"{escaped}/%")
+
+        # Resolve scoring weights — caller can override any subset.
+        w_cos = W_COSINE if semantic_weight is None else float(semantic_weight)
+        w_bm25 = W_BM25 if keyword_weight is None else float(keyword_weight)
+        w_rec = W_RECENCY if recency_weight is None else float(recency_weight)
+        if w_cos < 0 or w_bm25 < 0 or w_rec < 0:
+            raise ValueError(
+                "file_search weights must be non-negative "
+                f"(semantic={w_cos}, keyword={w_bm25}, recency={w_rec})"
+            )
 
         candidates: dict[tuple[str, int], dict] = {}
 
@@ -750,7 +786,7 @@ class Indexer:
             cos_norm = max(0.0, cos)
             bm25_norm = _bm25_norm(c["bm25"]) if c["bm25"] else 0.0
             recency = _recency(c["mtime"], now)
-            score = W_COSINE * cos_norm + W_BM25 * bm25_norm + W_RECENCY * recency
+            score = w_cos * cos_norm + w_bm25 * bm25_norm + w_rec * recency
             snippet = _make_snippet(c["content"], query)
             scored.append(
                 SearchResult(
