@@ -22,6 +22,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from mimir.models import TurnRecord
 from mimir.turn_logger import (
     TurnLogger,
+    _coerce_content,
     derive_result_fields,
     extract_turn_events,
     make_turn_id,
@@ -917,7 +918,6 @@ def test_coerce_content_drops_thinking_block_keeps_text():
     ``json.dumps(item)`` when an item lacked a ``text`` key. The fix
     is an explicit allowlist on the ``type`` field.
     """
-    from mimir.turn_logger import _coerce_content
 
     content = [
         {
@@ -938,7 +938,6 @@ def test_coerce_content_drops_thinking_block_keeps_text():
 def test_coerce_content_drops_redacted_thinking_block():
     """Anthropic's tamper-evident redacted-thinking shape — same
     drop semantics as visible thinking."""
-    from mimir.turn_logger import _coerce_content
 
     content = [
         {"type": "redacted_thinking", "data": "opaque-base64-here"},
@@ -952,7 +951,6 @@ def test_coerce_content_drops_tool_use_and_tool_result_in_content():
     and emits its own tool_call / tool_result events. The string we
     build here is for the AIMessage's user-visible OUTPUT only; tool
     structure in content blocks would double-count if we included it."""
-    from mimir.turn_logger import _coerce_content
 
     content = [
         {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"cmd": "ls"}},
@@ -966,7 +964,6 @@ def test_coerce_content_legacy_no_type_falls_through_as_text():
     """Back-compat: a content block with no ``type`` key but a ``text``
     key (the pre-typed-block LangChain shape) still gets its text
     included. This is the shape some non-Anthropic providers emit."""
-    from mimir.turn_logger import _coerce_content
 
     content = [{"text": "legacy text block, no type field"}]
     assert _coerce_content(content) == "legacy text block, no type field"
@@ -976,7 +973,6 @@ def test_coerce_content_multiple_text_blocks_joined_by_newline():
     """When the model emits multiple text blocks (e.g., separated by
     a thinking interlude), they're concatenated with a newline — same
     as the prior behavior modulo the thinking drop."""
-    from mimir.turn_logger import _coerce_content
 
     content = [
         {"type": "text", "text": "First paragraph."},
@@ -992,7 +988,6 @@ def test_coerce_content_unknown_type_is_silently_dropped():
     skipped. This is the right default — leaking raw internal state
     into a user-visible reply is a worse failure than dropping a
     block we don't know how to render."""
-    from mimir.turn_logger import _coerce_content
 
     content = [
         {"type": "future_unknown_block", "data": {"foo": "bar"}},
