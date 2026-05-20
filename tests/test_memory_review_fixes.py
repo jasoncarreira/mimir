@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -150,18 +151,27 @@ async def test_most_retrieved_filters_by_channel_id(client, monkeypatch):
     await client.end_session("sA", "A session", channel_id="CHAN_A")
     await client.end_session("sB", "B session", channel_id="CHAN_B")
     # Store an atom and write retrieval events tied to each session.
+    # Use a freshly-computed timestamp 1 hour in the past — comfortably
+    # inside the 7-day ``most_retrieved_atoms`` window regardless of
+    # when the test runs. Pre-fix this used a hardcoded
+    # ``'2026-05-13T00:00:00Z'`` literal: that's exactly 7 days before
+    # 2026-05-20, so the ``days=7`` cutoff (``now - 7 days``, computed
+    # at test time) slid past the test's ts at any wall-clock time
+    # later than midnight UTC, dropping the event from the window and
+    # making the assertion fail for ~23h59m of every day.
+    recent_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     r = await client.store("shared atom")
     aid = r["atom_id"]
     conn = client._ensure_conn()
     conn.execute(
         "INSERT INTO access_events (atom_id, ts, source, weight, session_id) "
-        "VALUES (?, '2026-05-13T00:00:00Z', 'retrieval', 1.0, 'sA')",
-        (aid,),
+        "VALUES (?, ?, 'retrieval', 1.0, 'sA')",
+        (aid, recent_ts),
     )
     conn.execute(
         "INSERT INTO access_events (atom_id, ts, source, weight, session_id) "
-        "VALUES (?, '2026-05-13T00:00:01Z', 'retrieval', 1.0, 'sA')",
-        (aid,),
+        "VALUES (?, ?, 'retrieval', 1.0, 'sA')",
+        (aid, recent_ts),
     )
     conn.commit()
     # Channel A: the atom should show.
