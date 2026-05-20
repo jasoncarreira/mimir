@@ -608,10 +608,10 @@ WHERE a.source_type = 'session_boundary'
         min_confidence_tier: str | None = None,
         context: list[dict[str, str]] | None = None,
         reference_date=None,
-        enable_contextual_rewrite: bool = False,
+        enable_contextual_rewrite: bool | None = None,
         pre_rewritten_query: str | None = None,
     ) -> dict[str, Any]:
-        # Two paths into the rewrite:
+        # Three paths into the rewrite:
         # 1. Caller pre-resolved the rewrite via ``contextual_rewrite()``
         #    and passes ``pre_rewritten_query`` — we skip the inline
         #    LLM call. This is the parallelization seam: the agent
@@ -623,6 +623,16 @@ WHERE a.source_type = 'session_boundary'
         #    + ``context``, we call the LLM here. Preserves the
         #    single-call ergonomics for callers that don't need
         #    parallelism.
+        # 3. Default (kwarg is ``None``): consult saga.toml's
+        #    ``[retrieval] enable_contextual_rewrite`` flag. Lets the
+        #    agent pass ``context=`` without having to thread the
+        #    toml flag through every call site. Bench / test code can
+        #    force-off by passing ``enable_contextual_rewrite=False``.
+        if enable_contextual_rewrite is None:
+            from ._config_io import get_config
+            enable_contextual_rewrite = bool(
+                get_config()("retrieval", "enable_contextual_rewrite", False)
+            )
         # Surface the precedence ambiguity so a future call site that
         # sets both kwargs gets a log line — the pre-resolved path
         # silently wins, which could otherwise hide a misconfiguration.
