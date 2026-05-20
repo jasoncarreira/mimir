@@ -274,6 +274,20 @@ class Config:
     saga_session_idle_minutes: int
     saga_consolidate_cron: str
 
+    # Timezone the scheduler interprets all cron expressions in
+    # (scheduler.yaml jobs, saga-consolidate, introspection-report,
+    # commitments-due-check, every poller). APScheduler ZoneInfo
+    # string — e.g., "UTC", "America/New_York", "Europe/London".
+    # Default UTC matches the pre-PR behavior (all cron expressions
+    # treated as UTC); operators deploying in a non-UTC region set
+    # this so they can author scheduler.yaml in local wall-clock time
+    # without mentally subtracting hours twice a year for DST.
+    # Invalid values fall back to UTC with a logged warning rather
+    # than crashing the scheduler — wrong-but-offset is preferable to
+    # agent-offline. ZoneInfo handles DST automatically via the
+    # system's tzdata.
+    scheduler_tz: str
+
     # Commitments Phase 2b — periodic due-check sweep emits
     # commitment_due / commitment_expired / commitment_snooze_pileup
     # algedonic events. Empty string disables the cron entirely.
@@ -567,6 +581,7 @@ class Config:
 
             saga_session_idle_minutes=_env_int("MIMIR_SAGA_SESSION_IDLE_MINUTES", 10),
             saga_consolidate_cron=_env("MIMIR_SAGA_CONSOLIDATE_CRON", "0 4 * * *"),
+            scheduler_tz=_env("MIMIR_SCHEDULER_TZ", "UTC"),
             commitments_due_check_cron=_env(
                 "MIMIR_COMMITMENTS_DUE_CHECK_CRON", "*/5 * * * *",
             ),
