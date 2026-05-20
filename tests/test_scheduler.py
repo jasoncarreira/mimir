@@ -13,6 +13,8 @@ from mimir.models import AgentEvent
 from mimir.scheduler import (
     Scheduler,
     SchedulerJob,
+    _build_trigger,
+    _resolve_tz,
     _scheduler_channel_id,
     load_jobs,
     write_jobs,
@@ -1571,3 +1573,111 @@ async def test_reload_pollers_preserves_apscheduler_job_for_broken_manifest(
         "APScheduler job for poller with corrupted manifest must be "
         "preserved (chainlink #84) — dict entry alone isn't enough."
     )
+
+
+# ─── MIMIR_SCHEDULER_TZ — configurable scheduler timezone ──────────────
+
+
+def test_resolve_tz_returns_zoneinfo_for_valid_name():
+    """ZoneInfo lookup for canonical IANA names succeeds.
+
+    ``America/New_York`` is the canonical zone Muninn deploys in;
+    ``UTC`` is the back-compat default. Both must resolve without
+    falling back."""
+    from zoneinfo import ZoneInfo
+
+    ny = _resolve_tz("America/New_York")
+    assert isinstance(ny, ZoneInfo)
+    assert str(ny) == "America/New_York"
+
+    utc = _resolve_tz("UTC")
+    assert isinstance(utc, ZoneInfo)
+    assert str(utc) == "UTC"
+
+
+def test_resolve_tz_falls_back_to_utc_on_invalid(caplog):
+    """A typo / unknown zone falls back to UTC with a logged warning
+    rather than crashing the scheduler. Wrong-but-functioning beats
+    agent-offline-on-startup."""
+    from zoneinfo import ZoneInfo
+
+    import logging
+    caplog.set_level(logging.WARNING, logger="mimir.scheduler")
+    result = _resolve_tz("Earth/Atlantis")
+    assert isinstance(result, ZoneInfo)
+    assert str(result) == "UTC"
+    # Warning should mention the bad value so the operator sees it.
+    assert any(
+        "Earth/Atlantis" in record.message for record in caplog.records
+    )
+
+
+def test_scheduler_default_tz_is_utc(tmp_path: Path):
+    """Constructing Scheduler without ``scheduler_tz`` keeps the
+    pre-PR behavior (UTC). Mimirbot relies on this — it doesn't set
+    ``MIMIR_SCHEDULER_TZ`` and its scheduler.yaml is UTC-shaped."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert str(sched._tz) == "UTC"
+
+
+def test_scheduler_honors_configured_tz(tmp_path: Path):
+    """When ``scheduler_tz`` is set, the underlying APScheduler is
+    constructed with that zone — so cron expressions in scheduler.yaml
+    fire in the configured local time, DST-aware via system tzdata."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml",
+        enqueue=noop,
+        scheduler_tz="America/New_York",
+    )
+    assert str(sched._tz) == "America/New_York"
+    # The internal AsyncIOScheduler must also carry that zone — without
+    # this, _build_trigger could be in ET but the scheduler itself would
+    # mis-interpret missed-job / coalesce windows.
+    assert str(sched._scheduler.timezone) == "America/New_York"
+
+
+def test_scheduler_invalid_tz_falls_back_to_utc(tmp_path: Path, caplog):
+    """Misconfigured operator (typo in ``MIMIR_SCHEDULER_TZ``) gets a
+    working scheduler in UTC + a logged warning, not a crash on
+    startup."""
+    import logging
+    async def noop(_e):
+        return True
+    caplog.set_level(logging.WARNING, logger="mimir.scheduler")
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml",
+        enqueue=noop,
+        scheduler_tz="Definitely/NotARealZone",
+    )
+    assert str(sched._tz) == "UTC"
+    assert any(
+        "Definitely/NotARealZone" in record.message
+        for record in caplog.records
+    )
+
+
+def test_build_trigger_threads_tz_through_to_cron():
+    """``_build_trigger`` must build CronTriggers anchored in the
+    passed-in tz so the scheduler can interpret each cron line in
+    the operator's local wall-clock time."""
+    from zoneinfo import ZoneInfo
+
+    ny = ZoneInfo("America/New_York")
+    job = SchedulerJob(name="briefing", prompt="x", cron="0 8 * * *")
+    trigger = _build_trigger(job, ny)
+    # APScheduler's CronTrigger stores its zone; str() round-trip
+    # confirms the right zone landed.
+    assert str(trigger.timezone) == "America/New_York"
+
+
+def test_build_trigger_defaults_to_utc_when_tz_omitted():
+    """Back-compat: bench/test call sites that haven't been updated
+    to pass tz must still get a UTC-anchored trigger (matches pre-PR
+    behavior)."""
+    job = SchedulerJob(name="x", prompt="y", cron="0 0 * * *")
+    trigger = _build_trigger(job)
+    assert str(trigger.timezone) == "UTC"
