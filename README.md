@@ -73,6 +73,7 @@ uv run mimir setup --home ~/mimir-home
 #   Anthropic Max plan (free):   claude setup-token
 #   API key:                     edit ~/mimir-home/.env, set ANTHROPIC_API_KEY
 #   Gateway:                     set ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
+#   Non-Anthropic Anthropic-compat (Minimax, Kimi, …): see "Alternative providers"
 
 # Optional but recommended for saga's embeddings:
 #   set OPENAI_API_KEY in ~/mimir-home/.env
@@ -87,6 +88,47 @@ behavioral introspection report. All gated by the homeostat so a
 saturated plan window doesn't blow through your quota.
 
 See `.env.example` for every environment variable mimir reads.
+
+## Alternative providers (Minimax, Kimi, …)
+
+`MIMIR_MODEL_SPEC` picks the model and provider. Forms:
+
+- `claude-code:<model>` — Max OAuth subprocess (default, free under Max plan).
+- `anthropic:<model>` — direct Anthropic API (paid credit).
+- `openai:<model>` — direct OpenAI.
+
+Reasoning-token model families that expose an **Anthropic-compat
+endpoint** (Minimax, Moonshot Kimi) ride the `anthropic:` provider with
+`ANTHROPIC_BASE_URL` overridden:
+
+```bash
+# Minimax via Anthropic-compat
+ANTHROPIC_API_KEY=<minimax-key>
+ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic
+MIMIR_MODEL_SPEC=anthropic:MiniMax-M2.7
+```
+
+```bash
+# Moonshot Kimi via Anthropic-compat
+ANTHROPIC_API_KEY=<moonshot-key>
+ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic
+MIMIR_MODEL_SPEC=anthropic:kimi-k2-0905-preview
+```
+
+Prefer Anthropic-compat over OpenAI-compat for these providers when both
+are offered: the provider converts reasoning to proper Anthropic-shape
+`thinking` content blocks server-side. The OAI-compat path returns the
+same model's reasoning as inline `<think>...</think>` tags in the
+content string — a less structured response that mimir would have to
+parse out before it could be cleanly logged + suppressed.
+
+Note: overriding `ANTHROPIC_BASE_URL` also affects any other consumer
+in the same process (e.g., the `claude` CLI subprocess that saga's
+`claude_code` provider spawns). If you set this, configure saga.toml's
+`[llm]` to route through the same alternate provider rather than
+falling back to `claude_code` — see
+[`saga/saga.example.toml`](./saga/saga.example.toml) for the
+provider options + per-section documentation.
 
 ## Development
 
