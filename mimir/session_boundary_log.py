@@ -1,19 +1,21 @@
-"""v0.4 §3: local mirror of SAGA session boundary atoms.
+"""Session-summary rendering for the prompt-assembly path.
 
-SAGA's ``/v1/sessions/recent`` is the source of truth, but if SAGA is
-briefly down at prompt-assembly time we still want the agent to see
-recent session summaries. This module owns an append-only JSONL at
-``<home>/.mimir/session_boundaries.jsonl`` populated by the
-``saga_end_session`` tool wrapper after a successful SAGA call. The
-local mirror is best-effort: failures don't crash the tool turn; the
-prompt assembly degrades gracefully when neither source is available.
+The agent's prompt builder needs a ``## Recent session summaries`` block
+showing the last few session boundaries on the current channel.
+Boundaries come from ``SagaStore.recent_session_boundaries()``; this
+module owns the *rendering* (chainlink #63 staleness markers,
+closed_since corrective filtering) and the ``count_turns_since()``
+helper that annotates each header with a "N turns this channel" marker.
 
-Storage path is under ``.mimir/`` (alongside the indexer's SQLite db),
-NOT under ``state/`` — the indexer doesn't walk ``.mimir/`` so the
-mirror won't get embedded as "knowledge."
+History: this module used to also own a local JSONL mirror
+(``SessionBoundaryLog``) that the legacy ``saga_end_session`` tool
+populated as a fallback for the prompt path when an external SAGA
+HTTP server was briefly unreachable. mimir.saga is now in-process —
+SagaStore is always available — so the mirror was orphaned (write
+path dead, read path always empty) and was removed.
 
 chainlink #63: session-summary Unfinished lists are point-in-time
-snapshots that go stale fast. The renderer now annotates each summary
+snapshots that go stale fast. The renderer annotates each summary
 header with relative-age + turn-count markers, suffixes the Unfinished
 sub-bullet with ``[verify before quoting]`` past either staleness
 threshold, and applies ``closed_since`` corrective overrides written
@@ -23,11 +25,8 @@ substring match against the closed_since refs).
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import re
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -37,62 +36,11 @@ from ._jsonl_tail import tail_jsonl_records
 log = logging.getLogger(__name__)
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(tz=timezone.utc).isoformat()
-
-
 # Minimum length for a closed_since entry to participate in substring
 # matching. Single-character refs would over-match (e.g. "#" appearing
 # in any prose); two-character is the natural floor for things like
 # "#1" or short PR refs while still rejecting empty/single-char noise.
 _MIN_CLOSED_SINCE_REF_LEN = 2
-
-
-@dataclass
-class SessionBoundaryLog:
-    """Append-only mirror at ``<home>/.mimir/session_boundaries.jsonl``.
-
-    Records mirror the wire shape of SAGA's session boundary atoms so
-    the prompt-render path doesn't care which source it got data from
-    (modulo the ``ts`` field — local mirror uses the append-time UTC
-    timestamp; SAGA's ``ts`` is the boundary atom's creation time on
-    the SAGA side).
-    """
-
-    path: Path
-
-    def __post_init__(self) -> None:
-        self._lock = asyncio.Lock()
-
-    async def append(self, record: dict[str, Any]) -> None:
-        """Append one record. Best-effort: caller catches/logs any
-        OSError so a failed mirror write doesn't fail the tool turn."""
-        record = {"ts": _utc_now_iso(), **record}
-        async with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
-
-    def recent(
-        self,
-        *,
-        channel_id: str | None = None,
-        count: int = 3,
-    ) -> list[dict[str, Any]]:
-        """Return up to ``count`` most-recent records, optionally
-        filtered by channel. Reverse-chronological. Empty list when
-        the file is missing or unreadable.
-
-        Tail-streamed: typical bound (count=3, occasional 20) resolves
-        in one chunk read regardless of how large the file has grown."""
-        out: list[dict[str, Any]] = []
-        for rec in tail_jsonl_records(self.path):
-            if channel_id is not None and rec.get("channel_id") != channel_id:
-                continue
-            out.append(rec)
-            if len(out) >= count:
-                break
-        return out
 
 
 def render_session_summaries(
