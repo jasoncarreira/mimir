@@ -464,8 +464,12 @@ def main() -> int:
     # Iterate per account so each one's resolved prompt + label stamps
     # onto its own messages. A failure on one account doesn't sink the
     # whole poll — log + continue so the remaining accounts still emit.
+    # Track success/failure counts independently of ``new_ids`` so an
+    # all-empty-inbox-but-one-account-failed run doesn't get
+    # mis-classified as a catastrophic failure (Mimir's PR #234 nit).
     new_ids: list[str] = []
-    any_account_failed = False
+    successful_accounts = 0
+    failed_accounts = 0
     for account in accounts:
         try:
             messages = _gog_search(account.email, query, max_fetch)
@@ -475,8 +479,9 @@ def main() -> int:
                 f"gmail-poller: search failed for account "
                 f"{account.name!r} ({account.email}): {exc}"
             )
-            any_account_failed = True
+            failed_accounts += 1
             continue
+        successful_accounts += 1
 
         for msg in messages:
             event = _format_event(msg, account)
@@ -496,11 +501,14 @@ def main() -> int:
             cursor = cursor[-CURSOR_MAX_IDS:]
         _save_cursor(cursor)
 
-    # Exit code: 0 even if some accounts failed but at least one
-    # succeeded (we already emitted what we could and stderr captured
-    # the per-account failures). Only 2 (search error) if EVERY
-    # account errored AND we emitted nothing.
-    if any_account_failed and not new_ids:
+    # Exit code: 0 when at least one account's search succeeded — empty
+    # inbox is a normal silence-as-filter result, not a failure, and a
+    # partial failure where another account succeeded is still useful
+    # (events from the surviving accounts get emitted; the failure was
+    # reported on stderr). Only exit 2 when EVERY account's search
+    # errored — at that point the run produced no signal at all and
+    # the framework should treat it as a catastrophic poll.
+    if failed_accounts > 0 and successful_accounts == 0:
         return 2
     return 0
 

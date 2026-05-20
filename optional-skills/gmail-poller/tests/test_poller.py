@@ -458,6 +458,42 @@ def test_config_json_all_accounts_failed_returns_2(
     assert _capture_emits(capsys) == []
 
 
+def test_config_json_partial_failure_with_empty_inbox_exits_0(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """Regression for the Mimir PR #234 nit: one account errors, the
+    OTHER succeeds but returns zero new messages (empty inbox is the
+    normal silence-as-filter case).
+
+    Pre-fix this incorrectly returned exit 2 because the condition
+    was ``any_account_failed and not new_ids`` — true when EITHER
+    side of the AND holds, even though intent was "all accounts
+    failed AND nothing emitted." Post-fix uses ``successful_accounts``
+    counter so this case correctly exits 0.
+    """
+    import subprocess as _sp
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    _write_config(tmp_path, [
+        {"name": "broken", "email": "broken@x.com", "prompt": "p1"},
+        {"name": "empty-inbox", "email": "empty@x.com", "prompt": "p2"},
+    ])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+
+    def fake_search(account, q, m):
+        if account == "broken@x.com":
+            raise _sp.CalledProcessError(1, ["gog"], "", "auth")
+        # 'empty-inbox' account succeeds but returns no messages.
+        return []
+
+    monkeypatch.setattr(fresh_poller, "_gog_search", fake_search)
+    rc = fresh_poller.main()
+    assert rc == 0, (
+        "partial failure with at least one successful (empty) account "
+        "should exit 0; pre-fix this was wrongly exit 2"
+    )
+    assert _capture_emits(capsys) == []
+
+
 def test_config_json_empty_accounts_list_exits_1(
     fresh_poller, tmp_path, monkeypatch, capsys,
 ):
@@ -469,13 +505,17 @@ def test_config_json_empty_accounts_list_exits_1(
     assert rc == 1
 
 
-def test_config_json_malformed_falls_through_to_gog_account(
+def test_config_json_malformed_does_not_fall_back_to_gog_account(
     fresh_poller, tmp_path, monkeypatch, capsys,
 ):
     """A malformed config.json yields an empty accounts list — caller
     sees the file as 'present but unusable' and exits 1 (does NOT
     silently fall back to GOG_ACCOUNT — that would hide an operator
-    config error)."""
+    config error).
+
+    (Previously named ``..._falls_through_to_gog_account`` — the
+    body's assertion contradicts that wording; Mimir PR #234 nit.)
+    """
     (tmp_path / "config.json").write_text("not valid json {")
     monkeypatch.setenv("GOG_ACCOUNT", "fallback@x.com")
     rc = fresh_poller.main()
