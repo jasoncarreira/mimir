@@ -222,7 +222,7 @@ class Config:
     # Common forms:
     #   claude-code:claude-sonnet-4-6     (default; free under Max plan)
     #   anthropic:claude-haiku-4-5        (direct API, paid)
-    #   openai:gpt-5.4-nano               (direct OpenAI)
+    #   openai:gpt-4.1-mini               (direct OpenAI)
     #
     # Non-Anthropic / non-OpenAI providers that expose an
     # Anthropic-compat endpoint (Minimax, Moonshot Kimi) ride the
