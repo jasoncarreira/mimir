@@ -38,9 +38,34 @@ Plus any literal env vars from the `env` field, plus any pass-throughs declared 
 **Command parsing (`pollers.json` `command` field)**: parsed by `/bin/sh -c` via `asyncio.create_subprocess_shell`. Shell features (env-var expansion `$FOO`, pipes, redirection) are available — and you're responsible for quoting args containing whitespace or shell metacharacters: `"python poller.py 'arg with spaces'"` not `"python poller.py arg with spaces"`.
 
 **Output contract:**
-- **stdout:** JSONL (one JSON object per line). Each line must have `prompt` (string); `poller` (string) is informational. Other keys flow into the resulting `AgentEvent.extra` so platform metadata (URLs, IDs, `source_platform`) carries through to your prompt rendering.
+- **stdout:** JSONL (one JSON object per line). Two record shapes:
+
+  *Event records* — `{"poller": "<name>", "prompt": "<text>", ...extras}`. Each becomes one `AgentEvent` (= one turn the agent runs). Other keys flow into `AgentEvent.extra` so platform metadata (URLs, IDs, `source_platform`) carries through to your prompt rendering.
+
+  *Signal records* — `{"poller": "<name>", "signal": "<event_type>", ...payload}`. These do NOT spawn an `AgentEvent`. The framework writes them to `events.jsonl` via `log_event(event_type, poller=<name>, **payload)` — recognized signal event types (below) surface in the next turn's **algedonic block** as negative signals (pain). Use for external-state health that the agent should see but that shouldn't each fire a turn of their own: OAuth token expiry, upstream 5xx outage, rate-limit cliffs.
+
+  Recognized signal event types (`feedback._EVENT_RULES`):
+
+  | event_type | When to emit |
+  |---|---|
+  | `poller_oauth_expired` | OAuth token expired or revoked (refresh failed) |
+  | `poller_auth_failed` | Non-OAuth auth failure (invalid API key, 401 from upstream) |
+  | `poller_service_outage` | Upstream service unreachable (5xx, DNS failure, connection refused) |
+  | `poller_rate_limited` | Upstream rate-limit hit (429 / explicit retry-after) |
+  | `poller_signal` | Generic / unclassified pain signal |
+
+  A record with neither `prompt` nor `signal` is silently dropped. A record with BOTH is treated as signal-only (the `prompt` is ignored — emit a separate record per shape).
+
 - **stderr:** Free-form diagnostic logging. Captured and emitted as a `poller_stderr` event in `events.jsonl` for observability — not forwarded as a turn-prompt, but greppable from `mimir introspection` / log scraping.
-- **Exit 0:** Success. **Non-zero:** Error — any events emitted by this run are *dropped* (protects against half-failed runs sending partial event streams). The next cron tick retries.
+- **Exit 0:** Success. **Non-zero:** Error — the framework drops stdout entirely (events AND signals from this run are NOT processed) and auto-emits `poller_nonzero_exit` (negative algedonic) so the operator sees recurring failures. The next cron tick retries.
+
+  **Implication for skill authors**: to surface a signal (e.g. "OAuth token expired"), emit the signal record then `return 0` — that's a successful detection, not a runtime failure. Reserve non-zero exit for catastrophic failures (script crashed, can't parse own config) where dropping stdout is the right move. The common pattern:
+
+  ```python
+  if oauth_token_expired:
+      emit({"signal": "poller_oauth_expired", "account": acct, "detail": "..."})
+      return 0  # we successfully detected the problem
+  ```
 
 Example poller script:
 
