@@ -158,3 +158,22 @@ def get_logger() -> EventLogger:
 
 async def log_event(event_type: str, **payload: Any) -> None:
     await get_logger().log(event_type, **payload)
+
+
+async def safe_log_event(event_type: str, **payload: Any) -> None:
+    """Best-effort wrapper around ``log_event`` that swallows logger-side
+    failures so a misbehaving event sink never crashes the primary work path.
+
+    Use at monitoring call sites (algedonic gap fills, bridge supervisors)
+    where the ``log_event`` result is informational only.  Logs at DEBUG
+    level on failure.
+
+    Public (no leading underscore) — intended for cross-module use.
+    Bridge modules keep their own private ``_safe_log_event`` helpers
+    (``mimir/bridges/{slack,discord}.py``) for isolation reasons that
+    are documented in those files.
+    """
+    try:
+        await log_event(event_type, **payload)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("log_event %r failed: %s", event_type, exc)
