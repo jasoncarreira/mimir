@@ -314,6 +314,7 @@ def build_app(config: Config) -> web.Application:
         scheduler_yaml=config.home / "scheduler.yaml",
         enqueue=dispatcher.enqueue,
         home=config.home,
+        scheduler_tz=config.scheduler_tz,
     )
     # Commitments store — Phase 2b due-check poller + the four
     # commitment_* langchain tools both need this. Pre-fix it was
