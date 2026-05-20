@@ -469,12 +469,27 @@ def test_scaffold_sanitizes_home_dir_name_for_service_name(tmp_path: Path):
             assert " " not in line.split(":", 1)[1].strip()
 
 
-def test_scaffold_explicit_service_name_overrides_sanitization(tmp_path: Path):
+def test_scaffold_explicit_service_name_overrides_home_name(tmp_path: Path):
+    """Explicit service name wins over the home-dir-derived default."""
     weird = tmp_path / "My Weird Home!"
     (weird / ".claude" / "skills").mkdir(parents=True)
     scaffold(weird, service_name="muninn")
     cy = (weird / "compose.yml").read_text()
     assert "container_name: muninn" in cy
+
+
+def test_scaffold_explicit_service_name_is_also_sanitized(tmp_path: Path, capsys):
+    """Operator typo in --service-name (spaces, slashes) gets fixed
+    instead of producing an invalid compose service name."""
+    weird = tmp_path / "agent-home"
+    (weird / ".claude" / "skills").mkdir(parents=True)
+    scaffold(weird, service_name="muninn alpha/v2")
+    cy = (weird / "compose.yml").read_text()
+    assert "container_name: muninn-alpha-v2" in cy
+    # And the operator gets told about the rewrite so it isn't silent.
+    captured = capsys.readouterr().out
+    assert "muninn alpha/v2" in captured
+    assert "muninn-alpha-v2" in captured
 
 
 # ── .gitignore belt-and-suspenders ───────────────────────────────────
