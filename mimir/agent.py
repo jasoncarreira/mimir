@@ -324,6 +324,43 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Window for the saga contextual-rewrite context. Matches
+# ``mimir.saga.query_rewrite._MAX_CONTEXT_MESSAGES`` so the rewriter's
+# last-10-msgs trim doesn't waste effort on entries we'd ship and
+# then chop.
+_REWRITE_CONTEXT_MESSAGES = 10
+
+
+def _rewrite_context_from_buffer(
+    buffer: MessageBuffer, channel_id: str,
+) -> list[dict[str, str]] | None:
+    """Render the channel's recent transcript in the shape SagaStore's
+    contextual rewrite expects: ``[{role, content}, …]`` with role in
+    ``{"user", "assistant"}``.
+
+    ``system_note`` kinds and any other non-conversational records are
+    dropped — the rewrite needs reference antecedents, not algedonic
+    signals. Returns ``None`` when the channel has no recent
+    conversational history so SagaStore short-circuits the LLM call.
+    """
+    recent = buffer.recent_for_channel(
+        channel_id, limit=_REWRITE_CONTEXT_MESSAGES,
+    )
+    out: list[dict[str, str]] = []
+    for msg in recent:
+        if msg.kind == "user_message":
+            role = "user"
+        elif msg.kind == "assistant_message":
+            role = "assistant"
+        else:
+            continue  # skip system_note
+        content = (msg.content or "").strip()
+        if not content:
+            continue
+        out.append({"role": role, "content": content})
+    return out or None
+
+
 # Default system prompt — production cutover replaces this with mimir's
 # full system-prompt assembly (core memory + skills + persona).
 _DEFAULT_SYSTEM_PROMPT = """\
@@ -837,10 +874,22 @@ class Agent:
         saga_atom_ids: list[str] = []
         if self._saga is not None and event.trigger not in NON_USER_QUERY_TRIGGERS:
             try:
+                # Pass the channel's recent transcript so SagaStore's
+                # contextual rewrite (gated by saga.toml's
+                # [retrieval].enable_contextual_rewrite — default True
+                # for prod homes) can resolve referential queries
+                # ("yes, look for that") into self-contained retrieval
+                # anchors before embedding/FTS. ``None`` channel
+                # (system / poller triggers without a channel) skips
+                # the rewrite naturally — context will be empty.
+                rewrite_context = _rewrite_context_from_buffer(
+                    self._buffer, event.channel_id,
+                ) if event.channel_id else None
                 payload = await self._saga.query(
                     event.content,
                     top_k=12,
                     session_id=saga_session_id,
+                    context=rewrite_context,
                 )
                 raw_block = _format_saga_payload(payload)
                 if raw_block and raw_block != "(no atoms)":
