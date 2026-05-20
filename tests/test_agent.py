@@ -1121,3 +1121,93 @@ async def test_rewrite_context_from_buffer_respects_window(tmp_path: Path):
     assert len(ctx) == _REWRITE_CONTEXT_MESSAGES == 10
     # And they are the most-recent 10, in chronological order.
     assert [c["content"] for c in ctx] == [f"msg-{i}" for i in range(5, 15)]
+
+
+# ── _turn_matched_expected_tool_call ─────────────────────────────────
+
+
+def test_turn_matched_expected_tool_call_bash_substring():
+    """Bash tool with declared substring in its command satisfies."""
+    from mimir.agent import _turn_matched_expected_tool_call
+
+    markers = {
+        "bash_substrings": ["gh pr review"],
+        "tool_names": [],
+        "signal_on_missing": "x",
+    }
+    events = [
+        {"type": "tool_call", "name": "Bash",
+         "args": {"command": "gh pr review 123 --approve --body 'lgtm'"}},
+    ]
+    assert _turn_matched_expected_tool_call(events, markers) is True
+
+
+def test_turn_matched_expected_tool_call_mcp_tool_name():
+    """A tool_call whose name is in the markers' tool_names satisfies
+    even without a Bash substring match — covers the MCP path."""
+    from mimir.agent import _turn_matched_expected_tool_call
+
+    markers = {
+        "bash_substrings": ["gh pr review"],
+        "tool_names": ["pull_request_review_write"],
+        "signal_on_missing": "x",
+    }
+    events = [
+        {"type": "tool_call", "name": "pull_request_review_write", "args": {}},
+    ]
+    assert _turn_matched_expected_tool_call(events, markers) is True
+
+
+def test_turn_matched_expected_tool_call_non_matching_bash_does_not_match():
+    """``gh pr view`` shouldn't satisfy a marker that wants
+    ``gh pr review``. Pin the substring discrimination."""
+    from mimir.agent import _turn_matched_expected_tool_call
+
+    markers = {
+        "bash_substrings": ["gh pr review"],
+        "tool_names": [],
+        "signal_on_missing": "x",
+    }
+    events = [
+        {"type": "tool_call", "name": "Bash",
+         "args": {"command": "gh pr view 123"}},
+    ]
+    assert _turn_matched_expected_tool_call(events, markers) is False
+
+
+def test_turn_matched_expected_tool_call_empty_or_invalid_markers():
+    """Empty / None / non-dict markers → False (no expectation set,
+    nothing to match against)."""
+    from mimir.agent import _turn_matched_expected_tool_call
+
+    events = [
+        {"type": "tool_call", "name": "Bash",
+         "args": {"command": "gh pr review 123"}},
+    ]
+    assert _turn_matched_expected_tool_call(events, {}) is False
+    assert _turn_matched_expected_tool_call(events, None) is False
+    assert _turn_matched_expected_tool_call(events, "not a dict") is False
+    # Markers with both lists empty also → False.
+    empty_markers = {"tool_names": [], "bash_substrings": []}
+    assert _turn_matched_expected_tool_call(events, empty_markers) is False
+
+
+def test_turn_matched_expected_tool_call_ignores_non_tool_call_events():
+    """Reasoning events, tool_result events, etc. should NOT contribute
+    to the match — only tool_call type."""
+    from mimir.agent import _turn_matched_expected_tool_call
+
+    markers = {
+        "bash_substrings": ["gh pr review"],
+        "tool_names": [],
+        "signal_on_missing": "x",
+    }
+    events = [
+        # A reasoning event mentioning the string shouldn't trigger.
+        {"type": "reasoning",
+         "content": "I should run gh pr review 123 next"},
+        # A tool_result echoing the command shouldn't trigger either.
+        {"type": "tool_result", "name": "Bash",
+         "result": "gh pr review succeeded"},
+    ]
+    assert _turn_matched_expected_tool_call(events, markers) is False
