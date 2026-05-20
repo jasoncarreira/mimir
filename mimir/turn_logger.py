@@ -45,17 +45,97 @@ def truncate_input(prompt: str) -> str:
     return prompt[:MAX_INPUT_BYTES] + "…[truncated]"
 
 
+#: Content-block ``type`` values that carry user-visible reply text.
+#: Anything outside this set is intentionally dropped by
+#: ``_coerce_content``. ``None`` is in the set so legacy / pre-typed
+#: blocks (``{"text": "..."}`` with no ``type`` key) still pass through.
+_VISIBLE_TEXT_BLOCK_TYPES: frozenset[str | None] = frozenset({"text", None})
+
+
+def _extract_thinking_blocks(content: Any) -> list[str]:
+    """Walk a LangChain message content list and return the text of
+    Anthropic-style structured thinking blocks (Anthropic extended
+    thinking + Minimax / Moonshot Kimi via Anthropic-compat).
+
+    Returns a list of reasoning texts in document order. Empty list
+    for string content or content without any thinking blocks.
+
+    Use case: ``extract_turn_events`` emits each captured block as a
+    ``reasoning`` event with ``source: "model_thinking_block"`` so
+    ``turns.jsonl`` preserves the model's chain of thought for
+    introspection / debugging — even though ``_coerce_content``
+    correctly drops the same blocks from the user-visible output
+    path.
+
+    ``redacted_thinking`` blocks (Anthropic's tamper-evident
+    server-encrypted form) are captured with a placeholder marker —
+    we record that a redacted block was present without the
+    content, since the ``data`` field is opaque base64.
+    """
+    if not isinstance(content, list):
+        return []
+    out: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "thinking":
+            text = item.get("thinking")
+            if isinstance(text, str) and text:
+                out.append(text)
+        elif item_type == "redacted_thinking":
+            out.append("[redacted thinking block — server-encrypted]")
+    return out
+
+
 def _coerce_content(content: Any) -> str:
+    """Flatten a LangChain message content field into a single string
+    that's safe to render to user-facing surfaces (bridge.send,
+    messages.jsonl).
+
+    LangChain returns content as either a plain string (legacy shape)
+    or a list of structured content blocks. The block types we know
+    about:
+
+    * ``{"type": "text", "text": "..."}`` — user-visible reply. **KEPT.**
+    * ``{"type": "thinking", "thinking": "...", "signature": "..."}`` —
+      Anthropic extended-thinking reasoning (and Minimax via
+      Anthropic-compat). **DROPPED** — not user-visible; the agent's
+      private chain of thought.
+    * ``{"type": "redacted_thinking", "data": "..."}`` — Anthropic's
+      tamper-evident-but-server-redacted reasoning form. **DROPPED.**
+    * ``{"type": "tool_use", …}`` / ``{"type": "tool_result", …}`` —
+      tool roundtrip structure. **DROPPED** here because
+      ``extract_turn_events`` extracts these separately via the
+      tool_calls / ToolMessage paths; including them again as text
+      would double-count.
+
+    Items with no ``type`` key fall back to ``item.get("text")`` for
+    back-compat with the legacy LangChain shape.
+
+    **Pre-fix behavior (2026-05-20 muninn-mimir cutover):** unknown
+    types fell back to ``json.dumps(item)``, which dumped the raw
+    thinking block (with its ``signature`` cryptographic field and
+    reasoning text) as JSON into the user-visible reply. Discord
+    showed Muninn's private reasoning as a literal JSON dict above
+    every response. The fix is the explicit type filter.
+    """
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        # LangChain can return [{"type": "text", "text": "..."}, ...]
         parts: list[str] = []
         for item in content:
             if isinstance(item, dict):
-                parts.append(item.get("text") or json.dumps(item, default=str))
+                item_type = item.get("type")
+                if item_type in _VISIBLE_TEXT_BLOCK_TYPES:
+                    text = item.get("text")
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+                # else: thinking / redacted_thinking / tool_use /
+                # tool_result / any future-unknown typed block —
+                # silently skipped (not user-visible).
             else:
                 parts.append(str(item))
         return "\n".join(parts)
@@ -105,6 +185,20 @@ def extract_turn_events(
     output_parts: list[str] = []
     for i, msg in enumerate(messages):
         if isinstance(msg, AIMessage):
+            # Capture Anthropic-style structured thinking blocks BEFORE
+            # ``_coerce_content`` drops them. Each block becomes its own
+            # ``reasoning`` event with ``source: "model_thinking_block"``
+            # so turns.jsonl preserves the model's chain of thought even
+            # though the user-visible output path strips it. Ordering:
+            # emit reasoning events first (chronologically the model
+            # thinks then replies), then the rest of the legacy
+            # content/tool-call logic.
+            for _think_text in _extract_thinking_blocks(msg.content):
+                events.append({
+                    "type": "reasoning",
+                    "source": "model_thinking_block",
+                    "content": _think_text,
+                })
             content_text = _coerce_content(msg.content)
             # ChatClaudeCode executes tools inside the ``claude`` CLI
             # subprocess and stashes the parsed ToolUseBlocks under
