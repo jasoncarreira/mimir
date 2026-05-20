@@ -66,6 +66,29 @@ def _events_cap() -> int:
     return min(_env_int("MIMIR_MAX_EVENTS", _EVENTS_CAP_DEFAULT), _EVENTS_CAP_MAX)
 
 
+def _is_anthropic_oauth_deployment() -> bool:
+    """True when this deployment talks to Anthropic's actual OAuth-
+    backed API (or no remote endpoint at all). False when the operator
+    routes ``ANTHROPIC_BASE_URL`` at a non-Anthropic compat endpoint
+    (Minimax / Moonshot Kimi / a gateway / etc.) — in which case
+    Anthropic's ``/api/oauth/usage`` endpoint is meaningless and
+    polling it would emit ``oauth_usage_failed`` every cron tick.
+
+    Heuristic: parse ``ANTHROPIC_BASE_URL``. Unset / empty / pointing
+    at ``api.anthropic.com`` → real Anthropic. Anything else → a
+    proxy / compat endpoint where the OAuth usage poller has no
+    useful work to do."""
+    from urllib.parse import urlparse
+    raw = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if not raw:
+        return True
+    try:
+        host = (urlparse(raw).hostname or "").lower()
+    except (ValueError, AttributeError):
+        return True  # malformed → assume Anthropic; the SDK will error elsewhere
+    return host == "api.anthropic.com"
+
+
 def _oauth_credentials_path() -> Path | None:
     """Resolve the OAuth credentials path. Empty string explicitly
     disables (useful in tests / non-OAuth deployments). Unset prefers
@@ -74,6 +97,15 @@ def _oauth_credentials_path() -> Path | None:
     whatever bind mount / volume the operator has set up for the
     homedir. Falls back to ``$HOME/.claude/.credentials.json`` (where
     ``claude /login`` writes by default) only if MIMIR_HOME is unset.
+
+    Returns ``None`` when ``ANTHROPIC_BASE_URL`` points at a non-
+    Anthropic compat endpoint (Minimax / Kimi / gateway). The OAuth
+    usage endpoint (``/api/oauth/usage``) is Anthropic-specific; on
+    a routed deployment it doesn't exist + would emit
+    ``oauth_usage_failed`` every cron tick. The agent's chat model
+    still works fine via the routed endpoint — only the usage poller
+    is auto-disabled. Operators can force the poller back on with
+    an explicit ``MIMIR_CLAUDE_OAUTH_CREDENTIALS=<path>`` env.
 
     Containerized deployments without bind mounts otherwise see the
     refresh-token rotation get blown away on every container rebuild,
@@ -85,7 +117,14 @@ def _oauth_credentials_path() -> Path | None:
         # Explicitly empty → disable.
         return None
     if raw is not None:
+        # Explicit path wins, even on a routed deployment (operator
+        # opt-in: "I know what I'm doing, poll Anthropic anyway").
         return Path(raw).expanduser().resolve()
+    # No explicit env override. Auto-disable on non-Anthropic
+    # deployments (Minimax / Kimi / etc.) — the poller has no useful
+    # endpoint to hit and would just spam ``oauth_usage_failed``.
+    if not _is_anthropic_oauth_deployment():
+        return None
     mimir_home = os.environ.get("MIMIR_HOME")
     if mimir_home:
         return Path(mimir_home).expanduser().resolve() / ".claude" / ".credentials.json"
