@@ -187,6 +187,35 @@ class TestWriteGuardBackend:
         assert callable(b.read)
         assert callable(b.ls_info)
 
+    def test_deepagents_06_async_fs_methods_forward(self, home: Path) -> None:
+        """deepagents 0.6+ exposes high-level ``als`` / ``agrep`` /
+        ``aglob`` wrappers (return tool-friendly result types) on top
+        of the pre-0.6 low-level ``*_info`` / ``*_raw`` variants. The
+        agent's filesystem tools call the high-level names. Pre-fix,
+        ``WriteGuardBackend`` allowlisted only the low-level variants,
+        so an agent on deepagents 0.6+ hit ``AttributeError:
+        WriteGuardBackend does not forward 'agrep'`` on any grep call.
+
+        Caught during muninn-mimir cutover 2026-05-20 (the heartbeat
+        skill called ``agrep`` and crashed).
+
+        All six methods are read-only (audited against
+        ``deepagents/backends/composite.py``); allowlisting them is
+        safe."""
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        # Sync read wrappers
+        assert callable(b.ls)
+        assert callable(b.grep)
+        assert callable(b.glob)
+        # Async read wrappers (the ones the agent typically uses)
+        assert callable(b.als)
+        assert callable(b.agrep)
+        assert callable(b.aglob)
+        # Existing low-level variants still forward (back-compat).
+        assert callable(b.ls_info)
+        assert callable(b.grep_raw)
+        assert callable(b.aglob_info)
+
 
 class TestReadOnlyFilesystemBackend:
     def test_blocks_all_writes(self, home: Path) -> None:

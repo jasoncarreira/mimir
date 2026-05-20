@@ -72,11 +72,23 @@ class WriteGuardBackend:
     # Anything not in this list raises AttributeError — default-deny so
     # a future deepagents release adding ``delete_file`` / ``rename`` /
     # ``mkdir`` can't bypass the guard until we audit + wrap it.
+    #
+    # The ``*_info`` / ``*_raw`` variants are pre-deepagents-0.6 low-
+    # level shapes (return raw structs). The bare names (``ls``,
+    # ``als``, ``grep``, ``agrep``, ``glob``, ``aglob``) are the
+    # deepagents-0.6+ high-level wrappers — they're what the agent
+    # actually calls as filesystem tools. Both kinds are read-only
+    # (audited against ``deepagents/backends/composite.py``); allow-
+    # listing both keeps back-compat with older deepagents versions
+    # while making the 0.6+ tool surface work. Pre-fix, an agent on
+    # deepagents 0.6+ hit ``AttributeError: WriteGuardBackend does
+    # not forward 'agrep'`` every turn it tried to grep — surfaced
+    # during muninn-mimir cutover 2026-05-20.
     _ALLOWED_READS = frozenset({
         "read", "aread",
-        "ls_info", "als_info",
-        "grep_raw", "agrep_raw",
-        "glob_info", "aglob_info",
+        "ls", "als", "ls_info", "als_info",
+        "grep", "agrep", "grep_raw", "agrep_raw",
+        "glob", "aglob", "glob_info", "aglob_info",
         "execute", "aexecute",  # bash via backend — read-shaped from FS perspective
         "download_files", "adownload_files",
     })
