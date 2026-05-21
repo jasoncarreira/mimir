@@ -327,22 +327,40 @@ _OPENAI_WINDOW_HOURS: dict[str, float] = {
 
 class OpenAIQuotaProvider(QuotaProvider):
     """Reads OpenAI Codex Plus / Pro subscription quota windows from
-    :class:`RateLimitStore`. The store is populated by an OpenAI-side
-    usage poller (TODO — follow-up PR), which queries Codex CLI's
-    auth-backed usage endpoint on a cron and writes
-    ``RateLimitSnapshot`` entries keyed ``openai_five_hour`` /
-    ``openai_seven_day``.
+    :class:`RateLimitStore`.
 
-    **Today: stub.** Same shape as :class:`MinimaxQuotaProvider`.
-    Until the OpenAI usage poller lands, ``get_windows`` returns the
-    empty list — the arbiter treats that as "no signal" and falls
-    through to cost-rate-only suppression.
+    **Codex doesn't have a polling endpoint** — quota state is piggy-
+    backed on every Codex API response via headers, the same way
+    Anthropic does it. From ``openai/codex`` source
+    (``codex-rs/codex-api/src/rate_limits.rs``):
 
-    Currently registered when ``MIMIR_MODEL_SPEC`` starts with
-    ``openai:`` AND the billing mode is QUOTA (operator declared
-    subscription tier via ``mimir setup --subscription``). Operators
-    on pay-per-token API keys keep the AnthropicQuotaProvider default
-    (which is empty for them too, but is the right fallback).
+    * ``x-codex-primary-used-percent`` / ``-window-minutes`` /
+      ``-reset-at`` — short window (typically 5h)
+    * ``x-codex-secondary-*`` — long window (typically weekly)
+    * ``x-codex-credits-*`` — credits balance
+
+    So the writer that populates ``openai_five_hour`` /
+    ``openai_seven_day`` in the store will be a response-header
+    interceptor on the LangChain Codex client (TODO — follow-up PR
+    requires a Codex Plus client integration first; the OpenAI Codex
+    subscription protocol hits ``chatgpt.com/backend-api/codex/
+    responses``, which is different from ``api.openai.com/v1/chat/
+    completions``).
+
+    **Today: stub.** Returns ``[]`` until the header extractor lands;
+    the arbiter treats empty as "no signal" and falls through to
+    cost-rate suppression — safe fallback.
+
+    Registered when ``MIMIR_MODEL_SPEC`` starts with ``openai:`` AND
+    the billing mode is QUOTA (operator declared subscription tier
+    via ``mimir setup --subscription``). Pay-per-token API keys
+    against ``api.openai.com`` get no quota provider — cost-rate
+    handles that side.
+
+    Token storage (for the eventual Codex Plus client): Codex CLI
+    persists OAuth tokens at ``$CODEX_HOME/auth.json`` (defaults to
+    ``~/.codex/auth.json``). Operators run ``codex login`` to
+    populate it.
     """
 
     _STORE_KEY_PREFIX = "openai_"
