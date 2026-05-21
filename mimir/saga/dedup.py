@@ -100,8 +100,42 @@ class DedupResult:
     evidence_counts_rebuilt: list[str] = field(default_factory=list)
 
 
+#: Baseline ``encoding_confidence`` value for a freshly-stored atom.
+#: Mirrors the default in ``store.py``, ``schema.sql``, and
+#: ``_config_io.py``'s ``default_encoding_confidence`` — keep these
+#: synced when bumping. The retrieval-ranking factor (see
+#: ``recall.ENCODING_CONFIDENCE_WEIGHT``) computes
+#: ``(encoding_confidence - BASELINE_ENCODING_CONFIDENCE)`` so an atom
+#: that's never been absorbed contributes zero, and only post-baseline
+#: confidence (from dedup absorption or future feedback nudges) moves
+#: the score.
+BASELINE_ENCODING_CONFIDENCE = 0.7
+
+#: Coefficient for the asymptotic dedup-absorption nudge applied to
+#: ``encoding_confidence`` when a duplicate is folded into a canonical:
+#:
+#:     new = old + (1.0 - old) * ABSORPTION_COEFFICIENT
+#:
+#: With 0.3, the trajectory from baseline (0.7) over N absorptions is:
+#: 0.700 → 0.790 → 0.853 → 0.897 → 0.928 → 0.949 → ... → 1.0.
+#: Asymptotic so a single hot-context atom can't reach 1.0 by being
+#: re-encoded a few times — sustained re-encoding across many sessions
+#: still moves the score but with diminishing returns.
+ABSORPTION_COEFFICIENT = 0.3
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _bump_encoding_confidence(current: float) -> float:
+    """Apply one dedup-absorption nudge to ``current``. Asymptotic
+    approach to 1.0; never exceeds it; never decreases. Pure function,
+    safe to test independently."""
+    if not isinstance(current, (int, float)):
+        return BASELINE_ENCODING_CONFIDENCE
+    bumped = current + (1.0 - current) * ABSORPTION_COEFFICIENT
+    return min(1.0, max(BASELINE_ENCODING_CONFIDENCE, bumped))
 
 
 def _atom_activation(conn: sqlite3.Connection, atom_id: str) -> float:
@@ -386,7 +420,12 @@ def merge_duplicate_into_canonical(
     ):
         return
 
-    # 1. Topics + metadata merge into canonical (persist).
+    # 1. Topics + metadata merge into canonical (persist). Also nudge
+    #    ``encoding_confidence`` upward — the agent saved this fact more
+    #    than once, which is independent evidence that it's a stable,
+    #    well-supported encoding. Asymptotic to 1.0 so repeated dedup
+    #    in a single hot-context session can't fully saturate the
+    #    signal. See ``_bump_encoding_confidence`` for the math.
     can_topics = json.loads(canonical.get("topics") or "[]")
     dup_topics = json.loads(duplicate.get("topics") or "[]")
     merged_topics = _merge_topics(can_topics, dup_topics)
@@ -394,9 +433,36 @@ def merge_duplicate_into_canonical(
     can_meta = json.loads(canonical.get("metadata") or "{}")
     dup_meta = json.loads(duplicate.get("metadata") or "{}")
     merged_meta = _merge_metadata(can_meta, dup_meta, duplicate_id=dup_id)
+
+    current_enc_conf = canonical.get("encoding_confidence")
+    if current_enc_conf is None:
+        # Caller didn't fetch the column — read it fresh. Defends
+        # against being called from a path that's seeing only the
+        # legacy SELECT list.
+        row = conn.execute(
+            "SELECT encoding_confidence FROM atoms WHERE id = ?",
+            (can_id,),
+        ).fetchone()
+        current_enc_conf = (
+            float(row[0]) if row and row[0] is not None
+            else BASELINE_ENCODING_CONFIDENCE
+        )
+    new_enc_conf = _bump_encoding_confidence(float(current_enc_conf))
+    # Cache the new value on the canonical dict so the caller's
+    # in-memory view stays consistent (relevant when a single dedup
+    # pass folds N duplicates into the same canonical — each
+    # iteration sees the previous iteration's bumped value).
+    canonical["encoding_confidence"] = new_enc_conf
+
     conn.execute(
-        "UPDATE atoms SET topics = ?, metadata = ? WHERE id = ?",
-        (json.dumps(merged_topics), json.dumps(merged_meta), can_id),
+        "UPDATE atoms SET topics = ?, metadata = ?, "
+        "encoding_confidence = ? WHERE id = ?",
+        (
+            json.dumps(merged_topics),
+            json.dumps(merged_meta),
+            new_enc_conf,
+            can_id,
+        ),
     )
 
     # 2. Redirect access_events and rebuild summary.
@@ -470,7 +536,7 @@ def _candidate_raws_for_dedup(
     rows = conn.execute(
         f"SELECT a.id, a.content, a.stream, a.memory_type, a.source_type, "
         f"  a.created_at, a.topics, a.metadata, a.is_pinned, a.agent_id, "
-        f"  a.session_id "
+        f"  a.session_id, a.encoding_confidence "
         f"FROM atoms a "
         f"WHERE {' AND '.join(where)} "
         f"ORDER BY a.created_at",
@@ -478,7 +544,7 @@ def _candidate_raws_for_dedup(
     ).fetchall()
     cols = ("id", "content", "stream", "memory_type", "source_type",
             "created_at", "topics", "metadata", "is_pinned",
-            "agent_id", "session_id")
+            "agent_id", "session_id", "encoding_confidence")
     return [dict(zip(cols, r)) for r in rows]
 
 
