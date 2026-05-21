@@ -40,6 +40,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -205,6 +206,7 @@ _PROVIDER_EXTRAS: dict[str, str] = {
     "claude-code": "claude-code",  # → pip install 'mimir[claude-code]'
     "anthropic": "anthropic",
     "openai": "openai",
+    "codex-plus": "codex-plus",
 }
 
 
@@ -239,25 +241,33 @@ def _resolve_model(
     spec: str | BaseChatModel,
     *,
     max_retries: int = 6,
+    rate_limit_callback: Callable[[Any], None] | None = None,
 ) -> BaseChatModel:
     """Translate a mimir-friendly model spec into a constructed BaseChatModel.
 
     Supported:
       - ``claude-code:<model>`` → ChatClaudeCode (Max OAuth subprocess)
+      - ``codex-plus:<model>`` → ChatCodexPlus (ChatGPT-account
+                                  subscription protocol via
+                                  ``chatgpt.com/backend-api/codex/responses``)
       - ``<provider>:<model>``  → init_chat_model with ``max_retries`` (and,
                                   for OpenAI hitting api.openai.com,
                                   ``use_responses_api=True``)
       - BaseChatModel instance  → pass-through (Bedrock/Vertex/custom)
 
-    ``max_retries`` only applies to the non-claude-code path — ChatClaudeCode
-    spawns a Claude Code subprocess which handles its own retry semantics.
+    ``max_retries`` only applies to the non-subprocess paths.
+
+    ``rate_limit_callback`` is currently honored only for
+    ``codex-plus:``. Pass it from the agent so successful Codex Plus
+    responses transcribe their ``x-codex-*`` headers into the
+    ``RateLimitStore`` keys that :class:`OpenAIQuotaProvider` reads.
 
     The model-provider package (``langchain-claude-code``,
-    ``langchain-anthropic``, etc.) is a pip extra (see pyproject.toml's
-    ``[project.optional-dependencies]``). We lazy-import here so installing
-    only the extras you'll use keeps the dep graph small — raising a
-    clear hint on ImportError tells the operator exactly which extra
-    they're missing.
+    ``langchain-anthropic``, ``langchain-codex-plus``, etc.) is a pip
+    extra (see pyproject.toml's ``[project.optional-dependencies]``).
+    We lazy-import here so installing only the extras you'll use keeps
+    the dep graph small — raising a clear hint on ImportError tells
+    the operator exactly which extra they're missing.
     """
     if isinstance(spec, BaseChatModel):
         return spec
@@ -284,6 +294,26 @@ def _resolve_model(
         return ChatClaudeCode(
             model=model_name,
             permission_mode="bypassPermissions",
+        )
+    if spec.startswith("codex-plus:"):
+        try:
+            from langchain_codex_plus import ChatCodexPlus  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ImportError(
+                "MIMIR_MODEL_SPEC=codex-plus:* requires the 'codex-plus' extra. "
+                "Install via `pip install 'mimir[codex-plus]'` "
+                "(or `uv pip install langchain-codex-plus`)."
+            ) from exc
+        model_name = spec.split(":", 1)[1]
+        # ``reasoning_effort="none"`` matches mimir's general
+        # preference for cheap inference — operators who need deeper
+        # reasoning can override via the langchain-codex-plus
+        # construction parameters (out of scope for the spec string
+        # alone; bind a custom BaseChatModel instance for that).
+        return ChatCodexPlus(
+            model=model_name,
+            reasoning_effort="none",
+            rate_limit_callback=rate_limit_callback,
         )
     # langchain ``init_chat_model`` resolves provider extras at call time
     # (``anthropic:`` → langchain-anthropic, ``openai:`` → langchain-openai).
@@ -781,10 +811,21 @@ class Agent:
             # Stored so run_turn can drain recorded denials into the
             # TurnRecord.permission_denials field at end of turn.
             self._backend = backend
+            # Bridge ChatCodexPlus's per-response x-codex-* headers
+            # into the same RateLimitStore that OpenAIQuotaProvider
+            # reads (closes the writer-side gap from PR #248). For
+            # non-codex-plus specs the callback is unused — the
+            # standard ChatOpenAI / Anthropic clients don't expose a
+            # rate_limit_callback and the kwarg is ignored.
+            from .billing import make_codex_plus_rate_limit_callback
+            codex_plus_callback = make_codex_plus_rate_limit_callback(
+                self._rate_limits
+            )
             self._agent = create_deep_agent(
                 model=_resolve_model(
                     model_spec,
                     max_retries=getattr(self._config, "model_max_retries", 6),
+                    rate_limit_callback=codex_plus_callback,
                 ),
                 tools=all_mimir_tools(),
                 system_prompt=system_prompt,
