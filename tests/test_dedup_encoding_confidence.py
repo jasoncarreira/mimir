@@ -339,3 +339,210 @@ def test_max_possible_boost_stays_below_dominant_terms():
     # Dominant RRF term: w_rrf default ~20.0, RRF scores ~0.01-0.05.
     # Even a moderately-relevant candidate has w_rrf * rrf ~0.5+.
     assert max_boost < 0.05  # below TREND_MODIFIERS["strengthening"] = 0.10
+
+
+# ─── Inheritance: take MAX of {canonical, duplicate} before bumping ─
+
+
+def _make_pair(saga_store, *, can_seed: float, dup_seed: float):
+    """Helper: create two atoms, set their encoding_confidence to the
+    seed values via a direct UPDATE, return (can_id, dup_id)."""
+    import asyncio
+
+    async def _setup():
+        a = await saga_store.store(content="canonical fact", stream="semantic")
+        b = await saga_store.store(content="duplicate fact alt", stream="semantic")
+        return a["atom_id"], b["atom_id"]
+
+    can_id, dup_id = asyncio.run(_setup())
+    conn = saga_store._ensure_conn()
+    conn.executemany(
+        "UPDATE atoms SET encoding_confidence = ? WHERE id = ?",
+        [(can_seed, can_id), (dup_seed, dup_id)],
+    )
+    conn.commit()
+    return can_id, dup_id
+
+
+def _fetch_pair(conn, can_id: str, dup_id: str):
+    cols = ("id", "content", "topics", "metadata", "agent_id",
+            "encoding_confidence")
+
+    def _row(atom_id: str) -> dict:
+        return dict(zip(cols, conn.execute(
+            "SELECT id, content, topics, metadata, agent_id, "
+            "encoding_confidence FROM atoms WHERE id = ?",
+            (atom_id,),
+        ).fetchone()))
+
+    return _row(can_id), _row(dup_id)
+
+
+def test_merge_inherits_higher_duplicate_confidence(saga_store):
+    """The load-bearing case: duplicate has a HIGHER
+    ``encoding_confidence`` than canonical (because duplicate was
+    previously the absorption target of other dedups before this
+    one). The merged canonical must inherit the duplicate's value
+    plus the new bump — NOT start over from the canonical's own
+    lower value.
+
+    Without the MAX rule, the duplicate's accumulated confidence
+    would be silently discarded — exactly the failure mode the
+    operator flagged."""
+    from mimir.saga.dedup import merge_duplicate_into_canonical
+
+    # Duplicate has been absorbed 3 times (≈ 0.897); canonical is
+    # fresh (0.7). pick_canonical picked the lower-confidence one
+    # because the canonical has higher activation / is pinned /
+    # whatever — encoding_confidence isn't in that sort key.
+    can_id, dup_id = _make_pair(saga_store, can_seed=0.7, dup_seed=0.897)
+    conn = saga_store._ensure_conn()
+    canonical, duplicate = _fetch_pair(conn, can_id, dup_id)
+    merge_duplicate_into_canonical(
+        conn, canonical=canonical, duplicate=duplicate,
+    )
+    conn.commit()
+
+    result = conn.execute(
+        "SELECT encoding_confidence FROM atoms WHERE id = ?", (can_id,),
+    ).fetchone()[0]
+    # max(0.7, 0.897) = 0.897; one bump → 0.897 + (1-0.897)*0.3 = 0.9279
+    assert result == pytest.approx(_bump_encoding_confidence(0.897))
+    # Sanity: this is HIGHER than what we'd get without inheritance
+    # (just bumping canonical's 0.7 once → 0.79). The whole point.
+    assert result > _bump_encoding_confidence(0.7) + 0.05
+
+
+def test_merge_keeps_canonicals_value_when_higher(saga_store):
+    """Reverse direction: canonical's confidence > duplicate's.
+    Behavior should match pre-fix (bump canonical's value)."""
+    from mimir.saga.dedup import merge_duplicate_into_canonical
+
+    can_id, dup_id = _make_pair(saga_store, can_seed=0.897, dup_seed=0.7)
+    conn = saga_store._ensure_conn()
+    canonical, duplicate = _fetch_pair(conn, can_id, dup_id)
+    merge_duplicate_into_canonical(
+        conn, canonical=canonical, duplicate=duplicate,
+    )
+    conn.commit()
+
+    result = conn.execute(
+        "SELECT encoding_confidence FROM atoms WHERE id = ?", (can_id,),
+    ).fetchone()[0]
+    assert result == pytest.approx(_bump_encoding_confidence(0.897))
+
+
+def test_merge_uses_max_on_arbitrary_pair(saga_store):
+    """Both atoms have non-trivial history. The MAX rule picks the
+    higher seed regardless of which side it's on."""
+    from mimir.saga.dedup import merge_duplicate_into_canonical
+
+    for can_seed, dup_seed in [(0.8, 0.85), (0.85, 0.8), (0.95, 0.7)]:
+        can_id, dup_id = _make_pair(
+            saga_store, can_seed=can_seed, dup_seed=dup_seed,
+        )
+        conn = saga_store._ensure_conn()
+        canonical, duplicate = _fetch_pair(conn, can_id, dup_id)
+        merge_duplicate_into_canonical(
+            conn, canonical=canonical, duplicate=duplicate,
+        )
+        conn.commit()
+        result = conn.execute(
+            "SELECT encoding_confidence FROM atoms WHERE id = ?", (can_id,),
+        ).fetchone()[0]
+        expected = _bump_encoding_confidence(max(can_seed, dup_seed))
+        assert result == pytest.approx(expected), (
+            f"can_seed={can_seed} dup_seed={dup_seed}: "
+            f"got {result}, expected {expected}"
+        )
+
+
+def test_merge_falls_back_to_baseline_for_missing_duplicate_value(saga_store):
+    """If the duplicate dict lacks ``encoding_confidence`` (e.g.,
+    called from a legacy path with a narrower SELECT) the function
+    fetches it from the DB rather than treating absent-from-dict as
+    'zero confidence'. This protects against silently zeroing a
+    duplicate that actually had a high value."""
+    from mimir.saga.dedup import merge_duplicate_into_canonical
+
+    can_id, dup_id = _make_pair(saga_store, can_seed=0.7, dup_seed=0.95)
+    conn = saga_store._ensure_conn()
+    canonical, duplicate = _fetch_pair(conn, can_id, dup_id)
+    # Simulate a legacy caller: blow away the duplicate's
+    # encoding_confidence from the in-memory dict.
+    del duplicate["encoding_confidence"]
+    merge_duplicate_into_canonical(
+        conn, canonical=canonical, duplicate=duplicate,
+    )
+    conn.commit()
+
+    result = conn.execute(
+        "SELECT encoding_confidence FROM atoms WHERE id = ?", (can_id,),
+    ).fetchone()[0]
+    # Should have refetched the 0.95, MAX'd against 0.7, then bumped.
+    assert result == pytest.approx(_bump_encoding_confidence(0.95))
+
+
+def test_merge_inheritance_across_multiple_absorptions_into_one_canonical(saga_store):
+    """When dedup folds multiple duplicates into the same canonical
+    in one pass, each absorption MAX-merges against the previous
+    iteration's result. A high-confidence duplicate in the middle of
+    the sequence should still raise the canonical, not get clobbered
+    by lower-confidence neighbors before or after."""
+    import asyncio
+
+    from mimir.saga.dedup import merge_duplicate_into_canonical
+
+    async def _setup():
+        ids = []
+        for i in range(4):
+            r = await saga_store.store(
+                content=f"shared fact {i}", stream="semantic",
+            )
+            ids.append(r["atom_id"])
+        return ids
+
+    can_id, *dup_ids = asyncio.run(_setup())
+    conn = saga_store._ensure_conn()
+    # Seeds: canonical low, duplicates [low, HIGH, low]. Without the
+    # MAX rule, the high-confidence duplicate's value would be lost
+    # between the surrounding low-confidence ones.
+    conn.execute(
+        "UPDATE atoms SET encoding_confidence = 0.7 WHERE id = ?", (can_id,),
+    )
+    seeds = [0.7, 0.95, 0.7]
+    for dup_id, seed in zip(dup_ids, seeds, strict=True):
+        conn.execute(
+            "UPDATE atoms SET encoding_confidence = ? WHERE id = ?",
+            (seed, dup_id),
+        )
+    conn.commit()
+
+    cols = ("id", "content", "topics", "metadata", "agent_id",
+            "encoding_confidence")
+
+    def _atom(atom_id: str) -> dict:
+        return dict(zip(cols, conn.execute(
+            "SELECT id, content, topics, metadata, agent_id, "
+            "encoding_confidence FROM atoms WHERE id = ?", (atom_id,),
+        ).fetchone()))
+
+    canonical = _atom(can_id)
+    for dup_id in dup_ids:
+        merge_duplicate_into_canonical(
+            conn, canonical=canonical, duplicate=_atom(dup_id),
+        )
+    conn.commit()
+
+    # Trace:
+    #   start: canonical=0.7
+    #   absorb dup0 (0.7): max(0.7, 0.7)=0.7 → bump = 0.79
+    #   absorb dup1 (0.95): max(0.79, 0.95)=0.95 → bump = 0.965
+    #   absorb dup2 (0.7): max(0.965, 0.7)=0.965 → bump = 0.9755
+    final = conn.execute(
+        "SELECT encoding_confidence FROM atoms WHERE id = ?", (can_id,),
+    ).fetchone()[0]
+    expected = _bump_encoding_confidence(0.7)
+    expected = _bump_encoding_confidence(max(expected, 0.95))
+    expected = _bump_encoding_confidence(max(expected, 0.7))
+    assert final == pytest.approx(expected, abs=1e-6)
