@@ -436,11 +436,18 @@ def build_dashboard_payload(events_log: Path, days: int) -> dict[str, Any]:
     empty ``chainlink_issues`` envelope so the frontend's tab renders
     consistently. For the chainlink-populated variant used by the
     live route handler, see ``build_dashboard_payload_async``."""
+    from .usage_history import compute_usage_history
+
     events = _load_events(events_log, days)
     stats = compute_stats(events, days)
     stats["chainlink_issues"] = {
         "available": False, "issues": [], "error": None,
     }
+    # Per-provider subscription-quota history for the ops chart.
+    # Renders one chart per provider that has data, so a multi-
+    # subscription deployment (e.g. Anthropic Max OAuth for chat +
+    # Codex Plus for saga LLM calls) shows both concurrently.
+    stats["usage_history"] = compute_usage_history(events, days)
     return stats
 
 
