@@ -317,8 +317,12 @@ async def fetch_channel_history(
 async def list_schedules() -> str:
     """List all scheduled jobs (heartbeat, reflect, custom ticks).
 
-    Returns each job's name, cron expression, channel, last-run
-    timestamp, and next-fire time.
+    Returns each job's configuration: name, cron, channel, and the
+    prompt-source (one of ``prompt`` / ``prompt_file`` / ``callable``).
+    Runtime fields (``last_run`` / ``next_fire``) live on apscheduler
+    ``Job`` objects rather than the YAML-config ``SchedulerJob``;
+    surfacing them here would require joining the two views, which
+    we don't do today.
     """
     scheduler = _STATE["scheduler"]
     if scheduler is None:
@@ -329,12 +333,31 @@ async def list_schedules() -> str:
         return f"list_schedules failed: {exc}"
     if not jobs:
         return "(no scheduled jobs)"
-    return json.dumps(
-        [{"name": j.name, "cron": j.cron, "channel_id": j.channel_id,
-          "last_run": str(j.last_run), "next_fire": str(j.next_fire)}
-         for j in jobs],
-        indent=2, ensure_ascii=False, default=str,
-    )
+    out: list[dict[str, Any]] = []
+    for j in jobs:
+        entry: dict[str, Any] = {
+            "name": j.name,
+            "cron": j.cron,
+            "channel_id": j.channel_id,
+        }
+        # Surface whichever prompt-source field is populated (mutually
+        # exclusive per SchedulerJob's contract). Inline prompts are
+        # truncated to keep this tool's output skim-friendly.
+        if getattr(j, "prompt_file", None):
+            entry["prompt_file"] = j.prompt_file
+        elif getattr(j, "callable_name", None):
+            entry["callable"] = j.callable_name
+        elif j.prompt:
+            entry["prompt"] = (
+                j.prompt if len(j.prompt) <= 200 else j.prompt[:200] + "..."
+            )
+        # ``time_of_day`` is an alternative to ``cron`` — surface it
+        # when the operator picked that style instead.
+        time_of_day = getattr(j, "time_of_day", None)
+        if time_of_day:
+            entry["time_of_day"] = time_of_day
+        out.append(entry)
+    return json.dumps(out, indent=2, ensure_ascii=False, default=str)
 
 
 @tool
