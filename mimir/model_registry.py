@@ -220,18 +220,37 @@ def detect_route(
         )
 
     # ── OpenAI (gpt-*, o1-*, o3-*, o4-*) ────────────────────────────
-    # Direct OpenAI API. Same endpoint whether on a Codex subscription
-    # or pay-per-token — ``--subscription`` only toggles the monitor.
+    # ``--subscription`` here flips to ``codex-plus:`` — the
+    # ChatGPT-account-backed Codex Plus protocol talks to
+    # ``chatgpt.com/backend-api/codex/responses`` (OAuth, SSE, custom
+    # request shape), which is a different wire protocol than the
+    # public ``api.openai.com``. Per-response ``x-codex-*`` headers
+    # feed ``OpenAIQuotaProvider`` via the chat model's
+    # ``rate_limit_callback`` (wired in ``agent._lazy_agent_build``).
+    # API-mode (default) keeps the existing ``openai:`` route through
+    # ``langchain-openai`` ChatOpenAI.
     if (
         name_lower.startswith("gpt-")
         or name_lower.startswith("o1-")
         or name_lower.startswith("o3-")
         or name_lower.startswith("o4-")
     ):
+        if subscription:
+            return ModelRoute(
+                model_spec=f"codex-plus:{name}",
+                env={},
+                provider_name=PROVIDER_OPENAI,
+                billing_mode=BILLING_SUBSCRIPTION,
+                monitor_env=sub_monitor_env,
+                monitor_label=(
+                    "OpenAI Codex Plus quota (x-codex-* response headers; "
+                    "no separate poller — fed by ChatCodexPlus callback)"
+                ),
+            )
         return _api_or_sub_route(
             model_spec=f"openai:{name}",
             provider_name=PROVIDER_OPENAI,
-            subscription=subscription,
+            subscription=False,
             api_monitor_env=api_monitor_env,
             api_monitor_label=api_monitor_label,
             sub_monitor_env=sub_monitor_env,
