@@ -231,6 +231,241 @@ class AnthropicQuotaProvider(QuotaProvider):
         return out
 
 
+# ─── Minimax concrete implementation (stub — Issue #243) ──────────────
+
+
+# Window sizes for Minimax's quota plan. Presumed 5h + 7d in the same
+# shape as Anthropic / z.ai — the QuotaWindow contract should map
+# cleanly. NOT VERIFIED until the Minimax usage poller (Issue #243)
+# lands and confirms the actual windows the billing API exposes; if
+# the real values differ, this dict updates without breaking the
+# QuotaWindow interface. Per-model sub-buckets (if any) get added
+# here once the integration is wired.
+_MINIMAX_WINDOW_HOURS: dict[str, float] = {
+    "five_hour": 5.0,
+    "seven_day": 24.0 * 7,
+}
+
+
+class MinimaxQuotaProvider(QuotaProvider):
+    """Reads Minimax subscription quota windows from
+    :class:`RateLimitStore`. The store is populated by the Minimax-
+    side usage poller (TODO — Issue #243), which mirrors the
+    ``oauth_usage_poller.py`` pattern: queries Minimax's billing
+    endpoint on a 3-min cron and writes ``RateLimitSnapshot`` entries
+    keyed ``minimax_five_hour`` / ``minimax_seven_day``.
+
+    **Today: stub.** Until the usage poller lands, ``get_windows``
+    returns the empty list — the arbiter treats that as "no signal"
+    and falls through to cost-rate-only suppression (or accepts the
+    spike-ratio default). Once the poller is wired, the snapshot read
+    here transcribes the cached values into ``QuotaWindow``
+    objects.
+
+    The provider is registered automatically for Minimax-compat
+    deployments (``ANTHROPIC_BASE_URL`` pointing at
+    ``api.minimax.io``) via :func:`build_quota_providers`. Operators
+    on canonical Anthropic + Max OAuth continue to get
+    ``AnthropicQuotaProvider``.
+    """
+
+    #: ``RateLimitStore`` key prefix for Minimax-side snapshots. The
+    #: poller writes keys like ``minimax_five_hour``; this provider
+    #: reads them back.
+    _STORE_KEY_PREFIX = "minimax_"
+
+    def __init__(self, store: RateLimitStore) -> None:
+        self._store = store
+
+    @property
+    def provider_name(self) -> str:
+        return "minimax"
+
+    def get_windows(self) -> list[QuotaWindow]:
+        # TODO(#243): once Minimax usage poller lands, walk
+        # _MINIMAX_WINDOW_HOURS and transcribe store snapshots to
+        # QuotaWindow with on_pace projections (same shape as
+        # AnthropicQuotaProvider above). For now: no data → empty
+        # list → arbiter treats as "no signal" (safe fallback).
+        out: list[QuotaWindow] = []
+        snaps = self._store.current()
+        for key, hours in _MINIMAX_WINDOW_HOURS.items():
+            snap = snaps.get(f"{self._STORE_KEY_PREFIX}{key}")
+            if snap is None:
+                continue
+            is_derived = getattr(snap, "derived", False)
+            if is_derived:
+                on_pace = None
+            else:
+                proj = project_window_end(snap, hours)
+                on_pace = (
+                    proj.on_pace_utilization if proj is not None else None
+                )
+            out.append(
+                QuotaWindow(
+                    key=key,
+                    window_hours=hours,
+                    utilization=snap.utilization,
+                    on_pace_utilization=on_pace,
+                    resets_at=snap.resets_at,
+                    derived=is_derived,
+                )
+            )
+        return out
+
+
+# ─── OpenAI concrete implementation (stub — Codex Plus subscription) ──
+
+
+# OpenAI Codex Plus / Pro subscription documents window-based quota
+# in the same 5h + weekly shape as Anthropic Max / Minimax sub. The
+# weekly window length differs slightly (rolling 7d vs calendar-week)
+# but the QuotaWindow contract handles that fine — the arbiter just
+# cares about utilization + resets_at.
+_OPENAI_WINDOW_HOURS: dict[str, float] = {
+    "five_hour": 5.0,
+    "seven_day": 24.0 * 7,
+}
+
+
+class OpenAIQuotaProvider(QuotaProvider):
+    """Reads OpenAI Codex Plus / Pro subscription quota windows from
+    :class:`RateLimitStore`.
+
+    **Codex doesn't have a polling endpoint** — quota state is piggy-
+    backed on every Codex API response via headers, the same way
+    Anthropic does it. From ``openai/codex`` source
+    (``codex-rs/codex-api/src/rate_limits.rs``):
+
+    * ``x-codex-primary-used-percent`` / ``-window-minutes`` /
+      ``-reset-at`` — short window (typically 5h)
+    * ``x-codex-secondary-*`` — long window (typically weekly)
+    * ``x-codex-credits-*`` — credits balance
+
+    So the writer that populates ``openai_five_hour`` /
+    ``openai_seven_day`` in the store will be a response-header
+    interceptor on the LangChain Codex client (TODO — follow-up PR
+    requires a Codex Plus client integration first; the OpenAI Codex
+    subscription protocol hits ``chatgpt.com/backend-api/codex/
+    responses``, which is different from ``api.openai.com/v1/chat/
+    completions``).
+
+    **Today: stub.** Returns ``[]`` until the header extractor lands;
+    the arbiter treats empty as "no signal" and falls through to
+    cost-rate suppression — safe fallback.
+
+    Registered when ``MIMIR_MODEL_SPEC`` starts with ``openai:`` AND
+    the billing mode is QUOTA (operator declared subscription tier
+    via ``mimir setup --subscription``). Pay-per-token API keys
+    against ``api.openai.com`` get no quota provider — cost-rate
+    handles that side.
+
+    Token storage (for the eventual Codex Plus client): Codex CLI
+    persists OAuth tokens at ``$CODEX_HOME/auth.json`` (defaults to
+    ``~/.codex/auth.json``). Operators run ``codex login`` to
+    populate it.
+    """
+
+    _STORE_KEY_PREFIX = "openai_"
+
+    def __init__(self, store: RateLimitStore) -> None:
+        self._store = store
+
+    @property
+    def provider_name(self) -> str:
+        return "openai"
+
+    def get_windows(self) -> list[QuotaWindow]:
+        # TODO: once OpenAI usage poller lands, walk
+        # _OPENAI_WINDOW_HOURS and transcribe store snapshots to
+        # QuotaWindow with on_pace projections. Until then: no
+        # ``openai_*`` keys in the store → empty list → arbiter
+        # treats as "no signal" (safe fallback).
+        out: list[QuotaWindow] = []
+        snaps = self._store.current()
+        for key, hours in _OPENAI_WINDOW_HOURS.items():
+            snap = snaps.get(f"{self._STORE_KEY_PREFIX}{key}")
+            if snap is None:
+                continue
+            is_derived = getattr(snap, "derived", False)
+            if is_derived:
+                on_pace = None
+            else:
+                proj = project_window_end(snap, hours)
+                on_pace = (
+                    proj.on_pace_utilization if proj is not None else None
+                )
+            out.append(
+                QuotaWindow(
+                    key=key,
+                    window_hours=hours,
+                    utilization=snap.utilization,
+                    on_pace_utilization=on_pace,
+                    resets_at=snap.resets_at,
+                    derived=is_derived,
+                )
+            )
+        return out
+
+
+# ─── Auto-discovery: which QuotaProvider(s) to register at boot ───────
+
+
+def build_quota_providers(
+    *,
+    store: RateLimitStore,
+    billing_mode: BillingMode,
+    model_spec: str = "",
+    anthropic_base_url: str = "",
+) -> list[QuotaProvider]:
+    """Return the right ``QuotaProvider`` list for this deployment's
+    routing. Replaces the hardcoded ``[AnthropicQuotaProvider(...)]``
+    that ``mimir.agent`` used to build directly.
+
+    Returns empty list for ``PAY_AS_YOU_GO`` — no quota signal exists,
+    cost-rate suppression handles the spending side instead.
+
+    For ``QUOTA`` mode, picks providers based on the agent's routing.
+    Detection key precedence:
+
+    1. **``MIMIR_MODEL_SPEC`` prefix** (most specific):
+       * ``openai:*`` → :class:`OpenAIQuotaProvider` (Codex Plus / Pro)
+       * ``claude-code:*`` → :class:`AnthropicQuotaProvider`
+         (Max OAuth — provider explicitly chosen via subprocess)
+    2. **``ANTHROPIC_BASE_URL`` host** (for ``anthropic:*`` routes
+       that didn't qualify the provider):
+       * ``api.minimax.io`` → :class:`MinimaxQuotaProvider`
+       * everything else (canonical / unset / unknown gateway) →
+         :class:`AnthropicQuotaProvider`
+
+    Adding a new provider (Moonshot subscription quota, gateway
+    quotas, etc.) is one ``elif`` branch.
+    """
+    if billing_mode is not BillingMode.QUOTA:
+        return []
+    spec = (model_spec or "").strip().lower()
+    if spec.startswith("openai:"):
+        return [OpenAIQuotaProvider(store)]
+    if spec.startswith("claude-code:"):
+        return [AnthropicQuotaProvider(store)]
+    # ``anthropic:*`` and everything else falls through to URL-based
+    # detection — the host tells us whether we're routed to a compat
+    # endpoint or hitting Anthropic directly.
+    from urllib.parse import urlparse
+    base = (anthropic_base_url or "").strip()
+    host = ""
+    if base:
+        try:
+            host = urlparse(base).hostname or ""
+        except (ValueError, AttributeError):
+            host = ""
+    if host == "api.minimax.io":
+        return [MinimaxQuotaProvider(store)]
+    # Default: canonical Anthropic (unset URL OR api.anthropic.com OR
+    # any other host where we don't have a wrapped quota API yet).
+    return [AnthropicQuotaProvider(store)]
+
+
 # ─── suppression evaluation ────────────────────────────────────────────
 
 

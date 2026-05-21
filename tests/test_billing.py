@@ -731,3 +731,261 @@ def test_is_anthropic_oauth_deployment_malformed_url_falls_back_safely(monkeypat
     # And the more meaningful semantic check: passing a totally
     # bogus URL string shouldn't blow up the agent. Just don't
     # raise.
+
+
+# ─── Auto-discovery: build_quota_providers ──────────────────────────────
+
+
+def test_build_quota_providers_returns_empty_for_pay_as_you_go(tmp_path):
+    """PAY_AS_YOU_GO has no quota signal — return empty list. The
+    arbiter falls back to cost-rate suppression."""
+    from mimir.billing import BillingMode, build_quota_providers
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store, billing_mode=BillingMode.PAY_AS_YOU_GO,
+    )
+    assert providers == []
+
+
+def test_build_quota_providers_anthropic_default(tmp_path):
+    """No ``ANTHROPIC_BASE_URL`` override → canonical Anthropic +
+    ``AnthropicQuotaProvider``."""
+    from mimir.billing import (
+        AnthropicQuotaProvider, BillingMode, build_quota_providers,
+    )
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store, billing_mode=BillingMode.QUOTA,
+    )
+    assert len(providers) == 1
+    assert isinstance(providers[0], AnthropicQuotaProvider)
+    assert providers[0].provider_name == "anthropic"
+
+
+def test_build_quota_providers_canonical_anthropic_url(tmp_path):
+    """``ANTHROPIC_BASE_URL=https://api.anthropic.com`` → still
+    Anthropic (operator just made it explicit)."""
+    from mimir.billing import (
+        AnthropicQuotaProvider, BillingMode, build_quota_providers,
+    )
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        anthropic_base_url="https://api.anthropic.com",
+    )
+    assert isinstance(providers[0], AnthropicQuotaProvider)
+
+
+def test_build_quota_providers_minimax_routing(tmp_path):
+    """``ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic`` →
+    ``MinimaxQuotaProvider``. The discovery picks the right provider
+    automatically based on the routing config — no manual flag
+    needed."""
+    from mimir.billing import (
+        BillingMode, MinimaxQuotaProvider, build_quota_providers,
+    )
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        anthropic_base_url="https://api.minimax.io/anthropic",
+    )
+    assert len(providers) == 1
+    assert isinstance(providers[0], MinimaxQuotaProvider)
+    assert providers[0].provider_name == "minimax"
+
+
+def test_build_quota_providers_unknown_gateway_falls_back_to_anthropic(tmp_path):
+    """Unknown ``ANTHROPIC_BASE_URL`` host (e.g., a private gateway we
+    haven't wrapped) → Anthropic provider as the safe fallback. The
+    operator either gets useful data (if the gateway proxies the
+    OAuth usage endpoint) or empty windows (no signal — the arbiter
+    handles that gracefully)."""
+    from mimir.billing import (
+        AnthropicQuotaProvider, BillingMode, build_quota_providers,
+    )
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        anthropic_base_url="https://my-gateway.example.com/v1",
+    )
+    assert isinstance(providers[0], AnthropicQuotaProvider)
+
+
+def test_build_quota_providers_malformed_url_safe(tmp_path):
+    """Bogus URL string shouldn't crash discovery — fall back to
+    Anthropic provider (the safe default)."""
+    from mimir.billing import (
+        AnthropicQuotaProvider, BillingMode, build_quota_providers,
+    )
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        anthropic_base_url="://not-a-url",
+    )
+    assert len(providers) == 1
+    assert isinstance(providers[0], AnthropicQuotaProvider)
+
+
+# ─── MinimaxQuotaProvider (stub today; populates from store when poller wired) ─
+
+
+def test_minimax_provider_returns_empty_when_store_has_no_snapshots(tmp_path):
+    """Until the Minimax usage poller lands (#243), the store carries
+    no ``minimax_*`` keys → provider returns empty list → arbiter
+    treats as 'no signal' (cost-rate fallback runs)."""
+    from mimir.billing import MinimaxQuotaProvider
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    assert MinimaxQuotaProvider(store).get_windows() == []
+
+
+def test_minimax_provider_transcribes_store_snapshots(tmp_path, monkeypatch):
+    """When the Minimax usage poller (TODO #243) writes
+    ``minimax_five_hour`` / ``minimax_seven_day`` snapshots to the
+    store, the provider transcribes them into QuotaWindow objects
+    with the right window-hours mapping. Pins the contract that the
+    poller will satisfy."""
+    from datetime import datetime, timezone
+    from mimir.billing import MinimaxQuotaProvider
+    from mimir.rate_limits import RateLimitSnapshot, RateLimitStore
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    # Stub ``current()`` to return the shape the future poller will
+    # persist (the persistence write path is the poller's
+    # responsibility; this test pins the provider-side READ contract).
+    now_iso = datetime.now(timezone.utc).isoformat()
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    snapshots = {
+        "minimax_five_hour": RateLimitSnapshot(
+            status="allowed",
+            utilization=0.30,
+            resets_at=now_ts + 3600,
+            observed_at=now_iso,
+        ),
+        "minimax_seven_day": RateLimitSnapshot(
+            status="allowed",
+            utilization=0.10,
+            resets_at=now_ts + 86400 * 6,
+            observed_at=now_iso,
+        ),
+    }
+    monkeypatch.setattr(store, "current", lambda: snapshots)
+
+    windows = MinimaxQuotaProvider(store).get_windows()
+    keys = {w.key for w in windows}
+    assert keys == {"five_hour", "seven_day"}
+    five = next(w for w in windows if w.key == "five_hour")
+    assert five.utilization == 0.30
+    assert five.window_hours == 5.0
+
+
+# ─── OpenAI (Codex Plus subscription) ───────────────────────────────────
+
+
+def test_build_quota_providers_openai_codex_subscription(tmp_path):
+    """``MIMIR_MODEL_SPEC=openai:gpt-5 --subscription`` →
+    ``OpenAIQuotaProvider``. The model_spec prefix is the strongest
+    signal (operator explicitly chose OpenAI as the provider)."""
+    from mimir.billing import (
+        BillingMode, OpenAIQuotaProvider, build_quota_providers,
+    )
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        model_spec="openai:gpt-5",
+    )
+    assert len(providers) == 1
+    assert isinstance(providers[0], OpenAIQuotaProvider)
+    assert providers[0].provider_name == "openai"
+
+
+def test_build_quota_providers_claude_code_model_spec(tmp_path):
+    """``MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6`` →
+    ``AnthropicQuotaProvider`` (Max OAuth, the protocol-different
+    path)."""
+    from mimir.billing import (
+        AnthropicQuotaProvider, BillingMode, build_quota_providers,
+    )
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        model_spec="claude-code:claude-sonnet-4-6",
+    )
+    assert isinstance(providers[0], AnthropicQuotaProvider)
+
+
+def test_build_quota_providers_model_spec_beats_url(tmp_path):
+    """When the model_spec explicitly names a provider, it wins over
+    ``ANTHROPIC_BASE_URL``. (Operator on Codex Plus might still have
+    a leftover ``ANTHROPIC_BASE_URL`` from earlier setup; their model
+    spec is the durable signal.)"""
+    from mimir.billing import (
+        BillingMode, OpenAIQuotaProvider, build_quota_providers,
+    )
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        model_spec="openai:gpt-5",
+        anthropic_base_url="https://api.minimax.io/anthropic",
+    )
+    assert isinstance(providers[0], OpenAIQuotaProvider)
+
+
+# ─── OpenAIQuotaProvider (stub; populates from store when poller wired) ─
+
+
+def test_openai_provider_returns_empty_when_store_has_no_snapshots(tmp_path):
+    """Until the OpenAI usage poller lands, store has no ``openai_*``
+    keys → empty list → arbiter falls through to cost-rate."""
+    from mimir.billing import OpenAIQuotaProvider
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    assert OpenAIQuotaProvider(store).get_windows() == []
+
+
+def test_openai_provider_transcribes_store_snapshots(tmp_path, monkeypatch):
+    """Pins the OpenAI read contract — same shape as Minimax's."""
+    from datetime import datetime, timezone
+    from mimir.billing import OpenAIQuotaProvider
+    from mimir.rate_limits import RateLimitSnapshot, RateLimitStore
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    snapshots = {
+        "openai_five_hour": RateLimitSnapshot(
+            status="allowed",
+            utilization=0.45,
+            resets_at=now_ts + 3600,
+            observed_at=now_iso,
+        ),
+        "openai_seven_day": RateLimitSnapshot(
+            status="allowed",
+            utilization=0.12,
+            resets_at=now_ts + 86400 * 6,
+            observed_at=now_iso,
+        ),
+    }
+    monkeypatch.setattr(store, "current", lambda: snapshots)
+    windows = OpenAIQuotaProvider(store).get_windows()
+    keys = {w.key for w in windows}
+    assert keys == {"five_hour", "seven_day"}
+    five = next(w for w in windows if w.key == "five_hour")
+    assert five.utilization == 0.45
+    assert five.window_hours == 5.0
