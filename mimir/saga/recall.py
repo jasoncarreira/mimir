@@ -27,6 +27,7 @@ from .activation import (
     GLOBAL_FALLBACK_THRESHOLD,
     compute_activation,
 )
+from .dedup import BASELINE_ENCODING_CONFIDENCE
 from .mark_access import AccessEvent, mark_access
 from .retrieval_fusion import DEFAULT_K as RRF_DEFAULT_K, reciprocal_rank_fusion
 
@@ -117,6 +118,19 @@ TREND_MODIFIERS = {
     "weakening":     -0.10,
     "stale":         -0.25,
 }
+
+#: Weight applied to the encoding-confidence delta in the composite
+#: score. Computed as
+#: ``ENCODING_CONFIDENCE_WEIGHT * (encoding_confidence - BASELINE)``
+#: so a fresh-out-of-the-box atom contributes zero, and post-baseline
+#: confidence — produced by dedup absorption today, by future feedback
+#: signals later — adds a small additive boost. Magnitude calibrated
+#: to roughly match ``TREND_MODIFIERS["strengthening"]`` at the
+#: asymptotic ceiling (delta=0.3 × 0.05 ≈ 0.015), well below the
+#: ``w_rrf=20`` dominant term — strictly a tiebreaker among
+#: similar-relevance candidates, never enough to surface a marginally-
+#: relevant repeatedly-encoded fact over a highly-relevant one-shot.
+ENCODING_CONFIDENCE_WEIGHT = 0.05
 
 # Default top-k for candidate generation passes. FAISS returns 3× the
 # eventual k to give the score ranker headroom; FTS5 returns 2× because
@@ -263,13 +277,14 @@ def recall(
     candidate_id_list = list(candidate_ids)
     atom_rows = conn.execute(
         f"SELECT id, content, stream, profile, memory_type, source_type, "
-        f"topics, metadata, agent_id, is_pinned, created_at, session_id "
+        f"topics, metadata, agent_id, is_pinned, created_at, session_id, "
+        f"encoding_confidence "
         f"FROM atoms WHERE id IN ({placeholders}) AND tombstoned = 0",
         candidate_id_list,
     ).fetchall()
     cols = ("id", "content", "stream", "profile", "memory_type",
             "source_type", "topics", "metadata", "agent_id", "is_pinned",
-            "created_at", "session_id")
+            "created_at", "session_id", "encoding_confidence")
     atoms = {row[0]: dict(zip(cols, row)) for row in atom_rows}
 
     # Apply agent_id filter + optional stream filter at this stage.
@@ -481,6 +496,20 @@ def _score_candidates(
             c.trend_label = trend
             c.trend_modifier = TREND_MODIFIERS.get(trend, 0.0)
 
+        # Encoding-confidence delta from baseline. Atoms that have
+        # absorbed dedup duplicates (or, in future, accumulated
+        # positive feedback nudges) get a small additive boost. Solo
+        # atoms at baseline contribute exactly zero — no spurious
+        # ranking shift for the common case. See
+        # ``ENCODING_CONFIDENCE_WEIGHT`` docstring for the
+        # calibration rationale.
+        enc_conf = c.atom.get("encoding_confidence")
+        enc_conf_boost = 0.0
+        if isinstance(enc_conf, (int, float)):
+            enc_conf_boost = ENCODING_CONFIDENCE_WEIGHT * (
+                float(enc_conf) - BASELINE_ENCODING_CONFIDENCE
+            )
+
         # Base ranking signal: RRF over FAISS + FTS ranked lists.
         # See DEFAULT_SCORING_WEIGHTS docstring for the w_rrf calibration.
         c.total = (
@@ -490,6 +519,7 @@ def _score_candidates(
           + c.session_boost
           + c.pinned_boost
           + c.trend_modifier
+          + enc_conf_boost
           # Evidence boost applied in _apply_evidence_boost (post-split).
           # Supersession/contradiction penalties are TBD.
         )
