@@ -13,8 +13,10 @@ instead of:
 
 This module owns the bare-name → ``ModelRoute`` mapping that powers
 the ``--model`` flag. The detection is prefix-based — cheap,
-deterministic, easy to extend. Unknown names default to claude-code
-(the safe path for a Claude family name we don't yet know).
+deterministic, easy to extend. Unknown names default to direct
+Anthropic API (the durable path — Anthropic is sunsetting claude-code
+on subscription plans, and the API path works regardless of plan
+tier).
 
 Add a new provider:
 
@@ -91,9 +93,10 @@ class ModelRoute:
     monitor_label: str = ""
 
 
-#: Default model when ``mimir setup`` runs without ``--model``. Matches
-#: ``Config.from_env``'s ``MIMIR_MODEL_SPEC`` default — claude-sonnet-4-6
-#: via Max OAuth (free under the Anthropic Max plan).
+#: Default model when ``mimir setup`` runs without ``--model``.
+#: Resolves to ``anthropic:claude-sonnet-4-6`` (direct Anthropic API)
+#: by default; ``mimir setup --subscription`` flips Claude family
+#: routes to ``claude-code:`` (legacy Max OAuth subprocess).
 DEFAULT_MODEL_NAME = "claude-sonnet-4-6"
 
 

@@ -38,8 +38,9 @@ DEFAULT_ENV_TEMPLATE = dedent(
     # ---- Agent chat model ------------------------------------------------
     # MIMIR_MODEL_SPEC has the form ``<provider>:<model>``. Examples:
     #
-    #   claude-code:claude-sonnet-4-6     (default — Max OAuth subprocess)
-    #   anthropic:claude-haiku-4-5        (direct Anthropic API + paid key)
+    #   anthropic:claude-sonnet-4-6       (default — direct Anthropic API)
+    #   claude-code:claude-sonnet-4-6     (legacy Max OAuth subprocess; opt
+    #                                      in via ``mimir setup --subscription``)
     #   anthropic:MiniMax-M2.7            (Minimax via Anthropic-compat —
     #                                      also set ANTHROPIC_BASE_URL)
     #   anthropic:kimi-k2-0905-preview    (Moonshot Kimi)
@@ -47,7 +48,7 @@ DEFAULT_ENV_TEMPLATE = dedent(
     #
     # ``mimir setup --model <name>`` auto-detects the right prefix +
     # writes ANTHROPIC_BASE_URL when the provider needs one (Minimax,
-    # Moonshot). Without --model, mimir uses ``claude-code:claude-sonnet-4-6``.
+    # Moonshot). Without --model, mimir uses ``anthropic:claude-sonnet-4-6``.
     MIMIR_MODEL_SPEC=
 
     # ---- LLM gateway (Anthropic-compatible) ------------------------------
