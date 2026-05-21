@@ -74,22 +74,24 @@ def test_default_off_for_claude():
     assert route.provider_name == PROVIDER_ANTHROPIC_API
 
 
-def test_subscription_keeps_model_spec_for_openai_minimax_moonshot():
-    """For OpenAI / Minimax / Moonshot, subscription vs API tier is
-    pure billing (same HTTP endpoint, just a different API token).
+def test_subscription_keeps_model_spec_for_minimax_moonshot():
+    """For Minimax / Moonshot, subscription vs API tier is pure
+    billing (same HTTP endpoint, just a different API token).
     ``--subscription`` keeps the same ``model_spec`` but flips the
-    monitor."""
-    # OpenAI
-    api_route = detect_route("gpt-4.1-mini")
-    sub_route = detect_route("gpt-4.1-mini", subscription=True)
-    assert api_route.model_spec == sub_route.model_spec == "openai:gpt-4.1-mini"
-    assert api_route.billing_mode == BILLING_API
-    assert sub_route.billing_mode == BILLING_SUBSCRIPTION
+    monitor.
+
+    OpenAI is no longer in this bucket — see
+    :func:`test_subscription_flips_openai_to_codex_plus`. Subscription
+    on a gpt-* model is a DIFFERENT wire protocol (Codex Plus at
+    ``chatgpt.com/backend-api``, not ``api.openai.com``), so the spec
+    flips to ``codex-plus:``.
+    """
     # Minimax — base URL stays the same; only billing mode flips.
     api_route = detect_route("MiniMax-M2.7")
     sub_route = detect_route("MiniMax-M2.7", subscription=True)
     assert api_route.model_spec == sub_route.model_spec == "anthropic:MiniMax-M2.7"
     assert api_route.env == sub_route.env  # base_url preserved
+    assert api_route.billing_mode == BILLING_API
     assert sub_route.billing_mode == BILLING_SUBSCRIPTION
     # Moonshot
     api_route = detect_route("kimi-k2")
@@ -98,11 +100,30 @@ def test_subscription_keeps_model_spec_for_openai_minimax_moonshot():
     assert sub_route.billing_mode == BILLING_SUBSCRIPTION
 
 
-def test_subscription_flips_monitor_for_non_claude_providers():
-    """The actual operator-facing difference for OpenAI / Minimax /
-    Moonshot when subscription is set: monitor switches from
-    cost-tracking to quota-polling."""
-    for name in ["gpt-4.1-mini", "MiniMax-M2.7", "kimi-k2-1.0"]:
+def test_subscription_flips_openai_to_codex_plus():
+    """``--subscription`` on a gpt-* / o-* model flips to the
+    ``codex-plus:`` provider — DIFFERENT wire protocol (Codex Plus
+    SSE at ``chatgpt.com/backend-api``, not the public OpenAI API at
+    ``api.openai.com``). Without ``--subscription``, the API route
+    keeps the existing ``openai:`` spec."""
+    api_route = detect_route("gpt-4.1-mini")
+    sub_route = detect_route("gpt-4.1-mini", subscription=True)
+    assert api_route.model_spec == "openai:gpt-4.1-mini"
+    assert api_route.billing_mode == BILLING_API
+    assert sub_route.model_spec == "codex-plus:gpt-4.1-mini"
+    assert sub_route.billing_mode == BILLING_SUBSCRIPTION
+    # o-family models route the same way.
+    o3_sub = detect_route("o3-pro", subscription=True)
+    assert o3_sub.model_spec == "codex-plus:o3-pro"
+    assert o3_sub.billing_mode == BILLING_SUBSCRIPTION
+
+
+def test_subscription_flips_monitor_for_minimax_moonshot():
+    """The actual operator-facing difference for Minimax / Moonshot
+    when subscription is set: monitor switches from cost-tracking to
+    quota-polling. (OpenAI Codex Plus has its own monitor label —
+    no separate poller; quota is fed inline by ChatCodexPlus.)"""
+    for name in ["MiniMax-M2.7", "kimi-k2-1.0"]:
         api_route = detect_route(name)
         sub_route = detect_route(name, subscription=True)
         assert "MIMIR_COST_HOURLY_LIMIT_USD" in api_route.monitor_env

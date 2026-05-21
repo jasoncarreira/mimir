@@ -41,6 +41,14 @@ anthropic = [
 openai = [
     "langchain-openai>=1.2.1",
 ]
+# Codex Plus is a different protocol than the public OpenAI API
+# (``chatgpt.com/backend-api/codex/responses`` OAuth-backed SSE, not
+# ``api.openai.com/v1/responses``). The chat model lives in its own
+# package and ships an own rate-limit-headers integration that wires
+# directly into ``OpenAIQuotaProvider`` via the agent's callback hook.
+codex-plus = [
+    "langchain-codex-plus>=0.0.1",
+]
 # Bridge extras — install if you want that bridge.
 discord = [
     "discord-py>=2.6",
@@ -54,10 +62,18 @@ dev = [
     "pytest-aiohttp>=1.0",
     "discord-py>=2.6",
     "slack-bolt>=1.18",
-    # Tests touch all three model adapters at the import level.
+    # Tests touch all four model adapters at the import level.
     "langchain-claude-code>=0.1.0",
     "langchain-anthropic>=1.4",
     "langchain-openai>=1.2.1",
+    "langchain-codex-plus>=0.0.1",
+    # mimir.saga.vector_index uses FAISS for ANN search; without it
+    # the index degrades to an empty-result stub and tests asserting
+    # on indexed-atom counts (test_saga_correctness_regressions,
+    # test_memory_production_surface) fail. Hard dep at the package
+    # level is debatable (some operators may want BM25-only); pinning
+    # in dev means tests always exercise the real path.
+    "faiss-cpu>=1.13",
 ]
 
 [project.scripts]
@@ -110,7 +126,8 @@ saga = { workspace = true }
 # uv-native dependency group (PEP 735). Mirrors
 # ``[project.optional-dependencies].dev`` so ``uv sync`` and
 # ``pip install -e ".[dev]"`` both pull the same test toolchain
-# plus all three model adapters (tests import each at module level).
+# plus all four model adapters (tests import each at module level)
+# and faiss-cpu (vector_index tests need a real index).
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
@@ -120,4 +137,6 @@ dev = [
     "langchain-claude-code>=0.1.0",
     "langchain-anthropic>=1.4",
     "langchain-openai>=1.2.1",
+    "langchain-codex-plus>=0.0.1",
+    "faiss-cpu>=1.13",
 ]

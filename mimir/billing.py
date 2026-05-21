@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Optional
 
 from .rate_limits import (
+    RateLimitSnapshot,
     RateLimitStore,
     project_window_end,
     running_on_claude_max,
@@ -406,6 +407,63 @@ class OpenAIQuotaProvider(QuotaProvider):
                 )
             )
         return out
+
+
+# ─── Writer side: ChatCodexPlus → RateLimitStore ──────────────────────
+
+
+def make_codex_plus_rate_limit_callback(
+    store: RateLimitStore,
+) -> Any:
+    """Build the rate_limit_callback that ``ChatCodexPlus`` invokes
+    after each successful ``/codex/responses`` call. Transcribes the
+    parsed ``CodexRateLimits`` headers into ``RateLimitSnapshot``
+    entries keyed ``openai_five_hour`` / ``openai_seven_day`` — the
+    keys :class:`OpenAIQuotaProvider` already reads.
+
+    The callback runs inline on the chat model's response path (sync
+    or async — depends on which ``invoke``/``ainvoke``/``stream``
+    variant the agent uses). We write through the store's sync API
+    to avoid having to reason about which thread / loop the callback
+    is firing on; the store's last-write-wins behavior is acceptable
+    because quota snapshots are monotonically refreshed.
+
+    Argument typed as :class:`Any` to avoid an eager
+    ``langchain_codex_plus`` import; the duck-typed ``rl`` object is
+    a :class:`langchain_codex_plus.CodexRateLimits` with optional
+    ``primary`` / ``secondary`` :class:`CodexQuotaWindow` fields.
+    Conversion: ``used_percent`` (0-100) → ``utilization`` (0-1).
+    """
+    import datetime as _dt
+
+    def _callback(rl: Any) -> None:
+        observed_at = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+        if rl is None:
+            return
+        primary = getattr(rl, "primary", None)
+        if primary is not None and primary.used_percent is not None:
+            store.record_sync(
+                "openai_five_hour",
+                RateLimitSnapshot(
+                    status="allowed",
+                    utilization=float(primary.used_percent) / 100.0,
+                    resets_at=primary.reset_at,
+                    observed_at=observed_at,
+                ),
+            )
+        secondary = getattr(rl, "secondary", None)
+        if secondary is not None and secondary.used_percent is not None:
+            store.record_sync(
+                "openai_seven_day",
+                RateLimitSnapshot(
+                    status="allowed",
+                    utilization=float(secondary.used_percent) / 100.0,
+                    resets_at=secondary.reset_at,
+                    observed_at=observed_at,
+                ),
+            )
+
+    return _callback
 
 
 # ─── Auto-discovery: which QuotaProvider(s) to register at boot ───────
