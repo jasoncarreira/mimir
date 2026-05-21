@@ -6,7 +6,9 @@ guards against parser drift if Minimax changes wire field names.
 """
 from __future__ import annotations
 
+import copy
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -196,8 +198,6 @@ async def test_poll_once_writes_both_windows(
     # clock time. Same class of time-bomb the
     # ``test_callback_writes_both_windows_when_present`` fix in
     # ``tests/test_codex_plus_wireup.py`` documented.
-    import copy
-    import time
     fresh_payload = copy.deepcopy(REAL_PAYLOAD)
     now_ms = int(time.time() * 1000)
     for entry in fresh_payload["model_remains"]:
