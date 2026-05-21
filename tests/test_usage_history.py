@@ -178,13 +178,30 @@ def test_normalize_tolerates_legacy_windows_key():
     assert out["codex_plus"]["five_hour"][0].utilization == pytest.approx(0.5)
 
 
+def test_normalize_explicit_empty_recorded_does_not_fall_back():
+    # If a record carries an explicit empty ``recorded`` dict, treat it
+    # as "no data this tick" rather than silently falling back to a
+    # populated ``windows`` field. Realistic when both writers fire on
+    # the same event and one of them legitimately captured nothing.
+    rec = {
+        "timestamp": _ts(0),
+        "type": "codex_plus_usage_ok",
+        "recorded": {},
+        "windows": {
+            "five_hour": {"utilization": 0.99, "resets_at": 100},
+        },
+    }
+    out = normalize_subscription_events([rec])
+    # ``recorded`` is present-and-empty → nothing emitted; ``windows``
+    # is NOT consulted as a fallback.
+    assert out == {}
+
+
 # ---- compute_usage_history (end-to-end + downsampling) ------------------
 
 
 def test_compute_usage_history_emits_serializable_json():
-    out = compute_usage_history(
-        [_minimax_event(_ts(0), 0.27, 0.11)], days=7,
-    )
+    out = compute_usage_history([_minimax_event(_ts(0), 0.27, 0.11)])
     # JSON-serializable: every leaf must be primitive (no UsagePoint).
     point = out["minimax"]["five_hour"][0]
     assert isinstance(point, dict)
@@ -197,9 +214,7 @@ def test_compute_usage_history_omits_empty_providers():
     # Only Minimax events present → only "minimax" key in output. An
     # Anthropic-OAuth-only deployment doesn't get an empty Codex Plus
     # chart rendered.
-    out = compute_usage_history(
-        [_minimax_event(_ts(0), 0.27, 0.11)], days=7,
-    )
+    out = compute_usage_history([_minimax_event(_ts(0), 0.27, 0.11)])
     assert set(out.keys()) == {"minimax"}
 
 
@@ -209,7 +224,7 @@ def test_compute_usage_history_downsamples_below_cap():
     events = []
     for m in range(600):
         events.append(_minimax_event(_ts(m), 0.5, 0.2))
-    out = compute_usage_history(events, days=7, max_points_per_series=200)
+    out = compute_usage_history(events, max_points_per_series=200)
     assert len(out["minimax"]["five_hour"]) <= 200
     # Should keep meaningful detail — not collapse to a single point.
     assert len(out["minimax"]["five_hour"]) > 10
@@ -218,7 +233,7 @@ def test_compute_usage_history_downsamples_below_cap():
 def test_compute_usage_history_passes_through_below_cap():
     # 50 raw points and cap of 200 → all 50 returned, no bucketing loss.
     events = [_minimax_event(_ts(m), 0.5, 0.2) for m in range(50)]
-    out = compute_usage_history(events, days=7, max_points_per_series=200)
+    out = compute_usage_history(events, max_points_per_series=200)
     assert len(out["minimax"]["five_hour"]) == 50
 
 
@@ -233,6 +248,6 @@ def test_downsample_keeps_last_value_per_bucket():
         _minimax_event(early.isoformat(), 0.1, 0.05),
         _minimax_event(late.isoformat(), 0.9, 0.5),
     ]
-    out = compute_usage_history(events, days=7, max_points_per_series=1)
+    out = compute_usage_history(events, max_points_per_series=1)
     # max_points=1 forces both into the same bucket → late wins.
     assert out["minimax"]["five_hour"][0]["utilization"] == pytest.approx(0.9)
