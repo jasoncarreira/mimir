@@ -511,6 +511,10 @@ _DASHBOARD_HTML = """<!doctype html>
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <!-- Date adapter required for Chart.js time-axis (Usage panel).
+         Bundles date-fns + the adapter, ~25 KB minified. No-op when
+         the Usage panel has no data. -->
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
     <style>
       /* Dark palette — kept the original variable names (--paper, --ink,
          etc.) so the rest of the stylesheet doesn't have to know we
@@ -657,6 +661,7 @@ _DASHBOARD_HTML = """<!doctype html>
 
       <nav class="tabs">
         <button class="tab active" data-panel="overview">Overview</button>
+        <button class="tab" data-panel="usage">Usage</button>
         <button class="tab" data-panel="invocations">Invocations</button>
         <button class="tab" data-panel="resolution">Resolution paths</button>
         <button class="tab" data-panel="shell">Shell jobs</button>
@@ -669,6 +674,11 @@ _DASHBOARD_HTML = """<!doctype html>
       <section id="overview" class="panel active">
         <div class="chart-wrap"><canvas id="event-mix"></canvas></div>
         <div class="chart-wrap"><canvas id="events-timeseries"></canvas></div>
+      </section>
+
+      <section id="usage" class="panel">
+        <p class="hint">Subscription quota utilization over time. One chart per active subscription, one line per quota window (5h, 7d, plus model-scoped sub-windows). Empty means the provider has no captured events in the lookback window — either no models called or the quota writer (poller / callback) isn't wired.</p>
+        <div id="usage-charts"></div>
       </section>
 
       <section id="invocations" class="panel">
@@ -977,6 +987,107 @@ _DASHBOARD_HTML = """<!doctype html>
         data: { labels: triggerLabels, datasets: [{ label: 'Queued', data: triggerValues, backgroundColor: accent }] },
         options: { indexAxis: 'y', plugins: { title: { display: true, text: 'Events queued by trigger' }, legend: { display: false } } }
       });
+
+      // ── Usage charts ──────────────────────────────────────────────────
+      // One chart per provider present in D.usage_history; one line per
+      // window inside that provider. A multi-subscription deployment
+      // (Anthropic Max OAuth for chat + Codex Plus for saga LLM calls)
+      // renders both charts side-by-side.
+      const usageContainer = document.getElementById('usage-charts');
+      const usageHistory = D.usage_history || {};
+      const usageProviders = Object.keys(usageHistory);
+      if (usageProviders.length === 0) {
+        usageContainer.innerHTML =
+          '<div class="hint">No subscription quota events in window. ' +
+          'Set <code>MIMIR_BILLING_MODE=quota</code> and configure a poller/callback ' +
+          '(<code>MIMIR_MINIMAX_USAGE_POLL_CRON</code>, <code>MIMIR_CLAUDE_OAUTH_CREDENTIALS</code>, ' +
+          'or a Codex Plus model call) to populate this chart.</div>';
+      } else {
+        // Display names + window colors. Unknown providers / windows
+        // fall back to the raw key + a stable grey so the UI keeps
+        // rendering when a future provider lands without dashboard
+        // updates.
+        const providerLabels = {
+          anthropic: 'Anthropic Max (OAuth)',
+          minimax: 'Minimax',
+          codex_plus: 'Codex Plus',
+        };
+        const windowColors = {
+          five_hour: '#6c8ef7',
+          seven_day: '#fbbf24',
+          seven_day_sonnet: '#10b981',
+          seven_day_omelette: '#a78bfa',
+          seven_day_opus: '#f472b6',
+        };
+        for (const provider of usageProviders) {
+          const wrap = document.createElement('div');
+          wrap.className = 'chart-wrap';
+          const canvas = document.createElement('canvas');
+          canvas.id = 'usage-' + provider;
+          wrap.appendChild(canvas);
+          usageContainer.appendChild(wrap);
+
+          const windows = usageHistory[provider];
+          const datasets = [];
+          for (const [windowName, points] of Object.entries(windows)) {
+            datasets.push({
+              label: windowName,
+              data: points.map(p => ({
+                x: p.ts,
+                // utilization is 0..1; multiply for human-readable %.
+                // null carries through as a gap (spanGaps below).
+                y: p.utilization == null ? null : p.utilization * 100,
+              })),
+              borderColor: windowColors[windowName] || '#9ca3af',
+              backgroundColor: 'transparent',
+              tension: 0.1,
+              pointRadius: 0,
+              borderWidth: 2,
+              spanGaps: true,
+            });
+          }
+          new Chart(canvas, {
+            type: 'line',
+            data: { datasets },
+            options: {
+              // Inherit the global ``canvas { max-height: 320px }``
+              // rule — no explicit aspect override needed.
+              plugins: {
+                title: {
+                  display: true,
+                  text: providerLabels[provider] || provider,
+                },
+                tooltip: {
+                  callbacks: {
+                    label: function(ctx) {
+                      const v = ctx.parsed.y;
+                      if (v == null) return ctx.dataset.label + ': n/a';
+                      return ctx.dataset.label + ': ' + v.toFixed(1) + '%';
+                    },
+                  },
+                },
+              },
+              scales: {
+                x: {
+                  type: 'time',
+                  time: { tooltipFormat: 'MMM d, HH:mm' },
+                  ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 8 },
+                },
+                y: {
+                  min: 0,
+                  // Soft cap at 100% with a small headroom so a
+                  // reading slightly over (e.g. a provider rounding
+                  // up) still renders on-axis instead of clipped.
+                  suggestedMax: 100,
+                  ticks: { callback: v => v + '%' },
+                  title: { display: true, text: 'Utilization' },
+                },
+              },
+              interaction: { mode: 'index', intersect: false },
+            },
+          });
+        }
+      }
 
       } // end render(D)
 
