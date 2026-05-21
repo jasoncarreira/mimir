@@ -190,8 +190,22 @@ async def test_poll_once_writes_both_windows(
     """Happy path: fetch → pick → write both snapshots → ok event."""
     store = RateLimitStore(path=tmp_path / "rate_limits.json")
 
+    # Slide the captured payload's window-end timestamps to future-
+    # relative so ``RateLimitStore.current()`` doesn't filter the
+    # snapshots as stale once we pass the originally-captured wall-
+    # clock time. Same class of time-bomb the
+    # ``test_callback_writes_both_windows_when_present`` fix in
+    # ``tests/test_codex_plus_wireup.py`` documented.
+    import copy
+    import time
+    fresh_payload = copy.deepcopy(REAL_PAYLOAD)
+    now_ms = int(time.time() * 1000)
+    for entry in fresh_payload["model_remains"]:
+        entry["end_time"] = now_ms + 5 * 3600 * 1000           # +5h
+        entry["weekly_end_time"] = now_ms + 7 * 24 * 3600 * 1000  # +7d
+
     async def _fake_fetch(cfg, *, session=None):
-        return REAL_PAYLOAD
+        return fresh_payload
 
     monkeypatch.setattr("mimir.minimax_usage_poller.fetch_remains", _fake_fetch)
     cfg = MinimaxPollerConfig(api_key="test-key")
