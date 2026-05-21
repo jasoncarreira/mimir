@@ -123,6 +123,32 @@ class RateLimitStore:
             except OSError as exc:
                 log.warning("rate_limits.json write failed: %s", exc)
 
+    def record_sync(
+        self,
+        rate_limit_type: str,
+        snapshot: RateLimitSnapshot,
+    ) -> None:
+        """Synchronous version of :meth:`record` for callers that can't
+        ``await`` (e.g. ``ChatCodexPlus.rate_limit_callback``, which
+        fires inline from a streaming SSE handler on either the loop
+        thread or a thread executor — figuring out which is brittle).
+
+        No async lock; relies on last-write-wins being acceptable.
+        That's true here because snapshots are monotonically refreshed
+        (each successful response carries the latest quota state) and
+        the file is small, so concurrent writes converge fast. Best-
+        effort: IO errors are logged and swallowed.
+        """
+        data = self._load()
+        data[rate_limit_type] = asdict(snapshot)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                json.dumps(data, indent=2, default=str), encoding="utf-8",
+            )
+        except OSError as exc:
+            log.warning("rate_limits.json write failed: %s", exc)
+
     def current(self) -> dict[str, RateLimitSnapshot]:
         """Return only entries whose window hasn't reset. Drops stale
         entries (resets_at < now) but keeps records with ``resets_at=None``
