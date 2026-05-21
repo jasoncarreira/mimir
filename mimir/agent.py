@@ -533,13 +533,14 @@ class Agent:
         from .billing import build_quota_providers
         from .budget import HomeostaticArbiter
         # Auto-discover quota providers based on routing config.
-        # Returns ``[AnthropicQuotaProvider]`` for canonical Anthropic /
-        # Max OAuth deployments (back-compat with the prior hardcoded
-        # path); ``[MinimaxQuotaProvider]`` when ``ANTHROPIC_BASE_URL``
-        # routes to Minimax; ``[]`` for pay-as-you-go.
+        # Discovery is layered: ``MIMIR_MODEL_SPEC`` prefix wins
+        # (``openai:`` / ``claude-code:`` are explicit provider picks),
+        # then ``ANTHROPIC_BASE_URL`` host disambiguates ``anthropic:*``
+        # routes (Minimax compat vs canonical Anthropic).
         quota_providers = build_quota_providers(
             store=self._rate_limits,
             billing_mode=config.billing_mode,
+            model_spec=config.model_spec,
             anthropic_base_url=os.environ.get("ANTHROPIC_BASE_URL", ""),
         )
         self._arbiter = HomeostaticArbiter(

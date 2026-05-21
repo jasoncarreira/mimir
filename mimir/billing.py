@@ -311,6 +311,82 @@ class MinimaxQuotaProvider(QuotaProvider):
         return out
 
 
+# ─── OpenAI concrete implementation (stub — Codex Plus subscription) ──
+
+
+# OpenAI Codex Plus / Pro subscription documents window-based quota
+# in the same 5h + weekly shape as Anthropic Max / Minimax sub. The
+# weekly window length differs slightly (rolling 7d vs calendar-week)
+# but the QuotaWindow contract handles that fine — the arbiter just
+# cares about utilization + resets_at.
+_OPENAI_WINDOW_HOURS: dict[str, float] = {
+    "five_hour": 5.0,
+    "seven_day": 24.0 * 7,
+}
+
+
+class OpenAIQuotaProvider(QuotaProvider):
+    """Reads OpenAI Codex Plus / Pro subscription quota windows from
+    :class:`RateLimitStore`. The store is populated by an OpenAI-side
+    usage poller (TODO — follow-up PR), which queries Codex CLI's
+    auth-backed usage endpoint on a cron and writes
+    ``RateLimitSnapshot`` entries keyed ``openai_five_hour`` /
+    ``openai_seven_day``.
+
+    **Today: stub.** Same shape as :class:`MinimaxQuotaProvider`.
+    Until the OpenAI usage poller lands, ``get_windows`` returns the
+    empty list — the arbiter treats that as "no signal" and falls
+    through to cost-rate-only suppression.
+
+    Currently registered when ``MIMIR_MODEL_SPEC`` starts with
+    ``openai:`` AND the billing mode is QUOTA (operator declared
+    subscription tier via ``mimir setup --subscription``). Operators
+    on pay-per-token API keys keep the AnthropicQuotaProvider default
+    (which is empty for them too, but is the right fallback).
+    """
+
+    _STORE_KEY_PREFIX = "openai_"
+
+    def __init__(self, store: RateLimitStore) -> None:
+        self._store = store
+
+    @property
+    def provider_name(self) -> str:
+        return "openai"
+
+    def get_windows(self) -> list[QuotaWindow]:
+        # TODO: once OpenAI usage poller lands, walk
+        # _OPENAI_WINDOW_HOURS and transcribe store snapshots to
+        # QuotaWindow with on_pace projections. Until then: no
+        # ``openai_*`` keys in the store → empty list → arbiter
+        # treats as "no signal" (safe fallback).
+        out: list[QuotaWindow] = []
+        snaps = self._store.current()
+        for key, hours in _OPENAI_WINDOW_HOURS.items():
+            snap = snaps.get(f"{self._STORE_KEY_PREFIX}{key}")
+            if snap is None:
+                continue
+            is_derived = getattr(snap, "derived", False)
+            if is_derived:
+                on_pace = None
+            else:
+                proj = project_window_end(snap, hours)
+                on_pace = (
+                    proj.on_pace_utilization if proj is not None else None
+                )
+            out.append(
+                QuotaWindow(
+                    key=key,
+                    window_hours=hours,
+                    utilization=snap.utilization,
+                    on_pace_utilization=on_pace,
+                    resets_at=snap.resets_at,
+                    derived=is_derived,
+                )
+            )
+        return out
+
+
 # ─── Auto-discovery: which QuotaProvider(s) to register at boot ───────
 
 
@@ -318,6 +394,7 @@ def build_quota_providers(
     *,
     store: RateLimitStore,
     billing_mode: BillingMode,
+    model_spec: str = "",
     anthropic_base_url: str = "",
 ) -> list[QuotaProvider]:
     """Return the right ``QuotaProvider`` list for this deployment's
@@ -327,20 +404,32 @@ def build_quota_providers(
     Returns empty list for ``PAY_AS_YOU_GO`` — no quota signal exists,
     cost-rate suppression handles the spending side instead.
 
-    For ``QUOTA`` mode, picks providers based on the agent's routing:
+    For ``QUOTA`` mode, picks providers based on the agent's routing.
+    Detection key precedence:
 
-    * ``ANTHROPIC_BASE_URL`` routed to ``api.minimax.io`` →
-      :class:`MinimaxQuotaProvider` (Minimax subscription tier).
-    * Anything else (unset / canonical Anthropic / unknown gateway) →
-      :class:`AnthropicQuotaProvider`.
+    1. **``MIMIR_MODEL_SPEC`` prefix** (most specific):
+       * ``openai:*`` → :class:`OpenAIQuotaProvider` (Codex Plus / Pro)
+       * ``claude-code:*`` → :class:`AnthropicQuotaProvider`
+         (Max OAuth — provider explicitly chosen via subprocess)
+    2. **``ANTHROPIC_BASE_URL`` host** (for ``anthropic:*`` routes
+       that didn't qualify the provider):
+       * ``api.minimax.io`` → :class:`MinimaxQuotaProvider`
+       * everything else (canonical / unset / unknown gateway) →
+         :class:`AnthropicQuotaProvider`
 
-    Detection mirrors ``mimir.config._is_anthropic_oauth_deployment``:
-    parses the URL's hostname so a routed deployment ends up with the
-    right provider. Adding a new provider (Moonshot subscription,
-    OpenAI Codex, etc.) is one ``elif`` branch.
+    Adding a new provider (Moonshot subscription quota, gateway
+    quotas, etc.) is one ``elif`` branch.
     """
     if billing_mode is not BillingMode.QUOTA:
         return []
+    spec = (model_spec or "").strip().lower()
+    if spec.startswith("openai:"):
+        return [OpenAIQuotaProvider(store)]
+    if spec.startswith("claude-code:"):
+        return [AnthropicQuotaProvider(store)]
+    # ``anthropic:*`` and everything else falls through to URL-based
+    # detection — the host tells us whether we're routed to a compat
+    # endpoint or hitting Anthropic directly.
     from urllib.parse import urlparse
     base = (anthropic_base_url or "").strip()
     host = ""

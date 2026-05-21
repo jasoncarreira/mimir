@@ -887,3 +887,105 @@ def test_minimax_provider_transcribes_store_snapshots(tmp_path, monkeypatch):
     five = next(w for w in windows if w.key == "five_hour")
     assert five.utilization == 0.30
     assert five.window_hours == 5.0
+
+
+# ─── OpenAI (Codex Plus subscription) ───────────────────────────────────
+
+
+def test_build_quota_providers_openai_codex_subscription(tmp_path):
+    """``MIMIR_MODEL_SPEC=openai:gpt-5 --subscription`` →
+    ``OpenAIQuotaProvider``. The model_spec prefix is the strongest
+    signal (operator explicitly chose OpenAI as the provider)."""
+    from mimir.billing import (
+        BillingMode, OpenAIQuotaProvider, build_quota_providers,
+    )
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        model_spec="openai:gpt-5",
+    )
+    assert len(providers) == 1
+    assert isinstance(providers[0], OpenAIQuotaProvider)
+    assert providers[0].provider_name == "openai"
+
+
+def test_build_quota_providers_claude_code_model_spec(tmp_path):
+    """``MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6`` →
+    ``AnthropicQuotaProvider`` (Max OAuth, the protocol-different
+    path)."""
+    from mimir.billing import (
+        AnthropicQuotaProvider, BillingMode, build_quota_providers,
+    )
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        model_spec="claude-code:claude-sonnet-4-6",
+    )
+    assert isinstance(providers[0], AnthropicQuotaProvider)
+
+
+def test_build_quota_providers_model_spec_beats_url(tmp_path):
+    """When the model_spec explicitly names a provider, it wins over
+    ``ANTHROPIC_BASE_URL``. (Operator on Codex Plus might still have
+    a leftover ``ANTHROPIC_BASE_URL`` from earlier setup; their model
+    spec is the durable signal.)"""
+    from mimir.billing import (
+        BillingMode, OpenAIQuotaProvider, build_quota_providers,
+    )
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        model_spec="openai:gpt-5",
+        anthropic_base_url="https://api.minimax.io/anthropic",
+    )
+    assert isinstance(providers[0], OpenAIQuotaProvider)
+
+
+# ─── OpenAIQuotaProvider (stub; populates from store when poller wired) ─
+
+
+def test_openai_provider_returns_empty_when_store_has_no_snapshots(tmp_path):
+    """Until the OpenAI usage poller lands, store has no ``openai_*``
+    keys → empty list → arbiter falls through to cost-rate."""
+    from mimir.billing import OpenAIQuotaProvider
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    assert OpenAIQuotaProvider(store).get_windows() == []
+
+
+def test_openai_provider_transcribes_store_snapshots(tmp_path, monkeypatch):
+    """Pins the OpenAI read contract — same shape as Minimax's."""
+    from datetime import datetime, timezone
+    from mimir.billing import OpenAIQuotaProvider
+    from mimir.rate_limits import RateLimitSnapshot, RateLimitStore
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    snapshots = {
+        "openai_five_hour": RateLimitSnapshot(
+            status="allowed",
+            utilization=0.45,
+            resets_at=now_ts + 3600,
+            observed_at=now_iso,
+        ),
+        "openai_seven_day": RateLimitSnapshot(
+            status="allowed",
+            utilization=0.12,
+            resets_at=now_ts + 86400 * 6,
+            observed_at=now_iso,
+        ),
+    }
+    monkeypatch.setattr(store, "current", lambda: snapshots)
+    windows = OpenAIQuotaProvider(store).get_windows()
+    keys = {w.key for w in windows}
+    assert keys == {"five_hour", "seven_day"}
+    five = next(w for w in windows if w.key == "five_hour")
+    assert five.utilization == 0.45
+    assert five.window_hours == 5.0
