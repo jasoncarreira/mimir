@@ -530,11 +530,18 @@ class Agent:
         # beats and per-turn ``## Self-state`` render share the same
         # instance. Wire into the scheduler immediately so heartbeats
         # fired before the first turn are still arbitrated.
-        from .billing import AnthropicQuotaProvider, BillingMode, QuotaProvider
+        from .billing import build_quota_providers
         from .budget import HomeostaticArbiter
-        quota_providers: list[QuotaProvider] = []
-        if config.billing_mode is BillingMode.QUOTA:
-            quota_providers.append(AnthropicQuotaProvider(self._rate_limits))
+        # Auto-discover quota providers based on routing config.
+        # Returns ``[AnthropicQuotaProvider]`` for canonical Anthropic /
+        # Max OAuth deployments (back-compat with the prior hardcoded
+        # path); ``[MinimaxQuotaProvider]`` when ``ANTHROPIC_BASE_URL``
+        # routes to Minimax; ``[]`` for pay-as-you-go.
+        quota_providers = build_quota_providers(
+            store=self._rate_limits,
+            billing_mode=config.billing_mode,
+            anthropic_base_url=os.environ.get("ANTHROPIC_BASE_URL", ""),
+        )
         self._arbiter = HomeostaticArbiter(
             home=config.home,
             rate_limit_store=self._rate_limits,

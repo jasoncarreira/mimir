@@ -231,6 +231,131 @@ class AnthropicQuotaProvider(QuotaProvider):
         return out
 
 
+# ─── Minimax concrete implementation (stub — Issue #243) ──────────────
+
+
+# Window sizes for Minimax's quota plan. Their subscription tier
+# documents 5h + 7d windows in the same shape as Anthropic / z.ai —
+# the QuotaWindow contract maps cleanly. Per-model sub-buckets (if
+# any) get added here once the usage-API integration lands.
+_MINIMAX_WINDOW_HOURS: dict[str, float] = {
+    "five_hour": 5.0,
+    "seven_day": 24.0 * 7,
+}
+
+
+class MinimaxQuotaProvider(QuotaProvider):
+    """Reads Minimax subscription quota windows from
+    :class:`RateLimitStore`. The store is populated by the Minimax-
+    side usage poller (TODO — Issue #243), which mirrors the
+    ``oauth_usage_poller.py`` pattern: queries Minimax's billing
+    endpoint on a 3-min cron and writes ``RateLimitSnapshot`` entries
+    keyed ``minimax_five_hour`` / ``minimax_seven_day``.
+
+    **Today: stub.** Until the usage poller lands, ``get_windows``
+    returns the empty list — the arbiter treats that as "no signal"
+    and falls through to cost-rate-only suppression (or accepts the
+    spike-ratio default). Once the poller is wired, the snapshot read
+    here transcribes the cached values into ``QuotaWindow``
+    objects.
+
+    The provider is registered automatically for muninn-mimir-shape
+    deployments (``ANTHROPIC_BASE_URL`` pointing at
+    ``api.minimax.io``) via :func:`build_quota_providers`. Operators
+    on canonical Anthropic + Max OAuth continue to get
+    ``AnthropicQuotaProvider``.
+    """
+
+    #: ``RateLimitStore`` key prefix for Minimax-side snapshots. The
+    #: poller writes keys like ``minimax_five_hour``; this provider
+    #: reads them back.
+    _STORE_KEY_PREFIX = "minimax_"
+
+    def __init__(self, store: RateLimitStore) -> None:
+        self._store = store
+
+    @property
+    def provider_name(self) -> str:
+        return "minimax"
+
+    def get_windows(self) -> list[QuotaWindow]:
+        # TODO(#243): once Minimax usage poller lands, walk
+        # _MINIMAX_WINDOW_HOURS and transcribe store snapshots to
+        # QuotaWindow with on_pace projections (same shape as
+        # AnthropicQuotaProvider above). For now: no data → empty
+        # list → arbiter treats as "no signal" (safe fallback).
+        out: list[QuotaWindow] = []
+        snaps = self._store.current()
+        for key, hours in _MINIMAX_WINDOW_HOURS.items():
+            snap = snaps.get(f"{self._STORE_KEY_PREFIX}{key}")
+            if snap is None:
+                continue
+            is_derived = getattr(snap, "derived", False)
+            if is_derived:
+                on_pace = None
+            else:
+                proj = project_window_end(snap, hours)
+                on_pace = (
+                    proj.on_pace_utilization if proj is not None else None
+                )
+            out.append(
+                QuotaWindow(
+                    key=key,
+                    window_hours=hours,
+                    utilization=snap.utilization,
+                    on_pace_utilization=on_pace,
+                    resets_at=snap.resets_at,
+                    derived=is_derived,
+                )
+            )
+        return out
+
+
+# ─── Auto-discovery: which QuotaProvider(s) to register at boot ───────
+
+
+def build_quota_providers(
+    *,
+    store: RateLimitStore,
+    billing_mode: BillingMode,
+    anthropic_base_url: str = "",
+) -> list[QuotaProvider]:
+    """Return the right ``QuotaProvider`` list for this deployment's
+    routing. Replaces the hardcoded ``[AnthropicQuotaProvider(...)]``
+    that ``mimir.agent`` used to build directly.
+
+    Returns empty list for ``PAY_AS_YOU_GO`` — no quota signal exists,
+    cost-rate suppression handles the spending side instead.
+
+    For ``QUOTA`` mode, picks providers based on the agent's routing:
+
+    * ``ANTHROPIC_BASE_URL`` routed to ``api.minimax.io`` →
+      :class:`MinimaxQuotaProvider` (Minimax subscription tier).
+    * Anything else (unset / canonical Anthropic / unknown gateway) →
+      :class:`AnthropicQuotaProvider`.
+
+    Detection mirrors ``mimir.config._is_anthropic_oauth_deployment``:
+    parses the URL's hostname so a routed deployment ends up with the
+    right provider. Adding a new provider (Moonshot subscription,
+    OpenAI Codex, etc.) is one ``elif`` branch.
+    """
+    if billing_mode is not BillingMode.QUOTA:
+        return []
+    from urllib.parse import urlparse
+    base = (anthropic_base_url or "").strip()
+    host = ""
+    if base:
+        try:
+            host = urlparse(base).hostname or ""
+        except (ValueError, AttributeError):
+            host = ""
+    if host == "api.minimax.io":
+        return [MinimaxQuotaProvider(store)]
+    # Default: canonical Anthropic (unset URL OR api.anthropic.com OR
+    # any other host where we don't have a wrapped quota API yet).
+    return [AnthropicQuotaProvider(store)]
+
+
 # ─── suppression evaluation ────────────────────────────────────────────
 
 
