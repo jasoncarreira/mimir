@@ -232,6 +232,10 @@ class WriteGuardBackend:
             return WriteResult(
                 error=f"Write blocked. Writable directories: {self._allowed_dirs_label()}",
             )
+        # Idempotent with the strip already applied inside
+        # ``_resolve_target`` during the writable-root check — the
+        # explicit call here keeps the forward to ``self._fs`` self-
+        # contained against future refactors of ``_resolve_target``.
         return self._fs.write(
             file_path=self._canonicalize_path(file_path),
             content=content,
@@ -252,6 +256,7 @@ class WriteGuardBackend:
             return EditResult(
                 error=f"Edit blocked. Writable directories: {self._allowed_dirs_label()}",
             )
+        # Idempotent with ``_resolve_target`` — see ``write`` above.
         return self._fs.edit(
             file_path=self._canonicalize_path(file_path),
             old_string=old_string,
