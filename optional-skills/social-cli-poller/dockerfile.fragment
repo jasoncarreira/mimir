@@ -10,6 +10,19 @@
 #
 # Pinned to a clone of main because letta-ai/social-cli is still
 # pre-tag. Bump to a release tag when one lands.
+#
+# Symlink target: ``dist/cli.js`` (the built output) directly, NOT
+# the ``bin/`` directory listed in package.json's ``bin`` field —
+# that ``bin/social-cli`` only materializes when the package is
+# installed externally (via ``npm install``, ``pnpm link --global``,
+# etc.), not by ``pnpm build`` on the package's own tree. Pre-fix,
+# the symlink pointed at a path that never existed, so the bundled
+# install was silently broken — every ``social-cli`` invocation
+# inside the container hit a dangling symlink and operators were
+# forced to clone + build into ``/tmp`` as a workaround. The
+# ``chmod +x`` is required because ``dist/cli.js`` is shipped with
+# 0644 perms by default; the shebang (``#!/usr/bin/env node``)
+# handles dispatch once it's executable.
 
 # Clones letta-ai/social-cli's main branch (no tags published yet).
 # When upstream stabilizes + cuts tagged releases, pin to a commit hash
@@ -20,4 +33,5 @@
 RUN corepack enable && corepack prepare pnpm@latest --activate \
  && git clone --depth 1 https://github.com/letta-ai/social-cli.git /opt/social-cli \
  && cd /opt/social-cli && pnpm install --frozen-lockfile && pnpm build \
- && ln -sf /opt/social-cli/bin/social-cli /usr/local/bin/social-cli
+ && chmod +x /opt/social-cli/dist/cli.js \
+ && ln -sf /opt/social-cli/dist/cli.js /usr/local/bin/social-cli
