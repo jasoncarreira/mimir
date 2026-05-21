@@ -234,10 +234,13 @@ class AnthropicQuotaProvider(QuotaProvider):
 # ─── Minimax concrete implementation (stub — Issue #243) ──────────────
 
 
-# Window sizes for Minimax's quota plan. Their subscription tier
-# documents 5h + 7d windows in the same shape as Anthropic / z.ai —
-# the QuotaWindow contract maps cleanly. Per-model sub-buckets (if
-# any) get added here once the usage-API integration lands.
+# Window sizes for Minimax's quota plan. Presumed 5h + 7d in the same
+# shape as Anthropic / z.ai — the QuotaWindow contract should map
+# cleanly. NOT VERIFIED until the Minimax usage poller (Issue #243)
+# lands and confirms the actual windows the billing API exposes; if
+# the real values differ, this dict updates without breaking the
+# QuotaWindow interface. Per-model sub-buckets (if any) get added
+# here once the integration is wired.
 _MINIMAX_WINDOW_HOURS: dict[str, float] = {
     "five_hour": 5.0,
     "seven_day": 24.0 * 7,
@@ -259,7 +262,7 @@ class MinimaxQuotaProvider(QuotaProvider):
     here transcribes the cached values into ``QuotaWindow``
     objects.
 
-    The provider is registered automatically for muninn-mimir-shape
+    The provider is registered automatically for Minimax-compat
     deployments (``ANTHROPIC_BASE_URL`` pointing at
     ``api.minimax.io``) via :func:`build_quota_providers`. Operators
     on canonical Anthropic + Max OAuth continue to get

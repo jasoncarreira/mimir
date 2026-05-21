@@ -8,12 +8,17 @@ confirm that:
 1. ``CodexAuth`` parsing works against a real auth.json on this box.
 2. The Codex API base accepts our bearer token without the full codex-rs
    client baggage (CA pinning, cookie store, etc).
-3. Response carries the ``x-codex-primary-*`` / ``x-codex-secondary-*``
-   rate-limit headers documented in ``codex-rs/codex-api/src/rate_limits.rs``.
 
-If (3) holds, the architecture for ``OpenAIQuotaProvider`` is validated
-— wiring becomes a response-header interceptor on a future Codex Plus
-LangChain client, not a separate poller.
+The ``x-codex-primary-*`` / ``x-codex-secondary-*`` rate-limit headers
+documented in ``codex-rs/codex-api/src/rate_limits.rs`` are attached
+only to ``/codex/responses`` (inference) success responses — NOT to
+``/codex/models``. This probe deliberately avoids the inference
+endpoint to keep cost at zero; the actual rate-limit-header validation
+was performed separately with a 1-token ``/codex/responses`` call (see
+the PR description for the captured values). The architecture for
+:class:`mimir.billing.OpenAIQuotaProvider` is therefore confirmed: the
+writer will be a response-header interceptor on a future Codex Plus
+LangChain client, not a polling endpoint.
 
 Usage::
 
