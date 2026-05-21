@@ -434,20 +434,38 @@ def merge_duplicate_into_canonical(
     dup_meta = json.loads(duplicate.get("metadata") or "{}")
     merged_meta = _merge_metadata(can_meta, dup_meta, duplicate_id=dup_id)
 
-    current_enc_conf = canonical.get("encoding_confidence")
-    if current_enc_conf is None:
-        # Caller didn't fetch the column — read it fresh. Defends
-        # against being called from a path that's seeing only the
-        # legacy SELECT list.
+    # Inherit the HIGHER ``encoding_confidence`` from the {canonical,
+    # duplicate} pair before bumping. ``pick_canonical`` orders by
+    # activation/pinned/etc. — NOT by encoding_confidence — so the
+    # canonical is often NOT the more-encoded atom in the cluster.
+    # Without this inheritance, absorbing a previously-merged
+    # duplicate (k=3 → 0.897) into a fresh canonical (k=0 → 0.7)
+    # would clobber the duplicate's accumulated confidence down to
+    # 0.79. The MAX rule preserves the strongest evidence; the bump
+    # then adds the current merge's vote on top.
+    can_enc = canonical.get("encoding_confidence")
+    if can_enc is None:
+        # Caller didn't fetch the column on the canonical — read fresh.
         row = conn.execute(
             "SELECT encoding_confidence FROM atoms WHERE id = ?",
             (can_id,),
         ).fetchone()
-        current_enc_conf = (
+        can_enc = (
             float(row[0]) if row and row[0] is not None
             else BASELINE_ENCODING_CONFIDENCE
         )
-    new_enc_conf = _bump_encoding_confidence(float(current_enc_conf))
+    dup_enc = duplicate.get("encoding_confidence")
+    if dup_enc is None:
+        row = conn.execute(
+            "SELECT encoding_confidence FROM atoms WHERE id = ?",
+            (dup_id,),
+        ).fetchone()
+        dup_enc = (
+            float(row[0]) if row and row[0] is not None
+            else BASELINE_ENCODING_CONFIDENCE
+        )
+    starting = max(float(can_enc), float(dup_enc))
+    new_enc_conf = _bump_encoding_confidence(starting)
     # Cache the new value on the canonical dict so the caller's
     # in-memory view stays consistent (relevant when a single dedup
     # pass folds N duplicates into the same canonical — each
