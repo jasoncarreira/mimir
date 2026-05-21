@@ -487,6 +487,11 @@ def build_quota_providers(
     Detection key precedence:
 
     1. **``MIMIR_MODEL_SPEC`` prefix** (most specific):
+       * ``codex-plus:*`` → :class:`OpenAIQuotaProvider` (Codex Plus
+         subscription via ``langchain-codex-plus`` — same store keys
+         as ``openai:`` since both feed the same arbiter view, but the
+         writer is the chat model's ``rate_limit_callback`` rather
+         than a polling endpoint).
        * ``openai:*`` → :class:`OpenAIQuotaProvider` (Codex Plus / Pro)
        * ``claude-code:*`` → :class:`AnthropicQuotaProvider`
          (Max OAuth — provider explicitly chosen via subprocess)
@@ -502,7 +507,7 @@ def build_quota_providers(
     if billing_mode is not BillingMode.QUOTA:
         return []
     spec = (model_spec or "").strip().lower()
-    if spec.startswith("openai:"):
+    if spec.startswith("codex-plus:") or spec.startswith("openai:"):
         return [OpenAIQuotaProvider(store)]
     if spec.startswith("claude-code:"):
         return [AnthropicQuotaProvider(store)]

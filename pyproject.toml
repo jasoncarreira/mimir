@@ -47,7 +47,7 @@ openai = [
 # package and ships an own rate-limit-headers integration that wires
 # directly into ``OpenAIQuotaProvider`` via the agent's callback hook.
 codex-plus = [
-    "langchain-codex-plus>=0.0.1",
+    "langchain-codex-plus>=0.0.1,<0.1",
 ]
 # Bridge extras — install if you want that bridge.
 discord = [
@@ -66,7 +66,7 @@ dev = [
     "langchain-claude-code>=0.1.0",
     "langchain-anthropic>=1.4",
     "langchain-openai>=1.2.1",
-    "langchain-codex-plus>=0.0.1",
+    "langchain-codex-plus>=0.0.1,<0.1",
     # mimir.saga.vector_index uses FAISS for ANN search; without it
     # the index degrades to an empty-result stub and tests asserting
     # on indexed-atom counts (test_saga_correctness_regressions,
@@ -137,6 +137,6 @@ dev = [
     "langchain-claude-code>=0.1.0",
     "langchain-anthropic>=1.4",
     "langchain-openai>=1.2.1",
-    "langchain-codex-plus>=0.0.1",
+    "langchain-codex-plus>=0.0.1,<0.1",
     "faiss-cpu>=1.13",
 ]

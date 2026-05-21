@@ -152,15 +152,21 @@ def test_callback_writes_both_windows_when_present(tmp_path: Path):
     conversion checked on both."""
     store = RateLimitStore(path=tmp_path / "rl.json")
     callback = make_codex_plus_rate_limit_callback(store)
+    # Use timestamps in the future — ``RateLimitStore.current()``
+    # filters entries whose ``resets_at`` is in the past as stale.
+    # (Pinning absolute unix-ts here was a latent bug that surfaced
+    # ~5h after a fixed value goes past now().)
+    primary_reset = int(time.time()) + 5 * 3600        # 5h window
+    secondary_reset = int(time.time()) + 7 * 24 * 3600  # 7d window
     callback(_FakeRateLimits(
-        primary=_FakeQuotaWindow(used_percent=25.0, reset_at=1779343790),
-        secondary=_FakeQuotaWindow(used_percent=8.0, reset_at=1779930590),
+        primary=_FakeQuotaWindow(used_percent=25.0, reset_at=primary_reset),
+        secondary=_FakeQuotaWindow(used_percent=8.0, reset_at=secondary_reset),
     ))
     loaded = store.current()
     assert loaded["openai_five_hour"].utilization == pytest.approx(0.25)
-    assert loaded["openai_five_hour"].resets_at == 1779343790
+    assert loaded["openai_five_hour"].resets_at == primary_reset
     assert loaded["openai_seven_day"].utilization == pytest.approx(0.08)
-    assert loaded["openai_seven_day"].resets_at == 1779930590
+    assert loaded["openai_seven_day"].resets_at == secondary_reset
 
 
 def test_callback_skips_when_used_percent_missing(tmp_path: Path):
@@ -234,24 +240,39 @@ def test_openai_quota_provider_reads_callback_writes(tmp_path: Path):
 def test_discovery_registers_openai_provider_for_codex_plus_spec(
     tmp_path: Path,
 ):
-    """A ``codex-plus:gpt-5.4`` spec should still register
-    :class:`OpenAIQuotaProvider` — same provider, same store keys."""
+    """A ``codex-plus:gpt-5.4`` spec registers :class:`OpenAIQuotaProvider`
+    — the chat model's rate-limit callback feeds the same
+    ``openai_five_hour`` / ``openai_seven_day`` keys this provider
+    reads, so the arbiter sees a coherent quota window for the
+    deployment."""
+    from mimir.billing import OpenAIQuotaProvider
+
     store = RateLimitStore(path=tmp_path / "rl.json")
     providers = build_quota_providers(
         store=store,
         billing_mode=BillingMode.QUOTA,
         model_spec="codex-plus:gpt-5.4",
     )
-    # PR #248 dispatch routes ``codex-plus:`` through the same fall-
-    # through as ``openai:``-with-subscription would: an explicit
-    # provider hint or, failing that, the Anthropic default. Since
-    # ``codex-plus:`` isn't an explicit branch yet, we expect it to
-    # produce SOME provider; assert at least one is registered.
-    assert len(providers) >= 1
-    # The default fall-through path returns AnthropicQuotaProvider —
-    # this test documents the current behavior. The follow-up (when
-    # ``codex-plus:`` becomes a first-class discovery branch) will
-    # flip this expectation to ``OpenAIQuotaProvider``.
+    assert len(providers) == 1
+    assert isinstance(providers[0], OpenAIQuotaProvider)
+
+
+def test_discovery_codex_plus_overrides_anthropic_base_url(tmp_path: Path):
+    """``codex-plus:`` is a model_spec prefix branch, so it takes
+    precedence over a stale ``ANTHROPIC_BASE_URL`` env (e.g., from a
+    previous run that routed to Minimax). The chat model isn't
+    actually talking to ``ANTHROPIC_BASE_URL`` for codex-plus specs;
+    quota dispatch must follow."""
+    from mimir.billing import OpenAIQuotaProvider
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        model_spec="codex-plus:gpt-5.4",
+        anthropic_base_url="https://api.minimax.io/anthropic",
+    )
+    assert isinstance(providers[0], OpenAIQuotaProvider)
 
 
 # ─── _resolve_model: codex-plus: spec lazy-imports + constructs ────────
