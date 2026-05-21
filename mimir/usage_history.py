@@ -128,10 +128,14 @@ def normalize_subscription_events(
         # Codex Plus + Minimax + Anthropic OAuth all use the same shape:
         # a ``recorded`` dict mapping window keys to ``{utilization,
         # resets_at, status}`` snapshots. Codex Plus's older event
-        # variant used ``windows`` instead of ``recorded``; tolerate
-        # both so we don't lose the historical data when the writer
-        # gets renamed.
-        windows = ev.get("recorded") or ev.get("windows") or {}
+        # variant used ``windows`` instead of ``recorded``; fall back
+        # to it only when ``recorded`` is absent (not when it's
+        # explicitly empty) so a record with both keys present doesn't
+        # surprisingly silently rewrite empty-recorded from the legacy
+        # field.
+        windows = ev.get("recorded")
+        if windows is None:
+            windows = ev.get("windows", {})
         if not isinstance(windows, dict):
             continue
         for raw_key, snap in windows.items():
@@ -211,13 +215,14 @@ def _downsample_last_per_bucket(
 
 def compute_usage_history(
     events: Iterable[dict[str, Any]],
-    days: int,
     *,
     max_points_per_series: int = 200,
 ) -> dict[str, dict[str, list[dict[str, Any]]]]:
-    """End-to-end: filter to window, normalize, downsample, JSON-ify.
+    """End-to-end: normalize → downsample → JSON-ify.
 
-    Returns the schema the ops dashboard renders:
+    Caller is responsible for date-windowing ``events`` before passing
+    them in (the ops dashboard uses ``_load_events(events_log, days)``
+    for this). Output schema:
 
     .. code-block:: python
 
@@ -227,13 +232,10 @@ def compute_usage_history(
           }
         }
 
-    ``days`` is the lookback window in days (caller-applied via the
-    events query). Providers with zero records are omitted entirely so
-    the dashboard can render charts per non-empty provider — an
-    Anthropic-OAuth-only deployment doesn't get an empty Codex Plus
-    chart.
+    Providers with zero records are omitted entirely so the dashboard
+    can render charts per non-empty provider — an Anthropic-OAuth-only
+    deployment doesn't get an empty Codex Plus chart.
     """
-    del days  # event filtering by date happens at the caller (compute_stats)
     normalized = normalize_subscription_events(events)
     result: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for provider, windows in normalized.items():
