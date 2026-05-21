@@ -661,6 +661,15 @@ def build_app(config: Config) -> web.Application:
         # ``credentials.json`` (operator-minted via ``claude /login``)
         # and refreshing tokens itself, bypassing Claude Code CLI's
         # broken auto-refresh on headless / copied-creds boxes.
+        # Shared RateLimitStore used by both the Anthropic OAuth
+        # poller and the Minimax poller below. Constructed
+        # unconditionally so the Minimax path doesn't depend on the
+        # OAuth path's gating. Single writer per poller instance, the
+        # store's own asyncio.Lock serializes concurrent writes — fine
+        # for two pollers on different cron cadences.
+        rate_limit_store = RateLimitStore(
+            path=config.home / ".mimir" / "rate_limits.json",
+        )
         oauth_poll_registered = False
         if config.oauth_credentials_path is not None:
             try:
@@ -670,9 +679,6 @@ def build_app(config: Config) -> web.Application:
                 # RateLimitStore here — single writer, single asyncio.Lock,
                 # no race. The path is the same JSON file the SDK-era
                 # agent wrote to so operators get continuity.
-                rate_limit_store = RateLimitStore(
-                    path=config.home / ".mimir" / "rate_limits.json",
-                )
                 oauth_poll_registered = scheduler.add_oauth_usage_poll_job(
                     rate_limit_store,
                     config.oauth_usage_poll_cron,
@@ -692,6 +698,40 @@ def build_app(config: Config) -> web.Application:
                     job="oauth-usage-poll",
                     error=str(exc),
                 )
+
+        # Minimax usage poller. Opt-in: requires both
+        # MIMIR_MINIMAX_USAGE_POLL_CRON (non-empty) AND
+        # MINIMAX_API_KEY in env. We don't gate on billing_mode here
+        # — the poller is harmless on a pay-as-you-go account (just
+        # writes utilization snapshots; arbiter consumes them only if
+        # MinimaxQuotaProvider is registered, which is gated on
+        # billing_mode + ANTHROPIC_BASE_URL in mimir.billing).
+        minimax_poll_registered = False
+        if config.minimax_usage_poll_cron.strip():
+            minimax_api_key = os.environ.get("MINIMAX_API_KEY", "").strip()
+            if not minimax_api_key:
+                await log_event(
+                    "scheduler_invalid_cron",
+                    job="minimax-usage-poll",
+                    error=(
+                        "MIMIR_MINIMAX_USAGE_POLL_CRON is set but "
+                        "MINIMAX_API_KEY is unset — poller not registered"
+                    ),
+                )
+            else:
+                try:
+                    minimax_poll_registered = scheduler.add_minimax_usage_poll_job(
+                        rate_limit_store,
+                        config.minimax_usage_poll_cron,
+                        minimax_api_key,
+                        model_name=config.minimax_usage_model_name,
+                    )
+                except ValueError as exc:
+                    await log_event(
+                        "scheduler_invalid_cron",
+                        job="minimax-usage-poll",
+                        error=str(exc),
+                    )
 
         # Identities populator (chainlink #44). Daily scrape of
         # connected bridges into state/identities.yaml. Default cron

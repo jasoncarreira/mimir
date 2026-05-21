@@ -1402,6 +1402,63 @@ class Scheduler:
             coalesce=True,
         )
 
+    # ---- Minimax coding-plan usage poll cron -------------------------
+
+    # Same shape as add_oauth_usage_poll_job but for Minimax deployments.
+    # Polls Minimax's ``coding_plan/remains`` endpoint and writes
+    # ``minimax_five_hour`` / ``minimax_seven_day`` snapshots that
+    # :class:`mimir.billing.MinimaxQuotaProvider` reads. Independent
+    # of the Anthropic OAuth poller — they can both be registered on
+    # a hybrid deployment, but typical deployments register one or
+    # the other based on which gateway the agent talks to.
+    def add_minimax_usage_poll_job(
+        self,
+        rate_limit_store: Any,
+        cron_expr: str,
+        api_key: str,
+        *,
+        model_name: str = "MiniMax-M*",
+        job_id: str = "minimax-usage-poll",
+    ) -> bool:
+        """Register the Minimax plan-window usage poller. Returns
+        ``False`` on empty effective cron (env-var default empty AND
+        no yaml override), matching ``add_oauth_usage_poll_job``'s
+        opt-out shape.
+
+        ``model_name`` defaults to ``"MiniMax-M*"`` — the chat-models
+        bucket. Override for deployments on the speech / music / image
+        plans (each has its own per-plan quota in the response).
+        """
+        from .minimax_usage_poller import MinimaxPollerConfig, poll_once
+
+        cfg = MinimaxPollerConfig(
+            api_key=api_key,
+            model_name=model_name,
+        )
+
+        async def _run() -> None:
+            try:
+                await poll_once(cfg, rate_limit_store)
+            except Exception as exc:  # noqa: BLE001
+                # poll_once is meant to swallow its own errors via
+                # log_event; this is a defensive belt — if something
+                # leaks (e.g. import-time bug) we still surface it.
+                await log_event(
+                    "minimax_usage_failed",
+                    stage="job_wrapper",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+        return self.register_callable(
+            name=job_id,
+            fn=_run,
+            default_cron=cron_expr,
+            job_id=job_id,
+            misfire_grace_time=60,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # ---- bind-mount health probe cron --------------------------------
 
     # VSM: S3 — non-LLM safety probe for the VirtioFS bind-mount stale-
