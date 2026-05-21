@@ -128,8 +128,18 @@ def test_classify_scope_excludes_skip_paths():
 
 
 def test_classify_scope_excludes_skip_prefixes():
-    assert _classify_scope("state/social/inbox.md") is None
-    assert _classify_scope("state/social/nested/deep.md") is None
+    # Poller working dirs hold credentials (.env), cursors, and
+    # bookkeeping that should never surface via search.
+    assert _classify_scope("state/pollers/social-cli-notifications/.env") is None
+    assert _classify_scope("state/pollers/gmail-inbox/cursor.json") is None
+    assert (
+        _classify_scope("state/pollers/social-cli-notifications/inbox-bsky.yaml")
+        is None
+    )
+    # Even an accidental .md drop under state/pollers is excluded.
+    assert (
+        _classify_scope("state/pollers/social-cli-notifications/notes.md") is None
+    )
     # Sibling state subtree unaffected.
     assert _classify_scope("state/seeds/x.md") == "state"
 

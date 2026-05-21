@@ -337,7 +337,14 @@ INDEX_SKIP_PATHS: frozenset[str] = frozenset(
     }
 )
 INDEX_SKIP_PREFIXES: tuple[str, ...] = (
-    "state/social/",  # social-cli artifacts (FUTURE_WORK §10.1)
+    # Poller working directories — non-content state (cursors, inboxes,
+    # credentials, processed-message manifests). Nothing under here is
+    # authored knowledge the agent should retrieve. Belt-and-suspenders
+    # since the indexer is already .md-only and pollers write .json /
+    # .yaml / .env, but protects against accidental .md drops (e.g. a
+    # poller logging a notes file) and against future indexer expansion
+    # to non-.md formats.
+    "state/pollers/",
 )
 
 
