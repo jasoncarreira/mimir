@@ -436,32 +436,61 @@ def make_codex_plus_rate_limit_callback(
     """
     import datetime as _dt
 
+    from .event_logger import log_event_sync
+
     def _callback(rl: Any) -> None:
         observed_at = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
         if rl is None:
             return
+        # Collect snapshots first so we can emit a single combined
+        # ``codex_plus_usage_ok`` event at the end — same shape as
+        # ``minimax_usage_ok`` / ``oauth_usage_ok`` so ``usage_history``
+        # treats all three providers uniformly.
+        recorded: dict[str, dict[str, Any]] = {}
         primary = getattr(rl, "primary", None)
         if primary is not None and primary.used_percent is not None:
+            util = float(primary.used_percent) / 100.0
             store.record_sync(
                 "openai_five_hour",
                 RateLimitSnapshot(
                     status="allowed",
-                    utilization=float(primary.used_percent) / 100.0,
+                    utilization=util,
                     resets_at=primary.reset_at,
                     observed_at=observed_at,
                 ),
             )
+            recorded["five_hour"] = {
+                "utilization": util,
+                "resets_at": primary.reset_at,
+                "status": "allowed",
+            }
         secondary = getattr(rl, "secondary", None)
         if secondary is not None and secondary.used_percent is not None:
+            util = float(secondary.used_percent) / 100.0
             store.record_sync(
                 "openai_seven_day",
                 RateLimitSnapshot(
                     status="allowed",
-                    utilization=float(secondary.used_percent) / 100.0,
+                    utilization=util,
                     resets_at=secondary.reset_at,
                     observed_at=observed_at,
                 ),
             )
+            recorded["seven_day"] = {
+                "utilization": util,
+                "resets_at": secondary.reset_at,
+                "status": "allowed",
+            }
+        # Emit one event per response so the ops dashboard can build
+        # a time series. Best-effort — log_event_sync's OSError path
+        # already swallows file IO errors at WARN; we belt-and-suspender
+        # against logger-not-initialized too (some tests construct the
+        # callback before event_logger.init_logger has run).
+        if recorded:
+            try:
+                log_event_sync("codex_plus_usage_ok", recorded=recorded)
+            except (RuntimeError, OSError):
+                pass
 
     return _callback
 

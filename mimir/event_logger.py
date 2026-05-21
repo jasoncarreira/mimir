@@ -85,6 +85,22 @@ class EventLogger:
             except OSError as exc:
                 log.warning("events.jsonl write failed: %s", exc)
 
+    def log_sync(self, event_type: str, **payload: Any) -> None:
+        """Synchronous append — see ``log_event_sync`` for callsite
+        rationale. No async lock acquisition; relies on POSIX
+        ``O_APPEND`` atomicity. Errors are swallowed at WARN (same as
+        the async path) so a misbehaving log sink never crashes the
+        primary work path."""
+        record = self._record(event_type, payload)
+        try:
+            self._ensure_dir()
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
+            self._line_count += 1
+            # Trim deferred to the async path — see comment in log().
+        except OSError as exc:
+            log.warning("events.jsonl sync write failed: %s", exc)
+
     def _record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         rec: dict[str, Any] = {
             "timestamp": _utc_now_iso(),
@@ -158,6 +174,17 @@ def get_logger() -> EventLogger:
 
 async def log_event(event_type: str, **payload: Any) -> None:
     await get_logger().log(event_type, **payload)
+
+
+def log_event_sync(event_type: str, **payload: Any) -> None:
+    """Sync variant for callsites that can't await — e.g. langchain
+    ``rate_limit_callback`` invoked inline on the chat model's response
+    path. POSIX ``O_APPEND`` keeps writes atomic at the OS level for
+    records well under ``PIPE_BUF`` (4 KB on Linux), so the sync path
+    doesn't interleave with the async writer even when both fire at the
+    same time. Trimming is intentionally deferred — the next async
+    ``log_event`` will catch up on the line-count check."""
+    get_logger().log_sync(event_type, **payload)
 
 
 async def safe_log_event(event_type: str, **payload: Any) -> None:
