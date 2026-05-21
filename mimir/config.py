@@ -514,6 +514,18 @@ class Config:
     oauth_usage_poll_cron: str
     oauth_refresh_warn_days: int
 
+    # Minimax usage poller (mimir/minimax_usage_poller.py): hits
+    # ``www.minimax.io/v1/api/openplatform/coding_plan/remains`` and
+    # writes ``minimax_five_hour`` / ``minimax_seven_day`` snapshots
+    # to ``RateLimitStore``. Independent of the Anthropic OAuth poller;
+    # typical deployments use one or the other based on which gateway
+    # the agent talks to. Disabled by default (empty cron) — operator
+    # opts in by setting ``MIMIR_MINIMAX_USAGE_POLL_CRON`` (e.g.
+    # ``*/3 * * * *`` to match the Anthropic poller cadence) and
+    # providing ``MINIMAX_API_KEY``.
+    minimax_usage_poll_cron: str
+    minimax_usage_model_name: str
+
     # Bind-mount health probe (mimir/health_probe.py): detects the
     # VirtioFS stale-inode failure mode and self-restarts via SIGTERM
     # to PID 1 so Docker's restart-unless-stopped policy re-mounts
@@ -715,6 +727,17 @@ class Config:
             ),
             oauth_refresh_warn_days=_env_int(
                 "MIMIR_OAUTH_REFRESH_WARN_DAYS", 25,
+            ),
+
+            # Default to empty (disabled). Minimax deployments opt in
+            # by setting both this env + MINIMAX_API_KEY. The poller's
+            # server-side registration in server.py double-checks the
+            # API key is present before scheduling.
+            minimax_usage_poll_cron=_env(
+                "MIMIR_MINIMAX_USAGE_POLL_CRON", "",
+            ),
+            minimax_usage_model_name=_env(
+                "MIMIR_MINIMAX_USAGE_MODEL", "MiniMax-M*",
             ),
 
             health_probe_cron=_env(
