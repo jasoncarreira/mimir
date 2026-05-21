@@ -205,6 +205,51 @@ def test_callback_tolerates_none_input(tmp_path: Path):
     assert store.current() == {}
 
 
+def test_callback_emits_codex_plus_usage_ok_event(tmp_path: Path):
+    """End-to-end: the callback writes a ``codex_plus_usage_ok`` event
+    to events.jsonl so ``usage_history`` can build a time series.
+    Shape matches ``minimax_usage_ok`` / ``oauth_usage_ok``: a
+    ``recorded`` dict with un-prefixed window keys (``five_hour``,
+    ``seven_day``) and ``{utilization, resets_at, status}`` per snap."""
+    import json
+
+    from mimir.event_logger import init_logger
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="t-1")
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    primary_reset = int(time.time()) + 5 * 3600
+    secondary_reset = int(time.time()) + 7 * 24 * 3600
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(used_percent=25.0, reset_at=primary_reset),
+        secondary=_FakeQuotaWindow(used_percent=8.0, reset_at=secondary_reset),
+    ))
+    lines = events_path.read_text().splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["type"] == "codex_plus_usage_ok"
+    assert set(rec["recorded"].keys()) == {"five_hour", "seven_day"}
+    assert rec["recorded"]["five_hour"]["utilization"] == pytest.approx(0.25)
+    assert rec["recorded"]["five_hour"]["resets_at"] == primary_reset
+    assert rec["recorded"]["seven_day"]["utilization"] == pytest.approx(0.08)
+
+
+def test_callback_emits_no_event_when_no_windows(tmp_path: Path):
+    """A None input must not emit a misleading empty event."""
+    from mimir.event_logger import init_logger
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="t-2")
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    callback(None)
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(used_percent=None),
+    ))
+    assert not events_path.exists() or events_path.read_text() == ""
+
+
 # ─── End-to-end read: OpenAIQuotaProvider sees what the callback wrote ─
 
 
