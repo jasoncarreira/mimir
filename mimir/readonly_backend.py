@@ -32,6 +32,33 @@ from deepagents.backends.protocol import EditResult, FileUploadResponse, WriteRe
 log = logging.getLogger(__name__)
 
 
+class _RootAwareFilesystemBackend(FilesystemBackend):
+    """FilesystemBackend that treats absolute paths under ``cwd`` as virtual.
+
+    Upstream's ``virtual_mode=True`` resolves every incoming path as a
+    virtual path under ``cwd``, so ``/mimir-home/state/foo.md`` becomes
+    ``cwd/mimir-home/state/foo.md`` on disk — i.e. double-prefixed.
+    Agents that see container-absolute paths in shell output (or in the
+    feedback signals at the top of the prompt) naturally call
+    ``read_file("/mimir-home/...")`` and get a misleading "not found",
+    even when the file is right there.
+
+    The fix: if an incoming absolute path is already rooted at ``cwd``,
+    strip the prefix before ``_resolve_path`` sees it. The virtual form
+    (``/state/foo.md``) still works unchanged, so existing callers are
+    not affected.
+    """
+
+    def _resolve_path(self, key: str) -> Path:
+        if self.virtual_mode and key.startswith("/"):
+            root_str = str(self.cwd).rstrip("/")
+            if key == root_str:
+                key = "/"
+            elif key.startswith(root_str + "/"):
+                key = "/" + key[len(root_str) + 1:]
+        return super()._resolve_path(key)
+
+
 def _normalize_writable_dir(name: str) -> str | None:
     """Reject unsafe names (``.``, ``..``, absolute, traversal) up-front.
 
@@ -95,7 +122,7 @@ class WriteGuardBackend:
 
     def __init__(self, root_dir: Path, writable_dirs: list[str]) -> None:
         self._root = Path(root_dir).resolve()
-        self._fs = FilesystemBackend(root_dir=root_dir, virtual_mode=True)
+        self._fs = _RootAwareFilesystemBackend(root_dir=root_dir, virtual_mode=True)
         cleaned: list[str] = []
         for d in writable_dirs:
             normalized = _normalize_writable_dir(d)
@@ -146,12 +173,34 @@ class WriteGuardBackend:
             f"add it to _ALLOWED_READS after auditing whether it's a mutator."
         )
 
+    def _canonicalize_path(self, file_path: str) -> str:
+        """Strip the container-root prefix from absolute paths.
+
+        Agents see container-absolute paths (``/mimir-home/state/x.md``)
+        in shell output and feedback signals, then pass them straight to
+        read/write tools. Without this collapse, both the FilesystemBackend
+        (with ``virtual_mode=True``) and ``_resolve_target`` end up
+        double-prefixing the path with ``root_dir``.
+        """
+        if not file_path.startswith("/"):
+            return file_path
+        root_str = str(self._root).rstrip("/")
+        if file_path == root_str:
+            return "/"
+        if file_path.startswith(root_str + "/"):
+            return "/" + file_path[len(root_str) + 1:]
+        return file_path
+
     def _resolve_target(self, file_path: str) -> Path | None:
         """Resolve a tool-supplied path to a real filesystem location.
 
         Returns ``None`` when the input contains lexical traversal that
         survives normalization (cheap check before hitting the disk).
         """
+        # Strip the container-root prefix (no-op when the path is already
+        # in virtual form) so the writable-root check sees the same path
+        # the FilesystemBackend will receive after canonicalization.
+        file_path = self._canonicalize_path(file_path)
         # Strip leading slashes so the input is always relative to root.
         relative = PurePosixPath(file_path.lstrip("/"))
         # Lexical traversal rejection before touching the disk: anything
@@ -183,7 +232,14 @@ class WriteGuardBackend:
             return WriteResult(
                 error=f"Write blocked. Writable directories: {self._allowed_dirs_label()}",
             )
-        return self._fs.write(file_path=file_path, content=content)
+        # Idempotent with the strip already applied inside
+        # ``_resolve_target`` during the writable-root check — the
+        # explicit call here keeps the forward to ``self._fs`` self-
+        # contained against future refactors of ``_resolve_target``.
+        return self._fs.write(
+            file_path=self._canonicalize_path(file_path),
+            content=content,
+        )
 
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         return self.write(file_path=file_path, content=content)
@@ -200,8 +256,9 @@ class WriteGuardBackend:
             return EditResult(
                 error=f"Edit blocked. Writable directories: {self._allowed_dirs_label()}",
             )
+        # Idempotent with ``_resolve_target`` — see ``write`` above.
         return self._fs.edit(
-            file_path=file_path,
+            file_path=self._canonicalize_path(file_path),
             old_string=old_string,
             new_string=new_string,
             replace_all=replace_all,
@@ -253,7 +310,7 @@ class ReadOnlyFilesystemBackend:
     _ALLOWED_READS = WriteGuardBackend._ALLOWED_READS
 
     def __init__(self, root_dir: Path) -> None:
-        self._fs = FilesystemBackend(root_dir=root_dir, virtual_mode=True)
+        self._fs = _RootAwareFilesystemBackend(root_dir=root_dir, virtual_mode=True)
 
     def __getattr__(self, name: str) -> Any:
         if name in self._ALLOWED_READS:

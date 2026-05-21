@@ -63,6 +63,32 @@ class TestWriteGuardBackend:
         text = getattr(result, "content", None) or str(result)
         assert "preexisting" in text
 
+    def test_read_with_container_absolute_path(self, home: Path) -> None:
+        # Agents in muninn-mimir frequently see container-absolute paths
+        # (e.g. /mimir-home/state/x.md) in shell output and feedback
+        # signals, then call read_file with that exact path. Upstream's
+        # virtual_mode=True double-prefixes the path; the
+        # _RootAwareFilesystemBackend strips the cwd prefix so both
+        # forms resolve to the same file. Regression for turn
+        # 1da3c007b611 where 4 read_file calls failed against existing
+        # files because the agent passed the absolute container path.
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        absolute = f"{home}/logs/existing.txt"
+        result = b.read(file_path=absolute)
+        text = getattr(result, "content", None) or str(result)
+        assert "preexisting" in text
+
+    def test_write_with_container_absolute_path(self, home: Path) -> None:
+        # Writes via the container-absolute form must reach the same
+        # file as the virtual form. Without the prefix-strip, the write
+        # would land at <home>/<home>/state/x.txt — outside the writable
+        # root, so it would error AND/OR write to the wrong place.
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        absolute = f"{home}/state/from-absolute.txt"
+        r = b.write(file_path=absolute, content="ok")
+        assert getattr(r, "error", None) is None
+        assert (home / "state" / "from-absolute.txt").read_text() == "ok"
+
     def test_blocks_edit_outside_writable_root(self, home: Path) -> None:
         b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
         r = b.edit(
