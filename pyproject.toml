@@ -33,7 +33,7 @@ dependencies = [
 # the matching package, so installing only one keeps the dep graph
 # small. Pick at least one or the agent can't build a model.
 claude-code = [
-    "langchain-claude-code>=0.1.0",
+    "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39",
 ]
 anthropic = [
     "langchain-anthropic>=1.4",
@@ -63,7 +63,7 @@ dev = [
     "discord-py>=2.6",
     "slack-bolt>=1.18",
     # Tests touch all four model adapters at the import level.
-    "langchain-claude-code>=0.1.0",
+    "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39",
     "langchain-anthropic>=1.4",
     "langchain-openai>=1.2.1",
     "langchain-codex-plus>=0.0.1,<0.1",
@@ -82,6 +82,13 @@ mimir = "mimir.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# Permit ``pkg @ git+https://...`` direct references in
+# project.optional-dependencies. We pin ``langchain-claude-code`` to
+# our fork SHA while upstream PRs (#2, #4, #6) land; once those merge
+# we can revert to the registry version and drop this flag.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["mimir"]
@@ -134,7 +141,7 @@ dev = [
     "pytest-aiohttp>=1.0",
     "discord-py>=2.6",
     "slack-bolt>=1.18",
-    "langchain-claude-code>=0.1.0",
+    "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39",
     "langchain-anthropic>=1.4",
     "langchain-openai>=1.2.1",
     "langchain-codex-plus>=0.0.1,<0.1",
