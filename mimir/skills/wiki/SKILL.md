@@ -6,7 +6,7 @@ allowed-tools:
   - Read
   - Write
   - file_search
-  - saga_store
+  - memory_store
 ---
 
 # Wiki
