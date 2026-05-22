@@ -247,6 +247,12 @@ def _render_return_summary(returns_schema: dict[str, Any]) -> str:
     """One-line return-shape summary for the SubAgent description.
 
     Example: ``Returns: forecast, high_temp_c, low_temp_c.``
+
+    Top-level ``properties`` keys only — nested structure is visible
+    in the system_prompt's ``response_format`` block but kept out of
+    the description (a trigger heuristic, not a full schema). A
+    deeply-nested ``returns`` schema (e.g. weather's ``current`` and
+    ``forecast`` sub-objects) renders as just the top names.
     """
     props = returns_schema.get("properties") or {}
     if not props:
