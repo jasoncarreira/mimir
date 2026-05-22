@@ -34,7 +34,7 @@ returns:
 
 # Find Skills
 
-mimir's bundled skills live under `.claude/skills/<name>/SKILL.md` (relative
+mimir's bundled skills live under `skills/<name>/SKILL.md` (relative
 to `MIMIR_HOME`). The system prompt's Skills section already lists them by
 name; this skill is for *discovery* — when you want a one-line description of
 what each skill is for, or you're searching for a capability and want to see
@@ -43,7 +43,7 @@ if it's already covered.
 ## List all skills with descriptions
 
 ```bash
-for d in "$HOME"/.claude/skills/*/; do
+for d in "$HOME"/skills/*/; do
   name=$(basename "$d")
   # Extract the description: line from the YAML frontmatter (between the two ---).
   desc=$(awk '/^---$/{n++; next} n==1 && /^description:/{sub(/^description:[[:space:]]*/, ""); print; exit}' "$d/SKILL.md")
@@ -56,13 +56,13 @@ done
 ## Find a skill by keyword
 
 ```bash
-grep -l -i "<keyword>" "$HOME"/.claude/skills/*/SKILL.md
+grep -l -i "<keyword>" "$HOME"/skills/*/SKILL.md
 ```
 
 Or to search the descriptions specifically:
 
 ```bash
-for d in "$HOME"/.claude/skills/*/; do
+for d in "$HOME"/skills/*/; do
   name=$(basename "$d")
   desc=$(awk '/^---$/{n++; next} n==1 && /^description:/{sub(/^description:[[:space:]]*/, ""); print; exit}' "$d/SKILL.md")
   if echo "$desc" | grep -qi "<keyword>"; then
@@ -74,11 +74,11 @@ done
 ## Read a specific skill in full
 
 ```bash
-cat "$HOME/.claude/skills/<name>/SKILL.md"
+cat "$HOME/skills/<name>/SKILL.md"
 ```
 
 Skills with `references/` or `scripts/` subdirectories carry additional
-material — `ls "$HOME/.claude/skills/<name>/"` to see what else is there.
+material — `ls "$HOME/skills/<name>/"` to see what else is there.
 
 ## When you've decided a capability isn't covered
 

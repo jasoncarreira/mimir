@@ -47,8 +47,8 @@ To monitor:
 
 ## Finding sessions
 
-- List sessions on your socket: `.claude/skills/tmux/scripts/find-sessions.sh -S "$SOCKET"`.
-- Scan all sockets in `MIMIR_TMUX_SOCKET_DIR`: `.claude/skills/tmux/scripts/find-sessions.sh --all`.
+- List sessions on your socket: `skills/tmux/scripts/find-sessions.sh -S "$SOCKET"`.
+- Scan all sockets in `MIMIR_TMUX_SOCKET_DIR`: `skills/tmux/scripts/find-sessions.sh --all`.
 
 ## Sending input safely
 
@@ -58,7 +58,7 @@ To monitor:
 ## Watching output
 
 - Capture recent history: `tmux -S "$SOCKET" capture-pane -p -J -t target -S -200`.
-- Wait for a prompt / pattern: `.claude/skills/tmux/scripts/wait-for-text.sh -t session:0.0 -p 'pattern'`.
+- Wait for a prompt / pattern: `skills/tmux/scripts/wait-for-text.sh -t session:0.0 -p 'pattern'`.
 - Attaching is OK; detach with `Ctrl+b d`.
 
 ## Spawning processes
@@ -73,11 +73,11 @@ To monitor:
 
 ## Helper: wait-for-text.sh
 
-`.claude/skills/tmux/scripts/wait-for-text.sh` polls a pane for a regex (or fixed
+`skills/tmux/scripts/wait-for-text.sh` polls a pane for a regex (or fixed
 string) with a timeout.
 
 ```bash
-.claude/skills/tmux/scripts/wait-for-text.sh -t session:0.0 -p 'pattern' [-F] [-T 20] [-i 0.5] [-l 2000]
+skills/tmux/scripts/wait-for-text.sh -t session:0.0 -p 'pattern' [-F] [-T 20] [-i 0.5] [-l 2000]
 ```
 
 - `-t`/`--target` pane target (required)

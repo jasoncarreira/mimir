@@ -13,13 +13,24 @@ This middleware closes that gap by replacing ``state["skills_metadata"]``
 (SkillsMiddleware's render-time source of truth) with a filtered list
 that excludes any name in :attr:`FilterDelegatedSkillsMiddleware.delegated_skill_names`.
 
-Ordering: the middleware MUST run AFTER ``SkillsMiddleware`` so that
-SkillsMiddleware's ``before_agent`` populates the metadata first.
+**State schema** — we explicitly declare ``state_schema = SkillsState``
+(SkillsMiddleware's schema, which carries ``skills_metadata``). Without
+this, langgraph's per-middleware schema merge doesn't include the
+field in our middleware's visible state, and the update we return
+gets silently dropped (the field isn't in the graph's reducer table
+from our middleware's perspective). The bug fixed here: muninn-mimir
+2026-05-22 22:57 weather invocation went inline rather than via
+``task()`` because the inline catalog still contained ``weather``
+despite this middleware nominally being wired — the missing schema
+declaration meant the filter's state update never landed.
+
+**Ordering** — the middleware MUST run AFTER ``SkillsMiddleware`` so
+that SkillsMiddleware's ``before_agent`` populates the metadata first.
 ``create_deep_agent`` appends user-passed ``middleware=[...]`` entries
 after the framework's built-in middleware stack (graph.py:708-709), so
 passing this middleware via that kwarg achieves the right order.
 
-State reducer: ``skills_metadata`` is annotated only with
+**State reducer** — ``skills_metadata`` is annotated only with
 ``PrivateStateAttr`` (a schema annotation, not a reducer), so langgraph's
 default REPLACE semantics apply — our update overwrites the unfiltered
 value.
@@ -30,6 +41,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from deepagents.middleware.skills import SkillsState
 from langchain.agents.middleware.types import (
     AgentMiddleware,
 )
@@ -43,7 +55,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-class FilterDelegatedSkillsMiddleware(AgentMiddleware[Any, Any, Any]):
+class FilterDelegatedSkillsMiddleware(AgentMiddleware[SkillsState, Any, Any]):
     """Drop delegated skills from ``state["skills_metadata"]`` before the model sees the catalog.
 
     Args:
@@ -53,9 +65,10 @@ class FilterDelegatedSkillsMiddleware(AgentMiddleware[Any, Any, Any]):
             dropped from the rendered ``Skills System`` block.
     """
 
-    # SkillsMiddleware defines its own state_schema (SkillsState) with
-    # ``skills_metadata``; we don't need to redeclare since langgraph
-    # merges state schemas across middlewares declared on the same graph.
+    # langgraph needs us to declare the state schema that carries
+    # ``skills_metadata`` so the reducer table picks up our updates.
+    # See the module docstring for the bug this fixes.
+    state_schema = SkillsState
 
     def __init__(self, *, delegated_skill_names: Iterable[str]) -> None:
         self._delegated = frozenset(delegated_skill_names)
@@ -63,14 +76,11 @@ class FilterDelegatedSkillsMiddleware(AgentMiddleware[Any, Any, Any]):
     def _filter(self, state: dict[str, Any]) -> dict[str, Any] | None:
         """Return a state update with the filtered list, or ``None`` if no change."""
         metadata = state.get("skills_metadata")
-        # Entry log so middleware-ordering regressions surface fast.
-        # We rely on user-passed middleware appending AFTER
-        # ``SkillsMiddleware`` in deepagents' built-in stack
-        # (graph.py:708-709); if a framework change ever reorders
-        # that, this filter runs against an empty state and silently
-        # becomes a no-op. The "0 entries" debug line at startup
-        # will give an operator the obvious smoke signal.
-        log.debug(
+        # INFO-level entry log so ordering / wiring regressions surface
+        # fast in deployment logs. The "0 entries" case at startup
+        # would mean either SkillsMiddleware didn't run before us
+        # (graph stack changed) or the schema isn't being merged.
+        log.info(
             "FilterDelegatedSkillsMiddleware: called with %d "
             "skills_metadata entries; %d delegated names registered",
             len(metadata) if isinstance(metadata, list) else 0,
@@ -85,7 +95,7 @@ class FilterDelegatedSkillsMiddleware(AgentMiddleware[Any, Any, Any]):
         if len(filtered) == len(metadata):
             return None
         dropped = len(metadata) - len(filtered)
-        log.debug(
+        log.info(
             "filtered %d delegated skill(s) from the inline catalog "
             "(remaining=%d)", dropped, len(filtered),
         )
