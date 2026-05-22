@@ -83,15 +83,13 @@ import yaml
 log = logging.getLogger(__name__)
 
 
-# Skills that declare ``allowed-tools`` for documentation but need parent
-# context to operate. Bypass subagent compilation; they stay inline.
-#
-# Promote to an ``inline: true`` frontmatter flag in the follow-up that
-# generalizes the spike.
-_REFLECTIVE_OVERRIDE: frozenset[str] = frozenset({
-    "memory",
-    "wiki",
-})
+# Removed 2026-05-22: the _REFLECTIVE_OVERRIDE set existed when the
+# trigger for compilation was "skill declares allowed-tools". That
+# heuristic produced too many false positives — operators used
+# allowed-tools as documentation ("the skill talks about these tools")
+# not as a delegation signal. The flipped contract: skills are inline
+# by default and opt IN to delegation with ``subagent: true`` in
+# frontmatter. With opt-in there's no need for an override set.
 
 
 # Framework built-in tool names (capitalized) that deepagents'
@@ -284,7 +282,6 @@ def compile_skills_to_subagents(
     parent_tools: list[Any],
     *,
     skills_subdir: str | None = None,
-    reflective_override: frozenset[str] = _REFLECTIVE_OVERRIDE,
 ) -> CompileResult:
     """Scan ``<home>/skills/*/SKILL.md`` and
     ``<home>/.mimir_builtin_skills/*/SKILL.md`` and compile eligible
@@ -293,17 +290,25 @@ def compile_skills_to_subagents(
     Mirrors SkillsMiddleware's dual-location discovery and its
     last-source-wins shadowing: bundled skills are scanned first, then
     operator-installed skills override same-named entries. A fresh
-    deployment with only the bundled refresh in place gets the full
-    bundled SubAgent set; operators customize a skill by installing
+    deployment with only the bundled refresh in place gets the bundled
+    delegation set; operators customize a skill by installing
     same-named content under ``<home>/skills/`` (the operator location
     wins on name collision).
+
+    **Delegation contract (post-2026-05-22, opt-in)**: skills are
+    inline by default and opt IN to delegation via ``subagent: true``
+    in frontmatter. The prior heuristic ("declares allowed-tools →
+    delegate") produced too many false positives — operators used
+    ``allowed-tools`` as documentation rather than as a delegation
+    signal. Genuine SubAgent candidates (narrow tool surface, bounded
+    workflow, parent context not load-bearing) explicitly mark
+    themselves with ``subagent: true``.
 
     A skill is eligible iff:
 
     1. The directory contains a readable SKILL.md
     2. Frontmatter parses (or is empty — empty == ineligible)
-    3. Frontmatter declares ``allowed-tools`` as a non-empty list
-    4. The skill name is NOT in ``reflective_override``
+    3. Frontmatter declares ``subagent: true``
 
     For each eligible skill, the function produces a SubAgent spec with:
 
@@ -314,7 +319,8 @@ def compile_skills_to_subagents(
     - ``system_prompt`` = the SKILL.md body (frontmatter stripped)
     - ``tools`` = the resolved subset of ``allowed-tools`` (custom
       mimir tools; framework built-ins auto-included via subagent
-      middleware)
+      middleware). If ``allowed-tools`` is absent, the SubAgent
+      inherits the framework default tool surface.
 
     Framework built-ins (Bash, Read, Write, etc.) in ``allowed-tools``
     are noted but not explicitly registered — deepagents' default
@@ -370,18 +376,21 @@ def compile_skills_to_subagents(
         if not isinstance(meta, dict) or not meta:
             continue
 
-        allowed = meta.get("allowed-tools") or meta.get("allowed_tools")
-        if not allowed or not isinstance(allowed, list):
+        # Delegation is opt-in: the skill must declare ``subagent: true``.
+        # Anything else stays inline (read SKILL.md into parent context).
+        if meta.get("subagent") is not True:
             continue
 
         # Frontmatter name wins; directory name is the fallback.
         name = str(meta.get("name") or skill_name)
-        if name in reflective_override:
-            log.debug(
-                "skill %s in reflective_override; staying inline despite "
-                "allowed-tools declaration", name,
-            )
-            continue
+
+        # ``allowed-tools`` is optional for delegated skills — when
+        # absent, the SubAgent inherits the framework's default tool
+        # surface. When present, we resolve it into the SubAgent's
+        # explicit ``tools`` field.
+        allowed = meta.get("allowed-tools") or meta.get("allowed_tools") or []
+        if not isinstance(allowed, list):
+            allowed = []
 
         # Resolve allowed-tools entries.
         custom_tools: list[Any] = []

@@ -1,6 +1,7 @@
 ---
 name: identity-lookup
 description: Look up who an alias belongs to (people) or what a channel id is (channels) using state/identities.yaml. Use when the operator or a turn-context refers to a platform-prefixed id ("who is discord-238367217903730690?", "what channel is slack-C100?") or you need to resolve aliases the other direction (canonical → display name + aliases). Read-side only — the populator (mimir.identities_populator) maintains the registry.
+subagent: true
 allowed-tools:
   - Bash
   - Read
