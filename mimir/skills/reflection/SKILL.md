@@ -7,7 +7,7 @@ allowed-tools:
   - Glob
   - Read
   - Write
-  - saga_query
+  - memory_query
 ---
 
 # Reflection
