@@ -141,7 +141,7 @@ Two caveats on the edit itself:
 
 * The skills shipped under `mimir/skills/` are part of the mimir source repo. The right
   shape is a PR against `jasoncarreira/mimir`, not an in-place edit on the deployed
-  agent's `.claude/skills/` copy. The bot has been doing this for skill updates already.
+  agent's `skills/` copy. The bot has been doing this for skill updates already.
 * Edit the skill *with the lesson encoded*, not as a rant. The next reader (you, in a
   future turn, with no context) needs the *rule*, not the *story*.
 
