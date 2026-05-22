@@ -865,6 +865,25 @@ class Agent:
             if operator_dir.is_dir():
                 skill_sources.append(str(operator_dir))
 
+            # Drop delegated skill names from the inline ``Skills System``
+            # catalog so the agent doesn't see them in both the ``task``
+            # tool catalog (via SubAgentMiddleware) and as inline skills
+            # (via SkillsMiddleware). The filter middleware runs AFTER
+            # SkillsMiddleware (user-passed middleware is appended past
+            # the framework stack — graph.py:708-709) so SkillsMiddleware
+            # populates ``state["skills_metadata"]`` first, then ours
+            # replaces it with a filtered view.
+            extra_middleware: list[Any] = []
+            if self._delegated_skill_names:
+                from ._skills_filter_middleware import (
+                    FilterDelegatedSkillsMiddleware,
+                )
+                extra_middleware.append(
+                    FilterDelegatedSkillsMiddleware(
+                        delegated_skill_names=self._delegated_skill_names,
+                    )
+                )
+
             self._agent = create_deep_agent(
                 model=_resolve_model(
                     model_spec,
@@ -876,6 +895,7 @@ class Agent:
                 backend=backend,
                 subagents=self._delegated_subagent_specs,
                 skills=skill_sources or None,
+                middleware=extra_middleware,
             )
             return self._agent
 
