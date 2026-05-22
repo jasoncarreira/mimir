@@ -8,11 +8,25 @@ been tried sit in their own bucket so they don't crowd the proven ones.
 Same shape as saga's ``mark_contributions`` but at the skill layer —
 the second real amplification (positive feedback) loop in mimir.
 
-The data source: each AssistantMessage with a ``Skill`` tool_use block
-emits a ``tool_call`` event in turns.jsonl with ``name == "Skill"`` and
-``args.skill == "<skill-name>"``. The matching ``tool_result`` carries
-``is_error`` and a possibly-truncated ``content`` body. We pair them by
-``id`` to classify outcome.
+Two signals get folded into the per-skill counters:
+
+1. **Claude Code runtime** (Letta-era / claude-agent-sdk): each
+   AssistantMessage with a ``Skill`` tool_use block emits a
+   ``tool_call`` event with ``name == "Skill"`` and
+   ``args.skill == "<skill-name>"``. The matching ``tool_result``
+   carries ``is_error``. We pair them by ``id``.
+
+2. **deepagents runtime** (mimir today): there is no ``Skill`` tool —
+   ``SkillsMiddleware`` injects prompt instructions telling the model
+   to load a skill by calling ``read_file`` on its ``SKILL.md``. We
+   recognise ``read_file`` calls whose ``file_path`` matches
+   ``.claude/skills/<name>/SKILL.md`` (any prefix tolerated:
+   ``/mimir-home/...``, ``./...``, bare relative) and treat them as
+   skill loads. Even when ``SkillsMiddleware`` itself isn't wired
+   (mimir's current state — see ``_assemble_skill_block`` for the
+   in-house prompt-block equivalent), the agent still uses this same
+   ``read_file`` pathway when invoking a skill from a prompt that
+   says "load the `<name>` skill", so this signal works regardless.
 
 Outcome classification:
   - **success**   — tool_result with is_error=False, no in-turn retry
@@ -32,6 +46,7 @@ Operator override via ``state/skill-pin.yaml``:
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -39,6 +54,13 @@ from pathlib import Path
 from typing import Iterable
 
 import yaml
+
+# ``.claude/skills/<name>/SKILL.md`` with any prefix
+# (``/mimir-home/...``, ``./...``, bare relative). The capture group
+# is the skill name — exactly one path segment, no nested categories.
+_SKILL_READ_RE = re.compile(
+    r"(?:^|/)\.claude/skills/([^/]+)/SKILL\.md$",
+)
 
 
 # VSM: S3 — skill amplification. Per-skill success-rate aggregator
@@ -160,12 +182,28 @@ def _classify_skill_calls(
         if not isinstance(ev, dict):
             continue
         etype = ev.get("type")
-        if etype == "tool_call" and ev.get("name") == "Skill":
+        if etype == "tool_call":
+            name = ev.get("name")
             args = ev.get("args") or {}
-            skill = (args.get("skill") if isinstance(args, dict) else None) or "?"
-            tool_id = ev.get("id")
-            if isinstance(tool_id, str) and skill:
-                pending[tool_id] = str(skill)
+            if not isinstance(args, dict):
+                args = {}
+            skill: str | None = None
+            if name == "Skill":
+                # Claude Code runtime: structured Skill tool invocation.
+                raw_skill = args.get("skill")
+                if raw_skill:
+                    skill = str(raw_skill)
+            elif name == "read_file":
+                # deepagents runtime: SKILL.md read = skill load.
+                file_path = args.get("file_path") or ""
+                if isinstance(file_path, str):
+                    m = _SKILL_READ_RE.search(file_path)
+                    if m:
+                        skill = m.group(1)
+            if skill:
+                tool_id = ev.get("id")
+                if isinstance(tool_id, str):
+                    pending[tool_id] = skill
         elif etype == "tool_result":
             tool_id = ev.get("id")
             if isinstance(tool_id, str) and tool_id in pending:
