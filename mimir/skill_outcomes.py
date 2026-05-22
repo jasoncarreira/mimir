@@ -40,11 +40,10 @@ Outcome classification:
     routed back). Treated as failure for ranking purposes but
     counted separately for diagnostics.
 
-Operator override via ``state/skill-pin.yaml``:
-  ```yaml
-  pin_top: [memory, wiki]
-  hide: [legacy-thing]
-  ```
+Skill catalog rendering is handled by deepagents' ``SkillsMiddleware``
+(per the architecture restoration in PR #265). This module focuses on
+per-skill telemetry — success/failure counts surfaced into the
+``## Self-state`` block of the system prompt — not catalog rendering.
 """
 
 from __future__ import annotations
@@ -52,18 +51,22 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Iterable
 
-import yaml
-
-# ``.claude/skills/<name>/SKILL.md`` with any prefix
-# (``/mimir-home/...``, ``./...``, bare relative). The capture group
-# is the skill name — exactly one path segment, no nested categories.
+# ``skills/<name>/SKILL.md`` (post-2026-05-22 relocation) or the
+# legacy ``.claude/skills/<name>/SKILL.md``, either with any prefix
+# (``/mimir-home/...``, ``./...``, bare relative). Also matches the
+# read-only bundled location ``.mimir_builtin_skills/<name>/SKILL.md``.
+# The capture group is the skill name — exactly one path segment.
+#
+# The legacy ``.claude/skills/`` alternative stays matched indefinitely
+# because old turns.jsonl records (from before the relocation) carry
+# the pre-migration path; dropping it would lose historical telemetry.
 _SKILL_READ_RE = re.compile(
-    r"(?:^|/)\.claude/skills/([^/]+)/SKILL\.md$",
+    r"(?:^|/)(?:\.claude/skills|\.mimir_builtin_skills|skills)/([^/]+)/SKILL\.md$",
 )
 
 
@@ -94,28 +97,6 @@ class SkillOutcome:
         if denom == 0:
             return None
         return self.success / denom
-
-
-@dataclass
-class SkillPinConfig:
-    """state/skill-pin.yaml shape."""
-    pin_top: list[str] = field(default_factory=list)
-    hide: list[str] = field(default_factory=list)
-
-    @classmethod
-    def load(cls, path: Path) -> "SkillPinConfig":
-        if not path.is_file():
-            return cls()
-        try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        except (OSError, yaml.YAMLError):
-            return cls()
-        if not isinstance(data, dict):
-            return cls()
-        return cls(
-            pin_top=list(data.get("pin_top") or []),
-            hide=list(data.get("hide") or []),
-        )
 
 
 def _iter_turns(path: Path) -> Iterable[dict]:
@@ -298,28 +279,21 @@ def aggregate(
 def order_skills(
     seeded: list[str],
     aggregates: dict[str, SkillOutcome],
-    pin: SkillPinConfig,
     *,
     now: datetime | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     """Return three buckets in render order:
 
       1. **Proven** — used in window with success_rate ≥ 0.5.
-         Pinned-top items get added first within this bucket;
-         everything else sorts by (success_rate desc, last_used desc).
+         Sorted by (success_rate desc, last_used desc).
       2. **Untried** — seeded but no tool calls in window. Alphabetic.
       3. **Risky** — used but success_rate < 0.5. Alphabetic.
-
-    ``hide``-listed skills are removed from all buckets.
     """
-    hidden = set(pin.hide or [])
     proven: list[tuple[str, float, datetime | None]] = []
     untried: list[str] = []
     risky: list[str] = []
 
     for name in seeded:
-        if name in hidden:
-            continue
         agg = aggregates.get(name)
         # "Untried" means no completed/failed/abandoned invocations —
         # i.e. nothing we can rank against. Skill outcomes that exist
@@ -334,107 +308,33 @@ def order_skills(
         else:
             risky.append(name)
 
-    pinned_first = [n for n in (pin.pin_top or []) if n in {p[0] for p in proven}]
-    rest = sorted(
-        [p for p in proven if p[0] not in set(pinned_first)],
-        key=lambda x: (-x[1], -(x[2].timestamp() if x[2] else 0)),
-    )
-    proven_names = pinned_first + [r[0] for r in rest]
-
-    return proven_names, sorted(untried), sorted(risky)
-
-
-# Hard cap on the per-skill description we render into the system
-# prompt's `## Skills` block. Triggers/descriptions in SKILL.md
-# frontmatter are often 100-300 chars — that's fine for the catalog
-# page, but in the every-turn system prompt we want one terminal-line
-# of signal per skill, not three. Truncate with an ellipsis past this
-# many chars. 120 is wide enough that "Use when X (a, b, c, ...)" -
-# style descriptions retain their disambiguating examples; the earlier
-# 80 cap routinely cut mid-list (flagged 2026-05-17 after PR #186
-# rendered the block in the live prompt for the first time).
-_SKILL_DESC_MAX_CHARS = 120
-
-
-def _truncate_desc(text: str, limit: int = _SKILL_DESC_MAX_CHARS) -> str:
-    """One-line truncate. Strips newlines, collapses inner whitespace,
-    trims trailing punctuation, appends an ellipsis if the source
-    exceeded ``limit``."""
-    cleaned = " ".join(text.split())
-    if len(cleaned) <= limit:
-        return cleaned.rstrip(".")
-    # Reserve one char for the ellipsis. Try to break at a word
-    # boundary inside the limit; fall back to a hard cut if no space.
-    cut = cleaned[: limit - 1]
-    space = cut.rfind(" ")
-    if space > limit // 2:
-        cut = cut[:space]
-    return cut.rstrip(",;:- ") + "…"
-
-
-def render_skill_catalog(
-    seeded: list[str],
-    pin: SkillPinConfig,
-    *,
-    descriptions: dict[str, str] | None = None,
-) -> str | None:
-    """Render the install-stable `## Skills` section for the system
-    prompt — alphabetical list of every seeded skill name, with
-    ``pin.hide``-listed skills filtered out. Pin order is NOT applied
-    here (pinning is a per-turn ranking concern, not a catalog
-    concern); rendered as a plain alphabetic list so the system prompt
-    stays cacheable across turns.
-
-    If ``descriptions`` is provided, each line is rendered as
-    ``- <name> — <one-line description>`` (truncated to
-    ``_SKILL_DESC_MAX_CHARS``); skills missing from the map render as
-    bare ``- <name>``. SKILL.md frontmatter is install-stable, so
-    descriptions don't bust the prompt cache.
-
-    Volatile bucket assignment + ``(N/M in window)`` counts live in
-    ``render_skill_telemetry`` (rendered into the per-turn
-    ``## Self-state`` block) — keeping them out of the system prompt
-    means a skill invocation no longer perturbs the prompt-cache prefix.
-
-    Returns None when no skills survive the hide filter (don't print an
-    empty header)."""
-    hidden = set(pin.hide or [])
-    visible = sorted(name for name in seeded if name not in hidden)
-    if not visible:
-        return None
-    descs = descriptions or {}
-    lines: list[str] = []
-    for name in visible:
-        desc = descs.get(name, "").strip()
-        if desc:
-            lines.append(f"- {name} — {_truncate_desc(desc)}")
-        else:
-            lines.append(f"- {name}")
-    return "\n".join(lines)
+    proven.sort(key=lambda x: (-x[1], -(x[2].timestamp() if x[2] else 0)))
+    return [p[0] for p in proven], sorted(untried), sorted(risky)
 
 
 def render_skill_telemetry(
     seeded: list[str],
     aggregates: dict[str, SkillOutcome],
-    pin: SkillPinConfig,
     *,
     now: datetime | None = None,
 ) -> str | None:
-    """Render per-turn-variable skill bucket telemetry for the
-    ``## Self-state`` block. Emits Proven (success ≥ 50%) and Risky
-    (success < 50%) buckets with ``(N/M in window)`` counts.
+    """Render per-turn skill bucket telemetry for the ``## Self-state``
+    block. Emits Proven (success ≥ 50%) and Risky (success < 50%)
+    buckets with ``(N/M in window)`` counts.
 
     Untried skills (no completed invocations in window) are *not*
-    enumerated here — the install-stable catalog in the system prompt
-    already lists them, and re-listing them here would just bloat the
-    block with names that have no telemetry to share. The model can
-    infer "any skill in the catalog not mentioned in telemetry has no
-    recent activity."
+    enumerated here — the framework's ``SkillsMiddleware`` catalog
+    already lists every available skill, and re-listing them here
+    would just bloat the block with names that have no telemetry to
+    share. The model can infer "any skill in the catalog not
+    mentioned in telemetry has no recent activity."
 
-    Returns None when no skill has any in-window activity (don't print
-    an empty header). The returned body has no leading ``## Self-state``
-    header — caller composes it into a larger block."""
-    proven, _untried, risky = order_skills(seeded, aggregates, pin, now=now)
+    Returns None when no skill has any in-window activity (don't
+    print an empty header). The returned body has no leading
+    ``## Self-state`` header — caller composes it into a larger
+    block.
+    """
+    proven, _untried, risky = order_skills(seeded, aggregates, now=now)
     if not (proven or risky):
         return None
 

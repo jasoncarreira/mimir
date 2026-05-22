@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from mimir.skills.reflection import most_retrieved as script
+from mimir.reflection import most_retrieved as script
 
 
 class _FakeClient:

@@ -82,10 +82,10 @@ def _seed_skill(
     home: Path, name: str, allowed_tools: list[str] | None,
     description: str = "test skill", body: str = "skill body text",
 ) -> None:
-    """Create ``<home>/.claude/skills/<name>/SKILL.md`` with the given
+    """Create ``<home>/skills/<name>/SKILL.md`` with the given
     frontmatter. ``allowed_tools=None`` means the field is omitted
     entirely (eligibility off)."""
-    sd = home / ".claude" / "skills" / name
+    sd = home / "skills" / name
     sd.mkdir(parents=True, exist_ok=True)
     fm_lines = [
         "---",
@@ -252,7 +252,7 @@ def test_compile_multiple_skills_with_mixed_eligibility(tmp_path: Path):
 
 def test_compile_uses_dirname_when_frontmatter_name_missing(tmp_path: Path):
     """Frontmatter without explicit ``name`` falls back to directory."""
-    sd = tmp_path / ".claude" / "skills" / "from-dir"
+    sd = tmp_path / "skills" / "from-dir"
     sd.mkdir(parents=True)
     (sd / "SKILL.md").write_text(
         "---\ndescription: x\nallowed-tools:\n  - Bash\n---\nbody\n"
@@ -269,7 +269,7 @@ def test_compile_skill_with_params_schema_renders_block(tmp_path: Path):
     """Skill declares ``params`` JSON Schema → rendered as
     ``## Parameters`` block in subagent system_prompt, summarized
     into the SubAgent description."""
-    sd = tmp_path / ".claude" / "skills" / "weather"
+    sd = tmp_path / "skills" / "weather"
     sd.mkdir(parents=True)
     (sd / "SKILL.md").write_text(
         "---\n"
@@ -305,7 +305,7 @@ def test_compile_skill_with_params_schema_renders_block(tmp_path: Path):
 def test_compile_skill_with_returns_schema_sets_response_format(tmp_path: Path):
     """Skill declares ``returns`` JSON Schema → passed verbatim to
     SubAgent ``response_format`` field, summarized into description."""
-    sd = tmp_path / ".claude" / "skills" / "weather"
+    sd = tmp_path / "skills" / "weather"
     sd.mkdir(parents=True)
     returns_block = (
         "returns:\n"
@@ -353,7 +353,7 @@ def test_compile_skill_without_params_or_returns(tmp_path: Path):
 def test_compile_skill_with_both_params_and_returns(tmp_path: Path):
     """Both fields together — both render correctly, description
     carries both summaries."""
-    sd = tmp_path / ".claude" / "skills" / "weather"
+    sd = tmp_path / "skills" / "weather"
     sd.mkdir(parents=True)
     (sd / "SKILL.md").write_text(
         "---\n"
@@ -384,7 +384,7 @@ def test_compile_skill_with_both_params_and_returns(tmp_path: Path):
 def test_compile_skill_with_malformed_params_is_ignored(tmp_path: Path):
     """``params`` that isn't a dict gets silently ignored — skill
     still compiles, just without the params rendering."""
-    sd = tmp_path / ".claude" / "skills" / "x"
+    sd = tmp_path / "skills" / "x"
     sd.mkdir(parents=True)
     (sd / "SKILL.md").write_text(
         "---\n"

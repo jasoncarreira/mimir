@@ -10,11 +10,9 @@ import pytest
 
 from mimir.skill_outcomes import (
     SkillOutcome,
-    SkillPinConfig,
     _classify_skill_calls,
     aggregate,
     order_skills,
-    render_skill_catalog,
     render_skill_telemetry,
 )
 
@@ -349,15 +347,14 @@ def test_order_skills_buckets_correctly():
         "wiki": SkillOutcome(skill="wiki", success=3, failure=4,
                               last_used=base - timedelta(hours=2)),
         # heartbeat: untried (not in aggs)
-        # alert: pin_top'd
         "alert": SkillOutcome(skill="alert", success=1, failure=0,
                               last_used=base - timedelta(days=1)),
     }
-    pin = SkillPinConfig(pin_top=["alert"], hide=[])
     proven, untried, risky = order_skills(
-        ["memory", "wiki", "alert", "heartbeat"], aggs, pin, now=base,
+        ["memory", "wiki", "alert", "heartbeat"], aggs, now=base,
     )
-    # Pinned-top (alert) before other proven (memory).
+    # Proven sorted by success_rate desc then last_used desc.
+    # memory (0.8, 1h ago) and alert (1.0, 1d ago): alert's rate higher.
     assert proven == ["alert", "memory"]
     # heartbeat had no aggregates → untried.
     assert untried == ["heartbeat"]
@@ -365,103 +362,18 @@ def test_order_skills_buckets_correctly():
     assert risky == ["wiki"]
 
 
-def test_order_skills_respects_hide():
-    aggs = {"deprecated": SkillOutcome(skill="deprecated", success=5, failure=0)}
-    pin = SkillPinConfig(pin_top=[], hide=["deprecated"])
-    proven, untried, risky = order_skills(["deprecated", "memory"], aggs, pin)
-    assert "deprecated" not in proven
-    assert "deprecated" not in risky
-    assert "deprecated" not in untried
-
-
-def test_render_skill_catalog_alphabetic_install_stable():
-    """Catalog is alphabetical, contains every seeded skill, no
-    bucket headers, no telemetry — install-stable so the system-prompt
-    cache prefix isn't busted by skill invocations (chainlink #15)."""
-    pin = SkillPinConfig()
-    out = render_skill_catalog(["wiki", "memory", "heartbeat"], pin)
-    assert out is not None
-    # Alphabetical
-    assert out.split("\n") == ["- heartbeat", "- memory", "- wiki"]
-    # No bucket headers / counts in the catalog
-    assert "**" not in out
-    assert "in window" not in out
-
-
-def test_render_skill_catalog_filters_hidden():
-    pin = SkillPinConfig(hide=["legacy"])
-    out = render_skill_catalog(["legacy", "memory"], pin)
-    assert out is not None
-    assert "legacy" not in out
-    assert "memory" in out
-
-
-def test_render_skill_catalog_returns_none_when_empty():
-    assert render_skill_catalog([], SkillPinConfig()) is None
-    # All seeded skills hidden ⇒ None
-    assert render_skill_catalog(["x"], SkillPinConfig(hide=["x"])) is None
-
-
-def test_render_skill_catalog_renders_descriptions_when_provided():
-    """When ``descriptions`` is passed, each line renders as
-    ``- name — desc`` so the model can dispatch on what each skill
-    is for without round-tripping through find-skills."""
-    pin = SkillPinConfig()
-    descs = {
-        "memory": "Criteria for deciding when, where and how to remember information",
-        "wiki": "Maintain a structured wiki under state/wiki/",
+def test_order_skills_proven_sorted_by_rate_then_recency():
+    """Same success rate → most-recently-used wins the tie."""
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    aggs = {
+        "old_winner": SkillOutcome(skill="old_winner", success=2, failure=0,
+                                    last_used=base - timedelta(days=2)),
+        "new_winner": SkillOutcome(skill="new_winner", success=2, failure=0,
+                                    last_used=base - timedelta(minutes=10)),
     }
-    out = render_skill_catalog(["memory", "wiki"], pin, descriptions=descs)
-    assert out is not None
-    assert "- memory — Criteria for deciding when, where and how to remember information" in out
-    assert "- wiki — Maintain a structured wiki under state/wiki/" in out
-
-
-def test_render_skill_catalog_falls_back_to_bare_name_when_desc_missing():
-    """A skill present in ``seeded`` but absent from ``descriptions``
-    (or with an empty desc) renders as bare ``- name`` — never blocks
-    a skill from showing up."""
-    pin = SkillPinConfig()
-    out = render_skill_catalog(
-        ["alpha", "beta"], pin, descriptions={"alpha": "first skill"}
-    )
-    assert out is not None
-    lines = out.split("\n")
-    assert lines == ["- alpha — first skill", "- beta"]
-
-
-def test_render_skill_catalog_truncates_long_descriptions():
-    """Long triggers/descriptions (frontmatter is often 100-300 chars)
-    truncate to a single-line budget so the system-prompt block stays
-    one terminal-row per skill."""
-    pin = SkillPinConfig()
-    long_desc = (
-        "Use when something has gone very wrong and you need to walk a long "
-        "diagnostic checklist across multiple subsystems including pollers, "
-        "scheduled ticks, the dispatcher, and the bridge layer to figure "
-        "out where the message actually got dropped"
-    )
-    out = render_skill_catalog(
-        ["introspection"], pin, descriptions={"introspection": long_desc}
-    )
-    assert out is not None
-    line = out.split("\n")[0]
-    # Truncation produces a single line under a reasonable bound and
-    # ends with the ellipsis sentinel.
-    assert line.startswith("- introspection — ")
-    assert line.endswith("…")
-    assert len(line) < 150  # name + " — " + ~120 char desc + ellipsis
-
-
-def test_render_skill_catalog_filters_hidden_with_descriptions():
-    """Hidden skills don't get descriptions rendered either."""
-    pin = SkillPinConfig(hide=["legacy"])
-    out = render_skill_catalog(
-        ["legacy", "memory"], pin, descriptions={"legacy": "x", "memory": "y"}
-    )
-    assert out is not None
-    assert "legacy" not in out
-    assert "- memory — y" in out
+    proven, _, _ = order_skills(["old_winner", "new_winner"], aggs, now=base)
+    # Same rate (1.0), new_winner used more recently → first.
+    assert proven == ["new_winner", "old_winner"]
 
 
 def test_render_skill_telemetry_emits_proven_and_risky_only():
@@ -472,9 +384,8 @@ def test_render_skill_telemetry_emits_proven_and_risky_only():
         "wiki": SkillOutcome(skill="wiki", success=1, failure=4,
                               last_used=base),
     }
-    pin = SkillPinConfig()
     out = render_skill_telemetry(
-        ["memory", "wiki", "heartbeat"], aggs, pin, now=base,
+        ["memory", "wiki", "heartbeat"], aggs, now=base,
     )
     assert out is not None
     # Proven and Risky present, with N/M counts
@@ -490,9 +401,7 @@ def test_render_skill_telemetry_emits_proven_and_risky_only():
 def test_render_skill_telemetry_returns_none_when_no_activity():
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     # All seeded skills untried (no aggregates) ⇒ no telemetry
-    out = render_skill_telemetry(
-        ["memory", "wiki"], {}, SkillPinConfig(), now=base,
-    )
+    out = render_skill_telemetry(["memory", "wiki"], {}, now=base)
     assert out is None
 
 
@@ -502,19 +411,5 @@ def test_render_skill_telemetry_returns_none_when_only_untried():
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     # Aggregate exists but with zero counts ⇒ untried bucket
     aggs = {"memory": SkillOutcome(skill="memory", last_used=None)}
-    out = render_skill_telemetry(["memory"], aggs, SkillPinConfig(), now=base)
+    out = render_skill_telemetry(["memory"], aggs, now=base)
     assert out is None
-
-
-def test_pin_config_loads_yaml(tmp_path):
-    yaml_path = tmp_path / "skill-pin.yaml"
-    yaml_path.write_text("pin_top:\n  - memory\n  - wiki\nhide:\n  - legacy\n")
-    pin = SkillPinConfig.load(yaml_path)
-    assert pin.pin_top == ["memory", "wiki"]
-    assert pin.hide == ["legacy"]
-
-
-def test_pin_config_missing_file_returns_empty(tmp_path):
-    pin = SkillPinConfig.load(tmp_path / "missing.yaml")
-    assert pin.pin_top == []
-    assert pin.hide == []

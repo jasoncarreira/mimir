@@ -1221,7 +1221,7 @@ class Scheduler:
         async def _run() -> None:
             try:
                 from datetime import datetime, timezone as _tz
-                from .skills.reflection.introspection_report import (
+                from .reflection.introspection_report import (
                     aggregate, render_markdown, maybe_emit_health_event,
                 )
                 turns_log = home / "logs" / "turns.jsonl"

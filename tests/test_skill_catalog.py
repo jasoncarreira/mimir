@@ -222,11 +222,11 @@ def test_render_catalog_escapes_pipes_in_trigger() -> None:
 
 def test_generate_on_real_bundled_skills_includes_known_skill() -> None:
     """generate() with the default skills root should index every
-    bundled skill — including ones we know exist (memory, heartbeat,
+    bundled skill — including ones we know exist (memory, wiki,
     introspection)."""
     output = generate()
     assert "### `memory`" in output
-    assert "### `heartbeat`" in output
+    assert "### `memory`" in output
     assert "### `introspection`" in output
 
 

@@ -205,7 +205,7 @@ fuzzy / paraphrased recall. For pages worth retrieving by paraphrase
 page's headline as a semantic atom:
 
 ```
-mcp__mimir__saga_store(
+memory_store(
     content="Alice Smith — eng team lead, async-first advocate. See state/wiki/entities/alice.md",
     stream="semantic",
 )

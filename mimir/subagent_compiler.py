@@ -285,7 +285,7 @@ def compile_skills_to_subagents(
     home: Path,
     parent_tools: list[Any],
     *,
-    skills_subdir: str = ".claude/skills",
+    skills_subdir: str = "skills",
     reflective_override: frozenset[str] = _REFLECTIVE_OVERRIDE,
 ) -> CompileResult:
     """Scan ``<home>/<skills_subdir>/*/SKILL.md`` and compile eligible

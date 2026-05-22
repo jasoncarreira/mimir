@@ -4,7 +4,7 @@ description: Diagnose your own behavior by reading the structured logs you leave
 allowed-tools:
   - Bash
   - Read
-  - saga_query
+  - memory_query
 ---
 
 # Introspection
@@ -183,7 +183,7 @@ where 3+ consecutive turns score >0.9 pairwise.
 
 Variety-decay on the retrieval surface: if a small set of SAGA
 atoms dominates citations across recent turns, that's a working-
-set collapse. Group `saga_query` results (or post-message
+set collapse. Group `memory_query` results (or post-message
 contribution credits) by returned atom_id over trailing N turns;
 compute Gini or Shannon entropy of the citation distribution.
 Low entropy + high Gini = collapsed retrieval.

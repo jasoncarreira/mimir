@@ -1,7 +1,7 @@
 """Pollers framework — subprocess-shaped external-state watchers.
 
 chainlink #3. Pollers live alongside skills under
-``<home>/.claude/skills/<name>/`` with a ``pollers.json`` manifest that
+``<home>/skills/<name>/`` with a ``pollers.json`` manifest that
 declares one or more poller scripts. The scheduler discovers them at
 startup (and on the ``mcp__mimir__reload_pollers`` MCP tool call), runs
 each on its declared cron, and parses the script's stdout as JSONL.
