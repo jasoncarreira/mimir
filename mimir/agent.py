@@ -1907,12 +1907,23 @@ class Agent:
     def _assemble_skill_telemetry_lines(self) -> str | None:
         """Per-turn skill bucket telemetry lines for ``## Self-state``."""
         try:
-            from .skill_outcomes import aggregate, render_skill_telemetry
+            from .skill_outcomes import (
+                aggregate,
+                load_skill_success_criteria,
+                render_skill_telemetry,
+            )
             from .skill_defs import installed_skill_names
             seeded = installed_skill_names(self._config.home)
             if not seeded:
                 return None
-            aggs = aggregate(self._config.turns_log)
+            # Per-skill success_criteria refines load-kind outcomes
+            # into success vs incomplete based on whether the
+            # operator-declared completion signals fired in the turn.
+            # No-op for skills without a success_criteria block.
+            criteria = load_skill_success_criteria(self._config.home)
+            aggs = aggregate(
+                self._config.turns_log, skill_criteria=criteria,
+            )
             return render_skill_telemetry(seeded, aggs)
         except Exception:  # noqa: BLE001
             log.exception(

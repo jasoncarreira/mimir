@@ -10,8 +10,11 @@ import pytest
 
 from mimir.skill_outcomes import (
     SkillOutcome,
+    SkillSuccessCriteria,
     _classify_skill_calls,
+    _parse_criteria_from_skill_md,
     aggregate,
+    load_skill_success_criteria,
     order_skills,
     render_skill_telemetry,
 )
@@ -422,3 +425,238 @@ def test_render_skill_telemetry_returns_none_when_only_untried():
     aggs = {"memory": SkillOutcome(skill="memory", last_used=None)}
     out = render_skill_telemetry(["memory"], aggs, now=base)
     assert out is None
+
+
+# ─── success_criteria refinement ─────────────────────────────────────────
+
+
+def _read_file_event(skill: str, idx: int = 1, is_error: bool = False) -> list[dict]:
+    """Helper: a read_file(SKILL.md) call + tool_result pair."""
+    return [
+        {"type": "tool_call", "id": f"r{idx}", "name": "read_file",
+         "args": {"file_path": f"/h/.mimir_builtin_skills/{skill}/SKILL.md"}},
+        {"type": "tool_result", "id": f"r{idx}", "is_error": is_error},
+    ]
+
+
+def test_classify_load_with_criteria_met_yields_success():
+    """A load whose skill has success_criteria, with a matching event
+    after the load in the same turn, stays classified as success."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "alert": SkillSuccessCriteria(
+            any_of=[{"tool_call": {"name": "send_message"}}],
+        ),
+    }
+    events = _read_file_event("alert") + [
+        {"type": "tool_call", "id": "s1", "name": "send_message",
+         "args": {"channel_id": "operator", "text": "wake up"}},
+        {"type": "tool_result", "id": "s1", "is_error": False},
+    ]
+    out = list(_classify_skill_calls(events, base, skill_criteria=criteria))
+    assert out == [("alert", "success", base, "load")]
+
+
+def test_classify_load_with_criteria_unmet_yields_incomplete():
+    """Load succeeded but the operator's success_criteria found no
+    matching event in the tail → ``incomplete`` (not failure).
+    Operators see this distinct from "the file errored" so they can
+    investigate procedure drift vs broken skills separately."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "alert": SkillSuccessCriteria(
+            any_of=[{"tool_call": {"name": "send_message"}}],
+        ),
+    }
+    events = _read_file_event("alert") + [
+        {"type": "tool_call", "id": "w1", "name": "write_file",
+         "args": {"file_path": "state/notes.md"}},
+        {"type": "tool_result", "id": "w1", "is_error": False},
+    ]
+    out = list(_classify_skill_calls(events, base, skill_criteria=criteria))
+    assert out == [("alert", "incomplete", base, "load")]
+
+
+def test_classify_load_failure_skips_criteria_check():
+    """If the load itself errored (is_error=True), don't run criteria
+    — there's no procedure to check. Stays as ``failure``."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "alert": SkillSuccessCriteria(
+            any_of=[{"tool_call": {"name": "send_message"}}],
+        ),
+    }
+    events = _read_file_event("alert", is_error=True)
+    out = list(_classify_skill_calls(events, base, skill_criteria=criteria))
+    assert out == [("alert", "failure", base, "load")]
+
+
+def test_classify_load_with_no_criteria_for_skill_yields_success():
+    """A skill not in the criteria map keeps the legacy load-only
+    signal — backward compat for skills that haven't been audited."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "alert": SkillSuccessCriteria(
+            any_of=[{"tool_call": {"name": "send_message"}}],
+        ),
+    }
+    events = _read_file_event("threadborn")
+    out = list(_classify_skill_calls(events, base, skill_criteria=criteria))
+    assert out == [("threadborn", "success", base, "load")]
+
+
+def test_classify_execution_kind_ignores_criteria():
+    """task() invocations already have a clean signal via
+    tool_result.is_error. Criteria don't apply — even if the skill
+    has a criteria block, an execution-path outcome stays raw."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "weather": SkillSuccessCriteria(
+            # Deliberately impossible to match, to prove it's ignored.
+            any_of=[{"tool_call": {"name": "never_called"}}],
+        ),
+    }
+    events = [
+        {"type": "tool_call", "id": "t1", "name": "task",
+         "args": {"subagent_type": "weather"}},
+        {"type": "tool_result", "id": "t1", "is_error": False},
+    ]
+    out = list(_classify_skill_calls(events, base, skill_criteria=criteria))
+    assert out == [("weather", "success", base, "execution")]
+
+
+def test_classify_criteria_args_subset_match():
+    """Pattern with ``args`` matches when every declared key equals
+    the event's value; the event may carry extra args not in the
+    pattern."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "memory": SkillSuccessCriteria(
+            any_of=[{
+                "tool_call": {
+                    "name": "memory_store",
+                    "args": {"tier": "ATOMIC"},
+                },
+            }],
+        ),
+    }
+    # Matching: tier matches; other args ignored
+    events_ok = _read_file_event("memory") + [
+        {"type": "tool_call", "id": "m1", "name": "memory_store",
+         "args": {"tier": "ATOMIC", "session_id": "abc", "text": "x"}},
+        {"type": "tool_result", "id": "m1", "is_error": False},
+    ]
+    out_ok = list(_classify_skill_calls(events_ok, base, skill_criteria=criteria))
+    assert out_ok[0][1] == "success"
+
+    # Mismatching: tier different
+    events_drift = _read_file_event("memory") + [
+        {"type": "tool_call", "id": "m1", "name": "memory_store",
+         "args": {"tier": "CORE"}},
+        {"type": "tool_result", "id": "m1", "is_error": False},
+    ]
+    out_drift = list(_classify_skill_calls(events_drift, base, skill_criteria=criteria))
+    assert out_drift[0][1] == "incomplete"
+
+
+def test_aggregate_threads_criteria_through_to_classifier(tmp_path):
+    """End-to-end: aggregate() respects skill_criteria — the incomplete
+    counter increments for loads that don't trigger any criteria."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    turns = tmp_path / "turns.jsonl"
+    drift_turn = {
+        "ts": _ts(60, base),
+        "events": _read_file_event("alert") + [
+            {"type": "tool_call", "id": "w1", "name": "write_file",
+             "args": {"file_path": "state/notes.md"}},
+            {"type": "tool_result", "id": "w1", "is_error": False},
+        ],
+    }
+    turns.write_text(json.dumps(drift_turn) + "\n")
+    criteria = {
+        "alert": SkillSuccessCriteria(
+            any_of=[{"tool_call": {"name": "send_message"}}],
+        ),
+    }
+    aggs = aggregate(turns, now=base, skill_criteria=criteria)
+    alert = aggs["alert"]
+    assert alert.incomplete == 1
+    assert alert.load_incomplete == 1
+    assert alert.success == 0
+    assert alert.total == 1
+    # success_rate folds incomplete into the denominator as not-success
+    assert alert.success_rate == 0.0
+
+
+# ─── frontmatter loader ──────────────────────────────────────────────────
+
+
+def test_parse_criteria_from_skill_md_returns_none_without_block(tmp_path: Path):
+    """A SKILL.md with no ``success_criteria`` field returns None
+    (signal: "no criteria to check, trust the load signal")."""
+    path = tmp_path / "SKILL.md"
+    path.write_text(
+        "---\nname: bare\ndescription: x\nallowed-tools: [Bash]\n---\nbody\n"
+    )
+    assert _parse_criteria_from_skill_md(path) is None
+
+
+def test_parse_criteria_from_skill_md_extracts_any_of(tmp_path: Path):
+    path = tmp_path / "SKILL.md"
+    path.write_text(
+        "---\n"
+        "name: alert\n"
+        "description: x\n"
+        "success_criteria:\n"
+        "  any_of:\n"
+        "    - tool_call:\n"
+        "        name: send_message\n"
+        "    - tool_call:\n"
+        "        name: write_file\n"
+        "---\nbody\n"
+    )
+    c = _parse_criteria_from_skill_md(path)
+    assert c is not None
+    assert len(c.any_of) == 2
+    assert c.any_of[0]["tool_call"]["name"] == "send_message"
+
+
+def test_load_skill_success_criteria_scans_both_dirs(tmp_path: Path):
+    """Operator-installed skills under ``<home>/skills/`` shadow
+    bundled same-named entries (matches the rest of the dual-location
+    contract)."""
+    bundled = tmp_path / ".mimir_builtin_skills"
+    operator = tmp_path / "skills"
+    (bundled / "alert").mkdir(parents=True)
+    (bundled / "alert" / "SKILL.md").write_text(
+        "---\nname: alert\ndescription: x\n"
+        "success_criteria:\n  any_of:\n    - tool_call: {name: send_message}\n"
+        "---\nbody\n"
+    )
+    (operator / "alert").mkdir(parents=True)
+    (operator / "alert" / "SKILL.md").write_text(
+        "---\nname: alert\ndescription: x\n"
+        "success_criteria:\n  any_of:\n    - tool_call: {name: OPERATOR_OVERRIDE}\n"
+        "---\nbody\n"
+    )
+    crits = load_skill_success_criteria(tmp_path)
+    assert "alert" in crits
+    # Operator entry wins on collision.
+    assert crits["alert"].any_of[0]["tool_call"]["name"] == "OPERATOR_OVERRIDE"
+
+
+def test_load_skill_success_criteria_real_bundle(tmp_path: Path):
+    """Smoke: alert and memory SKILL.md from the bundle parse and
+    expose their declared criteria via the loader."""
+    from mimir.skill_defs import refresh_builtin_skills
+    refresh_builtin_skills(tmp_path)
+    crits = load_skill_success_criteria(tmp_path)
+    assert "alert" in crits, "alert SKILL.md should declare success_criteria"
+    assert "memory" in crits, "memory SKILL.md should declare success_criteria"
+    # alert: send_message; memory: memory_store / memory_query / saga_end_session
+    assert any(
+        p["tool_call"]["name"] == "send_message"
+        for p in crits["alert"].any_of
+    )
+    memory_names = {p["tool_call"]["name"] for p in crits["memory"].any_of}
+    assert {"memory_store", "memory_query"} <= memory_names

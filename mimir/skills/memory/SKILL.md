@@ -11,6 +11,15 @@ allowed-tools:
   - memory_query
   - memory_store
   - send_message
+success_criteria:
+  # Memory is bidirectional — a read OR a write counts. Loading the
+  # skill and then not exercising either path means we consulted the
+  # policy but never acted on it (the exact confab-risk shape the
+  # threadborn 2026-05-21 post-mortem flagged).
+  any_of:
+    - tool_call: {name: memory_store}
+    - tool_call: {name: memory_query}
+    - tool_call: {name: saga_end_session}
 ---
 
 # Memory

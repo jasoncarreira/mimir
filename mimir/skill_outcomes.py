@@ -49,12 +49,17 @@ per-skill telemetry — success/failure counts surfaced into the
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
+
+import yaml
+
+log = logging.getLogger(__name__)
 
 # ``skills/<name>/SKILL.md`` (post-2026-05-22 relocation) or the
 # legacy ``.claude/skills/<name>/SKILL.md``, either with any prefix
@@ -68,6 +73,152 @@ from typing import Iterable
 _SKILL_READ_RE = re.compile(
     r"(?:^|/)(?:\.claude/skills|\.mimir_builtin_skills|skills)/([^/]+)/SKILL\.md$",
 )
+
+
+# ─── inline-skill success criteria (Option 2 from skill-as-tool-architecture.md) ───
+#
+# The load signal (``read_file(SKILL.md)`` is_error=False) only tells
+# us the agent loaded the prompt. Whether the agent followed the
+# procedure described in the SKILL.md body is invisible. For skills
+# whose "done" state has a clear declarative shape, operators declare
+# a ``success_criteria`` block in frontmatter:
+#
+#   success_criteria:
+#     any_of:
+#       - tool_call:
+#           name: send_message
+#       - tool_call:
+#           name: memory_store
+#           args:
+#             tier: ATOMIC
+#
+# When the classifier sees a successful load whose skill has a
+# ``success_criteria``, it scans the rest of the turn for events
+# matching any of the patterns. If at least one matches, the load is
+# classified as **success** (procedure completed). If none match, the
+# load is classified as **incomplete** — the file opened, but the
+# stated outcome never landed. Operators see ``incomplete`` distinct
+# from ``failure`` (file errored) and from ``abandoned`` (no result
+# pair); incomplete is a "drift" signal, the others are "broken"
+# signals.
+#
+# Schema (intentionally minimal — extend per skill as needs surface):
+#   any_of: list of patterns (success on FIRST match)
+#   pattern:
+#     tool_call:
+#       name: str  (required)
+#       args: dict (optional; subset-match — keys present in the
+#                   pattern must equal the event's args[key])
+
+
+@dataclass
+class SkillSuccessCriteria:
+    """Operator-declared "did the skill's procedure actually run?" test.
+
+    Parsed from a skill's frontmatter ``success_criteria`` block.
+    Used by :func:`_classify_skill_calls` to refine the load signal
+    into success / incomplete based on subsequent tool calls in the
+    same turn.
+    """
+
+    any_of: list[dict[str, Any]] = field(default_factory=list)
+
+    def matches_any(self, events_after_load: Iterable[dict]) -> bool:
+        """Return True iff at least one ``any_of`` pattern matches at
+        least one event in the iterable. Empty ``any_of`` returns True
+        — no criteria == nothing to check (backward compat for skills
+        that have a ``success_criteria:`` block but no patterns yet)."""
+        if not self.any_of:
+            return True
+        for ev in events_after_load:
+            if not isinstance(ev, dict) or ev.get("type") != "tool_call":
+                continue
+            for pattern in self.any_of:
+                if _pattern_matches_event(pattern, ev):
+                    return True
+        return False
+
+
+def _pattern_matches_event(pattern: dict[str, Any], event: dict) -> bool:
+    """Subset-match a success-criteria pattern against a tool_call event.
+
+    Pattern shape: ``{"tool_call": {"name": str, "args": dict?}}``.
+    Subset semantics: every key the pattern declares must be present
+    in the event AND have the equal value. Keys the event has but the
+    pattern doesn't declare are ignored.
+    """
+    pat_tc = pattern.get("tool_call")
+    if not isinstance(pat_tc, dict):
+        return False
+    expected_name = pat_tc.get("name")
+    if expected_name and event.get("name") != expected_name:
+        return False
+    expected_args = pat_tc.get("args")
+    if isinstance(expected_args, dict) and expected_args:
+        actual_args = event.get("args") or {}
+        if not isinstance(actual_args, dict):
+            return False
+        for k, expected in expected_args.items():
+            if actual_args.get(k) != expected:
+                return False
+    return True
+
+
+def load_skill_success_criteria(home: Path) -> dict[str, SkillSuccessCriteria]:
+    """Scan ``<home>/.mimir_builtin_skills/`` and ``<home>/skills/`` for
+    skills that declare ``success_criteria`` in frontmatter.
+
+    Returns ``{skill_name: SkillSuccessCriteria}`` for the skills that
+    have one. Skills without the block aren't in the result map —
+    callers use ``.get(name)`` and treat absence as "no criteria check
+    needed, just trust the load signal."
+
+    Operator-installed skills (``<home>/skills/``) shadow bundled
+    same-named entries, mirroring the rest of the dual-location
+    contract (SkillsMiddleware + subagent_compiler).
+    """
+    from .skill_defs import home_builtin_skills_dir, home_skills_dir
+    out: dict[str, SkillSuccessCriteria] = {}
+    for src in (home_builtin_skills_dir(home), home_skills_dir(home)):
+        if not src.is_dir():
+            continue
+        for skill_md in src.glob("*/SKILL.md"):
+            try:
+                criteria = _parse_criteria_from_skill_md(skill_md)
+            except (OSError, yaml.YAMLError) as exc:
+                log.warning(
+                    "load_skill_success_criteria: failed to parse %s: %s",
+                    skill_md, exc,
+                )
+                continue
+            if criteria is not None:
+                out[skill_md.parent.name] = criteria
+    return out
+
+
+def _parse_criteria_from_skill_md(path: Path) -> SkillSuccessCriteria | None:
+    """Read a SKILL.md frontmatter and extract ``success_criteria`` if
+    present. Returns ``None`` when the field isn't declared (vs. an
+    empty :class:`SkillSuccessCriteria` when declared-but-empty, which
+    matches everything — operator probably mid-authoring)."""
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        return None
+    end = text.find("\n---", 4)
+    if end < 0:
+        return None
+    fm_str = text[4:end]
+    fm = yaml.safe_load(fm_str)
+    if not isinstance(fm, dict):
+        return None
+    block = fm.get("success_criteria")
+    if not isinstance(block, dict):
+        return None
+    any_of_raw = block.get("any_of")
+    any_of: list[dict[str, Any]] = []
+    if isinstance(any_of_raw, list):
+        any_of = [p for p in any_of_raw if isinstance(p, dict)]
+    return SkillSuccessCriteria(any_of=any_of)
 
 
 # VSM: S3 — skill amplification. Per-skill success-rate aggregator
@@ -105,20 +256,29 @@ class SkillOutcome:
     success: int = 0
     failure: int = 0
     abandoned: int = 0
+    # ``incomplete`` — load opened fine but the operator-declared
+    # ``success_criteria`` didn't match anywhere in the post-load
+    # tail. Distinct from ``failure`` (load errored) and from
+    # ``abandoned`` (no tool_result pair). Only emitted for the
+    # ``load`` kind — execution outcomes already have a clean signal
+    # via ``tool_result.is_error`` on the ``task()`` result.
+    incomplete: int = 0
     # Per-path breakdown of the totals above. Sum invariants:
     # ``execution_success + load_success == success`` (and same for
-    # failure/abandoned). Maintained by ``aggregate()``.
+    # failure/abandoned/incomplete — though execution_incomplete is
+    # always 0 since the criteria check only runs on loads).
     execution_success: int = 0
     execution_failure: int = 0
     execution_abandoned: int = 0
     load_success: int = 0
     load_failure: int = 0
     load_abandoned: int = 0
+    load_incomplete: int = 0
     last_used: datetime | None = None
 
     @property
     def total(self) -> int:
-        return self.success + self.failure + self.abandoned
+        return self.success + self.failure + self.abandoned + self.incomplete
 
     @property
     def execution_total(self) -> int:
@@ -130,19 +290,23 @@ class SkillOutcome:
 
     @property
     def load_total(self) -> int:
-        return self.load_success + self.load_failure + self.load_abandoned
+        return (
+            self.load_success
+            + self.load_failure
+            + self.load_abandoned
+            + self.load_incomplete
+        )
 
     @property
     def success_rate(self) -> float | None:
-        """Rate of successful invocations over all completed-or-abandoned
-        ones. Abandoned counts as failure (matches the module docstring:
-        "treated as failure for ranking purposes") since an unmatched
-        tool_call usually means the agent gave up mid-skill — not a
-        positive signal. None when no usable data."""
-        denom = self.success + self.failure + self.abandoned
-        if denom == 0:
+        """Rate of successful invocations over the total. Abandoned and
+        incomplete both count as "not success" for ranking purposes —
+        abandoned because the agent gave up mid-skill, incomplete
+        because it loaded but the procedure criteria didn't match. None
+        when no usable data."""
+        if self.total == 0:
             return None
-        return self.success / denom
+        return self.success / self.total
 
     @property
     def execution_success_rate(self) -> float | None:
@@ -184,6 +348,7 @@ def _classify_skill_calls(
     events: list[dict], turn_ts: datetime,
     *,
     turn_succeeded: bool | None = None,
+    skill_criteria: dict[str, SkillSuccessCriteria] | None = None,
 ) -> Iterable[tuple[str, str, datetime, str]]:
     """Walk a single turn's events list, recognize skill invocations,
     pair their tool_call ↔ tool_result by id, yield
@@ -239,8 +404,8 @@ def _classify_skill_calls(
     failure). Subagent-mode skills aren't affected — they have
     explicit per-invocation tool_result outcomes.
     """
-    pending: dict[str, tuple[str, str]] = {}   # tool_use_id → (skill name, kind)
-    for ev in events:
+    pending: dict[str, tuple[str, str, int]] = {}   # tool_use_id → (skill name, kind, call_index)
+    for idx, ev in enumerate(events):
         if not isinstance(ev, dict):
             continue
         etype = ev.get("type")
@@ -274,23 +439,28 @@ def _classify_skill_calls(
             if skill:
                 tool_id = ev.get("id")
                 if isinstance(tool_id, str):
-                    pending[tool_id] = (skill, kind)
+                    pending[tool_id] = (skill, kind, idx)
         elif etype == "tool_result":
             tool_id = ev.get("id")
             if isinstance(tool_id, str) and tool_id in pending:
-                skill, kind = pending.pop(tool_id)
+                skill, kind, call_idx = pending.pop(tool_id)
                 is_error = bool(ev.get("is_error"))
-                yield (
-                    skill,
-                    "failure" if is_error else "success",
-                    turn_ts,
-                    kind,
-                )
+                if is_error:
+                    yield skill, "failure", turn_ts, kind
+                else:
+                    # Successful pair. For LOAD kind, refine via
+                    # operator-declared success_criteria if any.
+                    outcome = _refine_load_outcome(
+                        skill, kind, events, call_idx, skill_criteria,
+                    )
+                    yield skill, outcome, turn_ts, kind
 
     # Anything left in pending has no matching tool_result.
     # Use the turn-level signal as a fallback (see classifier
-    # docstring for the imprecision tradeoff).
-    for skill, kind in pending.values():
+    # docstring for the imprecision tradeoff). Criteria don't apply
+    # here — without a tool_result anchor we don't know how to
+    # bound the "after the load" window.
+    for skill, kind, _ in pending.values():
         if turn_succeeded is True:
             yield skill, "success", turn_ts, kind
         elif turn_succeeded is False:
@@ -299,13 +469,47 @@ def _classify_skill_calls(
             yield skill, "abandoned", turn_ts, kind
 
 
+def _refine_load_outcome(
+    skill: str, kind: str, events: list[dict], call_idx: int,
+    skill_criteria: dict[str, SkillSuccessCriteria] | None,
+) -> str:
+    """For a successful tool_call/tool_result pair, refine to
+    ``"success"`` or ``"incomplete"`` based on the skill's declared
+    ``success_criteria`` (if any).
+
+    Only LOAD kind gets refined — execution kind already has the
+    clean ``task()`` signal. Skills without criteria stay at
+    ``"success"`` (no refinement available; we trust the load signal).
+    """
+    if kind != "load" or not skill_criteria:
+        return "success"
+    criteria = skill_criteria.get(skill)
+    if criteria is None:
+        return "success"
+    # Scan events after the load's tool_call index. The tool_result
+    # itself sits somewhere after call_idx; criteria patterns only
+    # match tool_call events anyway so the tool_result event in
+    # between is a no-op for matching.
+    tail = events[call_idx + 1:]
+    return "success" if criteria.matches_any(tail) else "incomplete"
+
+
 def aggregate(
     turns_log: Path, *,
     window_hours: int = 24 * 7,   # 7d default
     now: datetime | None = None,
+    skill_criteria: dict[str, SkillSuccessCriteria] | None = None,
 ) -> dict[str, SkillOutcome]:
     """Walk turns.jsonl, accumulate per-skill outcome counts within
-    the window."""
+    the window.
+
+    ``skill_criteria`` opts into per-skill procedure-completion checks
+    (see :class:`SkillSuccessCriteria`). Load events from skills with
+    criteria get refined into ``success`` vs ``incomplete`` based on
+    subsequent tool calls in the same turn. ``None`` (default) keeps
+    the legacy load-only-signal behavior. Callers typically supply
+    ``load_skill_success_criteria(home)``.
+    """
     now = now or datetime.now(tz=timezone.utc)
     cutoff = now - timedelta(hours=window_hours)
     out: dict[str, SkillOutcome] = defaultdict(lambda: SkillOutcome(skill="?"))
@@ -332,7 +536,9 @@ def aggregate(
             None if raw_is_error is None else not bool(raw_is_error)
         )
         for skill, outcome, _, kind in _classify_skill_calls(
-            events, ts, turn_succeeded=turn_succeeded
+            events, ts,
+            turn_succeeded=turn_succeeded,
+            skill_criteria=skill_criteria,
         ):
             entry = out[skill]
             entry.skill = skill
@@ -353,7 +559,11 @@ def aggregate(
                     entry.execution_failure += 1
                 elif kind == "load":
                     entry.load_failure += 1
-            else:
+            elif outcome == "incomplete":
+                entry.incomplete += 1
+                if kind == "load":
+                    entry.load_incomplete += 1
+            else:  # abandoned
                 entry.abandoned += 1
                 if kind == "execution":
                     entry.execution_abandoned += 1
@@ -431,21 +641,29 @@ def render_skill_telemetry(
         """Render the count summary. When a skill has activity on
         both paths (task() execution AND read_file() load), show the
         breakdown so the operator can tell apart the clean signal
-        from the proxy one. Single-path skills render compactly."""
+        from the proxy one. Single-path skills render compactly. An
+        ``incomplete`` suffix surfaces when the operator's
+        success_criteria detected drift (file loaded but procedure
+        didn't fire)."""
         et = agg.execution_total
         lt = agg.load_total
+        incomplete_suffix = (
+            f", {agg.incomplete} incomplete" if agg.incomplete else ""
+        )
         if et and lt:
             return (
                 f"{agg.success}/{agg.total} in window — "
                 f"exec {agg.execution_success}/{et}, "
-                f"load {agg.load_success}/{lt}"
+                f"load {agg.load_success}/{lt}{incomplete_suffix}"
             )
         if et:
             return f"{agg.success}/{agg.total} in window (exec)"
         if lt:
-            return f"{agg.success}/{agg.total} in window (load)"
-        # Neither kind labeled — legacy records or unknown path.
-        return f"{agg.success}/{agg.total} in window"
+            return (
+                f"{agg.success}/{agg.total} in window (load)"
+                f"{incomplete_suffix}"
+            )
+        return f"{agg.success}/{agg.total} in window{incomplete_suffix}"
 
     lines: list[str] = []
     if proven:
