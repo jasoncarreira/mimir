@@ -48,6 +48,7 @@ per-skill telemetry — success/failure counts surfaced into the
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import re
@@ -144,8 +145,23 @@ def _pattern_matches_event(pattern: dict[str, Any], event: dict) -> bool:
 
     Pattern shape: ``{"tool_call": {"name": str, "args": dict?}}``.
     Subset semantics: every key the pattern declares must be present
-    in the event AND have the equal value. Keys the event has but the
-    pattern doesn't declare are ignored.
+    in the event AND match. Keys the event has but the pattern
+    doesn't declare are ignored.
+
+    **Args matching** (per arg key):
+
+    * ``<key>: <value>`` — exact equality. Use for enums, ids, etc.
+    * ``<key>_glob: "<pattern>"`` — fnmatch glob applied to
+      ``event.args[<key>]``. Use for path matches and other
+      string-prefix patterns. The matched key in the event is the
+      one *without* the ``_glob`` suffix; the suffix only exists in
+      the pattern. Operators pick one form per arg.
+
+    fnmatch semantics: ``*`` matches any chars *including* ``/``, so
+    ``state/wiki/*.md`` matches ``state/wiki/entities/foo.md`` as
+    well as ``state/wiki/index.md``. Operators wanting strict
+    single-segment matching should use ``?`` plus literal segment
+    boundaries.
     """
     pat_tc = pattern.get("tool_call")
     if not isinstance(pat_tc, dict):
@@ -159,8 +175,18 @@ def _pattern_matches_event(pattern: dict[str, Any], event: dict) -> bool:
         if not isinstance(actual_args, dict):
             return False
         for k, expected in expected_args.items():
-            if actual_args.get(k) != expected:
-                return False
+            if k.endswith("_glob"):
+                real_key = k[: -len("_glob")]
+                actual_val = actual_args.get(real_key)
+                if not isinstance(actual_val, str):
+                    return False
+                if not isinstance(expected, str):
+                    return False
+                if not fnmatch.fnmatch(actual_val, expected):
+                    return False
+            else:
+                if actual_args.get(k) != expected:
+                    return False
     return True
 
 

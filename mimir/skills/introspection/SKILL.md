@@ -5,6 +5,24 @@ allowed-tools:
   - Bash
   - Read
   - memory_query
+success_criteria:
+  # Introspection is a diagnostic skill — "look at the logs to
+  # understand X." Concrete outputs are either a written report
+  # (state/reports/<file>.md) or a memory_query that paid off (the
+  # agent looked something up to anchor its diagnosis). A turn that
+  # loads the SKILL.md and then does neither means the diagnosis
+  # never landed in durable form.
+  any_of:
+    - tool_call:
+        name: write_file
+        args:
+          file_path_glob: "*state/reports/*"
+    - tool_call:
+        name: edit_file
+        args:
+          file_path_glob: "*state/reports/*"
+    - tool_call:
+        name: memory_query
 ---
 
 # Introspection

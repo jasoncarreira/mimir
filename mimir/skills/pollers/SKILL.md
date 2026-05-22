@@ -6,6 +6,27 @@ allowed-tools:
   - Read
   - Write
   - reload_pollers
+success_criteria:
+  # The pollers skill is for *building* or *fixing* pollers — both
+  # produce a write under skills/<poller>/pollers.json (the manifest)
+  # or the poller's script, plus a reload_pollers call to register
+  # the change. A turn that reads the SKILL.md but doesn't touch a
+  # poller dir is consulting, not authoring.
+  any_of:
+    - tool_call:
+        name: write_file
+        args:
+          file_path_glob: "*skills/*/pollers.json"
+    - tool_call:
+        name: write_file
+        args:
+          file_path_glob: "*skills/*/poller*"
+    - tool_call:
+        name: edit_file
+        args:
+          file_path_glob: "*skills/*/pollers.json"
+    - tool_call:
+        name: reload_pollers
 ---
 
 # Pollers — Event-Driven Monitoring

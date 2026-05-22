@@ -660,3 +660,58 @@ def test_load_skill_success_criteria_real_bundle(tmp_path: Path):
     )
     memory_names = {p["tool_call"]["name"] for p in crits["memory"].any_of}
     assert {"memory_store", "memory_query"} <= memory_names
+
+
+def test_classify_criteria_args_glob_match():
+    """``<key>_glob`` triggers fnmatch on ``event.args[<key>]`` —
+    used for file-path matching where exact equality would be too
+    strict (operators don't know the exact path the agent will pick)."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "wiki": SkillSuccessCriteria(
+            any_of=[{
+                "tool_call": {
+                    "name": "write_file",
+                    "args": {"file_path_glob": "*state/wiki/*"},
+                },
+            }],
+        ),
+    }
+    # On-target: path matches the glob → success.
+    events_ok = _read_file_event("wiki") + [
+        {"type": "tool_call", "id": "w1", "name": "write_file",
+         "args": {"file_path": "/h/state/wiki/entities/Foo.md", "content": "x"}},
+        {"type": "tool_result", "id": "w1", "is_error": False},
+    ]
+    out_ok = list(_classify_skill_calls(events_ok, base, skill_criteria=criteria))
+    assert out_ok[0][1] == "success"
+
+    # Off-target: path doesn't match the glob → incomplete.
+    events_drift = _read_file_event("wiki") + [
+        {"type": "tool_call", "id": "w1", "name": "write_file",
+         "args": {"file_path": "/h/state/notes.md", "content": "x"}},
+        {"type": "tool_result", "id": "w1", "is_error": False},
+    ]
+    out_drift = list(_classify_skill_calls(events_drift, base, skill_criteria=criteria))
+    assert out_drift[0][1] == "incomplete"
+
+
+def test_load_skill_success_criteria_wiki_introspection_pollers(tmp_path: Path):
+    """Bundle-wide smoke: wiki + introspection + pollers all expose
+    their declared criteria via the loader (next batch of skills
+    audited after alert + memory)."""
+    from mimir.skill_defs import refresh_builtin_skills
+    refresh_builtin_skills(tmp_path)
+    crits = load_skill_success_criteria(tmp_path)
+    for name in ("wiki", "introspection", "pollers"):
+        assert name in crits, f"{name} should declare success_criteria"
+        assert crits[name].any_of, f"{name} criteria.any_of is empty"
+    # Spot-check the path-glob form landed for the file-shaped checks.
+    wiki_globs = [
+        p["tool_call"].get("args", {}).get("file_path_glob")
+        for p in crits["wiki"].any_of
+        if "args" in p["tool_call"]
+    ]
+    assert any(g and "state/wiki" in g for g in wiki_globs), (
+        "wiki criteria should target state/wiki/ paths"
+    )
