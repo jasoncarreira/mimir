@@ -26,11 +26,11 @@ def _ts(minutes_ago: float, base: datetime) -> str:
 def test_classify_pairs_call_and_result():
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     events = [
-        {"type": "tool_call", "id": "tool_1", "name": "Skill",
-         "args": {"skill": "memory"}},
+        {"type": "tool_call", "id": "tool_1", "name": "task",
+         "args": {"subagent_type": "memory"}},
         {"type": "tool_result", "id": "tool_1", "is_error": False, "content": "ok"},
-        {"type": "tool_call", "id": "tool_2", "name": "Skill",
-         "args": {"skill": "wiki"}},
+        {"type": "tool_call", "id": "tool_2", "name": "task",
+         "args": {"subagent_type": "wiki"}},
         {"type": "tool_result", "id": "tool_2", "is_error": True, "content": "boom"},
     ]
     out = list(_classify_skill_calls(events, base))
@@ -41,8 +41,8 @@ def test_classify_unmatched_call_is_abandoned_when_turn_outcome_unknown():
     """No tool_result + no turn_succeeded → "abandoned" (legacy path)."""
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     events = [
-        {"type": "tool_call", "id": "tool_1", "name": "Skill",
-         "args": {"skill": "alert"}},
+        {"type": "tool_call", "id": "tool_1", "name": "task",
+         "args": {"subagent_type": "alert"}},
         # no matching tool_result
     ]
     out = list(_classify_skill_calls(events, base))
@@ -61,8 +61,8 @@ def test_classify_unmatched_call_infers_success_from_turn():
     """
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     events = [
-        {"type": "tool_call", "id": "tool_1", "name": "Skill",
-         "args": {"skill": "heartbeat"}},
+        {"type": "tool_call", "id": "tool_1", "name": "task",
+         "args": {"subagent_type": "heartbeat"}},
         # No tool_result — ChatClaudeCode streaming gap
     ]
     out = list(_classify_skill_calls(events, base, turn_succeeded=True))
@@ -73,8 +73,8 @@ def test_classify_unmatched_call_infers_failure_from_turn():
     """No tool_result + turn errored → "failure"."""
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     events = [
-        {"type": "tool_call", "id": "tool_1", "name": "Skill",
-         "args": {"skill": "heartbeat"}},
+        {"type": "tool_call", "id": "tool_1", "name": "task",
+         "args": {"subagent_type": "heartbeat"}},
     ]
     out = list(_classify_skill_calls(events, base, turn_succeeded=False))
     assert out == [("heartbeat", "failure", base)]
@@ -85,8 +85,8 @@ def test_classify_exact_result_takes_precedence_over_turn_success():
     turn_succeeded says otherwise — exact beats inferred."""
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     events = [
-        {"type": "tool_call", "id": "tool_1", "name": "Skill",
-         "args": {"skill": "memory"}},
+        {"type": "tool_call", "id": "tool_1", "name": "task",
+         "args": {"subagent_type": "memory"}},
         # Explicit error result despite turn_succeeded=True
         {"type": "tool_result", "id": "tool_1", "is_error": True, "content": "boom"},
     ]
@@ -200,14 +200,15 @@ def test_classify_read_file_skill_load_falls_back_when_no_result():
     assert out_unk == [("heartbeat", "abandoned", base)]
 
 
-def test_classify_dual_runtime_in_same_turn():
-    """If both runtimes' patterns appear in one turn (e.g. mixed
-    pre/post-migration log), both count. Last-source-wins is not the
-    semantic; both are real load events."""
+def test_classify_both_invocation_patterns_in_same_turn():
+    """A turn can carry both invocation patterns: a delegated skill
+    invoked via ``task`` AND an inline skill loaded via ``read_file``.
+    Both should be counted — they're not competing signals, they're
+    measuring different things (execution outcome vs load outcome)."""
     base = datetime(2026, 5, 22, 14, 0, tzinfo=timezone.utc)
     events = [
-        {"type": "tool_call", "id": "s1", "name": "Skill",
-         "args": {"skill": "memory"}},
+        {"type": "tool_call", "id": "s1", "name": "task",
+         "args": {"subagent_type": "memory"}},
         {"type": "tool_result", "id": "s1", "is_error": False},
         {"type": "tool_call", "id": "r1", "name": "read_file",
          "args": {"file_path": ".claude/skills/threadborn/SKILL.md"}},
@@ -225,16 +226,16 @@ def test_aggregate_window_filters_old_turns(tmp_path):
     in_window = {
         "ts": _ts(60, base),
         "events": [
-            {"type": "tool_call", "id": "a", "name": "Skill",
-             "args": {"skill": "memory"}},
+            {"type": "tool_call", "id": "a", "name": "task",
+         "args": {"subagent_type": "memory"}},
             {"type": "tool_result", "id": "a", "is_error": False},
         ],
     }
     out_of_window = {
         "ts": _ts(60 * 24 * 30, base),  # 30 days ago, outside 7d default
         "events": [
-            {"type": "tool_call", "id": "b", "name": "Skill",
-             "args": {"skill": "memory"}},
+            {"type": "tool_call", "id": "b", "name": "task",
+         "args": {"subagent_type": "memory"}},
             {"type": "tool_result", "id": "b", "is_error": True},
         ],
     }
@@ -251,18 +252,18 @@ def test_aggregate_accumulates_across_turns(tmp_path):
     turns = tmp_path / "turns.jsonl"
     records = [
         {"ts": _ts(10, base), "events": [
-            {"type": "tool_call", "id": "1", "name": "Skill",
-             "args": {"skill": "memory"}},
+            {"type": "tool_call", "id": "1", "name": "task",
+         "args": {"subagent_type": "memory"}},
             {"type": "tool_result", "id": "1", "is_error": False},
         ]},
         {"ts": _ts(20, base), "events": [
-            {"type": "tool_call", "id": "2", "name": "Skill",
-             "args": {"skill": "memory"}},
+            {"type": "tool_call", "id": "2", "name": "task",
+         "args": {"subagent_type": "memory"}},
             {"type": "tool_result", "id": "2", "is_error": True},
         ]},
         {"ts": _ts(30, base), "events": [
-            {"type": "tool_call", "id": "3", "name": "Skill",
-             "args": {"skill": "memory"}},
+            {"type": "tool_call", "id": "3", "name": "task",
+         "args": {"subagent_type": "memory"}},
             {"type": "tool_result", "id": "3", "is_error": False},
         ]},
     ]
@@ -275,20 +276,20 @@ def test_aggregate_accumulates_across_turns(tmp_path):
 
 def test_aggregate_chatclaudecode_gap_infers_from_result_is_error(tmp_path):
     """Turn records with result_is_error=False but no tool_results
-    (ChatClaudeCode streaming gap) should count Skill invocations as
+    (ChatClaudeCode streaming gap) should count skill invocations as
     success, not abandoned → heartbeat/reflection/github skills land
     in the proven bucket instead of risky.
     """
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     turns = tmp_path / "turns.jsonl"
-    # Simulate 3 heartbeat turns: Skill call, no tool_result, turn ok
+    # Simulate 3 heartbeat turns: task call, no tool_result, turn ok
     records = [
         {
             "ts": _ts(60 * i, base),
             "result_is_error": False,
             "events": [
-                {"type": "tool_call", "id": f"id{i}", "name": "Skill",
-                 "args": {"skill": "heartbeat"}},
+                {"type": "tool_call", "id": f"id{i}", "name": "task",
+                 "args": {"subagent_type": "heartbeat"}},
                 # No matching tool_result — ChatClaudeCode gap
             ],
         }
@@ -310,8 +311,8 @@ def test_aggregate_chatclaudecode_gap_failed_turn_counts_as_failure(tmp_path):
         "ts": _ts(30, base),
         "result_is_error": True,
         "events": [
-            {"type": "tool_call", "id": "x1", "name": "Skill",
-             "args": {"skill": "heartbeat"}},
+            {"type": "tool_call", "id": "x1", "name": "task",
+         "args": {"subagent_type": "heartbeat"}},
         ],
     }
     turns.write_text(json.dumps(record) + "\n")
@@ -328,8 +329,8 @@ def test_aggregate_result_is_error_absent_falls_back_to_abandoned(tmp_path):
         "ts": _ts(30, base),
         # no result_is_error field
         "events": [
-            {"type": "tool_call", "id": "x1", "name": "Skill",
-             "args": {"skill": "heartbeat"}},
+            {"type": "tool_call", "id": "x1", "name": "task",
+         "args": {"subagent_type": "heartbeat"}},
         ],
     }
     turns.write_text(json.dumps(record) + "\n")
