@@ -345,6 +345,11 @@ INDEX_SKIP_PREFIXES: tuple[str, ...] = (
     # poller logging a notes file) and against future indexer expansion
     # to non-.md formats.
     "state/pollers/",
+    # Social-CLI artifacts — operator-managed social graph / inbox
+    # state; not authored knowledge the agent retrieves. Frequent writes
+    # (per-message processed manifests, inbox snapshots) would cause
+    # constant reindex churn on social-active installs.
+    "state/social/",
 )
 
 
