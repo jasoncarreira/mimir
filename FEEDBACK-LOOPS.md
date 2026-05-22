@@ -66,7 +66,7 @@ result and adjusts.
 **Latency:** zero (synchronous in the tool wrapper).
 **Closes the loop:** within-turn — the agent learns the channel is
 "saturated" and stops trying.
-**Call sites:** `mimir/channeltools.py`, `mimir/agent.py:loop_detector`.
+**Call sites:** `mimir/loop_detector.py`, `mimir/agent.py:loop_detector`.
 
 ### 1.4 Tool-call budget
 
@@ -105,30 +105,54 @@ before acting again.
 **Frequency:** every turn (block re-rendered).
 **Latency:** seconds (tail-read of jsonl files).
 **Closes the loop:** next turn (or any turn within the window).
-**Call sites:** `mimir/feedback.py`, `mimir/prompts.py:131`,
-`mimir/agent.py:571`.
+**Call sites:** `mimir/feedback.py`, `mimir/prompts.py:256`,
+`mimir/agent.py:543` (FeedbackLog init).
 
 **Surfaced event types** (each maps to a polarity + render rule
 in `mimir/feedback.py:_EVENT_RULES`):
 
-- `error`, `tool_call_denied`, `tool_call_budget_warning`
-- `send_message_loop_warning`, `send_message_loop_hard_stop`
-- `saga_query_error`, `saga_feedback_error`,
-  `saga_consolidate_error`, `saga_synthesis_dispatch_failed`,
-  `saga_synthesis_empty_window`
-- `cost_rate_alert`, `rate_limit_warning`, `rate_limit_rejected`,
-  `rate_limit_off_pace`
-- `scheduled_tick_dropped` (dispatcher rejected),
-  `scheduled_tick_suppressed` (§12.4 arbiter blocked),
-  `heartbeat_health_degraded` (§4.7 weekly health metric),
+- **Core:** `error`, `tool_call_denied`
+- **Budget:** `tool_call_budget_denied`, `tool_call_budget_soft_warning`
+  (and legacy alias `tool_call_budget_warning`)
+- **Loop protection:** `send_message_loop_warning`,
+  `send_message_loop_hard_stop`
+- **SAGA:** `saga_query_error`, `saga_feedback_error`,
+  `saga_consolidate_error`, `saga_decay_error`, `saga_forget_error`,
+  `saga_synthesis_dispatch_failed`, `saga_synthesis_empty_window`,
+  `saga_synthesis_skipped_boundary`
+- **Cost/quota:** `cost_rate_alert`, `rate_limit_warning`,
+  `rate_limit_rejected`, `rate_limit_off_pace`,
+  `quota_reading_anomalous`
+- **Scheduling:** `scheduled_tick_dropped` (dispatcher rejected),
+  `scheduled_tick_suppressed` (arbiter blocked),
+  `heartbeat_health_degraded` (§4.8 weekly health metric),
   `introspection_report_error`,
-  `predictions_pending_review` (predictions skill — past-horizon
-  items piling up; nudges the agent to run `mimir predictions review`)
-- `send_message_unknown_channel`
-- Positive: `saga_feedback_sent`, `react_received`,
-  `saga_consolidate_ok` (cron summary line),
-  `introspection_report_ok` (carries the report file path so the
-  agent can Read it within the 24h algedonic window)
+  `predictions_pending_review` (past-horizon items; nudges
+  `mimir predictions review`)
+- **Channels:** `send_message_unknown_channel`, `auto_dispatch_failed`
+- **Pollers:** `poller_oauth_expired`, `poller_auth_failed`,
+  `poller_service_outage`, `poller_rate_limited`, `poller_signal`,
+  `poller_nonzero_exit`, `poller_review_missed_submission`
+- **OAuth:** `oauth_usage_failed`, `oauth_logged_out`,
+  `oauth_refresh_token_age_warn`
+- **Infrastructure:** `bind_mount_stale_detected`,
+  `bind_mount_stale_persistent`, `git_commit_failed`,
+  `git_push_failed`, `git_pull_blocked`,
+  `shell_job_complete_enqueue_failed`
+- **Bridge supervision:** `discord_bridge_retry`,
+  `discord_bridge_login_failure`, `discord_bridge_intents_failure`,
+  `slack_bridge_retry`, `slack_bridge_auth_failure`,
+  `slack_bridge_scope_failure`
+- **Wiki / spawn / commitments:** `wiki_backlinks_unhealthy`,
+  `claude_code_spawn_auth_failed`, `claude_code_spawn_work_failed`,
+  `commitment_expired`
+- **Positive:** `saga_feedback_sent`, `react_received`,
+  `cost_rate_advisory`, `saga_consolidate_ok`, `saga_decay_ok`,
+  `saga_forget_ok`, `introspection_report_ok`,
+  `oauth_usage_ok`, `oauth_refresh_ok`, `bind_mount_recovered`,
+  `ntfy_post_ok`, `git_push_ok`, `git_pull_ok`, `git_fetch_ok`,
+  `shell_job_complete_enqueue_ok`, `claude_code_spawn_completed`,
+  `commitment_due`
 
 Adding a new signal: one line in `_EVENT_RULES`, one renderer
 clause in `_render_event_line`, plus a test pair in
