@@ -53,11 +53,11 @@ exported (set it in `mimirbot/.env` if running there).
 
 ```bash
 # Default location (set inside the script — Victor, NY, US).
-python3 .claude/skills/weather/get_weather.py
+python3 skills/weather/get_weather.py
 
 # Specific city. Comma-separated; ISO country codes for disambiguation.
-python3 .claude/skills/weather/get_weather.py "London,UK"
-python3 .claude/skills/weather/get_weather.py "San Francisco,CA,US"
+python3 skills/weather/get_weather.py "London,UK"
+python3 skills/weather/get_weather.py "San Francisco,CA,US"
 ```
 
 Default output is plain text (current conditions + 5-day high/low/precip).
@@ -65,7 +65,7 @@ Add `--json` when you want to format the output yourself or pull specific
 fields:
 
 ```bash
-python3 .claude/skills/weather/get_weather.py "Tokyo,JP" --json
+python3 skills/weather/get_weather.py "Tokyo,JP" --json
 ```
 
 The JSON shape:
