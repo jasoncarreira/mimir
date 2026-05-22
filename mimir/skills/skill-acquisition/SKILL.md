@@ -1,6 +1,7 @@
 ---
 name: skill-acquisition
 description: Discover, evaluate, install, and wrap external agent skills from ClawHub registry, skillflag-compliant CLI tools, and GitHub repos. Use when asked to find new capabilities, install a skill, browse what's available, or package a local skill for sharing.
+subagent: true
 allowed-tools:
   - Bash
   - Read

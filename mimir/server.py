@@ -37,7 +37,13 @@ from .saga_client import SagaClient, make_saga_client
 from .scheduler import Scheduler
 from .search import Indexer
 from .session_manager import ChannelSession, SessionManager
-from .skill_defs import seed_skills
+from .skill_defs import (
+    home_skills_dir,
+    migrate_legacy_skills_dir,
+    refresh_builtin_skills,
+    seed_scheduler,
+)
+from .prompt_templates import seed_prompts
 from .subagent_defs import seed_subagent_defs
 from .subagent_inbox import SubagentInbox
 from .turn_logger import TurnLogger
@@ -239,7 +245,20 @@ def build_app(config: Config) -> web.Application:
     (config.home / "messages").mkdir(parents=True, exist_ok=True)
     (config.home / ".claude" / "agents").mkdir(parents=True, exist_ok=True)
     seeded = seed_subagent_defs(config.home)
-    seeded_skills_map = seed_skills(config.home)
+    # One-shot migration: existing deployments with skills under
+    # ``<home>/.claude/skills/`` get their content moved to the
+    # ``<home>/skills/`` operator location. Idempotent — no-op once
+    # done, since the source dir is gone after the first run.
+    migrate_legacy_skills_dir(config.home)
+    # Refresh bundled skills into ``<home>/.mimir_builtin_skills/``.
+    # Unconditional overwrite — the bundle is read-only by convention,
+    # always matches mimir source.
+    seeded_skills_map = refresh_builtin_skills(config.home)
+    # Seed default operator prompts (heartbeat.md, reflect.md) and the
+    # default scheduler.yaml if missing. Idempotent — only writes when
+    # the target is absent, so operator customizations persist.
+    seed_prompts(config.home)
+    seed_scheduler(config.home)
 
     init_logger(
         config.events_log,
@@ -779,11 +798,14 @@ def build_app(config: Config) -> web.Application:
         reload_stats = scheduler.reload()
 
         # Pollers framework (chainlink #3). Discovers any
-        # ``<home>/.claude/skills/**/pollers.json`` and registers each
-        # as a cron-fired subprocess. Most installs have no pollers
-        # and ``installed_pollers`` is 0 (no-ops cleanly).
+        # ``<home>/skills/**/pollers.json`` and registers each as a
+        # cron-fired subprocess. Most installs have no pollers and
+        # ``installed_pollers`` is 0 (no-ops cleanly). Bundled
+        # built-ins under ``<home>/.mimir_builtin_skills/`` are NOT
+        # scanned — pollers are deployment-specific operator config,
+        # never part of the mimir bundle.
         installed_pollers = scheduler.add_poller_jobs(
-            config.home / ".claude" / "skills",
+            home_skills_dir(config.home),
         )
 
         if (

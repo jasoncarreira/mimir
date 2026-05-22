@@ -11,6 +11,15 @@ allowed-tools:
   - memory_query
   - memory_store
   - send_message
+success_criteria:
+  # Memory is bidirectional — a read OR a write counts. Loading the
+  # skill and then not exercising either path means we consulted the
+  # policy but never acted on it (the exact confab-risk shape the
+  # threadborn 2026-05-21 post-mortem flagged).
+  any_of:
+    - tool_call: {name: memory_store}
+    - tool_call: {name: memory_query}
+    - tool_call: {name: saga_end_session}
 ---
 
 # Memory
@@ -102,12 +111,12 @@ to switch strategies — not to retry the same call.
 ### SAGA atoms — semantic recall
 
 Mirror durable facts as semantic atoms via
-`mcp__mimir__memory_store(stream="semantic")`. Atoms support fuzzy /
+`memory_store(stream="semantic")`. Atoms support fuzzy /
 paraphrased queries via embeddings *and* keyword match on distinctive
 terms — so include in the atom content any anchor that a future query
 might use to find this fact: names, handles, dates, identifiers,
 technical phrases. The pre-message hook injects relevant atoms
-automatically; mid-turn queries via `mcp__mimir__memory_query` work for
+automatically; mid-turn queries via `memory_query` work for
 follow-ups.
 
 ## What gets seen turn-to-turn
@@ -142,7 +151,7 @@ it?"
    `file_search` or direct path; `state/INDEX.md` lives outside the
    prompt, and the wiki's own `index.md` + backlinks are the
    navigation layer.
-10. **SAGA atoms (full content)** — `mcp__mimir__memory_query` reaches
+10. **SAGA atoms (full content)** — `memory_query` reaches
     beyond the auto-injected top-k.
 11. **`events.jsonl`** — `introspection` skill; ~30-day retention at
     default 75k cap.

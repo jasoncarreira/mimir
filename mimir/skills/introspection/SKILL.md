@@ -4,7 +4,25 @@ description: Diagnose your own behavior by reading the structured logs you leave
 allowed-tools:
   - Bash
   - Read
-  - saga_query
+  - memory_query
+success_criteria:
+  # Introspection is a diagnostic skill — "look at the logs to
+  # understand X." Concrete outputs are either a written report
+  # (state/reports/<file>.md) or a memory_query that paid off (the
+  # agent looked something up to anchor its diagnosis). A turn that
+  # loads the SKILL.md and then does neither means the diagnosis
+  # never landed in durable form.
+  any_of:
+    - tool_call:
+        name: write_file
+        args:
+          file_path_glob: "*state/reports/*"
+    - tool_call:
+        name: edit_file
+        args:
+          file_path_glob: "*state/reports/*"
+    - tool_call:
+        name: memory_query
 ---
 
 # Introspection
@@ -183,7 +201,7 @@ where 3+ consecutive turns score >0.9 pairwise.
 
 Variety-decay on the retrieval surface: if a small set of SAGA
 atoms dominates citations across recent turns, that's a working-
-set collapse. Group `saga_query` results (or post-message
+set collapse. Group `memory_query` results (or post-message
 contribution credits) by returned atom_id over trailing N turns;
 compute Gini or Shannon entropy of the citation distribution.
 Low entropy + high Gini = collapsed retrieval.
