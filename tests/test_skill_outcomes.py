@@ -32,7 +32,11 @@ def test_classify_pairs_call_and_result():
         {"type": "tool_result", "id": "tool_2", "is_error": True, "content": "boom"},
     ]
     out = list(_classify_skill_calls(events, base))
-    assert out == [("memory", "success", base), ("wiki", "failure", base)]
+    # task() invocations always emit kind="execution" — the clean signal.
+    assert out == [
+        ("memory", "success", base, "execution"),
+        ("wiki", "failure", base, "execution"),
+    ]
 
 
 def test_classify_unmatched_call_is_abandoned_when_turn_outcome_unknown():
@@ -44,7 +48,7 @@ def test_classify_unmatched_call_is_abandoned_when_turn_outcome_unknown():
         # no matching tool_result
     ]
     out = list(_classify_skill_calls(events, base))
-    assert out == [("alert", "abandoned", base)]
+    assert out == [("alert", "abandoned", base, "execution")]
 
 
 def test_classify_unmatched_call_infers_success_from_turn():
@@ -64,7 +68,7 @@ def test_classify_unmatched_call_infers_success_from_turn():
         # No tool_result — ChatClaudeCode streaming gap
     ]
     out = list(_classify_skill_calls(events, base, turn_succeeded=True))
-    assert out == [("heartbeat", "success", base)]
+    assert out == [("heartbeat", "success", base, "execution")]
 
 
 def test_classify_unmatched_call_infers_failure_from_turn():
@@ -75,7 +79,7 @@ def test_classify_unmatched_call_infers_failure_from_turn():
          "args": {"subagent_type": "heartbeat"}},
     ]
     out = list(_classify_skill_calls(events, base, turn_succeeded=False))
-    assert out == [("heartbeat", "failure", base)]
+    assert out == [("heartbeat", "failure", base, "execution")]
 
 
 def test_classify_exact_result_takes_precedence_over_turn_success():
@@ -89,7 +93,7 @@ def test_classify_exact_result_takes_precedence_over_turn_success():
         {"type": "tool_result", "id": "tool_1", "is_error": True, "content": "boom"},
     ]
     out = list(_classify_skill_calls(events, base, turn_succeeded=True))
-    assert out == [("memory", "failure", base)]
+    assert out == [("memory", "failure", base, "execution")]
 
 
 def test_classify_ignores_non_skill_tools():
@@ -118,7 +122,8 @@ def test_classify_read_file_skill_md_as_load():
         {"type": "tool_result", "id": "r1", "is_error": False, "content": "..."},
     ]
     out = list(_classify_skill_calls(events, base))
-    assert out == [("threadborn", "success", base)]
+    # read_file() on a SKILL.md emits kind="load" — proxy signal.
+    assert out == [("threadborn", "success", base, "load")]
 
 
 def test_classify_read_file_skill_md_failure():
@@ -130,7 +135,7 @@ def test_classify_read_file_skill_md_failure():
          "content": "Error: File not found"},
     ]
     out = list(_classify_skill_calls(events, base))
-    assert out == [("threadborn", "failure", base)]
+    assert out == [("threadborn", "failure", base, "load")]
 
 
 def test_classify_read_file_tolerates_path_prefixes():
@@ -150,7 +155,7 @@ def test_classify_read_file_tolerates_path_prefixes():
             {"type": "tool_result", "id": "r1", "is_error": False},
         ]
         out = list(_classify_skill_calls(events, base))
-        assert out == [("moltbook", "success", base)], f"path={path}"
+        assert out == [("moltbook", "success", base, "load")], f"path={path}"
 
 
 def test_classify_read_file_non_skill_path_ignored():
@@ -187,15 +192,17 @@ def test_classify_read_file_skill_load_falls_back_when_no_result():
          "args": {"file_path": "/mimir-home/.claude/skills/heartbeat/SKILL.md"}},
         # No tool_result.
     ]
-    # Turn succeeded → infer success.
+    # Turn succeeded → infer success. The "load" kind survives the
+    # fallback so per-path counters stay accurate even when the exact
+    # tool_result is absent.
     out_ok = list(_classify_skill_calls(events, base, turn_succeeded=True))
-    assert out_ok == [("heartbeat", "success", base)]
+    assert out_ok == [("heartbeat", "success", base, "load")]
     # Turn failed → infer failure.
     out_fail = list(_classify_skill_calls(events, base, turn_succeeded=False))
-    assert out_fail == [("heartbeat", "failure", base)]
+    assert out_fail == [("heartbeat", "failure", base, "load")]
     # Turn outcome unknown → abandoned.
     out_unk = list(_classify_skill_calls(events, base))
-    assert out_unk == [("heartbeat", "abandoned", base)]
+    assert out_unk == [("heartbeat", "abandoned", base, "load")]
 
 
 def test_classify_both_invocation_patterns_in_same_turn():
@@ -213,8 +220,10 @@ def test_classify_both_invocation_patterns_in_same_turn():
         {"type": "tool_result", "id": "r1", "is_error": False},
     ]
     out = list(_classify_skill_calls(events, base))
-    assert ("memory", "success", base) in out
-    assert ("threadborn", "success", base) in out
+    # Both paths land in the output, each tagged with its kind so the
+    # downstream aggregator can keep counters separate.
+    assert ("memory", "success", base, "execution") in out
+    assert ("threadborn", "success", base, "load") in out
     assert len(out) == 2
 
 

@@ -76,15 +76,61 @@ _SKILL_READ_RE = re.compile(
 # loop_id: 12.3
 @dataclass
 class SkillOutcome:
+    """Per-skill outcome tallies across a window.
+
+    The ``success`` / ``failure`` / ``abandoned`` fields are *totals*
+    used for ranking (proven vs risky buckets). Two distinct invocation
+    paths feed these totals — the per-path counters
+    (``execution_*`` and ``load_*``) preserve the breakdown so an
+    operator can tell apart "skill ran cleanly" from "skill loaded
+    cleanly":
+
+    * **execution** — ``task(subagent_type=X)`` call returns a
+      ``tool_result`` whose ``is_error`` flag *directly* reflects
+      whether the subagent's workflow finished cleanly. Clean signal.
+    * **load** — ``read_file(.../SKILL.md)`` call's ``is_error`` only
+      tells us the SKILL.md file opened, NOT whether the agent
+      followed the procedure it described. Proxy signal coupled to
+      the parent turn's overall outcome via the fallback in
+      :func:`_classify_skill_calls`.
+
+    Mixing the two into a single rate hides that distinction. The
+    breakdown matters when an operator asks "is this skill genuinely
+    succeeding, or is it just reading its own SKILL.md and then
+    drifting?". Aggregate counters stay as the ranking input;
+    breakdown counters are surface-level diagnostics.
+    """
+
     skill: str
     success: int = 0
     failure: int = 0
     abandoned: int = 0
+    # Per-path breakdown of the totals above. Sum invariants:
+    # ``execution_success + load_success == success`` (and same for
+    # failure/abandoned). Maintained by ``aggregate()``.
+    execution_success: int = 0
+    execution_failure: int = 0
+    execution_abandoned: int = 0
+    load_success: int = 0
+    load_failure: int = 0
+    load_abandoned: int = 0
     last_used: datetime | None = None
 
     @property
     def total(self) -> int:
         return self.success + self.failure + self.abandoned
+
+    @property
+    def execution_total(self) -> int:
+        return (
+            self.execution_success
+            + self.execution_failure
+            + self.execution_abandoned
+        )
+
+    @property
+    def load_total(self) -> int:
+        return self.load_success + self.load_failure + self.load_abandoned
 
     @property
     def success_rate(self) -> float | None:
@@ -97,6 +143,25 @@ class SkillOutcome:
         if denom == 0:
             return None
         return self.success / denom
+
+    @property
+    def execution_success_rate(self) -> float | None:
+        """Success rate computed only from the clean ``task()`` path.
+        ``None`` when the skill never ran via ``task()`` in window."""
+        if self.execution_total == 0:
+            return None
+        return self.execution_success / self.execution_total
+
+    @property
+    def load_success_rate(self) -> float | None:
+        """Success rate computed only from the proxy ``read_file()``
+        path. ``None`` when the skill never loaded inline in window.
+        Less reliable than ``execution_success_rate`` — read the
+        :class:`SkillOutcome` docstring on the proxy/clean distinction
+        before acting on this number."""
+        if self.load_total == 0:
+            return None
+        return self.load_success / self.load_total
 
 
 def _iter_turns(path: Path) -> Iterable[dict]:
@@ -119,12 +184,13 @@ def _classify_skill_calls(
     events: list[dict], turn_ts: datetime,
     *,
     turn_succeeded: bool | None = None,
-) -> Iterable[tuple[str, str, datetime]]:
+) -> Iterable[tuple[str, str, datetime, str]]:
     """Walk a single turn's events list, recognize skill invocations,
     pair their tool_call ↔ tool_result by id, yield
-    ``(skill_name, outcome, ts)`` tuples.
+    ``(skill_name, outcome, ts, kind)`` tuples.
 
     Outcome ∈ {"success", "failure", "abandoned"}.
+    Kind ∈ {"execution", "load"} — see below.
 
     **Two invocation patterns on the deepagents runtime:**
 
@@ -132,24 +198,22 @@ def _classify_skill_calls(
        delegated execution. Skill compiled to a SubAgent (see
        ``mimir.subagent_compiler``); parent agent invokes via the
        framework's ``task`` tool. ``tool_result.is_error`` directly
-       reflects whether the subagent's workflow succeeded. This is
-       the **execution** signal — clean, structured.
+       reflects whether the subagent's workflow succeeded. Emitted
+       with ``kind="execution"`` — this is the clean signal.
 
     2. ``tool_call(name="read_file", args.file_path="…/SKILL.md")``
        — inline load. Skill stays in the catalog; agent reads
        SKILL.md and improvises with its full parent tool surface.
-       This is a **load** signal — measures whether the file was
-       readable, NOT whether the subsequent improvised workflow
-       succeeded. Inline-skill execution outcomes are inherently
-       coupled to the parent turn (see plan in
+       Emitted with ``kind="load"`` — this measures only whether the
+       file was readable, NOT whether the subsequent improvised
+       workflow succeeded. Inline-skill execution outcomes are
+       inherently coupled to the parent turn (see plan in
        ``docs/skill-as-tool-architecture.md``).
 
-    The classifier doesn't distinguish — it produces the same
-    ``(skill, outcome, ts)`` tuples for both. Downstream
-    aggregation treats them identically. Future enhancement: split
-    counters into ``execution_success`` (task path) vs
-    ``load_success`` (read_file path) so operators can see the
-    difference.
+    Downstream aggregation accumulates totals (used for ranking) and
+    per-kind breakdowns (used for diagnostics) separately so an
+    operator can tell "ran cleanly" from "loaded cleanly". See
+    :class:`SkillOutcome` for the breakdown's semantics.
 
     ``turn_succeeded`` is the overall turn signal (False when
     ``result_is_error`` is True). When a skill invocation has no
@@ -175,7 +239,7 @@ def _classify_skill_calls(
     failure). Subagent-mode skills aren't affected — they have
     explicit per-invocation tool_result outcomes.
     """
-    pending: dict[str, str] = {}   # tool_use_id → skill name
+    pending: dict[str, tuple[str, str]] = {}   # tool_use_id → (skill name, kind)
     for ev in events:
         if not isinstance(ev, dict):
             continue
@@ -186,6 +250,7 @@ def _classify_skill_calls(
             if not isinstance(args, dict):
                 args = {}
             skill: str | None = None
+            kind: str = ""
             if name == "task":
                 # deepagents subagent-execution path: ``task`` tool
                 # invokes a registered SubAgent. For mimir-skill-derived
@@ -196,6 +261,7 @@ def _classify_skill_calls(
                 sub = args.get("subagent_type")
                 if isinstance(sub, str) and sub:
                     skill = sub
+                    kind = "execution"
             elif name == "read_file":
                 # deepagents inline path: agent reads SKILL.md to load
                 # the skill into parent context, then improvises.
@@ -204,27 +270,33 @@ def _classify_skill_calls(
                     m = _SKILL_READ_RE.search(file_path)
                     if m:
                         skill = m.group(1)
+                        kind = "load"
             if skill:
                 tool_id = ev.get("id")
                 if isinstance(tool_id, str):
-                    pending[tool_id] = skill
+                    pending[tool_id] = (skill, kind)
         elif etype == "tool_result":
             tool_id = ev.get("id")
             if isinstance(tool_id, str) and tool_id in pending:
-                skill = pending.pop(tool_id)
+                skill, kind = pending.pop(tool_id)
                 is_error = bool(ev.get("is_error"))
-                yield skill, ("failure" if is_error else "success"), turn_ts
+                yield (
+                    skill,
+                    "failure" if is_error else "success",
+                    turn_ts,
+                    kind,
+                )
 
     # Anything left in pending has no matching tool_result.
     # Use the turn-level signal as a fallback (see classifier
     # docstring for the imprecision tradeoff).
-    for skill in pending.values():
+    for skill, kind in pending.values():
         if turn_succeeded is True:
-            yield skill, "success", turn_ts
+            yield skill, "success", turn_ts, kind
         elif turn_succeeded is False:
-            yield skill, "failure", turn_ts
+            yield skill, "failure", turn_ts, kind
         else:
-            yield skill, "abandoned", turn_ts
+            yield skill, "abandoned", turn_ts, kind
 
 
 def aggregate(
@@ -259,17 +331,34 @@ def aggregate(
         turn_succeeded: bool | None = (
             None if raw_is_error is None else not bool(raw_is_error)
         )
-        for skill, outcome, _ in _classify_skill_calls(
+        for skill, outcome, _, kind in _classify_skill_calls(
             events, ts, turn_succeeded=turn_succeeded
         ):
             entry = out[skill]
             entry.skill = skill
+            # Increment the aggregate total AND the per-kind counter
+            # so totals stay correct for ranking and the breakdown
+            # stays correct for diagnostics. Unknown kinds (legacy
+            # records, future paths) only bump the aggregate; the
+            # breakdown is best-effort.
             if outcome == "success":
                 entry.success += 1
+                if kind == "execution":
+                    entry.execution_success += 1
+                elif kind == "load":
+                    entry.load_success += 1
             elif outcome == "failure":
                 entry.failure += 1
+                if kind == "execution":
+                    entry.execution_failure += 1
+                elif kind == "load":
+                    entry.load_failure += 1
             else:
                 entry.abandoned += 1
+                if kind == "execution":
+                    entry.execution_abandoned += 1
+                elif kind == "load":
+                    entry.load_abandoned += 1
             if entry.last_used is None or ts > entry.last_used:
                 entry.last_used = ts
 
@@ -338,15 +427,33 @@ def render_skill_telemetry(
     if not (proven or risky):
         return None
 
+    def _fmt_counts(agg: SkillOutcome) -> str:
+        """Render the count summary. When a skill has activity on
+        both paths (task() execution AND read_file() load), show the
+        breakdown so the operator can tell apart the clean signal
+        from the proxy one. Single-path skills render compactly."""
+        et = agg.execution_total
+        lt = agg.load_total
+        if et and lt:
+            return (
+                f"{agg.success}/{agg.total} in window — "
+                f"exec {agg.execution_success}/{et}, "
+                f"load {agg.load_success}/{lt}"
+            )
+        if et:
+            return f"{agg.success}/{agg.total} in window (exec)"
+        if lt:
+            return f"{agg.success}/{agg.total} in window (load)"
+        # Neither kind labeled — legacy records or unknown path.
+        return f"{agg.success}/{agg.total} in window"
+
     lines: list[str] = []
     if proven:
         lines.append("- skills proven (recent success):")
         for name in proven:
-            agg = aggregates[name]
-            lines.append(f"  - {name} ({agg.success}/{agg.total} in window)")
+            lines.append(f"  - {name} ({_fmt_counts(aggregates[name])})")
     if risky:
         lines.append("- skills risky ⚠ (recent failures > successes):")
         for name in risky:
-            agg = aggregates[name]
-            lines.append(f"  - {name} ({agg.success}/{agg.total} in window)")
+            lines.append(f"  - {name} ({_fmt_counts(aggregates[name])})")
     return "\n".join(lines)
