@@ -260,3 +260,141 @@ def test_compile_uses_dirname_when_frontmatter_name_missing(tmp_path: Path):
     result = compile_skills_to_subagents(tmp_path, [])
     assert result.delegated_skills == {"from-dir"}
     assert result.subagents[0]["name"] == "from-dir"
+
+
+# ─── params / returns schema handling ─────────────────────────────────
+
+
+def test_compile_skill_with_params_schema_renders_block(tmp_path: Path):
+    """Skill declares ``params`` JSON Schema → rendered as
+    ``## Parameters`` block in subagent system_prompt, summarized
+    into the SubAgent description."""
+    sd = tmp_path / ".claude" / "skills" / "weather"
+    sd.mkdir(parents=True)
+    (sd / "SKILL.md").write_text(
+        "---\n"
+        "name: weather\n"
+        "description: Get weather for a city.\n"
+        "allowed-tools:\n"
+        "  - Bash\n"
+        "params:\n"
+        "  type: object\n"
+        "  properties:\n"
+        "    city:\n"
+        "      type: string\n"
+        "      description: City name\n"
+        "    days:\n"
+        "      type: integer\n"
+        "      description: Forecast horizon\n"
+        "  required: [city]\n"
+        "---\n"
+        "Skill body.\n"
+    )
+    result = compile_skills_to_subagents(tmp_path, [])
+    spec = result.subagents[0]
+    # system_prompt gets the parameters block appended.
+    assert "## Parameters" in spec["system_prompt"]
+    assert "city" in spec["system_prompt"]
+    assert "City name" in spec["system_prompt"]
+    # description gets the one-line summary appended.
+    assert "Get weather for a city." in spec["description"]
+    assert "city (required)" in spec["description"]
+    assert "days (optional)" in spec["description"]
+
+
+def test_compile_skill_with_returns_schema_sets_response_format(tmp_path: Path):
+    """Skill declares ``returns`` JSON Schema → passed verbatim to
+    SubAgent ``response_format`` field, summarized into description."""
+    sd = tmp_path / ".claude" / "skills" / "weather"
+    sd.mkdir(parents=True)
+    returns_block = (
+        "returns:\n"
+        "  type: object\n"
+        "  properties:\n"
+        "    forecast:\n"
+        "      type: string\n"
+        "    high_temp_c:\n"
+        "      type: number\n"
+        "  required: [forecast]\n"
+    )
+    (sd / "SKILL.md").write_text(
+        "---\n"
+        "name: weather\n"
+        "description: Get weather.\n"
+        "allowed-tools:\n"
+        "  - Bash\n"
+        f"{returns_block}"
+        "---\nbody\n"
+    )
+    result = compile_skills_to_subagents(tmp_path, [])
+    spec = result.subagents[0]
+    # response_format gets the schema dict.
+    assert spec["response_format"]["type"] == "object"
+    assert "forecast" in spec["response_format"]["properties"]
+    assert spec["response_format"]["required"] == ["forecast"]
+    # description gets the return-shape summary.
+    assert "Returns: forecast, high_temp_c" in spec["description"]
+
+
+def test_compile_skill_without_params_or_returns(tmp_path: Path):
+    """Backward-compat: skills without params/returns work as before
+    — no ``## Parameters`` block, no ``response_format`` field, no
+    summary suffix on description."""
+    _seed_skill(tmp_path, "bare", allowed_tools=["Bash"])
+    result = compile_skills_to_subagents(tmp_path, [])
+    spec = result.subagents[0]
+    assert "## Parameters" not in spec["system_prompt"]
+    assert "response_format" not in spec
+    # description unchanged from frontmatter
+    assert "Params:" not in spec["description"]
+    assert "Returns:" not in spec["description"]
+
+
+def test_compile_skill_with_both_params_and_returns(tmp_path: Path):
+    """Both fields together — both render correctly, description
+    carries both summaries."""
+    sd = tmp_path / ".claude" / "skills" / "weather"
+    sd.mkdir(parents=True)
+    (sd / "SKILL.md").write_text(
+        "---\n"
+        "name: weather\n"
+        "description: Get weather.\n"
+        "allowed-tools:\n"
+        "  - Bash\n"
+        "params:\n"
+        "  type: object\n"
+        "  properties:\n"
+        "    city: {type: string}\n"
+        "  required: [city]\n"
+        "returns:\n"
+        "  type: object\n"
+        "  properties:\n"
+        "    forecast: {type: string}\n"
+        "  required: [forecast]\n"
+        "---\nbody\n"
+    )
+    result = compile_skills_to_subagents(tmp_path, [])
+    spec = result.subagents[0]
+    assert "## Parameters" in spec["system_prompt"]
+    assert "response_format" in spec
+    assert "Params: city (required)." in spec["description"]
+    assert "Returns: forecast." in spec["description"]
+
+
+def test_compile_skill_with_malformed_params_is_ignored(tmp_path: Path):
+    """``params`` that isn't a dict gets silently ignored — skill
+    still compiles, just without the params rendering."""
+    sd = tmp_path / ".claude" / "skills" / "x"
+    sd.mkdir(parents=True)
+    (sd / "SKILL.md").write_text(
+        "---\n"
+        "name: x\n"
+        "description: x\n"
+        "allowed-tools:\n  - Bash\n"
+        "params: not-a-dict\n"
+        "---\nbody\n"
+    )
+    result = compile_skills_to_subagents(tmp_path, [])
+    assert result.delegated_skills == {"x"}
+    spec = result.subagents[0]
+    assert "## Parameters" not in spec["system_prompt"]
