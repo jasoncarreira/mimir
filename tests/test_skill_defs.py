@@ -121,11 +121,15 @@ def test_seed_skills_cleans_up_tmp_from_prior_crash(tmp_path: Path):
     assert (tmp_path / ".mimir_builtin_skills" / "memory" / "SKILL.md").is_file()
 
 
-def test_installed_skill_names_includes_user_added_skills(tmp_path: Path):
-    """§12.4 review #11: skills the user adds under <home>/.mimir_builtin_skills/
-    should appear in the ranker's input alongside bundled skills."""
+def test_installed_skill_names_includes_operator_installed_skills(tmp_path: Path):
+    """Operator-installed skills under ``<home>/skills/`` are picked
+    up by the ranker alongside the bundled ``.mimir_builtin_skills/``
+    entries. Per the post-2026-05-22 dual-location split, this is
+    the canonical "user adds a skill" surface — the bundled dir is
+    read-only and overwritten every boot, so anything an operator
+    writes there gets clobbered."""
     seed_skills(tmp_path)
-    user_skill = tmp_path / ".mimir_builtin_skills" / "my-custom-skill"
+    user_skill = tmp_path / "skills" / "my-custom-skill"
     user_skill.mkdir(parents=True)
     (user_skill / "SKILL.md").write_text("---\nname: my-custom-skill\n---\nbody")
 

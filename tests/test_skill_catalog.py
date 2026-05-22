@@ -226,7 +226,7 @@ def test_generate_on_real_bundled_skills_includes_known_skill() -> None:
     introspection)."""
     output = generate()
     assert "### `memory`" in output
-    assert "### `memory`" in output
+    assert "### `wiki`" in output
     assert "### `introspection`" in output
 
 
