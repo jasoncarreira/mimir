@@ -413,16 +413,24 @@ def test_compile_skill_with_returns_schema_sets_response_format(tmp_path: Path):
     assert spec["response_format"]["required"] == ["forecast"]
     # description gets the return-shape summary.
     assert "Returns: forecast, high_temp_c" in spec["description"]
+    # system_prompt gets a ## Final Response block so the SubAgent
+    # knows to call the structured-output tool (whose default name is
+    # opaque without this guidance).
+    assert "## Final Response" in spec["system_prompt"]
+    assert "structured-output tool" in spec["system_prompt"]
+    # Schema rendered into the block for readability.
+    assert "forecast:" in spec["system_prompt"]
 
 
 def test_compile_skill_without_params_or_returns(tmp_path: Path):
     """Backward-compat: skills without params/returns work as before
-    — no ``## Parameters`` block, no ``response_format`` field, no
-    summary suffix on description."""
+    — no ``## Parameters`` block, no ``## Final Response`` block, no
+    ``response_format`` field, no summary suffix on description."""
     _seed_skill(tmp_path, "bare", allowed_tools=["Bash"])
     result = compile_skills_to_subagents(tmp_path, [])
     spec = result.subagents[0]
     assert "## Parameters" not in spec["system_prompt"]
+    assert "## Final Response" not in spec["system_prompt"]
     assert "response_format" not in spec
     # description unchanged from frontmatter
     assert "Params:" not in spec["description"]

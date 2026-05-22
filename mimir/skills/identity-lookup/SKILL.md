@@ -5,6 +5,46 @@ subagent: true
 allowed-tools:
   - Bash
   - Read
+params:
+  type: object
+  properties:
+    query:
+      type: string
+      description: An alias or canonical id to resolve. Examples — "discord-238367217903730690", "slack-C100", "jason", "bsky:carreira.bsky.social".
+    kind:
+      type: string
+      enum: [person, channel, any]
+      description: Narrow the search to one registry. "any" (default) checks people first, then channels.
+  required: [query]
+returns:
+  title: identity_lookup_result
+  description: Resolution of one alias / canonical id against state/identities.yaml. ``found=false`` when the registry has no matching entry.
+  type: object
+  properties:
+    found:
+      type: boolean
+      description: True when the query matched a registered canonical or alias.
+    kind:
+      type: [string, "null"]
+      enum: [person, channel, null]
+      description: Which registry the match came from. Null when not found.
+    canonical:
+      type: [string, "null"]
+      description: Canonical id (e.g. "jason", "slack-C100"). Null when not found.
+    display_name:
+      type: [string, "null"]
+      description: Operator-set human-readable name; null when the entry has no display_name field.
+    aliases:
+      type: array
+      items: {type: string}
+      description: All known aliases for this canonical. Empty when not found.
+    channel_kind:
+      type: [string, "null"]
+      description: Only present for channels — one of "public", "dm", "guild-meta", or other operator-set value. Null for people and not-found.
+    notes:
+      type: [string, "null"]
+      description: Free-form operator notes on the entry, when present.
+  required: [found, kind, canonical, aliases]
 ---
 
 # Identity Lookup

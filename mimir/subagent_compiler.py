@@ -256,6 +256,47 @@ def _render_return_summary(returns_schema: dict[str, Any]) -> str:
     return f"Returns: {', '.join(props.keys())}."
 
 
+def _render_returns_block(returns_schema: dict[str, Any]) -> str:
+    """Render the ``returns`` schema as a system-prompt block.
+
+    Symmetric to :func:`_render_params_block`. The langchain
+    structured-output machinery binds an artificial tool to the model
+    whose name/description come from the schema's ``title`` /
+    ``description`` (structured_output.py:159-170). Without a
+    title the tool name defaults to ``response_format_<uuid>`` — the
+    model has to guess this is the "final answer" tool. The block we
+    inject here makes that contract explicit in the SubAgent's
+    system_prompt so the model knows (a) it should call a tool to
+    return, (b) what shape that tool expects.
+
+    Example output:
+
+    .. code-block:: markdown
+
+        ## Final Response
+
+        Return your final result by calling the structured-output tool
+        with arguments matching this schema:
+
+        ```yaml
+        type: object
+        properties:
+          found:
+            type: boolean
+        required: [found]
+        ```
+    """
+    schema_yaml = yaml.safe_dump(
+        returns_schema, default_flow_style=False, sort_keys=False,
+    ).rstrip()
+    return (
+        "\n\n## Final Response\n\n"
+        "Return your final result by calling the structured-output tool "
+        "with arguments matching this schema:\n\n"
+        f"```yaml\n{schema_yaml}\n```\n"
+    )
+
+
 def _resolve_tool(name: str, registry: dict[str, Any]) -> Any | None:
     """Look up a tool by ``allowed-tools`` entry. Returns the tool
     instance, ``"builtin"`` for framework built-ins (caller skips them),
@@ -448,9 +489,14 @@ def compile_skills_to_subagents(
         # ``response_format=`` field, which accepts JSON schema dicts.
         # The framework enforces the schema on the subagent's last
         # message, so the parent receives structured ``tool_result``
-        # content matching this shape.
+        # content matching this shape. We also render a ``## Final
+        # Response`` block into the SubAgent's system_prompt so the
+        # model has explicit guidance to use the structured-output
+        # tool langchain binds for response_format (whose default name
+        # is ``response_format_<uuid>`` — opaque without the block).
         returns_schema = meta.get("returns")
         if isinstance(returns_schema, dict) and returns_schema:
+            system_prompt += _render_returns_block(returns_schema)
             summary = _render_return_summary(returns_schema)
             if summary:
                 description = f"{description} {summary}"

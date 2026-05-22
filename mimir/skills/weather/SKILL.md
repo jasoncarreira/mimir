@@ -17,6 +17,8 @@ params:
       maximum: 5
   required: [city]
 returns:
+  title: weather_result
+  description: Final structured weather payload for the parent agent. Includes current conditions and an optional daily forecast.
   type: object
   properties:
     city:
