@@ -141,6 +141,8 @@ _KNOWN_MCP_TOOLS = frozenset(
         "send_message",
         "react",
         "file_search",
+        "memory_query",
+        "memory_store",
         "saga_query",
         "saga_store",
         "saga_end_session",
