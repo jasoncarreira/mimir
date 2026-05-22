@@ -791,6 +791,30 @@ class Agent:
                 "MIMIR_MODEL_SPEC",
                 getattr(self._config, "model_spec", "claude-code:claude-sonnet-4-6"),
             )
+            # Compile skills with declared ``allowed-tools`` into SubAgent
+            # specs (per docs/skill-as-tool-architecture.md). Must run
+            # BEFORE _build_system_prompt so the inline skill catalog can
+            # suppress the delegated names — otherwise the agent sees the
+            # same skill twice (once as a catalog entry to "load via
+            # read_file", once via the framework's ``task`` tool surface)
+            # and picks the old path.
+            try:
+                from .subagent_compiler import compile_skills_to_subagents
+                compile_result = compile_skills_to_subagents(
+                    self._config.home, all_mimir_tools(),
+                )
+                self._delegated_subagent_specs = compile_result.subagents
+                self._delegated_skill_names = compile_result.delegated_skills
+            except Exception:  # noqa: BLE001
+                # Compilation is best-effort — drift, parse errors, or
+                # filesystem issues should NEVER block agent boot. Fall
+                # back to "no delegated skills" so everything stays inline.
+                log.exception(
+                    "skill subagent compilation failed; falling back to inline"
+                )
+                self._delegated_subagent_specs = []
+                self._delegated_skill_names = set()
+
             # Assemble the real system prompt — core memory + memory index +
             # operator alert channel + skill catalog. Built fresh per turn
             # so skill bucket assignments / outcome aggregates stay current
@@ -830,6 +854,7 @@ class Agent:
                 tools=all_mimir_tools(),
                 system_prompt=system_prompt,
                 backend=backend,
+                subagents=self._delegated_subagent_specs,
             )
             return self._agent
 
@@ -1676,6 +1701,13 @@ class Agent:
             from .skill_defs import installed_skill_names
             from .skill_catalog import load_catalog, DEFAULT_SKILLS_ROOT
             seeded = installed_skill_names(self._config.home)
+            # Suppress skills that compiled to SubAgent specs — the agent
+            # invokes them via the framework's ``task`` tool, so listing
+            # them again in the inline catalog would prompt the model
+            # to read the SKILL.md and improvise (the pre-spike path).
+            delegated = getattr(self, "_delegated_skill_names", set()) or set()
+            if delegated:
+                seeded = [s for s in seeded if s not in delegated]
             if not seeded:
                 return None
             pin = SkillPinConfig.load(

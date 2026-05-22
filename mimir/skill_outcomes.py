@@ -8,25 +8,29 @@ been tried sit in their own bucket so they don't crowd the proven ones.
 Same shape as saga's ``mark_contributions`` but at the skill layer —
 the second real amplification (positive feedback) loop in mimir.
 
-Two signals get folded into the per-skill counters:
+Two signals get folded into the per-skill counters, matching the
+two invocation patterns on the deepagents runtime:
 
-1. **Claude Code runtime** (Letta-era / claude-agent-sdk): each
-   AssistantMessage with a ``Skill`` tool_use block emits a
-   ``tool_call`` event with ``name == "Skill"`` and
-   ``args.skill == "<skill-name>"``. The matching ``tool_result``
-   carries ``is_error``. We pair them by ``id``.
+1. **Subagent execution** (delegatable skills): ``Skill`` declares
+   ``allowed-tools`` in frontmatter → ``mimir.subagent_compiler``
+   produces a SubAgent spec → ``create_deep_agent(subagents=...)``
+   registers it → agent invokes via the framework's ``task`` tool.
+   Signal: ``tool_call(name="task", args.subagent_type="<skill>")``.
+   ``tool_result.is_error`` directly reflects whether the
+   subagent's workflow succeeded — **execution** signal, clean.
 
-2. **deepagents runtime** (mimir today): there is no ``Skill`` tool —
-   ``SkillsMiddleware`` injects prompt instructions telling the model
-   to load a skill by calling ``read_file`` on its ``SKILL.md``. We
-   recognise ``read_file`` calls whose ``file_path`` matches
-   ``.claude/skills/<name>/SKILL.md`` (any prefix tolerated:
-   ``/mimir-home/...``, ``./...``, bare relative) and treat them as
-   skill loads. Even when ``SkillsMiddleware`` itself isn't wired
-   (mimir's current state — see ``_assemble_skill_block`` for the
-   in-house prompt-block equivalent), the agent still uses this same
-   ``read_file`` pathway when invoking a skill from a prompt that
-   says "load the `<name>` skill", so this signal works regardless.
+2. **Inline load** (reflective / no-allowed-tools skills): skill
+   stays in the catalog; agent reads ``SKILL.md`` to load body
+   into parent context and improvises. Signal:
+   ``tool_call(name="read_file", args.file_path=".../SKILL.md")``.
+   ``tool_result.is_error`` reflects whether the FILE was readable
+   — **load** signal, not execution. Execution outcome of the
+   subsequent improvised work is muddled with the parent turn
+   (see plan in ``docs/skill-as-tool-architecture.md``).
+
+The pre-deepagents ``Skill`` tool from claude-agent-sdk used to be
+a third pattern; that runtime is gone, and the matching code has
+been removed.
 
 Outcome classification:
   - **success**   — tool_result with is_error=False, no in-turn retry
@@ -135,20 +139,45 @@ def _classify_skill_calls(
     *,
     turn_succeeded: bool | None = None,
 ) -> Iterable[tuple[str, str, datetime]]:
-    """Walk a single turn's events list, pair Skill tool_call ↔
-    tool_result by id, yield (skill_name, outcome, ts) tuples.
+    """Walk a single turn's events list, recognize skill invocations,
+    pair their tool_call ↔ tool_result by id, yield
+    ``(skill_name, outcome, ts)`` tuples.
 
     Outcome ∈ {"success", "failure", "abandoned"}.
 
-    ``turn_succeeded`` is the overall turn success signal (False when
-    ``result_is_error`` is True). When a Skill call has no matching
-    tool_result — which happens systematically on the ChatClaudeCode /
-    deepagents streaming path because ToolResultBlocks for built-in
-    Claude Code tools (Skill, Bash, Read …) are never surfaced in the
-    Python-layer events list — we fall back to ``turn_succeeded``
-    instead of always emitting "abandoned". Without this fallback,
-    every Skill invocation on a heartbeat/reflection/poller turn
-    lands in the risky bucket even when the turn completed cleanly.
+    **Two invocation patterns on the deepagents runtime:**
+
+    1. ``tool_call(name="task", args.subagent_type="<skill>")`` —
+       delegated execution. Skill compiled to a SubAgent (see
+       ``mimir.subagent_compiler``); parent agent invokes via the
+       framework's ``task`` tool. ``tool_result.is_error`` directly
+       reflects whether the subagent's workflow succeeded. This is
+       the **execution** signal — clean, structured.
+
+    2. ``tool_call(name="read_file", args.file_path="…/SKILL.md")``
+       — inline load. Skill stays in the catalog; agent reads
+       SKILL.md and improvises with its full parent tool surface.
+       This is a **load** signal — measures whether the file was
+       readable, NOT whether the subsequent improvised workflow
+       succeeded. Inline-skill execution outcomes are inherently
+       coupled to the parent turn (see plan in
+       ``docs/skill-as-tool-architecture.md``).
+
+    The classifier doesn't distinguish — it produces the same
+    ``(skill, outcome, ts)`` tuples for both. Downstream
+    aggregation treats them identically. Future enhancement: split
+    counters into ``execution_success`` (task path) vs
+    ``load_success`` (read_file path) so operators can see the
+    difference.
+
+    ``turn_succeeded`` is the overall turn signal (False when
+    ``result_is_error`` is True). When a skill invocation has no
+    matching tool_result — happens on the ChatClaudeCode streaming
+    path for built-in tools, and on agent-pivots — we fall back to
+    ``turn_succeeded`` instead of always emitting "abandoned".
+    Without this fallback, every read_file load on a heartbeat
+    turn lands in the risky bucket even when the turn completed
+    cleanly.
 
     Resolution:
       - Matching tool_result present → use is_error (exact)
@@ -157,25 +186,13 @@ def _classify_skill_calls(
       - No tool_result + turn_succeeded=None  → "abandoned" (legacy /
         turn outcome unavailable)
 
-    **Inference imprecision (aggregate-level correct, per-call-level
-    imprecise).** When a turn has both a Skill call AND a later
-    non-Skill tool call (Bash, Read, …), this fallback can't
-    distinguish which tool drove the turn-level error. If the Skill
-    succeeded but a later Bash crashed the turn, the Skill gets
-    attributed "failure" via the fallback. Inverse case (Skill itself
-    drove the failure) is correctly attributed. Heartbeat /
-    reflection / poller turns are usually Skill-dominated so the
-    bucket telemetry trends right in aggregate; rare turns with
-    mixed tool-call patterns may misattribute.
-
-    **Backfill vs forward-looking.** Once the
-    ``enrich_streaming_metadata`` patch (PR #193) is live for new
-    turns, ChatClaudeCode emits matching tool_result events for
-    built-in tools and the exact-match branch above takes over. The
-    inferred-from-turn fallback's value then shifts from "working
-    around current breakage" to "working around historical
-    breakage" — old turns in turns.jsonl from before #193 landed
-    keep flowing through this path indefinitely.
+    **Inference imprecision** (aggregate-level correct, per-call-
+    level imprecise): turns with multiple tool kinds can't attribute
+    a turn-level error to the specific skill that caused it. Inline
+    skills are particularly affected (read_file load + N improvised
+    tool calls; turn fails → all loads in that turn get attributed
+    failure). Subagent-mode skills aren't affected — they have
+    explicit per-invocation tool_result outcomes.
     """
     pending: dict[str, str] = {}   # tool_use_id → skill name
     for ev in events:
@@ -188,13 +205,19 @@ def _classify_skill_calls(
             if not isinstance(args, dict):
                 args = {}
             skill: str | None = None
-            if name == "Skill":
-                # Claude Code runtime: structured Skill tool invocation.
-                raw_skill = args.get("skill")
-                if raw_skill:
-                    skill = str(raw_skill)
+            if name == "task":
+                # deepagents subagent-execution path: ``task`` tool
+                # invokes a registered SubAgent. For mimir-skill-derived
+                # SubAgents the subagent_type IS the skill name.
+                # Framework's ``general-purpose`` subagent task calls
+                # also land here but get filtered downstream because
+                # they're not in the seeded skill list.
+                sub = args.get("subagent_type")
+                if isinstance(sub, str) and sub:
+                    skill = sub
             elif name == "read_file":
-                # deepagents runtime: SKILL.md read = skill load.
+                # deepagents inline path: agent reads SKILL.md to load
+                # the skill into parent context, then improvises.
                 file_path = args.get("file_path") or ""
                 if isinstance(file_path, str):
                     m = _SKILL_READ_RE.search(file_path)
@@ -212,9 +235,8 @@ def _classify_skill_calls(
                 yield skill, ("failure" if is_error else "success"), turn_ts
 
     # Anything left in pending has no matching tool_result.
-    # In ChatClaudeCode turns the streaming path never surfaces
-    # tool_result events for built-in tools, so ALL Skill calls
-    # land here. Use the turn-level signal as a fallback.
+    # Use the turn-level signal as a fallback (see classifier
+    # docstring for the imprecision tradeoff).
     for skill in pending.values():
         if turn_succeeded is True:
             yield skill, "success", turn_ts

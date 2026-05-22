@@ -3,6 +3,42 @@ name: weather
 description: Get current conditions and 5-day forecast for a city via OpenWeatherMap. Requires `OPENWEATHER_API_KEY` in the environment. Use when the user asks about weather or when planning anything where weather is load-bearing (outdoor events, travel, watering schedules).
 allowed-tools:
   - Bash
+params:
+  type: object
+  properties:
+    city:
+      type: string
+      description: City name, optionally with country code (e.g. "Charlotte, NC, US" or "London, GB"). OpenWeatherMap accepts both city alone and city+region.
+    days:
+      type: integer
+      description: Forecast horizon in days (1-5). Omit for "current conditions only".
+      minimum: 1
+      maximum: 5
+  required: [city]
+returns:
+  type: object
+  properties:
+    city:
+      type: string
+      description: Normalized city name as returned by OpenWeatherMap.
+    current:
+      type: object
+      description: Current conditions (temp, humidity, description).
+      properties:
+        temp_c: {type: number}
+        humidity_pct: {type: number}
+        description: {type: string}
+    forecast:
+      type: array
+      description: Daily forecast entries. Empty when `days` was omitted from params.
+      items:
+        type: object
+        properties:
+          date: {type: string, description: "ISO date YYYY-MM-DD"}
+          high_c: {type: number}
+          low_c: {type: number}
+          description: {type: string}
+  required: [city, current]
 ---
 
 # Weather
