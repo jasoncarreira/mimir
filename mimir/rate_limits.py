@@ -346,6 +346,15 @@ def project_window_end(
 
     - ``utilization`` is unknown (no signal to project from)
     - ``resets_at`` is unknown (no time anchor for the window)
+    - ``utilization >= 1.0`` (bucket saturated / pegged). A reading of
+      100% means the old bucket is fully consumed; it carries no rate
+      information useful for projecting the new window. The window will
+      reset to 0% — projecting forward from 1.0 at the start of the new
+      window produces absurd multiples like 1093% (fingerprinted in
+      ``memory/issues/anthropic-5h-bucket-pegged.md``). The raw-utilization
+      suppress check (≥ 0.80) already handles the suppression decision in
+      this case; adding a spurious "⚠ on pace: 1093% by reset" banner is
+      pure noise.
     - elapsed fraction of the window < ``min_elapsed_fraction``
       (early-window noise dominates: a single call in the first
       few minutes of a 5h window projects to absurd multiples)
@@ -355,6 +364,10 @@ def project_window_end(
     = rate × window. Equivalent to ``util × (window / elapsed)``.
     """
     if snapshot.utilization is None or snapshot.resets_at is None:
+        return None
+    if snapshot.utilization >= 1.0:
+        # Saturated / pegged bucket — see docstring. Raw suppress fires
+        # at ≥ 0.80; no useful rate signal to extrapolate here.
         return None
     if window_size_hours <= 0:
         return None
