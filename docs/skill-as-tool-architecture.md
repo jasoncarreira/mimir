@@ -407,25 +407,40 @@ when they need them.
    outcome? Inline mode inherits the parent's turn-level outcome
    and dodges this question.
 
-   **Strawman shape**: `tool_result.content` carries a structured
-   outcome enum.
+   **Strawman shape**: `tool_result.content` carries counts, not an
+   enum.
 
-   | Outcome | Meaning | When emitted |
-   |---|---|---|
-   | `success` | All declared steps completed without error | Multi-step skill ran every step cleanly |
-   | `partial` | Some declared steps completed, others errored or were skipped | Multi-step skill hit a recoverable error mid-flow |
-   | `failure` | No useful work done; first-step error or budget exhausted before any output | Skill couldn't start, or hit unrecoverable error early |
+   ```yaml
+   attempted: 8     # declared sub-steps the skill tried to run
+   succeeded: 5     # of those, how many completed cleanly
+   failed_steps:    # optional detail for retry/inspection
+     - gmail: rate limited (429)
+     - weather: provider timeout
+     - calendar: auth expired
+   ```
 
-   `is_error` on the parent's tool_result maps as `failure → True`,
-   `success | partial → False`. `partial` carries a `failed_steps`
-   list in the content payload so the parent can decide whether to
-   retry or accept.
+   The parent's `tool_result.is_error` maps as
+   `succeeded == 0 → True`, else `False`. Counts subsume the
+   ternary success/partial/failure framing cleanly:
 
-   Rationale: bool is too coarse for multi-step skills; a fully-
-   general status object is too freeform to feed clean
-   `skill_outcomes` aggregation. Three-valued enum is the cheapest
-   shape that lets the spike measure "did this skill mostly work"
-   without overcommitting to a richer schema.
+   | Old ternary | Equivalent counts |
+   |---|---|
+   | `success` | `succeeded == attempted` |
+   | `partial` | `0 < succeeded < attempted` |
+   | `failure` | `succeeded == 0` |
+
+   Counts are more expressive (5/8 tells the parent more than
+   "partial"), naturally extend `skill_outcomes` (partials become
+   fractional contributions to the existing success/failure counters),
+   and don't require an enum schema to maintain. The `attempted`
+   field is the skill's own declaration of how many sub-steps it ran
+   — single-step skills always emit `attempted: 1`.
+
+   Rationale: bool is too coarse for multi-step skills; a ternary
+   enum throws away the granularity that the skill body actually
+   has; a fully-general status object is too freeform. Counts are
+   the smallest representation that preserves "did this skill
+   mostly work" without sliding into either extreme.
 
 2. **Saga session granularity for subagent skills.** One session
    per subagent invocation, or share the parent's session? Per-
@@ -466,6 +481,41 @@ when they need them.
    workflows it executes. Inline mode handles them naturally: the
    body loads into parent context and the agent uses what it
    learns.
+
+   **Alternative trigger mechanism worth considering**
+   (mimir-carreira on PR #263 v2 review): instead of
+   `allowed-tools`-presence as the trigger with `inline: true`
+   overrides, make execution explicit via a dedicated frontmatter
+   field:
+
+   ```yaml
+   ---
+   name: threadborn
+   execution: subagent
+   allowed-tools:
+     - curl
+     - fetch_url
+     - memory_store
+   ---
+   ```
+
+   Tradeoffs vs the allowed-tools-as-trigger design:
+
+   | | allowed-tools-as-trigger | execution-as-explicit |
+   |---|---|---|
+   | What `allowed-tools` means | Declares + triggers subagent mode | Declares tool surface only |
+   | How execution mode chosen | Implicit (trigger + override) | Explicit field |
+   | Skill with `allowed-tools` declared for documentation only | Needs `inline: true` override | Just omit `execution: subagent` |
+   | Verbosity | Lower (one field for most) | Higher (every skill needs `execution`) |
+   | Surprise potential | "Why is this running as a subagent?" → because `allowed-tools` is set | Always answerable from the explicit field |
+
+   The decision boils down to: optimize for terseness
+   (allowed-tools-as-trigger, fewer fields, more overrides) or
+   clarity (execution-as-explicit, more fields, fewer special
+   cases)? The empirical mismatch in muninn — 3 reflective skills
+   declare `allowed-tools` for documentation — is the practical
+   case where the trigger design adds confusion that the explicit
+   design wouldn't have.
 
 5. **Failure transcript visibility (subagent mode).** When a
    subagent fails, what does the parent see? Full transcript
