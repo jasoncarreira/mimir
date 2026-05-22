@@ -216,8 +216,19 @@ async def test_debounce_coalesces_burst_to_single_push(
 ) -> None:
     """5 commits within the debounce window produce 5 commits and
     exactly 1 push (the prior 4 push tasks are cancelled before
-    firing)."""
-    _short_debounce(monkeypatch, 0.10)
+    firing).
+
+    Debounce window is set to 0.50s and inter-commit yields use
+    ``asyncio.sleep(0)`` (pure event-loop yield, no wall-clock delay).
+    This eliminates the timing flake that appeared with the previous
+    0.10s / 0.01s pairing: under CI load, a 0.01s sleep could take
+    >100ms of real time, allowing the prior debounce timer to fire
+    before the next commit cancelled it.  With sleep(0) the interim
+    tasks never advance past their ``asyncio.sleep(DEBOUNCE_SECONDS)``
+    call before being cancelled; only the final task's timer actually
+    expires.
+    """
+    _short_debounce(monkeypatch, 0.50)
     subprocess.run(
         ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
         cwd=home_repo, check=True,
@@ -239,9 +250,11 @@ async def test_debounce_coalesces_burst_to_single_push(
         await git_tracking.commit_turn_changes(
             turn_id=f"t{i}", trigger="user_message", home=home_repo, enabled=True,
         )
-        # Stay well under the debounce window so the prior push is
-        # cancelled by the next commit.
-        await asyncio.sleep(0.01)
+        # Yield to the event loop once so each new push task is
+        # scheduled, but use sleep(0) — no wall-clock delay — so the
+        # debounce timer never expires between successive commits
+        # regardless of CI load.
+        await asyncio.sleep(0)
 
     # 5 commits landed on the branch.
     log = subprocess.run(
@@ -253,7 +266,7 @@ async def test_debounce_coalesces_burst_to_single_push(
     # Let the debounce expire and the final push fire.
     assert git_tracking._pending_push_task is not None
     try:
-        await asyncio.wait_for(git_tracking._pending_push_task, timeout=2.0)
+        await asyncio.wait_for(git_tracking._pending_push_task, timeout=3.0)
     except asyncio.CancelledError:
         pass
 
