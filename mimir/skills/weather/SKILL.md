@@ -1,6 +1,7 @@
 ---
 name: weather
 description: Get current conditions and 5-day forecast for a city via OpenWeatherMap. Requires `OPENWEATHER_API_KEY` in the environment. Use when the user asks about weather or when planning anything where weather is load-bearing (outdoor events, travel, watering schedules).
+subagent: true
 allowed-tools:
   - Bash
 params:
@@ -16,6 +17,8 @@ params:
       maximum: 5
   required: [city]
 returns:
+  title: weather_result
+  description: Final structured weather payload for the parent agent. Includes current conditions and an optional daily forecast.
   type: object
   properties:
     city:

@@ -12,6 +12,7 @@
 # Tracked: human-readable curated state.
 !memory/**
 !prompts/**
+!skills/**
 !state/wiki/**
 !state/INDEX.md
 !state/heartbeat-backlog.md
@@ -57,3 +58,11 @@ rate_limits.json
 
 # Re-allow the few jsonl files we genuinely want tracked.
 !state/applied-proposals.jsonl
+
+# Bundled skills are refreshed from the mimir package on every boot
+# (see mimir.skill_defs.refresh_builtin_skills). Tracking them would
+# fight that refresh — every startup would produce a no-op diff. The
+# leading ``*`` already blocks this since no ``!.mimir_builtin_skills``
+# allowlist exists; the explicit entry is belt-and-suspenders in case
+# an operator switches to a blocklist style.
+.mimir_builtin_skills/

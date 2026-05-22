@@ -132,56 +132,11 @@ DEFAULT_ENV_TEMPLATE = dedent(
 )
 
 
-DEFAULT_SCHEDULER_YAML = dedent(
-    """\
-    # mimir scheduler — APScheduler cron jobs that enqueue LLM ticks.
-    # Each job triggers a turn on ``channel_id`` with ``trigger=scheduled_tick``.
-    #
-    # Two recurring LLM ticks are enabled by default:
-    #
-    #   - heartbeat: hourly autonomous-work cadence. Pulls one item from
-    #     state/heartbeat-backlog.md and does it. The §12.4 homeostat
-    #     suppresses fires when the plan window saturates or cost rate
-    #     trips, so this default is safe even at hourly cadence.
-    #   - reflect: weekly cross-session audit (Sunday 06:00 UTC). The
-    #     SAGA consolidation cron runs nightly at 04:00 UTC, so by the
-    #     time reflection fires Sunday morning the most recent
-    #     consolidation pass is two hours old.
-    #
-    # Two non-LLM crons are auto-installed by the runtime (no entry
-    # needed here):
-    #
-    #   - saga-consolidate: nightly atom merge / synthesis pass
-    #     (MIMIR_SAGA_CONSOLIDATE_CRON, default 04:00 daily).
-    #   - introspection-report: weekly behavioral / health snapshot
-    #     written to state/reports/ with algedonic emit on degraded
-    #     heartbeat success rate (MIMIR_INTROSPECTION_REPORT_CRON,
-    #     default Fri 14:00).
-    #
-    # To disable a default tick, comment it out below or remove it.
-    # To add a custom tick, prefer ``prompt_file`` over inline ``prompt``
-    # so the prompt content can grow without cluttering this file:
-    #
-    #   - name: morning-checkin
-    #     cron: "0 9 * * 1-5"
-    #     channel_id: web-default
-    #     prompt_file: morning-checkin.md   # under <home>/prompts/
-    #
-    # Each job needs exactly one of ``cron`` (5-field) or ``time_of_day``
-    # (HH:MM, daily UTC), and exactly one of ``prompt`` (inline) or
-    # ``prompt_file`` (path under <home>/prompts/).
-
-    - name: heartbeat
-      cron: "0 * * * *"
-      channel_id: null   # synthetic scheduler:heartbeat channel
-      prompt_file: heartbeat.md
-
-    - name: reflect
-      cron: "0 6 * * 0"
-      channel_id: null   # synthetic scheduler:reflect channel
-      prompt_file: reflect.md
-    """
-)
+# The bundled scheduler_template.yaml under mimir/ is the canonical
+# default scheduler config; setup_home seeds it via seed_scheduler().
+# A constant lived here originally but it diverged from the bundled
+# file used by server.py startup — single source now in
+# mimir/scheduler_template.yaml.
 
 
 DEFAULT_HEARTBEAT_BACKLOG = dedent(
@@ -298,39 +253,13 @@ DEFAULT_HEARTBEAT_PATTERNS = dedent(
 )
 
 
-DEFAULT_HEARTBEAT_PROMPT = dedent(
-    """\
-    This is a heartbeat tick — autonomous-work cadence, not a user message.
-
-    Run the heartbeat skill: librarian protocol first (state coherence,
-    drift, re-anchor to current date), then pick ONE item from
-    state/heartbeat-backlog.md and do it. End the turn silently when done.
-
-    If something genuinely needs operator attention, route through the
-    operator alert channel; otherwise no user-visible message.
-    """
-)
-
-
-DEFAULT_REFLECT_PROMPT = dedent(
-    """\
-    This is the weekly reflection tick — autonomous, no user message.
-
-    Run the reflection skill: cross-session audit of the past 7 days
-    across both behavioral analysis (failures, drift, recurring
-    patterns) and memory architecture review (core cleanup, atom
-    promotion candidates, wiki health).
-
-    Start by reading memory/30-reflection-policy.md (the autonomous-vs-
-    propose-only boundary) and the reflection SKILL.md. Output is
-    propose-only by default — write to state/proposed-changes.md for
-    operator review unless the policy explicitly permits autonomous
-    application.
-
-    End the turn silently when done; the introspection-report cron
-    handles the operator-facing summary separately.
-    """
-)
+# The bundled heartbeat.md / reflect.md under mimir/prompt_templates/
+# are the canonical scheduled-tick prompts; setup_home seeds them via
+# seed_prompts(). The short "trigger" constants that used to live here
+# (DEFAULT_HEARTBEAT_PROMPT / DEFAULT_REFLECT_PROMPT) were a relic of
+# when heartbeat/reflection were bundled SKILLS — the agent would
+# receive a 5-line trigger and dispatch to the skill. Post-unbundling
+# the scheduler loads the full workflow body directly.
 
 
 DEFAULT_VSM_TERMS = dedent(
@@ -409,7 +338,7 @@ DEFAULT_REFLECTION_POLICY = dedent(
 
     - Core memory edits (cleanup, restructure, promote-to-core, demote)
     - Persona block edits (memory/core/00-*.md)
-    - Skill creation (.claude/skills/<name>/)
+    - Skill creation (skills/<name>/)
     - Wiki page deletions
     - Memory file deletions
 
@@ -878,7 +807,7 @@ DEFAULT_WIKI_AGENTS_MD = dedent(
     # AGENTS.md
 
     Schema for maintaining the wiki under ``state/wiki/``. The full skill
-    is at ``.claude/skills/wiki/SKILL.md`` — this file is a quick reference.
+    is at ``skills/wiki/SKILL.md`` — this file is a quick reference.
 
     ## Three layers
 
@@ -1116,7 +1045,7 @@ def setup_home(
         "state/wiki/topics",
         "messages",
         ".claude/agents",
-        ".claude/skills",
+        "skills",
     ):
         p = home / sub
         if not p.exists():
@@ -1190,12 +1119,16 @@ def setup_home(
         _default_saga_toml(home, saga_key, embedding=embedding),
     ):
         files_created.append("saga.toml")
-    if _write_if_missing(home / "scheduler.yaml", DEFAULT_SCHEDULER_YAML):
+    # scheduler.yaml + prompts/ seed from the bundled templates (the
+    # canonical sources). seed_scheduler/seed_prompts return per-file
+    # status so we can update files_created accurately.
+    from .skill_defs import seed_scheduler as _seed_scheduler
+    from .prompt_templates import seed_prompts as _seed_prompts_pre
+    if _seed_scheduler(home) == "created":
         files_created.append("scheduler.yaml")
-    if _write_if_missing(home / "prompts" / "heartbeat.md", DEFAULT_HEARTBEAT_PROMPT):
-        files_created.append("prompts/heartbeat.md")
-    if _write_if_missing(home / "prompts" / "reflect.md", DEFAULT_REFLECT_PROMPT):
-        files_created.append("prompts/reflect.md")
+    for _pname, _pstatus in _seed_prompts_pre(home).items():
+        if _pstatus == "created":
+            files_created.append(f"prompts/{_pname}")
     if _write_if_missing(home / "memory" / "core" / "identity.md", DEFAULT_IDENTITY_MD):
         files_created.append("memory/core/identity.md")
     if _write_if_missing(home / "state" / "wiki" / "AGENTS.md", DEFAULT_WIKI_AGENTS_MD):
@@ -1246,6 +1179,11 @@ def setup_home(
         files_created.append("state/proposed-changes.md")
 
     seeded_subagents = seed_subagent_defs(home)
+    # Migrate legacy ``.claude/skills/`` → ``skills/`` first, then
+    # refresh the bundled built-ins into ``.mimir_builtin_skills/``.
+    # Prompts and scheduler.yaml were already seeded above (idempotent).
+    from .skill_defs import migrate_legacy_skills_dir
+    migrate_legacy_skills_dir(home)
     seeded_skills = seed_skills(home)
 
     # PR 4b: bootstrap the home dir as a git repo (idempotent). Reads
@@ -1758,7 +1696,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "most-retrieved",
         help="Top-N SAGA atoms by retrieval count over the last N days.",
     )
-    from .skills.reflection import most_retrieved as _most_retrieved
+    from .reflection import most_retrieved as _most_retrieved
     _most_retrieved.add_argparse(refl_mr_p)
 
     # §12.2: applied-proposals audit — closes the double-loop.
@@ -1780,7 +1718,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "introspection-report",
         help="Weekly behavioral / health report from turns.jsonl + events.jsonl.",
     )
-    from .skills.reflection import introspection_report as _intro_report
+    from .reflection import introspection_report as _intro_report
     _intro_report.add_argparse(refl_intro_p)
 
     pred_p = sub.add_parser(
@@ -1833,7 +1771,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     skills_list_p = skills_sub.add_parser(
         "list",
         help="List skills installed in an agent home "
-             "(walks <home>/.claude/skills/). Shows name, [poller] flag "
+             "(walks <home>/skills/). Shows name, [poller] flag "
              "when a pollers.json is present, and the SKILL.md description.",
     )
     _skill_install.add_argparse_list(skills_list_p)
@@ -1851,14 +1789,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     skills_install_p = skills_sub.add_parser(
         "install",
         help="Install an opt-in skill from optional-skills/ into an agent "
-             "home's .claude/skills/. Pollers (skills with pollers.json) "
+             "home's skills/. Pollers (skills with pollers.json) "
              "register on next `reload_pollers` or `mimir run` boot.",
     )
     _skill_install.add_argparse_install(skills_install_p)
 
     # mimir scaffold-docker — generate container-deploy files
     # (Dockerfile, compose.yml, compose.env, start.sh) into an agent
-    # home. Inspects <home>/.claude/skills/ for per-skill OS-deps
+    # home. Inspects <home>/skills/ for per-skill OS-deps
     # (dockerfile.fragment) and env vars (pollers.json pass_env).
     # Idempotent — re-run after installing pollers to pick up their
     # fragments + env-var requirements.
@@ -2122,13 +2060,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.command == "reflection":
         if args.reflection_action == "most-retrieved":
-            from .skills.reflection import most_retrieved as _most_retrieved
+            from .reflection import most_retrieved as _most_retrieved
             sys.exit(asyncio.run(_most_retrieved.run(args)))
         if args.reflection_action == "introspection-report":
-            from .skills.reflection import introspection_report as _intro_report
+            from .reflection import introspection_report as _intro_report
             sys.exit(_intro_report.run(args))
         if args.reflection_action == "mark-applied":
-            from .skills.reflection import applied_audit as _applied_audit
+            from .reflection import applied_audit as _applied_audit
             home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
             try:
                 proposal = _applied_audit.mark_applied(
@@ -2142,7 +2080,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(f"Applied: {proposal.id}")
             sys.exit(0)
         if args.reflection_action == "audit":
-            from .skills.reflection import applied_audit as _applied_audit
+            from .reflection import applied_audit as _applied_audit
             home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
             rows = _applied_audit.audit_window(
                 home,
