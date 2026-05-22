@@ -209,7 +209,7 @@ Don't create one when:
 - It's a within-turn working note → use the Plan tool or just hold it in
   context.
 - It's a memory / preference about the user → store in saga via
-  `saga_store`, not chainlink.
+  `memory_store`, not chainlink.
 - The user is just venting and didn't ask you to track anything.
 
 ## Subissue decomposition pattern
@@ -371,7 +371,7 @@ General tactics:
 Several primitives have built-in idempotency you can lean on — plus a
 couple that *look* idempotent but aren't:
 
-- **`saga_store` is unique-key idempotent.** Same content twice → one
+- **`memory_store` is unique-key idempotent.** Same content twice → one
   atom (deduplicated at the atom layer). Synth turns firing twice on
   the same boundary don't create two atoms.
 - **`applied_proposals.jsonl` is the proposal-replay guard.** Before
