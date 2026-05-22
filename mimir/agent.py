@@ -845,6 +845,45 @@ class Agent:
             codex_plus_callback = make_codex_plus_rate_limit_callback(
                 self._rate_limits
             )
+            # Skills surfaced via SkillsMiddleware: pass operator +
+            # bundled source paths as discovery sources. The framework
+            # scans each source for ``<name>/SKILL.md`` entries and
+            # renders a catalog into the system prompt at request time.
+            # Operator location wins on name collision per the
+            # framework's last-source-wins shadowing rule.
+            from .skill_defs import (
+                home_builtin_skills_dir,
+                home_skills_dir,
+            )
+            skill_sources: list[str] = []
+            operator_dir = home_skills_dir(self._config.home)
+            builtin_dir = home_builtin_skills_dir(self._config.home)
+            # Bundled (read-only intent) listed first so operator
+            # entries shadow same-named bundled ones.
+            if builtin_dir.is_dir():
+                skill_sources.append(str(builtin_dir))
+            if operator_dir.is_dir():
+                skill_sources.append(str(operator_dir))
+
+            # Drop delegated skill names from the inline ``Skills System``
+            # catalog so the agent doesn't see them in both the ``task``
+            # tool catalog (via SubAgentMiddleware) and as inline skills
+            # (via SkillsMiddleware). The filter middleware runs AFTER
+            # SkillsMiddleware (user-passed middleware is appended past
+            # the framework stack — graph.py:708-709) so SkillsMiddleware
+            # populates ``state["skills_metadata"]`` first, then ours
+            # replaces it with a filtered view.
+            extra_middleware: list[Any] = []
+            if self._delegated_skill_names:
+                from ._skills_filter_middleware import (
+                    FilterDelegatedSkillsMiddleware,
+                )
+                extra_middleware.append(
+                    FilterDelegatedSkillsMiddleware(
+                        delegated_skill_names=self._delegated_skill_names,
+                    )
+                )
+
             self._agent = create_deep_agent(
                 model=_resolve_model(
                     model_spec,
@@ -855,6 +894,8 @@ class Agent:
                 system_prompt=system_prompt,
                 backend=backend,
                 subagents=self._delegated_subagent_specs,
+                skills=skill_sources or None,
+                middleware=extra_middleware,
             )
             return self._agent
 
@@ -1668,75 +1709,30 @@ class Agent:
                 self._indexes.read_memory_index()
                 if self._indexes is not None else None
             )
-            skill_block = self._assemble_skill_block()
+            # Skill catalog rendering moved to deepagents' SkillsMiddleware
+            # (wired via ``create_deep_agent(skills=...)``). build_system_prompt
+            # no longer composes a skill_block — the middleware injects
+            # ``## Skills System`` into the prompt at request time.
             return build_system_prompt(
                 core_blocks=core_blocks,
                 memory_index_body=memory_index_body,
                 operator_alert_channel=getattr(
                     self._config, "operator_alert_channel", "",
                 ),
-                skill_block=skill_block,
+                skill_block=None,
                 home_dir=str(self._config.home),
             )
         except Exception:
             log.exception("_build_system_prompt failed; using minimal default")
             return _DEFAULT_SYSTEM_PROMPT
 
-    def _assemble_skill_block(self) -> str | None:
-        """v0.5+ §12.3: render the install-stable skill catalog for the
-        system prompt. Returns None when no skills are seeded; volatile
-        per-turn telemetry (success/total counts) is handled separately
-        via the self-state block (deferred to Phase D).
-
-        Each rendered line is ``- <name> — <one-line trigger>`` when
-        SKILL.md frontmatter declares one; otherwise bare ``- <name>``.
-        Trigger phrases come from the home-seeded ``<home>/.claude/
-        skills/`` copy first, with a fallback to the bundled root for
-        any skill not yet copied — covers fresh-install homes before
-        ``seed_skills`` runs. SKILL.md frontmatter is install-stable,
-        so description content doesn't perturb the prompt cache
-        (chainlink #15)."""
-        try:
-            from .skill_outcomes import SkillPinConfig, render_skill_catalog
-            from .skill_defs import installed_skill_names
-            from .skill_catalog import load_catalog, DEFAULT_SKILLS_ROOT
-            seeded = installed_skill_names(self._config.home)
-            # Suppress skills that compiled to SubAgent specs — the agent
-            # invokes them via the framework's ``task`` tool, so listing
-            # them again in the inline catalog would prompt the model
-            # to read the SKILL.md and improvise (the pre-spike path).
-            delegated = getattr(self, "_delegated_skill_names", set()) or set()
-            if delegated:
-                seeded = [s for s in seeded if s not in delegated]
-            if not seeded:
-                return None
-            pin = SkillPinConfig.load(
-                self._config.home / "state" / "skill-pin.yaml",
-            )
-            descriptions: dict[str, str] = {}
-            try:
-                home_skills = self._config.home / ".claude" / "skills"
-                for entry in load_catalog(home_skills):
-                    if entry.trigger:
-                        descriptions[entry.name] = entry.trigger
-                    elif entry.description:
-                        descriptions[entry.name] = entry.description
-                for entry in load_catalog(DEFAULT_SKILLS_ROOT):
-                    if entry.name in descriptions:
-                        continue
-                    if entry.trigger:
-                        descriptions[entry.name] = entry.trigger
-                    elif entry.description:
-                        descriptions[entry.name] = entry.description
-            except Exception:  # noqa: BLE001
-                # Description load is best-effort; on any failure fall
-                # back to the bare-names rendering.
-                log.exception("skill description load failed; rendering names only")
-                descriptions = {}
-            return render_skill_catalog(seeded, pin, descriptions=descriptions)
-        except Exception:
-            log.exception("_assemble_skill_block failed; skipping")
-            return None
+    # NOTE: _assemble_skill_block was removed in the skills-middleware
+    # restoration PR. The framework's SkillsMiddleware now renders the
+    # catalog at request time via wrap_model_call — see the
+    # ``create_deep_agent(skills=...)`` call in _get_or_build_agent.
+    # Per-turn skill telemetry (the "(N/M in window)" counters) stays
+    # in mimir's hands via _assemble_skill_telemetry_lines and the
+    # ``## Self-state`` block.
 
     # ────────────────────────────────────────────────────────────
     # Per-turn block assembly (ported from main)
@@ -1912,17 +1908,23 @@ class Agent:
         """Per-turn skill bucket telemetry lines for ``## Self-state``."""
         try:
             from .skill_outcomes import (
-                SkillPinConfig, aggregate, render_skill_telemetry,
+                aggregate,
+                load_skill_success_criteria,
+                render_skill_telemetry,
             )
             from .skill_defs import installed_skill_names
             seeded = installed_skill_names(self._config.home)
             if not seeded:
                 return None
-            aggs = aggregate(self._config.turns_log)
-            pin = SkillPinConfig.load(
-                self._config.home / "state" / "skill-pin.yaml"
+            # Per-skill success_criteria refines load-kind outcomes
+            # into success vs incomplete based on whether the
+            # operator-declared completion signals fired in the turn.
+            # No-op for skills without a success_criteria block.
+            criteria = load_skill_success_criteria(self._config.home)
+            aggs = aggregate(
+                self._config.turns_log, skill_criteria=criteria,
             )
-            return render_skill_telemetry(seeded, aggs, pin)
+            return render_skill_telemetry(seeded, aggs)
         except Exception:  # noqa: BLE001
             log.exception(
                 "_assemble_skill_telemetry_lines failed; skipping",

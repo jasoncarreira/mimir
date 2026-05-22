@@ -10,11 +10,12 @@ import pytest
 
 from mimir.skill_outcomes import (
     SkillOutcome,
-    SkillPinConfig,
+    SkillSuccessCriteria,
     _classify_skill_calls,
+    _parse_criteria_from_skill_md,
     aggregate,
+    load_skill_success_criteria,
     order_skills,
-    render_skill_catalog,
     render_skill_telemetry,
 )
 
@@ -34,7 +35,11 @@ def test_classify_pairs_call_and_result():
         {"type": "tool_result", "id": "tool_2", "is_error": True, "content": "boom"},
     ]
     out = list(_classify_skill_calls(events, base))
-    assert out == [("memory", "success", base), ("wiki", "failure", base)]
+    # task() invocations always emit kind="execution" — the clean signal.
+    assert out == [
+        ("memory", "success", base, "execution"),
+        ("wiki", "failure", base, "execution"),
+    ]
 
 
 def test_classify_unmatched_call_is_abandoned_when_turn_outcome_unknown():
@@ -46,7 +51,7 @@ def test_classify_unmatched_call_is_abandoned_when_turn_outcome_unknown():
         # no matching tool_result
     ]
     out = list(_classify_skill_calls(events, base))
-    assert out == [("alert", "abandoned", base)]
+    assert out == [("alert", "abandoned", base, "execution")]
 
 
 def test_classify_unmatched_call_infers_success_from_turn():
@@ -66,7 +71,7 @@ def test_classify_unmatched_call_infers_success_from_turn():
         # No tool_result — ChatClaudeCode streaming gap
     ]
     out = list(_classify_skill_calls(events, base, turn_succeeded=True))
-    assert out == [("heartbeat", "success", base)]
+    assert out == [("heartbeat", "success", base, "execution")]
 
 
 def test_classify_unmatched_call_infers_failure_from_turn():
@@ -77,7 +82,7 @@ def test_classify_unmatched_call_infers_failure_from_turn():
          "args": {"subagent_type": "heartbeat"}},
     ]
     out = list(_classify_skill_calls(events, base, turn_succeeded=False))
-    assert out == [("heartbeat", "failure", base)]
+    assert out == [("heartbeat", "failure", base, "execution")]
 
 
 def test_classify_exact_result_takes_precedence_over_turn_success():
@@ -91,7 +96,7 @@ def test_classify_exact_result_takes_precedence_over_turn_success():
         {"type": "tool_result", "id": "tool_1", "is_error": True, "content": "boom"},
     ]
     out = list(_classify_skill_calls(events, base, turn_succeeded=True))
-    assert out == [("memory", "failure", base)]
+    assert out == [("memory", "failure", base, "execution")]
 
 
 def test_classify_ignores_non_skill_tools():
@@ -120,7 +125,8 @@ def test_classify_read_file_skill_md_as_load():
         {"type": "tool_result", "id": "r1", "is_error": False, "content": "..."},
     ]
     out = list(_classify_skill_calls(events, base))
-    assert out == [("threadborn", "success", base)]
+    # read_file() on a SKILL.md emits kind="load" — proxy signal.
+    assert out == [("threadborn", "success", base, "load")]
 
 
 def test_classify_read_file_skill_md_failure():
@@ -132,7 +138,7 @@ def test_classify_read_file_skill_md_failure():
          "content": "Error: File not found"},
     ]
     out = list(_classify_skill_calls(events, base))
-    assert out == [("threadborn", "failure", base)]
+    assert out == [("threadborn", "failure", base, "load")]
 
 
 def test_classify_read_file_tolerates_path_prefixes():
@@ -152,7 +158,7 @@ def test_classify_read_file_tolerates_path_prefixes():
             {"type": "tool_result", "id": "r1", "is_error": False},
         ]
         out = list(_classify_skill_calls(events, base))
-        assert out == [("moltbook", "success", base)], f"path={path}"
+        assert out == [("moltbook", "success", base, "load")], f"path={path}"
 
 
 def test_classify_read_file_non_skill_path_ignored():
@@ -189,15 +195,17 @@ def test_classify_read_file_skill_load_falls_back_when_no_result():
          "args": {"file_path": "/mimir-home/.claude/skills/heartbeat/SKILL.md"}},
         # No tool_result.
     ]
-    # Turn succeeded → infer success.
+    # Turn succeeded → infer success. The "load" kind survives the
+    # fallback so per-path counters stay accurate even when the exact
+    # tool_result is absent.
     out_ok = list(_classify_skill_calls(events, base, turn_succeeded=True))
-    assert out_ok == [("heartbeat", "success", base)]
+    assert out_ok == [("heartbeat", "success", base, "load")]
     # Turn failed → infer failure.
     out_fail = list(_classify_skill_calls(events, base, turn_succeeded=False))
-    assert out_fail == [("heartbeat", "failure", base)]
+    assert out_fail == [("heartbeat", "failure", base, "load")]
     # Turn outcome unknown → abandoned.
     out_unk = list(_classify_skill_calls(events, base))
-    assert out_unk == [("heartbeat", "abandoned", base)]
+    assert out_unk == [("heartbeat", "abandoned", base, "load")]
 
 
 def test_classify_both_invocation_patterns_in_same_turn():
@@ -215,8 +223,10 @@ def test_classify_both_invocation_patterns_in_same_turn():
         {"type": "tool_result", "id": "r1", "is_error": False},
     ]
     out = list(_classify_skill_calls(events, base))
-    assert ("memory", "success", base) in out
-    assert ("threadborn", "success", base) in out
+    # Both paths land in the output, each tagged with its kind so the
+    # downstream aggregator can keep counters separate.
+    assert ("memory", "success", base, "execution") in out
+    assert ("threadborn", "success", base, "load") in out
     assert len(out) == 2
 
 
@@ -349,15 +359,14 @@ def test_order_skills_buckets_correctly():
         "wiki": SkillOutcome(skill="wiki", success=3, failure=4,
                               last_used=base - timedelta(hours=2)),
         # heartbeat: untried (not in aggs)
-        # alert: pin_top'd
         "alert": SkillOutcome(skill="alert", success=1, failure=0,
                               last_used=base - timedelta(days=1)),
     }
-    pin = SkillPinConfig(pin_top=["alert"], hide=[])
     proven, untried, risky = order_skills(
-        ["memory", "wiki", "alert", "heartbeat"], aggs, pin, now=base,
+        ["memory", "wiki", "alert", "heartbeat"], aggs, now=base,
     )
-    # Pinned-top (alert) before other proven (memory).
+    # Proven sorted by success_rate desc then last_used desc.
+    # memory (0.8, 1h ago) and alert (1.0, 1d ago): alert's rate higher.
     assert proven == ["alert", "memory"]
     # heartbeat had no aggregates → untried.
     assert untried == ["heartbeat"]
@@ -365,103 +374,18 @@ def test_order_skills_buckets_correctly():
     assert risky == ["wiki"]
 
 
-def test_order_skills_respects_hide():
-    aggs = {"deprecated": SkillOutcome(skill="deprecated", success=5, failure=0)}
-    pin = SkillPinConfig(pin_top=[], hide=["deprecated"])
-    proven, untried, risky = order_skills(["deprecated", "memory"], aggs, pin)
-    assert "deprecated" not in proven
-    assert "deprecated" not in risky
-    assert "deprecated" not in untried
-
-
-def test_render_skill_catalog_alphabetic_install_stable():
-    """Catalog is alphabetical, contains every seeded skill, no
-    bucket headers, no telemetry — install-stable so the system-prompt
-    cache prefix isn't busted by skill invocations (chainlink #15)."""
-    pin = SkillPinConfig()
-    out = render_skill_catalog(["wiki", "memory", "heartbeat"], pin)
-    assert out is not None
-    # Alphabetical
-    assert out.split("\n") == ["- heartbeat", "- memory", "- wiki"]
-    # No bucket headers / counts in the catalog
-    assert "**" not in out
-    assert "in window" not in out
-
-
-def test_render_skill_catalog_filters_hidden():
-    pin = SkillPinConfig(hide=["legacy"])
-    out = render_skill_catalog(["legacy", "memory"], pin)
-    assert out is not None
-    assert "legacy" not in out
-    assert "memory" in out
-
-
-def test_render_skill_catalog_returns_none_when_empty():
-    assert render_skill_catalog([], SkillPinConfig()) is None
-    # All seeded skills hidden ⇒ None
-    assert render_skill_catalog(["x"], SkillPinConfig(hide=["x"])) is None
-
-
-def test_render_skill_catalog_renders_descriptions_when_provided():
-    """When ``descriptions`` is passed, each line renders as
-    ``- name — desc`` so the model can dispatch on what each skill
-    is for without round-tripping through find-skills."""
-    pin = SkillPinConfig()
-    descs = {
-        "memory": "Criteria for deciding when, where and how to remember information",
-        "wiki": "Maintain a structured wiki under state/wiki/",
+def test_order_skills_proven_sorted_by_rate_then_recency():
+    """Same success rate → most-recently-used wins the tie."""
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    aggs = {
+        "old_winner": SkillOutcome(skill="old_winner", success=2, failure=0,
+                                    last_used=base - timedelta(days=2)),
+        "new_winner": SkillOutcome(skill="new_winner", success=2, failure=0,
+                                    last_used=base - timedelta(minutes=10)),
     }
-    out = render_skill_catalog(["memory", "wiki"], pin, descriptions=descs)
-    assert out is not None
-    assert "- memory — Criteria for deciding when, where and how to remember information" in out
-    assert "- wiki — Maintain a structured wiki under state/wiki/" in out
-
-
-def test_render_skill_catalog_falls_back_to_bare_name_when_desc_missing():
-    """A skill present in ``seeded`` but absent from ``descriptions``
-    (or with an empty desc) renders as bare ``- name`` — never blocks
-    a skill from showing up."""
-    pin = SkillPinConfig()
-    out = render_skill_catalog(
-        ["alpha", "beta"], pin, descriptions={"alpha": "first skill"}
-    )
-    assert out is not None
-    lines = out.split("\n")
-    assert lines == ["- alpha — first skill", "- beta"]
-
-
-def test_render_skill_catalog_truncates_long_descriptions():
-    """Long triggers/descriptions (frontmatter is often 100-300 chars)
-    truncate to a single-line budget so the system-prompt block stays
-    one terminal-row per skill."""
-    pin = SkillPinConfig()
-    long_desc = (
-        "Use when something has gone very wrong and you need to walk a long "
-        "diagnostic checklist across multiple subsystems including pollers, "
-        "scheduled ticks, the dispatcher, and the bridge layer to figure "
-        "out where the message actually got dropped"
-    )
-    out = render_skill_catalog(
-        ["introspection"], pin, descriptions={"introspection": long_desc}
-    )
-    assert out is not None
-    line = out.split("\n")[0]
-    # Truncation produces a single line under a reasonable bound and
-    # ends with the ellipsis sentinel.
-    assert line.startswith("- introspection — ")
-    assert line.endswith("…")
-    assert len(line) < 150  # name + " — " + ~120 char desc + ellipsis
-
-
-def test_render_skill_catalog_filters_hidden_with_descriptions():
-    """Hidden skills don't get descriptions rendered either."""
-    pin = SkillPinConfig(hide=["legacy"])
-    out = render_skill_catalog(
-        ["legacy", "memory"], pin, descriptions={"legacy": "x", "memory": "y"}
-    )
-    assert out is not None
-    assert "legacy" not in out
-    assert "- memory — y" in out
+    proven, _, _ = order_skills(["old_winner", "new_winner"], aggs, now=base)
+    # Same rate (1.0), new_winner used more recently → first.
+    assert proven == ["new_winner", "old_winner"]
 
 
 def test_render_skill_telemetry_emits_proven_and_risky_only():
@@ -472,9 +396,8 @@ def test_render_skill_telemetry_emits_proven_and_risky_only():
         "wiki": SkillOutcome(skill="wiki", success=1, failure=4,
                               last_used=base),
     }
-    pin = SkillPinConfig()
     out = render_skill_telemetry(
-        ["memory", "wiki", "heartbeat"], aggs, pin, now=base,
+        ["memory", "wiki", "heartbeat"], aggs, now=base,
     )
     assert out is not None
     # Proven and Risky present, with N/M counts
@@ -490,9 +413,7 @@ def test_render_skill_telemetry_emits_proven_and_risky_only():
 def test_render_skill_telemetry_returns_none_when_no_activity():
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     # All seeded skills untried (no aggregates) ⇒ no telemetry
-    out = render_skill_telemetry(
-        ["memory", "wiki"], {}, SkillPinConfig(), now=base,
-    )
+    out = render_skill_telemetry(["memory", "wiki"], {}, now=base)
     assert out is None
 
 
@@ -502,19 +423,295 @@ def test_render_skill_telemetry_returns_none_when_only_untried():
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     # Aggregate exists but with zero counts ⇒ untried bucket
     aggs = {"memory": SkillOutcome(skill="memory", last_used=None)}
-    out = render_skill_telemetry(["memory"], aggs, SkillPinConfig(), now=base)
+    out = render_skill_telemetry(["memory"], aggs, now=base)
     assert out is None
 
 
-def test_pin_config_loads_yaml(tmp_path):
-    yaml_path = tmp_path / "skill-pin.yaml"
-    yaml_path.write_text("pin_top:\n  - memory\n  - wiki\nhide:\n  - legacy\n")
-    pin = SkillPinConfig.load(yaml_path)
-    assert pin.pin_top == ["memory", "wiki"]
-    assert pin.hide == ["legacy"]
+# ─── success_criteria refinement ─────────────────────────────────────────
 
 
-def test_pin_config_missing_file_returns_empty(tmp_path):
-    pin = SkillPinConfig.load(tmp_path / "missing.yaml")
-    assert pin.pin_top == []
-    assert pin.hide == []
+def _read_file_event(skill: str, idx: int = 1, is_error: bool = False) -> list[dict]:
+    """Helper: a read_file(SKILL.md) call + tool_result pair."""
+    return [
+        {"type": "tool_call", "id": f"r{idx}", "name": "read_file",
+         "args": {"file_path": f"/h/.mimir_builtin_skills/{skill}/SKILL.md"}},
+        {"type": "tool_result", "id": f"r{idx}", "is_error": is_error},
+    ]
+
+
+def test_classify_load_with_criteria_met_yields_success():
+    """A load whose skill has success_criteria, with a matching event
+    after the load in the same turn, stays classified as success."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "alert": SkillSuccessCriteria(
+            any_of=[{"tool_call": {"name": "send_message"}}],
+        ),
+    }
+    events = _read_file_event("alert") + [
+        {"type": "tool_call", "id": "s1", "name": "send_message",
+         "args": {"channel_id": "operator", "text": "wake up"}},
+        {"type": "tool_result", "id": "s1", "is_error": False},
+    ]
+    out = list(_classify_skill_calls(events, base, skill_criteria=criteria))
+    assert out == [("alert", "success", base, "load")]
+
+
+def test_classify_load_with_criteria_unmet_yields_incomplete():
+    """Load succeeded but the operator's success_criteria found no
+    matching event in the tail → ``incomplete`` (not failure).
+    Operators see this distinct from "the file errored" so they can
+    investigate procedure drift vs broken skills separately."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "alert": SkillSuccessCriteria(
+            any_of=[{"tool_call": {"name": "send_message"}}],
+        ),
+    }
+    events = _read_file_event("alert") + [
+        {"type": "tool_call", "id": "w1", "name": "write_file",
+         "args": {"file_path": "state/notes.md"}},
+        {"type": "tool_result", "id": "w1", "is_error": False},
+    ]
+    out = list(_classify_skill_calls(events, base, skill_criteria=criteria))
+    assert out == [("alert", "incomplete", base, "load")]
+
+
+def test_classify_load_failure_skips_criteria_check():
+    """If the load itself errored (is_error=True), don't run criteria
+    — there's no procedure to check. Stays as ``failure``."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "alert": SkillSuccessCriteria(
+            any_of=[{"tool_call": {"name": "send_message"}}],
+        ),
+    }
+    events = _read_file_event("alert", is_error=True)
+    out = list(_classify_skill_calls(events, base, skill_criteria=criteria))
+    assert out == [("alert", "failure", base, "load")]
+
+
+def test_classify_load_with_no_criteria_for_skill_yields_success():
+    """A skill not in the criteria map keeps the legacy load-only
+    signal — backward compat for skills that haven't been audited."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "alert": SkillSuccessCriteria(
+            any_of=[{"tool_call": {"name": "send_message"}}],
+        ),
+    }
+    events = _read_file_event("threadborn")
+    out = list(_classify_skill_calls(events, base, skill_criteria=criteria))
+    assert out == [("threadborn", "success", base, "load")]
+
+
+def test_classify_execution_kind_ignores_criteria():
+    """task() invocations already have a clean signal via
+    tool_result.is_error. Criteria don't apply — even if the skill
+    has a criteria block, an execution-path outcome stays raw."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "weather": SkillSuccessCriteria(
+            # Deliberately impossible to match, to prove it's ignored.
+            any_of=[{"tool_call": {"name": "never_called"}}],
+        ),
+    }
+    events = [
+        {"type": "tool_call", "id": "t1", "name": "task",
+         "args": {"subagent_type": "weather"}},
+        {"type": "tool_result", "id": "t1", "is_error": False},
+    ]
+    out = list(_classify_skill_calls(events, base, skill_criteria=criteria))
+    assert out == [("weather", "success", base, "execution")]
+
+
+def test_classify_criteria_args_subset_match():
+    """Pattern with ``args`` matches when every declared key equals
+    the event's value; the event may carry extra args not in the
+    pattern."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "memory": SkillSuccessCriteria(
+            any_of=[{
+                "tool_call": {
+                    "name": "memory_store",
+                    "args": {"tier": "ATOMIC"},
+                },
+            }],
+        ),
+    }
+    # Matching: tier matches; other args ignored
+    events_ok = _read_file_event("memory") + [
+        {"type": "tool_call", "id": "m1", "name": "memory_store",
+         "args": {"tier": "ATOMIC", "session_id": "abc", "text": "x"}},
+        {"type": "tool_result", "id": "m1", "is_error": False},
+    ]
+    out_ok = list(_classify_skill_calls(events_ok, base, skill_criteria=criteria))
+    assert out_ok[0][1] == "success"
+
+    # Mismatching: tier different
+    events_drift = _read_file_event("memory") + [
+        {"type": "tool_call", "id": "m1", "name": "memory_store",
+         "args": {"tier": "CORE"}},
+        {"type": "tool_result", "id": "m1", "is_error": False},
+    ]
+    out_drift = list(_classify_skill_calls(events_drift, base, skill_criteria=criteria))
+    assert out_drift[0][1] == "incomplete"
+
+
+def test_aggregate_threads_criteria_through_to_classifier(tmp_path):
+    """End-to-end: aggregate() respects skill_criteria — the incomplete
+    counter increments for loads that don't trigger any criteria."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    turns = tmp_path / "turns.jsonl"
+    drift_turn = {
+        "ts": _ts(60, base),
+        "events": _read_file_event("alert") + [
+            {"type": "tool_call", "id": "w1", "name": "write_file",
+             "args": {"file_path": "state/notes.md"}},
+            {"type": "tool_result", "id": "w1", "is_error": False},
+        ],
+    }
+    turns.write_text(json.dumps(drift_turn) + "\n")
+    criteria = {
+        "alert": SkillSuccessCriteria(
+            any_of=[{"tool_call": {"name": "send_message"}}],
+        ),
+    }
+    aggs = aggregate(turns, now=base, skill_criteria=criteria)
+    alert = aggs["alert"]
+    assert alert.incomplete == 1
+    assert alert.load_incomplete == 1
+    assert alert.success == 0
+    assert alert.total == 1
+    # success_rate folds incomplete into the denominator as not-success
+    assert alert.success_rate == 0.0
+
+
+# ─── frontmatter loader ──────────────────────────────────────────────────
+
+
+def test_parse_criteria_from_skill_md_returns_none_without_block(tmp_path: Path):
+    """A SKILL.md with no ``success_criteria`` field returns None
+    (signal: "no criteria to check, trust the load signal")."""
+    path = tmp_path / "SKILL.md"
+    path.write_text(
+        "---\nname: bare\ndescription: x\nallowed-tools: [Bash]\n---\nbody\n"
+    )
+    assert _parse_criteria_from_skill_md(path) is None
+
+
+def test_parse_criteria_from_skill_md_extracts_any_of(tmp_path: Path):
+    path = tmp_path / "SKILL.md"
+    path.write_text(
+        "---\n"
+        "name: alert\n"
+        "description: x\n"
+        "success_criteria:\n"
+        "  any_of:\n"
+        "    - tool_call:\n"
+        "        name: send_message\n"
+        "    - tool_call:\n"
+        "        name: write_file\n"
+        "---\nbody\n"
+    )
+    c = _parse_criteria_from_skill_md(path)
+    assert c is not None
+    assert len(c.any_of) == 2
+    assert c.any_of[0]["tool_call"]["name"] == "send_message"
+
+
+def test_load_skill_success_criteria_scans_both_dirs(tmp_path: Path):
+    """Operator-installed skills under ``<home>/skills/`` shadow
+    bundled same-named entries (matches the rest of the dual-location
+    contract)."""
+    bundled = tmp_path / ".mimir_builtin_skills"
+    operator = tmp_path / "skills"
+    (bundled / "alert").mkdir(parents=True)
+    (bundled / "alert" / "SKILL.md").write_text(
+        "---\nname: alert\ndescription: x\n"
+        "success_criteria:\n  any_of:\n    - tool_call: {name: send_message}\n"
+        "---\nbody\n"
+    )
+    (operator / "alert").mkdir(parents=True)
+    (operator / "alert" / "SKILL.md").write_text(
+        "---\nname: alert\ndescription: x\n"
+        "success_criteria:\n  any_of:\n    - tool_call: {name: OPERATOR_OVERRIDE}\n"
+        "---\nbody\n"
+    )
+    crits = load_skill_success_criteria(tmp_path)
+    assert "alert" in crits
+    # Operator entry wins on collision.
+    assert crits["alert"].any_of[0]["tool_call"]["name"] == "OPERATOR_OVERRIDE"
+
+
+def test_load_skill_success_criteria_real_bundle(tmp_path: Path):
+    """Smoke: alert and memory SKILL.md from the bundle parse and
+    expose their declared criteria via the loader."""
+    from mimir.skill_defs import refresh_builtin_skills
+    refresh_builtin_skills(tmp_path)
+    crits = load_skill_success_criteria(tmp_path)
+    assert "alert" in crits, "alert SKILL.md should declare success_criteria"
+    assert "memory" in crits, "memory SKILL.md should declare success_criteria"
+    # alert: send_message; memory: memory_store / memory_query / saga_end_session
+    assert any(
+        p["tool_call"]["name"] == "send_message"
+        for p in crits["alert"].any_of
+    )
+    memory_names = {p["tool_call"]["name"] for p in crits["memory"].any_of}
+    assert {"memory_store", "memory_query"} <= memory_names
+
+
+def test_classify_criteria_args_glob_match():
+    """``<key>_glob`` triggers fnmatch on ``event.args[<key>]`` —
+    used for file-path matching where exact equality would be too
+    strict (operators don't know the exact path the agent will pick)."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "wiki": SkillSuccessCriteria(
+            any_of=[{
+                "tool_call": {
+                    "name": "write_file",
+                    "args": {"file_path_glob": "*state/wiki/*"},
+                },
+            }],
+        ),
+    }
+    # On-target: path matches the glob → success.
+    events_ok = _read_file_event("wiki") + [
+        {"type": "tool_call", "id": "w1", "name": "write_file",
+         "args": {"file_path": "/h/state/wiki/entities/Foo.md", "content": "x"}},
+        {"type": "tool_result", "id": "w1", "is_error": False},
+    ]
+    out_ok = list(_classify_skill_calls(events_ok, base, skill_criteria=criteria))
+    assert out_ok[0][1] == "success"
+
+    # Off-target: path doesn't match the glob → incomplete.
+    events_drift = _read_file_event("wiki") + [
+        {"type": "tool_call", "id": "w1", "name": "write_file",
+         "args": {"file_path": "/h/state/notes.md", "content": "x"}},
+        {"type": "tool_result", "id": "w1", "is_error": False},
+    ]
+    out_drift = list(_classify_skill_calls(events_drift, base, skill_criteria=criteria))
+    assert out_drift[0][1] == "incomplete"
+
+
+def test_load_skill_success_criteria_wiki_introspection_pollers(tmp_path: Path):
+    """Bundle-wide smoke: wiki + introspection + pollers all expose
+    their declared criteria via the loader (next batch of skills
+    audited after alert + memory)."""
+    from mimir.skill_defs import refresh_builtin_skills
+    refresh_builtin_skills(tmp_path)
+    crits = load_skill_success_criteria(tmp_path)
+    for name in ("wiki", "introspection", "pollers"):
+        assert name in crits, f"{name} should declare success_criteria"
+        assert crits[name].any_of, f"{name} criteria.any_of is empty"
+    # Spot-check the path-glob form landed for the file-shaped checks.
+    wiki_globs = [
+        p["tool_call"].get("args", {}).get("file_path_glob")
+        for p in crits["wiki"].any_of
+        if "args" in p["tool_call"]
+    ]
+    assert any(g and "state/wiki" in g for g in wiki_globs), (
+        "wiki criteria should target state/wiki/ paths"
+    )

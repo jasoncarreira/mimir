@@ -10,12 +10,12 @@ services / credentials (Gmail OAuth, GitHub PAT, Bluesky session
 tokens, etc.).
 
 Wiring those in used to mean ``cp -r mimir/optional-skills/<name>
-<home>/.claude/skills/`` plus reading the SKILL.md for env vars to set.
+<home>/skills/`` plus reading the SKILL.md for env vars to set.
 This module makes it a CLI: ``mimir skills install <name>`` and
 ``mimir skills list-optional``.
 
 The skill bundle stays in this repo; install just copies the directory
-to the agent's ``.claude/skills/`` so the runtime's skill discovery
+to the agent's ``skills/`` so the runtime's skill discovery
 picks it up. The agent's next ``reload_pollers`` (or next ``mimir run``
 boot) registers the poller defined in ``pollers.json``.
 
@@ -24,7 +24,7 @@ Layout assumptions
 * Source: ``<repo_root>/optional-skills/<name>/`` — must contain
   ``SKILL.md``. May also contain ``pollers.json`` (poller skills) and
   any other support files (Python sources, tests, templates).
-* Destination: ``<home>/.claude/skills/<name>/``. Created if absent.
+* Destination: ``<home>/skills/<name>/``. Created if absent.
 
 A pre-existing destination is treated as a conflict; ``--force``
 clobbers (after a recursive removal). The intent is "operators see
@@ -80,7 +80,7 @@ def _walk_skills_dir(root: Path) -> list[OptionalSkill]:
     """Walk a directory of skills and return one ``OptionalSkill`` per
     valid subdir. Shared between ``list_available`` (walks
     ``optional-skills/``) and ``list_installed`` (walks
-    ``<home>/.claude/skills/``) so the two listing paths stay in lockstep.
+    ``<home>/skills/``) so the two listing paths stay in lockstep.
 
     Skipped:
     - Hidden entries (``.foo``)
@@ -229,7 +229,7 @@ def install(
 
 
 def list_installed(home: Path) -> list[OptionalSkill]:
-    """Walk ``<home>/.claude/skills/`` and return one entry per skill.
+    """Walk ``<home>/skills/`` and return one entry per skill.
 
     Same shape as ``list_available`` (both reuse ``_walk_skills_dir``)
     so the CLI can format both listings the same way.
@@ -289,7 +289,7 @@ def add_argparse_install(parser) -> None:
     parser.add_argument(
         "--force", action="store_true",
         help="Overwrite an existing skill directory at the destination. "
-             "Recursive rm under <home>/.claude/skills/<name>/ — any "
+             "Recursive rm under <home>/skills/<name>/ — any "
              "custom edits there are lost.",
     )
     parser.set_defaults(skill_install_cmd=cmd_install)
@@ -391,7 +391,7 @@ def cmd_list(args) -> int:
         return 0
     width = max(len(s.name) for s in skills)
     pollers = [s for s in skills if s.has_pollers_json]
-    print(f"installed skills in {home}/.claude/skills/  "
+    print(f"installed skills in {home}/skills/  "
           f"(n={len(skills)}, pollers={len(pollers)}):\n")
     for s in skills:
         print(_format_skill_row(s, width))

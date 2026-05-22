@@ -9,7 +9,7 @@ from textwrap import dedent
 
 import pytest
 
-from mimir.skills.reflection.applied_audit import (
+from mimir.reflection.applied_audit import (
     AppliedProposal,
     AuditRow,
     Signal,

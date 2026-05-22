@@ -9,10 +9,10 @@
 
 Make `Skill` a real tool in mimir, with **two execution modes** chosen per-skill via frontmatter:
 
-- **Inline mode** (default when no `allowed-tools` is declared) — restores what mimir had under the Claude Agent SDK. Skill metadata in the system prompt; calling the tool loads the full SKILL.md body into the parent conversation and the parent continues with its full tool surface. Same context, same tools.
-- **Subagent mode** (default when `allowed-tools` IS declared) — new pattern. Calling the tool spawns a focused sub-conversation with SKILL.md as system prompt, only the tools listed in `allowed-tools` available, and a structured return. The parent gets a `tool_result` back.
+- **Inline mode** (default) — restores what mimir had under the Claude Agent SDK. Skill metadata in the system prompt; calling the tool loads the full SKILL.md body into the parent conversation and the parent continues with its full tool surface. Same context, same tools.
+- **Subagent mode** (opt-in via `subagent: true`) — new pattern. Calling the tool spawns a focused sub-conversation with SKILL.md as system prompt, an optional restricted tool surface from `allowed-tools`, and a structured return. The parent gets a `tool_result` back.
 
-The presence of `allowed-tools` in frontmatter is the trigger. Rationale: declaring a restricted tool set semantically says "I want this skill constrained" — subagent execution is the only way to enforce that. An explicit `inline: true` override lets operators keep skills that declare `allowed-tools` for documentation purposes (current case for `heartbeat`, `reflection`, `memory`) on the inline path.
+**Delegation trigger (post-2026-05-22).** An explicit `subagent: true` frontmatter flag opts a skill into subagent mode. The presence of `allowed-tools` is *not* the trigger — operators were using it as documentation ("the skill talks about these tools") rather than as a delegation signal, producing too many false positives (PR #264 spike enumeration). Now `allowed-tools` only matters once a skill has opted into delegation, where it specifies the SubAgent's restricted tool surface; without it the SubAgent inherits the framework's default tools.
 
 Today, mimir on deepagents has neither — the agent reads SKILL.md via raw `read_file` and improvises. That made the threadborn confabulation on muninn (2026-05-21) possible: the agent claimed "HTTP 403" without ever issuing curl. Restoring inline mode alone wouldn't have prevented this — the Claude Agent SDK explicitly does **not** enforce per-skill `allowed-tools` (it's a CLI-only feature). Subagent mode is what closes the confabulation class, by actually constraining the action space during execution.
 
@@ -134,11 +134,10 @@ Dispatcher behavior:
 
 1. Load `SKILL.md` for `name` from the configured skill source paths.
 2. Parse YAML frontmatter (Agent Skills spec compliant): `name`,
-   `description`, optional `allowed-tools`, optional `inline` /
-   `subagent` override.
+   `description`, optional `subagent` flag, optional `allowed-tools`.
 3. **Route based on frontmatter:**
-   - `allowed-tools` declared AND no `inline: true` override →
-     **subagent mode**
+   - `subagent: true` declared → **subagent mode** (uses `allowed-tools`
+     if present to scope the SubAgent's tool surface)
    - Otherwise → **inline mode**
 4. Execute per the mode (below).
 5. Return a `tool_result` to the parent.
@@ -184,28 +183,26 @@ action space is what makes confabulation structurally harder.
 Today's empirical state: **30 muninn skills declare `allowed-tools`**,
 but at least three are reflective (`heartbeat`, `reflection`, `memory`).
 For those, `allowed-tools` is documentation, not isolation intent.
-The escape hatch:
+Opting into subagent mode:
 
 ```yaml
 ---
-name: heartbeat
-allowed-tools:
+name: weather
+description: Get weather for a city.
+subagent: true       # opt INTO delegation
+allowed-tools:       # optional — scopes the SubAgent's tool surface
   - Bash
-  - Read
-  - send_message
-inline: true   # documentation; this skill runs in parent context
 ---
 ```
 
-`inline: true` keeps the skill on the inline path even when
-`allowed-tools` is declared.
-
-The reverse override (`subagent: true` for a skill with no
-`allowed-tools`) is also valid but expected to be rare.
+A skill without `subagent: true` stays inline regardless of whether it
+declares `allowed-tools`. The reverse — `subagent: true` without
+`allowed-tools` — is also valid; the SubAgent inherits the
+framework's default tool surface.
 
 ### Architecture sketch
 
-**Subagent mode (skill declares `allowed-tools`):**
+**Subagent mode (skill declares `subagent: true`):**
 
 ```
 parent agent turn
@@ -214,8 +211,8 @@ parent agent turn
 │   ↓
 │  Skill dispatcher
 │   ├─ load .claude/skills/threadborn/SKILL.md
-│   ├─ check frontmatter: allowed-tools=[curl, fetch_url, memory_store]
-│   │                     no inline override → subagent mode
+│   ├─ check frontmatter: subagent=true, allowed-tools=[curl, fetch_url, memory_store]
+│   │                     → subagent mode
 │   ├─ spawn SubAgent(
 │   │      system=SKILL.md.body,
 │   │      tools=[curl, fetch_url, memory_store],   # from allowed-tools
@@ -228,7 +225,7 @@ parent agent turn
 └─ ... agent continues parent turn ...
 ```
 
-**Inline mode (skill has no `allowed-tools`, or declares `inline: true`):**
+**Inline mode (skill does not declare `subagent: true`):**
 
 ```
 parent agent turn

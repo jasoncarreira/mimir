@@ -7,6 +7,23 @@ allowed-tools:
   - Write
   - file_search
   - memory_store
+success_criteria:
+  # The wiki skill's whole reason for existing is to grow / repair
+  # state/wiki/. Loading the policy without touching the wiki tree
+  # is drift — the agent consulted the rules but never acted on
+  # them. memory_store also counts since the wiki workflow emits
+  # cross-links into saga, not just directly into state/wiki/.
+  any_of:
+    - tool_call:
+        name: write_file
+        args:
+          file_path_glob: "*state/wiki/*"
+    - tool_call:
+        name: edit_file
+        args:
+          file_path_glob: "*state/wiki/*"
+    - tool_call:
+        name: memory_store
 ---
 
 # Wiki
@@ -205,7 +222,7 @@ fuzzy / paraphrased recall. For pages worth retrieving by paraphrase
 page's headline as a semantic atom:
 
 ```
-mcp__mimir__saga_store(
+memory_store(
     content="Alice Smith — eng team lead, async-first advocate. See state/wiki/entities/alice.md",
     stream="semantic",
 )

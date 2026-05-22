@@ -4,6 +4,13 @@ description: Use when a high-priority signal needs to reach the operator but doe
 allowed-tools:
   - Read
   - send_message
+success_criteria:
+  # The skill's whole purpose is operator notification. If we load
+  # the SKILL.md but no send_message follows, the alert was computed
+  # but never delivered — drift, not failure.
+  any_of:
+    - tool_call:
+        name: send_message
 ---
 
 # Operator alert channel

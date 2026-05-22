@@ -36,7 +36,7 @@ def home_with_two_skills(tmp_path: Path) -> Path:
     """Mimir home with two installed skills, one with a fragment, one
     without. Sufficient for fragment + env-var collection tests."""
     home = tmp_path / "home"
-    skills = home / ".claude" / "skills"
+    skills = home / "skills"
     skills.mkdir(parents=True)
 
     # Skill A: has dockerfile.fragment + pollers.json
@@ -79,7 +79,7 @@ def test_collect_fragments_falls_back_to_bundled(tmp_path: Path, monkeypatch):
 
     # Home with skill-c installed but NO fragment of its own.
     home = tmp_path / "home"
-    skills = home / ".claude" / "skills"
+    skills = home / "skills"
     (skills / "skill-c").mkdir(parents=True)
     (skills / "skill-c" / "SKILL.md").write_text(
         "---\nname: skill-c\ndescription: C\n---\nbody"
@@ -103,7 +103,7 @@ def test_collect_fragments_ordered_by_skill_name(tmp_path: Path):
     """Stable Dockerfile output across runs: fragments come out
     alphabetically by skill name."""
     home = tmp_path / "home"
-    skills = home / ".claude" / "skills"
+    skills = home / "skills"
     skills.mkdir(parents=True)
     for name in ("z-skill", "a-skill", "m-skill"):
         d = skills / name
@@ -137,7 +137,7 @@ def test_collect_required_env_vars_dedupes(tmp_path: Path):
     """If two pollers both declare the same pass_env entry, it appears
     only once in the result."""
     home = tmp_path / "home"
-    skills = home / ".claude" / "skills"
+    skills = home / "skills"
     skills.mkdir(parents=True)
     for name in ("a", "b"):
         d = skills / name
@@ -301,7 +301,7 @@ def test_scaffold_picks_up_new_skill_after_install(
     (home / "compose.env").write_text(env_text)
 
     # Install a new skill with its own fragment + pollers.json.
-    new = home / ".claude" / "skills" / "skill-new"
+    new = home / "skills" / "skill-new"
     new.mkdir()
     (new / "SKILL.md").write_text("---\nname: skill-new\n---\n")
     (new / "dockerfile.fragment").write_text("RUN echo skill-new")
@@ -483,7 +483,7 @@ def test_cmd_passes_extras_through(home_with_two_skills: Path, capsys):
 def test_scaffold_sanitizes_home_dir_name_for_service_name(tmp_path: Path):
     """Home dir with spaces / special chars → safe container name."""
     weird = tmp_path / "My Weird Home!"
-    (weird / ".claude" / "skills").mkdir(parents=True)
+    (weird / "skills").mkdir(parents=True)
     result = scaffold(weird)
     cy = (weird / "compose.yml").read_text()
     # Allowed chars: alnum + hyphen + underscore; spaces / ! become hyphens.
@@ -497,7 +497,7 @@ def test_scaffold_sanitizes_home_dir_name_for_service_name(tmp_path: Path):
 def test_scaffold_explicit_service_name_overrides_home_name(tmp_path: Path):
     """Explicit service name wins over the home-dir-derived default."""
     weird = tmp_path / "My Weird Home!"
-    (weird / ".claude" / "skills").mkdir(parents=True)
+    (weird / "skills").mkdir(parents=True)
     scaffold(weird, service_name="muninn")
     cy = (weird / "compose.yml").read_text()
     assert "container_name: muninn" in cy
@@ -507,7 +507,7 @@ def test_scaffold_explicit_service_name_is_also_sanitized(tmp_path: Path, capsys
     """Operator typo in --service-name (spaces, slashes) gets fixed
     instead of producing an invalid compose service name."""
     weird = tmp_path / "agent-home"
-    (weird / ".claude" / "skills").mkdir(parents=True)
+    (weird / "skills").mkdir(parents=True)
     scaffold(weird, service_name="muninn alpha/v2")
     cy = (weird / "compose.yml").read_text()
     assert "container_name: muninn-alpha-v2" in cy
@@ -550,7 +550,7 @@ def test_collect_required_env_vars_survives_malformed_pollers_json(tmp_path: Pat
     crash collection. Mimir #225 review flagged: ``"pollers": "oops"``
     would raise TypeError on the next ``.get()`` chain."""
     home = tmp_path / "home"
-    skills = home / ".claude" / "skills"
+    skills = home / "skills"
     skills.mkdir(parents=True)
     s = skills / "broken-skill"
     s.mkdir()
@@ -565,7 +565,7 @@ def test_collect_required_env_vars_skips_non_string_pass_env(tmp_path: Path):
     """If pass_env is a list but contains non-strings, those entries
     are skipped (not crashed-on)."""
     home = tmp_path / "home"
-    skills = home / ".claude" / "skills"
+    skills = home / "skills"
     skills.mkdir(parents=True)
     s = skills / "weird-skill"
     s.mkdir()
@@ -661,7 +661,7 @@ def test_scaffold_reports_only_changed_files(home_with_two_skills):
     """
     scaffold(home_with_two_skills)
     # Install a new skill with a fragment → Dockerfile changes; others don't.
-    new = home_with_two_skills / ".claude" / "skills" / "newcomer"
+    new = home_with_two_skills / "skills" / "newcomer"
     new.mkdir()
     (new / "SKILL.md").write_text("---\nname: newcomer\n---\n")
     (new / "dockerfile.fragment").write_text("RUN echo newcomer")

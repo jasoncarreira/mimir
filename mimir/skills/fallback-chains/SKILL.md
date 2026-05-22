@@ -78,7 +78,7 @@ Push is cheaper and faster but needs the source's cooperation. Pull always works
 **Saga retrieval** (mimir-specific):
 
 ```
-1. saga_query with the relevant terms (typed retrieval)
+1. memory_query with the relevant terms (typed retrieval)
 2. Direct file Read of memory/core/ + state/wiki/ if the answer should be canonical
 3. Glob-by-keyword across memory/ as a last resort
 4. Ask the operator (loud — the canonical info isn't where it should be)
