@@ -105,6 +105,120 @@ def test_classify_ignores_non_skill_tools():
     assert out == []
 
 
+# ─── read_file → SKILL.md (deepagents runtime) ──────────────────────────
+
+
+def test_classify_read_file_skill_md_as_load():
+    """deepagents runtime: SkillsMiddleware (or mimir's _assemble_skill_block)
+    tells the agent to load a skill by ``read_file`` on its SKILL.md.
+    That read_file is what we count — there is no structured Skill tool
+    on this runtime."""
+    base = datetime(2026, 5, 22, 14, 0, tzinfo=timezone.utc)
+    events = [
+        {"type": "tool_call", "id": "r1", "name": "read_file",
+         "args": {"file_path": "/mimir-home/.claude/skills/threadborn/SKILL.md"}},
+        {"type": "tool_result", "id": "r1", "is_error": False, "content": "..."},
+    ]
+    out = list(_classify_skill_calls(events, base))
+    assert out == [("threadborn", "success", base)]
+
+
+def test_classify_read_file_skill_md_failure():
+    base = datetime(2026, 5, 22, 14, 0, tzinfo=timezone.utc)
+    events = [
+        {"type": "tool_call", "id": "r1", "name": "read_file",
+         "args": {"file_path": "/mimir-home/.claude/skills/threadborn/SKILL.md"}},
+        {"type": "tool_result", "id": "r1", "is_error": True,
+         "content": "Error: File not found"},
+    ]
+    out = list(_classify_skill_calls(events, base))
+    assert out == [("threadborn", "failure", base)]
+
+
+def test_classify_read_file_tolerates_path_prefixes():
+    """Match works regardless of container-absolute, relative, or
+    workspace-root prefix."""
+    base = datetime(2026, 5, 22, 14, 0, tzinfo=timezone.utc)
+    cases = [
+        "/mimir-home/.claude/skills/moltbook/SKILL.md",
+        "./.claude/skills/moltbook/SKILL.md",
+        ".claude/skills/moltbook/SKILL.md",
+        "/some/other/prefix/.claude/skills/moltbook/SKILL.md",
+    ]
+    for path in cases:
+        events = [
+            {"type": "tool_call", "id": "r1", "name": "read_file",
+             "args": {"file_path": path}},
+            {"type": "tool_result", "id": "r1", "is_error": False},
+        ]
+        out = list(_classify_skill_calls(events, base))
+        assert out == [("moltbook", "success", base)], f"path={path}"
+
+
+def test_classify_read_file_non_skill_path_ignored():
+    """read_file on something that isn't a SKILL.md doesn't count as a
+    skill load — even within the skills tree."""
+    base = datetime(2026, 5, 22, 14, 0, tzinfo=timezone.utc)
+    ignored_paths = [
+        # Supporting file inside a skill dir — not the load event.
+        "/mimir-home/.claude/skills/threadborn/helper.py",
+        # README at the skills tree root.
+        "/mimir-home/.claude/skills/README.md",
+        # Memory file that happens to be SKILL.md.
+        "/mimir-home/memory/topics/SKILL.md",
+        # Unrelated file.
+        "/mimir-home/state/today.md",
+    ]
+    for path in ignored_paths:
+        events = [
+            {"type": "tool_call", "id": "r1", "name": "read_file",
+             "args": {"file_path": path}},
+            {"type": "tool_result", "id": "r1", "is_error": False},
+        ]
+        out = list(_classify_skill_calls(events, base))
+        assert out == [], f"unexpected match on {path}"
+
+
+def test_classify_read_file_skill_load_falls_back_when_no_result():
+    """If the agent reads SKILL.md but no tool_result lands in the same
+    turn (streaming gap, agent pivoted), the fallback to turn_succeeded
+    applies — same as the existing Skill-tool path."""
+    base = datetime(2026, 5, 22, 14, 0, tzinfo=timezone.utc)
+    events = [
+        {"type": "tool_call", "id": "r1", "name": "read_file",
+         "args": {"file_path": "/mimir-home/.claude/skills/heartbeat/SKILL.md"}},
+        # No tool_result.
+    ]
+    # Turn succeeded → infer success.
+    out_ok = list(_classify_skill_calls(events, base, turn_succeeded=True))
+    assert out_ok == [("heartbeat", "success", base)]
+    # Turn failed → infer failure.
+    out_fail = list(_classify_skill_calls(events, base, turn_succeeded=False))
+    assert out_fail == [("heartbeat", "failure", base)]
+    # Turn outcome unknown → abandoned.
+    out_unk = list(_classify_skill_calls(events, base))
+    assert out_unk == [("heartbeat", "abandoned", base)]
+
+
+def test_classify_dual_runtime_in_same_turn():
+    """If both runtimes' patterns appear in one turn (e.g. mixed
+    pre/post-migration log), both count. Last-source-wins is not the
+    semantic; both are real load events."""
+    base = datetime(2026, 5, 22, 14, 0, tzinfo=timezone.utc)
+    events = [
+        {"type": "tool_call", "id": "s1", "name": "Skill",
+         "args": {"skill": "memory"}},
+        {"type": "tool_result", "id": "s1", "is_error": False},
+        {"type": "tool_call", "id": "r1", "name": "read_file",
+         "args": {"file_path": ".claude/skills/threadborn/SKILL.md"}},
+        {"type": "tool_result", "id": "r1", "is_error": False},
+    ]
+    out = list(_classify_skill_calls(events, base))
+    assert ("memory", "success", base) in out
+    assert ("threadborn", "success", base) in out
+    assert len(out) == 2
+
+
 def test_aggregate_window_filters_old_turns(tmp_path):
     base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     turns = tmp_path / "turns.jsonl"
