@@ -51,6 +51,9 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Iterable
+
+import yaml
 
 # ``.claude/skills/<name>/SKILL.md`` with any prefix
 # (``/mimir-home/...``, ``./...``, bare relative). The capture group
@@ -58,9 +61,6 @@ from pathlib import Path
 _SKILL_READ_RE = re.compile(
     r"(?:^|/)\.claude/skills/([^/]+)/SKILL\.md$",
 )
-from typing import Iterable
-
-import yaml
 
 
 # VSM: S3 — skill amplification. Per-skill success-rate aggregator
