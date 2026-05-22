@@ -1098,14 +1098,10 @@ wheels = [
 [[package]]
 name = "langchain-claude-code"
 version = "0.1.0"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/jasoncarreira/langchain-claude-code?rev=f7af15b613d1e016437740f739321316730cdd39#f7af15b613d1e016437740f739321316730cdd39" }
 dependencies = [
     { name = "claude-agent-sdk" },
     { name = "langchain-core" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e5/6b/0d4ecd906dd70a8f018cf555360e71718e48e4c8856994c9a53cac423297/langchain_claude_code-0.1.0.tar.gz", hash = "sha256:959273ee091374e087a657846a0258c287e0dbd7c4c0c8361875bc53e6babadb", size = 184861, upload-time = "2025-12-02T19:44:25.095Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b7/bd/aef448681b6ebc1bca59fd9a67019f5225caec1ea17a1809930eec5491a3/langchain_claude_code-0.1.0-py3-none-any.whl", hash = "sha256:0f98d851654793e1d8cf3cc42aa5a33ff32b46e5f491ba8ff51d08b3279b507a", size = 10821, upload-time = "2025-12-02T19:44:23.418Z" },
 ]
 
 [[package]]
@@ -1392,10 +1388,10 @@ requires-dist = [
     { name = "langchain", specifier = ">=1.3" },
     { name = "langchain-anthropic", marker = "extra == 'anthropic'", specifier = ">=1.4" },
     { name = "langchain-anthropic", marker = "extra == 'dev'", specifier = ">=1.4" },
-    { name = "langchain-claude-code", marker = "extra == 'claude-code'", specifier = ">=0.1.0" },
-    { name = "langchain-claude-code", marker = "extra == 'dev'", specifier = ">=0.1.0" },
-    { name = "langchain-codex-plus", marker = "extra == 'codex-plus'", specifier = ">=0.0.1" },
-    { name = "langchain-codex-plus", marker = "extra == 'dev'", specifier = ">=0.0.1" },
+    { name = "langchain-claude-code", marker = "extra == 'claude-code'", git = "https://github.com/jasoncarreira/langchain-claude-code?rev=f7af15b613d1e016437740f739321316730cdd39" },
+    { name = "langchain-claude-code", marker = "extra == 'dev'", git = "https://github.com/jasoncarreira/langchain-claude-code?rev=f7af15b613d1e016437740f739321316730cdd39" },
+    { name = "langchain-codex-plus", marker = "extra == 'codex-plus'", specifier = ">=0.0.1,<0.1" },
+    { name = "langchain-codex-plus", marker = "extra == 'dev'", specifier = ">=0.0.1,<0.1" },
     { name = "langchain-openai", marker = "extra == 'dev'", specifier = ">=1.2.1" },
     { name = "langchain-openai", marker = "extra == 'openai'", specifier = ">=1.2.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
@@ -1415,8 +1411,8 @@ dev = [
     { name = "discord-py", specifier = ">=2.6" },
     { name = "faiss-cpu", specifier = ">=1.13" },
     { name = "langchain-anthropic", specifier = ">=1.4" },
-    { name = "langchain-claude-code", specifier = ">=0.1.0" },
-    { name = "langchain-codex-plus", specifier = ">=0.0.1" },
+    { name = "langchain-claude-code", git = "https://github.com/jasoncarreira/langchain-claude-code?rev=f7af15b613d1e016437740f739321316730cdd39" },
+    { name = "langchain-codex-plus", specifier = ">=0.0.1,<0.1" },
     { name = "langchain-openai", specifier = ">=1.2.1" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-aiohttp", specifier = ">=1.0" },
