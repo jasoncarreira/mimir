@@ -70,7 +70,7 @@ Before either track, gather inputs:
   `<home>/.mimir/session_boundaries.jsonl` is append-only JSONL —
   `tail -n 50 <home>/.mimir/session_boundaries.jsonl | jq` gives you
   the last 50 boundaries across all channels without needing a tool.
-  (Don't use `mcp__mimir__saga_query` for this — it ranks by
+  (Don't use `mcp__mimir__memory_query` for this — it ranks by
   similarity, not recency, and may not surface boundary-typed atoms
   at all.)
 - **Most-retrieved atoms** — invoke the bundled CLI subcommand via Bash:

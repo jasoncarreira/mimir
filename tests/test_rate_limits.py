@@ -452,6 +452,38 @@ def test_projection_skips_when_window_already_past():
     assert project_window_end(snap, 5.0, reference_time=now) is None
 
 
+def test_projection_skips_when_bucket_saturated():
+    """A reading of 100% is a pegged/saturated bucket — the old window
+    is fully consumed. Projecting forward produces absurd multiples like
+    1093% when the endpoint still reports the old saturated value 27
+    minutes into the new window. Return None; the raw suppress check
+    at ≥ 0.80 already handles the suppression decision.
+    (See memory/issues/anthropic-5h-bucket-pegged.md.)"""
+    from mimir.rate_limits import project_window_end
+
+    now = 1_000_000.0
+    # 27 minutes into a fresh 5h window, endpoint still pegged at 100%
+    snap = RateLimitSnapshot(
+        status="allowed_warning",
+        utilization=1.0,
+        resets_at=int(now + (5.0 - 0.45) * 3600),  # 4.55h remaining
+    )
+    assert project_window_end(snap, 5.0, reference_time=now) is None
+
+
+def test_projection_skips_when_bucket_over_full():
+    """Utilization > 1.0 is also saturated — same guard applies."""
+    from mimir.rate_limits import project_window_end
+
+    now = 1_000_000.0
+    snap = RateLimitSnapshot(
+        status="allowed_warning",
+        utilization=1.01,
+        resets_at=int(now + 2.5 * 3600),
+    )
+    assert project_window_end(snap, 5.0, reference_time=now) is None
+
+
 # ---- render projection inline ------------------------------------------
 
 
