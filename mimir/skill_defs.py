@@ -63,7 +63,7 @@ SKILLS_DIR_NAME = "skills"
 
 #: Legacy location from when skills lived under ``.claude/skills/``.
 #: Read-only for migration; never written to in new code.
-_LEGACY_SKILLS_DIR_NAME = Path(".claude") / "skills"
+_LEGACY_SKILLS_DIR_NAME = ".claude/skills"
 
 _BUNDLED_ROOT = Path(__file__).parent / "skills"
 
