@@ -196,8 +196,8 @@ async def test_sweep_skips_core_and_indexes(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_sweep_skips_workspace_paths(tmp_path: Path):
-    """v0.4 §7: heartbeat-backlog / proposed-changes / state/social are
-    operator-agent workspace, not knowledge — must not be embedded."""
+    """v0.4 §7: heartbeat-backlog / proposed-changes / state/pollers
+    are operator-agent workspace, not knowledge — must not be embedded."""
     _seed(tmp_path)
     # Skip-listed exact paths.
     (tmp_path / "state" / "heartbeat-backlog.md").write_text(
@@ -206,9 +206,12 @@ async def test_sweep_skips_workspace_paths(tmp_path: Path):
     (tmp_path / "state" / "proposed-changes.md").write_text(
         "<!-- desc: proposals -->\n# Proposals\ntokenmjzrtq here too."
     )
-    # Skip-listed prefix.
-    (tmp_path / "state" / "social").mkdir()
-    (tmp_path / "state" / "social" / "inbox.md").write_text(
+    # Skip-listed prefix — poller working directories (cursors, .env,
+    # inbox manifests). Per #255 the prefix is ``state/pollers/``
+    # (previously ``state/social/``, which never existed in any
+    # deployment).
+    (tmp_path / "state" / "pollers" / "social-cli-notifications").mkdir(parents=True)
+    (tmp_path / "state" / "pollers" / "social-cli-notifications" / "inbox.md").write_text(
         "<!-- desc: social inbox -->\ntokenmjzrtq social-cli artifact."
     )
     # Adjacent state file that SHOULD index — control case.
@@ -222,7 +225,7 @@ async def test_sweep_skips_workspace_paths(tmp_path: Path):
     paths = {r.path for r in results}
     assert "state/heartbeat-backlog.md" not in paths
     assert "state/proposed-changes.md" not in paths
-    assert "state/social/inbox.md" not in paths
+    assert "state/pollers/social-cli-notifications/inbox.md" not in paths
     assert "state/neighbor.md" in paths
 
 
