@@ -15,6 +15,22 @@ Routing decision per skill, made at startup:
 2. Skill does NOT declare ``allowed-tools`` → stays inline, rendered
    in mimir's normal skill catalog.
 
+Optional frontmatter fields (delegatable skills only):
+
+- ``params`` — JSON Schema dict declaring what the parent agent
+  should pass via the task description. Rendered as a
+  ``## Parameters`` block in the subagent's system_prompt;
+  summarized into the SubAgent description so the parent sees the
+  expected shape before invoking.
+- ``returns`` — JSON Schema dict for the expected output shape.
+  Passed to deepagents' ``response_format=`` field, which enforces
+  the schema on the subagent's last message. Parent receives
+  structured ``tool_result`` content matching this shape.
+
+Both are optional — skills compiled without them inherit today's
+free-text behavior (task description is a single string; result is
+the last assistant message).
+
 **Reflective override (spike-era).** A small set of skills declare
 ``allowed-tools`` for documentation purposes but actually need the
 parent's in-context reasoning to operate (per the heuristic in
@@ -170,6 +186,74 @@ def _emit_unknown_tool_event(
         pass
 
 
+def _render_params_block(params_schema: dict[str, Any]) -> str:
+    """Render a JSON Schema ``params`` dict as a system-prompt block.
+
+    The subagent receives a parent-supplied free-text ``description``
+    as its user message; the params block tells the subagent what
+    shape that description is expected to carry. Operators author
+    using JSON Schema (the framework standard); we render to YAML for
+    legibility in the prompt.
+
+    Example output:
+
+    .. code-block:: markdown
+
+        ## Parameters
+
+        The parent agent should supply the following params in the
+        task description. Schema:
+
+        ```yaml
+        type: object
+        properties:
+          city:
+            type: string
+            description: City name (e.g. "Charlotte, NC")
+        required: [city]
+        ```
+    """
+    schema_yaml = yaml.safe_dump(
+        params_schema, default_flow_style=False, sort_keys=False,
+    ).rstrip()
+    return (
+        "\n\n## Parameters\n\n"
+        "The parent agent should supply the following params in the task description. "
+        "Schema:\n\n"
+        f"```yaml\n{schema_yaml}\n```\n"
+    )
+
+
+def _render_param_summary(params_schema: dict[str, Any]) -> str:
+    """One-line param summary suitable for appending to the SubAgent's
+    description (which the parent agent sees when deciding to invoke).
+
+    Example: ``Params: city (required), days (optional).``
+    """
+    props = params_schema.get("properties") or {}
+    required = set(params_schema.get("required") or [])
+    if not props:
+        return ""
+    parts: list[str] = []
+    for name in props:
+        if name in required:
+            parts.append(f"{name} (required)")
+        else:
+            parts.append(f"{name} (optional)")
+    return f"Params: {', '.join(parts)}."
+
+
+def _render_return_summary(returns_schema: dict[str, Any]) -> str:
+    """One-line return-shape summary for the SubAgent description.
+
+    Example: ``Returns: forecast, high_temp_c, low_temp_c.``
+    """
+    props = returns_schema.get("properties") or {}
+    if not props:
+        return ""
+    return f"Returns: {', '.join(props.keys())}."
+
+
 def _resolve_tool(name: str, registry: dict[str, Any]) -> Any | None:
     """Look up a tool by ``allowed-tools`` entry. Returns the tool
     instance, ``"builtin"`` for framework built-ins (caller skips them),
@@ -296,14 +380,41 @@ def compile_skills_to_subagents(
         # has the framework built-ins via middleware. Don't skip.
 
         description = str(meta.get("description") or f"{name} skill")
+        system_prompt = body
+
+        # Optional ``params`` (JSON Schema) — operator declares what
+        # the parent agent should pass via the task description.
+        # Rendered as a ## Parameters block in the subagent's prompt
+        # so the subagent knows what to expect; summarized into the
+        # SubAgent description so the parent sees it before invoking.
+        params_schema = meta.get("params")
+        if isinstance(params_schema, dict) and params_schema:
+            system_prompt += _render_params_block(params_schema)
+            summary = _render_param_summary(params_schema)
+            if summary:
+                description = f"{description} {summary}"
+
+        # Optional ``returns`` (JSON Schema) — operator declares the
+        # expected output shape. Translates directly to deepagents'
+        # ``response_format=`` field, which accepts JSON schema dicts.
+        # The framework enforces the schema on the subagent's last
+        # message, so the parent receives structured ``tool_result``
+        # content matching this shape.
+        returns_schema = meta.get("returns")
+        if isinstance(returns_schema, dict) and returns_schema:
+            summary = _render_return_summary(returns_schema)
+            if summary:
+                description = f"{description} {summary}"
 
         spec: dict[str, Any] = {
             "name": name,
             "description": description,
-            "system_prompt": body,
+            "system_prompt": system_prompt,
         }
         if custom_tools:
             spec["tools"] = custom_tools
+        if isinstance(returns_schema, dict) and returns_schema:
+            spec["response_format"] = returns_schema
 
         subagents.append(spec)
         delegated.add(name)
