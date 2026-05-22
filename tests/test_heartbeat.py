@@ -16,29 +16,29 @@ from mimir.cli import (
 )
 from mimir.models import AgentEvent
 from mimir.prompts import HEARTBEAT_DEFAULT_PROMPT, build_turn_prompt
-from mimir.skill_defs import _bundled_skill_names
+# ---- Heartbeat prompt template (no longer a bundled skill) ---------------
 
 
-# ---- Skill bundling ------------------------------------------------------
-
-
-def test_heartbeat_skill_is_bundled():
-    assert "heartbeat" in _bundled_skill_names()
-
-
-def test_heartbeat_skill_has_frontmatter_and_required_sections():
-    skill_path = (
+def test_heartbeat_prompt_template_is_bundled():
+    """Post-2026-05-22: heartbeat's workflow ships as a prompt template,
+    not a bundled skill. The template gets seeded to ``<home>/prompts/``
+    on first setup; the scheduler's heartbeat entry points at it."""
+    template = (
         Path(__file__).parent.parent
         / "mimir"
-        / "skills"
-        / "heartbeat"
-        / "SKILL.md"
+        / "prompt_templates"
+        / "heartbeat.md"
     )
-    body = skill_path.read_text()
-    # Frontmatter present (required by the loader).
-    assert body.startswith("---\n")
-    assert "name: heartbeat" in body
-    assert "description:" in body
+    assert template.is_file(), f"heartbeat template missing at {template}"
+
+
+def test_heartbeat_prompt_template_has_required_sections():
+    body = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "prompt_templates"
+        / "heartbeat.md"
+    ).read_text()
     # Core sections of the cadence.
     for header in (
         "Mode: autonomous",
@@ -46,7 +46,9 @@ def test_heartbeat_skill_has_frontmatter_and_required_sections():
         "Backlog protocol",
         "End silently",
     ):
-        assert header in body, f"heartbeat skill missing section: {header!r}"
+        assert header in body, (
+            f"heartbeat prompt template missing section: {header!r}"
+        )
 
 
 # ---- setup_home additions -----------------------------------------------

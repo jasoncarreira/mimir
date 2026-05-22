@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.skills.reflection.introspection_report import (
+from mimir.reflection.introspection_report import (
     HeartbeatPipeline,
     Report,
     aggregate,

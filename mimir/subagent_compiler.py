@@ -83,17 +83,13 @@ import yaml
 log = logging.getLogger(__name__)
 
 
-# Skills that declare ``allowed-tools`` for documentation but need parent
-# context to operate. Bypass subagent compilation; they stay inline.
-#
-# Promote to an ``inline: true`` frontmatter flag in the follow-up that
-# generalizes the spike.
-_REFLECTIVE_OVERRIDE: frozenset[str] = frozenset({
-    "heartbeat",
-    "reflection",
-    "memory",
-    "wiki",
-})
+# Removed 2026-05-22: the _REFLECTIVE_OVERRIDE set existed when the
+# trigger for compilation was "skill declares allowed-tools". That
+# heuristic produced too many false positives — operators used
+# allowed-tools as documentation ("the skill talks about these tools")
+# not as a delegation signal. The flipped contract: skills are inline
+# by default and opt IN to delegation with ``subagent: true`` in
+# frontmatter. With opt-in there's no need for an override set.
 
 
 # Framework built-in tool names (capitalized) that deepagents'
@@ -260,6 +256,53 @@ def _render_return_summary(returns_schema: dict[str, Any]) -> str:
     return f"Returns: {', '.join(props.keys())}."
 
 
+def _render_returns_block(returns_schema: dict[str, Any]) -> str:
+    """Render the ``returns`` schema as a system-prompt block.
+
+    Symmetric to :func:`_render_params_block`. The langchain
+    structured-output machinery binds an artificial tool to the model
+    whose name/description come from the schema's ``title`` /
+    ``description`` (structured_output.py:159-170). Without a
+    title the tool name defaults to ``response_format_<uuid>`` — the
+    model has to guess this is the "final answer" tool. We surface
+    the title verbatim into the rendered block so the SubAgent can
+    refer to the tool by name rather than infer it from context.
+
+    Example output:
+
+    .. code-block:: markdown
+
+        ## Final Response
+
+        Return your final result by calling the ``weather_result``
+        tool with arguments matching this schema:
+
+        ```yaml
+        type: object
+        title: weather_result
+        properties:
+          ...
+        ```
+    """
+    schema_yaml = yaml.safe_dump(
+        returns_schema, default_flow_style=False, sort_keys=False,
+    ).rstrip()
+    title = returns_schema.get("title")
+    # langchain falls back to ``response_format_<uuid>`` when title
+    # is missing; we can't predict the uuid at compile time, so the
+    # untitled case falls back to generic phrasing.
+    if isinstance(title, str) and title:
+        call_phrase = f"calling the ``{title}`` tool"
+    else:
+        call_phrase = "calling the structured-output tool"
+    return (
+        "\n\n## Final Response\n\n"
+        f"Return your final result by {call_phrase} "
+        "with arguments matching this schema:\n\n"
+        f"```yaml\n{schema_yaml}\n```\n"
+    )
+
+
 def _resolve_tool(name: str, registry: dict[str, Any]) -> Any | None:
     """Look up a tool by ``allowed-tools`` entry. Returns the tool
     instance, ``"builtin"`` for framework built-ins (caller skips them),
@@ -285,18 +328,34 @@ def compile_skills_to_subagents(
     home: Path,
     parent_tools: list[Any],
     *,
-    skills_subdir: str = ".claude/skills",
-    reflective_override: frozenset[str] = _REFLECTIVE_OVERRIDE,
+    skills_subdir: str | None = None,
 ) -> CompileResult:
-    """Scan ``<home>/<skills_subdir>/*/SKILL.md`` and compile eligible
+    """Scan ``<home>/skills/*/SKILL.md`` and
+    ``<home>/.mimir_builtin_skills/*/SKILL.md`` and compile eligible
     skills to SubAgent specs.
+
+    Mirrors SkillsMiddleware's dual-location discovery and its
+    last-source-wins shadowing: bundled skills are scanned first, then
+    operator-installed skills override same-named entries. A fresh
+    deployment with only the bundled refresh in place gets the bundled
+    delegation set; operators customize a skill by installing
+    same-named content under ``<home>/skills/`` (the operator location
+    wins on name collision).
+
+    **Delegation contract (post-2026-05-22, opt-in)**: skills are
+    inline by default and opt IN to delegation via ``subagent: true``
+    in frontmatter. The prior heuristic ("declares allowed-tools →
+    delegate") produced too many false positives — operators used
+    ``allowed-tools`` as documentation rather than as a delegation
+    signal. Genuine SubAgent candidates (narrow tool surface, bounded
+    workflow, parent context not load-bearing) explicitly mark
+    themselves with ``subagent: true``.
 
     A skill is eligible iff:
 
     1. The directory contains a readable SKILL.md
     2. Frontmatter parses (or is empty — empty == ineligible)
-    3. Frontmatter declares ``allowed-tools`` as a non-empty list
-    4. The skill name is NOT in ``reflective_override``
+    3. Frontmatter declares ``subagent: true``
 
     For each eligible skill, the function produces a SubAgent spec with:
 
@@ -307,24 +366,52 @@ def compile_skills_to_subagents(
     - ``system_prompt`` = the SKILL.md body (frontmatter stripped)
     - ``tools`` = the resolved subset of ``allowed-tools`` (custom
       mimir tools; framework built-ins auto-included via subagent
-      middleware)
+      middleware). If ``allowed-tools`` is absent, the SubAgent
+      inherits the framework default tool surface.
 
     Framework built-ins (Bash, Read, Write, etc.) in ``allowed-tools``
     are noted but not explicitly registered — deepagents' default
     subagent middleware stack provides them. So a skill declaring
     ``allowed-tools: [Bash]`` produces a SubAgent with ``tools=[]``
     and still has Bash available at runtime via the middleware.
+
+    ``skills_subdir`` is a legacy kwarg: when set, only that single
+    subdir under ``home`` is scanned (no bundled-dir merge). New
+    callers should leave it as ``None`` to get the dual-location
+    behavior; the parameter exists for tests that need to isolate a
+    specific layout.
     """
-    skills_dir = home / skills_subdir
+    from .skill_defs import (
+        BUILTIN_SKILLS_DIR_NAME,
+        SKILLS_DIR_NAME,
+    )
+
+    # Bundled location listed first so operator entries shadow same-named
+    # bundled ones (matches SkillsMiddleware's last-source-wins rule).
+    if skills_subdir is None:
+        scan_dirs = [
+            home / BUILTIN_SKILLS_DIR_NAME,
+            home / SKILLS_DIR_NAME,
+        ]
+    else:
+        scan_dirs = [home / skills_subdir]
+
     warnings: list[str] = []
-    if not skills_dir.is_dir():
+    scan_dirs = [d for d in scan_dirs if d.is_dir()]
+    if not scan_dirs:
         return CompileResult(subagents=[], delegated_skills=set(), warnings=warnings)
 
     registry = _build_registry(parent_tools)
-    subagents: list[dict[str, Any]] = []
+    # dict preserves insertion order so the last source (operator
+    # location) overwrites earlier (bundled location) entries on
+    # name collision.
+    specs_by_name: dict[str, dict[str, Any]] = {}
     delegated: set[str] = set()
+    skill_mds: list[Path] = []
+    for d in scan_dirs:
+        skill_mds.extend(sorted(d.glob("*/SKILL.md")))
 
-    for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
+    for skill_md in skill_mds:
         skill_name = skill_md.parent.name
         try:
             meta, body = parse_skill_frontmatter(skill_md)
@@ -336,18 +423,21 @@ def compile_skills_to_subagents(
         if not isinstance(meta, dict) or not meta:
             continue
 
-        allowed = meta.get("allowed-tools") or meta.get("allowed_tools")
-        if not allowed or not isinstance(allowed, list):
+        # Delegation is opt-in: the skill must declare ``subagent: true``.
+        # Anything else stays inline (read SKILL.md into parent context).
+        if meta.get("subagent") is not True:
             continue
 
         # Frontmatter name wins; directory name is the fallback.
         name = str(meta.get("name") or skill_name)
-        if name in reflective_override:
-            log.debug(
-                "skill %s in reflective_override; staying inline despite "
-                "allowed-tools declaration", name,
-            )
-            continue
+
+        # ``allowed-tools`` is optional for delegated skills — when
+        # absent, the SubAgent inherits the framework's default tool
+        # surface. When present, we resolve it into the SubAgent's
+        # explicit ``tools`` field.
+        allowed = meta.get("allowed-tools") or meta.get("allowed_tools") or []
+        if not isinstance(allowed, list):
+            allowed = []
 
         # Resolve allowed-tools entries.
         custom_tools: list[Any] = []
@@ -405,9 +495,14 @@ def compile_skills_to_subagents(
         # ``response_format=`` field, which accepts JSON schema dicts.
         # The framework enforces the schema on the subagent's last
         # message, so the parent receives structured ``tool_result``
-        # content matching this shape.
+        # content matching this shape. We also render a ``## Final
+        # Response`` block into the SubAgent's system_prompt so the
+        # model has explicit guidance to use the structured-output
+        # tool langchain binds for response_format (whose default name
+        # is ``response_format_<uuid>`` — opaque without the block).
         returns_schema = meta.get("returns")
         if isinstance(returns_schema, dict) and returns_schema:
+            system_prompt += _render_returns_block(returns_schema)
             summary = _render_return_summary(returns_schema)
             if summary:
                 description = f"{description} {summary}"
@@ -422,11 +517,16 @@ def compile_skills_to_subagents(
         if isinstance(returns_schema, dict) and returns_schema:
             spec["response_format"] = returns_schema
 
-        subagents.append(spec)
+        # Dual-location: later-seen entry (operator dir) overwrites
+        # the earlier-seen bundled entry. Same last-source-wins
+        # semantics as SkillsMiddleware so the rendered ``task``
+        # catalog and the inline ``Skills System`` catalog stay
+        # consistent on what an operator customization shadows.
+        specs_by_name[name] = spec
         delegated.add(name)
 
     return CompileResult(
-        subagents=subagents,
+        subagents=list(specs_by_name.values()),
         delegated_skills=delegated,
         warnings=warnings,
     )

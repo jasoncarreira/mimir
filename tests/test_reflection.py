@@ -24,22 +24,29 @@ from mimir.skill_defs import _bundled_skill_names
 # ---- Skill bundling ------------------------------------------------------
 
 
-def test_reflection_skill_is_bundled():
-    assert "reflection" in _bundled_skill_names()
-
-
-def test_reflection_skill_documents_both_tracks():
-    skill_path = (
+def test_reflection_prompt_template_is_bundled():
+    """Reflection's workflow ships as an operator prompt template,
+    NOT as a bundled skill. Per the skills-architecture-restoration
+    plan, scheduled-task workflows (heartbeat, reflection) live in
+    ``mimir/prompt_templates/`` and get seeded to a deployment's
+    ``<home>/prompts/`` directory on first setup."""
+    template = (
         Path(__file__).parent.parent
         / "mimir"
-        / "skills"
-        / "reflection"
-        / "SKILL.md"
+        / "prompt_templates"
+        / "reflect.md"
     )
-    body = skill_path.read_text()
-    assert body.startswith("---\n")
-    assert "name: reflection" in body
-    # Two tracks the skill must teach.
+    assert template.is_file(), f"reflection prompt template missing at {template}"
+
+
+def test_reflection_prompt_documents_both_tracks():
+    body = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "prompt_templates"
+        / "reflect.md"
+    ).read_text()
+    # Two tracks the workflow must teach.
     assert "behavioral" in body.lower()
     assert "memory architecture review" in body.lower()
     # Promotion criteria — load-bearing for atom-to-core decisions.
@@ -47,17 +54,16 @@ def test_reflection_skill_documents_both_tracks():
         assert criterion in body, f"missing promotion criterion: {criterion}"
 
 
-def test_reflection_skill_references_bundled_script():
-    """The skill must point at the most-retrieved CLI subcommand — that's
-    how the agent gets atom-to-core promotion candidates."""
-    skill_path = (
+def test_reflection_prompt_references_cli_subcommand():
+    """The workflow must point at the ``mimir reflection
+    most-retrieved`` CLI subcommand — that's how the agent gets
+    atom-to-core promotion candidates."""
+    body = (
         Path(__file__).parent.parent
         / "mimir"
-        / "skills"
-        / "reflection"
-        / "SKILL.md"
-    )
-    body = skill_path.read_text()
+        / "prompt_templates"
+        / "reflect.md"
+    ).read_text()
     assert "mimir reflection most-retrieved" in body
     assert "--contributed-only" in body
 

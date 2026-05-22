@@ -1,6 +1,7 @@
 ---
 name: skill-creator
 description: Create or update reusable skills for this agent. Use this skill ONLY when the user asks to create a new skill, edit an existing skill, improve a SKILL.md, or capture a repeated workflow as a reusable skill. Do not use this skill for one-off tasks.
+subagent: true
 allowed-tools:
   - Edit
   - Read

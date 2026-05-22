@@ -26,7 +26,11 @@ def test_setup_creates_home_layout(tmp_path: Path):
     assert (home / "state" / "wiki" / "topics").is_dir()
     assert (home / "messages").is_dir()
     assert (home / ".claude" / "agents").is_dir()
-    assert (home / ".claude" / "skills").is_dir()
+    # Post-2026-05-22: bundled skills live under .mimir_builtin_skills/
+    # (read-only refresh target) and operator-installed skills under
+    # skills/ (tracked/writable). The legacy .claude/skills/ path is
+    # only created as a side-effect of legacy-migration, not by setup.
+    assert (home / ".mimir_builtin_skills").is_dir()
     # Templates landed.
     assert (home / ".env").is_file()
     assert (home / "scheduler.yaml").is_file()
@@ -34,6 +38,9 @@ def test_setup_creates_home_layout(tmp_path: Path):
     assert (home / "state" / "wiki" / "AGENTS.md").is_file()
     assert (home / "state" / "wiki" / "index.md").is_file()
     assert (home / "state" / "wiki" / "log.md").is_file()
+    # Default scheduled-task prompt templates seeded (heartbeat + reflect).
+    assert (home / "prompts" / "heartbeat.md").is_file()
+    assert (home / "prompts" / "reflect.md").is_file()
     # Identity reconciliation starter (FUTURE_WORK §6.1).
     identities_yaml = home / "state" / "identities.yaml"
     assert identities_yaml.is_file()
@@ -44,8 +51,8 @@ def test_setup_creates_home_layout(tmp_path: Path):
     # Empty by default — operator adds entries.
     assert "people: []" in body
     # Skills + subagents got seeded.
-    assert (home / ".claude" / "skills" / "memory" / "SKILL.md").is_file()
-    assert (home / ".claude" / "skills" / "wiki" / "SKILL.md").is_file()
+    assert (home / ".mimir_builtin_skills" / "memory" / "SKILL.md").is_file()
+    assert (home / ".mimir_builtin_skills" / "wiki" / "SKILL.md").is_file()
     # Status report covers what we did.
     assert status["home"] == str(home.resolve())
     assert "memory/core" in status["dirs_created"]
@@ -65,8 +72,8 @@ def test_setup_is_idempotent_and_preserves_user_edits(tmp_path: Path):
         "SAGA_API_KEY=user-saga-token\n"
     )
     (home / ".env").write_text(user_env)
-    # User adds a custom skill.
-    custom = home / ".claude" / "skills" / "my-skill"
+    # User adds a custom skill at the operator-writable location.
+    custom = home / "skills" / "my-skill"
     custom.mkdir(parents=True)
     (custom / "SKILL.md").write_text("custom")
     # Re-run setup — must not clobber existing values.

@@ -1,0 +1,46 @@
+# mimir scheduler — APScheduler cron jobs that enqueue LLM ticks.
+# Each job triggers a turn on ``channel_id`` with ``trigger=scheduled_tick``.
+#
+# Two recurring LLM ticks are enabled by default:
+#
+#   - heartbeat: hourly autonomous-work cadence. Pulls one item from
+#     state/heartbeat-backlog.md and does it. The §12.4 homeostat
+#     suppresses fires when the plan window saturates or cost rate
+#     trips, so this default is safe even at hourly cadence.
+#   - reflect: weekly cross-session audit (Sunday 06:00 UTC). The
+#     SAGA consolidation cron runs nightly at 04:00 UTC, so by the
+#     time reflection fires Sunday morning the most recent
+#     consolidation pass is two hours old.
+#
+# Two non-LLM crons are auto-installed by the runtime (no entry
+# needed here):
+#
+#   - saga-consolidate: nightly atom merge / synthesis pass
+#     (MIMIR_SAGA_CONSOLIDATE_CRON, default 04:00 daily).
+#   - introspection-report: weekly behavioral / health snapshot
+#     written to state/reports/ with algedonic emit on degraded
+#     heartbeat success rate (MIMIR_INTROSPECTION_REPORT_CRON,
+#     default Fri 14:00).
+#
+# To disable a default tick, comment it out below or remove it.
+# To add a custom tick, prefer ``prompt_file`` over inline ``prompt``
+# so the prompt content can grow without cluttering this file:
+#
+#   - name: morning-checkin
+#     cron: "0 9 * * 1-5"
+#     channel_id: web-default
+#     prompt_file: morning-checkin.md   # under <home>/prompts/
+#
+# Each job needs exactly one of ``cron`` (5-field) or ``time_of_day``
+# (HH:MM, daily UTC), and exactly one of ``prompt`` (inline) or
+# ``prompt_file`` (path under <home>/prompts/).
+
+- name: heartbeat
+  cron: "0 * * * *"
+  channel_id: null   # synthetic scheduler:heartbeat channel
+  prompt_file: heartbeat.md
+
+- name: reflect
+  cron: "0 6 * * 0"
+  channel_id: null   # synthetic scheduler:reflect channel
+  prompt_file: reflect.md
