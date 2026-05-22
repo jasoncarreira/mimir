@@ -1,6 +1,6 @@
 ---
 name: pollers
-description: Mechanics for building and managing pollers — subprocess scripts that check external services on a schedule and emit events when something has changed. Use when authoring a new poller (a `pollers.json` manifest plus a script in any language), debugging why a poller isn't firing, or extending an existing one. Pollers run on cron, emit JSONL events when there's something to report, and stay silent otherwise (silence-as-filter). The framework discovers `<home>/.claude/skills/<name>/pollers.json` files at startup and via `reload_pollers`; each emitted event becomes a fresh turn on a `poller:<name>` synthetic channel. Companion to the `world-scanning` skill, which catalogs *what's worth polling*. Distinct from `async-tasks` (one-shot wake-up via bash_async, not recurring) and from in-process scheduler callables (saga-consolidate, oauth-usage-poll — those mutate mimir-internal state and aren't subprocess-isolated).
+description: Mechanics for building and managing pollers — subprocess scripts that check external services on a schedule and emit events when something has changed. Use when authoring a new poller (a `pollers.json` manifest plus a script in any language), debugging why a poller isn't firing, or extending an existing one. Pollers run on cron, emit JSONL events when there's something to report, and stay silent otherwise (silence-as-filter). The framework discovers `<home>/skills/<name>/pollers.json` files at startup and via `reload_pollers`; each emitted event becomes a fresh turn on a `poller:<name>` synthetic channel. Companion to the `world-scanning` skill, which catalogs *what's worth polling*. Distinct from `async-tasks` (one-shot wake-up via bash_async, not recurring) and from in-process scheduler callables (saga-consolidate, oauth-usage-poll — those mutate mimir-internal state and aren't subprocess-isolated).
 allowed-tools:
   - Bash
   - Read
@@ -54,7 +54,7 @@ The script runs with the skill directory as its **cwd**. It receives these envir
 
 Plus any literal env vars from the `env` field, plus any pass-throughs declared in `pass_env` (see field docs below), plus the deny-filtered allowlist of the agent's process environment.
 
-**Why STATE_DIR is separate from the skill dir**: skills are deployable artifacts (resettable via `seed_skills`, image-shippable, optionally reset on container rebuild). Cursor files are persistent runtime data — losing them means re-emitting the entire backlog of "events since cursor=0" on next run, which for a github-poller would be every PR comment in every watched repo. Mimir's filing rules separate these — skills under `.claude/skills/`, runtime state under `state/`.
+**Why STATE_DIR is separate from the skill dir**: skills are deployable artifacts (resettable via `seed_skills`, image-shippable, optionally reset on container rebuild). Cursor files are persistent runtime data — losing them means re-emitting the entire backlog of "events since cursor=0" on next run, which for a github-poller would be every PR comment in every watched repo. Mimir's filing rules separate these — skills under `skills/`, runtime state under `state/`.
 
 **Command parsing (`pollers.json` `command` field)**: parsed by `/bin/sh -c` via `asyncio.create_subprocess_shell`. Shell features (env-var expansion `$FOO`, pipes, redirection) are available — and you're responsible for quoting args containing whitespace or shell metacharacters: `"python poller.py 'arg with spaces'"` not `"python poller.py arg with spaces"`.
 
@@ -159,7 +159,7 @@ if __name__ == "__main__":
 
 ### 3. Register the pollers
 
-After creating or updating `pollers.json`, call the `reload_pollers` tool. This re-scans `<home>/.claude/skills/**/pollers.json` and registers any new pollers with the scheduler. Removed pollers (skill uninstalled, manifest deleted) get dropped on the same call.
+After creating or updating `pollers.json`, call the `reload_pollers` tool. This re-scans `<home>/skills/**/pollers.json` and registers any new pollers with the scheduler. Removed pollers (skill uninstalled, manifest deleted) get dropped on the same call.
 
 ```
 reload_pollers()
@@ -179,12 +179,12 @@ Mimir ships ready-built poller skills under ``mimir/optional-skills/`` — opt-i
 To install one:
 
 ```
-cp -r mimir/optional-skills/<name> <home>/.claude/skills/
+cp -r mimir/optional-skills/<name> <home>/skills/
 # (set the skill's required env vars — see its SKILL.md)
 reload_pollers
 ```
 
-Removing a skill: delete the directory under `<home>/.claude/skills/` and call `reload_pollers` to drop the cron job.
+Removing a skill: delete the directory under `<home>/skills/` and call `reload_pollers` to drop the cron job.
 
 ## File Layout
 
@@ -239,4 +239,4 @@ If a poller isn't working:
 
 | Tool | Description |
 |------|-------------|
-| `reload_pollers` | Re-scan `<home>/.claude/skills/**/pollers.json` and register pollers. Call after installing or updating a skill. Also picks up skills with their `pollers.json` deleted (drops the corresponding cron jobs). |
+| `reload_pollers` | Re-scan `<home>/skills/**/pollers.json` and register pollers. Call after installing or updating a skill. Also picks up skills with their `pollers.json` deleted (drops the corresponding cron jobs). |
