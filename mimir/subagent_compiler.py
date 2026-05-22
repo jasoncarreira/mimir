@@ -264,10 +264,9 @@ def _render_returns_block(returns_schema: dict[str, Any]) -> str:
     whose name/description come from the schema's ``title`` /
     ``description`` (structured_output.py:159-170). Without a
     title the tool name defaults to ``response_format_<uuid>`` — the
-    model has to guess this is the "final answer" tool. The block we
-    inject here makes that contract explicit in the SubAgent's
-    system_prompt so the model knows (a) it should call a tool to
-    return, (b) what shape that tool expects.
+    model has to guess this is the "final answer" tool. We surface
+    the title verbatim into the rendered block so the SubAgent can
+    refer to the tool by name rather than infer it from context.
 
     Example output:
 
@@ -275,23 +274,30 @@ def _render_returns_block(returns_schema: dict[str, Any]) -> str:
 
         ## Final Response
 
-        Return your final result by calling the structured-output tool
-        with arguments matching this schema:
+        Return your final result by calling the ``weather_result``
+        tool with arguments matching this schema:
 
         ```yaml
         type: object
+        title: weather_result
         properties:
-          found:
-            type: boolean
-        required: [found]
+          ...
         ```
     """
     schema_yaml = yaml.safe_dump(
         returns_schema, default_flow_style=False, sort_keys=False,
     ).rstrip()
+    title = returns_schema.get("title")
+    # langchain falls back to ``response_format_<uuid>`` when title
+    # is missing; we can't predict the uuid at compile time, so the
+    # untitled case falls back to generic phrasing.
+    if isinstance(title, str) and title:
+        call_phrase = f"calling the ``{title}`` tool"
+    else:
+        call_phrase = "calling the structured-output tool"
     return (
         "\n\n## Final Response\n\n"
-        "Return your final result by calling the structured-output tool "
+        f"Return your final result by {call_phrase} "
         "with arguments matching this schema:\n\n"
         f"```yaml\n{schema_yaml}\n```\n"
     )

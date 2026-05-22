@@ -414,12 +414,45 @@ def test_compile_skill_with_returns_schema_sets_response_format(tmp_path: Path):
     # description gets the return-shape summary.
     assert "Returns: forecast, high_temp_c" in spec["description"]
     # system_prompt gets a ## Final Response block so the SubAgent
-    # knows to call the structured-output tool (whose default name is
-    # opaque without this guidance).
+    # knows to call the structured-output tool. The schema in this
+    # fixture has no ``title`` field, so the rendered phrasing falls
+    # back to the generic "structured-output tool" wording.
     assert "## Final Response" in spec["system_prompt"]
     assert "structured-output tool" in spec["system_prompt"]
     # Schema rendered into the block for readability.
     assert "forecast:" in spec["system_prompt"]
+
+
+def test_compile_skill_with_titled_returns_renders_tool_name(tmp_path: Path):
+    """When the returns schema carries a ``title``, the rendered
+    ``## Final Response`` block names the tool explicitly (matches
+    the runtime tool name langchain binds — structured_output.py:
+    159-164 uses the schema's ``title`` as the tool name)."""
+    sd = tmp_path / "skills" / "weather"
+    sd.mkdir(parents=True)
+    (sd / "SKILL.md").write_text(
+        "---\n"
+        "name: weather\n"
+        "description: Get weather.\n"
+        "subagent: true\n"
+        "allowed-tools:\n"
+        "  - Bash\n"
+        "returns:\n"
+        "  title: weather_result\n"
+        "  description: forecast payload\n"
+        "  type: object\n"
+        "  properties:\n"
+        "    forecast: {type: string}\n"
+        "  required: [forecast]\n"
+        "---\nbody\n"
+    )
+    result = compile_skills_to_subagents(tmp_path, [])
+    spec = result.subagents[0]
+    # The renderer surfaces the title verbatim so the SubAgent can
+    # refer to the tool by name rather than infer it.
+    assert "``weather_result`` tool" in spec["system_prompt"]
+    # Generic phrasing should not appear when a title is set.
+    assert "structured-output tool" not in spec["system_prompt"]
 
 
 def test_compile_skill_without_params_or_returns(tmp_path: Path):

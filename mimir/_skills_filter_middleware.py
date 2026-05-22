@@ -63,6 +63,19 @@ class FilterDelegatedSkillsMiddleware(AgentMiddleware[Any, Any, Any]):
     def _filter(self, state: dict[str, Any]) -> dict[str, Any] | None:
         """Return a state update with the filtered list, or ``None`` if no change."""
         metadata = state.get("skills_metadata")
+        # Entry log so middleware-ordering regressions surface fast.
+        # We rely on user-passed middleware appending AFTER
+        # ``SkillsMiddleware`` in deepagents' built-in stack
+        # (graph.py:708-709); if a framework change ever reorders
+        # that, this filter runs against an empty state and silently
+        # becomes a no-op. The "0 entries" debug line at startup
+        # will give an operator the obvious smoke signal.
+        log.debug(
+            "FilterDelegatedSkillsMiddleware: called with %d "
+            "skills_metadata entries; %d delegated names registered",
+            len(metadata) if isinstance(metadata, list) else 0,
+            len(self._delegated),
+        )
         if not metadata or not self._delegated:
             return None
         filtered = [

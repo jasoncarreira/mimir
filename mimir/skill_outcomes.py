@@ -506,6 +506,19 @@ def _refine_load_outcome(
     Only LOAD kind gets refined — execution kind already has the
     clean ``task()`` signal. Skills without criteria stay at
     ``"success"`` (no refinement available; we trust the load signal).
+
+    **Scope caveat — shared-tail false positives.** The scan window
+    runs from the load's ``tool_call`` index to the end of the turn.
+    If a turn loads two inline skills A and B back-to-back, skill A's
+    criteria match against B's subsequent tool calls too — B's
+    ``memory_store`` could credit A as ``success`` even though A's
+    procedure was never followed. In practice this is mild because
+    criteria patterns are typically distinctive (e.g., ``send_message``
+    for alert, ``write_file → state/wiki/`` for wiki), but for skills
+    whose criteria patterns match tools other skills also call, the
+    confound is real. Operators authoring new criteria should pick
+    patterns that uniquely identify their skill's completion signal
+    where possible.
     """
     if kind != "load" or not skill_criteria:
         return "success"
