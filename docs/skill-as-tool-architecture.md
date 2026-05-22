@@ -56,6 +56,46 @@ alone: take Skills' discovery model (filesystem-based, frontmatter-driven,
 model-invoked) and add Subagent-style execution as an opt-in mode triggered
 by frontmatter declaration.
 
+### Scope: discoverable skills only
+
+Not every `.claude/skills/*/SKILL.md` file is in scope. The skill
+catalog today contains three distinct populations:
+
+1. **Discoverable skills** — agent decides to invoke based on
+   description match. Examples: `memory`, `wiki`, `chainlink`,
+   `identity-lookup`, `github`, `gog`, `weather`,
+   `mermaid-diagrams`, `predictions`, `tmux`, `bluesky`,
+   `view-attachment`, `find-skills`, `skill-creator`,
+   `skill-acquisition`. Meta-skills like `pollers` (mechanics)
+   and `world-scanning` (catalog) fit here too — reference docs
+   the agent reads when relevant.
+
+2. **Scheduled-task workflows** — fired by `scheduler.yaml`
+   entries, not chosen by the agent. Examples: `heartbeat`,
+   `reflection`, `daily-journal`, `morning-briefing`,
+   `threadborn-browse`, `moltbook-browse`, `ai-news-check`,
+   `constitutional-review`. The SKILL.md wrapper is an
+   organizational artifact — the workflow could live in the
+   scheduler prompt directly.
+
+3. **Poller workflows** — fired by the poller infrastructure on
+   `poller:<name>` channels, not chosen by the agent. Examples:
+   `gmail-poller`, `github-poller`, `social-cli-poller`. Same
+   misclassification as (2).
+
+Empirically verified against muninn's `turns.jsonl`:
+**scheduled-task and poller workflows are loaded zero times
+outside their trigger context.** The agent never decides to
+invoke them ad-hoc, so they don't benefit from the Skill-tool
+routing decision (inline vs subagent). They're operator-invoked,
+trigger-driven workflows, not model-discoverable skills.
+
+**Out of scope for this design**: (2) and (3). Their SKILL.md
+wrappers should be inlined into their respective trigger configs
+(scheduler.yaml prompts, poller configs) as separate cleanup
+work. This design is only about the Skill tool's behavior for
+**discoverable** skills.
+
 ### Why this matters
 
 The threadborn confabulation on 2026-05-21 made the limitation
@@ -288,13 +328,36 @@ skill rather than have it implicit in the current declarations.
 
 ### 3. Parameter-passing convention (subagent mode)
 
-A subagent-mode skill needs context from the parent (e.g.,
-`email-jason-personal` needs the email content). Today that comes
-from parent context. With a subagent, that needs to flow via
-`Skill(name=..., params={...})`, and a standardized convention
-(e.g., `params` exposed as a markdown block in the subagent's system
-prompt) needs to be defined and adopted. Inline mode doesn't have
-this problem — the parent context flows through naturally.
+A subagent-mode skill needs context from the parent (e.g., a delegatable
+`identity-lookup` needs the ID string). With a subagent, that flows via
+`Skill(name=..., params={...})`, and a standardized convention needs to
+be adopted. Inline mode doesn't have this problem — parent context flows
+through naturally.
+
+**Strawman convention**: `params` get rendered as a `## Context` YAML
+block appended to the subagent's system prompt, after the SKILL.md body:
+
+```
+# <SKILL.md body...>
+
+---
+
+## Context
+
+```yaml
+<params dict serialized as YAML>
+```
+```
+
+The skill's SKILL.md body is expected to reference params by key when
+it needs them ("Use the `topic` field from Context to search…").
+Subagent treats Context as authoritative input.
+
+Why YAML in a fenced code block: visible delineation from the workflow
+body (the model doesn't confuse instructions for data), tolerates
+nested structures without ambiguity, easy to inspect in transcripts.
+Not the only viable convention but the cheapest one that handles the
+cases we know about.
 
 ### 4. Loss of mid-skill flexibility (subagent mode)
 
@@ -337,12 +400,32 @@ when they need them.
 
 ## Open questions
 
-1. **Partial success semantics (subagent mode).** Morning-briefing
-   has 8 steps. If 5 of 8 surfaces return data and 3 fail (Gmail
-   API rate-limited, weather provider down), is that success,
-   failure, or a new "partial" outcome? skill_outcomes needs to
-   know how to count it. Inline mode inherits the parent's
-   turn-level outcome and dodges this question.
+1. **Partial success semantics (subagent mode).** A multi-step
+   delegatable skill (e.g. a hypothetical `digest` skill scanning
+   several feeds) may finish with some sub-tasks failing and
+   others succeeding. Is that success, failure, or a third
+   outcome? Inline mode inherits the parent's turn-level outcome
+   and dodges this question.
+
+   **Strawman shape**: `tool_result.content` carries a structured
+   outcome enum.
+
+   | Outcome | Meaning | When emitted |
+   |---|---|---|
+   | `success` | All declared steps completed without error | Multi-step skill ran every step cleanly |
+   | `partial` | Some declared steps completed, others errored or were skipped | Multi-step skill hit a recoverable error mid-flow |
+   | `failure` | No useful work done; first-step error or budget exhausted before any output | Skill couldn't start, or hit unrecoverable error early |
+
+   `is_error` on the parent's tool_result maps as `failure → True`,
+   `success | partial → False`. `partial` carries a `failed_steps`
+   list in the content payload so the parent can decide whether to
+   retry or accept.
+
+   Rationale: bool is too coarse for multi-step skills; a fully-
+   general status object is too freeform to feed clean
+   `skill_outcomes` aggregation. Three-valued enum is the cheapest
+   shape that lets the spike measure "did this skill mostly work"
+   without overcommitting to a richer schema.
 
 2. **Saga session granularity for subagent skills.** One session
    per subagent invocation, or share the parent's session? Per-
@@ -356,16 +439,33 @@ when they need them.
    answer probably depends on whether mimir's adds value over
    SkillsMiddleware's progressive disclosure rendering.
 
-4. **Default inversion for empirically misaligned skills.** Current
-   muninn frontmatter has `allowed-tools` declared on reflective
-   skills (heartbeat, reflection, memory) for documentation
-   purposes. The proposed rule defaults them to subagent mode,
-   which is wrong for them. Options:
-   - Trust the trigger and require `inline: true` override on
-     those skills (forces an audit).
-   - Reverse the default — `subagent: true` opt-in instead of
-     `allowed-tools` as the trigger.
-   - Add a default-mode config knob at the deployment level.
+4. **Reflective vs delegatable classification heuristic.** After
+   scoping the design to discoverable skills only (excluding both
+   **scheduled-task workflows** and **poller workflows** currently
+   wrapped as skills — see Background), the candidate skills to
+   classify are real model-invokable skills.
+
+   **Proposed heuristic** (from mimir-carreira on PR #263):
+
+   > A skill is **delegatable** iff it needs only its declared
+   > params and shared state (filesystem, saga) to do its work.
+   > It is **reflective** iff it requires the parent's
+   > in-context reasoning or session summaries to operate correctly.
+
+   Applied to muninn's ~20 real discoverable skills:
+
+   | Verdict | Skills |
+   |---|---|
+   | reflective | memory, wiki |
+   | delegatable workflow | chainlink, identity-lookup, github, gog, weather, view-attachment, mermaid-diagrams, predictions, ntfy, find-skills, skill-creator, skill-acquisition, tmux, 1password, bluesky, gemini-image, minimax-image, hugo-blog, jira |
+   | meta-skill (inline mode) | pollers (mechanics), world-scanning, onboarding, async-tasks, fallback-chains, five-whys, circuit-breaker, try-harder, introspection, lagrange |
+
+   The "meta-skill" category resolves the trickier cases — they're
+   reference docs the agent reads when relevant (designing a new
+   poller, debugging a behavior pattern, etc.) rather than
+   workflows it executes. Inline mode handles them naturally: the
+   body loads into parent context and the agent uses what it
+   learns.
 
 5. **Failure transcript visibility (subagent mode).** When a
    subagent fails, what does the parent see? Full transcript
@@ -381,11 +481,30 @@ when they need them.
    with the parent's tools, or a fresh-from-scratch list?
    Different security/reliability tradeoffs.
 
-8. **Migration ordering.** Which skills go first? The browse-style
-   skills currently lacking `allowed-tools` (`threadborn`,
-   `moltbook`, `morning-briefing`, `ai-news`) are the highest-
-   leverage subagent candidates because they're confabulation-prone
-   today. Each needs its `allowed-tools` set declared and verified.
+   **Implied intent for the spike**: the subagent gets **exactly**
+   the tools declared in `allowed-tools`, no intersection with
+   parent, no auto-injection of base tools (read_file, shell). If
+   a skill needs `read_file`, it lists `read_file`. This is the
+   most restrictive of the three options and makes the security
+   boundary unambiguous — the operator sees the exact action
+   surface in frontmatter and that's what runs.
+
+   The intersect-with-parent variant ("subagent gets allowed-tools
+   ∩ parent.allowed-tools") sounds like belt-and-suspenders but
+   actually creates a coupling where a parent-side tool restriction
+   silently shrinks subagent capability. Bad surprise mode.
+
+   The fresh-from-scratch variant ("subagent has only what
+   allowed-tools lists, parent's tool set is irrelevant") is what
+   the spike should implement. If we discover a real need for
+   inheritance later, we add it explicitly; defaulting to
+   inheritance now would hide bugs.
+
+8. **Migration ordering.** Which skills go first? The delegatable
+   workflows currently lacking explicit `allowed-tools` (chainlink,
+   identity-lookup, etc. — verify which need declarations) are the
+   first wave. Reflective skills (memory, wiki) get the
+   `inline: true` path. Meta-skills default to inline naturally.
 
 ## What this doesn't replace
 
