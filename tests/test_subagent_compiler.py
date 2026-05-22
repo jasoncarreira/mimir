@@ -107,6 +107,51 @@ def test_compile_missing_skills_dir(tmp_path: Path):
     assert result.delegated_skills == set()
 
 
+def _seed_skill_in(
+    dir_: Path, name: str, allowed_tools: list[str] | None,
+    description: str = "test skill", body: str = "skill body text",
+) -> None:
+    """Same as _seed_skill but for arbitrary parent dirs (e.g.
+    ``.mimir_builtin_skills`` for dual-location tests)."""
+    sd = dir_ / name
+    sd.mkdir(parents=True, exist_ok=True)
+    fm_lines = ["---", f"name: {name}", f"description: {description}"]
+    if allowed_tools is not None:
+        fm_lines.append("allowed-tools:")
+        for t in allowed_tools:
+            fm_lines.append(f"  - {t}")
+    fm_lines.append("---")
+    (sd / "SKILL.md").write_text("\n".join(fm_lines) + "\n\n" + body + "\n")
+
+
+def test_compile_picks_up_bundled_skills(tmp_path: Path):
+    """A fresh deployment with only the bundled refresh in place
+    should still compile every allowed-tools-having bundled skill."""
+    bundled = tmp_path / ".mimir_builtin_skills"
+    _seed_skill_in(bundled, "alpha", allowed_tools=["Bash"])
+    _seed_skill_in(bundled, "beta", allowed_tools=["Bash"])
+    result = compile_skills_to_subagents(tmp_path, [])
+    assert result.delegated_skills == {"alpha", "beta"}
+
+
+def test_compile_operator_shadows_bundled(tmp_path: Path):
+    """When the same skill name exists in both directories, the
+    operator-installed version wins (matches SkillsMiddleware's
+    last-source-wins rule). Same semantics as Pattern 1 / Pattern 2."""
+    bundled = tmp_path / ".mimir_builtin_skills"
+    _seed_skill_in(
+        bundled, "memory-helper", allowed_tools=["Bash"],
+        description="BUNDLED version",
+    )
+    _seed_skill(
+        tmp_path, "memory-helper", allowed_tools=["Bash"],
+        description="OPERATOR override",
+    )
+    result = compile_skills_to_subagents(tmp_path, [])
+    assert len(result.subagents) == 1
+    assert result.subagents[0]["description"] == "OPERATOR override"
+
+
 def test_compile_skill_without_allowed_tools_stays_inline(tmp_path: Path):
     """Skills with no allowed-tools declaration are not eligible."""
     _seed_skill(tmp_path, "memory-only", allowed_tools=None)
@@ -149,7 +194,9 @@ def test_compile_skill_with_only_framework_builtins(tmp_path: Path):
 def test_compile_reflective_override_blocks_compilation(tmp_path: Path):
     """Skills in the override set keep their inline behavior even
     when they declare allowed-tools."""
-    _seed_skill(tmp_path, "heartbeat", allowed_tools=["Bash", "memory_store"])
+    # ``memory`` is in the default _REFLECTIVE_OVERRIDE set — it
+    # declares allowed-tools but needs parent context to operate.
+    _seed_skill(tmp_path, "memory", allowed_tools=["Bash", "memory_store"])
     result = compile_skills_to_subagents(
         tmp_path, [_FakeTool("memory_store")],
     )
@@ -234,13 +281,13 @@ def test_compile_multiple_skills_with_mixed_eligibility(tmp_path: Path):
     send = _FakeTool("send_message")
     _seed_skill(tmp_path, "lookup", allowed_tools=["Bash", "memory_store"])
     _seed_skill(tmp_path, "inline-only", allowed_tools=None)
-    _seed_skill(tmp_path, "heartbeat", allowed_tools=["Bash"])  # in default override
+    _seed_skill(tmp_path, "memory", allowed_tools=["Bash"])  # in default override
     _seed_skill(
         tmp_path, "messenger",
         allowed_tools=["send_message", "saga_store"],  # drift
     )
     result = compile_skills_to_subagents(tmp_path, [mem, send])
-    # Three skills declared allowed-tools, but heartbeat is in the
+    # Three skills declared allowed-tools, but memory is in the
     # override → only 2 compile.
     assert result.delegated_skills == {"lookup", "messenger"}
     names = {s["name"] for s in result.subagents}

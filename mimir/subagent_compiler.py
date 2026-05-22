@@ -89,8 +89,6 @@ log = logging.getLogger(__name__)
 # Promote to an ``inline: true`` frontmatter flag in the follow-up that
 # generalizes the spike.
 _REFLECTIVE_OVERRIDE: frozenset[str] = frozenset({
-    "heartbeat",
-    "reflection",
     "memory",
     "wiki",
 })
@@ -285,11 +283,20 @@ def compile_skills_to_subagents(
     home: Path,
     parent_tools: list[Any],
     *,
-    skills_subdir: str = "skills",
+    skills_subdir: str | None = None,
     reflective_override: frozenset[str] = _REFLECTIVE_OVERRIDE,
 ) -> CompileResult:
-    """Scan ``<home>/<skills_subdir>/*/SKILL.md`` and compile eligible
+    """Scan ``<home>/skills/*/SKILL.md`` and
+    ``<home>/.mimir_builtin_skills/*/SKILL.md`` and compile eligible
     skills to SubAgent specs.
+
+    Mirrors SkillsMiddleware's dual-location discovery and its
+    last-source-wins shadowing: bundled skills are scanned first, then
+    operator-installed skills override same-named entries. A fresh
+    deployment with only the bundled refresh in place gets the full
+    bundled SubAgent set; operators customize a skill by installing
+    same-named content under ``<home>/skills/`` (the operator location
+    wins on name collision).
 
     A skill is eligible iff:
 
@@ -314,17 +321,44 @@ def compile_skills_to_subagents(
     subagent middleware stack provides them. So a skill declaring
     ``allowed-tools: [Bash]`` produces a SubAgent with ``tools=[]``
     and still has Bash available at runtime via the middleware.
+
+    ``skills_subdir`` is a legacy kwarg: when set, only that single
+    subdir under ``home`` is scanned (no bundled-dir merge). New
+    callers should leave it as ``None`` to get the dual-location
+    behavior; the parameter exists for tests that need to isolate a
+    specific layout.
     """
-    skills_dir = home / skills_subdir
+    from .skill_defs import (
+        BUILTIN_SKILLS_DIR_NAME,
+        SKILLS_DIR_NAME,
+    )
+
+    # Bundled location listed first so operator entries shadow same-named
+    # bundled ones (matches SkillsMiddleware's last-source-wins rule).
+    if skills_subdir is None:
+        scan_dirs = [
+            home / BUILTIN_SKILLS_DIR_NAME,
+            home / SKILLS_DIR_NAME,
+        ]
+    else:
+        scan_dirs = [home / skills_subdir]
+
     warnings: list[str] = []
-    if not skills_dir.is_dir():
+    scan_dirs = [d for d in scan_dirs if d.is_dir()]
+    if not scan_dirs:
         return CompileResult(subagents=[], delegated_skills=set(), warnings=warnings)
 
     registry = _build_registry(parent_tools)
-    subagents: list[dict[str, Any]] = []
+    # dict preserves insertion order so the last source (operator
+    # location) overwrites earlier (bundled location) entries on
+    # name collision.
+    specs_by_name: dict[str, dict[str, Any]] = {}
     delegated: set[str] = set()
+    skill_mds: list[Path] = []
+    for d in scan_dirs:
+        skill_mds.extend(sorted(d.glob("*/SKILL.md")))
 
-    for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
+    for skill_md in skill_mds:
         skill_name = skill_md.parent.name
         try:
             meta, body = parse_skill_frontmatter(skill_md)
@@ -422,11 +456,16 @@ def compile_skills_to_subagents(
         if isinstance(returns_schema, dict) and returns_schema:
             spec["response_format"] = returns_schema
 
-        subagents.append(spec)
+        # Dual-location: later-seen entry (operator dir) overwrites
+        # the earlier-seen bundled entry. Same last-source-wins
+        # semantics as SkillsMiddleware so the rendered ``task``
+        # catalog and the inline ``Skills System`` catalog stay
+        # consistent on what an operator customization shadows.
+        specs_by_name[name] = spec
         delegated.add(name)
 
     return CompileResult(
-        subagents=subagents,
+        subagents=list(specs_by_name.values()),
         delegated_skills=delegated,
         warnings=warnings,
     )
