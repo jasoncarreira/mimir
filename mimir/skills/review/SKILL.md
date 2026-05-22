@@ -6,7 +6,7 @@ allowed-tools:
   - Read
   - Glob
   - Grep
-  - Agent
+  - Task
 ---
 
 # PR Review

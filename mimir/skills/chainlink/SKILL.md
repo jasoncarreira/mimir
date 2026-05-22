@@ -4,7 +4,7 @@ description: Local CLI issue tracker for todos, follow-ups, structured records, 
 allowed-tools:
   - Bash
   - Read
-  - saga_store
+  - memory_store
   - send_message
 ---
 

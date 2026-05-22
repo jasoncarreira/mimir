@@ -8,8 +8,8 @@ allowed-tools:
   - Write
   - file_search
   - saga_end_session
-  - saga_query
-  - saga_store
+  - memory_query
+  - memory_store
   - send_message
 ---
 

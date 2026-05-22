@@ -556,6 +556,92 @@ when they need them.
    first wave. Reflective skills (memory, wiki) get the
    `inline: true` path. Meta-skills default to inline naturally.
 
+## Measuring skill execution success
+
+Two architectures produce two telemetry stories. The classifier in
+`mimir/skill_outcomes.py` matches both invocation patterns and
+yields uniform `(skill, outcome, ts)` tuples for aggregation, but
+the *meaning* of "success" differs by path.
+
+### Delegated skills (subagent execution) — clean
+
+When the agent invokes a delegated skill, it emits:
+
+```
+tool_call(name="task", args.subagent_type="<skill>")
+tool_result(is_error=<bool>, content=<structured response or text>)
+```
+
+The framework runs the subagent end-to-end. The `tool_result.is_error`
+field directly reflects whether the SubAgent's workflow ran
+successfully. This is an **execution** signal:
+
+- `is_error=False` → the skill workflow completed without raising
+- `is_error=True` → the workflow errored (network failure, schema
+  validation failure, budget exhaustion, exception in a custom tool)
+
+If the skill declares the OQ #1 counts shape in `returns`
+(`attempted` / `succeeded` / `failed_steps`), the structured
+response carries fractional contributions. Aggregate counters can
+add a partial as `successes += (succeeded / attempted)` and
+`failures += (1 - succeeded / attempted)` rather than binary. Future
+enhancement; binary `is_error` is the baseline.
+
+**No design work needed here.** Wire and ship.
+
+### Inline skills (read_file path) — inherently coupled to parent
+
+When the agent invokes an inline skill, it emits:
+
+```
+tool_call(name="read_file", args.file_path=".../<skill>/SKILL.md")
+tool_result(is_error=<bool>, content=<SKILL.md body or error>)
+```
+
+`tool_result.is_error` reflects whether the **file was readable**,
+not whether the subsequent improvised workflow succeeded. The
+skill's actual work happens via N subsequent `shell_exec`, `Read`,
+`Write`, `memory_store`, etc. calls in the same turn, with no
+explicit "skill done" boundary. Execution success is **muddled with
+the parent turn's outcome by definition** — that's the nature of
+inline-mode skills.
+
+Four candidate approaches, ranked by signal quality:
+
+| Approach | Mechanism | Signal | Cost |
+|---|---|---|---|
+| A. Turn-level inheritance (today's fallback) | Skill outcome = parent's `result_is_error` | Coarse — misattributes when turn fails for non-skill reasons | Zero (already wired) |
+| B. Subsequent-error window | After `read_file(SKILL.md)`, scan rest-of-turn for any `is_error=True` tool_result | Better localized; boundary-confused on multi-skill turns | Small |
+| C. Boundary-based attribution | After load, attribute until next skill load OR end of turn. Errors in window = failure | Best heuristic — handles multi-skill turns | Medium |
+| D. Author-declared completion marker | Skill body emits `memory_store("__skill_complete__:<name>:<status>")` at end | Cleanest — but requires per-skill cooperation | Per-skill work |
+
+**Recommendation**:
+
+- **Default to Approach C (boundary-based attribution)** for the
+  inline path. Best signal-to-cost ratio.
+- **Document the limitation honestly** in the `skill_outcomes`
+  module docstring: "Inline-skill execution outcomes are
+  heuristic; for clean execution outcomes, declare `allowed-tools`
+  so the skill runs as a SubAgent."
+- **Treat delegatable conversion as the right answer** when
+  execution-success measurement matters. The architecture's point
+  is to move skills from inline → delegated; measurement clarity
+  is one of the reasons.
+
+The current code uses Approach A (turn-level inheritance) as the
+fallback. Upgrading to Approach C is a follow-up — small classifier
+change, no semantic backwards-incompatibility (Approach C is
+strictly better-localized than A).
+
+### Removed: Claude Agent SDK Skill tool
+
+Pre-deepagents, the runtime exposed `Skill` as a structured tool
+and `skill_outcomes` matched `tool_call(name="Skill")`. That
+runtime is gone; the matching code has been removed. Any old
+turns.jsonl records carrying `name="Skill"` events would now be
+silently skipped — acceptable since they pre-date the deepagents
+migration on every live deployment.
+
 ## What this doesn't replace
 
 - **The skill catalog block in the system prompt.** Still
