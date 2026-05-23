@@ -77,33 +77,49 @@ def _read_fragment(skill_name: str, *roots: Path) -> str | None:
 
 
 def collect_fragments(home: Path) -> list[Fragment]:
-    """For each skill present in ``<home>/skills/``, look up its
+    """For each skill present in ``<home>/skills/`` OR
+    ``<home>/.mimir_builtin_skills/``, look up its
     ``dockerfile.fragment`` — preferring the installed copy in the home,
     falling back to the bundled source (``mimir/skills/<name>/`` or
     ``optional-skills/<name>/``). Ordered alphabetically by skill name
     for stable Dockerfile output.
 
-    The fallback handles the case where a home was seeded before the
-    fragment file existed in the bundle: ``seed_skills`` won't refresh
-    an existing skill dir, so the operator's home lacks the new file
-    even though they have the skill. The scaffolder paints over that
-    gap.
+    Both source dirs get walked so bundled skills with OS deps
+    (notably ``chainlink``, which ships a ``dockerfile.fragment``
+    that builds ``chainlink-tracker``) get their fragment included
+    even when the operator hasn't manually installed them under
+    ``skills/``. Dedupe by name — operator-side dirs win on
+    collision, matching the rest of the dual-location contract
+    (SkillsMiddleware's last-source-wins shadowing).
+
+    The bundled-source fallback for the fragment FILE itself handles
+    the older case where a home was seeded before the fragment file
+    existed in the bundle: ``seed_skills`` won't refresh an existing
+    skill dir, so the operator's home lacks the new file even though
+    they have the skill.
     """
-    skills_root = home / "skills"
-    if not skills_root.is_dir():
-        return []
-    out: list[Fragment] = []
-    for skill_dir in sorted(skills_root.iterdir()):
-        if not skill_dir.is_dir() or skill_dir.name.startswith("."):
+    operator_dir = home / "skills"
+    builtin_dir = home / ".mimir_builtin_skills"
+    seen: dict[str, Path] = {}
+    for src in (builtin_dir, operator_dir):
+        if not src.is_dir():
             continue
+        for skill_dir in src.iterdir():
+            if not skill_dir.is_dir() or skill_dir.name.startswith("."):
+                continue
+            seen[skill_dir.name] = src  # operator dir wins (iterated second)
+
+    out: list[Fragment] = []
+    for skill_name in sorted(seen):
+        skills_root = seen[skill_name]
         content = _read_fragment(
-            skill_dir.name,
-            skills_root,  # check home first (operator may have edited)
+            skill_name,
+            skills_root,  # check the location it was found in first
             *_BUNDLED_SKILL_ROOTS,  # then bundled defaults / optional
         )
         if content is None:
             continue
-        out.append(Fragment(skill_name=skill_dir.name, content=content))
+        out.append(Fragment(skill_name=skill_name, content=content))
     return out
 
 
@@ -188,7 +204,8 @@ FROM python:3.11-slim
 # 2026-05: git for the source clone + agent dev loop, gh for PR
 # creation, build-essential for any C extensions, ca-certificates for
 # HTTPS clones, poppler-utils for Claude Code's PDF Read, Node 20
-# (claude-agent-sdk + mermaid-cli are npm packages).
+# (claude-agent-sdk + mermaid-cli are npm packages), jq for JSONL
+# log parsing across many skill bodies + the introspection recipes.
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends \\
         git \\
@@ -198,6 +215,7 @@ RUN apt-get update \\
         gnupg \\
         tmux \\
         poppler-utils \\
+        jq \\
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\
         | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\
  && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \\
