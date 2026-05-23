@@ -1,5 +1,6 @@
-# social-cli-poller — install social-cli (Bluesky / X notifications
-# CLI from https://github.com/letta-ai/social-cli). The poller calls
+# social-cli — install the social-cli binary used by both the
+# notifications poller and the feed poller (Bluesky / X CLI from
+# https://github.com/letta-ai/social-cli). The pollers call
 # `social-cli` from PATH unless SOCIAL_CLI_BIN overrides.
 #
 # social-cli is a Node project; we clone, pnpm install + build, then
