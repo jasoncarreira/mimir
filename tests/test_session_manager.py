@@ -109,11 +109,127 @@ async def test_stale_timer_callback_is_a_no_op():
 
 @pytest.mark.asyncio
 async def test_increment_turn_count_only_for_active():
-    mgr = SessionManager(idle_minutes=60)
+    # ``max_turns=0`` disables the cap so the simple increment test
+    # isn't tripped by hitting the burst-cap default.
+    mgr = SessionManager(idle_minutes=60, max_turns=0)
     await mgr.touch("c1")
     mgr.increment_turn_count("c1")
     mgr.increment_turn_count("c1")
     assert mgr._sessions["c1"].turn_count == 2
+
+
+@pytest.mark.asyncio
+async def test_turn_cap_forces_synthesis_for_burst_channel():
+    """SPEC §5.6 / §16 item 17 — burst-messaging gap: a channel that
+    never idles should still get session synthesis once turn_count
+    reaches the cap. Synthesis fires via the same on_idle callback
+    path as the idle timer; the session is removed from the manager
+    so the next ``touch()`` mints a fresh id.
+    """
+    fired: list[ChannelSession] = []
+
+    async def on_idle(session: ChannelSession) -> None:
+        fired.append(session)
+
+    # idle_minutes=60 so the idle timer never fires during the test;
+    # the turn cap must be the trigger.
+    mgr = SessionManager(idle_minutes=60, max_turns=3, on_idle=on_idle)
+    first = await mgr.touch("c1")
+    mgr.increment_turn_count("c1")  # 1
+    mgr.increment_turn_count("c1")  # 2
+    mgr.increment_turn_count("c1")  # 3 → triggers force-end
+
+    # The forced end runs as a background task; wait for it with a
+    # generous CI-safe timeout. asyncio.wait_for surfaces a clean
+    # TimeoutError rather than a silent assertion failure.
+    async def _wait_for_fired() -> None:
+        while not fired:
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(_wait_for_fired(), timeout=2.0)
+    assert len(fired) == 1, "burst-cap synthesis didn't fire"
+    assert fired[0].saga_session_id == first.saga_session_id
+    assert fired[0].turn_count == 3
+    # Session must be gone so the next touch starts fresh.
+    assert "c1" not in mgr._sessions
+
+    second = await mgr.touch("c1")
+    assert second.saga_session_id != first.saga_session_id
+
+
+@pytest.mark.asyncio
+async def test_turn_cap_spawns_exactly_one_task_even_past_cap():
+    """Regression: with ``>=`` the spawn condition fires on every
+    turn past the cap, accumulating no-op tasks. ``==`` fires exactly
+    once. We over-increment to verify only one synthesis lands AND
+    ``_pending_tasks`` never grows past the singular entry."""
+    fired: list[ChannelSession] = []
+
+    async def on_idle(session: ChannelSession) -> None:
+        fired.append(session)
+
+    mgr = SessionManager(idle_minutes=60, max_turns=3, on_idle=on_idle)
+    await mgr.touch("c1")
+    mgr.increment_turn_count("c1")  # 1
+    mgr.increment_turn_count("c1")  # 2
+    mgr.increment_turn_count("c1")  # 3 → spawn ONE task
+    # Past-cap increments. The session.ended guard will short-circuit
+    # them once the cap task runs, but they MUST NOT each spawn their
+    # own task in the meantime.
+    mgr.increment_turn_count("c1")  # 4 → would spawn under >=
+    mgr.increment_turn_count("c1")  # 5 → would spawn under >=
+
+    async def _wait_for_fired() -> None:
+        while not fired:
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(_wait_for_fired(), timeout=2.0)
+    # Give the loop one more pass in case extra tasks were lingering.
+    await asyncio.sleep(0.01)
+    assert len(fired) == 1, "cap fired more than once"
+    assert len(mgr._pending_tasks) == 0, (
+        "cap task pile-up: pending_tasks should drain to zero, "
+        f"got {len(mgr._pending_tasks)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn_cap_zero_disables():
+    """max_turns=0 → cap disabled, only idle timer can end the session."""
+    fired: list[ChannelSession] = []
+
+    async def on_idle(session: ChannelSession) -> None:
+        fired.append(session)
+
+    mgr = SessionManager(idle_minutes=60, max_turns=0, on_idle=on_idle)
+    await mgr.touch("c1")
+    for _ in range(20):
+        mgr.increment_turn_count("c1")
+    await asyncio.sleep(0.05)
+    assert fired == []
+    assert "c1" in mgr._sessions
+    assert mgr._sessions["c1"].turn_count == 20
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_pending_turn_cap_task():
+    """Hitting the cap schedules a force-end task. If shutdown lands
+    before that task acquires the lock and dispatches, the cancel
+    path must abort it cleanly — no synthesis callback should fire."""
+    fired: list[ChannelSession] = []
+
+    async def on_idle(session: ChannelSession) -> None:
+        fired.append(session)
+
+    mgr = SessionManager(idle_minutes=60, max_turns=1, on_idle=on_idle)
+    await mgr.touch("c1")
+    mgr.increment_turn_count("c1")  # schedules force-end task
+
+    # Shutdown before the task gets to run — must cancel and await
+    # cleanly without firing the synthesis callback.
+    await mgr.shutdown()
+    assert fired == []
+    assert mgr._pending_tasks == set()
 
 
 @pytest.mark.asyncio
