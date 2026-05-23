@@ -243,6 +243,220 @@ class TestWriteGuardBackend:
         assert callable(b.aglob_info)
 
 
+class TestCoreMemoryReflectionGate:
+    """S5-2 — memory/core/ writes are reflection-turn-only by policy.
+
+    Layered on top of the per-directory writable-roots check: even when
+    ``memory`` is in ``writable_dirs`` (the production default), writes
+    under ``memory/core/`` are refused unless an active ``TurnContext``
+    declares ``trigger == "scheduled_tick"`` AND ``channel_id`` starts
+    with ``"scheduler:reflect"``.
+    """
+
+    @pytest.fixture
+    def home_with_memory(self, tmp_path: Path) -> Path:
+        (tmp_path / "state").mkdir()
+        (tmp_path / "memory").mkdir()
+        (tmp_path / "memory" / "core").mkdir()
+        (tmp_path / "logs").mkdir()
+        return tmp_path
+
+    @staticmethod
+    def _make_turn_ctx(trigger: str, channel_id: str):
+        """Build a minimal TurnContext for the gate check. The backend
+        only reads ``.trigger`` and ``.channel_id``, so a partial dataclass
+        construction is fine."""
+        from mimir.models import TurnContext
+        return TurnContext(
+            turn_id="t-test",
+            session_id="s-test",
+            trigger=trigger,
+            channel_id=channel_id,
+            started_at=0.0,
+        )
+
+    @staticmethod
+    def _set_turn(ctx):
+        from mimir._context import set_current_turn
+        return set_current_turn(ctx)
+
+    @staticmethod
+    def _clear_turn(token):
+        from mimir._context import reset_current_turn
+        reset_current_turn(token)
+
+    def test_blocks_core_memory_write_in_user_message_turn(
+        self, home_with_memory: Path
+    ) -> None:
+        b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
+        ctx = self._make_turn_ctx(trigger="user_message", channel_id="discord-123")
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/00-persona.md", content="bad")
+            assert "reflection-only" in (getattr(r, "error", "") or "")
+        finally:
+            self._clear_turn(tok)
+
+    def test_blocks_core_memory_write_in_heartbeat_turn(
+        self, home_with_memory: Path
+    ) -> None:
+        """Heartbeat is scheduled_tick BUT on scheduler:heartbeat, not
+        scheduler:reflect — must not slip through."""
+        b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
+        ctx = self._make_turn_ctx(
+            trigger="scheduled_tick", channel_id="scheduler:heartbeat"
+        )
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/40-learned-behaviors.md",
+                        content="bad")
+            assert "reflection-only" in (getattr(r, "error", "") or "")
+        finally:
+            self._clear_turn(tok)
+
+    def test_allows_core_memory_write_in_reflection_turn(
+        self, home_with_memory: Path
+    ) -> None:
+        b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
+        ctx = self._make_turn_ctx(
+            trigger="scheduled_tick", channel_id="scheduler:reflect"
+        )
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/40-learned-behaviors.md",
+                        content="ok")
+            assert getattr(r, "error", None) is None
+        finally:
+            self._clear_turn(tok)
+
+    def test_allows_core_memory_write_when_no_turn_active(
+        self, home_with_memory: Path
+    ) -> None:
+        """Backend tests, ``mimir setup``, and non-turn cron callables
+        write outside any TurnContext. The gate must not block them."""
+        b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
+        # No turn set — _current_turn is None.
+        r = b.write(file_path="/memory/core/00-persona.md", content="ok")
+        assert getattr(r, "error", None) is None
+
+    def test_allows_core_memory_write_when_gate_disabled(
+        self, home_with_memory: Path
+    ) -> None:
+        """Bench / dev mode: pass ``enforce_core_memory_reflection_only=False``
+        to opt out of the S5-2 gate. Other write protections (writable
+        roots) still apply."""
+        b = WriteGuardBackend(
+            root_dir=home_with_memory,
+            writable_dirs=["memory"],
+            enforce_core_memory_reflection_only=False,
+        )
+        ctx = self._make_turn_ctx(trigger="user_message", channel_id="discord-123")
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/00-persona.md", content="ok")
+            assert getattr(r, "error", None) is None
+        finally:
+            self._clear_turn(tok)
+
+    def test_edit_to_core_memory_gated_same_as_write(
+        self, home_with_memory: Path
+    ) -> None:
+        # Seed a file inside core so Edit has something to operate on.
+        (home_with_memory / "memory" / "core" / "00-persona.md").write_text(
+            "original\n"
+        )
+        b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
+        ctx = self._make_turn_ctx(trigger="user_message", channel_id="discord-123")
+        tok = self._set_turn(ctx)
+        try:
+            r = b.edit(
+                file_path="/memory/core/00-persona.md",
+                old_string="original",
+                new_string="bad",
+            )
+            assert "reflection-only" in (getattr(r, "error", "") or "")
+        finally:
+            self._clear_turn(tok)
+
+    def test_writes_to_memory_outside_core_unaffected(
+        self, home_with_memory: Path
+    ) -> None:
+        """memory/learnings-pending.md is under memory/, NOT memory/core/.
+        The gate must not over-reach to sibling subtrees."""
+        b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
+        ctx = self._make_turn_ctx(trigger="user_message", channel_id="discord-123")
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(
+                file_path="/memory/learnings-pending.md", content="entry"
+            )
+            assert getattr(r, "error", None) is None
+        finally:
+            self._clear_turn(tok)
+
+    def test_traversal_into_core_via_relative_path_blocked(
+        self, home_with_memory: Path
+    ) -> None:
+        """An agent that smuggles ``../core/foo.md`` from inside memory/
+        must NOT slip past the gate. In practice ``_resolve_target``'s
+        existing traversal guard fires first and rejects the path before
+        the gate even runs — defence-in-depth. Either block reason is
+        acceptable as long as the write does NOT succeed."""
+        b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
+        ctx = self._make_turn_ctx(trigger="user_message", channel_id="discord-123")
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(
+                file_path="/memory/sub/../core/00-persona.md",
+                content="bad",
+            )
+            err = getattr(r, "error", "") or ""
+            assert err  # must be blocked
+            assert ("reflection-only" in err) or ("Write blocked" in err)
+        finally:
+            self._clear_turn(tok)
+
+    def test_denial_recorded_for_core_memory_block(
+        self, home_with_memory: Path
+    ) -> None:
+        """The blocked write must appear in ``drain_denials()`` with a
+        distinct ``op`` so the turn viewer can show what was attempted."""
+        b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
+        ctx = self._make_turn_ctx(trigger="user_message", channel_id="discord-123")
+        tok = self._set_turn(ctx)
+        try:
+            b.write(file_path="/memory/core/00-persona.md", content="bad")
+        finally:
+            self._clear_turn(tok)
+        denials = b.drain_denials()
+        assert len(denials) == 1
+        assert denials[0]["op"] == "write_core_memory_non_reflection"
+        assert "memory/core" in denials[0]["file_path"]
+
+    def test_upload_to_core_memory_blocks_batch(
+        self, home_with_memory: Path
+    ) -> None:
+        """Upload batches are atomic: if any path is core-memory-blocked
+        in a non-reflection turn, the whole batch fails."""
+        b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
+        ctx = self._make_turn_ctx(trigger="user_message", channel_id="discord-123")
+        tok = self._set_turn(ctx)
+        try:
+            results = b.upload_files([
+                ("/memory/learnings-pending.md", b"entry"),
+                ("/memory/core/40-learned-behaviors.md", b"bad"),
+            ])
+        finally:
+            self._clear_turn(tok)
+        # Both entries fail because the batch is atomic.
+        assert all(getattr(r, "error", None) == "permission_denied"
+                   for r in results)
+        # And the denial trail records the core-memory-specific op.
+        denials = b.drain_denials()
+        ops = [d["op"] for d in denials]
+        assert "upload_core_memory_non_reflection" in ops
+
+
 class TestReadOnlyFilesystemBackend:
     def test_blocks_all_writes(self, home: Path) -> None:
         b = ReadOnlyFilesystemBackend(root_dir=home)
