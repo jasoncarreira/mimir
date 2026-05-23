@@ -440,6 +440,12 @@ User-message turns are NOT blocked by the pause (interactive responsiveness wins
 
 **Resume of in-flight work.** What's NOT covered: pause + resume of a `spawn_claude_code` subprocess that hits 429 partway through. The subprocess fails; its partial output (if written to `output_dir`) is preserved on disk, but there's no automatic re-invocation. The parent agent sees the failure and decides whether to retry after the window resets. A "subprocess resume after quota recovers" primitive is a future addition (track as §16 item 18 sub-b — when it bites operationally).
 
+#### Tool budget exemptions
+
+`send_message` and `react` bypass the per-turn tool-call cap entirely — they neither consume a slot nor get refused when the budget is exhausted. Driving rationale: when the budget is hit, the denial text tells the model to "finish the turn"; but the final assistant-text reply does NOT auto-deliver to channels (an explicit `send_message` call is the only delivery path — see §7.1). Without exempting `send_message`, the agent would hit the cap, be told to stop, and have no way to actually notify the operator. `react` is exempt for the same operator-acknowledgement reason.
+
+Implementation: `_BUDGET_EXEMPT_TOOLS = frozenset({"send_message", "react"})` in `mimir/tools/budget_gate.py`. `shell_exec` is **not** exempt — a turn that saturates the budget via shell calls can still send a final notification via `send_message`. Operators setting tight budgets should be aware that `shell_exec` calls compete for the cap; `send_message` and `react` are always available as the unblocked delivery path, regardless of how many other tool calls have fired.
+
 ### 4.10 State repo and push-failure recovery
 
 Agent home (`/mimir-home`) is tracked as a git repo synced to `mimirbot-state` via a post-turn hook (see §4.2 step 7 and `MIMIR_HOME_GIT_TRACKING.md`). Commits happen per-turn; pushes are debounced to 60 s and coalesce bursts into a single network call.
@@ -1620,3 +1626,13 @@ Gaps identified by independent spec review, organized by severity. Critical gaps
 25. **Cost dashboard.** The HTML turn viewer (§11) shows per-turn cost but has no aggregate view. Operator needs: daily spend, per-channel breakdown, per-profile subagent spend, quota window status. Could be a `/dashboard` page served by the same HTTP server or an exported CSV for external tooling.
 
 26. **Prompt-injection safeguards.** Mimir processes untrusted content from external sources (channel messages, poller events, web fetches). No sanitization layer exists between external content and the model's context window. Revisit if mimir is ever exposed to adversarial or untrusted operators.
+
+#### Architectural honesty — VSM vocabulary vs implementation (legibility, 2026-05-23)
+
+The VSM vocabulary used in core memory blocks and code comments is aspirational in several places. These notes correct the framing for operators who are familiar with Beer's VSM and expect the labels to be exact.
+
+27. **S3 in mimir is reactive dispatch, not a regulatory monitor.** Beer's S3 is a "here-and-now" system that monitors S1 operations and intervenes mid-operation. Mimir's S3 label refers to the `user_message` turn type — a dispatch-and-reply mechanism. Each turn is a fresh invocation; there is no within-turn regulatory loop that observes ongoing tool calls and adjusts them. The only within-turn enforcement is the tool budget cap (§4.9), which is more S2 than S3. Operators reading Beer's VSM should expect purely reactive behavior from user-message turns, not a monitoring-and-intervention loop. *Full gap analysis: `state/wiki/topics/mimir-vsm-eval.md` GAP [S3-1].*
+
+28. **Heartbeat "S4" work is primarily maintenance, not autonomous future-looking intelligence.** The core memory block `20-vsm-terms.md` describes S4 as "autonomous, future-looking work." In practice, most heartbeat work is backlog execution: stale-open chainlink sweeps, wiki orphan checks, doc reconciliation, standing watch items. Genuine future-oriented work — anticipating environmental changes, proactively structuring for predicted operator needs, emitting predictions about future behavior — requires explicit items in `state/heartbeat-backlog.md`. The `predictions` and `world-scanning` skills exist but need operator-seeded backlog items to run. New operators should expect a scheduled-maintenance cadence from heartbeats, not autonomous intelligence, until the backlog is populated with future-oriented tasks. *Full gap analysis: `state/wiki/topics/mimir-vsm-eval.md` GAP [S4-1].*
+
+29. **Single-operator only (current implementation).** Mimir supports multiple users across multiple channels via `state/identities.yaml` and cross-platform pull. However, the regulatory model is single-operator: every channel shares the same system prompt, the same action-boundary policies (`memory/core/06-action-boundaries.md`), and the same trust level. There is no per-operator permission zone, per-operator persona, or per-operator S5 variety. The open-source framing implies that other operators could run mimir with their own identity and policies — extending this requires a per-operator variety layer that is not yet implemented. For now: one mimir instance = one operator identity. *Full gap analysis: `state/wiki/topics/mimir-vsm-eval.md` GAP [Var-2].*
