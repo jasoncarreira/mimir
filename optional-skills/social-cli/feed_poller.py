@@ -91,9 +91,9 @@ def _fetch(platform: str, limit: int, bin_path: str) -> Path:
     """Run ``social-cli feed`` for one platform, return path to the
     output YAML.
 
-    social-cli writes the output to ``feed.yaml`` by default. We use
-    ``-o feed-<platform>.yaml`` so multiple platforms don't clobber
-    each other when the framework runs us serially.
+    social-cli writes the output to ``feed.yaml`` by default. We
+    pass ``--output feed-<platform>.yaml`` so multiple platforms
+    don't clobber each other when the framework runs us serially.
     """
     out_path = STATE_DIR / f"feed-{platform}.yaml"
     cmd = [
@@ -196,10 +196,10 @@ def main() -> int:
 
     bin_path = os.environ.get("SOCIAL_CLI_BIN", "").strip() or "social-cli"
 
-    seen = set(_load_cursor())
     # Preserve cursor insertion order so LRU eviction at the head
     # works without metadata. Same shape as the notifications poller.
-    ordered: list[str] = _load_cursor()
+    ordered = _load_cursor()
+    seen = set(ordered)
 
     emitted_count = 0
     for platform in platforms:
