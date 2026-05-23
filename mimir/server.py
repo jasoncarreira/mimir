@@ -313,7 +313,10 @@ def build_app(config: Config) -> web.Application:
         api_key=config.saga_api_key or None,
         db_path=_db_path,
     )
-    sessions = SessionManager(idle_minutes=config.saga_session_idle_minutes)
+    sessions = SessionManager(
+        idle_minutes=config.saga_session_idle_minutes,
+        max_turns=config.saga_session_max_turns,
+    )
     inbox = SubagentInbox()
 
     # Channel layer (SPEC §7.2). BenchBridge always registers — it's how the
