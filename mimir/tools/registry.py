@@ -702,10 +702,10 @@ def all_mimir_tools() -> list:
     # MCP servers come up; empty when MCP is unconfigured).
     from .mcp import get_mcp_tools
     tools.extend(get_mcp_tools())
-    # Per-turn tool-call budget gate (181-N). Each tool gets a thin
-    # wrapper that increments TurnContext.tool_call_count and refuses
-    # invocations past Config.tool_call_budget. Idempotent — wrapping
-    # an already-wrapped tool is a no-op.
-    from .budget_gate import apply_budget_gate
-    tools = [apply_budget_gate(t) for t in tools]
+    # Per-turn tool-call budget gating moved to ``BudgetGateMiddleware``
+    # (mimir/tools/budget_gate.py) and wired via ``create_deep_agent
+    # (middleware=...)`` in agent.py. The middleware intercepts every
+    # tool call — registered AND deepagents built-ins — so the
+    # previous per-tool wrapping pattern (apply_budget_gate) was
+    # removed to avoid double-counting.
     return tools
