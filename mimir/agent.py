@@ -841,6 +841,15 @@ class Agent:
             if operator_dir.is_dir():
                 skill_sources.append(str(operator_dir))
 
+            # ``BudgetGateMiddleware`` enforces the per-turn tool-call
+            # budget at the langchain middleware layer so it catches
+            # BOTH mimir-registered tools and deepagents' built-ins
+            # (shell_exec, read_file, write_file, glob, edit_file,
+            # write_todos). Pre-fix the budget gate wrapped each
+            # ``all_mimir_tools()`` entry individually and missed the
+            # built-ins — production heartbeats hit 142 tool_calls
+            # vs a budget of 120 with zero denials firing.
+            from .tools.budget_gate import BudgetGateMiddleware
             self._agent = create_deep_agent(
                 model=_resolve_model(
                     model_spec,
@@ -851,6 +860,7 @@ class Agent:
                 system_prompt=system_prompt,
                 backend=backend,
                 skills=skill_sources or None,
+                middleware=(BudgetGateMiddleware(),),
             )
             return self._agent
 
