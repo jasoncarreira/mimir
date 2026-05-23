@@ -48,6 +48,15 @@ NAME_PATTERNS=(
   '.env.*'
 )
 
+# Basenames that match NAME_PATTERNS but are known-safe. Specifically:
+# skill-local ``credentials.yaml`` manifests ship declarations
+# (env-var names + probe spec, NOT secret values) per SPEC §16 item
+# 14 / PR #285. Only add to this list when the file has a strict
+# no-secret-content invariant; the content scan below still runs.
+NAME_ALLOWLIST=(
+  'credentials.yaml'
+)
+
 staged=$(git diff --cached --name-only --diff-filter=ACM)
 if [ -z "$staged" ]; then
   exit 0
@@ -57,6 +66,16 @@ fi
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   base=$(basename -- "$f")
+  allowed=0
+  for nw in "${NAME_ALLOWLIST[@]}"; do
+    if [ "$base" = "$nw" ]; then
+      allowed=1
+      break
+    fi
+  done
+  if [ "$allowed" -eq 1 ]; then
+    continue
+  fi
   for np in "${NAME_PATTERNS[@]}"; do
     # shellcheck disable=SC2254
     case "$base" in

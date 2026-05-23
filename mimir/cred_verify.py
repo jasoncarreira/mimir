@@ -1,46 +1,55 @@
 """Credential verification probes (SPEC §16 item 14 — credential
-rotation, Phase 2).
+rotation, Phase 2.5).
 
-Phase 1 (``docs/credentials.md``) cataloged every credential mimir
-consumes and named the verification probe for each. This module
-encodes those probes as a callable registry so:
+Skills register their own credentials via a ``credentials.yaml``
+manifest shipped alongside ``SKILL.md``. The framework discovers
+these at startup and builds the probe registry — no central
+hardcoded list to grow as new skills land.
 
-- The operator can run a probe before/after rotation:
-  ``mimir verify-cred GITHUB_TOKEN`` → exit 0 if live, 1 if stale.
-- The rotation tool (Phase 3) can call ``verify(name)`` inline to
-  decide whether to commit the new value or roll back.
-- Each probe is independently testable — no need to stand up the
-  full agent to verify a single credential.
+Discovery roots (operator-shadows-bundled, mirrors PR #272's
+skills walker):
 
-Probe contract:
+  1. ``mimir/credentials.yaml`` — mimir-core creds shipped with the
+     package (ANTHROPIC_API_KEY, MIMIR_API_KEY, GITHUB_TOKEN, the
+     Discord/Slack bridge tokens, Claude OAuth).
+  2. ``<home>/.mimir_builtin_skills/<skill>/credentials.yaml`` —
+     bundled optional skills.
+  3. ``<home>/skills/<skill>/credentials.yaml`` — operator skills.
 
-- Each probe is an idempotent, side-effect-free check that the
-  credential reaches the upstream service. Probes do NOT consume
-  any quota / tokens beyond what's needed to confirm authentication
-  (typically an ``auth status`` / ``whoami`` style call).
-- Probes return a :class:`ProbeResult` carrying ``ok`` (bool) +
-  a one-line ``detail`` for operator-facing reporting + the cred
-  ``type`` (A/B/C/D from docs/credentials.md).
-- A probe MAY be ``UNAVAILABLE`` (the tool isn't installed, the
-  envvar isn't set, etc.). That's not the same as "stale credential"
-  — it's "can't probe". Surface as ``ok=False`` with a distinguishing
-  detail prefix; the rotation tool can decide whether to treat
-  unavailable as fatal.
+Within a given probe name, later roots shadow earlier ones — so an
+operator can override a bundled probe spec without forking the
+framework.
 
-Type B (long-lived bridge) and Type C (OAuth refresh) probes are
-stubbed — they need events.jsonl scanning / process-state inspection
-that's better staged into Phase 3. The registry surfaces them as
-``not_implemented`` so the CLI lists them rather than silently
-omitting them.
+Probe kinds (declarative, no Python needed for the common cases):
+
+  - ``subprocess`` — run a command, exit 0 = live. Short-circuits
+    to ``unavailable`` when ``binary`` isn't on PATH.
+  - ``format`` — env present + ``prefix`` / ``min_len`` /
+    ``disallowed_prefix`` check.
+  - ``all_env_set`` — every named env var is set + non-empty.
+  - ``not_implemented`` — explicit Phase-3 stub for Type B/C.
+  - ``python`` — escape hatch. ``script`` is a path relative to
+    the manifest dir; ``function`` (default ``probe``) returns
+    ``(ok, detail)``. Loaded via ``importlib.util``.
+
+Probe contract: side-effect-free; runs a cheap auth-status / format
+check that confirms reachability without consuming provider quota.
 """
 
 from __future__ import annotations
 
+import importlib.util
+import logging
 import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Callable, Literal
+from pathlib import Path
+from typing import Any, Callable, Literal
+
+import yaml
+
+log = logging.getLogger(__name__)
 
 
 CredType = Literal["A", "B", "C", "D"]
@@ -62,30 +71,25 @@ class ProbeResult:
 
 @dataclass
 class Probe:
-    """Registry entry. ``fn`` runs the probe and returns
-    ``(ok, detail)``; the registry wraps it in :class:`ProbeResult`
-    so callers get the name + type for free."""
+    """Registry entry."""
 
     name: str
     cred_type: CredType
-    env_vars: tuple[str, ...]  # which env vars feed this credential
-    description: str           # one-liner for ``mimir verify-creds`` listing
+    env_vars: tuple[str, ...]
+    description: str
     fn: Callable[[], tuple[bool, str]]
+    source: str   # where the manifest lived (for debugging duplicates)
 
 
-# ── helpers ──────────────────────────────────────────────────────────
+# ── helpers used by factories ────────────────────────────────────────
 
 
 def _env_set(name: str) -> tuple[bool, str | None]:
-    """``(True, value)`` if env var is set + non-empty, else
-    ``(False, None)``."""
     v = os.environ.get(name, "").strip()
     return (bool(v), v if v else None)
 
 
 def _all_env_set(*names: str) -> tuple[bool, str]:
-    """``(True, "")`` if every name is set + non-empty, else
-    ``(False, "missing: <comma-list>")``."""
     missing = [n for n in names if not os.environ.get(n, "").strip()]
     if missing:
         return (False, f"missing env: {', '.join(missing)}")
@@ -97,9 +101,9 @@ def _has_binary(name: str) -> bool:
 
 
 def _run_quiet(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
-    """Run a probe subprocess. Returns ``(rc, stdout, stderr)``. Times
-    out at ``timeout`` seconds; on timeout returns ``rc=124`` (the
-    coreutils ``timeout`` convention) so callers can disambiguate."""
+    """``(rc, stdout, stderr)``. ``rc=124`` on timeout, ``rc=127``
+    on missing binary (coreutils convention so callers can
+    disambiguate)."""
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, check=False, timeout=timeout,
@@ -115,275 +119,314 @@ def _unavailable(reason: str) -> tuple[bool, str]:
     return (False, f"unavailable: {reason}")
 
 
-def _not_implemented(typ: str) -> tuple[bool, str]:
-    return (False, f"not_implemented: Type {typ} probe pending Phase 3")
+# ── factories — one per probe kind ───────────────────────────────────
 
 
-# ── Type A probes ────────────────────────────────────────────────────
+def _make_subprocess_probe(
+    binary: str, cmd: list[str], env_vars: tuple[str, ...],
+    success_detail: str | None = None,
+) -> Callable[[], tuple[bool, str]]:
+    """``kind: subprocess`` — short-circuit if binary missing or
+    declared env vars unset; else run cmd, exit 0 = live."""
+    def _probe() -> tuple[bool, str]:
+        if not _has_binary(binary):
+            return _unavailable(f"`{binary}` not installed")
+        if env_vars:
+            ok, missing = _all_env_set(*env_vars)
+            if not ok:
+                return _unavailable(missing)
+        rc, out, err = _run_quiet(cmd)
+        if rc == 0:
+            # Surface the first non-empty stderr/stdout line so the
+            # operator sees who the token belongs to (gh writes the
+            # login to stderr, acli writes to stdout, etc.).
+            first = next(
+                (l for l in (err.splitlines() + out.splitlines()) if l.strip()),
+                "",
+            )
+            return (True, success_detail or first or f"{binary} ok")
+        return (False, (err.splitlines() + out.splitlines() or [f"{binary} exit {rc}"])[0])
+    return _probe
 
 
-def _probe_github_token() -> tuple[bool, str]:
-    if not _has_binary("gh"):
-        return _unavailable("`gh` CLI not installed")
-    if not os.environ.get("GITHUB_TOKEN", "").strip():
-        return _unavailable("GITHUB_TOKEN not set")
-    rc, out, err = _run_quiet(["gh", "auth", "status"])
-    if rc == 0:
-        # gh writes the authenticated login to stderr (annoyingly).
-        # Surface the first non-empty line so the operator sees who
-        # the token belongs to.
-        first = next((l for l in (err.splitlines() + out.splitlines()) if l.strip()), "")
-        return (True, first or "gh auth status ok")
-    return (False, (err.splitlines() or ["gh auth status failed"])[0])
+def _make_format_probe(
+    env: str, *, prefix: str | None = None, min_len: int = 16,
+    disallowed_prefix: str | None = None,
+    length: int | None = None, charset: str | None = None,
+) -> Callable[[], tuple[bool, str]]:
+    """``kind: format`` — env present + (optional) prefix / length /
+    charset / disallowed_prefix check. Live API call deferred to
+    first real use."""
+    def _probe() -> tuple[bool, str]:
+        ok, value = _env_set(env)
+        if not ok or value is None:
+            return _unavailable(f"{env} not set")
+        if length is not None and len(value) != length:
+            return (False, f"format wrong (expected {length} chars, got {len(value)})")
+        if length is None and len(value) < min_len:
+            return (False, f"format wrong (too short, got {len(value)} chars)")
+        if charset == "hex" and not all(c in "0123456789abcdef" for c in value.lower()):
+            return (False, "format wrong (expected hex)")
+        if prefix is not None and not value.startswith(prefix):
+            return (False, f"format wrong (expected prefix {prefix!r})")
+        if disallowed_prefix is not None and value.startswith(disallowed_prefix):
+            return (False, f"format wrong (starts with {disallowed_prefix!r} — wrong provider?)")
+        return (True, f"format ok ({len(value)} chars)")
+    return _probe
 
 
-def _probe_acli_token() -> tuple[bool, str]:
-    if not _has_binary("acli"):
-        return _unavailable("`acli` not installed")
-    ok, missing = _all_env_set("ACLI_TOKEN", "ACLI_EMAIL", "ACLI_SITE")
-    if not ok:
-        return _unavailable(missing)
-    rc, out, err = _run_quiet(["acli", "jira", "auth", "status"])
-    if rc == 0:
-        return (True, "acli authenticated")
-    return (False, (out.splitlines() + err.splitlines() or ["acli auth status failed"])[0])
+def _make_all_env_set_probe(
+    env_vars: tuple[str, ...], note: str | None = None,
+) -> Callable[[], tuple[bool, str]]:
+    """``kind: all_env_set`` — every named env var must be set +
+    non-empty. Used for multi-var bundles (X OAuth quartet, ACLI's
+    three vars) where partial updates break signing."""
+    def _probe() -> tuple[bool, str]:
+        ok, missing = _all_env_set(*env_vars)
+        if not ok:
+            # ``missing`` already reads as ``"missing env: FOO, BAR"`` —
+            # return it directly rather than wrapping in
+            # ``_unavailable`` (which would double-prefix to
+            # ``"unavailable: missing env: ..."``).
+            return (False, missing)
+        detail = "format ok"
+        if note:
+            detail = f"{detail} ({note})"
+        return (True, detail)
+    return _probe
 
 
-def _probe_op_token() -> tuple[bool, str]:
-    if not _has_binary("op"):
-        return _unavailable("`op` (1Password CLI) not installed")
-    if not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN", "").strip():
-        return _unavailable("OP_SERVICE_ACCOUNT_TOKEN not set")
-    rc, out, err = _run_quiet(["op", "whoami"])
-    if rc == 0:
-        return (True, out or "op authenticated")
-    return (False, (err.splitlines() or ["op whoami failed"])[0])
+def _make_not_implemented_probe(cred_type: CredType) -> Callable[[], tuple[bool, str]]:
+    def _probe() -> tuple[bool, str]:
+        return (False, f"not_implemented: Type {cred_type} probe pending Phase 3")
+    return _probe
 
 
-def _probe_openweather_key() -> tuple[bool, str]:
-    """OpenWeather has no auth-status endpoint. Format-check only:
-    confirm the env var is set + has the right shape (32-char hex).
-    The first real ``weather`` invocation will surface a 401 if the
-    key is stale."""
-    ok, value = _env_set("OPENWEATHER_API_KEY")
-    if not ok or value is None:
-        # Explicit guard rather than ``assert`` — ``python -O`` strips
-        # asserts, and the rotation tool (Phase 3) will call this in
-        # a tight pre/post-rotation loop where defensive narrowing is
-        # cheap insurance.
-        return _unavailable("OPENWEATHER_API_KEY not set")
-    if len(value) != 32 or not all(c in "0123456789abcdef" for c in value.lower()):
-        return (False, f"format wrong (expected 32 hex chars, got {len(value)})")
-    return (True, "format ok (live call deferred to first ``weather`` use)")
+def _make_python_probe(
+    manifest_dir: Path, script: str, function: str = "probe",
+) -> Callable[[], tuple[bool, str]]:
+    """``kind: python`` — escape hatch. The skill ships a Python file
+    next to ``credentials.yaml`` (or anywhere relative to it); the
+    framework loads it via ``importlib.util`` and calls ``function()``.
+
+    The callable's contract: zero args, returns ``(ok: bool, detail: str)``.
+
+    Module-level side effects (e.g. HTTP imports) happen the FIRST
+    time the probe is invoked — and on EVERY subsequent call too,
+    since the closure re-execs the module each time rather than
+    caching the loaded module. For mimir's verify-once-per-rotation
+    pattern this is harmless. If a future caller invokes the same
+    probe in a tight loop, switch to caching the loaded module on
+    first run (single-element ``nonlocal`` dict). Either way a
+    broken script raises in here and surfaces as a failing probe;
+    it doesn't crash the registry.
+    """
+    script_path = (manifest_dir / script).resolve()
+
+    def _probe() -> tuple[bool, str]:
+        if not script_path.is_file():
+            return _unavailable(f"probe script not found: {script_path}")
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f"_cred_probe_{script_path.stem}_{id(script_path)}", script_path,
+            )
+            if spec is None or spec.loader is None:
+                return _unavailable(f"can't load probe script: {script_path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            fn = getattr(module, function, None)
+            if not callable(fn):
+                return _unavailable(
+                    f"probe script has no callable {function!r}",
+                )
+            result = fn()
+        except Exception as exc:  # noqa: BLE001 — surface any user-script failure
+            return (False, f"probe script raised: {type(exc).__name__}: {exc}")
+        if (not isinstance(result, tuple) or len(result) != 2
+                or not isinstance(result[0], bool)
+                or not isinstance(result[1], str)):
+            return (False, f"probe script returned bad shape: {result!r}")
+        return result
+    return _probe
 
 
-# ── Type D probes ────────────────────────────────────────────────────
+# ── manifest parsing + discovery ─────────────────────────────────────
 
 
-def _probe_static_key_format(env: str, *, prefix: str | None = None,
-                             min_len: int = 16,
-                             disallowed_prefix: str | None = None,
-                             ) -> tuple[bool, str]:
-    """Generic format check for a static API key. Confirms the env
-    var is set, non-trivially long, optionally starts with the
-    expected provider prefix, and optionally does NOT start with a
-    disallowed prefix (used to distinguish providers whose key
-    prefixes overlap, e.g. ``sk-ant-...`` is also a valid ``sk-``).
-    Live API calls are deferred to the first real use — running a
-    probe burns tokens for no additional safety beyond a format
-    check."""
-    ok, value = _env_set(env)
-    if not ok or value is None:
-        return _unavailable(f"{env} not set")
-    if len(value) < min_len:
-        return (False, f"format wrong (too short, got {len(value)} chars)")
-    if prefix is not None and not value.startswith(prefix):
-        return (False, f"format wrong (expected prefix {prefix!r})")
-    if disallowed_prefix is not None and value.startswith(disallowed_prefix):
-        return (False, f"format wrong (starts with {disallowed_prefix!r} — wrong provider?)")
-    return (True, f"format ok ({len(value)} chars{' ' + prefix if prefix else ''})")
+def _build_probe_from_spec(
+    entry: dict[str, Any], manifest_path: Path,
+) -> Probe | None:
+    """Validate a single ``credentials:`` entry from a manifest and
+    build the runtime Probe. Returns ``None`` (with a logged warning)
+    on malformed entries — keeps a bad manifest from breaking the
+    whole registry."""
+    name = entry.get("name")
+    cred_type = entry.get("cred_type")
+    env_vars = tuple(entry.get("env_vars", []))
+    description = entry.get("description", "")
+    probe_spec = entry.get("probe", {})
+    kind = probe_spec.get("kind") if isinstance(probe_spec, dict) else None
 
+    if not isinstance(name, str) or not name:
+        log.warning("credentials_manifest_skipped: %s — missing/bad name", manifest_path)
+        return None
+    if cred_type not in ("A", "B", "C", "D"):
+        log.warning(
+            "credentials_manifest_skipped: %s name=%r — bad cred_type=%r",
+            manifest_path, name, cred_type,
+        )
+        return None
 
-def _probe_anthropic_api_key() -> tuple[bool, str]:
-    return _probe_static_key_format("ANTHROPIC_API_KEY", prefix="sk-ant-")
+    fn: Callable[[], tuple[bool, str]] | None
+    if kind == "subprocess":
+        fn = _make_subprocess_probe(
+            binary=probe_spec["binary"],
+            cmd=list(probe_spec["cmd"]),
+            env_vars=env_vars,
+            success_detail=probe_spec.get("success_detail"),
+        )
+    elif kind == "format":
+        # Pull only the kwargs the factory accepts; ignore extras
+        # silently so future-additive spec changes don't crash older
+        # frameworks.
+        accepted = {"prefix", "min_len", "disallowed_prefix", "length", "charset"}
+        kwargs = {k: probe_spec[k] for k in accepted if k in probe_spec}
+        env = probe_spec.get("env", env_vars[0] if env_vars else None)
+        if not env:
+            log.warning(
+                "credentials_manifest_skipped: %s name=%r — format probe has no env target",
+                manifest_path, name,
+            )
+            return None
+        fn = _make_format_probe(env, **kwargs)
+    elif kind == "all_env_set":
+        fn = _make_all_env_set_probe(env_vars, note=probe_spec.get("note"))
+    elif kind == "not_implemented":
+        fn = _make_not_implemented_probe(cred_type)
+    elif kind == "python":
+        fn = _make_python_probe(
+            manifest_path.parent,
+            script=probe_spec["script"],
+            function=probe_spec.get("function", "probe"),
+        )
+    else:
+        log.warning(
+            "credentials_manifest_skipped: %s name=%r — unknown probe kind=%r",
+            manifest_path, name, kind,
+        )
+        return None
 
-
-def _probe_voyage_api_key() -> tuple[bool, str]:
-    return _probe_static_key_format("VOYAGE_API_KEY", prefix="pa-")
-
-
-def _probe_openai_api_key() -> tuple[bool, str]:
-    # ``sk-ant-`` is also a valid ``sk-`` prefix; flag it explicitly
-    # so an Anthropic key accidentally dropped into OPENAI_API_KEY
-    # surfaces here rather than at first use.
-    return _probe_static_key_format(
-        "OPENAI_API_KEY", prefix="sk-", disallowed_prefix="sk-ant-",
+    return Probe(
+        name=name, cred_type=cred_type, env_vars=env_vars,
+        description=description, fn=fn, source=str(manifest_path),
     )
 
 
-def _probe_tavily_api_key() -> tuple[bool, str]:
-    return _probe_static_key_format("TAVILY_API_KEY", prefix="tvly-")
+def _load_manifest(manifest_path: Path) -> list[Probe]:
+    """Parse one ``credentials.yaml`` file. Returns the probe list
+    (possibly empty). Logs and continues on parse/format errors."""
+    try:
+        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, OSError) as exc:
+        log.warning("credentials_manifest_unreadable: %s — %s", manifest_path, exc)
+        return []
+    if not isinstance(data, dict):
+        return []
+    entries = data.get("credentials")
+    if not isinstance(entries, list):
+        return []
+    out: list[Probe] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        probe = _build_probe_from_spec(entry, manifest_path)
+        if probe is not None:
+            out.append(probe)
+    return out
 
 
-def _probe_mimir_api_key() -> tuple[bool, str]:
-    # Operator-chosen — no prefix convention. Just length.
-    return _probe_static_key_format("MIMIR_API_KEY", min_len=16)
+# Package-shipped manifest (mimir-core credentials). Sibling to this
+# file so it's always findable regardless of how mimir is installed.
+_PACKAGE_MANIFEST = Path(__file__).parent / "credentials.yaml"
 
 
-def _probe_x_oauth_quartet() -> tuple[bool, str]:
-    """X's OAuth 1.0a needs all four env vars present and signed
-    consistently. The format check confirms presence + non-trivial
-    length; ``social-cli whoami -p x`` is the real live probe (added
-    in Type-B-style Phase 3)."""
-    ok, missing = _all_env_set(
-        "X_API_KEY", "X_API_SECRET",
-        "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET",
-    )
-    if not ok:
-        return _unavailable(missing)
-    return (True, "format ok (live: ``social-cli whoami -p x``)")
+def _resolve_home(home: Path | None) -> Path | None:
+    if home is not None:
+        return home
+    raw = os.environ.get("MIMIR_HOME")
+    return Path(raw).expanduser().resolve() if raw else None
 
 
-def _probe_bsky_app_password() -> tuple[bool, str]:
-    """Bluesky app passwords are 4-block hyphenated (xxxx-xxxx-xxxx-xxxx).
-    Accepted env var name varies between deployments — accept either."""
-    ok, value = _env_set("ATPROTO_APP_PASSWORD")
-    if not ok:
-        ok, value = _env_set("BSKY_APP_PASSWORD")
-    if not ok:
-        return _unavailable("ATPROTO_APP_PASSWORD / BSKY_APP_PASSWORD not set")
-    assert value is not None
-    blocks = value.split("-")
-    if len(blocks) != 4 or any(len(b) != 4 for b in blocks):
-        return (False, "format wrong (expected xxxx-xxxx-xxxx-xxxx)")
-    return (True, "format ok (live: ``social-cli whoami -p bsky``)")
+def _discover_probes(home: Path | None) -> dict[str, Probe]:
+    """Walk the discovery roots, build a Probe per entry, return the
+    merged registry. Later-discovered names shadow earlier ones — the
+    operator's ``<home>/skills/`` always wins over the bundle."""
+    out: dict[str, Probe] = {}
+
+    def _ingest(manifest_path: Path) -> None:
+        if not manifest_path.is_file():
+            return
+        for probe in _load_manifest(manifest_path):
+            if probe.name in out:
+                log.info(
+                    "credentials_manifest_shadow: %s shadows earlier %s",
+                    manifest_path, out[probe.name].source,
+                )
+            out[probe.name] = probe
+
+    _ingest(_PACKAGE_MANIFEST)
+
+    if home is not None:
+        for root_name in (".mimir_builtin_skills", "skills"):
+            root = home / root_name
+            if not root.is_dir():
+                continue
+            for skill_dir in sorted(root.iterdir()):
+                if not skill_dir.is_dir() or skill_dir.name.startswith("."):
+                    continue
+                _ingest(skill_dir / "credentials.yaml")
+
+    return out
 
 
-# ── Type B + C probes (stubbed for Phase 3) ─────────────────────────
+# ── public API ───────────────────────────────────────────────────────
 
 
-def _probe_discord_token() -> tuple[bool, str]:
-    return _not_implemented("B")
+_probes_cache: dict[str, Probe] | None = None
+_probes_cache_home: Path | None = None
 
 
-def _probe_slack_tokens() -> tuple[bool, str]:
-    return _not_implemented("B")
+def get_probes(home: Path | None = None) -> dict[str, Probe]:
+    """Return the merged probe registry. Cached per ``home`` value
+    so repeated CLI calls don't re-walk the disk."""
+    global _probes_cache, _probes_cache_home
+    resolved = _resolve_home(home)
+    if _probes_cache is not None and _probes_cache_home == resolved:
+        return _probes_cache
+    _probes_cache = _discover_probes(resolved)
+    _probes_cache_home = resolved
+    return _probes_cache
 
 
-def _probe_claude_oauth() -> tuple[bool, str]:
-    return _not_implemented("C")
+def reset_probes_cache() -> None:
+    """For tests / when MIMIR_HOME changes mid-process."""
+    global _probes_cache, _probes_cache_home
+    _probes_cache = None
+    _probes_cache_home = None
 
 
-def _probe_gmail_oauth() -> tuple[bool, str]:
-    return _not_implemented("C")
-
-
-# ── Registry ─────────────────────────────────────────────────────────
-
-
-PROBES: dict[str, Probe] = {
-    # Type A — subprocess re-spawn
-    "GITHUB_TOKEN": Probe(
-        name="GITHUB_TOKEN", cred_type="A", env_vars=("GITHUB_TOKEN",),
-        description="GitHub PAT (gh CLI + git push to state repo)",
-        fn=_probe_github_token,
-    ),
-    "ACLI_TOKEN": Probe(
-        name="ACLI_TOKEN", cred_type="A",
-        env_vars=("ACLI_TOKEN", "ACLI_EMAIL", "ACLI_SITE"),
-        description="Atlassian CLI (Jira) — all 3 vars required",
-        fn=_probe_acli_token,
-    ),
-    "OP_SERVICE_ACCOUNT_TOKEN": Probe(
-        name="OP_SERVICE_ACCOUNT_TOKEN", cred_type="A",
-        env_vars=("OP_SERVICE_ACCOUNT_TOKEN",),
-        description="1Password service account token",
-        fn=_probe_op_token,
-    ),
-    "OPENWEATHER_API_KEY": Probe(
-        name="OPENWEATHER_API_KEY", cred_type="A",
-        env_vars=("OPENWEATHER_API_KEY",),
-        description="OpenWeather API key (weather skill)",
-        fn=_probe_openweather_key,
-    ),
-    # Type B — long-lived bridge clients (Phase 3 will wire live probes)
-    "DISCORD_TOKEN": Probe(
-        name="DISCORD_TOKEN", cred_type="B", env_vars=("DISCORD_TOKEN",),
-        description="Discord bridge bot token",
-        fn=_probe_discord_token,
-    ),
-    "SLACK_TOKENS": Probe(
-        name="SLACK_TOKENS", cred_type="B",
-        env_vars=("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
-        description="Slack bridge bot + app tokens",
-        fn=_probe_slack_tokens,
-    ),
-    # Type C — OAuth refresh dance (Phase 3 will wire login-flow probes)
-    "CLAUDE_OAUTH": Probe(
-        name="CLAUDE_OAUTH", cred_type="C", env_vars=("MIMIR_CLAUDE_OAUTH_CREDENTIALS",),
-        description="Claude Max OAuth (.credentials.json refresh token)",
-        fn=_probe_claude_oauth,
-    ),
-    "GMAIL_OAUTH": Probe(
-        # env_vars is empty because Gmail OAuth state lives in the
-        # gog keyring file (not env vars). Phase 3's probe will check
-        # for the file's presence + a successful ``gog gmail search
-        # --max 1`` call rather than env coverage.
-        name="GMAIL_OAUTH", cred_type="C", env_vars=(),
-        description="Gmail / Google Workspace OAuth (gog keyring)",
-        fn=_probe_gmail_oauth,
-    ),
-    # Type D — static API keys
-    "ANTHROPIC_API_KEY": Probe(
-        name="ANTHROPIC_API_KEY", cred_type="D", env_vars=("ANTHROPIC_API_KEY",),
-        description="Anthropic API key (format-check only)",
-        fn=_probe_anthropic_api_key,
-    ),
-    "VOYAGE_API_KEY": Probe(
-        name="VOYAGE_API_KEY", cred_type="D", env_vars=("VOYAGE_API_KEY",),
-        description="Voyage AI embedding key (format-check only)",
-        fn=_probe_voyage_api_key,
-    ),
-    "OPENAI_API_KEY": Probe(
-        name="OPENAI_API_KEY", cred_type="D", env_vars=("OPENAI_API_KEY",),
-        description="OpenAI API key (format-check only)",
-        fn=_probe_openai_api_key,
-    ),
-    "TAVILY_API_KEY": Probe(
-        name="TAVILY_API_KEY", cred_type="D", env_vars=("TAVILY_API_KEY",),
-        description="Tavily web-search API key (format-check only)",
-        fn=_probe_tavily_api_key,
-    ),
-    "MIMIR_API_KEY": Probe(
-        name="MIMIR_API_KEY", cred_type="D", env_vars=("MIMIR_API_KEY",),
-        description="mimir's own HTTP server API gate (format-check only)",
-        fn=_probe_mimir_api_key,
-    ),
-    "X_OAUTH": Probe(
-        name="X_OAUTH", cred_type="D",
-        env_vars=("X_API_KEY", "X_API_SECRET",
-                  "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET"),
-        description="X OAuth 1.0a — all 4 vars required",
-        fn=_probe_x_oauth_quartet,
-    ),
-    "BSKY_APP_PASSWORD": Probe(
-        name="BSKY_APP_PASSWORD", cred_type="D",
-        env_vars=("ATPROTO_APP_PASSWORD", "BSKY_APP_PASSWORD"),
-        description="Bluesky app password (format-check only)",
-        fn=_probe_bsky_app_password,
-    ),
-}
-
-
-def verify(name: str) -> ProbeResult:
-    """Run a single probe by registry name. Returns a ``ProbeResult``
-    with ``ok=False, detail='unknown credential'`` if the name isn't
-    registered — this is the friendly path Phase 3 (rotation) wants
-    so a typo doesn't propagate a bare ``KeyError`` through the
-    rotation flow. The CLI keeps its own guard (returning rc=2 with
-    a registered-name listing) for a richer operator UX."""
-    probe = PROBES.get(name)
+def verify(name: str, home: Path | None = None) -> ProbeResult:
+    """Run a single probe by registry name. Returns a
+    ``ProbeResult(ok=False, detail='unknown credential: ...')`` if
+    the name isn't registered — Phase 3 (rotation) calls this inline
+    and doesn't want a bare ``KeyError`` on a typo."""
+    probes = get_probes(home)
+    probe = probes.get(name)
     if probe is None:
+        # ``cred_type="A"`` is arbitrary here — there's no actual
+        # type for an unknown credential. Callers that branch on
+        # cred_type for error handling should check ``ok`` first.
+        # If/when CredType gains a "?" or "unknown" value, swap this.
         return ProbeResult(
             name=name, cred_type="A", ok=False,
             detail=f"unknown credential: {name!r}",
@@ -394,39 +437,35 @@ def verify(name: str) -> ProbeResult:
     )
 
 
-def verify_all() -> list[ProbeResult]:
-    """Run every probe in registry order. Used by ``mimir verify-creds``
-    for a full-deployment health check."""
-    return [verify(name) for name in PROBES]
+def verify_all(home: Path | None = None) -> list[ProbeResult]:
+    """Run every discovered probe in registry order."""
+    return [verify(name, home=home) for name in get_probes(home)]
 
 
-# ── CLI entrypoints (wired in cli.py) ───────────────────────────────
+# ── CLI entrypoints (wired in cli.py) ────────────────────────────────
 
 
-def run_verify_cred_cmd(name: str) -> int:
-    """``mimir verify-cred <name>`` entrypoint. Returns the exit code
-    callers should pass to ``sys.exit``: 0 if live, 1 if stale /
-    unavailable / not-implemented, 2 if ``name`` doesn't exist."""
-    if name not in PROBES:
-        avail = ", ".join(sorted(PROBES))
+def run_verify_cred_cmd(name: str, home: Path | None = None) -> int:
+    probes = get_probes(home)
+    if name not in probes:
+        avail = ", ".join(sorted(probes))
         print(f"unknown credential: {name!r}")
-        print(f"  registered: {avail}")
+        print(f"  registered: {avail or '(none — no credentials.yaml manifests discovered)'}")
         return 2
-    result = verify(name)
+    result = verify(name, home=home)
     print(result.render())
     return 0 if result.ok else 1
 
 
-def run_verify_creds_cmd(only_type: str | None = None) -> int:
-    """``mimir verify-creds [--type X]`` entrypoint. Returns 0 if all
-    listed probes are ``ok``, 1 if any fail. Filters by ``only_type``
-    when set (one of A/B/C/D).
-    """
-    results = verify_all()
+def run_verify_creds_cmd(only_type: str | None = None, home: Path | None = None) -> int:
+    results = verify_all(home=home)
     if only_type:
         results = [r for r in results if r.cred_type == only_type]
     if not results:
-        print(f"no probes registered for type {only_type!r}")
+        if only_type:
+            print(f"no probes registered for type {only_type!r}")
+        else:
+            print("no probes registered (no credentials.yaml manifests discovered)")
         return 1
     failures = 0
     for r in results:
