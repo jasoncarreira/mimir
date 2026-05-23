@@ -1,12 +1,6 @@
 ---
 name: review
 description: Review a pull request and POST the review to GitHub via `gh pr review`. Use when asked to review a PR, or when the github-activity poller fires a PR-opened / PR-review-requested event. Always submits after drafting — a review that stays in turn output and never reaches GitHub is a non-review.
-allowed-tools:
-  - Bash
-  - Read
-  - Glob
-  - Grep
-  - Task
 ---
 
 # PR Review

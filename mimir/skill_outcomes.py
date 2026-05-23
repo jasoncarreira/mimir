@@ -8,25 +8,23 @@ been tried sit in their own bucket so they don't crowd the proven ones.
 Same shape as saga's ``mark_contributions`` but at the skill layer —
 the second real amplification (positive feedback) loop in mimir.
 
-Two signals get folded into the per-skill counters, matching the
-two invocation patterns on the deepagents runtime:
+Skill invocation pattern on the deepagents runtime is **inline load**:
+the agent reads ``SKILL.md`` to pull the body into its own context and
+improvises with the parent's full tool surface. Signal:
+``tool_call(name="read_file", args.file_path=".../SKILL.md")``.
+``tool_result.is_error`` reflects whether the FILE was readable
+— **load** signal, not execution. Execution outcome of the
+subsequent improvised work is muddled with the parent turn —
+refined for some skills via the ``success_criteria`` frontmatter
+block (see :class:`SkillSuccessCriteria`).
 
-1. **Subagent execution** (delegatable skills): ``Skill`` declares
-   ``allowed-tools`` in frontmatter → ``mimir.subagent_compiler``
-   produces a SubAgent spec → ``create_deep_agent(subagents=...)``
-   registers it → agent invokes via the framework's ``task`` tool.
-   Signal: ``tool_call(name="task", args.subagent_type="<skill>")``.
-   ``tool_result.is_error`` directly reflects whether the
-   subagent's workflow succeeded — **execution** signal, clean.
-
-2. **Inline load** (reflective / no-allowed-tools skills): skill
-   stays in the catalog; agent reads ``SKILL.md`` to load body
-   into parent context and improvises. Signal:
-   ``tool_call(name="read_file", args.file_path=".../SKILL.md")``.
-   ``tool_result.is_error`` reflects whether the FILE was readable
-   — **load** signal, not execution. Execution outcome of the
-   subsequent improvised work is muddled with the parent turn
-   (see plan in ``docs/skill-as-tool-architecture.md``).
+A second pattern — ``task(subagent_type=...)`` for compiled SubAgent
+delegation — was tried in the PR #266 / #269 arc but removed
+2026-05-23 (the LLM consistently routed around it; see the rip-out
+commit). The ``execution``-kind path in the classifier remains since
+the framework still auto-injects a ``general-purpose`` subagent the
+agent can occasionally use; those calls just don't correspond to
+any mimir skill.
 
 The pre-deepagents ``Skill`` tool from claude-agent-sdk used to be
 a third pattern; that runtime is gone, and the matching code has
@@ -76,7 +74,7 @@ _SKILL_READ_RE = re.compile(
 )
 
 
-# ─── inline-skill success criteria (Option 2 from skill-as-tool-architecture.md) ───
+# ─── inline-skill success criteria ───────────────────────────────────────
 #
 # The load signal (``read_file(SKILL.md)`` is_error=False) only tells
 # us the agent loaded the prompt. Whether the agent followed the
@@ -200,8 +198,8 @@ def load_skill_success_criteria(home: Path) -> dict[str, SkillSuccessCriteria]:
     needed, just trust the load signal."
 
     Operator-installed skills (``<home>/skills/``) shadow bundled
-    same-named entries, mirroring the rest of the dual-location
-    contract (SkillsMiddleware + subagent_compiler).
+    same-named entries, mirroring SkillsMiddleware's last-source-wins
+    rule.
     """
     from .skill_defs import home_builtin_skills_dir, home_skills_dir
     out: dict[str, SkillSuccessCriteria] = {}
@@ -386,11 +384,14 @@ def _classify_skill_calls(
     **Two invocation patterns on the deepagents runtime:**
 
     1. ``tool_call(name="task", args.subagent_type="<skill>")`` —
-       delegated execution. Skill compiled to a SubAgent (see
-       ``mimir.subagent_compiler``); parent agent invokes via the
-       framework's ``task`` tool. ``tool_result.is_error`` directly
-       reflects whether the subagent's workflow succeeded. Emitted
-       with ``kind="execution"`` — this is the clean signal.
+       still detected for the framework's auto-injected
+       ``general-purpose`` subagent and any future operator-supplied
+       subagent specs. Emitted with ``kind="execution"`` — a clean
+       per-invocation signal. Mimir no longer compiles its own
+       skills to SubAgents (the spike was removed 2026-05-23), so
+       this path's ``skill`` field is usually ``general-purpose``
+       and gets filtered downstream because it isn't in the seeded
+       skill list.
 
     2. ``tool_call(name="read_file", args.file_path="…/SKILL.md")``
        — inline load. Skill stays in the catalog; agent reads
@@ -398,8 +399,9 @@ def _classify_skill_calls(
        Emitted with ``kind="load"`` — this measures only whether the
        file was readable, NOT whether the subsequent improvised
        workflow succeeded. Inline-skill execution outcomes are
-       inherently coupled to the parent turn (see plan in
-       ``docs/skill-as-tool-architecture.md``).
+       inherently coupled to the parent turn — refined per-skill
+       via ``success_criteria`` frontmatter where the completion
+       signal is declaratively defined.
 
     Downstream aggregation accumulates totals (used for ranking) and
     per-kind breakdowns (used for diagnostics) separately so an

@@ -1,8 +1,6 @@
 ---
 name: tmux
 description: Remote-control tmux sessions for interactive CLIs by sending keystrokes and scraping pane output. Use when you need an interactive TTY (REPLs, agents that prompt) or want to run multiple long-lived processes in parallel and poll their state. For non-interactive long-running jobs prefer the long-running-jobs skill.
-allowed-tools:
-  - Bash
 ---
 
 # tmux

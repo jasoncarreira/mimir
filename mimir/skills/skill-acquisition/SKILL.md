@@ -1,10 +1,42 @@
 ---
 name: skill-acquisition
 description: Discover, evaluate, install, and wrap external agent skills from ClawHub registry, skillflag-compliant CLI tools, and GitHub repos. Use when asked to find new capabilities, install a skill, browse what's available, or package a local skill for sharing.
-subagent: true
-allowed-tools:
-  - Bash
-  - Read
+success_criteria:
+  # The skill documents five flows (ClawHub browse/install, skillflag
+  # CLI install, GitHub-search discovery, raw-repo clone+copy). All
+  # installs target ``./skills/<name>/`` per the body. Any of those
+  # flows firing counts as the skill having actually run; loading the
+  # SKILL.md and doing none of them means we read the policy but
+  # never explored or installed anything.
+  any_of:
+    # ClawHub — search/explore/inspect/install/publish
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*clawhub *"
+    # skillflag — generic CLI + the ``<tool> --skill <subcommand>`` form
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*skillflag *"
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*--skill *"
+    # GitHub-side discovery (gh search) + raw-repo install (git clone)
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*gh search code*"
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*git clone*"
+    # Post-clone install via cp to the canonical landing zone
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*cp *skills/*"
 ---
 
 # Skill Acquisition
