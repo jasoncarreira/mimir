@@ -398,10 +398,12 @@ class TestCoreMemoryReflectionGate:
         self, home_with_memory: Path
     ) -> None:
         """An agent that smuggles ``../core/foo.md`` from inside memory/
-        must NOT slip past the gate. In practice ``_resolve_target``'s
-        existing traversal guard fires first and rejects the path before
-        the gate even runs — defence-in-depth. Either block reason is
-        acceptable as long as the write does NOT succeed."""
+        must NOT slip past the gate. ``_resolve_target`` rejects any
+        path whose ``.parts`` contains ``..`` (lexical traversal guard
+        in the existing writable-roots check), so this case is blocked
+        at the writable-roots layer before the core-memory gate runs.
+        Either block reason is acceptable — the assertion is just
+        \"this write must NOT succeed.\""""
         b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
         ctx = self._make_turn_ctx(trigger="user_message", channel_id="discord-123")
         tok = self._set_turn(ctx)
