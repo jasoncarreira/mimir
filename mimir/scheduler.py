@@ -1201,6 +1201,45 @@ class Scheduler:
             coalesce=False,
         )
 
+    # ---- Index-integrity cron ----------------------------------------
+
+    def add_index_integrity_job(
+        self,
+        home: Path,
+        cron_expr: str = "30 4 * * *",
+        *,
+        job_id: str = "index-integrity",
+    ) -> bool:
+        """Register the daily index-integrity check (SPEC §8.3,
+        §16 item 16). Runs ``check_all(home)`` against both
+        ``.mimir/index.db`` and ``.mimir/saga.db`` and emits
+        ``index_integrity_ok`` / ``index_integrity_failed`` events
+        (algedonic-wired in ``feedback.py``).
+
+        Default cron: ``30 4 * * *`` — 30 min after saga-consolidate's
+        4am default. Running AFTER consolidation means we catch any
+        corruption consolidation may have introduced before the next
+        agent turn sees stale retrieval results. Operator can override
+        via the yaml's ``callable: index-integrity`` entry.
+        """
+        from .index_integrity import run_scheduled_integrity_check
+
+        async def _fire() -> None:
+            await run_scheduled_integrity_check(home)
+
+        return self.register_callable(
+            name=job_id,
+            fn=_fire,
+            default_cron=cron_expr,
+            job_id=job_id,
+            # An hour of grace is plenty — the check is cheap (no LLM)
+            # and detection-only, so a late fire doesn't have downstream
+            # consequences.
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # ---- Introspection-report cron -----------------------------------
 
     # VSM: S3* (audit) — weekly behavioral / health snapshot. Non-LLM
