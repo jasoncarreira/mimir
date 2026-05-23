@@ -210,11 +210,78 @@ on its behalf. Removing a skill (or never installing it) means
 right behavior: a deployment that doesn't use jira has nothing to
 verify about ACLI_TOKEN.
 
+## `mimir rotate` — automated rotation (Phase 3)
+
+Run from the deployment directory (where `compose.env` + `compose.yml`
+live). The CLI handles the snapshot-before-write rollback machinery,
+the force-recreate, and the post-rotation verify automatically.
+
+```
+mimir rotate --env GITHUB_TOKEN                    # stdin (getpass'd if a TTY)
+mimir rotate --env GITHUB_TOKEN --from-file new.txt
+mimir rotate --env GITHUB_TOKEN --service agent    # multi-service deployments
+mimir rotate --env GITHUB_TOKEN --no-recreate      # edit-only, skip docker
+```
+
+What it does, in order:
+
+1. **Resolve config.** Locates `compose.env` + the compose file
+   (`compose.yml` / `docker-compose.yml`) in the deployment dir.
+   Auto-detects the service name when there's only one service;
+   requires `--service` otherwise.
+2. **Look up the credential.** Walks the merged probe registry to
+   find which credential owns this env var (so the post-rotation
+   verify runs the right probe). If the env var isn't registered,
+   the CLI warns and still proceeds — verification is skipped, but
+   the compose.env edit + audit trail still happen.
+3. **Snapshot.** Copies `compose.env` → `compose.env.bak.<unix-ts>`
+   BEFORE the write. Rollback always has a target.
+4. **Atomic edit.** Writes the new value to a sibling tmp file,
+   `fsync`s, renames over `compose.env`. Only the matching
+   `<name>=...` line changes; surrounding lines, comments, and
+   ordering are preserved verbatim.
+5. **Audit start.** Appends `credential_rotation_started` to
+   `./rotations.jsonl` with the env var name, the credential it
+   belongs to, the credential's type (A/B/C/D), and SHA-256
+   12-char prefixes of the old and new values (enough to
+   distinguish without exposing the secret).
+6. **Recreate.** `docker compose up -d --force-recreate <service>`.
+   Per the §14 reload-semantics gotcha, plain `restart` doesn't
+   reload env_file — the recreate is mandatory.
+7. **Wait for ready.** Polls `docker compose ps --format json`
+   until the service reports `State=running` (60s timeout).
+8. **Verify in-container.** `docker compose exec -T <service> mimir
+   verify-cred <cred-name>` — runs the probe with the freshly-
+   rotated env value visible. Exit 0 = live.
+9. **On success.** Appends `credential_rotation_completed` to
+   `rotations.jsonl` with `duration_s` + the verify probe's detail
+   line. Backup file is left in place; operator decides whether
+   to clean up.
+10. **On any failure** (recreate, wait, verify): restore
+    `compose.env` from the backup, recreate the service again to
+    bring the previous-good state back online, append
+    `credential_rotation_failed` to `rotations.jsonl` with the
+    failure stage + detail, exit non-zero. The backup file stays
+    so the operator can compare what was attempted.
+
+Audit-trail shape (`rotations.jsonl`):
+
+```jsonl
+{"timestamp": "...", "type": "credential_rotation_started", "env": "GITHUB_TOKEN", "cred": "GITHUB_TOKEN", "cred_type": "A", "old_value_hash": "sha256:abc123def456", "new_value_hash": "sha256:fed987cba321", "backup": "compose.env.bak.1716480000", "service": "agent"}
+{"timestamp": "...", "type": "credential_rotation_completed", "env": "GITHUB_TOKEN", "duration_s": 18.4, "verify": "Logged in to github.com as mimir-carreira"}
+{"timestamp": "...", "type": "credential_rotation_failed", "env": "GITHUB_TOKEN", "stage": "verify", "detail": "...", "rolled_back": true}
+```
+
+The audit lives in the deployment dir, not in the container's
+`events.jsonl` — that's a deliberate scope choice for Phase 3
+(write-from-host, where the rotation actually runs). A later phase
+may cross-write into the container's event log if operators want
+the rotation events alongside agent activity.
+
 ## What this doc doesn't cover yet
 
-Next PR in the credential-rotation series:
+Future PRs in the credential-rotation series:
 
-- **`mimir rotate --cred <name>`** — atomic compose.env edit + recreate + verify, with audit events (`credential_rotation_started`, `credential_rotation_completed`, with old/new hashes for grep-by-rotation-event)
-- **Drain mode** (later, opt-in) — pause new event dispatch while in-flight turns finish, then rotate
-
-Until those land, this doc is the manual runbook. Treat the "verification probe" column as the source of truth for what "rotation succeeded" means.
+- **Multi-var bundle rotation** — `mimir rotate --cred X_OAUTH` to update all 4 X OAuth env vars atomically (single-env rotation is the 90% case; bundle is the 10%)
+- **Drain mode** (later, opt-in) — pause new event dispatch while in-flight turns finish, then rotate. Useful for Type B (bridge) credentials where a reconnect window may drop inbound messages
+- **Live Type B/C probes** — replace the `not_implemented` stubs in the registry with real verification (e.g., parse `events.jsonl` for `bridge_connected` post-recreate)
