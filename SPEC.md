@@ -399,6 +399,39 @@ The context is set via `set_current_turn(ctx)` at the top of `run_turn` and rese
 - Global semaphore enforces hard concurrency. When at the cap, new events queue (with timestamp) and start as soon as a slot frees. The dispatcher emits `event_admission_wait` for any event that waited > 5s.
 - A `MIMIR_MAX_CHANNEL_QUEUE` env var (default 100) caps per-channel queue depth; over-cap, the dispatcher rejects with an error event written to events.jsonl and (if applicable) a polite "I'm overloaded, try again" reply via `send_message`.
 
+### 4.9 Budget enforcement and quota management
+
+Two distinct budget layers apply at runtime: per-spawn subagent caps and Anthropic platform quota windows.
+
+#### Per-spawn caps (spawn_claude_code)
+
+Each agent profile configures a hard dollar ceiling passed to the Claude Code subprocess via `--max-cost`:
+
+| Profile | Cap |
+|---|---|
+| `code-implementer` | $25 |
+| `bench-runner` | $10 |
+| `doc-writer` | $5 |
+
+When a spawn reaches its cap, Claude Code terminates the subprocess with a non-zero exit code and returns a partial result (whatever the subprocess completed before hitting the limit). The parent receives this in the `spawn_claude_code` tool result with a truncated `result` field and a `cost_usd` near the cap. The parent is responsible for detecting the truncation and filing a chainlink for follow-up rather than retrying the same spawn (retrying doubles the cost with no structural difference).
+
+#### Platform quota windows (Anthropic API / OAuth)
+
+Mimir's model provider (Anthropic Max plan or API key) enforces rolling quota windows. Two windows matter at present:
+
+- **5-hour rolling** — resets continuously as the trailing window slides.
+- **7-day plan-wide** — resets on a fixed weekly boundary.
+
+The `arbiter` (in `mimir/arbiter.py`) polls the Anthropic usage endpoint on each scheduled tick before admitting the tick to run. The decision logic:
+
+1. Query current 5h and 7d utilization percentages from the OAuth usage poll result (cached in `state/` every ~15 min by the `oauth-usage-poll` scheduled job).
+2. If either window is ≥ `MIMIR_QUOTA_SUPPRESS_THRESHOLD` (default 95%), emit a `quota_suppressed` event to events.jsonl and skip the tick. The suppression is advisory — a queued user_message turn always runs regardless, since interactive responsiveness outweighs quota conservation.
+3. If the usage poll result is stale (> 30 min old) or missing, the arbiter uses the last trusted value rather than blocking. A `quota_reading_anomaly` event is emitted when the poll data is distrusted.
+
+**Exhaustion handling.** Full quota exhaustion causes Anthropic API calls to return 429. The agent loop surfaces this as an error event (`error`, `anthropic_rate_limit`) to events.jsonl. The next scheduled tick's arbiter check will see 100% utilization and suppress. User-message turns will also fail at the API call — the channel worker catches the exception, writes the error event, and sends a "temporarily rate-limited, try again in N minutes" reply via `send_message` if the channel is interactive.
+
+**Gap (⚠️ critical, see §16 item 18).** The spec currently lacks a recovery path for the scenario where quota is exhausted mid-session (e.g. a long `spawn_claude_code` run hits 100% partway through). The agent has no mechanism to pause, preserve partial results, and resume after the window resets. Filing chainlink work for when this becomes a live operational issue.
+
 ---
 
 ## 5. Memory system
@@ -890,6 +923,45 @@ All skills under `.mimir_builtin_skills/` as of 2026-05:
 **Dropped from original open-strix port:**
 - `mountaineering/` — removed with PR #271 (SubAgent delegation machinery dropped); `spawn_claude_code` is the out-of-process delegation primitive now (§7.6).
 - `prediction-review/` — depends on a journal mimir doesn't have.
+
+### 8.3 Index integrity and rebuild
+
+Mimir maintains two independent search indexes. Corruption in either produces silent retrieval failures — zero results or stale results — rather than errors. Knowing the difference and the recovery procedure matters operationally.
+
+#### File corpus index (`file_search`)
+
+Backed by SQLite + fastembed (BM25 FTS5 + dense vector index). Lives at `<home>/state/search.db`.
+
+**What constitutes corruption:**
+- FTS5 rowid drift (typically from a crash mid-write): `file_search` returns 0 results for file content that `read_file` confirms exists.
+- Embedding dimension mismatch: if the fastembed model is swapped while the DB already has embeddings, dense similarity scores are wrong (wrong shape → fallback to BM25 only or IndexError on inner-product).
+- Missing entries: files written out-of-band (e.g. via `bash` or a subagent with a different cwd) may not have triggered the normal write-hook → index pipeline.
+
+**Detection signals:**
+- `file_search("topic that should match known files")` returns 0 results or results from different files.
+- The auto-rebuild 60s sweep (`index.py:_sweep`) logs `index_rebuild` events to events.jsonl; absence of these events for > 10 min suggests the sweep is wedged.
+- `state/INDEX.md` or `memory/INDEX.md` has a stale timestamp (generated by the indexer; stale = indexer not running).
+
+**Recovery:**
+1. Call `rebuild_index(scope="all")` via the `rebuild_index` MCP tool. This drops and rebuilds both FTS5 and vector index from scratch by re-walking `memory/` and `state/`.
+2. If the embedding model changed: ensure `MIMIR_EMBED_MODEL` matches what's configured, then run `rebuild_index`. Do not re-embed SAGA atoms via this path — SAGA has its own re-embedding pipeline (`saga_calibration.re_embed`; see below).
+3. Confirm recovery: `file_search("known content")` returns expected paths. Check `events.jsonl` for a new `index_rebuild` event.
+
+**Gap (⚠️ critical, see §16 item 16).** There is no automated corruption detection. The 60s sweep assumes the SQLite file is healthy; it does not validate FTS5 integrity or check vector dimension consistency. A periodic `PRAGMA integrity_check` on the FTS5 virtual table and a dimension-sanity check on the first vector row would catch both without a full rebuild.
+
+#### SAGA semantic index (FAISS)
+
+SAGA maintains a FAISS in-memory vector index (`saga/vector_index.py:_atoms_index`) rebuilt from the `atoms` table on startup. This is separate from the file corpus index.
+
+**What constitutes corruption / staleness:**
+- Index built from an older atoms snapshot (e.g. mimir restarted after a crash mid-consolidation): atoms added since the last restart are missing from the FAISS index.
+- Embedding provider change mid-life: atoms embedded with Voyage have a different dimension from OpenAI-embedded atoms; mixing them in one FAISS index produces incorrect similarity scores. `saga_calibration.re_embed` handles the migration.
+- The FAISS index is not persisted to disk in v1 — a restart always rebuilds from the atoms table. This is by design (index rebuild is cheap at current DB sizes), but means crash + large ingest = longer cold-start.
+
+**Recovery:**
+1. `saga_calibration.re_embed` (Python API; no MCP surface yet) re-embeds all active atoms with the current provider, updates the `embedding` and `embedding_provider` columns, and sets `index_rebuild_needed=True`.
+2. After `re_embed`, SAGA rebuilds the FAISS index from the updated atoms table on next startup (or can be triggered via an in-process `_rebuild_index()` call; no public MCP tool exists for this yet).
+3. The SAGA `sentence_embeddings` subatom table is NOT touched by `re_embed` and has its own rebuild path (see `saga/subatom.py`).
 
 ---
 
@@ -1468,3 +1540,39 @@ Total: ~15.5 working days for a first benchmarkable build (Phase 4 expanded by 0
 11. **Channel ID conventions.** The spec assumes channel IDs are stable strings. When the same human's Slack ID changes (workspace migration) we lose continuity. Track this as a future "identity reconciliation" problem.
 12. **Within-turn parallel tool execution.** [Resolved: LangGraph handles this] Post-deepagents, LangGraph controls the tool-execution loop. Multiple tool calls in one assistant message run sequentially within the LangGraph state machine. No flock race; §4.4 sequential assumption holds.
 13. **Background subagent stream delivery.** [Resolved: moot] The `Agent(background=True)` SDK pattern is no longer used. Background delegation is via `spawn_claude_code` with `bash_async` wait patterns (§4.3). Completion arrives as a `shell_job_complete` wake-up event on the spawning channel.
+
+### Gap analysis (2026-05-23) — from external spec review
+
+Gaps identified by independent spec review, organized by severity. Critical gaps are active operational problems; significant gaps are scale/maturity concerns; enhancement opportunities are lower-priority visibility improvements.
+
+#### ⚠️ Critical — active operational problems
+
+14. **Credential rotation protocol.** No procedure for rotating GitHub PAT or Anthropic OAuth tokens without causing race conditions with in-flight operations. The live failure mode (credential-store truncation on auth failure) is fingerprinted at `memory/issues/git-credential-store-erase-on-auth-failure.md`, but the spec has no recovery procedure or rotation sequence. Required: (a) credential update order relative to active turn lifecycle, (b) how to drain in-flight turns before rotation, (c) how to verify the new credential is wired before declaring success.
+
+15. **State-push recovery.** When the post-turn git push to `mimirbot-state` fails (network blip, credential expiry, merge conflict), mimir's agent home and the remote repo diverge silently. The spec mentions `git revert` (§16 item 8) but doesn't specify: (a) how push failure is detected and surfaced (it should write a `state_push_failed` event to events.jsonl and alert via the operator channel), (b) the recovery sequence (local commit is safe; push retry with exponential backoff; escalate after N retries), (c) how to reconcile after extended divergence (accumulated local commits vs. remote state). This is a real operational scenario — see the 22-unpushed-autocommits situation logged in heartbeat history.
+
+16. **Index corruption detection and rebuild.** The spec has no procedure for detecting or recovering from file corpus or SAGA FAISS index corruption. Silent retrieval failures (zero results, stale results) are the observable symptom. Spec text for the rebuild procedure has been added at §8.3, but automated detection (periodic FTS5 integrity check, dimension-sanity probe) is still unimplemented. Track as a follow-up item.
+
+17. **Session timeout for continuous channels.** SAGA session synthesis fires on idle timeout (§5.6). High-traffic channels (e.g. a heartbeat-heavy operator channel) may never go idle — memory grows unbounded within the session and synthesis never fires. The spec needs a time-based fallback: force a session boundary after `MIMIR_MAX_SESSION_DURATION` (suggested: 4 hours) regardless of idle state, implemented in the SAGA session manager or as a scheduled job.
+
+18. **Tool-call budget enforcement and quota exhaustion handling.** Per-spawn budget caps and Anthropic quota window semantics are now documented at §4.9. The remaining gap: no recovery path for mid-session quota exhaustion (e.g. a long spawn hits 100% partway through). A durable "pause + resume after quota reset" mechanism is missing from both the subagent protocol and the spec. Chainlink work deferred.
+
+#### Significant — scale and maturity concerns
+
+19. **Channel memory and cost limits at scale.** No per-channel memory cap or cost watermark. A burst channel that never goes idle can accumulate unbounded chat history and trigger unlimited SAGA stores. `MIMIR_MAX_CHANNEL_QUEUE` caps queue depth (§4.8) but not stored memory or per-channel spend. Revisit at production scale.
+
+20. **Skill versioning.** `SkillsMiddleware` resolves `<home>/skills/` over `.mimir_builtin_skills/` at startup. If the operator has a pinned override and the bundled version is updated, the two silently diverge. No version metadata, no conflict detection, no upgrade path. See `memory/issues/skill-doc-source-runtime-drift.md` for the fingerprinted failure mode.
+
+21. **Schema evolution / migration tooling.** SAGA schema changes (`schema_version` table, `_apply_pending_migrations`) have a known failure mode on fresh DBs (see `memory/issues/saga-migration-fresh-db-trap.md`). The file-corpus SQLite (`search.db`) has no migration layer at all — schema changes require a full rebuild. Required: a versioned migration runner for both databases with rollback support.
+
+22. **Synthesis failure recovery.** SAGA session synthesis (`saga_session_end`) can fail if SAGA is unreachable or the LLM extraction step times out. Current behavior: the failure is logged; the session remains open; the next synthesis attempt starts from an even larger context. No retry policy, no partial-synthesis path, no operator alert on synthesis failure. Revisit when synthesis failures appear in events.jsonl.
+
+23. **Channel cardinality and cost attribution.** Cost is tracked at the turn level (`cost_usd` in `turns.jsonl`) but not rolled up per channel or per subagent profile. Multi-channel deployments have no per-channel spend dashboard. The per-spawn `cost_usd` return from `spawn_claude_code` exists but is not aggregated. Add cost roll-up (daily, per-channel, per-profile) as part of §11 (operator dashboard, §16 item 25).
+
+#### Enhancement opportunities
+
+24. **Health-check endpoints.** The HTTP server has no `/health` or `/ready` endpoint. Docker and Kubernetes health probes currently use the bind-mount test (`memory/issues/virtiofs-stale-inode.md`) as a proxy. Add explicit liveness (process alive) and readiness (SAGA reachable, index built) endpoints.
+
+25. **Cost dashboard.** The HTML turn viewer (§11) shows per-turn cost but has no aggregate view. Operator needs: daily spend, per-channel breakdown, per-profile subagent spend, quota window status. Could be a `/dashboard` page served by the same HTTP server or an exported CSV for external tooling.
+
+26. **Prompt-injection safeguards.** Mimir processes untrusted content from external sources (channel messages, poller events, web fetches). No sanitization layer exists between external content and the model's context window. Revisit if mimir is ever exposed to adversarial or untrusted operators.
