@@ -166,9 +166,12 @@ def _probe_openweather_key() -> tuple[bool, str]:
     The first real ``weather`` invocation will surface a 401 if the
     key is stale."""
     ok, value = _env_set("OPENWEATHER_API_KEY")
-    if not ok:
+    if not ok or value is None:
+        # Explicit guard rather than ``assert`` — ``python -O`` strips
+        # asserts, and the rotation tool (Phase 3) will call this in
+        # a tight pre/post-rotation loop where defensive narrowing is
+        # cheap insurance.
         return _unavailable("OPENWEATHER_API_KEY not set")
-    assert value is not None  # narrowing for mypy
     if len(value) != 32 or not all(c in "0123456789abcdef" for c in value.lower()):
         return (False, f"format wrong (expected 32 hex chars, got {len(value)})")
     return (True, "format ok (live call deferred to first ``weather`` use)")
@@ -178,20 +181,26 @@ def _probe_openweather_key() -> tuple[bool, str]:
 
 
 def _probe_static_key_format(env: str, *, prefix: str | None = None,
-                             min_len: int = 16) -> tuple[bool, str]:
+                             min_len: int = 16,
+                             disallowed_prefix: str | None = None,
+                             ) -> tuple[bool, str]:
     """Generic format check for a static API key. Confirms the env
-    var is set, non-trivially long, and (if ``prefix`` given) starts
-    with the expected provider prefix. Live API calls are deferred
-    to the first real use — running a probe burns tokens for no
-    additional safety beyond a format check."""
+    var is set, non-trivially long, optionally starts with the
+    expected provider prefix, and optionally does NOT start with a
+    disallowed prefix (used to distinguish providers whose key
+    prefixes overlap, e.g. ``sk-ant-...`` is also a valid ``sk-``).
+    Live API calls are deferred to the first real use — running a
+    probe burns tokens for no additional safety beyond a format
+    check."""
     ok, value = _env_set(env)
-    if not ok:
+    if not ok or value is None:
         return _unavailable(f"{env} not set")
-    assert value is not None
     if len(value) < min_len:
         return (False, f"format wrong (too short, got {len(value)} chars)")
     if prefix is not None and not value.startswith(prefix):
         return (False, f"format wrong (expected prefix {prefix!r})")
+    if disallowed_prefix is not None and value.startswith(disallowed_prefix):
+        return (False, f"format wrong (starts with {disallowed_prefix!r} — wrong provider?)")
     return (True, f"format ok ({len(value)} chars{' ' + prefix if prefix else ''})")
 
 
@@ -204,7 +213,12 @@ def _probe_voyage_api_key() -> tuple[bool, str]:
 
 
 def _probe_openai_api_key() -> tuple[bool, str]:
-    return _probe_static_key_format("OPENAI_API_KEY", prefix="sk-")
+    # ``sk-ant-`` is also a valid ``sk-`` prefix; flag it explicitly
+    # so an Anthropic key accidentally dropped into OPENAI_API_KEY
+    # surfaces here rather than at first use.
+    return _probe_static_key_format(
+        "OPENAI_API_KEY", prefix="sk-", disallowed_prefix="sk-ant-",
+    )
 
 
 def _probe_tavily_api_key() -> tuple[bool, str]:
@@ -311,6 +325,10 @@ PROBES: dict[str, Probe] = {
         fn=_probe_claude_oauth,
     ),
     "GMAIL_OAUTH": Probe(
+        # env_vars is empty because Gmail OAuth state lives in the
+        # gog keyring file (not env vars). Phase 3's probe will check
+        # for the file's presence + a successful ``gog gmail search
+        # --max 1`` call rather than env coverage.
         name="GMAIL_OAUTH", cred_type="C", env_vars=(),
         description="Gmail / Google Workspace OAuth (gog keyring)",
         fn=_probe_gmail_oauth,
@@ -358,10 +376,18 @@ PROBES: dict[str, Probe] = {
 
 
 def verify(name: str) -> ProbeResult:
-    """Run a single probe by registry name. Raises ``KeyError`` if
-    ``name`` isn't registered — callers that want a soft failure
-    should use ``name in PROBES`` first."""
-    probe = PROBES[name]
+    """Run a single probe by registry name. Returns a ``ProbeResult``
+    with ``ok=False, detail='unknown credential'`` if the name isn't
+    registered — this is the friendly path Phase 3 (rotation) wants
+    so a typo doesn't propagate a bare ``KeyError`` through the
+    rotation flow. The CLI keeps its own guard (returning rc=2 with
+    a registered-name listing) for a richer operator UX."""
+    probe = PROBES.get(name)
+    if probe is None:
+        return ProbeResult(
+            name=name, cred_type="A", ok=False,
+            detail=f"unknown credential: {name!r}",
+        )
     ok, detail = probe.fn()
     return ProbeResult(
         name=probe.name, cred_type=probe.cred_type, ok=ok, detail=detail,

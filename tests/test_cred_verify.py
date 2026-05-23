@@ -140,6 +140,26 @@ def test_subprocess_probe_fails_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch)
     assert "expired" in result.detail.lower()
 
 
+def test_openai_probe_rejects_anthropic_prefix(monkeypatch: pytest.MonkeyPatch):
+    """``sk-ant-...`` is a valid ``sk-`` prefix but is an Anthropic
+    key, not an OpenAI one. The probe explicitly flags this case so
+    an accidental copy-paste between env vars surfaces immediately."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ant-" + "x" * 50)
+    result = verify("OPENAI_API_KEY")
+    assert not result.ok
+    assert "sk-ant-" in result.detail
+
+
+def test_verify_returns_unknown_result_instead_of_raising():
+    """The Phase 2 review surfaced this: Phase 3 (rotation) will call
+    ``verify(name)`` inline; a typo shouldn't propagate a bare
+    ``KeyError``. Return a ProbeResult instead so callers can act on
+    ``ok=False`` uniformly."""
+    result = verify("NOT_A_REAL_CRED")
+    assert not result.ok
+    assert "unknown credential" in result.detail
+
+
 def test_type_b_probes_are_not_implemented():
     """Type B (long-lived bridge) probes are stubbed for Phase 3 —
     they should surface as failing with a distinctive marker rather
