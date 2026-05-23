@@ -28,6 +28,52 @@ log = logging.getLogger(__name__)
 Polarity = Literal["negative", "positive"]
 
 
+# ---------------------------------------------------------------------------
+# Alg-2 temporal run detection — valence groups, runs, annotated runs
+# (spec: state/spec/alg2-temporal-runs-spec.md)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ValenceGroup:
+    """A set of related kinds that form a logical success/failure space.
+
+    Transitions are detected *within* a group only — an oauth recovery
+    doesn't label a git push degradation. New groups can be added to
+    ``_VALENCE_GROUPS`` without any other code changes.
+    """
+    label: str                       # human-readable: "git push"
+    positive_kinds: frozenset[str]   # rule-kind tags (short tags like "git_push_ok")
+    negative_kinds: frozenset[str]
+    verb_map: dict[str, str]         # kind → short verb ("git_push_ok" → "succeeded")
+
+
+@dataclass(frozen=True)
+class Run:
+    """A maximal contiguous subsequence of events with the same kind within
+    a logical valence group, in chronological order.
+
+    "Contiguous" means no event from the *same* group intervenes —
+    events from other groups do not break a run.
+    """
+    group_key: str
+    kind: str
+    polarity: Polarity
+    count: int
+    start_ts: str
+    end_ts: str
+
+
+@dataclass(frozen=True)
+class AnnotatedRun:
+    """A Run tagged with the transition that opened it (if any).
+
+    ``transition_type`` is None for the first run in a group or when the
+    run continues the same polarity as the previous run.
+    """
+    run: Run
+    transition_type: Literal["recovery", "degradation"] | None
+
+
 @dataclass(frozen=True)
 class FeedbackSignal:
     ts: str
@@ -404,6 +450,178 @@ assert _POLARITY_DYNAMIC_KINDS.isdisjoint(_FIRST_OCCURRENCE_ONLY_KINDS), (
 _AROUSAL_THRESHOLDS: dict[str, int] = {}
 
 
+# ---------------------------------------------------------------------------
+# Valence groups — define success/failure spaces for run detection.
+# Each group key maps to a ValenceGroup; the kind tags used here are the
+# SHORT rule-kind tags (values from _EVENT_RULES), not the raw event types.
+#
+# Invariant: kind sets across all groups must be disjoint.
+# Validated by assertion below.
+# ---------------------------------------------------------------------------
+
+def _build_valence_groups() -> dict[str, ValenceGroup]:
+    return {
+        "git_push": ValenceGroup(
+            label="git push",
+            positive_kinds=frozenset({"git_push_ok"}),
+            negative_kinds=frozenset({"git_push_failed", "git_push_stale"}),
+            verb_map={
+                "git_push_ok": "succeeded",
+                "git_push_failed": "failed",
+                "git_push_stale": "stale",
+            },
+        ),
+        "git_pull": ValenceGroup(
+            label="git pull",
+            positive_kinds=frozenset({"git_pull_ok", "git_fetch_ok"}),
+            negative_kinds=frozenset({"git_pull_blocked"}),
+            verb_map={
+                "git_pull_ok": "pulled",
+                "git_fetch_ok": "fetched",
+                "git_pull_blocked": "blocked",
+            },
+        ),
+        "git_commit": ValenceGroup(
+            label="git commit",
+            positive_kinds=frozenset(),
+            negative_kinds=frozenset({"git_commit_failed"}),
+            verb_map={
+                "git_commit_failed": "failed",
+            },
+        ),
+        "bind_mount": ValenceGroup(
+            label="bind mount",
+            positive_kinds=frozenset({"bind_mount_recovered"}),
+            negative_kinds=frozenset({"bind_mount_stale", "bind_mount_persistent"}),
+            verb_map={
+                "bind_mount_recovered": "recovered",
+                "bind_mount_stale": "stale",
+                "bind_mount_persistent": "persistent",
+            },
+        ),
+        "discord_bridge": ValenceGroup(
+            label="Discord bridge",
+            positive_kinds=frozenset(),
+            negative_kinds=frozenset({
+                "discord_bridge_retry",
+                "discord_bridge_login_failure",
+                "discord_bridge_intents_failure",
+            }),
+            verb_map={
+                "discord_bridge_retry": "retrying",
+                "discord_bridge_login_failure": "login-failed",
+                "discord_bridge_intents_failure": "intents-failed",
+            },
+        ),
+        "slack_bridge": ValenceGroup(
+            label="Slack bridge",
+            positive_kinds=frozenset(),
+            negative_kinds=frozenset({
+                "slack_bridge_retry",
+                "slack_bridge_auth_failure",
+                "slack_bridge_scope_failure",
+            }),
+            verb_map={
+                "slack_bridge_retry": "retrying",
+                "slack_bridge_auth_failure": "auth-failed",
+                "slack_bridge_scope_failure": "scope-failed",
+            },
+        ),
+        "oauth": ValenceGroup(
+            label="oauth",
+            positive_kinds=frozenset({"oauth_usage_ok", "oauth_refresh_ok"}),
+            negative_kinds=frozenset({
+                "oauth_usage_failed",
+                "oauth_logged_out",
+                "oauth_refresh_age_warn",
+            }),
+            verb_map={
+                "oauth_usage_ok": "ok",
+                "oauth_refresh_ok": "refreshed",
+                "oauth_usage_failed": "failed",
+                "oauth_logged_out": "logged-out",
+                "oauth_refresh_age_warn": "age-warn",
+            },
+        ),
+        "spawn": ValenceGroup(
+            label="spawn",
+            positive_kinds=frozenset({"spawn_ok"}),
+            negative_kinds=frozenset({"spawn_auth_fail", "spawn_work_fail"}),
+            verb_map={
+                "spawn_ok": "completed",
+                "spawn_auth_fail": "auth-failed",
+                "spawn_work_fail": "work-failed",
+            },
+        ),
+        "quota": ValenceGroup(
+            label="quota",
+            positive_kinds=frozenset({"quota_recovered"}),
+            negative_kinds=frozenset({"quota_exhausted", "quota_anomaly"}),
+            verb_map={
+                "quota_recovered": "recovered",
+                "quota_exhausted": "exhausted",
+                "quota_anomaly": "anomalous",
+            },
+        ),
+        "viability": ValenceGroup(
+            label="viability",
+            positive_kinds=frozenset({"viability_ok"}),
+            negative_kinds=frozenset({
+                "collapse_output_sim",
+                "collapse_atom_gini",
+                "collapse_topic_lock",
+                "curation_reflection_low",
+                "curation_feedback_low",
+                "curation_forget_low",
+                "viability_error",
+            }),
+            verb_map={
+                "viability_ok": "healthy",
+                "collapse_output_sim": "output-similarity",
+                "collapse_atom_gini": "atom-concentration",
+                "collapse_topic_lock": "topic-lock",
+                "curation_reflection_low": "reflection-low",
+                "curation_feedback_low": "feedback-low",
+                "curation_forget_low": "forget-low",
+                "viability_error": "error",
+            },
+        ),
+        # Logical pairings not in the original spec but present in _EVENT_RULES.
+        "index_integrity": ValenceGroup(
+            label="index integrity",
+            positive_kinds=frozenset({"index_integrity_ok"}),
+            negative_kinds=frozenset({"index_integrity_failed"}),
+            verb_map={
+                "index_integrity_ok": "ok",
+                "index_integrity_failed": "failed",
+            },
+        ),
+        "shell_job": ValenceGroup(
+            label="shell job",
+            positive_kinds=frozenset({"shell_job_complete_enqueue_ok"}),
+            negative_kinds=frozenset({"shell_job_complete_enqueue_failed"}),
+            verb_map={
+                "shell_job_complete_enqueue_ok": "enqueued",
+                "shell_job_complete_enqueue_failed": "enqueue-failed",
+            },
+        ),
+    }
+
+
+_VALENCE_GROUPS: dict[str, ValenceGroup] = _build_valence_groups()
+
+# Validate: kind sets across all groups must be disjoint.
+_all_grouped_kinds: list[str] = []
+for _vg in _VALENCE_GROUPS.values():
+    _all_grouped_kinds.extend(_vg.positive_kinds)
+    _all_grouped_kinds.extend(_vg.negative_kinds)
+assert len(_all_grouped_kinds) == len(set(_all_grouped_kinds)), (
+    "ValenceGroup kind sets must be disjoint — a kind appears in more than "
+    "one group. Check _VALENCE_GROUPS for duplicates."
+)
+del _all_grouped_kinds, _vg
+
+
 # Pre-pass helper: count occurrences of each rule-matched event kind
 # in the algedonic window. Iterates tail-first (most-recent first),
 # stops at cutoff_iso. Called before the main selection loop so the
@@ -428,6 +646,208 @@ def _count_kinds_in_window(
         _, kind = rule
         counts[kind] = counts.get(kind, 0) + 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Alg-2 temporal run detection — implementation
+# ---------------------------------------------------------------------------
+
+def _compute_group_runs(
+    snapshot: "JsonlSnapshot | None",
+    events_path: Path,
+    cutoff_iso: str,
+    valence_groups: dict[str, ValenceGroup],
+) -> dict[str, list[Run]]:
+    """Return {group_key: [Run, ...]} in CHRONOLOGICAL order (oldest first).
+
+    Collects all rule-matched events in the window, sorts by ts ascending,
+    then identifies maximal contiguous runs per group.  "Contiguous" means
+    no intervening event from the *same* group — events from other groups
+    are transparent.
+    """
+    # Build reverse lookup: kind → (group_key, polarity)
+    kind_to_group: dict[str, tuple[str, Polarity]] = {}
+    for gk, group in valence_groups.items():
+        for k in group.positive_kinds:
+            kind_to_group[k] = (gk, "positive")
+        for k in group.negative_kinds:
+            kind_to_group[k] = (gk, "negative")
+
+    # Collect all rule-matched events in the window (iter is tail-first).
+    window_events: list[tuple[str, str]] = []  # (ts, kind)
+    for ev in iter_snapshot_or_tail(snapshot, events_path):
+        ts = ev.get("timestamp")
+        if not isinstance(ts, str) or ts < cutoff_iso:
+            if isinstance(ts, str):
+                break
+            continue
+        evtype = ev.get("type")
+        rule = _EVENT_RULES.get(evtype) if isinstance(evtype, str) else None
+        if rule is None:
+            continue
+        _, kind = rule
+        if kind in kind_to_group:
+            window_events.append((ts, kind))
+
+    # Sort chronologically (oldest first) for run detection.
+    window_events.sort(key=lambda x: x[0])
+
+    result: dict[str, list[Run]] = {}
+
+    for group_key, group in valence_groups.items():
+        # Filter to events belonging to this group (preserves chrono order).
+        group_events = [
+            (ts, kind)
+            for ts, kind in window_events
+            if kind_to_group.get(kind, (None,))[0] == group_key
+        ]
+        if not group_events:
+            continue
+
+        runs: list[Run] = []
+        cur_kind = group_events[0][1]
+        cur_polarity = kind_to_group[cur_kind][1]
+        cur_start = group_events[0][0]
+        cur_end = group_events[0][0]
+        cur_count = 1
+
+        for ts, kind in group_events[1:]:
+            if kind == cur_kind:
+                cur_count += 1
+                cur_end = ts
+            else:
+                runs.append(Run(
+                    group_key=group_key,
+                    kind=cur_kind,
+                    polarity=cur_polarity,
+                    count=cur_count,
+                    start_ts=cur_start,
+                    end_ts=cur_end,
+                ))
+                cur_kind = kind
+                cur_polarity = kind_to_group[kind][1]
+                cur_start = ts
+                cur_end = ts
+                cur_count = 1
+
+        # Close the final open run.
+        runs.append(Run(
+            group_key=group_key,
+            kind=cur_kind,
+            polarity=cur_polarity,
+            count=cur_count,
+            start_ts=cur_start,
+            end_ts=cur_end,
+        ))
+        result[group_key] = runs
+
+    return result
+
+
+def _annotate_transitions(runs: list[Run]) -> list[AnnotatedRun]:
+    """Tag each run with the transition that opened it (if any).
+
+    A transition fires when the polarity of the current run differs from
+    the immediately preceding run.  The first run never has a transition
+    (no prior context within the window).
+    """
+    annotated: list[AnnotatedRun] = []
+    for i, run in enumerate(runs):
+        if i == 0:
+            transition_type = None
+        else:
+            prior = runs[i - 1]
+            if prior.polarity == "positive" and run.polarity == "negative":
+                transition_type = "degradation"
+            elif prior.polarity == "negative" and run.polarity == "positive":
+                transition_type = "recovery"
+            else:
+                transition_type = None
+        annotated.append(AnnotatedRun(run=run, transition_type=transition_type))
+    return annotated
+
+
+def _format_run_segment(run: Run, group: ValenceGroup) -> str:
+    verb = group.verb_map.get(run.kind, run.kind)
+    return f"{verb} ×{run.count}"
+
+
+def _format_chain(annotated_runs: list[AnnotatedRun], group: ValenceGroup) -> str:
+    """Format a run chain as a human-readable string.
+
+    For >5 runs: show the first 2 and last 2, compressing the middle.
+    The transition label ([recovery] / [degradation]) is taken from the
+    rightmost transition in the chain.
+    """
+    # Find the most recent (rightmost) transition type.
+    last_transition: Literal["recovery", "degradation"] | None = None
+    for ar in annotated_runs:
+        if ar.transition_type is not None:
+            last_transition = ar.transition_type
+
+    n = len(annotated_runs)
+    if n <= 5:
+        segments = [_format_run_segment(ar.run, group) for ar in annotated_runs]
+    else:
+        # Show first 2 + "... (N more)" + last 2.
+        head = [_format_run_segment(ar.run, group) for ar in annotated_runs[:2]]
+        tail = [_format_run_segment(ar.run, group) for ar in annotated_runs[-2:]]
+        compressed = n - 4
+        segments = head + [f"... ({compressed} more)"] + tail
+
+    chain_str = " → ".join(segments)
+    if last_transition:
+        chain_str += f" [{last_transition}]"
+    return f"{group.label}: {chain_str}"
+
+
+def _synthesize_chain_signals(
+    group_runs: dict[str, list[Run]],
+    valence_groups: dict[str, ValenceGroup],
+) -> tuple[list[FeedbackSignal], set[str]]:
+    """For each group with a polarity transition, synthesize one FeedbackSignal.
+
+    Returns:
+        chain_signals: list of synthesized FeedbackSignal (one per group
+            with at least one transition).
+        chain_consumed_kinds: set of rule-kind tags whose events are fully
+            rendered by a chain signal and should be skipped in the main
+            display loop.
+    """
+    chain_signals: list[FeedbackSignal] = []
+    chain_consumed_kinds: set[str] = set()
+
+    for group_key, runs in group_runs.items():
+        if len(runs) < 2:
+            continue  # need ≥ 2 runs to have any transition
+
+        annotated = _annotate_transitions(runs)
+        has_transition = any(ar.transition_type is not None for ar in annotated)
+        if not has_transition:
+            continue
+
+        group = valence_groups[group_key]
+        chain_str = _format_chain(annotated, group)
+
+        # The chain's polarity and timestamp come from the most recent run.
+        most_recent = runs[-1]
+        total_count = sum(r.count for r in runs)
+
+        chain_signals.append(FeedbackSignal(
+            ts=most_recent.end_ts,
+            polarity=most_recent.polarity,
+            kind=f"{group_key}_chain",
+            channel_id=None,
+            content=chain_str,
+            count=total_count,
+        ))
+
+        # Mark ALL kinds in this group as chain-consumed so the main loop
+        # skips their individual events (the chain renders the full sequence).
+        chain_consumed_kinds.update(group.positive_kinds)
+        chain_consumed_kinds.update(group.negative_kinds)
+
+    return chain_signals, chain_consumed_kinds
 
 
 # Render hooks: per-kind one-liner builders. Defaults to a generic
@@ -1008,6 +1428,19 @@ class FeedbackLog:
             self.events_snapshot, self.events_path, cutoff_iso
         )
 
+        # Temporal run detection (Alg-2 enhancement): scan for valence-group
+        # polarity transitions (recovery / degradation) and synthesize one
+        # chain FeedbackSignal per transitioning group.  chain_consumed_kinds
+        # is the set of rule-kind tags fully rendered by a chain — the main
+        # loop must skip those individual events so they don't duplicate.
+        # Chain signals are always-surface (bypass the per-polarity limit).
+        group_runs = _compute_group_runs(
+            self.events_snapshot, self.events_path, cutoff_iso, _VALENCE_GROUPS
+        )
+        chain_signals, chain_consumed_kinds = _synthesize_chain_signals(
+            group_runs, _VALENCE_GROUPS
+        )
+
         negatives: list[FeedbackSignal] = []
         positives: list[FeedbackSignal] = []
         # Kinds whose first occurrence (most recent, since we walk
@@ -1054,6 +1487,11 @@ class FeedbackLog:
                     polarity = ev_polarity
                 elif ev_polarity == "neutral":
                     continue
+            # Chain-consumed kinds: their events are fully rendered by a
+            # transition chain signal. Skip them in the individual-event
+            # path so they don't duplicate the chain line.
+            if kind in chain_consumed_kinds:
+                continue
             # Arousal filter: suppress kinds below their minimum-occurrence
             # threshold. Default threshold is 1 (always surface); raise in
             # _AROUSAL_THRESHOLDS for kinds where single occurrence is noise.
@@ -1092,6 +1530,17 @@ class FeedbackLog:
             # Early exit when both sides full.
             if len(negatives) >= limit and len(positives) >= limit:
                 break
+
+        # Inject chain signals (always-surface — they bypass the per-polarity
+        # limit).  Sort each bucket by ts descending so chain signals
+        # interleave correctly with individually-displayed events.
+        for sig in chain_signals:
+            if sig.polarity == "negative":
+                negatives.append(sig)
+            else:
+                positives.append(sig)
+        negatives.sort(key=lambda s: s.ts, reverse=True)
+        positives.sort(key=lambda s: s.ts, reverse=True)
 
         # 2) turns.jsonl — error / result_is_error are turn-level negatives
         # the events stream might not capture.
@@ -1187,7 +1636,13 @@ def _format_lines(signals: list[FeedbackSignal], *, window_hours: int = 24) -> l
         # surfaces the "pattern vs one-off" distinction that Beer's
         # arousal filter is meant to provide. A single occurrence renders
         # with no suffix — no noise for genuinely discrete events.
-        count_suffix = f" (×{sig.count} in {window_hours}h)" if sig.count > 1 else ""
+        # Exception: chain signals (kind ends with "_chain") already encode
+        # per-run counts inline ("succeeded ×20 → failed ×5 → ...") — a
+        # redundant total count suffix would be confusing and noisy.
+        if sig.kind.endswith("_chain"):
+            count_suffix = ""
+        else:
+            count_suffix = f" (×{sig.count} in {window_hours}h)" if sig.count > 1 else ""
         out.append(f"- {ts} — {sig.content}{count_suffix}{ch}")
     return out
 
