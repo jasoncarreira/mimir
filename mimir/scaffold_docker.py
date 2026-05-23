@@ -2,10 +2,14 @@
 
 Generates ``Dockerfile``, ``compose.yml``, ``compose.env`` (operator-edited
 secrets file), and ``start.sh`` into a mimir home so it can be deployed
-in a container the same way mimirbot is. Inspects ``<home>/skills/``
-to pick up per-skill OS-level deps (a skill that needs a system tool
-ships a ``dockerfile.fragment`` next to its ``SKILL.md``) and per-skill
-env-var requirements (``pollers.json`` ``pass_env``).
+in a container the same way mimirbot is. Inspects both
+``<home>/skills/`` (operator-installed) and
+``<home>/.mimir_builtin_skills/`` (the bundled refresh target) to pick
+up per-skill OS-level deps (a skill that needs a system tool ships a
+``dockerfile.fragment`` next to its ``SKILL.md``) and per-skill env-var
+requirements (``pollers.json`` ``pass_env``). Operator-side entries
+shadow bundled same-named entries on collision, matching
+``SkillsMiddleware``'s last-source-wins rule.
 
 **Idempotency contract:**
 
@@ -77,40 +81,62 @@ def _read_fragment(skill_name: str, *roots: Path) -> str | None:
 
 
 def collect_fragments(home: Path) -> list[Fragment]:
-    """For each skill present in ``<home>/skills/``, look up its
+    """For each skill present in ``<home>/skills/`` OR
+    ``<home>/.mimir_builtin_skills/``, look up its
     ``dockerfile.fragment`` — preferring the installed copy in the home,
     falling back to the bundled source (``mimir/skills/<name>/`` or
     ``optional-skills/<name>/``). Ordered alphabetically by skill name
     for stable Dockerfile output.
 
-    The fallback handles the case where a home was seeded before the
-    fragment file existed in the bundle: ``seed_skills`` won't refresh
-    an existing skill dir, so the operator's home lacks the new file
-    even though they have the skill. The scaffolder paints over that
-    gap.
+    Both source dirs get walked so bundled skills with OS deps
+    (notably ``chainlink``, which ships a ``dockerfile.fragment``
+    that builds ``chainlink-tracker``) get their fragment included
+    even when the operator hasn't manually installed them under
+    ``skills/``. Dedupe by name — operator-side dirs win on
+    collision, matching the rest of the dual-location contract
+    (SkillsMiddleware's last-source-wins shadowing).
+
+    The bundled-source fallback for the fragment FILE itself handles
+    the older case where a home was seeded before the fragment file
+    existed in the bundle: ``seed_skills`` won't refresh an existing
+    skill dir, so the operator's home lacks the new file even though
+    they have the skill.
     """
-    skills_root = home / "skills"
-    if not skills_root.is_dir():
-        return []
-    out: list[Fragment] = []
-    for skill_dir in sorted(skills_root.iterdir()):
-        if not skill_dir.is_dir() or skill_dir.name.startswith("."):
+    operator_dir = home / "skills"
+    builtin_dir = home / ".mimir_builtin_skills"
+    seen: dict[str, Path] = {}
+    for src in (builtin_dir, operator_dir):
+        if not src.is_dir():
             continue
+        for skill_dir in src.iterdir():
+            if not skill_dir.is_dir() or skill_dir.name.startswith("."):
+                continue
+            seen[skill_dir.name] = src  # operator dir wins (iterated second)
+
+    out: list[Fragment] = []
+    for skill_name in sorted(seen):
+        skills_root = seen[skill_name]
         content = _read_fragment(
-            skill_dir.name,
-            skills_root,  # check home first (operator may have edited)
+            skill_name,
+            skills_root,  # check the location it was found in first
             *_BUNDLED_SKILL_ROOTS,  # then bundled defaults / optional
         )
         if content is None:
             continue
-        out.append(Fragment(skill_name=skill_dir.name, content=content))
+        out.append(Fragment(skill_name=skill_name, content=content))
     return out
 
 
 def collect_required_env_vars(home: Path) -> list[str]:
-    """Walk ``<home>/skills/*/pollers.json`` and collect every
-    env var listed in ``pass_env`` across all poller skills. De-duped,
-    sorted. Plus baseline mimir vars (MIMIR_API_KEY, etc.).
+    """Walk ``<home>/skills/*/pollers.json`` AND
+    ``<home>/.mimir_builtin_skills/*/pollers.json`` and collect every
+    env var listed in ``pass_env`` across all poller skills. De-duped.
+    Plus baseline mimir vars (MIMIR_API_KEY, etc.).
+
+    Mirrors :func:`collect_fragments`'s dual-location scan so a bundled
+    poller (none ship today, but the architecture allows it) gets its
+    ``pass_env`` requirements surfaced into ``compose.env`` without the
+    operator having to duplicate the skill into ``<home>/skills/``.
     """
     baseline = [
         "MIMIR_API_KEY",           # auth gate for non-shell HTTP routes
@@ -126,9 +152,10 @@ def collect_required_env_vars(home: Path) -> list[str]:
     ]
     seen = set(baseline)
     extra: list[str] = []
-    skills_root = home / "skills"
-    if skills_root.is_dir():
-        for skill_dir in sorted(skills_root.iterdir()):
+    for root in (home / ".mimir_builtin_skills", home / "skills"):
+        if not root.is_dir():
+            continue
+        for skill_dir in sorted(root.iterdir()):
             if not skill_dir.is_dir() or skill_dir.name.startswith("."):
                 continue
             pollers_json = skill_dir / "pollers.json"
@@ -188,7 +215,8 @@ FROM python:3.11-slim
 # 2026-05: git for the source clone + agent dev loop, gh for PR
 # creation, build-essential for any C extensions, ca-certificates for
 # HTTPS clones, poppler-utils for Claude Code's PDF Read, Node 20
-# (claude-agent-sdk + mermaid-cli are npm packages).
+# (claude-agent-sdk + mermaid-cli are npm packages), jq for JSONL
+# log parsing across many skill bodies + the introspection recipes.
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends \\
         git \\
@@ -198,6 +226,7 @@ RUN apt-get update \\
         gnupg \\
         tmux \\
         poppler-utils \\
+        jq \\
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\
         | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\
  && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \\
