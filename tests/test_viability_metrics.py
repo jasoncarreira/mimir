@@ -263,11 +263,10 @@ def test_curation_counts_feedback_and_forget_events(tmp_path: Path):
     now = datetime.now(tz=timezone.utc)
     _write_event(tmp_path, type="saga_feedback_sent", ts=now)
     _write_event(tmp_path, type="saga_feedback_sent", ts=now)
-    _write_event(tmp_path, type="saga_feedback_ok", ts=now)
     _write_event(tmp_path, type="saga_forget_ok", ts=now)
     _write_event(tmp_path, type="some_other_event", ts=now)  # ignored
     metrics = vm.compute_curation_metrics(tmp_path, window_days=28, now=now)
-    assert metrics.feedback_event_count == 3
+    assert metrics.feedback_event_count == 2
     assert metrics.forget_event_count == 1
 
 

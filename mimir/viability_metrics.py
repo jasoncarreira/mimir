@@ -68,10 +68,12 @@ from typing import Iterable
 log = logging.getLogger(__name__)
 
 
-# ── thresholds (operator-tunable via env vars; loaded at run time) ──
+# ── thresholds (proposed starting points; tune by editing here, or
+#    add env-var overrides later if operators need per-deployment knobs) ──
 
 
-# Collapse thresholds (operator-tunable later; conservative defaults).
+# Collapse thresholds — conservative defaults; revisit once we have
+# multi-deployment baselines.
 COSINE_SIM_MEAN_THRESHOLD = 0.85
 ATOM_CITATION_GINI_THRESHOLD = 0.70
 TOPIC_DIVERSITY_MIN_RATIO = 0.20
@@ -307,8 +309,10 @@ def compute_collapse_metrics(
     """Compute the three collapse indicators over a trailing window.
 
     ``window_days`` — only include turns with ts within the window.
-    ``max_turns`` — hard cap on output-embedding pairs (cosine is
-    O(n²); 200 keeps the report tractable).
+    ``max_turns`` — hard cap on outputs to embed. We compute cosine
+    on consecutive pairs (O(n) pair comparisons), so the dominant cost
+    is the fastembed step itself: 200 turns keeps embedding time
+    bounded on the weekly cron without truncating realistic windows.
     """
     now = now or datetime.now(tz=timezone.utc)
     horizon = now - timedelta(days=window_days)
@@ -336,7 +340,8 @@ def compute_collapse_metrics(
         trigger = str(rec.get("trigger") or "")
         topic_keys.append((channel, trigger, _top_token(output)))
 
-    # Cap output count for cosine (O(n²) cost).
+    # Cap to bound fastembed cost (consecutive-pair cosine is O(n);
+    # the embedding step is the actual cost driver).
     outputs_sample = outputs[-max_turns:]
 
     # Output cosine similarity — uses fastembed via the existing
@@ -448,7 +453,7 @@ def compute_curation_metrics(
 
     feedback_event_count = 0
     forget_event_count = 0
-    feedback_event_types = {"saga_feedback_sent", "saga_feedback_ok"}
+    feedback_event_types = {"saga_feedback_sent"}
 
     for rec in _iter_jsonl(home / "logs" / "events.jsonl"):
         ts = _parse_ts(rec.get("timestamp"))
