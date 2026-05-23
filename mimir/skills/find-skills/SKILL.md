@@ -1,35 +1,9 @@
 ---
 name: find-skills
 description: Discover what bundled skills exist in this mimir install and what each one does. Use when you're not sure if a capability is already covered by a skill ("can I X?", "is there a skill for Y?", "what skills do I have?"). Reads SKILL.md frontmatter from each skill directory and surfaces names + descriptions.
-subagent: true
 allowed-tools:
   - Bash
   - Read
-params:
-  type: object
-  properties:
-    query:
-      type: string
-      description: Optional case-insensitive substring to match against skill names and descriptions. Omit to list every installed skill.
-  required: []
-returns:
-  title: find_skills_result
-  description: Discovery payload listing every bundled skill that matched the query (or all skills when no query was supplied). ``count == 0`` when nothing matches — the parent can route to skill-acquisition or proceed with built-in tools.
-  type: object
-  properties:
-    skills:
-      type: array
-      description: Matching skills. Each entry carries the name as advertised in frontmatter plus the operator's description line. Sorted by name.
-      items:
-        type: object
-        properties:
-          name: {type: string, description: "Skill identifier (matches directory name)."}
-          description: {type: string, description: "First paragraph of the frontmatter description field."}
-        required: [name, description]
-    count:
-      type: integer
-      description: Number of skills in the `skills` array — convenience field for the parent agent's "are there any?" checks.
-  required: [skills, count]
 ---
 
 # Find Skills
