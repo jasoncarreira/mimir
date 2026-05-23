@@ -120,7 +120,13 @@ class WriteGuardBackend:
         "download_files", "adownload_files",
     })
 
-    def __init__(self, root_dir: Path, writable_dirs: list[str]) -> None:
+    def __init__(
+        self,
+        root_dir: Path,
+        writable_dirs: list[str],
+        *,
+        enforce_core_memory_reflection_only: bool = True,
+    ) -> None:
         self._root = Path(root_dir).resolve()
         self._fs = _RootAwareFilesystemBackend(root_dir=root_dir, virtual_mode=True)
         cleaned: list[str] = []
@@ -136,6 +142,19 @@ class WriteGuardBackend:
         ]
         # For error messages — the friendlier "/state/" form.
         self._writable_labels: list[str] = ["/" + d for d in cleaned]
+        # Pre-resolved memory/core/ root for the S5-2 turn-type gate.
+        # When ``enforce_core_memory_reflection_only`` is True, writes
+        # under this path are only allowed during the weekly reflection
+        # turn (``trigger == "scheduled_tick"`` AND ``channel_id`` starts
+        # with ``"scheduler:reflect"``). All other turn types — heartbeats,
+        # user messages, react events, ad-hoc scheduled callables — are
+        # blocked. The policy is documented in
+        # ``memory/core/30-reflection-policy.md`` but was previously
+        # text-only; this is the code enforcement layer (VSM eval S5-2).
+        self._memory_core_root: Path = (self._root / "memory" / "core").resolve()
+        self._enforce_core_memory_reflection_only: bool = (
+            enforce_core_memory_reflection_only
+        )
         # Recorded denials, one per blocked Write/Edit/upload. The agent
         # drains this list at end-of-turn (``drain_denials()``) into
         # TurnRecord.permission_denials so the audit trail is visible
@@ -223,6 +242,54 @@ class WriteGuardBackend:
             for root in self._writable_roots
         )
 
+    def _is_core_memory_write_blocked(self, file_path: str) -> bool:
+        """True iff this write should be refused by the S5-2 turn-type gate.
+
+        Returns True only when ALL of these hold:
+          1. The resolved target is under ``memory/core/``
+          2. ``enforce_core_memory_reflection_only`` is True (default)
+          3. There is an active ``TurnContext``
+          4. That turn is NOT the weekly reflection
+             (``trigger != "scheduled_tick"`` or
+             ``channel_id`` does not start with ``"scheduler:reflect"``)
+
+        Returns False in every other case — including "no active turn"
+        (so backend tests, ``mimir setup``, and non-turn callables are
+        not affected). The first check (writable-root membership) is
+        done by ``_is_write_allowed``; this gate stacks on top.
+        """
+        if not self._enforce_core_memory_reflection_only:
+            return False
+        resolved = self._resolve_target(file_path)
+        if resolved is None:
+            return False
+        under_core = (
+            resolved == self._memory_core_root
+            or resolved.is_relative_to(self._memory_core_root)
+        )
+        if not under_core:
+            return False
+        # Lazy import to avoid a module cycle (mimir._context → models
+        # → potentially back into the agent layer that constructs the
+        # backend).
+        from ._context import get_current_turn
+        ctx = get_current_turn()
+        if ctx is None:
+            return False  # no turn → fall through (tests / setup / cron)
+        is_reflection = (
+            ctx.trigger == "scheduled_tick"
+            and (ctx.channel_id or "").startswith("scheduler:reflect")
+        )
+        return not is_reflection
+
+    _CORE_MEMORY_DENY_REASON = (
+        "Write blocked: memory/core/ is reflection-only by policy "
+        "(memory/core/30-reflection-policy.md, §S5-2). Edit during a "
+        "trigger=scheduled_tick channel=scheduler:reflect turn, or "
+        "escalate to the operator. To stage a change, write to "
+        "state/proposed-changes.md."
+    )
+
     def _allowed_dirs_label(self) -> str:
         return ", ".join(f"{label}/" for label in self._writable_labels)
 
@@ -232,6 +299,9 @@ class WriteGuardBackend:
             return WriteResult(
                 error=f"Write blocked. Writable directories: {self._allowed_dirs_label()}",
             )
+        if self._is_core_memory_write_blocked(file_path):
+            self._record_denial("write_core_memory_non_reflection", file_path)
+            return WriteResult(error=self._CORE_MEMORY_DENY_REASON)
         # Idempotent with the strip already applied inside
         # ``_resolve_target`` during the writable-root check — the
         # explicit call here keeps the forward to ``self._fs`` self-
@@ -256,6 +326,9 @@ class WriteGuardBackend:
             return EditResult(
                 error=f"Edit blocked. Writable directories: {self._allowed_dirs_label()}",
             )
+        if self._is_core_memory_write_blocked(file_path):
+            self._record_denial("edit_core_memory_non_reflection", file_path)
+            return EditResult(error=self._CORE_MEMORY_DENY_REASON)
         # Idempotent with ``_resolve_target`` — see ``write`` above.
         return self._fs.edit(
             file_path=self._canonicalize_path(file_path),
@@ -287,9 +360,12 @@ class WriteGuardBackend:
         # mixed response shape would be more surprising than failing
         # the batch cleanly.
         blocked_paths = {p for p, _ in files if not self._is_write_allowed(p)}
-        if blocked_paths:
+        core_blocked = {p for p, _ in files if self._is_core_memory_write_blocked(p)}
+        if blocked_paths or core_blocked:
             for p in blocked_paths:
                 self._record_denial("upload", p)
+            for p in core_blocked - blocked_paths:
+                self._record_denial("upload_core_memory_non_reflection", p)
             return [
                 FileUploadResponse(path=p, error="permission_denied")
                 for p, _ in files
