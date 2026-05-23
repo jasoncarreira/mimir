@@ -158,6 +158,14 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # Recovery procedure: §8.3 (rebuild_index / saga_calibration.re_embed).
     "index_integrity_ok": ("positive", "index_integrity_ok"),
     "index_integrity_failed": ("negative", "index_integrity_failed"),
+    # SPEC §4.9 / §16 item 18 — mid-turn quota exhaustion: the model
+    # call returned a 429 and the agent recorded a pause via
+    # QuotaPauseTracker. The arbiter suppresses scheduled ticks while
+    # paused. ``quota_recovered`` fires once on the lazy-expiry
+    # transition (when ``now`` crosses the recorded reset time) so
+    # the agent's feedback block can show "transient, recovered."
+    "quota_exhausted": ("negative", "quota_exhausted"),
+    "quota_recovered": ("positive", "quota_recovered"),
     "git_pull_ok": ("positive", "git_pull_ok"),
     "git_fetch_ok": ("positive", "git_fetch_ok"),
     "shell_job_complete_enqueue_ok": ("positive", "shell_job_complete_enqueue_ok"),
