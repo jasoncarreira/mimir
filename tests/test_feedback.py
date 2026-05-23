@@ -787,3 +787,146 @@ def test_tool_call_budget_soft_warning_renders_as_negative(tmp_path: Path):
     assert any("tool_budget" in s.kind for s in negatives), (
         "tool_call_budget_soft_warning should surface as a tool_budget negative"
     )
+
+
+# ─── Alg-2: Beer arousal filter — count tracking and threshold gating ───
+
+
+def test_count_default_is_1_for_single_occurrence(tmp_path: Path):
+    """A single event in the window produces a FeedbackSignal with count=1.
+    No suffix in the rendered block — discrete events aren't annotated."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(0.5), "type": "git_push_failed",
+         "reason": "ssh refused", "returncode": 128, "turn_id": "t"},
+    ])
+    negatives, _ = log.recent()
+    assert len(negatives) == 1
+    assert negatives[0].count == 1
+
+    block = log.recent_block()
+    assert block is not None
+    assert "×" not in block  # no count suffix for one-offs
+
+
+def test_count_tracks_all_window_occurrences_for_first_occurrence_only_kind(
+    tmp_path: Path,
+):
+    """Kinds in _FIRST_OCCURRENCE_ONLY_KINDS show only the most recent
+    occurrence, but the attached count reflects ALL window occurrences.
+    This is the core arousal-filter signal: 'git_push_ok ×47' vs '×1'."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(5.0), "type": "git_push_ok", "turn_id": "t_a"},
+        {"timestamp": _ts(2.0), "type": "git_push_ok", "turn_id": "t_b"},
+        {"timestamp": _ts(0.5), "type": "git_push_ok", "turn_id": "t_c"},
+    ])
+    _, positives = log.recent()
+    assert len(positives) == 1  # only most-recent shown
+    assert positives[0].count == 3  # but count reflects all 3
+
+
+def test_count_suffix_renders_in_block_when_gt_1(tmp_path: Path):
+    """The rendered block includes '(×N in 24h)' when a kind fires
+    more than once in the window — pattern visibility per Alg-2."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(2.0), "type": "git_push_ok", "turn_id": "t_a"},
+        {"timestamp": _ts(0.5), "type": "git_push_ok", "turn_id": "t_b"},
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "×2 in 24h" in block
+
+
+def test_count_suffix_uses_actual_window_hours(tmp_path: Path):
+    """Count suffix uses the caller-supplied window_hours, not a hardcoded 24."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(0.5), "type": "git_push_ok", "turn_id": "t_a"},
+        {"timestamp": _ts(0.2), "type": "git_push_ok", "turn_id": "t_b"},
+    ])
+    block = log.recent_block(window_hours=48)
+    assert block is not None
+    assert "×2 in 48h" in block
+
+
+def test_count_tracks_by_rule_kind_not_event_type(tmp_path: Path):
+    """Different event types that map to the same rule kind share the
+    kind-level count. E.g. tool_call_budget_denied and
+    tool_call_budget_soft_warning both map to rule kind 'tool_budget'."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(2.0), "type": "tool_call_budget_denied",
+         "channel_id": "c", "count": 11, "budget": 10},
+        {"timestamp": _ts(0.5), "type": "tool_call_budget_soft_warning",
+         "channel_id": "c", "count": 9, "budget": 10},
+    ])
+    negatives, _ = log.recent()
+    # Both events have kind "tool_budget"; combined count = 2.
+    tool_budget_signals = [s for s in negatives if s.kind == "tool_budget"]
+    assert len(tool_budget_signals) >= 1
+    assert tool_budget_signals[0].count == 2
+
+
+def test_arousal_threshold_suppresses_below_min_occurrences(tmp_path: Path):
+    """A kind with threshold=2 and only 1 occurrence is suppressed.
+    Per Beer: single-occurrence doesn't clear the statistical filter."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(0.5), "type": "error",
+         "where": "test", "error": "one-off", "channel_id": "c"},
+    ])
+    # Override: require 2 occurrences for "error" kind before surfacing.
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(0.5), "type": "error",
+         "where": "test", "error": "one-off", "channel_id": "c"},
+    ])
+    log.arousal_thresholds = {"error": 2}
+    negatives, positives = log.recent()
+    # error was the only event; below threshold → suppressed.
+    assert len(negatives) == 0
+    assert len(positives) == 0
+
+
+def test_arousal_threshold_surfaces_when_count_meets_threshold(tmp_path: Path):
+    """A kind with threshold=2 and exactly 2 occurrences clears the filter
+    and surfaces with count=2 attached."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(2.0), "type": "error",
+         "where": "test", "error": "first", "channel_id": "c"},
+        {"timestamp": _ts(0.5), "type": "error",
+         "where": "test", "error": "second", "channel_id": "c"},
+    ])
+    log.arousal_thresholds = {"error": 2}
+    negatives, _ = log.recent()
+    assert len(negatives) > 0
+    assert negatives[0].count == 2
+
+
+def test_arousal_threshold_default_1_does_not_suppress_anything(tmp_path: Path):
+    """With default thresholds (empty dict → all default to 1), every
+    matching event surfaces on first occurrence — existing behaviour preserved."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(0.5), "type": "tool_call_denied",
+         "tool": "file_search", "reason": "budget", "channel_id": "c"},
+    ])
+    # No custom thresholds — should behave exactly as before Alg-2.
+    assert log.arousal_thresholds is None
+    negatives, _ = log.recent()
+    assert len(negatives) == 1
+
+
+def test_count_on_non_first_occurrence_kind_aggregates(tmp_path: Path):
+    """For kinds NOT in _FIRST_OCCURRENCE_ONLY_KINDS with distinct content,
+    each occurrence gets its own slot AND carries the total kind count.
+    The count on each is the same (total kind occurrences in window), not
+    the per-content occurrence count."""
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(2.0), "type": "tool_call_denied",
+         "tool": "Read", "reason": "outside_home", "channel_id": "c"},
+        {"timestamp": _ts(0.5), "type": "tool_call_denied",
+         "tool": "Write", "reason": "outside_home", "channel_id": "c"},
+    ])
+    negatives, _ = log.recent()
+    # Both denials surface (distinct content).
+    assert len(negatives) == 2
+    # Each carries the total kind count (2 tool_denied events).
+    assert all(s.count == 2 for s in negatives)
+    block = log.recent_block()
+    # Both lines show the count suffix.
+    assert block.count("×2 in 24h") == 2
