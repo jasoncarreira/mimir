@@ -1696,6 +1696,34 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Only run probes for this consumer type (see docs/credentials.md).",
     )
 
+    # ``mimir rotate`` — credential rotation (SPEC §16 item 14, Phase 3).
+    # Atomic compose.env edit + force-recreate + post-rotation verify,
+    # with rollback if verification fails. Run from the deployment dir.
+    rotate_p = sub.add_parser(
+        "rotate",
+        help="Rotate a single env credential — compose.env edit + recreate + verify.",
+    )
+    rotate_p.add_argument(
+        "--env", required=True, dest="env_name",
+        help="Env var name to rotate (e.g. GITHUB_TOKEN).",
+    )
+    rotate_p.add_argument(
+        "--from-file", default=None, dest="from_file",
+        help="Read new value from this file. Default: read one line from stdin (getpass'd if a TTY).",
+    )
+    rotate_p.add_argument(
+        "--service", default=None,
+        help="Compose service name to recreate + verify against. Auto-detected if only one service.",
+    )
+    rotate_p.add_argument(
+        "--deployment-dir", default=None, dest="deployment_dir",
+        help="Directory containing compose.env + compose.yml. Default: cwd.",
+    )
+    rotate_p.add_argument(
+        "--no-recreate", action="store_true", dest="skip_recreate",
+        help="Skip docker compose recreate + verify; only update compose.env.",
+    )
+
     loops_p = sub.add_parser(
         "loops",
         help="Show feedback-loop inventory + last-fire status (FUTURE_WORK §12.6b).",
@@ -2017,6 +2045,24 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "verify-creds":
         from .cred_verify import run_verify_creds_cmd
         sys.exit(run_verify_creds_cmd(only_type=args.cred_type))
+
+    if args.command == "rotate":
+        from .cred_rotate import run_rotate
+        new_value: str | None = None
+        if args.from_file:
+            try:
+                new_value = Path(args.from_file).read_text(encoding="utf-8").rstrip("\n")
+            except OSError as exc:
+                print(f"can't read --from-file: {exc}", file=sys.stderr)
+                sys.exit(2)
+        dep = Path(args.deployment_dir).resolve() if args.deployment_dir else None
+        sys.exit(run_rotate(
+            env_name=args.env_name,
+            new_value=new_value,
+            deployment_dir=dep,
+            service=args.service,
+            skip_recreate=args.skip_recreate,
+        ))
 
     if args.command == "loops":
         from .loops_cmd import run_loops_cmd
