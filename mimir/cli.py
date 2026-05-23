@@ -1675,6 +1675,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
 
+    # `mimir verify-cred <name>` / `mimir verify-creds` — credential
+    # verification probes (SPEC §16 item 14, Phase 2). Probes live in
+    # mimir/cred_verify.py; this CLI is the thin shell. Returns exit 0
+    # if live, 1 if stale, 2 if the credential name isn't registered.
+    verify_cred_p = sub.add_parser(
+        "verify-cred",
+        help="Verify a single credential by name (e.g. GITHUB_TOKEN).",
+    )
+    verify_cred_p.add_argument(
+        "name", help="Credential name from the registry (see ``mimir verify-creds``).",
+    )
+    verify_creds_p = sub.add_parser(
+        "verify-creds",
+        help="Verify all registered credentials (optionally filtered by type).",
+    )
+    verify_creds_p.add_argument(
+        "--type", choices=["A", "B", "C", "D"], default=None,
+        dest="cred_type",
+        help="Only run probes for this consumer type (see docs/credentials.md).",
+    )
+
     loops_p = sub.add_parser(
         "loops",
         help="Show feedback-loop inventory + last-fire status (FUTURE_WORK §12.6b).",
@@ -1988,6 +2009,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             file=sys.stderr,
         )
         return
+
+    if args.command == "verify-cred":
+        from .cred_verify import run_verify_cred_cmd
+        sys.exit(run_verify_cred_cmd(args.name))
+
+    if args.command == "verify-creds":
+        from .cred_verify import run_verify_creds_cmd
+        sys.exit(run_verify_creds_cmd(only_type=args.cred_type))
 
     if args.command == "loops":
         from .loops_cmd import run_loops_cmd
