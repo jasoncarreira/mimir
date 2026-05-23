@@ -1,6 +1,6 @@
 ---
 name: social-cli
-description: Bluesky + X social loop. The bundled poller runs `social-cli sync` on cron (default `*/15`), parses `inbox.yaml`, and wakes the agent in batches of up to 3 never-seen notifications per turn. Agent reads inbox, writes `outbox.yaml`, runs `social-cli dispatch`. Also supports one-shot commands (post/reply/thread/like). Opt-in: install the skill, drop `.env` credentials into `<home>/state/pollers/social-cli-notifications/`.
+description: Bluesky + X social loop. The bundled notifications poller runs `social-cli sync` on cron (default `*/15`), parses `inbox.yaml`, and wakes the agent in batches of up to 3 never-seen notifications per turn. The optional feed poller runs `social-cli feed` every 2h for timeline scanning. Agent reads inbox, writes `outbox.yaml`, runs `social-cli dispatch`. Also supports one-shot commands (post/reply/thread/like). Opt-in: install the skill, drop `.env` credentials into `<home>/state/pollers/social-cli-notifications/`. Companion to the `pollers` framework skill and the `world-scanning` skill.
 ---
 
 # social-cli — Bluesky + X social loop
@@ -98,26 +98,55 @@ reload_pollers
 # → "social-cli-notifications" appears in the registered list
 ```
 
+## The two pollers
+
+`pollers.json` declares two pollers:
+
+| Poller name                  | Cron          | Surface                                  | `batch_size` |
+|---|---|---|---|
+| `social-cli-notifications`   | `*/15 * * * *`| Mentions, replies, follows, likes        | 3            |
+| `social-cli-feed`            | `0 */2 * * *` | Timeline posts from accounts followed    | 10           |
+
+Each poller gets its own `STATE_DIR` (`<home>/state/pollers/<name>/`),
+its own cursor (`emitted.json`), and its own copy of the credentials
+`.env`. The two run independently. Credentials are identical between
+them — easiest is to symlink:
+
+```bash
+ln -s ../social-cli-notifications/.env \
+      <home>/state/pollers/social-cli-feed/.env
+```
+
 ## Poller-tunable env vars
 
-| Variable                 | Default      | Notes |
-|---|---|---|
-| `MIMIR_SOCIAL_PLATFORMS` | `bsky,x`     | CSV. Drop platforms not configured. |
-| `MIMIR_SOCIAL_LIMIT`     | `50`         | Per-platform sync cap, 1–200. |
-| `MIMIR_SOCIAL_USERS_DIR` | (unset)      | Path to user-memory `.md` files; matched notifications get a `userContext` field. |
-| `SOCIAL_CLI_BIN`         | `social-cli` | Override binary path. |
+| Variable                    | Default      | Used by | Notes |
+|---|---|---|---|
+| `MIMIR_SOCIAL_PLATFORMS`    | `bsky,x`     | both    | CSV. Drop platforms not configured. |
+| `MIMIR_SOCIAL_LIMIT`        | `50`         | notif   | Per-platform sync cap, 1–200. |
+| `MIMIR_SOCIAL_FEED_LIMIT`   | `50`         | feed    | Per-platform feed cap, 1–200. |
+| `MIMIR_SOCIAL_USERS_DIR`    | (unset)      | notif   | Path to user-memory `.md` files; matched notifications get a `userContext` field. |
+| `SOCIAL_CLI_BIN`            | `social-cli` | both    | Override binary path. |
 
-All four are in `pollers.json` `pass_env` so the `MIMIR_*` filter
+All are listed in `pollers.json` `pass_env` so the `MIMIR_*` filter
 doesn't strip them.
 
 ## Wake batching
 
-`pollers.json` sets `batch_size: 3` — the framework coalesces up
-to 3 never-seen notifications into a single AgentEvent. With N new
-notifications, the agent wakes `ceil(N / 3)` times. So 1 mention
-= 1 turn, 5 mentions = 2 turns (3 + 2), 10 mentions = 4 turns
-(3+3+3+1). Compose one `outbox.yaml` per turn covering all
-notifications surfaced that turn, then dispatch once.
+Both pollers coalesce via the framework's `batch_size` field — one
+AgentEvent per batch, not per item. With N new items the agent wakes
+`ceil(N / batch_size)` times.
+
+- **Notifications** (`batch_size: 3`): 1 mention = 1 turn, 5 = 2
+  turns (3 + 2), 10 = 4 turns. Tight batches because mentions need
+  fast, individual responses.
+- **Feed** (`batch_size: 10`): 27 posts = 3 turns of up to 10. Bigger
+  batches because timeline scanning is bulk-context, not 1:1 reply.
+
+For notifications, compose one `outbox.yaml` per turn covering all
+items surfaced that turn, then `dispatch` once. For feed turns the
+agent typically just observes; if it decides to engage with a feed
+post, that engagement goes through the same `outbox.yaml` →
+`dispatch` path (or a one-shot `social-cli post`/`reply`).
 
 ## Cursor model — two cursors, both needed
 
@@ -138,7 +167,10 @@ backlog storm, run `social-cli sync` once in `STATE_DIR` before
 
 ## Working directory contents
 
-`STATE_DIR` is `cwd` for every social-cli invocation. Files there:
+Each poller has its own `STATE_DIR` (= `<home>/state/pollers/<name>/`)
+and that's `cwd` for any `social-cli` invocation it makes.
+
+**`social-cli-notifications/`:**
 
 - `.env` — credentials (operator-managed, mode 600)
 - `inbox.yaml` — social-cli's notification queue
@@ -148,12 +180,19 @@ backlog storm, run `social-cli sync` once in `STATE_DIR` before
 - `dispatch_result-*.yaml`, `sent_ledger-*.yaml` — audit trail
 - `emitted.json` — poller cursor
 
+**`social-cli-feed/`:**
+
+- `.env` — credentials (symlink to the notifications poller's `.env`)
+- `feed-{bsky,x}.yaml` — social-cli's per-platform timeline output
+- `emitted.json` — feed poller cursor
+
 Don't move social-cli's files out of `STATE_DIR` — every command
 reads/writes relative to cwd.
 
-## What the poller emits
+## What the pollers emit
 
-One JSONL event per never-seen notification:
+**Notifications poller** — one JSONL event per never-seen mention /
+reply / follow / like / repost directed at the agent's handle:
 
 ```json
 {
@@ -167,6 +206,25 @@ One JSONL event per never-seen notification:
   "text": "...",
   "timestamp": "2026-03-25T12:00:00Z",
   "post_id": "at://did:plc:xxx/app.bsky.feed.post/abc"
+}
+```
+
+**Feed poller** — one JSONL event per never-seen post on the
+agent's home timeline:
+
+```json
+{
+  "poller": "social-cli-feed",
+  "prompt": "[bsky] feed post from alice.bsky.social\n  > Interesting take ...\n  id: at://did:plc:xxx/app.bsky.feed.post/abc\n  likes:42 replies:7 reposts:3",
+  "source_platform": "bsky",
+  "post_id": "at://did:plc:xxx/app.bsky.feed.post/abc",
+  "author": "alice.bsky.social",
+  "author_id": "did:plc:xxx",
+  "text": "Interesting take ...",
+  "timestamp": "2026-05-23T12:00:00Z",
+  "like_count": 42,
+  "reply_count": 7,
+  "repost_count": 3
 }
 ```
 
