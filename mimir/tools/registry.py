@@ -24,6 +24,7 @@ to memory_tool.py's set_memory_client pattern.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import asyncio
 import logging
@@ -37,6 +38,12 @@ log = logging.getLogger(__name__)
 from langchain_core.runnables import RunnableConfig
 
 from ..bridges._directives import parse_directives, ReactDirective
+
+# Per-task ContextVar for channel_id — isolated across concurrent asyncio
+# Tasks so concurrent turns on different channels don't race (S2-1 fix).
+_current_channel_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mimir_current_channel_id", default=None
+)
 
 
 def _channel_from_config_or_state(
@@ -63,7 +70,7 @@ def _channel_from_config_or_state(
         from_config = (configurable.get("channel_id") or "").strip()
         if from_config:
             return from_config
-    return (_STATE.get("current_channel_id") or "").strip()
+    return (_current_channel_id_var.get() or "").strip()
 
 from langchain_core.tools import InjectedToolArg, tool
 
@@ -102,10 +109,20 @@ def set_spawn_config(config: Any) -> None:
     _STATE["spawn_config"] = config
 
 
-def set_current_channel_id(channel_id: str | None) -> None:
-    """Called per-turn by the dispatcher so channel-scoped tools
-    (send_message, react) default to the right channel."""
-    _STATE["current_channel_id"] = channel_id
+def set_current_channel_id(channel_id: str | None) -> contextvars.Token:
+    """Set the per-task channel_id. Returns a Token; call
+    reset_current_channel_id(token) in a finally block to restore.
+
+    ContextVar is isolated per asyncio.Task — concurrent turns on
+    different channels don't race. Replaces the old process-global
+    _STATE["current_channel_id"] write (S2-1 fix).
+    """
+    return _current_channel_id_var.set(channel_id)
+
+
+def reset_current_channel_id(token: contextvars.Token) -> None:
+    """Restore the prior channel_id using the Token from set_current_channel_id."""
+    _current_channel_id_var.reset(token)
 
 
 # ────────────────────────────────────────────────────────────────────

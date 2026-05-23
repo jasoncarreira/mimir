@@ -440,6 +440,16 @@ class Config:
     # arbitrary session id (and call saga_end_session etc.).
     api_key: str
 
+    # Set MIMIR_ALLOW_UNAUTHENTICATED=true to suppress the startup
+    # security warning when MIMIR_API_KEY is empty. For development /
+    # localhost use only; production deployments should set MIMIR_API_KEY.
+    allow_unauthenticated: bool
+
+    # Per-turn wall-clock timeout in seconds. 0 = no timeout (bench/dev).
+    # Default 1800 (30 min) catches indefinitely hung turns while
+    # allowing legitimate long heartbeat or reflection work.
+    turn_timeout_seconds: int
+
     # Algedonic surfacing (v0.4 §2). Window for the Recent feedback
     # signals prompt section; per-polarity cap on rendered items. 0 for
     # the limit disables the section entirely. Tune small if the prompt
@@ -690,6 +700,9 @@ class Config:
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
             api_key=_env("MIMIR_API_KEY"),
+            allow_unauthenticated=_env("MIMIR_ALLOW_UNAUTHENTICATED", "false").lower()
+                in {"true", "1", "yes"},
+            turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", 3600),
 
             feedback_window_hours=_env_int("MIMIR_FEEDBACK_WINDOW_HOURS", 24),
             feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),
