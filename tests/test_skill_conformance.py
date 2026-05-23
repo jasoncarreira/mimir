@@ -14,16 +14,17 @@ Schema today (minimum spine):
   description: <non-empty, prose preferred>
   ---
 
-Future extensions land here as later subissues:
-
-  * chainlink #79 (G3 ``allowed-tools:``) — once the field is added,
-    assert it is present (populated or explicitly empty).
-  * G4 ``triggers:`` (deferred) — would add a similar assertion.
+The ``allowed-tools:`` field used to live here (chainlink #79 / G3)
+but was removed 2026-05-23 — deepagents' SkillsMiddleware silently
+rejected mimir's YAML-list form (string-only per Anthropic Agent
+Skills spec), so the field never rendered in the catalog and had no
+runtime enforcement. After the SubAgent delegation rip-out (PR #271)
+there was no remaining consumer for the field; it got dropped along
+with its conformance audit.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
@@ -31,7 +32,6 @@ import pytest
 from mimir.skill_md import (
     extract_list_field as _extract_list_field,
     parse_frontmatter as _parse_frontmatter,
-    strip_frontmatter as _strip_frontmatter,
 )
 
 # Bundled skills live alongside the source so the test does not depend
@@ -72,205 +72,6 @@ def test_skill_md_has_required_frontmatter(skill_dir: Path) -> None:
         f"discovery; a skill without one is effectively invisible to the ranker. "
         f"Add a one-sentence summary of when to use this skill."
     )
-
-
-@pytest.mark.parametrize("skill_dir", _bundled_skill_dirs(), ids=lambda p: p.name)
-def test_skill_md_has_allowed_tools(skill_dir: Path) -> None:
-    """Every bundled SKILL.md must declare ``allowed-tools:`` in frontmatter.
-
-    chainlink #79 (G3) under chainlink #29 (GBrain pattern adoption).
-    The field lists the tools the skill body explicitly references,
-    so reviewers can spot ad-hoc tool dependencies growing into a
-    skill without updating the documented surface. Docs-only today
-    (no runtime enforcement — see state/spec/g3-allowed-tools-audit.md
-    for the enforcement-decision discussion).
-
-    An explicitly empty list is allowed for skills that are pure prose
-    (no tool surface) but the convention is to enumerate at least the
-    ``Read`` you need to follow the skill's instructions.
-    """
-    skill_md = skill_dir / "SKILL.md"
-    text = skill_md.read_text()
-    tools = _extract_list_field(text, "allowed-tools")
-    assert tools is not None, (
-        f"{skill_dir.name}/SKILL.md: missing or malformed 'allowed-tools:' "
-        f"field in frontmatter. The schema is **YAML list only** — bullet "
-        f"form (\n  - Read\n  - Write\n) or inline array form "
-        f"(``allowed-tools: [Read, Write]``). The scalar form "
-        f"``allowed-tools: Foo`` is rejected. Use an explicit empty list "
-        f"(``allowed-tools: []``) if the skill is pure prose. See "
-        f"state/spec/g3-allowed-tools-audit.md for the audit-derived "
-        f"per-skill surface."
-    )
-
-
-# --- Body-vs-declared allowed-tools audit ---------------------------------
-#
-# Address PR #130 review feedback: two skills (memory, heartbeat) shipped
-# with body-referenced tools missing from their declared allowed-tools.
-# Spot-check found the gaps; a regex-driven body scan finds the rest and
-# locks them in against future drift.
-#
-# Conservative detection: only count references that LOOK explicit —
-# backtick-wrapped tool names or the "X tool" prose suffix. Bare-word
-# detection of snake_case (e.g. ``react``, ``echo``) over-triggers on
-# common English words, and bare-word detection of CamelCase (``Read``,
-# ``Write``) over-triggers on prose verbs. Both anchored patterns below
-# survived a manual sweep of the 29 bundled skills.
-
-_KNOWN_BUILTIN_TOOLS = frozenset(
-    {
-        "Bash",
-        "Edit",
-        "Glob",
-        "Grep",
-        "Read",
-        "Write",
-        "WebFetch",
-        "WebSearch",
-        "Task",
-        "NotebookEdit",
-        "Agent",
-    }
-)
-
-# Mimir MCP tools — the ``mcp__mimir__`` prefix may or may not be present
-# in the body or the declared list; both forms normalize to the bare name.
-_KNOWN_MCP_TOOLS = frozenset(
-    {
-        "send_message",
-        "react",
-        "file_search",
-        "memory_query",
-        "memory_store",
-        "saga_query",
-        "saga_store",
-        "saga_end_session",
-        "saga_feedback",
-        "saga_mark_contributions",
-        "saga_forget",
-        "get_turn",
-        "fetch_channel_history",
-        "add_schedule",
-        "remove_schedule",
-        "list_schedules",
-        "rebuild_index",
-        "echo",
-        "reload_pollers",
-        "bash_async",
-        "bash_jobs_list",
-        "bash_job_output",
-        "spawn_claude_code",
-        "commitment_complete",
-        "commitment_snooze",
-        "commitment_dismiss",
-        "commitment_list",
-    }
-)
-
-_KNOWN_TOOLS = _KNOWN_BUILTIN_TOOLS | _KNOWN_MCP_TOOLS
-
-# Backticked: ``Read``, ``send_message``, ``mcp__mimir__send_message``.
-_BACKTICK_TOKEN = re.compile(r"`(?:mcp__mimir__)?([A-Za-z_][\w_]*)`")
-
-# Prose "X tool" suffix: ``Bash tool``, ``Task tool``. CamelCase + ``tool``.
-_X_TOOL_SUFFIX = re.compile(r"\b([A-Z][a-zA-Z]+)\s+tool\b")
-
-
-def _extract_body_tool_references(body: str) -> set[str]:
-    """Return tool names the body references via the two anchored
-    patterns (backticked tokens, ``X tool`` suffix). Unknown tokens
-    are dropped — the function only returns members of ``_KNOWN_TOOLS``.
-    """
-    refs: set[str] = set()
-    for match in _BACKTICK_TOKEN.finditer(body):
-        token = match.group(1)
-        if token in _KNOWN_TOOLS:
-            refs.add(token)
-    for match in _X_TOOL_SUFFIX.finditer(body):
-        token = match.group(1)
-        if token in _KNOWN_BUILTIN_TOOLS:
-            refs.add(token)
-    return refs
-
-
-def _normalize_declared(declared: list[str]) -> set[str]:
-    """Strip ``mcp__mimir__`` prefix from declared entries so the diff
-    against body references is apples-to-apples."""
-    out: set[str] = set()
-    for entry in declared:
-        cleaned = entry.strip()
-        if cleaned.startswith("mcp__mimir__"):
-            cleaned = cleaned[len("mcp__mimir__") :]
-        if cleaned:
-            out.add(cleaned)
-    return out
-
-
-@pytest.mark.parametrize("skill_dir", _bundled_skill_dirs(), ids=lambda p: p.name)
-def test_skill_md_allowed_tools_covers_body_references(skill_dir: Path) -> None:
-    """Every tool the body references must appear in ``allowed-tools``.
-
-    The audit body-scans for two anchored patterns (backticked tokens
-    and the ``X tool`` prose suffix) and asserts the resulting set is
-    a subset of the declared list. False-positive shape (body mentions
-    a tool but the skill doesn't actually use it): declare it anyway —
-    cost of an extra entry is one line; cost of a missed declaration
-    is the audit gap that PR #130's review surfaced.
-
-    If the body intentionally references a tool only as a counter-
-    example (\"do NOT use ``send_message`` in this skill\"), declare
-    it anyway and add a clarifying note nearby — the audit can't tell
-    intent from a code fence.
-    """
-    skill_md = skill_dir / "SKILL.md"
-    text = skill_md.read_text()
-    declared_list = _extract_list_field(text, "allowed-tools")
-    if declared_list is None:
-        # The other test catches missing field; nothing to compare here.
-        return
-
-    declared = _normalize_declared(declared_list)
-    body = _strip_frontmatter(text)
-    body_refs = _extract_body_tool_references(body)
-
-    missing = body_refs - declared
-    assert not missing, (
-        f"{skill_dir.name}/SKILL.md: body references tools that are not in "
-        f"declared 'allowed-tools': {sorted(missing)}. Add them to the "
-        f"frontmatter list (or remove the body reference). The audit "
-        f"scans for backticked tokens and the 'X tool' prose suffix; "
-        f"both shapes signal a real tool surface."
-    )
-
-
-def test_extract_body_tool_references_backtick_form() -> None:
-    body = "Use `Read` to load a file. Then `send_message` to reply."
-    assert _extract_body_tool_references(body) == {"Read", "send_message"}
-
-
-def test_extract_body_tool_references_x_tool_suffix() -> None:
-    body = "Spawn it via the Task tool. The Bash tool also works."
-    assert _extract_body_tool_references(body) == {"Task", "Bash"}
-
-
-def test_extract_body_tool_references_ignores_bare_prose_verbs() -> None:
-    """Bare ``Read the spec``, bare ``Write down``, etc. must NOT trip
-    the audit — false positives drown the signal."""
-    body = "Read the spec carefully. Write down your findings. React quickly."
-    assert _extract_body_tool_references(body) == set()
-
-
-def test_extract_body_tool_references_strips_mcp_prefix() -> None:
-    body = "Call `mcp__mimir__saga_query` with the topic."
-    assert _extract_body_tool_references(body) == {"saga_query"}
-
-
-def test_normalize_declared_strips_mcp_prefix() -> None:
-    assert _normalize_declared(["mcp__mimir__send_message", "Read"]) == {
-        "send_message",
-        "Read",
-    }
 
 
 def test_parse_frontmatter_rejects_missing_opening_delim() -> None:

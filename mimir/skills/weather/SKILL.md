@@ -1,8 +1,6 @@
 ---
 name: weather
 description: Get current conditions and 5-day forecast for a city via OpenWeatherMap. Requires `OPENWEATHER_API_KEY` in the environment. Use when the user asks about weather or when planning anything where weather is load-bearing (outdoor events, travel, watering schedules).
-allowed-tools:
-  - Bash
 success_criteria:
   # The skill's job is to run get_weather.py and report. If we loaded
   # the SKILL.md but never invoked the script, the question wasn't

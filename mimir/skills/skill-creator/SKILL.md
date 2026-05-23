@@ -1,10 +1,6 @@
 ---
 name: skill-creator
 description: Create or update reusable skills for this agent. Use this skill ONLY when the user asks to create a new skill, edit an existing skill, improve a SKILL.md, or capture a repeated workflow as a reusable skill. Do not use this skill for one-off tasks.
-allowed-tools:
-  - Edit
-  - Read
-  - Write
 success_criteria:
   # The skill's lasting artifact is a Write or Edit to a SKILL.md
   # under the skills/ tree. The "create a new skill" use case
@@ -63,7 +59,7 @@ Every SKILL.md begins with YAML frontmatter delimited by `---` lines. The parser
 |---|---|---|---|
 | `name` | yes | string | The skill's short identifier (matches the directory name). |
 | `description` | yes | string | Trigger description — what the skill does + exact "when to use" cues + what it should NOT be used for. Single line is safest; if you need length, use plain quoted strings (NOT YAML folded `>` blocks — those have a known parser pitfall, see "Gotchas" below). |
-| `allowed-tools` | yes | **YAML list** | Tools this skill's body documents using. **List form only** — bullet (one item per line, `- Read`) or inline array (`[Read, Write]`). The scalar form `allowed-tools: Foo` is rejected by the conformance test. Use an explicit empty list `allowed-tools: []` if the skill is pure prose with no tool calls. |
+| `success_criteria` | optional | dict | Operator-declared "did the skill's procedure actually run?" test for outcome telemetry. See `mimir/skill_outcomes.py:SkillSuccessCriteria` for the shape (`any_of` list of `tool_call` patterns, with `name` + optional `args` / `args_glob`). Skills with a clear declarative completion signal benefit from declaring this; meta-cognitive skills can omit it. |
 
 ## The `<!-- desc: -->` first-body-line convention
 
@@ -82,26 +78,28 @@ Conventions:
 
 The conformance test does NOT currently fail-loud on a missing `<!-- desc: -->`; the indexer falls back gracefully (see `tests/test_skill_conformance.py` for the current coverage shape). Treat it as a soft requirement — landing it improves your skill's discoverability without breaking CI.
 
-## Allowed-tools enforcement (current status)
+## Why no `allowed-tools` field
 
-The `allowed-tools` field is **docs-only today** — `mimir/agent.py` does NOT consume it for runtime sandboxing. The conformance test (`tests/test_skill_conformance.py`) ensures every tool the skill BODY mentions is also declared in the frontmatter list (body-vs-declared audit), so the field is a *true* "what tools does this skill need" map for review purposes. Phase-2 runtime filtering is tracked separately (see `state/spec/g3-allowed-tools-audit.md` for the audit baseline and the Path-2 decision parking).
+Earlier versions of mimir tracked an `allowed-tools` frontmatter field listing the tools each skill's body documented using. It got removed 2026-05-23 because:
 
-Do NOT rely on `allowed-tools` as a sandbox; relying on it as documentation is the supported use today.
+1. **deepagents' SkillsMiddleware silently rejected it.** The parser only accepts the space-separated string form (per the Anthropic Agent Skills spec); mimir used the YAML-list form. Every parse logged "Ignoring non-string 'allowed-tools'" at DEBUG level (invisible at INFO) and treated the field as empty.
+2. **No runtime enforcement existed.** The original PR #264 spike compiled `allowed-tools`-declaring skills into restricted-tool SubAgents — but the LLMs routed around delegation in production (PR #271), so the SubAgent path was ripped out.
+
+The skill body still describes which tools the procedure uses in prose; that documentation is the supported pattern today. Use `success_criteria` to *measure* whether the canonical tool actually fired.
 
 ## Gotchas
 
 - **YAML folded scalars** (`description: >`): the bundled `mimir/skill_md.py` parser handles `description: >` and `description: |` blocks correctly (covered by `test_parse_frontmatter_handles_folded_description`; `mimir/skills/onboarding/SKILL.md` ships using folded form), so mimir's own catalog + INDEX rendering is fine. The pitfall is for *downstream* tooling that uses `yaml.safe_load` directly: if the next key sits at the same indent without a blank-line separator, `yaml.safe_load` can fold it into the description's value. Stick to plain quoted strings if you want maximum portability across tooling that doesn't go through `mimir/skill_md.py`.
-- **`allowed-tools: Foo`** (scalar) is silently parsed by some YAML readers as `allowed-tools: "Foo"`. The conformance test rejects this — the field is **list-only**. Use `allowed-tools: [Foo]` or the multi-line bullet form.
 - **Stale catalog**: after editing a SKILL.md, run `mimir skills catalog` to regenerate `memory/skills-catalog.md`. The catalog isn't auto-regenerated on file write today.
 - **Missing `<!-- desc: -->`**: indexer falls back to `[auto]` + first sentence. Functional, but the per-skill prompt row gets less specific.
 
 ## Authoring Checklist
 
-1. Write frontmatter with `name`, a high-signal `description`, and an `allowed-tools` list (YAML list shape, not scalar). Use `[]` for prose-only skills.
+1. Write frontmatter with `name` and a high-signal `description`. Optionally add a `success_criteria` block if the skill has a clear declarative completion signal (a Bash command pattern, a Write to a specific path, etc.) — see `mimir/skills/weather/SKILL.md` for a minimal example.
 2. Add the `<!-- desc: -->` first-body-line comment (agent-facing voice, dense).
 3. Add concise execution steps in the SKILL body.
 4. Include concrete paths/commands the agent should run.
 5. Keep scope narrow; split broad domains into multiple skills.
 6. Prefer deterministic instructions over generic advice.
-7. Run `pytest tests/test_skill_conformance.py tests/test_skill_catalog.py` locally to catch frontmatter / allowed-tools drift before pushing.
+7. Run `pytest tests/test_skill_conformance.py tests/test_skill_catalog.py` locally to catch frontmatter drift before pushing.
 8. After landing, run `mimir skills catalog` to refresh the catalog file.

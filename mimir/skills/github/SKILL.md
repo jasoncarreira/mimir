@@ -1,8 +1,6 @@
 ---
 name: github
 description: Interact with GitHub via the `gh` CLI. Use for issues (read, comment, file), pull requests (view, comment, check CI status), workflow runs, and `gh api` for queries the subcommands don't cover. Authentication is via the bot's GITHUB_TOKEN (already wired through `gh auth setup-git` at container start).
-allowed-tools:
-  - Bash
 success_criteria:
   # The skill exists to wrap gh CLI invocations. Loading the SKILL.md
   # and not running any gh command means we read the policy but
