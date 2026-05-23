@@ -43,7 +43,6 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -185,7 +184,11 @@ def _make_all_env_set_probe(
     def _probe() -> tuple[bool, str]:
         ok, missing = _all_env_set(*env_vars)
         if not ok:
-            return _unavailable(missing)
+            # ``missing`` already reads as ``"missing env: FOO, BAR"`` —
+            # return it directly rather than wrapping in
+            # ``_unavailable`` (which would double-prefix to
+            # ``"unavailable: missing env: ..."``).
+            return (False, missing)
         detail = "format ok"
         if note:
             detail = f"{detail} ({note})"
@@ -207,10 +210,16 @@ def _make_python_probe(
     framework loads it via ``importlib.util`` and calls ``function()``.
 
     The callable's contract: zero args, returns ``(ok: bool, detail: str)``.
-    Module-level side effects (e.g. HTTP imports) happen at the
-    FIRST probe call, not at framework startup, so a broken script
-    doesn't crash the registry — it surfaces as an unavailable
-    probe.
+
+    Module-level side effects (e.g. HTTP imports) happen the FIRST
+    time the probe is invoked — and on EVERY subsequent call too,
+    since the closure re-execs the module each time rather than
+    caching the loaded module. For mimir's verify-once-per-rotation
+    pattern this is harmless. If a future caller invokes the same
+    probe in a tight loop, switch to caching the loaded module on
+    first run (single-element ``nonlocal`` dict). Either way a
+    broken script raises in here and surfaces as a failing probe;
+    it doesn't crash the registry.
     """
     script_path = (manifest_dir / script).resolve()
 
@@ -385,7 +394,6 @@ def _discover_probes(home: Path | None) -> dict[str, Probe]:
 
 _probes_cache: dict[str, Probe] | None = None
 _probes_cache_home: Path | None = None
-_probes_cache_marker = object()  # sentinel for "no home queried yet"
 
 
 def get_probes(home: Path | None = None) -> dict[str, Probe]:
@@ -415,6 +423,10 @@ def verify(name: str, home: Path | None = None) -> ProbeResult:
     probes = get_probes(home)
     probe = probes.get(name)
     if probe is None:
+        # ``cred_type="A"`` is arbitrary here — there's no actual
+        # type for an unknown credential. Callers that branch on
+        # cred_type for error handling should check ``ok`` first.
+        # If/when CredType gains a "?" or "unknown" value, swap this.
         return ProbeResult(
             name=name, cred_type="A", ok=False,
             detail=f"unknown credential: {name!r}",
