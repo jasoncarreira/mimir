@@ -21,7 +21,7 @@ rewrite.
 
 Soft + hard semantics (unchanged):
 
-* Below ``soft_threshold = max(1, ceil(budget * 0.75))``: silent.
+* Below ``soft_threshold = max(1, int(budget * 0.75))``: silent.
 * At soft threshold: log a one-time-per-turn
   ``tool_call_budget_soft_warning`` event. The tool still runs.
 * At or above ``hard_threshold = budget``: refuse the call,
@@ -161,12 +161,13 @@ class BudgetGateMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command],
     ) -> ToolMessage | Command:
-        denial = _check_and_increment_or_deny(_tool_name_from_request(request))
+        tool_name = _tool_name_from_request(request)
+        denial = _check_and_increment_or_deny(tool_name)
         if denial is not None:
             return ToolMessage(
                 content=denial,
                 tool_call_id=_tool_call_id(request),
-                name=_tool_name_from_request(request),
+                name=tool_name,
                 status="error",
             )
         return handler(request)
@@ -176,12 +177,13 @@ class BudgetGateMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
     ) -> ToolMessage | Command:
-        denial = _check_and_increment_or_deny(_tool_name_from_request(request))
+        tool_name = _tool_name_from_request(request)
+        denial = _check_and_increment_or_deny(tool_name)
         if denial is not None:
             return ToolMessage(
                 content=denial,
                 tool_call_id=_tool_call_id(request),
-                name=_tool_name_from_request(request),
+                name=tool_name,
                 status="error",
             )
         return await handler(request)

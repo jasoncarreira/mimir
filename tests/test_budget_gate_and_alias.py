@@ -199,6 +199,28 @@ async def test_middleware_awrap_refuses_at_cap():
     assert len(handler_calls) == 2  # Third never ran.
 
 
+def test_middleware_sync_wrap_passes_through_under_budget():
+    """Symmetric to the async pass-through case — verifies the sync
+    ``wrap_tool_call`` delegates to the handler when below the cap."""
+    mw = BudgetGateMiddleware()
+    handler_calls: list[ToolCallRequest] = []
+
+    def handler(req: ToolCallRequest) -> ToolMessage:
+        handler_calls.append(req)
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
+    ctx = _make_ctx(budget=5)
+    token = set_current_turn(ctx)
+    try:
+        out = mw.wrap_tool_call(_make_request("t1", "id-1"), handler)
+    finally:
+        reset_current_turn(token)
+    assert isinstance(out, ToolMessage)
+    assert out.content == "ok"
+    assert len(handler_calls) == 1
+    assert ctx.tool_call_count == 1
+
+
 def test_middleware_sync_wrap_refuses_at_cap():
     """The sync ``wrap_tool_call`` path mirrors the async one."""
     mw = BudgetGateMiddleware()
@@ -340,6 +362,8 @@ def test_get_turn_alias_returns_same_record(tmp_path) -> None:
     assert out_canonical == out_alias
     parsed = json.loads(out_canonical)
     assert parsed["turn_id"] == "abc123"
+    # ``input`` is stripped per the get_turn contract — the alias
+    # must preserve that.
     assert "input" not in parsed
 
 
