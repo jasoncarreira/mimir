@@ -73,14 +73,25 @@ class SessionManager:
     def __init__(
         self,
         idle_minutes: int = 10,
+        max_turns: int = 10,
         on_idle: OnIdle | None = None,
         is_busy: IsBusy | None = None,
     ) -> None:
         self._idle_seconds = max(1, int(idle_minutes * 60))
+        # ``max_turns`` caps the number of turns per session so synthesis
+        # fires on continuous channels that never idle (SPEC §5.6 / §16
+        # item 17 — burst-messaging gap). 0 = disable the cap.
+        self._max_turns = max(0, int(max_turns))
         self._on_idle = on_idle
         self._is_busy = is_busy
         self._sessions: dict[str, ChannelSession] = {}
         self._lock = asyncio.Lock()
+        # Strong-ref pattern: asyncio keeps only weak refs to tasks,
+        # so without this a cap-triggered ``_force_end_for_turn_cap``
+        # task could be GC'd before it acquires the lock and dispatches
+        # synthesis. Tasks self-remove via the done callback so the
+        # set drains naturally.
+        self._pending_tasks: set[asyncio.Task] = set()
 
     def _idle_seconds_value(self) -> int:
         return self._idle_seconds
@@ -130,10 +141,49 @@ class SessionManager:
 
     def increment_turn_count(self, channel_id: str) -> None:
         """Bumped by the agent at the start of each turn — surfaces in
-        ``saga_session_ended.turn_count`` for observability."""
+        ``saga_session_ended.turn_count`` for observability.
+
+        When the count reaches ``max_turns`` (default 10), schedules a
+        forced session end so synthesis fires even on channels that
+        never go idle. The synthesis turn is enqueued on the same
+        channel; the per-channel dispatcher serializes turns so it
+        runs after the current turn completes. The next inbound event
+        for this channel mints a fresh session via ``touch()``.
+
+        SPEC §5.6 / §16 item 17 — burst-messaging gap.
+        """
         session = self._sessions.get(channel_id)
-        if session and not session.ended:
-            session.turn_count += 1
+        if not session or session.ended:
+            return
+        session.turn_count += 1
+        if (
+            self._max_turns > 0
+            and session.turn_count == self._max_turns
+        ):
+            # ``==`` not ``>=`` so the spawn fires exactly once per
+            # session. Turns past the cap that arrive before the cap
+            # task lands would otherwise each spawn another (no-op)
+            # task — the session-id guard makes them correctness-safe
+            # but they accumulate in ``_pending_tasks`` until the
+            # session actually ends.
+            # ``increment_turn_count`` is sync (called from the agent's
+            # turn entry path); ``_force_end_for_turn_cap`` needs the
+            # async lock. Spawn a task — the dispatcher's per-channel
+            # serialization will run the synthesis turn after the
+            # current turn finishes.
+            #
+            # Strong-ref the task on ``self._pending_tasks`` until it
+            # completes. asyncio only keeps weak refs, so without this
+            # the task can be GC'd before it dispatches. Store-on-
+            # session would race with the ``_force_end_for_turn_cap``
+            # pop, so it lives at the manager level instead.
+            task = asyncio.create_task(
+                self._force_end_for_turn_cap(
+                    channel_id, session.saga_session_id,
+                )
+            )
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._pending_tasks.discard)
 
     async def end_now(self, channel_id: str) -> ChannelSession | None:
         """Force-end a session (e.g. from a bridge disconnect). Triggers the
@@ -149,6 +199,40 @@ class SessionManager:
         await self._dispatch_idle(session)
         return session
 
+    async def _force_end_for_turn_cap(
+        self, channel_id: str, saga_session_id: str,
+    ) -> None:
+        """Internal: end a session because the per-session turn cap was
+        reached. Emits a distinct ``saga_session_turn_cap_reached``
+        event before the standard ``saga_session_ended`` so operators
+        can tell idle-timeout-ended sessions apart from burst-capped
+        ones in events.jsonl.
+
+        Guarded against races: between the ``increment_turn_count``
+        check and this task running, the session may have been replaced
+        (``touch`` after rapid end/start) or force-ended (``end_now``).
+        In either case we no-op.
+        """
+        async with self._lock:
+            session = self._sessions.get(channel_id)
+            if session is None or session.saga_session_id != saga_session_id:
+                return
+            if session.ended:
+                return
+            session.ended = True
+            self._sessions.pop(channel_id, None)
+            if session.idle_handle is not None:
+                session.idle_handle.cancel()
+                session.idle_handle = None
+        await log_event(
+            "saga_session_turn_cap_reached",
+            channel_id=channel_id,
+            saga_session_id=saga_session_id,
+            turn_count=session.turn_count,
+            max_turns=self._max_turns,
+        )
+        await self._dispatch_idle(session)
+
     async def shutdown(self) -> None:
         """Cancel all timers and drop all sessions. Called at app shutdown
         — does NOT trigger synthesis turns (the worker pool is draining)."""
@@ -159,6 +243,17 @@ class SessionManager:
                     session.idle_handle = None
                 session.ended = True
             self._sessions.clear()
+        # Cancel any in-flight turn-cap force-end tasks too. Without
+        # this they could try to dispatch synthesis against a draining
+        # worker pool. Iterate over a snapshot since the done callback
+        # mutates ``_pending_tasks``. Awaiting after cancel ensures
+        # we don't get "Task was destroyed but it is pending" warnings
+        # if the event loop is also tearing down.
+        pending = list(self._pending_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # ---- internals ------------------------------------------------------
 
