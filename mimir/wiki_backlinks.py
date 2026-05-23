@@ -134,20 +134,45 @@ def find_slug_collisions(wiki_dir: Path) -> dict[str, list[Path]]:
     return {slug: paths for slug, paths in by_slug.items() if len(paths) > 1}
 
 
+#: Category prefixes documented in ``mimir/skills/wiki/SKILL.md``. A
+#: wikilink that includes one — ``[[concepts/foo]]`` — refers to the
+#: same page as the bare ``[[foo]]`` (resolution goes by slug, not
+#: path; see ``BacklinksGraph._resolve``). Without normalization here,
+#: the prefixed form gets recorded as a dangling link to the literal
+#: ``"concepts/foo"`` slug while the actual ``"foo"`` page gets
+#: falsely flagged as orphan — exactly the case muninn-mimir's
+#: 2026-05-23 wiki-health report surfaced.
+#:
+#: Matching is case-sensitive — Obsidian wikilinks are case-sensitive,
+#: so ``[[Concepts/foo]]`` won't be stripped. Acceptable: the wiki
+#: convention is lowercase category dirs.
+# Keep in sync with mimir/skills/wiki/SKILL.md §Layout — adding a new
+# category subdir there (e.g. ``projects/``) needs a matching entry here.
+_CATEGORY_PREFIXES: tuple[str, ...] = ("concepts/", "topics/", "entities/")
+
+
 def extract_links(text: str) -> Iterable[tuple[int, str]]:
     """Yield ``(line_number, target_slug)`` for each wikilink in
     ``text``. Line numbers are 1-indexed.
 
-    Normalizes ``[[name.md]]`` → ``name`` since per Obsidian convention
-    both forms are equivalent (https://help.obsidian.md/Linking+notes).
-    Without this, a page that uses the explicit-extension form would
-    show up as a dangling link to the literal ``"name.md"`` slug while
-    the real ``"name"`` page would still be flagged as orphan."""
+    Normalizations applied to each target:
+
+    - ``[[name.md]]`` → ``name`` (Obsidian explicit-extension form;
+      see https://help.obsidian.md/Linking+notes).
+    - ``[[concepts/name]]`` → ``name`` (and ``topics/``, ``entities/``).
+      The wiki layout under ``mimir/skills/wiki/SKILL.md`` puts pages
+      under category subdirs, but slug-based resolution treats them
+      as equivalent to the bare form.
+    """
     for line_no, line in enumerate(text.splitlines(), 1):
         for m in _WIKILINK_RE.finditer(line):
             target = m.group(1).strip()
             if target.endswith(".md"):
                 target = target[:-3]
+            for prefix in _CATEGORY_PREFIXES:
+                if target.startswith(prefix):
+                    target = target[len(prefix):]
+                    break
             yield line_no, target
 
 
