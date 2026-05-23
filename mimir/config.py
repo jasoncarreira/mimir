@@ -450,14 +450,20 @@ class Config:
     # allowing legitimate long heartbeat or reflection work.
     turn_timeout_seconds: int
 
-    # S5-2 onboarding bypass window. During the first N days after
-    # ``mimir setup`` writes ``<home>/.mimir/first-boot.json``, the
-    # reflection-only gate on ``memory/core/`` yields so the agent
-    # can collaboratively bootstrap its persona / memory architecture.
-    # After the window closes, the gate enforces normally. Setting
-    # this to 0 disables the bypass entirely (gate enforced from day
-    # one — useful for tests and locked-down deployments).
-    onboarding_window_days: int
+    # S5-2 onboarding bypass — operator opt-in via ``MIMIR_ONBOARDING_MODE``
+    # in compose.env. When True, the reflection-only gate on
+    # ``memory/core/`` yields so the agent can freely bootstrap its
+    # persona / memory architecture during first-run setup. After
+    # onboarding completes, the operator clears the env var and
+    # restarts the container to engage the gate.
+    #
+    # Restart-to-flip is the tamper-resistance property: the agent can
+    # edit compose.env from bash (planting a dormant
+    # ``MIMIR_ONBOARDING_MODE=true``) but the value doesn't take effect
+    # until restart, and the agent has no docker socket to self-
+    # restart. ``prohibited_action_guard`` also blocks bash writes to
+    # ``compose.env``, closing the obvious dormant-plant vector.
+    onboarding_mode: bool
 
     # Algedonic surfacing (v0.4 §2). Window for the Recent feedback
     # signals prompt section; per-polarity cap on rendered items. 0 for
@@ -712,7 +718,8 @@ class Config:
             allow_unauthenticated=_env("MIMIR_ALLOW_UNAUTHENTICATED", "false").lower()
                 in {"true", "1", "yes"},
             turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", 3600),
-            onboarding_window_days=_env_int("MIMIR_ONBOARDING_WINDOW_DAYS", 3),
+            onboarding_mode=_env("MIMIR_ONBOARDING_MODE", "false").lower()
+                in {"true", "1", "yes"},
 
             feedback_window_hours=_env_int("MIMIR_FEEDBACK_WINDOW_HOURS", 24),
             feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),

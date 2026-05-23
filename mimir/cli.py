@@ -16,12 +16,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import os
 import re
 import secrets
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from textwrap import dedent
 from typing import Sequence
@@ -130,6 +128,20 @@ DEFAULT_ENV_TEMPLATE = dedent(
     # dispatch failures). Leave blank to disable. Use a normal channel_id —
     # typically your DM with the bot, e.g. dm-slack-U05XXXX or dm-discord-NNN.
     MIMIR_OPERATOR_ALERT_CHANNEL=
+
+    # ---- S5-2 onboarding bypass ------------------------------------------
+    # Bypasses the reflection-only gate on memory/core/ writes so the
+    # agent can collaboratively bootstrap its persona / memory
+    # architecture during first-run setup. `mimir setup` writes this
+    # as `true` on first run; after onboarding completes, set to
+    # `false` (or delete the line) and `docker compose restart` to
+    # engage the gate.
+    #
+    # Restart-to-flip is the tamper-resistance property: the agent can
+    # edit this file via shell but the value isn't read until the next
+    # container restart. The agent has no docker socket to self-restart.
+    # `prohibited_action_guard` also blocks bash writes to compose.env.
+    MIMIR_ONBOARDING_MODE=true
     """
 )
 
@@ -945,6 +957,9 @@ _SAGA_API_KEY_LINE_RE = re.compile(r"^(\s*)SAGA_API_KEY\s*=.*$", re.MULTILINE)
 _MIMIR_MODEL_SPEC_LINE_RE = re.compile(
     r"^(\s*)MIMIR_MODEL_SPEC\s*=.*$", re.MULTILINE,
 )
+_MIMIR_ONBOARDING_MODE_LINE_RE = re.compile(
+    r"^(\s*)MIMIR_ONBOARDING_MODE\s*=.*$", re.MULTILINE,
+)
 _ANTHROPIC_BASE_URL_LINE_RE = re.compile(
     r"^(\s*)ANTHROPIC_BASE_URL\s*=.*$", re.MULTILINE,
 )
@@ -1112,29 +1127,24 @@ def setup_home(
     else:
         saga_key = _env_get_var(home / ".env", _SAGA_API_KEY_LINE_RE) or ""
 
+    # S5-2 onboarding bypass — default ON for fresh deployments so the
+    # agent can collaboratively bootstrap memory/core/ during first-run
+    # setup. Idempotent: only writes when missing (a re-run never
+    # clobbers an operator-set ``false``). Operators must mirror this
+    # to compose.env for it to take effect inside the container —
+    # ``mimir setup`` only manages ``<home>/.env``, never compose.env.
+    onboarding_mode_action: str | None = None
+    if _env_get_var(home / ".env", _MIMIR_ONBOARDING_MODE_LINE_RE) is None:
+        _env_set_var(
+            home / ".env", "MIMIR_ONBOARDING_MODE", "true",
+            _MIMIR_ONBOARDING_MODE_LINE_RE,
+        )
+        onboarding_mode_action = "set to true (first setup; mirror to compose.env)"
+
     # v0.5 §2: write saga.toml for in-process saga (skip if --no-saga; the
     # caller passes that signal by setting saga_key to None — but for now
     # setup always generates one).
     (home / ".mimir").mkdir(parents=True, exist_ok=True)
-    # S5-2 onboarding anchor: ``<home>/.mimir/first-boot.json`` carries
-    # the ``created_at`` timestamp that the WriteGuardBackend uses to
-    # bound the post-setup core-memory bypass window. Only written on
-    # FIRST setup (``_write_if_missing``) — re-running ``mimir setup``
-    # to seed a missing template MUST NOT reset the window. The agent
-    # cannot regenerate it via bash because
-    # ``prohibited_action_guard`` blocks ``mimir setup`` and writes to
-    # ``.mimir/first-boot.json`` at the bash layer.
-    first_boot_payload = json.dumps({
-        "created_at": datetime.now(tz=timezone.utc).isoformat(),
-        "note": (
-            "S5-2 onboarding anchor. Do not edit by hand — the "
-            "WriteGuardBackend checks created_at + file ctime to bound "
-            "the bypass window. Run `mimir onboarding status` to see "
-            "time remaining."
-        ),
-    }, indent=2) + "\n"
-    if _write_if_missing(home / ".mimir" / "first-boot.json", first_boot_payload):
-        files_created.append(".mimir/first-boot.json")
     if _write_if_missing(
         home / "saga.toml",
         _default_saga_toml(home, saga_key, embedding=embedding),
@@ -1261,6 +1271,7 @@ def setup_home(
         "skills": seeded_skills,
         "api_key_action": api_key_action,
         "saga_api_key_action": saga_api_key_action,
+        "onboarding_mode_action": onboarding_mode_action,
         "git_bootstrap": git_bootstrap_status,
         "embedding_preset": embedding,
         "model_spec": route.model_spec,
@@ -1291,6 +1302,19 @@ def _print_setup_report(status: dict[str, object]) -> None:
         print("  MIMIR_API_KEY:  generated (see .env; rotate via `mimir regenerate-api-key`)")
     if status.get("saga_api_key_action") == "generated":
         print("  SAGA_API_KEY:   generated (unused in in-process mode; preserved for external-saga use)")
+    onboarding_action = status.get("onboarding_mode_action")
+    if onboarding_action:
+        # First-setup signal: tell the operator to also set this in
+        # compose.env so docker actually injects it on container start.
+        # ``<home>/.env`` is mimir-managed; ``compose.env`` is operator-
+        # managed (docker reads it via ``env_file`` in compose.yml).
+        print(f"  MIMIR_ONBOARDING_MODE: {onboarding_action}")
+        print("                  ↑ ALSO add this line to compose.env before")
+        print("                    `docker compose up -d` — docker reads")
+        print("                    compose.env, not <home>/.env.")
+        print("                    After onboarding completes, set to")
+        print("                    `false` (or delete the line) in compose.env")
+        print("                    and `docker compose restart` to engage the gate.")
     # Model + usage-monitor routing — surface what setup decided so
     # the operator can confirm or override.
     model_spec = status.get("model_spec")
@@ -1554,71 +1578,6 @@ def _identities_resolve_cmd(home: Path, author: str) -> None:
     print(f"{author} → {canonical}{suffix}")
 
 
-def _cmd_onboarding_status(home: Path) -> int:
-    """Print the S5-2 onboarding bypass-window state.
-
-    Three outcomes:
-      - Missing anchor → "no anchor; gate enforced from day one"
-      - Anchor + window open → "active; N hours remaining"
-      - Anchor + window expired → "expired; gate enforced"
-
-    Also reports a tamper signal when the file's ctime is more than 60
-    seconds newer than ``created_at`` — operator should investigate
-    (likely an agent-side rewrite via shell). Window length is read from
-    the env (``MIMIR_ONBOARDING_WINDOW_DAYS``) so the report matches
-    what the live backend uses.
-    """
-    anchor = home / ".mimir" / "first-boot.json"
-    window_days_raw = os.environ.get("MIMIR_ONBOARDING_WINDOW_DAYS", "3")
-    try:
-        window_days = int(window_days_raw)
-    except ValueError:
-        window_days = 3
-    if window_days == 0:
-        print("S5-2 onboarding bypass: DISABLED (MIMIR_ONBOARDING_WINDOW_DAYS=0)")
-        return 0
-    if not anchor.is_file():
-        print(
-            f"S5-2 onboarding anchor: MISSING ({anchor})\n"
-            f"  No bypass — memory/core/ writes require reflection turn.\n"
-            f"  Run `mimir setup --home {home}` to create the anchor "
-            f"(only valid on a fresh home)."
-        )
-        return 0
-    try:
-        with anchor.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        content_iso = str(data.get("created_at") or "")
-        content_ts = datetime.fromisoformat(content_iso.replace("Z", "+00:00"))
-    except (OSError, json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
-        print(f"S5-2 onboarding anchor: UNREADABLE ({anchor}): {exc}", file=sys.stderr)
-        return 1
-    stat = anchor.stat()
-    ctime = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc)
-    now = datetime.now(tz=timezone.utc)
-    effective_start = min(content_ts, ctime)
-    expires_at = effective_start + timedelta(days=window_days)
-    tamper_skew = (ctime - content_ts).total_seconds()
-    print(f"S5-2 onboarding anchor: {anchor}")
-    print(f"  created_at (content):  {content_ts.isoformat()}")
-    print(f"  ctime (inode):         {ctime.isoformat()}")
-    print(f"  effective start:       {effective_start.isoformat()} (min of the two)")
-    print(f"  window:                {window_days} days")
-    print(f"  expires_at:            {expires_at.isoformat()}")
-    if now < expires_at:
-        remaining = expires_at - now
-        hours = remaining.total_seconds() / 3600
-        print(f"  status:                ACTIVE — {hours:.1f}h remaining")
-    else:
-        print("  status:                EXPIRED — gate enforced")
-    if tamper_skew > 60:
-        print(
-            f"  ⚠ tamper signal:       ctime is {tamper_skew:.0f}s newer than "
-            f"created_at\n"
-            f"                         (file was likely rewritten — "
-            f"window uses min(content_ts, ctime) so this doesn't extend the bypass)"
-        )
-    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -1867,26 +1826,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
 
-    # S5-2 onboarding status check. Read-only — there's no
-    # ``start`` / ``complete`` subcommand because the window is
-    # automatically managed by ``mimir setup`` (creates the anchor on
-    # first run) and elapsed wall time (anchor + N days).
-    # Operators who legitimately need to extend or end the window edit
-    # ``<home>/.mimir/first-boot.json`` directly from the host (or
-    # ``rm`` it to end onboarding early).
-    onboarding_p = sub.add_parser(
-        "onboarding",
-        help="S5-2 onboarding bypass status — show window remaining + tamper signals.",
-    )
-    onboarding_sub = onboarding_p.add_subparsers(dest="onboarding_action")
-    onboarding_status_p = onboarding_sub.add_parser(
-        "status",
-        help="Print bypass-window state (active/expired/missing + time remaining).",
-    )
-    onboarding_status_p.add_argument(
-        "--home", type=Path, default=None,
-        help="Agent home (overrides MIMIR_HOME; default: cwd).",
-    )
 
     refl_p = sub.add_parser(
         "reflection",
@@ -2241,12 +2180,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
         sys.exit(run_loops_cmd(home))
 
-    if args.command == "onboarding":
-        if args.onboarding_action == "status":
-            home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
-            sys.exit(_cmd_onboarding_status(home))
-        onboarding_p.print_help()
-        sys.exit(1)
 
     if args.command == "predictions":
         from .skills.predictions import script as _predictions_script

@@ -62,25 +62,24 @@ _PROHIBITIONS: list[_Prohibition] = [
         ),
         "git push --force[--with-lease]/-f to main/master (reversed-arg form)",
     ),
-    # S5-2 onboarding layer: block bash vectors for extending the
-    # post-first-boot bypass window. The WriteGuardBackend's tamper
-    # check (ctime vs content_ts) catches backdated rewrites, but
-    # the agent could still ``rm`` the anchor and re-run ``mimir
-    # setup`` to re-create it with a fresh ctime. These prohibitions
-    # close that vector at the shell layer — the operator's
-    # legitimate ``docker exec`` path from the host doesn't go through
-    # the agent's tool dispatch, so it's unaffected.
+    # S5-2 onboarding layer: block bash writes to ``compose.env``. The
+    # WriteGuardBackend reads ``MIMIR_ONBOARDING_MODE`` once at
+    # construction; the agent can't flip it on a live process. But it
+    # could plant a dormant ``MIMIR_ONBOARDING_MODE=true`` line in
+    # ``compose.env`` via shell (``echo ... >> compose.env``), which
+    # would take effect on the next container restart. The operator's
+    # path (editing compose.env from the host) doesn't go through this
+    # guard, so it's unaffected — only the agent's in-container shell
+    # is constrained.
+    #
+    # Pattern matches any reference to ``compose.env`` in the command.
+    # Coarse on purpose: ``cat compose.env`` (reading) gets blocked too,
+    # but the agent has no legitimate reason to read it (no operator
+    # secrets are kept anywhere the agent needs to look up). False
+    # positives are acceptable; false negatives are not.
     _Prohibition(
-        re.compile(r"\bmimir\s+setup\b", re.I),
-        "mimir setup invocation (operator-only; would reset onboarding window)",
-    ),
-    _Prohibition(
-        re.compile(r"\bmimir\s+onboarding\b", re.I),
-        "mimir onboarding command (operator-only)",
-    ),
-    _Prohibition(
-        re.compile(r"\.mimir/first-boot\b"),
-        "write/touch/rm of .mimir/first-boot.json (operator-only anchor file)",
+        re.compile(r"\bcompose\.env\b"),
+        "compose.env reference (operator-managed; agent must not read or write)",
     ),
 ]
 
