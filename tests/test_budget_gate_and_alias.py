@@ -1,14 +1,22 @@
-"""181-N regressions: tool-call budget gate + ``get_turn`` alias.
+"""Tool-call budget gate (middleware) + ``get_turn`` alias.
 
-The SDK build gated tool calls via a ``PreToolUse`` HookMatcher that
-checked TurnContext.tool_call_count against the per-turn budget. The
-deepagents cutover dropped that — ``Config.tool_call_budget`` existed
-but didn't gate anything. Restored as a langchain Tool wrapper that
-mutates each registered tool's coroutine/func to add a budget check.
+Budget enforcement is now a langchain ``AgentMiddleware``
+(``mimir.tools.budget_gate.BudgetGateMiddleware``) wired into
+deepagents via ``create_deep_agent(middleware=...)``. The middleware
+intercepts every ``wrap_tool_call`` / ``awrap_tool_call`` invocation —
+BOTH mimir-registered tools and deepagents' built-ins (``shell_exec``,
+``read_file``, etc.). Pre-2026-05-23 we wrapped each registered tool's
+coroutine/func individually and missed the built-ins; production
+heartbeats blew past a 120 budget with zero denial events.
 
-Also restored: ``get_turn`` as a back-compat alias for the renamed
-``mimir_get_turn`` so skill docs referencing the pre-rename name
-don't silently 404.
+These tests exercise the middleware via two surfaces:
+
+1. The internal ``_check_and_increment_or_deny`` helper (lower-cost,
+   directly mutates ``TurnContext.tool_call_count`` so we can verify
+   the bookkeeping without standing up a langgraph agent).
+2. The ``BudgetGateMiddleware.wrap_tool_call`` / ``awrap_tool_call``
+   methods (the integration surface — verifies the ToolMessage
+   return shape and that the handler is bypassed at the cap).
 """
 
 from __future__ import annotations
@@ -17,10 +25,15 @@ import time
 from typing import Any
 
 import pytest
+from langchain.agents.middleware import ToolCallRequest
+from langchain_core.messages import ToolMessage
 
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.models import TurnContext
-from mimir.tools.budget_gate import apply_budget_gate
+from mimir.tools.budget_gate import (
+    BudgetGateMiddleware,
+    _check_and_increment_or_deny,
+)
 
 
 def _make_ctx(budget: int = 5) -> TurnContext:
@@ -34,96 +47,77 @@ def _make_ctx(budget: int = 5) -> TurnContext:
     )
 
 
-def _make_fake_tool(name: str = "fake_tool"):
-    """Build a minimal langchain BaseTool. We avoid pulling in the
-    full ``@tool`` decorator so the wrapper logic is exercised on a
-    plain coroutine + func surface."""
-    from langchain_core.tools import StructuredTool
-
-    call_count = {"sync": 0, "async": 0}
-
-    def _sync(**kwargs: Any) -> str:
-        call_count["sync"] += 1
-        return f"sync {call_count['sync']}"
-
-    async def _async(**kwargs: Any) -> str:
-        call_count["async"] += 1
-        return f"async {call_count['async']}"
-
-    tool = StructuredTool.from_function(
-        func=_sync, coroutine=_async, name=name, description="fake tool",
+def _make_request(tool_name: str = "fake_tool",
+                  tool_call_id: str = "tc-1") -> ToolCallRequest:
+    """Minimal ToolCallRequest for middleware tests. ``state`` /
+    ``runtime`` aren't read by the budget middleware so we pass
+    ``None`` for both — keeps the test surface small."""
+    return ToolCallRequest(
+        tool_call={"name": tool_name, "args": {}, "id": tool_call_id, "type": "tool_call"},
+        tool=None,
+        state=None,
+        runtime=None,  # type: ignore[arg-type]
     )
-    return tool, call_count
 
 
-# ─── Budget gate ──────────────────────────────────────────────────
+# ─── Bookkeeping helper ───────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_below_budget_calls_pass_through() -> None:
-    tool, counts = _make_fake_tool()
-    apply_budget_gate(tool)
+def test_below_budget_increments_and_returns_none():
     ctx = _make_ctx(budget=5)
     token = set_current_turn(ctx)
     try:
         for _ in range(3):
-            await tool.ainvoke({})
+            assert _check_and_increment_or_deny("fake_tool") is None
     finally:
         reset_current_turn(token)
-    assert counts["async"] == 3
     assert ctx.tool_call_count == 3
 
 
-@pytest.mark.asyncio
-async def test_at_budget_refuses_with_denial_message() -> None:
-    tool, counts = _make_fake_tool()
-    apply_budget_gate(tool)
+def test_at_budget_returns_denial_message():
     ctx = _make_ctx(budget=2)
     token = set_current_turn(ctx)
     try:
-        await tool.ainvoke({})  # 1
-        await tool.ainvoke({})  # 2 — at budget
-        out = await tool.ainvoke({})  # 3 — refused
+        assert _check_and_increment_or_deny("fake_tool") is None  # 1
+        assert _check_and_increment_or_deny("fake_tool") is None  # 2
+        out = _check_and_increment_or_deny("fake_tool")  # 3 — refused
     finally:
         reset_current_turn(token)
+    assert out is not None
     assert "Tool-call budget exhausted" in out
     assert "2/2 calls used" in out
-    assert counts["async"] == 2  # The 3rd call never reached the body.
+    assert "fake_tool" in out
+    # Count must NOT advance past the cap (refused calls don't bump).
+    assert ctx.tool_call_count == 2
 
 
-@pytest.mark.asyncio
-async def test_budget_zero_disables_gating() -> None:
-    tool, counts = _make_fake_tool()
-    apply_budget_gate(tool)
+def test_budget_zero_disables_gating():
     ctx = _make_ctx(budget=0)
     token = set_current_turn(ctx)
     try:
         for _ in range(20):
-            await tool.ainvoke({})
+            assert _check_and_increment_or_deny("fake_tool") is None
     finally:
         reset_current_turn(token)
-    assert counts["async"] == 20
+    # No enforcement → count stays at 0 (helper exits early on
+    # budget=0 before incrementing).
+    assert ctx.tool_call_count == 0
 
 
-@pytest.mark.asyncio
-async def test_no_active_turn_disables_gating() -> None:
+def test_no_active_turn_disables_gating():
     """Tests + bench harnesses invoke tools without a TurnContext.
     The gate must be transparent in that case."""
-    tool, counts = _make_fake_tool()
-    apply_budget_gate(tool)
     # No set_current_turn — _resolve_budget_state returns None.
     for _ in range(10):
-        await tool.ainvoke({})
-    assert counts["async"] == 10
+        assert _check_and_increment_or_deny("fake_tool") is None
 
 
 @pytest.mark.asyncio
 async def test_soft_warning_fires_once_per_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """At/above the soft threshold (75% of budget), one warning
-    event fires per turn — subsequent crossings re-evaluate but
-    don't re-emit."""
+    """At/above the soft threshold (75% of budget), one warning event
+    fires per turn — subsequent crossings re-evaluate but don't re-emit."""
     captured: list[tuple[str, dict]] = []
 
     async def _capture(kind: str, **kw: Any) -> None:
@@ -131,22 +125,20 @@ async def test_soft_warning_fires_once_per_turn(
 
     monkeypatch.setattr("mimir.event_logger.log_event", _capture)
 
-    tool, _ = _make_fake_tool()
-    apply_budget_gate(tool)
     ctx = _make_ctx(budget=8)  # soft threshold = max(1, 6) = 6
     token = set_current_turn(ctx)
     try:
         # 5 calls — below soft.
         for _ in range(5):
-            await tool.ainvoke({})
+            _check_and_increment_or_deny("fake_tool")
         # 6th call crosses soft → one warning. Subsequent 7th also
         # ≥ soft but should NOT re-emit (per-turn idempotent).
-        await tool.ainvoke({})
-        await tool.ainvoke({})
+        _check_and_increment_or_deny("fake_tool")
+        _check_and_increment_or_deny("fake_tool")
     finally:
         reset_current_turn(token)
 
-    # Give the scheduled tasks a chance to run.
+    # Yield so the fire-and-forget log_event tasks land.
     import asyncio
     await asyncio.sleep(0)
 
@@ -155,43 +147,189 @@ async def test_soft_warning_fires_once_per_turn(
     assert soft_warns[0]["soft_threshold"] == 6
 
 
-def test_apply_budget_gate_is_idempotent() -> None:
-    tool, _ = _make_fake_tool()
-    apply_budget_gate(tool)
-    first_coro = tool.coroutine
-    apply_budget_gate(tool)  # second wrap should be a no-op
-    assert tool.coroutine is first_coro
-    assert getattr(tool, "_mimir_budget_wrapped", False) is True
+# ─── Middleware surface ───────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_sync_tool_path_also_gates() -> None:
-    """A sync tool (no coroutine) still gets the gate on its func.
-    Important because mimir_get_turn is sync."""
-    from langchain_core.tools import StructuredTool
+async def test_middleware_awrap_passes_through_under_budget():
+    """Below the cap, ``awrap_tool_call`` delegates to the handler
+    unchanged."""
+    mw = BudgetGateMiddleware()
+    handler_calls: list[ToolCallRequest] = []
 
-    counts = {"n": 0}
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        handler_calls.append(req)
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
 
-    def _sync(**kwargs: Any) -> str:
-        counts["n"] += 1
-        return "ran"
+    ctx = _make_ctx(budget=5)
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("t1", "id-1"), handler)
+    finally:
+        reset_current_turn(token)
+    assert isinstance(out, ToolMessage)
+    assert out.content == "ok"
+    assert len(handler_calls) == 1
+    assert ctx.tool_call_count == 1
 
-    tool = StructuredTool.from_function(
-        func=_sync, name="sync_only", description="",
-    )
-    apply_budget_gate(tool)
+
+@pytest.mark.asyncio
+async def test_middleware_awrap_refuses_at_cap():
+    """At the cap, the handler is NOT called and the middleware
+    returns a denial ToolMessage with status='error'."""
+    mw = BudgetGateMiddleware()
+    handler_calls: list[ToolCallRequest] = []
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        handler_calls.append(req)
+        return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+    ctx = _make_ctx(budget=2)
+    token = set_current_turn(ctx)
+    try:
+        await mw.awrap_tool_call(_make_request("t1", "id-1"), handler)  # 1
+        await mw.awrap_tool_call(_make_request("t1", "id-2"), handler)  # 2
+        out = await mw.awrap_tool_call(_make_request("t1", "id-3"), handler)  # refused
+    finally:
+        reset_current_turn(token)
+    assert isinstance(out, ToolMessage)
+    assert "Tool-call budget exhausted" in str(out.content)
+    assert out.status == "error"
+    assert out.tool_call_id == "id-3"
+    assert len(handler_calls) == 2  # Third never ran.
+
+
+def test_middleware_sync_wrap_passes_through_under_budget():
+    """Symmetric to the async pass-through case — verifies the sync
+    ``wrap_tool_call`` delegates to the handler when below the cap."""
+    mw = BudgetGateMiddleware()
+    handler_calls: list[ToolCallRequest] = []
+
+    def handler(req: ToolCallRequest) -> ToolMessage:
+        handler_calls.append(req)
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
+    ctx = _make_ctx(budget=5)
+    token = set_current_turn(ctx)
+    try:
+        out = mw.wrap_tool_call(_make_request("t1", "id-1"), handler)
+    finally:
+        reset_current_turn(token)
+    assert isinstance(out, ToolMessage)
+    assert out.content == "ok"
+    assert len(handler_calls) == 1
+    assert ctx.tool_call_count == 1
+
+
+def test_middleware_sync_wrap_refuses_at_cap():
+    """The sync ``wrap_tool_call`` path mirrors the async one."""
+    mw = BudgetGateMiddleware()
+    handler_calls: list[ToolCallRequest] = []
+
+    def handler(req: ToolCallRequest) -> ToolMessage:
+        handler_calls.append(req)
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
     ctx = _make_ctx(budget=1)
     token = set_current_turn(ctx)
     try:
-        await tool.ainvoke({})  # 1 — passes
-        out = await tool.ainvoke({})  # 2 — refused
+        mw.wrap_tool_call(_make_request("t1", "id-1"), handler)  # passes
+        out = mw.wrap_tool_call(_make_request("t1", "id-2"), handler)  # refused
     finally:
         reset_current_turn(token)
-    assert "Tool-call budget exhausted" in out
-    assert counts["n"] == 1
+    assert isinstance(out, ToolMessage)
+    assert "Tool-call budget exhausted" in str(out.content)
+    assert len(handler_calls) == 1
 
 
-# ─── get_turn alias ───────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_send_message_and_react_bypass_the_cap():
+    """``send_message`` is the only delivery path for the agent's reply
+    (final assistant text doesn't auto-deliver to channels). If the cap
+    refuses send_message too, the agent hits the budget and has no way
+    to tell the operator anything. Exempting it — AND skipping the
+    count increment — keeps that channel open. ``react`` follows the
+    same operator-facing-acknowledgement logic."""
+    mw = BudgetGateMiddleware()
+    handler_calls: list[str] = []
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        handler_calls.append(req.tool_call["name"])
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
+    ctx = _make_ctx(budget=2)
+    token = set_current_turn(ctx)
+    try:
+        # Burn the budget with non-exempt calls.
+        await mw.awrap_tool_call(_make_request("shell_exec", "id-1"), handler)
+        await mw.awrap_tool_call(_make_request("shell_exec", "id-2"), handler)
+        # Past the cap: a regular tool is refused...
+        denied = await mw.awrap_tool_call(_make_request("shell_exec", "id-3"), handler)
+        assert isinstance(denied, ToolMessage)
+        assert "Tool-call budget exhausted" in str(denied.content)
+        # ...but send_message and react MUST still pass through.
+        sm = await mw.awrap_tool_call(_make_request("send_message", "id-4"), handler)
+        rx = await mw.awrap_tool_call(_make_request("react", "id-5"), handler)
+    finally:
+        reset_current_turn(token)
+    assert sm.content == "ok"
+    assert rx.content == "ok"
+    assert handler_calls == ["shell_exec", "shell_exec", "send_message", "react"]
+    # Exempt tools must NOT bump the count (otherwise heavy send_message
+    # use would still tick toward... nothing useful, but for clarity
+    # the spec is "free passage").
+    assert ctx.tool_call_count == 2
+
+
+def test_denial_message_mentions_exempt_tools():
+    """The model needs to know what it CAN still do when the cap hits.
+    The denial text names ``send_message`` and ``react`` so it doesn't
+    waste turns retrying gated tools."""
+    ctx = _make_ctx(budget=1)
+    token = set_current_turn(ctx)
+    try:
+        _check_and_increment_or_deny("shell_exec")  # 1, passes
+        out = _check_and_increment_or_deny("shell_exec")  # refused
+    finally:
+        reset_current_turn(token)
+    assert out is not None
+    assert "send_message" in out
+    assert "react" in out
+
+
+@pytest.mark.asyncio
+async def test_middleware_catches_unregistered_tools():
+    """The deepagents built-ins (``shell_exec``, ``read_file``, etc.)
+    arrive at the middleware as ToolCallRequests whose ``tool`` may
+    be set OR None depending on registration. Either way the budget
+    check fires on the ``tool_call.name`` — which is the gap that
+    motivated this rewrite."""
+    mw = BudgetGateMiddleware()
+    handler_invocations = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_invocations
+        handler_invocations += 1
+        return ToolMessage(content="ran", tool_call_id=req.tool_call["id"])
+
+    ctx = _make_ctx(budget=1)
+    token = set_current_turn(ctx)
+    try:
+        # First call: deepagents built-in shell_exec — ``tool`` would
+        # be the deepagents-supplied tool. Passes the cap.
+        req1 = _make_request("shell_exec", "id-a")
+        await mw.awrap_tool_call(req1, handler)
+        # Second call: at the cap. Same shape, refused.
+        req2 = _make_request("shell_exec", "id-b")
+        out = await mw.awrap_tool_call(req2, handler)
+    finally:
+        reset_current_turn(token)
+    assert isinstance(out, ToolMessage)
+    assert "shell_exec" in str(out.content)
+    assert handler_invocations == 1
+
+
+# ─── get_turn alias (unchanged from prior file) ───────────────────
 
 
 def test_get_turn_alias_is_a_distinct_tool() -> None:
@@ -224,7 +362,8 @@ def test_get_turn_alias_returns_same_record(tmp_path) -> None:
     assert out_canonical == out_alias
     parsed = json.loads(out_canonical)
     assert parsed["turn_id"] == "abc123"
-    # ``input`` was stripped per the contract.
+    # ``input`` is stripped per the get_turn contract — the alias
+    # must preserve that.
     assert "input" not in parsed
 
 

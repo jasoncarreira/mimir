@@ -2,37 +2,58 @@
 
 The SDK build gated tool calls via a ``PreToolUse`` HookMatcher that
 checked ``TurnContext.tool_call_count`` against
-``ctx.tool_call_budget`` before allowing each invocation. Pre-181-N
-the deepagents agent had no equivalent — ``Config.tool_call_budget``
-existed but didn't gate anything, so panic-search loops could chew
-through token budget indefinitely.
+``ctx.tool_call_budget`` before allowing each invocation. The hook ran
+on EVERY tool call, including the SDK's built-in tools (read/write/bash).
 
-Restoration: ``apply_budget_gate`` wraps every langchain tool with a
-pre-invocation check. The wrapper runs synchronously on the tool's
-call path (no separate hook chain), so it composes cleanly with the
-deepagents middleware surface without requiring custom middleware.
+Post-181 the deepagents agent has a langchain ``AgentMiddleware`` layer
+that intercepts every tool invocation via ``wrap_tool_call`` /
+``awrap_tool_call``. That's the right level — built-ins included.
 
-Soft + hard semantics:
+Prior implementation (replaced 2026-05-23): we monkey-patched each
+mimir tool's ``coroutine``/``func`` via ``apply_budget_gate`` and
+added the list to ``create_deep_agent(tools=...)``. That missed
+deepagents' built-in tools (``shell_exec``, ``read_file``,
+``write_file``, ``glob``, ``edit_file``, ``write_todos``) which are
+added by deepagents internally and never went through the mimir
+tools list. Production heartbeats hit 142 tool_calls vs a budget of
+120 with zero budget events firing — the gap that motivated this
+rewrite.
 
-* Below ``soft_threshold = max(1, ceil(budget * 0.75))``: silent.
-* Between soft and hard: log a one-time-per-turn
+Soft + hard semantics (unchanged):
+
+* Below ``soft_threshold = max(1, int(budget * 0.75))``: silent.
+* At soft threshold: log a one-time-per-turn
   ``tool_call_budget_soft_warning`` event. The tool still runs.
 * At or above ``hard_threshold = budget``: refuse the call,
-  return a budget-denied string, emit ``tool_call_budget_denied``.
+  return a ``ToolMessage`` with the denial text, emit
+  ``tool_call_budget_denied``.
 
-A ``budget`` of 0 disables enforcement entirely (matches main's
-contract — operators set MIMIR_TOOL_CALL_BUDGET=0 for benchmarks
+A ``budget`` of 0 disables enforcement entirely (matches the SDK
+contract — operators set ``MIMIR_TOOL_CALL_BUDGET=0`` for benchmarks
 that need uncapped exploration).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Awaitable, Callable
 
-from langchain_core.tools import BaseTool
+from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
+from langchain_core.messages import ToolMessage
+from langgraph.types import Command
 
 log = logging.getLogger(__name__)
+
+
+# Tools exempt from the per-turn cap. They neither consume a slot nor
+# get refused after the cap is hit. The driving case is ``send_message``:
+# when the budget is exhausted the denial path tells the model to
+# "finish the turn", but the final assistant text does NOT auto-deliver
+# to channels (an explicit send_message call is the only delivery path
+# — see SPEC §7.1). Without exempting it, the agent would hit the cap,
+# get told to stop, but have no way to actually tell the operator. ``react``
+# is exempt for the same operator-facing-acknowledgement reason.
+_BUDGET_EXEMPT_TOOLS = frozenset({"send_message", "react"})
 
 
 def _resolve_budget_state() -> tuple[Any, int] | None:
@@ -51,11 +72,11 @@ def _resolve_budget_state() -> tuple[Any, int] | None:
 
 
 def _emit_event_sync(kind: str, **kwargs: Any) -> None:
-    """Fire-and-forget log_event from a sync tool-call wrapper.
+    """Fire-and-forget log_event from inside the middleware sync path.
 
-    The tool wrapper runs as part of the langchain dispatch; depending
-    on the tool's own shape it may be sync or async. log_event is
-    async — we schedule it on the running loop when possible.
+    The middleware's ``wrap_tool_call`` is sync; ``log_event`` is async.
+    We schedule it on the running loop when available, drop otherwise
+    (the denial text on the returned ToolMessage is still load-bearing).
     """
     try:
         import asyncio
@@ -63,97 +84,106 @@ def _emit_event_sync(kind: str, **kwargs: Any) -> None:
         loop = asyncio.get_running_loop()
         loop.create_task(log_event(kind, **kwargs))
     except RuntimeError:
-        # No running loop (sync caller); silently drop. The denial
-        # message in the tool return value is still visible to the
-        # model.
         log.debug("budget event %s dropped: no running loop", kind)
 
 
 def _budget_denied_message(tool_name: str, count: int, budget: int) -> str:
     return (
         f"Tool-call budget exhausted: {count}/{budget} calls used "
-        f"this turn. ``{tool_name}`` was refused. Reflect on what "
-        f"you have so far and finish the turn rather than firing "
-        f"another tool."
+        f"this turn. ``{tool_name}`` was refused. ``send_message`` and "
+        f"``react`` remain available so you can still reply or "
+        f"acknowledge — use them to wrap up the turn rather than "
+        f"firing another tool."
     )
 
 
-def apply_budget_gate(tool: BaseTool) -> BaseTool:
-    """Wrap ``tool`` with a per-turn budget check.
-
-    Mutates the tool in-place by replacing its ``coroutine`` / ``func``
-    with a budget-aware shim. Returns the same tool for chaining.
-
-    The shim's logic, in order:
-
-      1. Resolve the active TurnContext + non-zero budget. If either
-         is missing → no gating, call the original function unchanged.
-      2. If ``ctx.tool_call_count >= budget`` → emit
-         ``tool_call_budget_denied`` (one per refusal) and return the
-         budget-denied message string.
-      3. Else increment the count. If we just crossed the soft
-         threshold (and haven't warned yet), emit
-         ``tool_call_budget_soft_warning`` once per turn.
-      4. Delegate to the original function.
-
-    Idempotent: a tool that's already wrapped (carries the
-    ``_mimir_budget_wrapped`` marker) is returned unchanged.
-    """
-    if getattr(tool, "_mimir_budget_wrapped", False):
-        return tool
-
-    original_coroutine = tool.coroutine
-    original_func = tool.func
-
-    def _check_and_increment(tool_name: str) -> str | None:
-        """Returns a denial message (str) if the call should be refused,
-        or ``None`` if the call should proceed."""
-        state = _resolve_budget_state()
-        if state is None:
-            return None
-        ctx, budget = state
-        count = getattr(ctx, "tool_call_count", 0) or 0
-        if count >= budget:
-            _emit_event_sync(
-                "tool_call_budget_denied",
-                tool=tool_name,
-                count=count,
-                budget=budget,
-            )
-            return _budget_denied_message(tool_name, count, budget)
-        # Increment first, then check soft threshold against the new
-        # count — easier to reason about than off-by-one.
-        new_count = count + 1
-        ctx.tool_call_count = new_count
-        soft = max(1, int(budget * 0.75))
-        if new_count >= soft and not getattr(
-            ctx, "_tool_call_soft_warning_emitted", False,
-        ):
-            ctx._tool_call_soft_warning_emitted = True
-            _emit_event_sync(
-                "tool_call_budget_soft_warning",
-                tool=tool_name,
-                count=new_count,
-                budget=budget,
-                soft_threshold=soft,
-            )
+def _check_and_increment_or_deny(tool_name: str) -> str | None:
+    """Returns a denial message (str) if the call should be refused,
+    or ``None`` if the call should proceed. Shared between the sync
+    and async middleware paths so the bookkeeping stays identical."""
+    # Exempt tools (send_message, react) bypass both the count
+    # increment AND the cap check — see ``_BUDGET_EXEMPT_TOOLS``
+    # docstring for why. Free passage, no bookkeeping.
+    if tool_name in _BUDGET_EXEMPT_TOOLS:
         return None
+    state = _resolve_budget_state()
+    if state is None:
+        return None
+    ctx, budget = state
+    count = getattr(ctx, "tool_call_count", 0) or 0
+    if count >= budget:
+        _emit_event_sync(
+            "tool_call_budget_denied",
+            tool=tool_name,
+            count=count,
+            budget=budget,
+        )
+        return _budget_denied_message(tool_name, count, budget)
+    new_count = count + 1
+    ctx.tool_call_count = new_count
+    soft = max(1, int(budget * 0.75))
+    if new_count >= soft and not getattr(
+        ctx, "_tool_call_soft_warning_emitted", False,
+    ):
+        ctx._tool_call_soft_warning_emitted = True
+        _emit_event_sync(
+            "tool_call_budget_soft_warning",
+            tool=tool_name,
+            count=new_count,
+            budget=budget,
+            soft_threshold=soft,
+        )
+    return None
 
-    if original_coroutine is not None:
-        async def _gated_coro(**kwargs: Any) -> Any:
-            denial = _check_and_increment(tool.name)
-            if denial is not None:
-                return denial
-            return await original_coroutine(**kwargs)
-        tool.coroutine = _gated_coro
 
-    if original_func is not None:
-        def _gated_sync(**kwargs: Any) -> Any:
-            denial = _check_and_increment(tool.name)
-            if denial is not None:
-                return denial
-            return original_func(**kwargs)
-        tool.func = _gated_sync
+def _tool_name_from_request(request: ToolCallRequest) -> str:
+    """Pull a usable name off the ToolCallRequest. ``request.tool``
+    is the BaseTool when registered, ``None`` for un-registered calls
+    (e.g. typos the model generates). The ``tool_call`` dict always
+    carries the name the model used."""
+    tc = getattr(request, "tool_call", None) or {}
+    return str(tc.get("name") or "<unknown>")
 
-    tool._mimir_budget_wrapped = True
-    return tool
+
+def _tool_call_id(request: ToolCallRequest) -> str:
+    tc = getattr(request, "tool_call", None) or {}
+    return str(tc.get("id") or "")
+
+
+class BudgetGateMiddleware(AgentMiddleware):
+    """Intercept every tool call (built-in or registered) for per-turn
+    budget enforcement. Pairs with ``TurnContext.tool_call_budget`` /
+    ``tool_call_count`` set by ``agent.run_turn``.
+    """
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command],
+    ) -> ToolMessage | Command:
+        tool_name = _tool_name_from_request(request)
+        denial = _check_and_increment_or_deny(tool_name)
+        if denial is not None:
+            return ToolMessage(
+                content=denial,
+                tool_call_id=_tool_call_id(request),
+                name=tool_name,
+                status="error",
+            )
+        return handler(request)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
+    ) -> ToolMessage | Command:
+        tool_name = _tool_name_from_request(request)
+        denial = _check_and_increment_or_deny(tool_name)
+        if denial is not None:
+            return ToolMessage(
+                content=denial,
+                tool_call_id=_tool_call_id(request),
+                name=tool_name,
+                status="error",
+            )
+        return await handler(request)
