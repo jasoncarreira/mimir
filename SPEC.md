@@ -958,7 +958,7 @@ Mimir maintains two independent search indexes. Corruption in either produces si
 
 #### File corpus index (`file_search`)
 
-Backed by SQLite + fastembed (BM25 FTS5 + dense vector index). Lives at `<home>/state/search.db`.
+Backed by SQLite + fastembed (BM25 FTS5 + dense vector index). Lives at `<home>/.mimir/index.db`.
 
 **What constitutes corruption:**
 - FTS5 rowid drift (typically from a crash mid-write): `file_search` returns 0 results for file content that `read_file` confirms exists.
@@ -975,7 +975,15 @@ Backed by SQLite + fastembed (BM25 FTS5 + dense vector index). Lives at `<home>/
 2. If the embedding model changed: ensure `MIMIR_EMBED_MODEL` matches what's configured, then run `rebuild_index`. Do not re-embed SAGA atoms via this path — SAGA has its own re-embedding pipeline (`saga_calibration.re_embed`; see below).
 3. Confirm recovery: `file_search("known content")` returns expected paths. Check `events.jsonl` for a new `index_rebuild` event.
 
-**Gap (⚠️ critical, see §16 item 16).** There is no automated corruption detection. The 60s sweep assumes the SQLite file is healthy; it does not validate FTS5 integrity or check vector dimension consistency. A periodic `PRAGMA integrity_check` on the FTS5 virtual table and a dimension-sanity check on the first vector row would catch both without a full rebuild.
+**Automated detection (PR #289, §16 item 16 resolved).** A daily integrity-check cron (`30 4 * * *`, after saga-consolidate at 04:00) runs five probes per database via `mimir/index_integrity.py`:
+
+1. `PRAGMA integrity_check` — SQLite-level page/btree corruption.
+2. `PRAGMA foreign_key_check` — orphaned rows after a partial delete.
+3. FTS5 self-check (`INSERT INTO ft(ft) VALUES('integrity-check')`) — FTS5 b-tree corruption that `integrity_check` doesn't catch.
+4. FTS5 row-count match against the base table — sync drift from a crash mid-write.
+5. Embedding-dim uniformity — mixed blob lengths indicate the embedder was swapped without a full rebuild.
+
+Clean run emits `index_integrity_ok`; any failure emits `index_integrity_failed` with the failures list. The latter is wired as a negative algedonic signal (`feedback.py`) so the agent sees corruption on the next turn's feedback block. Operators can also probe on demand via `mimir verify-index` (or `--db index` / `--db saga`).
 
 #### SAGA semantic index (FAISS)
 
@@ -1579,7 +1587,7 @@ Gaps identified by independent spec review, organized by severity. Critical gaps
 
 15. **State-push recovery.** [Resolved: §4.10] Push-failure detection, retry with exponential backoff (5 m → 15 m → 45 m), `git_push_stale` algedonic escalation after retries exhausted, and extended-divergence recovery path specified and implemented. See §4.10.
 
-16. **Index corruption detection and rebuild.** The spec has no procedure for detecting or recovering from file corpus or SAGA FAISS index corruption. Silent retrieval failures (zero results, stale results) are the observable symptom. Spec text for the rebuild procedure has been added at §8.3, but automated detection (periodic FTS5 integrity check, dimension-sanity probe) is still unimplemented. Track as a follow-up item.
+16. **Index corruption detection and rebuild.** [Resolved: §8.3] Rebuild procedure documented at §8.3; automated detection shipped as a daily `index-integrity` cron emitting `index_integrity_ok` / `index_integrity_failed` algedonic events covering SQLite `integrity_check`, FTS5 self-check, FTS5 sync drift, foreign-key consistency, and embedding-dim uniformity for both `.mimir/index.db` and `.mimir/saga.db`. Ad-hoc inspection via `mimir verify-index`.
 
 17. **Session timeout for continuous channels.** [Resolved: turn-count cap] Implemented as `MIMIR_SAGA_SESSION_MAX_TURNS` (default 10, see §5.6). A continuous channel that never idles still gets synthesis after the cap is reached; the cap-path emits `saga_session_turn_cap_reached` so operators can distinguish it from the idle-timer path. The originally-suggested time-based fallback was deferred in favor of the turn cap — message-count is a tighter proxy for "session got long enough to synthesize" than wall-clock duration (a slow-burning channel at 1 msg/hour for 4h would otherwise force-synthesize on 4 turns, often too few to be useful, while a burst channel at 100 msg/min would not be capped at all by a 4h timer).
 
