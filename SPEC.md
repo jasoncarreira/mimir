@@ -1107,16 +1107,24 @@ Each `events` entry is one of:
 
 Tool-result `content` is truncated at 4KB (`MAX_TOOL_RESULT_BYTES`); input at 2KB (`MAX_INPUT_BYTES`). Identical caps to open-strix.
 
-### 10.3 Adapting from the SDK to LangChain-shape events
+### 10.3 LangChain-native event extraction
 
-Open-strix's `extract_turn_events` walks LangChain `AIMessage` / `ToolMessage` objects. Mimir uses the Claude Agent SDK, which emits `SDKAssistantMessage` / `SDKUserMessage` (with `tool_use_block` / `tool_result_block`). `mimir/turn_logger.py` provides an SDK-native `extract_turn_events()` that produces the *same* `events` list shape — i.e., the file format is identical, only the upstream message types differ.
+Post-deepagents migration (PR #181), mimir uses LangGraph natively and `turn_logger.py` walks `langchain_core.messages` objects directly — the same direction as open-strix. Three message shapes are supported:
 
-Mapping:
-- `SDKAssistantMessage` text content with `tool_use_blocks` → `{"type": "reasoning", "content": text}` followed by one `{"type": "tool_call", id, name, args}` per tool use.
-- `SDKAssistantMessage` text content with no tool_use_blocks → appended to `output`.
-- `SDKUserMessage` containing tool_result_blocks → one `{"type": "tool_result", id, name, content, is_error}` per block.
+| Shape | Source | How it appears |
+|---|---|---|
+| `AIMessage.tool_calls` + `ToolMessage` | langchain-anthropic, langchain-openai | Standard LangGraph tool-call roundtrip |
+| `AIMessage.response_metadata["internal_tool_calls"]` + `["tool_results"]` | ChatClaudeCode / Max OAuth subprocess | Built-in Claude Code tool results captured via SDK hooks |
+| `AIMessage` text-only (no tool_calls) | Final assistant message | Appended to `output` |
 
-Subagent results (returned by the `Agent` tool) appear as a `tool_result` event whose `name` is `"Agent"`; the inner subagent turns are not flattened into the parent log. Subagent invocations get their own per-call `<home>/logs/agent-runs/<agent_name>-<turn_id>.jsonl` if we want to inspect them later — defer that to phase 5.
+Mapping to the event list schema:
+- `AIMessage` with tool_calls → `{"type": "reasoning", "content": text}` + one `{"type": "tool_call", id, name, args}` per call.
+- Final `AIMessage` (last in the message list) → content appended to `output`, even if it also has tool_calls.
+- `ToolMessage` → `{"type": "tool_result", id, name, content, is_error}`.
+
+The on-disk schema is identical to the SDK era — bench tooling (`benchmark/scripts/collate_turns.py`, `benchmark/overview_turns.py`, the turn viewer) reads this output without modification.
+
+Out-of-process subagents spawned via `spawn_claude_code` (§7, §4.3) run in a separate Claude Code process. Their turns are not flattened into the parent's event log — each subagent writes its own turns to the parent's `logs/` path via the spawner's `output_dir` param.
 
 ### 10.4 Retention
 
@@ -1187,76 +1195,104 @@ open http://localhost:<host_port>/turns
 
 ### 12.1 Dockerfile
 
-Single Python image — SAGA is Python (FastAPI + Uvicorn), so we just `pip install` it alongside mimir:
+Single-process build. SAGA runs in-process (workspace dependency, not a sidecar), so there's one Python process rather than supervisord managing two. Claude Code CLI is installed via npm — it's the subprocess transport for `spawn_claude_code` (§4.3) and the Max/OAuth auth path.
 
 ```dockerfile
-FROM python:3.12-slim
-RUN apt-get update && apt-get install -y supervisor curl git && rm -rf /var/lib/apt/lists/*
+FROM python:3.11-slim AS base
 
-# SAGA (Python / FastAPI), copied from the vendored saga package.
-COPY saga /opt/saga
-RUN pip install /opt/saga
+# Node.js + Claude Code CLI (subprocess transport for spawn_claude_code)
+# PDF ingest tools (poppler-utils for text PDFs, tesseract-ocr for scanned)
+ENV NODE_VERSION=20
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg \
+        poppler-utils tesseract-ocr tesseract-ocr-eng \
+    && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @anthropic-ai/claude-code \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Mimir
-COPY pyproject.toml /opt/mimir/
-COPY mimir /opt/mimir/mimir
-RUN pip install /opt/mimir
+# uv: fast package manager
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && mv /root/.local/bin/uv /usr/local/bin/uv
 
-COPY docker/supervisord.conf /etc/supervisor/conf.d/mimir.conf
-COPY docker/entrypoint.sh /entrypoint.sh
-EXPOSE 8080 3002
-ENTRYPOINT ["/entrypoint.sh"]
+# Non-root user; Claude Code needs $HOME writable
+RUN useradd -m -u 1001 -s /bin/bash mimir
+USER mimir
+WORKDIR /home/mimir/app
+
+# Deps layer (cached unless pyproject / uv.lock changes)
+COPY --chown=mimir:mimir pyproject.toml uv.lock ./
+COPY --chown=mimir:mimir saga/pyproject.toml ./saga/pyproject.toml
+RUN uv sync --frozen --no-dev
+
+COPY --chown=mimir:mimir mimir/ ./mimir/
+COPY --chown=mimir:mimir saga/saga/ ./saga/saga/
+COPY --chown=mimir:mimir benchmarks/ ./benchmarks/
+
+# Pre-warm fastembed model cache
+RUN uv run python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')" || true
+
+ENV MIMIR_HOME=/home/mimir/agent
+ENV MIMIR_WEB_PORT=8080
+EXPOSE 8080
+
+VOLUME ["/home/mimir/agent", "/home/mimir/.claude", "/home/mimir/.cache"]
+CMD ["uv", "run", "mimir", "run", "--home", "/home/mimir/agent"]
 ```
 
-### 12.2 supervisord.conf
+No `docker/supervisord.conf` — the original two-process architecture (separate SAGA FastAPI sidecar + mimir) was replaced by in-process saga.core calls (PR #181).
 
-```ini
-[program:saga]
-command=python -m saga.server
-autostart=true
-autorestart=true
-stdout_logfile=/app/logs/saga.log
+### 12.2 Volumes
 
-[program:mimir]
-command=python -m mimir.server
-autostart=true
-autorestart=true
-stdout_logfile=/app/logs/mimir.log
-environment=SAGA_ENDPOINT="http://localhost:3002"
-```
-
-### 12.3 Volumes
-
-- `/home` → benchmark mounts the agent's working directory here. Equivalent to open-strix's `agent-home-*` mount pattern.
-- `/app/logs` → captures stdout for both processes.
+- `/home/mimir/agent` — agent home (`memory/`, `state/`, `logs/`, `.mimir/saga.db`). Persists across container restarts.
+- `/home/mimir/.claude` — Claude Code session credential (Max plan OAuth path). Mount the host `~/.claude/` here.
+- `/home/mimir/.cache` — fastembed model cache. Persists across rebuilds so the first request doesn't re-download.
 
 ---
 
 ## 13. Benchmark adapter
 
-### 13.1 Files added under `odin/benchmark/`
+### 13.1 Longmemeval runner (primary)
 
-- `adapters/mimir.py` — adapter class (subclass of `BaseAdapter`), modeled after `adapters/open_strix.py`.
-- `prompts/mimir/{persona,flow,communication,learned_behaviors}.md` — editable prompt fragments.
-- `docker/mimir/` — adapter-side compose file or build context if not pulled directly from `odin/mimir/`.
-- One line in `scripts/run_sequential_bench.sh`'s adapter list.
+The primary benchmark integration is the longmemeval runner under `benchmarks/longmemeval_via_mimir/`:
+
+```
+benchmarks/
+  longmemeval_via_mimir/
+    runner.py          # orchestrates Q&A loop against mimir
+    route.py           # per-question routing helpers
+    saga_p*.toml       # saga configs for different param sweeps
+    README.md
+```
+
+**Invocation** (from `/workspace/mimir`):
+
+```bash
+uv run python -m benchmarks.longmemeval_via_mimir.runner \
+    --dataset-path /longmemeval-data/ \
+    --output-dir results/longmemeval_via_mimir/
+```
+
+The runner injects questions via the `/event` endpoint (`channel_id` with `bench-` prefix; `BenchBridge` routes outbound `send_message` to result files). Hypothesis files land under `--output-dir`; score via:
+
+```bash
+uv run --with backoff --with openai --with nltk \
+    python benchmarks/longmemeval_via_mimir/evaluate_qa.py \
+    --predictions results/longmemeval_via_mimir/<run>/ \
+    --output results/longmemeval_via_mimir/<run>-scores.json
+```
+
+Caveats: `--dataset-path` must be explicit (default resolves incorrectly — see `memory/issues/longmemeval-runner-dataset-path-default-missing.md`); `--limit N` produces category-skewed slices (see `memory/issues/longmemeval-limit-flag-category-skew.md`).
 
 ### 13.2 Adapter responsibilities
 
-- **Build/start container** — same pattern as open-strix.
-- **Reset between tasks** — tar snapshot/restore of `<home>` plus a `TRUNCATE` on the SQLite index. `<home>/.claude/agents/` survives reset.
-- **Event injection** — POST to mimir's `/event` endpoint with `channel_id` set to a `bench-` prefix; the `BenchBridge` (§7.2.1) routes outbound `send_message` back to stdout that the adapter consumes.
-- **Resume detection** — same `task-<N>-result.json` rule as bluesky_recall (memory: `feedback_clean_per_task_jsons_for_fresh_run`).
+- **Reset between tasks** — tar snapshot/restore of `<home>` + SQLite index truncate + saga reset (delete `agent/.mimir/saga.db`). `<home>/.claude/agents/` survives.
+- **Event injection** — POST `{"channel_id": "bench-<task_id>", "content": "…"}` to `http://localhost:8080/event`.
+- **Resume detection** — existing hypothesis files in `--output-dir`; questions with answers already on disk are skipped.
 
-### 13.3 Reset strategy
+### 13.3 BenchBridge
 
-```python
-def reset(self) -> None:
-    self._archive_and_truncate_turns()  # if relevant
-    self._restore_home_from_baseline_tar()
-    self._truncate_index_db()
-    self._reset_saga()  # delete /home/.saga/atoms.db or POST /reset
-```
+`BenchBridge` (§7.2.1) is a no-op send bridge: outbound `send_message` / `react` calls route through the registry and write structured JSON for the runner to parse — no Discord/Slack delivery. Enabled when the channel ID has a `bench-` prefix.
 
 ---
 
@@ -1303,36 +1339,26 @@ def reset(self) -> None:
 
 ### 14.1 Pointing mimir at Minimax-M2.7 (or any Anthropic-compatible gateway)
 
-The Claude Agent SDK accepts these env vars by being a thin wrapper over the Claude Code CLI subprocess, which honors the gateway protocol documented at `code.claude.com/docs/en/llm-gateway`. The SDK has no `base_url` parameter on `ClaudeAgentOptions`; we forward env via `ClaudeAgentOptions.env`:
+Post-deepagents migration, mimir uses `langchain-anthropic` / `ChatClaudeCode` as the LLM backend (PR #181). Gateway configuration is via environment variables that the LangChain provider picks up directly — no `ClaudeAgentOptions` wrapper needed:
 
-```python
-options = ClaudeAgentOptions(
-    system_prompt=build_system_prompt(),
-    tools=[...],
-    skills=[...],
-    agents={...},
-    model=os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7"),
-    effort="high",
-    thinking={"type": "adaptive"},
-    env={
-        "ANTHROPIC_BASE_URL": os.environ.get("ANTHROPIC_BASE_URL", ""),
-        "ANTHROPIC_AUTH_TOKEN": os.environ.get("ANTHROPIC_AUTH_TOKEN", ""),
-        "ANTHROPIC_MODEL": os.environ.get("ANTHROPIC_MODEL", ""),
-        "ANTHROPIC_CUSTOM_MODEL_OPTION": os.environ.get("ANTHROPIC_CUSTOM_MODEL_OPTION", ""),
-        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-    },
-)
+```bash
+ANTHROPIC_BASE_URL=https://your-gateway/
+ANTHROPIC_AUTH_TOKEN=...
+ANTHROPIC_MODEL=minimax-m2.7        # or gateway-equivalent name
+ANTHROPIC_CUSTOM_MODEL_OPTION=1     # skip claude-* name validation
 ```
 
-This means **mimir is benchmark-comparable with the existing 6 adapters on Minimax-M2.7** without any SDK code changes: the benchmark adapter sets `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_MODEL=minimax-m2.7` (or `ANTHROPIC_CUSTOM_MODEL_OPTION` if name validation kicks in) before launching the container. `effort` and `thinking` are silently ignored by Minimax-M2.7 (same behavior as the other adapters today).
+The benchmark adapter sets these before launching the container. `effort` and `thinking` params are ignored by non-Anthropic gateways (same behavior as the other adapters).
 
-When run on Claude (Opus 4.7), all advanced features — adaptive thinking, effort, subagents — work natively.
+When run against Claude (Opus 4.7 via OAuth or API key), all features work natively — adaptive thinking, `spawn_claude_code` subagents, 1M context beta.
 
-Channel-specific config (Bluesky/Slack) is deferred — `send_message` only needs to write to the benchmark's stdout stream in v1.
+Channel-specific config (Bluesky/Slack) is live (both bridges implemented post-Phase 6.3); deferred config is mainly around per-channel rate-limit granularity and Bluesky reply threading.
 
 ---
 
 ## 15. Phased build plan
+
+> **Archive note:** All phases shipped by 2026-05-22. This section is preserved as a historical record of the build sequence. Phase completion dates noted inline where known.
 
 ### Phase 1 — skeleton (1–2 days)
 - Repo scaffold (`pyproject.toml`, package layout).
@@ -1429,16 +1455,16 @@ Total: ~15.5 working days for a first benchmarkable build (Phase 4 expanded by 0
 
 ## 16. Open questions / deferred decisions
 
-1. **Slack and Bluesky bridge implementations.** Phase 6.3 lands stubs; production fill-in (auth flow, retry, rate limits, attachments) is deferred until needed. Per-channel rate limits to prevent cross-turn `send_message` spam are also deferred — circuit breaker (§7.2.4) only covers within-turn loops.
-2. **Embedder upgrade path.** Likely target: `text-embedding-3-large` or a stronger open model. Decision deferred; v1 ships fastembed bge-small.
+1. **Slack and Bluesky bridge implementations.** Slack and Discord bridges are live (production). Bluesky bridge is implemented. Per-channel rate-limit granularity (beyond the within-turn circuit breaker at §7.2.4) is still deferred.
+2. **Embedder upgrade path.** Likely target: `text-embedding-3-large` or a stronger open model. Decision deferred; v1 ships fastembed bge-small. Voyage AI embeddings explored as alternative (see `memory/issues/voyage-embedding-input-type-required.md`).
 3. **SAGA auto-store cadence.** SAGA's own atom extractor decides when to store from message content; mimir doesn't impose a separate cadence. Revisit if extraction is too noisy.
-4. **Subagent recursion.** SDK forbids it (verified against `claude-agent-sdk==0.1.58` docs: "Subagents cannot spawn their own subagents. Don't include `Agent` in a subagent's `tools` array."). If a future climber needs to spawn a researcher, the parent dispatches both sequentially. The `Agent` tool is *omitted* from each subagent definition's `tools` list.
+4. **Subagent recursion.** [Resolved: changed post-deepagents migration] The `Agent` SDK tool is no longer the subagent mechanism. `spawn_claude_code` (§4.3) spawns an out-of-process Claude Code subprocess — recursion is possible (a subagent can itself call `spawn_claude_code`) but budget-gated. The original SDK-level "cannot spawn subagents" restriction no longer applies.
 5. **Index regeneration cost.** With end-of-turn debounce (§3.4, §6.3) regeneration is one tree-walk per turn regardless of how many writes happened. Cheap for ~50 files; revisit if either tree crosses ~500 — at that point add a `MIMIR_INDEX_MAX_ENTRIES` cap on what `memory/INDEX.md` renders into the prompt and let the rest live behind `file_search`.
 6. **Renumbering pressure.** With 10-spacing, gaps close after ~10 inserts at a single position. Add a maintenance scheduled job ("renumber memory/core/ if gaps closed") in Phase 5.
 7. **SAGA decay/forget cadence.** Mimir runs periodic consolidation (§5.6) but leaves `/v1/decay` and `/v1/forget` to SAGA's internal defaults. Revisit if working memory grows unbounded or stale atoms degrade retrieval.
-8. **Git audit/rollback layer.** Optional: wrap the agent home in a git repo and commit per turn (or per memory write). Not the concurrency story — that's already solved by namespacing + the cross-channel writer thread — but useful for "show me what changed in the last 5 turns" and "roll back the last turn" capabilities. Deferred. Cost: every memory op gains a git op; benefit: free history + rollback.
+8. **Git audit/rollback layer.** [Resolved: shipped] Agent home (`/mimir-home`) is tracked via git in the `mimirbot-state` repo — commits happen via post-turn hooks. Per-turn rollback is available via `git revert`. See `memory/issues/git-credential-store-erase-on-auth-failure.md` for the main operational gotcha.
 9. **Chat history file growth.** `messages/chat_history.jsonl` is unbounded by default. Daily logrotate or size-based trimming when a real production deployment cares. Memory deques are bounded; the file is a complete history.
 10. **Bash content writes.** The prompt steers the agent toward `write_file`/`edit_file` for memory edits, but if it `echo > memory/core/00-persona.md`s anyway, last-writer-wins applies and there's no `flock`. Acceptable today; if it becomes a real failure mode, wrap bash with a path-aware preflight that runs cross-channel-path commands under `flock(1)`.
 11. **Channel ID conventions.** The spec assumes channel IDs are stable strings. When the same human's Slack ID changes (workspace migration) we lose continuity. Track this as a future "identity reconciliation" problem.
-12. **Within-turn parallel tool execution.** The Claude Agent SDK docs do not specify whether multiple non-`Agent` `tool_use` blocks in one assistant message run concurrently or sequentially. §4.4 #4 treats them as effectively sequential; `flock` makes us correct either way. **Action**: 30-line repro test in Phase 1 to confirm — if concurrent, document and adjust §4.4; if sequential, no change needed.
-13. **Background subagent stream delivery.** `TaskStartedMessage` is documented as emitted on the parent's stream when an `Agent(background=True)` task starts. `TaskProgressMessage` and `TaskNotificationMessage` types are exported by the SDK but their runtime delivery contract (stream vs. polling) is not in the published docs. **Action**: Phase 5 should include a runtime smoke test — fire a long-running `Agent("climber", ...)` with `background=True`, assert the parent receives `TaskNotificationMessage` on its stream when the climber finishes. If the contract turns out to be polling, the spec's `subagent_inbox` queue (§4.4) needs a poll loop instead of a stream-handler.
+12. **Within-turn parallel tool execution.** [Resolved: LangGraph handles this] Post-deepagents, LangGraph controls the tool-execution loop. Multiple tool calls in one assistant message run sequentially within the LangGraph state machine. No flock race; §4.4 sequential assumption holds.
+13. **Background subagent stream delivery.** [Resolved: moot] The `Agent(background=True)` SDK pattern is no longer used. Background delegation is via `spawn_claude_code` with `bash_async` wait patterns (§4.3). Completion arrives as a `shell_job_complete` wake-up event on the spawning channel.
