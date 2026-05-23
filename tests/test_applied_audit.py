@@ -312,6 +312,153 @@ def test_compute_signals_unknown_kind_returns_empty(tmp_path: Path):
     assert signals == []
 
 
+def test_compute_signals_drops_phantom_tool_match(tmp_path: Path):
+    """Prose like 'Adding the introspection' or 'Unblocks chainlink #61'
+    used to match the loose CamelCase regex and produce a phantom
+    ``tool_calls:Adding 0 → 0`` row. The tightened heuristic + the
+    0/0 drop guard means these surface as 'no parseable signal' rows
+    instead."""
+    proposal = AppliedProposal(
+        id="2026-05-09 — unblock chainlink #61",
+        applied_at=NOW.isoformat(),
+        predicted_effect=(
+            "Unblocks chainlink #61. Adding the introspection description "
+            "makes find-skills' awk extractor surface non-empty."
+        ),
+    )
+    # Empty turns log → any tool name would yield 0/0.
+    signals = compute_signals(
+        proposal,
+        events_log=tmp_path / "events.jsonl",
+        turns_log=tmp_path / "turns.jsonl",
+        now=NOW + timedelta(days=7),
+    )
+    assert signals == []
+
+
+def test_compute_signals_expect_line_events_kind(tmp_path: Path):
+    """A structured ``Expect: events:<type> drops`` line should pick the
+    new ``events`` signal kind and measure that specific event type."""
+    applied_at = NOW
+    proposal = AppliedProposal(
+        id="2026-04-24 — drop synth-skip boundary",
+        applied_at=applied_at.isoformat(),
+        predicted_effect=(
+            "The post-check should fire less often.\n"
+            "Expect: events:saga_synthesis_skipped_boundary drops"
+        ),
+    )
+    events = tmp_path / "logs" / "events.jsonl"
+    for i in range(4):
+        _write_event(events, ts=applied_at - timedelta(hours=12 + i),
+                     type="saga_synthesis_skipped_boundary")
+    _write_event(events, ts=applied_at + timedelta(hours=2),
+                 type="saga_synthesis_skipped_boundary")
+    # Noise: a different event type in the same window.
+    _write_event(events, ts=applied_at + timedelta(hours=3),
+                 type="tool_denied")
+
+    signals = compute_signals(
+        proposal,
+        events_log=events,
+        turns_log=tmp_path / "logs" / "turns.jsonl",
+        window_days=7,
+        now=applied_at + timedelta(days=7),
+    )
+    assert len(signals) == 1
+    s = signals[0]
+    assert s.name == "events:saga_synthesis_skipped_boundary"
+    assert s.before == 4
+    assert s.after == 1
+
+
+def test_compute_signals_expect_line_tool_calls(tmp_path: Path):
+    """Structured ``Expect: tool_calls:<name> rises`` should map to the
+    tool_calls kind even when the prose says nothing about tools."""
+    applied_at = NOW
+    proposal = AppliedProposal(
+        id="2026-04-24 — promote memory_query",
+        applied_at=applied_at.isoformat(),
+        predicted_effect=(
+            "Sessions that touched the new core block reach for it more.\n"
+            "Expect: tool_calls:memory_query rises"
+        ),
+    )
+    turns = tmp_path / "logs" / "turns.jsonl"
+    _write_turn(turns, ts=applied_at - timedelta(hours=4),
+                tool_calls=["memory_query"])
+    _write_turn(turns, ts=applied_at + timedelta(hours=4),
+                tool_calls=["memory_query", "memory_query", "memory_query"])
+
+    signals = compute_signals(
+        proposal,
+        events_log=tmp_path / "logs" / "events.jsonl",
+        turns_log=turns,
+        window_days=7,
+        now=applied_at + timedelta(days=7),
+    )
+    assert len(signals) == 1
+    assert signals[0].name == "tool_calls:memory_query"
+    assert signals[0].before == 1
+    assert signals[0].after == 3
+
+
+def test_compute_signals_expect_line_error_events(tmp_path: Path):
+    """``Expect: error_events drops`` (no target) routes through the
+    error-events path."""
+    applied_at = NOW
+    proposal = AppliedProposal(
+        id="x",
+        applied_at=applied_at.isoformat(),
+        predicted_effect="Expect: error_events drops",
+    )
+    events = tmp_path / "logs" / "events.jsonl"
+    for i in range(3):
+        _write_event(events, ts=applied_at - timedelta(hours=12 + i),
+                     type="tool_denied")
+    _write_event(events, ts=applied_at + timedelta(hours=2),
+                 type="tool_denied")
+    signals = compute_signals(
+        proposal,
+        events_log=events,
+        turns_log=tmp_path / "logs" / "turns.jsonl",
+        now=applied_at + timedelta(days=7),
+    )
+    assert len(signals) == 1
+    assert signals[0].name == "error_events"
+    assert signals[0].before == 3
+    assert signals[0].after == 1
+
+
+def test_compute_signals_expect_line_wins_over_prose(tmp_path: Path):
+    """If both a structured Expect: line and prose error-rate phrasing
+    are present, the Expect: line wins — it's the operator's explicit
+    instruction about what to measure."""
+    applied_at = NOW
+    proposal = AppliedProposal(
+        id="x",
+        applied_at=applied_at.isoformat(),
+        predicted_effect=(
+            "Error rate would drop a lot.\n"
+            "Expect: events:saga_synthesis_skipped_boundary drops"
+        ),
+    )
+    events = tmp_path / "logs" / "events.jsonl"
+    _write_event(events, ts=applied_at - timedelta(hours=4),
+                 type="saga_synthesis_skipped_boundary")
+    signals = compute_signals(
+        proposal,
+        events_log=events,
+        turns_log=tmp_path / "logs" / "turns.jsonl",
+        now=applied_at + timedelta(days=7),
+    )
+    # Expect: line specifies the event-type kind, not the generic
+    # error-events kind — so we measure the specific event type, not
+    # the broad error bucket.
+    assert len(signals) == 1
+    assert signals[0].name == "events:saga_synthesis_skipped_boundary"
+
+
 # ─── audit_window ──────────────────────────────────────────────────────
 
 
