@@ -113,6 +113,39 @@ def test_extract_links_strips_md_extension():
     assert list(extract_links("[[stigmergy.md#origins]]")) == [(1, "stigmergy")]
 
 
+def test_extract_links_strips_category_prefix():
+    """Wiki pages live under ``concepts/`` / ``topics/`` / ``entities/``
+    subdirs (per the wiki SKILL.md layout). Slug-based resolution
+    treats ``[[concepts/foo]]`` as equivalent to ``[[foo]]``. Without
+    this normalization the prefixed form gets recorded as a dangling
+    link to literal ``"concepts/foo"`` AND the real ``foo`` page gets
+    falsely flagged as orphan — the bug muninn-mimir's wiki-health
+    report surfaced on 2026-05-23."""
+    assert list(extract_links("[[concepts/stigmergy]]")) == [(1, "stigmergy")]
+    assert list(extract_links("[[topics/mempalace]]")) == [(1, "mempalace")]
+    assert list(extract_links("[[entities/penny]]")) == [(1, "penny")]
+
+
+def test_extract_links_prefix_combined_with_md_extension():
+    """Both ``[[concepts/foo.md]]`` and ``[[concepts/foo]]`` should
+    normalize to ``"foo"``. Order: strip ``.md`` first, then category
+    prefix — works in both orderings, but pinning this ensures the
+    interaction is tested."""
+    assert list(extract_links("[[concepts/stigmergy.md]]")) == [(1, "stigmergy")]
+    assert list(extract_links("[[topics/foo.md|display]]")) == [(1, "foo")]
+    assert list(extract_links("[[entities/bar.md#origins]]")) == [(1, "bar")]
+
+
+def test_extract_links_no_prefix_left_alone():
+    """Targets without a category prefix pass through unchanged —
+    we should not accidentally strip arbitrary leading path-like
+    fragments (e.g. ``random/foo`` keeps its prefix because
+    ``random/`` isn't a known category)."""
+    assert list(extract_links("[[random/foo]]")) == [(1, "random/foo")]
+    # Bare slug unchanged.
+    assert list(extract_links("[[just_a_slug]]")) == [(1, "just_a_slug")]
+
+
 # ─── find_pages ──────────────────────────────────────────────────────
 
 
