@@ -227,7 +227,50 @@ class HomeostaticArbiter:
 
         The S3/S4 partition layer is informational (rendered into the
         prompt block) but doesn't gate firing — busy days shouldn't
-        starve weekly maintenance work."""
+        starve weekly maintenance work.
+
+        Mid-turn quota exhaustion (SPEC §4.9 / §16 item 18): when a
+        prior turn hit a 429 and recorded a pause via QuotaPauseTracker,
+        ``is_paused()`` returns True until the recorded reset time.
+        While paused, scheduled ticks suppress regardless of
+        utilization — the upstream provider has already told us
+        we're cut off. The lazy-expiry inside ``is_paused`` clears
+        the pause when ``now`` crosses the reset timestamp; we
+        emit ``quota_recovered`` on that transition (positive
+        algedonic signal so the agent sees "we're back online").
+        """
+        # Quota-pause check fires BEFORE the utilization-based
+        # branches: an upstream 429 is a hard fact, not a heuristic.
+        # Imported locally to keep budget.py's import surface tight
+        # (quota_pause is a small module the arbiter only needs at
+        # decision time).
+        from .quota_pause import QuotaPauseTracker
+        pause_path = self.home / ".mimir" / "quota_pause.json"
+        if pause_path.is_file():
+            tracker = QuotaPauseTracker(pause_path)
+            status = tracker.is_paused(now=now)
+            if status.paused:
+                ts = status.reset_at.isoformat() if status.reset_at else "?"
+                return False, f"quota_exhausted_pause:resets_at={ts}"
+            if status.reset_at is not None:
+                # Lazy-expiry transition: the pause was active a moment
+                # ago and just cleared. Fire-and-forget the recovery
+                # event — sync arbiter can't await, so we schedule it
+                # on the running loop if there is one.
+                try:
+                    import asyncio
+                    from .event_logger import log_event
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(log_event(
+                        "quota_recovered",
+                        reset_at=status.reset_at.isoformat(),
+                        previous_reason=status.reason,
+                    ))
+                except RuntimeError:
+                    # No running loop (sync test path) — operator can
+                    # see recovery from the absence of the pause file.
+                    pass
+
         snap = self.snapshot(now=now)
 
         if self.billing_mode is BillingMode.QUOTA:
