@@ -314,6 +314,7 @@ class Config:
 
     # SAGA session (§5.6)
     saga_session_idle_minutes: int
+    saga_session_max_turns: int
     saga_consolidate_cron: str
 
     # Timezone the scheduler interprets all cron expressions in
@@ -634,6 +635,7 @@ class Config:
             recent_message_chars=_env_int("MIMIR_RECENT_MESSAGE_CHARS", 4096),
 
             saga_session_idle_minutes=_env_int("MIMIR_SAGA_SESSION_IDLE_MINUTES", 10),
+            saga_session_max_turns=_env_int("MIMIR_SAGA_SESSION_MAX_TURNS", 10),
             saga_consolidate_cron=_env("MIMIR_SAGA_CONSOLIDATE_CRON", "0 4 * * *"),
             scheduler_tz=_env("MIMIR_SCHEDULER_TZ", "UTC"),
             commitments_due_check_cron=_env(
