@@ -151,7 +151,14 @@ def _format_event(post: dict) -> dict | None:
     text = (post.get("text") or "").strip()
     if len(text) > TEXT_PREVIEW_CHARS:
         text = text[: TEXT_PREVIEW_CHARS - 1] + "…"
-    timestamp = post.get("timestamp") or ""
+    # PyYAML parses unquoted ISO timestamps into ``datetime`` objects
+    # (social-cli emits them unquoted in feed-{platform}.yaml). JSON
+    # can't serialize datetime, so coerce to ISO string here.
+    raw_ts = post.get("timestamp")
+    if hasattr(raw_ts, "isoformat"):
+        timestamp = raw_ts.isoformat()
+    else:
+        timestamp = str(raw_ts) if raw_ts else ""
     likes = post.get("likeCount") or 0
     replies = post.get("replyCount") or 0
     reposts = post.get("repostCount") or 0

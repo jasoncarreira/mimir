@@ -308,6 +308,23 @@ def discover_pollers(
             persist_dir = (
                 state_root / name if state_root is not None else None
             )
+            # Create the per-poller STATE_DIR at discovery time so
+            # operators can drop credentials (`.env`) and cursor seed
+            # files into a known location BEFORE the first cron tick
+            # fires. ``run_poller`` also mkdir's defensively at run
+            # time, but doing it here too means the dir is visible to
+            # ``ls`` immediately after ``reload_pollers`` / container
+            # boot — the operator doesn't have to wait for the cron
+            # schedule to mature.
+            if persist_dir is not None:
+                try:
+                    persist_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    log.warning(
+                        "poller_persist_dir_create_failed: %s name=%r "
+                        "persist_dir=%s — %s",
+                        pollers_file, name, persist_dir, exc,
+                    )
             # ``batch_size`` is optional; defaults to per-item-per-turn
             # to preserve the open-strix-equivalent shape. Garbage
             # values (negative, non-int, zero) fall back to default
