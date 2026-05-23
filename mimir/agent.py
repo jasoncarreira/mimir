@@ -1135,6 +1135,38 @@ class Agent:
             error = f"{type(exc).__name__}: {exc}"
             events = []
             log.exception("agent.astream failed: %s", exc)
+            # Mid-turn quota exhaustion handling (SPEC §4.9 / §16 item 18).
+            # If the model call surfaced as a 429, record a pause so
+            # subsequent scheduled ticks suppress until the window
+            # resets, and emit a structured ``quota_exhausted`` event
+            # (algedonic negative). User-message turns still try to
+            # run per §4.9 — they'll get their own 429 and surface
+            # it to the operator via send_message rather than vanishing.
+            try:
+                from .quota_pause import (
+                    QuotaPauseTracker,
+                    extract_reset_at,
+                    is_quota_exhaustion,
+                )
+                if is_quota_exhaustion(exc):
+                    reset_at, provider = extract_reset_at(exc)
+                    tracker = QuotaPauseTracker(
+                        self._config.home / ".mimir" / "quota_pause.json"
+                    )
+                    tracker.pause_until(
+                        reset_at, reason="quota_exhausted", provider=provider,
+                    )
+                    await log_event(
+                        "quota_exhausted",
+                        channel_id=event.channel_id,
+                        turn_id=turn_id,
+                        reset_at=reset_at.isoformat(),
+                        provider=provider,
+                        exception_class=type(exc).__name__,
+                        exception_message=str(exc)[:240],
+                    )
+            except Exception:  # noqa: BLE001 — defensive boundary
+                log.exception("quota_pause emit failed; continuing")
 
         # Result fields drive both the TurnRecord and the feedback-signal
         # branch below, so compute once and reuse.
