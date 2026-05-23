@@ -1699,8 +1699,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     # ``mimir verify-index`` — index integrity probes (SPEC §8.3,
     # §16 item 16). Run all checks against the file-corpus and SAGA
     # databases; exit 0 if clean, 1 if any check fails. Scheduled
-    # daily by the framework (cron 30 3 * * *) — this CLI is for
-    # ad-hoc operator inspection.
+    # daily by the framework (cron 30 4 * * *, after saga-consolidate
+    # at 04:00) — this CLI is for ad-hoc operator inspection.
     verify_index_p = sub.add_parser(
         "verify-index",
         help="Check SQLite + FTS5 + embedding-dim integrity of the file-corpus and SAGA indexes.",
