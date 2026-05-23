@@ -4,6 +4,19 @@ description: Discover what bundled skills exist in this mimir install and what e
 allowed-tools:
   - Bash
   - Read
+success_criteria:
+  # The skill's whole purpose is enumerating + filtering the skills
+  # tree. A Bash call that touches the skills/ or .mimir_builtin_skills/
+  # paths is the canonical signal of "discovery actually ran".
+  any_of:
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*skills/*/SKILL.md*"
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*.mimir_builtin_skills*"
 ---
 
 # Find Skills

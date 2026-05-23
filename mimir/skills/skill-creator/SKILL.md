@@ -5,6 +5,19 @@ allowed-tools:
   - Edit
   - Read
   - Write
+success_criteria:
+  # The skill's lasting artifact is a Write or Edit to a SKILL.md
+  # under the skills/ tree. The "create a new skill" use case
+  # produces a Write; "improve a SKILL.md" produces an Edit.
+  any_of:
+    - tool_call:
+        name: Write
+        args:
+          file_path_glob: "*skills/*/SKILL.md"
+    - tool_call:
+        name: Edit
+        args:
+          file_path_glob: "*skills/*/SKILL.md"
 ---
 
 <!-- desc: How to author a new skill — frontmatter shape, allowed-tools, desc-line, body conventions; cite mimir/skill_md.py as parser-of-record. -->

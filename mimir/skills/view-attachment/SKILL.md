@@ -4,6 +4,20 @@ description: View image or file attachments that you can't directly see. Use thi
 allowed-tools:
   - Bash
   - Read
+success_criteria:
+  # The skill's purpose is reading or inspecting an attachment under
+  # state/attachments/. Either path counts: Read directly (for image
+  # / text the runtime can handle) or Bash (file/identify/pdftotext
+  # for other formats).
+  any_of:
+    - tool_call:
+        name: Read
+        args:
+          file_path_glob: "*state/attachments/*"
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*state/attachments/*"
 ---
 
 # view-attachment

@@ -4,6 +4,24 @@ description: Discover, evaluate, install, and wrap external agent skills from Cl
 allowed-tools:
   - Bash
   - Read
+success_criteria:
+  # Either we browsed candidates (clawhub / skillflag CLI invocation)
+  # or we landed an installed skill (Write to skills/<name>/SKILL.md).
+  # Loading the SKILL.md and doing neither means we read the policy
+  # but never explored or installed anything.
+  any_of:
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*clawhub*"
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*skillflag*"
+    - tool_call:
+        name: Write
+        args:
+          file_path_glob: "*skills/*/SKILL.md"
 ---
 
 # Skill Acquisition

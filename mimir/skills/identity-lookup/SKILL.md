@@ -4,6 +4,23 @@ description: Look up who an alias belongs to (people) or what a channel id is (c
 allowed-tools:
   - Bash
   - Read
+success_criteria:
+  # Lookup happens via Bash + YAML parsing of identities.yaml (the
+  # portable form documented in the skill body), or the in-tree
+  # IdentityResolver path. Both pin to identifiable command shapes.
+  any_of:
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*identities.yaml*"
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*IdentityResolver*"
+    - tool_call:
+        name: Read
+        args:
+          file_path_glob: "*state/identities.yaml"
 ---
 
 # Identity Lookup
