@@ -62,6 +62,26 @@ _PROHIBITIONS: list[_Prohibition] = [
         ),
         "git push --force[--with-lease]/-f to main/master (reversed-arg form)",
     ),
+    # S5-2 onboarding layer: block bash vectors for extending the
+    # post-first-boot bypass window. The WriteGuardBackend's tamper
+    # check (ctime vs content_ts) catches backdated rewrites, but
+    # the agent could still ``rm`` the anchor and re-run ``mimir
+    # setup`` to re-create it with a fresh ctime. These prohibitions
+    # close that vector at the shell layer — the operator's
+    # legitimate ``docker exec`` path from the host doesn't go through
+    # the agent's tool dispatch, so it's unaffected.
+    _Prohibition(
+        re.compile(r"\bmimir\s+setup\b", re.I),
+        "mimir setup invocation (operator-only; would reset onboarding window)",
+    ),
+    _Prohibition(
+        re.compile(r"\bmimir\s+onboarding\b", re.I),
+        "mimir onboarding command (operator-only)",
+    ),
+    _Prohibition(
+        re.compile(r"\.mimir/first-boot\b"),
+        "write/touch/rm of .mimir/first-boot.json (operator-only anchor file)",
+    ),
 ]
 
 _BLOCK_PREFIX = "PROHIBITED_ACTION"

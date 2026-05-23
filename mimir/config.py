@@ -450,6 +450,15 @@ class Config:
     # allowing legitimate long heartbeat or reflection work.
     turn_timeout_seconds: int
 
+    # S5-2 onboarding bypass window. During the first N days after
+    # ``mimir setup`` writes ``<home>/.mimir/first-boot.json``, the
+    # reflection-only gate on ``memory/core/`` yields so the agent
+    # can collaboratively bootstrap its persona / memory architecture.
+    # After the window closes, the gate enforces normally. Setting
+    # this to 0 disables the bypass entirely (gate enforced from day
+    # one — useful for tests and locked-down deployments).
+    onboarding_window_days: int
+
     # Algedonic surfacing (v0.4 §2). Window for the Recent feedback
     # signals prompt section; per-polarity cap on rendered items. 0 for
     # the limit disables the section entirely. Tune small if the prompt
@@ -703,6 +712,7 @@ class Config:
             allow_unauthenticated=_env("MIMIR_ALLOW_UNAUTHENTICATED", "false").lower()
                 in {"true", "1", "yes"},
             turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", 3600),
+            onboarding_window_days=_env_int("MIMIR_ONBOARDING_WINDOW_DAYS", 3),
 
             feedback_window_hours=_env_int("MIMIR_FEEDBACK_WINDOW_HOURS", 24),
             feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),

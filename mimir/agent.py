@@ -808,6 +808,7 @@ class Agent:
             backend = WriteGuardBackend(
                 root_dir=self._config.home,
                 writable_dirs=self._config.writable_dirs,
+                onboarding_window_days=self._config.onboarding_window_days,
             )
             # Stored so run_turn can drain recorded denials into the
             # TurnRecord.permission_denials field at end of turn.

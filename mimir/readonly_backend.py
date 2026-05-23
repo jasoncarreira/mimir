@@ -22,7 +22,9 @@ mutator methods added by deepagents (``delete_file``, ``rename``,
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -126,6 +128,7 @@ class WriteGuardBackend:
         writable_dirs: list[str],
         *,
         enforce_core_memory_reflection_only: bool = True,
+        onboarding_window_days: int = 3,
     ) -> None:
         self._root = Path(root_dir).resolve()
         self._fs = _RootAwareFilesystemBackend(root_dir=root_dir, virtual_mode=True)
@@ -155,6 +158,21 @@ class WriteGuardBackend:
         self._enforce_core_memory_reflection_only: bool = (
             enforce_core_memory_reflection_only
         )
+        # Onboarding bypass — during the first N days after first boot,
+        # the S5-2 gate yields so the agent can collaboratively set up
+        # its persona / memory architecture without policy friction.
+        # Anchor: ``<home>/.mimir/first-boot.json`` (written by
+        # ``mimir setup`` on first invocation only). The window uses
+        # ``min(content_ts, file ctime)`` as the effective start to
+        # defend against the agent backdating ``created_at`` via bash.
+        # The agent CAN'T fully self-toggle: prohibited_action_guard
+        # blocks ``mimir setup`` / ``mimir onboarding`` invocations and
+        # writes to ``.mimir/first-boot.json`` at the bash layer (PR
+        # for S5-2 onboarding layer). Defense-in-depth: gate is tamper-
+        # *evident* (ctime mismatch logged) but the bash guard makes
+        # the obvious tamper paths fail loudly first.
+        self._first_boot_path: Path = self._root / ".mimir" / "first-boot.json"
+        self._onboarding_window_days: int = onboarding_window_days
         # Recorded denials, one per blocked Write/Edit/upload. The agent
         # drains this list at end-of-turn (``drain_denials()``) into
         # TurnRecord.permission_denials so the audit trail is visible
@@ -242,14 +260,53 @@ class WriteGuardBackend:
             for root in self._writable_roots
         )
 
+    def _onboarding_bypass_active(self) -> bool:
+        """True iff the post-first-boot bypass window is open.
+
+        Anchor: ``<home>/.mimir/first-boot.json`` (written by
+        ``mimir setup`` on first invocation only). The window starts at
+        ``min(content.created_at, file ctime)`` — using the EARLIER of
+        the two as the effective start defends against the agent
+        backdating ``created_at`` via bash to extend its own window
+        (``min`` picks the legitimate value). ctime can only move
+        forward via inode-metadata changes; backdating requires
+        ``CAP_SYS_TIME`` which mimir's container doesn't have.
+
+        Returns False on any parse error or missing file — fail-closed
+        for the bypass means the gate stays ON, which is the safe
+        direction. Tamper attempts (large ctime-vs-content_ts skew)
+        also fall through to False.
+        """
+        try:
+            stat = self._first_boot_path.stat()
+        except (OSError, FileNotFoundError):
+            return False
+        try:
+            with self._first_boot_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            content_iso = str(data.get("created_at") or "")
+            content_ts = datetime.fromisoformat(
+                content_iso.replace("Z", "+00:00")
+            )
+        except (OSError, json.JSONDecodeError, ValueError, KeyError, TypeError):
+            return False
+        ctime = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc)
+        effective_start = min(content_ts, ctime)
+        now = datetime.now(tz=timezone.utc)
+        return now < effective_start + timedelta(
+            days=self._onboarding_window_days
+        )
+
     def _is_core_memory_write_blocked(self, file_path: str) -> bool:
         """True iff this write should be refused by the S5-2 turn-type gate.
 
         Returns True only when ALL of these hold:
           1. The resolved target is under ``memory/core/``
           2. ``enforce_core_memory_reflection_only`` is True (default)
-          3. There is an active ``TurnContext``
-          4. That turn is NOT the weekly reflection
+          3. The post-first-boot onboarding bypass window is NOT open
+             (``_onboarding_bypass_active()`` returns False)
+          4. There is an active ``TurnContext``
+          5. That turn is NOT the weekly reflection
              (``trigger != "scheduled_tick"`` or
              ``channel_id`` does not start with ``"scheduler:reflect"``)
 
@@ -268,6 +325,13 @@ class WriteGuardBackend:
             or resolved.is_relative_to(self._memory_core_root)
         )
         if not under_core:
+            return False
+        # Onboarding bypass: first N days post-setup, allow core writes
+        # without requiring a reflection turn. See
+        # ``_onboarding_bypass_active`` for the anchor file + tamper
+        # protection. The prohibited_action_guard separately blocks the
+        # obvious bash-level vectors for extending the window.
+        if self._onboarding_bypass_active():
             return False
         # Lazy import to avoid a module cycle (mimir._context → models
         # → potentially back into the agent layer that constructs the

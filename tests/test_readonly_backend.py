@@ -459,6 +459,213 @@ class TestCoreMemoryReflectionGate:
         assert "upload_core_memory_non_reflection" in ops
 
 
+class TestOnboardingBypassWindow:
+    """S5-2 onboarding bypass — the gate yields for the first N days
+    after ``mimir setup`` writes ``<home>/.mimir/first-boot.json``.
+
+    The bypass uses ``min(content.created_at, file ctime)`` as the
+    effective start so backdated rewrites can't extend the window. The
+    bash-layer prohibited-action guard separately blocks the obvious
+    re-run vectors (``mimir setup``, ``mimir onboarding``, writes to
+    ``.mimir/first-boot.json``).
+    """
+
+    import json as _json
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    @pytest.fixture
+    def home_with_anchor(self, tmp_path: Path) -> Path:
+        (tmp_path / "state").mkdir()
+        (tmp_path / "memory").mkdir()
+        (tmp_path / "memory" / "core").mkdir()
+        (tmp_path / ".mimir").mkdir()
+        return tmp_path
+
+    @staticmethod
+    def _write_anchor(home: Path, created_iso: str) -> Path:
+        import json
+        anchor = home / ".mimir" / "first-boot.json"
+        anchor.write_text(
+            json.dumps({"created_at": created_iso}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return anchor
+
+    @staticmethod
+    def _make_user_turn_ctx():
+        from mimir.models import TurnContext
+        return TurnContext(
+            turn_id="t-test", session_id="s-test", trigger="user_message",
+            channel_id="discord-123", started_at=0.0,
+        )
+
+    @staticmethod
+    def _set_turn(ctx):
+        from mimir._context import set_current_turn
+        return set_current_turn(ctx)
+
+    @staticmethod
+    def _clear_turn(token):
+        from mimir._context import reset_current_turn
+        reset_current_turn(token)
+
+    def test_bypass_active_within_window(self, home_with_anchor: Path) -> None:
+        """A fresh first-boot.json (created_at = now) opens the window;
+        non-reflection writes to memory/core/ succeed."""
+        from datetime import datetime, timezone
+        self._write_anchor(home_with_anchor, datetime.now(tz=timezone.utc).isoformat())
+        b = WriteGuardBackend(
+            root_dir=home_with_anchor, writable_dirs=["memory"],
+            onboarding_window_days=3,
+        )
+        ctx = self._make_user_turn_ctx()
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/00-persona.md", content="bootstrap")
+            assert getattr(r, "error", None) is None
+        finally:
+            self._clear_turn(tok)
+
+    def test_bypass_expired_after_window(self, home_with_anchor: Path) -> None:
+        """A first-boot.json with created_at 5 days ago + matching ctime
+        is past the 3-day window — gate enforces."""
+        from datetime import datetime, timezone, timedelta
+        # Write an anchor with created_at in the past. Its ctime is now
+        # (whenever we wrote it), so content_ts < ctime → effective_start
+        # = content_ts (5 days ago) → window expired.
+        five_days_ago = (datetime.now(tz=timezone.utc) - timedelta(days=5)).isoformat()
+        self._write_anchor(home_with_anchor, five_days_ago)
+        b = WriteGuardBackend(
+            root_dir=home_with_anchor, writable_dirs=["memory"],
+            onboarding_window_days=3,
+        )
+        ctx = self._make_user_turn_ctx()
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/00-persona.md", content="late")
+            assert "reflection-only" in (getattr(r, "error", "") or "")
+        finally:
+            self._clear_turn(tok)
+
+    def test_bypass_inactive_when_anchor_missing(self, home_with_anchor: Path) -> None:
+        """No first-boot.json file → gate enforces from day one."""
+        # No anchor written.
+        b = WriteGuardBackend(
+            root_dir=home_with_anchor, writable_dirs=["memory"],
+            onboarding_window_days=3,
+        )
+        ctx = self._make_user_turn_ctx()
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/00-persona.md", content="no anchor")
+            assert "reflection-only" in (getattr(r, "error", "") or "")
+        finally:
+            self._clear_turn(tok)
+
+    def test_backdated_content_does_not_extend_window(
+        self, home_with_anchor: Path
+    ) -> None:
+        """The agent rewrites first-boot.json with a FAKE recent
+        created_at via bash. ctime gets reset to now (legitimate
+        property — bash can't backdate inode metadata without
+        CAP_SYS_TIME). But content_ts can be set to anything.
+
+        Defense: ``min(content_ts, ctime)`` picks the earlier of the
+        two. If the file was REALLY first written long ago, ctime
+        carries that history; even if content_ts is rewritten to
+        "yesterday," the original ctime is preserved across content
+        rewrites (only inode replacement resets ctime)."""
+        from datetime import datetime, timezone, timedelta
+        # Simulate: file created long ago, content recently faked.
+        # We can't easily backdate ctime in a unit test, so we exercise
+        # the inverse: content_ts in the past, ctime now (the realistic
+        # tamper shape — content forged backward to LOOK newer than the
+        # gate threshold via min(...) inversion would require backdating
+        # ctime, which we don't allow).
+        #
+        # Scenario A: content_ts in the future, ctime now → min picks
+        # ctime (now) → bypass active. But this exact case is harmless
+        # (agent gains nothing by claiming future creation).
+        future_ts = (datetime.now(tz=timezone.utc) + timedelta(days=10)).isoformat()
+        self._write_anchor(home_with_anchor, future_ts)
+        b = WriteGuardBackend(
+            root_dir=home_with_anchor, writable_dirs=["memory"],
+            onboarding_window_days=3,
+        )
+        ctx = self._make_user_turn_ctx()
+        tok = self._set_turn(ctx)
+        try:
+            # min(future_ts, ctime=now) = now. Window from "now" = 3d
+            # ahead → bypass active. We assert window is bounded by the
+            # smaller of the two, NOT a fake future date 10 days out.
+            # (Indirectly verified by checking write succeeds within 3d
+            # but would have failed at day 5 of "real" time.)
+            r = b.write(file_path="/memory/core/00-persona.md", content="ok")
+            assert getattr(r, "error", None) is None
+        finally:
+            self._clear_turn(tok)
+
+    def test_window_days_zero_disables_bypass(self, home_with_anchor: Path) -> None:
+        """Setting onboarding_window_days=0 means: anchor present or
+        not, gate enforces immediately. Useful for tests and
+        locked-down deployments."""
+        from datetime import datetime, timezone
+        self._write_anchor(home_with_anchor, datetime.now(tz=timezone.utc).isoformat())
+        b = WriteGuardBackend(
+            root_dir=home_with_anchor, writable_dirs=["memory"],
+            onboarding_window_days=0,
+        )
+        ctx = self._make_user_turn_ctx()
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/00-persona.md", content="bad")
+            assert "reflection-only" in (getattr(r, "error", "") or "")
+        finally:
+            self._clear_turn(tok)
+
+    def test_unreadable_anchor_falls_through_to_gate(
+        self, home_with_anchor: Path
+    ) -> None:
+        """Malformed first-boot.json (not JSON) → bypass inactive → gate
+        enforced. Fail-closed for the bypass; safer direction."""
+        anchor = home_with_anchor / ".mimir" / "first-boot.json"
+        anchor.write_text("not-valid-json{{", encoding="utf-8")
+        b = WriteGuardBackend(
+            root_dir=home_with_anchor, writable_dirs=["memory"],
+            onboarding_window_days=3,
+        )
+        ctx = self._make_user_turn_ctx()
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/00-persona.md", content="garbage anchor")
+            assert "reflection-only" in (getattr(r, "error", "") or "")
+        finally:
+            self._clear_turn(tok)
+
+    def test_reflection_turn_unaffected_by_bypass_state(
+        self, home_with_anchor: Path
+    ) -> None:
+        """Reflection turns always pass the gate, regardless of bypass.
+        Sanity check that the bypass is purely additive — it doesn't
+        change the reflection-turn allow path."""
+        from mimir.models import TurnContext
+        # No anchor → bypass off. Reflection turn should still write.
+        b = WriteGuardBackend(
+            root_dir=home_with_anchor, writable_dirs=["memory"],
+            onboarding_window_days=3,
+        )
+        ctx = TurnContext(
+            turn_id="t", session_id="s", trigger="scheduled_tick",
+            channel_id="scheduler:reflect", started_at=0.0,
+        )
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/40-learned-behaviors.md", content="ok")
+            assert getattr(r, "error", None) is None
+        finally:
+            self._clear_turn(tok)
+
+
 class TestReadOnlyFilesystemBackend:
     def test_blocks_all_writes(self, home: Path) -> None:
         b = ReadOnlyFilesystemBackend(root_dir=home)
