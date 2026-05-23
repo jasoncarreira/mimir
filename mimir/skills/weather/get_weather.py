@@ -11,6 +11,7 @@ Usage:
 import json
 import os
 import sys
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 
@@ -23,6 +24,11 @@ args = sys.argv[1:]
 output_json = '--json' in args
 args = [a for a in args if a != '--json']
 location = args[0] if args else 'Victor,NY,US'
+# URL-encode the location so cities with spaces ("Victor, NY, US",
+# "San Francisco,CA,US") don't break the OpenWeatherMap query string.
+# OpenWeatherMap accepts both comma- and space-separated forms; the
+# server tolerates either as long as the spaces are percent-encoded.
+location_q = urllib.parse.quote(location, safe=',')
 
 units = 'imperial'
 unit_label = '°F'
@@ -39,7 +45,7 @@ result = {}
 
 # Current conditions
 try:
-    current = fetch(f'{base}/weather?q={location}&units={units}&appid={API_KEY}')
+    current = fetch(f'{base}/weather?q={location_q}&units={units}&appid={API_KEY}')
     result['current'] = {
         'location': current['name'],
         'description': current['weather'][0]['description'],
@@ -53,7 +59,7 @@ except Exception as e:
 
 # 5-day forecast
 try:
-    forecast = fetch(f'{base}/forecast?q={location}&units={units}&appid={API_KEY}')
+    forecast = fetch(f'{base}/forecast?q={location_q}&units={units}&appid={API_KEY}')
     days = defaultdict(list)
     for item in forecast['list']:
         date = item['dt_txt'].split()[0]
