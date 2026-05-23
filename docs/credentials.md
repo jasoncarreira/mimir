@@ -50,7 +50,7 @@ memory under `feedback_mimirbot_env_reload`.
 | `GOG_KEYRING_PASSWORD` | `gog` keyring decryption | Operator-set; rotates with the keyring itself | `gog list` succeeds without prompting |
 | `OPENWEATHER_API_KEY` | `weather` skill / curl scripts | https://home.openweathermap.org/api_keys | `curl -fsSL "...?appid=$KEY"` returns 200 |
 | `OP_SERVICE_ACCOUNT_TOKEN` | `op` CLI (1Password) | 1Password admin — Service Accounts | `op whoami` |
-| `NTFY_TOPIC` | `ntfy` push notifications | Operator-chosen topic name | Send a test message; check ntfy.sh subscription |
+| `NTFY_TOPIC` | `ntfy` push notifications | Pick a new topic name (ntfy.sh has no revoke surface — this is a rename, not a token rotation) | Send a test message; check ntfy.sh subscription |
 
 ### Type B — Long-lived bridge clients
 
@@ -67,7 +67,7 @@ traffic windows when possible.
 
 | Env var / storage | Used by | Upstream regen | Verification probe |
 |---|---|---|---|
-| `~/.claude/.credentials.json` (path resolved by `MIMIR_CLAUDE_OAUTH_CREDENTIALS`) | Claude Max OAuth subprocess for `ANTHROPIC_BASE_URL`-routed deployments | `claude /login` from a terminal with access to the host browser | `mimir oauth-usage-check` (already exists); a non-failing `oauth_usage_polled` event in `events.jsonl` |
+| `$MIMIR_HOME/.claude/.credentials.json` (path resolved by `MIMIR_CLAUDE_OAUTH_CREDENTIALS`; falls back to `$HOME/.claude/.credentials.json` only if MIMIR_HOME is unset) | Claude Max OAuth subprocess for `ANTHROPIC_BASE_URL`-routed deployments | `claude /login` from a terminal with access to the host browser | `mimir oauth-usage-check` (already exists); a non-failing `oauth_usage_polled` event in `events.jsonl` |
 | Gmail OAuth refresh tokens (gog keyring) | `gog` CLI for Gmail / Calendar | `gog auth login <account>` (interactive) | `gog gmail search 'newer_than:1h' --max 1 --account <name>` succeeds |
 | Google Workspace OAuth (gogcli) | Google Calendar, Drive | Same as above | `gog calendar list --account <name>` |
 
@@ -115,10 +115,17 @@ single-var.
 ### A or D — single-var rotation
 
 1. Get new value from upstream
-2. Atomic edit of `compose.env` (write to tmp, fsync, rename)
-3. `docker compose up -d --force-recreate`
-4. Run the verification probe; confirm success
-5. If probe fails: roll back `compose.env` from the tmp backup; recreate again
+2. Snapshot the current file *before* touching it:
+   ```bash
+   cp compose.env compose.env.bak.$(date +%s)
+   ```
+3. Atomic edit of `compose.env` (write to a sibling tmp, fsync, rename
+   over `compose.env` — the rename is the commit). The snapshot in
+   step 2 is what step 6 restores from; the tmp from step 3 is gone
+   after the rename
+4. `docker compose up -d --force-recreate`
+5. Run the verification probe; confirm success
+6. If probe fails: `mv compose.env.bak.<ts> compose.env`; `docker compose up -d --force-recreate` again to restore the prior working state
 
 ### B — bridge reconnect rotation
 
