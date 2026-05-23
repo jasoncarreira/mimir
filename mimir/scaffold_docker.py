@@ -2,10 +2,14 @@
 
 Generates ``Dockerfile``, ``compose.yml``, ``compose.env`` (operator-edited
 secrets file), and ``start.sh`` into a mimir home so it can be deployed
-in a container the same way mimirbot is. Inspects ``<home>/skills/``
-to pick up per-skill OS-level deps (a skill that needs a system tool
-ships a ``dockerfile.fragment`` next to its ``SKILL.md``) and per-skill
-env-var requirements (``pollers.json`` ``pass_env``).
+in a container the same way mimirbot is. Inspects both
+``<home>/skills/`` (operator-installed) and
+``<home>/.mimir_builtin_skills/`` (the bundled refresh target) to pick
+up per-skill OS-level deps (a skill that needs a system tool ships a
+``dockerfile.fragment`` next to its ``SKILL.md``) and per-skill env-var
+requirements (``pollers.json`` ``pass_env``). Operator-side entries
+shadow bundled same-named entries on collision, matching
+``SkillsMiddleware``'s last-source-wins rule.
 
 **Idempotency contract:**
 
@@ -124,9 +128,15 @@ def collect_fragments(home: Path) -> list[Fragment]:
 
 
 def collect_required_env_vars(home: Path) -> list[str]:
-    """Walk ``<home>/skills/*/pollers.json`` and collect every
-    env var listed in ``pass_env`` across all poller skills. De-duped,
-    sorted. Plus baseline mimir vars (MIMIR_API_KEY, etc.).
+    """Walk ``<home>/skills/*/pollers.json`` AND
+    ``<home>/.mimir_builtin_skills/*/pollers.json`` and collect every
+    env var listed in ``pass_env`` across all poller skills. De-duped.
+    Plus baseline mimir vars (MIMIR_API_KEY, etc.).
+
+    Mirrors :func:`collect_fragments`'s dual-location scan so a bundled
+    poller (none ship today, but the architecture allows it) gets its
+    ``pass_env`` requirements surfaced into ``compose.env`` without the
+    operator having to duplicate the skill into ``<home>/skills/``.
     """
     baseline = [
         "MIMIR_API_KEY",           # auth gate for non-shell HTTP routes
@@ -142,9 +152,10 @@ def collect_required_env_vars(home: Path) -> list[str]:
     ]
     seen = set(baseline)
     extra: list[str] = []
-    skills_root = home / "skills"
-    if skills_root.is_dir():
-        for skill_dir in sorted(skills_root.iterdir()):
+    for root in (home / ".mimir_builtin_skills", home / "skills"):
+        if not root.is_dir():
+            continue
+        for skill_dir in sorted(root.iterdir()):
             if not skill_dir.is_dir() or skill_dir.name.startswith("."):
                 continue
             pollers_json = skill_dir / "pollers.json"
