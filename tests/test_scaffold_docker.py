@@ -99,6 +99,46 @@ def test_collect_fragments_empty_home(tmp_path: Path):
     assert collect_fragments(tmp_path / "no-such-home") == []
 
 
+def test_collect_fragments_walks_builtin_dir_too(tmp_path: Path):
+    """Bundled skills land under ``<home>/.mimir_builtin_skills/``
+    via :func:`refresh_builtin_skills` on every boot. The scaffolder
+    must walk that directory in addition to ``<home>/skills/`` so
+    bundled-skill OS deps (notably chainlink's ``chainlink-tracker``
+    build) get picked up without the operator having to duplicate
+    the skill into their operator dir.
+    """
+    home = tmp_path / "home"
+    builtin = home / ".mimir_builtin_skills"
+    (builtin / "chainlink").mkdir(parents=True)
+    (builtin / "chainlink" / "SKILL.md").write_text(
+        "---\nname: chainlink\ndescription: c\n---\nbody"
+    )
+    (builtin / "chainlink" / "dockerfile.fragment").write_text("RUN cargo install chainlink-tracker")
+    # No operator-side ``skills/chainlink``.
+    frags = collect_fragments(home)
+    assert len(frags) == 1
+    assert frags[0].skill_name == "chainlink"
+    assert "chainlink-tracker" in frags[0].content
+
+
+def test_collect_fragments_operator_shadows_builtin(tmp_path: Path):
+    """When a skill exists in BOTH locations, the operator copy wins
+    (matches SkillsMiddleware's last-source-wins shadowing). Operator
+    customization of OS deps is the supported override path."""
+    home = tmp_path / "home"
+    builtin = home / ".mimir_builtin_skills"
+    operator = home / "skills"
+    (builtin / "shared").mkdir(parents=True)
+    (builtin / "shared" / "dockerfile.fragment").write_text("RUN echo bundled-fragment")
+    (operator / "shared").mkdir(parents=True)
+    (operator / "shared" / "dockerfile.fragment").write_text("RUN echo operator-fragment")
+    frags = collect_fragments(home)
+    assert len(frags) == 1
+    assert frags[0].skill_name == "shared"
+    assert "operator-fragment" in frags[0].content
+    assert "bundled-fragment" not in frags[0].content
+
+
 def test_collect_fragments_ordered_by_skill_name(tmp_path: Path):
     """Stable Dockerfile output across runs: fragments come out
     alphabetically by skill name."""
