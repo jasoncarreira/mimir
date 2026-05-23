@@ -560,10 +560,16 @@ async def run_poller(
 
     stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
     if stderr_text:
+        # Include the subprocess exit code so downstream readers can
+        # distinguish diagnostic progress noise (exit_code=0, e.g. ``gh``
+        # writing auth progress to stderr on a successful run) from actual
+        # errors (exit_code != 0). Without this field every stderr emission
+        # looks like a failure in events.jsonl — chainlink #93.
         await log_event(
             "poller_stderr",
             poller=poller.name,
             stderr=stderr_text[:POLLER_STDERR_LOG_CHARS],
+            exit_code=proc.returncode if proc is not None else None,
         )
 
     if proc is None or proc.returncode != 0:
