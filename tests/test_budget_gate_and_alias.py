@@ -221,6 +221,61 @@ def test_middleware_sync_wrap_refuses_at_cap():
 
 
 @pytest.mark.asyncio
+async def test_send_message_and_react_bypass_the_cap():
+    """``send_message`` is the only delivery path for the agent's reply
+    (final assistant text doesn't auto-deliver to channels). If the cap
+    refuses send_message too, the agent hits the budget and has no way
+    to tell the operator anything. Exempting it — AND skipping the
+    count increment — keeps that channel open. ``react`` follows the
+    same operator-facing-acknowledgement logic."""
+    mw = BudgetGateMiddleware()
+    handler_calls: list[str] = []
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        handler_calls.append(req.tool_call["name"])
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
+    ctx = _make_ctx(budget=2)
+    token = set_current_turn(ctx)
+    try:
+        # Burn the budget with non-exempt calls.
+        await mw.awrap_tool_call(_make_request("shell_exec", "id-1"), handler)
+        await mw.awrap_tool_call(_make_request("shell_exec", "id-2"), handler)
+        # Past the cap: a regular tool is refused...
+        denied = await mw.awrap_tool_call(_make_request("shell_exec", "id-3"), handler)
+        assert isinstance(denied, ToolMessage)
+        assert "Tool-call budget exhausted" in str(denied.content)
+        # ...but send_message and react MUST still pass through.
+        sm = await mw.awrap_tool_call(_make_request("send_message", "id-4"), handler)
+        rx = await mw.awrap_tool_call(_make_request("react", "id-5"), handler)
+    finally:
+        reset_current_turn(token)
+    assert sm.content == "ok"
+    assert rx.content == "ok"
+    assert handler_calls == ["shell_exec", "shell_exec", "send_message", "react"]
+    # Exempt tools must NOT bump the count (otherwise heavy send_message
+    # use would still tick toward... nothing useful, but for clarity
+    # the spec is "free passage").
+    assert ctx.tool_call_count == 2
+
+
+def test_denial_message_mentions_exempt_tools():
+    """The model needs to know what it CAN still do when the cap hits.
+    The denial text names ``send_message`` and ``react`` so it doesn't
+    waste turns retrying gated tools."""
+    ctx = _make_ctx(budget=1)
+    token = set_current_turn(ctx)
+    try:
+        _check_and_increment_or_deny("shell_exec")  # 1, passes
+        out = _check_and_increment_or_deny("shell_exec")  # refused
+    finally:
+        reset_current_turn(token)
+    assert out is not None
+    assert "send_message" in out
+    assert "react" in out
+
+
+@pytest.mark.asyncio
 async def test_middleware_catches_unregistered_tools():
     """The deepagents built-ins (``shell_exec``, ``read_file``, etc.)
     arrive at the middleware as ToolCallRequests whose ``tool`` may

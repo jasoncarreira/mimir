@@ -45,6 +45,17 @@ from langgraph.types import Command
 log = logging.getLogger(__name__)
 
 
+# Tools exempt from the per-turn cap. They neither consume a slot nor
+# get refused after the cap is hit. The driving case is ``send_message``:
+# when the budget is exhausted the denial path tells the model to
+# "finish the turn", but the final assistant text does NOT auto-deliver
+# to channels (an explicit send_message call is the only delivery path
+# — see SPEC §7.1). Without exempting it, the agent would hit the cap,
+# get told to stop, but have no way to actually tell the operator. ``react``
+# is exempt for the same operator-facing-acknowledgement reason.
+_BUDGET_EXEMPT_TOOLS = frozenset({"send_message", "react"})
+
+
 def _resolve_budget_state() -> tuple[Any, int] | None:
     """Return ``(ctx, budget)`` if a TurnContext with a non-zero
     ``tool_call_budget`` is active. ``None`` means: no enforcement
@@ -79,9 +90,10 @@ def _emit_event_sync(kind: str, **kwargs: Any) -> None:
 def _budget_denied_message(tool_name: str, count: int, budget: int) -> str:
     return (
         f"Tool-call budget exhausted: {count}/{budget} calls used "
-        f"this turn. ``{tool_name}`` was refused. Reflect on what "
-        f"you have so far and finish the turn rather than firing "
-        f"another tool."
+        f"this turn. ``{tool_name}`` was refused. ``send_message`` and "
+        f"``react`` remain available so you can still reply or "
+        f"acknowledge — use them to wrap up the turn rather than "
+        f"firing another tool."
     )
 
 
@@ -89,6 +101,11 @@ def _check_and_increment_or_deny(tool_name: str) -> str | None:
     """Returns a denial message (str) if the call should be refused,
     or ``None`` if the call should proceed. Shared between the sync
     and async middleware paths so the bookkeeping stays identical."""
+    # Exempt tools (send_message, react) bypass both the count
+    # increment AND the cap check — see ``_BUDGET_EXEMPT_TOOLS``
+    # docstring for why. Free passage, no bookkeeping.
+    if tool_name in _BUDGET_EXEMPT_TOOLS:
+        return None
     state = _resolve_budget_state()
     if state is None:
         return None
