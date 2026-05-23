@@ -1696,6 +1696,32 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Only run probes for this consumer type (see docs/credentials.md).",
     )
 
+    # ``mimir viability-report`` — collapse + curation metrics
+    # (SPEC §16 items follow-up from VSM eval). Computes the three
+    # collapse indicators (cosine sim, atom-citation Gini, topic
+    # diversity) and write-side curation rate. Operator-facing
+    # ad-hoc inspection; scheduler runs it weekly automatically.
+    viability_p = sub.add_parser(
+        "viability-report",
+        help="Generate the collapse-detection + curation-rate viability report.",
+    )
+    viability_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+    viability_p.add_argument(
+        "--collapse-window-days", type=int, default=7,
+        help="Trailing window for collapse indicators (default: 7).",
+    )
+    viability_p.add_argument(
+        "--curation-window-days", type=int, default=28,
+        help="Trailing window for curation rates (default: 28).",
+    )
+    viability_p.add_argument(
+        "--no-write", action="store_true",
+        help="Print only; don't write to state/reports/viability-YYYY-MM-DD.md.",
+    )
+
     # ``mimir verify-index`` — index integrity probes (SPEC §8.3,
     # §16 item 16). Run all checks against the file-corpus and SAGA
     # databases; exit 0 if clean, 1 if any check fails. Scheduled
@@ -2068,6 +2094,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         from .index_integrity import run_verify_index_cmd
         home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
         sys.exit(run_verify_index_cmd(home=home, db=args.db))
+
+    if args.command == "viability-report":
+        from .viability_metrics import run_viability_report_cmd
+        home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+        warning_count = run_viability_report_cmd(
+            home=home,
+            collapse_window_days=args.collapse_window_days,
+            curation_window_days=args.curation_window_days,
+            write_to_disk=not args.no_write,
+        )
+        # Exit 0 for clean (no warnings), 1 for one-or-more warnings.
+        # Mirrors verify-index / verify-cred so operator scripts can
+        # branch on the count.
+        sys.exit(0 if warning_count == 0 else 1)
 
     if args.command == "rotate":
         from .cred_rotate import run_rotate

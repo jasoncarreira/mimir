@@ -1201,6 +1201,42 @@ class Scheduler:
             coalesce=False,
         )
 
+    # ---- Viability-report cron ---------------------------------------
+
+    def add_viability_report_job(
+        self,
+        home: Path,
+        cron_expr: str = "0 5 * * 0",
+        *,
+        job_id: str = "viability-report",
+    ) -> bool:
+        """Register the weekly viability-report check (SPEC §16
+        follow-up from the 2026-05-23 VSM eval). Computes the three
+        collapse indicators + write-side curation rate; writes
+        ``state/reports/viability-YYYY-MM-DD.md`` and emits one
+        algedonic event per threshold-crossing.
+
+        Default cron: ``0 5 * * 0`` — 5 AM Sunday, after the weekly
+        introspection-report at 4 AM Sunday. Running AFTER
+        introspection means the report sees the freshest reflection
+        output the agent has produced for the week. Operator can
+        override via the yaml's ``callable: viability-report`` entry.
+        """
+        from .viability_metrics import run_scheduled_viability_report
+
+        async def _fire() -> None:
+            await run_scheduled_viability_report(home)
+
+        return self.register_callable(
+            name=job_id,
+            fn=_fire,
+            default_cron=cron_expr,
+            job_id=job_id,
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # ---- Index-integrity cron ----------------------------------------
 
     def add_index_integrity_job(
