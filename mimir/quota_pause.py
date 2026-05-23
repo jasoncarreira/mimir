@@ -276,8 +276,10 @@ def is_quota_exhaustion(exc: BaseException) -> bool:
        and generic provider-specific wrappers.
     """
     cls_name = type(exc).__name__
-    if cls_name == "RateLimitError":
-        return True
+    # ``"RateLimit" in cls_name`` subsumes the exact-match check
+    # (the exact name IS a substring of itself) — single check
+    # catches ``RateLimitError`` and any ``*RateLimit*`` variant
+    # provider SDKs introduce.
     if "RateLimit" in cls_name:
         return True
     status = getattr(getattr(exc, "response", None), "status_code", None)
