@@ -43,8 +43,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -85,8 +87,11 @@ def _emit(deployment_dir: Path, kind: str, **fields: Any) -> None:
     is the audit trail Phase 4 (drain mode) will cross-reference into
     the container's events.jsonl. Fire-and-forget — never raises;
     rotation correctness must not depend on the audit succeeding."""
+    # UTC iso8601 — matches the container's events.jsonl convention
+    # so the host-side rotations log correlates cleanly with the
+    # in-container event stream.
     record = {
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "type": kind,
         **fields,
     }
@@ -119,9 +124,21 @@ def _resolve_service_name(compose_file: Path, requested: str | None) -> str:
         return requested
     try:
         import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyYAML is required for auto-detecting compose services — "
+            "install via `uv sync` or pass --service explicitly.",
+        ) from exc
+    try:
         data = yaml.safe_load(compose_file.read_text(encoding="utf-8")) or {}
-    except (OSError, ImportError) as exc:
-        raise RuntimeError(f"Can't parse compose file {compose_file}: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"Can't read compose file {compose_file}: {exc}",
+        ) from exc
+    except yaml.YAMLError as exc:
+        raise RuntimeError(
+            f"Can't parse compose file {compose_file}: {exc}",
+        ) from exc
     services = data.get("services") if isinstance(data, dict) else None
     if not isinstance(services, dict) or not services:
         raise RuntimeError(f"No services found in {compose_file}")
@@ -205,12 +222,26 @@ def _atomic_replace_env(
     # Atomic write: tmp file in the same directory, fsync, rename
     # over the target. The rename is the commit point — a crash
     # before rename leaves compose.env unchanged.
-    tmp = compose_env.with_suffix(compose_env.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        f.writelines(new_lines)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.replace(compose_env)
+    #
+    # ``tempfile.mkstemp`` (with delete=False semantics — we close +
+    # rename) gives a unique sibling name so a stale tmp from a
+    # previous crashed rotation isn't silently overwritten and two
+    # concurrent runs (CI scripts) can't clobber each other.
+    tmp_fd, tmp_path_str = tempfile.mkstemp(
+        prefix=compose_env.name + ".", suffix=".tmp", dir=str(compose_env.parent),
+    )
+    tmp = Path(tmp_path_str)
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(compose_env)
+    except Exception:
+        # Clean up the stranded tmp on failure so a retry doesn't
+        # leave junk behind.
+        tmp.unlink(missing_ok=True)
+        raise
 
     return old_value, backup_path
 
@@ -218,14 +249,33 @@ def _atomic_replace_env(
 def _rollback(backup_path: Path, compose_env: Path) -> None:
     """Restore ``compose.env`` from ``backup_path``. Used when any
     later step (recreate, verify) fails. The backup is left in place
-    after restore — operator inspects manually whether to delete."""
+    after restore — operator inspects manually whether to delete.
+
+    Atomic: copy to a sibling tmp, then ``replace`` over compose.env.
+    Symmetric with ``_atomic_replace_env`` — a crash mid-copy leaves
+    compose.env as the just-written (failed) new value rather than a
+    partially-restored half-and-half. Either way the operator can
+    re-run rollback from the same backup.
+    """
     if not backup_path.is_file():
         print(
             f"warn: backup {backup_path} missing — cannot rollback automatically",
             file=sys.stderr,
         )
         return
-    shutil.copy2(backup_path, compose_env)
+    tmp_fd, tmp_path_str = tempfile.mkstemp(
+        prefix=compose_env.name + ".rollback.",
+        suffix=".tmp",
+        dir=str(compose_env.parent),
+    )
+    os.close(tmp_fd)
+    tmp = Path(tmp_path_str)
+    try:
+        shutil.copy2(backup_path, tmp)
+        tmp.replace(compose_env)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # ── docker compose operations ────────────────────────────────────────
@@ -323,11 +373,15 @@ def _find_cred_for_env(env_name: str) -> tuple[str, str] | None:
 def _prompt_new_value(env_name: str) -> str:
     """Read the new value from stdin. Uses ``getpass`` so the value
     isn't echoed to the terminal — important when rotating a token
-    from a shared screen / pair-coding context."""
+    from a shared screen / pair-coding context.
+
+    Both the TTY path and the piped path strip ONLY the trailing
+    newline (``rstrip("\\n")``) — full ``.strip()`` would silently
+    eat a credential that starts/ends with a space, an edge case
+    not worth surprising the operator with.
+    """
     if sys.stdin.isatty():
-        return getpass.getpass(f"New value for {env_name}: ").strip()
-    # Non-interactive (piped stdin): read one line, strip the
-    # trailing newline. Operator-friendly for scripted rotations.
+        return getpass.getpass(f"New value for {env_name}: ").rstrip("\n")
     return sys.stdin.readline().rstrip("\n")
 
 
@@ -445,6 +499,7 @@ def _execute(ctx: RotationContext, *, skip_recreate: bool) -> int:
             rolled_back=True,
         )
         print(f"container didn't reach running: {ready_detail}", file=sys.stderr)
+        print(f"rolled back to {backup_path.name}", file=sys.stderr)
         return 1
 
     if ctx.cred_name is not None:
