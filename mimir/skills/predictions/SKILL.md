@@ -1,9 +1,6 @@
 ---
 name: predictions
 description: Use when making a forward-looking claim with a checkable outcome (reply within 24h, error rate will drop, this skill will see more use) — record to state/predictions.jsonl with a review horizon so reflection can grade you later. Closes the in-the-moment double-loop.
-allowed-tools:
-  - Bash
-  - Read
 ---
 
 # Predictions

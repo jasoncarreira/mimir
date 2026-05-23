@@ -1,10 +1,20 @@
 ---
 name: view-attachment
 description: View image or file attachments that you can't directly see. Use this skill when you receive a message with attachments listed as file paths and you need to understand their contents. Especially useful for text-only models that cannot process images natively.
-subagent: true
-allowed-tools:
-  - Bash
-  - Read
+success_criteria:
+  # The skill's purpose is reading or inspecting an attachment under
+  # state/attachments/. Either path counts: Read directly (for image
+  # / text the runtime can handle) or Bash (file/identify/pdftotext
+  # for other formats).
+  any_of:
+    - tool_call:
+        name: Read
+        args:
+          file_path_glob: "*state/attachments/*"
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*state/attachments/*"
 ---
 
 # view-attachment

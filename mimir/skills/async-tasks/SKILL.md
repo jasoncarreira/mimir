@@ -1,15 +1,6 @@
 ---
 name: async-tasks
 description: Turn "block until condition X is met" into an agent wake-up via the bash_async tool. Use when you need to wait for a one-shot event without burning context — a webhook arriving, a CI pipeline finishing, a file appearing, a long shell command completing — AND you want this conversation to resume with full context when the event fires. Distinct from pollers (recurring) and the synchronous Bash tool (blocks the turn). The completion event lands as a fresh turn on the spawning channel; no polling needed.
-allowed-tools:
-  - Bash
-  - Read
-  - Task
-  - add_schedule
-  - bash_async
-  - bash_job_output
-  - bash_jobs_list
-  - send_message
 ---
 
 # Async Task Patterns

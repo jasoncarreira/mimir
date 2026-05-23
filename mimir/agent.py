@@ -791,30 +791,6 @@ class Agent:
                 "MIMIR_MODEL_SPEC",
                 getattr(self._config, "model_spec", "claude-code:claude-sonnet-4-6"),
             )
-            # Compile skills with declared ``allowed-tools`` into SubAgent
-            # specs (per docs/skill-as-tool-architecture.md). Must run
-            # BEFORE _build_system_prompt so the inline skill catalog can
-            # suppress the delegated names — otherwise the agent sees the
-            # same skill twice (once as a catalog entry to "load via
-            # read_file", once via the framework's ``task`` tool surface)
-            # and picks the old path.
-            try:
-                from .subagent_compiler import compile_skills_to_subagents
-                compile_result = compile_skills_to_subagents(
-                    self._config.home, all_mimir_tools(),
-                )
-                self._delegated_subagent_specs = compile_result.subagents
-                self._delegated_skill_names = compile_result.delegated_skills
-            except Exception:  # noqa: BLE001
-                # Compilation is best-effort — drift, parse errors, or
-                # filesystem issues should NEVER block agent boot. Fall
-                # back to "no delegated skills" so everything stays inline.
-                log.exception(
-                    "skill subagent compilation failed; falling back to inline"
-                )
-                self._delegated_subagent_specs = []
-                self._delegated_skill_names = set()
-
             # Assemble the real system prompt — core memory + memory index +
             # operator alert channel + skill catalog. Built fresh per turn
             # so skill bucket assignments / outcome aggregates stay current
@@ -865,25 +841,6 @@ class Agent:
             if operator_dir.is_dir():
                 skill_sources.append(str(operator_dir))
 
-            # Drop delegated skill names from the inline ``Skills System``
-            # catalog so the agent doesn't see them in both the ``task``
-            # tool catalog (via SubAgentMiddleware) and as inline skills
-            # (via SkillsMiddleware). The filter middleware runs AFTER
-            # SkillsMiddleware (user-passed middleware is appended past
-            # the framework stack — graph.py:708-709) so SkillsMiddleware
-            # populates ``state["skills_metadata"]`` first, then ours
-            # replaces it with a filtered view.
-            extra_middleware: list[Any] = []
-            if self._delegated_skill_names:
-                from ._skills_filter_middleware import (
-                    FilterDelegatedSkillsMiddleware,
-                )
-                extra_middleware.append(
-                    FilterDelegatedSkillsMiddleware(
-                        delegated_skill_names=self._delegated_skill_names,
-                    )
-                )
-
             self._agent = create_deep_agent(
                 model=_resolve_model(
                     model_spec,
@@ -893,9 +850,7 @@ class Agent:
                 tools=all_mimir_tools(),
                 system_prompt=system_prompt,
                 backend=backend,
-                subagents=self._delegated_subagent_specs,
                 skills=skill_sources or None,
-                middleware=extra_middleware,
             )
             return self._agent
 

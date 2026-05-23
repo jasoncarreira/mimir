@@ -4,11 +4,20 @@ description: >
   Guide for the first days with a new human. Use when: the `init` memory block exists (pointing
   you here), you have no persona/communication blocks yet, or a human explicitly asks about setup.
   This skill is about having good conversations — not filling out forms.
-subagent: true
-allowed-tools:
-  - Edit
-  - Read
-  - Write
+success_criteria:
+  # Onboarding's lasting artifact is persona / schedule / communication
+  # blocks landing under memory/core/. Loading the SKILL.md without
+  # eventually writing or editing one of those is the "had the
+  # conversation but never captured it" failure mode.
+  any_of:
+    - tool_call:
+        name: Write
+        args:
+          file_path_glob: "*memory/core/*.md"
+    - tool_call:
+        name: Edit
+        args:
+          file_path_glob: "*memory/core/*.md"
 ---
 
 # Onboarding
