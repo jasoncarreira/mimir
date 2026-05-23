@@ -219,80 +219,91 @@ Exactly one of `cron` or `time_of_day` must be set per job.
 
 ### 4.1 Process model
 
-Two processes inside one container, supervised by `supervisord`:
+One primary Python process inside the container (no supervisord):
 
-1. **Mimir** — Python service running the Claude Agent SDK loop, plus the indexer thread, plus the channel bridges (§7.2.1) as asyncio tasks, plus a small HTTP control surface (event injection, health check).
-2. **SAGA** — the existing SAGA server (Python / FastAPI + Uvicorn, port 3002, source vendored under `saga/saga/`), unmodified, configured against the same volume-mounted home.
+1. **Mimir** — Python service running the deepagents/LangGraph agent loop, plus the indexer thread, plus the channel bridges (§7.2.1) as asyncio tasks, plus a small HTTP control surface (event injection, health check, SAGA consolidate endpoint).
+
+**SAGA** runs **in-process** as `SagaStore` (the default since v0.5). `make_saga_client()` selects the implementation based on `Config.saga_endpoint`: when no endpoint is configured it instantiates `SagaStore` directly (SQLite, same process, no HTTP loop). The HTTP `_HttpSaga` adapter is preserved for operators running a separate saga HTTP server, but is not the default.
 
 Channel bridges (Slack, Discord, Bluesky, Web UI, Bench) are NOT separate processes — they run inside the mimir process as asyncio coroutines, sharing the per-channel dispatcher (§4.5) and the global concurrency cap. Subprocess pollers (§7.2.2) are the only out-of-process channel components, and they're inbound-only.
-
-A single-container deployment matches the user's "we're going to be containerizing this" constraint and keeps the harness self-contained for the benchmark adapter.
 
 ### 4.2 Agent loop
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ event arrives (HTTP POST /event or scheduler tick)           │
-├──────────────────────────────────────────────────────────────┤
-│ 1. mimir.index.rebuild()    # regenerate memory/INDEX.md     │
-│                             # and state/INDEX.md             │
-│ 2. saga pre-message hook    # query SAGA with the incoming   │
-│                             # event text; format hits as a   │
-│                             # turn-prompt block              │
-│ 3. mimir.prompts.build()    # system + turn prompts (incl.   │
-│                             # SAGA hits)                     │
-│ 4. claude_agent_sdk.query(prompt, options=...)               │
-│      ├─ tool calls flow through mimir.tools                  │
-│      ├─ skill invocations resolve to mimir/skills/*          │
-│      └─ subagent calls (Agent tool) spawn isolated loops     │
-│ 5. saga post-message hook   # call saga_mark_contributions   │
-│                             # with the atom ids that were    │
-│                             # injected pre-message           │
-│ 6. persist final assistant message; emit channel output      │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ event arrives (HTTP POST /event or scheduler tick)               │
+├──────────────────────────────────────────────────────────────────┤
+│ 1. session attach             # touch SessionManager; get or     │
+│                               # create saga_session_id           │
+│ 2. typing indicator           # Discord/Slack bridge fires       │
+│                               # "mimir is typing…" on user msgs  │
+│ 3. saga pre-message hook      # SagaStore.query(event.content)  │
+│                               # → "Possibly relevant memories"   │
+│                               # block + atom_ids list            │
+│                               # (skipped for scheduled_tick /    │
+│                               # saga_session_end / poller turns) │
+│ 4. mimir.prompts.build()      # system + turn prompts (core mem, │
+│                               # memory index, skill catalog,     │
+│                               # feedback signals, session        │
+│                               # summaries, resource usage,       │
+│                               # upcoming, self-state, SAGA block)│
+│ 5. agent.astream(             # LangGraph CompiledStateGraph     │
+│      {messages: [HumanMessage(turn_prompt)]},                    │
+│      config={thread_id, channel_id},                             │
+│      stream_mode="values"                                        │
+│    )                                                             │
+│      ├─ tool calls flow through mimir.tools (LangChain @tool)   │
+│      ├─ skill invocations resolved by SkillsMiddleware           │
+│      └─ spawn_claude_code MCP tool for out-of-process delegation│
+│ 6. saga post-message hook     # SagaStore.feedback(atom_ids,    │
+│                               # output, feedback=pos/neg)        │
+│ 7. persist TurnRecord; emit channel output via bridge.send       │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-Streaming is on by default (per Claude Agent SDK guidance). `effort="high"`, `thinking={"type": "adaptive"}`, `model="claude-opus-4-7"`.
+The deepagents singleton (`CompiledStateGraph`) is built lazily on the first turn and reused across all subsequent turns — it is thread-safe and constructed once per process. `create_deep_agent(model=..., tools=..., system_prompt=..., backend=...)` configures it with the full mimir tool set and a `WriteGuardBackend` (enforces per-directory write-permission from `Config.writable_dirs`).
 
-### 4.3 Subagents (mountaineering replacement)
+Model: `claude-code:claude-sonnet-4-6` (default, overridable via `MIMIR_MODEL_SPEC`). The `claude-code:` prefix routes through `langchain-claude-code` / the Claude Code CLI subprocess. Other model specs (e.g. `anthropic:claude-opus-4-7`) route through `langchain-anthropic` directly.
 
-Three subagents ship out of the box, defined as filesystem agents under `<home>/.claude/agents/`:
+### 4.3 Subagents (out-of-process delegation)
 
-- **`climber.md`** — hill-climbing optimization tasks. Reads a `program.md` from the climb directory, runs propose/test/score/keep iterations, writes a sliding-window log to `<climb_dir>/log.jsonl`, returns the best candidate. Tools: `bash`, `read_file`, `write_file`, `edit_file`, `glob_files`. `background=True` so long climbs don't block the parent. No subagent recursion (SDK constraint).
-- **`researcher.md`** — "go look this up" tasks. Tools: `web_search`, `fetch_url`, `read_file`. Designed to be safe for parallel fan-out — multiple `Agent("researcher", ...)` calls in one turn.
-- **`critic.md`** — independent review of a draft answer. Tools: `read_file`, `file_search` (skill), `web_search`. Used for verification fan-out (parent answers, critic runs in parallel, parent merges).
+Mimir delegates long-running or context-isolated work via `spawn_claude_code` — an MCP tool that runs `claude -p --output-format json <prompt>` as a subprocess and returns the result JSON. This is the replacement for the original mountaineering `Agent()` SDK primitive.
 
-Filesystem definitions mean new subagents can be added without redeploying. The supervisor agent (the main mimir loop) calls them through the SDK's `Agent` tool.
+```
+spawn_claude_code(prompt, cwd=None, timeout_s=1800, name=None)
+   → asyncio.to_thread(_run_claude_subprocess)
+       → subprocess.run(["claude", "-p", "--output-format", "json", prompt])
+   ← {"result": "...", "cost_usd": ..., "num_turns": ...}
+```
 
-**What we lose vs. open-strix mountaineering:** the parent can't watch progress mid-climb. The SDK returns only the climber's final message. **Workaround:** the climber writes its sliding-window log to disk (`log.jsonl`); the parent can poll it via `read_file` between turns or via a scheduled tick. With `background: true` (see §4.4) the parent can fire off a long climb and keep working — the SDK streams `TaskNotificationMessage` when the climber finishes and writes the result to `output_file`.
+Agent profiles under `<home>/.claude/agents/` configure per-role behavior (system prompt, allowed tools). Three profiles ship by default:
+
+- **`code-implementer`** — multi-file code changes, test runs, PRs. Budget cap: $25.
+- **`bench-runner`** — benchmark / evaluation runs. Budget cap: $10.
+- **`doc-writer`** — documentation, wiki, spec authoring. Budget cap: $5.
+
+**Key properties of spawn_claude_code:**
+- The call is `async` — it wraps the blocking subprocess in `asyncio.to_thread`, so the dispatcher event loop stays free for other channels while the subprocess runs.
+- The spawn is **sequential from the caller's perspective**: `spawn_claude_code` awaits the subprocess to completion before returning the result. To run multiple spawns in parallel within one turn, the model issues multiple `spawn_claude_code` tool_use blocks in the same assistant message — deepagents/Claude Code executes them concurrently and returns all results before the next model generation.
+- There is no background/non-blocking spawn mode (no `AgentDefinition(background=True)` equivalent). Long-running spawns hold the turn open; structure multi-session work as chainlink subissues across heartbeat ticks instead.
+
+**Completion wake-up path.** For shell jobs launched via `bash_async`, completion is delivered as a `shell_job_complete` trigger on the spawning channel (§7.3). This is distinct from `spawn_claude_code` (synchronous) — bash_async is the non-blocking shell-command primitive, not the subagent primitive.
 
 ### 4.4 Parallelism
 
-The SDK gives mimir four useful concurrency primitives. Mimir uses all of them; cap behavior is documented per primitive.
+Mimir's parallelism model post-deepagents migration:
 
-**(1) Parallel subagents in one turn.** The parent emits multiple `Agent` tool_use blocks in a single assistant message. Each subagent runs concurrently in an isolated context; the parent blocks until all return; their messages stream tagged with `parent_tool_use_id` so the viewer can interleave them. Used for:
-- **Fan-out research** — parent calls `Agent("researcher", q1)` + `Agent("researcher", q2)` + `Agent("researcher", q3)` simultaneously when chasing multiple unrelated probes.
-- **Fan-out climbs** — parent dispatches N climbers exploring different starting points, picks the best result.
-- **Verification** — main agent answers; `Agent("critic", ...)` runs in parallel to flag issues before the answer ships.
+**(1) Within-turn parallel tool calls.** When the model emits multiple `tool_use` blocks in a single assistant message, Claude Code / deepagents executes them concurrently. This is the primary within-turn parallelism surface — e.g. the model issues `spawn_claude_code(task_a)` + `spawn_claude_code(task_b)` + `file_search(q)` in one message; all three run in parallel, results return before the next model generation.
 
-**(2) Background subagents.** `AgentDefinition(background=True)` makes the `Agent` tool return immediately. The parent's turn proceeds. Result delivery happens via system messages on the parent's stream:
-- `TaskStartedMessage(task_id, description, task_type)` — fired when the subagent begins.
-- `TaskProgressMessage(task_id, usage, last_tool_name)` — periodic.
-- `TaskNotificationMessage(task_id, status, output_file, summary, usage)` — fired on completion. Final result text lives at `output_file`.
+**(2) Across-turn spawns via heartbeat chain.** For work that exceeds one turn's budget, decompose via chainlink subissues (§50-heartbeat-patterns.md) and pick one subissue per heartbeat. Each heartbeat is an independent turn; spawns within a heartbeat are synchronous.
 
-The parent reads `output_file` when it sees the notification — typically by setting up a hook in the agent loop that injects "subagent X finished, here's the result" as a tool-result-like message on the next turn. Mimir wires this via a small `subagent_inbox` queue inside the server.
+**(3) Cross-channel concurrency.** Different channels' worker tasks run concurrently (§4.5). The dispatcher serializes turns within one channel but runs them in parallel across channels.
 
-Used for: long climbs, slow research, anything the user shouldn't have to wait on.
-
-**(3) Multiple concurrent `query()` calls.** Independent top-level `query()` invocations run in parallel via `asyncio.gather` — each spawns its own CLI subprocess with its own context. Mimir uses this only for offline/maintenance work (e.g. nightly skill-curation passes), not in the request path. Caveat: rate limits apply per-API-key across all subprocesses; CPU and memory grow linearly with N.
-
-**(4) Within-turn parallel tool calls.** When the model emits multiple non-`Agent` `tool_use` blocks in one assistant message, the SDK's tool runner executes them — parallelism is undocumented and implementation-defined. Mimir treats this as **effectively sequential** for design purposes. If we need true concurrency for a tool batch, we wrap them in subagents (which *are* documented as parallel-safe).
-
-**Streaming and tools.** With `include_partial_messages=True` the parent's stream emits `StreamEvent` deltas during the current generation. Tools execute between turns; the *next* assistant generation can't start until all tool results from the current turn return. Subagent fan-out doesn't change this — the parent sees subagent results as `tool_result` blocks before its next generation begins.
+**Streaming.** `agent.astream(stream_mode="values")` yields the full LangGraph state snapshot after each graph step. The `StreamingAutoDispatcher` observes each new `AIMessage` as it accumulates and flushes "plan" text to the channel at the first tool_call boundary (so the user sees intent before tool results arrive). Tool calls execute between graph steps; the next model generation begins only after all tool results from the current step are available.
 
 ### 4.5 Concurrent request handling
 
-Mimir must serve multiple concurrent inbound channels (e.g. two Slack DMs from different people) without one blocking the other. The SDK's only supported concurrency primitive at the request boundary is **separate top-level `query()` calls** — a single `ClaudeSDKClient` is sequential by design, so we cannot share one client across requests.
+Mimir serves multiple concurrent inbound channels without one blocking the other. Each turn runs `agent.astream()` on the shared `CompiledStateGraph` singleton — LangGraph's state graph is thread-safe and isolates per-turn state via the `thread_id` configurable key.
 
 **Topology — per-channel queue, bounded global concurrency:**
 
@@ -313,7 +324,7 @@ inbound event (POST /event, channel bridge §7.2.1, or poller §7.2.2)
 │   acquire global sem   │  │   acquire global sem   │  │   acquire global sem   │
 │   run_turn(event)      │  │   run_turn(event)      │  │   run_turn(event)      │
 │       ↓                │  │       ↓                │  │       ↓                │
-│   query() subprocess   │  │   query() subprocess   │  │   query() subprocess   │
+│   agent.astream(...)   │  │   agent.astream(...)   │  │   agent.astream(...)   │
 └────────────────────────┘  └────────────────────────┘  └────────────────────────┘
    ↑ per-channel ordering        ↑ runs in parallel        ↑ runs in parallel
      preserved                     with the others           with the others
@@ -324,7 +335,7 @@ inbound event (POST /event, channel bridge §7.2.1, or poller §7.2.2)
 - **Global semaphore caps in-flight turns.** Default `MIMIR_MAX_CONCURRENT_TURNS = 10`; tunable. Excess events queue and wait their turn.
 - **Idle workers retire.** A worker exits after 60s of empty queue; respawns on next event.
 - **Workers swallow exceptions.** Each `run_turn` is wrapped in `try/except`; any unhandled exception is logged to events.jsonl as `error` and the worker continues draining the queue. A single bad turn never wedges a channel.
-- **Each turn = one fresh `query()` call** with its own `ClaudeSDKClient` (or one-shot `query()`) and its own subprocess.
+- **Each turn shares the CompiledStateGraph singleton.** LangGraph's state isolation is via `thread_id` (= `saga_session_id or channel_id`), not separate process instances.
 
 ### 4.6 Per-turn state isolation
 
@@ -333,18 +344,23 @@ Each turn carries a `TurnContext` value through the call chain — never a modul
 ```python
 @dataclass
 class TurnContext:
-    turn_id: str             # 16-char hex
-    session_id: str          # = channel_id (lets the viewer filter per-DM)
-    trigger: str             # "user_message" | "scheduled_tick" | "saga_session_end" | ...
+    turn_id: str              # 16-char hex
+    session_id: str           # = channel_id (lets the viewer filter per-DM)
+    trigger: str              # "user_message" | "scheduled_tick" | "saga_session_end" | ...
     channel_id: str | None
     started_at: float
+    agent_id: str             # from Config; identifies this mimir instance
     saga_session_id: str | None = None    # active SAGA session for this channel (§5.6)
-    saga_atom_ids: list[str] = field(default_factory=list)
+    loop_detector: LoopDetector | None = None  # per-turn send-loop circuit breaker
+    tool_call_budget: int = 0             # 0 = unlimited; enforced by registry.py wrapper
+    wiki_mtime_snapshot: dict = field(default_factory=dict)  # pre-turn wiki page mtimes
 ```
 
-The SAGA pre-message hook stashes `atom_ids` on the context; the post-message hook reads from it. Concurrent turns each have their own context — no cross-talk.
+The SAGA pre-message query stashes `saga_atom_ids` on the context; the post-message credit pass reads from it. Concurrent turns each have their own context — no cross-talk.
 
 `session_id = channel_id` is intentional: it lets the HTML viewer filter turns per-DM ("show me only Alice's conversation") and matches the open-strix convention of one session per logical channel.
+
+The context is set via `set_current_turn(ctx)` at the top of `run_turn` and reset in the `finally` block. A module-global `_set_cid(channel_id)` companion covers the `langchain-claude-code` path where tool `_arun` calls receive a fresh `RunnableConfig()` that lacks the `channel_id` configurable.
 
 ### 4.7 Shared-state guarantees
 
@@ -354,14 +370,14 @@ The SAGA pre-message hook stashes `atom_ids` on the context; the post-message ho
 | `events.jsonl` | Same — append-only with a lock. |
 | Indexer thread | Single writer, drains its own work queue. Concurrent file writes enqueue indexing tasks; eventually consistent within the 60s sweep. |
 | `INDEX.md` regeneration | Lock-serialized; the second writer overwrites with the newer snapshot. |
-| SAGA service | Handles its own concurrency. Each turn's pre/post hooks are independent HTTP calls. |
-| `Write` / `Edit` (SDK preset tools) | **Single-process serialization** via the dispatcher's per-channel queue + global semaphore. Within a turn, tool calls are sequential. Across turns on the same channel, the per-channel worker FIFO serializes. Across channels, two simultaneous edits to the same memory file would race — but in practice each channel writes only to its own subtree, and the agent uses `Edit` (atomic read-modify-write inside the SDK) for shared paths. Note: an earlier draft of this spec called for per-file `flock(LOCK_EX)` on every write. That predated the switch from custom MCP file-op tools to SDK preset hooks (see `mimir/hooks.py` docstring) — the actual write happens in the CLI subprocess, which mimir's process can't transactionally wrap. If multi-process mimir ever ships, revisit. |
+| SAGA / SagaStore | In-process SQLite via `SagaStore`; thread-safety is `check_same_thread=False` on the connection pool + per-call serialization via `asyncio.to_thread`. The HTTP `_HttpSaga` adapter handles its own concurrency when an external saga server is configured. |
+| `Write` / `Edit` (Claude Code built-in tools) | **Single-process serialization** via the dispatcher's per-channel queue + global semaphore. Within a turn, tool calls execute between graph steps (never interleaved). Across turns on the same channel, the per-channel worker FIFO serializes. Across channels, two simultaneous edits to the same memory file would race — but in practice each channel writes only to its own subtree. The actual write happens in the Claude Code CLI subprocess; mimir's process can't transactionally wrap it. If multi-process mimir ever ships, revisit. |
 | `Bash` writes | Out of band; we don't intercept syscalls. OS gives small-write atomicity. Semantic collisions are on the agent. The prompt steers content edits toward `Write` / `Edit`; bash is for moves, listings, processes. |
 | Per-channel writes (`memory/channels/<id>/`, etc.) | No contention in practice — only the channel's worker writes there, and the per-channel worker FIFO serializes its own writes. |
 | `chat_history.jsonl` append | Single asyncio.Lock around the append (same pattern as `turn_logger`). |
 | Schedule changes | Single `_SCHEDULER_LOCK` (open-strix port) serializes `add_schedule` / `remove_schedule`. |
 
-**Subagents and concurrency.** A turn that fans out N parallel subagents counts as **one** in-flight slot in the global semaphore — we don't double-count, since the parent process is what holds the slot. This means a fan-out of 5 researchers consumes 1 slot but spawns 5 subprocess subagents; tune `MIMIR_MAX_CONCURRENT_TURNS` with this in mind.
+**Subagents and concurrency.** A turn that issues N parallel `spawn_claude_code` tool calls counts as **one** in-flight slot in the global semaphore — the parent's `run_turn` holds the slot; each subprocess runs in `asyncio.to_thread` alongside the others. A fan-out of 5 spawns consumes 1 semaphore slot but 5 subprocess instances; tune `MIMIR_MAX_CONCURRENT_TURNS` with subprocess CPU/memory cost in mind, not just slot count.
 
 ### 4.8 Backpressure and admission
 
