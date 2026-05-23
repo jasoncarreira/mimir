@@ -420,8 +420,8 @@ Rendered into the system prompt under a single `## Core memory` section, in lexi
 Anything under `memory/` outside `memory/core/`. Not in the prompt. Discoverable via:
 
 1. **`memory/INDEX.md`** — name + one-line description, dumped into every system prompt
-2. **`file_search` skill** — semantic + keyword hybrid retrieval (also covers `state/`)
-3. **`read_file`** or **`bash` (`cat`/`grep`)** — direct read once the path is known
+2. **`file_search`** MCP tool — semantic + keyword hybrid retrieval (also covers `state/`)
+3. **`read_file`** or **`shell_exec`** — direct read once the path is known
 
 The agent promotes a non-core file to core by `mv`-ing it into `memory/core/` with an `NN-` prefix, and demotes by `mv`-ing it out. No special tooling required.
 
@@ -492,7 +492,7 @@ If a public channel needs the same restriction (a "confidential" tag), add a `pr
 
 ### 5.5 Per-channel memory subtree
 
-Independent of the message buffer, the agent gets per-channel **memory** scoped under `memory/channels/<channel_id>/`. This is for agent-curated notes ("things I learned about Alice", "open questions in #eng", etc.) — not message history. Per-channel notes don't race with other channels' writes, and they're searchable via `file_search`. Cross-channel knowledge belongs in `memory/shared/` (no special concurrency semantics — same `flock` rules as everything else).
+Independent of the message buffer, the agent gets per-channel **memory** scoped under `memory/channels/<channel_id>/`. This is for agent-curated notes ("things I learned about Alice", "open questions in #eng", etc.) — not message history. Per-channel notes don't race with other channels' writes, and they're searchable via `file_search`.
 
 ### 5.6 Per-channel SAGA sessions
 
@@ -562,9 +562,9 @@ people in this channel, decisions, recurring patterns, useful context for
 future sessions — write or edit files under:
 
   memory/channels/{channel_id}/   # channel-specific notes
-  memory/shared/                  # cross-channel facts
+  state/wiki/                     # cross-channel synthesis (concepts, topics, entities)
 
-Use bash and the file-op tools. Skip this step entirely if nothing notable
+Use shell_exec and the file-op tools. Skip this step entirely if nothing notable
 came up — no need to manufacture content.
 
 ### 2. Score SAGA atoms
@@ -589,6 +589,7 @@ Synthesize and call:
     decisions_made=["..."],           # omit if nothing concrete
     unfinished=["..."],               # omit if nothing was left dangling
     emotional_state="<one phrase>",   # omit if neutral / unclear
+    closed_since=["..."],             # omit unless operator issued a correction
   )
 
 After step 3, do not send any user-facing message — this is a bookkeeping turn.
@@ -600,14 +601,11 @@ After step 3, do not send any user-facing message — this is a bookkeeping turn
 
 A session **cannot reopen** after it ends. The next inbound event for the same channel mints a fresh `saga_session_id`. This matches the boundary-atom semantics — the boundary is what's queried by the next session for "what were we doing last time?".
 
-#### Dependencies on SAGA
+#### SAGA integration
 
-Two SAGA-side changes; both flagged for the SAGA maintainer. The `/v1/outcome` and `/v1/consolidate` endpoints we use for upvoting and weekly consolidation already exist as-is (`/v1/outcome` already accepts `session_id`). Until the changes below land, mimir's hooks pass the fields anyway (extras drop on the wire) and the synthesis turn's tool call surfaces as a 404 in events.jsonl — the session is still dropped locally so it doesn't get stuck:
+The in-process `SagaStore` (mimir/saga rewrite, PR #161) replaced the original HTTP `/v1/sessions/end` design — `saga_end_session` now calls `SagaStore.end_session()` directly, which writes the boundary atom, topics, decisions, unfinished, mood, and `closed_since` corrections inline. No external endpoint required.
 
-1. **NEW endpoint `POST /v1/sessions/end`** — required. Body: `{session_id, summary, topics_discussed?, decisions_made?, unfinished?, emotional_state?}`. ~10-line wrapper in `saga/saga/server.py` around `core.store_session_boundary` (`saga/saga/core.py:3393-3437`). Without this, the boundary atom doesn't get written and the next session can't query "what were we doing last time?".
-2. **Add `session_id: Optional[str] = None` to `FeedbackRequest`** (`saga/saga/server.py:114-117`) and pass it through to `core.mark_contributions` (which already accepts the kwarg — `saga/saga/core.py:2129`). One-line schema add + one-line plumbing. Nice-to-have: gives SAGA session-scoped co-retrieval stats. Without it, contribution credit still works, just not bucketed by session.
-
-`/v1/query` does not need `session_id` for v1 — the underlying retrieval (`hybrid_retrieve_with_triples`) doesn't use it. Skip.
+The `saga_feedback` and `saga_mark_contributions` MCP tools (§7, SAGA sub-group) operate through the same in-process path. The weekly consolidation job calls `SagaStore.consolidate()` directly (not `/v1/consolidate`).
 
 #### Weekly consolidation
 
@@ -615,7 +613,7 @@ Two SAGA-side changes; both flagged for the SAGA maintainer. The `/v1/outcome` a
 
 **Two-pass consolidation.** Since the in-process `SagaStore` (mimir/saga rewrite) replaced the HTTP `/v1/consolidate` call, the consolidate job runs two passes per fire:
 
-1. **Pass 1 — dedup.** Tight-threshold clustering (**0.92 floor for all providers** — computed as `max(_PROVIDER_AUTO_THRESHOLDS[provider], 0.92)`) collapses near-duplicate raws into a canonical chosen by **ACT-R activation** (Petrov OL — see `mimir/saga/activation.py`), with tiebreaks pinned > observation trend > evidence_count > older-created. The floor is calibrated against mimir's saga.db + muninn's MSAM where 0.92 sits at the ~99.98th percentile of pair similarity for Voyage and both OpenAI variants (3-small + 3-large). Duplicates are tombstoned with `reason='merged'`; their `access_events` are redirected to the canonical (activation history preserved by sum-linearity), their `atom_relations` are redirected with dedup, and a `consolidated_into` edge is added. No LLM cost.
+1. **Pass 1 — dedup.** Tight-threshold clustering (**0.92 floor for all providers** — computed as `max(_PROVIDER_AUTO_THRESHOLDS[provider], 0.92)`) collapses near-duplicate raws into a canonical chosen by **ACT-R activation** (Petrov OL — see `mimir/saga/activation.py`), with tiebreaks pinned > observation trend > evidence_count > older-created. The floor is calibrated against mimir's saga.db where 0.92 sits at the ~99.98th percentile of pair similarity for Voyage and both OpenAI variants (3-small + 3-large). Duplicates are tombstoned with `reason='merged'`; their `access_events` are redirected to the canonical (activation history preserved by sum-linearity), their `atom_relations` are redirected with dedup, and a `consolidated_into` edge is added. No LLM cost.
 2. **Pass 2 — thematic.** Observation synthesis runs on the now-deduped candidate set using the per-provider thematic threshold from `_PROVIDER_AUTO_THRESHOLDS` — **all providers now resolve to 0.80**, matching the 0.88 historical OpenAI baseline and the 0.904 Voyage baseline. The earlier voyage=0.92 / onnx=0.92 entries were lifted from a "stop cap-saturating" heuristic; pass 1 dedup now absorbs the template-near-dup noise that drove cap-saturation, so pass 2 can run at the looser threshold where coherent thematic clusters form.
 
 The `saga_consolidate_ok` event payload now includes a `dedup` block with `candidates_scanned`, `clusters_formed`, `canonicals_kept`, `duplicates_tombstoned`, `threshold` so operators can read off what each pass did. Callers wanting to skip pass 1 (e.g. one-off bench reproductions) pass `dedup_first=False` to `SagaStore.consolidate(...)`; thresholds override via `dedup_threshold=...`. `dedup_max_clusters=N` caps the number of dedup clusters processed (not atoms tombstoned — one cluster of 5 counts as 1 against the cap and tombstones 4).
@@ -771,102 +769,127 @@ Verbatim port of `open_strix/tools.py:282-453`. `send_message` tracks similarity
 
 The breaker has caught real runaway loops in open-strix benchmark runs; defaults are calibrated and worth keeping.
 
-### 7.3 Bash + file ops
+### 7.3 Shell + file ops
 
-The agent uses these for everything memory-related (create/edit/rename/delete blocks, reorganize subdirs under `memory/`, etc.).
+The agent uses these for all filesystem work (memory editing, reorganizing dirs, running scripts, etc.).
 
-- `bash(command: str, timeout: int = 30)` — runs in `<home>` as cwd. Sandboxed to the container; no host access. Stdout + stderr returned with exit code.
+**Synchronous shell:**
+- `shell_exec(command: str)` — execute a shell command via `shlex.split` (no shell expansion). Returns `exit=N\nstdout: ...\nstderr: ...`. Path-confinement enforced by allowlist prefix check. Runs in `<home>` by convention.
+
+**Async background shell:**
+- `bash_async(command: str, session_id: str)` — spawn command in background; returns immediately with a `job_id`. Fires `shell_job_complete` event (with exit code + tail output) when done — that event triggers a fresh turn so the agent can process the result.
+- `bash_job_output(job_id: str, tail_lines: str = "1000", stream: str = "both")` — fetch tail of stdout/stderr for a running or finished job. Streams: `stdout`, `stderr`, `both`.
+- `bash_jobs_list(scope: str = "running")` — list registered async jobs. Scopes: `running`, `visible`, `all`.
+
+**File ops:**
 - `read_file(path: str)`
 - `write_file(path: str, content: str)`
 - `edit_file(path: str, old_string: str, new_string: str)`
 - `glob_files(pattern: str)`
 
-All paths are relative to `<home>`. Absolute paths or paths with `..` outside `<home>` are rejected by the file-op tools. Bash inherits its cwd-confinement from the container itself. All required string args on file-op tools use the `_need()` defensive validator (catches MiniMax-style null-arg drops).
+All paths must stay under the path-confinement allowlist (`/mimir-home`, `/workspace`, `/benchmark`, `/mimir-results`). Absolute `..`-escape paths are rejected.
 
 ### 7.4 Web
-- `web_search(query: str)` — returns top-N result snippets.
-- `fetch_url(url: str)` — returns extracted main content.
 
-### 7.5 Scheduling
+Conditional on LLM provider. When the provider is `claude_code`, Claude Code's native `WebSearch` and `WebFetch` tools handle these natively — the MCP tools below are not registered to avoid duplication:
 
-Identical semantics to open-strix:
+- `web_search(query: str)` — Tavily API search; returns compact YAML result set.
+- `fetch_url(url: str)` — download URL to `<home>/attachments/fetch-cache/`; return virtual path + metadata. Can be disabled via `MIMIR_FETCH_URL_DISABLED=1`.
+
+### 7.5 Scheduling & meta-tools
+
 - `list_schedules()` — YAML dump of `scheduler.yaml`.
-- `add_schedule(name: str, prompt: str, cron: str | None = None, time_of_day: str | None = None, channel_id: str | None = None)` — **add or replace by name.** Filters out any existing job with the same name, then appends. Exactly one of `cron`/`time_of_day` required.
-- `remove_schedule(name: str)`.
+- `add_schedule(name: str, prompt: str, cron: str | None = None, time_of_day: str | None = None, channel_id: str | None = None)` — **add or replace by name.** Exactly one of `cron`/`time_of_day` required.
+- `remove_schedule(name: str)` — remove by name.
+- `reload_pollers()` — re-scan `<home>/skills/*/pollers.json` and (re)register any new pollers with the scheduler.
 
-No `edit_schedule`. Editing is `add_schedule` with the same name (atomic replace under a single lock). The prompt documents this.
+No `edit_schedule` — editing is `add_schedule` with the same name (atomic replace).
 
-### 7.6 Reserved (not in v1)
-- `climb_register` / `climb_unregister` / `climb_status` — replaced by SDK subagents (call `Agent("climber", ...)`).
-- `journal` — explicitly excluded (lessons from `project_open_strix_journal_poisoning`).
+Additional meta-tools:
+- `fetch_channel_history(channel_id: str, limit: int = 20)` — fetch recent messages from a channel (up to 100). Complements the `## Recent activity` turn-prompt block for deeper history.
+- `mimir_get_turn(turn_id: str)` — retrieve a full turn record from `turns.jsonl` by 12-char hex ID. Also exposed as `get_turn` for back-compat. Strips `input`/`saga_atom_ids`/`usage` fields.
+- `saga_forget(dry_run: bool = True, ...)` — run the intentional-forgetting engine (dedup by similarity, decay low-retrieved atoms). Always preview with `dry_run=True` first. Full params: `min_retrievals`, `contribution_threshold`, `contradiction_threshold`, `confidence_floor`, `grace_days`.
+
+### 7.6 Subagent spawning
+
+- `spawn_claude_code(prompt: str, cwd: str | None = None, timeout_s: int = 1800, name: str | None = None)` — spawn a Claude Code subprocess to execute a complex task. Returns output, cost, and model usage metrics. The subagent runs in its own context (fresh memory, no parent conversation history). Budget caps enforced via agent profiles under `<home>/.claude/agents/` (code-implementer: $25, bench-runner: $10, doc-writer: $5). See §4.3 for the full subagent model.
+
+### 7.7 SAGA memory tools
+
+The SAGA tools are the manual escape hatches alongside the automatic pre/post-message hooks (§9.3). Most SAGA activity is automatic; these are for explicit correction, synthesis, and session management:
+
+- `memory_query(query: str, top_k: int = 12)` — explicit semantic atom retrieval. Returns observations, raw history, and structured triples. Returned atom IDs are auto-appended to `ctx.saga_atom_ids` for post-message credit.
+- `memory_store(content: str, stream: str, session_id: str | None = None, source_type: str = "agent_authored")` — store an atom explicitly. One fact per call. Streams: `semantic` / `episodic` / `procedural`.
+- `saga_feedback(atom_id: str, signal: str, session_id: str | None = None)` — corrective signal: `useful`, `incorrect`, or `stale`. Maps to SAGA outcome API.
+- `saga_mark_contributions(atom_ids: list[str], response_text: str, session_id: str | None = None)` — manually credit a set of atom IDs against a response.
+- `saga_end_session(session_id: str, summary: str, topics_discussed?, decisions_made?, unfinished?, emotional_state?, closed_since?)` — write session boundary atom. Auto-called by idle-timeout synthesis turn (§5.6); also callable explicitly when the agent knows a session is wrapping.
+
+### 7.8 Commitments tools
+
+Active records of forward-looking obligations (the agent's own promises + operator requests):
+
+- `commitment_list(due_within_days: int = 7)` — list active (non-terminal) commitments. Pass `0` for all regardless of due date.
+- `commitment_complete(commitment_id: str, message_id: str | None = None)` — mark as completed.
+- `commitment_snooze(commitment_id: str, until_iso: str, reason: str | None = None)` — defer until ISO datetime.
+- `commitment_dismiss(commitment_id: str, reason: str | None = None)` — dismiss without completing.
+
+### 7.9 Excluded tools
+
+- `journal` — explicitly excluded (lessons from open-strix journal poisoning).
 - `lookup` / dictionary-style tools — out of scope.
-- `create_memory_block` / `update_memory_block` / `patch_memory_block` / `delete_memory_block` — explicitly excluded. Use `bash` and file ops.
+- `create_memory_block` / `update_memory_block` / `patch_memory_block` / `delete_memory_block` — explicitly excluded. Use `shell_exec` and file ops.
 
 ---
 
 ## 8. Skills
 
-Three bundled skills under `mimir/skills/`. Each is a Claude Agent SDK skill: a folder with `SKILL.md` + a Python module exposing one or more callable tools.
+Skills are pure-prompt `SKILL.md` folders — no code, no registered tools. The agent reads a skill's SKILL.md on demand to get a detailed workflow for a specialized task. Note: `file_search`, `rebuild_index`, and all SAGA operations (`memory_query`, `memory_store`, `saga_feedback`, etc.) are **MCP tools** (§7), not skills.
 
-### 8.1 `file_search/`
+### 8.1 Dual-location architecture
 
-Hybrid search over the SQLite/fastembed index. Covers both non-core memory and state.
+The `SkillsMiddleware` (PR #266) resolves skills from two locations at startup:
 
-```
-file_search(query: str, scope: "memory" | "state" | "all" = "all", k: int = 5)
-  -> list[{path, scope, score, snippet, description}]
-```
+1. **`<home>/.mimir_builtin_skills/`** — bundled, package-managed, read-only at runtime.
+2. **`<home>/skills/`** — operator/agent-added, survives restarts, takes **higher priority** when names clash. Used by `mimir setup` to seed operator-specific skill overrides.
 
-`SKILL.md` documents when to use it: "when you need to find a memory or state file by topic, not by exact path." Routing rule in the prompt: "if you know the path, `read_file` directly; otherwise `file_search`."
+`mimir skills catalog` generates `memory/skills-catalog.md` — a one-row-per-skill reference table loaded into the every-turn prompt. Reading any skill's SKILL.md costs one tool call; the catalog is the quick-reference that tells the agent when to bother.
 
-### 8.2 `memory/`
+### 8.2 Bundled skill catalog
 
-(Bundled at `mimir/skills/memory/`; the directory was renamed
-from `msam/` during the SAGA rebrand. Operator overrides under
-`<home>/.claude/skills/memory/` follow the same name.)
+All skills under `.mimir_builtin_skills/` as of 2026-05:
 
-Wraps the SAGA HTTP client. Most SAGA activity is automatic through the pre/post-message hooks (§9.3); the skill exposes the manual escape hatches:
+| Skill | Purpose |
+|---|---|
+| `alert` | Route urgent signals to the operator alert channel when out of band. |
+| `async-tasks` | Turn a "wait for X" into a bash_async wake-up; avoid blocking the turn on a one-shot event. |
+| `chainlink` | Local issue tracker — todos, follow-ups, multi-heartbeat decomposition. |
+| `circuit-breaker` | Recognize runaway loops (same tool call 3×, same error 3×) and stop. |
+| `commitments` | Read, resolve, and reason about durable forward-looking obligations. |
+| `fallback-chains` | Layer alternative channels/scrapers with explicit fall-through for modal failures. |
+| `find-skills` | Discover what bundled skills exist and what each does. |
+| `five-whys` | Structured root-cause analysis — forces behavioral resolutions into diffs. |
+| `github` | GitHub via `gh` CLI: issues, PRs, CI checks, `gh api` queries. |
+| `identity-lookup` | Resolve platform-prefixed ids to names via `state/identities.yaml`. |
+| `introspection` | Diagnose agent behavior via `turns.jsonl`, `events.jsonl`, `scheduler.yaml`. |
+| `long-running-jobs` | Background shell commands with output capture and completion callbacks. |
+| `memory` | Criteria for when, where, and how to remember — filing rubric, SAGA atom model. |
+| `mermaid-diagrams` | Create software diagrams (class, sequence, flowchart, C4, ER, state, gantt). |
+| `ntfy` | Phone push notification via ntfy.sh — genuine algedonic alarms only. |
+| `onboarding` | Guide for first days with a new human; persona/comms setup. |
+| `pollers` | Build and manage subprocess pollers (recurring external-state checks). |
+| `predictions` | Record forward-looking claims with checkable outcomes to `state/predictions.jsonl`. |
+| `review` | Review a pull request and POST the review to GitHub via `gh pr review`. |
+| `skill-acquisition` | Discover, install, and wrap external skills from ClawHub or GitHub. |
+| `skill-creator` | Create or update reusable skills for this agent. |
+| `tmux` | Remote-control tmux sessions for interactive CLIs (REPLs, agents that prompt). |
+| `view-attachment` | View image/file attachments that the model can't directly see. |
+| `weather` | Current conditions and 5-day forecast via OpenWeatherMap. |
+| `wiki` | Maintain `state/wiki/` — ingest raw sources, synthesize cross-linked pages, lint health. |
+| `world-scanning` | Catalog of pollers worth building (CI pipelines, releases, config drift, etc.). |
 
-- `saga_query(query: str, top_k: int = 12)` — explicit semantic atom retrieval (the same call the pre-message hook makes; available for follow-up queries inside a turn). Returned `atom_id`s are auto-appended to the parent's `turn_state.saga_atom_ids` so they get credited at post-message without the agent having to remember (§9.3).
-- `saga_store(content: str, kind: str, confidence: float)` — explicit store. The agent rarely calls this directly — SAGA extracts atoms from messages on its own.
-- `saga_feedback(atom_id: str, signal: "useful" | "incorrect" | "stale")` — corrective signal. Skill translates to SAGA's `/v1/outcome` vocabulary: `useful → positive`, `incorrect → negative`, `stale → negative` (no SAGA-side change required; `/v1/outcome` already accepts `session_id`, which the skill passes from `TurnContext`).
-- `saga_mark_contributions(atom_ids: list[str])` — manual variant of the post-message hook, for cases where the agent wants to credit atoms it pulled in mid-turn via `saga_query`.
-- `saga_end_session(session_id: str, summary: str, topics_discussed: list[str] | None = None, decisions_made: list[str] | None = None, unfinished: list[str] | None = None, emotional_state: str | None = None)` — POSTs to `/v1/sessions/end`, which calls `core.store_session_boundary` and writes a "Session Boundary [<id>]: <summary>\nTopics: ...\nDecisions: ...\nUnfinished: ...\nMood at close: ..." episodic atom (only the fields with substance render; empty lists/None are dropped). Auto-invoked by the synthesis turn at idle timeout (§5.6); the agent can also call it explicitly when it knows a session is wrapping (e.g. user says "talk later").
-
-`SKILL.md` describes the SAGA atom model (semantic / episodic / procedural with confidence gating), the auto pre/post hooks, and when to prefer SAGA over `file_search` (semantic gist vs. verbatim retrieval).
-
-### 8.3 `index/`
-
-One callable tool, mostly diagnostic:
-
-- `rebuild_index(scope: "memory" | "state" | "all" = "all")` — force a full reindex and INDEX.md regeneration. Normally unnecessary (auto-rebuild on writes + 60s sweep), but useful when files arrive out-of-band.
-
-### 8.4 Ported skills from open-strix
-
-Pure-prompt skills (just a `SKILL.md`) are essentially free to port — copy the markdown, adjust any references to journal/pollers/etc. that mimir doesn't have. Source root: `open-strix-base/open_strix/builtin_skills/`. Recommended set:
-
-| Skill | Purpose | Adapt? |
-|---|---|---|
-| `five-whys/` | Structured root cause analysis through iterative questioning. | Verbatim — no mimir-specific references. |
-| `introspection/` | Diagnose agent behavior using events.jsonl, journal, scheduler. | **Adapt:** strip journal references; lean on events.jsonl + turns.jsonl + state. |
-| `long-running-jobs/` | Run shell commands in background with output capture. | Verbatim (mimir has bash). |
-| `memory/` | Criteria for when/where/how to remember information. | **Rewrite:** mimir's memory model differs (no extended/, no journal). Keep the *principles*, replace the directory map. |
-| `onboarding/` | Guide for first days with a new human; persona/comms setup. | Adapt — point at `memory/core/00-persona.md`. |
-| `skill-acquisition/` | Discover/install/wrap external skills from ClawHub etc. | Verbatim. |
-| `skill-creator/` | Create or update reusable skills for this agent. | **Adapt:** target Claude Agent SDK skill folder format, not open-strix's loader. |
-| `view-attachment/` | View image/file attachments by path. | Verbatim. |
-
-**Explicitly dropped (initial port):**
-- `prediction-review/` — depends on the journal mimir doesn't have.
-
-**Ported back in (v0.4):**
-- `mountaineering/` — five framework files (philosophy, laws, harness, preflight, climb-design) port verbatim; the SKILL.md adds a Mimir-specific mechanism section pointing at the climber subagent (§4.3). open-strix's `climber.py` is replaced by the bundled subagent (`mimir/subagent_defs.py`); the discipline (Five Laws, four phases) is unchanged.
-
-**Bundled, not from open-strix:**
-- `pollers/` — adapted into mimir's channel layer (§7.2.2); the SKILL.md and design-patterns.md copy verbatim, the `reload_pollers` tool is wired into mimir's scheduler.
-- `heartbeat/`, `reflection/`, `alert/` — v0.4 additions (V0.4.md §1, §4, §6). Heartbeat is the autonomous-work cadence; reflection is the weekly cross-session audit; alert is the operator-escalation discipline.
-
-Skills install under `mimir/skills/` (bundled with the package) **plus** `<home>/.claude/skills/` for agent-installable ones (matches the SDK's filesystem skill convention). The bundled set is read-only at runtime; user/agent-added skills land in the home dir and survive across restarts but are reset between benchmark tasks.
+**Dropped from original open-strix port:**
+- `mountaineering/` — removed with PR #271 (SubAgent delegation machinery dropped); `spawn_claude_code` is the out-of-process delegation primitive now (§7.6).
+- `prediction-review/` — depends on a journal mimir doesn't have.
 
 ---
 
@@ -874,42 +897,30 @@ Skills install under `mimir/skills/` (bundled with the package) **plus** `<home>
 
 ### 9.1 System prompt
 
+Assembly order (each conditional — section is omitted when its value is absent):
+
 ```
-{persona.md content from prompts/}
-{flow.md content}
-{communication.md content}
+{persona block — from memory/core/00-*.md or _DEFAULT_PERSONA}
+
+## Agent home                            # when home_dir is set (install-stable, cache-friendly)
+MIMIR_HOME={home_dir}
 
 ## Core memory
-{each memory/core/*.md, in numeric order, separated by --- and the file's H1}
+{each memory/core/*.md, in numeric-prefix order, separated by ---}
 
 ## Memory index
 {<home>/memory/INDEX.md content}
 
-## Conventions
-- Always-in-context blocks live under memory/core/, ordered by numeric prefix
-  (00-, 10-, 20-, ...). To insert at position N, name the file N-<topic>.md.
-  Renumber with `mv` if gaps close.
-- Anything else under memory/ is non-core: organize it however helps you.
-  It is listed in memory/INDEX.md and is searchable via the file_search skill.
-- Bulk verbatim content goes in state/. state/INDEX.md is NOT in the system
-  prompt — read it directly with `read_file <home>/state/INDEX.md` when you
-  want an overview, or use the file_search skill to find files by topic.
-- Each file's first line should be: <!-- desc: short description -->.
-  If absent, the indexes fall back to the file's first sentence.
-- The INDEX.md files are auto-generated; do not hand-edit them.
-- Edit memory blocks with bash and file-op tools — no dedicated memory-block
-  tools exist.
+{conventions block — inline, from _DEFAULT_CONVENTIONS}
 
 ## Operator config                       # only when MIMIR_OPERATOR_ALERT_CHANNEL set
 Operator alert channel: {value}
+
+## Skills                                # when skill_block is set; ordered by success rate
+{per-skill name + description block from mimir skills catalog}
 ```
 
-(`## Available tools` and `## Available skills` sections were in the
-original sketch but never landed — the SDK surfaces both natively
-through its tool/skill registries, so duplicating in the system prompt
-was redundant.)
-
-The prompts/ directory under the *benchmark* repo (mirroring the existing open-strix layout) holds the editable text fragments. The mimir runtime reads them at boot.
+The conventions block covers core/non-core layout, `<!-- desc: ... -->` convention, auto-managed INDEX.md files, and the "edit memory with file-op tools, no dedicated memory-block tools" rule.
 
 ### 9.2 Turn prompt
 
@@ -917,49 +928,66 @@ Section assembly order (each conditional — section is omitted when its
 input is empty):
 
 ```
-## Known identities                      # FUTURE_WORK §6.1; resolver-driven
+## Known identities                      # FUTURE_WORK; resolver-driven
 {identity records for authors visible in this turn}
 
-## Recent feedback signals               # v0.4 §2 algedonic surfacing
-{Negative (last Nh): / Positive (last Nh): bullets from feedback.py}
+## Recent feedback signals               # algedonic surfacing from feedback.py
+{Negative (last Nh): / Positive (last Nh): bullets}
 
-## Recent session summaries              # v0.4 §3 session-boundary surfacing
-{recent boundaries for the current channel from SAGA (or local mirror fallback)}
+## Recent session summaries              # session-boundary surfacing
+{recent session summaries for the current channel}
+
+## Resource usage                        # cost / cache / context utilization
+{last turn cost; last 1h/5h/7d aggregates; plan-window utilization; per-section token breakdown}
+
+## Upcoming                              # feedforward: scheduled jobs + commitments due
+{next scheduled jobs; commitments with upcoming due dates}
+
+## Upcoming commitments                  # active obligations (Phase 3 commitments extractor)
+{commitment records due within the near window}
+
+## Self-state                            # homeostat constraints + S3/S4 share
+{seven_day window %; cost rate; S3/S4 tool-call share; token totals}
 
 ## Recent activity
 {merged chronological stream:
-  - last N messages from messages/<channel_id>.jsonl
+  - last N messages from current channel
   - last M messages by the same author from other channels (last 24h)
   each line: [<ts> <channel_id>] <author>: <content>}
 
 ## Possibly relevant memories (from SAGA)
-{pre_message_saga_block — see 9.3}
+{pre_message_saga_block — see §9.3}
 
-## Subagent updates                      # only when subagent_inbox has entries
+## Subagent updates                      # only when there are pending notifications
 {TaskNotificationMessage payloads from prior turns}
 
-[event_kind: {trigger}, channel: {channel_id}, author: {author}, ts: {ts}]
-{event_body}
+## Today's date
+{YYYY-MM-DD}
+
+[scheduled_tick: {channel_id}, ts: {ts}, saga_session_id: {id}]
+{schedule_prompt or HEARTBEAT_DEFAULT_PROMPT}
 ```
 
-For scheduled wakeups (no inbound author, so cross-author pull is skipped):
-
+For user messages the event header is:
 ```
-{same conditional sections as above}
-
-[scheduled_tick: {channel_id}, ts: {ts}]
-{schedule_prompt or HEARTBEAT_DEFAULT_PROMPT — see prompts.py}
+## ▶ Current message — respond to this
+[user_message: {trigger}, channel: {channel_id}, author: {name}, ts: {ts}, msg_id: {id}, saga_session_id: {id}]
+{message body}
 ```
+
+For `shell_job_complete` wake-ups:
+```
+[shell_job_complete: {channel_id}, job_id: {id}, exit_code: {n}, ts: {ts}, saga_session_id: {id}]
+{status line + tail output}
+```
+
+The `## Resource usage` section has a per-section token breakdown appended at the end (sections under ~25 tokens are dropped). `build_turn_prompt()` in `mimir/prompts.py` is the canonical reference.
 
 No journal entries. No always-injected core memory beyond what's already in the system prompt.
 
 ### 9.3 SAGA hooks
 
-(Hook code samples below use `ctx.*` to match the actual attribute
-name on `TurnContext`; the original spec drafted these as
-`turn_state.*`.)
-
-**Pre-message** — fires after `index.rebuild()` and before `query()`. Mirrors muninnbot's `msam_hooks.mjs:PreMessage` and open-strix-hindsight's pre-message retrieval:
+**Pre-message** — fires after `index.rebuild()` and before `run_turn()`. Runs `SagaStore.query()` against the inbound event body:
 
 ```python
 hits = saga_client.query(
@@ -972,26 +1000,28 @@ ctx.saga_atom_ids = [h["atom_id"] for h in hits]
 ctx.saga_block = format_atoms_for_prompt(hits)
 ```
 
-`format_atoms_for_prompt` produces a short bullet list — kind tag, content, no IDs in the visible output. The atom IDs are stashed on `ctx` for the post-message hook. If the query returns nothing, the block is omitted from the turn prompt entirely.
+`format_atoms_for_prompt` produces a short bullet list — kind tag, content, no IDs in the visible output. Atom IDs are stashed on `ctx` for the post-message hook. If the query returns nothing, the block is omitted from the turn prompt entirely.
 
-**Mid-turn `saga_query` tracking.** The `memory/` skill's `saga_query` wrapper (§8.2) appends every returned `atom_id` to `ctx.saga_atom_ids` in addition to passing the hits back to the model. The agent doesn't have to remember to credit mid-turn retrievals — they're auto-merged into the post-message call below.
+Pre-message is **skipped** for `trigger="saga_session_end"` and `trigger="scheduled_tick"` — synthesis and heartbeat turns use the event body as a query but return noise atoms and burn an embedding call for nothing (see `memory/issues/saga-query-noise-on-scheduled-ticks.md`).
 
-**Post-message** — fires after the SDK returns the final assistant message:
+**Mid-turn `memory_query` tracking.** Calling `memory_query` (§7.7) appends every returned `atom_id` to `ctx.saga_atom_ids` automatically. The agent doesn't have to manually credit mid-turn retrievals — they merge into the post-message call below.
+
+**Post-message** — fires after the model's final assistant message:
 
 ```python
 if ctx.saga_atom_ids:
     saga_client.mark_contributions(
         atom_ids=list(set(ctx.saga_atom_ids)),  # pre-injected ∪ mid-turn-queried
         response_text=final_assistant_text,
-        session_id=ctx.saga_session_id,         # §5.6
+        session_id=ctx.saga_session_id,
     )
 ```
 
-`mark_contributions` is SAGA's `POST /v1/feedback` endpoint (`saga/saga/server.py:425-429`) for crediting atoms that influenced a reply (used for confidence weighting / promotion / decay). SAGA's scorer decides which atoms in the passed set actually contributed based on overlap with the response text — we don't disambiguate client-side.
+SAGA's scorer decides which atoms in the passed set actually contributed based on overlap with the response text — no client-side disambiguation.
 
-**Subagents do not inherit the parent's `saga_atom_ids`.** A subagent sees its own `TurnContext`. If a subagent calls `saga_query` and wants the retrievals credited, it credits them via its own `saga_mark_contributions` from inside the subagent. The parent neither tracks nor credits subagent-internal SAGA activity. This keeps the parent's credit signal clean and lets each context decide what counts as "useful".
+**Subagents do not inherit the parent's `saga_atom_ids`.** Each subagent has its own `TurnContext`. If a subagent calls `memory_query` and wants retrievals credited, it calls `saga_mark_contributions` from inside the subagent. The parent neither tracks nor credits subagent-internal SAGA activity.
 
-`ctx.saga_atom_ids` is per-turn (cleared between turns). SAGA session boundaries (per-channel, idle-driven) are §5.6. Weekly consolidation is a separate scheduled job (§5.6).
+`ctx.saga_atom_ids` is per-turn (cleared between turns). SAGA session boundaries are §5.6. Weekly consolidation is a separate scheduled job (§5.6).
 
 ---
 
