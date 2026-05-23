@@ -610,6 +610,16 @@ def build_app(config: Config) -> web.Application:
             await log_event("scheduler_invalid_cron", error=str(exc))
             consolidate_registered = False
 
+        # Register the daily index-integrity check (SPEC §8.3,
+        # §16 item 16). Runs 30 min after saga-consolidate so any
+        # consolidation-induced corruption surfaces before agent
+        # turns hit stale retrieval. Bad cron logs and continues —
+        # this is a detection-only check; missing it isn't fatal.
+        try:
+            scheduler.add_index_integrity_job(home=config.home)
+        except ValueError as exc:
+            await log_event("scheduler_invalid_cron", error=str(exc), job="index-integrity")
+
         # Register weekly introspection-report cron (FEEDBACK-LOOPS §4.7
         # + §4.8). Non-LLM: aggregates turns/events, writes report,
         # emits heartbeat_health_degraded events when scheduled-tick

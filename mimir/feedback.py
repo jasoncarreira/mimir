@@ -151,6 +151,13 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "ntfy_post_ok": ("positive", "ntfy_post_ok"),
     "git_push_ok": ("positive", "git_push_ok"),
     "git_push_stale": ("negative", "git_push_stale"),
+    # SPEC §8.3 / §16 item 16 — automated index-integrity check fires
+    # daily against the file-corpus and SAGA SQLite databases. Detects
+    # SQLite-level corruption, FTS5 self-check failures, FTS5 row-count
+    # drift, and embedding-dim mixing (model-swap-without-rebuild).
+    # Recovery procedure: §8.3 (rebuild_index / saga_calibration.re_embed).
+    "index_integrity_ok": ("positive", "index_integrity_ok"),
+    "index_integrity_failed": ("negative", "index_integrity_failed"),
     "git_pull_ok": ("positive", "git_pull_ok"),
     "git_fetch_ok": ("positive", "git_fetch_ok"),
     "shell_job_complete_enqueue_ok": ("positive", "shell_job_complete_enqueue_ok"),
