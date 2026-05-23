@@ -152,11 +152,68 @@ Same as A, plus:
 | X OAuth 1.0a requires all four keys consistent — partial rotation breaks signing | Inferred from upstream OAuth 1.0a spec |
 | Slack bolt's WebSocket reconnect can take 5–30s; inbound DMs land but aren't surfaced until reconnect | Observed during prior token rotations |
 
+## Per-skill credential manifests (Phase 2.5)
+
+The probe definitions in the table above are **not** hardcoded in
+the framework. Each skill that needs a credential ships a
+``credentials.yaml`` next to its ``SKILL.md``; mimir's discovery
+walker (mirroring the dual-skills-dir architecture from PR #272)
+loads all of them at startup and merges into a single registry.
+
+Roots, in shadow order (later wins):
+
+1. ``mimir/credentials.yaml`` (package) — mimir-core creds: the
+   model provider, mimir's own HTTP gate, bridge tokens, the state-
+   repo PAT.
+2. ``<home>/.mimir_builtin_skills/<skill>/credentials.yaml`` —
+   bundled optional skills.
+3. ``<home>/skills/<skill>/credentials.yaml`` — operator skills.
+
+Manifest schema:
+
+```yaml
+credentials:
+  - name: ACLI_TOKEN            # registry key
+    cred_type: A                # A / B / C / D — see classification above
+    env_vars: [ACLI_TOKEN, ACLI_EMAIL, ACLI_SITE]
+    description: "..."
+    probe:
+      kind: subprocess          # one of: subprocess, format, all_env_set,
+                                # not_implemented, python
+      ...                       # kind-specific keys (see below)
+```
+
+Probe kinds:
+
+- **`subprocess`** — run a command; exit 0 = live.
+  Keys: ``binary`` (short-circuits to ``unavailable`` if not on PATH),
+  ``cmd``, optional ``success_detail``.
+- **`format`** — env present + (optional) prefix / length / charset
+  / disallowed-prefix check.
+  Keys: ``env`` (the env var to check), ``prefix``, ``min_len``,
+  ``length``, ``charset`` (``"hex"``), ``disallowed_prefix``.
+- **`all_env_set`** — every name in ``env_vars`` must be non-empty.
+  Used for multi-var bundles (X OAuth quartet, ACLI's three vars)
+  where partial updates break signing.
+  Keys: optional ``note`` appended to success detail.
+- **`not_implemented`** — explicit Phase-3 stub. Reports the cred's
+  ``cred_type`` so the gap is grep-able.
+- **`python`** — escape hatch. Loads ``script`` (path relative to
+  ``credentials.yaml``) via importlib and calls ``function`` (default
+  ``"probe"``). The callable takes no args and returns
+  ``(ok: bool, detail: str)``. See ``mimir/optional-skills/social-cli/
+  probe_bsky_password.py`` for an example.
+
+If a skill has no ``credentials.yaml``, no credentials are registered
+on its behalf. Removing a skill (or never installing it) means
+``mimir verify-creds`` won't list its credentials — which is the
+right behavior: a deployment that doesn't use jira has nothing to
+verify about ACLI_TOKEN.
+
 ## What this doc doesn't cover yet
 
-Next PRs in the credential-rotation series will add:
+Next PR in the credential-rotation series:
 
-- **`mimir verify-cred <name>`** — wraps each probe above into a CLI subcommand; exit 0 = live, 1 = stale
 - **`mimir rotate --cred <name>`** — atomic compose.env edit + recreate + verify, with audit events (`credential_rotation_started`, `credential_rotation_completed`, with old/new hashes for grep-by-rotation-event)
 - **Drain mode** (later, opt-in) — pause new event dispatch while in-flight turns finish, then rotate
 
