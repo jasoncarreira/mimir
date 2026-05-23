@@ -33,6 +33,7 @@ currently stubbed — re-wire in a follow-up.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -964,8 +965,11 @@ class Agent:
         # the race-free route. The dispatcher serializes turns per-
         # channel, so the cross-channel race Mimir originally flagged
         # is constrained to the moment between set and reset here.
-        from .tools.registry import set_current_channel_id as _set_cid
-        _set_cid(event.channel_id)
+        from .tools.registry import (
+            set_current_channel_id as _set_cid,
+            reset_current_channel_id as _reset_cid,
+        )
+        cid_token = _set_cid(event.channel_id)
         try:
             return await self._run_turn_body(
                 event, ctx, ctx_token, turn_id, session_id, saga_session_id,
@@ -973,7 +977,7 @@ class Agent:
             )
         finally:
             reset_current_turn(ctx_token)
-            _set_cid(None)
+            _reset_cid(cid_token)
 
     async def _run_turn_body(
         self,
@@ -1083,54 +1087,80 @@ class Agent:
             ),
         )
 
+        timeout = self._config.turn_timeout_seconds
+        # asyncio.timeout() requires Python 3.11+. Fall back to
+        # nullcontext (no enforcement) on older interpreters with a
+        # one-time warning so operators know it's inactive.
+        if timeout > 0:
+            if hasattr(asyncio, "timeout"):
+                _timeout_ctx: Any = asyncio.timeout(timeout)
+            else:
+                log.warning(
+                    "MIMIR_TURN_TIMEOUT_SECONDS=%s ignored: asyncio.timeout "
+                    "requires Python 3.11+. Upgrade to enable per-turn timeout.",
+                    timeout,
+                )
+                _timeout_ctx = contextlib.nullcontext()
+        else:
+            _timeout_ctx = contextlib.nullcontext()
+
         error: str | None = None
         messages: list[Any] = []
         output = ""
         try:
-            # ``stream_mode="values"`` yields the full state snapshot
-            # after each graph step; ``state.get("messages", [])`` is
-            # the canonical message list. Feed each NEW AIMessage
-            # through the streaming state machine so mid-turn plan
-            # flushes happen at the first tool_call boundary —
-            # NOT at end of turn.
-            invoke_config = {
-                "configurable": {
-                    "thread_id": saga_session_id or session_id,
-                    # Per-turn channel id so send_message / react /
-                    # fetch_channel_history can default to it when
-                    # the model doesn't supply ``channel_id``
-                    # explicitly. Threads through LangGraph instead
-                    # of the old process-global ``_STATE`` setter,
-                    # which raced across concurrent dispatcher turns
-                    # on different channels.
-                    "channel_id": event.channel_id,
-                },
-            }
-            # Track the count of AIMessages we've already streamed
-            # into the state machine. ``stream_mode="values"``
-            # re-emits the cumulative messages list on every step,
-            # so without slice-past-observed we'd feed the same
-            # AIMessages in multiple times. The state machine's
-            # ``observed_count`` is bumped per-call, so we feed
-            # only the new AIMessages each iteration.
-            ai_observed = 0
-            async for chunk in agent.astream(
-                {"messages": [HumanMessage(content=turn_prompt)]},
-                config=invoke_config,
-                stream_mode="values",
-            ):
-                messages = list(chunk.get("messages", []))
-                if streaming.enabled:
-                    # Walk messages, ignore any non-AIMessage, slice
-                    # past the ones already observed.
-                    ai_count = 0
-                    for msg in messages:
-                        if isinstance(msg, AIMessage):
-                            ai_count += 1
-                            if ai_count > ai_observed:
-                                await streaming.observe(msg)
-                    ai_observed = ai_count
-            events, output = extract_turn_events(messages)
+            async with _timeout_ctx:
+                # ``stream_mode="values"`` yields the full state snapshot
+                # after each graph step; ``state.get("messages", [])`` is
+                # the canonical message list. Feed each NEW AIMessage
+                # through the streaming state machine so mid-turn plan
+                # flushes happen at the first tool_call boundary —
+                # NOT at end of turn.
+                invoke_config = {
+                    "configurable": {
+                        "thread_id": saga_session_id or session_id,
+                        # Per-turn channel id so send_message / react /
+                        # fetch_channel_history can default to it when
+                        # the model doesn't supply ``channel_id``
+                        # explicitly. Threads through LangGraph instead
+                        # of the old process-global ``_STATE`` setter,
+                        # which raced across concurrent dispatcher turns
+                        # on different channels.
+                        "channel_id": event.channel_id,
+                    },
+                }
+                # Track the count of AIMessages we've already streamed
+                # into the state machine. ``stream_mode="values"``
+                # re-emits the cumulative messages list on every step,
+                # so without slice-past-observed we'd feed the same
+                # AIMessages in multiple times. The state machine's
+                # ``observed_count`` is bumped per-call, so we feed
+                # only the new AIMessages each iteration.
+                ai_observed = 0
+                async for chunk in agent.astream(
+                    {"messages": [HumanMessage(content=turn_prompt)]},
+                    config=invoke_config,
+                    stream_mode="values",
+                ):
+                    messages = list(chunk.get("messages", []))
+                    if streaming.enabled:
+                        # Walk messages, ignore any non-AIMessage, slice
+                        # past the ones already observed.
+                        ai_count = 0
+                        for msg in messages:
+                            if isinstance(msg, AIMessage):
+                                ai_count += 1
+                                if ai_count > ai_observed:
+                                    await streaming.observe(msg)
+                        ai_observed = ai_count
+                events, output = extract_turn_events(messages)
+        except asyncio.TimeoutError:
+            error = f"TurnTimeout: turn exceeded {timeout}s wall-clock limit"
+            events = []
+            log.error(
+                "turn timed out after %ss (channel=%s, turn=%s)",
+                timeout, event.channel_id, turn_id,
+            )
+            await log_event("turn_timeout", channel_id=event.channel_id, timeout_s=timeout)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             events = []

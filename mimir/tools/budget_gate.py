@@ -42,6 +42,8 @@ from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
+
 log = logging.getLogger(__name__)
 
 
@@ -150,6 +152,18 @@ def _tool_call_id(request: ToolCallRequest) -> str:
     return str(tc.get("id") or "")
 
 
+def _check_prohibited(tool_name: str, request: "ToolCallRequest") -> str | None:
+    """Return a prohibition message if this bash call is prohibited, else None."""
+    if not is_bash_tool(tool_name):
+        return None
+    tc = getattr(request, "tool_call", None) or {}
+    args = tc.get("args") or {}
+    command = args.get("command", "")
+    if not command:
+        return None
+    return check_prohibited_bash(command)
+
+
 class BudgetGateMiddleware(AgentMiddleware):
     """Intercept every tool call (built-in or registered) for per-turn
     budget enforcement. Pairs with ``TurnContext.tool_call_budget`` /
@@ -162,6 +176,19 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest], ToolMessage | Command],
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
+
+        # P0 safety: block prohibited bash patterns (force-push to main/master)
+        prohibition = _check_prohibited(tool_name, request)
+        if prohibition is not None:
+            _emit_event_sync("prohibited_action_blocked", tool=tool_name,
+                             reason=prohibition[:200])
+            return ToolMessage(
+                content=prohibition,
+                tool_call_id=_tool_call_id(request),
+                name=tool_name,
+                status="error",
+            )
+
         denial = _check_and_increment_or_deny(tool_name)
         if denial is not None:
             return ToolMessage(
@@ -178,6 +205,19 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
+
+        # P0 safety: block prohibited bash patterns (force-push to main/master)
+        prohibition = _check_prohibited(tool_name, request)
+        if prohibition is not None:
+            _emit_event_sync("prohibited_action_blocked", tool=tool_name,
+                             reason=prohibition[:200])
+            return ToolMessage(
+                content=prohibition,
+                tool_call_id=_tool_call_id(request),
+                name=tool_name,
+                status="error",
+            )
+
         denial = _check_and_increment_or_deny(tool_name)
         if denial is not None:
             return ToolMessage(

@@ -49,6 +49,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # regardless of which path fired.
     "tool_call_budget_denied": ("negative", "tool_budget"),
     "tool_call_budget_soft_warning": ("negative", "tool_budget"),
+    "prohibited_action_blocked": ("negative", "prohibited_blocked"),
     "send_message_loop_hard_stop": ("negative", "loop_stop"),
     "send_message_loop_warning": ("negative", "loop_warn"),
     "saga_query_error": ("negative", "saga_query_error"),

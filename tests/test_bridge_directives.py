@@ -292,7 +292,12 @@ import pytest
 
 from mimir.bridges.base import Bridge, SendResult
 from mimir.channel_registry import ChannelRegistry
-from mimir.tools.registry import send_message, set_channel_registry
+from mimir.tools.registry import (
+    reset_current_channel_id,
+    send_message,
+    set_channel_registry,
+    set_current_channel_id,
+)
 
 
 @dataclass
@@ -327,10 +332,8 @@ async def test_send_message_strips_actions_and_reacts():
     bridge.react() for each ReactDirective."""
     bridge = _CaptureBridge()
     set_channel_registry(_make_registry(bridge))
+    cid_token = set_current_channel_id("cap-test")
     try:
-        from mimir.tools.registry import _STATE
-        _STATE["current_channel_id"] = "cap-test"
-
         result = await send_message.ainvoke(
             {
                 "text": (
@@ -351,6 +354,7 @@ async def test_send_message_strips_actions_and_reacts():
 
         assert "send_message ok" in result
     finally:
+        reset_current_channel_id(cid_token)
         set_channel_registry(None)
 
 
@@ -361,10 +365,8 @@ async def test_send_message_react_defaults_to_sent_message_id():
     bridge = _CaptureBridge()
     bridge._last_id = "auto-id-42"
     set_channel_registry(_make_registry(bridge))
+    cid_token = set_current_channel_id("cap-test")
     try:
-        from mimir.tools.registry import _STATE
-        _STATE["current_channel_id"] = "cap-test"
-
         await send_message.ainvoke(
             {
                 "text": (
@@ -377,6 +379,7 @@ async def test_send_message_react_defaults_to_sent_message_id():
 
         assert bridge.reacted[0][1] == "auto-id-42"
     finally:
+        reset_current_channel_id(cid_token)
         set_channel_registry(None)
 
 
@@ -386,13 +389,12 @@ async def test_send_message_without_actions_unchanged():
     no extra react calls."""
     bridge = _CaptureBridge()
     set_channel_registry(_make_registry(bridge))
+    cid_token = set_current_channel_id("cap-test")
     try:
-        from mimir.tools.registry import _STATE
-        _STATE["current_channel_id"] = "cap-test"
-
         await send_message.ainvoke({"text": "just a normal reply"})
 
         assert bridge.sent[0][1] == "just a normal reply"
         assert bridge.reacted == []
     finally:
+        reset_current_channel_id(cid_token)
         set_channel_registry(None)
