@@ -229,6 +229,20 @@ def build_app(config: Config) -> web.Application:
         middlewares=[_make_auth_middleware(config.api_key or "")],
     )
 
+    if not config.api_key:
+        _msg = (
+            "MIMIR_API_KEY is not set — POST /event and POST /chat are "
+            "unauthenticated. Any host that can reach this server can inject "
+            "messages or trigger saga_end_session. "
+            "Set MIMIR_API_KEY before exposing to a network. "
+            "For development on localhost, set MIMIR_ALLOW_UNAUTHENTICATED=true "
+            "to suppress this warning."
+        )
+        if getattr(config, "allow_unauthenticated", False):
+            log.debug("unauthenticated mode acknowledged: %s", _msg)
+        else:
+            log.warning(_msg)
+
     # Access-log filter: mask ``?api_key=`` query values so the SSE
     # fallback path doesn't leave secrets in stdout / log files. PR #104
     # review note. Idempotent — multiple calls don't stack the filter

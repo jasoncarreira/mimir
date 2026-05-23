@@ -26,6 +26,7 @@ from mimir.tools.registry import (
     _channel_from_config_or_state,
     fetch_channel_history,
     react,
+    reset_current_channel_id,
     send_message,
     set_channel_registry,
     set_commitments_store,
@@ -48,53 +49,64 @@ def _reset_state() -> None:
 
 class TestChannelFromConfigOrState:
     def test_explicit_arg_wins(self) -> None:
-        # Even with _STATE and config populated, explicit arg dominates.
-        _STATE["current_channel_id"] = "state-chan"
-        config = {"configurable": {"channel_id": "config-chan"}}
-        assert _channel_from_config_or_state("explicit-chan", config) == "explicit-chan"
+        # Even with the contextvar and config populated, explicit arg dominates.
+        tok = set_current_channel_id("contextvar-chan")
+        try:
+            config = {"configurable": {"channel_id": "config-chan"}}
+            assert _channel_from_config_or_state("explicit-chan", config) == "explicit-chan"
+        finally:
+            reset_current_channel_id(tok)
 
-    def test_config_wins_over_state(self) -> None:
+    def test_config_wins_over_contextvar(self) -> None:
         # Empty/None arg + populated config → config used. This is the
-        # canonical path post-fix; concurrent turns on different
-        # channels each see their own configurable.
-        _STATE["current_channel_id"] = "state-chan"
-        config = {"configurable": {"channel_id": "config-chan"}}
-        assert _channel_from_config_or_state(None, config) == "config-chan"
-        assert _channel_from_config_or_state("", config) == "config-chan"
-        assert _channel_from_config_or_state("   ", config) == "config-chan"
+        # canonical path; concurrent turns on different channels each
+        # see their own configurable.
+        tok = set_current_channel_id("contextvar-chan")
+        try:
+            config = {"configurable": {"channel_id": "config-chan"}}
+            assert _channel_from_config_or_state(None, config) == "config-chan"
+            assert _channel_from_config_or_state("", config) == "config-chan"
+            assert _channel_from_config_or_state("   ", config) == "config-chan"
+        finally:
+            reset_current_channel_id(tok)
 
-    def test_state_used_when_config_empty(self) -> None:
-        # Back-compat fallback for tests / scripts that still call
-        # set_current_channel_id directly. Production dispatcher path
-        # uses config (above).
-        _STATE["current_channel_id"] = "state-chan"
-        assert _channel_from_config_or_state(None, None) == "state-chan"
-        assert _channel_from_config_or_state(None, {"configurable": {}}) == "state-chan"
+    def test_contextvar_used_when_config_empty(self) -> None:
+        # ContextVar fallback for the claude-code path (S2-1 fix).
+        # Production dispatcher path uses config (above).
+        tok = set_current_channel_id("contextvar-chan")
+        try:
+            assert _channel_from_config_or_state(None, None) == "contextvar-chan"
+            assert _channel_from_config_or_state(None, {"configurable": {}}) == "contextvar-chan"
+        finally:
+            reset_current_channel_id(tok)
 
     def test_all_empty_returns_empty_string(self) -> None:
-        _STATE["current_channel_id"] = None
+        # No explicit arg, no config, no contextvar set → empty string.
         assert _channel_from_config_or_state(None, None) == ""
         assert _channel_from_config_or_state("", {"configurable": {}}) == ""
 
     def test_set_current_channel_id_back_compat(self) -> None:
-        set_current_channel_id("legacy-chan")
+        tok = set_current_channel_id("legacy-chan")
         assert _channel_from_config_or_state(None, None) == "legacy-chan"
-        set_current_channel_id(None)
+        reset_current_channel_id(tok)
         assert _channel_from_config_or_state(None, None) == ""
 
-    def test_state_resolves_when_config_is_empty_runnableconfig(self) -> None:
+    def test_contextvar_resolves_when_config_is_empty_runnableconfig(self) -> None:
         # Regression guard for the claude-code path: the langchain-
         # claude-code SDK shim calls ``tool._arun(**args,
         # config=RunnableConfig())`` with an empty config, so the
-        # RunnableConfig route can't see channel_id. _STATE must
-        # carry the channel through that gap. Pre-181-G run_turn
+        # RunnableConfig route can't see channel_id. ContextVar carries
+        # the channel through that gap (S2-1 fix). Pre-181-G run_turn
         # never set _STATE under the new RunnableConfig design;
         # send_message would fail with "no channel_id".
-        set_current_channel_id("from-state")
-        # Simulate the patch's empty RunnableConfig: a dict with no
-        # ``configurable`` key (or an empty configurable).
-        for empty_cfg in ({}, {"configurable": {}}, None):
-            assert _channel_from_config_or_state(None, empty_cfg) == "from-state"
+        tok = set_current_channel_id("from-contextvar")
+        try:
+            # Simulate the patch's empty RunnableConfig: a dict with no
+            # ``configurable`` key (or an empty configurable).
+            for empty_cfg in ({}, {"configurable": {}}, None):
+                assert _channel_from_config_or_state(None, empty_cfg) == "from-contextvar"
+        finally:
+            reset_current_channel_id(tok)
 
 
 # ─── Agent.__init__ stores commitments_store ───────────────────────
