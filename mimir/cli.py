@@ -1696,6 +1696,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Only run probes for this consumer type (see docs/credentials.md).",
     )
 
+    # ``mimir verify-index`` — index integrity probes (SPEC §8.3,
+    # §16 item 16). Run all checks against the file-corpus and SAGA
+    # databases; exit 0 if clean, 1 if any check fails. Scheduled
+    # daily by the framework (cron 30 4 * * *, after saga-consolidate
+    # at 04:00) — this CLI is for ad-hoc operator inspection.
+    verify_index_p = sub.add_parser(
+        "verify-index",
+        help="Check SQLite + FTS5 + embedding-dim integrity of the file-corpus and SAGA indexes.",
+    )
+    verify_index_p.add_argument(
+        "--db", choices=["index", "saga"], default=None,
+        help="Run only one database's checks (default: both).",
+    )
+    verify_index_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
     # ``mimir rotate`` — credential rotation (SPEC §16 item 14, Phase 3).
     # Atomic compose.env edit + force-recreate + post-rotation verify,
     # with rollback if verification fails. Run from the deployment dir.
@@ -2045,6 +2063,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "verify-creds":
         from .cred_verify import run_verify_creds_cmd
         sys.exit(run_verify_creds_cmd(only_type=args.cred_type))
+
+    if args.command == "verify-index":
+        from .index_integrity import run_verify_index_cmd
+        home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+        sys.exit(run_verify_index_cmd(home=home, db=args.db))
 
     if args.command == "rotate":
         from .cred_rotate import run_rotate
