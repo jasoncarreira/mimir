@@ -12,6 +12,11 @@ from pathlib import Path
 from mimir.feedback import (
     FeedbackLog,
     FeedbackSignal,
+    _VALENCE_GROUPS,
+    _annotate_transitions,
+    _compute_group_runs,
+    _format_chain,
+    _synthesize_chain_signals,
     pending_forget_candidates_count,
     render_feedback_block,
 )
@@ -498,29 +503,41 @@ def test_chainlink65_paired_positive_kinds_render(tmp_path: Path):
 
 
 def test_chainlink65_paired_positives_surface_next_to_failures(tmp_path: Path):
-    """Operator-decided shape (chainlink #36 comment 42): the paired
-    success and the sticky failure line must surface side-by-side so
-    the contrast ("old failure + recent success = transient,
-    recovered") is readable. Both polarity blocks render with their
-    respective lines."""
+    """Alg-2 temporal run detection supersedes the old side-by-side paired-positive
+    shape (chainlink #36 comment 42): a git_push_failed → git_push_ok sequence is
+    now rendered as a recovery chain rather than two separate lines.
+
+    The contrast ("old failure + recent success = transient, recovered") is still
+    readable — now encoded as a single chain line in the Positive block:
+    "git push: failed ×1 → succeeded ×1 [recovery]"
+    """
     log = _make_log(tmp_path, events=[
-        # Old failure — first-occurrence-only-deduped sticky line.
+        # Old failure.
         {"timestamp": _ts(20.0), "type": "git_push_failed",
          "reason": "ssh: connection refused", "returncode": 128,
          "turn_id": "t_old"},
-        # Recent recovery — the paired positive.
+        # Recent recovery.
         {"timestamp": _ts(0.5), "type": "git_push_ok",
          "turn_id": "t_new"},
     ])
+    negatives, positives = log.recent()
     block = log.recent_block()
     assert block is not None
-    # Negative block carries the sticky failure.
-    assert "git push to mimirbot-state failed" in block
-    # Positive block carries the paired success.
-    assert "git push to mimirbot-state succeeded" in block
-    # Both subsections present.
-    assert "Negative" in block
+
+    # Chain signal is in the Positive block (most recent run = ok).
+    chain = [s for s in positives if s.kind == "git_push_chain"]
+    assert len(chain) == 1
+    assert "failed ×1" in chain[0].content
+    assert "succeeded ×1" in chain[0].content
+    assert "[recovery]" in chain[0].content
+
+    # The chain renders the full contrast — individual lines are absent.
+    assert not any(s.kind == "git_push_ok" for s in positives)
+    assert not any(s.kind == "git_push_failed" for s in negatives)
+
+    # Only the Positive subsection is present (recovery → positive polarity).
     assert "Positive" in block
+    assert "git push:" in block
 
 
 def test_chainlink65_paired_positives_dedup_to_most_recent(tmp_path: Path):
@@ -930,3 +947,412 @@ def test_count_on_non_first_occurrence_kind_aggregates(tmp_path: Path):
     block = log.recent_block()
     # Both lines show the count suffix.
     assert block.count("×2 in 24h") == 2
+
+
+# ---------------------------------------------------------------------------
+# TestRunDetection — Alg-2 temporal run detection
+# (spec: state/spec/alg2-temporal-runs-spec.md)
+# ---------------------------------------------------------------------------
+
+def _ts_seq(*offsets_hours: float) -> list[str]:
+    """Return ISO timestamps for a sequence of offsets_hours-ago values."""
+    now = datetime.now(tz=timezone.utc)
+    return [(now - timedelta(hours=h)).isoformat() for h in offsets_hours]
+
+
+def _push_events(ts: str, kind_str: str) -> dict:
+    """Build a git_push_ok or git_push_failed event at the given timestamp."""
+    type_map = {
+        "ok": "git_push_ok",
+        "failed": "git_push_failed",
+        "stale": "git_push_stale",
+    }
+    return {"type": type_map[kind_str], "timestamp": ts}
+
+
+def test_basic_recovery_chain(tmp_path: Path):
+    """20× git_push_ok → 5× git_push_failed → 1× git_push_ok → [recovery] in positives."""
+    # Timestamps: oldest (0.9h) to newest (0.1h), in chronological order.
+    ts_ok1 = [_ts(0.9 - i * 0.03) for i in range(20)]   # oldest 20
+    ts_fail = [_ts(0.30 - i * 0.02) for i in range(5)]   # middle 5
+    ts_ok2 = [_ts(0.09)]                                   # newest 1
+    events = (
+        [{"type": "git_push_ok", "timestamp": t} for t in ts_ok1]
+        + [{"type": "git_push_failed", "timestamp": t} for t in ts_fail]
+        + [{"type": "git_push_ok", "timestamp": t} for t in ts_ok2]
+    )
+    log = _make_log(tmp_path, events=events)
+    negatives, positives = log.recent()
+
+    # No separate git_push_ok / git_push_failed lines — all consumed by chain.
+    assert not any(s.kind == "git_push_ok" for s in positives)
+    assert not any(s.kind == "git_push_failed" for s in negatives)
+
+    # Chain signal is in the positive bucket (most recent run = ok).
+    chain = [s for s in positives if s.kind == "git_push_chain"]
+    assert len(chain) == 1
+    sig = chain[0]
+    assert sig.polarity == "positive"
+    assert "succeeded ×20" in sig.content
+    assert "failed ×5" in sig.content
+    assert "succeeded ×1" in sig.content
+    assert "[recovery]" in sig.content
+    assert sig.content.startswith("git push:")
+
+
+def test_basic_degradation_chain(tmp_path: Path):
+    """10× git_push_ok → 3× git_push_failed → [degradation] in negatives."""
+    ts_ok = [_ts(0.5 - i * 0.02) for i in range(10)]
+    ts_fail = [_ts(0.25 - i * 0.02) for i in range(3)]
+    events = (
+        [{"type": "git_push_ok", "timestamp": t} for t in ts_ok]
+        + [{"type": "git_push_failed", "timestamp": t} for t in ts_fail]
+    )
+    log = _make_log(tmp_path, events=events)
+    negatives, positives = log.recent()
+
+    chain = [s for s in negatives if s.kind == "git_push_chain"]
+    assert len(chain) == 1
+    sig = chain[0]
+    assert sig.polarity == "negative"
+    assert "succeeded ×10" in sig.content
+    assert "failed ×3" in sig.content
+    assert "[degradation]" in sig.content
+
+
+def test_steady_run_no_chain(tmp_path: Path):
+    """47× git_push_ok with no failures → no chain, standard count display."""
+    ts_list = [_ts(0.9 - i * 0.01) for i in range(47)]
+    events = [{"type": "git_push_ok", "timestamp": t} for t in ts_list]
+    log = _make_log(tmp_path, events=events)
+    negatives, positives = log.recent()
+
+    # No chain signal.
+    assert not any(s.kind == "git_push_chain" for s in positives)
+    assert not any(s.kind == "git_push_chain" for s in negatives)
+
+    # Standard first-occurrence-only with count.
+    ok_signals = [s for s in positives if s.kind == "git_push_ok"]
+    assert len(ok_signals) == 1
+    assert ok_signals[0].count == 47
+    block = log.recent_block()
+    assert "×47 in 24h" in block
+
+
+def test_multiple_transitions(tmp_path: Path):
+    """5×ok → 2×failed → 3×ok → 1×failed → [degradation] in negatives."""
+    times = [
+        *[_ts(1.0 - i * 0.05) for i in range(5)],   # 5 ok
+        *[_ts(0.70 - i * 0.05) for i in range(2)],  # 2 failed
+        *[_ts(0.50 - i * 0.05) for i in range(3)],  # 3 ok
+        *[_ts(0.20 - i * 0.05) for i in range(1)],  # 1 failed
+    ]
+    types = (
+        ["git_push_ok"] * 5
+        + ["git_push_failed"] * 2
+        + ["git_push_ok"] * 3
+        + ["git_push_failed"] * 1
+    )
+    events = [{"type": t, "timestamp": ts} for t, ts in zip(types, times)]
+    log = _make_log(tmp_path, events=events)
+    negatives, _ = log.recent()
+
+    chain = [s for s in negatives if s.kind == "git_push_chain"]
+    assert len(chain) == 1
+    sig = chain[0]
+    assert sig.polarity == "negative"
+    assert "succeeded ×5" in sig.content
+    assert "failed ×2" in sig.content
+    assert "succeeded ×3" in sig.content
+    assert "failed ×1" in sig.content
+    assert "[degradation]" in sig.content
+
+
+def test_chain_over_5_runs_compressed(tmp_path: Path):
+    """6 runs: ok×10, failed×3, ok×5, failed×2, ok×8, failed×1 — middle 2 compressed."""
+    times = [
+        *[_ts(1.2 - i * 0.05) for i in range(10)],  # ok×10
+        *[_ts(0.65 - i * 0.05) for i in range(3)],  # failed×3
+        *[_ts(0.40 - i * 0.05) for i in range(5)],  # ok×5
+        *[_ts(0.15 - i * 0.03) for i in range(2)],  # failed×2
+        *[_ts(0.07 - i * 0.005) for i in range(8)], # ok×8
+        *[_ts(0.02)],                                # failed×1
+    ]
+    types = (
+        ["git_push_ok"] * 10
+        + ["git_push_failed"] * 3
+        + ["git_push_ok"] * 5
+        + ["git_push_failed"] * 2
+        + ["git_push_ok"] * 8
+        + ["git_push_failed"] * 1
+    )
+    events = [{"type": t, "timestamp": ts} for t, ts in zip(types, times)]
+    log = _make_log(tmp_path, events=events)
+    negatives, _ = log.recent()
+
+    chain = [s for s in negatives if s.kind == "git_push_chain"]
+    assert len(chain) == 1
+    content = chain[0].content
+    # First 2 runs visible.
+    assert "succeeded ×10" in content
+    assert "failed ×3" in content
+    # Middle 2 compressed.
+    assert "... (2 more)" in content
+    # Last 2 runs visible.
+    assert "succeeded ×8" in content
+    assert "failed ×1" in content
+    assert "[degradation]" in content
+
+
+def test_chain_consumed_kinds_not_duplicated(tmp_path: Path):
+    """Chain signal is present; no separate git_push_ok / git_push_failed line."""
+    # Same setup as test_basic_recovery_chain (abbreviated).
+    ts_ok1 = [_ts(0.9 - i * 0.03) for i in range(5)]
+    ts_fail = [_ts(0.30 - i * 0.02) for i in range(2)]
+    ts_ok2 = [_ts(0.09)]
+    events = (
+        [{"type": "git_push_ok", "timestamp": t} for t in ts_ok1]
+        + [{"type": "git_push_failed", "timestamp": t} for t in ts_fail]
+        + [{"type": "git_push_ok", "timestamp": t} for t in ts_ok2]
+    )
+    log = _make_log(tmp_path, events=events)
+    negatives, positives = log.recent()
+    all_signals = negatives + positives
+
+    # Chain rendered it.
+    assert any(s.kind == "git_push_chain" for s in all_signals)
+    # Individual kinds not present.
+    assert not any(s.kind == "git_push_ok" for s in all_signals)
+    assert not any(s.kind == "git_push_failed" for s in all_signals)
+
+
+def test_non_grouped_kind_unaffected(tmp_path: Path):
+    """A kind not in any valence group uses the existing count-display path."""
+    events = [
+        {"type": "saga_query_error", "timestamp": _ts(0.5),
+         "error": "db locked"},
+        {"type": "saga_query_error", "timestamp": _ts(0.3),
+         "error": "db locked"},
+        {"type": "saga_query_error", "timestamp": _ts(0.1),
+         "error": "db locked"},
+    ]
+    log = _make_log(tmp_path, events=events)
+    negatives, _ = log.recent()
+
+    # 3 identical-content events → content-dedup collapses to 1, count=3.
+    saga_signals = [s for s in negatives if s.kind == "saga_query_error"]
+    assert len(saga_signals) == 1
+    assert saga_signals[0].count == 3
+    block = log.recent_block()
+    assert "×3 in 24h" in block
+
+
+def test_single_group_event_no_chain(tmp_path: Path):
+    """Only 1 git_push_ok event → 1 run, no transition, no chain."""
+    events = [{"type": "git_push_ok", "timestamp": _ts(0.5)}]
+    log = _make_log(tmp_path, events=events)
+    negatives, positives = log.recent()
+
+    assert not any(s.kind == "git_push_chain" for s in positives + negatives)
+    assert any(s.kind == "git_push_ok" for s in positives)
+
+
+def test_interleaved_unrelated_events(tmp_path: Path):
+    """oauth_usage_ok between two git_push events doesn't break the git_push run."""
+    events = [
+        {"type": "git_push_ok", "timestamp": _ts(0.5)},
+        {"type": "oauth_usage_ok", "timestamp": _ts(0.3),   # unrelated
+         "recorded": {}},
+        {"type": "git_push_failed", "timestamp": _ts(0.1)},
+    ]
+    log = _make_log(tmp_path, events=events)
+    negatives, positives = log.recent()
+
+    # git_push chain is in negatives (most recent run = failed).
+    chain = [s for s in negatives if s.kind == "git_push_chain"]
+    assert len(chain) == 1
+    assert "succeeded ×1" in chain[0].content
+    assert "failed ×1" in chain[0].content
+    assert "[degradation]" in chain[0].content
+
+    # oauth chain: only one event, so no chain — displays normally.
+    assert not any(s.kind == "oauth_chain" for s in positives + negatives)
+
+
+def test_chain_timestamp_is_most_recent(tmp_path: Path):
+    """The chain FeedbackSignal.ts matches the ts of the last event in the chain."""
+    ts_ok = _ts(0.5)
+    ts_fail = _ts(0.1)
+    events = [
+        {"type": "git_push_ok", "timestamp": ts_ok},
+        {"type": "git_push_failed", "timestamp": ts_fail},
+    ]
+    log = _make_log(tmp_path, events=events)
+    negatives, _ = log.recent()
+
+    chain = [s for s in negatives if s.kind == "git_push_chain"]
+    assert len(chain) == 1
+    # ts_fail is the most recent event.
+    assert chain[0].ts == ts_fail
+
+
+def test_chain_no_count_suffix_in_rendered_block(tmp_path: Path):
+    """Chain signals don't get a redundant (×N in 24h) suffix in the block."""
+    ts_ok = [_ts(0.5 - i * 0.05) for i in range(3)]
+    ts_fail = [_ts(0.2 - i * 0.05) for i in range(2)]
+    events = (
+        [{"type": "git_push_ok", "timestamp": t} for t in ts_ok]
+        + [{"type": "git_push_failed", "timestamp": t} for t in ts_fail]
+    )
+    log = _make_log(tmp_path, events=events)
+    block = log.recent_block()
+
+    # Chain line is present.
+    assert "git push:" in block
+    assert "[degradation]" in block
+    # No total count suffix tacked on (counts are inline per-run).
+    assert "(×5 in 24h)" not in block
+
+
+def test_same_polarity_runs_no_chain(tmp_path: Path):
+    """git_push_stale followed by git_push_failed — both negative, no transition."""
+    events = [
+        {"type": "git_push_stale", "timestamp": _ts(0.5)},
+        {"type": "git_push_stale", "timestamp": _ts(0.4)},
+        {"type": "git_push_failed", "timestamp": _ts(0.2)},
+    ]
+    log = _make_log(tmp_path, events=events)
+    negatives, positives = log.recent()
+
+    # No chain (both runs are negative polarity → no polarity transition).
+    assert not any(s.kind == "git_push_chain" for s in negatives + positives)
+
+
+# Unit tests for internal functions.
+
+def _make_runs_source(tmp_path: Path, events: list[dict]) -> Path:
+    """Write events.jsonl and return the path."""
+    p = tmp_path / "events.jsonl"
+    _write_jsonl(p, events)
+    return p
+
+
+def test_compute_group_runs_basic(tmp_path: Path):
+    """_compute_group_runs returns chronological runs per group."""
+    now = datetime.now(tz=timezone.utc)
+    cutoff = (now - timedelta(hours=24)).isoformat()
+    ts1 = (now - timedelta(minutes=30)).isoformat()
+    ts2 = (now - timedelta(minutes=20)).isoformat()
+    ts3 = (now - timedelta(minutes=10)).isoformat()
+    events = [
+        {"type": "git_push_ok", "timestamp": ts1},
+        {"type": "git_push_ok", "timestamp": ts2},
+        {"type": "git_push_failed", "timestamp": ts3},
+    ]
+    p = _make_runs_source(tmp_path, events)
+    group_runs = _compute_group_runs(None, p, cutoff, _VALENCE_GROUPS)
+
+    assert "git_push" in group_runs
+    runs = group_runs["git_push"]
+    assert len(runs) == 2
+    assert runs[0].kind == "git_push_ok" and runs[0].count == 2
+    assert runs[1].kind == "git_push_failed" and runs[1].count == 1
+    # Chronological: start_ts of run1 < start_ts of run2.
+    assert runs[0].start_ts < runs[1].start_ts
+
+
+def test_annotate_transitions_recovery():
+    from mimir.feedback import Run
+    runs = [
+        Run("git_push", "git_push_failed", "negative", 3, "t1", "t2"),
+        Run("git_push", "git_push_ok", "positive", 1, "t3", "t3"),
+    ]
+    annotated = _annotate_transitions(runs)
+    assert annotated[0].transition_type is None
+    assert annotated[1].transition_type == "recovery"
+
+
+def test_annotate_transitions_degradation():
+    from mimir.feedback import Run
+    runs = [
+        Run("git_push", "git_push_ok", "positive", 10, "t1", "t2"),
+        Run("git_push", "git_push_failed", "negative", 3, "t3", "t4"),
+    ]
+    annotated = _annotate_transitions(runs)
+    assert annotated[0].transition_type is None
+    assert annotated[1].transition_type == "degradation"
+
+
+def test_format_chain_no_compression():
+    from mimir.feedback import Run, AnnotatedRun
+    group = _VALENCE_GROUPS["git_push"]
+    runs = [
+        Run("git_push", "git_push_ok", "positive", 20, "t1", "t2"),
+        Run("git_push", "git_push_failed", "negative", 5, "t3", "t4"),
+        Run("git_push", "git_push_ok", "positive", 1, "t5", "t5"),
+    ]
+    annotated = [
+        AnnotatedRun(run=runs[0], transition_type=None),
+        AnnotatedRun(run=runs[1], transition_type="degradation"),
+        AnnotatedRun(run=runs[2], transition_type="recovery"),
+    ]
+    result = _format_chain(annotated, group)
+    assert result == "git push: succeeded ×20 → failed ×5 → succeeded ×1 [recovery]"
+
+
+def test_synthesize_chain_signals_has_transition(tmp_path: Path):
+    """_synthesize_chain_signals returns a signal for groups with transitions."""
+    from mimir.feedback import Run
+    group_runs = {
+        "git_push": [
+            Run("git_push", "git_push_ok", "positive", 10, "t1", "t2"),
+            Run("git_push", "git_push_failed", "negative", 3, "t3", "t4"),
+        ]
+    }
+    signals, consumed = _synthesize_chain_signals(group_runs, _VALENCE_GROUPS)
+    assert len(signals) == 1
+    assert signals[0].kind == "git_push_chain"
+    assert signals[0].polarity == "negative"
+    assert "git_push_ok" in consumed
+    assert "git_push_failed" in consumed
+    assert "git_push_stale" in consumed
+
+
+def test_synthesize_chain_signals_no_transition(tmp_path: Path):
+    """_synthesize_chain_signals returns nothing when all runs share a polarity."""
+    from mimir.feedback import Run
+    group_runs = {
+        "git_push": [
+            Run("git_push", "git_push_ok", "positive", 10, "t1", "t2"),
+            Run("git_push", "git_push_ok", "positive", 5, "t3", "t4"),
+        ]
+    }
+    signals, consumed = _synthesize_chain_signals(group_runs, _VALENCE_GROUPS)
+    assert signals == []
+    assert consumed == set()
+
+
+def test_valence_groups_disjoint():
+    """All _VALENCE_GROUPS kind sets are disjoint — no kind appears twice."""
+    all_kinds: list[str] = []
+    for group in _VALENCE_GROUPS.values():
+        all_kinds.extend(group.positive_kinds)
+        all_kinds.extend(group.negative_kinds)
+    assert len(all_kinds) == len(set(all_kinds)), (
+        "Duplicate kind found across valence groups"
+    )
+
+
+def test_viability_group_all_kinds_covered():
+    """All viability event kinds in _EVENT_RULES are in the viability ValenceGroup."""
+    from mimir.feedback import _EVENT_RULES
+    viability_rule_kinds = {
+        v[1] for k, v in _EVENT_RULES.items()
+        if k.startswith(("collapse_risk_", "curation_below_threshold_",
+                          "viability_report_"))
+    }
+    vg = _VALENCE_GROUPS["viability"]
+    covered = vg.positive_kinds | vg.negative_kinds
+    assert viability_rule_kinds <= covered, (
+        f"Uncovered viability kinds: {viability_rule_kinds - covered}"
+    )
