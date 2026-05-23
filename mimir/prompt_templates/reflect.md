@@ -94,12 +94,12 @@ Before either track, gather inputs:
   mimir reflection audit --weeks-back-min 1 --weeks-back-max 4
   ```
   Prints a `## Effects of prior proposals` block: predicted-vs-measured
-  signals (error-rate deltas, tool-call frequency deltas) for proposals
-  the operator applied 1-4 weeks ago. Empty output is fine — only
-  surface the block in your write-up when there are rows to show.
-  This closes the §12.2 double-loop: proposals you drafted that the
-  operator merged get a real feedback signal here, not just "merged
-  and forgotten."
+  signals (error-rate deltas, tool-call frequency deltas, named-event
+  deltas) for proposals the operator applied 1-4 weeks ago. Empty
+  output is fine — only surface the block in your write-up when there
+  are rows to show. This closes the §12.2 double-loop: proposals you
+  drafted that the operator merged get a real feedback signal here,
+  not just "merged and forgotten."
 
 ## Step 2 — Run track A (behavioral)
 
@@ -277,6 +277,35 @@ If the policy file is missing or unparseable, fall back to
 
 The operator can promote a propose-only action to autonomous as trust
 builds. They edit the policy file; you read it next reflection.
+
+### Writing proposals — include an `Expect:` line
+
+Every proposal you write to `state/proposed-changes.md` should carry a
+`Predicted effect:` paragraph (free-form prose explaining what you
+expect to happen) AND a final structured `Expect:` line the §12.2
+audit can parse. Without it, the audit emits "no parseable
+predicted-effect signal" 1-4 weeks later and the double-loop stays
+open — you proposed something, but no measurement closes back.
+
+Format:
+```
+Expect: <kind>[:<target>] <direction>
+```
+
+Kinds:
+- `error_events drops` / `rises` — broad error bucket (tool denials,
+  scheduled-tick drops, rate-limit-off-pace, cost-rate-alert).
+- `tool_calls:<tool_name> drops` / `rises` — e.g.
+  `tool_calls:memory_query rises`. Use the actual registered tool name
+  (snake_case for mimir tools; PascalCase for claude-code built-ins
+  like Read / Write / Edit).
+- `events:<event_type> drops` / `rises` — a specific event type from
+  `events.jsonl` (e.g. `events:saga_synthesis_skipped_boundary drops`,
+  `events:wiki_backlinks_unhealthy drops`).
+
+When in doubt, pick the narrowest event type that captures what you're
+fixing. The audit window is the same N days before vs after the
+applied timestamp, so the prediction is falsifiable.
 
 ## Step 5 — End the turn
 

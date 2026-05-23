@@ -363,30 +363,86 @@ _ERROR_EVENT_TYPES = {
     "tool_denied", "scheduled_tick_dropped", "scheduled_tick_suppressed",
     "rate_limit_off_pace", "cost_rate_alert",
 }
-_TOOL_NAME_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]+)\b")
+
+# Tool-name allowlist for the prose-heuristic fallback. The original
+# implementation matched ANY ``[A-Z][A-Za-z0-9_]+`` token, which fires
+# on capitalized English words ("Adding", "Future", "With", "Unblocks")
+# and produces phantom ``tool_calls:Adding 0 → 0`` rows in the audit
+# block. Restrict to:
+#   - snake_case names (anything with an underscore — covers every
+#     mimir-registered tool: send_message, memory_query, saga_*, etc.)
+#   - a small set of single-word PascalCase tools that surface through
+#     deepagents / claude-code's built-in toolset
+# New PascalCase tools added through deepagents need an entry here.
+_KNOWN_PASCAL_TOOLS: frozenset[str] = frozenset({
+    "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task",
+})
+_TOOL_NAME_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*(?:_[A-Za-z0-9_]+)+|[A-Z][a-z]+)\b")
+
+
+# Structured ``Expect:`` line. Recommended for new proposals — gives the
+# §12.2 audit a parseable signal instead of relying on prose heuristics.
+# Format:
+#   Expect: <kind>[:<target>] <direction>
+# Examples:
+#   Expect: error_events drops
+#   Expect: tool_calls:memory_query rises
+#   Expect: events:saga_synthesis_skipped_boundary drops
+_EXPECT_LINE_RE = re.compile(
+    r"^expect:\s*([a-z_]+)(?::([A-Za-z0-9_]+))?\s+"
+    r"(drop|drops|fall|falls|down|decrease|decreases|fewer|less|"
+    r"rise|rises|up|increase|increases|more)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _parse_expect_line(text: str) -> tuple[str, str | None]:
+    """Parse an ``Expect: <kind>[:<target>] <direction>`` line.
+
+    Returns ``(kind, target)`` or ``("unknown", None)``. Direction
+    parses successfully but isn't returned — we measure the actual
+    delta and let the reader compare against the prediction's English.
+    """
+    m = _EXPECT_LINE_RE.search(text)
+    if not m:
+        return ("unknown", None)
+    return (m.group(1).lower(), m.group(2))
 
 
 def _signal_kind_from_predicted(text: str) -> tuple[str, str | None]:
     """Map ``Predicted effect:`` text to (kind, target). Kinds:
 
-    - ``error_rate`` — "error rate would drop / fall / decrease"
-    - ``tool_freq`` — "<TOOL> would be invoked more / less often"
-    - ``unknown``   — couldn't classify; audit row carries no signals
+    - ``error_events`` — error-event count over the window
+    - ``tool_calls``   — count of a named tool's invocations (target=name)
+    - ``events``       — count of a named event type (target=event_type)
+    - ``unknown``      — couldn't classify; audit row carries no signals
 
-    Heuristic — operators write predicted effects in plain English; we
-    parse the obvious cases and leave the rest for v2."""
+    Resolution order:
+      1. Structured ``Expect: <kind>[:<target>] <direction>`` line wins
+         when present (the recommended convention going forward).
+      2. Prose error-rate fallback — "error rate would drop / rise /
+         decrease / fewer / less / more / up / down" with "error".
+      3. Prose tool-frequency fallback — restricted to known tool-name
+         shapes (snake_case or known single-word PascalCase). The
+         original any-CamelCase match produced false positives on
+         English words like "Adding" / "Future" / "Unblocks".
+    """
+    kind, target = _parse_expect_line(text)
+    if kind != "unknown":
+        return (kind, target)
+
     t = text.lower()
-    if "error" in t and ("drop" in t or "fall" in t or "decrease" in t
-                          or "fewer" in t or "less" in t or "down" in t):
-        return ("error_rate", None)
-    if "error" in t and ("rise" in t or "increase" in t or "more" in t
-                          or "up" in t):
-        return ("error_rate", None)
-    # Tool frequency: look for a CamelCase token followed by frequency words.
-    if "tool" in t or "skill" in t or "invoke" in t or "call" in t:
-        m = _TOOL_NAME_RE.search(text)  # original casing
-        if m:
-            return ("tool_freq", m.group(1))
+    if "error" in t and any(w in t for w in (
+        "drop", "fall", "decrease", "fewer", "less", "down",
+        "rise", "increase", "more", "up",
+    )):
+        return ("error_events", None)
+
+    if any(w in t for w in ("tool", "skill", "invoke", "call")):
+        for m in _TOOL_NAME_RE.finditer(text):
+            name = m.group(1)
+            if "_" in name or name in _KNOWN_PASCAL_TOOLS:
+                return ("tool_calls", name)
     return ("unknown", None)
 
 
@@ -420,7 +476,7 @@ def compute_signals(
         return []
 
     out: list[Signal] = []
-    if kind == "error_rate":
+    if kind == "error_events":
         before = _count_events_in_window(
             events_log, start=before_start, end=before_end,
             type_filter=lambda r: r.get("type") in _ERROR_EVENT_TYPES,
@@ -431,15 +487,32 @@ def compute_signals(
         )
         out.append(Signal(name="error_events", before=before, after=after,
                           unit="count"))
-    elif kind == "tool_freq":
+    elif kind == "tool_calls" and target:
         before = _count_tool_calls_in_window(
             turns_log, start=before_start, end=before_end, tool_name=target,
         )
         after = _count_tool_calls_in_window(
             turns_log, start=after_start, end=after_end, tool_name=target,
         )
+        # Drop 0→0 — usually a sign the prose heuristic matched a word
+        # that isn't actually a tool name (defense in depth on top of
+        # the allowlist in ``_TOOL_NAME_RE``).
+        if before > 0 or after > 0:
+            out.append(Signal(
+                name=f"tool_calls:{target}", before=before, after=after,
+                unit="count",
+            ))
+    elif kind == "events" and target:
+        before = _count_events_in_window(
+            events_log, start=before_start, end=before_end,
+            type_filter=lambda r: r.get("type") == target,
+        )
+        after = _count_events_in_window(
+            events_log, start=after_start, end=after_end,
+            type_filter=lambda r: r.get("type") == target,
+        )
         out.append(Signal(
-            name=f"tool_calls:{target}", before=before, after=after,
+            name=f"events:{target}", before=before, after=after,
             unit="count",
         ))
     return out
