@@ -134,38 +134,44 @@ def _sync(platforms: list[str], limit: int, users_dir: str | None,
     # inbox.yaml on disk.
 
 
-def _load_inbox() -> list[dict]:
-    """Parse inbox.yaml. Returns list of notification dicts, empty
-    if the file is missing or has no items.
+def _load_inbox(platforms: list[str]) -> list[dict]:
+    """Parse inbox-{platform}.yaml for each configured platform and
+    return the concatenated notifications list (empty if no files /
+    no items).
 
-    Uses the stdlib-only YAML loader trick: social-cli emits a
-    well-defined subset of YAML, but we still want to avoid the
-    PyYAML dependency at this layer. The poller framework
-    doesn't bundle PyYAML, so we read the file and parse via the
-    `yaml` module if installed, falling back to a minimal manual
-    parser for the shape social-cli emits.
+    Modern social-cli writes per-platform inbox files
+    (``inbox-bsky.yaml``, ``inbox-x.yaml``) rather than a single
+    merged ``inbox.yaml``. The `--output` flag is documented but
+    silently ignored — the per-platform layout is mandatory. Pre-
+    refactor this function looked at ``inbox.yaml`` and emitted
+    nothing because that file never gets written.
     """
-    inbox_path = STATE_DIR / "inbox.yaml"
-    if not inbox_path.exists():
-        return []
-    text = inbox_path.read_text(encoding="utf-8")
     try:
         import yaml  # type: ignore[import-untyped]
-        data = yaml.safe_load(text) or {}
     except ImportError:
         _eprint(
             "social-cli: PyYAML not installed; "
-            "falling back to JSON shim — install pyyaml in mimir's "
-            "venv for robust parsing"
+            "install pyyaml in mimir's venv for robust parsing"
         )
-        # Last-resort fallback: only works because mimir's venv
-        # always has pyyaml installed via the saga dep tree. Re-raise
-        # if even that lookup fails.
         raise
-    notifications = data.get("notifications") if isinstance(data, dict) else None
-    if not isinstance(notifications, list):
-        return []
-    return [n for n in notifications if isinstance(n, dict)]
+
+    out: list[dict] = []
+    for platform in platforms:
+        inbox_path = STATE_DIR / f"inbox-{platform}.yaml"
+        if not inbox_path.exists():
+            continue
+        try:
+            data = yaml.safe_load(inbox_path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as exc:
+            _eprint(
+                f"social-cli: inbox-{platform}.yaml parse failed: {exc}"
+            )
+            continue
+        notifications = data.get("notifications") if isinstance(data, dict) else None
+        if not isinstance(notifications, list):
+            continue
+        out.extend(n for n in notifications if isinstance(n, dict))
+    return out
 
 
 def _format_event(notif: dict) -> dict | None:
@@ -181,7 +187,14 @@ def _format_event(notif: dict) -> dict | None:
     text = (notif.get("text") or "").strip()
     if len(text) > TEXT_PREVIEW_CHARS:
         text = text[: TEXT_PREVIEW_CHARS - 1] + "…"
-    timestamp = notif.get("timestamp") or ""
+    # PyYAML parses unquoted ISO timestamps into ``datetime`` objects
+    # (social-cli emits them unquoted). JSON can't serialize datetime,
+    # so coerce to ISO string here.
+    raw_ts = notif.get("timestamp")
+    if hasattr(raw_ts, "isoformat"):
+        timestamp = raw_ts.isoformat()
+    else:
+        timestamp = str(raw_ts) if raw_ts else ""
     post_id = notif.get("postId") or notif.get("post_id")
     user_context = (notif.get("userContext") or "").strip()
     user_ctx_block = ""
@@ -239,9 +252,9 @@ def main() -> int:
         _eprint(f"social-cli: sync failed: {exc}")
         return 2
 
-    # Step 2: parse inbox.yaml.
+    # Step 2: parse per-platform inbox files.
     try:
-        notifications = _load_inbox()
+        notifications = _load_inbox(platforms)
     except (ImportError, OSError) as exc:
         _eprint(f"social-cli: inbox parse failed: {exc}")
         return 3
