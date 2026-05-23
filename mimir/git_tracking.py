@@ -55,6 +55,10 @@ log = logging.getLogger(__name__)
 # through naturally.
 _push_debounce_locks: dict[str, asyncio.Lock] = {}
 _pending_push_tasks: dict[str, asyncio.Task] = {}
+_push_retry_tasks: dict[str, asyncio.Task | None] = {}
+
+# Retry schedule after a push failure. Tests monkeypatch this.
+PUSH_RETRY_DELAYS: tuple[float, ...] = (300.0, 900.0, 2700.0)  # 5m, 15m, 45m
 
 
 def __getattr__(name: str):
@@ -123,6 +127,10 @@ def reset_module_state() -> None:
         if task is not None and not task.done():
             task.cancel()
     _pending_push_tasks.clear()
+    for task in list(_push_retry_tasks.values()):
+        if task is not None and not task.done():
+            task.cancel()
+    _push_retry_tasks.clear()
     _push_debounce_locks.clear()
 
 
@@ -311,6 +319,11 @@ async def _schedule_debounced_push(*, turn_id: str, home: Path) -> None:
     dev / parallel tests) no longer collide.
     """
     key = _home_key(home)
+    # Cancel any pending retry task before creating a new debounce — the new
+    # debounce push will cover all unpushed commits, making the retry redundant.
+    existing_retry = _push_retry_tasks.pop(key, None)
+    if existing_retry is not None and not existing_retry.done():
+        existing_retry.cancel()
     async with _get_lock(home):
         existing = _pending_push_tasks.get(key)
         if existing is not None and not existing.done():
@@ -339,6 +352,7 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
         return  # superseded; the new task owns the push.
     if not await _has_origin_remote(home):
         return
+    key = _home_key(home)
     try:
         await _git("push", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
@@ -348,6 +362,11 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
             timeout_s=PUSH_TIMEOUT_SECONDS,
             turn_id=turn_id,
         )
+        existing = _push_retry_tasks.get(key)
+        if existing is None or existing.done():
+            _push_retry_tasks[key] = asyncio.create_task(
+                _retry_push(home=home, delay=PUSH_RETRY_DELAYS[0], attempt=0, turn_id=turn_id)
+            )
         return
     except GitError as exc:
         await log_event(
@@ -356,6 +375,11 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
             returncode=exc.returncode,
             turn_id=turn_id,
         )
+        existing = _push_retry_tasks.get(key)
+        if existing is None or existing.done():
+            _push_retry_tasks[key] = asyncio.create_task(
+                _retry_push(home=home, delay=PUSH_RETRY_DELAYS[0], attempt=0, turn_id=turn_id)
+            )
         return
     except (OSError, asyncio.CancelledError) as exc:
         # OSError: git binary missing / fork failed. CancelledError
@@ -367,7 +391,17 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
             reason=_short_err(exc),
             turn_id=turn_id,
         )
+        existing = _push_retry_tasks.get(key)
+        if existing is None or existing.done():
+            _push_retry_tasks[key] = asyncio.create_task(
+                _retry_push(home=home, delay=PUSH_RETRY_DELAYS[0], attempt=0, turn_id=turn_id)
+            )
         return
+    # Success — cancel any pending retry (e.g. from a prior failure in
+    # this session) before emitting the ok event.
+    existing_retry = _push_retry_tasks.pop(key, None)
+    if existing_retry is not None and not existing_retry.done():
+        existing_retry.cancel()
     # chainlink #65 (sub B): paired-positive emit. The push succeeded;
     # surface it so the algedonic block can show "old git_push_failed
     # + recent git_push_ok = transient, recovered" against the sticky
@@ -396,6 +430,94 @@ async def _has_origin_remote(home: Path) -> bool:
         return False
 
 
+async def _retry_push(*, home: Path, delay: float, attempt: int, turn_id: str) -> None:
+    """Retry push after backoff. Self-chains: on failure, schedules the next retry
+    (or emits git_push_stale when retries exhausted). Cancellable: debounce push
+    or reset_module_state cancel this task to stop the chain."""
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        return  # superseded by new commit debounce or shutdown
+
+    if not await _has_origin_remote(home):
+        return
+
+    key = _home_key(home)
+    # Try the push.
+    error_reason = None
+    error_returncode = None
+    try:
+        await _git("push", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        error_reason = "timeout"
+    except GitError as exc:
+        error_reason = _short_err(exc)
+        error_returncode = exc.returncode
+    except asyncio.CancelledError:
+        return
+    except OSError as exc:
+        error_reason = _short_err(exc)
+
+    if error_reason is None:
+        # Success.
+        _push_retry_tasks.pop(key, None)
+        extra: dict[str, Any] = {"via": "retry", "attempt": attempt + 1}
+        await log_event("git_push_ok", turn_id=turn_id, **extra)
+        return
+
+    # Failure — log it.
+    fail_extra: dict[str, Any] = {"reason": error_reason, "attempt": attempt + 1, "turn_id": turn_id}
+    if error_returncode is not None:
+        fail_extra["returncode"] = error_returncode
+    await log_event("git_push_failed", **fail_extra)
+
+    # Chain to next retry or escalate.
+    next_attempt = attempt + 1
+    if next_attempt >= len(PUSH_RETRY_DELAYS):
+        # Retries exhausted — emit algedonic escalation.
+        unpushed = await _count_unpushed_commits(home)
+        await log_event("git_push_stale", unpushed_commits=unpushed, attempts=next_attempt, turn_id=turn_id)
+        _push_retry_tasks.pop(key, None)
+        return
+
+    # Schedule next retry. This overwrites our own ref in the dict (we're done
+    # after this return; the new task is the live retry).
+    _push_retry_tasks[key] = asyncio.create_task(
+        _retry_push(home=home, delay=PUSH_RETRY_DELAYS[next_attempt], attempt=next_attempt, turn_id=turn_id)
+    )
+
+
+async def _count_unpushed_commits(home: Path) -> int:
+    """Count commits on HEAD not yet pushed to the upstream.
+
+    First tries the tracking-branch refspec ``@{upstream}..HEAD``. If no
+    upstream is configured (fresh branch, never pushed), falls back to
+    ``origin/HEAD..HEAD``. If that also fails (remote HEAD not set), falls
+    back to counting all local commits on HEAD — a safe over-count that is
+    better than returning 0 when we know a push is failing. Returns 0 on
+    any other error.
+    """
+    for refspec in ("@{upstream}..HEAD", "origin/HEAD..HEAD"):
+        try:
+            result = await _git(
+                "rev-list", "--count", refspec,
+                cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+            return int(result.stdout.strip())
+        except (GitError, asyncio.TimeoutError, OSError, ValueError):
+            continue
+    # Final fallback: count all commits on HEAD. Over-counts if some have
+    # been pushed (e.g. by a previous session) but is directionally correct.
+    try:
+        result = await _git(
+            "rev-list", "--count", "HEAD",
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+        return int(result.stdout.strip())
+    except (GitError, asyncio.TimeoutError, OSError, ValueError):
+        return 0
+
+
 def _short_err(exc: BaseException) -> str:
     """Single-line, safely-truncated error description for events.jsonl.
     Long stderr (e.g. multi-line git error blocks) gets squashed to a
@@ -411,4 +533,5 @@ __all__: tuple[str, ...] = (
     "reset_module_state",
     "DEBOUNCE_SECONDS",
     "PUSH_TIMEOUT_SECONDS",
+    "PUSH_RETRY_DELAYS",
 )
