@@ -91,7 +91,7 @@ def _load_cursor() -> list[str]:
     try:
         data = json.loads(CURSOR_FILE.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        _eprint(f"social-cli-poller: cursor load failed ({exc}); resetting")
+        _eprint(f"social-cli: cursor load failed ({exc}); resetting")
         return []
     return [str(x) for x in data] if isinstance(data, list) else []
 
@@ -154,7 +154,7 @@ def _load_inbox() -> list[dict]:
         data = yaml.safe_load(text) or {}
     except ImportError:
         _eprint(
-            "social-cli-poller: PyYAML not installed; "
+            "social-cli: PyYAML not installed; "
             "falling back to JSON shim — install pyyaml in mimir's "
             "venv for robust parsing"
         )
@@ -220,7 +220,7 @@ def main() -> int:
     platforms_csv = os.environ.get("MIMIR_SOCIAL_PLATFORMS", "bsky,x").strip()
     platforms = [p.strip() for p in platforms_csv.split(",") if p.strip()]
     if not platforms:
-        _eprint("social-cli-poller: MIMIR_SOCIAL_PLATFORMS resolves to no platforms; exiting")
+        _eprint("social-cli: MIMIR_SOCIAL_PLATFORMS resolves to no platforms; exiting")
         return 1
 
     try:
@@ -236,14 +236,14 @@ def main() -> int:
     try:
         _sync(platforms, limit, users_dir, bin_path)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        _eprint(f"social-cli-poller: sync failed: {exc}")
+        _eprint(f"social-cli: sync failed: {exc}")
         return 2
 
     # Step 2: parse inbox.yaml.
     try:
         notifications = _load_inbox()
     except (ImportError, OSError) as exc:
-        _eprint(f"social-cli-poller: inbox parse failed: {exc}")
+        _eprint(f"social-cli: inbox parse failed: {exc}")
         return 3
 
     # Step 3: emit new IDs only.

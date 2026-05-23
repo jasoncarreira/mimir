@@ -11,6 +11,17 @@
         "MIMIR_SOCIAL_USERS_DIR",
         "SOCIAL_CLI_BIN"
       ]
+    },
+    {
+      "name": "social-cli-feed",
+      "command": "python3 feed_poller.py",
+      "cron": "0 */2 * * *",
+      "batch_size": 10,
+      "pass_env": [
+        "MIMIR_SOCIAL_PLATFORMS",
+        "MIMIR_SOCIAL_FEED_LIMIT",
+        "SOCIAL_CLI_BIN"
+      ]
     }
   ]
 }

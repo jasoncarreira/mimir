@@ -773,7 +773,7 @@ def test_social_cli_fragment_has_pin_comment():
     so a future maintainer pins when upstream stabilizes."""
     frag_path = (
         Path(__file__).parent.parent
-        / "optional-skills" / "social-cli-poller" / "dockerfile.fragment"
+        / "optional-skills" / "social-cli" / "dockerfile.fragment"
     )
     text = frag_path.read_text()
     assert "pin" in text.lower() or "tag" in text.lower()
