@@ -16,7 +16,7 @@ success_criteria:
           file_path_glob: "*skills/*/SKILL.md"
 ---
 
-<!-- desc: How to author a new skill — frontmatter shape, allowed-tools, desc-line, body conventions; cite mimir/skill_md.py as parser-of-record. -->
+<!-- desc: How to author a new skill — frontmatter shape (name, description, success_criteria), desc-line, body conventions; cite mimir/skill_md.py as parser-of-record. -->
 
 # skill-creator
 

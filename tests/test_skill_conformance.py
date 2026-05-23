@@ -130,9 +130,11 @@ def test_extract_list_field_inline_array_form() -> None:
 
 
 def test_extract_list_field_rejects_scalar_form() -> None:
-    """``allowed-tools: Foo`` (scalar, not list) must be rejected so the
-    conformance test reports it as a missing/malformed field instead of
-    silently coercing to ``[Foo]``. PR #130 review feedback."""
+    """``<key>: Foo`` (scalar, not list) must return None — callers
+    that want a list should not be handed a silently-coerced ``[Foo]``.
+    The ``allowed-tools`` field itself is no longer used (removed
+    2026-05-23), but the parser-utility behavior is still load-bearing
+    for any future list-shaped frontmatter field."""
     text = "---\nname: example\nallowed-tools: Foo\n---\n"
     assert _extract_list_field(text, "allowed-tools") is None
 
