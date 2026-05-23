@@ -474,7 +474,11 @@ async def test_run_poller_stderr_logged_as_poller_stderr(
 ) -> None:
     """Pollers can log diagnostic info to stderr (per the contract);
     the framework captures that and emits a ``poller_stderr`` event so
-    the operator can grep for it. Doesn't affect event emission."""
+    the operator can grep for it. Doesn't affect event emission.
+
+    The event includes ``exit_code`` so readers can distinguish progress
+    noise (exit_code=0) from actual failures (exit_code != 0) — chainlink #93.
+    """
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", """
 import json, sys
@@ -492,6 +496,37 @@ print(json.dumps({"poller": "x", "prompt": "ok"}))
     stderr = [e for e in events if e["type"] == "poller_stderr"]
     assert len(stderr) == 1
     assert "checking external service" in stderr[0]["stderr"]
+    # exit_code=0: progress noise on a successful run (e.g. gh auth output)
+    assert stderr[0].get("exit_code") == 0
+
+
+@pytest.mark.asyncio
+async def test_run_poller_stderr_exit_code_nonzero_on_failure(
+    tmp_path: Path, home: Path,
+) -> None:
+    """When a poller writes to stderr AND exits non-zero, the
+    ``poller_stderr`` event carries ``exit_code != 0`` so readers
+    can treat it as an actual error, not progress noise — chainlink #93.
+    """
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import sys
+print("fatal: could not connect to service", file=sys.stderr)
+sys.exit(1)
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 0  # no events emitted (non-zero exit)
+    events = _read_events(home)
+    stderr = [e for e in events if e["type"] == "poller_stderr"]
+    assert len(stderr) == 1
+    assert "fatal: could not connect" in stderr[0]["stderr"]
+    # exit_code != 0: real failure, not progress noise
+    assert stderr[0].get("exit_code") == 1
 
 
 @pytest.mark.asyncio
