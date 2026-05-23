@@ -1,24 +1,35 @@
-"""Credential verification probes (SPEC §16 item 14, Phase 2).
+"""Credential verification — discovery + factories + CLI (Phase 2.5).
 
-Tests the registry shape, the per-probe behavior (with subprocess
-mocked so we don't depend on which tools are installed in the test
-environment), and the CLI entrypoints.
+Skills register their credentials via ``credentials.yaml`` next to
+``SKILL.md``. The framework discovers these at startup, builds a
+probe per entry via factory functions, and merges them with the
+mimir-core manifest shipped at ``mimir/credentials.yaml``.
+
+Tests here cover:
+- Each probe factory in isolation (subprocess, format, all_env_set,
+  not_implemented, python escape hatch).
+- The discovery walker (which roots, what shadows what, malformed
+  manifests don't break the registry).
+- The CLI entrypoints (``mimir verify-cred`` / ``verify-creds``).
+- End-to-end: a synthetic home with multiple manifests yields the
+  expected combined registry.
 """
 
 from __future__ import annotations
 
 import io
 import os
+import textwrap
 from contextlib import redirect_stdout
-from typing import Any
+from pathlib import Path
 
 import pytest
 
 from mimir import cred_verify
 from mimir.cred_verify import (
-    PROBES,
-    Probe,
     ProbeResult,
+    get_probes,
+    reset_probes_cache,
     run_verify_cred_cmd,
     run_verify_creds_cmd,
     verify,
@@ -26,241 +37,493 @@ from mimir.cred_verify import (
 )
 
 
-# ── Registry shape ───────────────────────────────────────────────────
+@pytest.fixture(autouse=True)
+def _reset_cache():
+    """Each test gets a fresh registry — no leakage from prior runs."""
+    reset_probes_cache()
+    yield
+    reset_probes_cache()
 
 
-def test_every_probe_is_well_formed():
-    """Each registry entry has a name, type, env_vars, description,
-    and callable fn. Catches typos / missing fields on new additions."""
-    for key, probe in PROBES.items():
-        assert key == probe.name, f"registry key mismatch: {key!r} vs {probe.name!r}"
-        assert probe.cred_type in ("A", "B", "C", "D"), probe
-        assert isinstance(probe.env_vars, tuple), probe
-        assert probe.description, probe
-        assert callable(probe.fn), probe
+def _write_manifest(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(body))
 
 
-def test_registry_has_at_least_one_of_each_type():
-    """The classification doc enumerates four types. The registry
-    must surface at least one probe per type so the CLI ``--type``
-    filter returns non-empty results."""
-    types = {p.cred_type for p in PROBES.values()}
-    assert types == {"A", "B", "C", "D"}, f"missing types: {set('ABCD') - types}"
+# ── Factories — exercised end-to-end via a tmp manifest ──────────────
 
 
-# ── Probe behavior ───────────────────────────────────────────────────
-
-
-def test_static_key_probe_passes_when_format_ok(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-" + "x" * 50)
-    result = verify("ANTHROPIC_API_KEY")
+def test_format_probe_passes_with_correct_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("FAKE_KEY", "sk-ant-" + "x" * 50)
+    _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
+        credentials:
+          - name: FAKE_KEY
+            cred_type: D
+            env_vars: [FAKE_KEY]
+            description: "fake"
+            probe:
+              kind: format
+              env: FAKE_KEY
+              prefix: "sk-ant-"
+              min_len: 20
+    """)
+    # Replace the package manifest with an empty one so this test
+    # only exercises the operator-side discovery.
+    monkeypatch.setattr(
+        cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml",
+    )
+    result = verify("FAKE_KEY")
     assert result.ok
-    assert result.cred_type == "D"
     assert "format ok" in result.detail
 
 
-def test_static_key_probe_fails_on_wrong_prefix(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "wrong-prefix-" + "x" * 30)
-    result = verify("ANTHROPIC_API_KEY")
-    assert not result.ok
-    assert "prefix" in result.detail.lower()
-
-
-def test_static_key_probe_fails_when_too_short(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("TAVILY_API_KEY", "tvly-x")
-    result = verify("TAVILY_API_KEY")
-    assert not result.ok
-    assert "too short" in result.detail.lower()
-
-
-def test_unset_env_reports_unavailable(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    result = verify("ANTHROPIC_API_KEY")
-    assert not result.ok
-    assert "unavailable" in result.detail.lower()
-
-
-def test_x_oauth_quartet_needs_all_four(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("X_API_KEY", "k" * 20)
-    monkeypatch.setenv("X_API_SECRET", "s" * 40)
-    monkeypatch.setenv("X_ACCESS_TOKEN", "t" * 50)
-    monkeypatch.delenv("X_ACCESS_TOKEN_SECRET", raising=False)
-    result = verify("X_OAUTH")
-    assert not result.ok
-    assert "X_ACCESS_TOKEN_SECRET" in result.detail
-
-
-def test_bsky_app_password_format(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("ATPROTO_APP_PASSWORD", "abcd-efgh-ijkl-mnop")
-    monkeypatch.delenv("BSKY_APP_PASSWORD", raising=False)
-    result = verify("BSKY_APP_PASSWORD")
-    assert result.ok
-
-    # Wrong shape — should fail.
-    monkeypatch.setenv("ATPROTO_APP_PASSWORD", "not-a-valid-shape")
-    result = verify("BSKY_APP_PASSWORD")
-    assert not result.ok
-
-
-def test_subprocess_probe_unavailable_without_binary(
-    monkeypatch: pytest.MonkeyPatch,
+def test_format_probe_rejects_disallowed_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    """The Type A probes short-circuit to ``unavailable`` when the
-    binary is missing from PATH, rather than running and failing
-    with a misleading error."""
-    monkeypatch.setattr(cred_verify, "_has_binary", lambda name: False)
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp_" + "x" * 40)
-    result = verify("GITHUB_TOKEN")
-    assert not result.ok
-    assert "unavailable" in result.detail.lower()
-    assert "gh" in result.detail.lower()
-
-
-def test_subprocess_probe_passes_on_zero_exit(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(cred_verify, "_has_binary", lambda name: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp_" + "x" * 40)
-    monkeypatch.setattr(
-        cred_verify, "_run_quiet",
-        lambda cmd, timeout=10: (0, "", "Logged in to github.com as mimir-carreira"),
-    )
-    result = verify("GITHUB_TOKEN")
-    assert result.ok
-    assert "mimir-carreira" in result.detail
-
-
-def test_subprocess_probe_fails_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(cred_verify, "_has_binary", lambda name: True)
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp_" + "x" * 40)
-    monkeypatch.setattr(
-        cred_verify, "_run_quiet",
-        lambda cmd, timeout=10: (1, "", "error: token expired"),
-    )
-    result = verify("GITHUB_TOKEN")
-    assert not result.ok
-    assert "expired" in result.detail.lower()
-
-
-def test_openai_probe_rejects_anthropic_prefix(monkeypatch: pytest.MonkeyPatch):
-    """``sk-ant-...`` is a valid ``sk-`` prefix but is an Anthropic
-    key, not an OpenAI one. The probe explicitly flags this case so
-    an accidental copy-paste between env vars surfaces immediately."""
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-ant-" + "x" * 50)
-    result = verify("OPENAI_API_KEY")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENAI_KEY", "sk-ant-" + "x" * 50)
+    _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
+        credentials:
+          - name: OPENAI_KEY
+            cred_type: D
+            env_vars: [OPENAI_KEY]
+            description: "openai-shape"
+            probe:
+              kind: format
+              env: OPENAI_KEY
+              prefix: "sk-"
+              disallowed_prefix: "sk-ant-"
+              min_len: 20
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    result = verify("OPENAI_KEY")
     assert not result.ok
     assert "sk-ant-" in result.detail
 
 
-def test_verify_returns_unknown_result_instead_of_raising():
-    """The Phase 2 review surfaced this: Phase 3 (rotation) will call
-    ``verify(name)`` inline; a typo shouldn't propagate a bare
-    ``KeyError``. Return a ProbeResult instead so callers can act on
-    ``ok=False`` uniformly."""
-    result = verify("NOT_A_REAL_CRED")
+def test_format_probe_unavailable_when_env_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MISSING_KEY", raising=False)
+    _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
+        credentials:
+          - name: MISSING_KEY
+            cred_type: D
+            env_vars: [MISSING_KEY]
+            description: ""
+            probe:
+              kind: format
+              env: MISSING_KEY
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    result = verify("MISSING_KEY")
     assert not result.ok
-    assert "unknown credential" in result.detail
+    assert "unavailable" in result.detail
 
 
-def test_type_b_probes_are_not_implemented():
-    """Type B (long-lived bridge) probes are stubbed for Phase 3 —
-    they should surface as failing with a distinctive marker rather
-    than silently succeeding or being absent from the registry."""
-    result = verify("DISCORD_TOKEN")
+def test_subprocess_probe_unavailable_without_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("FAKE_TOKEN", "x" * 40)
+    _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
+        credentials:
+          - name: FAKE_TOKEN
+            cred_type: A
+            env_vars: [FAKE_TOKEN]
+            description: ""
+            probe:
+              kind: subprocess
+              binary: definitely-not-installed
+              cmd: [definitely-not-installed, status]
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    monkeypatch.setattr(cred_verify, "_has_binary", lambda name: False)
+    result = verify("FAKE_TOKEN")
+    assert not result.ok
+    assert "unavailable" in result.detail
+    assert "definitely-not-installed" in result.detail
+
+
+def test_subprocess_probe_passes_on_zero_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("FAKE_TOKEN", "x" * 40)
+    _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
+        credentials:
+          - name: FAKE_TOKEN
+            cred_type: A
+            env_vars: [FAKE_TOKEN]
+            description: ""
+            probe:
+              kind: subprocess
+              binary: faketool
+              cmd: [faketool, status]
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    monkeypatch.setattr(cred_verify, "_has_binary", lambda name: True)
+    monkeypatch.setattr(
+        cred_verify, "_run_quiet",
+        lambda cmd, timeout=10: (0, "", "Authenticated as alice"),
+    )
+    result = verify("FAKE_TOKEN")
+    assert result.ok
+    assert "alice" in result.detail
+
+
+def test_all_env_set_probe_needs_every_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("FAKE_A", "1")
+    monkeypatch.setenv("FAKE_B", "2")
+    monkeypatch.delenv("FAKE_C", raising=False)
+    _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
+        credentials:
+          - name: FAKE_QUARTET
+            cred_type: D
+            env_vars: [FAKE_A, FAKE_B, FAKE_C]
+            description: ""
+            probe:
+              kind: all_env_set
+              note: "rotation must be atomic"
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    result = verify("FAKE_QUARTET")
+    assert not result.ok
+    assert "FAKE_C" in result.detail
+    # Add FAKE_C and re-run.
+    monkeypatch.setenv("FAKE_C", "3")
+    reset_probes_cache()
+    result = verify("FAKE_QUARTET")
+    assert result.ok
+    assert "rotation must be atomic" in result.detail
+
+
+def test_not_implemented_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
+        credentials:
+          - name: FUTURE_BRIDGE_TOKEN
+            cred_type: B
+            env_vars: [FUTURE_BRIDGE_TOKEN]
+            description: ""
+            probe:
+              kind: not_implemented
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    result = verify("FUTURE_BRIDGE_TOKEN")
     assert not result.ok
     assert "not_implemented" in result.detail
+    assert "Type B" in result.detail
 
 
-def test_type_c_probes_are_not_implemented():
-    result = verify("CLAUDE_OAUTH")
+def test_python_probe_loads_skill_local_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("FAKE_KEY", "the-expected-value")
+    skill_dir = tmp_path / "skills" / "fake"
+    _write_manifest(skill_dir / "credentials.yaml", """
+        credentials:
+          - name: FAKE_KEY
+            cred_type: D
+            env_vars: [FAKE_KEY]
+            description: ""
+            probe:
+              kind: python
+              script: my_probe.py
+    """)
+    (skill_dir / "my_probe.py").write_text(textwrap.dedent("""
+        import os
+        def probe() -> tuple[bool, str]:
+            v = os.environ.get("FAKE_KEY", "")
+            if v == "the-expected-value":
+                return (True, "custom probe says ok")
+            return (False, f"got: {v!r}")
+    """))
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    result = verify("FAKE_KEY")
+    assert result.ok
+    assert "custom probe says ok" in result.detail
+
+
+def test_python_probe_missing_script_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    skill_dir = tmp_path / "skills" / "fake"
+    _write_manifest(skill_dir / "credentials.yaml", """
+        credentials:
+          - name: FAKE_KEY
+            cred_type: D
+            env_vars: [FAKE_KEY]
+            description: ""
+            probe:
+              kind: python
+              script: not_actually_there.py
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    result = verify("FAKE_KEY")
     assert not result.ok
-    assert "not_implemented" in result.detail
+    assert "probe script not found" in result.detail
+
+
+def test_python_probe_handles_script_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A broken probe script must not crash the registry; surface
+    the exception as a probe failure."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    skill_dir = tmp_path / "skills" / "fake"
+    _write_manifest(skill_dir / "credentials.yaml", """
+        credentials:
+          - name: BROKEN_PROBE
+            cred_type: D
+            env_vars: []
+            description: ""
+            probe:
+              kind: python
+              script: bad.py
+    """)
+    (skill_dir / "bad.py").write_text("def probe():\n    raise ValueError('nope')\n")
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    result = verify("BROKEN_PROBE")
+    assert not result.ok
+    assert "raised" in result.detail
+    assert "nope" in result.detail
+
+
+# ── Discovery walker ─────────────────────────────────────────────────
+
+
+def test_discovery_walks_both_skill_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A bundled + operator manifest are both included; the registry
+    contains entries from both roots."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    _write_manifest(tmp_path / ".mimir_builtin_skills" / "bundled" / "credentials.yaml", """
+        credentials:
+          - name: BUNDLED_KEY
+            cred_type: D
+            env_vars: [BUNDLED_KEY]
+            description: ""
+            probe:
+              kind: format
+              env: BUNDLED_KEY
+              min_len: 4
+    """)
+    _write_manifest(tmp_path / "skills" / "operator" / "credentials.yaml", """
+        credentials:
+          - name: OPERATOR_KEY
+            cred_type: D
+            env_vars: [OPERATOR_KEY]
+            description: ""
+            probe:
+              kind: format
+              env: OPERATOR_KEY
+              min_len: 4
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    probes = get_probes()
+    assert "BUNDLED_KEY" in probes
+    assert "OPERATOR_KEY" in probes
+
+
+def test_operator_manifest_shadows_bundled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """When a name appears in both roots, the operator copy wins."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    _write_manifest(tmp_path / ".mimir_builtin_skills" / "common" / "credentials.yaml", """
+        credentials:
+          - name: SHARED_KEY
+            cred_type: D
+            env_vars: [SHARED_KEY]
+            description: "bundled version"
+            probe:
+              kind: format
+              env: SHARED_KEY
+              min_len: 4
+    """)
+    _write_manifest(tmp_path / "skills" / "common" / "credentials.yaml", """
+        credentials:
+          - name: SHARED_KEY
+            cred_type: D
+            env_vars: [SHARED_KEY]
+            description: "operator version"
+            probe:
+              kind: format
+              env: SHARED_KEY
+              min_len: 4
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    probes = get_probes()
+    assert probes["SHARED_KEY"].description == "operator version"
+    assert "skills/common" in probes["SHARED_KEY"].source
+
+
+def test_malformed_manifest_doesnt_kill_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A bad YAML file logs a warning but the rest of the registry
+    still loads."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / "skills" / "broken").mkdir(parents=True)
+    (tmp_path / "skills" / "broken" / "credentials.yaml").write_text("not: [valid")  # syntax error
+    _write_manifest(tmp_path / "skills" / "ok" / "credentials.yaml", """
+        credentials:
+          - name: GOOD_KEY
+            cred_type: D
+            env_vars: [GOOD_KEY]
+            description: ""
+            probe:
+              kind: format
+              env: GOOD_KEY
+              min_len: 4
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    probes = get_probes()
+    assert "GOOD_KEY" in probes
+    # Broken manifest contributed no entries.
+    assert all("broken" not in p.source for p in probes.values())
+
+
+def test_unknown_probe_kind_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Future probe kinds shouldn't crash an older framework."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    _write_manifest(tmp_path / "skills" / "future" / "credentials.yaml", """
+        credentials:
+          - name: FUTURE_KEY
+            cred_type: D
+            env_vars: [FUTURE_KEY]
+            description: ""
+            probe:
+              kind: hypothetical_future_kind
+              foo: bar
+          - name: OK_KEY
+            cred_type: D
+            env_vars: [OK_KEY]
+            description: ""
+            probe:
+              kind: format
+              env: OK_KEY
+              min_len: 4
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    probes = get_probes()
+    assert "FUTURE_KEY" not in probes
+    assert "OK_KEY" in probes
+
+
+def test_package_manifest_loaded_by_default(monkeypatch: pytest.MonkeyPatch):
+    """The mimir-core ``credentials.yaml`` shipped with the package
+    must be discovered even when MIMIR_HOME is unset."""
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    probes = get_probes()
+    # The core manifest must include at least ANTHROPIC_API_KEY +
+    # MIMIR_API_KEY + GITHUB_TOKEN — the mimir-process foundations.
+    assert "ANTHROPIC_API_KEY" in probes
+    assert "MIMIR_API_KEY" in probes
+    assert "GITHUB_TOKEN" in probes
 
 
 # ── CLI entrypoints ──────────────────────────────────────────────────
 
 
-def test_verify_cred_unknown_name():
+def test_verify_cred_unknown_name_reports_registered_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
+        credentials:
+          - name: SOMEKEY
+            cred_type: D
+            env_vars: [SOMEKEY]
+            description: ""
+            probe: { kind: format, env: SOMEKEY, min_len: 4 }
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = run_verify_cred_cmd("NOT_A_REAL_CRED")
+        rc = run_verify_cred_cmd("NOT_REAL")
     assert rc == 2
-    assert "unknown credential" in buf.getvalue()
+    out = buf.getvalue()
+    assert "unknown credential" in out
+    assert "SOMEKEY" in out  # the registered name listed for the operator
 
 
-def test_verify_cred_ok(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-" + "x" * 50)
+def test_verify_creds_summary_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("OK_KEY", "x" * 20)
+    monkeypatch.delenv("BAD_KEY", raising=False)
+    _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
+        credentials:
+          - name: OK_KEY
+            cred_type: D
+            env_vars: [OK_KEY]
+            description: ""
+            probe: { kind: format, env: OK_KEY, min_len: 4 }
+          - name: BAD_KEY
+            cred_type: D
+            env_vars: [BAD_KEY]
+            description: ""
+            probe: { kind: format, env: BAD_KEY, min_len: 4 }
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = run_verify_cred_cmd("ANTHROPIC_API_KEY")
-    assert rc == 0
-    assert "OK" in buf.getvalue()
-    assert "ANTHROPIC_API_KEY" in buf.getvalue()
+        rc = run_verify_creds_cmd()
+    assert rc == 1  # partial failure
+    out = buf.getvalue()
+    assert "1/2 probes ok" in out
 
 
-def test_verify_cred_stale(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+def test_verify_creds_filter_by_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("D_KEY", "x" * 20)
+    monkeypatch.setenv("A_KEY", "y" * 20)
+    _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
+        credentials:
+          - name: D_KEY
+            cred_type: D
+            env_vars: [D_KEY]
+            description: ""
+            probe: { kind: format, env: D_KEY, min_len: 4 }
+          - name: A_KEY
+            cred_type: A
+            env_vars: [A_KEY]
+            description: ""
+            probe: { kind: format, env: A_KEY, min_len: 4 }
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = run_verify_cred_cmd("ANTHROPIC_API_KEY")
-    assert rc == 1
-    assert "FAIL" in buf.getvalue()
+        run_verify_creds_cmd(only_type="D")
+    out = buf.getvalue()
+    assert "[D]" in out
+    assert "[A]" not in out
 
 
-def test_verify_creds_filters_by_type(monkeypatch: pytest.MonkeyPatch):
-    """``--type D`` runs only Type D probes; the output should not
-    contain any Type A/B/C names."""
-    # Make every Type D probe pass.
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-" + "x" * 50)
-    monkeypatch.setenv("VOYAGE_API_KEY", "pa-" + "x" * 40)
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-" + "x" * 40)
-    monkeypatch.setenv("TAVILY_API_KEY", "tvly-" + "x" * 30)
-    monkeypatch.setenv("MIMIR_API_KEY", "x" * 20)
-    monkeypatch.setenv("X_API_KEY", "x" * 20)
-    monkeypatch.setenv("X_API_SECRET", "x" * 40)
-    monkeypatch.setenv("X_ACCESS_TOKEN", "x" * 50)
-    monkeypatch.setenv("X_ACCESS_TOKEN_SECRET", "x" * 40)
-    monkeypatch.setenv("ATPROTO_APP_PASSWORD", "abcd-efgh-ijkl-mnop")
-
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        rc = run_verify_creds_cmd(only_type="D")
-    output = buf.getvalue()
-    assert rc == 0
-    assert "[D]" in output
-    assert "[A]" not in output
-    assert "[B]" not in output
-    assert "[C]" not in output
-
-
-def test_verify_creds_reports_partial_failures(monkeypatch: pytest.MonkeyPatch):
-    """Filter to Type D and DON'T set the env vars — every probe
-    should fail and the rc should be 1, but ALL probes should still
-    have been attempted (no short-circuit on first failure)."""
-    for env in (
-        "ANTHROPIC_API_KEY", "VOYAGE_API_KEY", "OPENAI_API_KEY",
-        "TAVILY_API_KEY", "MIMIR_API_KEY", "X_API_KEY",
-        "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET",
-        "ATPROTO_APP_PASSWORD", "BSKY_APP_PASSWORD",
-    ):
-        monkeypatch.delenv(env, raising=False)
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        rc = run_verify_creds_cmd(only_type="D")
-    output = buf.getvalue()
-    assert rc == 1
-    type_d_count = sum(1 for p in PROBES.values() if p.cred_type == "D")
-    assert output.count("[D]") == type_d_count
-    assert "0/" + str(type_d_count) + " probes ok" in output
-
-
-def test_verify_creds_filter_no_matches(monkeypatch: pytest.MonkeyPatch):
-    """If a type filter produces no probes (currently impossible
-    given the registry, but defensible against future churn), the
-    CLI should report that cleanly rather than print '0/0 ok'."""
-    # Temporarily clear PROBES of all D entries by monkeypatching.
-    filtered = {k: p for k, p in PROBES.items() if p.cred_type != "D"}
-    monkeypatch.setattr(cred_verify, "PROBES", filtered)
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        rc = run_verify_creds_cmd(only_type="D")
-    assert rc == 1
-    assert "no probes registered" in buf.getvalue()
+def test_verify_returns_unknown_result_instead_of_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Phase 3 (rotation) calls ``verify(name)`` inline; a typo
+    shouldn't propagate a bare ``KeyError``. Return a ProbeResult."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
+    result = verify("DEFINITELY_NOT_REGISTERED")
+    assert not result.ok
+    assert "unknown credential" in result.detail
