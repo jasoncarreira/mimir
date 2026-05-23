@@ -150,6 +150,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # #36 comment 42 for the design call.
     "ntfy_post_ok": ("positive", "ntfy_post_ok"),
     "git_push_ok": ("positive", "git_push_ok"),
+    "git_push_stale": ("negative", "git_push_stale"),
     "git_pull_ok": ("positive", "git_pull_ok"),
     "git_fetch_ok": ("positive", "git_fetch_ok"),
     "shell_job_complete_enqueue_ok": ("positive", "shell_job_complete_enqueue_ok"),
