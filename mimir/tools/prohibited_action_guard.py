@@ -10,7 +10,7 @@ Currently enforced:
 - git push --force / --force-with-lease / -f to main or master
 
 Wired into BudgetGateMiddleware, so it applies to all bash/shell tool
-calls (shell_exec, bash_async, bash_exec) regardless of provider.
+calls (shell_exec, bash_async, bash_exec, Bash) regardless of provider.
 """
 
 from __future__ import annotations
@@ -20,6 +20,10 @@ from typing import NamedTuple
 
 
 _BASH_TOOL_NAMES: frozenset[str] = frozenset({
+    # claude-code's native shell built-in surfaces as "Bash" (capital B)
+    # when registered through deepagents. Must be in this set or the guard
+    # short-circuits and the call is forwarded to the handler unchecked.
+    "Bash",
     "shell_exec",
     "bash_async",
     "bash_exec",

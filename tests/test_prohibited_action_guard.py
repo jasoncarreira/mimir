@@ -110,6 +110,13 @@ class TestIsBashTool:
     def test_mcp_bash_async_is_bash(self) -> None:
         assert is_bash_tool("mcp__mimir__bash_async") is True
 
+    def test_bash_capital_b_is_bash(self) -> None:
+        """claude-code's native shell built-in surfaces as 'Bash' (capital B)
+        when registered through deepagents. Regression for the correctness gap
+        flagged in Jason's code review: is_bash_tool('Bash') was False before
+        this fix, allowing force-push commands through the guard unchecked."""
+        assert is_bash_tool("Bash") is True
+
     def test_non_bash_tool_not_checked(self) -> None:
         assert is_bash_tool("send_message") is False
 

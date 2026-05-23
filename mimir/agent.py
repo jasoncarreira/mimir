@@ -1088,19 +1088,14 @@ class Agent:
         )
 
         timeout = self._config.turn_timeout_seconds
-        # asyncio.timeout() requires Python 3.11+. Fall back to
-        # nullcontext (no enforcement) on older interpreters with a
-        # one-time warning so operators know it's inactive.
+        # asyncio.timeout() is available on Python 3.11+, which is the
+        # hard deployment floor for mimir. Using it directly (no hasattr
+        # guard) means a mis-deployed Python <3.11 crashes loudly with
+        # AttributeError at turn-time rather than silently skipping
+        # enforcement — a P0 safety mechanism should never degrade
+        # silently. 0 = disabled (bench/dev).
         if timeout > 0:
-            if hasattr(asyncio, "timeout"):
-                _timeout_ctx: Any = asyncio.timeout(timeout)
-            else:
-                log.warning(
-                    "MIMIR_TURN_TIMEOUT_SECONDS=%s ignored: asyncio.timeout "
-                    "requires Python 3.11+. Upgrade to enable per-turn timeout.",
-                    timeout,
-                )
-                _timeout_ctx = contextlib.nullcontext()
+            _timeout_ctx: Any = asyncio.timeout(timeout)
         else:
             _timeout_ctx = contextlib.nullcontext()
 
