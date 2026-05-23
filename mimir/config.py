@@ -446,7 +446,7 @@ class Config:
     allow_unauthenticated: bool
 
     # Per-turn wall-clock timeout in seconds. 0 = no timeout (bench/dev).
-    # Default 1800 (30 min) catches indefinitely hung turns while
+    # Default 3600 (1h) catches indefinitely hung turns while
     # allowing legitimate long heartbeat or reflection work.
     turn_timeout_seconds: int
 
@@ -702,7 +702,7 @@ class Config:
             api_key=_env("MIMIR_API_KEY"),
             allow_unauthenticated=_env("MIMIR_ALLOW_UNAUTHENTICATED", "false").lower()
                 in {"true", "1", "yes"},
-            turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", 1800),
+            turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", 3600),
 
             feedback_window_hours=_env_int("MIMIR_FEEDBACK_WINDOW_HOURS", 24),
             feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),
