@@ -432,6 +432,30 @@ The `arbiter` (in `mimir/arbiter.py`) polls the Anthropic usage endpoint on each
 
 **Gap (⚠️ critical, see §16 item 18).** The spec currently lacks a recovery path for the scenario where quota is exhausted mid-session (e.g. a long `spawn_claude_code` run hits 100% partway through). The agent has no mechanism to pause, preserve partial results, and resume after the window resets. Filing chainlink work for when this becomes a live operational issue.
 
+### 4.10 State repo and push-failure recovery
+
+Agent home (`/mimir-home`) is tracked as a git repo synced to `mimirbot-state` via a post-turn hook (see §4.2 step 7 and `MIMIR_HOME_GIT_TRACKING.md`). Commits happen per-turn; pushes are debounced to 60 s and coalesce bursts into a single network call.
+
+**Push failure detection and surfacing.** Each `git push` that returns a non-zero exit, times out (30 s hard cap), or raises an OS error logs a `git_push_failed` event to `events.jsonl`. The algedonic feedback block (§9.4) surfaces this to the agent on the next turn. A paired `git_push_ok` event is emitted on any successful push (debounced or retry) so the feedback block can show "old failure + recent success = transient, recovered."
+
+**Retry with exponential backoff.** On a debounced push failure, the module schedules a retry chain with delays of 5 min → 15 min → 45 min (configurable via the `PUSH_RETRY_DELAYS` module constant; tests monkeypatch to compressed values). Each retry:
+
+1. Logs `git_push_failed` with the attempt number.
+2. On success: emits `git_push_ok` with `via="retry"` and clears retry state.
+3. On failure: schedules the next retry, or — if retries are exhausted — escalates via `git_push_stale`.
+
+**Escalation after exhausted retries.** When all three retries fail (~65 min from first failure), the module emits `git_push_stale` — an algedonic negative signal — carrying `unpushed_commits: int` (count of commits on HEAD not yet in origin). This surfaces as a priority signal on the next turn's prompt; the agent should alert the operator and investigate (credential expiry, remote unavailability, merge conflict).
+
+**Cancellation on new activity.** When a new post-turn commit fires a debounce push, any pending retry task for that home is cancelled. The debounce push covers all unpushed commits (including those the retry was targeting), making the retry redundant.
+
+**Recovery from extended divergence.** If the remote was unavailable for many commits:
+
+1. The `git_push_stale` event carries the unpushed commit count as a starting point.
+2. On remote restoration: the next commit triggers a debounce push that sends all accumulated commits in one push (git push sends all reachable commits not in the remote; no manual reconciliation needed for pure-append cases).
+3. For merge-conflict cases (remote state changed while local commits accumulated): `git pull --rebase` is the default recovery path. `git push --force` requires explicit operator approval (escalate-first per §06-action-boundaries.md).
+
+**Config.** Gated on `MIMIR_GIT_TRACKING_ENABLED=true`. No-remote path (no origin configured) still commits per-turn but skips push and retry entirely.
+
 ---
 
 ## 5. Memory system
@@ -1553,7 +1577,7 @@ Gaps identified by independent spec review, organized by severity. Critical gaps
 
 14. **Credential rotation protocol.** No procedure for rotating GitHub PAT or Anthropic OAuth tokens without causing race conditions with in-flight operations. The live failure mode (credential-store truncation on auth failure) is fingerprinted at `memory/issues/git-credential-store-erase-on-auth-failure.md`, but the spec has no recovery procedure or rotation sequence. Required: (a) credential update order relative to active turn lifecycle, (b) how to drain in-flight turns before rotation, (c) how to verify the new credential is wired before declaring success.
 
-15. **State-push recovery.** When the post-turn git push to `mimirbot-state` fails (network blip, credential expiry, merge conflict), mimir's agent home and the remote repo diverge silently. The spec mentions `git revert` (§16 item 8) but doesn't specify: (a) how push failure is detected and surfaced (it should write a `state_push_failed` event to events.jsonl and alert via the operator channel), (b) the recovery sequence (local commit is safe; push retry with exponential backoff; escalate after N retries), (c) how to reconcile after extended divergence (accumulated local commits vs. remote state). This is a real operational scenario — see the 22-unpushed-autocommits situation logged in heartbeat history.
+15. **State-push recovery.** [Resolved: §4.10] Push-failure detection, retry with exponential backoff (5 m → 15 m → 45 m), `git_push_stale` algedonic escalation after retries exhausted, and extended-divergence recovery path specified and implemented. See §4.10.
 
 16. **Index corruption detection and rebuild.** The spec has no procedure for detecting or recovering from file corpus or SAGA FAISS index corruption. Silent retrieval failures (zero results, stale results) are the observable symptom. Spec text for the rebuild procedure has been added at §8.3, but automated detection (periodic FTS5 integrity check, dimension-sanity probe) is still unimplemented. Track as a follow-up item.
 
