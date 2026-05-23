@@ -1,9 +1,6 @@
 ---
 name: fallback-chains
 description: Layer alternative channels / scrapers / data sources with explicit fall-through, where each rung covers a different failure mode. Use when interacting with the world (sending a notification, fetching from a third party, detecting a state change, authenticating) and the single canonical path could fail in known ways. Distinct from retrying — retries handle transient failures; fallback chains handle modal ones (channel down, API gone, cookie expired). Three layers tops; the terminal rung is loud.
-allowed-tools:
-  - Read
-  - memory_query
 ---
 
 # Fallback Chains

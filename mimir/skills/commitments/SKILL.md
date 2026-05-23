@@ -1,13 +1,6 @@
 ---
 name: commitments
 description: How to read, resolve, and reason about commitments — durable records of future obligations (your own promises and the operator's requests). Use whenever the `## Upcoming commitments` prompt block surfaces something you might act on, or when you want to inspect what's pending beyond what the block shows.
-allowed-tools:
-  - Read
-  - commitment_complete
-  - commitment_snooze
-  - commitment_dismiss
-  - commitment_list
-  - send_message
 ---
 
 # Commitments

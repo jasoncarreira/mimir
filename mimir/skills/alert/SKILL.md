@@ -1,9 +1,6 @@
 ---
 name: alert
 description: Use when a high-priority signal needs to reach the operator but doesn't fit the current conversation (off-hours wake, urgent error needing eyes, scheduled-tick discovery worth surfacing now). Routes via MIMIR_OPERATOR_ALERT_CHANNEL.
-allowed-tools:
-  - Read
-  - send_message
 success_criteria:
   # The skill's whole purpose is operator notification. If we load
   # the SKILL.md but no send_message follows, the alert was computed

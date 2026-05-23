@@ -1,10 +1,6 @@
 ---
 name: introspection
 description: Diagnose your own behavior by reading the structured logs you leave behind — turns.jsonl, events.jsonl, chat_history.jsonl, scheduler.yaml. Use when something has gone wrong (a message didn't land, a scheduled job isn't firing, a communication pattern feels off), when you need to understand a pattern over many turns, or when cost / token usage needs auditing. Covers jq query recipes and points at the debugging-jobs / debugging-communication / debugging-drift companion guides for specific failure modes.
-allowed-tools:
-  - Bash
-  - Read
-  - memory_query
 success_criteria:
   # Introspection is a diagnostic skill — "look at the logs to
   # understand X." Concrete outputs are either a written report
