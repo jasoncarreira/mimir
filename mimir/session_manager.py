@@ -158,8 +158,14 @@ class SessionManager:
         session.turn_count += 1
         if (
             self._max_turns > 0
-            and session.turn_count >= self._max_turns
+            and session.turn_count == self._max_turns
         ):
+            # ``==`` not ``>=`` so the spawn fires exactly once per
+            # session. Turns past the cap that arrive before the cap
+            # task lands would otherwise each spawn another (no-op)
+            # task — the session-id guard makes them correctness-safe
+            # but they accumulate in ``_pending_tasks`` until the
+            # session actually ends.
             # ``increment_turn_count`` is sync (called from the agent's
             # turn entry path); ``_force_end_for_turn_cap`` needs the
             # async lock. Spawn a task — the dispatcher's per-channel

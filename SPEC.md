@@ -550,6 +550,8 @@ Each session has an asyncio timer that fires after `MIMIR_SAGA_SESSION_IDLE_MINU
 
 In parallel with the idle timer, each session has a **turn cap** (`MIMIR_SAGA_SESSION_MAX_TURNS`, default 10). When `turn_count` reaches the cap, `increment_turn_count` schedules a forced session end immediately — the synthesis turn is enqueued on the same channel and runs after the current turn completes (per-channel dispatcher serialization), then the next inbound event mints a fresh session. Setting the cap to 0 disables it (idle-only behavior). The cap closes the burst-messaging gap where a continuously active channel never goes idle and synthesis never fires; the event log distinguishes the two paths via `saga_session_turn_cap_reached` (cap path) vs the standard idle-timer flow.
 
+Cap-value tradeoff: a lower cap means more frequent synthesis turns on slow channels (each synthesis itself costs one LLM turn), while a higher cap means longer accumulated context per session — which can blow the turn prompt budget if the channel is chatty. 10 is the empirical default; tune downward for high-volume channels where per-message importance is low (a chat firehose), upward for low-volume channels where you want fewer interruptions (a single operator DM).
+
 #### Lifecycle
 
 **On every inbound event** (bridge, scheduler tick, HTTP injection), the dispatcher (§4.5) calls `session_manager.touch(channel_id)` *before* enqueueing onto the per-channel queue:
