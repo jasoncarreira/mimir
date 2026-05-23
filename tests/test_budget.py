@@ -298,3 +298,66 @@ def test_build_turn_prompt_omits_self_state_when_none():
         self_state_block=None,
     )
     assert "## Self-state" not in prompt
+
+
+# ─── quota-pause integration (SPEC §4.9, §16 item 18) ─────────────────
+
+
+def test_quota_pause_suppresses_heartbeat(tmp_path: Path):
+    """When QuotaPauseTracker has an active pause, should_fire_heartbeat
+    returns (False, "quota_exhausted_pause:...") regardless of
+    utilization. SPEC §4.9 / §16 item 18."""
+    from datetime import datetime, timedelta, timezone
+    from mimir.quota_pause import QuotaPauseTracker
+
+    # Pre-write a pause file at the path the arbiter consults.
+    pause_path = tmp_path / ".mimir" / "quota_pause.json"
+    tracker = QuotaPauseTracker(pause_path)
+    reset_at = datetime.now(tz=timezone.utc) + timedelta(hours=2)
+    tracker.pause_until(reset_at, reason="quota_exhausted", provider="anthropic")
+
+    arb = _arbiter(tmp_path)
+    fire, reason = arb.should_fire_heartbeat()
+    assert not fire
+    assert reason.startswith("quota_exhausted_pause:resets_at=")
+    # The reset timestamp is surfaced in the reason so operator triage
+    # via events.jsonl can see when the pause clears.
+    assert reset_at.isoformat() in reason
+
+
+def test_quota_pause_clears_after_reset(tmp_path: Path):
+    """Past-reset pause → lazy-expiry clears the state file and the
+    arbiter returns to its normal behavior. The next read of the
+    tracker sees no pause."""
+    from datetime import datetime, timedelta, timezone
+    from mimir.quota_pause import QuotaPauseTracker
+
+    pause_path = tmp_path / ".mimir" / "quota_pause.json"
+    tracker = QuotaPauseTracker(pause_path)
+    # Reset 5 minutes ago — should lazy-expire on the first arbiter call.
+    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    tracker.pause_until(past, reason="quota_exhausted")
+    assert pause_path.is_file()
+
+    arb = _arbiter(tmp_path)
+    fire, reason = arb.should_fire_heartbeat()
+    # Pause has expired → normal arbiter behavior. No utilization, no
+    # cost rate, no other suppressors → should fire.
+    assert fire
+    assert reason == "ok"
+    # The lazy-expiry also removed the state file.
+    assert not pause_path.is_file()
+
+
+def test_no_quota_pause_file_skips_check_cleanly(tmp_path: Path):
+    """When no pause file exists, the arbiter skips the QuotaPauseTracker
+    construction entirely (the ``if pause_path.is_file()`` guard).
+    Confirmed by behavior: arbiter returns normal decision with no
+    side effects on the .mimir dir."""
+    arb = _arbiter(tmp_path)
+    fire, reason = arb.should_fire_heartbeat()
+    assert fire
+    assert reason == "ok"
+    # No .mimir dir got created as a side effect — the early guard
+    # prevented an unnecessary tracker.
+    assert not (tmp_path / ".mimir").exists()

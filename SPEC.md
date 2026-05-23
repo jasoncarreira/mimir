@@ -428,9 +428,17 @@ The `arbiter` (in `mimir/arbiter.py`) polls the Anthropic usage endpoint on each
 2. If either window is ≥ `MIMIR_QUOTA_SUPPRESS_THRESHOLD` (default 95%), emit a `quota_suppressed` event to events.jsonl and skip the tick. The suppression is advisory — a queued user_message turn always runs regardless, since interactive responsiveness outweighs quota conservation.
 3. If the usage poll result is stale (> 30 min old) or missing, the arbiter uses the last trusted value rather than blocking. A `quota_reading_anomaly` event is emitted when the poll data is distrusted.
 
-**Exhaustion handling.** Full quota exhaustion causes Anthropic API calls to return 429. The agent loop surfaces this as an error event (`error`, `anthropic_rate_limit`) to events.jsonl. The next scheduled tick's arbiter check will see 100% utilization and suppress. User-message turns will also fail at the API call — the channel worker catches the exception, writes the error event, and sends a "temporarily rate-limited, try again in N minutes" reply via `send_message` if the channel is interactive.
+**Exhaustion handling.** Full quota exhaustion causes Anthropic API calls to return 429. The pre-tick arbiter check (above) catches the case where we know we'd exhaust BEFORE running anything. The mid-turn case — a turn that started below the 80% threshold but blew past 100% during execution — is handled by a separate path:
 
-**Gap (⚠️ critical, see §16 item 18).** The spec currently lacks a recovery path for the scenario where quota is exhausted mid-session (e.g. a long `spawn_claude_code` run hits 100% partway through). The agent has no mechanism to pause, preserve partial results, and resume after the window resets. Filing chainlink work for when this becomes a live operational issue.
+1. The agent's `run_turn` catches the exception from `agent.astream` and classifies it via `quota_pause.is_quota_exhaustion` (checks SDK exception class, HTTP 429 status, and provider-message text).
+2. `quota_pause.extract_reset_at` parses the reset time from Anthropic-specific headers (`anthropic-ratelimit-tokens-reset` etc.) or a generic `Retry-After`, falling back to a 5-hour default (matching Anthropic's 5h rolling window).
+3. The agent records the pause via `QuotaPauseTracker` (persisted at `<home>/.mimir/quota_pause.json` so a container restart mid-pause doesn't lose it) and emits a `quota_exhausted` event with the reset time, provider label, and exception details.
+4. The arbiter's `should_fire_heartbeat` consults the tracker BEFORE the utilization check — while paused, scheduled ticks are suppressed with reason `quota_exhausted_pause:resets_at=<iso>`.
+5. The tracker lazy-expires past its reset time. The arbiter's first read after the transition emits `quota_recovered` (positive algedonic) so the agent sees "we're back online" in its next-turn feedback block.
+
+User-message turns are NOT blocked by the pause (interactive responsiveness wins over quota conservation). They'll hit the API and either succeed (window has reset) or get their own 429 — which the agent surfaces to the operator via `send_message` rather than vanishing silently.
+
+**Resume of in-flight work.** What's NOT covered: pause + resume of a `spawn_claude_code` subprocess that hits 429 partway through. The subprocess fails; its partial output (if written to `output_dir`) is preserved on disk, but there's no automatic re-invocation. The parent agent sees the failure and decides whether to retry after the window resets. A "subprocess resume after quota recovers" primitive is a future addition (track as §16 item 18 sub-b — when it bites operationally).
 
 ### 4.10 State repo and push-failure recovery
 
@@ -1591,7 +1599,7 @@ Gaps identified by independent spec review, organized by severity. Critical gaps
 
 17. **Session timeout for continuous channels.** [Resolved: turn-count cap] Implemented as `MIMIR_SAGA_SESSION_MAX_TURNS` (default 10, see §5.6). A continuous channel that never idles still gets synthesis after the cap is reached; the cap-path emits `saga_session_turn_cap_reached` so operators can distinguish it from the idle-timer path. The originally-suggested time-based fallback was deferred in favor of the turn cap — message-count is a tighter proxy for "session got long enough to synthesize" than wall-clock duration (a slow-burning channel at 1 msg/hour for 4h would otherwise force-synthesize on 4 turns, often too few to be useful, while a burst channel at 100 msg/min would not be capped at all by a 4h timer).
 
-18. **Tool-call budget enforcement and quota exhaustion handling.** Per-spawn budget caps and Anthropic quota window semantics are now documented at §4.9. The remaining gap: no recovery path for mid-session quota exhaustion (e.g. a long spawn hits 100% partway through). A durable "pause + resume after quota reset" mechanism is missing from both the subagent protocol and the spec. Chainlink work deferred.
+18. **Tool-call budget enforcement and quota exhaustion handling.** [Mostly resolved] Per-turn tool-call cap via `BudgetGateMiddleware` (PR #282, intercepts deepagents built-ins too); per-spawn $25/$10/$5 caps and pre-tick arbiter suppression at 80% utilization at §4.9; mid-turn 429 handling via `QuotaPauseTracker` (§4.9, this PR) — exception classification, reset-time extraction, file-persisted pause, lazy expiry, `quota_exhausted` + `quota_recovered` algedonic events. **Sub-gap remaining:** automatic resume of a `spawn_claude_code` subprocess that died on 429 partway through. Subprocess partial output is preserved (if written to `output_dir`) but the parent agent has to manually decide to retry after the window resets. Deferred — wait for it to bite operationally.
 
 #### Significant — scale and maturity concerns
 
