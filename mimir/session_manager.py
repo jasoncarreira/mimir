@@ -86,6 +86,13 @@ class SessionManager:
         self._is_busy = is_busy
         self._sessions: dict[str, ChannelSession] = {}
         self._lock = asyncio.Lock()
+        # Pending turn-cap force-end tasks. asyncio's event loop only
+        # keeps weak refs to tasks, so without strong storage here a
+        # cap-triggered ``_force_end_for_turn_cap`` task could be
+        # garbage-collected before it acquires the lock + dispatches
+        # synthesis. Tasks self-remove via the done callback so the
+        # set drains naturally. Mirrors PR #281 review fix.
+        self._pending_tasks: set[asyncio.Task] = set()
 
     def _idle_seconds_value(self) -> int:
         return self._idle_seconds
@@ -159,11 +166,19 @@ class SessionManager:
             # async lock. Spawn a task — the dispatcher's per-channel
             # serialization will run the synthesis turn after the
             # current turn finishes.
-            asyncio.create_task(
+            #
+            # Strong-ref the task on ``self._pending_tasks`` until it
+            # completes. asyncio only keeps weak refs, so without this
+            # the task can be GC'd before it dispatches. Store-on-
+            # session would race with the ``_force_end_for_turn_cap``
+            # pop, so it lives at the manager level instead.
+            task = asyncio.create_task(
                 self._force_end_for_turn_cap(
                     channel_id, session.saga_session_id,
                 )
             )
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._pending_tasks.discard)
 
     async def end_now(self, channel_id: str) -> ChannelSession | None:
         """Force-end a session (e.g. from a bridge disconnect). Triggers the
@@ -223,6 +238,12 @@ class SessionManager:
                     session.idle_handle = None
                 session.ended = True
             self._sessions.clear()
+        # Cancel any in-flight turn-cap force-end tasks too. Without
+        # this they could try to dispatch synthesis against a draining
+        # worker pool. Iterate over a snapshot since the done callback
+        # mutates ``_pending_tasks``.
+        for task in list(self._pending_tasks):
+            task.cancel()
 
     # ---- internals ------------------------------------------------------
 

@@ -139,11 +139,14 @@ async def test_turn_cap_forces_synthesis_for_burst_channel():
     mgr.increment_turn_count("c1")  # 2
     mgr.increment_turn_count("c1")  # 3 → triggers force-end
 
-    # The forced end runs as a background task; yield until it lands.
-    for _ in range(20):
-        if fired:
-            break
-        await asyncio.sleep(0.01)
+    # The forced end runs as a background task; wait for it with a
+    # generous CI-safe timeout. asyncio.wait_for surfaces a clean
+    # TimeoutError rather than a silent assertion failure.
+    async def _wait_for_fired() -> None:
+        while not fired:
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(_wait_for_fired(), timeout=2.0)
     assert len(fired) == 1, "burst-cap synthesis didn't fire"
     assert fired[0].saga_session_id == first.saga_session_id
     assert fired[0].turn_count == 3
