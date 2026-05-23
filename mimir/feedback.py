@@ -35,6 +35,9 @@ class FeedbackSignal:
     kind: str  # short tag: "tool_denied", "error", "saga_feedback", ...
     channel_id: str | None
     content: str  # one-line rendered description
+    count: int = 1  # total occurrences of this kind in the algedonic window;
+                    # > 1 means "pattern, not a one-off" — Beer arousal filter
+                    # signal. Populated by the pre-pass in FeedbackLog.recent().
 
 
 # Event-type → (polarity, short-tag) mapping. Anything not listed is
@@ -379,6 +382,52 @@ assert _POLARITY_DYNAMIC_KINDS.isdisjoint(_FIRST_OCCURRENCE_ONLY_KINDS), (
     f"the first-only set. Conflict: "
     f"{_POLARITY_DYNAMIC_KINDS & _FIRST_OCCURRENCE_ONLY_KINDS}"
 )
+
+# Arousal thresholds — Beer (Brain of the Firm, Chapter 7) arousal filter.
+# Maps rule kind → minimum occurrence count in the algedonic window before
+# the kind claims a slot in the block. Default (absent from dict) = 1, meaning
+# "surface on first occurrence" — these are Beer's "discrete internal events"
+# that should bypass the regulatory hierarchy immediately.
+#
+# Raise threshold for kinds where a single occurrence is below the noise floor
+# and only a sustained pattern is worth escalating to S5 attention. The
+# threshold is a statistical criterion: "has this fired enough times to be
+# significant rather than coincidental?"
+#
+# Infrastructure note: all currently-registered kinds remain at the default
+# threshold (1). The structure is here for operational tuning as experience
+# reveals routinely-noisy kinds that don't warrant first-occurrence surfacing.
+# The count IS surfaced in the rendered line (see _format_lines) regardless of
+# threshold — "×47 in 24h" on a git_push_ok signals "constant pushing, healthy"
+# while "×1" signals "just happened once." Pattern visibility is the primary
+# Alg-2 deliverable; threshold gating is secondary infrastructure.
+_AROUSAL_THRESHOLDS: dict[str, int] = {}
+
+
+# Pre-pass helper: count occurrences of each rule-matched event kind
+# in the algedonic window. Iterates tail-first (most-recent first),
+# stops at cutoff_iso. Called before the main selection loop so the
+# full-window count is available for (a) threshold gating and
+# (b) attaching to displayed FeedbackSignals as pattern-visibility context.
+def _count_kinds_in_window(
+    snapshot: "JsonlSnapshot | None",
+    events_path: Path,
+    cutoff_iso: str,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for ev in iter_snapshot_or_tail(snapshot, events_path):
+        ts = ev.get("timestamp")
+        if not isinstance(ts, str) or ts < cutoff_iso:
+            if isinstance(ts, str):
+                break
+            continue
+        evtype = ev.get("type")
+        rule = _EVENT_RULES.get(evtype) if isinstance(evtype, str) else None
+        if rule is None:
+            continue
+        _, kind = rule
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
 
 
 # Render hooks: per-kind one-liner builders. Defaults to a generic
@@ -916,6 +965,12 @@ class FeedbackLog:
     default_limit_per_polarity: int = 5
     events_snapshot: JsonlSnapshot | None = None
     turns_snapshot: JsonlSnapshot | None = None
+    arousal_thresholds: dict[str, int] | None = None
+    # None → use the module-level _AROUSAL_THRESHOLDS. Override in tests
+    # (or operator config) to tune per-kind minimum-occurrence thresholds
+    # without monkeypatching. Passed as None by default so the live
+    # deployment uses the shared dict and changes to it propagate at
+    # import time.
 
     def recent(
         self,
@@ -935,6 +990,23 @@ class FeedbackLog:
 
         cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=window_hours)
         cutoff_iso = cutoff.isoformat()
+
+        # Arousal filter pre-pass (Beer Ch.7): count all rule-matched
+        # event-kind occurrences in the window before the display loop.
+        # Serves two purposes:
+        #   1. Threshold gate: kinds below their min_occurrences are
+        #      suppressed — only sustained patterns clear their filter.
+        #   2. Count display: FeedbackSignal.count > 1 renders as
+        #      "(×N in Xh)" so the agent can distinguish a one-off from
+        #      a recurring pattern without needing separate tool calls.
+        thresholds = (
+            self.arousal_thresholds
+            if self.arousal_thresholds is not None
+            else _AROUSAL_THRESHOLDS
+        )
+        kind_counts = _count_kinds_in_window(
+            self.events_snapshot, self.events_path, cutoff_iso
+        )
 
         negatives: list[FeedbackSignal] = []
         positives: list[FeedbackSignal] = []
@@ -982,6 +1054,12 @@ class FeedbackLog:
                     polarity = ev_polarity
                 elif ev_polarity == "neutral":
                     continue
+            # Arousal filter: suppress kinds below their minimum-occurrence
+            # threshold. Default threshold is 1 (always surface); raise in
+            # _AROUSAL_THRESHOLDS for kinds where single occurrence is noise.
+            min_occ = thresholds.get(kind, 1)
+            if kind_counts.get(kind, 0) < min_occ:
+                continue
             # First-occurrence-only kinds: skip duplicates. Tail-first
             # iteration means we keep the most recent.
             if kind in _FIRST_OCCURRENCE_ONLY_KINDS:
@@ -1008,6 +1086,7 @@ class FeedbackLog:
                     kind=kind,
                     channel_id=ev.get("channel_id"),
                     content=content,
+                    count=kind_counts.get(kind, 1),
                 )
             )
             # Early exit when both sides full.
@@ -1089,22 +1168,27 @@ def render_feedback_block(
     parts: list[str] = []
     if negatives:
         parts.append(f"Negative (last {window_hours}h):")
-        parts.extend(_format_lines(negatives))
+        parts.extend(_format_lines(negatives, window_hours=window_hours))
     if positives:
         if parts:
             parts.append("")  # blank line between subsections
         parts.append(f"Positive (last {window_hours}h):")
-        parts.extend(_format_lines(positives))
+        parts.extend(_format_lines(positives, window_hours=window_hours))
     return "\n".join(parts)
 
 
-def _format_lines(signals: list[FeedbackSignal]) -> list[str]:
+def _format_lines(signals: list[FeedbackSignal], *, window_hours: int = 24) -> list[str]:
     out: list[str] = []
     for sig in signals:
         # YYYY-MM-DDTHH:MM:SS+00:00 → "YYYY-MM-DD HH:MM" for compactness.
         ts = _short_ts(sig.ts)
         ch = f" [{sig.channel_id}]" if sig.channel_id else ""
-        out.append(f"- {ts} — {sig.content}{ch}")
+        # Arousal filter count display: "(×N in Xh)" when count > 1
+        # surfaces the "pattern vs one-off" distinction that Beer's
+        # arousal filter is meant to provide. A single occurrence renders
+        # with no suffix — no noise for genuinely discrete events.
+        count_suffix = f" (×{sig.count} in {window_hours}h)" if sig.count > 1 else ""
+        out.append(f"- {ts} — {sig.content}{count_suffix}{ch}")
     return out
 
 
