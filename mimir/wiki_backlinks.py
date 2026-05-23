@@ -142,6 +142,12 @@ def find_slug_collisions(wiki_dir: Path) -> dict[str, list[Path]]:
 #: ``"concepts/foo"`` slug while the actual ``"foo"`` page gets
 #: falsely flagged as orphan — exactly the case muninn-mimir's
 #: 2026-05-23 wiki-health report surfaced.
+#:
+#: Matching is case-sensitive — Obsidian wikilinks are case-sensitive,
+#: so ``[[Concepts/foo]]`` won't be stripped. Acceptable: the wiki
+#: convention is lowercase category dirs.
+# Keep in sync with mimir/skills/wiki/SKILL.md §Layout — adding a new
+# category subdir there (e.g. ``projects/``) needs a matching entry here.
 _CATEGORY_PREFIXES: tuple[str, ...] = ("concepts/", "topics/", "entities/")
 
 
