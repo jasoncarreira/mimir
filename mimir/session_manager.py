@@ -86,12 +86,11 @@ class SessionManager:
         self._is_busy = is_busy
         self._sessions: dict[str, ChannelSession] = {}
         self._lock = asyncio.Lock()
-        # Pending turn-cap force-end tasks. asyncio's event loop only
-        # keeps weak refs to tasks, so without strong storage here a
-        # cap-triggered ``_force_end_for_turn_cap`` task could be
-        # garbage-collected before it acquires the lock + dispatches
+        # Strong-ref pattern: asyncio keeps only weak refs to tasks,
+        # so without this a cap-triggered ``_force_end_for_turn_cap``
+        # task could be GC'd before it acquires the lock and dispatches
         # synthesis. Tasks self-remove via the done callback so the
-        # set drains naturally. Mirrors PR #281 review fix.
+        # set drains naturally.
         self._pending_tasks: set[asyncio.Task] = set()
 
     def _idle_seconds_value(self) -> int:
@@ -241,9 +240,14 @@ class SessionManager:
         # Cancel any in-flight turn-cap force-end tasks too. Without
         # this they could try to dispatch synthesis against a draining
         # worker pool. Iterate over a snapshot since the done callback
-        # mutates ``_pending_tasks``.
-        for task in list(self._pending_tasks):
+        # mutates ``_pending_tasks``. Awaiting after cancel ensures
+        # we don't get "Task was destroyed but it is pending" warnings
+        # if the event loop is also tearing down.
+        pending = list(self._pending_tasks)
+        for task in pending:
             task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # ---- internals ------------------------------------------------------
 

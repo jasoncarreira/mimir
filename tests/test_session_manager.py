@@ -176,6 +176,27 @@ async def test_turn_cap_zero_disables():
 
 
 @pytest.mark.asyncio
+async def test_shutdown_cancels_pending_turn_cap_task():
+    """Hitting the cap schedules a force-end task. If shutdown lands
+    before that task acquires the lock and dispatches, the cancel
+    path must abort it cleanly — no synthesis callback should fire."""
+    fired: list[ChannelSession] = []
+
+    async def on_idle(session: ChannelSession) -> None:
+        fired.append(session)
+
+    mgr = SessionManager(idle_minutes=60, max_turns=1, on_idle=on_idle)
+    await mgr.touch("c1")
+    mgr.increment_turn_count("c1")  # schedules force-end task
+
+    # Shutdown before the task gets to run — must cancel and await
+    # cleanly without firing the synthesis callback.
+    await mgr.shutdown()
+    assert fired == []
+    assert mgr._pending_tasks == set()
+
+
+@pytest.mark.asyncio
 async def test_end_now_triggers_synthesis_callback():
     fired: list[ChannelSession] = []
 
