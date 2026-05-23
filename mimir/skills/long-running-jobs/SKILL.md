@@ -1,8 +1,6 @@
 ---
 name: long-running-jobs
 description: Run shell commands in the background with output capture and completion callbacks. Use when a command might take more than ~30 seconds (builds, tests, deployments, data processing) and you want to keep working while it runs.
-allowed-tools:
-  - Bash
 ---
 
 # Long-Running Jobs

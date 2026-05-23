@@ -1,16 +1,6 @@
 ---
 name: memory
 description: Criteria for deciding when, where and how to remember information. Use this skill whenever you might need to update a core memory block, file something under memory/, or write to a state file. It is CRITICAL that you use this skill.
-allowed-tools:
-  - Edit
-  - Glob
-  - Read
-  - Write
-  - file_search
-  - saga_end_session
-  - memory_query
-  - memory_store
-  - send_message
 success_criteria:
   # Memory is bidirectional — a read OR a write counts. Loading the
   # skill and then not exercising either path means we consulted the
