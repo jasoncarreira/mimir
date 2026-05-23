@@ -191,6 +191,23 @@ def test_unseen_posts_persist_in_cursor(fresh_feed_poller, monkeypatch, capsys, 
     assert _capture_emits(capsys) == []
 
 
+def test_datetime_timestamp_serialized(fresh_feed_poller, monkeypatch, capsys, tmp_path):
+    """social-cli's feed.yaml has unquoted ISO timestamps; PyYAML
+    parses them as datetime. Coercion in _format_event keeps json.dumps
+    happy."""
+    from datetime import datetime, timezone
+    monkeypatch.setenv("MIMIR_SOCIAL_PLATFORMS", "bsky")
+    post = _post("p1")
+    post["timestamp"] = datetime(2026, 5, 23, 12, 0, 0, tzinfo=timezone.utc)
+    _write_feed(tmp_path, "bsky", [post])
+    _stub_fetch(monkeypatch, fresh_feed_poller)
+
+    rc = fresh_feed_poller.main()
+    assert rc == 0
+    events = _capture_emits(capsys)
+    assert events[0]["timestamp"] == "2026-05-23T12:00:00+00:00"
+
+
 def test_cursor_lru_caps_at_max(fresh_feed_poller, monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("MIMIR_SOCIAL_PLATFORMS", "bsky")
     fresh_feed_poller.CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)

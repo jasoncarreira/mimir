@@ -29,15 +29,29 @@ def fresh_poller(tmp_path: Path, monkeypatch):
     return importlib.import_module("poller")
 
 
-def _write_inbox(state_dir: Path, notifications: list[dict]) -> None:
-    """Write a synthetic inbox.yaml in social-cli's exact shape."""
+def _write_inbox(state_dir: Path, notifications: list[dict],
+                 platforms: list[str] | None = None) -> None:
+    """Write synthetic per-platform inbox-{platform}.yaml files in
+    social-cli's exact shape.
+
+    If ``platforms`` is unset, the notifications are bucketed by their
+    ``platform`` field (default: all in ``inbox-bsky.yaml`` for older
+    tests that don't set MIMIR_SOCIAL_PLATFORMS).
+    """
     import yaml
     state_dir.mkdir(parents=True, exist_ok=True)
-    body = yaml.safe_dump({
-        "notifications": notifications,
-        "_sync": {"timestamp": "2026-03-25T12:00:00Z"},
-    })
-    (state_dir / "inbox.yaml").write_text(body)
+    by_platform: dict[str, list[dict]] = {}
+    for n in notifications:
+        p = n.get("platform") or "bsky"
+        by_platform.setdefault(p, []).append(n)
+    # If platforms were specified but empty for one, still write the
+    # file so the test sees an empty-platform read path.
+    for p in (platforms or list(by_platform.keys()) or ["bsky"]):
+        body = yaml.safe_dump({
+            "notifications": by_platform.get(p, []),
+            "_sync": {"timestamp": "2026-03-25T12:00:00Z"},
+        })
+        (state_dir / f"inbox-{p}.yaml").write_text(body)
 
 
 def _notif(nid: str, platform="bsky", ntype="mention",
@@ -223,6 +237,22 @@ def test_user_context_truncated_and_emitted(fresh_poller, monkeypatch, capsys, t
     assert "context:" in events[0]["prompt"]
     # Truncated to 500 + ellipsis.
     assert "…" in events[0]["prompt"]
+
+
+def test_datetime_timestamp_serialized(fresh_poller, monkeypatch, capsys, tmp_path):
+    """social-cli emits unquoted ISO timestamps; PyYAML parses them as
+    datetime objects. Pre-fix this crashed json.dumps. Now we coerce to
+    ISO string in _format_event."""
+    from datetime import datetime, timezone
+    notif = _notif("n1")
+    notif["timestamp"] = datetime(2026, 5, 23, 12, 0, 0, tzinfo=timezone.utc)
+    _write_inbox(tmp_path, [notif])
+    monkeypatch.setattr(fresh_poller, "_sync", lambda *a, **k: None)
+
+    rc = fresh_poller.main()
+    assert rc == 0  # didn't crash
+    events = _capture_emits(capsys)
+    assert events[0]["timestamp"] == "2026-05-23T12:00:00+00:00"
 
 
 def test_cursor_lru_caps_at_max(fresh_poller, monkeypatch, capsys, tmp_path):
