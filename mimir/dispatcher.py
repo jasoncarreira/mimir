@@ -20,6 +20,7 @@ from typing import Awaitable, Callable
 from .config import Config
 from .event_logger import log_event
 from .models import AgentEvent
+from .scheduler import SCHEDULER_CHANNEL_PREFIX
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,17 @@ class Dispatcher:
         self._queues: dict[str, asyncio.Queue[AgentEvent]] = {}
         self._workers: dict[str, asyncio.Task] = {}
         self._semaphore = asyncio.Semaphore(config.max_concurrent_turns)
+        # S2-3 fix: cross-job mutex for scheduler-triggered turns. The
+        # per-channel queue already serializes within a channel; this
+        # extra lock serializes across the ``scheduler:*`` channel family
+        # so the weekly reflect (Sun 06:00) and an hourly heartbeat
+        # firing at the same minute don't race on shared state files
+        # (``state/heartbeat-backlog.md``,
+        # ``state/learnings-pending.md``, ``state/proposed-changes.md``).
+        # Non-scheduler turns are unaffected — user_message / react /
+        # poller events still run concurrently up to
+        # ``max_concurrent_turns``.
+        self._scheduler_tick_lock = asyncio.Lock()
         self._closed = False
         self._high_water_logged: dict[str, bool] = {}
         # Channels with a turn currently inside run_turn (held the semaphore,
@@ -144,7 +156,16 @@ class Dispatcher:
                             continue
                         self._in_flight.add(channel_id)
                         try:
-                            await self._run_turn(event)
+                            # S2-3: serialize scheduler-triggered turns
+                            # across the whole ``scheduler:*`` channel
+                            # family. Non-scheduler turns skip the lock
+                            # and run concurrently up to the global
+                            # semaphore's cap.
+                            if channel_id.startswith(SCHEDULER_CHANNEL_PREFIX):
+                                async with self._scheduler_tick_lock:
+                                    await self._run_turn(event)
+                            else:
+                                await self._run_turn(event)
                         except Exception as exc:  # noqa: BLE001
                             log.exception("run_turn raised for %s", channel_id)
                             await log_event(

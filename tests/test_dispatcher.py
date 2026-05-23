@@ -292,6 +292,161 @@ async def test_idle_worker_retires_and_cleans_up_per_channel_dicts(
     await disp.drain()
 
 
+class TestSchedulerTickSerialization:
+    """S2-3 — scheduler:* channels share a process-wide async mutex so
+    the weekly reflect and an hourly heartbeat firing in the same minute
+    don't race on shared state files (heartbeat-backlog.md,
+    learnings-pending.md, proposed-changes.md)."""
+
+    @pytest.mark.asyncio
+    async def test_two_scheduler_ticks_serialize(self, tmp_path: Path) -> None:
+        """Two scheduler-triggered turns enqueued back-to-back must run
+        one-at-a-time even though they're on different channels and
+        the global semaphore would otherwise let them run concurrently."""
+        cfg = _make_config(tmp_path, max_concurrent_turns=4)
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_started = asyncio.Event()
+        order: list[str] = []
+
+        async def runner(event: AgentEvent) -> None:
+            if event.channel_id == "scheduler:reflect":
+                first_started.set()
+                await release_first.wait()
+                order.append("reflect")
+            elif event.channel_id == "scheduler:heartbeat":
+                second_started.set()
+                order.append("heartbeat")
+
+        disp = Dispatcher(cfg, runner)
+        await disp.enqueue(AgentEvent(
+            trigger="scheduled_tick", channel_id="scheduler:reflect", content=""
+        ))
+        await first_started.wait()
+        # Second scheduler tick on a DIFFERENT scheduler channel — must
+        # wait for the first to release the cross-channel mutex.
+        await disp.enqueue(AgentEvent(
+            trigger="scheduled_tick", channel_id="scheduler:heartbeat", content=""
+        ))
+        # Give the worker a chance to TRY to start the second turn.
+        await asyncio.sleep(0.05)
+        # If serialization works, second_started is still unset.
+        assert not second_started.is_set(), (
+            "scheduler:heartbeat started while scheduler:reflect was holding "
+            "the cross-job mutex"
+        )
+
+        release_first.set()
+        await disp.drain()
+        # Order is deterministic: reflect finishes before heartbeat starts.
+        assert order == ["reflect", "heartbeat"]
+
+    @pytest.mark.asyncio
+    async def test_non_scheduler_turn_runs_concurrently_with_scheduler_tick(
+        self, tmp_path: Path,
+    ) -> None:
+        """A user_message turn must NOT be blocked by an in-flight
+        scheduler tick. The mutex only constrains scheduler:* among
+        themselves; user-facing turns stay responsive."""
+        cfg = _make_config(tmp_path, max_concurrent_turns=4)
+        scheduler_started = asyncio.Event()
+        release_scheduler = asyncio.Event()
+        user_started = asyncio.Event()
+        completed: list[str] = []
+
+        async def runner(event: AgentEvent) -> None:
+            if event.channel_id == "scheduler:reflect":
+                scheduler_started.set()
+                await release_scheduler.wait()
+                completed.append("scheduler")
+            elif event.channel_id == "discord-123":
+                user_started.set()
+                completed.append("user")
+
+        disp = Dispatcher(cfg, runner)
+        await disp.enqueue(AgentEvent(
+            trigger="scheduled_tick", channel_id="scheduler:reflect", content=""
+        ))
+        await scheduler_started.wait()
+        await disp.enqueue(AgentEvent(
+            trigger="user_message", channel_id="discord-123", content="hi"
+        ))
+        # User turn proceeds even though scheduler is holding the
+        # scheduler-tick lock.
+        await asyncio.wait_for(user_started.wait(), timeout=1.0)
+        assert completed == ["user"]
+        release_scheduler.set()
+        await disp.drain()
+        assert "scheduler" in completed
+
+    @pytest.mark.asyncio
+    async def test_scheduler_lock_released_on_exception(
+        self, tmp_path: Path,
+    ) -> None:
+        """If a scheduler turn raises, the lock must still release so
+        the next scheduler turn isn't stuck waiting indefinitely.
+        Regression for the deadlock-on-error class."""
+        cfg = _make_config(tmp_path)
+        completed: list[str] = []
+
+        async def runner(event: AgentEvent) -> None:
+            if event.content == "raise":
+                raise RuntimeError("synthetic scheduler failure")
+            completed.append(event.content)
+
+        disp = Dispatcher(cfg, runner)
+        await disp.enqueue(AgentEvent(
+            trigger="scheduled_tick", channel_id="scheduler:reflect",
+            content="raise",
+        ))
+        await disp.enqueue(AgentEvent(
+            trigger="scheduled_tick", channel_id="scheduler:heartbeat",
+            content="after-raise",
+        ))
+        await disp.drain()
+        # Second scheduler turn ran — lock was released even though
+        # the first raised.
+        assert completed == ["after-raise"]
+
+    @pytest.mark.asyncio
+    async def test_two_non_scheduler_turns_run_concurrently(
+        self, tmp_path: Path,
+    ) -> None:
+        """Sanity check: two user_message turns on different channels
+        still run concurrently (max_concurrent_turns=4). The mutex
+        change must not regress non-scheduler concurrency."""
+        cfg = _make_config(tmp_path, max_concurrent_turns=4)
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        release = asyncio.Event()
+        completed: list[str] = []
+
+        async def runner(event: AgentEvent) -> None:
+            if event.channel_id == "discord-1":
+                first_started.set()
+                await release.wait()
+                completed.append("c1")
+            else:
+                second_started.set()
+                completed.append("c2")
+
+        disp = Dispatcher(cfg, runner)
+        await disp.enqueue(AgentEvent(
+            trigger="user_message", channel_id="discord-1", content=""
+        ))
+        await first_started.wait()
+        await disp.enqueue(AgentEvent(
+            trigger="user_message", channel_id="discord-2", content=""
+        ))
+        # Second user_message proceeds in parallel — no scheduler-tick
+        # mutex constrains it.
+        await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        assert completed == ["c2"]
+        release.set()
+        await disp.drain()
+        assert "c1" in completed
+
+
 @pytest.mark.asyncio
 async def test_drain_does_not_purge_dict_entries_for_busy_channels(
     tmp_path: Path,
