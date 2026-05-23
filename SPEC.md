@@ -4,7 +4,7 @@
 **Owner:** jcarreira
 **Date:** 2026-04-25
 
-Mimir is a memory-centric agent harness built on the Claude Agent SDK. It draws the memory model from open-strix (always-in-context "core" blocks plus on-demand non-core memory), the semantic-memory sidecar from muninnbot (MSAM), and the bash-and-file-ops tool surface common to open-strix / lettabot / Claude Code. It ships as a standalone Python package with its own Docker container and slots into `odin/benchmark` as a new adapter.
+Mimir is a memory-centric agent harness built on LangGraph (deepagents). It draws the memory model from open-strix (always-in-context "core" blocks plus on-demand non-core memory), the semantic-memory sidecar from muninnbot (SAGA, formerly MSAM), and the bash-and-file-ops tool surface common to open-strix / lettabot / Claude Code. It ships as a standalone Python package with its own Docker container and slots into `odin/benchmark` as a new adapter.
 
 The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdom-keeper Odin consults.
 
@@ -19,7 +19,7 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
 5. **Search/SAGA/indexing ship as skills, not inline tools.** A skill is a folder with `SKILL.md` + a Python module; at the model's interface a skill that exposes a function is still a tool. The distinction is packaging — skills are filesystem-installable and can be added without redeploying. Inline tools stay minimal — bash, file ops, channel messaging, scheduling, web.
 6. **No bespoke memory-block tools.** The agent edits memory blocks the same way a human would: bash and file ops. No `create_memory_block` / `update_memory_block` / etc.
 7. **SAGA in the same container, hooked on both ends.** Pre-message: SAGA is queried for relevant atoms and the hits are injected into the turn prompt (muninnbot/open-strix-hindsight pattern). Post-message: SAGA's `mark_contributions` is called to weight the atoms that informed the reply.
-8. **Subagents replace mountaineering.** The SDK's first-class `Agent` tool gives us isolated-context climbers without writing a supervisor of our own.
+8. **Out-of-process delegation via `spawn_claude_code`.** Long-running or sandboxed sub-tasks run in a separate Claude Code process (not in the parent's context window). The parent fires `spawn_claude_code` with a budget cap and an agent profile; a wake-up event fires on the parent's channel when the child exits.
 
 ---
 
@@ -30,16 +30,19 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
 ├── pyproject.toml
 ├── README.md
 ├── SPEC.md                       # this document
+├── FEEDBACK-LOOPS.md             # notes on feedback and algedonic signaling design
 ├── Dockerfile
 ├── docker/                       # (legacy — pre-v0.5 supervisord layout)
 │   ├── entrypoint.sh             # legacy: started mimir + msam under one PID 1
 │   └── supervisord.conf          # legacy: mimir agent + msam (now saga) server
+├── scripts/                      # maintenance + utility scripts
+├── docs/                         # design docs and code-review notes
 ├── mimir/                        # python package
 │   ├── __init__.py
 │   ├── server.py                 # entrypoint: HTTP + event loop
-│   ├── agent.py                  # Claude Agent SDK driver (query loop)
+│   ├── agent.py                  # LangGraph/deepagents driver (run_turn loop)
 │   ├── prompts.py                # system + turn prompt assembly
-│   ├── memory.py                 # core block loading
+│   ├── core_blocks.py            # core memory block loading (was memory.py)
 │   ├── index.py                  # INDEX.md generator
 │   ├── search.py                 # fastembed + sqlite indexer
 │   ├── saga_client.py            # SagaClient Protocol + _InProcessSaga
@@ -47,15 +50,29 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
 │   │                             # opt-out). v0.5 §2 — saga lives in the
 │   │                             # same process unless SAGA_ENDPOINT is set
 │   │                             # to a non-localhost URL.
-│   ├── scheduler.py              # add/list/remove schedules
-│   ├── tools.py                  # tool definitions exposed to the SDK
+│   ├── sagatools.py              # MCP tool wrappers around SagaClient
+│   ├── scheduler.py              # add/list/remove schedules (§6)
+│   ├── shell_jobs.py             # background bash jobs — bash_async / bash_job_output
+│   ├── pollers.py                # poller subprocess runner + manifest loader (§7.2.2)
+│   ├── history.py                # per-channel message history (§5.4)
+│   ├── feedback.py               # saga feedback / mark_contributions hook
+│   ├── dispatcher.py             # per-channel queue + S2 coordination
+│   ├── loop_detector.py          # send_message dedup / loop guard (S2)
+│   ├── skill_catalog.py          # skills catalog builder (mimir skills catalog)
+│   ├── skill_defs.py             # skill registration and tool definitions
+│   ├── billing.py                # plan-window billing helpers
+│   ├── budget.py                 # per-session tool-call budget gate
+│   ├── rate_limits.py            # homeostatic arbiter — suppresses ticks on quota overrun
+│   ├── health_probe.py           # bind-mount VirtioFS health probe (1/min cron)
 │   ├── channel_registry.py       # prefix → bridge dispatch (§7.2.3)
+│   ├── commitments/              # commitments extraction + tracking
+│   │   ├── extractor.py          # LLM-based promise extractor
+│   │   ├── store.py              # JSONL persistence
+│   │   └── poller.py             # due-check scheduled callable
 │   ├── bridges/                  # in-process channel bridges (§7.2.1)
-│   │   ├── __init__.py
 │   │   ├── base.py               # Bridge ABC
 │   │   ├── slack.py              # slack-bolt socket-mode
 │   │   ├── discord.py            # discord.py (port from open-strix)
-│   │   ├── bluesky.py            # atproto convo bridge
 │   │   ├── web_chat.py           # local web chat bridge — registers /chat onto the shared aiohttp app served by mimir/web_ui.py
 │   │   └── bench.py              # benchmark stdout bridge
 │   ├── turn_logger.py            # turns.jsonl writer (open-strix schema)
@@ -69,57 +86,54 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
 │   │                             # via MIMIR_PROMPTS_DIR.
 │   │                             # `saga_session_end_lean.md` sibling
 │   │                             # is the lean variant for narrow contexts.
-│   ├── sagatools.py              # MCP tool wrappers around SagaClient
-│   └── skills/                   # Claude Agent SDK skills (bundled)
-│       ├── memory-search/
-│       │   ├── SKILL.md
-│       │   └── search.py
-│       ├── memory/               # saga-backed memory tools (renamed from msam/)
-│       │   └── SKILL.md
-│       └── index/
-│           ├── SKILL.md
-│           └── rebuild.py
+│   └── skills/                   # bundled skills (operator-installed overrides — see §8)
+│       └── (skill overrides take priority over .mimir_builtin_skills/)
 ├── saga/                         # v0.5 §1 — workspace member, ex-msam2.
 │   ├── pyproject.toml            # saga as a standalone uv-installable
 │   │                             # package (no mimir dep).
 │   ├── saga/                     # python source (was msam/).
 │   └── benchmarks/longmemeval/   # saga-direct retrieval bench.
-└── benchmarks/
-    └── longmemeval_via_mimir/    # v0.5 §3 — integration bench. Drives
-                                  # LongMemEval through mimir's BenchBridge
-                                  # so cache + contextual_rewrite +
-                                  # mark_contributions effects measure
-                                  # end-to-end. NOT under saga/ (saga stays
-                                  # mimir-independent).
-├── home/                         # default agent home (volume-mounted)
-│   ├── logs/
-│   │   ├── events.jsonl          # firehose: lifecycle, queue, tool, scheduler events
-│   │   └── turns.jsonl           # one record per turn — open-strix schema
-│   ├── messages/
-│   │   └── chat_history.jsonl    # global append-only log; replayed into in-memory deques (§5.4)
-│   ├── memory/
-│   │   ├── INDEX.md              # auto-generated, lists everything under memory/ except core/
-│   │   ├── core/                 # always-in-context blocks (global)
-│   │   │   ├── 00-persona.md
-│   │   │   ├── 10-procedures.md
-│   │   │   └── 20-style.md
-│   │   ├── channels/             # per-channel agent-written notes (no cross-channel race)
-│   │   │   └── <channel_id>/     # e.g. dm-alice/, eng/, ops/
-│   │   └── shared/               # cross-channel agent knowledge (serialized writes)
-│   ├── state/
-│   │   ├── INDEX.md              # auto-generated, lists everything under state/
-│   │   └── (verbatim bulk content — agent-created)
-│   ├── scheduler.yaml            # scheduled jobs
-│   ├── skills/                   # agent-installable skills (with optional pollers.json — §7.2.2)
-│   └── .claude/
-│       └── agents/               # subagent definitions (climber, researcher, critic)
-└── tests/
-    ├── test_index.py
-    ├── test_search.py
-    └── test_scheduler.py
+├── benchmarks/
+│   └── longmemeval_via_mimir/    # v0.5 §3 — integration bench. Drives
+│                                 # LongMemEval through mimir's BenchBridge
+│                                 # so cache + contextual_rewrite +
+│                                 # mark_contributions effects measure
+│                                 # end-to-end. NOT under saga/ (saga stays
+│                                 # mimir-independent).
+└── tests/                        # mimir package tests (per-package saga tests under saga/saga/tests/)
 
-(Per-package tests live under each package: ``saga/saga/tests/`` for
-saga, ``tests/`` at workspace root for mimir + integration glue.)
+```
+
+Agent home (volume-mounted at `MIMIR_HOME`, defaults to `/mimir-home`):
+
+```
+<home>/
+├── logs/
+│   ├── events.jsonl              # firehose: lifecycle, queue, tool, scheduler events
+│   └── turns.jsonl               # one record per turn — open-strix schema
+├── messages/
+│   └── chat_history.jsonl        # global append-only log; replayed into in-memory deques (§5.4)
+├── memory/
+│   ├── INDEX.md                  # auto-generated, lists everything under memory/ except core/
+│   ├── core/                     # always-in-context blocks (loaded each turn)
+│   │   ├── 00-identity.md
+│   │   ├── 05-non-goals.md
+│   │   ├── 06-action-boundaries.md
+│   │   └── ...                   # (numeric-prefix ordered; agent manages)
+│   ├── channels/                 # per-channel agent-written notes
+│   │   └── <channel_id>/
+│   └── issues/                   # operational-gotcha fingerprints (every-turn INDEX)
+├── state/
+│   ├── INDEX.md                  # auto-generated, lists everything under state/
+│   ├── wiki/                     # synthesized knowledge (concepts/, topics/, entities/)
+│   ├── raw/                      # verbatim source extracts (append-only)
+│   ├── spec/                     # design docs in flight (chainlink-tracked)
+│   └── heartbeat-backlog.md      # autonomous-work queue
+├── scheduler.yaml                # scheduled jobs
+├── skills/                       # agent-installed skill overrides (higher priority than .mimir_builtin_skills/)
+└── .mimir_builtin_skills/        # bundled skills shipped with the image (lower priority)
+    └── <skill-name>/
+        └── SKILL.md
 ```
 
 ---
