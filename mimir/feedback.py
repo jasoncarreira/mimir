@@ -166,6 +166,19 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # the agent's feedback block can show "transient, recovered."
     "quota_exhausted": ("negative", "quota_exhausted"),
     "quota_recovered": ("positive", "quota_recovered"),
+    # SPEC §16 items follow-up from the 2026-05-23 VSM eval. The weekly
+    # viability report (mimir/viability_metrics.py) emits one event per
+    # threshold-crossing it detects. Each is a distinct collapse /
+    # curation failure mode so they're individually surfaced rather
+    # than rolled into a single ``viability_warning`` catch-all.
+    "collapse_risk_output_self_similarity": ("negative", "collapse_output_sim"),
+    "collapse_risk_atom_concentration": ("negative", "collapse_atom_gini"),
+    "collapse_risk_topic_lock": ("negative", "collapse_topic_lock"),
+    "curation_below_threshold_reflection": ("negative", "curation_reflection_low"),
+    "curation_below_threshold_feedback": ("negative", "curation_feedback_low"),
+    "curation_below_threshold_forget": ("negative", "curation_forget_low"),
+    "viability_report_ok": ("positive", "viability_ok"),
+    "viability_report_error": ("negative", "viability_error"),
     "git_pull_ok": ("positive", "git_pull_ok"),
     "git_fetch_ok": ("positive", "git_fetch_ok"),
     "shell_job_complete_enqueue_ok": ("positive", "shell_job_complete_enqueue_ok"),

@@ -620,6 +620,16 @@ def build_app(config: Config) -> web.Application:
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc), job="index-integrity")
 
+        # Register the weekly viability report (SPEC §16 follow-up
+        # from the 2026-05-23 VSM eval — collapse detection + curation
+        # rate). Runs Sunday 5 AM, after introspection-report at 4 AM
+        # so the report sees the week's fresh reflection output.
+        # Detection-only; bad cron logs and continues.
+        try:
+            scheduler.add_viability_report_job(home=config.home)
+        except ValueError as exc:
+            await log_event("scheduler_invalid_cron", error=str(exc), job="viability-report")
+
         # Register weekly introspection-report cron (FEEDBACK-LOOPS §4.7
         # + §4.8). Non-LLM: aggregates turns/events, writes report,
         # emits heartbeat_health_degraded events when scheduled-tick
