@@ -1,6 +1,6 @@
-"""Regression tests for PR #208 — saga correctness batch.
+"""Regression tests for PR #208 — saga correctness batch + migration unit tests.
 
-Covers two related fixes:
+Covers two regression groups and one schema-migration unit:
 
 1. FAISS index tombstone sync — ``SagaStore.forget`` must call
    ``_index.remove(atom_id)`` for each tombstoned atom. Pre-fix the
@@ -12,10 +12,13 @@ Covers two related fixes:
    contributing zero. The previous incarnation of this code (MSAM
    decay) regressed on similar edge cases.
 
-The schema-migration empty-applied edge case is left as a
-documented limitation in ``_apply_pending_migrations`` — fixing it
-correctly requires PRAGMA-driven schema introspection, more work
-than the current single-operator deployment posture warrants.
+3. ``_apply_pending_migrations`` dispatch logic — unit tests that pin
+   the fresh/existing-DB branching with a sentinel MIGRATIONS dict so
+   the tests are independent of the real DDL side-effects.
+   The ``fresh=False`` + empty-applied path is an xfail because the
+   correct fix requires ``PRAGMA table_info`` introspection (see the
+   KNOWN LIMITATION comment in client.py) — it currently stamps the
+   current version without running migrations.
 """
 
 from __future__ import annotations
@@ -223,3 +226,94 @@ def test_compute_activation_zero_weight_recent_event_contributes_zero():
         now=now,
     )
     assert math.isclose(act_with_zero, act_baseline, rel_tol=1e-9)
+
+
+# ─── _apply_pending_migrations: fresh/existing-DB split ──────────────
+
+
+def _minimal_schema_version_db(conn: sqlite3.Connection) -> None:
+    """Seed a minimal in-memory DB with only a schema_version table and
+    a sentinel log table (no atoms, no sessions). Used to test the
+    migration-dispatch logic in isolation without real DDL side-effects."""
+    conn.executescript(
+        """
+        CREATE TABLE schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );
+        CREATE TABLE _migration_log (version INTEGER);
+        """
+    )
+    conn.commit()
+
+
+def _patched_store(monkeypatch):
+    """Return a bare SagaStore instance with MIGRATIONS and
+    CURRENT_SCHEMA_VERSION patched to a simple, self-contained sentinel
+    migration. Migration 2 appends a row to ``_migration_log``."""
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore.__new__(SagaStore)
+    monkeypatch.setattr(
+        SagaStore,
+        "MIGRATIONS",
+        {2: "INSERT INTO _migration_log VALUES (2);"},
+    )
+    monkeypatch.setattr(SagaStore, "CURRENT_SCHEMA_VERSION", 2)
+    return store
+
+
+def test_apply_pending_migrations_fresh_true_stamps_current_version_no_ddl(
+    monkeypatch,
+):
+    """fresh=True: ``schema.sql`` has already been applied. The function
+    must stamp ``CURRENT_SCHEMA_VERSION`` and return *without* running
+    any migration DDL (running it would collide with the already-current
+    table shapes)."""
+    store = _patched_store(monkeypatch)
+    conn = sqlite3.connect(":memory:")
+    _minimal_schema_version_db(conn)
+
+    store._apply_pending_migrations(conn, fresh=True)
+
+    # Only the current version should be stamped — no v1, no migration ran.
+    versions = {r[0] for r in conn.execute("SELECT version FROM schema_version")}
+    assert versions == {2}, f"expected {{2}}, got {versions}"
+
+    log = conn.execute("SELECT version FROM _migration_log").fetchall()
+    assert log == [], "no migration DDL should run on fresh=True"
+
+
+@pytest.mark.xfail(
+    reason=(
+        "KNOWN LIMITATION (chainlink #175): existing DB with empty "
+        "schema_version stamps CURRENT_SCHEMA_VERSION without running "
+        "migrations. Fix requires PRAGMA table_info introspection to "
+        "distinguish a fresh schema.sql DB from a pre-migration-era DB — "
+        "see the KNOWN LIMITATION comment in mimir/saga/client.py."
+    ),
+    strict=True,
+)
+def test_apply_pending_migrations_fresh_false_empty_applied_runs_migrations(
+    monkeypatch,
+):
+    """fresh=False with an empty schema_version table (pre-migration-era
+    DB) — the function *should* treat it as v1 and apply pending migrations
+    (2..N), not silently stamp the current version and skip them.
+
+    Currently XFAIL: the function stamps CURRENT_SCHEMA_VERSION instead.
+    Remove the xfail mark when the PRAGMA-introspection fix lands.
+    """
+    store = _patched_store(monkeypatch)
+    conn = sqlite3.connect(":memory:")
+    _minimal_schema_version_db(conn)
+
+    store._apply_pending_migrations(conn, fresh=False)
+
+    # Both v1 (baseline stamp) and v2 (migration applied) should appear.
+    versions = {r[0] for r in conn.execute("SELECT version FROM schema_version")}
+    assert 1 in versions, "v1 baseline should be stamped"
+    assert 2 in versions, "migration v2 should have been applied"
+
+    log = conn.execute("SELECT version FROM _migration_log").fetchall()
+    assert log == [(2,)], f"migration v2 DDL should have run once; got {log}"
