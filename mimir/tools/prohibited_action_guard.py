@@ -1,16 +1,34 @@
-"""Code-level enforcement for the 'prohibited' zone of mimir's action boundaries.
+"""Best-effort regex screen for prohibited bash patterns.
 
 Supplements the text-based policy in memory/core/06-action-boundaries.md
-with harness-level interception for the most consequential bash patterns.
-Not comprehensive (full enforcement requires an LLM), but provides
-verifiable code-level protection for the hardest prohibitions and gives
-new operators a concrete reference point.
+with a substring/regex check on the bash tool's ``command`` argument
+*before* it reaches the shell. This is not a sandbox and not a
+security boundary — a determined caller wraps the command in a script
+file, base64-decodes a payload, uses git aliases, sets a different
+working directory, or simply renames the binary, and the regex
+doesn't see it. Treat it as a guardrail against accidents and a
+deterrent against trivial bypass attempts, not as enforcement.
 
-Currently enforced:
+Why it's still useful:
+- Most accidents look like the obvious form (``git push --force main``
+  typed directly), and screening those out closes off the cheap
+  failure mode.
+- The block message points the agent at the policy doc, which
+  surfaces the prohibition in the conversation's context.
+- New operators reading the codebase see one concrete reference
+  point for "what mimir won't let the agent do."
+
+If you need an actual security boundary, sandbox the agent process
+(seccomp/AppArmor/container caps) — not this module.
+
+Currently screened:
 - git push --force / --force-with-lease / -f to main or master
+- references to compose.env (operator-managed, must not be touched
+  from inside the agent process)
 
-Wired into BudgetGateMiddleware, so it applies to all bash/shell tool
-calls (shell_exec, bash_async, bash_exec, Bash) regardless of provider.
+Wired into BudgetGateMiddleware, so the screen applies to all
+bash/shell tool calls (shell_exec, bash_async, bash_exec, Bash)
+regardless of provider.
 """
 
 from __future__ import annotations

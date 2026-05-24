@@ -910,9 +910,37 @@ def build_app(config: Config) -> web.Application:
     return app
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _validate_bind_security(host: str, api_key: str) -> None:
+    """Refuse to bind a non-loopback interface without an API key.
+
+    Pre-OSS hardening (review item #2). The prior default bound
+    ``0.0.0.0`` regardless of whether ``MIMIR_API_KEY`` was set, so
+    any container with a published port was accessible to any
+    network peer with no auth at all. We now refuse the unsafe
+    combination at startup with an actionable message.
+
+    Loopback binds (``127.0.0.1``, ``::1``, ``localhost``) are
+    allowed without an API key — the safe local-dev posture. Any
+    other host requires ``MIMIR_API_KEY`` to be set.
+    """
+    if not api_key and host not in _LOOPBACK_HOSTS:
+        raise SystemExit(
+            f"refusing to bind {host!r} without MIMIR_API_KEY set — "
+            f"any host that can reach the port would be able to inject "
+            f"events, drive the agent, and read conversation history. "
+            f"Either set MIMIR_API_KEY=<a random secret> or set "
+            f"MIMIR_WEB_HOST=127.0.0.1 (the default) for loopback-only "
+            f"binding."
+        )
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config = Config.from_env()
+    _validate_bind_security(config.web_host, config.api_key)
     app = build_app(config)
 
     loop = asyncio.new_event_loop()
@@ -920,9 +948,9 @@ def main() -> None:
 
     runner = web.AppRunner(app)
     loop.run_until_complete(runner.setup())
-    site = web.TCPSite(runner, host="0.0.0.0", port=config.web_port)
+    site = web.TCPSite(runner, host=config.web_host, port=config.web_port)
     loop.run_until_complete(site.start())
-    log.info("mimir listening on :%d", config.web_port)
+    log.info("mimir listening on %s:%d", config.web_host, config.web_port)
 
     stop = loop.create_future()
 
