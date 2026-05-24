@@ -229,6 +229,8 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "curation_below_threshold_forget": ("negative", "curation_forget_low"),
     "viability_report_ok": ("positive", "viability_ok"),
     "viability_report_error": ("negative", "viability_error"),
+    "applied_audit_ok": ("positive", "applied_audit_ok"),
+    "applied_audit_error": ("negative", "applied_audit_error"),
     "git_pull_ok": ("positive", "git_pull_ok"),
     "git_fetch_ok": ("positive", "git_fetch_ok"),
     "shell_job_complete_enqueue_ok": ("positive", "shell_job_complete_enqueue_ok"),
