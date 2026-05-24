@@ -1281,6 +1281,43 @@ class Scheduler:
             coalesce=True,
         )
 
+    # ---- Proposed-changes backlog cron --------------------------------
+
+    def add_proposed_changes_backlog_job(
+        self,
+        home: Path,
+        cron_expr: str = "0 7 * * *",
+        *,
+        job_id: str = "proposed-changes-backlog",
+    ) -> bool:
+        """Register the daily proposed-changes backlog check. Reads
+        ``state/proposed-changes.md`` and emits
+        ``proposed_changes_backlog`` (negative algedonic) when the
+        pending count >= 10 OR the oldest pending proposal is >= 21
+        days old. Below-threshold runs are silent.
+
+        Default cron: ``0 7 * * *`` — 07:00 UTC daily. Lands before
+        typical operator work hours so the signal is in the algedonic
+        block at the start of the day. Sustained backlog will trigger
+        Alg-3 escalation (``algedonic_escalation``) after 5 daily
+        fires; the operator gets a persistent paper-trail event in
+        addition to the per-turn block surfacing.
+        """
+        from .reflection.proposed_changes_health import run_scheduled_backlog_check
+
+        async def _fire() -> None:
+            await run_scheduled_backlog_check(home)
+
+        return self.register_callable(
+            name=job_id,
+            fn=_fire,
+            default_cron=cron_expr,
+            job_id=job_id,
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # ---- Index-integrity cron ----------------------------------------
 
     def add_index_integrity_job(
