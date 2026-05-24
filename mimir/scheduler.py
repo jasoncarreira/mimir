@@ -1237,6 +1237,41 @@ class Scheduler:
             coalesce=True,
         )
 
+    # ---- Applied-proposals audit cron --------------------------------
+
+    def add_applied_audit_job(
+        self,
+        home: Path,
+        cron_expr: str = "0 8 1 * *",
+        *,
+        job_id: str = "applied-audit",
+    ) -> bool:
+        """Register the monthly applied-proposals audit (VSM S4-2 —
+        double-loop closure). Computes before/after signals for
+        proposals applied 1–4 weeks prior, writes a report to
+        ``state/reports/applied-audit-YYYY-MM-DD.md``, and emits
+        ``applied_audit_ok`` / ``applied_audit_error`` algedonic events.
+
+        Default cron: ``0 8 1 * *`` — 08:00 UTC on the 1st of each
+        month. Running monthly gives the 1–4 week window meaningful
+        coverage of the previous month's merged proposals. Operator
+        can override via the yaml's ``callable: applied-audit`` entry.
+        """
+        from .reflection.applied_audit import run_scheduled_applied_audit
+
+        async def _fire() -> None:
+            await run_scheduled_applied_audit(home)
+
+        return self.register_callable(
+            name=job_id,
+            fn=_fire,
+            default_cron=cron_expr,
+            job_id=job_id,
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # ---- Index-integrity cron ----------------------------------------
 
     def add_index_integrity_job(

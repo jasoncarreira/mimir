@@ -580,3 +580,60 @@ def render_audit_block(rows: Iterable[AuditRow]) -> str | None:
                 )
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+# ─── Scheduled-job entry point ─────────────────────────────────────────
+
+
+async def run_scheduled_applied_audit(home: Path) -> None:
+    """Scheduled-job callable (VSM S4-2). Closes the double-loop:
+    reads ``state/applied-proposals.jsonl``, computes before/after
+    signals for proposals applied 1–4 weeks ago, writes a report
+    to ``state/reports/applied-audit-YYYY-MM-DD.md``, and emits
+    one ``applied_audit_ok`` event per run (with row count) or
+    ``applied_audit_error`` if an exception escapes.
+
+    Runs once per month (first of the month at 08:00 UTC) so the
+    1–4 week window captures the previous month's merged proposals.
+    When no proposals fall in the window (common early on), the run
+    still succeeds and writes an empty-window report — this confirms
+    the job is firing even when there is nothing to audit.
+    """
+    from ..event_logger import log_event  # mimir.event_logger; avoid circular
+
+    try:
+        rows = audit_window(home)
+        block = render_audit_block(rows)
+
+        report_dir = home / "state" / "reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        out_path = report_dir / f"applied-audit-{today}.md"
+
+        lines: list[str] = [
+            f"# Applied-proposals audit — {today}",
+            "",
+            f"_Window: proposals applied 1–4 weeks before {today}._",
+            f"_Proposals in window: {len(rows)}_",
+            "",
+        ]
+        if block:
+            lines.append("## Effects of prior proposals")
+            lines.append("")
+            lines.append(block)
+        else:
+            lines.append("_(No proposals in window — nothing to audit.)_")
+
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        await log_event(
+            "applied_audit_ok",
+            report_path=str(out_path),
+            rows_audited=len(rows),
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive scheduler boundary
+        log.exception("applied_audit scheduled run failed")
+        await log_event(
+            "applied_audit_error",
+            error=f"{type(exc).__name__}: {exc}",
+        )

@@ -18,6 +18,7 @@ from mimir.reflection.applied_audit import (
     load_applied_proposals,
     mark_applied,
     render_audit_block,
+    run_scheduled_applied_audit,
 )
 
 NOW = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
@@ -522,3 +523,113 @@ def test_render_audit_block_marks_unparseable():
     out = render_audit_block(rows)
     assert out is not None
     assert "no parseable predicted-effect signal" in out
+
+
+# ─── run_scheduled_applied_audit ───────────────────────────────────────
+
+
+def _write_applied_proposal(home: Path, *, applied_at: str) -> None:
+    """Seed a minimal applied-proposals.jsonl entry."""
+    log_path = home / "state" / "applied-proposals.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "id": "2026-04-15 — test proposal",
+        "applied_at": applied_at,
+        "source": "reflection 2026-04-15",
+        "proposal": "Split the persona block.",
+        "rationale": "Reduce prompt size.",
+        "affected": "memory/core/00-persona.md",
+        "predicted_effect": "Drift indicator drops.",
+    }
+    with log_path.open("a") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+@pytest.mark.asyncio
+async def test_scheduled_applied_audit_writes_report_and_emits_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Happy path: audit_window returns rows → report file created +
+    applied_audit_ok event emitted with correct rows_audited count."""
+    import mimir.reflection.applied_audit as aa_mod
+
+    fake_proposal = AppliedProposal(
+        id="2026-04-15 — test proposal",
+        applied_at=datetime(2026, 4, 15, tzinfo=timezone.utc).isoformat(),
+        predicted_effect="Drift indicator drops.",
+    )
+    fake_rows = [AuditRow(proposal=fake_proposal, signals=[])]
+
+    # Monkeypatch audit_window to return a known row without date arithmetic.
+    monkeypatch.setattr(aa_mod, "audit_window", lambda *a, **kw: fake_rows)
+
+    events: list[tuple[str, dict]] = []
+
+    async def fake_log(kind, **kw):
+        events.append((kind, kw))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", fake_log)
+    await run_scheduled_applied_audit(tmp_path)
+
+    # Report file must exist under state/reports/
+    reports = list((tmp_path / "state" / "reports").glob("applied-audit-*.md"))
+    assert reports, "expected at least one applied-audit-*.md report"
+    content = reports[0].read_text()
+    assert "2026-04-15 — test proposal" in content
+
+    kinds = [k for k, _ in events]
+    assert "applied_audit_ok" in kinds
+    ok_payloads = [kw for k, kw in events if k == "applied_audit_ok"]
+    assert ok_payloads[0]["rows_audited"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduled_applied_audit_empty_window_still_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """When no applied-proposals.jsonl exists (or it has no entries in
+    the window), the run still emits applied_audit_ok with rows_audited=0."""
+    events: list[tuple[str, dict]] = []
+
+    async def fake_log(kind, **kw):
+        events.append((kind, kw))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", fake_log)
+    # No applied-proposals.jsonl seeded — fresh home.
+    await run_scheduled_applied_audit(tmp_path)
+
+    kinds = [k for k, _ in events]
+    assert "applied_audit_ok" in kinds
+    ok_payloads = [kw for k, kw in events if k == "applied_audit_ok"]
+    assert ok_payloads[0]["rows_audited"] == 0
+
+    # Report file must still be written (confirms job fired).
+    reports = list((tmp_path / "state" / "reports").glob("applied-audit-*.md"))
+    assert reports, "report file must be written even for empty window"
+    assert "No proposals in window" in reports[0].read_text()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_applied_audit_catches_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """If audit_window raises, the job catches it and emits
+    applied_audit_error without propagating the exception."""
+    events: list[tuple[str, dict]] = []
+
+    async def fake_log(kind, **kw):
+        events.append((kind, kw))
+
+    def _boom(*a, **kw):
+        raise RuntimeError("test failure")
+
+    monkeypatch.setattr("mimir.event_logger.log_event", fake_log)
+    monkeypatch.setattr(
+        "mimir.reflection.applied_audit.audit_window", _boom,
+    )
+    # Must not raise.
+    await run_scheduled_applied_audit(tmp_path)
+
+    kinds = [k for k, _ in events]
+    assert "applied_audit_error" in kinds
+    assert "applied_audit_ok" not in kinds
