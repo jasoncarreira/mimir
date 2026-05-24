@@ -151,8 +151,8 @@ r = IdentityResolver(home=home)
 r.reload()
 
 # People side
-print(r.resolve("discord-100000000000000001"))           # → canonical (e.g. "jason")
-print(r.display_name("discord-100000000000000001"))      # → "Jason Carreira"
+print(r.resolve("discord-100000000000000001"))           # → canonical (e.g. "alice")
+print(r.display_name("discord-100000000000000001"))      # → "Alice Anderson"
 
 # Channels side
 print(r.resolve_channel("slack-C100"))                   # → canonical

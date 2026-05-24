@@ -1,8 +1,7 @@
 """SQLite + saga-provider hybrid indexer (SPEC §6).
 
-Recipe ported from muninnbot's ``scripts/state_search.py`` (PostgreSQL+pgvector
-in source) → SQLite + FTS5 here so the benchmark container has no Postgres
-dependency. Same hybrid score weights:
+Adapted from a PostgreSQL+pgvector hybrid-search recipe → SQLite + FTS5
+here so the container has no Postgres dependency. Hybrid score weights:
 
     score = 0.5 * cosine + 0.2 * fts_bm25 + 0.3 * recency
 

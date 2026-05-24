@@ -1,12 +1,11 @@
 # Mimir — Agent Harness Spec
 
 **Status:** draft v1
-**Owner:** jcarreira
 **Date:** 2026-04-25
 
-Mimir is a memory-centric agent harness built on LangGraph (deepagents). It draws the memory model from open-strix (always-in-context "core" blocks plus on-demand non-core memory), the semantic-memory sidecar from muninnbot (SAGA, formerly MSAM), and the bash-and-file-ops tool surface common to open-strix / lettabot / Claude Code. It ships as a standalone Python package with its own Docker container and slots into `odin/benchmark` as a new adapter.
+Mimir is a memory-centric agent harness built on LangGraph (deepagents). It draws the memory model from [open-strix](https://github.com/jasoncarreira/open-strix) (always-in-context "core" blocks plus on-demand non-core memory), a semantic-memory sidecar (SAGA, formerly MSAM), and the bash-and-file-ops tool surface common to similar agent harnesses / Claude Code. It ships as a standalone Python package with its own Docker container.
 
-The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdom-keeper Odin consults.
+The name is from Norse myth — Mímir, the keeper of memory and counsel.
 
 ---
 
@@ -18,7 +17,7 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
 4. **Searchable bulk content.** All non-core memory and state files are embedded into a local SQLite + fastembed index. The agent reaches them through a single `file_search` skill.
 5. **Search/SAGA/indexing ship as skills, not inline tools.** A skill is a folder with `SKILL.md` + a Python module; at the model's interface a skill that exposes a function is still a tool. The distinction is packaging — skills are filesystem-installable and can be added without redeploying. Inline tools stay minimal — bash, file ops, channel messaging, scheduling, web.
 6. **No bespoke memory-block tools.** The agent edits memory blocks the same way a human would: bash and file ops. No `create_memory_block` / `update_memory_block` / etc.
-7. **SAGA in the same container, hooked on both ends.** Pre-message: SAGA is queried for relevant atoms and the hits are injected into the turn prompt (muninnbot/open-strix-hindsight pattern). Post-message: SAGA's `mark_contributions` is called to weight the atoms that informed the reply.
+7. **SAGA in the same container, hooked on both ends.** Pre-message: SAGA is queried for relevant atoms and the hits are injected into the turn prompt (retrieval-on-read pattern). Post-message: SAGA's `mark_contributions` is called to weight the atoms that informed the reply.
 8. **Out-of-process delegation via `spawn_claude_code`.** Long-running or sandboxed sub-tasks run in a separate Claude Code process (not in the parent's context window). The parent fires `spawn_claude_code` with a budget cap and an agent profile; a wake-up event fires on the parent's channel when the child exits.
 
 ---
@@ -88,10 +87,10 @@ The Norse-mythology name continues the muninn/hugin theme — Mimir is the wisdo
 │   │                             # is the lean variant for narrow contexts.
 │   └── skills/                   # bundled skills (operator-installed overrides — see §8)
 │       └── (skill overrides take priority over .mimir_builtin_skills/)
-├── saga/                         # v0.5 §1 — workspace member, ex-msam2.
+├── saga/                         # v0.5 §1 — vendored workspace member.
 │   ├── pyproject.toml            # saga as a standalone uv-installable
 │   │                             # package (no mimir dep).
-│   ├── saga/                     # python source (was msam/).
+│   ├── saga/                     # python source.
 │   └── benchmarks/longmemeval/   # saga-direct retrieval bench.
 ├── benchmarks/
 │   └── longmemeval_via_mimir/    # v0.5 §3 — integration bench. Drives
@@ -699,7 +698,7 @@ The `saga_consolidate_ok` event payload now includes a `dedup` block with `candi
 
 ### 6.1 Storage
 
-Single SQLite database at `<home>/.mimir/index.db`. Indexes everything under `memory/` (excluding `memory/core/` and `memory/INDEX.md`) plus everything under `state/` (excluding `state/INDEX.md`). Two tables, one FTS5 virtual table — port of muninnbot's hybrid state-search recipe (originally `state_search.py` in the muninnbot project) from PostgreSQL + pgvector to SQLite + FTS5 to keep the benchmark container self-contained (no Postgres dependency):
+Single SQLite database at `<home>/.mimir/index.db`. Indexes everything under `memory/` (excluding `memory/core/` and `memory/INDEX.md`) plus everything under `state/` (excluding `state/INDEX.md`). Two tables, one FTS5 virtual table — adapted from a hybrid state-search recipe ported from PostgreSQL + pgvector to SQLite + FTS5 to keep the container self-contained (no Postgres dependency):
 
 ```sql
 CREATE TABLE files (
@@ -730,7 +729,7 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
 
 ### 6.2 Embedder
 
-`fastembed` with `BAAI/bge-small-en-v1.5` (384-dim, local, no network). Lighter-weight than muninnbot's source recipe (which uses a remote-embedding model against Postgres) — chosen here so the container has no external embedding-service dependency. Chunks: 1000 chars with 150-char overlap.
+`fastembed` with `BAAI/bge-small-en-v1.5` (384-dim, local, no network). Lighter-weight than a remote-embedding-against-Postgres recipe — chosen here so the container has no external embedding-service dependency. Chunks: 1000 chars with 150-char overlap.
 
 This is intentionally pluggable. `mimir/search.py` exposes `Embedder` as a class with one config knob (`MIMIR_EMBED_MODEL`); swapping to a stronger model later is one line.
 
@@ -745,7 +744,7 @@ The indexer is a small thread inside the mimir process:
 
 ### 6.4 Retrieval
 
-Hybrid scoring (lettabot's recipe):
+Hybrid scoring (cosine + BM25 + recency):
 
 ```
 score = 0.5 * cosine + 0.2 * fts_bm25 + 0.3 * recency
@@ -1156,9 +1155,9 @@ Two append-only JSONL files in `<home>/logs/`, both ported verbatim from open-st
 
 The two files are independent writers and serve different purposes: events.jsonl is the agent's "self-diagnosis backbone" (introspection skill source-of-truth, root-cause debugging); turns.jsonl is the conversation transcript optimized for human reading and the viewer UI.
 
-Both files use the exact open-strix schemas, which buys us free compatibility with existing tooling — `benchmark/scripts/collate_turns.py` (opaque-line) and `benchmark/overview_turns.py` (parses turns.jsonl fields by name).
+Both files use the schemas ported from [open-strix](https://github.com/jasoncarreira/open-strix), which buys free compatibility with existing tooling that consumes those JSONL shapes.
 
-**Note on case style:** open-strix's port uses snake_case (`turn_id`, `session_id`, `duration_ms`); lettabot's TypeScript original camelCases on the wire (`turnId`). Mimir adopts **open-strix snake_case** since that's what the python tooling parses. If we ever need to consume lettabot's TS-native turns.jsonl, add a normalization shim in the viewer rather than dual-writing.
+**Note on case style:** snake_case (`turn_id`, `session_id`, `duration_ms`) throughout, since that's what the python tooling parses. If a downstream consumer ever needs camelCase JSONL, add a normalization shim in the viewer rather than dual-writing.
 
 ### 10.1 events.jsonl schema
 
@@ -1563,7 +1562,7 @@ Channel-specific config (Bluesky/Slack) is live (both bridges implemented post-P
 - `prompts/mimir/*.md`.
 - Reset semantics (tar snapshot + index truncate + saga reset).
 - 1-task smoke test on bluesky_recall.
-- 5-task run, compare to lettabot/open-strix baselines.
+- 5-task run, compare to upstream baselines.
 
 ### Phase 8 — hardening
 - Structured logs.

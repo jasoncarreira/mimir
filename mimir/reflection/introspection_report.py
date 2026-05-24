@@ -1,4 +1,4 @@
-"""Weekly event introspection report (ported from muninnbot).
+"""Weekly event introspection report.
 
 Replaces step-1 hand work in the reflection skill with a structured
 report computed once. Produces a markdown summary covering:
