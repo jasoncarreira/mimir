@@ -28,6 +28,37 @@ success_criteria:
 
 Pollers are lightweight scripts that check external services on a schedule and report back when something needs attention. They live inside skills and are discovered automatically by the scheduler.
 
+## Contract
+
+**Trigger**: Authoring a new poller (a `pollers.json` manifest + script), debugging
+why an existing poller isn't firing, or extending an existing one (new emit type,
+schedule change, new pass-through env var). Distinct from `world-scanning` (which
+catalogs *what* to poll) and from `async-tasks` (one-shot subprocess via
+`bash_async`, not recurring).
+
+**Requires**: A clear answer to "what state am I checking?"; the cron expression for
+the check cadence; the ability to write the script in any language (the framework
+cares about JSONL stdout shape, not language). A skill directory at
+`<home>/skills/<name>/` to host both `pollers.json` and the script — the framework
+discovers `<home>/skills/<name>/pollers.json` automatically.
+
+**Guarantees**:
+- New poller registers automatically via `reload_pollers` (or process restart) — no
+  manual `scheduler.yaml` edit.
+- Emitted events route to a synthetic channel `poller:<name>` so the agent treats
+  each as a fresh trigger.
+- **Silence is the filter** — a poller that has nothing to report outputs nothing
+  and the agent stays asleep. Only state-changes wake the agent.
+- Subprocess isolation — a poller crash can't take down the parent agent. Stderr
+  surfaces as `poller_stderr` events for debugging.
+
+**Does not**: Decide *what* to poll (that's `world-scanning`); manage in-process
+state changes (use scheduler callables for those — `saga-consolidate`,
+`oauth-usage-poll`, `viability-report`, etc. — they're not subprocess-isolated and
+can mutate mimir-internal state directly); replace `async-tasks` for one-shot
+async work; guarantee a successful emit (poller bugs surface as `poller_stderr` /
+`poller_nonzero_exit` algedonic events, not as silent failures).
+
 ## How It Works
 
 1. A skill includes a `pollers.json` file alongside its `SKILL.md`
