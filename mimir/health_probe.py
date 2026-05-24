@@ -5,7 +5,7 @@ target gets unlinked while the guest still holds it open) and triggers
 container self-restart so Docker's ``restart: unless-stopped`` policy
 re-establishes the bind cleanly.
 
-See ``BIND_MOUNT_HEALTH_PROBE.md`` at repo root for the full spec
+See ``docs/internal/BIND_MOUNT_HEALTH_PROBE.md`` for the full spec
 (detection mechanism, why kill PID 1, restart-loop guard, scheduling
 cadence, edge cases).
 

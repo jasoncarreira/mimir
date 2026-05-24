@@ -543,7 +543,7 @@ def build_app(config: Config) -> web.Application:
     web_chat.register_routes(app)
 
     async def _on_startup(app: web.Application) -> None:
-        # PR 4b (MIMIR_HOME_GIT_TRACKING): idempotent bootstrap. Runs
+        # PR 4b (docs/internal/MIMIR_HOME_GIT_TRACKING.md): idempotent bootstrap. Runs
         # before the agent starts processing turns so the post-turn
         # commit hook lands on a real repo. Sync function dispatched to
         # a thread because subprocess.run blocks the loop. Bootstrap
@@ -740,7 +740,7 @@ def build_app(config: Config) -> web.Application:
                         error=str(exc),
                     )
 
-        # Stage 5 of CLAUDE_SDK_CLIENT_MIGRATION.md retired the original
+        # Stage 5 of docs/internal/CLAUDE_SDK_CLIENT_MIGRATION.md retired the original
         # quota-poll cron because the plan was to use the shared
         # persistent client's get_context_usage(). That endpoint turned
         # out to be context-window data; its apiUsage side-channel is
@@ -845,7 +845,7 @@ def build_app(config: Config) -> web.Application:
                 error=str(exc),
             )
 
-        # Bind-mount health probe (BIND_MOUNT_HEALTH_PROBE.md).
+        # Bind-mount health probe (docs/internal/BIND_MOUNT_HEALTH_PROBE.md).
         # Detects VirtioFS stale-inode failures and self-restarts via
         # SIGTERM to PID 1. The probe self-gates on
         # ``/proc/self/mountinfo`` containing a virtiofs entry, so

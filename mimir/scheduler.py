@@ -369,7 +369,7 @@ class Scheduler:
         # is the override surface — entries naming a registered
         # callable change its cron without a restart; missing yaml
         # entry → env-var-default-cron is used. See
-        # ``SCHEDULER_CALLABLE_JOBS.md`` for the design.
+        # ``docs/internal/SCHEDULER_CALLABLE_JOBS.md`` for the design.
         self._callables: dict[str, _CallableDef] = {}
         # Pollers framework (chainlink #3). Discovered from
         # ``<home>/.claude/skills/**/pollers.json`` at startup +
@@ -1148,7 +1148,7 @@ class Scheduler:
         identities-injection design).
 
         Migrated to the named-callable registry (see
-        ``SCHEDULER_CALLABLE_JOBS.md``). The yaml side may
+        ``docs/internal/SCHEDULER_CALLABLE_JOBS.md``). The yaml side may
         override ``cron_expr`` via a ``callable: saga-consolidate``
         entry; ``cron_expr`` here is the env-var-derived default."""
         async def _consolidate() -> None:
@@ -1653,7 +1653,7 @@ class Scheduler:
     # ---- bind-mount health probe cron --------------------------------
 
     # VSM: S3 — non-LLM safety probe for the VirtioFS bind-mount stale-
-    #      inode failure mode (see BIND_MOUNT_HEALTH_PROBE.md). Spawns a
+    #      inode failure mode (see docs/internal/BIND_MOUNT_HEALTH_PROBE.md). Spawns a
     #      ``pwd`` subprocess in MIMIR_HOME; nonzero exit or "deleted"
     #      in stderr means the bind is broken and the agent should
     #      self-restart so Docker's restart policy can re-mount.
