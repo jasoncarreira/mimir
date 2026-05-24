@@ -64,3 +64,9 @@ home/
 # one-shot data dumps out of the repo (e.g. commitments-extraction
 # backtest results, throwaway profiling output).
 /scratch/
+
+# Runtime agent state. ``state/`` is per-deployment and accumulates
+# identity bindings, spec results, proposed-change drafts, wiki topics,
+# etc. — none of which belongs in source control. A fresh agent home
+# generates its own ``state/`` on first run.
+/state/
