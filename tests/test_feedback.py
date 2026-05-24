@@ -1356,3 +1356,124 @@ def test_viability_group_all_kinds_covered():
     assert viability_rule_kinds <= covered, (
         f"Uncovered viability kinds: {viability_rule_kinds - covered}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Alg-3: auto-escalation tests
+# ---------------------------------------------------------------------------
+
+def test_alg3_escalation_emits_event_when_threshold_crossed(tmp_path: Path):
+    """When a negative kind crosses its threshold, recent() emits an
+    algedonic_escalation event visible via _escalated_kinds_in_window on
+    the next call, and the rendered negative block contains the escalation line."""
+    from mimir.feedback import (
+        _ESCALATION_THRESHOLDS,
+        _escalated_kinds_in_window,
+    )
+    from mimir.event_logger import init_logger, _reset_logger_for_tests
+    from datetime import datetime, timedelta, timezone
+
+    events_path = tmp_path / "logs" / "events.jsonl"
+    events_path.parent.mkdir(parents=True)
+
+    # Use git_push_failed (threshold=3) — seed exactly at threshold.
+    threshold = _ESCALATION_THRESHOLDS["git_push_failed"]
+    assert threshold == 3  # guard — update test if constant changes
+    _write_jsonl(events_path, [
+        {"timestamp": _ts(h), "type": "git_push_failed", "reason": "ssh refused"}
+        for h in [20.0, 10.0, 1.0]
+    ])
+
+    init_logger(events_path, session_id="test-alg3-emit")
+    try:
+        feedback_log = FeedbackLog(
+            events_path=events_path,
+            turns_path=tmp_path / "logs" / "turns.jsonl",
+        )
+        negatives, _ = feedback_log.recent()
+
+        # algedonic_escalation event should now be in events.jsonl.
+        cutoff_iso = (
+            datetime.now(tz=timezone.utc) - timedelta(hours=24)
+        ).isoformat()
+        escalated = _escalated_kinds_in_window(None, events_path, cutoff_iso)
+        assert "git_push_failed" in escalated, (
+            "expected algedonic_escalation(kind=git_push_failed) written to events.jsonl"
+        )
+
+        # Rendered block should contain the escalation line.
+        block = feedback_log.recent_block()
+        assert block is not None
+        assert "algedonic escalation" in block
+        assert "git_push_failed" in block
+    finally:
+        _reset_logger_for_tests()
+
+
+def test_alg3_escalation_deduped_within_window(tmp_path: Path):
+    """Calling recent() twice in the same window emits the escalation event
+    exactly once — the second call sees it in already_escalated and skips."""
+    from mimir.event_logger import init_logger, _reset_logger_for_tests
+
+    events_path = tmp_path / "logs" / "events.jsonl"
+    events_path.parent.mkdir(parents=True)
+    _write_jsonl(events_path, [
+        {"timestamp": _ts(h), "type": "git_push_failed", "reason": "auth"}
+        for h in [20.0, 10.0, 1.0]  # at threshold of 3
+    ])
+
+    init_logger(events_path, session_id="test-alg3-dedup")
+    try:
+        feedback_log = FeedbackLog(
+            events_path=events_path,
+            turns_path=tmp_path / "logs" / "turns.jsonl",
+        )
+        feedback_log.recent()   # first call — emits 1 escalation
+        feedback_log.recent()   # second call — must NOT emit again
+
+        escalation_events = [
+            json.loads(line)
+            for line in events_path.read_text().splitlines()
+            if line.strip()
+            and json.loads(line).get("type") == "algedonic_escalation"
+            and json.loads(line).get("kind") == "git_push_failed"
+        ]
+        assert len(escalation_events) == 1, (
+            f"expected exactly 1 escalation event, got {len(escalation_events)}"
+        )
+    finally:
+        _reset_logger_for_tests()
+
+
+def test_alg3_below_threshold_no_escalation(tmp_path: Path):
+    """When count < threshold, no algedonic_escalation event is emitted."""
+    from mimir.event_logger import init_logger, _reset_logger_for_tests
+    from mimir.feedback import _ESCALATION_THRESHOLDS
+
+    threshold = _ESCALATION_THRESHOLDS["git_push_failed"]  # 3
+    events_path = tmp_path / "logs" / "events.jsonl"
+    events_path.parent.mkdir(parents=True)
+    # Only threshold-1 events — must not trigger escalation.
+    _write_jsonl(events_path, [
+        {"timestamp": _ts(h), "type": "git_push_failed", "reason": "timeout"}
+        for h in range(threshold - 1)
+    ])
+
+    init_logger(events_path, session_id="test-alg3-below")
+    try:
+        FeedbackLog(
+            events_path=events_path,
+            turns_path=tmp_path / "logs" / "turns.jsonl",
+        ).recent()
+
+        escalation_events = [
+            json.loads(line)
+            for line in events_path.read_text().splitlines()
+            if line.strip()
+            and json.loads(line).get("type") == "algedonic_escalation"
+        ]
+        assert escalation_events == [], (
+            f"expected no escalation events below threshold, got {escalation_events}"
+        )
+    finally:
+        _reset_logger_for_tests()
