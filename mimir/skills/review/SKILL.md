@@ -9,6 +9,27 @@ Read the diff, draft a verdict, and **submit it via `gh pr review`**. The
 submission step is not optional — it is the definition of "done" for this
 skill.
 
+## Contract
+
+**Trigger**: Operator asks to review a PR; or the github-activity poller fires a
+`pr_opened` / `review_requested` event for a PR authored by someone other than
+`mimir-carreira` (mimir's own PRs don't self-review).
+
+**Requires**: PR number; `gh` CLI authenticated (verified by `gh auth status`);
+diff accessible — either under 20k lines via `gh pr diff`, or file list via
+`gh api repos/.../pulls/<n>/files --paginate` for large PRs.
+
+**Guarantees**:
+- A review is posted to GitHub (not just output to turn text) via `gh pr review`.
+- Verdict is one of APPROVE / REQUEST_CHANGES / COMMENT — never left unsubmitted.
+- Every blocking finding is anchored to a specific file + line in the diff.
+- Full test suite passes (or a clean explanation of why failures are pre-existing
+  and tracked) before APPROVE is submitted.
+
+**Does not**: Merge PRs; modify source code directly; auto-resolve conversations;
+review PRs it authored (`mimir-carreira` as author means a different reviewer is
+needed).
+
 ## Step-by-step
 
 ### 1. Get PR context

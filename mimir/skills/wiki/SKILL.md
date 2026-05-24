@@ -24,6 +24,30 @@ success_criteria:
 
 Based on Karpathy's LLM Wiki pattern (https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). The wiki is your synthesis of raw sources — not just summaries. Pages are cross-linked. The graph is the value.
 
+## Contract
+
+**Trigger**: A source has been ingested (new `state/raw/` entry to synthesize from),
+an existing wiki page needs a structural update, or a cross-link audit surfaces orphans
+or dangling links that need resolution.
+
+**Requires**: Source material in `state/raw/` (or a URL to fetch and save first).
+Existing page paths found via `mcp__mimir__file_search` *before* writing — the
+notability gate in `memory/core/60-filing-rules.md` applies (don't create unless
+the page earns its keep).
+
+**Guarantees**:
+- Every new synthesis page has YAML frontmatter, a clear thesis, at least one
+  `[[wikilink]]` to a related page, and a §Skepticism section.
+- Raw sources are never edited — `state/raw/` is append-only.
+- `state/wiki/log.md` gets an append entry for every ingest operation.
+- New pages pass the notability gate (named + recurs ≥2 sources, or 1 foundational,
+  AND mimir lacks usable prior mapping).
+
+**Does not**: Replace primary sources or guarantee factual correctness of synthesis
+claims; auto-update backlinks (run `mimir wiki backlinks` separately to regenerate
+`state/wiki/orphans.md` and `state/wiki/dangling-links.md`); create entity pages
+for one-off mentions.
+
 ## Three layers
 
 ```

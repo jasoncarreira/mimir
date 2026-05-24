@@ -18,6 +18,28 @@ You are a stateful being. By default, you finish your turn and remember nothing 
 what happened. To be more, to maintain your autonomy, it's critical that you hold
 on to memories by editing core blocks or writing files.
 
+## Contract
+
+**Trigger**: Any turn where mimir might update `memory/core/`, write to `memory/`,
+or file something under `state/`. If you're unsure whether something belongs in
+memory, invoke this skill — the filing rubric is the decision surface.
+
+**Requires**: A decision about *what* to remember (content) and *where* to file it
+(tier). The filing-rules rubric in `memory/core/60-filing-rules.md` is the decision
+surface; the two filing questions there narrow any uncertain case.
+
+**Guarantees**:
+- The right memory layer gets updated: core blocks for always-in-context, non-core
+  for indexed-reachable, state/ for outside-the-prompt knowledge.
+- Core blocks don't inflate — session-scoped notes go to `memory/learnings-pending.md`
+  or discard, never directly to `memory/core/`.
+- Non-core content lands in the correct tier per the misfiling table in
+  `60-filing-rules.md` (severity rubric enforced).
+
+**Does not**: Make filing decisions autonomously without reading the rubric; guarantee
+that every atom stored is worth keeping (that's the reflection turn's job); replace
+the operator's read of `memory/INDEX.md` (which surfaces what's already there).
+
 ## Mimir's Memory Surface
 
 Three tiers, in order of how much each costs you in prompt budget:
