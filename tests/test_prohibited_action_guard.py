@@ -94,6 +94,81 @@ class TestForcePushPatterns:
         assert _BLOCK_PREFIX in result
 
 
+class TestComposeEnvGuard:
+    """S5-2 onboarding layer: bash references to ``compose.env`` must
+    be blocked. WriteGuardBackend reads ``MIMIR_ONBOARDING_MODE`` once
+    at construction — the agent can't flip a live process's env — but
+    it could plant a dormant ``MIMIR_ONBOARDING_MODE=true`` line in
+    ``compose.env`` via shell that would take effect on the next
+    container restart. This guard closes that vector.
+
+    The operator's path (editing compose.env from the host) doesn't go
+    through the agent's tool dispatch, so it's unaffected — only the
+    in-container shell is constrained.
+    """
+
+    def test_compose_env_write_via_redirect_blocked(self) -> None:
+        # echo ... >> compose.env — dormant-plant attempt.
+        result = check_prohibited_bash(
+            'echo "MIMIR_ONBOARDING_MODE=true" >> /mimir-home/compose.env'
+        )
+        assert result is not None
+        assert _BLOCK_PREFIX in result
+
+    def test_compose_env_write_via_overwrite_blocked(self) -> None:
+        # echo ... > compose.env — wholesale replacement.
+        result = check_prohibited_bash('echo "ANYTHING=x" > compose.env')
+        assert result is not None
+        assert _BLOCK_PREFIX in result
+
+    def test_compose_env_via_cat_heredoc_blocked(self) -> None:
+        result = check_prohibited_bash(
+            "cat > /mimir-home/compose.env <<'EOF'\nKEY=value\nEOF"
+        )
+        assert result is not None
+        assert _BLOCK_PREFIX in result
+
+    def test_compose_env_via_sed_inplace_blocked(self) -> None:
+        # sed -i to edit a specific line.
+        result = check_prohibited_bash(
+            "sed -i 's/MIMIR_ONBOARDING_MODE=false/MIMIR_ONBOARDING_MODE=true/' "
+            "/mimir-home/compose.env"
+        )
+        assert result is not None
+        assert _BLOCK_PREFIX in result
+
+    def test_compose_env_read_blocked_too(self) -> None:
+        # Coarse on purpose — reading the file gets blocked too. The
+        # agent has no legitimate reason to read compose.env (operator
+        # secrets live there).
+        result = check_prohibited_bash("cat /mimir-home/compose.env")
+        assert result is not None
+        assert _BLOCK_PREFIX in result
+
+    def test_compose_env_substring_in_arg_blocked(self) -> None:
+        # ``compose.env`` appearing as a substring anywhere triggers
+        # the guard. Operator's host-side ``docker compose --env-file
+        # ./compose.env up -d`` runs OUTSIDE the agent's tool dispatch
+        # (different process tree), so this only catches in-container
+        # shell.
+        result = check_prohibited_bash(
+            "diff /tmp/backup.env /mimir-home/compose.env"
+        )
+        assert result is not None
+        assert _BLOCK_PREFIX in result
+
+    def test_unrelated_compose_path_allowed(self) -> None:
+        # ``docker-compose.yml`` or ``compose.yml`` don't contain
+        # ``compose.env`` as a substring → allowed.
+        result = check_prohibited_bash("cat /mimir-home/compose.yml")
+        assert result is None
+
+    def test_unrelated_env_file_allowed(self) -> None:
+        # A different .env file (e.g. ``<home>/.env``) doesn't match.
+        result = check_prohibited_bash("cat /mimir-home/.env")
+        assert result is None
+
+
 class TestIsBashTool:
     def test_shell_exec_is_bash(self) -> None:
         assert is_bash_tool("shell_exec") is True

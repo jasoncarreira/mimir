@@ -459,6 +459,191 @@ class TestCoreMemoryReflectionGate:
         assert "upload_core_memory_non_reflection" in ops
 
 
+class TestOnboardingMode:
+    """S5-2 onboarding bypass via the ``onboarding_mode`` constructor
+    flag (sourced from ``MIMIR_ONBOARDING_MODE`` env var in
+    production). When True, the reflection-only gate on
+    ``memory/core/`` yields so the agent can collaboratively bootstrap
+    its persona / memory architecture during first-run setup.
+
+    Restart-to-flip is the tamper-resistance property: the flag is
+    read once at backend construction; mid-process env changes don't
+    re-evaluate. The agent can edit compose.env via bash but the
+    value isn't read until the next container restart, and the agent
+    has no docker socket to self-restart.
+    """
+
+    @pytest.fixture
+    def home_with_memory(self, tmp_path: Path) -> Path:
+        (tmp_path / "state").mkdir()
+        (tmp_path / "memory").mkdir()
+        (tmp_path / "memory" / "core").mkdir()
+        return tmp_path
+
+    @staticmethod
+    def _make_user_turn_ctx():
+        from mimir.models import TurnContext
+        return TurnContext(
+            turn_id="t-test", session_id="s-test", trigger="user_message",
+            channel_id="discord-123", started_at=0.0,
+        )
+
+    @staticmethod
+    def _set_turn(ctx):
+        from mimir._context import set_current_turn
+        return set_current_turn(ctx)
+
+    @staticmethod
+    def _clear_turn(token):
+        from mimir._context import reset_current_turn
+        reset_current_turn(token)
+
+    def test_bypass_active_when_onboarding_mode_true(
+        self, home_with_memory: Path
+    ) -> None:
+        """With onboarding_mode=True, non-reflection writes to
+        memory/core/ succeed — the bootstrap path."""
+        b = WriteGuardBackend(
+            root_dir=home_with_memory, writable_dirs=["memory"],
+            onboarding_mode=True,
+        )
+        ctx = self._make_user_turn_ctx()
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/00-persona.md", content="bootstrap")
+            assert getattr(r, "error", None) is None
+        finally:
+            self._clear_turn(tok)
+
+    def test_gate_enforced_when_onboarding_mode_false(
+        self, home_with_memory: Path
+    ) -> None:
+        """Default ``onboarding_mode=False`` → gate enforces in
+        non-reflection turns. The production steady-state."""
+        b = WriteGuardBackend(
+            root_dir=home_with_memory, writable_dirs=["memory"],
+            onboarding_mode=False,
+        )
+        ctx = self._make_user_turn_ctx()
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/00-persona.md", content="bad")
+            assert "reflection-only" in (getattr(r, "error", "") or "")
+        finally:
+            self._clear_turn(tok)
+
+    def test_default_constructor_arg_is_false(
+        self, home_with_memory: Path
+    ) -> None:
+        """Omitting onboarding_mode= falls back to False — fail-closed
+        default. A backend constructed without the flag enforces the
+        gate (matches the steady-state production shape)."""
+        b = WriteGuardBackend(
+            root_dir=home_with_memory, writable_dirs=["memory"],
+            # No onboarding_mode arg.
+        )
+        ctx = self._make_user_turn_ctx()
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/00-persona.md", content="bad")
+            assert "reflection-only" in (getattr(r, "error", "") or "")
+        finally:
+            self._clear_turn(tok)
+
+    def test_reflection_turn_unaffected_by_onboarding_mode(
+        self, home_with_memory: Path
+    ) -> None:
+        """Reflection turns always pass the gate, regardless of
+        onboarding_mode. The bypass is purely additive."""
+        from mimir.models import TurnContext
+        # onboarding_mode=False — reflection turn should still write.
+        b = WriteGuardBackend(
+            root_dir=home_with_memory, writable_dirs=["memory"],
+            onboarding_mode=False,
+        )
+        ctx = TurnContext(
+            turn_id="t", session_id="s", trigger="scheduled_tick",
+            channel_id="scheduler:reflect", started_at=0.0,
+        )
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(file_path="/memory/core/40-learned-behaviors.md", content="ok")
+            assert getattr(r, "error", None) is None
+        finally:
+            self._clear_turn(tok)
+
+    def test_onboarding_mode_does_not_unlock_writable_roots(
+        self, home_with_memory: Path
+    ) -> None:
+        """The bypass only affects the S5-2 memory/core/ gate. Writes
+        outside MIMIR_FOLDERS are still blocked by the standard
+        writable-roots check."""
+        (home_with_memory / "logs").mkdir()
+        b = WriteGuardBackend(
+            root_dir=home_with_memory, writable_dirs=["memory"],
+            onboarding_mode=True,  # bypass on
+        )
+        # logs/ is not in writable_dirs → blocked by the outer check,
+        # not by the S5-2 gate.
+        r = b.write(file_path="/logs/exfil.txt", content="nope")
+        assert "Writable directories" in (getattr(r, "error", "") or "")
+
+    def test_onboarding_mode_does_not_affect_non_core_paths(
+        self, home_with_memory: Path
+    ) -> None:
+        """Writes to non-core memory/ paths (e.g.
+        memory/learnings-pending.md) work the same whether
+        onboarding_mode is on or off — they were never gated."""
+        b = WriteGuardBackend(
+            root_dir=home_with_memory, writable_dirs=["memory"],
+            onboarding_mode=False,
+        )
+        ctx = self._make_user_turn_ctx()
+        tok = self._set_turn(ctx)
+        try:
+            r = b.write(
+                file_path="/memory/learnings-pending.md", content="entry",
+            )
+            assert getattr(r, "error", None) is None
+        finally:
+            self._clear_turn(tok)
+
+    def test_onboarding_mode_true_logs_warning(
+        self, home_with_memory: Path, caplog
+    ) -> None:
+        """Construction with ``onboarding_mode=True`` must emit a
+        WARNING log so the operator sees "I'm in onboarding mode" on
+        every container restart. Reviewer note 3 on PR #301."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="mimir.readonly_backend"):
+            WriteGuardBackend(
+                root_dir=home_with_memory, writable_dirs=["memory"],
+                onboarding_mode=True,
+            )
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "MIMIR_ONBOARDING_MODE=true" in r.getMessage() for r in warnings
+        ), "expected an onboarding-mode WARNING; got: " + ", ".join(
+            r.getMessage() for r in warnings
+        )
+
+    def test_onboarding_mode_false_does_not_log_warning(
+        self, home_with_memory: Path, caplog
+    ) -> None:
+        """Default state (bypass off) must NOT emit the warning —
+        otherwise every container restart would log a misleading line."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="mimir.readonly_backend"):
+            WriteGuardBackend(
+                root_dir=home_with_memory, writable_dirs=["memory"],
+                onboarding_mode=False,
+            )
+        assert not any(
+            "MIMIR_ONBOARDING_MODE" in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
+
+
 class TestReadOnlyFilesystemBackend:
     def test_blocks_all_writes(self, home: Path) -> None:
         b = ReadOnlyFilesystemBackend(root_dir=home)
