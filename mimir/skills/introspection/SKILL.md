@@ -27,6 +27,33 @@ You are a stateful agent. Your behavior leaves traces in structured logs. This s
 teaches you to read those traces to diagnose problems, understand your own patterns,
 and improve.
 
+## Contract
+
+**Trigger**: Something went wrong and you need to know why — a message didn't land, a
+scheduled job didn't fire, a tool call returned an error you don't understand. Also
+fires for pattern-recognition work that spans many turns: cost spike investigation,
+repeated tool denials, drift detection, "what was I doing the last time X happened?"
+The operator asking "what happened when..." is the canonical trigger.
+
+**Requires**: `logs/turns.jsonl` and `logs/events.jsonl` accessible under `<home>/logs/`
+(seeded by `mimir setup`); `jq` on PATH for the query recipes; Read tool for the
+`chat_history.jsonl` spot-checks.
+
+**Guarantees**:
+- A diagnosis lands in durable form — either a written report at
+  `state/reports/<name>.md` or a `memory_query` that anchors the finding against
+  prior atoms. A turn that loads this skill and produces neither hasn't actually
+  diagnosed anything.
+- Source-of-truth hierarchy is respected: `turns.jsonl` for "what was the turn?",
+  `events.jsonl` for fine-grained tool-call analysis, `chat_history.jsonl` for "did
+  the message actually land?". Wiki pages are NOT ground truth for what just happened.
+
+**Does not**: Modify logs (read-only); replace the reflection turn's weekly aggregate
+view (introspection is per-incident; reflection is per-week); execute fixes for what
+it diagnoses (a diagnosis informs the fix; the fix is a separate turn); reach into
+SAGA atoms as the primary source of truth (atoms are post-synthesis; for "what
+happened", events.jsonl is closer to ground).
+
 ## Source of Truth Hierarchy
 
 1. **`logs/turns.jsonl`** — Per-turn summaries. One record per agent invocation with the full sequence of tool calls, results, and output. Best for understanding what happened during a specific turn.
