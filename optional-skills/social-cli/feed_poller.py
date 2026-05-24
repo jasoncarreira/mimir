@@ -165,11 +165,28 @@ def _format_event(post: dict) -> dict | None:
 
     text_line = f"\n  > {text}" if text else ""
     stats = f"likes:{likes} replies:{replies} reposts:{reposts}"
+    # Action hint: surfaces the right tool (outbox + dispatch) for any
+    # engagement decision the agent makes about this post. Without it,
+    # the agent's instinct is to reach for ``send_message`` — which
+    # routes to a Discord/Slack channel, NOT back to Bluesky/X. Caught
+    # by muninn-mimir 2026-05-23: a Bluesky feed post the agent wanted
+    # to reply to landed in Discord instead. Per-event overhead ~270
+    # chars; bounded by ``batch_size`` (default 10 for feed).
+    action_hint = (
+        "\n\n→ To engage with this post (reply / like / repost): append to "
+        "<STATE_DIR>/outbox.yaml + run `social-cli dispatch`.\n"
+        "  Minimal shape:\n"
+        "    dispatch:\n"
+        f"      - reply: {{ platform: {platform}, id: \"{pid}\", text: \"...\" }}\n"
+        f"      - like:  {{ platform: {platform}, id: \"{pid}\" }}\n"
+        f"  send_message routes to Discord/Slack — NOT to {platform}. Use outbox."
+    )
     prompt = (
         f"[{platform}] feed post from {author}"
         f"{text_line}"
         f"\n  id: {pid}"
         f"\n  {stats}"
+        f"{action_hint}"
     )
     out = {
         "poller": POLLER_NAME,
