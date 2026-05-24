@@ -653,6 +653,18 @@ def build_app(config: Config) -> web.Application:
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc), job="applied-audit")
 
+        # Register daily proposed-changes backlog check. Surfaces
+        # operator review backlog (>= 10 pending OR oldest >= 21d old)
+        # as a negative algedonic event the next turn after the cron
+        # fires. Detection-only; bad cron logs and continues.
+        try:
+            scheduler.add_proposed_changes_backlog_job(home=config.home)
+        except ValueError as exc:
+            await log_event(
+                "scheduler_invalid_cron", error=str(exc),
+                job="proposed-changes-backlog",
+            )
+
         # Register weekly introspection-report cron (FEEDBACK-LOOPS §4.7
         # + §4.8). Non-LLM: aggregates turns/events, writes report,
         # emits heartbeat_health_degraded events when scheduled-tick
