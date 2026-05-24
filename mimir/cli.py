@@ -957,9 +957,6 @@ _SAGA_API_KEY_LINE_RE = re.compile(r"^(\s*)SAGA_API_KEY\s*=.*$", re.MULTILINE)
 _MIMIR_MODEL_SPEC_LINE_RE = re.compile(
     r"^(\s*)MIMIR_MODEL_SPEC\s*=.*$", re.MULTILINE,
 )
-_MIMIR_ONBOARDING_MODE_LINE_RE = re.compile(
-    r"^(\s*)MIMIR_ONBOARDING_MODE\s*=.*$", re.MULTILINE,
-)
 _ANTHROPIC_BASE_URL_LINE_RE = re.compile(
     r"^(\s*)ANTHROPIC_BASE_URL\s*=.*$", re.MULTILINE,
 )
@@ -1072,7 +1069,8 @@ def setup_home(
     files_created: list[str] = []
     api_key_action: str | None = None
     saga_api_key_action: str | None = None
-    if _write_if_missing(home / ".env", DEFAULT_ENV_TEMPLATE):
+    env_was_new = _write_if_missing(home / ".env", DEFAULT_ENV_TEMPLATE)
+    if env_was_new:
         files_created.append(".env")
     # Inject the resolved model spec + provider env vars. Preserves any
     # existing operator value on re-run (don't clobber if the operator
@@ -1127,19 +1125,21 @@ def setup_home(
     else:
         saga_key = _env_get_var(home / ".env", _SAGA_API_KEY_LINE_RE) or ""
 
-    # S5-2 onboarding bypass — default ON for fresh deployments so the
-    # agent can collaboratively bootstrap memory/core/ during first-run
-    # setup. Idempotent: only writes when missing (a re-run never
-    # clobbers an operator-set ``false``). Operators must mirror this
-    # to compose.env for it to take effect inside the container —
-    # ``mimir setup`` only manages ``<home>/.env``, never compose.env.
+    # S5-2 onboarding bypass — default ON for FRESH deployments only.
+    # The template (DEFAULT_ENV_TEMPLATE) already includes
+    # ``MIMIR_ONBOARDING_MODE=true``, so a freshly-created ``.env`` has
+    # the line. For existing deployments (``.env`` already present
+    # before this run, line possibly missing because the env var
+    # didn't exist in earlier mimir versions), we DO NOT auto-add the
+    # line — that would silently re-enable the bypass on every restart
+    # post-upgrade, which is a footgun. Operators upgrading who want
+    # the bypass can add ``MIMIR_ONBOARDING_MODE=true`` to compose.env
+    # manually. Reviewer note 2 on PR #301.
     onboarding_mode_action: str | None = None
-    if _env_get_var(home / ".env", _MIMIR_ONBOARDING_MODE_LINE_RE) is None:
-        _env_set_var(
-            home / ".env", "MIMIR_ONBOARDING_MODE", "true",
-            _MIMIR_ONBOARDING_MODE_LINE_RE,
+    if env_was_new:
+        onboarding_mode_action = (
+            "set to true (first setup; mirror to compose.env)"
         )
-        onboarding_mode_action = "set to true (first setup; mirror to compose.env)"
 
     # v0.5 §2: write saga.toml for in-process saga (skip if --no-saga; the
     # caller passes that signal by setting saga_key to None — but for now
@@ -1576,8 +1576,6 @@ def _identities_resolve_cmd(home: Path, author: str) -> None:
     display = resolver.display_name(author)
     suffix = f" ({display})" if display else ""
     print(f"{author} → {canonical}{suffix}")
-
-
 
 
 def main(argv: Sequence[str] | None = None) -> None:

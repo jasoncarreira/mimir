@@ -608,6 +608,41 @@ class TestOnboardingMode:
         finally:
             self._clear_turn(tok)
 
+    def test_onboarding_mode_true_logs_warning(
+        self, home_with_memory: Path, caplog
+    ) -> None:
+        """Construction with ``onboarding_mode=True`` must emit a
+        WARNING log so the operator sees "I'm in onboarding mode" on
+        every container restart. Reviewer note 3 on PR #301."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="mimir.readonly_backend"):
+            WriteGuardBackend(
+                root_dir=home_with_memory, writable_dirs=["memory"],
+                onboarding_mode=True,
+            )
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "MIMIR_ONBOARDING_MODE=true" in r.getMessage() for r in warnings
+        ), "expected an onboarding-mode WARNING; got: " + ", ".join(
+            r.getMessage() for r in warnings
+        )
+
+    def test_onboarding_mode_false_does_not_log_warning(
+        self, home_with_memory: Path, caplog
+    ) -> None:
+        """Default state (bypass off) must NOT emit the warning —
+        otherwise every container restart would log a misleading line."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="mimir.readonly_backend"):
+            WriteGuardBackend(
+                root_dir=home_with_memory, writable_dirs=["memory"],
+                onboarding_mode=False,
+            )
+        assert not any(
+            "MIMIR_ONBOARDING_MODE" in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
+
 
 class TestReadOnlyFilesystemBackend:
     def test_blocks_all_writes(self, home: Path) -> None:
