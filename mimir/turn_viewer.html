@@ -118,7 +118,7 @@ tr:hover td{background:var(--surface2);cursor:pointer}
   <div class="status-dot stale" id="statusDot" title="Connecting&hellip;"></div>
   <nav class="header-links">
     <a href="/ops" title="Live ops dashboard">Ops</a>
-    <a href="#" onclick="event.preventDefault();window.__mimir_promptApiKey()" title="Set or rotate the MIMIR_API_KEY this browser uses">API key</a>
+    <a href="#" id="reset-key-link" style="display:none" onclick="event.preventDefault();window.__mimir_resetApiKey()" title="Clear the stored MIMIR_API_KEY and re-prompt — useful when the server-side key was rotated">↻ Reset key</a>
   </nav>
 </div>
 
@@ -260,14 +260,21 @@ function authedFetch(url, opts) {
     return r;
   });
 }
-// "Set / change API key" button next to the status dot — exposes the
-// otherwise-hidden re-prompt path so an operator can rotate keys without
-// clearing localStorage manually. Wire-up at the bottom of this script.
-window.__mimir_promptApiKey = function() {
+// Manual key reset — surfaces only when a key IS stored (see the
+// reset-key-link toggle below). Lets the operator swap to a freshly
+// rotated server-side key without first being denied. The auto-prompt
+// on first visit + auto-re-prompt on 401 covers the rest.
+window.__mimir_resetApiKey = function() {
+  setApiKey('');
   promptApiKey('manual rotation');
   // Force a refresh so the next poll uses the new key.
   if (typeof loadTurns === 'function') loadTurns();
 };
+// Toggle the "↻ Reset key" link visibility on page load.
+document.addEventListener('DOMContentLoaded', function() {
+  var link = document.getElementById('reset-key-link');
+  if (link) link.style.display = getApiKey() ? '' : 'none';
+});
 var activeTrigger = lsGet('activeTrigger', 'all');
 var searchQuery = '';
 var openTurnId = null;
