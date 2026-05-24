@@ -1344,9 +1344,22 @@ dev = [
     { name = "discord-py" },
     { name = "faiss-cpu" },
     { name = "langchain-anthropic" },
+    { name = "langchain-codex-plus" },
+    { name = "langchain-openai" },
+    { name = "mcp" },
+    { name = "pytest" },
+    { name = "pytest-aiohttp" },
+    { name = "pytest-asyncio" },
+    { name = "slack-bolt" },
+]
+dev-claude-code = [
+    { name = "discord-py" },
+    { name = "faiss-cpu" },
+    { name = "langchain-anthropic" },
     { name = "langchain-claude-code" },
     { name = "langchain-codex-plus" },
     { name = "langchain-openai" },
+    { name = "mcp" },
     { name = "pytest" },
     { name = "pytest-aiohttp" },
     { name = "pytest-asyncio" },
@@ -1354,6 +1367,9 @@ dev = [
 ]
 discord = [
     { name = "discord-py" },
+]
+mcp = [
+    { name = "mcp" },
 ]
 openai = [
     { name = "langchain-openai" },
@@ -1367,9 +1383,9 @@ dev = [
     { name = "discord-py" },
     { name = "faiss-cpu" },
     { name = "langchain-anthropic" },
-    { name = "langchain-claude-code" },
     { name = "langchain-codex-plus" },
     { name = "langchain-openai" },
+    { name = "mcp" },
     { name = "pytest" },
     { name = "pytest-aiohttp" },
     { name = "pytest-asyncio" },
@@ -1389,11 +1405,13 @@ requires-dist = [
     { name = "langchain-anthropic", marker = "extra == 'anthropic'", specifier = ">=1.4" },
     { name = "langchain-anthropic", marker = "extra == 'dev'", specifier = ">=1.4" },
     { name = "langchain-claude-code", marker = "extra == 'claude-code'", git = "https://github.com/jasoncarreira/langchain-claude-code?rev=f7af15b613d1e016437740f739321316730cdd39" },
-    { name = "langchain-claude-code", marker = "extra == 'dev'", git = "https://github.com/jasoncarreira/langchain-claude-code?rev=f7af15b613d1e016437740f739321316730cdd39" },
     { name = "langchain-codex-plus", marker = "extra == 'codex-plus'", specifier = ">=0.0.1,<0.1" },
     { name = "langchain-codex-plus", marker = "extra == 'dev'", specifier = ">=0.0.1,<0.1" },
     { name = "langchain-openai", marker = "extra == 'dev'", specifier = ">=1.2.1" },
     { name = "langchain-openai", marker = "extra == 'openai'", specifier = ">=1.2.1" },
+    { name = "mcp", marker = "extra == 'dev'", specifier = ">=1.27" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.27" },
+    { name = "mimir", extras = ["dev", "claude-code"], marker = "extra == 'dev-claude-code'" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
     { name = "pytest-aiohttp", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.3.0" },
@@ -1404,16 +1422,16 @@ requires-dist = [
     { name = "slack-bolt", marker = "extra == 'dev'", specifier = ">=1.18" },
     { name = "slack-bolt", marker = "extra == 'slack'", specifier = ">=1.18" },
 ]
-provides-extras = ["claude-code", "anthropic", "openai", "codex-plus", "discord", "slack", "dev"]
+provides-extras = ["claude-code", "anthropic", "openai", "codex-plus", "mcp", "discord", "slack", "dev", "dev-claude-code"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "discord-py", specifier = ">=2.6" },
     { name = "faiss-cpu", specifier = ">=1.13" },
     { name = "langchain-anthropic", specifier = ">=1.4" },
-    { name = "langchain-claude-code", git = "https://github.com/jasoncarreira/langchain-claude-code?rev=f7af15b613d1e016437740f739321316730cdd39" },
     { name = "langchain-codex-plus", specifier = ">=0.0.1,<0.1" },
     { name = "langchain-openai", specifier = ">=1.2.1" },
+    { name = "mcp", specifier = ">=1.27" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-aiohttp", specifier = ">=1.0" },
     { name = "pytest-asyncio", specifier = ">=1.3.0" },
