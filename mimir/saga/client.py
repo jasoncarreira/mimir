@@ -642,6 +642,65 @@ WHERE a.source_type = 'session_boundary'
         self._conn = conn
         return self._conn
 
+    def _detect_schema_version(self, conn: sqlite3.Connection) -> int:
+        """Infer the structural schema version of an existing DB by
+        inspecting PRAGMA table_info / foreign_key_list. Used by
+        ``_apply_pending_migrations`` when ``schema_version`` is empty
+        and we can't trust the stamped value — closes chainlink #175
+        (the "fresh=False + empty applied" footgun where the harness
+        would stamp ``CURRENT_SCHEMA_VERSION`` and silently skip every
+        migration).
+
+        Detection markers, highest version first:
+
+        - **v6**: ``access_events`` carries a foreign key onto
+          ``atoms(id)``. The v6 migration rebuilt every dependent
+          table to add FK + ON DELETE CASCADE; pre-v6 they were
+          standalone. ``PRAGMA foreign_key_list(access_events)``
+          returns the FK row iff v6 ran.
+        - **v4** (collapses v4/v5; v5 is a data-only delete that's
+          schema-indistinguishable from v4 and idempotent under
+          re-run): ``sessions`` has ``embedding_dim`` column.
+        - **v3**: ``sessions`` has ``topics_discussed`` column.
+        - **v2**: ``sessions`` table exists at all.
+        - **v1**: no ``sessions`` table — pre-migration era.
+
+        Returns the highest detected version. The caller stamps
+        baselines 1..detected, then applies migrations beyond.
+        Missing tables return empty rows from PRAGMA (no error),
+        so this is robust to bare-bones DBs (like the in-memory
+        fixtures used by unit tests).
+        """
+        # v6 marker: FK on access_events.atom_id → atoms(id).
+        try:
+            fks = conn.execute(
+                "PRAGMA foreign_key_list(access_events)"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            fks = []
+        if any(row[2] == "atoms" for row in fks):
+            return 6
+
+        # Below v6 — inspect sessions table presence + columns.
+        has_sessions = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='sessions'"
+        ).fetchone() is not None
+        if not has_sessions:
+            return 1
+
+        sessions_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "embedding_dim" in sessions_cols:
+            # v4 or v5 (v5 is a data-only delete + UPDATEs, idempotent
+            # under re-run; treating as v4 is safe and lets v5 fire as
+            # a no-op).
+            return 4
+        if "topics_discussed" in sessions_cols:
+            return 3
+        return 2  # sessions exists but no structured columns
+
     def _apply_pending_migrations(
         self, conn: sqlite3.Connection, *, fresh: bool,
     ) -> None:
@@ -671,24 +730,52 @@ WHERE a.source_type = 'session_boundary'
 
         target = self.CURRENT_SCHEMA_VERSION
         if not applied:
-            # Fresh DB or pre-migration era — stamp the current version.
+            # Two scenarios land here:
             #
-            # KNOWN LIMITATION (deferred): a DB that was created by old
-            # code with old-shape tables AND somehow lacks schema_version
-            # rows (operator manually cleared, mid-rename data import,
-            # etc.) would land here and silently skip migrations. Per
-            # operator deployment posture (no historic DBs in play),
-            # this is accepted. A complete fix would require introspecting
-            # ``PRAGMA table_info`` to infer the actual schema state and
-            # walk from the inferred version, which is more work than the
-            # one-deploy situation warrants.
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_version (version, applied_at) "
-                "VALUES (?, ?)",
-                (target, datetime.now(tz=timezone.utc).isoformat()),
-            )
+            #   A) Fresh DB created via ``schema.sql`` — tables are at
+            #      ``CURRENT_SCHEMA_VERSION`` shape; just stamp + return.
+            #
+            #   B) Existing DB with an empty ``schema_version`` table —
+            #      either a true pre-migration-era DB (tables at some
+            #      historic shape), or a mid-init retry case where
+            #      ``schema.sql`` already ran but the stamp INSERT
+            #      never landed (e.g., the migration step raised
+            #      mid-init and ``_ensure_conn`` closed the partial
+            #      connection — see
+            #      ``test_ensure_conn_does_not_cache_half_initialized_connection``).
+            #
+            # Distinguishing A from B requires PRAGMA introspection of
+            # the actual table shape; ``_detect_schema_version`` does
+            # that. After detection, we stamp the inferred version's
+            # baselines so the subsequent migrations loop only runs
+            # changes beyond what's already there.
+            now = datetime.now(tz=timezone.utc).isoformat()
+            if fresh:
+                # Scenario A: schema.sql just ran — DB is at target.
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_version "
+                    "(version, applied_at) VALUES (?, ?)",
+                    (target, now),
+                )
+                conn.commit()
+                return
+
+            # Scenario B: introspect to figure out where we actually are.
+            inferred = self._detect_schema_version(conn)
+            for v in range(1, inferred + 1):
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_version "
+                    "(version, applied_at) VALUES (?, ?)",
+                    (v, now),
+                )
             conn.commit()
-            return
+            applied = set(range(1, inferred + 1))
+            if inferred >= target:
+                # Tables are already at current shape (the half-init
+                # retry case) — nothing more to do.
+                return
+            # Else fall through to the migrations loop below, which
+            # will apply versions max(applied)+1 .. target.
 
         for version, ddl in sorted(self.MIGRATIONS.items()):
             if version <= max(applied):
@@ -706,15 +793,46 @@ WHERE a.source_type = 'session_boundary'
     def _ensure_index(self, conn: sqlite3.Connection) -> VectorIndex | None:
         """Lazily build the FAISS index on first retrieval. After build,
         store() incremental-adds keep it current; periodic rebuilds
-        handle tombstoning accumulation."""
+        handle tombstoning accumulation.
+
+        Dimension resolution order — mirrors ``_ensure_sessions_index``:
+
+        1. Pre-set ``self._embedding_dim`` (constructor arg or cached
+           from a prior call).
+        2. First row in the ``embeddings`` table — authoritative once
+           ANY embedding has been stored.
+        3. The configured provider's reported ``dimensions()`` — the
+           right value for an empty DB. Prevents the "fresh DB +
+           non-Voyage provider" failure mode where the previous
+           hardcoded ``1024`` default silently rejected every
+           384-dim (fastembed) or 1536-dim (OpenAI
+           text-embedding-3-small) vector that ever got stored.
+        4. No provider available → return ``None`` so the search
+           caller falls back to FTS-only. Better than building an
+           index at a guessed dim that turns every future ``store()``
+           write into a silent drop.
+        """
         if self._index_built:
             return self._index
-        # Determine the embedding dim from the first embedding row if
-        # not pre-set; falls back to 1024 (voyage default).
         dim = self._embedding_dim
         if dim is None:
             row = conn.execute("SELECT dim FROM embeddings LIMIT 1").fetchone()
-            dim = row[0] if row else 1024
+            if row:
+                dim = row[0]
+            else:
+                try:
+                    from .embeddings import get_provider
+                    dim = get_provider().dimensions()
+                except Exception:
+                    # Provider unavailable and DB is genuinely empty.
+                    # Cache the miss and return None — search callers
+                    # (``_make_faiss_search_fn``) already handle None by
+                    # returning empty results, so this gracefully
+                    # degrades to FTS-only retrieval rather than
+                    # building an index at a guessed dim.
+                    self._index_built = True
+                    self._index = None
+                    return None
             self._embedding_dim = dim
         self._index = VectorIndex(dimension=dim)
         self._index.build_from_db(conn)
