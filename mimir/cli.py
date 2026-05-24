@@ -128,6 +128,20 @@ DEFAULT_ENV_TEMPLATE = dedent(
     # dispatch failures). Leave blank to disable. Use a normal channel_id —
     # typically your DM with the bot, e.g. dm-slack-U05XXXX or dm-discord-NNN.
     MIMIR_OPERATOR_ALERT_CHANNEL=
+
+    # ---- S5-2 onboarding bypass ------------------------------------------
+    # Bypasses the reflection-only gate on memory/core/ writes so the
+    # agent can collaboratively bootstrap its persona / memory
+    # architecture during first-run setup. `mimir setup` writes this
+    # as `true` on first run; after onboarding completes, set to
+    # `false` (or delete the line) and `docker compose restart` to
+    # engage the gate.
+    #
+    # Restart-to-flip is the tamper-resistance property: the agent can
+    # edit this file via shell but the value isn't read until the next
+    # container restart. The agent has no docker socket to self-restart.
+    # `prohibited_action_guard` also blocks bash writes to compose.env.
+    MIMIR_ONBOARDING_MODE=true
     """
 )
 
@@ -1055,7 +1069,8 @@ def setup_home(
     files_created: list[str] = []
     api_key_action: str | None = None
     saga_api_key_action: str | None = None
-    if _write_if_missing(home / ".env", DEFAULT_ENV_TEMPLATE):
+    env_was_new = _write_if_missing(home / ".env", DEFAULT_ENV_TEMPLATE)
+    if env_was_new:
         files_created.append(".env")
     # Inject the resolved model spec + provider env vars. Preserves any
     # existing operator value on re-run (don't clobber if the operator
@@ -1109,6 +1124,22 @@ def setup_home(
         saga_api_key_action = "generated"
     else:
         saga_key = _env_get_var(home / ".env", _SAGA_API_KEY_LINE_RE) or ""
+
+    # S5-2 onboarding bypass — default ON for FRESH deployments only.
+    # The template (DEFAULT_ENV_TEMPLATE) already includes
+    # ``MIMIR_ONBOARDING_MODE=true``, so a freshly-created ``.env`` has
+    # the line. For existing deployments (``.env`` already present
+    # before this run, line possibly missing because the env var
+    # didn't exist in earlier mimir versions), we DO NOT auto-add the
+    # line — that would silently re-enable the bypass on every restart
+    # post-upgrade, which is a footgun. Operators upgrading who want
+    # the bypass can add ``MIMIR_ONBOARDING_MODE=true`` to compose.env
+    # manually. Reviewer note 2 on PR #301.
+    onboarding_mode_action: str | None = None
+    if env_was_new:
+        onboarding_mode_action = (
+            "set to true (first setup; mirror to compose.env)"
+        )
 
     # v0.5 §2: write saga.toml for in-process saga (skip if --no-saga; the
     # caller passes that signal by setting saga_key to None — but for now
@@ -1240,6 +1271,7 @@ def setup_home(
         "skills": seeded_skills,
         "api_key_action": api_key_action,
         "saga_api_key_action": saga_api_key_action,
+        "onboarding_mode_action": onboarding_mode_action,
         "git_bootstrap": git_bootstrap_status,
         "embedding_preset": embedding,
         "model_spec": route.model_spec,
@@ -1270,6 +1302,19 @@ def _print_setup_report(status: dict[str, object]) -> None:
         print("  MIMIR_API_KEY:  generated (see .env; rotate via `mimir regenerate-api-key`)")
     if status.get("saga_api_key_action") == "generated":
         print("  SAGA_API_KEY:   generated (unused in in-process mode; preserved for external-saga use)")
+    onboarding_action = status.get("onboarding_mode_action")
+    if onboarding_action:
+        # First-setup signal: tell the operator to also set this in
+        # compose.env so docker actually injects it on container start.
+        # ``<home>/.env`` is mimir-managed; ``compose.env`` is operator-
+        # managed (docker reads it via ``env_file`` in compose.yml).
+        print(f"  MIMIR_ONBOARDING_MODE: {onboarding_action}")
+        print("                  ↑ ALSO add this line to compose.env before")
+        print("                    `docker compose up -d` — docker reads")
+        print("                    compose.env, not <home>/.env.")
+        print("                    After onboarding completes, set to")
+        print("                    `false` (or delete the line) in compose.env")
+        print("                    and `docker compose restart` to engage the gate.")
     # Model + usage-monitor routing — surface what setup decided so
     # the operator can confirm or override.
     model_spec = status.get("model_spec")
@@ -1779,6 +1824,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
 
+
     refl_p = sub.add_parser(
         "reflection",
         help="Reflection skill helpers (invoked by skills/reflection/SKILL.md).",
@@ -2131,6 +2177,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         from .loops_cmd import run_loops_cmd
         home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
         sys.exit(run_loops_cmd(home))
+
 
     if args.command == "predictions":
         from .skills.predictions import script as _predictions_script
