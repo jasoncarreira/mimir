@@ -17,6 +17,38 @@ details, dispatch hooks — lives at `/opt/social-cli/AGENT_GUIDE.md`
 in the container. This skill covers only the mimir-specific glue:
 where state lives, how the poller wakes you, what env vars tune it.
 
+## Contract
+
+**Trigger**: A `poller:social-cli-notifications` or `poller:social-cli-feed`
+event lands on the turn — that IS the trigger. Also fires for operator-driven
+"post X to bsky" / "thread this idea" / "reply to that post about Y"
+instructions where the response surface is a social platform, not chat.
+
+**Requires**: `social-cli` binary on PATH (installed via the skill's
+`dockerfile.fragment` at image build); `.env` credentials with platform tokens
+in the matching `<state_dir>/.env` for each platform the operator wants
+polled (mode 600); the operator has set `MIMIR_SOCIAL_PLATFORMS` to scope to
+the platforms credentials are configured for.
+
+**Guarantees**:
+- Inbox-driven responses (mentions / replies / follows / likes) route
+  through `<state_dir>/outbox.yaml` + `social-cli dispatch`, **NOT** via
+  `send_message` (different surface — see the "`send_message` goes to chat
+  channels, NOT to Bluesky / X" section).
+- Dispatch validates per-action and continues on per-action failure;
+  per-action outcomes land in `dispatch_result.yaml` for review.
+- After successful `dispatch`, the inbox is pruned to pending work only —
+  no duplicate re-firing on next poll.
+- Cross-post (`platforms: [bsky, x]`) only when explicitly composed that
+  way in the outbox — never implicit.
+
+**Does not**: Auto-reply to mentions (the agent reads inbox + decides per
+item, even when batched); cross-post between Bluesky and X without explicit
+`platforms: [bsky, x]`; manage Discord / Slack delivery (that's
+`send_message`); fetch / hydrate full thread context (`social-cli` returns
+the surface event; if a reply needs more context, the agent fetches it
+separately).
+
 ## The agent's loop
 
 The poller surfaces notifications. The agent responds:
