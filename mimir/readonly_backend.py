@@ -126,6 +126,7 @@ class WriteGuardBackend:
         writable_dirs: list[str],
         *,
         enforce_core_memory_reflection_only: bool = True,
+        onboarding_mode: bool = False,
     ) -> None:
         self._root = Path(root_dir).resolve()
         self._fs = _RootAwareFilesystemBackend(root_dir=root_dir, virtual_mode=True)
@@ -155,6 +156,27 @@ class WriteGuardBackend:
         self._enforce_core_memory_reflection_only: bool = (
             enforce_core_memory_reflection_only
         )
+        # Onboarding-mode bypass — when True (sourced from the
+        # ``MIMIR_ONBOARDING_MODE`` env var, plumbed through
+        # ``Config.onboarding_mode``), the S5-2 reflection-only gate
+        # yields so the agent can collaboratively bootstrap its
+        # persona / memory architecture. Read once at __init__ from
+        # whatever Config supplies — a mid-process env mutation cannot
+        # flip the bypass live. Restart-to-flip is the operator's
+        # tamper-resistance guarantee: the agent CAN edit compose.env
+        # via shell to plant a dormant ``MIMIR_ONBOARDING_MODE=true``
+        # line, but the value isn't read until the next container
+        # restart, and the agent has no docker socket to self-restart.
+        # ``prohibited_action_guard`` separately blocks writes to
+        # ``compose.env`` from bash, closing the dormant-plant vector.
+        self._onboarding_mode: bool = onboarding_mode
+        if onboarding_mode and enforce_core_memory_reflection_only:
+            log.warning(
+                "MIMIR_ONBOARDING_MODE=true — S5-2 reflection-only gate "
+                "on memory/core/ is BYPASSED. Set MIMIR_ONBOARDING_MODE=false "
+                "(or remove the env var) and restart the container after "
+                "onboarding completes to engage the gate."
+            )
         # Recorded denials, one per blocked Write/Edit/upload. The agent
         # drains this list at end-of-turn (``drain_denials()``) into
         # TurnRecord.permission_denials so the audit trail is visible
@@ -248,8 +270,10 @@ class WriteGuardBackend:
         Returns True only when ALL of these hold:
           1. The resolved target is under ``memory/core/``
           2. ``enforce_core_memory_reflection_only`` is True (default)
-          3. There is an active ``TurnContext``
-          4. That turn is NOT the weekly reflection
+          3. ``onboarding_mode`` is False (the
+             ``MIMIR_ONBOARDING_MODE`` env-var bypass is not active)
+          4. There is an active ``TurnContext``
+          5. That turn is NOT the weekly reflection
              (``trigger != "scheduled_tick"`` or
              ``channel_id`` does not start with ``"scheduler:reflect"``)
 
@@ -268,6 +292,13 @@ class WriteGuardBackend:
             or resolved.is_relative_to(self._memory_core_root)
         )
         if not under_core:
+            return False
+        # Onboarding-mode bypass: when ``MIMIR_ONBOARDING_MODE=true``
+        # is set in the container env (typically via compose.env), the
+        # agent can freely edit ``memory/core/`` during first-run
+        # bootstrap. Operator restarts the container with the env var
+        # cleared to engage the gate after onboarding completes.
+        if self._onboarding_mode:
             return False
         # Lazy import to avoid a module cycle (mimir._context → models
         # → potentially back into the agent layer that constructs the
