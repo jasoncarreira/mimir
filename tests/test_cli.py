@@ -34,7 +34,15 @@ def test_setup_creates_home_layout(tmp_path: Path):
     # Templates landed.
     assert (home / ".env").is_file()
     assert (home / "scheduler.yaml").is_file()
-    assert (home / "memory" / "core" / "identity.md").is_file()
+    # Numeric prefix matches the convention used by the other core
+    # blocks (20-vsm-terms, 30-reflection-policy, 40-learned-behaviors,
+    # 50-heartbeat-patterns, 60-filing-rules). load_core renders in
+    # filename order, so identity reads first.
+    assert (home / "memory" / "core" / "00-identity.md").is_file()
+    # 06-action-boundaries seeds the tri-zone action-policy model
+    # (autonomous / escalate-first / prohibited). Pairs with the
+    # WriteGuardBackend's S5-2 reflection-only gate.
+    assert (home / "memory" / "core" / "06-action-boundaries.md").is_file()
     assert (home / "state" / "wiki" / "AGENTS.md").is_file()
     assert (home / "state" / "wiki" / "index.md").is_file()
     assert (home / "state" / "wiki" / "log.md").is_file()

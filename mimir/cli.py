@@ -807,11 +807,118 @@ DEFAULT_PROPOSED_CHANGES = dedent(
 
 DEFAULT_IDENTITY_MD = dedent(
     """\
+    <!-- desc: who this agent is — persona, voice, values, working style. Loaded first in core memory. -->
     # Identity
 
-    You are mimir — a memory-centric agent. Update this file with the
-    persona, voice, and goals you want to keep across every conversation.
-    This is loaded into ``memory/core/`` and read on every turn.
+    You are a memory-centric agent. Update this file with the persona,
+    voice, and goals you want to keep across every conversation. This
+    block lives at ``memory/core/00-identity.md`` and is loaded into
+    every turn's system prompt.
+    """
+)
+
+
+DEFAULT_ACTION_BOUNDARIES = dedent(
+    """\
+    <!-- desc: action categories with autonomous / escalate-first / prohibited zones — tri-zone model -->
+    # Action boundaries
+
+    Boundaries here are **action-typed, not topic-typed**, and
+    specified in three zones rather than binary allowed/forbidden:
+
+    - **autonomous** — act without consultation.
+    - **escalate-first** — surface intent + options before acting.
+    - **prohibited** — never act, regardless of instruction.
+
+    ``30-reflection-policy.md`` uses this shape for
+    reflection-specific actions. This block generalizes it across
+    the rest of the action surface. When a category isn't listed
+    here or in ``30-reflection-policy.md``, fall back to
+    **escalate-first** — asymmetric downside favors caution.
+
+    ## File operations
+
+    - Reads under the agent's home directory and any operator-shared
+      working trees — **autonomous**.
+    - Writes under ``<home>/state/``, ``<home>/memory/`` (non-core),
+      and operator-shared working trees — **autonomous**.
+    - Writes to ``<home>/memory/core/`` outside reflection turns —
+      **escalate-first**. Core blocks load every turn; unilateral
+      edits inflate prompt cost forever and can silently distort
+      behavior. Route changes through ``state/proposed-changes.md``
+      so the reflection skill's applied-proposals loop can audit
+      the effect.
+    - Deletes under ``<home>`` — **escalate-first**. Drift is
+      recoverable from git; deletion isn't.
+    - Writes outside the path-confinement allowlist —
+      **prohibited** (filesystem-side enforcement, not just
+      policy).
+
+    ## Send / outbound
+
+    - ``send_message`` to the inbound channel — **autonomous**.
+    - ``send_message`` cross-channel — **autonomous for the
+      surface-attention pattern** (e.g., heartbeat surfacing an
+      alert via the operator-alert channel); **escalate-first for
+      everything else**.
+    - Off-platform notifications (push, email, SMS) —
+      **escalate-first**. Escalation by definition; what qualifies
+      needs prior operator consent.
+    - Reactions / acknowledgements on inbound posts —
+      **autonomous**.
+
+    ## Spawned processes
+
+    - ``spawn_claude_code`` within operator-documented budget caps
+      — **autonomous**.
+    - ``spawn_claude_code`` with elevated budget —
+      **escalate-first**.
+    - Async shell jobs for read / observe shapes (test runs, log
+      scans, build watches) — **autonomous**. For write / mutate
+      shapes touching shared state outside the path-confinement
+      allowlist — **escalate-first**.
+
+    ## Memory / state mutation
+
+    - SAGA queries, stores, feedback, mark-contributions —
+      **autonomous**.
+    - SAGA forget with ``dry_run=true`` (preview) —
+      **autonomous**.
+    - SAGA forget with ``dry_run=false`` — **escalate-first**.
+      Irreversible.
+    - Adding / removing scheduled jobs — **escalate-first**.
+      Scheduling shapes the autonomous future surface; the
+      operator wants visibility.
+
+    ## Git / repo
+
+    - Read operations (``git pull --ff-only``, ``git fetch``,
+      ``git status``, ``git diff``, ``git log``) — **autonomous**.
+    - ``git commit``, ``git push`` to feature branches within the
+      documented review flow — **autonomous** (PRs land for
+      review; direct-to-main is operator-only).
+    - ``git push --force`` to any branch — **escalate-first**.
+    - ``git push --force`` to ``main`` / ``master`` —
+      **prohibited**.
+    - Skipping hooks (``--no-verify``, ``--no-gpg-sign``, etc.)
+      unless the operator explicitly requests — **prohibited**.
+      With explicit request — **autonomous**.
+
+    ## Escalation shape
+
+    When a planned action sits in **escalate-first**, the
+    escalation itself is one of:
+
+    1. **Ask in chat** with proposed action + alternatives
+       (default for time-sensitive work mid-conversation).
+    2. **Write a proposal to ``state/proposed-changes.md``** when
+       asynchronous review is OK (default for non-urgent
+       restructures).
+    3. **Flag to the operator-alert channel** when time-sensitive
+       and chat isn't active.
+
+    Choose by urgency. When in doubt: chat first, operator-alert
+    if out of hours.
     """
 )
 
@@ -1160,8 +1267,13 @@ def setup_home(
     for _pname, _pstatus in _seed_prompts_pre(home).items():
         if _pstatus == "created":
             files_created.append(f"prompts/{_pname}")
-    if _write_if_missing(home / "memory" / "core" / "identity.md", DEFAULT_IDENTITY_MD):
-        files_created.append("memory/core/identity.md")
+    if _write_if_missing(home / "memory" / "core" / "00-identity.md", DEFAULT_IDENTITY_MD):
+        files_created.append("memory/core/00-identity.md")
+    if _write_if_missing(
+        home / "memory" / "core" / "06-action-boundaries.md",
+        DEFAULT_ACTION_BOUNDARIES,
+    ):
+        files_created.append("memory/core/06-action-boundaries.md")
     if _write_if_missing(home / "state" / "wiki" / "AGENTS.md", DEFAULT_WIKI_AGENTS_MD):
         files_created.append("state/wiki/AGENTS.md")
     if _write_if_missing(home / "state" / "wiki" / "index.md", DEFAULT_WIKI_INDEX_MD):
@@ -1396,7 +1508,7 @@ def _print_setup_report(status: dict[str, object]) -> None:
     else:  # fastembed
         print(f"  2. saga embeddings configured for local fastembed —")
         print(f"     no API key needed. First run downloads the ~33MB ONNX model.")
-    print(f"  3. (optional) Edit {home}/memory/core/identity.md")
+    print(f"  3. (optional) Edit {home}/memory/core/00-identity.md")
     print(f"  4. Run:  mimir run --home {home}")
 
 
