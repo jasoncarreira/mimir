@@ -28,15 +28,15 @@ credential helper, so `gh pr create` and `git push` both work.
 or PRs, filing comments, checking CI, querying the API. If the task requires GitHub
 state (not just local repo state), invoke this skill.
 
-**Requires**: `GITHUB_TOKEN` in environment (verified by `gh auth status`). The PAT
-is fine-grained and scoped to `jasoncarreira/mimir*` repos only — operations on other
-repos return 403 (see `memory/issues/github-pat-scope.md`).
+**Requires**: `GITHUB_TOKEN` in environment (verified by `gh auth status`). The PAT's
+scope determines which repos are reachable — operations on out-of-scope repos return
+403; check what the operator configured if you hit one.
 
 **Guarantees**:
 - GitHub interactions happen via `gh` CLI (authenticated, auditable), not via
   WebFetch on raw GitHub URLs.
-- PAT scope is checked mentally before any cross-repo operation — a 403 from a
-  non-mimir repo is expected behavior, not a bug.
+- PAT scope is checked mentally before any cross-repo operation — a 403 from an
+  out-of-scope repo is expected behavior, not a bug.
 
 **Does not**: Push code (that's `git push`, separate from `gh`); manage GitHub Actions
 billing; access repos outside the PAT scope; file issues on external repos without

@@ -20,9 +20,9 @@ follow-ups, parking-lot items, anything that needs to persist between turns.
 to outlive the current session. Mimir notices work that deserves to be tracked across
 heartbeats or that needs `chainlink issue ready`-driven pickup in a future session.
 
-**Requires**: A cwd with a `.chainlink/` directory (or ancestor) — must be `/mimir-home`
-for the operator's tracker, NOT `/workspace/mimir`. The binary lives at
-`/usr/local/bin/chainlink`.
+**Requires**: A cwd with a `.chainlink/` directory (or ancestor) — the agent's home
+(where operator-tracked issues live), not the mimir source tree. The `chainlink`
+binary is on `PATH`.
 
 **Guarantees**:
 - Issues created with enough context for future-mimir to act on: title + description

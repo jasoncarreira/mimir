@@ -31,7 +31,8 @@ an existing wiki page needs a structural update, or a cross-link audit surfaces 
 or dangling links that need resolution.
 
 **Requires**: Source material in `state/raw/` (or a URL to fetch and save first).
-Existing page paths found via `mcp__mimir__file_search` *before* writing — the
+Existing page paths found via file search (e.g., Glob or the MCP file_search
+equivalent) *before* writing — the
 notability gate in `memory/core/60-filing-rules.md` applies (don't create unless
 the page earns its keep).
 

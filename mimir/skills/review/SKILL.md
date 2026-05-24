@@ -13,7 +13,7 @@ skill.
 
 **Trigger**: Operator asks to review a PR; or the github-activity poller fires a
 `pr_opened` / `review_requested` event for a PR authored by someone other than
-`mimir-carreira` (mimir's own PRs don't self-review).
+the agent itself (`$MIMIR_GITHUB_SELF_LOGIN`) — the agent doesn't self-review.
 
 **Requires**: PR number; `gh` CLI authenticated (verified by `gh auth status`);
 diff accessible — either under 20k lines via `gh pr diff`, or file list via
@@ -27,8 +27,8 @@ diff accessible — either under 20k lines via `gh pr diff`, or file list via
   and tracked) before APPROVE is submitted.
 
 **Does not**: Merge PRs; modify source code directly; auto-resolve conversations;
-review PRs it authored (`mimir-carreira` as author means a different reviewer is
-needed).
+review PRs it authored (when `$MIMIR_GITHUB_SELF_LOGIN` matches the PR author,
+a different reviewer is needed).
 
 ## Step-by-step
 
