@@ -13,6 +13,15 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+# ── Health-check thresholds ──────────────────────────────────────────────────
+# Fires ``core_prompt_degraded`` (negative algedonic event) when either check
+# fails. Calibrated conservatively: current production has 9 core files, so
+# MIN_COUNT=5 catches a total wipe without flagging minor deliberate pruning.
+# MIN_BYTES=200 catches empty or stub files (the smallest current block is
+# well over 1 KB). Both constants are module-level so tests can patch them.
+_CORE_BLOCKS_MIN_COUNT: int = 5
+_CORE_BLOCKS_MIN_BYTES: int = 200
+
 DESC_LINE_RE = re.compile(r"^\s*<!--\s*desc:\s*(.+?)\s*-->\s*$")
 H1_LINE_RE = re.compile(r"^\s*#\s+")
 SENTENCE_TERMINATOR_RE = re.compile(r"[.!?]")
@@ -101,6 +110,43 @@ def load_core(home: Path) -> list[CoreBlock]:
             )
         )
     return blocks
+
+
+def check_core_blocks_health(
+    blocks: list[CoreBlock],
+    min_count: int = _CORE_BLOCKS_MIN_COUNT,
+    min_bytes: int = _CORE_BLOCKS_MIN_BYTES,
+) -> tuple[bool, list[str]]:
+    """Return ``(degraded, issues)`` for a loaded set of core blocks.
+
+    ``degraded`` is True when any check fails:
+    - Fewer than ``min_count`` blocks were loaded (indicates wipe / dir loss).
+    - Any individual block is shorter than ``min_bytes`` (indicates empty /
+      stub file, i.e. an accidental overwrite that stripped content).
+
+    ``issues`` is a human-readable list of the problems found; empty when
+    ``degraded`` is False.
+
+    Designed to be called inside ``_build_system_prompt()`` *after*
+    ``load_core()`` so failures are visible every turn, not just at startup.
+    The caller emits ``core_prompt_degraded`` (negative algedonic event) +
+    logs WARNING when ``degraded`` is True.
+    """
+    issues: list[str] = []
+
+    if len(blocks) < min_count:
+        issues.append(
+            f"only {len(blocks)} core block(s) loaded (minimum {min_count})"
+        )
+
+    for block in blocks:
+        nbytes = len(block.content.encode("utf-8"))
+        if nbytes < min_bytes:
+            issues.append(
+                f"{block.path.name} is {nbytes} bytes (minimum {min_bytes})"
+            )
+
+    return bool(issues), issues
 
 
 def render_core_section(blocks: list[CoreBlock]) -> str:
