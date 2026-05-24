@@ -706,15 +706,46 @@ WHERE a.source_type = 'session_boundary'
     def _ensure_index(self, conn: sqlite3.Connection) -> VectorIndex | None:
         """Lazily build the FAISS index on first retrieval. After build,
         store() incremental-adds keep it current; periodic rebuilds
-        handle tombstoning accumulation."""
+        handle tombstoning accumulation.
+
+        Dimension resolution order — mirrors ``_ensure_sessions_index``:
+
+        1. Pre-set ``self._embedding_dim`` (constructor arg or cached
+           from a prior call).
+        2. First row in the ``embeddings`` table — authoritative once
+           ANY embedding has been stored.
+        3. The configured provider's reported ``dimensions()`` — the
+           right value for an empty DB. Prevents the "fresh DB +
+           non-Voyage provider" failure mode where the previous
+           hardcoded ``1024`` default silently rejected every
+           384-dim (fastembed) or 1536-dim (OpenAI
+           text-embedding-3-small) vector that ever got stored.
+        4. No provider available → return ``None`` so the search
+           caller falls back to FTS-only. Better than building an
+           index at a guessed dim that turns every future ``store()``
+           write into a silent drop.
+        """
         if self._index_built:
             return self._index
-        # Determine the embedding dim from the first embedding row if
-        # not pre-set; falls back to 1024 (voyage default).
         dim = self._embedding_dim
         if dim is None:
             row = conn.execute("SELECT dim FROM embeddings LIMIT 1").fetchone()
-            dim = row[0] if row else 1024
+            if row:
+                dim = row[0]
+            else:
+                try:
+                    from .embeddings import get_provider
+                    dim = get_provider().dimensions()
+                except Exception:
+                    # Provider unavailable and DB is genuinely empty.
+                    # Cache the miss and return None — search callers
+                    # (``_make_faiss_search_fn``) already handle None by
+                    # returning empty results, so this gracefully
+                    # degrades to FTS-only retrieval rather than
+                    # building an index at a guessed dim.
+                    self._index_built = True
+                    self._index = None
+                    return None
             self._embedding_dim = dim
         self._index = VectorIndex(dimension=dim)
         self._index.build_from_db(conn)
