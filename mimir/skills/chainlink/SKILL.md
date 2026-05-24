@@ -14,6 +14,27 @@ The five-whys skill uses chainlink as its storage backend (see
 the general-purpose CLI reference for everything else: todos, bug tracking,
 follow-ups, parking-lot items, anything that needs to persist between turns.
 
+## Contract
+
+**Trigger**: User mentions a task, bug, open question, or multi-step plan that needs
+to outlive the current session. Mimir notices work that deserves to be tracked across
+heartbeats or that needs `chainlink issue ready`-driven pickup in a future session.
+
+**Requires**: A cwd with a `.chainlink/` directory (or ancestor) — the agent's home
+(where operator-tracked issues live), not the mimir source tree. The `chainlink`
+binary is on `PATH`.
+
+**Guarantees**:
+- Issues created with enough context for future-mimir to act on: title + description
+  with handle (what to do), success path, failure path.
+- Subissue trees have dependency edges (`chainlink issue block`) where ordering matters.
+- Multi-heartbeat work has a parent issue with subissues decomposed before implementation
+  starts (planning-heartbeat-first discipline from `memory/core/50-heartbeat-patterns.md`).
+
+**Does not**: Sync to GitHub; send notifications; auto-close on PR merge (stale-open
+sweep is the mechanism, run weekly); initialize a new tracker without operator
+instruction.
+
 ## Where to operate
 
 Chainlink commands need a `.chainlink/` directory in the cwd or an ancestor.
