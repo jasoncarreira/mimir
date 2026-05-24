@@ -652,8 +652,8 @@ _DASHBOARD_HTML = """<!doctype html>
         </div>
         <nav>
           <a href="/turns" title="Turn viewer">Turns</a>
-          <a href="/api/ops" title="JSON twin">JSON</a>
-          <a href="#" onclick="event.preventDefault();window.__mimir_promptApiKey()" title="Set or rotate the MIMIR_API_KEY this browser uses">API key</a>
+          <a href="#" id="json-link" title="JSON twin (auth-aware)">JSON</a>
+          <a href="#" id="reset-key-link" style="display:none" onclick="event.preventDefault();window.__mimir_resetApiKey()" title="Clear the stored MIMIR_API_KEY and re-prompt — useful when the server-side key was rotated">↻ Reset key</a>
         </nav>
       </header>
 
@@ -771,12 +771,40 @@ _DASHBOARD_HTML = """<!doctype html>
           return r;
         });
       }
-      // Header link wiring ("API key" in the page-header nav).
-      window.__mimir_promptApiKey = function() {
+      // Header link wiring — manual key reset for the rare server-rotation
+      // case. The auto-prompt on first visit + auto-re-prompt on 401 covers
+      // 99% of operator flows; this is just an escape hatch when the
+      // server-side key was rotated and the operator wants to swap without
+      // first being denied. Only surfaces in the header when a key IS
+      // stored (the link toggle is wired below).
+      window.__mimir_resetApiKey = function() {
+        setApiKey('');
         promptApiKey('manual rotation');
-        // Reload so the dashboard re-fetches with the new key.
         window.location.reload();
       };
+      // Toggle the "↻ Reset key" link visibility based on whether the
+      // browser actually has a stored key. Run on DOMContentLoaded so the
+      // link element is in the tree.
+      document.addEventListener('DOMContentLoaded', function() {
+        const link = document.getElementById('reset-key-link');
+        if (link) link.style.display = getApiKey() ? '' : 'none';
+      });
+      // JSON link auth: the static <a href="/api/ops"> would 401 in
+      // auth-required mode because browser navigation doesn't send the
+      // X-API-Key header. The auth middleware accepts ``?api_key=`` as a
+      // query-param fallback (PR #291; access log masks the value), so we
+      // intercept the click and rewrite the URL. New tab so the operator
+      // doesn't lose the dashboard state.
+      document.addEventListener('DOMContentLoaded', function() {
+        const jsonLink = document.getElementById('json-link');
+        if (!jsonLink) return;
+        jsonLink.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          const key = getApiKey();
+          const url = '/api/ops' + (key ? '?api_key=' + encodeURIComponent(key) : '');
+          window.open(url, '_blank', 'noopener,noreferrer');
+        });
+      });
 
       // ── Dark-mode Chart.js defaults ──────────────────────────────────
       // Without this, Chart.js renders axis labels in #666 / grid in
@@ -1070,7 +1098,15 @@ _DASHBOARD_HTML = """<!doctype html>
               scales: {
                 x: {
                   type: 'time',
-                  time: { tooltipFormat: 'MMM d, HH:mm' },
+                  // Force day-level tick labels so the x-axis reads as
+                  // dates (Mar 5, Mar 6, …) rather than the hour-grained
+                  // labels Chart.js auto-picks for dense windows. The
+                  // tooltip still shows the precise time on hover.
+                  time: {
+                    unit: 'day',
+                    tooltipFormat: 'MMM d, HH:mm',
+                    displayFormats: { day: 'MMM d' },
+                  },
                   ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 8 },
                 },
                 y: {
