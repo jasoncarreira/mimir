@@ -149,10 +149,24 @@ with a logged warning rather than crashing the scheduler.
 
 ## Development
 
+Optional extras:
+
+| Extra | Pulls | When to use |
+|---|---|---|
+| `[dev]` | pytest + bridges + Anthropic / OpenAI / Codex Plus adapters + faiss | Default for contributors — covers the agent core, saga, bridges. |
+| `[dev-claude-code]` | `[dev]` + the `langchain-claude-code` git fork | Working on the Claude Code subprocess path specifically. The fork is a private SHA pin (upstream patches haven't merged); the bare `[dev]` install skips claude-code-specific tests. |
+| `[claude-code]` | Just the fork (no test toolchain) | Runtime install for users on Claude Max who don't intend to develop. |
+| `[anthropic]` / `[openai]` / `[codex-plus]` | Single model adapter | Runtime install with one model path. |
+
 ```bash
-# Tests
+# Tests — minimal toolchain (claude-code-specific tests will skip)
+uv pip install -e ".[dev]"
 uv run pytest                                       # 600+ tests
 uv run pytest --ignore=tests/test_bench_via_mimir.py  # skip the slow integration test
+
+# Tests — full toolchain (claude-code-specific tests will run)
+uv pip install -e ".[dev-claude-code]"
+uv run pytest
 
 # Saga's own tests
 cd saga && uv run pytest saga/tests/

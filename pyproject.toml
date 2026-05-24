@@ -32,6 +32,15 @@ dependencies = [
 # (``claude-code:``, ``anthropic:``, ``openai:`` etc.) and lazy-imports
 # the matching package, so installing only one keeps the dep graph
 # small. Pick at least one or the agent can't build a model.
+# langchain-claude-code routes the agent loop through the Claude Code
+# CLI subprocess (Max-plan friendly). This is a private git fork pinned
+# to a specific SHA — the upstream patches (#2/#4/#6) needed by mimir
+# haven't merged yet. The ``allow-direct-references = true`` flag in
+# ``[tool.hatch.metadata]`` permits the ``git+`` URL syntax.
+# Pre-OSS hardening (review item #4): kept as an opt-in extra so the
+# default install path is PyPI-resolvable. ``[dev]`` no longer pulls
+# this; ``[dev-claude-code]`` does, for contributors working on the
+# claude-code path specifically.
 claude-code = [
     "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39",
 ]
@@ -49,6 +58,14 @@ openai = [
 codex-plus = [
     "langchain-codex-plus>=0.0.1,<0.1",
 ]
+# Model Context Protocol — required if any ``MIMIR_MCP_SERVERS_*`` env
+# var is set. Pre-OSS hardening (review item #4 follow-on): this used
+# to come along transitively via ``langchain-claude-code``, but with
+# the fork now opt-in, MCP needs its own explicit extra so operators
+# who want MCP know to install it.
+mcp = [
+    "mcp>=1.27",
+]
 # Bridge extras — install if you want that bridge.
 discord = [
     "discord-py>=2.6",
@@ -56,17 +73,21 @@ discord = [
 slack = [
     "slack-bolt>=1.18",
 ]
+# ``pip install -e ".[dev]"`` — minimal dev toolchain. Does NOT pull
+# the langchain-claude-code git fork; that path is in
+# ``dev-claude-code`` below. Tests that touch the claude-code module
+# skip via ``pytest.importorskip("langchain_claude_code")`` when the
+# extra isn't installed.
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
     "pytest-aiohttp>=1.0",
     "discord-py>=2.6",
     "slack-bolt>=1.18",
-    # Tests touch all four model adapters at the import level.
-    "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39",
     "langchain-anthropic>=1.4",
     "langchain-openai>=1.2.1",
     "langchain-codex-plus>=0.0.1,<0.1",
+    "mcp>=1.27",
     # mimir.saga.vector_index uses FAISS for ANN search; without it
     # the index degrades to an empty-result stub and tests asserting
     # on indexed-atom counts (test_saga_correctness_regressions,
@@ -74,6 +95,15 @@ dev = [
     # level is debatable (some operators may want BM25-only); pinning
     # in dev means tests always exercise the real path.
     "faiss-cpu>=1.13",
+]
+
+# ``pip install -e ".[dev-claude-code]"`` — full dev toolchain INCLUDING
+# the langchain-claude-code git fork. Use this when working on the
+# claude-code subprocess path specifically. Contributors who only
+# touch the agent core / saga / bridges can use ``[dev]`` and let the
+# claude-code-specific tests skip.
+dev-claude-code = [
+    "mimir[dev,claude-code]",
 ]
 
 [project.scripts]
@@ -132,18 +162,19 @@ saga = { workspace = true }
 [dependency-groups]
 # uv-native dependency group (PEP 735). Mirrors
 # ``[project.optional-dependencies].dev`` so ``uv sync`` and
-# ``pip install -e ".[dev]"`` both pull the same test toolchain
-# plus all four model adapters (tests import each at module level)
-# and faiss-cpu (vector_index tests need a real index).
+# ``pip install -e ".[dev]"`` both pull the same test toolchain.
+# langchain-claude-code is OUT — it's behind the ``dev-claude-code``
+# extra (see pre-OSS hardening, review item #4). Tests that touch
+# the fork skip via ``pytest.importorskip``.
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
     "pytest-aiohttp>=1.0",
     "discord-py>=2.6",
     "slack-bolt>=1.18",
-    "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39",
     "langchain-anthropic>=1.4",
     "langchain-openai>=1.2.1",
     "langchain-codex-plus>=0.0.1,<0.1",
+    "mcp>=1.27",
     "faiss-cpu>=1.13",
 ]
