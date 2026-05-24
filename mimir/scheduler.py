@@ -782,11 +782,15 @@ class Scheduler:
         self._dispatch_invalid_manifest_events(invalid_events)
         return installed
 
-    async def reload_pollers(self) -> int:
+    async def reload_pollers(self) -> dict:
         """Re-scan the pollers directory and re-install. Called by the
         ``mcp__mimir__reload_pollers`` MCP tool after the agent installs
-        a new skill. No-op (returns 0) when ``add_poller_jobs`` was
-        never called (no skills_dir wired).
+        a new skill. No-op when ``add_poller_jobs`` was never called
+        (no skills_dir wired).
+
+        Returns a dict with keys ``registered`` (freshly installed this
+        reload), ``replaced`` (0 — not tracked), ``removed`` (0 — not
+        tracked), ``total`` (live count after reload).
 
         **Mutate lock (PR #107).** Wrapped with ``self._mutate_lock``
         so concurrent reload_pollers calls (e.g. operator triggers a
@@ -806,7 +810,7 @@ class Scheduler:
         """
         if self._pollers_dir is None:
             self._last_invalid_manifest_events = []
-            return 0
+            return {"registered": 0, "replaced": 0, "removed": 0, "total": 0}
         async with self._mutate_lock:
             _installed_fresh, invalid_events = await asyncio.to_thread(
                 self._reinstall_pollers,
@@ -846,7 +850,12 @@ class Scheduler:
         # concurrent reloads is intentionally non-deterministic.
         for payload in invalid_events:
             await log_event("poller_reload_invalid_manifest", **payload)
-        return live_total
+        return {
+            "registered": _installed_fresh,
+            "replaced": 0,
+            "removed": 0,
+            "total": live_total,
+        }
 
     def _reinstall_pollers(self) -> tuple[int, list[dict[str, Any]]]:
         """Wipe + re-discover + re-register. Sync — runs on the
