@@ -22,6 +22,26 @@ The `gh` CLI is installed in the container and authenticated via `GITHUB_TOKEN`
 from the env. Commits the agent makes through `git push` go through the same
 credential helper, so `gh pr create` and `git push` both work.
 
+## Contract
+
+**Trigger**: Any interaction with GitHub that goes beyond local git — reading issues
+or PRs, filing comments, checking CI, querying the API. If the task requires GitHub
+state (not just local repo state), invoke this skill.
+
+**Requires**: `GITHUB_TOKEN` in environment (verified by `gh auth status`). The PAT's
+scope determines which repos are reachable — operations on out-of-scope repos return
+403; check what the operator configured if you hit one.
+
+**Guarantees**:
+- GitHub interactions happen via `gh` CLI (authenticated, auditable), not via
+  WebFetch on raw GitHub URLs.
+- PAT scope is checked mentally before any cross-repo operation — a 403 from an
+  out-of-scope repo is expected behavior, not a bug.
+
+**Does not**: Push code (that's `git push`, separate from `gh`); manage GitHub Actions
+billing; access repos outside the PAT scope; file issues on external repos without
+operator approval.
+
 When inside `/workspace/mimir/` (the cloned repo) you don't need `--repo` —
 gh resolves the upstream remote. When working from elsewhere or operating on
 a different repo, pass `--repo owner/repo` (or use a URL).
