@@ -242,6 +242,13 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "viability_report_error": ("negative", "viability_error"),
     "applied_audit_ok": ("positive", "applied_audit_ok"),
     "applied_audit_error": ("negative", "applied_audit_error"),
+    # Daily proposed-changes backlog check (mimir/reflection/proposed_changes_health.py).
+    # Surfaces operator review backlog so the agent sees a between-reflection
+    # signal that the human-in-the-loop loop is broken. ``_error`` is the
+    # cron-callable's own failure path; the steady-state-healthy case emits
+    # nothing (no positive event needed — silence IS the success signal).
+    "proposed_changes_backlog": ("negative", "proposed_changes_backlog"),
+    "proposed_changes_backlog_error": ("negative", "proposed_changes_backlog_error"),
     "git_pull_ok": ("positive", "git_pull_ok"),
     "git_fetch_ok": ("positive", "git_fetch_ok"),
     "shell_job_complete_enqueue_ok": ("positive", "shell_job_complete_enqueue_ok"),
@@ -508,6 +515,11 @@ _ESCALATION_THRESHOLDS: dict[str, int] = {
     # VirtioFS issue is recurring, not a one-off.
     "bind_mount_stale": 3,
     "bind_mount_persistent": 2,
+    # Proposed-changes backlog: 5+ daily fires = 5 days of unaddressed
+    # backlog. Escalation event creates a persistent paper trail beyond
+    # the 24h algedonic display so introspection / viability reports
+    # find it during weekly reviews.
+    "proposed_changes_backlog": 5,
 }
 
 
@@ -1502,6 +1514,22 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"algedonic escalation: {kind} crossed threshold "
             f"({count_str}× ≥ {thr_str}× in 24h)"
         )
+    if rule_kind == "proposed_changes_backlog":
+        # Daily cron: surfaces pending count + oldest-age for the agent
+        # to see between reflections. Either threshold can trigger; show
+        # whichever values are present.
+        count = ev.get("pending_count")
+        oldest = ev.get("oldest_age_days")
+        parts = []
+        if isinstance(count, int):
+            parts.append(f"{count} pending")
+        if isinstance(oldest, int):
+            parts.append(f"oldest {oldest}d old")
+        detail = ", ".join(parts) if parts else "(no detail)"
+        return f"proposed-changes backlog: {detail}"
+    if rule_kind == "proposed_changes_backlog_error":
+        msg = ev.get("error") or "(no detail)"
+        return f"proposed-changes backlog check failed: {msg}"
     return rule_kind
 
 
