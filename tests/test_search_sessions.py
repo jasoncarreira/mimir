@@ -318,9 +318,14 @@ async def test_migration_v5_clears_atom_topics_before_deleting_boundaries(
         f"residuals: {counts}"
     )
 
-    # Step 6: Verify migration was actually stamped at v5.
+    # Step 6: Verify migration was actually stamped (v5 then v6 both land,
+    # so the final version equals CURRENT_SCHEMA_VERSION).
+    from mimir.saga.client import SagaStore as _SS
     v = conn2.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-    assert v == 5, f"schema_version should be 5 post-migration, got {v}"
+    assert v == _SS.CURRENT_SCHEMA_VERSION, (
+        f"schema_version should be {_SS.CURRENT_SCHEMA_VERSION} "
+        f"post-migration, got {v}"
+    )
 
     # Step 7: Non-boundary atom survives untouched.
     raw_exists = conn2.execute(
@@ -377,3 +382,236 @@ def test_ensure_conn_does_not_cache_half_initialized_connection(tmp_path):
     conn = store._ensure_conn()
     assert conn is not None
     assert store._conn is conn
+
+
+# ── Migration v6 tests ────────────────────────────────────────────────────
+
+
+def _make_v5_db(db_path, *, extra_orphan_rows: bool = False):
+    """Build a minimal v5 DB for migration-v6 tests.
+
+    If *extra_orphan_rows* is True, inserts one access_events row and one
+    atom_access_summary row pointing at a non-existent atom (simulating the
+    partial-v5 survivors that triggered chainlink #161).
+    """
+    import sqlite3
+    from pathlib import Path
+    from mimir.saga.client import SagaStore
+
+    # Let SagaStore create the schema + stamp v1..v5 normally.
+    s = SagaStore(db_path=db_path, embedding_dim=4)
+    conn = s._ensure_conn()
+    assert conn is not None
+
+    now = "2026-05-24T00:00:00+00:00"
+    # Insert a real atom so foreign key checks have something to land on.
+    conn.executescript(f"""
+        BEGIN;
+        INSERT INTO atoms (id, content, content_hash, source_type, agent_id, created_at)
+            VALUES ('atom-1', 'real atom', 'h1', 'conversation', 'default', '{now}');
+        INSERT INTO access_events (atom_id, ts, source)
+            VALUES ('atom-1', '{now}', 'store');
+        INSERT INTO atom_access_summary (atom_id, recent_ts_json, recent_weights_json)
+            VALUES ('atom-1', '[]', '[]');
+        COMMIT;
+    """)
+
+    if extra_orphan_rows:
+        # Disable FK enforcement to inject orphaned rows (simulating the
+        # partial-migration artifact from chainlink #161).
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute(
+            "INSERT INTO access_events (atom_id, ts, source) VALUES (?, ?, ?)",
+            ("ghost-atom-id", now, "retrieval"),
+        )
+        conn.execute(
+            "INSERT INTO atom_access_summary "
+            "(atom_id, recent_ts_json, recent_weights_json) VALUES (?, ?, ?)",
+            ("ghost-atom-id", "[]", "[]"),
+        )
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.commit()
+
+    # Stamp DB at v5 so opening a fresh store triggers migration 6.
+    conn.execute("DELETE FROM schema_version")
+    conn.execute(
+        "INSERT INTO schema_version (version, applied_at) VALUES (5, ?)",
+        ("2000-01-01T00:00:00+00:00",),
+    )
+    conn.commit()
+    s._conn = None  # force re-open path
+    return db_path
+
+
+def test_migration_v6_cleans_orphaned_access_events_rows(tmp_path):
+    """Migration v6 must delete orphaned access_events rows (atom_id with no
+    matching atoms.id) before rebuilding the table with ON DELETE CASCADE."""
+    db_path = _make_v5_db(tmp_path / "orphan.db", extra_orphan_rows=True)
+
+    # Opening a fresh store should trigger migration 6.
+    import sqlite3
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=db_path, embedding_dim=4)
+    conn = store._ensure_conn()
+
+    # The ghost-atom orphan must be gone.
+    ghost_access = conn.execute(
+        "SELECT COUNT(*) FROM access_events WHERE atom_id = 'ghost-atom-id'"
+    ).fetchone()[0]
+    ghost_summary = conn.execute(
+        "SELECT COUNT(*) FROM atom_access_summary WHERE atom_id = 'ghost-atom-id'"
+    ).fetchone()[0]
+    assert ghost_access == 0, (
+        f"migration v6 must remove orphaned access_events rows; found {ghost_access}"
+    )
+    assert ghost_summary == 0, (
+        f"migration v6 must remove orphaned atom_access_summary rows; found {ghost_summary}"
+    )
+
+    # The real atom's rows must survive.
+    real_access = conn.execute(
+        "SELECT COUNT(*) FROM access_events WHERE atom_id = 'atom-1'"
+    ).fetchone()[0]
+    assert real_access == 1, "real atom's access_events row must survive migration v6"
+
+    # Schema version must be stamped at v6.
+    v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+    assert v == 6, f"schema_version should be 6 post-migration, got {v}"
+
+    # PRAGMA foreign_key_check must return empty — no orphans remain.
+    conn2 = sqlite3.connect(str(db_path))
+    conn2.execute("PRAGMA foreign_keys=ON")
+    orphans = conn2.execute("PRAGMA foreign_key_check").fetchall()
+    conn2.close()
+    assert orphans == [], (
+        f"PRAGMA foreign_key_check must return 0 rows after migration v6; "
+        f"got: {orphans}"
+    )
+
+
+def test_migration_v6_cascade_delete_removes_dependents(tmp_path):
+    """After migration v6, deleting an atom must cascade to access_events,
+    atom_access_summary, embeddings, atom_topics, and atom_relations."""
+    db_path = _make_v5_db(tmp_path / "cascade.db", extra_orphan_rows=False)
+
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=db_path, embedding_dim=4)
+    conn = store._ensure_conn()
+
+    now = "2026-05-24T01:00:00+00:00"
+    # Insert a second atom with dependents in every CASCADE-target table.
+    conn.executescript(f"""
+        BEGIN;
+        INSERT INTO atoms (id, content, content_hash, source_type, agent_id, created_at)
+            VALUES ('atom-2', 'cascade target', 'h2', 'conversation', 'default', '{now}');
+        INSERT INTO access_events (atom_id, ts, source)
+            VALUES ('atom-2', '{now}', 'retrieval');
+        INSERT INTO atom_access_summary (atom_id, recent_ts_json, recent_weights_json)
+            VALUES ('atom-2', '[]', '[]');
+        INSERT INTO embeddings (atom_id, provider, model, dim, vec, embedded_at)
+            VALUES ('atom-2', 'stub', 'stub-4d', 4, x'00000000000000000000000000000000', '{now}');
+        INSERT INTO atom_topics (atom_id, topic) VALUES ('atom-2', 'cascade_test');
+        INSERT INTO atom_relations (source_id, target_id, relation_type, created_at)
+            VALUES ('atom-1', 'atom-2', 'evidenced_by', '{now}');
+        COMMIT;
+    """)
+
+    # Now delete atom-2 with FK enforcement ON (migration v6 adds CASCADE).
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("DELETE FROM atoms WHERE id = 'atom-2'")
+    conn.commit()
+
+    # Every dependent row must be gone.
+    for table, col in [
+        ("access_events", "atom_id"),
+        ("atom_access_summary", "atom_id"),
+        ("embeddings", "atom_id"),
+        ("atom_topics", "atom_id"),
+    ]:
+        n = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {col} = 'atom-2'"
+        ).fetchone()[0]
+        assert n == 0, f"{table} row for atom-2 must cascade-delete; found {n}"
+
+    # atom_relations has source_id + target_id both FK'd; the target-side
+    # edge ('atom-1' → 'atom-2') must be gone.
+    n_rel = conn.execute(
+        "SELECT COUNT(*) FROM atom_relations WHERE target_id = 'atom-2'"
+    ).fetchone()[0]
+    assert n_rel == 0, (
+        f"atom_relations target_id edge must cascade-delete; found {n_rel}"
+    )
+
+
+def test_migration_v6_triples_source_atom_id_set_null_on_delete(tmp_path):
+    """After migration v6, deleting an atom sets triples.source_atom_id=NULL
+    (ON DELETE SET NULL) rather than deleting the triple row."""
+    db_path = _make_v5_db(tmp_path / "triples_setnull.db", extra_orphan_rows=False)
+
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=db_path, embedding_dim=4)
+    conn = store._ensure_conn()
+
+    now = "2026-05-24T02:00:00+00:00"
+    conn.executescript(f"""
+        BEGIN;
+        INSERT INTO atoms (id, content, content_hash, source_type, agent_id, created_at)
+            VALUES ('atom-src', 'source atom', 'h-src', 'conversation', 'default', '{now}');
+        INSERT INTO triples (id, subject, predicate, object, source_atom_id, created_at)
+            VALUES ('triple-1', 'subj', 'pred', 'obj', 'atom-src', '{now}');
+        COMMIT;
+    """)
+
+    # Delete the source atom with FK enforcement ON.
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("DELETE FROM atoms WHERE id = 'atom-src'")
+    conn.commit()
+
+    # The triple must survive with source_atom_id=NULL.
+    row = conn.execute(
+        "SELECT id, source_atom_id FROM triples WHERE id = 'triple-1'"
+    ).fetchone()
+    assert row is not None, "triple must survive atom deletion (ON DELETE SET NULL)"
+    assert row[1] is None, (
+        f"source_atom_id must be NULL after atom deletion; got {row[1]!r}"
+    )
+
+
+def test_migration_v6_is_idempotent_on_fresh_db(tmp_path):
+    """A fresh DB created at v6 (schema.sql already has CASCADE) should pass
+    PRAGMA foreign_key_check without errors — the greenfield schema and the
+    migration produce the same result."""
+    import sqlite3
+    from mimir.saga.client import SagaStore
+
+    db_path = tmp_path / "fresh_v6.db"
+    store = SagaStore(db_path=db_path, embedding_dim=4)
+    conn = store._ensure_conn()
+
+    # Schema version must be stamped at v6 (CURRENT_SCHEMA_VERSION).
+    v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+    assert v == 6, f"fresh DB must be at v6; got {v}"
+
+    # Insert an atom and then delete it — dependents must cascade.
+    now = "2026-05-24T03:00:00+00:00"
+    conn.executescript(f"""
+        BEGIN;
+        INSERT INTO atoms (id, content, content_hash, source_type, agent_id, created_at)
+            VALUES ('a1', 'test', 'h-fresh', 'conversation', 'default', '{now}');
+        INSERT INTO access_events (atom_id, ts, source)
+            VALUES ('a1', '{now}', 'store');
+        COMMIT;
+    """)
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("DELETE FROM atoms WHERE id = 'a1'")
+    conn.commit()
+
+    # No orphans.
+    conn2 = sqlite3.connect(str(db_path))
+    conn2.execute("PRAGMA foreign_keys=ON")
+    orphans = conn2.execute("PRAGMA foreign_key_check").fetchall()
+    conn2.close()
+    assert orphans == [], f"fresh v6 DB must have no orphans; got: {orphans}"

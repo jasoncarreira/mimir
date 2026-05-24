@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS access_events (
     weight REAL DEFAULT 1.0,          -- multiplier (feedback=2.0, retrieval=1.0, consolidation=0.5)
     session_id TEXT,                  -- per-session attribution for reflect
     metadata TEXT DEFAULT '{}',
-    FOREIGN KEY (atom_id) REFERENCES atoms(id)
+    FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_access_atom_ts ON access_events(atom_id, ts DESC);
@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS atom_access_summary (
     old_weight_sum REAL DEFAULT 0.0,  -- sum of weights of displaced events
     old_oldest_ts TEXT,               -- timestamp of the oldest displaced event
     last_updated_ts TEXT,
-    FOREIGN KEY (atom_id) REFERENCES atoms(id)
+    FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
 );
 
 -- ──────────────────────────────────────────────────────────────────
@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
     dim INTEGER NOT NULL,
     vec BLOB NOT NULL,                -- raw float32 bytes
     embedded_at TEXT NOT NULL,
-    FOREIGN KEY (atom_id) REFERENCES atoms(id)
+    FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_emb_provider ON embeddings(provider);
@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS observations_metadata (
     last_evidence_at TEXT,
     consolidated_at TEXT NOT NULL,    -- when the observation was first synthesized
     consolidation_session TEXT,       -- which reflect session produced it
-    FOREIGN KEY (atom_id) REFERENCES atoms(id)
+    FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
 );
 
 -- ──────────────────────────────────────────────────────────────────
@@ -157,8 +157,8 @@ CREATE TABLE IF NOT EXISTS atom_relations (
     created_at TEXT NOT NULL,
     metadata TEXT DEFAULT '{}',
     PRIMARY KEY (source_id, target_id, relation_type),
-    FOREIGN KEY (source_id) REFERENCES atoms(id),
-    FOREIGN KEY (target_id) REFERENCES atoms(id)
+    FOREIGN KEY (source_id) REFERENCES atoms(id) ON DELETE CASCADE,
+    FOREIGN KEY (target_id) REFERENCES atoms(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_relations_source ON atom_relations(source_id, relation_type);
@@ -172,7 +172,7 @@ CREATE TABLE IF NOT EXISTS atom_topics (
     atom_id TEXT NOT NULL,
     topic TEXT NOT NULL,
     PRIMARY KEY (atom_id, topic),
-    FOREIGN KEY (atom_id) REFERENCES atoms(id)
+    FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_topics_topic ON atom_topics(topic);
 
@@ -200,7 +200,7 @@ CREATE TABLE IF NOT EXISTS triples (
     tombstoned INTEGER DEFAULT 0,
     created_at TEXT NOT NULL,
     metadata TEXT DEFAULT '{}',
-    FOREIGN KEY (source_atom_id) REFERENCES atoms(id)
+    FOREIGN KEY (source_atom_id) REFERENCES atoms(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_triples_spo ON triples(subject, predicate, object);
