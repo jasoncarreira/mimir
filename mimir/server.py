@@ -644,6 +644,15 @@ def build_app(config: Config) -> web.Application:
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc), job="viability-report")
 
+        # Register monthly applied-proposals audit (VSM S4-2 double-loop
+        # closure). Runs on the 1st of each month at 08:00 UTC; computes
+        # before/after signals for proposals applied 1-4 weeks prior.
+        # Detection-only; bad cron logs and continues.
+        try:
+            scheduler.add_applied_audit_job(home=config.home)
+        except ValueError as exc:
+            await log_event("scheduler_invalid_cron", error=str(exc), job="applied-audit")
+
         # Register weekly introspection-report cron (FEEDBACK-LOOPS §4.7
         # + §4.8). Non-LLM: aggregates turns/events, writes report,
         # emits heartbeat_health_degraded events when scheduled-tick
