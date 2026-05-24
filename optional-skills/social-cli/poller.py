@@ -206,11 +206,35 @@ def _format_event(notif: dict) -> dict | None:
         user_ctx_block = f"\n  context: {user_context}"
 
     text_line = f"\n  > {text}" if text else ""
+    # Action hint: identifies the right tool (outbox + dispatch) for any
+    # response the agent makes to this notification. The bare event
+    # ("mention from X / > text / id: ...") doesn't tell the agent
+    # WHERE to send the reply, so the default reach is ``send_message``
+    # — which routes to Discord/Slack, NOT back to Bluesky/X. Caught
+    # by muninn-mimir 2026-05-23. Per-event overhead ~250 chars;
+    # bounded by ``batch_size`` (default 3 for notifications).
+    #
+    # For ``like`` / ``follow`` / ``repost`` notifications (where the
+    # user is signaling, not asking), the agent may decide no
+    # outbound is needed — the hint still applies if it DOES decide
+    # to acknowledge.
+    target_id = post_id or nid
+    action_hint = (
+        "\n\n→ To reply or react: append to <STATE_DIR>/outbox.yaml + "
+        "run `social-cli dispatch`.\n"
+        "  Minimal shape:\n"
+        "    dispatch:\n"
+        f"      - reply: {{ platform: {platform}, id: \"{target_id}\", text: \"...\" }}\n"
+        f"      - like:  {{ platform: {platform}, id: \"{target_id}\" }}\n"
+        f"      - ignore: {{ id: \"{nid}\", reason: \"...\" }}   # skip without action\n"
+        f"  send_message routes to Discord/Slack — NOT to {platform}. Use outbox."
+    )
     prompt = (
         f"[{platform}] {ntype} from {author}"
         f"{text_line}"
         f"\n  id: {nid}"
         f"{user_ctx_block}"
+        f"{action_hint}"
     )
     out = {
         "poller": POLLER_NAME,

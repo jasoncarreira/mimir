@@ -205,6 +205,7 @@ def build_turn_prompt(
     upcoming_block: str | None = None,
     commitments_block: str | None = None,
     self_state_block: str | None = None,
+    auto_skill_block: tuple[str, str] | None = None,
     saga_session_id: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, SAGA
@@ -309,6 +310,24 @@ def build_turn_prompt(
 
     if subagent_block:
         _add_labeled("Subagent updates", subagent_block)
+
+    # Auto-surfaced skill block — when the turn lands on a
+    # ``poller:<name>`` channel and the named poller's parent skill
+    # has a SKILL.md, the resolver returns ``(skill_name, body)`` and
+    # we render it as a labeled section here. Placement is intentional:
+    # right above ``Today's date`` and the event header, so it's the
+    # last context the agent reads before the inbound event. The
+    # skill name is in the label so future readers can tell at a
+    # glance which skill auto-loaded.
+    #
+    # The full SKILL.md body lands inline; for skills with large
+    # SKILL.md files this is a sizeable prompt addition (~10-15 KB
+    # for social-cli's 261-line skill). Only fires on poller-driven
+    # turns — non-poller turns (user_message, scheduled_tick except
+    # reflect, react_received, saga_session_end, etc.) are unaffected.
+    if auto_skill_block:
+        skill_name, skill_body = auto_skill_block
+        _add_labeled(f"Skill: {skill_name}", skill_body)
 
     # Prompt-header timestamp: defaults to now (the agent's view of "today")
     # but can be overridden by the inbound event via ``extra.event_ts_iso``.
