@@ -123,6 +123,33 @@ def _load_events(events_log: Path, days: int) -> list[dict[str, Any]]:
     return out
 
 
+def _load_turns(turns_log: Path, days: int) -> list[dict[str, Any]]:
+    """Stream turns.jsonl from the tail; keep records inside the cutoff
+    window. Same tail-and-break pattern as ``_load_events``, but the
+    timestamp field is ``ts`` (TurnRecord shape) rather than
+    ``timestamp`` (Event shape).
+
+    Used by the token-usage chart in the Usage tab — per-turn token
+    counts live in ``TurnRecord.usage``, not in events.jsonl.
+
+    Missing log file returns []. Malformed JSON skipped. Output is
+    chronological order (oldest-first) for caller convenience.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    if not turns_log.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for record in tail_jsonl_records(turns_log):
+        ts = _parse_ts(record.get("ts", ""))
+        if ts is None:
+            continue
+        if ts < cutoff:
+            break
+        out.append(record)
+    out.reverse()
+    return out
+
+
 def _day_key(ts: datetime) -> str:
     return ts.date().isoformat()
 
@@ -305,18 +332,6 @@ def _backlog_items() -> list[dict[str, str]]:
             ),
         },
         {
-            "id": "llm-token-usage",
-            "title": "Token usage per turn (input / output / cache reads)",
-            "status": "Not instrumented",
-            "blocker": (
-                "ResultMessage carries token counts; mimir captures it "
-                "in turns.jsonl but not as a discrete events.jsonl entry. "
-                "Adding a per-turn llm_usage event would let the "
-                "dashboard render token-burn timeseries alongside the "
-                "cost-rate alert events."
-            ),
-        },
-        {
             "id": "session-boundary-rate",
             "title": "Session-boundary fire rate (synthesis pressure)",
             "status": "Partial — saga_synthesis_skipped_boundary fires but no positive counterpart",
@@ -436,6 +451,7 @@ def build_dashboard_payload(events_log: Path, days: int) -> dict[str, Any]:
     empty ``chainlink_issues`` envelope so the frontend's tab renders
     consistently. For the chainlink-populated variant used by the
     live route handler, see ``build_dashboard_payload_async``."""
+    from .token_usage_history import compute_token_usage_history
     from .usage_history import compute_usage_history
 
     events = _load_events(events_log, days)
@@ -449,6 +465,14 @@ def build_dashboard_payload(events_log: Path, days: int) -> dict[str, Any]:
     # Codex Plus for saga LLM calls) shows both concurrently.
     # ``events`` is already date-filtered by ``_load_events``.
     stats["usage_history"] = compute_usage_history(events)
+    # Per-day token volume history (Usage tab). Useful for both modes:
+    # subscription deployments see absolute volume alongside
+    # utilization-%; API-mode deployments use this as the PRIMARY
+    # Usage chart since their ``usage_history`` is empty (no
+    # quota-poll events fire on pay-per-token routes).
+    turns_log = events_log.parent / "turns.jsonl"
+    turns = _load_turns(turns_log, days)
+    stats["token_usage_history"] = compute_token_usage_history(turns)
     return stats
 
 
@@ -677,8 +701,9 @@ _DASHBOARD_HTML = """<!doctype html>
       </section>
 
       <section id="usage" class="panel">
-        <p class="hint">Subscription quota utilization over time. One chart per active subscription, one line per quota window (5h, 7d, plus model-scoped sub-windows). Empty means the provider has no captured events in the lookback window — either no models called or the quota writer (poller / callback) isn't wired.</p>
+        <p class="hint">Subscription quota utilization (above) + per-day token volume (below). Subscription chart is empty on pay-per-token deployments; token-volume chart is populated for any deployment with turns in the window.</p>
         <div id="usage-charts"></div>
+        <div id="token-usage-charts" style="margin-top: 1.2rem"></div>
       </section>
 
       <section id="invocations" class="panel">
@@ -1087,6 +1112,111 @@ _DASHBOARD_HTML = """<!doctype html>
             },
           });
         }
+      }
+
+      // ── Per-day token-usage chart ────────────────────────────────────
+      // Stacked bar chart of input / cache_creation / cache_read / output
+      // tokens per day, sourced from turns.jsonl. Useful for ALL
+      // deployments — subscription gets utilization-% above, this gets
+      // absolute volume below. For API-mode deployments where the
+      // subscription chart is empty, this is the PRIMARY Usage view.
+      const tokenContainer = document.getElementById('token-usage-charts');
+      const tokenHistory = D.token_usage_history || [];
+      if (tokenHistory.length === 0) {
+        tokenContainer.innerHTML =
+          '<div class="hint">No turns with usage data in window — chart will populate once turns land in <code>turns.jsonl</code>.</div>';
+      } else {
+        const tokenWrap = document.createElement('div');
+        tokenWrap.className = 'chart-wrap';
+        const tokenCanvas = document.createElement('canvas');
+        tokenCanvas.id = 'token-usage';
+        tokenWrap.appendChild(tokenCanvas);
+        tokenContainer.appendChild(tokenWrap);
+
+        // Stacked-bar layers, ordered cheap-to-expensive so the
+        // dominant cache_read tokens land in the middle of the stack
+        // (visually obvious) and the small-but-priciest output_tokens
+        // are at the top.
+        const tokenLayers = [
+          { key: 'input_tokens',                label: 'Input',          color: '#6c8ef7' },
+          { key: 'cache_creation_input_tokens', label: 'Cache creation', color: '#fbbf24' },
+          { key: 'cache_read_input_tokens',     label: 'Cache read',     color: '#10b981' },
+          { key: 'output_tokens',               label: 'Output',         color: '#f472b6' },
+        ];
+        const labels = tokenHistory.map(p => p.date);
+        const datasets = tokenLayers.map(layer => ({
+          label: layer.label,
+          data: tokenHistory.map(p => p[layer.key] || 0),
+          backgroundColor: layer.color,
+          borderWidth: 0,
+        }));
+        // Whether ANY day had a cost reading (subscription deployments
+        // return null; API-mode populates per-turn cost). Used to
+        // decide whether to show a cost summary below the chart.
+        const totalCost = tokenHistory.reduce(
+          (sum, p) => sum + (p.total_cost_usd || 0), 0,
+        );
+        const totalCostDays = tokenHistory.filter(
+          p => p.total_cost_usd != null,
+        ).length;
+
+        new Chart(tokenCanvas, {
+          type: 'bar',
+          data: { labels: labels, datasets: datasets },
+          options: {
+            plugins: {
+              title: {
+                display: true,
+                text: 'Token volume per day' +
+                  (totalCostDays > 0
+                    ? ' — total cost in window: $' + totalCost.toFixed(2)
+                    : ''),
+              },
+              tooltip: {
+                callbacks: {
+                  label: function(ctx) {
+                    const v = ctx.parsed.y;
+                    return ctx.dataset.label + ': ' + v.toLocaleString();
+                  },
+                  footer: function(items) {
+                    // Footer shows the day's turn_count + cost (when
+                    // available) — operator can see total volume +
+                    // throughput at a glance from the hover.
+                    const idx = items[0].dataIndex;
+                    const p = tokenHistory[idx];
+                    const parts = ['Turns: ' + (p.turn_count || 0)];
+                    if (p.total_cost_usd != null) {
+                      parts.push('Cost: $' + p.total_cost_usd.toFixed(4));
+                    }
+                    return parts.join(' · ');
+                  },
+                },
+              },
+            },
+            scales: {
+              x: {
+                stacked: true,
+                ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 10 },
+              },
+              y: {
+                stacked: true,
+                beginAtZero: true,
+                ticks: {
+                  // Compact integer formatting (10k, 100k, 1M) so the
+                  // axis stays readable when cache_read tokens
+                  // dominate by orders of magnitude.
+                  callback: function(v) {
+                    if (v >= 1_000_000) return (v / 1_000_000).toFixed(1) + 'M';
+                    if (v >= 1_000) return (v / 1_000).toFixed(0) + 'k';
+                    return v;
+                  },
+                },
+                title: { display: true, text: 'Tokens' },
+              },
+            },
+            interaction: { mode: 'index', intersect: false },
+          },
+        });
       }
 
       } // end render(D)
