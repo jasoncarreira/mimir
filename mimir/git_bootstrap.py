@@ -1,6 +1,6 @@
 """Idempotent git-init / clone bootstrap for ``/mimir-home``.
 
-PR 4b of MIMIR_HOME_GIT_TRACKING.md established the working copy as a
+PR 4b of docs/internal/MIMIR_HOME_GIT_TRACKING.md established the working copy as a
 git repo; PR 4d (this revision) replaces the in-URL token authentication
 with a git credential helper so the PAT is no longer embedded in
 ``.git/config`` or visible to ``git remote -v``. The module gets called
