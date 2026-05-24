@@ -18,6 +18,34 @@ Bias toward picking *one specific thing* to watch. "All of GitHub" is noise; "th
 on this branch" is a signal. Good pollers are narrow and rude — they only speak when
 something actually happened.
 
+## Contract
+
+**Trigger**: Operator asks "what could we poll?" / "I want to be notified
+about X" / "what should be a poller?". Also fires when the agent notices a
+class of state-changes it'd benefit from polling but hasn't catalogued
+yet — uncertainty about *what to monitor* is the trigger, not uncertainty
+about *how*.
+
+**Requires**: Familiarity with the `pollers` skill (this skill names the
+menu; that one supplies the cooking method). A specific
+service / signal / file in mind — generic "monitor everything" doesn't
+have an entry here.
+
+**Guarantees**:
+- Catalog organized by source class (git/github, issue trackers, RSS,
+  social, infra, …) so a search by "where the signal lives" returns
+  concrete poller candidates.
+- Each entry stays narrow enough to be a single concrete poller, not
+  "monitor everything in `<service>`."
+- Recommendations bias toward "silence as filter" — poll often, emit
+  rarely.
+
+**Does not**: Implement the polling (that's the `pollers` skill); rank
+candidates by value (operator priority decides); maintain a registry of
+which catalog items have actually been built into pollers — the
+`<home>/skills/<name>/pollers.json` files are the source of truth for
+"what's actually polling."
+
 ## Git / GitHub
 * `git fetch` the `main` branch for new updates from team members
 * Use `gh` to see pipeline failures before your operator
