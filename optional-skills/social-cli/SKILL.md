@@ -27,8 +27,46 @@ The poller surfaces notifications. The agent responds:
    `timestamp`, optionally `userContext`.
 
 2. **Write `outbox.yaml`** in the same dir with a `dispatch:` list.
-   Common action types: `reply`, `post`, `thread`, `like`,
-   `annotate`, `ignore`. See `AGENT_GUIDE.md` for the full grammar.
+   Common action shapes inline below — see `AGENT_GUIDE.md` for the
+   full grammar (annotate / quote-post / platform-per-text overrides
+   / dispatch hooks / etc.).
+
+   ```yaml
+   dispatch:
+     # Reply to a mention (or any post you have the id for)
+     - reply:
+         platform: bsky          # or: x
+         id: "at://did:plc:xxx/app.bsky.feed.post/abc"
+         text: "Your reply text"
+
+     # Like a post
+     - like:
+         platform: bsky
+         id: "at://did:plc:xxx/app.bsky.feed.post/abc"
+
+     # Repost (Bluesky) / retweet (X)
+     - repost:
+         platform: bsky
+         id: "at://did:plc:xxx/app.bsky.feed.post/abc"
+
+     # Proactive post (no parent id; goes to your own feed)
+     - post:
+         platforms: [bsky]       # or [bsky, x] for cross-post
+         text: "Today's observation."
+
+     # Thread (Bluesky / X)
+     - thread:
+         platform: bsky
+         posts:
+           - "1/ Opening claim."
+           - "2/ Supporting detail."
+           - "3/ Conclusion."
+
+     # Skip a notification without acting (removes it from inbox)
+     - ignore:
+         id: "notif_003"
+         reason: "spam"
+   ```
 
    When the poller wakes you with multiple notifications in one
    turn (it batches up to 3 — see "Wake batching" below), compose
@@ -43,6 +81,27 @@ The poller surfaces notifications. The agent responds:
    Dispatch validates, executes per-action (one failure doesn't
    block the rest), archives `outbox.yaml`, and removes dispatched
    notifications from `inbox.yaml`.
+
+### `send_message` goes to chat channels, NOT to Bluesky / X
+
+`send_message` and `react` deliver to Discord / Slack / web channels
+— whichever bridges the operator has wired up. **Bluesky and X are
+not bridge channels.** Their reply path is `outbox.yaml` +
+`social-cli dispatch`.
+
+If you saw a Bluesky or X post you want to respond to (reply, like,
+repost), that response goes through the outbox above, never through
+`send_message`. Using `send_message` here would route to whichever
+Discord/Slack channel happens to be on the turn's context — never to
+the social platform. The post stays unreplied and the operator sees
+a confused-looking message in chat.
+
+Caught in production 2026-05-23 (muninn-mimir): a Bluesky feed post
+the agent wanted to reply to landed in Discord because the agent
+reached for `send_message`. The poller prompt now includes an
+explicit "→ To engage: outbox + dispatch, NOT send_message" hint
+at the bottom of every social event to keep the right tool right
+next to the trigger.
 
 ### Don't use quick commands for inbox items
 

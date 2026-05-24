@@ -2099,6 +2099,23 @@ class Agent:
         self_state_block = await asyncio.to_thread(
             self._assemble_self_state_block,
         )
+        # Auto-surface the relevant SKILL.md when this turn is on a
+        # ``poller:<name>`` channel — the agent gets the skill's
+        # content inline without needing a ``find-skills`` lookup.
+        # Closes the failure mode where the agent reaches for
+        # ``send_message`` instead of the skill-specific workflow
+        # because it never loaded the matching skill (muninn-mimir
+        # 2026-05-23: a Bluesky reply landed in Discord). Non-poller
+        # turns return None and the prompt is unaffected.
+        from .skill_resolver import find_skill_for_channel
+        from .skill_defs import home_builtin_skills_dir, home_skills_dir
+        auto_skill_block = find_skill_for_channel(
+            event.channel_id,
+            skills_dirs=(
+                home_skills_dir(self._config.home),
+                home_builtin_skills_dir(self._config.home),
+            ),
+        )
         turn_prompt = build_turn_prompt(
             event,
             recent_messages=recent,
@@ -2112,6 +2129,7 @@ class Agent:
             upcoming_block=upcoming_block,
             commitments_block=commitments_block,
             self_state_block=self_state_block,
+            auto_skill_block=auto_skill_block,
             saga_session_id=ctx.saga_session_id,
         )
         return turn_prompt, recent
