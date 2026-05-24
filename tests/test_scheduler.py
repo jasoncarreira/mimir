@@ -1018,7 +1018,7 @@ async def test_reload_pollers_picks_up_new_skill(tmp_path: Path):
     # Drop a second skill and reload.
     _drop_pollers_skill(skills, "second")
     n2 = await sched.reload_pollers()
-    assert n2 == 2
+    assert n2["total"] == 2
     assert sched.registered_pollers() == ["first", "second"]
     assert sched._scheduler.get_job("poller:second") is not None
 
@@ -1040,7 +1040,7 @@ async def test_reload_pollers_drops_removed_skills(tmp_path: Path):
     # Delete the skill's pollers.json (simulating an uninstall).
     (skill_to_drop / "pollers.json").unlink()
     n = await sched.reload_pollers()
-    assert n == 1
+    assert n["total"] == 1
     assert sched.registered_pollers() == ["to-keep"]
     assert sched._scheduler.get_job("poller:to-drop") is None
 
@@ -1054,7 +1054,7 @@ async def test_reload_pollers_no_op_when_never_added(tmp_path: Path):
         return True
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
     n = await sched.reload_pollers()
-    assert n == 0
+    assert n["total"] == 0
 
 
 @pytest.mark.asyncio
@@ -1178,7 +1178,7 @@ async def test_reinstall_pollers_keeps_present_pollers_in_dict(tmp_path: Path):
     # Reload with the same skill present — entry stays in the dict
     # throughout (in-place update, not clear-and-rebuild).
     n = await sched.reload_pollers()
-    assert n == 1
+    assert n["total"] == 1
     assert "p1" in sched._pollers
     # The poller config is re-loaded but identity-equivalent.
     assert sched._pollers["p1"].name == poller_before.name
@@ -1206,7 +1206,7 @@ async def test_reinstall_pollers_drops_removed_skills_from_dict(
     import shutil
     shutil.rmtree(skills / "to-drop")
     n = await sched.reload_pollers()
-    assert n == 1
+    assert n["total"] == 1
     assert "to-keep" in sched._pollers
     # Stale entry dropped.
     assert "to-drop" not in sched._pollers
@@ -1458,11 +1458,11 @@ async def test_reinstall_pollers_preserves_entries_from_corrupted_manifest(
     # MCP reply's count agrees with the names list. Pre-fix this
     # returned 1 (only the cleanly-reinstalled poller); now returns
     # 2 (the preserved one + the cleanly-reinstalled one).
-    assert n == 2, (
+    assert n["total"] == 2, (
         "reload_pollers should return the live total "
         "(preserved + fresh), matching registered_pollers()"
     )
-    assert n == len(sched.registered_pollers())
+    assert n["total"] == len(sched.registered_pollers())
 
     # APScheduler job for the preserved poller is still registered.
     job_ids = {j.id for j in sched._scheduler.get_jobs()}
@@ -1537,7 +1537,7 @@ async def test_reload_pollers_drops_poller_when_manifest_deleted(
     import shutil
     shutil.rmtree(skills / "to-uninstall")
     n = await sched.reload_pollers()
-    assert n == 1
+    assert n["total"] == 1
     assert "to-keep" in sched._pollers
     # Clean deletion still drops the poller. This is the explicit
     # negative-case guard against over-correcting the chainlink #84
