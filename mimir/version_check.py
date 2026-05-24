@@ -55,20 +55,17 @@ _PYPI_JSON_URL = "https://pypi.org/pypi/{package}/json"
 def _pypi_package_name() -> str:
     """Return the PyPI distribution name to check.
 
-    Defaults to ``"mimir"`` but a name collision with an unrelated
-    package (Ralph Meijer's "Mimir daemons", existing on PyPI under
-    that name) means the open-source release uses a different
-    distribution name. Operator sets ``MIMIR_PYPI_PACKAGE_NAME`` to
-    the actual published name (e.g., ``mimir-agent``, ``odin-mimir``)
-    when the release happens.
+    Defaults to ``"mimir-agent"`` — the bare ``mimir`` name on PyPI
+    is taken by Ralph Meijer's unrelated Twisted-protocol project
+    (``Mimir daemons``), so the open-source release uses
+    ``mimir-agent`` as its distribution name. Python import path
+    stays ``mimir`` (the package directory); only the install
+    incantation differs: ``pip install mimir-agent``.
 
-    Until the env is set, the check returns "no signal" via the 404
-    path (the local ``mimir`` name finds the unrelated package, which
-    will pass the version comparison harmlessly since semver tuples
-    differ and pre-release filtering doesn't apply, but the check
-    surfaces an unrelated project's release as a mimir update — bad).
+    Operators on a fork or pre-release channel override via
+    ``MIMIR_PYPI_PACKAGE_NAME`` env var without code changes.
     """
-    return os.environ.get("MIMIR_PYPI_PACKAGE_NAME", "mimir").strip() or "mimir"
+    return os.environ.get("MIMIR_PYPI_PACKAGE_NAME", "mimir-agent").strip() or "mimir-agent"
 
 # 5-second timeout matches the existing OAuth poller etc. — PyPI is a
 # CDN-backed endpoint that should respond in << 1s; longer timeouts
