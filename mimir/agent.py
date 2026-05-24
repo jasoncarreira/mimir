@@ -2109,12 +2109,21 @@ class Agent:
         # turns return None and the prompt is unaffected.
         from .skill_resolver import find_skill_for_channel
         from .skill_defs import home_builtin_skills_dir, home_skills_dir
-        auto_skill_block = find_skill_for_channel(
+        # Disk I/O (walk skills dirs + read pollers.json + SKILL.md)
+        # wrapped in to_thread to match the existing pattern in this
+        # function — every other file-touching call here uses
+        # asyncio.to_thread. Consistency note from PR #315 review.
+        # Cost is sub-ms at current skill counts (<20 bundled + a few
+        # operator-installed) but keeps the event loop honest if skill
+        # counts grow or a SKILL.md gets large.
+        skills_dirs = (
+            home_skills_dir(self._config.home),
+            home_builtin_skills_dir(self._config.home),
+        )
+        auto_skill_block = await asyncio.to_thread(
+            find_skill_for_channel,
             event.channel_id,
-            skills_dirs=(
-                home_skills_dir(self._config.home),
-                home_builtin_skills_dir(self._config.home),
-            ),
+            skills_dirs,
         )
         turn_prompt = build_turn_prompt(
             event,
