@@ -1,5 +1,11 @@
 [project]
-name = "mimir"
+# PyPI distribution name. The bare ``mimir`` name is taken by an
+# unrelated Twisted-protocol project (Ralph Meijer's "Mimir daemons"),
+# so the open-source release uses ``mimir-agent``. The Python import
+# name stays ``mimir`` (the package directory under ``mimir/``), so
+# code keeps writing ``from mimir.agent import ...`` — only the
+# install incantation changes: ``pip install mimir-agent``.
+name = "mimir-agent"
 version = "0.1.0"
 description = "Memory-centric agent harness on deepagents / LangGraph"
 requires-python = ">=3.11"
