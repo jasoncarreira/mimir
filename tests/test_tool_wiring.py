@@ -181,7 +181,12 @@ async def test_spawn_claude_code_does_not_block_loop(
     sleep_started = asyncio.Event()
     other_tick_seen = asyncio.Event()
 
-    def _slow_run(argv: list[str], cwd: str | None, timeout_s: int) -> tuple[int, str, str]:
+    def _slow_run(
+        argv: list[str],
+        cwd: str | None,
+        timeout_s: int,
+        env: dict[str, str] | None = None,
+    ) -> tuple[int, str, str]:
         # Simulate a blocking subprocess that takes time. If this runs
         # on the main loop, `other_tick_seen` will never get set.
         sleep_started.set()
@@ -271,7 +276,10 @@ async def test_spawn_claude_code_passes_model_flag(
     captured: list[list[str]] = []
 
     def _capture_argv(
-        argv: list[str], cwd: str | None, timeout_s: int
+        argv: list[str],
+        cwd: str | None,
+        timeout_s: int,
+        env: dict[str, str] | None = None,
     ) -> tuple[int, str, str]:
         captured.append(argv)
         return 0, json.dumps({"result": "ok", "total_cost_usd": 0, "num_turns": 0}), ""
@@ -300,7 +308,10 @@ async def test_spawn_claude_code_omits_model_flag_when_not_set(
     captured: list[list[str]] = []
 
     def _capture_argv(
-        argv: list[str], cwd: str | None, timeout_s: int
+        argv: list[str],
+        cwd: str | None,
+        timeout_s: int,
+        env: dict[str, str] | None = None,
     ) -> tuple[int, str, str]:
         captured.append(argv)
         return 0, json.dumps({"result": "ok", "total_cost_usd": 0, "num_turns": 0}), ""

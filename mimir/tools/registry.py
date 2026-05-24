@@ -29,8 +29,12 @@ import hashlib
 import json
 import asyncio
 import logging
+import os
 import re
 import subprocess
+import time
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Optional
@@ -584,7 +588,140 @@ async def commitment_list(due_within_days: int = 7) -> str:
 # Spawn (mimir/spawn.py)
 # ────────────────────────────────────────────────────────────────────
 
-def _run_claude_subprocess(argv: list[str], cwd: str | None, timeout_s: int) -> tuple[int, str, str]:
+
+# Pre-OSS hardening (review item #5). ``spawn_claude_code`` previously
+# had no concurrency cap, no per-hour rate cap, and no recursion-depth
+# limit. A misbehaving agent could fan out an unbounded number of
+# parallel ``claude`` subprocesses or recursively spawn itself into a
+# fork bomb. The defaults below are conservative and operator-overridable.
+_SPAWN_MAX_CONCURRENT_DEFAULT = 3
+_SPAWN_MAX_PER_HOUR_DEFAULT = 20
+_SPAWN_MAX_DEPTH_DEFAULT = 2
+
+# Env var the *child* claude subprocess sees so a nested
+# ``spawn_claude_code`` inside the subprocess increments before
+# checking against the depth cap. The harness sets this to
+# ``parent_depth + 1`` when spawning.
+_SPAWN_DEPTH_ENV = "MIMIR_SPAWN_DEPTH"
+
+
+def _env_int_floor1(name: str, default: int) -> int:
+    """Read an int env var, defaulting if missing/invalid. Floors at 1
+    so an operator who sets ``=0`` doesn't accidentally disable all
+    spawns (the depth cap is the right tool for "no spawns")."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+@dataclass
+class _SpawnGuard:
+    """Process-wide state for spawn caps. Lazy-initialized on first
+    spawn so module import doesn't depend on an asyncio loop being
+    running."""
+
+    sem: asyncio.Semaphore | None = None
+    recent: deque[float] = field(default_factory=deque)
+    rate_lock: asyncio.Lock | None = None
+    max_concurrent: int = _SPAWN_MAX_CONCURRENT_DEFAULT
+    max_per_hour: int = _SPAWN_MAX_PER_HOUR_DEFAULT
+    max_depth: int = _SPAWN_MAX_DEPTH_DEFAULT
+
+
+_SPAWN_GUARD = _SpawnGuard()
+
+
+def _spawn_guard_init() -> _SpawnGuard:
+    """Re-read env vars and (re)initialize the semaphore + lock on first
+    spawn. Env vars are read each invocation so tests can change them
+    per-case without restarting the process; the semaphore / lock are
+    created exactly once per ``max_concurrent`` value so the
+    concurrency cap is real (every fresh ``Semaphore`` would defeat
+    the gate by handing every caller a full set of slots)."""
+    g = _SPAWN_GUARD
+    new_max_concurrent = _env_int_floor1(
+        "MIMIR_SPAWN_MAX_CONCURRENT", _SPAWN_MAX_CONCURRENT_DEFAULT,
+    )
+    g.max_per_hour = _env_int_floor1(
+        "MIMIR_SPAWN_MAX_PER_HOUR", _SPAWN_MAX_PER_HOUR_DEFAULT,
+    )
+    g.max_depth = _env_int_floor1(
+        "MIMIR_SPAWN_MAX_DEPTH", _SPAWN_MAX_DEPTH_DEFAULT,
+    )
+    # (Re)create only when the semaphore is missing or the cap
+    # changed — keeps the existing pending waiters in the same FIFO
+    # the loop scheduled them in. asyncio.Lock / Semaphore are
+    # loop-bound; the ``sem is None`` arm covers the cross-loop case
+    # (tests swap event loops between cases).
+    if g.sem is None or g.max_concurrent != new_max_concurrent:
+        g.sem = asyncio.Semaphore(new_max_concurrent)
+        g.max_concurrent = new_max_concurrent
+    if g.rate_lock is None:
+        g.rate_lock = asyncio.Lock()
+    return g
+
+
+def _spawn_reset_for_tests() -> None:
+    """Drop the existing semaphore + lock + rate window so a fresh
+    test gets clean state. Called only from tests."""
+    _SPAWN_GUARD.sem = None
+    _SPAWN_GUARD.rate_lock = None
+    _SPAWN_GUARD.recent.clear()
+
+
+async def _spawn_acquire_rate_slot(guard: _SpawnGuard) -> str | None:
+    """Check + reserve a per-hour spawn slot. Returns ``None`` if a
+    slot was reserved, or an error string if the cap is exhausted.
+
+    The window is a sliding 3600-second wall-clock window over
+    ``time.monotonic()`` timestamps. The check + append are inside
+    the rate_lock so two concurrent spawns can't both squeeze under
+    the cap on the same tick.
+    """
+    assert guard.rate_lock is not None  # initialized by _spawn_guard_init
+    async with guard.rate_lock:
+        now = time.monotonic()
+        cutoff = now - 3600
+        while guard.recent and guard.recent[0] < cutoff:
+            guard.recent.popleft()
+        if len(guard.recent) >= guard.max_per_hour:
+            oldest_age = int(now - guard.recent[0])
+            return (
+                f"spawn_claude_code refused: per-hour cap "
+                f"({guard.max_per_hour}/h) reached — oldest entry "
+                f"{oldest_age}s ago. Raise MIMIR_SPAWN_MAX_PER_HOUR "
+                f"or wait for the window to roll forward."
+            )
+        guard.recent.append(now)
+    return None
+
+
+def _spawn_release_rate_slot(guard: _SpawnGuard) -> None:
+    """Release the most-recent spawn slot — called on the refusal
+    paths AFTER the rate slot was reserved but BEFORE the concurrency
+    semaphore acquired (currently only the depth check is between
+    those, but the structure keeps the cleanup explicit). The
+    rate window is sliding, so the only correct behavior on
+    abort is to remove the entry we just appended."""
+    assert guard.rate_lock is not None
+    # No lock needed for a single pop — deque is thread-safe for
+    # append/pop and we're the only writer holding context here.
+    try:
+        guard.recent.pop()
+    except IndexError:
+        pass
+
+
+def _run_claude_subprocess(
+    argv: list[str],
+    cwd: str | None,
+    timeout_s: int,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
     """Sync subprocess.run wrapper — called from a thread via to_thread.
 
     Keeping the blocking I/O in a helper that's invoked through
@@ -592,6 +729,10 @@ def _run_claude_subprocess(argv: list[str], cwd: str | None, timeout_s: int) -> 
     dispatcher's event loop for the duration of the subprocess (up to
     ``timeout_s=1800`` by default). Returns (returncode, stdout, stderr)
     or raises subprocess.TimeoutExpired / FileNotFoundError unchanged.
+
+    ``env`` (if set) replaces the inherited environment. The spawn
+    path always sets it so ``MIMIR_SPAWN_DEPTH`` is incremented for
+    the child, enforcing the recursion cap defense-in-depth.
     """
     proc = subprocess.run(  # noqa: S603 — argv is constructed, not shell
         argv,
@@ -599,6 +740,7 @@ def _run_claude_subprocess(argv: list[str], cwd: str | None, timeout_s: int) -> 
         capture_output=True,
         text=True,
         timeout=timeout_s,
+        env=env,
     )
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -661,22 +803,71 @@ async def spawn_claude_code(
         return "spawn_claude_code failed: no spawn config"
     if not prompt or not prompt.strip():
         return "spawn_claude_code failed: prompt is required"
+
+    # ── Pre-OSS hardening (review item #5): concurrency / rate / depth caps.
+    guard = _spawn_guard_init()
+
+    # Depth check first — cheapest, no resource reservation needed.
+    # ``MIMIR_SPAWN_DEPTH`` is set by the harness on every nested
+    # spawn (``=parent_depth+1``); the root agent has it unset / 0.
+    current_depth = _env_int_floor1(_SPAWN_DEPTH_ENV, 0) if os.environ.get(
+        _SPAWN_DEPTH_ENV
+    ) else 0
+    if current_depth >= guard.max_depth:
+        return (
+            f"spawn_claude_code refused: recursion depth cap reached "
+            f"({current_depth} >= MIMIR_SPAWN_MAX_DEPTH={guard.max_depth}). "
+            f"The parent agent is already at this nesting level — "
+            f"deeper spawns would risk a fork-bomb / unbounded budget."
+        )
+
+    # Per-hour rate cap. Reserves a slot inside the rate_lock so two
+    # concurrent spawns can't both pass the check.
+    rate_err = await _spawn_acquire_rate_slot(guard)
+    if rate_err is not None:
+        return rate_err
+
+    # Concurrency cap. The semaphore reserves a slot for the duration
+    # of the subprocess; pending spawns wait their turn rather than
+    # piling up unbounded.
     cwd_path = Path(cwd).expanduser() if cwd else cfg.get("default_cwd")
+    # ``--`` separator before the prompt: the prompt is arbitrary
+    # operator/agent text, and a prompt starting with ``--<flag>``
+    # would otherwise be parsed by the claude CLI as another flag.
+    # (Review item — fast-follow in the §"Notable code bugs" section.)
     argv = ["claude", "-p", "--output-format", "json"]
     if model:
         argv += ["--model", model]
-    argv.append(prompt)
+    argv += ["--", prompt]
+
+    # Propagate ``MIMIR_SPAWN_DEPTH=current+1`` to the child so its
+    # own ``spawn_claude_code`` calls see the deeper level. The rest
+    # of the env is inherited verbatim.
+    child_env = dict(os.environ)
+    child_env[_SPAWN_DEPTH_ENV] = str(current_depth + 1)
+
+    assert guard.sem is not None
     try:
-        returncode, stdout, stderr = await asyncio.to_thread(
-            _run_claude_subprocess,
-            argv,
-            str(cwd_path) if cwd_path else None,
-            timeout_s,
-        )
-    except subprocess.TimeoutExpired:
-        return f"spawn_claude_code timed out after {timeout_s}s"
-    except FileNotFoundError:
-        return "spawn_claude_code failed: 'claude' CLI not on PATH"
+        async with guard.sem:
+            try:
+                returncode, stdout, stderr = await asyncio.to_thread(
+                    _run_claude_subprocess,
+                    argv,
+                    str(cwd_path) if cwd_path else None,
+                    timeout_s,
+                    child_env,
+                )
+            except subprocess.TimeoutExpired:
+                return f"spawn_claude_code timed out after {timeout_s}s"
+            except FileNotFoundError:
+                return "spawn_claude_code failed: 'claude' CLI not on PATH"
+    except BaseException:
+        # The subprocess never started OR exited abnormally; the
+        # rate-slot we reserved doesn't reflect real work that
+        # consumed budget. Release it so the per-hour window is
+        # accurate for the operator.
+        _spawn_release_rate_slot(guard)
+        raise
     if returncode != 0:
         return (
             f"spawn_claude_code failed: exit={returncode} "
