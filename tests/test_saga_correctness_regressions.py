@@ -284,25 +284,17 @@ def test_apply_pending_migrations_fresh_true_stamps_current_version_no_ddl(
     assert log == [], "no migration DDL should run on fresh=True"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "KNOWN LIMITATION (chainlink #175): existing DB with empty "
-        "schema_version stamps CURRENT_SCHEMA_VERSION without running "
-        "migrations. Fix requires PRAGMA table_info introspection to "
-        "distinguish a fresh schema.sql DB from a pre-migration-era DB — "
-        "see the KNOWN LIMITATION comment in mimir/saga/client.py."
-    ),
-    strict=True,
-)
 def test_apply_pending_migrations_fresh_false_empty_applied_runs_migrations(
     monkeypatch,
 ):
-    """fresh=False with an empty schema_version table (pre-migration-era
-    DB) — the function *should* treat it as v1 and apply pending migrations
-    (2..N), not silently stamp the current version and skip them.
+    """fresh=False with an empty schema_version table on a pre-
+    migration-era DB (no ``sessions`` table, no ``access_events`` FK) —
+    the function treats it as v1 and applies pending migrations 2..N,
+    rather than silently stamping the current version and skipping them.
 
-    Currently XFAIL: the function stamps CURRENT_SCHEMA_VERSION instead.
-    Remove the xfail mark when the PRAGMA-introspection fix lands.
+    Fixed via the ``_detect_schema_version`` PRAGMA-introspection helper
+    (chainlink #175). The detector returns 1 because no sessions table
+    exists, so v1 is stamped + migration v2 runs.
     """
     store = _patched_store(monkeypatch)
     conn = sqlite3.connect(":memory:")
@@ -317,3 +309,94 @@ def test_apply_pending_migrations_fresh_false_empty_applied_runs_migrations(
 
     log = conn.execute("SELECT version FROM _migration_log").fetchall()
     assert log == [(2,)], f"migration v2 DDL should have run once; got {log}"
+
+
+def test_apply_pending_migrations_fresh_false_empty_applied_skips_when_db_is_current(
+    monkeypatch, tmp_path,
+):
+    """The mid-init retry scenario: ``schema.sql`` ran (producing
+    v6-shape tables), then the migration step raised and the connection
+    got closed before schema_version was stamped. Next ``_ensure_conn``
+    sees ``fresh=False, applied={}``, but tables are already at
+    ``CURRENT_SCHEMA_VERSION``. ``_detect_schema_version`` returns 6
+    via the FK marker — stamp v1..v6 and skip the migrations loop
+    rather than re-running v6's DROP-and-rebuild on already-v6 tables.
+
+    Regression guard: under the naive "treat empty applied as v1"
+    fix, this test would attempt ``ALTER TABLE sessions ADD COLUMN
+    topics_discussed`` against a sessions table that already has it,
+    raising ``sqlite3.OperationalError: duplicate column name``.
+    """
+    from mimir.saga.client import SagaStore
+
+    # Real SagaStore against a real v6 DB (the file-backed path triggers
+    # schema.sql; we don't patch CURRENT_SCHEMA_VERSION or MIGRATIONS
+    # here because we want the production schema to fire).
+    db_path = tmp_path / "v6.saga.db"
+    store = SagaStore(db_path=db_path)
+    conn = store._ensure_conn()  # creates v6-shape tables + stamps v6
+
+    # Simulate the mid-init failure by clearing schema_version.
+    conn.execute("DELETE FROM schema_version")
+    conn.commit()
+
+    # Now call _apply_pending_migrations(fresh=False) — it should
+    # detect v6 via the FK marker and stamp without running anything.
+    store._apply_pending_migrations(conn, fresh=False)
+
+    versions = {r[0] for r in conn.execute("SELECT version FROM schema_version")}
+    assert versions == {1, 2, 3, 4, 5, 6}, (
+        f"all baselines 1..6 should be stamped on a v6-shape DB; "
+        f"got {sorted(versions)}"
+    )
+
+
+def test_detect_schema_version_returns_one_for_bare_db(tmp_path):
+    """No sessions table, no access_events table → v1."""
+    from mimir.saga.client import SagaStore
+    import sqlite3 as sq
+    store = SagaStore.__new__(SagaStore)
+    conn = sq.connect(":memory:")
+    assert store._detect_schema_version(conn) == 1
+
+
+def test_detect_schema_version_returns_six_for_current_schema(tmp_path):
+    """A DB created via the current ``schema.sql`` → v6 (FK marker)."""
+    from mimir.saga.client import SagaStore
+    store = SagaStore(db_path=tmp_path / "v6.saga.db")
+    conn = store._ensure_conn()
+    assert store._detect_schema_version(conn) == 6
+
+
+def test_detect_schema_version_distinguishes_v2_v3_v4(tmp_path):
+    """Synthetic sessions-table shapes test each pre-v6 marker."""
+    from mimir.saga.client import SagaStore
+    import sqlite3 as sq
+
+    store = SagaStore.__new__(SagaStore)
+
+    # v2: bare sessions table
+    conn2 = sq.connect(":memory:")
+    conn2.executescript(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, started_at TEXT NOT NULL);"
+    )
+    assert store._detect_schema_version(conn2) == 2
+
+    # v3: sessions has topics_discussed
+    conn3 = sq.connect(":memory:")
+    conn3.executescript(
+        "CREATE TABLE sessions ("
+        "id TEXT PRIMARY KEY, started_at TEXT NOT NULL, "
+        "topics_discussed TEXT NOT NULL DEFAULT '[]');"
+    )
+    assert store._detect_schema_version(conn3) == 3
+
+    # v4: sessions has embedding_dim
+    conn4 = sq.connect(":memory:")
+    conn4.executescript(
+        "CREATE TABLE sessions ("
+        "id TEXT PRIMARY KEY, started_at TEXT NOT NULL, "
+        "topics_discussed TEXT NOT NULL DEFAULT '[]', "
+        "embedding BLOB, embedding_dim INTEGER);"
+    )
+    assert store._detect_schema_version(conn4) == 4
