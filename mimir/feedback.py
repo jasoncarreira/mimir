@@ -101,6 +101,10 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "prohibited_action_blocked": ("negative", "prohibited_blocked"),
     "send_message_loop_hard_stop": ("negative", "loop_stop"),
     "send_message_loop_warning": ("negative", "loop_warn"),
+    # S2-2: cross-turn loop — same message sent 3+ times in 24h to the
+    # same channel.  Surfaces when FeedbackLog._detect_cross_turn_send_loops
+    # detects a flood that persisted across multiple turns.
+    "cross_turn_send_duplicate": ("negative", "cross_turn_loop"),
     "saga_query_error": ("negative", "saga_query_error"),
     "saga_feedback_error": ("negative", "saga_feedback_error"),
     "saga_consolidate_error": ("negative", "saga_consolidate_error"),
@@ -990,6 +994,14 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f"send_message_loop_hard_stop after {ev.get('count', '?')}"
     if rule_kind == "loop_warn":
         return f"send_message_loop_warning at {ev.get('count', '?')}"
+    if rule_kind == "cross_turn_loop":
+        # S2-2: cross-turn send flood — same content sent 3+ times in 24h.
+        cid = ev.get("channel_id") or "?"
+        count = ev.get("count", "?")
+        return (
+            f"cross-turn send loop: same message sent {count}× to {cid!r} in 24h — "
+            f"check for repeated heartbeat alerts or autonomous send loops"
+        )
     if rule_kind == "saga_query_error":
         return f"SAGA query failed: {ev.get('error') or '(no detail)'}"
     if rule_kind == "saga_feedback_error":
@@ -1498,6 +1510,100 @@ def _render_turn_error(rec: dict) -> str:
     return f"turn error: {err}"
 
 
+# ---------------------------------------------------------------------------
+# S2-2: cross-turn send_message loop detection
+#
+# The within-turn LoopDetector (loop_detector.py) catches near-duplicate
+# sends inside a single run_turn.  This function is the cross-turn analog:
+# it scans events.jsonl for ``send_message_sent`` events in the 24h window
+# and detects (channel_id × content_hash) pairs that appear 3+ times.
+#
+# A heartbeat that keeps sending the same alert every tick — flooding the
+# operator channel — is the canonical trigger.  The detection fires once per
+# 24h window per (channel_id, content_hash) pair (dedup via prior
+# ``cross_turn_send_duplicate`` events), so a sustained loop surfaces as a
+# single persistent algedonic negative rather than a new entry every tick.
+#
+# Beer framing: S2 cross-job variety-absorber operating across turn
+# boundaries, complementing the per-turn S2 circuit breaker.
+# ---------------------------------------------------------------------------
+
+def _detect_cross_turn_send_loops(
+    snapshot: "JsonlSnapshot | None",
+    events_path: Path,
+    cutoff_iso: str,
+    *,
+    threshold: int = 3,
+) -> list[FeedbackSignal]:
+    """S2-2: detect cross-turn send_message loops.
+
+    Scans events.jsonl for ``send_message_sent`` events in the 24h window.
+    Groups by (channel_id, content_hash); any pair with >= ``threshold`` sends
+    is a loop.  Emits a ``cross_turn_send_duplicate`` event for each new loop
+    detected (24h dedup via prior ``cross_turn_send_duplicate`` events).
+    Returns synthetic FeedbackSignals for any active loops so they surface in
+    the algedonic block on the next turn.
+    """
+    from .event_logger import log_event_sync  # lazy — avoids top-level cycle
+
+    send_counts: dict[tuple[str, str], int] = {}
+    already_flagged: set[tuple[str, str]] = set()
+
+    for ev in iter_snapshot_or_tail(snapshot, events_path):
+        ts = ev.get("timestamp")
+        if not isinstance(ts, str) or ts < cutoff_iso:
+            if isinstance(ts, str):
+                break
+            continue
+        evtype = ev.get("type")
+        if evtype == "send_message_sent":
+            cid = ev.get("channel_id") or ""
+            ch = ev.get("content_hash") or ""
+            if cid and ch:
+                send_counts[(cid, ch)] = send_counts.get((cid, ch), 0) + 1
+        elif evtype == "cross_turn_send_duplicate":
+            cid = ev.get("channel_id") or ""
+            ch = ev.get("content_hash") or ""
+            if cid and ch:
+                already_flagged.add((cid, ch))
+
+    signals: list[FeedbackSignal] = []
+    now_iso = datetime.now(tz=timezone.utc).isoformat()
+    for (cid, ch), count in send_counts.items():
+        if count < threshold:
+            continue
+        if (cid, ch) in already_flagged:
+            continue
+        # Emit a persistent event so subsequent turns' ``already_flagged``
+        # scan deduplicates within the 24h window.  Best-effort — a missing
+        # event_logger (test paths that don't call init_logger) is fine.
+        try:
+            log_event_sync(
+                "cross_turn_send_duplicate",
+                channel_id=cid,
+                content_hash=ch,
+                count=count,
+            )
+        except RuntimeError:
+            log.debug(
+                "cross_turn_send_duplicate not emitted: event_logger not initialised"
+            )
+        signals.append(
+            FeedbackSignal(
+                ts=now_iso,
+                polarity="negative",
+                kind="cross_turn_loop",
+                channel_id=cid,
+                content=(
+                    f"cross-turn send loop: same message sent {count}× to {cid!r} in 24h — "
+                    f"check for repeated heartbeat alerts or autonomous send loops"
+                ),
+                count=count,
+            )
+        )
+    return signals
+
+
 @dataclass
 class FeedbackLog:
     """Tails events.jsonl + turns.jsonl, surfaces recent feedback signals.
@@ -1696,6 +1802,18 @@ class FeedbackLog:
                 positives.append(sig)
         negatives.sort(key=lambda s: s.ts, reverse=True)
         positives.sort(key=lambda s: s.ts, reverse=True)
+
+        # S2-2: cross-turn send_message loop detection.  Always-surface —
+        # a cross-turn flood is an acute S2 concern that bypasses the
+        # per-polarity limit.  Detection runs after the main events loop so
+        # it doesn't interfere with the within-turn loop_stop / loop_warn
+        # signals that the individual-event pass already handles.
+        for sig in _detect_cross_turn_send_loops(
+            self.events_snapshot, self.events_path, cutoff_iso
+        ):
+            negatives.append(sig)
+        if any(s.kind == "cross_turn_loop" for s in negatives):
+            negatives.sort(key=lambda s: s.ts, reverse=True)
 
         # 2) turns.jsonl — error / result_is_error are turn-level negatives
         # the events stream might not capture.
