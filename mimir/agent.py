@@ -50,7 +50,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from .bridges._directives import parse_directives, ReactDirective
 from .channel_registry import ChannelRegistry
 from .config import Config
-from .event_logger import log_event, safe_log_event
+from .event_logger import log_event, log_event_sync, safe_log_event
 from .feedback import FeedbackLog
 from . import health
 from .history import Message, MessageBuffer
@@ -1725,9 +1725,26 @@ class Agent:
         broken core-block read or skill-catalog crash should NEVER
         prevent a turn from running."""
         try:
-            from .core_blocks import load_core
+            from .core_blocks import check_core_blocks_health, load_core
             from .prompts import build_system_prompt
             core_blocks = load_core(self._config.home)
+
+            # S1-3: detect silent identity loss before it propagates.
+            # Checks that enough core blocks loaded and none are stubs.
+            # log_event_sync is used because _build_system_prompt is sync;
+            # the async counterpart (log_event) would need an awaitable caller.
+            degraded, issues = check_core_blocks_health(core_blocks)
+            if degraded:
+                log.warning(
+                    "core_prompt_degraded: %s — agent will use degraded prompt",
+                    "; ".join(issues),
+                )
+                log_event_sync(
+                    "core_prompt_degraded",
+                    issues=issues,
+                    block_count=len(core_blocks),
+                )
+
             memory_index_body = (
                 self._indexes.read_memory_index()
                 if self._indexes is not None else None

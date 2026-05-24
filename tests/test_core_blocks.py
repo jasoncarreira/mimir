@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from mimir.core_blocks import (
+    check_core_blocks_health,
     describe_file,
     extract_desc_comment,
     first_sentence_fallback,
@@ -73,3 +74,45 @@ def test_render_core_section_separates_blocks(tmp_path: Path):
     assert "body-a" in rendered
     assert "body-b" in rendered
     assert "---" in rendered
+
+
+# ── S1-3: check_core_blocks_health ─────────────────────────────────────────
+
+
+def test_core_blocks_health_clean(tmp_path: Path):
+    """Enough healthy blocks → not degraded, no issues."""
+    core = tmp_path / "memory" / "core"
+    core.mkdir(parents=True)
+    for i in range(6):
+        # Each file is well over 200 bytes.
+        (core / f"{i:02d}-block.md").write_text("# Block\n" + "x" * 300)
+    blocks = load_core(tmp_path)
+    degraded, issues = check_core_blocks_health(blocks, min_count=5, min_bytes=200)
+    assert not degraded
+    assert issues == []
+
+
+def test_core_blocks_health_too_few(tmp_path: Path):
+    """Fewer blocks than min_count → degraded with under-count issue."""
+    core = tmp_path / "memory" / "core"
+    core.mkdir(parents=True)
+    for i in range(3):
+        (core / f"{i:02d}-block.md").write_text("# Block\n" + "x" * 300)
+    blocks = load_core(tmp_path)
+    degraded, issues = check_core_blocks_health(blocks, min_count=5, min_bytes=200)
+    assert degraded
+    assert any("3" in msg and "minimum 5" in msg for msg in issues)
+
+
+def test_core_blocks_health_undersized_file(tmp_path: Path):
+    """A block below min_bytes → degraded with the filename in the issue."""
+    core = tmp_path / "memory" / "core"
+    core.mkdir(parents=True)
+    for i in range(5):
+        (core / f"{i:02d}-block.md").write_text("# Block\n" + "x" * 300)
+    # One stub file well below 200 bytes.
+    (core / "05-stub.md").write_text("stub")
+    blocks = load_core(tmp_path)
+    degraded, issues = check_core_blocks_health(blocks, min_count=5, min_bytes=200)
+    assert degraded
+    assert any("05-stub.md" in msg for msg in issues)
