@@ -22,6 +22,25 @@ success_criteria:
 
 Create or update local skills in this agent home repo.
 
+## Phase 0: Should this be a skill?
+
+Before creating a new skill, answer these three questions. If any answer
+is "no" or "unclear" — stop and write a reply or a wiki page instead.
+
+1. **Recurring?** Has this workflow appeared ≥2 times, or is it clearly
+   going to repeat? One-off workflows are not skills — they bloat the
+   catalog and dilute discoverability.
+
+2. **Non-trivial?** Will the body exceed ~20 lines of meaningful steps?
+   A three-line procedure belongs in a reply, not a skill file.
+
+3. **Clear trigger?** Can you write a one-line description that
+   unambiguously tells the agent *when* to invoke this skill — and when
+   NOT to? Fuzzy triggers produce noisy skill catalog entries that get
+   invoked on the wrong task.
+
+All three "yes" → proceed. One or more "no" → don't create the skill.
+
 ## Where Skills Go
 
 User-editable skills belong in:
@@ -95,11 +114,13 @@ The skill body still describes which tools the procedure uses in prose; that doc
 
 ## Authoring Checklist
 
-1. Write frontmatter with `name` and a high-signal `description`. Optionally add a `success_criteria` block if the skill has a clear declarative completion signal (a Bash command pattern, a Write to a specific path, etc.) — see `mimir/skills/weather/SKILL.md` for a minimal example.
-2. Add the `<!-- desc: -->` first-body-line comment (agent-facing voice, dense).
-3. Add concise execution steps in the SKILL body.
-4. Include concrete paths/commands the agent should run.
-5. Keep scope narrow; split broad domains into multiple skills.
-6. Prefer deterministic instructions over generic advice.
-7. Run `pytest tests/test_skill_conformance.py tests/test_skill_catalog.py` locally to catch frontmatter drift before pushing.
-8. After landing, run `mimir skills catalog` to refresh the catalog file.
+1. **Phase 0 gate** — verify Phase 0 criteria above before touching anything.
+2. Write frontmatter with `name` and a high-signal `description`. Optionally add a `success_criteria` block if the skill has a clear declarative completion signal (a Bash command pattern, a Write to a specific path, etc.) — see `mimir/skills/weather/SKILL.md` for a minimal example.
+3. Add the `<!-- desc: -->` first-body-line comment (agent-facing voice, dense).
+4. Add concise execution steps in the SKILL body.
+5. Include concrete paths/commands the agent should run.
+6. Keep scope narrow; split broad domains into multiple skills.
+7. Prefer deterministic instructions over generic advice.
+8. **Quality gate — read the skill as an outsider.** Before writing tests, re-read the complete SKILL.md as if you were a different agent seeing it for the first time. Ask: Is the trigger unambiguous? Would the procedure produce consistent output across different runs? Are the steps concrete enough to follow without context? Fix gaps now — tests lock in behavior, so verify quality *before* tests encode it.
+9. Run `pytest tests/test_skill_conformance.py tests/test_skill_catalog.py` locally to catch frontmatter drift before pushing.
+10. After landing, run `mimir skills catalog` to refresh the catalog file.
