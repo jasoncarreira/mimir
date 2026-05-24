@@ -447,7 +447,7 @@ Implementation: `_BUDGET_EXEMPT_TOOLS = frozenset({"send_message", "react"})` in
 
 ### 4.10 State repo and push-failure recovery
 
-Agent home (`/mimir-home`) is tracked as a git repo synced to `mimirbot-state` via a post-turn hook (see §4.2 step 7 and `MIMIR_HOME_GIT_TRACKING.md`). Commits happen per-turn; pushes are debounced to 60 s and coalesce bursts into a single network call.
+Agent home (`/mimir-home`) is tracked as a git repo synced to `mimirbot-state` via a post-turn hook (see §4.2 step 7 and `docs/internal/MIMIR_HOME_GIT_TRACKING.md`). Commits happen per-turn; pushes are debounced to 60 s and coalesce bursts into a single network call.
 
 **Push failure detection and surfacing.** Each `git push` that returns a non-zero exit, times out (30 s hard cap), or raises an OS error logs a `git_push_failed` event to `events.jsonl`. The algedonic feedback block (§9.4) surfaces this to the agent on the next turn. A paired `git_push_ok` event is emitted on any successful push (debounced or retry) so the feedback block can show "old failure + recent success = transient, recovered."
 
