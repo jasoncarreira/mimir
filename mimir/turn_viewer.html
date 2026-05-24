@@ -499,6 +499,16 @@ function bindEventToggles(container) {
 
 function openDetail(turn) {
   if (!turn) return;
+  // Preserve scroll position across re-renders for the SAME turn —
+  // the polling loop (loadTurns, every 5s) calls openDetail again
+  // for the currently-open turn so freshly-arrived events render
+  // mid-stream. Without this, the panel scroll-resets to top on
+  // every poll, making it impossible to read further down. First
+  // click on a row IS a fresh open (different turn_id), so the
+  // scroll starts at top — that's the right user-expected behavior.
+  var detailPanel = document.getElementById('detailPanel');
+  var isRefresh = (openTurnId === turn.turn_id);
+  var savedScrollTop = isRefresh && detailPanel ? detailPanel.scrollTop : 0;
   openTurnId = turn.turn_id;
   document.getElementById('detailTs').textContent = fmtTime(turn.ts);
   document.getElementById('detailTrigger').innerHTML = triggerBadge(turn.trigger, turn.kind);
@@ -583,6 +593,18 @@ function openDetail(turn) {
 
   document.getElementById('detailPanel').classList.add('open');
   document.getElementById('detailOverlay').classList.add('open');
+
+  // Restore scroll position for refresh-re-renders. requestAnimationFrame
+  // waits for the browser to commit the new DOM before we set scrollTop;
+  // setting it synchronously here would race against the layout pass and
+  // not stick. The saved value is 0 on first open (fresh turn), so this
+  // is a no-op for that case — only the same-turn refresh path actually
+  // restores a non-zero scroll.
+  if (isRefresh && savedScrollTop > 0 && detailPanel) {
+    requestAnimationFrame(function() {
+      detailPanel.scrollTop = savedScrollTop;
+    });
+  }
 }
 
 function closeDetail() {
