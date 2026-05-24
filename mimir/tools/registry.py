@@ -594,6 +594,7 @@ async def spawn_claude_code(
     cwd: Optional[str] = None,
     timeout_s: int = 1800,
     name: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> str:
     """Spawn a Claude Code subprocess to execute a complex task.
 
@@ -609,11 +610,36 @@ async def spawn_claude_code(
     Now async, with the blocking subprocess call wrapped in
     ``asyncio.to_thread``.
 
+    **Model selection heuristic** (chainlink #158): pick based on
+    cognitive *depth* required, not output *shape* (destination path).
+    Passing ``model`` explicitly avoids the output-path-as-proxy
+    mis-tier (e.g. a wiki-page destination triggering a lighter model
+    for analytical work that needs deeper reasoning).
+
+    - ``model="opus"`` — analytical / evaluative work: VSM analysis,
+      gap inventories, skeptical code review, design decisions,
+      adversarial synthesis. Use when the task is "think critically"
+      even if the output lands at a doc/wiki path.
+    - ``model="sonnet"`` — default for most spawn work: implementation
+      tasks, benchmark runs, doc writing, spec drafts, mechanical
+      multi-step work where the path is well-defined.
+    - ``model="haiku"`` — high-throughput mechanical tasks that are
+      genuinely simple (e.g. format conversion, short summaries).
+      Rarely the right choice for spawn work; prefer sonnet as the
+      safe default.
+    - Omit ``model`` to let the claude CLI use its configured default
+      (currently sonnet-tier).
+
     Args:
         prompt: The task to hand to the spawned Claude Code instance.
         cwd: Working directory for the subprocess. Defaults to home.
         timeout_s: Subprocess timeout (default 30 min).
         name: Optional label recorded in the spawn log.
+        model: Claude model alias or full name (e.g. ``"opus"``,
+            ``"sonnet"``, ``"claude-opus-4-7"``). Passed as
+            ``--model`` to the claude CLI. Omit to use the CLI
+            default. Use ``"opus"`` for analytical/evaluative work
+            even when the output destination is doc-shaped.
     """
     cfg = _STATE["spawn_config"]
     if cfg is None:
@@ -621,7 +647,10 @@ async def spawn_claude_code(
     if not prompt or not prompt.strip():
         return "spawn_claude_code failed: prompt is required"
     cwd_path = Path(cwd).expanduser() if cwd else cfg.get("default_cwd")
-    argv = ["claude", "-p", "--output-format", "json", prompt]
+    argv = ["claude", "-p", "--output-format", "json"]
+    if model:
+        argv += ["--model", model]
+    argv.append(prompt)
     try:
         returncode, stdout, stderr = await asyncio.to_thread(
             _run_claude_subprocess,

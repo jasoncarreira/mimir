@@ -256,6 +256,64 @@ async def test_spawn_claude_code_handles_missing_claude_cli(
     assert "not on PATH" in msg
 
 
+@pytest.mark.asyncio
+async def test_spawn_claude_code_passes_model_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # chainlink #158: explicit model= must appear as --model <name> in
+    # the subprocess argv. Prevents output-path-as-proxy mis-tiering
+    # (analytical work routed to a lighter model because the output
+    # destination looks doc-shaped).
+    set_spawn_config({"default_cwd": tmp_path})
+
+    from mimir.tools import registry
+
+    captured: list[list[str]] = []
+
+    def _capture_argv(
+        argv: list[str], cwd: str | None, timeout_s: int
+    ) -> tuple[int, str, str]:
+        captured.append(argv)
+        return 0, json.dumps({"result": "ok", "total_cost_usd": 0, "num_turns": 0}), ""
+
+    monkeypatch.setattr(registry, "_run_claude_subprocess", _capture_argv)
+    await spawn_claude_code.ainvoke({"prompt": "analyse this", "model": "opus"})
+
+    assert captured, "subprocess was not called"
+    argv = captured[0]
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "opus"
+    # prompt must still be the final positional arg
+    assert argv[-1] == "analyse this"
+
+
+@pytest.mark.asyncio
+async def test_spawn_claude_code_omits_model_flag_when_not_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # When model= is not passed, --model must NOT appear in argv so the
+    # claude CLI uses its own default (don't force a tier unnecessarily).
+    set_spawn_config({"default_cwd": tmp_path})
+
+    from mimir.tools import registry
+
+    captured: list[list[str]] = []
+
+    def _capture_argv(
+        argv: list[str], cwd: str | None, timeout_s: int
+    ) -> tuple[int, str, str]:
+        captured.append(argv)
+        return 0, json.dumps({"result": "ok", "total_cost_usd": 0, "num_turns": 0}), ""
+
+    monkeypatch.setattr(registry, "_run_claude_subprocess", _capture_argv)
+    await spawn_claude_code.ainvoke({"prompt": "run benchmark"})
+
+    assert captured
+    argv = captured[0]
+    assert "--model" not in argv
+    assert argv[-1] == "run benchmark"
+
+
 # ─── InjectedToolArg schema fix (chainlink #147) ───────────────────
 
 
