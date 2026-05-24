@@ -56,6 +56,17 @@ Organize however helps you. Common shapes:
   as a hash-lookup against a future symptom. **Filing question:** "is
   this an operational issue I might hit and want flagged in the
   every-turn INDEX?" Yes → here.
+- `memory/learnings-pending.md` — the live append-only buffer for
+  candidate learned behaviors. Captured by `saga_session_end` synthesis
+  turns; reflection's §B.4 promotes durable ones to
+  `memory/core/40-learned-behaviors.md`. **Never write directly to
+  `40-learned-behaviors.md` outside a reflection turn.** Lifecycle:
+  - Synthesis turns **prepend** (newest-first) to the live file.
+  - Reflection's B.4 pass promotes / drops / keeps each entry.
+  - When the live file grows past ~1000 lines / 25k tokens, reflection
+    rotates it: rename to `memory/learnings-pending/<YYYY-WNN>.md`
+    (ISO week), create a fresh live file with just the header. Archives
+    are preserved indefinitely and reviewed during the rotation week.
 
 For people, recurring topics, concepts, and anything else that benefits
 from cross-references (a graph of who-relates-to-whom, which-concept-
