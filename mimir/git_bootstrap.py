@@ -81,12 +81,16 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
-# Committer identity — spec §"Locked answers" #3 (revised
-# 2026-05-06 msg 1501603018377007295). The email has no associated
-# GitHub account; commits show in the log without avatar attribution,
-# which is the desired shape for a non-human committer.
+# Committer identity for autonomous commits. The default email
+# is a non-routable ``.local`` domain so:
+#  - it has no associated GitHub account (commits don't render with
+#    an avatar — the desired shape for a non-human committer)
+#  - it doesn't leak operator infrastructure (an earlier default
+#    embedded a real deployment domain)
+# Operators override via ``MIMIR_GIT_USER_NAME`` /
+# ``MIMIR_GIT_USER_EMAIL`` in their compose.env / `.env`.
 DEFAULT_USER_NAME = "mimir"
-DEFAULT_USER_EMAIL = "mimir@muninnai.ai"
+DEFAULT_USER_EMAIL = "noreply@mimir-agent.local"
 
 
 # Templates are shipped inside the package so they're locatable at

@@ -288,6 +288,6 @@ Post-merge observation (one week):
 
 ## Source
 
-Discord channel 1500672382166110321 conversation 2026-05-10 21:19–22:52
+Discord channel 100000000000000002 conversation 2026-05-10 21:19–22:52
 UTC. Drafted 23:00 UTC heartbeat. Operator decision sought before
 landing.

@@ -23,8 +23,8 @@ Schema (full example)::
         notes: Eng team lead                # optional; surfaces in prompt
 
     channels:
-      - canonical: discord-1500672382166110321
-        display_name: jason-mimir
+      - canonical: discord-100000000000000002
+        display_name: ops-room
         kind: public                        # public | dm | guild-meta
         aliases: []                         # optional; rare for channels
         notes: Primary operator channel     # optional

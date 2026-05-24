@@ -1,6 +1,6 @@
 ---
 name: identity-lookup
-description: Look up who an alias belongs to (people) or what a channel id is (channels) using state/identities.yaml. Use when the operator or a turn-context refers to a platform-prefixed id ("who is discord-238367217903730690?", "what channel is slack-C100?") or you need to resolve aliases the other direction (canonical → display name + aliases). Read-side only — the populator (mimir.identities_populator) maintains the registry.
+description: Look up who an alias belongs to (people) or what a channel id is (channels) using state/identities.yaml. Use when the operator or a turn-context refers to a platform-prefixed id ("who is discord-100000000000000001?", "what channel is slack-C100?") or you need to resolve aliases the other direction (canonical → display name + aliases). Read-side only — the populator (mimir.identities_populator) maintains the registry.
 success_criteria:
   # Lookup happens via Bash + YAML parsing of identities.yaml (the
   # portable form documented in the skill body), or the in-tree
@@ -41,8 +41,8 @@ operator-managed and the populator handles updates.
 The operator or a recent-activity rendering surfaces a platform-prefixed
 id and you need to know what / who it is:
 
-- "Who is discord-238367217903730690?"
-- "What channel is slack-C100 / discord-1500672382166110321?"
+- "Who is discord-100000000000000001?"
+- "What channel is slack-C100 / discord-100000000000000002?"
 - "What aliases does jason have?"
 - "Is this a known person or just a raw id?"
 
@@ -71,7 +71,7 @@ from pathlib import Path
 
 home = Path(os.environ.get("MIMIR_HOME", os.environ["HOME"]))
 doc = yaml.safe_load((home / "state" / "identities.yaml").read_text())
-alias = "discord-238367217903730690"
+alias = "discord-100000000000000001"
 
 for person in doc.get("people") or []:
     if alias in (person.get("aliases") or []) or person.get("canonical") == alias:
@@ -151,12 +151,12 @@ r = IdentityResolver(home=home)
 r.reload()
 
 # People side
-print(r.resolve("discord-238367217903730690"))           # → canonical (e.g. "jason")
-print(r.display_name("discord-238367217903730690"))      # → "Jason Carreira"
+print(r.resolve("discord-100000000000000001"))           # → canonical (e.g. "alice")
+print(r.display_name("discord-100000000000000001"))      # → "Alice Anderson"
 
 # Channels side
 print(r.resolve_channel("slack-C100"))                   # → canonical
-print(r.channel_display_name("discord-1500672382166110321"))
+print(r.channel_display_name("discord-100000000000000002"))
 PY
 ```
 

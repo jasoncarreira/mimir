@@ -327,7 +327,7 @@ Heartbeat picks up issues by reading descriptions cold. Prose ("look into
 the rate-limit thing later") is unanchored — a future heartbeat reads it,
 shrugs, and moves on. Descriptions with **handles** ("investigate why
 `oauth_quota_anomalous` has fired 5×/day on
-`discord-1500672382166110321` since 2026-05-03") are actionable on first
+`discord-100000000000000002` since 2026-05-03") are actionable on first
 read. This applies equally to `-d/--description` on `create` and to the
 acceptance-criteria bullets on subissue descriptions (see "Subissue
 decomposition pattern" above) — same four questions, same handles.

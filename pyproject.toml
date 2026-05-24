@@ -3,7 +3,7 @@ name = "mimir"
 version = "0.1.0"
 description = "Memory-centric agent harness on deepagents / LangGraph"
 requires-python = ">=3.11"
-authors = [{ name = "jcarreira" }]
+authors = [{ name = "Jason Carreira" }]
 license = { text = "MIT" }
 
 dependencies = [
