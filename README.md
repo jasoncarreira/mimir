@@ -1,13 +1,17 @@
 # mimir
 
-A memory-centric agent harness on the Claude Agent SDK.
+[![PyPI](https://img.shields.io/pypi/v/mimir-agent.svg)](https://pypi.org/project/mimir-agent/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-mimir wraps the SDK with the surrounding apparatus an agent needs to
-operate over time, across channels, and across sessions: persistent
-memory (via [saga](./saga)), a tool-and-skill registry, scheduled
-ticks for autonomous work, message bridges (Discord / Slack / Bluesky
-/ web / benchmark stdout), and a feedback-loop / homeostat layer that
-keeps the agent regulated as it accumulates state.
+A memory-centric agent harness built on [deepagents](https://github.com/langchain-ai/deepagents)
+(LangGraph). Install: `pip install mimir-agent`.
+
+mimir wraps an LLM agent loop with the surrounding apparatus a long-running
+agent needs to operate over time, across channels, and across sessions:
+persistent memory (via [saga](./saga)), a tool-and-skill registry, scheduled
+ticks for autonomous work, message bridges (Discord / Slack / Bluesky / web /
+benchmark stdout), and a feedback-loop / homeostat layer that keeps the
+agent regulated as it accumulates state.
 
 The name is from Norse myth — Mímir, the keeper of memory and counsel.
 
@@ -45,11 +49,9 @@ mimir/                      # the agent harness — top-level package
 saga/                       # memory backend (vendored, formerly MSAM)
 benchmarks/longmemeval_via_mimir/   # integration bench against LongMemEval
 tests/                      # pytest suite
-docs/                       # architectural notes
+docs/                       # architectural notes (public) + internal/ (process docs)
 SPEC.md                     # detailed design doc
-FUTURE_WORK.md              # roadmap + experiments
 FEEDBACK-LOOPS.md           # mapping of every feedback loop in the system
-V0.4.md, V0.5.md            # version specs (historical)
 ```
 
 `saga/` is a memory-system package this repo depends on heavily —
@@ -61,8 +63,11 @@ Jaden Schwab, now extensively modified.
 Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 
 ```bash
-# Clone + install
-git clone <repo-url> mimir
+# Install from PyPI
+pip install mimir-agent
+
+# Or clone for development
+git clone https://github.com/jasoncarreira/mimir.git
 cd mimir
 uv sync
 
@@ -170,18 +175,19 @@ If you're orienting yourself in the codebase:
 2. **[FEEDBACK-LOOPS.md](./FEEDBACK-LOOPS.md)** — the regulatory
    architecture (mapped to Beer's Viable System Model)
 3. **[saga/README.md](./saga/README.md)** — memory backend
-4. **[FUTURE_WORK.md](./FUTURE_WORK.md)** — roadmap, including the
-   §12 series on autonomous-iteration loops
-5. **[V0.5.md](./V0.5.md)** — most recent shipped version's spec
-   (V0.4.md for the prior one)
+4. **[docs/](./docs/)** — additional architectural notes (`docs/internal/`
+   holds historical process docs that may help when archeology is needed
+   but aren't part of the public contract)
 
 ## License
 
-Copyright © 2026 Jason Carreira. License terms TBD — see
-[LICENSE](./LICENSE) for the current posture (all rights reserved
-pending a real open-source license decision).
+MIT — see [LICENSE](./LICENSE). Copyright © 2026 Jason Carreira.
 
-The [saga](./saga) subdirectory is independently MIT-licensed —
-see [saga/LICENSE](./saga/LICENSE) (combined copyright Jaden Schwab
-+ Jason Carreira). Saga's MIT terms are unaffected by mimir's
-top-level posture.
+The [saga](./saga) subdirectory is independently MIT-licensed (combined
+copyright Jaden Schwab + Jason Carreira); see [saga/LICENSE](./saga/LICENSE).
+
+## Contributing & security
+
+- [CONTRIBUTING.md](./CONTRIBUTING.md) — how to file issues and PRs
+- [SECURITY.md](./SECURITY.md) — vulnerability disclosure + threat-model posture
+- [CHANGELOG.md](./CHANGELOG.md) — release notes
