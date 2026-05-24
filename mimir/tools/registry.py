@@ -25,9 +25,11 @@ to memory_tool.py's set_memory_client pattern.
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import asyncio
 import logging
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -208,6 +210,19 @@ async def send_message(
             result = await bridge.send(cid, clean_text)
         except Exception as exc:
             return f"send_message failed: {exc}"
+
+        # S2-2: log a send_message_sent event with a normalized content hash
+        # so FeedbackLog._detect_cross_turn_send_loops can detect 24h floods
+        # (same message to same channel across multiple turns / heartbeats).
+        # Normalize: lowercase + collapse whitespace; truncate at 500 chars
+        # before hashing so two slightly-trimmed variants of a long message
+        # compare as equal.
+        _norm = re.sub(r"\s+", " ", clean_text.strip()).lower()[:500]
+        _content_hash = hashlib.md5(_norm.encode()).hexdigest()[:16]
+        try:
+            await _log_event("send_message_sent", channel_id=cid, content_hash=_content_hash)
+        except Exception:
+            pass  # best-effort; don't fail the send if event logging hiccups
 
         # Append outbound to chat-history buffer so the agent's next
         # turn sees its own reply in Recent activity. Dropped in PR
