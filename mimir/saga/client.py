@@ -167,7 +167,7 @@ class SagaStore:
     # greenfield DDL changes and add the migration that transforms an
     # older DB to match. ``_apply_pending_migrations`` walks
     # ``MIGRATIONS`` and applies any version > the DB's current.
-    CURRENT_SCHEMA_VERSION: int = 5
+    CURRENT_SCHEMA_VERSION: int = 6
 
     # Registry of post-greenfield schema changes. Keys are version
     # numbers (must be > 1, must be contiguous, must equal
@@ -354,6 +354,180 @@ WHERE a.source_type = 'session_boundary'
             -- Finally drop the atoms themselves. atoms_fts is kept in sync
             -- by the DELETE trigger in schema.sql.
             DELETE FROM atoms WHERE source_type = 'session_boundary';
+        """,
+        6: """
+            -- v6: Add ON DELETE CASCADE to all FK constraints that reference
+            -- atoms(id), and ON DELETE SET NULL to triples.source_atom_id.
+            -- Fixes index_integrity_failed algedonic signal caused by orphaned
+            -- rows in access_events / atom_access_summary (chainlink #161).
+            --
+            -- Root cause: the v5 migration had a partial-migration window
+            -- (original v5 missed atom_topics, causing FK rollback; combined
+            -- with the _ensure_conn half-init caching bug). The orphaned rows
+            -- are survivors of that window. The cleanup below removes them;
+            -- the CASCADE constraints prevent new orphans from any future
+            -- atom deletion path.
+            --
+            -- SQLite does not support ALTER TABLE ... MODIFY CONSTRAINT, so
+            -- we use the standard CREATE + COPY + DROP + RENAME pattern. FK
+            -- enforcement is disabled for the duration so the intermediate
+            -- table-missing state does not raise a constraint error.
+            PRAGMA foreign_keys=OFF;
+
+            -- ── Orphan cleanup (belt + suspenders; the COPY step filters
+            --    too, but explicit DELETEs make the before/after legible) ──
+            DELETE FROM access_events
+                WHERE atom_id NOT IN (SELECT id FROM atoms);
+            DELETE FROM atom_access_summary
+                WHERE atom_id NOT IN (SELECT id FROM atoms);
+            DELETE FROM embeddings
+                WHERE atom_id NOT IN (SELECT id FROM atoms);
+            DELETE FROM observations_metadata
+                WHERE atom_id NOT IN (SELECT id FROM atoms);
+            DELETE FROM atom_topics
+                WHERE atom_id NOT IN (SELECT id FROM atoms);
+            DELETE FROM atom_relations
+                WHERE source_id NOT IN (SELECT id FROM atoms)
+                   OR target_id NOT IN (SELECT id FROM atoms);
+            -- triples: NULL out source_atom_id for orphaned references
+            -- (the triple is still valid knowledge even without its source).
+            UPDATE triples SET source_atom_id = NULL
+                WHERE source_atom_id IS NOT NULL
+                  AND source_atom_id NOT IN (SELECT id FROM atoms);
+
+            -- ── access_events ──────────────────────────────────────────
+            CREATE TABLE new_access_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                atom_id TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                source TEXT NOT NULL,
+                weight REAL DEFAULT 1.0,
+                session_id TEXT,
+                metadata TEXT DEFAULT '{}',
+                FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
+            );
+            INSERT INTO new_access_events
+                SELECT id, atom_id, ts, source, weight, session_id, metadata
+                FROM access_events;
+            DROP TABLE access_events;
+            ALTER TABLE new_access_events RENAME TO access_events;
+            CREATE INDEX IF NOT EXISTS idx_access_atom_ts
+                ON access_events(atom_id, ts DESC);
+            CREATE INDEX IF NOT EXISTS idx_access_session
+                ON access_events(session_id);
+            CREATE INDEX IF NOT EXISTS idx_access_ts ON access_events(ts);
+
+            -- ── atom_access_summary ────────────────────────────────────
+            CREATE TABLE new_atom_access_summary (
+                atom_id TEXT PRIMARY KEY,
+                recent_ts_json TEXT DEFAULT '[]',
+                recent_weights_json TEXT DEFAULT '[]',
+                old_count INTEGER DEFAULT 0,
+                old_weight_sum REAL DEFAULT 0.0,
+                old_oldest_ts TEXT,
+                last_updated_ts TEXT,
+                FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
+            );
+            INSERT INTO new_atom_access_summary
+                SELECT * FROM atom_access_summary;
+            DROP TABLE atom_access_summary;
+            ALTER TABLE new_atom_access_summary RENAME TO atom_access_summary;
+
+            -- ── embeddings ─────────────────────────────────────────────
+            CREATE TABLE new_embeddings (
+                atom_id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                vec BLOB NOT NULL,
+                embedded_at TEXT NOT NULL,
+                FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
+            );
+            INSERT INTO new_embeddings SELECT * FROM embeddings;
+            DROP TABLE embeddings;
+            ALTER TABLE new_embeddings RENAME TO embeddings;
+            CREATE INDEX IF NOT EXISTS idx_emb_provider ON embeddings(provider);
+
+            -- ── observations_metadata ──────────────────────────────────
+            CREATE TABLE new_observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                evidence_count INTEGER DEFAULT 0,
+                trend TEXT,
+                last_evidence_at TEXT,
+                consolidated_at TEXT NOT NULL,
+                consolidation_session TEXT,
+                FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
+            );
+            INSERT INTO new_observations_metadata
+                SELECT * FROM observations_metadata;
+            DROP TABLE observations_metadata;
+            ALTER TABLE new_observations_metadata
+                RENAME TO observations_metadata;
+
+            -- ── atom_topics ────────────────────────────────────────────
+            CREATE TABLE new_atom_topics (
+                atom_id TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                PRIMARY KEY (atom_id, topic),
+                FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
+            );
+            INSERT INTO new_atom_topics SELECT * FROM atom_topics;
+            DROP TABLE atom_topics;
+            ALTER TABLE new_atom_topics RENAME TO atom_topics;
+            CREATE INDEX IF NOT EXISTS idx_topics_topic ON atom_topics(topic);
+
+            -- ── atom_relations ─────────────────────────────────────────
+            CREATE TABLE new_atom_relations (
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                confidence REAL DEFAULT 1.0,
+                created_at TEXT NOT NULL,
+                metadata TEXT DEFAULT '{}',
+                PRIMARY KEY (source_id, target_id, relation_type),
+                FOREIGN KEY (source_id) REFERENCES atoms(id) ON DELETE CASCADE,
+                FOREIGN KEY (target_id) REFERENCES atoms(id) ON DELETE CASCADE
+            );
+            INSERT INTO new_atom_relations SELECT * FROM atom_relations;
+            DROP TABLE atom_relations;
+            ALTER TABLE new_atom_relations RENAME TO atom_relations;
+            CREATE INDEX IF NOT EXISTS idx_relations_source
+                ON atom_relations(source_id, relation_type);
+            CREATE INDEX IF NOT EXISTS idx_relations_target
+                ON atom_relations(target_id, relation_type);
+
+            -- ── triples ────────────────────────────────────────────────
+            -- source_atom_id is nullable; ON DELETE SET NULL preserves the
+            -- triple's knowledge even when its originating atom is forgotten.
+            CREATE TABLE new_triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                source_atom_id TEXT,
+                confidence REAL DEFAULT 1.0,
+                valid_from TEXT,
+                valid_until TEXT,
+                embedding BLOB,
+                embedding_dim INTEGER,
+                tombstoned INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                metadata TEXT DEFAULT '{}',
+                FOREIGN KEY (source_atom_id) REFERENCES atoms(id)
+                    ON DELETE SET NULL
+            );
+            INSERT INTO new_triples SELECT * FROM triples;
+            DROP TABLE triples;
+            ALTER TABLE new_triples RENAME TO triples;
+            CREATE INDEX IF NOT EXISTS idx_triples_spo
+                ON triples(subject, predicate, object);
+            CREATE INDEX IF NOT EXISTS idx_triples_subject
+                ON triples(subject) WHERE tombstoned = 0;
+            CREATE INDEX IF NOT EXISTS idx_triples_current
+                ON triples(subject, predicate)
+                WHERE valid_until IS NULL AND tombstoned = 0;
+
+            PRAGMA foreign_keys=ON;
         """,
     }
 
