@@ -187,6 +187,17 @@ def log_event_sync(event_type: str, **payload: Any) -> None:
     get_logger().log_sync(event_type, **payload)
 
 
+def _reset_logger_for_tests() -> None:
+    """Reset the module-level logger singleton.
+
+    Only for use in unit tests — clears the ``_logger`` global so a test
+    that called ``init_logger`` doesn't pollute the next test's logger state.
+    Never call from production code.
+    """
+    global _logger
+    _logger = None
+
+
 async def safe_log_event(event_type: str, **payload: Any) -> None:
     """Best-effort wrapper around ``log_event`` that swallows logger-side
     failures so a misbehaving event sink never crashes the primary work path.
