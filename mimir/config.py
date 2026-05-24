@@ -434,11 +434,23 @@ class Config:
     # Server-side API key for the public injection endpoint (POST /event).
     # When set, requests must carry a matching ``X-API-Key`` header or get
     # 401. Empty default means no auth — fine for development on
-    # localhost, but the server binds to 0.0.0.0 so any production
-    # deployment should set this. Without it, an attacker who can reach
-    # the server can steer the agent into the synthesis path against an
-    # arbitrary session id (and call saga_end_session etc.).
+    # loopback (127.0.0.1, the default ``web_host``). Binding any
+    # non-loopback interface (``0.0.0.0`` or a specific external IP)
+    # requires a non-empty ``api_key``; the server refuses to start
+    # otherwise. Without auth on a network-reachable port, an attacker
+    # who can reach the port can steer the agent into the synthesis
+    # path against an arbitrary session id (and call saga_end_session
+    # etc.).
     api_key: str
+
+    # HTTP bind address. Default ``127.0.0.1`` — loopback-only, the safe
+    # posture for a process the operator interacts with locally.
+    # ``MIMIR_WEB_HOST=0.0.0.0`` (or a specific IP) exposes the port to
+    # the network and requires ``MIMIR_API_KEY`` to be set; startup
+    # refuses the combination of a non-loopback bind + missing key.
+    # Docker / k8s deployments typically set this to ``0.0.0.0`` and
+    # also supply an API key via the orchestrator's secret store.
+    web_host: str
 
     # Set MIMIR_ALLOW_UNAUTHENTICATED=true to suppress the startup
     # security warning when MIMIR_API_KEY is empty. For development /
@@ -715,6 +727,7 @@ class Config:
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
             api_key=_env("MIMIR_API_KEY"),
+            web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),
             allow_unauthenticated=_env("MIMIR_ALLOW_UNAUTHENTICATED", "false").lower()
                 in {"true", "1", "yes"},
             turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", 3600),
