@@ -36,8 +36,8 @@ This is *your* turn. There is no user waiting for a reply.
 ## Step 1 — Librarian Protocol
 
 Run this first, every heartbeat. Five quick checks (~2 min total).
-Catches drift before it compounds — Atlas's "lobotomy" pattern from
-muninnbot's notes is what we're avoiding.
+Catches drift before it compounds — the failure mode is silent
+"lobotomy" of working state without you noticing.
 
 **1. State coherence (30 sec)**
 Read your `memory/core/*.md` blocks. Are they intact, readable,

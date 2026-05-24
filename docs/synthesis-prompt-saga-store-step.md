@@ -8,8 +8,8 @@
 
 Drafted during 23:00 heartbeat after discord conversation 21:51–22:52 UTC
 on why mimir rarely reaches for `saga_store`. Operator pointed at the
-bench prompts (muninnbot/extraction.md, open-strix-hindsight/extraction.md)
-as the reference for what SAGA-store prompting looks like when it works.
+bench extraction prompts as the reference for what SAGA-store prompting
+looks like when it works.
 
 Revisions per operator 2026-05-10 23:12:
 - **Don't ground semantic atoms on a wiki entry.** Wiki-pairing is fine
@@ -63,9 +63,8 @@ Root cause analysis from the discord introspection:
 
 ## What the bench prompts do (the working reference)
 
-`/benchmark/prompts/muninnbot/extraction.md` and
-`/benchmark/prompts/open-strix-hindsight/extraction.md` are
-27-30-line tight templates with seven load-bearing pieces:
+The reference extraction prompts are 27-30-line tight templates with
+seven load-bearing pieces:
 
 1. **Dedicated extraction turn** — separate from the seed
    conversation; pure "read what happened, store atoms, done."

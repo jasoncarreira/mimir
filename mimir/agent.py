@@ -1342,9 +1342,9 @@ class Agent:
         # ``CommitmentExtractionHook`` runs Phase 2a commitment
         # extraction (saga_session_end → structured commitment records),
         # restoring the SDK-era ``CommitmentExtractionHook.finalize``
-        # behavior. Additional hooks (muninnbot-specific finalize logic,
-        # wiki backlinks, etc.) can be registered via the
-        # ``Agent(turn_hooks=...)`` constructor parameter or
+        # behavior. Additional deployment-specific finalize hooks
+        # (wiki backlinks, custom synthesis, etc.) can be registered
+        # via the ``Agent(turn_hooks=...)`` constructor parameter or
         # ``Agent.add_hook(...)``. Per-hook exception isolation —
         # see ``mimir.turn_hooks.fire_hooks``.
         await fire_hooks("finalize", self._hooks, ctx, event, record)

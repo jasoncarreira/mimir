@@ -250,11 +250,11 @@ def _parse_sources(raw: str) -> frozenset[str] | None:
 class Config:
     home: Path
     # Logical agent name — tags every TurnRecord + event record so a
-    # cross-process operator running two agents (e.g. "mimir" +
-    # "muninnbot") on the same infrastructure can disambiguate output
-    # by agent without grepping by MIMIR_HOME path. Default "mimir";
-    # second-agent deployments override via MIMIR_AGENT_ID. Has no
-    # effect on a single-agent deployment.
+    # cross-process operator running two agents on the same
+    # infrastructure can disambiguate output by agent without grepping
+    # by MIMIR_HOME path. Default "mimir"; multi-agent deployments
+    # override via MIMIR_AGENT_ID. Has no effect on a single-agent
+    # deployment.
     agent_id: str
     model: str
     # Post-cutover model spec for the deepagents path:

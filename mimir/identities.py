@@ -24,7 +24,7 @@ Schema (full example)::
 
     channels:
       - canonical: discord-100000000000000002
-        display_name: jason-mimir
+        display_name: ops-room
         kind: public                        # public | dm | guild-meta
         aliases: []                         # optional; rare for channels
         notes: Primary operator channel     # optional

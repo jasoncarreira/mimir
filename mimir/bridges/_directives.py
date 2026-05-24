@@ -17,9 +17,8 @@ order:
 → ``send-file`` quarterly-report.pdf with caption
 
 This avoids one tool-call round-trip per side effect (vs. the
-``send_message + react + send_file`` tool-based pattern). Lifted from
-lettabot (~/projects/letta/lettabot/src/core/directives.ts) — Python
-port with the same vocabulary.
+``send_message + react + send_file`` tool-based pattern). Ported
+from a TypeScript implementation with the same directive vocabulary.
 
 **Trust boundary:** parse only the agent's own assistant text. Don't
 run the parser on quoted user input, system reminders, or recent-message

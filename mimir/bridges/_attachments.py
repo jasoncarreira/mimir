@@ -11,9 +11,8 @@ path must resolve inside ``MIMIR_HOME/attachments/outbound/`` — escaping
 is rejected. ``..`` is resolved before the containment check, and
 symlinks are resolved before the check too, so neither bypass works.
 
-Lifted from lettabot (channels/attachments.ts) and open-strix
-(_resolve_send_message_attachments in tools.py:347-396) — Python port
-combining both shapes (inbound builder + outbound validator).
+Python port combining an inbound-builder + outbound-validator pattern
+from sibling agent harnesses.
 """
 
 from __future__ import annotations

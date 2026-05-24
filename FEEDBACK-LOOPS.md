@@ -375,8 +375,7 @@ out-of-date ones automatically.
 ### 4.7 Event-introspection report — weekly behavioral snapshot
 
 **S3\* (audit) — meta on the agent.** `mimir reflection
-introspection-report` (bundled CLI; ported from muninnbot's
-`event_introspection_report.py`) reads the past N days of
+introspection-report` (bundled CLI) reads the past N days of
 turns.jsonl + events.jsonl and produces a structured markdown
 report covering: turn counts by trigger, tool-usage and error
 rates, recurring error patterns, behavioral drift (tools
