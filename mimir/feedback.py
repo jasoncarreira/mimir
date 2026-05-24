@@ -216,6 +216,13 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # the agent's feedback block can show "transient, recovered."
     "quota_exhausted": ("negative", "quota_exhausted"),
     "quota_recovered": ("positive", "quota_recovered"),
+    # S1-3 (VSM eval): core memory block degradation — fewer-than-minimum
+    # blocks loaded OR an individual block is below the stub-size threshold.
+    # Silent identity loss is worse than loud identity loss: the agent
+    # continues running on a stripped-down prompt that may be missing persona,
+    # values, or filing rules. Negative so the algedonic block makes the
+    # degradation visible every turn until the operator can restore the files.
+    "core_prompt_degraded": ("negative", "core_prompt_degraded"),
     # SPEC §16 items follow-up from the 2026-05-23 VSM eval. The weekly
     # viability report (mimir/viability_metrics.py) emits one event per
     # threshold-crossing it detects. Each is a distinct collapse /
