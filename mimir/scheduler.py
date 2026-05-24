@@ -1318,6 +1318,41 @@ class Scheduler:
             coalesce=True,
         )
 
+    # ---- PyPI update-check cron --------------------------------------
+
+    def add_update_check_job(
+        self,
+        home: Path,
+        cron_expr: str = "0 8 * * *",
+        *,
+        job_id: str = "update-check",
+    ) -> bool:
+        """Register the daily PyPI version-check (``mimir/version_check.py``).
+        Queries PyPI for the latest released ``mimir`` version and emits
+        ``mimir_update_available`` (positive algedonic) when a newer
+        version exists. Pre-releases filtered out by default.
+
+        Default cron: ``0 8 * * *`` — 08:00 UTC daily. Cheap (one HTTP
+        GET to a CDN-backed PyPI endpoint, 5s timeout); silent when on
+        latest or PyPI lookup fails. The positive polarity matches the
+        spirit of the algedonic channel — new code is generally a good
+        thing, surface as pleasure-side signal not pain.
+        """
+        from .version_check import run_scheduled_update_check
+
+        async def _fire() -> None:
+            await run_scheduled_update_check(home)
+
+        return self.register_callable(
+            name=job_id,
+            fn=_fire,
+            default_cron=cron_expr,
+            job_id=job_id,
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # ---- Index-integrity cron ----------------------------------------
 
     def add_index_integrity_job(

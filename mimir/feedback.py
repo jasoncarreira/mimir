@@ -249,6 +249,15 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # nothing (no positive event needed — silence IS the success signal).
     "proposed_changes_backlog": ("negative", "proposed_changes_backlog"),
     "proposed_changes_backlog_error": ("negative", "proposed_changes_backlog_error"),
+    # PyPI version-check daily cron (mimir/version_check.py). Surfaces
+    # newer mimir releases so the operator sees a "version X available"
+    # signal in the agent's per-turn algedonic block and on /ops.
+    # Positive polarity — new code is generally a good thing. The error
+    # case (cron callable raised) is negative, but the routine "PyPI is
+    # currently unreachable" / "package not yet published" cases are
+    # silent (the check itself returns no signal — no event emitted).
+    "mimir_update_available": ("positive", "mimir_update_available"),
+    "mimir_update_check_error": ("negative", "mimir_update_check_error"),
     "git_pull_ok": ("positive", "git_pull_ok"),
     "git_fetch_ok": ("positive", "git_fetch_ok"),
     "shell_job_complete_enqueue_ok": ("positive", "shell_job_complete_enqueue_ok"),
@@ -1530,6 +1539,17 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "proposed_changes_backlog_error":
         msg = ev.get("error") or "(no detail)"
         return f"proposed-changes backlog check failed: {msg}"
+    if rule_kind == "mimir_update_available":
+        current = ev.get("current") or "?"
+        latest = ev.get("latest") or "?"
+        return (
+            f"mimir update available: {current} → {latest} "
+            f"(operator: `mimir update --apply`, then "
+            f"`docker compose restart` to engage)"
+        )
+    if rule_kind == "mimir_update_check_error":
+        msg = ev.get("error") or "(no detail)"
+        return f"mimir update-check failed: {msg}"
     return rule_kind
 
 

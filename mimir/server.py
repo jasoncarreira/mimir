@@ -665,6 +665,20 @@ def build_app(config: Config) -> web.Application:
                 job="proposed-changes-backlog",
             )
 
+        # Register daily PyPI update-check. Surfaces newer mimir
+        # releases as a positive algedonic event so operators see
+        # "newer version available" in the agent's per-turn block
+        # and via the /ops dashboard. Detection-only — operator
+        # runs ``mimir update --apply`` to actually install + then
+        # ``docker compose restart`` to engage.
+        try:
+            scheduler.add_update_check_job(home=config.home)
+        except ValueError as exc:
+            await log_event(
+                "scheduler_invalid_cron", error=str(exc),
+                job="update-check",
+            )
+
         # Register weekly introspection-report cron (FEEDBACK-LOOPS §4.7
         # + §4.8). Non-LLM: aggregates turns/events, writes report,
         # emits heartbeat_health_degraded events when scheduled-tick
