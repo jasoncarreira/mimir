@@ -213,7 +213,31 @@ P47 trend filter is additive, not a hard gate.
 
 ### B.4 — Pending-learnings buffer review
 
-Walk `memory/learnings-pending.md` entry-by-entry. For each:
+**Pre-step — size check + rotate if needed.** `memory/learnings-pending.md`
+is append-only between reflections. If it has grown past Read's single-call
+limit (~1000 lines / 25k tokens), rotate before reviewing:
+
+```bash
+wc -l /mimir-home/memory/learnings-pending.md
+```
+
+To rotate:
+1. Identify the closing ISO week: `date +%Y-W%V` (or the week containing
+   the latest entry in the file — avoid labeling with next week's number).
+2. Archive the live file: `mv /mimir-home/memory/learnings-pending.md \
+   /mimir-home/memory/learnings-pending/$(date +%Y-W%V).md`
+3. Seed a fresh live file with just the standard header (the `<!-- desc: -->`
+   line, the `# Learnings Pending` heading, and the lifecycle intro — no
+   content entries; synthesis turns will fill it with this week's candidates).
+4. Run the carry-forward audit **against the archived file** (the file you
+   just renamed). The live file starts empty and need not be reviewed yet.
+
+Archives live at `memory/learnings-pending/<YYYY-WNN>.md` (one per week).
+The most recent archive is always the primary review target when rotation
+just happened; in non-rotation weeks the live file is the only target.
+
+Walk `memory/learnings-pending.md` (and the most recent archive if it was
+just rotated or is only one week old) entry-by-entry. For each:
 
 - **Promote** — the pattern recurred this week or holds up on broader
   review (cross-check against session boundaries, recent failures,
