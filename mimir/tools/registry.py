@@ -435,8 +435,8 @@ async def reload_pollers() -> str:
     except Exception as exc:
         return f"reload_pollers failed: {exc}"
     return (
-        f"reload_pollers ok: registered={stats.get('registered',0)} "
-        f"replaced={stats.get('replaced',0)} removed={stats.get('removed',0)}"
+        f"reload_pollers ok: total={stats.get('total', 0)} "
+        f"(fresh={stats.get('registered', 0)})"
     )
 
 
