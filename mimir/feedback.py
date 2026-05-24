@@ -300,6 +300,12 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # Negative polarity — pileups are an avoidance smell, not a
     # neutral event.
     "commitment_snooze_pileup": ("negative", "commitment_snooze_pileup"),
+    # Alg-3 (VSM eval): auto-escalation of sustained negative patterns.
+    # Emitted by ``_emit_new_escalations`` inside FeedbackLog.recent() when a
+    # negative kind crosses its ``_ESCALATION_THRESHOLDS`` entry and has not
+    # already been escalated within the current 24h window.  Rendering via
+    # ``_render_event_line`` surfaces "which kind / how many / threshold."
+    "algedonic_escalation": ("negative", "algedonic_escalation"),
 }
 
 
@@ -455,6 +461,48 @@ assert _POLARITY_DYNAMIC_KINDS.isdisjoint(_FIRST_OCCURRENCE_ONLY_KINDS), (
 # while "×1" signals "just happened once." Pattern visibility is the primary
 # Alg-2 deliverable; threshold gating is secondary infrastructure.
 _AROUSAL_THRESHOLDS: dict[str, int] = {}
+
+# ---------------------------------------------------------------------------
+# Alg-3 (VSM eval S4 → S5 feedback loop): auto-escalation thresholds.
+#
+# Maps rule-kind (negative) → minimum count in the 24h window before an
+# ``algedonic_escalation`` event is emitted.  The escalation event fires at
+# most once per 24h window per kind (``_escalated_kinds_in_window`` provides
+# the dedup); it surfaces in the algedonic block on subsequent turns so the
+# "sustained pattern crossed threshold" signal isn't lost in the noise.
+#
+# Philosophy: escalation ≠ arousal.  ``_AROUSAL_THRESHOLDS`` gates *display*;
+# escalation gates *emission of a new event* — a persistent paper trail that
+# the viability report, introspection report, and operator can all query.  A
+# kind absent from this dict is never auto-escalated (single-occurrence kinds
+# like ``discord_bridge_login_failure`` are operator-actionable on first hit
+# and don't need a separate escalation event).
+# ---------------------------------------------------------------------------
+_ESCALATION_THRESHOLDS: dict[str, int] = {
+    # Git: 3 push failures in a day signals a structural problem (auth,
+    # network, dirty worktree) that self-correction hasn't caught.
+    "git_push_failed": 3,
+    # Bridges: sustained retries (5+) indicate an outage that outlasted
+    # normal backoff recovery — operator should rotate token or check
+    # platform status.
+    "discord_bridge_retry": 5,
+    "slack_bridge_retry": 5,
+    # Quota anomaly: the 5h endpoint is glitching repeatedly (>10 in 24h
+    # means it hasn't cleared on its own after the first cycle or two).
+    "quota_anomaly": 10,
+    # Viability / collapse: any 3+ signals in a day means the collapse
+    # detection is firing repeatedly — worth operator attention.
+    "collapse_output_sim": 3,
+    "collapse_atom_gini": 3,
+    "collapse_topic_lock": 3,
+    # Core prompt degraded: 2+ means the first signal didn't get resolved;
+    # the agent may have been running on a stripped-down prompt for hours.
+    "core_prompt_degraded": 2,
+    # Bind-mount stale: 3+ transient stales (or 2 persistent) means the
+    # VirtioFS issue is recurring, not a one-off.
+    "bind_mount_stale": 3,
+    "bind_mount_persistent": 2,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +701,73 @@ def _count_kinds_in_window(
         _, kind = rule
         counts[kind] = counts.get(kind, 0) + 1
     return counts
+
+
+def _escalated_kinds_in_window(
+    snapshot: "JsonlSnapshot | None",
+    events_path: Path,
+    cutoff_iso: str,
+) -> set[str]:
+    """Return the set of negative kinds already escalated in the window.
+
+    Scans for ``algedonic_escalation`` events whose ``kind`` payload matches
+    a negative kind tag.  Used by ``_emit_new_escalations`` to provide a 24h
+    dedup so each kind emits at most one escalation event per window.
+    """
+    escalated: set[str] = set()
+    for ev in iter_snapshot_or_tail(snapshot, events_path):
+        ts = ev.get("timestamp")
+        if not isinstance(ts, str) or ts < cutoff_iso:
+            if isinstance(ts, str):
+                break
+            continue
+        if ev.get("type") == "algedonic_escalation":
+            kind = ev.get("kind")
+            if isinstance(kind, str):
+                escalated.add(kind)
+    return escalated
+
+
+def _emit_new_escalations(
+    kind_counts: dict[str, int],
+    already_escalated: set[str],
+    thresholds: dict[str, int],
+) -> None:
+    """Emit ``algedonic_escalation`` events for threshold-crossing kinds not yet escalated.
+
+    Runs synchronously (via ``log_event_sync``); called from
+    ``FeedbackLog.recent()`` after the arousal-filter kind-count pre-pass.
+    The ``already_escalated`` set (from ``_escalated_kinds_in_window``)
+    provides the 24h dedup: each kind emits at most one escalation per window.
+
+    Beer framing: Alg-3 closes the S4 → S5 algedonic loop.  Arousal (Alg-2)
+    decides *what to display*; escalation decides *what to record as a new
+    event* so the threshold-crossing outlives the current turn's display
+    window and surfaces in introspection reports + viability scans.
+    """
+    from .event_logger import log_event_sync  # lazy import — avoids top-level cycle
+
+    for kind, threshold in thresholds.items():
+        if kind in already_escalated:
+            continue
+        count = kind_counts.get(kind, 0)
+        if count >= threshold:
+            try:
+                log_event_sync(
+                    "algedonic_escalation",
+                    kind=kind,
+                    count=count,
+                    threshold=threshold,
+                )
+            except RuntimeError:
+                # event_logger not initialised (e.g. in unit tests that
+                # construct FeedbackLog directly without a running server).
+                # Escalation is best-effort — silently skip rather than
+                # crashing the caller.
+                log.debug(
+                    "algedonic escalation for %r skipped: event_logger not initialised",
+                    kind,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1363,6 +1478,16 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         msg = ev.get("error") or ev.get("message") or "(no detail)"
         msg = " ".join(str(msg).split())
         return f"error in {where}: {msg}"
+    if rule_kind == "algedonic_escalation":
+        kind = ev.get("kind") or "?"
+        count = ev.get("count")
+        threshold = ev.get("threshold")
+        count_str = str(count) if isinstance(count, int) else "?"
+        thr_str = str(threshold) if isinstance(threshold, int) else "?"
+        return (
+            f"algedonic escalation: {kind} crossed threshold "
+            f"({count_str}× ≥ {thr_str}× in 24h)"
+        )
     return rule_kind
 
 
@@ -1398,6 +1523,11 @@ class FeedbackLog:
     # without monkeypatching. Passed as None by default so the live
     # deployment uses the shared dict and changes to it propagate at
     # import time.
+    escalation_thresholds: dict[str, int] | None = None
+    # None → use the module-level _ESCALATION_THRESHOLDS (Alg-3). Pass {} to
+    # disable escalation entirely (e.g. in tests that don't want side-effects
+    # from _emit_new_escalations writing to events.jsonl). Same propagation
+    # semantics as ``arousal_thresholds``.
 
     def recent(
         self,
@@ -1434,6 +1564,22 @@ class FeedbackLog:
         kind_counts = _count_kinds_in_window(
             self.events_snapshot, self.events_path, cutoff_iso
         )
+
+        # Alg-3: emit algedonic_escalation events for negative kinds that
+        # crossed their threshold and haven't already been escalated in this
+        # 24h window.  Escalation is a WRITE side-effect (log_event_sync
+        # appends to events.jsonl) so callers that want side-effect-free
+        # behavior should pass escalation_thresholds={} on construction.
+        _esc_thresholds = (
+            self.escalation_thresholds
+            if self.escalation_thresholds is not None
+            else _ESCALATION_THRESHOLDS
+        )
+        if _esc_thresholds:
+            _already_escalated = _escalated_kinds_in_window(
+                self.events_snapshot, self.events_path, cutoff_iso
+            )
+            _emit_new_escalations(kind_counts, _already_escalated, _esc_thresholds)
 
         # Temporal run detection (Alg-2 enhancement): scan for valence-group
         # polarity transitions (recovery / degradation) and synthesize one
