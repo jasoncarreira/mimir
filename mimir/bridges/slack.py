@@ -1,4 +1,4 @@
-"""Slack bridge (SPEC §7.2.1) — port of lettabot's slack channel adapter.
+"""Slack bridge (SPEC §7.2.1).
 
 Owns a long-lived Socket Mode connection inside the mimir process. Inbound
 messages → ``dispatcher.enqueue(AgentEvent)``. Outbound text is sent via

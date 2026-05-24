@@ -62,7 +62,7 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
        },
        {
          "name":        "agent",
-         "email":       "muninn@muninnai.ai",
+         "email":       "agent@example.com",
          "prompt-file": "email-agent.md"
        }
      ]

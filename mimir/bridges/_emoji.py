@@ -11,8 +11,8 @@ Custom-emoji forms (Discord ``<:foo:123>`` and Slack workspace-only
 aliases) are passed through unchanged — the agent gets them from the
 per-channel emoji vocabulary block in the turn prompt.
 
-Lifted from lettabot (~/projects/letta/lettabot/src/channels/shared/emoji.ts);
-Python port with the same alias set so cross-bot guidance is portable.
+Python port of a TypeScript emoji-alias table, keeping the same alias
+set so cross-implementation guidance stays portable.
 """
 
 from __future__ import annotations

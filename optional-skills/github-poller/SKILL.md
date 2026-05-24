@@ -74,7 +74,7 @@ All filtered by `created_at > cursor` and (when set) `user.login != MIMIR_GITHUB
 
 ## Why login-based, not email-based
 
-GitHub's API events expose `user.login` for issues, PRs, comments, and reviews — never the author's commit email. Email-based filtering (`mimir@muninnai.ai`) is the right key for **commits** but not for the API surface.
+GitHub's API events expose `user.login` for issues, PRs, comments, and reviews — never the author's commit email. Email-based filtering (e.g. `noreply@mimir-agent.local`) is the right key for **commits** but not for the API surface.
 
 ## Cost
 

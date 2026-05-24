@@ -116,10 +116,8 @@ exclude = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
-# v0.5: workspace setup. Mimir's pyproject is also the workspace root;
-# saga/ is the second member (imported via filter-repo from msam2 — see
-# V0.5.md §1). The package inside saga/ is still named ``msam`` at this
-# commit; renamed to ``saga`` in V0.5.md §6.
+# Workspace setup: mimir's pyproject is also the workspace root;
+# saga/ is the second member (a vendored sibling package).
 [tool.uv.workspace]
 members = ["saga"]
 
