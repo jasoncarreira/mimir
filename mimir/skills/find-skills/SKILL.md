@@ -24,6 +24,30 @@ name; this skill is for *discovery* — when you want a one-line description of
 what each skill is for, or you're searching for a capability and want to see
 if it's already covered.
 
+## Contract
+
+**Trigger**: Uncertainty about what skills exist or what a skill covers —
+"can I X?", "is there a skill for Y?", "what skills do I have?", "what does
+`<name>` actually do?". Also fires when about to write a new skill, to
+check whether the capability is already covered.
+
+**Requires**: `<home>/skills/` and / or `<home>/.mimir_builtin_skills/`
+present (both seeded by `mimir setup` / refreshed at startup); ability to
+run Bash for the awk-based frontmatter extractor.
+
+**Guarantees**:
+- One-line descriptions sourced from each SKILL.md's YAML frontmatter — no
+  guessing, no hallucinated capabilities.
+- Both operator-installed (`<home>/skills/`) and bundled
+  (`<home>/.mimir_builtin_skills/`) skills appear in the same listing.
+- Output is reproducible — same skill tree → same listing.
+
+**Does not**: Load skill bodies (only the frontmatter); execute the skills
+it surfaces; install new skills (that's `mimir skills install`); resolve
+which copy wins when operator + bundled both exist (operator shadows
+bundled — `installed_skill_names` is the canonical resolver elsewhere in
+the code).
+
 ## List all skills with descriptions
 
 ```bash

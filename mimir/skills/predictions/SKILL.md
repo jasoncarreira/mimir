@@ -16,6 +16,33 @@ This is a sibling to the `applied-proposals audit` (FUTURE_WORK
 tracks YOUR in-the-moment guesses. Both close double-loops; they
 just operate at different scopes.
 
+## Contract
+
+**Trigger**: Making a forward-looking claim with a checkable outcome
+(1-7 day horizon typical) — "the wiki cleanup will reduce orphan
+pages", "Tim will reply within 24h", "this prompt change will drop
+tool errors". Also fires when proposing a change in
+`state/proposed-changes.md` — attach a prediction so the
+applied-proposals audit can verify it.
+
+**Requires**: A specific check time / horizon; a claim narrow enough
+to be unambiguously right-or-wrong at horizon (not "things will go
+well"); `mimir predictions` CLI on PATH.
+
+**Guarantees**:
+- Each prediction lands as a structured `state/predictions.jsonl`
+  entry: claim, horizon, optional context — never as free-form prose.
+- Reflection's grading pass picks up due predictions and scores them;
+  results feed the agent's own calibration over time.
+- The audit loop closes: predicted-vs-actual deltas surface in
+  reflection turns and applied-proposals audits.
+
+**Does not**: Predict trivially-true / trivially-checkable things
+(the test: would you be willing to be wrong, and would being wrong
+teach you something?); auto-grade — that's reflection's job; chain
+predictions (each is independent — "if X then Y" splits into one
+prediction per claim).
+
 ## When to write a prediction
 
 - The operator just asked you to predict something explicitly
