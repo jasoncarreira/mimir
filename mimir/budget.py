@@ -31,11 +31,13 @@ includes the partition + tokens for agent awareness."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from ._jsonl_tail import tail_jsonl_records  # noqa: F401 — re-export
 from .jsonl_snapshot import JsonlSnapshot, iter_snapshot_or_tail
@@ -55,6 +57,13 @@ from .usage_stats import (
 )
 
 log = logging.getLogger(__name__)
+
+# Strong references to fire-and-forget background tasks (chainlink #118).
+# Module-level set holds tasks spawned by HomeostaticArbiter.should_fire_heartbeat
+# until completion.  The done-callback discards each entry so the set stays
+# bounded to in-flight tasks only.  See cpython docs "Coroutines and Tasks /
+# Important" callout.
+_background_tasks: set[asyncio.Task[Any]] = set()
 
 
 @dataclass
@@ -268,7 +277,6 @@ class HomeostaticArbiter:
                 #     run_coroutine_threadsafe to bridge across.
                 # (b) Called directly from async context or sync test —
                 #     get_running_loop() succeeds; schedule via create_task.
-                import asyncio
                 from .event_logger import log_event
                 _coro = log_event(
                     "quota_recovered",
@@ -281,7 +289,9 @@ class HomeostaticArbiter:
                 else:
                     try:
                         _loop = asyncio.get_running_loop()
-                        _loop.create_task(_coro)
+                        _task = _loop.create_task(_coro)
+                        _background_tasks.add(_task)
+                        _task.add_done_callback(_background_tasks.discard)
                     except RuntimeError:
                         # (b) sync test path — no loop at all; close
                         # the coroutine to avoid ResourceWarning.
