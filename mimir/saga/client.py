@@ -369,10 +369,13 @@ WHERE a.source_type = 'session_boundary'
             -- atom deletion path.
             --
             -- SQLite does not support ALTER TABLE ... MODIFY CONSTRAINT, so
-            -- we use the standard CREATE + COPY + DROP + RENAME pattern. FK
-            -- enforcement is disabled for the duration so the intermediate
-            -- table-missing state does not raise a constraint error.
-            PRAGMA foreign_keys=OFF;
+            -- we use the standard CREATE + COPY + DROP + RENAME pattern.
+            -- NOTE: FK enforcement is disabled at the connection level by
+            -- _apply_pending_migrations before calling executescript, and
+            -- restored afterwards. PRAGMA foreign_keys=OFF/ON inside
+            -- executescript would be a no-op (PRAGMAs that modify
+            -- connection state cannot be set within a transaction, and
+            -- executescript runs inside an implicit transaction).
 
             -- ── Orphan cleanup (belt + suspenders; the COPY step filters
             --    too, but explicit DELETEs make the before/after legible) ──
@@ -526,8 +529,6 @@ WHERE a.source_type = 'session_boundary'
             CREATE INDEX IF NOT EXISTS idx_triples_current
                 ON triples(subject, predicate)
                 WHERE valid_until IS NULL AND tombstoned = 0;
-
-            PRAGMA foreign_keys=ON;
         """,
     }
 
@@ -782,7 +783,19 @@ WHERE a.source_type = 'session_boundary'
                 continue
             if version > target:
                 break
+            # PRAGMA foreign_keys=ON/OFF inside executescript is a no-op:
+            # ``executescript`` issues an implicit COMMIT, which means it
+            # runs inside a transaction — connection-level PRAGMAs like
+            # ``foreign_keys`` cannot be set within a transaction. Control
+            # FK enforcement at the connection level instead, around the
+            # executescript call. Table-restructuring migrations (CREATE +
+            # COPY + DROP + RENAME) need FK=OFF during the intermediate
+            # state where both old and new tables exist; restoring ON
+            # afterward ensures constraints are enforced for all subsequent
+            # DML.
+            conn.execute("PRAGMA foreign_keys=OFF")
             conn.executescript(ddl)
+            conn.execute("PRAGMA foreign_keys=ON")
             conn.execute(
                 "INSERT INTO schema_version (version, applied_at) "
                 "VALUES (?, ?)",
