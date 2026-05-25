@@ -875,6 +875,12 @@ DEFAULT_ACTION_BOUNDARIES = dedent(
       working trees — **autonomous**.
     - Writes under ``<home>/state/``, ``<home>/memory/`` (non-core),
       and operator-shared working trees — **autonomous**.
+    - Writes under ``<home>/memory/channels/<channel_id>/`` —
+      **autonomous**. These files are auto-injected into every turn
+      prompt on that channel (see
+      ``core_blocks.load_channel_memory``), but per-channel blast
+      radius is bounded: edits only affect turns on *that* channel,
+      not globally like ``memory/core/`` does.
     - Writes to ``<home>/memory/core/`` outside reflection turns —
       **escalate-first**. Core blocks load every turn; unilateral
       edits inflate prompt cost forever and can silently distort
