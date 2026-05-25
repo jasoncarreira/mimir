@@ -17,16 +17,17 @@ dependencies = [
     # claude-agent-sdk was removed post-cutover (2026-05-14); the agent
     # loop now runs through deepagents (LangGraph). Model adapters are
     # optional extras — see [project.optional-dependencies] below.
+    #
+    # The runtime memory backend lives at ``mimir/saga/`` (inside this
+    # package) — it ships with the wheel and needs no external dep.
+    # The top-level workspace ``saga`` package is the bench harness
+    # shell only; needed by ``benchmarks/longmemeval_via_*/`` not by
+    # the runtime. See the ``[bench]`` optional extra below.
     "aiohttp>=3.12",
     "apscheduler>=3.11",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "fastembed>=0.4",
-    # saga is the in-process memory backend. Workspace member;
-    # editable-installed via [tool.uv.sources] below. Will fold into
-    # ``mimir.memory`` on the rename pass; flag is the
-    # MIMIR_LEGACY_INPROCESS_SAGA escape hatch (also retiring then).
-    "saga",
     "deepagents>=0.6.1",
     "langchain>=1.3",
     "requests>=2.33.1",
@@ -72,6 +73,16 @@ codex-plus = [
 mcp = [
     "mcp>=1.27",
 ]
+# LongMemEval bench harness — pulls the workspace ``saga`` package
+# (the bench shell, not the runtime memory backend). Only meaningful
+# when running ``benchmarks/longmemeval_via_*/`` from a workspace
+# checkout; ``saga`` is not published to PyPI separately, so this
+# extra resolves only against the workspace via ``[tool.uv.sources]``.
+# ``pip install mimir-agent[bench]`` from a fresh PyPI install will
+# fail to resolve ``saga`` and is not the intended path.
+bench = [
+    "saga",
+]
 # Bridge extras — install if you want that bridge.
 discord = [
     "discord-py>=2.6",
@@ -109,7 +120,7 @@ dev = [
 # touch the agent core / saga / bridges can use ``[dev]`` and let the
 # claude-code-specific tests skip.
 dev-claude-code = [
-    "mimir[dev,claude-code]",
+    "mimir-agent[dev,claude-code]",
 ]
 
 [project.scripts]
