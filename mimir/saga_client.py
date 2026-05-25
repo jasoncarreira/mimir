@@ -784,11 +784,13 @@ def _is_localhost(endpoint: str) -> bool:
 
 
 def _format_atom(a: dict[str, Any]) -> dict[str, Any]:
-    """Mirror saga/saga/server.py::_format_atom — the per-atom shape
-    mimir's pre-message hook + sagatools consume.
+    """Per-atom shape mimir's pre-message hook + sagatools consume.
 
-    Source of truth for the canonical shape lives in saga's server.py.
-    Drift here will be caught by the v0.5 §3 integration bench."""
+    Source of truth for the canonical shape: this function. Historically
+    mirrored from the out-of-process saga server's ``_format_atom``; now
+    that the runtime is in-process under ``mimir/saga/``, this IS the
+    canonical shape. The integration bench at
+    ``benchmarks/longmemeval_via_mimir/`` exercises it end-to-end."""
     topics = a.get("topics", [])
     if isinstance(topics, str):
         try:
