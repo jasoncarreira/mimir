@@ -1681,3 +1681,52 @@ def test_build_trigger_defaults_to_utc_when_tz_omitted():
     job = SchedulerJob(name="x", prompt="y", cron="0 0 * * *")
     trigger = _build_trigger(job)
     assert str(trigger.timezone) == "UTC"
+
+
+@pytest.mark.asyncio
+async def test_commitments_due_check_error_includes_traceback(
+    tmp_path: Path, monkeypatch
+):
+    """commitments_due_check_error event must include a ``traceback``
+    field so operators can debug cron-fired failures without a repro
+    (chainlink #99)."""
+    import json
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="test-cdc-err")
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    # Stub check_due_and_expired to raise unconditionally.
+    import mimir.commitments.poller as _poller_mod
+
+    async def _raise(*a, **kw):
+        raise RuntimeError("boom from test")
+
+    monkeypatch.setattr(_poller_mod, "check_due_and_expired", _raise)
+
+    # Use a sentinel store object — won't be called because the stub raises.
+    sched.add_commitments_due_check_job(
+        object(), "*/5 * * * *"  # type: ignore[arg-type]
+    )
+    job = sched._scheduler.get_job("commitments-due-check")
+    assert job is not None
+
+    await job.func()
+
+    events = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    error_events = [e for e in events if e.get("type") == "commitments_due_check_error"]
+    assert len(error_events) == 1, f"expected 1 error event, got {error_events}"
+    evt = error_events[0]
+    # Payload fields are flat (EventLogger.record does rec.update(payload)).
+    assert "RuntimeError" in evt["error"]
+    assert "traceback" in evt, "traceback field missing from error event (chainlink #99)"
+    assert "RuntimeError" in evt["traceback"]
+    assert "boom from test" in evt["traceback"]
