@@ -9,7 +9,7 @@ description = "Vendored LongMemEval bench shell. The runtime saga is now `mimir.
 license = "MIT"
 requires-python = ">=3.11"
 authors = [
-    {name = "Jaden Schwab"},
+    {name = "Jason Carreira"},
 ]
 
 # Bench harness deps only. The full saga runtime moved into mimir.saga;
