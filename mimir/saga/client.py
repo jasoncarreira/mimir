@@ -1615,7 +1615,9 @@ WHERE a.source_type = 'session_boundary'
             conn = self._ensure_conn()
             result = forget_by_criteria(
                 conn,
+                agent_id=self._agent_id,
                 min_age_days=grace_days,
+                min_retrievals=min_retrievals,
                 activation_below=confidence_floor,
                 dry_run=dry_run,
             )

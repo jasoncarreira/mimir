@@ -119,6 +119,7 @@ def forget_by_criteria(
     *,
     min_age_days: int | None = None,
     activation_below: float | None = None,
+    min_retrievals: int | None = None,
     stream: str | None = None,
     memory_type: str | None = None,
     source_type: str | None = None,
@@ -137,6 +138,11 @@ def forget_by_criteria(
     ``max_atoms`` is a hard cap to prevent runaway forgetting from a
     misconfigured criterion.
 
+    ``min_retrievals``: only forget atoms whose total retrieval count
+    (``retrieval`` + ``feedback_positive`` access events) is *strictly
+    less than* this value. Atoms never retrieved (no access_events row)
+    count as 0 and are included when the filter is active.
+
     Activation-based filtering requires reading atom_access_summary;
     the test below uses a SQL view to avoid pulling all atoms into
     Python. Approximate — the stored activation may be stale between
@@ -146,6 +152,7 @@ def forget_by_criteria(
     """
     where = ["a.agent_id = ?", "a.tombstoned = 0"]
     params: list = [agent_id]
+    joins: list[str] = []
 
     # ``now`` for age + activation math. Defaults to wall clock; bench
     # replays pass an explicit ``reference_date`` so historical-corpus
@@ -176,9 +183,24 @@ def forget_by_criteria(
     # Operator can still explicitly forget them via forget(ids).
     where.append("a.is_pinned = 0")
 
+    if min_retrievals is not None:
+        # LEFT JOIN to count retrieval + feedback_positive access events.
+        # COALESCE handles atoms with no rows in access_events (count = 0).
+        joins.append(
+            "LEFT JOIN ("
+            " SELECT atom_id, COUNT(*) AS _retrieval_cnt"
+            " FROM access_events"
+            " WHERE source IN ('retrieval', 'feedback_positive')"
+            " GROUP BY atom_id"
+            ") _rk ON _rk.atom_id = a.id"
+        )
+        where.append("COALESCE(_rk._retrieval_cnt, 0) < ?")
+        params.append(min_retrievals)
+
+    join_sql = " ".join(joins)
     where_sql = " AND ".join(where)
     rows = conn.execute(
-        f"SELECT a.id FROM atoms a WHERE {where_sql} "
+        f"SELECT a.id FROM atoms a {join_sql} WHERE {where_sql} "
         f"ORDER BY a.created_at ASC LIMIT ?",
         params + [max_atoms],
     ).fetchall()
