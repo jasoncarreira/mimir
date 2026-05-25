@@ -45,20 +45,21 @@ The name is from Norse myth — Mímir, the keeper of memory and counsel.
 ## Repository layout
 
 ```
-mimir/                      # the agent harness — top-level package
-mimir/saga/                 # in-process memory backend (runtime)
-saga/                       # bench shell for LongMemEval (separate workspace package)
+mimir/                              # the agent harness — top-level package
+mimir/saga/                         # in-process memory backend (runtime)
 benchmarks/longmemeval_via_mimir/   # integration bench against LongMemEval
-tests/                      # pytest suite
-docs/                       # architectural notes (public) + internal/ (process docs)
-SPEC.md                     # detailed design doc
-FEEDBACK-LOOPS.md           # mapping of every feedback loop in the system
+benchmarks/saga/                    # bench shell — separate workspace package, imported by the longmemeval runners
+tests/                              # pytest suite
+docs/                               # architectural notes (public) + internal/ (process docs)
+SPEC.md                             # detailed design doc
+FEEDBACK-LOOPS.md                   # mapping of every feedback loop in the system
 ```
 
 The runtime memory backend lives at `mimir/saga/` and is part of the
-`mimir-agent` package. The top-level `saga/` directory is a separate
-workspace package — a bench shell that the LongMemEval runners under
-`benchmarks/longmemeval_via_mimir/` import.
+`mimir-agent` package. The `saga` workspace package at `benchmarks/saga/`
+is a separate bench shell that the LongMemEval runners under
+`benchmarks/longmemeval_via_mimir/` import as
+`saga.benchmarks.longmemeval.*`.
 
 ## Quickstart
 

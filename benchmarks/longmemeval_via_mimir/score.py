@@ -48,12 +48,12 @@ def evaluate_command(hypotheses_path: Path, dataset_path: Path) -> str:
     """Return the shell command an operator runs to score hypotheses.
 
     We don't invoke the judge here — the upstream evaluator lives in
-    saga's external/longmemeval and needs OpenAI credentials. This
-    helper just produces the canonical command string so docs / runner
-    output stay in sync.
+    the bench-shell's external/longmemeval and needs OpenAI credentials.
+    This helper just produces the canonical command string so docs /
+    runner output stay in sync.
     """
     return (
-        f"cd saga/external/longmemeval/src/evaluation && "
+        f"cd benchmarks/saga/external/longmemeval/src/evaluation && "
         f"python evaluate_qa.py gpt-4o "
         f"{hypotheses_path.resolve()} "
         f"{dataset_path.resolve()}"
