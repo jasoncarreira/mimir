@@ -571,8 +571,10 @@ class Scheduler:
                 # event loop so concurrent dispatcher work (other
                 # channel turns, log writers) isn't stalled during the
                 # per-tick scan.
+                _loop = asyncio.get_running_loop()
                 fire, reason = await asyncio.to_thread(
                     self._arbiter.should_fire_heartbeat,
+                    event_loop=_loop,
                 )
             except Exception:  # noqa: BLE001
                 log.exception("arbiter.should_fire_heartbeat raised; firing anyway")
