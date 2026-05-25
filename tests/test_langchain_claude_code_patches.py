@@ -575,10 +575,49 @@ def _claude_cli_available() -> bool:
         return False
 
 
+def _claude_sdk_can_invoke() -> bool:
+    """True iff the ``claude`` CLI can actually make API calls in this
+    environment (i.e. has valid OAuth credentials and can reach Anthropic).
+
+    The integration test uses ``ClaudeSDKClient`` which spawns the claude
+    CLI as a subprocess.  The CLI must be able to authenticate — otherwise
+    ``receive_response()`` returns immediately with zero messages and no
+    hooks fire, producing a false failure (events=[]).
+
+    Probe: run ``claude -p "ok" --output-format text`` with a short
+    timeout and check it produces non-empty stdout.  This is a cheap
+    single-exchange call; failure (empty output, non-zero exit, or
+    timeout) indicates the credentials are absent or the endpoint is
+    unreachable.
+
+    Note: this check is intentionally *not* cached — it is only ever
+    called during test *collection* (inside ``skipif``), which happens
+    once per session.  A session-level cache would be premature
+    optimisation for a single integration test.
+    """
+    if not _claude_cli_available():
+        return False
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["claude", "-p", "respond with the single word: ok",
+             "--output-format", "text"],
+            capture_output=True, timeout=30, text=True,
+        )
+        return r.returncode == 0 and len(r.stdout.strip()) > 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+_SKIP_REASON_SDK_INTEGRATION = (
+    "claude CLI not available or cannot make API calls in this environment "
+    "(missing OAuth credentials / network) — integration test for built-in "
+    "tool hook coverage requires a live ClaudeSDKClient turn"
+)
+
 @pytest.mark.skipif(
-    not _claude_cli_available(),
-    reason="claude CLI not available — integration test for built-in "
-           "tool hook coverage requires the real subprocess",
+    not _claude_sdk_can_invoke(),
+    reason=_SKIP_REASON_SDK_INTEGRATION,
 )
 @pytest.mark.asyncio
 async def test_hooks_capture_built_in_bash_tool_integration():
