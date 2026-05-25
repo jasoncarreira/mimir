@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from .models import (
@@ -262,6 +263,27 @@ def _coerce_to_record(
         due_window_hint = due_window_hint.strip() or None
     else:
         due_window_hint = None
+
+    # Chainlink #97: if the hint is an ISO 8601 datetime string, parse
+    # it into due_window_start_unix so the due-check poller can fire on
+    # schedule. Relative phrases ("Thursday", "next sprint", "tomorrow")
+    # will raise ValueError and leave due_window_start_unix=None — the
+    # hint is still preserved verbatim for operator-facing rendering.
+    # Python <3.11: fromisoformat doesn't accept Z suffix; replace it.
+    due_window_start_unix: float | None = None
+    if due_window_hint:
+        try:
+            _hint_iso = due_window_hint.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(_hint_iso)
+            if dt.tzinfo is None:
+                # No timezone info — treat as UTC (consistent with mimir's
+                # convention; the prompt asks for ISO but doesn't mandate tz).
+                dt = dt.replace(tzinfo=timezone.utc)
+            due_window_start_unix = dt.timestamp()
+        except (ValueError, OverflowError, AttributeError):
+            # Not an ISO datetime string; leave hint-only, start_unix = None.
+            pass
+
     rec = CommitmentRecord(
         id=make_commitment_id(),
         channel_id=bound_channel,
@@ -269,7 +291,7 @@ def _coerce_to_record(
         kind=kind,
         sensitivity=sensitivity,
         suggested_reminder=suggested_reminder[:300],
-        due_window_start_unix=None,
+        due_window_start_unix=due_window_start_unix,
         due_window_end_unix=None,
         due_window_hint=due_window_hint,
         confidence=confidence,
@@ -283,7 +305,7 @@ def _coerce_to_record(
     rec.dedupe_key = make_dedupe_key(
         channel_id=bound_channel,
         text=rec.text,
-        due_window_start_unix=None,
+        due_window_start_unix=due_window_start_unix,
         recipient_identity=None,
     )
     return rec
