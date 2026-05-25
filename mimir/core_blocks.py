@@ -112,6 +112,80 @@ def load_core(home: Path) -> list[CoreBlock]:
     return blocks
 
 
+# ── Channel memory injection ────────────────────────────────────────────────
+# ``memory/channels/<channel_id>/`` contains per-channel fact files (operator
+# name, preferences, channel-specific patterns). When a ``user_message``
+# arrives on channel X, these files are injected into the turn prompt so the
+# agent has channel context without an explicit tool call each turn.
+#
+# Design constraints (chainlink #187):
+# - Only fires for real channels. Synthetic channels (``scheduler:*``,
+#   ``poller:*``) share no human operator context worth injecting.
+# - No prompt inflation on channels with no memory files — graceful no-op.
+# - Per-channel blast radius is bounded: a write to
+#   ``memory/channels/<id>/`` only affects turns on *that* channel, not
+#   every turn globally (unlike ``memory/core/``). This is the justification
+#   for keeping channel file writes **autonomous** in 06-action-boundaries.md
+#   even after auto-injection ships.
+# - Cap at ``_CHANNEL_MEMORY_MAX_BYTES`` to defend against runaway file
+#   growth. When the cap fires the returned block is truncated with a note
+#   so the agent can see the truncation rather than silently losing tail
+#   content.
+
+_CHANNEL_MEMORY_MAX_BYTES: int = 8_000  # ~2k tokens; covers current files with headroom
+
+
+# Synthetic channel prefixes whose turns should NOT receive channel-memory
+# injection. These channels process automated events (scheduled ticks, poller
+# notifications) where no human operator context is needed.
+_SYNTHETIC_PREFIXES: tuple[str, ...] = ("scheduler:", "poller:")
+
+
+def load_channel_memory(home: Path, channel_id: str) -> str | None:
+    """Load and concatenate ``memory/channels/<channel_id>/*.md`` files.
+
+    Returns a rendered block string ready for ``## Channel context`` injection,
+    or ``None`` when no files exist or the channel is synthetic.
+
+    Files are sorted lexicographically so ordering is deterministic and the
+    operator can control injection order via filename prefixes (``00-``, etc.).
+
+    Capped at ``_CHANNEL_MEMORY_MAX_BYTES``; truncated with a note when the
+    cap fires so the agent sees the truncation rather than losing content
+    silently.
+    """
+    if not channel_id:
+        return None
+    # Skip synthetic channels — no human operator context to inject.
+    if any(channel_id.startswith(p) for p in _SYNTHETIC_PREFIXES):
+        return None
+
+    channel_dir = home / "memory" / "channels" / channel_id
+    if not channel_dir.is_dir():
+        return None
+
+    parts: list[str] = []
+    for path in sorted(channel_dir.glob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8").rstrip()
+        except OSError:
+            continue
+        if text:
+            parts.append(text)
+
+    if not parts:
+        return None
+
+    combined = "\n\n---\n\n".join(parts)
+    encoded = combined.encode("utf-8")
+    if len(encoded) > _CHANNEL_MEMORY_MAX_BYTES:
+        # Truncate at byte boundary, add visible note.
+        truncated = encoded[:_CHANNEL_MEMORY_MAX_BYTES].decode("utf-8", errors="replace")
+        combined = truncated + f"\n\n…[channel memory truncated at {_CHANNEL_MEMORY_MAX_BYTES} bytes]"
+
+    return combined
+
+
 def check_core_blocks_health(
     blocks: list[CoreBlock],
     min_count: int = _CORE_BLOCKS_MIN_COUNT,
