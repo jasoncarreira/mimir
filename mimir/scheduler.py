@@ -1198,19 +1198,17 @@ class Scheduler:
                 # Include traceback so operators can diagnose the saga-
                 # side failure without trawling container logs (same
                 # pattern as commitments_due_check_error in PR #345).
-                import traceback as _tb
                 await log_event(
                     "saga_consolidate_error",
                     error=str(exc),
                     status=exc.status,
-                    traceback=_tb.format_exc(),
+                    traceback=tb.format_exc(),
                 )
             except Exception as exc:  # noqa: BLE001
-                import traceback as _tb
                 await log_event(
                     "saga_consolidate_error",
                     error=f"{type(exc).__name__}: {exc}",
-                    traceback=_tb.format_exc(),
+                    traceback=tb.format_exc(),
                 )
 
         return self.register_callable(
