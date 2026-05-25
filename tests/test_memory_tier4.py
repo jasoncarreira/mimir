@@ -245,6 +245,45 @@ def test_forget_by_criteria_activation_below(conn):
     assert r1 not in result.tombstoned_ids
 
 
+def test_forget_by_criteria_agent_id_filter(conn):
+    """forget_by_criteria respects the agent_id param — atoms belonging
+    to a different agent are not touched."""
+    from mimir.saga.store import store
+
+    mine = store(conn, "my atom", embed_fn=_fake_embed, agent_id="agent_a").atom_id
+    theirs = store(conn, "their atom", embed_fn=_fake_embed, agent_id="agent_b").atom_id
+
+    result = forget_by_criteria(conn, agent_id="agent_a", dry_run=True)
+    assert mine in result.tombstoned_ids
+    assert theirs not in result.tombstoned_ids
+
+
+def test_forget_by_criteria_min_retrievals(conn):
+    """min_retrievals filters out atoms that have been retrieved enough times.
+
+    An atom retrieved >= min_retrievals times is protected; atoms with
+    fewer retrievals (including zero) are candidates.
+    """
+    from mimir.saga.mark_access import AccessEvent, mark_access
+
+    cold = store(conn, "rarely retrieved", embed_fn=_fake_embed).atom_id
+    warm = store(conn, "frequently retrieved", embed_fn=_fake_embed).atom_id
+
+    # Give warm atom 5 retrieval events.
+    for _ in range(5):
+        mark_access(conn, [AccessEvent(atom_id=warm, source="retrieval")])
+
+    result = forget_by_criteria(conn, min_retrievals=5, dry_run=True)
+    # cold has 0 retrievals — below threshold → candidate
+    assert cold in result.tombstoned_ids
+    # warm has exactly 5 retrievals — not *strictly less than* 5 → protected
+    assert warm not in result.tombstoned_ids
+
+    # Threshold of 6 should include warm (5 < 6).
+    result2 = forget_by_criteria(conn, min_retrievals=6, dry_run=True)
+    assert warm in result2.tombstoned_ids
+
+
 # ────────────────────────────────────────────────────────────────────
 # feedback alias (the convenience wrapper)
 # ────────────────────────────────────────────────────────────────────
