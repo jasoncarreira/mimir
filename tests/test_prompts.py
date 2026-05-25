@@ -468,3 +468,40 @@ def test_format_section_sizes_empty_returns_empty_string():
 
     assert _format_section_sizes({}) == ""
     assert _format_section_sizes({"Tiny": 50}) == ""  # all filtered
+
+
+# ── channel_memory_block injection (chainlink #187) ──────────────────────────
+
+
+def test_turn_prompt_includes_channel_memory_block():
+    """When channel_memory_block is set, ## Channel context section appears."""
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-1500672382166110321",
+        content="hello",
+        author="discord-238367217903730690",
+    )
+    prompt = build_turn_prompt(
+        event,
+        channel_memory_block="Operator: Jason Carreira. Prefers direct answers.",
+    )
+    assert "## Channel context" in prompt
+    assert "Jason Carreira" in prompt
+
+
+def test_turn_prompt_omits_channel_context_when_none():
+    """When channel_memory_block is None (synthetic or no files), section absent."""
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        content="tick",
+        author="scheduler",
+    )
+    prompt = build_turn_prompt(event, channel_memory_block=None)
+    assert "## Channel context" not in prompt
