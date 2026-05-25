@@ -185,6 +185,29 @@ def test_coerce_iso_datetime_no_tz_treated_as_utc():
     assert rec.due_window_start_unix == pytest.approx(expected, abs=1.0)
 
 
+def test_coerce_iso_datetime_with_non_utc_offset():
+    """Non-UTC offset timezones (``-05:00``, ``+09:00``, etc.) parse
+    correctly to the equivalent UTC unix timestamp. Closes the
+    coverage gap flagged in PR #344's review — the code path handled
+    this fine via ``fromisoformat`` + ``.timestamp()``, but no test
+    locked it in."""
+    rec = _coerce_to_record(
+        {"text": "call at 10am EST", "confidence": 0.8,
+         "due_window_hint": "2026-06-01T10:00:00-05:00"},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert rec is not None
+    from datetime import datetime, timezone, timedelta
+    expected = datetime(
+        2026, 6, 1, 10, 0, 0,
+        tzinfo=timezone(timedelta(hours=-5)),
+    ).timestamp()
+    assert rec.due_window_start_unix == pytest.approx(expected, abs=1.0)
+    # 10am EST == 15:00 UTC — sanity-check via the UTC conversion.
+    utc_expected = datetime(2026, 6, 1, 15, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert rec.due_window_start_unix == pytest.approx(utc_expected, abs=1.0)
+
+
 def test_coerce_relative_hint_leaves_start_unix_none():
     """Relative phrases must NOT be misinterpreted as ISO; start_unix stays None."""
     for hint in ("Thursday", "next sprint", "tomorrow", "by end of week", "soon"):
