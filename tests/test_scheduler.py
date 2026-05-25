@@ -1730,3 +1730,51 @@ async def test_commitments_due_check_error_includes_traceback(
     assert "traceback" in evt, "traceback field missing from error event (chainlink #99)"
     assert "RuntimeError" in evt["traceback"]
     assert "boom from test" in evt["traceback"]
+
+
+# ─── saga_consolidate_error traceback (PR #345 follow-up) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_saga_consolidate_error_includes_traceback(tmp_path: Path):
+    """When the saga-consolidate cron raises, the emitted
+    ``saga_consolidate_error`` event must include a ``traceback`` field
+    so operators can diagnose without trawling container logs. Same
+    pattern PR #345 applied to ``commitments_due_check_error`` —
+    extended here to the next-closest error event for consistency.
+    """
+    import json
+    from mimir.event_logger import init_logger, _reset_logger_for_tests
+
+    class _RaisingSagaClient:
+        async def consolidate(self, **kwargs):
+            raise RuntimeError("boom from saga consolidate")
+
+    async def noop(_e):
+        return True
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="test-saga-consolidate-tb")
+    try:
+        sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+        sched.add_saga_consolidate_job(
+            _RaisingSagaClient(), "0 4 * * 0", home=tmp_path,
+        )
+        job = sched._scheduler.get_job("saga-consolidate")
+        assert job is not None
+        await job.func()
+
+        # Find the error event.
+        events = [
+            json.loads(line) for line in events_path.read_text().splitlines()
+            if line.strip()
+        ]
+        err_events = [e for e in events if e.get("type") == "saga_consolidate_error"]
+        assert len(err_events) == 1, f"expected 1 error event, got {len(err_events)}"
+        ev = err_events[0]
+        # Traceback is captured + names the exception.
+        assert "traceback" in ev
+        assert "RuntimeError" in ev["traceback"]
+        assert "boom from saga consolidate" in ev["traceback"]
+    finally:
+        _reset_logger_for_tests()

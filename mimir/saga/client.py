@@ -1610,6 +1610,33 @@ WHERE a.source_type = 'session_boundary'
         # That's a long time on low-churn deployments — meanwhile
         # over-fetches climb and FAISS top_k starts missing the real
         # top results past the removal noise.
+        #
+        # PR #342 fixed the silent-drop on ``agent_id`` +
+        # ``min_retrievals``. ``contribution_threshold`` +
+        # ``contradiction_threshold`` are accepted at the in-process
+        # surface (so callsites that pass them through to either
+        # provider don't break) but the underlying
+        # ``forget_by_criteria`` doesn't implement them yet (HTTP
+        # path forwards them server-side). Surface that gap as a
+        # log warning instead of the original silent drop — same
+        # shape as the bug PR #342 was fixing, applied to the two
+        # remaining params.
+        if contribution_threshold is not None:
+            log.warning(
+                "saga.SagaStore.forget: contribution_threshold=%r ignored "
+                "in the in-process path (not yet implemented in "
+                "forget_by_criteria). HTTP path forwards the param "
+                "server-side. See mimir-repo follow-up to PR #342.",
+                contribution_threshold,
+            )
+        if contradiction_threshold is not None:
+            log.warning(
+                "saga.SagaStore.forget: contradiction_threshold=%r ignored "
+                "in the in-process path (not yet implemented in "
+                "forget_by_criteria). HTTP path forwards the param "
+                "server-side. See mimir-repo follow-up to PR #342.",
+                contradiction_threshold,
+            )
         from .forget import forget_by_criteria
         def _do():
             conn = self._ensure_conn()

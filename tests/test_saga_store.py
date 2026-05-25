@@ -297,3 +297,95 @@ async def test_query_explicit_kwarg_overrides_config_flag(client, monkeypatch):
         enable_contextual_rewrite=False,
     )
     assert rewrite_calls == []
+
+
+# ─── PR #342 follow-up: warning when NYI forget params are passed ────
+
+
+@pytest.mark.asyncio
+async def test_forget_warns_when_contribution_threshold_passed(
+    tmp_path, caplog,
+):
+    """``SagaStore.forget(contribution_threshold=...)`` accepts the
+    param at the surface (so HTTP-path-shape callsites don't break)
+    but ``forget_by_criteria`` doesn't implement it. Pre-fix the
+    in-process path silently dropped the kwarg — same shape as the
+    bug PR #342 was closing for ``agent_id`` + ``min_retrievals``.
+    Now it logs a clear warning so operators see the gap.
+    """
+    import logging
+    from mimir.saga.client import SagaStore
+    db_path = tmp_path / "test.saga.db"
+    store = SagaStore(db_path=db_path)
+
+    with caplog.at_level(logging.WARNING, logger="mimir.saga.client"):
+        await store.forget(
+            dry_run=True,
+            contribution_threshold=0.3,
+        )
+    warning_msgs = [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and "contribution_threshold" in r.getMessage()
+    ]
+    assert warning_msgs, (
+        f"expected a WARNING mentioning contribution_threshold; got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+    assert "ignored" in warning_msgs[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_forget_warns_when_contradiction_threshold_passed(
+    tmp_path, caplog,
+):
+    """Same shape for the contradiction_threshold param."""
+    import logging
+    from mimir.saga.client import SagaStore
+    db_path = tmp_path / "test.saga.db"
+    store = SagaStore(db_path=db_path)
+
+    with caplog.at_level(logging.WARNING, logger="mimir.saga.client"):
+        await store.forget(
+            dry_run=True,
+            contradiction_threshold=0.5,
+        )
+    warning_msgs = [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and "contradiction_threshold" in r.getMessage()
+    ]
+    assert warning_msgs
+    assert "ignored" in warning_msgs[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_forget_silent_when_only_implemented_params_passed(
+    tmp_path, caplog,
+):
+    """Regression guard: a forget call that only uses the supported
+    params (agent_id is injected automatically, plus min_retrievals /
+    grace_days / confidence_floor) must NOT emit a warning."""
+    import logging
+    from mimir.saga.client import SagaStore
+    db_path = tmp_path / "test.saga.db"
+    store = SagaStore(db_path=db_path)
+
+    with caplog.at_level(logging.WARNING, logger="mimir.saga.client"):
+        await store.forget(
+            dry_run=True,
+            grace_days=30,
+            min_retrievals=5,
+        )
+    nyi_warnings = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and (
+            "contribution_threshold" in r.getMessage()
+            or "contradiction_threshold" in r.getMessage()
+        )
+    ]
+    assert not nyi_warnings, (
+        f"unexpected NYI-param warnings on a supported-params-only "
+        f"call: {[r.getMessage() for r in nyi_warnings]}"
+    )
