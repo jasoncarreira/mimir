@@ -53,7 +53,8 @@ uv run pytest --ignore=tests/test_bench_via_mimir.py   # skip slow integration
 
 If your change touches the agent loop, run the bench harness before opening
 the PR — see `benchmarks/longmemeval_via_mimir/README.md`. Memory-backend
-changes should run saga's own tests as well: `cd saga && uv run pytest`.
+changes (`mimir/saga/`) are covered by `tests/test_saga_*` in the main
+test suite — no separate `cd` is needed.
 
 ## Reviewing
 
