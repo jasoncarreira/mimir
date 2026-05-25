@@ -1,6 +1,13 @@
 # Spec: scheduler.yaml unification for non-LLM cron jobs
 
 **Filed:** 2026-05-08
+**Status:** **shipped** (2026-05). Implementation in `mimir/scheduler.py` via
+the `register_callable` / `callable: <name>` registry; non-LLM crons
+(saga-consolidate, introspection-report, oauth-usage-poll,
+bind-mount-health-probe, identities-populate, viability-report) are now
+operator-mutable from `scheduler.yaml` via `callable:` entries with no
+container restart needed. This doc is retained as design rationale.
+
 **Driver:** [chainlink #44 / PR #71 follow-up]; operator request after PR #71's
 "Concern 2" review surfaced the inconsistency.
 

@@ -424,10 +424,7 @@ def _fsync_events_log(events_log: Path) -> None:
     compliant for "flush any pending writes to this file": the kernel
     has a single page cache per inode, and fsync drives all dirty
     pages for that inode to disk regardless of which fd opened it.
-    Linux and macOS both follow this. The original review at
-    code-review-2026-05-09.md flagged this as undefined / no-op; that
-    framing was overcautious — see the Re-grades section in the
-    review doc.
+    Linux and macOS both follow this.
 
     Real residual concern: virtiofs / Docker-on-macOS has weaker
     fsync guarantees than direct-attached storage. ``fsync`` returns
