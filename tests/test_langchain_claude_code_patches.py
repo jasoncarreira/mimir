@@ -695,6 +695,142 @@ async def test_hooks_capture_built_in_bash_tool_integration():
         assert phases["tool_result"]["tool_use_id"] == tid
 
 
+@pytest.mark.asyncio
+async def test_hooks_capture_built_in_bash_tool_mocked():
+    """Mocked companion to ``test_hooks_capture_built_in_bash_tool_integration``.
+
+    The integration test above proves that an unmodified
+    ``ClaudeSDKClient`` actually invokes our PreToolUse / PostToolUse
+    hooks when a built-in Bash tool fires. That test is skipped in
+    environments without claude CLI auth, which means CI (no OAuth
+    keychain) and fresh-contributor machines get zero coverage of the
+    hook-pairing contract.
+
+    This test exercises the *contract* the SDK is documented to honor:
+    for each built-in tool invocation, the SDK calls
+    ``_pre_tool_use_hook`` with ``{"tool_name", "tool_input"}`` BEFORE
+    execution, then ``_post_tool_use_hook`` with
+    ``{"tool_name", "tool_response"}`` AFTER, both with the SAME
+    ``tool_use_id``. By simulating that call pattern directly against
+    our hook impls — no subprocess, no network, no auth — we pin the
+    hook-side wiring even when the SDK side can't be exercised.
+
+    Combined coverage:
+    - this test                          ← hook-side contract (always)
+    - integration test (skipped w/o auth)← SDK-side wiring (when possible)
+    - earlier unit tests in this file    ← hook plumbing internals
+    """
+    events: list[dict[str, Any]] = []
+    token = _tool_events_var.set(events)
+    try:
+        # The SDK's call pattern for two sequential Bash invocations.
+        # Each pair shares a tool_use_id and is delivered in this order:
+        # pre(call1), post(call1), pre(call2), post(call2). Real model
+        # output also typically yields one pair per Bash command.
+        await _pre_tool_use_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "echo a"}},
+            tool_use_id="toolu_01",
+            _ctx=None,
+        )
+        await _post_tool_use_hook(
+            {"tool_name": "Bash",
+             "tool_response": {"stdout": "a\n", "stderr": "", "exit_code": 0}},
+            tool_use_id="toolu_01",
+            _ctx=None,
+        )
+        await _pre_tool_use_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "echo b"}},
+            tool_use_id="toolu_02",
+            _ctx=None,
+        )
+        await _post_tool_use_hook(
+            {"tool_name": "Bash",
+             "tool_response": {"stdout": "b\n", "stderr": "", "exit_code": 0}},
+            tool_use_id="toolu_02",
+            _ctx=None,
+        )
+    finally:
+        _tool_events_var.reset(token)
+
+    # Same assertions as the integration test, against the simulated
+    # event stream.
+    bash_events = [e for e in events if e["name"] == "Bash"]
+    assert bash_events, (
+        f"expected Bash hook events; got: {sorted({e['name'] for e in events})}"
+    )
+
+    # Pair pre/post by tool_use_id — every PreToolUse has a matching PostToolUse.
+    by_id: dict[str, dict[str, dict]] = {}
+    for e in bash_events:
+        by_id.setdefault(e["tool_use_id"], {})[e["type"]] = e
+
+    assert set(by_id.keys()) == {"toolu_01", "toolu_02"}, (
+        f"expected exactly two paired tool_use_ids; got {sorted(by_id)}"
+    )
+    for tid, phases in by_id.items():
+        assert "tool_call" in phases, (
+            f"Bash {tid} has tool_result without tool_call"
+        )
+        assert "tool_result" in phases, (
+            f"Bash {tid} has tool_call without tool_result — the exact "
+            "shape the hooks patch fixes for built-in tools"
+        )
+        # The tool_use_id on each phase round-trips correctly.
+        assert phases["tool_call"]["tool_use_id"] == tid
+        assert phases["tool_result"]["tool_use_id"] == tid
+
+    # Ordering: pre always precedes post for the same tool_use_id (the
+    # SDK guarantees this; we pin that our hooks don't reshuffle).
+    by_id_order: dict[str, list[str]] = {}
+    for e in bash_events:
+        by_id_order.setdefault(e["tool_use_id"], []).append(e["type"])
+    for tid, order in by_id_order.items():
+        assert order == ["tool_call", "tool_result"], (
+            f"Bash {tid} hook events out of order: {order}"
+        )
+
+    # Success path: is_error is False on every tool_result.
+    for e in bash_events:
+        if e["type"] == "tool_result":
+            assert e.get("is_error") is False, (
+                f"unexpected is_error on success-path event: {e}"
+            )
+
+
+@pytest.mark.asyncio
+async def test_hooks_capture_failure_path_mocked():
+    """Companion to the success-path mock above. When the SDK reports a
+    tool failure (PostToolUseFailure path), the appended event must
+    carry ``is_error=True`` and the ``error`` field — distinguishable
+    from the success path even though both share the ``tool_result``
+    type tag. Downstream consumers (turn-logger, algedonic surfacing)
+    rely on this discriminator."""
+    events: list[dict[str, Any]] = []
+    token = _tool_events_var.set(events)
+    try:
+        await _pre_tool_use_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "exit 1"}},
+            tool_use_id="toolu_fail",
+            _ctx=None,
+        )
+        await _post_tool_use_failure_hook(
+            {"tool_name": "Bash", "error": "non-zero exit code: 1"},
+            tool_use_id="toolu_fail",
+            _ctx=None,
+        )
+    finally:
+        _tool_events_var.reset(token)
+
+    assert len(events) == 2
+    call, result = events
+    assert call["type"] == "tool_call"
+    assert call["tool_use_id"] == "toolu_fail"
+    assert result["type"] == "tool_result"
+    assert result["tool_use_id"] == "toolu_fail"
+    assert result["is_error"] is True
+    assert result.get("error") == "non-zero exit code: 1"
+
+
 # ── combined-patch interaction (enrich + hooks both applied) ────────
 
 
