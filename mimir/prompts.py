@@ -207,6 +207,7 @@ def build_turn_prompt(
     self_state_block: str | None = None,
     auto_skill_block: tuple[str, str] | None = None,
     saga_session_id: str | None = None,
+    channel_memory_block: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, SAGA
     atom hits, subagent completion notifications (from prior turns), event
@@ -249,6 +250,17 @@ def build_turn_prompt(
         )
         if identity_block:
             _add_labeled("Known identities", identity_block)
+
+    # Channel context (chainlink #187): per-channel operator facts injected
+    # inline so the agent has context (operator name, preferences, channel-
+    # specific patterns) without a tool call. Placement at the top of the
+    # turn prompt (after optional identity reconciliation, before algedonic
+    # feedback) mirrors how the system prompt presents core memory: the agent
+    # reads WHO it's talking to before it reads WHAT just happened.
+    # Only fires for real channels; synthetic channels (scheduler:*, poller:*)
+    # return None from load_channel_memory and this section is suppressed.
+    if channel_memory_block:
+        _add_labeled("Channel context", channel_memory_block)
 
     # Algedonic channel (v0.4 §2): self-feedback signals between identities
     # and recent activity, so the agent reads its own pain/pleasure data

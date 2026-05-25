@@ -2136,6 +2136,16 @@ class Agent:
             event.channel_id,
             skills_dirs,
         )
+        # Channel memory injection (chainlink #187): load per-channel fact
+        # files (operator name, preferences, patterns) from
+        # ``memory/channels/<channel_id>/``.  Returns None for synthetic
+        # channels (scheduler:*, poller:*) and channels with no memory files.
+        from .core_blocks import load_channel_memory
+        channel_memory_block = await asyncio.to_thread(
+            load_channel_memory,
+            self._config.home,
+            event.channel_id or "",
+        )
         turn_prompt = build_turn_prompt(
             event,
             recent_messages=recent,
@@ -2151,5 +2161,6 @@ class Agent:
             self_state_block=self_state_block,
             auto_skill_block=auto_skill_block,
             saga_session_id=ctx.saga_session_id,
+            channel_memory_block=channel_memory_block,
         )
         return turn_prompt, recent
