@@ -35,6 +35,7 @@ that need uncapped exploration).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Awaitable, Callable
 
@@ -73,6 +74,13 @@ def _resolve_budget_state() -> tuple[Any, int] | None:
     return ctx, int(budget)
 
 
+# Strong references to fire-and-forget background tasks (chainlink #118).
+# Module-level set holds tasks spawned by _emit_event_sync until completion.
+# The done-callback discards each entry so the set stays bounded to in-flight
+# tasks only.  See cpython docs "Coroutines and Tasks / Important" callout.
+_background_tasks: set["asyncio.Task[Any]"] = set()
+
+
 def _emit_event_sync(kind: str, **kwargs: Any) -> None:
     """Fire-and-forget log_event from inside the middleware sync path.
 
@@ -81,10 +89,11 @@ def _emit_event_sync(kind: str, **kwargs: Any) -> None:
     (the denial text on the returned ToolMessage is still load-bearing).
     """
     try:
-        import asyncio
-        from ..event_logger import log_event
+        from ..event_logger import log_event  # lazy: supports monkeypatching in tests
         loop = asyncio.get_running_loop()
-        loop.create_task(log_event(kind, **kwargs))
+        task = loop.create_task(log_event(kind, **kwargs))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
     except RuntimeError:
         log.debug("budget event %s dropped: no running loop", kind)
 
