@@ -49,7 +49,7 @@ RECENCY_HALF_LIFE_DAYS = 30.0
 W_COSINE = 0.5
 W_BM25 = 0.2
 W_RECENCY = 0.3
-# Mirrors saga's ``cached_embed_query`` LRU (saga/saga/embeddings.py:340).
+# Mirrors saga's ``cached_embed_query`` LRU (``mimir/saga/embeddings.py``).
 # A single turn issues a handful of ``file_search`` calls and benchmarks
 # replay the same queries; 64 is plenty without bloating worker memory.
 EMBED_QUERY_CACHE_SIZE = 64

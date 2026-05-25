@@ -1,7 +1,8 @@
 """``mimir loops`` — runtime introspection of mimir's feedback loops.
 
 Joins the static loop-inventory (VSM-tagged comments scanned from
-mimir/ + saga/saga/) against runtime evidence (events.jsonl + turns.jsonl
+mimir/ — including the in-process mimir/saga/ memory backend) against
+runtime evidence (events.jsonl + turns.jsonl
 tail) to produce a per-loop status table grouped by VSM layer.
 
 The diagnostic value is the **never-fired** rows. If inbound-reactions

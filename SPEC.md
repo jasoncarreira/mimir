@@ -99,7 +99,7 @@ The name is from Norse myth — Mímir, the keeper of memory and counsel.
 │                                 # mark_contributions effects measure
 │                                 # end-to-end. NOT under saga/ (saga stays
 │                                 # mimir-independent).
-└── tests/                        # mimir package tests (per-package saga tests under saga/saga/tests/)
+└── tests/                        # mimir package tests (includes the runtime saga backend under mimir/saga/; the bench-shell at benchmarks/saga/ has no own tests)
 
 ```
 
@@ -566,7 +566,7 @@ Independent of the message buffer, the agent gets per-channel **memory** scoped 
 
 ### 5.6 Per-channel SAGA sessions
 
-SAGA models memory in the context of **sessions** — TTL'd contexts that scope working-memory atoms, co-retrieval edges, and retrieval outcomes (see `saga/saga/core.py:1139`, `:2209`, `:2311`). Mimir scopes one SAGA session per channel and uses the channel's idle period as the session boundary.
+SAGA models memory in the context of **sessions** — TTL'd contexts that scope working-memory atoms, co-retrieval edges, and retrieval outcomes (see `mimir/saga/store.py` and `mimir/saga/recall.py`). Mimir scopes one SAGA session per channel and uses the channel's idle period as the session boundary.
 
 #### State
 
@@ -597,7 +597,7 @@ Cap-value tradeoff: a lower cap means more frequent synthesis turns on slow chan
 2. Otherwise: mint `saga_session_id = f"saga-{channel_id}-{int(time.time() * 1000)}"`, create the session, start the timer, log `saga_session_started` to events.jsonl.
 3. Either way, attach the current `saga_session_id` to the upcoming turn's `TurnContext.saga_session_id` (§4.6).
 
-**On idle timeout** — the asyncio timer fires `_end_session(channel_id)`. Session-end is an **LLM-driven synthesis turn**, not a fire-and-forget HTTP call, because SAGA's bookkeeping call (`core.store_session_boundary`, `saga/saga/core.py:3393-3437`) takes structured fields the LLM is best-placed to produce:
+**On idle timeout** — the asyncio timer fires `_end_session(channel_id)`. Session-end is an **LLM-driven synthesis turn**, not a fire-and-forget call, because SAGA's bookkeeping call (the session-boundary write in `mimir/saga/reflect.py`) takes structured fields the LLM is best-placed to produce:
 
 ```python
 store_session_boundary(

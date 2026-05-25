@@ -16,7 +16,7 @@ documentation drift warning.
 
 Scanning lives at runtime instead of as a build step so the tags
 stay in sync with whatever the venv has installed. Cost is one
-recursive walk of mimir/ + saga/saga/ at CLI invocation time
+recursive walk of mimir/ (including mimir/saga/) at CLI invocation time
 (~50ms typical).
 """
 
@@ -126,8 +126,9 @@ def _scan_file(path: Path) -> list[LoopTag]:
 
 
 def default_roots() -> list[Path]:
-    """Walk roots for the default ``mimir loops`` invocation. Includes
-    the workspace's mimir + saga packages but skips the integration
-    bench (which doesn't have feedback-loop entry points)."""
+    """Walk roots for the default ``mimir loops`` invocation. The mimir
+    package covers the runtime memory backend (``mimir/saga/``) as well
+    as the agent core; the bench-shell package at ``benchmarks/saga/``
+    has no feedback-loop entry points and is skipped."""
     here = Path(__file__).resolve().parent.parent
-    return [here / "mimir", here / "saga" / "saga"]
+    return [here / "mimir"]

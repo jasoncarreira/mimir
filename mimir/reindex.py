@@ -452,7 +452,8 @@ def dispatch(args: argparse.Namespace) -> int:
             cfg("retrieval", "enable_subatom_beam", False):
         print(
             "\nNote: [retrieval] enable_subatom_beam = true is set. The "
-            "sentence_embeddings cache (saga/saga/subatom.py) is NOT "
+            "sentence_embeddings cache (populated by the subatom-beam "
+            "retrieval path) is NOT "
             "migrated by this reindex. Clear it manually after this run "
             "(or wait for it to repopulate naturally on next "
             "compressed_retrieve calls):\n"
