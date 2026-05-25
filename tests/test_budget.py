@@ -361,3 +361,82 @@ def test_no_quota_pause_file_skips_check_cleanly(tmp_path: Path):
     # No .mimir dir got created as a side effect — the early guard
     # prevented an unnecessary tracker.
     assert not (tmp_path / ".mimir").exists()
+
+
+def test_quota_recovered_uses_run_coroutine_threadsafe_when_loop_provided(tmp_path: Path):
+    """When ``event_loop`` is passed to ``should_fire_heartbeat``
+    (the normal ``asyncio.to_thread`` path), the ``quota_recovered``
+    coroutine is submitted via ``asyncio.run_coroutine_threadsafe``
+    rather than ``get_running_loop()`` — which would raise RuntimeError
+    in a worker thread. Chainlink #184."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import patch
+    from mimir.quota_pause import QuotaPauseTracker
+
+    pause_path = tmp_path / ".mimir" / "quota_pause.json"
+    tracker = QuotaPauseTracker(pause_path)
+    # Pause that expired 5 minutes ago — triggers the lazy-expiry +
+    # quota_recovered emission path.
+    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    tracker.pause_until(past, reason="quota_exhausted")
+
+    arb = _arbiter(tmp_path)
+
+    submitted: list[object] = []
+
+    def _capture_threadsafe(coro, loop):  # noqa: ARG001
+        submitted.append(coro)
+        coro.close()  # avoid ResourceWarning — we're not running it
+
+    with patch("asyncio.run_coroutine_threadsafe", _capture_threadsafe):
+        fire, reason = arb.should_fire_heartbeat(event_loop=object())
+
+    assert fire
+    assert reason == "ok"
+    assert len(submitted) == 1, (
+        "run_coroutine_threadsafe should have been called exactly once "
+        f"for quota_recovered; calls: {submitted}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_quota_recovered_emits_from_to_thread(tmp_path: Path):
+    """End-to-end: when the scheduler's ``asyncio.to_thread`` shape runs
+    ``should_fire_heartbeat`` in a worker thread, ``quota_recovered``
+    actually fires on the main event loop. Chainlink #184."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+    from mimir.quota_pause import QuotaPauseTracker
+
+    pause_path = tmp_path / ".mimir" / "quota_pause.json"
+    tracker = QuotaPauseTracker(pause_path)
+    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    tracker.pause_until(past, reason="quota_exhausted")
+
+    emitted: list[str] = []
+
+    async def _fake_log_event(kind: str, **_kwargs) -> None:
+        emitted.append(kind)
+
+    import mimir.event_logger as _el_mod
+    original_log = _el_mod.log_event
+    _el_mod.log_event = _fake_log_event  # type: ignore[assignment]
+    try:
+        _loop = asyncio.get_running_loop()
+        arb = _arbiter(tmp_path)
+        fire, reason = await asyncio.to_thread(
+            arb.should_fire_heartbeat,
+            event_loop=_loop,
+        )
+        # Yield to the event loop so run_coroutine_threadsafe's task runs.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    finally:
+        _el_mod.log_event = original_log  # type: ignore[assignment]
+
+    assert fire
+    assert reason == "ok"
+    assert "quota_recovered" in emitted, (
+        f"quota_recovered not emitted; got: {emitted}"
+    )
