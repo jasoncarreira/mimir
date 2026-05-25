@@ -406,6 +406,13 @@ class Scheduler:
         cap = max(1, cap)  # 0 / negative → 1 (degenerate single-fire)
         self._poller_semaphore = asyncio.Semaphore(cap)
         self._poller_concurrency_cap = cap
+        # Strong references to fire-and-forget background tasks (chainlink #118).
+        # asyncio.create_task() returns a weakly-referenced Task — if no strong
+        # ref is held, the GC can collect it before it runs to completion.
+        # Each fire-and-forget create_task call adds here; the done-callback
+        # discards the entry so the set stays bounded to in-flight tasks only.
+        # See cpython docs "Coroutines and Tasks / Important" callout.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
         # APScheduler ``EVENT_JOB_MISSED`` listener — emits a
         # ``poller_misfired`` algedonic event whenever a job's fire
@@ -432,14 +439,14 @@ class Scheduler:
         lost.
         """
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             log.warning(
                 "scheduled_job_misfired (no loop): job=%s scheduled=%s",
                 event.job_id, event.scheduled_run_time,
             )
             return
-        loop.create_task(self._log_misfire(event))
+        self._spawn(self._log_misfire(event), name="scheduler-log-misfire")
 
     async def _log_misfire(self, event: JobExecutionEvent) -> None:
         # Distinguish poller misses (operator-actionable: tune cron or
@@ -454,6 +461,20 @@ class Scheduler:
                 if event.scheduled_run_time else None
             ),
         )
+
+    def _spawn(self, coro: Awaitable[Any], *, name: str | None = None) -> asyncio.Task[Any]:
+        """Schedule *coro* as a background task and hold a strong reference.
+
+        Bare ``loop.create_task(coro)`` returns a weakly-referenced Task that
+        the GC can collect before it completes if the caller discards the
+        return value.  This helper retains the task in ``_background_tasks``
+        until it finishes, matching the cpython-documented strong-ref pattern.
+        """
+        loop = asyncio.get_running_loop()
+        task: asyncio.Task[Any] = loop.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     # ---- LLM-tick jobs ------------------------------------------------
 
@@ -1039,7 +1060,7 @@ class Scheduler:
         if not events:
             return
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             for payload in events:
                 log.warning(
@@ -1048,8 +1069,9 @@ class Scheduler:
                 )
             return
         for payload in events:
-            loop.create_task(
+            self._spawn(
                 log_event("poller_reload_invalid_manifest", **payload),
+                name="scheduler-invalid-manifest-event",
             )
 
     async def _fire_poller(self, *, poller_name: str) -> None:

@@ -1778,3 +1778,97 @@ async def test_saga_consolidate_error_includes_traceback(tmp_path: Path):
         assert "boom from saga consolidate" in ev["traceback"]
     finally:
         _reset_logger_for_tests()
+
+
+# ─── chainlink #118: asyncio strong-ref for fire-and-forget tasks ────────────
+
+
+@pytest.mark.asyncio
+async def test_on_job_missed_task_is_held_in_background_tasks(tmp_path: Path):
+    """_on_job_missed uses _spawn() which holds a strong ref in
+    _background_tasks until the task completes (chainlink #118).
+    Regression: bare loop.create_task() without a retained reference
+    could be GC'd before it finishes on a busy event loop."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    log_started = asyncio.Event()
+    log_unblocked = asyncio.Event()
+
+    async def blocking_log_event(event_type: str, **kwargs):
+        log_started.set()
+        await log_unblocked.wait()
+
+    with patch("mimir.scheduler.log_event", new=blocking_log_event):
+        fake_event = SimpleNamespace(
+            job_id="poller:my-skill",
+            scheduled_run_time=datetime(2026, 5, 10, 12, 0, tzinfo=timezone.utc),
+        )
+        sched._on_job_missed(fake_event)
+        # Yield until the task starts — proves it was actually scheduled.
+        await asyncio.wait_for(log_started.wait(), timeout=1.0)
+
+        # While the task is suspended, the strong-ref set must hold it.
+        assert len(sched._background_tasks) == 1, (
+            "Expected 1 in-flight task in _background_tasks"
+        )
+
+        # Unblock the task and let it finish.
+        log_unblocked.set()
+        # Two yields: first lets the task run to completion; second lets
+        # the loop.call_soon-scheduled done_callback (discard) execute.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    # After completion the done-callback must have removed the entry.
+    assert len(sched._background_tasks) == 0, (
+        "_background_tasks should be empty after task completes"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_invalid_manifest_events_task_is_held_in_background_tasks(
+    tmp_path: Path,
+):
+    """_dispatch_invalid_manifest_events uses _spawn() which holds strong refs
+    for each event task until completion (chainlink #118)."""
+    from unittest.mock import patch
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    logged: list[str] = []
+    log_unblocked = asyncio.Event()
+
+    async def blocking_log_event(event_type: str, **kwargs):
+        logged.append(event_type)
+        await log_unblocked.wait()
+
+    events = [
+        {"manifest_path": "/a.json", "error": "bad json"},
+        {"manifest_path": "/b.json", "error": "missing field"},
+    ]
+    with patch("mimir.scheduler.log_event", new=blocking_log_event):
+        sched._dispatch_invalid_manifest_events(events)
+        # Yield to let tasks start.
+        await asyncio.sleep(0)
+
+        # Both tasks should be in flight.
+        assert len(sched._background_tasks) == 2, (
+            f"Expected 2 in-flight tasks, got {len(sched._background_tasks)}"
+        )
+
+        log_unblocked.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert len(sched._background_tasks) == 0
+    assert len(logged) == 2
