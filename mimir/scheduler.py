@@ -27,6 +27,7 @@ import asyncio
 import logging
 import os
 import time
+import traceback as tb
 from dataclasses import dataclass, field
 from datetime import timezone
 from pathlib import Path
@@ -1516,6 +1517,7 @@ class Scheduler:
                 await log_event(
                     "commitments_due_check_error",
                     error=f"{type(exc).__name__}: {exc}",
+                    traceback=tb.format_exc(),
                 )
 
         return self.register_callable(
