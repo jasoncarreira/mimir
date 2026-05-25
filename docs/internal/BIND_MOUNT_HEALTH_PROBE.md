@@ -2,7 +2,15 @@
 
 <!-- desc: detect VirtioFS bind-mount stale-inode states and recover by killing PID 1 -->
 
-**Status:** filed 2026-05-06. Implementation in flight (PR pending).
+**Status:** **shipped** (2026-05). Implementation in `mimir/health_probe.py`;
+operator surface via the `bind-mount-health-probe` callable job in
+`scheduler.yaml`. Superseded for new installs by the docker-volume layout
+(see [`MIMIR_HOME_GIT_TRACKING.md`](./MIMIR_HOME_GIT_TRACKING.md)), but the
+probe is kept active as belt-and-suspenders since the macOS-host VirtioFS
+failure mode also affects the workspace bind-mount.
+
+This doc is retained as design rationale for the detection + recovery
+mechanism.
 
 ## Problem
 

@@ -926,8 +926,8 @@ Total: ~10.5 days of focused work for the whole §12 stack.
 
 ### 2026-05-01 — v0.5 saga merge + in-process integration
 
-Closed the cross-repo coordination tax between mimir and msam. See
-`V0.5.md` for the full plan and commit refs (`b7e368b .. 45837d0`):
+Closed the cross-repo coordination tax between mimir and msam. Commit
+range: `b7e368b .. 45837d0`.
 
 - **§1 Workspace monorepo merge** — `msam2` (hindsight-ideas branch)
   merged into mimir at `saga/` via `git filter-repo` with full history
@@ -968,7 +968,7 @@ Also retired:
 
 ### 2026-05-01 — v0.4 self-awareness loops
 
-Closed several long-standing items. See `V0.4.md` for the full plan and commit refs (`bf7e3a4 .. 708647b`):
+Closed several long-standing items. Commit range: `bf7e3a4 .. 708647b`.
 
 - **§8.1 Periodic reflection / memory consolidation** → reflection skill + weekly cron entry. Two parallel tracks (behavioral + memory-architecture-review). Propose-only by default per `memory/core/30-reflection-policy.md`. Bundled `mimir reflection most-retrieved` CLI for atom-to-core promotion candidates.
 - **§8.3 Wisdom-keeper reflection loop** → partially. Memory-architecture-review track ships; "claims audit" extension is still future work (re-scoped above).
@@ -990,20 +990,5 @@ Also shipped (not previously tracked here, captured for posterity):
 ## Filed specs (separate documents)
 
 - **[CLAUDE_SDK_CLIENT_MIGRATION.md](./CLAUDE_SDK_CLIENT_MIGRATION.md)** —
-  staged plan to replace `claude_agent_sdk.query()` with the long-lived
-  `ClaudeSDKClient` in the agent loop. Unlocks `get_context_usage()` (Max
-  plan window utilization), `interrupt()`, `set_permission_mode()`,
-  `set_model()`, and lets us retire the cron-based quota poller. Filed
-  2026-05-04 alongside the cron poller in `mimir/quota_poller.py` —
-  the cron is the ship-this-week fix; the migration is the long-term
-  shape. ~one focused day of work across five stages.
-
-- **[SYNTHESIS_AND_BUDGET_FIXES.md](./SYNTHESIS_AND_BUDGET_FIXES.md)** —
-  two cost/autonomy fixes from the 2026-05-04 self-reflection cycle.
-  (1) Synthesis turn embeds full turn JSON including each turn's
-  `input` (a 30k-token rendered prompt that already contains prior
-  turns' context) — quadratic blowup, $2-3 per session-end at 500k
-  prompt tokens. Fix: pass turn IDs + atom-feedback structure;
-  add `mimir_get_turn(turn_id)` MCP tool for selective fetch during
-  memory capture. (2) `MIMIR_TOOL_CALL_BUDGET` default of 30 is too
-  low for an autonomous engineer; bump to 120. Two independent PRs.
+  superseded by the deepagents / LangGraph migration. Doc retained for the
+  design analysis (quota-visibility ask, session-reuse argument).
