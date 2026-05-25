@@ -930,3 +930,25 @@ def test_scaffold_unknown_mode_raises(tmp_path):
     from mimir.scaffold_docker import scaffold
     with pytest.raises(ValueError, match="unknown scaffold mode"):
         scaffold(tmp_path, mode="not-a-mode")
+
+
+# ─── defensive userdel before useradd (issue surfaced in muninn-mimir) ─
+
+
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+def test_render_dockerfile_includes_defensive_userdel(mode):
+    """Skill fragments — notably 1Password's apt package — can install
+    service users that grab UID 1000 before our useradd runs. Without
+    the defensive userdel, the build fails with exit code 4 ("UID
+    not unique"). Both modes must include the detect-and-delete block
+    so any future skill fragment that grabs a UID doesn't break the
+    image build. Caught by the muninn-mimir migration."""
+    from mimir.scaffold_docker import render_dockerfile
+    out = render_dockerfile([], mode=mode)
+    # The defensive block detects existing users / groups at the
+    # target UID/GID and removes them before useradd.
+    assert "existing_uid_user=$(getent passwd" in out
+    assert "userdel" in out
+    assert "groupdel" in out
+    # The actual useradd still runs.
+    assert 'useradd --uid "${USER_UID}"' in out

@@ -282,7 +282,24 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \\
 #   docker compose build --build-arg USER_UID=$(id -u)
 ARG USER_UID=1000
 ARG USER_GID=1000
-RUN groupadd --gid "${USER_GID}" mimir \\
+# Defensive: some skill fragments (notably 1Password's apt package)
+# install service users that may grab UID 1000 before this layer
+# runs — useradd then fails with exit code 4 ("UID not unique").
+# If a non-mimir user occupies our target UID/GID, delete it first
+# so the explicit useradd below succeeds. Safe because service
+# users have no homedir and their package data lives under
+# /etc + /var, which userdel leaves alone.
+RUN existing_uid_user=$(getent passwd "${USER_UID}" | cut -d: -f1) \\
+ && if [ -n "$existing_uid_user" ] && [ "$existing_uid_user" != "mimir" ]; then \\
+        echo "[Dockerfile] removing user $existing_uid_user at UID ${USER_UID} to free the slot for mimir"; \\
+        userdel "$existing_uid_user" 2>/dev/null || true; \\
+    fi \\
+ && existing_gid_group=$(getent group "${USER_GID}" | cut -d: -f1) \\
+ && if [ -n "$existing_gid_group" ] && [ "$existing_gid_group" != "mimir" ]; then \\
+        echo "[Dockerfile] removing group $existing_gid_group at GID ${USER_GID} to free the slot"; \\
+        groupdel "$existing_gid_group" 2>/dev/null || true; \\
+    fi \\
+ && groupadd --gid "${USER_GID}" mimir \\
  && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home --shell /bin/bash mimir \\
  && mkdir -p /workspace /mimir-home \\
  && chown -R mimir:mimir /workspace /mimir-home
@@ -375,7 +392,24 @@ RUN npm install -g @anthropic-ai/claude-code @mermaid-js/mermaid-cli
 # sudo. ``docker compose build --build-arg USER_UID=$(id -u)``.
 ARG USER_UID=1000
 ARG USER_GID=1000
-RUN groupadd --gid "${USER_GID}" mimir \\
+# Defensive: some skill fragments (notably 1Password's apt package)
+# install service users that may grab UID 1000 before this layer
+# runs — useradd then fails with exit code 4 ("UID not unique").
+# If a non-mimir user occupies our target UID/GID, delete it first
+# so the explicit useradd below succeeds. Safe because service
+# users have no homedir and their package data lives under
+# /etc + /var, which userdel leaves alone.
+RUN existing_uid_user=$(getent passwd "${USER_UID}" | cut -d: -f1) \\
+ && if [ -n "$existing_uid_user" ] && [ "$existing_uid_user" != "mimir" ]; then \\
+        echo "[Dockerfile] removing user $existing_uid_user at UID ${USER_UID} to free the slot for mimir"; \\
+        userdel "$existing_uid_user" 2>/dev/null || true; \\
+    fi \\
+ && existing_gid_group=$(getent group "${USER_GID}" | cut -d: -f1) \\
+ && if [ -n "$existing_gid_group" ] && [ "$existing_gid_group" != "mimir" ]; then \\
+        echo "[Dockerfile] removing group $existing_gid_group at GID ${USER_GID} to free the slot"; \\
+        groupdel "$existing_gid_group" 2>/dev/null || true; \\
+    fi \\
+ && groupadd --gid "${USER_GID}" mimir \\
  && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home --shell /bin/bash mimir \\
  && mkdir -p /mimir-home \\
  && chown -R mimir:mimir /mimir-home
