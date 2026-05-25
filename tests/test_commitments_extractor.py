@@ -139,6 +139,96 @@ def test_coerce_sensitivity_default_is_routine():
     assert rec.sensitivity == CommitmentSensitivity.ROUTINE
 
 
+# ── chainlink #97: ISO datetime hint → due_window_start_unix ────────
+
+
+def test_coerce_iso_datetime_hint_populates_start_unix():
+    """ISO 8601 due_window_hint must be parsed into due_window_start_unix
+    so the due-check poller can fire on schedule (chainlink #97)."""
+    rec = _coerce_to_record(
+        {"text": "review by deadline", "confidence": 0.9,
+         "due_window_hint": "2026-06-01T10:00:00+00:00"},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert rec is not None
+    # Hint string preserved verbatim.
+    assert rec.due_window_hint == "2026-06-01T10:00:00+00:00"
+    # Unix timestamp populated — 2026-06-01 10:00:00 UTC.
+    from datetime import datetime, timezone
+    expected = datetime(2026, 6, 1, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert rec.due_window_start_unix == pytest.approx(expected, abs=1.0)
+
+
+def test_coerce_iso_datetime_z_suffix_parsed():
+    """'Z' suffix (UTC shorthand) must be accepted on Python 3.10."""
+    rec = _coerce_to_record(
+        {"text": "ship before cutoff", "confidence": 0.85,
+         "due_window_hint": "2026-06-15T00:00:00Z"},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert rec is not None
+    from datetime import datetime, timezone
+    expected = datetime(2026, 6, 15, 0, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert rec.due_window_start_unix == pytest.approx(expected, abs=1.0)
+
+
+def test_coerce_iso_datetime_no_tz_treated_as_utc():
+    """ISO datetime without timezone is treated as UTC (mimir convention)."""
+    rec = _coerce_to_record(
+        {"text": "call at noon", "confidence": 0.8,
+         "due_window_hint": "2026-06-10T12:00:00"},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert rec is not None
+    from datetime import datetime, timezone
+    expected = datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert rec.due_window_start_unix == pytest.approx(expected, abs=1.0)
+
+
+def test_coerce_relative_hint_leaves_start_unix_none():
+    """Relative phrases must NOT be misinterpreted as ISO; start_unix stays None."""
+    for hint in ("Thursday", "next sprint", "tomorrow", "by end of week", "soon"):
+        rec = _coerce_to_record(
+            {"text": f"do the thing ({hint})", "confidence": 0.8,
+             "due_window_hint": hint},
+            channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+        )
+        assert rec is not None, f"hint={hint!r} returned None record"
+        assert rec.due_window_start_unix is None, (
+            f"hint={hint!r} incorrectly parsed as ISO; got {rec.due_window_start_unix}"
+        )
+        assert rec.due_window_hint == hint  # verbatim preserved
+
+
+def test_coerce_iso_datetime_dedupe_key_uses_day_bucket():
+    """When start_unix is populated, dedupe key must use the day bucket
+    (not 'none'), so same commitment on different days doesn't collapse."""
+    from mimir.commitments.models import make_dedupe_key
+    rec = _coerce_to_record(
+        {"text": "review PR #999", "confidence": 0.9,
+         "due_window_hint": "2026-06-01T10:00:00+00:00"},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert rec is not None
+    assert rec.due_window_start_unix is not None
+    # Dedupe key must match the day-bucket version.
+    expected_key = make_dedupe_key(
+        channel_id=None,  # channel_unbound
+        text=rec.text,
+        due_window_start_unix=rec.due_window_start_unix,
+        recipient_identity=None,
+    )
+    assert rec.dedupe_key == expected_key
+    # And must differ from the 'none' (no-date) version.
+    no_date_key = make_dedupe_key(
+        channel_id=None,
+        text=rec.text,
+        due_window_start_unix=None,
+        recipient_identity=None,
+    )
+    assert rec.dedupe_key != no_date_key
+
+
 # ── extract_commitments (end-to-end with stub model) ────────────────
 
 
