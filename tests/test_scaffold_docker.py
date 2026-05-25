@@ -952,3 +952,35 @@ def test_render_dockerfile_includes_defensive_userdel(mode):
     assert "groupdel" in out
     # The actual useradd still runs.
     assert 'useradd --uid "${USER_UID}"' in out
+
+
+def test_render_dockerfile_pypi_preserves_shell_extras_ref():
+    """Regression: ``str.replace`` is substring-based, and an earlier
+    draft used ``{MIMIR_EXTRAS}`` as the Python placeholder. That
+    string ALSO appears inside the shell ref ``${MIMIR_EXTRAS}`` on
+    the ``pip install`` line, so the Python replacement would mangle
+    the shell expansion at the same time, leaving a stray
+    ``$<extras-list>`` that the shell would treat as a variable
+    lookup at build time — producing an invalid ``pip install
+    mimir-agent[,discord,slack,mcp]`` (leading empty extra). Caught
+    by mimir-carreira review on #336.
+
+    The fix swapped to ``__MIMIR_EXTRAS__`` as the marker (can't
+    appear inside ``${VAR}``). This test pins both ends of the
+    invariant.
+    """
+    from mimir.scaffold_docker import render_dockerfile
+    out = render_dockerfile(
+        [], mode="pypi", mimir_extras=["anthropic", "discord"],
+    )
+    # The shell variable reference survives intact for runtime
+    # expansion via docker ARG.
+    assert '"mimir-agent[${MIMIR_EXTRAS}]"' in out
+    # The ARG default got the operator-supplied csv.
+    assert 'ARG MIMIR_EXTRAS="anthropic,discord"' in out
+    # No stray ``$anthropic`` artifact — what the bug would leave.
+    # (``mimir-agent[${MIMIR_EXTRAS}]`` is the legitimate use; the
+    # bug shape would be ``mimir-agent[$anthropic,discord]`` where
+    # the shell would try to expand ``$anthropic``.)
+    assert "$anthropic" not in out
+    assert "$discord" not in out
