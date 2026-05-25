@@ -406,6 +406,24 @@ def test_render_compose_yml_no_unresolved_placeholders():
     assert "{WEB_PORT}" not in out
 
 
+def test_render_compose_yml_defaults_web_host_to_zero_zero_zero_zero():
+    """Inside-container bind must default to 0.0.0.0 so docker's
+    port-forward can reach the app. mimir's default since PR #323 is
+    127.0.0.1 (host-install safety); without this override containers
+    silently produce "Empty reply from server" through the host-side
+    forward. Host exposure stays loopback-only via the
+    ``127.0.0.1:<host_port>:8080`` binding in ``ports:``."""
+    from mimir.scaffold_docker import render_compose_yml
+    for mode in ("workspace", "pypi"):
+        out = render_compose_yml(service_name="x", web_port=8080, mode=mode)
+        assert "MIMIR_WEB_HOST: 0.0.0.0" in out, (
+            f"mode={mode!r}: expected MIMIR_WEB_HOST=0.0.0.0 in the "
+            f"environment block; got:\n{out}"
+        )
+        # And the host-side port forward stays loopback-only.
+        assert "127.0.0.1:8080:8080" in out
+
+
 # ── render_start_sh() ────────────────────────────────────────────────
 
 

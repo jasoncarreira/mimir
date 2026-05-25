@@ -549,6 +549,15 @@ services:
     environment:
       MIMIR_HOME: /mimir-home
       MIMIR_WEB_PORT: 8080
+      # Inside-container bind. Must be 0.0.0.0 so Docker's port-forward
+      # (see ``ports:`` below) can reach the app — mimir's default is
+      # 127.0.0.1 (PR #323, defense-in-depth on host installs), which
+      # in a container only listens on container-loopback and produces
+      # a silent "Empty reply from server" through the host-side
+      # forward. Host exposure stays loopback-only via the
+      # "127.0.0.1:..." binding in ``ports:``; MIMIR_API_KEY gates
+      # the endpoint either way.
+      MIMIR_WEB_HOST: 0.0.0.0
     ports:
       # 127.0.0.1 binding — defense in depth alongside the auth
       # middleware. To expose on LAN, change to "0.0.0.0:{WEB_PORT}:8080".
@@ -595,6 +604,15 @@ services:
     environment:
       MIMIR_HOME: /mimir-home
       MIMIR_WEB_PORT: 8080
+      # Inside-container bind. Must be 0.0.0.0 so Docker's port-forward
+      # (see ``ports:`` below) can reach the app — mimir's default is
+      # 127.0.0.1 (PR #323, defense-in-depth on host installs), which
+      # in a container only listens on container-loopback and produces
+      # a silent "Empty reply from server" through the host-side
+      # forward. Host exposure stays loopback-only via the
+      # "127.0.0.1:..." binding in ``ports:``; MIMIR_API_KEY gates
+      # the endpoint either way.
+      MIMIR_WEB_HOST: 0.0.0.0
     ports:
       # 127.0.0.1 binding — defense in depth alongside the auth
       # middleware. To expose on LAN, change to "0.0.0.0:{WEB_PORT}:8080".
