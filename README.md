@@ -88,7 +88,7 @@ Available extras (combine in one install command — e.g. `pip install
 
 | Extra | Pulls |
 |---|---|
-| `anthropic`, `openai`, `codex-plus` | model adapter packages |
+| `anthropic`, `openai`, `codex-plus` | model adapter packages (`codex-plus` = ChatGPT Plus / Pro Codex subscription via the OAuth-backed gateway) |
 | `claude-code` | Claude Code subprocess provider (git-pinned fork until upstream patches land) |
 | `discord`, `slack` | bridge runtimes |
 | `mcp` | Model Context Protocol client |
@@ -98,7 +98,7 @@ Available extras (combine in one install command — e.g. `pip install
 ```bash
 git clone https://github.com/jasoncarreira/mimir.git
 cd mimir
-uv sync --extra dev      # or [dev-claude-code] for the Claude Code subprocess path
+uv sync --extra dev                 # or: uv sync --extra dev-claude-code (Claude Code subprocess path)
 
 uv run mimir setup --home ~/mimir-home
 uv run mimir run --home ~/mimir-home
