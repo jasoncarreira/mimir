@@ -439,7 +439,7 @@ async def test_fire_consults_arbiter_and_suppresses(tmp_path: Path):
         return True
 
     class _SuppressingArbiter:
-        def should_fire_heartbeat(self):
+        def should_fire_heartbeat(self, **_kwargs):
             return False, "plan_window_saturated:7d_opus@0.92"
 
     sched = Scheduler(
@@ -463,7 +463,7 @@ async def test_fire_consults_arbiter_and_fires(tmp_path: Path):
         return True
 
     class _FiringArbiter:
-        def should_fire_heartbeat(self):
+        def should_fire_heartbeat(self, **_kwargs):
             return True, "ok"
 
     sched = Scheduler(
