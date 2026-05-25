@@ -481,6 +481,39 @@ DEFAULT_FILING_RULES = dedent(
     - Yes → `memory/issues/` (fingerprint-shaped, runbook character).
     - No (concept/topic without operational-gotcha shape) → `state/wiki/`.
 
+    ## Notability gate
+
+    **Default: don't create.** The prompt-cost of a junk page is paid
+    every indexer rebuild.
+
+    - ``state/wiki/concepts/`` — named + recurs ≥2 sources (or 1
+      foundational) AND the agent lacks usable mapping
+    - ``state/wiki/entities/`` — work recurs ≥2 times in corpus, OR
+      named referent the corpus repeatedly cites
+    - ``memory/issues/`` — observed failure ≥1 time AND fingerprinted
+      (distinctive error / tool-call / env signature for hash-lookup)
+    - ``state/wiki/topics/`` — prefer expanding existing; new only
+      when the embed would dwarf the parent
+
+    Violations land as **drift-amplifier** per the severity rubric above.
+
+    ## Search-first lookup
+
+    The dual of "where to write": **where to read FROM.** Default
+    order for any lookup task:
+
+    1. ``file_search`` over ``state/`` + ``memory/`` (skips core,
+       which is already in the prompt). Covers wiki, raw, issues,
+       channels, specs.
+    2. ``Read`` of a known path — when you know exactly where the
+       file lives from a prior reply, index line, or spec.
+    3. External ``WebFetch`` / ``WebSearch`` only when content is
+       provably not internal.
+
+    Skipping earlier rungs when internal content exists is a
+    **drift-amplifier** — retrieval cost compounds and the
+    internal layer's discoverability rots.
+
     ## Misfiling table
 
     | Pattern | Belongs in | Severity |
@@ -845,9 +878,10 @@ DEFAULT_ACTION_BOUNDARIES = dedent(
     - Writes to ``<home>/memory/core/`` outside reflection turns —
       **escalate-first**. Core blocks load every turn; unilateral
       edits inflate prompt cost forever and can silently distort
-      behavior. Route changes through ``state/proposed-changes.md``
-      so the reflection skill's applied-proposals loop can audit
-      the effect.
+      behavior. Reflection turns have documented autonomy here (see
+      ``30-reflection-policy.md``). Outside reflection, route
+      changes through ``state/proposed-changes.md``; the reflection
+      skill's applied-proposals loop can audit the effect.
     - Deletes under ``<home>`` — **escalate-first**. Drift is
       recoverable from git; deletion isn't.
     - Writes outside the path-confinement allowlist —
