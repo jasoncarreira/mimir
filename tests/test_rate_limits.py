@@ -634,3 +634,67 @@ def test_off_pace_warning_lists_each_bucket_with_resets():
     assert "80% used" in lines[1]
     assert "140%" in lines[1]
     assert "in 1h" in lines[1]
+
+
+# ---- atomic write + thread-safety (chainlink #181) ---------------------
+
+
+def test_record_sync_atomic_no_temp_file_left(tmp_path: Path):
+    """After record_sync the target file exists and no .tmp file remains."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    snap = RateLimitSnapshot(status="allowed", utilization=0.25,
+                             resets_at=int(time.time()) + 3600)
+    store.record_sync("five_hour", snap)
+    assert (tmp_path / "rl.json").exists()
+    tmp_files = list(tmp_path.glob(".rate_limits.tmp.*"))
+    assert tmp_files == [], f"Unexpected temp file(s) left: {tmp_files}"
+
+
+def test_record_sync_survives_corrupt_existing_file(tmp_path: Path):
+    """A corrupt on-disk file should be overwritten, not crash the write.
+    Corruption triggers _load()'s fallback (empty dict) and record_sync
+    replaces the file with valid JSON — quota suppression stays operational."""
+    path = tmp_path / "rl.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{corrupted{{", encoding="utf-8")
+    store = RateLimitStore(path=path)
+    snap = RateLimitSnapshot(status="allowed", utilization=0.40,
+                             resets_at=int(time.time()) + 3600)
+    store.record_sync("five_hour", snap)  # must not raise
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["five_hour"]["utilization"] == 0.40
+
+
+def test_record_sync_concurrent_threads_no_corruption(tmp_path: Path):
+    """Two threads calling record_sync simultaneously must not corrupt
+    the file. The threading.Lock serializes the read-modify-write; the
+    atomic rename prevents partial writes on the thread that 'wins'."""
+    import concurrent.futures
+
+    path = tmp_path / "rl.json"
+    store = RateLimitStore(path=path)
+    future_ts = int(time.time()) + 86400
+
+    def write_snap(key: str, utilization: float) -> None:
+        for _ in range(50):
+            store.record_sync(key, RateLimitSnapshot(
+                status="allowed", utilization=utilization,
+                resets_at=future_ts,
+            ))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futs = [
+            ex.submit(write_snap, "five_hour", 0.10),
+            ex.submit(write_snap, "seven_day", 0.20),
+            ex.submit(write_snap, "five_hour", 0.30),
+            ex.submit(write_snap, "seven_day", 0.40),
+        ]
+        for f in futs:
+            f.result()
+
+    # File must be valid JSON after concurrent writes.
+    text = path.read_text(encoding="utf-8")
+    data = json.loads(text)  # raises on corruption
+    assert isinstance(data, dict)
+    assert "five_hour" in data
+    assert "seven_day" in data
