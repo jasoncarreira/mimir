@@ -107,7 +107,7 @@ def test_setup_writes_saga_toml(tmp_path: Path):
     assert saga_toml.is_file()
     assert "saga.toml" in (status["files_created"] or [])
     body = saga_toml.read_text()
-    # mimir-prod overrides per V0.5.md §2.
+    # mimir-prod overrides — contextual rewrite + two-tier + extraction on.
     assert "enable_contextual_rewrite = true" in body
     assert "two_tier_enabled = true" in body
     assert "enable_extraction = true" in body

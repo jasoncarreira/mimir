@@ -1,4 +1,4 @@
-"""v0.5 §3: integration bench scaffolding tests.
+"""Integration-bench scaffolding tests.
 
 The full runner needs a real LongMemEval dataset + OpenAI judge to
 exercise end-to-end. These tests cover the deterministic pieces:
@@ -8,8 +8,7 @@ exercise end-to-end. These tests cover the deterministic pieces:
 - ``runner._extract_hypothesis`` correctly parses BenchBridge stdout
   lines.
 - The ``mimir/`` package can be imported without the saga workspace
-  being importable, and vice-versa (standalone-ness sanity check —
-  V0.5.md §1 invariant).
+  being importable, and vice-versa (standalone-ness sanity check).
 """
 
 from __future__ import annotations
