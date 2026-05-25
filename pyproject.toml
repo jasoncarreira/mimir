@@ -39,18 +39,25 @@ dependencies = [
 # (``claude-code:``, ``anthropic:``, ``openai:`` etc.) and lazy-imports
 # the matching package, so installing only one keeps the dep graph
 # small. Pick at least one or the agent can't build a model.
-# langchain-claude-code routes the agent loop through the Claude Code
-# CLI subprocess (Max-plan friendly). This is a private git fork pinned
-# to a specific SHA — the upstream patches (#2/#4/#6) needed by mimir
-# haven't merged yet. The ``allow-direct-references = true`` flag in
-# ``[tool.hatch.metadata]`` permits the ``git+`` URL syntax.
-# Pre-OSS hardening (review item #4): kept as an opt-in extra so the
-# default install path is PyPI-resolvable. ``[dev]`` no longer pulls
-# this; ``[dev-claude-code]`` does, for contributors working on the
-# claude-code path specifically.
-claude-code = [
-    "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39",
-]
+# NOTE on Claude Code support: ``langchain-claude-code`` is required
+# to route the agent loop through the Claude Code CLI subprocess
+# (Max-plan friendly). We pin a private fork at a specific SHA because
+# the upstream patches (#2/#4/#6) haven't merged yet.
+#
+# PyPI rejects published packages that declare direct URL (git+)
+# dependencies — even gated behind an optional extra. So mimir-agent
+# CANNOT declare a ``[claude-code]`` extra here without breaking
+# publishing. Operators who want Claude Max support install the
+# fork separately AFTER mimir-agent:
+#
+#   pip install mimir-agent[anthropic]
+#   pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39"
+#
+# When upstream merges + cuts a release, this becomes a normal
+# registry dep and we can move it back into an extra. Tracking:
+# chainlink #268. The Dockerfile mirrors this — operators selecting
+# the Claude Code path do an extra ``pip install`` step in the
+# build (see Dockerfile comment block).
 anthropic = [
     "langchain-anthropic>=1.4",
 ]
@@ -114,14 +121,16 @@ dev = [
     "faiss-cpu>=1.13",
 ]
 
-# ``pip install -e ".[dev-claude-code]"`` — full dev toolchain INCLUDING
-# the langchain-claude-code git fork. Use this when working on the
-# claude-code subprocess path specifically. Contributors who only
-# touch the agent core / saga / bridges can use ``[dev]`` and let the
-# claude-code-specific tests skip.
-dev-claude-code = [
-    "mimir-agent[dev,claude-code]",
-]
+# For dev work on the Claude Code subprocess path, install ``[dev]``
+# then add the fork from git:
+#
+#   uv sync --extra dev
+#   uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39"
+#
+# The ``[dev-claude-code]`` extra is gone for the same reason
+# ``[claude-code]`` is gone — PyPI direct-URL rejection. Tests that
+# touch ``langchain_claude_code`` use ``pytest.importorskip`` so they
+# skip cleanly when the fork isn't installed.
 
 [project.scripts]
 mimir = "mimir.cli:main"
@@ -130,12 +139,14 @@ mimir = "mimir.cli:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.metadata]
-# Permit ``pkg @ git+https://...`` direct references in
-# project.optional-dependencies. We pin ``langchain-claude-code`` to
-# our fork SHA while upstream PRs (#2, #4, #6) land; once those merge
-# we can revert to the registry version and drop this flag.
-allow-direct-references = true
+# No ``allow-direct-references`` here. The previous ``[claude-code]``
+# optional extra used a ``git+https://…`` direct reference, but PyPI
+# rejects published packages that declare ANY direct URL dep — even
+# behind an extra. The fork install moved to a documented separate
+# step (see pyproject.toml's claude-code NOTE block, the Dockerfile's
+# claude-code comment, and README's auth section). When upstream
+# merges + publishes a release this flag can be reinstated alongside
+# a registry-style claude-code extra.
 
 [tool.hatch.build.targets.wheel]
 packages = ["mimir"]

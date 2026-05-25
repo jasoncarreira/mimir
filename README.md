@@ -72,7 +72,7 @@ mimir setup --home ~/mimir-home
 
 # Configure auth — pick one
 #   API key:                     edit ~/mimir-home/.env, set ANTHROPIC_API_KEY
-#   Anthropic Max plan (free):   pip install "mimir-agent[claude-code]" + claude setup-token
+#   Anthropic Max plan (free):   one extra install step — see "Claude Max plan" below
 #   Gateway:                     set ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
 #   Non-Anthropic Anthropic-compat (Minimax, Kimi, …): see "Alternative providers"
 
@@ -89,16 +89,32 @@ Available extras (combine in one install command — e.g. `pip install
 | Extra | Pulls |
 |---|---|
 | `anthropic`, `openai`, `codex-plus` | model adapter packages (`codex-plus` = ChatGPT Plus / Pro Codex subscription via the OAuth-backed gateway) |
-| `claude-code` | Claude Code subprocess provider (git-pinned fork until upstream patches land) |
 | `discord`, `slack` | bridge runtimes |
 | `mcp` | Model Context Protocol client |
+
+For **Claude Max** (the subprocess provider via `langchain-claude-code`),
+that package is currently a git-pinned fork — PyPI rejects published
+packages that declare direct `git+` URLs, so it isn't an extra. Install
+the fork as a separate step after `mimir-agent`:
+
+```bash
+pip install mimir-agent[anthropic]
+pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39"
+claude setup-token   # OAuth dance — once per host
+```
+
+This works around upstream PRs (#2 / #4 / #6) that haven't merged yet.
+Once they land + a release is cut, the second `pip install` collapses
+back into a `[claude-code]` extra. Tracked in mimir-repo issue #268.
 
 ### Or clone for development
 
 ```bash
 git clone https://github.com/jasoncarreira/mimir.git
 cd mimir
-uv sync --extra dev                 # or: uv sync --extra dev-claude-code (Claude Code subprocess path)
+uv sync --extra dev
+# For the Claude Code subprocess path, also:
+# uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39"
 
 uv run mimir setup --home ~/mimir-home
 uv run mimir run --home ~/mimir-home
@@ -175,10 +191,17 @@ Optional extras:
 
 | Extra | Pulls | When to use |
 |---|---|---|
-| `[dev]` | pytest + bridges + Anthropic / OpenAI / Codex Plus adapters + faiss | Default for contributors — covers the agent core, saga, bridges. |
-| `[dev-claude-code]` | `[dev]` + the `langchain-claude-code` git fork | Working on the Claude Code subprocess path specifically. The fork is a private SHA pin (upstream patches haven't merged); the bare `[dev]` install skips claude-code-specific tests. |
-| `[claude-code]` | Just the fork (no test toolchain) | Runtime install for users on Claude Max who don't intend to develop. |
+| `[dev]` | pytest + bridges + Anthropic / OpenAI / Codex Plus adapters + faiss | Default for contributors — covers the agent core, saga, bridges. Claude-code-specific tests skip cleanly via `pytest.importorskip`. |
 | `[anthropic]` / `[openai]` / `[codex-plus]` | Single model adapter | Runtime install with one model path. |
+
+Developers on the Claude Code subprocess path install the
+git-pinned fork as a separate step (same reasoning as the runtime
+Claude Max path above):
+
+```bash
+uv sync --extra dev
+uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39"
+```
 
 ```bash
 # Tests — minimal toolchain (claude-code-specific tests will skip)
@@ -187,7 +210,8 @@ uv run pytest                                       # 600+ tests
 uv run pytest --ignore=tests/test_bench_via_mimir.py  # skip the slow integration test
 
 # Tests — full toolchain (claude-code-specific tests will run)
-uv pip install -e ".[dev-claude-code]"
+uv pip install -e ".[dev]"
+uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39"
 uv run pytest
 
 # Saga's own tests
