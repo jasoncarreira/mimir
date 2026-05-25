@@ -60,6 +60,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Claude Code CLI keeps its OAuth credential under ``.claude/``.
 RUN useradd -m -u 1001 -s /bin/bash mimir
 USER mimir
+# Land ``docker exec -it <ctn> bash`` at a predictable home dir.
+# Docker's default of ``/`` is technically fine but operators
+# dropping into the container expect to be near the state. Per
+# mimir-carreira review note on PR #331.
+WORKDIR /home/mimir
 
 # Install mimir-agent into a user-owned venv at ``/home/mimir/venv``.
 # This venv is what the pending-update flow targets — the
