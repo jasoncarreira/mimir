@@ -1,0 +1,77 @@
+name: Publish to PyPI
+
+# Triggered by a tag matching ``v*`` (e.g. ``v0.1.0``) — push the tag
+# and the workflow builds + publishes via PyPI trusted publishing (OIDC,
+# no API token in repo secrets).
+#
+# One-time setup before the first publish works:
+#
+# 1. Register the project name on PyPI by adding a *pending publisher*:
+#       https://pypi.org/manage/account/publishing/
+#    Fields:
+#       - PyPI Project Name : mimir-agent
+#       - Owner             : jasoncarreira
+#       - Repository name   : mimir
+#       - Workflow filename : publish.yml
+#       - Environment name  : pypi
+#
+# 2. Create a ``pypi`` environment under the repo's Settings →
+#    Environments and (optionally) add deployment branch / tag
+#    protection rules.
+#
+# Subsequent releases need no manual step — bump ``version`` in
+# ``pyproject.toml``, commit, ``git tag v<version>`` + ``git push --tags``,
+# and this workflow does the rest.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Set up Python
+        run: uv python install 3.11
+      - name: Build distributions
+        run: uv build
+      - name: List artifacts
+        run: ls -la dist/
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mimir-agent
+    # OIDC trusted publishing requires the workflow job to mint an
+    # OIDC token; ``id-token: write`` is the only extra permission
+    # the official PyPA action asks for.
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # Trusted publishing — no ``password`` / ``username`` /
+        # ``api_token`` needed. PyPI verifies the OIDC claim against
+        # the pending-publisher config registered for this project.
