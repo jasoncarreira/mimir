@@ -258,6 +258,14 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # silent (the check itself returns no signal — no event emitted).
     "mimir_update_available": ("positive", "mimir_update_available"),
     "mimir_update_check_error": ("negative", "mimir_update_check_error"),
+    # Pending-update flag lifecycle (see mimir/update_on_start.py).
+    # ``mimir_update_starting`` is a neutral diagnostic — it only
+    # appears in the event log, not the feedback block, because the
+    # operator already knows they approved the install. ``applied``
+    # is positive (the upgrade succeeded). ``failed`` is negative
+    # (rolled back to the prior version; operator should investigate).
+    "mimir_update_applied": ("positive", "mimir_update_applied"),
+    "mimir_update_failed": ("negative", "mimir_update_failed"),
     "git_pull_ok": ("positive", "git_pull_ok"),
     "git_fetch_ok": ("positive", "git_fetch_ok"),
     "shell_job_complete_enqueue_ok": ("positive", "shell_job_complete_enqueue_ok"),
@@ -1544,12 +1552,26 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         latest = ev.get("latest") or "?"
         return (
             f"mimir update available: {current} → {latest} "
-            f"(operator: `mimir update --apply`, then "
-            f"`docker compose restart` to engage)"
+            f"(operator approves → I call request_mimir_update → "
+            f"`docker compose restart` installs on boot)"
         )
     if rule_kind == "mimir_update_check_error":
         msg = ev.get("error") or "(no detail)"
         return f"mimir update-check failed: {msg}"
+    if rule_kind == "mimir_update_applied":
+        spec = ev.get("spec") or "?"
+        return f"mimir update applied on restart: {spec}"
+    if rule_kind == "mimir_update_failed":
+        spec = ev.get("spec") or "?"
+        rc = ev.get("rc")
+        err = ev.get("error") or ev.get("stderr_tail") or ""
+        tail = f" ({err[:120]})" if err else ""
+        rc_part = f" rc={rc}" if rc is not None else ""
+        return (
+            f"mimir update FAILED for {spec}{rc_part}{tail} — "
+            f"running on prior version, flag cleared, operator can "
+            f"re-approve via request_mimir_update once cause is known"
+        )
     return rule_kind
 
 
