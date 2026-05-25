@@ -431,3 +431,99 @@ async def test_commitment_extraction_forces_unbound_on_synthetic_channel(
         f"commitment must be unbound after synthetic-channel extraction; "
         f"got channel_id={rec.channel_id!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_store_add_raises_does_not_stop_remaining_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-record exception isolation: if ``store.add`` raises for one
+    commitment, the loop continues and subsequent records still land.
+
+    This is the ``store.add raises → log + continue with next record``
+    case listed in the module docstring but previously untested
+    (chainlink #98).
+
+    Arrange: extractor returns two records — "boom-key" (first) and
+    "ok-key" (second).  Wrap ``store.add`` so it raises on the first
+    call and delegates to the real implementation on the second.
+
+    Assert:
+    - Both ``store.add`` calls are attempted (exception did not short-
+      circuit the loop).
+    - "ok-key" lands in the store; "boom-key" does not.
+    - ``commitments_extracted`` fires with count=1.
+    """
+    agent = _make_agent(tmp_path)
+    from mimir.commitments.extractor import MIN_OUTPUT_LEN
+
+    rec_boom = CommitmentRecord(
+        id="c-boom",
+        text="this one will raise on store.add",
+        channel_id="ch-1",
+        saga_session_id="sess-1",
+        source_turn_id="turn-extract-test",
+        dedupe_key="boom-key",
+    )
+    rec_ok = CommitmentRecord(
+        id="c-ok",
+        text="this one should still land after the boom",
+        channel_id="ch-1",
+        saga_session_id="sess-1",
+        source_turn_id="turn-extract-test",
+        dedupe_key="ok-key",
+    )
+
+    async def _extract_two(*args: Any, **kwargs: Any) -> list:
+        return [rec_boom, rec_ok]
+
+    events: list[tuple[str, dict]] = []
+
+    async def _capture(kind: str, **kw: Any) -> None:
+        events.append((kind, kw))
+
+    # Wrap the real store.add: raise on first call, delegate on second.
+    original_add = agent._commitments.add
+    call_count: list[int] = [0]
+
+    async def _add_raises_once(rec: Any) -> Any:
+        call_count[0] += 1
+        if call_count[0] == 1:
+            raise RuntimeError("store.add boom — first record only")
+        return await original_add(rec)
+
+    monkeypatch.setattr(agent._commitments, "add", _add_raises_once)
+    monkeypatch.setattr("mimir.turn_hooks.log_event", _capture)
+    monkeypatch.setattr(
+        "mimir.commitments.extractor.extract_commitments", _extract_two,
+    )
+
+    event = AgentEvent(trigger="saga_session_end", channel_id="ch-1")
+    ctx = _make_ctx(event, saga_session_id="sess-1")
+    record = _make_record("z" * (MIN_OUTPUT_LEN + 100))
+    # Must not raise despite the first store.add failing.
+    await _fire_extraction(agent, ctx, event, record)
+
+    # Both add calls were attempted — exception didn't short-circuit the loop.
+    assert call_count[0] == 2, (
+        f"expected 2 store.add calls (one boom + one ok); got {call_count[0]}"
+    )
+
+    # The second record landed; the first did not.
+    state = agent._commitments.current_state()
+    assert any(r.dedupe_key == "ok-key" for r in state.values()), (
+        "rec_ok must land in store after rec_boom's add raised"
+    )
+    assert not any(r.dedupe_key == "boom-key" for r in state.values()), (
+        "rec_boom must NOT land in store — its add raised"
+    )
+
+    # commitments_extracted fires with count=1 (only the successful add).
+    kinds = [k for k, _ in events]
+    assert "commitments_extracted" in kinds, (
+        f"expected commitments_extracted event; got {kinds}"
+    )
+    extracted_ev = next(kw for k, kw in events if k == "commitments_extracted")
+    assert extracted_ev["count"] == 1, (
+        f"expected count=1 (only ok-key added); got {extracted_ev['count']}"
+    )
