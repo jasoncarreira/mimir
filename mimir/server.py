@@ -905,6 +905,22 @@ def build_app(config: Config) -> web.Application:
             scheduled_jobs_invalid=reload_stats["invalid"],
         )
         await log_event("api_started", port=config.web_port)
+
+        # Drain any startup-events recorded by the pre-init pending-
+        # update pre-flight in this process boot. ``init_logger`` is
+        # now up, so ``mimir_update_starting`` / ``_applied`` /
+        # ``_failed`` events queued in ``<home>/.mimir/startup-events.jsonl``
+        # land in events.jsonl and surface in the algedonic feedback
+        # block on the next turn. No-op when no pending-update flow
+        # ran on this boot (the common case).
+        from .update_on_start import consume_startup_events
+        try:
+            drained = await consume_startup_events(config.home, log_event)
+            if drained:
+                log.info("drained %d startup-update event(s) into events.jsonl", drained)
+        except Exception:  # noqa: BLE001 — drain is best-effort
+            log.exception("startup-events drain failed")
+
         asyncio.create_task(indexer.sweep())
 
     async def _on_cleanup(app: web.Application) -> None:

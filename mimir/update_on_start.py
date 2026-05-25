@@ -87,6 +87,19 @@ log = logging.getLogger(__name__)
 _FLAG_DIRNAME = ".mimir"
 _FLAG_BASENAME = "pending-update.flag"
 
+# Startup-events sidecar. ``apply_pending_update`` runs BEFORE
+# ``init_logger`` has been called (it's the very first action of
+# ``server.main``), so events emitted during the install can't go
+# through the normal ``mimir.event_logger.log_event`` path —
+# ``get_logger`` would raise. Instead we write a JSONL sidecar at
+# the well-known path below; ``consume_startup_events`` drains it
+# through the now-initialized event logger from inside
+# ``server._on_startup``. Result: ``mimir_update_starting`` /
+# ``_applied`` / ``_failed`` events DO land in ``events.jsonl``
+# and surface in the algedonic feedback block on the first turn
+# after the restart, even though the install itself ran pre-init.
+_STARTUP_EVENTS_BASENAME = "startup-events.jsonl"
+
 # pip-install timeout. The install itself averages ~30s on faiss-heavy
 # stacks; 5 minutes covers slow mirrors + cold-start. After that we
 # give up rather than hang the entire restart indefinitely.
@@ -190,19 +203,25 @@ def _install_spec(pkg: str, parsed: PendingUpdate) -> str:
 
 
 def _run_pip_install(
-    spec: str, include_pre: bool, log_event: Callable[..., None],
+    spec: str, include_pre: bool, emit: Callable[..., None],
 ) -> int:
     """Run ``python -m pip install --upgrade <spec>`` synchronously.
     Returns the exit code. Catches FileNotFoundError (no python on
     PATH — shouldn't happen, but defensive) and timeout (pip hung
-    on a slow mirror) and translates to non-zero rc + event log."""
+    on a slow mirror) and translates to non-zero rc + event log.
+
+    ``emit`` is the combined sidecar+stdout emit callable produced
+    by ``_make_emit`` — every event fires through both paths so the
+    operator sees the result in container logs immediately AND in
+    the algedonic block on the next turn after restart.
+    """
     argv = [
         sys.executable, "-m", "pip", "install", "--upgrade",
     ]
     if include_pre:
         argv.append("--pre")
     argv.append(spec)
-    log_event("mimir_update_starting", spec=spec, include_pre=include_pre)
+    emit("mimir_update_starting", spec=spec, include_pre=include_pre)
     try:
         completed = subprocess.run(
             argv,
@@ -212,14 +231,14 @@ def _run_pip_install(
             text=True,
         )
     except FileNotFoundError as exc:
-        log_event(
+        emit(
             "mimir_update_failed",
             spec=spec,
             error=f"{type(exc).__name__}: {exc}",
         )
         return 127
     except subprocess.TimeoutExpired:
-        log_event(
+        emit(
             "mimir_update_failed",
             spec=spec,
             error=f"pip install exceeded {_PIP_TIMEOUT_S}s",
@@ -230,7 +249,7 @@ def _run_pip_install(
         # resolver conflict; the event log isn't the right place
         # for that. Operator pulls the full log if they need it.
         tail = (completed.stderr or completed.stdout or "")[-500:]
-        log_event(
+        emit(
             "mimir_update_failed",
             spec=spec,
             rc=completed.returncode,
@@ -240,13 +259,105 @@ def _run_pip_install(
 
 
 def _default_log_event(event_kind: str, **fields) -> None:
-    """Fallback logger used when ``apply_pending_update`` runs before
-    ``init_logger`` has been called. Writes through to stdout in the
-    same JSON-ish shape the event logger uses, so a startup-time
-    ``mimir_update_applied`` is still grep-able even when the real
-    logger isn't up yet."""
+    """Fallback in-process logger used when ``apply_pending_update``
+    runs before ``init_logger`` has been called. Writes through to
+    stdout in the same JSON-ish shape the event logger uses, so a
+    startup-time ``mimir_update_applied`` is still grep-able from
+    container logs even when the real logger isn't up yet.
+
+    Note: this is the in-process diagnostic path. Persistence into
+    ``events.jsonl`` (so the event surfaces in the algedonic
+    feedback block on the next turn) is handled separately via the
+    sidecar (see ``_record_startup_event`` + ``consume_startup_events``).
+    Both paths fire on every emit.
+    """
     parts = [f"{k}={v}" for k, v in fields.items() if v not in (None, "")]
     log.info("event=%s %s", event_kind, " ".join(parts))
+
+
+def _record_startup_event(home: Path, event_kind: str, **fields) -> None:
+    """Append a JSONL line to the startup-events sidecar so the event
+    can be drained into ``events.jsonl`` after ``init_logger`` is up.
+
+    Append-only: each install attempt may emit multiple events
+    (``mimir_update_starting`` then ``_applied`` / ``_failed``).
+    Best-effort: filesystem failure here doesn't abort the install
+    — the stdout log path still reports the outcome, and the next
+    restart's ``consume_startup_events`` will find whatever did
+    make it onto disk.
+    """
+    sidecar = home / _FLAG_DIRNAME / _STARTUP_EVENTS_BASENAME
+    try:
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "type": event_kind,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            **fields,
+        }
+        with sidecar.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except OSError as exc:
+        log.warning("startup-events sidecar write failed: %s", exc)
+
+
+def _make_emit(home: Path, log_event: Callable[..., None]) -> Callable[..., None]:
+    """Combine the in-process log + the persistent sidecar into a
+    single emit function. Used internally so callsites don't have to
+    remember both paths. Tests can still inspect what was logged via
+    the ``log_event`` parameter — both channels fire on every call."""
+    def _emit(event_kind: str, **fields) -> None:
+        log_event(event_kind, **fields)
+        _record_startup_event(home, event_kind, **fields)
+    return _emit
+
+
+async def consume_startup_events(home: Path, async_log_event) -> int:
+    """Drain the startup-events sidecar through the now-initialized
+    event logger. Returns the number of events drained.
+
+    Called from ``server._on_startup`` AFTER ``init_logger`` has set
+    up the real ``mimir.event_logger.log_event``. Each line in the
+    sidecar is replayed as a real event so it lands in ``events.jsonl``
+    and surfaces in the algedonic feedback block on the next turn.
+
+    The sidecar is deleted on success so subsequent restarts don't
+    re-emit stale events. On parse error of an individual line, the
+    line is skipped (corrupt line shouldn't block the rest). If the
+    sidecar doesn't exist (the common case — no install attempted
+    on this restart), returns 0 silently.
+    """
+    sidecar = home / _FLAG_DIRNAME / _STARTUP_EVENTS_BASENAME
+    if not sidecar.is_file():
+        return 0
+    try:
+        raw = sidecar.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("startup-events sidecar read failed: %s", exc)
+        return 0
+    drained = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            log.warning("startup-events sidecar: skipping malformed line: %r", line[:120])
+            continue
+        kind = payload.pop("type", None)
+        payload.pop("ts", None)  # the event logger stamps its own ts
+        if not isinstance(kind, str) or not kind:
+            continue
+        try:
+            await async_log_event(kind, **payload)
+            drained += 1
+        except Exception:  # noqa: BLE001 — drain is best-effort
+            log.exception("startup-events drain failed for %s", kind)
+    try:
+        sidecar.unlink()
+    except OSError as exc:
+        log.warning("startup-events sidecar unlink failed: %s", exc)
+    return drained
 
 
 def apply_pending_update(
@@ -270,6 +381,7 @@ def apply_pending_update(
     """
     log_event = log_event or _default_log_event
     exec_fn = _exec or os.execv
+    emit = _make_emit(home, log_event)
 
     path = flag_path(home)
     if not path.is_file():
@@ -278,7 +390,7 @@ def apply_pending_update(
     parsed = _read_flag(path)
     pkg = _pypi_package_name()
     spec = _install_spec(pkg, parsed)
-    rc = _run_pip_install(spec, parsed.include_prereleases, log_event)
+    rc = _run_pip_install(spec, parsed.include_prereleases, emit)
 
     # Always delete the flag — success means we don't re-attempt;
     # failure means we don't loop on a broken install.
@@ -289,11 +401,12 @@ def apply_pending_update(
 
     if rc != 0:
         # Continue startup on the old version. The
-        # ``mimir_update_failed`` event was already logged inside
-        # ``_run_pip_install``.
+        # ``mimir_update_failed`` event was already emitted inside
+        # ``_run_pip_install`` (and written to the sidecar so the
+        # algedonic block surfaces it on next turn).
         return True
 
-    log_event("mimir_update_applied", spec=spec, approved_at=parsed.approved_at)
+    emit("mimir_update_applied", spec=spec, approved_at=parsed.approved_at)
     # Re-exec to pick up the new code. Same PID — supervisor stays
     # quiet. The argv carries over verbatim so e.g. ``--home`` flags
     # passed in survive the re-exec.

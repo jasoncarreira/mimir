@@ -302,3 +302,152 @@ def test_apply_honors_pypi_package_name_env(
     apply_pending_update(tmp_path, lambda *a, **k: None, _exec=lambda *a: None)
 
     assert captured_argv[0][-1] == "mimir-fork"
+
+
+# ─── startup-events sidecar (the carry-over fix from PR #330 review) ─
+
+
+def test_apply_writes_sidecar_with_install_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``apply_pending_update`` runs BEFORE ``init_logger``; events
+    must be persisted to a sidecar file so they can be drained into
+    ``events.jsonl`` later by ``consume_startup_events``. Verifies
+    that on the happy path, both ``mimir_update_starting`` and
+    ``mimir_update_applied`` land in the sidecar."""
+    write_flag(tmp_path, target_version="0.2.0")
+
+    def _fake_run(argv, **kwargs):
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _R()
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    apply_pending_update(tmp_path, lambda *a, **k: None, _exec=lambda *a: None)
+
+    sidecar = tmp_path / ".mimir" / "startup-events.jsonl"
+    assert sidecar.is_file(), "sidecar was not written"
+    lines = [json.loads(l) for l in sidecar.read_text().splitlines() if l.strip()]
+    kinds = [e["type"] for e in lines]
+    assert "mimir_update_starting" in kinds
+    assert "mimir_update_applied" in kinds
+
+
+def test_apply_writes_sidecar_on_install_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure path: ``mimir_update_failed`` lands in the sidecar so
+    the algedonic block on next turn can surface the rollback."""
+    write_flag(tmp_path)
+
+    def _fake_run(argv, **kwargs):
+        class _R:
+            returncode = 1
+            stdout = ""
+            stderr = "ERROR: ..."
+        return _R()
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    apply_pending_update(tmp_path, lambda *a, **k: None, _exec=lambda *a: None)
+
+    sidecar = tmp_path / ".mimir" / "startup-events.jsonl"
+    assert sidecar.is_file()
+    lines = [json.loads(l) for l in sidecar.read_text().splitlines() if l.strip()]
+    kinds = [e["type"] for e in lines]
+    assert "mimir_update_starting" in kinds
+    assert "mimir_update_failed" in kinds
+    # Verify the failure event captured the rc + truncated stderr.
+    failed = next(e for e in lines if e["type"] == "mimir_update_failed")
+    assert failed["rc"] == 1
+    assert "stderr_tail" in failed
+
+
+@pytest.mark.asyncio
+async def test_consume_startup_events_drains_into_async_logger(
+    tmp_path: Path,
+) -> None:
+    """``consume_startup_events`` reads the sidecar, replays each
+    event through the now-initialized async ``log_event``, and
+    deletes the sidecar so subsequent restarts don't re-emit."""
+    from mimir.update_on_start import (
+        _record_startup_event,
+        _STARTUP_EVENTS_BASENAME,
+        consume_startup_events,
+    )
+
+    # Simulate what apply_pending_update writes.
+    _record_startup_event(
+        tmp_path, "mimir_update_starting", spec="mimir-agent==0.2.0",
+        include_pre=False,
+    )
+    _record_startup_event(
+        tmp_path, "mimir_update_applied", spec="mimir-agent==0.2.0",
+        approved_at="2026-05-24T22:00:00Z",
+    )
+
+    captured: list[tuple[str, dict]] = []
+
+    async def _async_log(kind, **fields):
+        captured.append((kind, fields))
+
+    drained = await consume_startup_events(tmp_path, _async_log)
+
+    assert drained == 2
+    kinds = [c[0] for c in captured]
+    assert kinds == ["mimir_update_starting", "mimir_update_applied"]
+    # The ``ts`` field is stripped before replay — the real event
+    # logger stamps its own timestamp.
+    for kind, fields in captured:
+        assert "ts" not in fields
+    # Sidecar is gone after drain.
+    sidecar = tmp_path / ".mimir" / _STARTUP_EVENTS_BASENAME
+    assert not sidecar.exists()
+
+
+@pytest.mark.asyncio
+async def test_consume_startup_events_noop_when_no_sidecar(
+    tmp_path: Path,
+) -> None:
+    """No sidecar (the common case — no install attempted on this
+    restart) → returns 0, no async_log_event calls."""
+    from mimir.update_on_start import consume_startup_events
+
+    calls: list = []
+    async def _async_log(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    drained = await consume_startup_events(tmp_path, _async_log)
+    assert drained == 0
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_consume_startup_events_skips_malformed_lines(
+    tmp_path: Path,
+) -> None:
+    """A corrupt sidecar line shouldn't block the rest of the drain.
+    Robustness — the sidecar is written best-effort + the operator
+    might inspect / edit it between boot and drain."""
+    from mimir.update_on_start import (
+        _STARTUP_EVENTS_BASENAME,
+        consume_startup_events,
+    )
+
+    sidecar = tmp_path / ".mimir" / _STARTUP_EVENTS_BASENAME
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(
+        json.dumps({"type": "mimir_update_starting", "spec": "x"}) + "\n"
+        + "this is not json\n"
+        + json.dumps({"type": "mimir_update_applied", "spec": "x"}) + "\n"
+    )
+
+    captured: list[str] = []
+    async def _async_log(kind, **fields):
+        captured.append(kind)
+
+    drained = await consume_startup_events(tmp_path, _async_log)
+    # Two valid events drained; the malformed line skipped.
+    assert drained == 2
+    assert captured == ["mimir_update_starting", "mimir_update_applied"]
