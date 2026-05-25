@@ -205,7 +205,10 @@ class HomeostaticArbiter:
         )
 
     def should_fire_heartbeat(
-        self, *, now: datetime | None = None,
+        self,
+        *,
+        now: datetime | None = None,
+        event_loop: "asyncio.AbstractEventLoop | None" = None,
     ) -> tuple[bool, str]:
         """Return ``(fire, reason)``. ``fire=True`` lets the scheduled
         tick run; ``fire=False`` suppresses it. Reason is the
@@ -255,21 +258,34 @@ class HomeostaticArbiter:
             if status.reset_at is not None:
                 # Lazy-expiry transition: the pause was active a moment
                 # ago and just cleared. Fire-and-forget the recovery
-                # event — sync arbiter can't await, so we schedule it
-                # on the running loop if there is one.
-                try:
-                    import asyncio
-                    from .event_logger import log_event
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(log_event(
-                        "quota_recovered",
-                        reset_at=status.reset_at.isoformat(),
-                        previous_reason=status.reason,
-                    ))
-                except RuntimeError:
-                    # No running loop (sync test path) — operator can
-                    # see recovery from the absence of the pause file.
-                    pass
+                # event — sync arbiter can't await.
+                #
+                # Two paths:
+                # (a) Called from asyncio.to_thread (the normal scheduler
+                #     path) — there IS a running event loop in the main
+                #     thread, but get_running_loop() raises RuntimeError
+                #     here because this worker thread has none. Use
+                #     run_coroutine_threadsafe to bridge across.
+                # (b) Called directly from async context or sync test —
+                #     get_running_loop() succeeds; schedule via create_task.
+                import asyncio
+                from .event_logger import log_event
+                _coro = log_event(
+                    "quota_recovered",
+                    reset_at=status.reset_at.isoformat(),
+                    previous_reason=status.reason,
+                )
+                if event_loop is not None:
+                    # (a) thread-safe bridge to the caller's event loop
+                    asyncio.run_coroutine_threadsafe(_coro, event_loop)
+                else:
+                    try:
+                        _loop = asyncio.get_running_loop()
+                        _loop.create_task(_coro)
+                    except RuntimeError:
+                        # (b) sync test path — no loop at all; close
+                        # the coroutine to avoid ResourceWarning.
+                        _coro.close()
 
         snap = self.snapshot(now=now)
 
