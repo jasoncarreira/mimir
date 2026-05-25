@@ -18,7 +18,8 @@ keeps state on the App and resets between turns; we just allocate fresh.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from enum import Enum
 
@@ -52,30 +53,48 @@ def _normalize(text: str) -> str:
 @dataclass
 class LoopDetector:
     """One instance per TurnContext. Not async-safe — relies on the per-turn
-    serialization of tool calls (the SDK runs them sequentially)."""
+    serialization of tool calls (the SDK runs them sequentially).
+
+    Sliding-window detection: checks the current message against the last
+    ``window_size`` messages, not just the immediate predecessor.  This
+    catches A,B,A,B,... alternation patterns that bypassed the original
+    one-back design.
+    """
 
     soft_limit: int = 5
     hard_limit: int = 10
     similarity_threshold: float = 0.9
+    window_size: int = 10
 
     # Internal state — bumped by ``check``.
-    _last_normalized: str | None = None
     _streak: int = 0
     _warning_reaction_emitted: bool = False
+    # Last window_size normalized texts; bounded deque created in __post_init__.
+    _history: deque = field(default_factory=deque)
+
+    def __post_init__(self) -> None:
+        # default_factory produces an unbounded deque; bind it to window_size.
+        self._history = deque(self._history, maxlen=self.window_size)
 
     def check(self, text: str) -> BreakerDecision:
         normalized = _normalize(text)
-        previous = self._last_normalized
-        if previous is None:
+
+        if not self._history:
             ratio = 0.0
             streak = 1
         else:
-            ratio = SequenceMatcher(a=previous, b=normalized).ratio()
+            # Sliding window: match against ANY message in history, not just
+            # the most recent.  Catches A,B,A,B,... alternation loops.
+            ratio = max(
+                SequenceMatcher(a=prev, b=normalized).ratio()
+                for prev in self._history
+            )
             if ratio >= self.similarity_threshold:
                 streak = self._streak + 1
             else:
                 streak = 1
-        self._last_normalized = normalized
+
+        self._history.append(normalized)
         self._streak = streak
 
         if streak >= self.hard_limit:
