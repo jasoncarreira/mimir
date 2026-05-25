@@ -37,6 +37,12 @@ def parse_frontmatter(text: str) -> dict[str, str]:
     closing delimiter). Values are stripped; multi-line folded values
     (``description: >`` with subsequent indented lines) are joined into
     the first key's value.
+
+    Folded-scalar contract (``key: >`` / ``key: |``):
+        - Continuation lines MUST start with whitespace (i.e. be indented).
+        - A non-empty, non-indented line that does NOT match a key pattern
+          raises ``ValueError`` — fail-loudly rather than silently swallowing
+          a subsequent key or mis-parsing the value. (chainlink #104)
     """
     lines = text.splitlines()
     if not lines or not _FRONTMATTER_DELIM.match(lines[0]):
@@ -44,6 +50,7 @@ def parse_frontmatter(text: str) -> dict[str, str]:
 
     out: dict[str, str] = {}
     current_key: str | None = None
+    in_folded_block: bool = False  # True after ``key: >`` / ``key: |``
     closed = False
     for raw in lines[1:]:
         if _FRONTMATTER_DELIM.match(raw):
@@ -57,10 +64,27 @@ def parse_frontmatter(text: str) -> dict[str, str]:
             # multi-line block. Continuation lines are accumulated below.
             if value in {">", "|"}:
                 out[current_key] = ""
+                in_folded_block = True
             else:
                 out[current_key] = value
-        elif current_key is not None and raw.strip():
-            # Continuation line for a folded block.
+                in_folded_block = False
+        elif in_folded_block and raw[0:1].isspace() and raw.strip():
+            # Indented continuation line for a folded block.
+            prior = out.get(current_key, "")
+            out[current_key] = (prior + " " + raw.strip()).strip()
+        elif in_folded_block and raw.strip():
+            # Non-empty, non-key-matching, non-indented line inside a folded
+            # block. This is malformed YAML — the continuation must be indented.
+            # Fail loudly so authors notice the mis-parse instead of silently
+            # getting a truncated or wrong value. (chainlink #104)
+            raise ValueError(
+                f"folded-scalar continuation for key '{current_key}' must be"
+                f" indented, but got: {raw!r}"
+            )
+        elif not in_folded_block and current_key is not None and raw.strip():
+            # Legacy plain-value continuation (outside a folded block).
+            # In practice this only fires for edge-case trailing content;
+            # kept for backward compatibility.
             prior = out.get(current_key, "")
             out[current_key] = (prior + " " + raw.strip()).strip()
 
