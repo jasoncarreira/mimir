@@ -58,14 +58,14 @@ Python (or `yq` if available) to query — `grep` works for quick checks
 but YAML structure trips up greps for multi-line entries.
 
 The bare-YAML examples below come first because they're portable
-(no need to be inside `/workspace/mimir`); the typed
+(work regardless of how mimir was installed); the typed
 `IdentityResolver` path further down is the cleaner alternative when
-you're already in-tree.
+you're already inside a Python process that has `mimir` importable.
 
 ### Resolve an alias to its canonical + record
 
 ```bash
-uv run --extra dev python <<'PY'
+python <<'PY'
 import yaml, os
 from pathlib import Path
 
@@ -89,7 +89,7 @@ PY
 ### Resolve a channel id
 
 ```bash
-uv run --extra dev python <<'PY'
+python <<'PY'
 import yaml, os
 from pathlib import Path
 
@@ -113,7 +113,7 @@ PY
 ### List all people / channels
 
 ```bash
-uv run --extra dev python <<'PY'
+python <<'PY'
 import yaml, os
 from pathlib import Path
 
@@ -137,11 +137,12 @@ PY
 ### Programmatic resolution via IdentityResolver
 
 The runtime already loads `identities.yaml` into
-`mimir.identities.IdentityResolver`. From a CLI debugging session inside
-`/workspace/mimir`:
+`mimir.identities.IdentityResolver`. From any Python process that
+has `mimir` importable (the agent's own interpreter, or a debug
+shell in the same environment):
 
 ```bash
-cd /workspace/mimir && uv run --extra dev python <<'PY'
+python <<'PY'
 import os
 from pathlib import Path
 from mimir.identities import IdentityResolver

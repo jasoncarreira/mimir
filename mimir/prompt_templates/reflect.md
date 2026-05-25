@@ -218,14 +218,14 @@ is append-only between reflections. If it has grown past Read's single-call
 limit (~1000 lines / 25k tokens), rotate before reviewing:
 
 ```bash
-wc -l /mimir-home/memory/learnings-pending.md
+wc -l "$MIMIR_HOME/memory/learnings-pending.md"
 ```
 
 To rotate:
 1. Identify the closing ISO week: `date +%Y-W%V` (or the week containing
    the latest entry in the file — avoid labeling with next week's number).
-2. Archive the live file: `mv /mimir-home/memory/learnings-pending.md \
-   /mimir-home/memory/learnings-pending/$(date +%Y-W%V).md`
+2. Archive the live file: `mv "$MIMIR_HOME/memory/learnings-pending.md" \
+   "$MIMIR_HOME/memory/learnings-pending/$(date +%Y-W%V).md"`
 3. Seed a fresh live file with just the standard header (the `<!-- desc: -->`
    line, the `# Learnings Pending` heading, and the lifecycle intro — no
    content entries; synthesis turns will fill it with this week's candidates).
