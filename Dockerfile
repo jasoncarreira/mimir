@@ -29,11 +29,12 @@ FROM python:3.11-slim AS base
 # OS deps:
 #   - ca-certificates curl gnupg: prereqs for adding NodeSource +
 #     fetching uv installer
-#   - git: required when the ``claude-code`` extra is selected —
-#     ``langchain-claude-code`` is pinned to a git ref until upstream
-#     PRs land (see chainlink #268). Without git in the image,
-#     ``pip install mimir-agent[claude-code]`` fails at the git
-#     clone step.
+#   - git: required when the build adds Claude Code subprocess
+#     support — ``langchain-claude-code`` is pinned to a git ref
+#     until upstream PRs land (see issue #268). The fork isn't a
+#     mimir-agent extra (PyPI rejects direct git URLs), so it ships
+#     as an EXTRA build step that builds add explicitly (see the
+#     ``MIMIR_ENABLE_CLAUDE_CODE`` block below).
 #   - nodejs + npm + @anthropic-ai/claude-code: the Claude Code CLI
 #     binary, needed when the deployment routes through the
 #     subprocess provider (Max OAuth path).
@@ -81,15 +82,30 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 # multi-bridge deployment (Anthropic API, Discord, Slack, MCP).
 # Override at build time:
 #
-#   docker build --build-arg MIMIR_EXTRAS=claude-code,anthropic,discord .
+#   docker build --build-arg MIMIR_EXTRAS=anthropic,discord .
 #
 # Available extras (see pyproject.toml):
-#   anthropic, claude-code, openai, codex-plus  (model providers)
+#   anthropic, openai, codex-plus               (model providers)
 #   discord, slack                              (bridges)
 #   mcp                                         (Model Context Protocol)
+#
+# Note: there is NO ``claude-code`` extra. ``langchain-claude-code``
+# is a git-pinned fork (PyPI rejects packages with direct URL deps),
+# so it installs as an extra build step gated on
+# ``MIMIR_ENABLE_CLAUDE_CODE``. See the block below.
 ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
+
+# Optional: install the Claude Code subprocess provider. Set
+# ``--build-arg MIMIR_ENABLE_CLAUDE_CODE=1`` to enable. Pinned to a
+# specific fork SHA; bump when upstream patches merge (issue #268).
+ARG MIMIR_ENABLE_CLAUDE_CODE=0
+ARG LANGCHAIN_CLAUDE_CODE_REF=f7af15b613d1e016437740f739321316730cdd39
+RUN if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \
+        pip install --no-cache-dir \
+            "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@${LANGCHAIN_CLAUDE_CODE_REF}" ; \
+    fi
 
 # Pre-warm the fastembed cache so the first request doesn't pay the
 # ~80MB download. Skipped silently if offline at build time.

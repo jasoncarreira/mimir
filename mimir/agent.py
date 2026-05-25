@@ -204,7 +204,12 @@ def _filter_session_turns(
 
 
 _PROVIDER_EXTRAS: dict[str, str] = {
-    "claude-code": "claude-code",  # → pip install 'mimir[claude-code]'
+    # ``claude-code`` is intentionally absent: ``langchain-claude-code``
+    # is a git-pinned fork (PyPI rejects packages with direct URL deps),
+    # so it's installed as a separate step, not via an extra. See the
+    # ImportError message in the claude-code provider branch below for
+    # the install incantation. Tracked: issue #268 — restore the extra
+    # when upstream publishes a release.
     "anthropic": "anthropic",
     "openai": "openai",
     "codex-plus": "codex-plus",
@@ -279,9 +284,15 @@ def _resolve_model(
             from langchain_claude_code import ChatClaudeCode  # type: ignore[import-untyped]
         except ImportError as exc:
             raise ImportError(
-                "MIMIR_MODEL_SPEC=claude-code:* requires the 'claude-code' extra. "
-                "Install via `pip install 'mimir[claude-code]'` "
-                "(or `uv pip install langchain-claude-code`)."
+                "MIMIR_MODEL_SPEC=claude-code:* requires the "
+                "``langchain-claude-code`` package. PyPI rejects "
+                "packages with direct URL deps, so it isn't a "
+                "mimir-agent extra — install it directly:\n"
+                "  pip install \"langchain-claude-code @ git+"
+                "https://github.com/jasoncarreira/langchain-claude-code"
+                "@f7af15b613d1e016437740f739321316730cdd39\"\n"
+                "Restored as an extra once upstream patches "
+                "(see issue #268) merge + a release is cut."
             ) from exc
         model_name = spec.split(":", 1)[1]
         # ``permission_mode="bypassPermissions"`` matches SDK-era
