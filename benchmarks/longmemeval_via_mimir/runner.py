@@ -29,7 +29,8 @@ plus an OpenAI API key for the judge).
 This file is intentionally a *driver*. Heavy lifting (atom storage,
 retrieval, scoring) reuses saga's bench infrastructure. The reason for
 this harness existing AT ALL is the cache/contextual-rewrite/credit-pass
-interactions that are invisible to saga-direct benches — see V0.5.md §3.
+interactions that are invisible to saga-direct benches — running through
+the full mimir agent path is the only way to exercise them in concert.
 """
 
 from __future__ import annotations

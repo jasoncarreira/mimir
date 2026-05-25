@@ -2,7 +2,14 @@
 
 <!-- desc: Docker-internal volume for /mimir-home + git-tracked human-readable subset; replaces VirtioFS bind-mount -->
 
-**Status:** 2026-05-06 — ready for implementation. Open questions resolved by operator (§"Locked answers"). Companion to `BIND_MOUNT_HEALTH_PROBE.md` (current mitigation, PR #23).
+**Status:** **shipped** (2026-05). Implementation in `mimir/git_bootstrap.py`
+(bootstrap + credential-helper plumbing) and `mimir/git_tracking.py`
+(periodic-commit + push for the human-readable subset). Companion to
+[`BIND_MOUNT_HEALTH_PROBE.md`](./BIND_MOUNT_HEALTH_PROBE.md) (also shipped;
+kept active as belt-and-suspenders).
+
+This doc is retained as design rationale. See the addendum below for the
+one place the implementation diverges from the original spec.
 
 > **Addendum (PR 4d, 2026-05-06):** the in-URL token approach
 > originally specified for `inject_token_into_url` (§"Authentication

@@ -9,9 +9,6 @@ Phase 2 (planned): session-boundary extraction hook + due-check poller
 + algedonic ``commitment_due`` / ``commitment_expired`` events.
 
 Phase 3 (planned): prompt-builder block (Upcoming commitments).
-
-See ``docs/code-review-2026-05-09.md`` and scratch backtest report for
-the design rationale.
 """
 
 from .models import (

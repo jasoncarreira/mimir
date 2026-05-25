@@ -2,9 +2,18 @@
 
 <!-- desc: design + staged rollout for replacing `query()` with ClaudeSDKClient in mimir/agent.py -->
 
-**Status:** filed 2026-05-04. Not started. Cron-based quota poller is shipping
-as the immediate quota-visibility fix; this migration is the long-term shape
-for the agent's main loop.
+**Status:** **superseded** (2026-05). The agent loop moved to deepagents /
+LangGraph instead of `ClaudeSDKClient`; quota visibility for the Max plan
+is provided by the OAuth-token-based cron poller, which solved the
+immediate quota-visibility motivation. The structural reasons this migration
+was attractive (long-lived client, single subprocess) are also addressed
+differently by deepagents — the agent loop now lives inside a LangGraph
+state machine, with the `langchain-claude-code` provider handling the
+subprocess shape.
+
+This doc is retained for the design analysis (the quota-visibility ask, the
+session-reuse argument); the `ClaudeSDKClient`-specific implementation plan
+below is no longer the path forward.
 
 ## Motivation
 
