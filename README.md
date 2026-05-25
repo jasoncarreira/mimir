@@ -8,7 +8,7 @@ A memory-centric agent harness built on [deepagents](https://github.com/langchai
 
 mimir wraps an LLM agent loop with the surrounding apparatus a long-running
 agent needs to operate over time, across channels, and across sessions:
-persistent memory (via [saga](./saga)), a tool-and-skill registry, scheduled
+persistent memory (the in-process `mimir.saga` backend), a tool-and-skill registry, scheduled
 ticks for autonomous work, message bridges (Discord / Slack / Bluesky / web /
 benchmark stdout), and a feedback-loop / homeostat layer that keeps the
 agent regulated as it accumulates state.
@@ -46,7 +46,8 @@ The name is from Norse myth — Mímir, the keeper of memory and counsel.
 
 ```
 mimir/                      # the agent harness — top-level package
-saga/                       # memory backend (vendored, formerly MSAM)
+mimir/saga/                 # in-process memory backend (runtime)
+saga/                       # bench shell for LongMemEval (separate workspace package)
 benchmarks/longmemeval_via_mimir/   # integration bench against LongMemEval
 tests/                      # pytest suite
 docs/                       # architectural notes (public) + internal/ (process docs)
@@ -54,9 +55,10 @@ SPEC.md                     # detailed design doc
 FEEDBACK-LOOPS.md           # mapping of every feedback loop in the system
 ```
 
-`saga/` is a memory-system package this repo depends on heavily —
-see [saga/README.md](./saga/README.md). Originally a fork of MSAM by
-Jaden Schwab, now extensively modified.
+The runtime memory backend lives at `mimir/saga/` and is part of the
+`mimir-agent` package. The top-level `saga/` directory is a separate
+workspace package — a bench shell that the LongMemEval runners under
+`benchmarks/longmemeval_via_mimir/` import.
 
 ## Quickstart
 
@@ -213,9 +215,6 @@ uv run pytest --ignore=tests/test_bench_via_mimir.py  # skip the slow integratio
 uv pip install -e ".[dev]"
 uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39"
 uv run pytest
-
-# Saga's own tests
-cd saga && uv run pytest saga/tests/
 ```
 
 The bench harness is in `benchmarks/longmemeval_via_mimir/`. See
@@ -229,7 +228,9 @@ If you're orienting yourself in the codebase:
 1. **[SPEC.md](./SPEC.md)** — what mimir is, the design choices
 2. **[FEEDBACK-LOOPS.md](./FEEDBACK-LOOPS.md)** — the regulatory
    architecture (mapped to Beer's Viable System Model)
-3. **[saga/README.md](./saga/README.md)** — memory backend
+3. **[mimir/saga/\_\_init\_\_.py](./mimir/saga/__init__.py)** — memory
+   backend operation surface (the module docstring is the public-API
+   reference)
 4. **[docs/](./docs/)** — additional architectural notes (`docs/internal/`
    holds historical process docs that may help when archeology is needed
    but aren't part of the public contract)
@@ -237,9 +238,6 @@ If you're orienting yourself in the codebase:
 ## License
 
 MIT — see [LICENSE](./LICENSE). Copyright © 2026 Jason Carreira.
-
-The [saga](./saga) subdirectory is independently MIT-licensed (combined
-copyright Jaden Schwab + Jason Carreira); see [saga/LICENSE](./saga/LICENSE).
 
 ## Contributing & security
 
