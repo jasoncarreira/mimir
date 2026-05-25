@@ -101,6 +101,46 @@ def test_parse_frontmatter_handles_folded_description() -> None:
     assert fm["description"] == "First line continuation. Second line."
 
 
+def test_parse_frontmatter_folded_block_terminated_by_next_key() -> None:
+    """A zero-indent key after a folded block correctly ends the block.
+
+    The key concern (chainlink #104): a poorly-formatted SKILL.md with
+    ``description: >`` followed by an unindented continuation could
+    silently absorb the next key.  A proper key at column 0 must
+    always start a new field, even when inside a folded block.
+    """
+    text = (
+        "---\n"
+        "name: example\n"
+        "description: >\n"
+        "  Properly indented line.\n"
+        "trigger: when operator asks\n"
+        "---\n"
+    )
+    fm = _parse_frontmatter(text)
+    assert fm["description"] == "Properly indented line."
+    assert fm["trigger"] == "when operator asks"
+
+
+def test_parse_frontmatter_folded_block_rejects_unindented_continuation() -> None:
+    """Non-indented non-key line inside a folded block raises ValueError.
+
+    The silent-swallow gotcha (chainlink #104): if an author writes
+    ``description: >`` and the continuation has no leading whitespace,
+    the old parser would silently accumulate it.  The fixed parser
+    raises loudly so authors notice the mis-format.
+    """
+    text = (
+        "---\n"
+        "name: example\n"
+        "description: >\n"
+        "no indent here\n"  # not indented — should raise
+        "---\n"
+    )
+    with pytest.raises(ValueError, match="folded-scalar continuation"):
+        _parse_frontmatter(text)
+
+
 def test_extract_list_field_block_form() -> None:
     text = (
         "---\n"
