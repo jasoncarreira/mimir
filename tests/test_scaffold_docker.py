@@ -777,3 +777,156 @@ def test_social_cli_fragment_has_pin_comment():
     )
     text = frag_path.read_text()
     assert "pin" in text.lower() or "tag" in text.lower()
+
+
+# ─── PyPI mode (issue #332) ─────────────────────────────────────────
+
+
+def test_render_dockerfile_pypi_mode_installs_from_pypi(tmp_path):
+    """``mode='pypi'`` emits a Dockerfile that runs
+    ``pip install mimir-agent[...]`` instead of cloning + ``uv sync``."""
+    from mimir.scaffold_docker import render_dockerfile
+    out = render_dockerfile([], mode="pypi")
+    assert "pip install --no-cache-dir \"mimir-agent[" in out
+    assert "uv sync" not in out
+    assert "git clone" not in out
+    # User-owned venv at /home/mimir/venv (required for pending-update
+    # flow to ``pip install --upgrade`` without root).
+    assert "VIRTUAL_ENV=/home/mimir/venv" in out
+    # Optional claude-code support gated on a build-arg.
+    assert "MIMIR_ENABLE_CLAUDE_CODE" in out
+    assert "langchain-claude-code @ git+https" in out
+
+
+def test_render_dockerfile_pypi_mode_default_extras(tmp_path):
+    """Default ``mimir_extras`` is the common multi-bridge production
+    set: anthropic + discord + slack + mcp."""
+    from mimir.scaffold_docker import render_dockerfile
+    out = render_dockerfile([], mode="pypi", mimir_extras=None)
+    assert 'ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"' in out
+
+
+def test_render_dockerfile_pypi_mode_custom_extras(tmp_path):
+    """Operator-supplied ``mimir_extras`` flow into the build-arg
+    default, so ``docker build`` without ``--build-arg MIMIR_EXTRAS=…``
+    picks them up."""
+    from mimir.scaffold_docker import render_dockerfile
+    out = render_dockerfile([], mode="pypi", mimir_extras=["anthropic", "discord"])
+    assert 'ARG MIMIR_EXTRAS="anthropic,discord"' in out
+
+
+def test_render_dockerfile_pypi_mode_preserves_skill_fragments():
+    """Skill fragments (chainlink, hugo, etc.) still land in the
+    fragments block regardless of mode."""
+    from mimir.scaffold_docker import render_dockerfile, Fragment
+    f = Fragment(skill_name="myskill", content="RUN echo hello")
+    out = render_dockerfile([f], mode="pypi")
+    assert "# --- myskill ---" in out
+    assert "RUN echo hello" in out
+
+
+def test_render_dockerfile_workspace_mode_unchanged():
+    """Regression: default ``mode='workspace'`` produces the historic
+    template — uv installer present (sync runs at boot via start.sh),
+    workspace WORKDIR, no PyPI-mode artifacts."""
+    from mimir.scaffold_docker import render_dockerfile
+    out = render_dockerfile([], mode="workspace")
+    # uv installer present (the layer that places uv at /usr/local/bin)
+    assert "/usr/local/bin/uv" in out
+    # Workspace bind path
+    assert "WORKDIR /workspace" in out
+    # No PyPI-mode artifacts
+    assert "pip install --no-cache-dir \"mimir-agent[" not in out
+    assert "VIRTUAL_ENV=/home/mimir/venv" not in out
+
+
+def test_render_dockerfile_unknown_mode_raises():
+    from mimir.scaffold_docker import render_dockerfile
+    with pytest.raises(ValueError, match="unknown scaffold mode"):
+        render_dockerfile([], mode="kubernetes")
+
+
+# ─── compose.yml PyPI mode ──────────────────────────────────────────
+
+
+def test_render_compose_yml_pypi_drops_workspace_volume():
+    """No ``workspace`` named volume, no ``/workspace`` mount."""
+    from mimir.scaffold_docker import render_compose_yml
+    out = render_compose_yml(service_name="foo", web_port=8091, mode="pypi")
+    assert "workspace:" not in out
+    assert "/workspace" not in out
+    # /mimir-home bind-mount preserved.
+    assert "- .:/mimir-home" in out
+    # Substitutions still work.
+    assert "container_name: foo" in out
+    assert "127.0.0.1:8091:8080" in out
+
+
+def test_render_compose_yml_workspace_mode_still_has_volume():
+    """Regression: workspace mode keeps the named volume."""
+    from mimir.scaffold_docker import render_compose_yml
+    out = render_compose_yml(service_name="foo", web_port=8091, mode="workspace")
+    assert "workspace:/workspace" in out
+    assert "volumes:\n  workspace:" in out
+
+
+# ─── start.sh PyPI mode ─────────────────────────────────────────────
+
+
+def test_render_start_sh_pypi_drops_clone_and_uv_sync():
+    """PyPI start.sh has no clone, no ``uv sync``, no ``uv run``."""
+    from mimir.scaffold_docker import render_start_sh
+    out = render_start_sh(mode="pypi")
+    assert "git clone" not in out
+    assert "uv sync" not in out
+    assert "uv run" not in out
+    # Still does gh auth + mimir setup + exec mimir run.
+    assert "gh auth" in out
+    assert "mimir setup" in out
+    assert "exec mimir run" in out
+
+
+def test_render_start_sh_pypi_ignores_uv_extras():
+    """uv_extras has no effect in pypi mode — the Dockerfile carries
+    MIMIR_EXTRAS instead."""
+    from mimir.scaffold_docker import render_start_sh
+    out_no = render_start_sh(uv_extras=None, mode="pypi")
+    out_yes = render_start_sh(uv_extras=["discord", "slack"], mode="pypi")
+    assert out_no == out_yes  # extras have no effect
+
+
+def test_render_start_sh_workspace_mode_unchanged():
+    """Regression: workspace mode still has the clone + uv sync."""
+    from mimir.scaffold_docker import render_start_sh
+    out = render_start_sh(uv_extras=["discord"], mode="workspace")
+    assert "git clone" in out
+    assert "uv sync" in out
+    assert "--extra discord" in out
+
+
+# ─── scaffold() end-to-end in PyPI mode ─────────────────────────────
+
+
+def test_scaffold_pypi_mode_writes_pypi_flavored_files(tmp_path):
+    """End-to-end: ``mode='pypi'`` produces Dockerfile + compose.yml +
+    start.sh that all match the PyPI shape."""
+    from mimir.scaffold_docker import scaffold
+    result = scaffold(
+        tmp_path, service_name="test-agent", web_port=8092,
+        mode="pypi", mimir_extras=["anthropic"],
+    )
+    assert any("Dockerfile" in f for f in result.files_written)
+    df = (tmp_path / "Dockerfile").read_text()
+    cy = (tmp_path / "compose.yml").read_text()
+    ss = (tmp_path / "start.sh").read_text()
+    assert 'ARG MIMIR_EXTRAS="anthropic"' in df
+    assert "workspace:" not in cy
+    assert "uv sync" not in ss
+    # start.sh is executable.
+    assert (tmp_path / "start.sh").stat().st_mode & 0o111
+
+
+def test_scaffold_unknown_mode_raises(tmp_path):
+    from mimir.scaffold_docker import scaffold
+    with pytest.raises(ValueError, match="unknown scaffold mode"):
+        scaffold(tmp_path, mode="not-a-mode")

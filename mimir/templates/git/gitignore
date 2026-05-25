@@ -28,6 +28,19 @@
 !saga.toml
 !scheduler.yaml
 
+# Deployment infrastructure — track so the repo serves as a
+# disaster-recovery snapshot of how this agent is wired (UID
+# mapping, port binding, build extras, skill-fragment composition,
+# operator override mounts). Behavioral state (memory/, skills/,
+# state/wiki) shows what the agent KNOWS; these files show how it
+# RUNS. ``compose.env`` stays blocked (real secrets); the sanitized
+# ``compose.env.example`` template can live alongside if useful.
+!Dockerfile
+!compose.yml
+!compose.override.yml
+!start.sh
+!compose.env.example
+
 # Re-block any binary/log artifact that slipped past the include rules
 # above (belt-and-suspenders; if a future change drops atoms.db into
 # memory/, the include rule for memory/** would otherwise pick it up).
