@@ -887,6 +887,90 @@ async def spawn_claude_code(
 
 
 # ────────────────────────────────────────────────────────────────────
+# Pending mimir-package update (mimir/update_on_start.py)
+# ────────────────────────────────────────────────────────────────────
+
+
+@tool
+async def request_mimir_update(
+    target_version: Optional[str] = None,
+    include_prereleases: bool = False,
+) -> str:
+    """Approve a mimir package update — writes the pending-update flag.
+
+    **Escalate-first action** (per memory/core/06-action-boundaries.md):
+    invoke ONLY after the operator has explicitly approved the update
+    in the current conversation. Writing this flag without operator
+    consent is a self-modification of the running binary — the same
+    kind of compounding-cost / silent-drift concern that gates
+    ``memory/core/`` edits. The flag IS the operator's consent
+    signal; do not fabricate it.
+
+    Trigger conditions (all must hold):
+      1. A ``mimir_update_available`` event has fired (visible in the
+         per-turn feedback block).
+      2. You raised the available update with the operator in this
+         conversation.
+      3. The operator replied with explicit approval ("yes", "do the
+         update", "approve", etc.) — NOT a non-committal acknowledgment.
+
+    What happens after this tool succeeds:
+      - A flag file is written to ``<MIMIR_HOME>/.mimir/pending-update.flag``.
+      - On the NEXT process restart (operator runs ``docker compose
+        restart`` or the equivalent), the startup pre-flight in
+        ``server.main`` runs ``pip install --upgrade``, deletes the
+        flag, and re-execs onto the new code. ``mimir_update_applied``
+        (positive) or ``mimir_update_failed`` (negative) lands in
+        the algedonic block on the first turn after restart.
+      - The running agent (this process) keeps running on the OLD
+        version until the operator restarts.
+
+    Args:
+        target_version: Pin to a specific version (e.g. ``"0.2.0"``).
+            Default empty → pip resolves the latest matching the
+            ``include_prereleases`` setting at install time. Pinning
+            is what you want when the operator explicitly reviewed a
+            specific release; leaving it empty is appropriate when
+            they said "update to whatever's latest."
+        include_prereleases: True → pip ``--pre`` flag passed at
+            install time (alpha / beta / rc accepted). Default False.
+
+    Returns: a confirmation string with the path written and what
+    will happen on next restart, plus the operator-facing reminder.
+    """
+    from pathlib import Path
+    from ..update_on_start import write_flag
+
+    home_env = os.environ.get("MIMIR_HOME")
+    if not home_env:
+        return (
+            "request_mimir_update failed: MIMIR_HOME env not set — "
+            "can't resolve the flag location. (This shouldn't happen "
+            "in a normal deployment; surface to the operator.)"
+        )
+    home = Path(home_env)
+
+    cleaned_target = (target_version or "").strip()
+    path = write_flag(
+        home,
+        target_version=cleaned_target,
+        include_prereleases=bool(include_prereleases),
+    )
+
+    pin_desc = f"pinned to {cleaned_target}" if cleaned_target else "latest at install time"
+    pre_desc = " (pre-releases allowed)" if include_prereleases else ""
+    return (
+        f"Pending-update flag written to {path}.\n"
+        f"Target: {pin_desc}{pre_desc}.\n"
+        f"On next restart, mimir will run pip install --upgrade and "
+        f"re-exec onto the new code. The running process keeps the "
+        f"OLD version until the operator restarts.\n"
+        f"Operator: run `docker compose restart` (or the equivalent "
+        f"for your deployment) when ready."
+    )
+
+
+# ────────────────────────────────────────────────────────────────────
 # Convenience: assemble all tools for the deepagent factory
 # ────────────────────────────────────────────────────────────────────
 
@@ -942,6 +1026,9 @@ def all_mimir_tools() -> list:
         commitment_dismiss, commitment_list,
         # Spawn
         spawn_claude_code,
+        # Mimir-package self-update (operator-approved, applied on
+        # next restart). See mimir/update_on_start.py.
+        request_mimir_update,
     ]
     web_search_on, fetch_url_on = web_tools_enabled()
     if web_search_on or fetch_url_on:

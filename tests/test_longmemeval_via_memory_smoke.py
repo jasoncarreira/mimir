@@ -16,6 +16,14 @@ from pathlib import Path
 
 import pytest
 
+# Skip the bench-smoke tests if the optional workspace ``saga`` package
+# isn't installed. ``saga`` lives behind the ``[bench]`` extra (PR
+# #329); ``pip install -e ".[dev]"`` doesn't pull it. Without the
+# package, the runner can't import ``saga.benchmarks.longmemeval``
+# and these tests can't exercise the pipeline. Operators who run
+# benches install ``[bench]`` from a workspace checkout.
+pytest.importorskip("saga.benchmarks")
+
 
 def _stub_provider():
     """4d "bag-of-keywords" embedding provider — matches the integration

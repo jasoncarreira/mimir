@@ -952,6 +952,18 @@ def _validate_bind_security(host: str, api_key: str) -> None:
 
 
 def main() -> None:
+    # Pre-flight: if the operator approved a mimir-package update via
+    # the ``request_mimir_update`` tool, apply it now — BEFORE any
+    # asyncio / logger / config import-chain that would lock the
+    # current process to the old code. On install success the call
+    # ``execv``'s away (same PID, fresh Python import); on failure
+    # the flag is deleted and we continue on the old version. The
+    # function is a no-op when no flag is present (the common path).
+    # See ``mimir/update_on_start.py`` for the full design rationale.
+    from .update_on_start import apply_pending_update
+    _home_for_flag = Path(os.environ.get("MIMIR_HOME") or os.getcwd())
+    apply_pending_update(_home_for_flag)
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config = Config.from_env()
     _validate_bind_security(config.web_host, config.api_key)
