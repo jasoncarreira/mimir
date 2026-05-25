@@ -371,6 +371,12 @@ async def test_consume_startup_events_drains_into_async_logger(
     """``consume_startup_events`` reads the sidecar, replays each
     event through the now-initialized async ``log_event``, and
     deletes the sidecar so subsequent restarts don't re-emit."""
+    # Intentional: importing underscore-prefixed internals so the
+    # test can drive the sidecar from the same path the production
+    # ``apply_pending_update`` would. The leading underscore signals
+    # "module-internal" — kept that way so tests can pin the wire
+    # format, while production callers go through the public
+    # ``apply_pending_update`` / ``consume_startup_events`` pair.
     from mimir.update_on_start import (
         _record_startup_event,
         _STARTUP_EVENTS_BASENAME,
@@ -451,3 +457,70 @@ async def test_consume_startup_events_skips_malformed_lines(
     # Two valid events drained; the malformed line skipped.
     assert drained == 2
     assert captured == ["mimir_update_starting", "mimir_update_applied"]
+
+
+def test_apply_truncates_stale_sidecar_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defense against the "drain succeeded but unlink failed on
+    prior boot" failure mode: when ``apply_pending_update`` detects
+    a fresh flag, it clears any leftover sidecar before writing the
+    current boot's events. Without this, the prior boot's stale
+    events would still be on disk and the next drain would replay
+    both old + new — duplicate ``mimir_update_applied`` lines in
+    ``events.jsonl``.
+
+    Mimir-carreira nit 1 on PR #333 review.
+    """
+    # Plant a stale sidecar from a hypothetical prior boot.
+    from mimir.update_on_start import _STARTUP_EVENTS_BASENAME
+    sidecar = tmp_path / ".mimir" / _STARTUP_EVENTS_BASENAME
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(
+        json.dumps({"type": "mimir_update_applied", "spec": "STALE"}) + "\n"
+    )
+
+    # Write a fresh flag — simulates a new operator approval.
+    write_flag(tmp_path, target_version="0.2.0")
+
+    def _fake_run(argv, **kwargs):
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _R()
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    apply_pending_update(tmp_path, lambda *a, **k: None, _exec=lambda *a: None)
+
+    # The stale "STALE" entry must be gone. Only the current boot's
+    # events should be present.
+    lines = [json.loads(l) for l in sidecar.read_text().splitlines() if l.strip()]
+    specs = [e.get("spec") for e in lines]
+    assert "STALE" not in specs, "stale sidecar entry leaked into current boot's drain"
+    # The current boot's events ARE present.
+    assert any(
+        e.get("type") == "mimir_update_applied" and e.get("spec") == "mimir-agent==0.2.0"
+        for e in lines
+    )
+
+
+def test_apply_does_not_touch_sidecar_when_no_flag(
+    tmp_path: Path,
+) -> None:
+    """The truncate fires ONLY when a flag is present. A boot with
+    no pending-update doesn't touch the sidecar — preserves the
+    invariant that an existing sidecar represents work this boot
+    actually did, and avoids spuriously deleting state if some
+    other component started using the sidecar path."""
+    from mimir.update_on_start import _STARTUP_EVENTS_BASENAME
+    sidecar = tmp_path / ".mimir" / _STARTUP_EVENTS_BASENAME
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sentinel = json.dumps({"type": "sentinel", "from": "other-component"}) + "\n"
+    sidecar.write_text(sentinel)
+
+    # No flag — the no-op path.
+    result = apply_pending_update(tmp_path, lambda *a, **k: None, _exec=lambda *a: None)
+    assert result is False
+    # Sidecar still has the sentinel content; truncate did not fire.
+    assert sidecar.read_text() == sentinel

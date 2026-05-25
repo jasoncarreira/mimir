@@ -76,7 +76,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 log = logging.getLogger(__name__)
 
@@ -300,6 +300,37 @@ def _record_startup_event(home: Path, event_kind: str, **fields) -> None:
         log.warning("startup-events sidecar write failed: %s", exc)
 
 
+def _truncate_startup_events(home: Path) -> None:
+    """Clear any stale startup-events sidecar before a new install
+    attempt's events get appended.
+
+    Defense against the rare case where ``consume_startup_events``
+    drained successfully on a prior boot but its ``sidecar.unlink()``
+    call failed (full disk, weird FS state, etc.). Without this
+    truncate, the prior boot's stale events would get appended to by
+    the current boot's writes — next drain would replay both old +
+    new entries, producing duplicate ``mimir_update_applied`` events
+    in ``events.jsonl``.
+
+    Called from ``apply_pending_update`` ONLY when a pending-update
+    flag is present (i.e., we're about to start writing). Boots
+    without a flag don't touch the sidecar — preserves the
+    consume-side guarantee that an existing sidecar represents
+    work this boot actually did.
+
+    Best-effort: if the truncate itself fails (rare), the append
+    falls back to the prior-boot behavior (potential duplicates on
+    drain) — still better than crashing the startup pre-flight.
+    """
+    sidecar = home / _FLAG_DIRNAME / _STARTUP_EVENTS_BASENAME
+    try:
+        sidecar.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("startup-events sidecar truncate failed: %s", exc)
+
+
 def _make_emit(home: Path, log_event: Callable[..., None]) -> Callable[..., None]:
     """Combine the in-process log + the persistent sidecar into a
     single emit function. Used internally so callsites don't have to
@@ -311,7 +342,10 @@ def _make_emit(home: Path, log_event: Callable[..., None]) -> Callable[..., None
     return _emit
 
 
-async def consume_startup_events(home: Path, async_log_event) -> int:
+async def consume_startup_events(
+    home: Path,
+    async_log_event: Callable[..., Awaitable[None]],
+) -> int:
     """Drain the startup-events sidecar through the now-initialized
     event logger. Returns the number of events drained.
 
@@ -386,6 +420,11 @@ def apply_pending_update(
     path = flag_path(home)
     if not path.is_file():
         return False
+
+    # We're about to write events to the sidecar; clear any stale
+    # entries from a prior boot whose drain succeeded but unlink
+    # failed. Keeps the next drain from replaying both old + new.
+    _truncate_startup_events(home)
 
     parsed = _read_flag(path)
     pkg = _pypi_package_name()
