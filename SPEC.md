@@ -1322,36 +1322,40 @@ Single-process build. SAGA runs in-process (workspace dependency, not a sidecar)
 FROM python:3.11-slim AS base
 
 # Node.js + Claude Code CLI (subprocess transport for spawn_claude_code)
+# git: required by the ``claude-code`` extra (langchain-claude-code is
+#      git-pinned until upstream patches land)
 # PDF ingest tools (poppler-utils for text PDFs, tesseract-ocr for scanned)
 ENV NODE_VERSION=20
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg \
+        ca-certificates curl gnupg git \
         poppler-utils tesseract-ocr tesseract-ocr-eng \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g @anthropic-ai/claude-code \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# uv: fast package manager
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && mv /root/.local/bin/uv /usr/local/bin/uv
-
-# Non-root user; Claude Code needs $HOME writable
+# Non-root user; the mimir process needs to own its venv so the
+# pending-update flow can ``pip install --upgrade mimir-agent``
+# without root. ``$HOME`` writable also matters for Claude Code's
+# OAuth credential under ``~/.claude/``.
 RUN useradd -m -u 1001 -s /bin/bash mimir
 USER mimir
-WORKDIR /home/mimir/app
+WORKDIR /home/mimir
 
-# Deps layer (cached unless pyproject / uv.lock changes)
-COPY --chown=mimir:mimir pyproject.toml uv.lock ./
-COPY --chown=mimir:mimir saga/pyproject.toml ./saga/pyproject.toml
-RUN uv sync --frozen --no-dev
+# User-owned venv. ``apply_pending_update`` (mimir/update_on_start.py)
+# pip-installs the next release into THIS venv on next restart.
+ENV VIRTUAL_ENV=/home/mimir/venv
+RUN python3 -m venv "$VIRTUAL_ENV"
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-COPY --chown=mimir:mimir mimir/ ./mimir/
-COPY --chown=mimir:mimir saga/saga/ ./saga/saga/
-COPY --chown=mimir:mimir benchmarks/ ./benchmarks/
+# Install mimir-agent from PyPI. Override extras at build time:
+#   docker build --build-arg MIMIR_EXTRAS=claude-code,anthropic,discord .
+ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 
 # Pre-warm fastembed model cache
-RUN uv run python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')" || true
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')" || true
 
 ENV MIMIR_HOME=/home/mimir/agent
 ENV MIMIR_WEB_PORT=8080
@@ -1386,7 +1390,8 @@ benchmarks/
     README.md
 ```
 
-**Invocation** (from `/workspace/mimir`):
+**Invocation** (from a workspace checkout — benches require the
+`[bench]` extra and aren't part of the PyPI install):
 
 ```bash
 uv run python -m benchmarks.longmemeval_via_mimir.runner \

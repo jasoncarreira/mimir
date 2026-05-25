@@ -42,9 +42,10 @@ scope determines which repos are reachable — operations on out-of-scope repos 
 billing; access repos outside the PAT scope; file issues on external repos without
 operator approval.
 
-When inside `/workspace/mimir/` (the cloned repo) you don't need `--repo` —
-gh resolves the upstream remote. When working from elsewhere or operating on
-a different repo, pass `--repo owner/repo` (or use a URL).
+When `cwd` is inside a git checkout of the target repo, you don't need `--repo`
+— gh resolves the upstream remote from the local `origin`. When working from
+elsewhere or operating on a different repo, pass `--repo owner/repo` (or use a
+URL).
 
 ## Pull requests
 

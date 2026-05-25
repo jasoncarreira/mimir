@@ -179,7 +179,7 @@ jq 'select(.channel_id == "CHANNEL_ID") | {ts, tools: [.events[] | select(.type 
 ### With Python (if jq unavailable)
 
 ```bash
-uv run python - <<'PY'
+python - <<'PY'
 import json
 from pathlib import Path
 from collections import Counter

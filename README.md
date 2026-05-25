@@ -60,23 +60,19 @@ Jaden Schwab, now extensively modified.
 
 ## Quickstart
 
-Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
+Requires Python 3.11+.
+
+### Install from PyPI
 
 ```bash
-# Install from PyPI
-pip install mimir-agent
-
-# Or clone for development
-git clone https://github.com/jasoncarreira/mimir.git
-cd mimir
-uv sync
+pip install "mimir-agent[anthropic]"   # pick the model-provider extra(s) you'll use
 
 # Set up an agent home (creates dirs, seeds skills, generates API keys)
-uv run mimir setup --home ~/mimir-home
+mimir setup --home ~/mimir-home
 
 # Configure auth — pick one
-#   Anthropic Max plan (free):   claude setup-token
 #   API key:                     edit ~/mimir-home/.env, set ANTHROPIC_API_KEY
+#   Anthropic Max plan (free):   pip install "mimir-agent[claude-code]" + claude setup-token
 #   Gateway:                     set ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
 #   Non-Anthropic Anthropic-compat (Minimax, Kimi, …): see "Alternative providers"
 
@@ -84,6 +80,27 @@ uv run mimir setup --home ~/mimir-home
 #   set OPENAI_API_KEY in ~/mimir-home/.env
 
 # Run
+mimir run --home ~/mimir-home
+```
+
+Available extras (combine in one install command — e.g. `pip install
+"mimir-agent[anthropic,discord,slack,mcp]"`):
+
+| Extra | Pulls |
+|---|---|
+| `anthropic`, `openai`, `codex-plus` | model adapter packages |
+| `claude-code` | Claude Code subprocess provider (git-pinned fork until upstream patches land) |
+| `discord`, `slack` | bridge runtimes |
+| `mcp` | Model Context Protocol client |
+
+### Or clone for development
+
+```bash
+git clone https://github.com/jasoncarreira/mimir.git
+cd mimir
+uv sync --extra dev      # or [dev-claude-code] for the Claude Code subprocess path
+
+uv run mimir setup --home ~/mimir-home
 uv run mimir run --home ~/mimir-home
 ```
 
