@@ -40,7 +40,7 @@ Three things have made the alternative — `ClaudeSDKClient`, the long-lived for
    runaway subagent, dynamically widening permissions for a privileged
    sub-skill, swapping models mid-conversation for cost reasons.
 3. **Symmetry with saga.** Saga's `claude_code` provider already uses
-   `ClaudeSDKClient` (saga/saga/_llm.py: `_PersistentClaudeCode`). The agent
+   `ClaudeSDKClient` (`mimir/saga/_llm.py`: `_PersistentClaudeCode`). The agent
    loop using `query()` while every other in-process LLM call uses the long-
    lived form is asymmetric and surprising.
 

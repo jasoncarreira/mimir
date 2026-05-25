@@ -20,9 +20,9 @@ dependencies = [
     #
     # The runtime memory backend lives at ``mimir/saga/`` (inside this
     # package) — it ships with the wheel and needs no external dep.
-    # The top-level workspace ``saga`` package is the bench harness
-    # shell only; needed by ``benchmarks/longmemeval_via_*/`` not by
-    # the runtime. See the ``[bench]`` optional extra below.
+    # The ``saga`` workspace package at ``benchmarks/saga/`` is the
+    # bench harness shell only; needed by ``benchmarks/longmemeval_via_*/``
+    # not by the runtime. See the ``[bench]`` optional extra below.
     "aiohttp>=3.12",
     "apscheduler>=3.11",
     "python-dotenv>=1.0",
@@ -175,9 +175,10 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 # Workspace setup: mimir's pyproject is also the workspace root;
-# saga/ is the second member (a vendored sibling package).
+# benchmarks/saga/ is the second member (the LongMemEval bench shell
+# — not the runtime memory backend, which lives at mimir/saga/).
 [tool.uv.workspace]
-members = ["saga"]
+members = ["benchmarks/saga"]
 
 # Resolve the ``saga`` dependency declared in [project.dependencies]
 # from the workspace member rather than PyPI. uv installs it editable so

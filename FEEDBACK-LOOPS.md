@@ -38,7 +38,7 @@ atoms that have helped in the past get a base-level lift).
 **Latency:** within the same turn (post-message hook fires before
 TurnRecord lands).
 **Closes the loop:** yes — next-turn retrieval sees the boost.
-**Call sites:** `mimir/agent.py:444`, `saga/saga/core.py:3442`.
+**Call sites:** `mimir/agent.py`, `mimir/saga/contributions.py`.
 
 ### 1.2 Tool-result feedback — within-turn correction
 
@@ -330,8 +330,8 @@ source atoms via `evidenced_by` edges (P9 evidence boost).
 **Closes the loop:** consolidation's output feeds future retrieves;
 source-atom stability decay means low-value detail eventually fades
 out of retrieval.
-**Call sites:** `saga/saga/consolidation.py`,
-`mimir/scheduler.py:249`.
+**Call sites:** `mimir/saga/consolidate.py`,
+`mimir/scheduler.py`.
 
 ### 4.4 Saga decay — atom stability over time
 
@@ -346,8 +346,9 @@ Retrieval respects state filters (default: active + fading).
 explicit opt-in for production).
 **Closes the loop:** retrieval naturally favors recently-relevant
 atoms even without the explicit contribution boost.
-**Call sites:** `saga/saga/decay.py`, `saga/saga/core.py:469`
-(activation scoring).
+**Call sites:** `mimir/saga/activation.py` (activation scoring +
+decay schedule; the standalone `decay.py` module was folded in
+during the in-process rewrite).
 
 ### 4.5 Supersedes resolution
 
@@ -368,9 +369,9 @@ demoting stale facts in favor of their replacements.
 
 **Closes the loop:** retrieval favors current-state atoms over
 out-of-date ones automatically.
-**Call sites:** `saga/saga/core.py:402` (write-time resolver),
-`saga/saga/decay.py` (cron-driven), `saga/saga/core.py`
-`_apply_supersedes_demotion`.
+**Call sites:** `mimir/saga/store.py` (write-time resolver),
+`mimir/saga/consolidate.py` (cron-driven), supersedes-demotion
+applied inline during recall.
 
 ### 4.7 Event-introspection report — weekly behavioral snapshot
 
@@ -440,9 +441,10 @@ the source atoms within the entity-filtered pool → join RRF.
 **Closes the loop:** consolidation-time emissions feed retrieve-
 time entity lookups; entity-matched atoms participate in RRF
 fusion alongside semantic / keyword pathways.
-**Call sites:** `saga/saga/triples.py:query_world`,
-`saga/saga/core.py:_world_model_pathway`,
-`saga/saga/consolidation.py` (temporal-tag prompt extension).
+**Call sites:** `mimir/saga/triples.py` (triple extraction +
+world query), `mimir/saga/recall.py` (world-model retrieval
+pathway), `mimir/saga/consolidate.py` (temporal-tag prompt
+extension).
 
 ---
 

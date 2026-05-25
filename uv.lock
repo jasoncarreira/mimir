@@ -1375,7 +1375,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.33.1" },
-    { name = "saga", marker = "extra == 'bench'", editable = "saga" },
+    { name = "saga", marker = "extra == 'bench'", editable = "benchmarks/saga" },
     { name = "slack-bolt", marker = "extra == 'dev'", specifier = ">=1.18" },
     { name = "slack-bolt", marker = "extra == 'slack'", specifier = ">=1.18" },
 ]
@@ -2706,7 +2706,7 @@ wheels = [
 [[package]]
 name = "saga"
 version = "2026.5.19"
-source = { editable = "saga" }
+source = { editable = "benchmarks/saga" }
 dependencies = [
     { name = "openai" },
 ]

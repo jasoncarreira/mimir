@@ -3,7 +3,7 @@
 End-to-end LongMemEval bench that exercises mimir's full dispatch path
 (BenchBridge → pre_message_hook → saga query → agent response →
 post_message_hook → mark_contributions). Complementary to saga's
-direct retrieval bench at `saga/saga/benchmarks/longmemeval/`.
+direct retrieval bench at `benchmarks/saga/saga/benchmarks/longmemeval/`.
 
 ## Why two benches
 
