@@ -35,6 +35,8 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -42,6 +44,33 @@ from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    """Write JSON ``data`` to ``path`` atomically.
+
+    Uses write-to-temp + ``os.replace`` so that a partial write (e.g.
+    due to a crash or concurrent writer) never corrupts the target file.
+    POSIX guarantees that ``rename``/``os.replace`` on the same
+    filesystem is atomic; the temp file lives in the same directory as
+    ``path`` to ensure that invariant.
+
+    ``path.parent`` is created if it doesn't exist. Raises ``OSError``
+    on IO failure after the temp file is cleaned up.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(data, indent=2, default=str)
+    fd, tmp_name = tempfile.mkstemp(prefix=".rate_limits.tmp.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def running_on_claude_max() -> bool:
@@ -98,10 +127,13 @@ class RateLimitSnapshot:
 class RateLimitStore:
     """Lock-serialized JSON file at ``<home>/.mimir/rate_limits.json``.
     Multiple turns can in principle write concurrently (subagents),
-    so writes are gated through an asyncio.Lock."""
+    so writes are gated through an asyncio.Lock (async path) and a
+    threading.Lock (sync path). Both paths use atomic write-to-temp +
+    rename so a concurrent write or crash never leaves a corrupted file."""
 
     path: Path
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _thread_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     async def record(
         self,
@@ -111,15 +143,16 @@ class RateLimitStore:
         """Replace the entry for ``rate_limit_type`` with ``snapshot``.
         Best effort — on IO failure we log and move on; the prompt
         section degrades to "no plan data" rather than crashing the
-        turn."""
+        turn.
+
+        The asyncio.Lock serializes concurrent coroutine callers.
+        Writes are atomic (temp + rename) so a crash mid-write cannot
+        corrupt the file."""
         async with self._lock:
             data = self._load()
             data[rate_limit_type] = asdict(snapshot)
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                self.path.write_text(
-                    json.dumps(data, indent=2, default=str), encoding="utf-8",
-                )
+                _write_json_atomic(self.path, data)
             except OSError as exc:
                 log.warning("rate_limits.json write failed: %s", exc)
 
@@ -133,21 +166,20 @@ class RateLimitStore:
         fires inline from a streaming SSE handler on either the loop
         thread or a thread executor — figuring out which is brittle).
 
-        No async lock; relies on last-write-wins being acceptable.
-        That's true here because snapshots are monotonically refreshed
-        (each successful response carries the latest quota state) and
-        the file is small, so concurrent writes converge fast. Best-
-        effort: IO errors are logged and swallowed.
+        A threading.Lock serializes concurrent thread callers; writes
+        are atomic (temp + rename) so a crash mid-write cannot corrupt
+        the file. Last-write-wins semantics are acceptable because
+        snapshots are monotonically refreshed (each successful response
+        carries the latest quota state). Best-effort: IO errors are
+        logged and swallowed.
         """
-        data = self._load()
-        data[rate_limit_type] = asdict(snapshot)
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps(data, indent=2, default=str), encoding="utf-8",
-            )
-        except OSError as exc:
-            log.warning("rate_limits.json write failed: %s", exc)
+        with self._thread_lock:
+            data = self._load()
+            data[rate_limit_type] = asdict(snapshot)
+            try:
+                _write_json_atomic(self.path, data)
+            except OSError as exc:
+                log.warning("rate_limits.json write failed: %s", exc)
 
     def current(self) -> dict[str, RateLimitSnapshot]:
         """Return only entries whose window hasn't reset. Drops stale
