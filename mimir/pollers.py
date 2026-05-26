@@ -124,6 +124,13 @@ POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS = 300
 #: :data:`mimir.scheduler.SCHEDULER_CHANNEL_PREFIX`.
 POLLER_CHANNEL_PREFIX = "poller:"
 
+#: Current pollers.json manifest schema version understood by this build.
+#: Manifests with ``schema_version`` absent are treated as v1 (backwards
+#: compatible). Manifests with a *higher* version emit a warning but are
+#: still parsed on a best-effort basis — most field additions are additive
+#: and can be ignored safely; breaking changes would require a major bump.
+POLLER_MANIFEST_SCHEMA_VERSION = 1
+
 
 @dataclass
 class _CircuitBreakerState:
@@ -318,6 +325,21 @@ def discover_pollers(
                 pollers_file,
             )
             continue
+
+        # Schema-version gate: absent means v1 (backwards compatible).
+        # Present-but-unknown → warn and continue best-effort — field
+        # additions across minor bumps are typically additive, so the
+        # entries we *can* parse are still worth registering.
+        schema_version = raw.get("schema_version")
+        if schema_version is not None and schema_version != POLLER_MANIFEST_SCHEMA_VERSION:
+            log.warning(
+                "poller_manifest_unknown_version: %s — got schema_version=%r, "
+                "expected %d; attempting best-effort parse",
+                pollers_file,
+                schema_version,
+                POLLER_MANIFEST_SCHEMA_VERSION,
+            )
+
         entries = raw.get("pollers")
         if not isinstance(entries, list):
             log.warning(

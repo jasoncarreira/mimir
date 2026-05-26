@@ -25,6 +25,7 @@ from mimir.models import AgentEvent
 from mimir.pollers import (
     POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
     POLLER_CIRCUIT_BREAKER_THRESHOLD,
+    POLLER_MANIFEST_SCHEMA_VERSION,
     POLLER_TIMEOUT_SECONDS,
     PollerConfig,
     _CircuitBreakerState,
@@ -170,6 +171,77 @@ def test_discover_walks_nested_skill_dirs(tmp_path: Path):
     out = discover_pollers(skills)
     names = sorted(p.name for p in out)
     assert names == ["a-poll", "b-poll"]
+
+
+# ─── chainlink #91: schema_version field ─────────────────────────────
+
+
+def test_discover_accepts_schema_version_1(tmp_path: Path, caplog):
+    """schema_version=1 (the current version) must be silently accepted —
+    no warning, pollers registered normally."""
+    import logging
+
+    skills = tmp_path / "skills"
+    skill_dir = skills / "my-skill"
+    skill_dir.mkdir(parents=True)
+    manifest = {
+        "schema_version": POLLER_MANIFEST_SCHEMA_VERSION,
+        "pollers": [{"name": "p1", "command": "echo hi", "cron": "* * * * *"}],
+    }
+    (skill_dir / "pollers.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        out = discover_pollers(skills)
+
+    assert len(out) == 1
+    assert out[0].name == "p1"
+    assert not any("poller_manifest_unknown_version" in r.getMessage() for r in caplog.records)
+
+
+def test_discover_accepts_absent_schema_version(tmp_path: Path, caplog):
+    """Manifests without schema_version (legacy shape) must be accepted
+    silently — backward compatibility."""
+    import logging
+
+    skills = tmp_path / "skills"
+    skill_dir = skills / "legacy-skill"
+    _write_pollers_json(skill_dir, [{"name": "leg", "command": "echo", "cron": "* * * * *"}])
+
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        out = discover_pollers(skills)
+
+    assert len(out) == 1
+    assert out[0].name == "leg"
+    assert not any("poller_manifest_unknown_version" in r.getMessage() for r in caplog.records)
+
+
+def test_discover_warns_on_unknown_schema_version_but_still_parses(tmp_path: Path, caplog):
+    """Unknown schema_version (e.g. 99) must emit a warning and still
+    return any parseable pollers — best-effort, don't silently drop."""
+    import logging
+
+    skills = tmp_path / "skills"
+    skill_dir = skills / "future-skill"
+    skill_dir.mkdir(parents=True)
+    manifest = {
+        "schema_version": 99,
+        "pollers": [{"name": "future-p", "command": "echo", "cron": "* * * * *"}],
+    }
+    (skill_dir / "pollers.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        out = discover_pollers(skills)
+
+    # Warning emitted …
+    assert any("poller_manifest_unknown_version" in r.getMessage() for r in caplog.records)
+    warning_text = next(
+        r.getMessage() for r in caplog.records
+        if "poller_manifest_unknown_version" in r.getMessage()
+    )
+    assert "schema_version=99" in warning_text
+    # … but pollers still registered on best-effort basis.
+    assert len(out) == 1
+    assert out[0].name == "future-p"
 
 
 # ─── chainlink #84: invalid-manifest reporting + back-reference ──────
