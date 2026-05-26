@@ -1732,3 +1732,100 @@ def test_resolved_incident_no_file_falls_back_gracefully(tmp_path: Path) -> None
     # No events file either — should return empty cleanly.
     negatives, positives = log.recent()
     assert negatives == [] and positives == []
+
+
+# ---------------------------------------------------------------------------
+# Timestamp robustness tests (chainlink #199 — fromisoformat comparison)
+# ---------------------------------------------------------------------------
+
+from mimir.feedback import _is_event_resolved, _parse_resolved_ts  # noqa: E402
+
+
+def test_parse_resolved_ts_aware_stamp() -> None:
+    """Offset-bearing stamps round-trip correctly."""
+    from datetime import timezone
+    dt = _parse_resolved_ts("2026-05-25T19:30:00+00:00")
+    assert dt is not None
+    assert dt.tzinfo is not None
+    assert dt.year == 2026 and dt.month == 5 and dt.day == 25
+    assert dt.tzinfo == timezone.utc or dt.utcoffset().total_seconds() == 0
+
+
+def test_parse_resolved_ts_naive_stamp_assumed_utc() -> None:
+    """Naive stamps (no tz suffix) are treated as UTC."""
+    from datetime import timezone
+    dt = _parse_resolved_ts("2026-05-25T19:30:00")
+    assert dt is not None
+    assert dt.tzinfo == timezone.utc
+
+
+def test_parse_resolved_ts_bad_input_returns_none() -> None:
+    """Unparseable input returns None rather than raising."""
+    assert _parse_resolved_ts("not-a-date") is None
+    assert _parse_resolved_ts("") is None
+
+
+def test_is_event_resolved_naive_resolved_at_same_second() -> None:
+    """A naive resolved_at stamp at the same wall-clock second as the event
+    timestamp should correctly suppress the event (semantic equality — the
+    event predates or equals the fix).
+
+    Before chainlink #199 this was a silent bug: the naive stamp sorted
+    lexicographically before the microsecond-bearing event stamp, so the
+    rule didn't apply even though the event timestamp == resolved_at.
+    """
+    # Event at exactly T; resolved_at also at T (naive, no microseconds).
+    # The event occurred at T, the fix landed at T — event is pre-fix, so
+    # the rule should cover it (ev_dt < rule_dt is False, but ev_dt == rule_dt
+    # means "same instant" → suppressed by our < comparison, which requires
+    # ev_dt < rule_dt to suppress).
+    #
+    # Clarify the semantic: "event predates the fix" means ev_ts < resolved_at.
+    # At equality the event is AT the fix boundary — we treat it as NOT
+    # suppressed (ev_dt >= rule_dt → continue).
+    ev = {
+        "type": "error",
+        "timestamp": "2026-05-25T19:30:00.000000+00:00",  # T, with microseconds
+        "error": "some error",
+    }
+    rule = {
+        "event_type": "error",
+        "pattern": "",
+        "resolved_at": "2026-05-25T19:30:00",  # T, naive, no microseconds
+        "reason": "fix at T",
+    }
+    # ev_dt == rule_dt → NOT suppressed (event is not strictly before the fix)
+    assert not _is_event_resolved(ev, [rule])
+
+
+def test_is_event_resolved_naive_resolved_at_event_before() -> None:
+    """Event strictly before the naive resolved_at stamp IS suppressed."""
+    ev = {
+        "type": "error",
+        "timestamp": "2026-05-25T19:29:59.999999+00:00",  # 1 µs before T
+        "error": "some error",
+    }
+    rule = {
+        "event_type": "error",
+        "pattern": "",
+        "resolved_at": "2026-05-25T19:30:00",  # T, naive
+        "reason": "fix at T",
+    }
+    assert _is_event_resolved(ev, [rule])
+
+
+def test_is_event_resolved_naive_resolved_at_event_after() -> None:
+    """Event strictly after the naive resolved_at stamp is NOT suppressed
+    (the fix didn't hold)."""
+    ev = {
+        "type": "error",
+        "timestamp": "2026-05-25T19:30:01+00:00",
+        "error": "some error",
+    }
+    rule = {
+        "event_type": "error",
+        "pattern": "",
+        "resolved_at": "2026-05-25T19:30:00",  # T, naive
+        "reason": "fix at T",
+    }
+    assert not _is_event_resolved(ev, [rule])

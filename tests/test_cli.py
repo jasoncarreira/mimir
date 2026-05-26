@@ -883,3 +883,124 @@ def test_setup_does_not_write_dead_MIMIR_MODEL_env_var(tmp_path: Path):
             "MIMIR_MODEL_SPEC"
         ):
             pytest.fail(f"unexpected dead env line: {stripped!r}")
+
+
+# ---------------------------------------------------------------------------
+# ``mimir feedback mark-resolved`` CLI (chainlink #198)
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402 — already imported by helpers above; fine here
+
+
+def _run_feedback_cmd(argv: list[str]) -> int:
+    """Call ``main(argv)``; return the SystemExit code (0 on success)."""
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+    return exc_info.value.code
+
+
+def test_feedback_mark_resolved_writes_jsonl(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``mimir feedback mark-resolved`` appends a valid JSONL rule and
+    prints a confirmation."""
+    incidents = tmp_path / "resolved-incidents.jsonl"
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "mark-resolved",
+            "--type", "error",
+            "--pattern", "langchain-claude-code",
+            "--reason", "start.sh now installs the package",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "marked resolved" in captured.out
+    assert incidents.exists()
+    rules = [json.loads(line) for line in incidents.read_text().splitlines() if line.strip()]
+    assert len(rules) == 1
+    assert rules[0]["event_type"] == "error"
+    assert rules[0]["pattern"] == "langchain-claude-code"
+    assert rules[0]["reason"] == "start.sh now installs the package"
+    assert "resolved_at" in rules[0]
+
+
+def test_feedback_mark_resolved_custom_resolved_at(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``--resolved-at`` stores the supplied (normalised) timestamp."""
+    _run_feedback_cmd(
+        [
+            "feedback",
+            "mark-resolved",
+            "--type", "error",
+            "--pattern", "",
+            "--reason", "test fix",
+            "--resolved-at", "2026-05-25T12:00:00",
+            "--home", str(tmp_path),
+        ]
+    )
+    incidents = tmp_path / "resolved-incidents.jsonl"
+    rules = [json.loads(l) for l in incidents.read_text().splitlines() if l.strip()]
+    # Naive stamp should be stored as UTC-aware
+    assert rules[0]["resolved_at"] == "2026-05-25T12:00:00+00:00"
+
+
+def test_feedback_mark_resolved_invalid_resolved_at_exits_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A non-ISO --resolved-at exits with code 1 and doesn't write."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "mark-resolved",
+            "--type", "error",
+            "--reason", "test",
+            "--resolved-at", "not-a-date",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 1
+    assert not (tmp_path / "resolved-incidents.jsonl").exists()
+
+
+def test_feedback_mark_resolved_dry_run_no_write(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``--dry-run`` prints preview but does not write the file."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "mark-resolved",
+            "--type", "*",
+            "--reason", "test",
+            "--dry-run",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "dry-run" in captured.out
+    assert not (tmp_path / "resolved-incidents.jsonl").exists()
+
+
+def test_feedback_mark_resolved_unknown_type_warns(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """An unknown --type emits a warning but still writes the rule."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "mark-resolved",
+            "--type", "totally_unknown_event",
+            "--reason", "test",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "warning" in captured.err.lower() or "warning" in captured.out.lower()
+    incidents = tmp_path / "resolved-incidents.jsonl"
+    assert incidents.exists()
