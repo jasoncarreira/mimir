@@ -232,10 +232,19 @@ def build_state_index(home: Path) -> str:
 class IndexGenerator:
     """End-of-turn debounced rebuilder. Call ``mark_dirty()`` from any write
     path; call ``flush()`` from the agent loop after a turn completes.
+
+    ``skills_root`` is the directory containing one sub-directory per skill,
+    each with a ``SKILL.md`` file.  When ``None`` (default) the bundled
+    ``mimir/skills/`` directory is used (via ``skill_catalog.DEFAULT_SKILLS_ROOT``).
+    The memory flush path regenerates ``memory/skills-catalog.md`` if its
+    content drifts from a fresh generation — so any SKILL.md edit is picked
+    up at the next memory rebuild rather than only when the operator manually
+    runs ``mimir skills catalog`` (chainlink #109).
     """
 
-    def __init__(self, home: Path) -> None:
+    def __init__(self, home: Path, skills_root: Path | None = None) -> None:
         self._home = home
+        self._skills_root = skills_root  # None → defer to DEFAULT_SKILLS_ROOT
         self._dirty_memory = False
         self._dirty_state = False
         self._dirty_wiki = False
@@ -269,6 +278,37 @@ class IndexGenerator:
         tmp = path.with_suffix(".md.tmp")
         tmp.write_text(body, encoding="utf-8")
         tmp.replace(path)
+        # Regenerate skills-catalog.md if drift detected (chainlink #109).
+        # A diff check prevents unnecessary writes when nothing changed.
+        self._refresh_skills_catalog()
+
+    def _refresh_skills_catalog(self) -> None:
+        """Write ``memory/skills-catalog.md`` if it differs from a fresh
+        generation.  Silent on errors — catalog drift is recoverable; a
+        write failure here must not crash the index flush."""
+        catalog_path = self._home / "memory" / "skills-catalog.md"
+        if not catalog_path.parent.is_dir():
+            return
+        from .skill_catalog import generate as _gen_catalog  # local import: keeps cli callers thin
+        try:
+            fresh = _gen_catalog(self._skills_root)
+        except Exception:  # noqa: BLE001 — defensive; catalog regen is best-effort
+            log.warning("skills-catalog.md regeneration failed", exc_info=True)
+            return
+        existing: str = ""
+        if catalog_path.is_file():
+            try:
+                existing = catalog_path.read_text(encoding="utf-8")
+            except OSError:
+                pass  # treat missing/unreadable as empty → always write
+        if fresh == existing:
+            return  # already current; skip the write
+        tmp = catalog_path.with_suffix(".md.tmp")
+        try:
+            tmp.write_text(fresh, encoding="utf-8")
+            tmp.replace(catalog_path)
+        except OSError:
+            log.warning("failed to write skills-catalog.md", exc_info=True)
 
     def _write_state(self) -> None:
         path = self._home / "state" / "INDEX.md"
