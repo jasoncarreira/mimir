@@ -25,6 +25,7 @@ from mimir.models import AgentEvent
 from mimir.pollers import (
     POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
     POLLER_CIRCUIT_BREAKER_THRESHOLD,
+    POLLER_MANIFEST_SCHEMA_VERSION,
     POLLER_TIMEOUT_SECONDS,
     PollerConfig,
     _CircuitBreakerState,
@@ -170,6 +171,77 @@ def test_discover_walks_nested_skill_dirs(tmp_path: Path):
     out = discover_pollers(skills)
     names = sorted(p.name for p in out)
     assert names == ["a-poll", "b-poll"]
+
+
+# ─── chainlink #91: schema_version field ─────────────────────────────
+
+
+def test_discover_accepts_schema_version_1(tmp_path: Path, caplog):
+    """schema_version=1 (the current version) must be silently accepted —
+    no warning, pollers registered normally."""
+    import logging
+
+    skills = tmp_path / "skills"
+    skill_dir = skills / "my-skill"
+    skill_dir.mkdir(parents=True)
+    manifest = {
+        "schema_version": POLLER_MANIFEST_SCHEMA_VERSION,
+        "pollers": [{"name": "p1", "command": "echo hi", "cron": "* * * * *"}],
+    }
+    (skill_dir / "pollers.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        out = discover_pollers(skills)
+
+    assert len(out) == 1
+    assert out[0].name == "p1"
+    assert not any("poller_manifest_unknown_version" in r.getMessage() for r in caplog.records)
+
+
+def test_discover_accepts_absent_schema_version(tmp_path: Path, caplog):
+    """Manifests without schema_version (legacy shape) must be accepted
+    silently — backward compatibility."""
+    import logging
+
+    skills = tmp_path / "skills"
+    skill_dir = skills / "legacy-skill"
+    _write_pollers_json(skill_dir, [{"name": "leg", "command": "echo", "cron": "* * * * *"}])
+
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        out = discover_pollers(skills)
+
+    assert len(out) == 1
+    assert out[0].name == "leg"
+    assert not any("poller_manifest_unknown_version" in r.getMessage() for r in caplog.records)
+
+
+def test_discover_warns_on_unknown_schema_version_but_still_parses(tmp_path: Path, caplog):
+    """Unknown schema_version (e.g. 99) must emit a warning and still
+    return any parseable pollers — best-effort, don't silently drop."""
+    import logging
+
+    skills = tmp_path / "skills"
+    skill_dir = skills / "future-skill"
+    skill_dir.mkdir(parents=True)
+    manifest = {
+        "schema_version": 99,
+        "pollers": [{"name": "future-p", "command": "echo", "cron": "* * * * *"}],
+    }
+    (skill_dir / "pollers.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        out = discover_pollers(skills)
+
+    # Warning emitted …
+    assert any("poller_manifest_unknown_version" in r.getMessage() for r in caplog.records)
+    warning_text = next(
+        r.getMessage() for r in caplog.records
+        if "poller_manifest_unknown_version" in r.getMessage()
+    )
+    assert "schema_version=99" in warning_text
+    # … but pollers still registered on best-effort basis.
+    assert len(out) == 1
+    assert out[0].name == "future-p"
 
 
 # ─── chainlink #84: invalid-manifest reporting + back-reference ──────
@@ -1559,6 +1631,90 @@ print('{"poller": "x", "prompt": "ok"}')
     # Value must NOT leak into the event payload.
     payload = json.dumps(passthrough_events[0])
     assert "ghp_secret_should_not_appear_in_event" not in payload
+
+
+# ─── chainlink #95: poller.env secret-key warning ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_poller_env_secret_key_emits_warning(tmp_path: Path, home: Path) -> None:
+    """When ``poller.env`` contains a key whose name matches a deny-list
+    pattern (``*_TOKEN``, ``*_API_KEY``, ``MIMIR_*``), the framework emits
+    a ``poller_env_secret_reintroduced`` warning event.
+
+    ``poller.env`` is the literal-value path for static config; ``pass_env``
+    is the documented path for forwarding live secrets.  A careless operator
+    who writes ``env: { MY_API_KEY: "..." }`` in pollers.json re-exposes a
+    deny-list key without realising it — the event surfaces this as an
+    algedonic negative so the misconfiguration is visible.
+    """
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print('{"poller": "x", "prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"MY_API_KEY": "literal_static_value"},
+        skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    warn_events = [e for e in events if e.get("type") == "poller_env_secret_reintroduced"]
+    assert len(warn_events) == 1
+    assert warn_events[0].get("poller") == "x"
+    assert warn_events[0].get("key") == "MY_API_KEY"
+    # Value must NOT appear in the event payload.
+    payload = json.dumps(warn_events[0])
+    assert "literal_static_value" not in payload
+
+
+@pytest.mark.asyncio
+async def test_run_poller_env_non_secret_key_no_warning(tmp_path: Path, home: Path) -> None:
+    """``poller.env`` keys whose names do NOT match deny-list patterns must
+    NOT emit a ``poller_env_secret_reintroduced`` event — only genuinely
+    secret-named keys trigger the warning."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print('{"poller": "x", "prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"GITHUB_REPOS": "owner/repo", "POLL_INTERVAL": "60"},
+        skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    warn_events = [e for e in events if e.get("type") == "poller_env_secret_reintroduced"]
+    assert warn_events == []
+
+
+@pytest.mark.asyncio
+async def test_run_poller_env_mimir_prefix_key_emits_warning(tmp_path: Path, home: Path) -> None:
+    """``MIMIR_*``-prefixed keys in ``poller.env`` also trigger the
+    ``poller_env_secret_reintroduced`` warning (same deny-prefix logic)."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print('{"poller": "x", "prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"MIMIR_SOME_INTERNAL_KEY": "value"},
+        skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    warn_events = [e for e in events if e.get("type") == "poller_env_secret_reintroduced"]
+    assert len(warn_events) == 1
+    assert warn_events[0].get("key") == "MIMIR_SOME_INTERNAL_KEY"
 
 
 # ─── Algedonic signals from pollers ──────────────────────────────────

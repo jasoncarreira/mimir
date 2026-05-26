@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,8 @@ import pytest
 from mimir.skill_catalog import (
     SkillEntry,
     _extract_trigger,
+    _load_catalog_inner,
+    cmd,
     generate,
     load_catalog,
     load_skill,
@@ -147,6 +150,22 @@ def test_render_catalog_smoke(tmp_path: Path) -> None:
     assert "### `beta`" in output
 
 
+def test_render_catalog_schema_version_marker() -> None:
+    """render_catalog emits a catalog-schema version comment near the top.
+
+    Downstream parsers that rely on the three-column shape (Skill / Trigger /
+    Allowed tools) should key on this marker rather than column indices alone.
+    A v1 → v2 bump signals a breaking column change.
+    """
+    output = render_catalog([])
+    assert "<!-- catalog-schema: v1 -->" in output
+    lines = output.splitlines()
+    # Marker must be in the first three lines (after the desc comment and
+    # before the h1 title) so parsers can detect it without scanning the
+    # full file.
+    assert any("catalog-schema: v1" in line for line in lines[:3])
+
+
 def test_render_catalog_handles_empty_allowed_tools() -> None:
     entries = [
         SkillEntry(
@@ -281,3 +300,93 @@ def test_generate_is_idempotent(tmp_path: Path) -> None:
     first = generate(tmp_path)
     second = generate(tmp_path)
     assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Malformed-SKILL.md stderr warning + --strict flag (chainlink #105)
+# ---------------------------------------------------------------------------
+
+
+def test_load_skill_emits_stderr_on_malformed_frontmatter(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A SKILL.md with broken YAML emits a WARNING to stderr and returns None."""
+    skill_dir = _make_skill(tmp_path, "broken", "no frontmatter here\n")
+    result = load_skill(skill_dir)
+    assert result is None
+    captured = capsys.readouterr()
+    assert "WARNING:" in captured.err
+    assert "broken" in captured.err
+    assert "parse error" in captured.err
+
+
+def test_load_skill_no_stderr_when_skill_md_missing(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A missing SKILL.md (not a skill dir) is silently skipped — no warning."""
+    (tmp_path / "notaskill").mkdir()
+    result = load_skill(tmp_path / "notaskill")
+    assert result is None
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_load_catalog_inner_counts_parse_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """_load_catalog_inner returns (entries, error_count); good skills are
+    included, bad ones are counted in the error total."""
+    _make_skill(tmp_path, "good", "---\nname: good\ndescription: A good skill.\n---\n")
+    _make_skill(tmp_path, "bad", "no frontmatter at all\n")
+    entries, error_count = _load_catalog_inner(tmp_path)
+    assert [e.name for e in entries] == ["good"]
+    assert error_count == 1
+    # The parse failure was reported on stderr.
+    captured = capsys.readouterr()
+    assert "WARNING:" in captured.err
+
+
+def test_load_catalog_inner_no_skill_md_not_counted_as_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Dirs without a SKILL.md are skipped silently — not counted as errors."""
+    (tmp_path / "not-a-skill").mkdir()  # dir with no SKILL.md
+    _make_skill(tmp_path, "real", "---\nname: real\ndescription: Real skill.\n---\n")
+    entries, error_count = _load_catalog_inner(tmp_path)
+    assert error_count == 0
+    assert [e.name for e in entries] == ["real"]
+    assert capsys.readouterr().err == ""
+
+
+def test_cmd_strict_exits_1_on_parse_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``mimir skills catalog --strict`` exits 1 when any SKILL.md is malformed."""
+    _make_skill(tmp_path, "bad", "no frontmatter\n")
+    args = argparse.Namespace(out=None, skills_root=tmp_path, strict=True)
+    exit_code = cmd(args)
+    assert exit_code == 1
+
+
+def test_cmd_strict_exits_0_when_all_valid(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``mimir skills catalog --strict`` exits 0 when every SKILL.md parses cleanly."""
+    _make_skill(tmp_path, "good", "---\nname: good\ndescription: A good skill.\n---\n")
+    args = argparse.Namespace(out=None, skills_root=tmp_path, strict=True)
+    exit_code = cmd(args)
+    assert exit_code == 0
+
+
+def test_cmd_non_strict_exits_0_even_with_parse_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Without --strict, the command exits 0 even when SKILL.md files are broken
+    (operator still sees warnings on stderr, but the catalog is still generated)."""
+    _make_skill(tmp_path, "bad", "no frontmatter\n")
+    args = argparse.Namespace(out=None, skills_root=tmp_path, strict=False)
+    exit_code = cmd(args)
+    assert exit_code == 0
+    # Warning still emitted to stderr.
+    captured = capsys.readouterr()
+    assert "WARNING:" in captured.err

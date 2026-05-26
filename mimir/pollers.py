@@ -124,6 +124,13 @@ POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS = 300
 #: :data:`mimir.scheduler.SCHEDULER_CHANNEL_PREFIX`.
 POLLER_CHANNEL_PREFIX = "poller:"
 
+#: Current pollers.json manifest schema version understood by this build.
+#: Manifests with ``schema_version`` absent are treated as v1 (backwards
+#: compatible). Manifests with a *higher* version emit a warning but are
+#: still parsed on a best-effort basis — most field additions are additive
+#: and can be ignored safely; breaking changes would require a major bump.
+POLLER_MANIFEST_SCHEMA_VERSION = 1
+
 
 @dataclass
 class _CircuitBreakerState:
@@ -318,6 +325,21 @@ def discover_pollers(
                 pollers_file,
             )
             continue
+
+        # Schema-version gate: absent means v1 (backwards compatible).
+        # Present-but-unknown → warn and continue best-effort — field
+        # additions across minor bumps are typically additive, so the
+        # entries we *can* parse are still worth registering.
+        schema_version = raw.get("schema_version")
+        if schema_version is not None and schema_version != POLLER_MANIFEST_SCHEMA_VERSION:
+            log.warning(
+                "poller_manifest_unknown_version: %s — got schema_version=%r, "
+                "expected %d; attempting best-effort parse",
+                pollers_file,
+                schema_version,
+                POLLER_MANIFEST_SCHEMA_VERSION,
+            )
+
         entries = raw.get("pollers")
         if not isinstance(entries, list):
             log.warning(
@@ -600,6 +622,26 @@ async def run_poller(
                 key=key,
             )
     env.update(poller.env)  # explicit per-skill overlay still wins
+    # chainlink #95: warn when poller.env re-introduces a key whose name
+    # matches the deny-list patterns.  ``pass_env`` is the documented path
+    # for forwarding live secrets from os.environ; ``poller.env`` is the
+    # literal-value path meant for static config — not secrets.  Operators
+    # who accidentally write ``env: { MY_API_KEY: "${MY_API_KEY}" }`` in
+    # pollers.json re-expose a denied key without realising it (the
+    # ``${…}`` is NOT shell-expanded — pollers.py coerces values to str
+    # at parse time, so the literal string "${MY_API_KEY}" reaches the
+    # subprocess, which is confusing but also signals the operator put
+    # the wrong thing in ``env``).  Emit a negative event so the algedonic
+    # block surfaces this configuration smell.  The value is NOT logged.
+    for key in poller.env:
+        if any(key.endswith(s) for s in _DENY_SUFFIXES) or any(
+            key.startswith(p) for p in _DENY_PREFIXES
+        ):
+            await log_event(
+                "poller_env_secret_reintroduced",
+                poller=poller.name,
+                key=key,
+            )
     env["STATE_DIR"] = str(persist_dir)
     env["POLLER_NAME"] = poller.name
 
