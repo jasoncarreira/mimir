@@ -90,6 +90,8 @@ The line immediately after the closing `---` of frontmatter should be an HTML co
 
 The auto-managed `memory/INDEX.md` (and `state/INDEX.md`) scrape this line to render the file's row in the every-turn-visible index. Without it, the indexer falls back to the first sentence prefixed with `[auto]` — usable but lower-signal for skill authors who want their skill discovered.
 
+**Important scope note**: SKILL.md files are **not** currently walked by the memory indexer. The desc-line in a SKILL.md is a convention for human readers and future tooling — it is not scraped into `memory/INDEX.md` or `state/INDEX.md` today. The live skill discovery path is `memory/skills-catalog.md` (maintained by `mimir skills catalog`, regenerated on index drift). If the memory indexer is extended to walk skill directories in a future release, the desc-line would automatically become the index entry — that's why the convention is enforced now.
+
 Conventions:
 - Single line, ≤200 chars. The row appears in the system prompt every turn — keep it dense.
 - Agent-facing voice (what the skill *does*), not engineer-facing (which chainlink filed it, what commit shipped it).

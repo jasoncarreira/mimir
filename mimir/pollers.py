@@ -124,6 +124,13 @@ POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS = 300
 #: :data:`mimir.scheduler.SCHEDULER_CHANNEL_PREFIX`.
 POLLER_CHANNEL_PREFIX = "poller:"
 
+# Pollers manifest schema version history:
+#
+#   v1 (2026-05-26, chainlink #91): introduced the ``schema_version`` field.
+#     Manifests without ``schema_version`` are treated as v1 for backwards
+#     compatibility. Manifests with an unknown version emit a warning but are
+#     still parsed on a best-effort basis (breaking changes require a bump).
+#
 #: Current pollers.json manifest schema version understood by this build.
 #: Manifests with ``schema_version`` absent are treated as v1 (backwards
 #: compatible). Manifests with a *higher* version emit a warning but are
