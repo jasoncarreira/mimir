@@ -189,6 +189,12 @@ def render_catalog(entries: list[SkillEntry]) -> str:
     - Cell values may change as skills are added, renamed, or updated.
     - Downstream parsers should key on the ``<!-- catalog-schema: vN -->``
       comment in the first two lines, not on column indices alone.
+
+    Catalog schema version history:
+
+    v1 (2026-05-26, chainlink #103): initial schema.  Three columns
+      (``Skill``, ``Trigger``, ``Allowed tools``) with stable names and
+      order.  Breaking changes require a ``catalog-schema: v2`` bump.
     """
     lines: list[str] = []
     lines.append("<!-- desc: All bundled mimir skills, one row per skill (name, trigger phrase, allowed tools). Use to find which skill applies to a problem. Regen via `mimir skills catalog`. -->")
