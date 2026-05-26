@@ -2,10 +2,16 @@
 name: weather
 description: Get current conditions and 5-day forecast for a city via OpenWeatherMap. Requires `OPENWEATHER_API_KEY` in the environment. Use when the user asks about weather or when planning anything where weather is load-bearing (outdoor events, travel, watering schedules).
 success_criteria:
-  # The skill's job is to run get_weather.py and report. If we loaded
+  # The skill's job is to run get_weather and report. If we loaded
   # the SKILL.md but never invoked the script, the question wasn't
-  # actually answered.
+  # actually answered. The glob matches both the module-style
+  # invocation (preferred — works from any cwd) and a direct script
+  # invocation (legacy / advanced).
   any_of:
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "*mimir.skills.weather.get_weather*"
     - tool_call:
         name: Bash
         args:
@@ -21,13 +27,19 @@ exported (set it in `mimirbot/.env` if running there).
 
 ## Usage
 
+Invoke via Python module syntax so the path works from any cwd —
+mimir's bundled skills live inside the installed `mimir` package
+(at `mimir/skills/weather/get_weather.py`), reachable via `-m`
+regardless of where the venv lands or what directory the shell
+tool spawns from.
+
 ```bash
 # Default location (set inside the script — Victor, NY, US).
-python3 skills/weather/get_weather.py
+python3 -m mimir.skills.weather.get_weather
 
 # Specific city. Comma-separated; ISO country codes for disambiguation.
-python3 skills/weather/get_weather.py "London,UK"
-python3 skills/weather/get_weather.py "San Francisco,CA,US"
+python3 -m mimir.skills.weather.get_weather "London,UK"
+python3 -m mimir.skills.weather.get_weather "San Francisco,CA,US"
 ```
 
 Default output is plain text (current conditions + 5-day high/low/precip).
@@ -35,7 +47,7 @@ Add `--json` when you want to format the output yourself or pull specific
 fields:
 
 ```bash
-python3 skills/weather/get_weather.py "Tokyo,JP" --json
+python3 -m mimir.skills.weather.get_weather "Tokyo,JP" --json
 ```
 
 The JSON shape:
