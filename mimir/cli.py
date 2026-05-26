@@ -2212,6 +2212,49 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .commitments import cli as _commitments_cli
     _commitments_cli.add_argparse(commitments_p)
 
+    # ``mimir feedback mark-resolved`` — writer side of resolved-incidents.jsonl
+    # (chainlink #197 shipped the consumer; chainlink #198 ships this writer).
+    # Lets operators mark a known error pattern as resolved without hand-crafting
+    # JSONL or risking timestamp format mismatch.
+    feedback_p = sub.add_parser(
+        "feedback",
+        help="Feedback observability helpers (mark-resolved, future list/delete).",
+    )
+    feedback_sub = feedback_p.add_subparsers(dest="feedback_action")
+
+    feedback_mr_p = feedback_sub.add_parser(
+        "mark-resolved",
+        help="Append a resolved-incident rule to resolved-incidents.jsonl so matching "
+             "events are silenced from the algedonic feedback block.",
+    )
+    feedback_mr_p.add_argument(
+        "--type", required=True, dest="event_type",
+        help="Event type to suppress, or '*' to match any type.",
+    )
+    feedback_mr_p.add_argument(
+        "--pattern", default="",
+        help="Substring to match against the event JSON (empty = match all events "
+             "of the given type).",
+    )
+    feedback_mr_p.add_argument(
+        "--reason", required=True,
+        help="Free-text rationale for marking resolved (stored in the JSONL line).",
+    )
+    feedback_mr_p.add_argument(
+        "--resolved-at", default=None, dest="resolved_at",
+        help="ISO-8601 timestamp the fix landed (default: now() UTC).  Suppresses "
+             "events timestamped *before* this value.",
+    )
+    feedback_mr_p.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="Preview how many events in the current 24h window would be filtered; "
+             "don't write to resolved-incidents.jsonl.",
+    )
+    feedback_mr_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
     reindex_p = sub.add_parser(
         "reindex",
         help="Re-embed saga atoms and/or file_search chunks under the "
@@ -2479,6 +2522,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             sys.exit(1)
         from .commitments import cli as _commitments_cli
         sys.exit(_commitments_cli.dispatch(args))
+
+    if args.command == "feedback":
+        if args.feedback_action == "mark-resolved":
+            from .feedback_cmd import run_mark_resolved
+            home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+            sys.exit(run_mark_resolved(
+                home=home,
+                event_type=args.event_type,
+                pattern=args.pattern,
+                reason=args.reason,
+                resolved_at=args.resolved_at,
+                dry_run=args.dry_run,
+            ))
+        feedback_p.print_help()
+        sys.exit(1)
 
     if args.command == "reindex":
         from . import reindex as _reindex

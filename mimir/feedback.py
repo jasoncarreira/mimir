@@ -1768,6 +1768,25 @@ def _load_resolved_incidents(path: Path) -> list[dict]:
     return rules
 
 
+def _parse_resolved_ts(s: str) -> "datetime | None":
+    """Parse an ISO-8601 timestamp string to a timezone-aware datetime.
+
+    Accepts both offset-aware (``2026-05-25T19:30:00+00:00``) and naive
+    (``2026-05-25T19:30:00``) forms.  Naive stamps are assumed UTC — the
+    operator-curated file follows mimir's UTC convention throughout.
+    Returns ``None`` on any parse error so callers can skip bad entries
+    gracefully.
+    """
+    from datetime import datetime, timezone  # local import — same module
+    try:
+        dt = datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _is_event_resolved(ev: dict, rules: list[dict]) -> bool:
     """Return True if ``ev`` should be hidden because a resolved-incident
     rule covers it.
@@ -1777,10 +1796,18 @@ def _is_event_resolved(ev: dict, rules: list[dict]) -> bool:
     2. ``rule["pattern"]`` (if non-empty) is a substring of the JSON
        serialisation of the event.
     3. ``ev["timestamp"] < rule["resolved_at"]`` (the event predates the fix).
+
+    Timestamps are compared as timezone-aware ``datetime`` objects rather
+    than raw strings (chainlink #199) so operator-written naive stamps like
+    ``2026-05-25T19:30:00`` compare correctly against the microsecond-bearing
+    event timestamps in ``events.jsonl``.
     """
     ev_type = ev.get("type", "")
-    ev_ts = ev.get("timestamp", "")
-    if not isinstance(ev_ts, str):
+    ev_ts_str = ev.get("timestamp", "")
+    if not isinstance(ev_ts_str, str):
+        return False
+    ev_dt = _parse_resolved_ts(ev_ts_str)
+    if ev_dt is None:
         return False
     ev_json: str | None = None  # lazy — only serialise if needed
     for rule in rules:
@@ -1788,6 +1815,9 @@ def _is_event_resolved(ev: dict, rules: list[dict]) -> bool:
         rule_pattern = rule.get("pattern", "")
         rule_resolved_at = rule.get("resolved_at", "")
         if not isinstance(rule_resolved_at, str) or not rule_resolved_at:
+            continue
+        rule_dt = _parse_resolved_ts(rule_resolved_at)
+        if rule_dt is None:
             continue
         # 1. Type match
         if rule_type != "*" and ev_type != rule_type:
@@ -1799,7 +1829,7 @@ def _is_event_resolved(ev: dict, rules: list[dict]) -> bool:
             if rule_pattern not in ev_json:
                 continue
         # 3. Timestamp: event must predate the resolution
-        if ev_ts >= rule_resolved_at:
+        if ev_dt >= rule_dt:
             continue
         return True
     return False
