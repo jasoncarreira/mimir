@@ -87,6 +87,7 @@ Output strictly-valid JSON matching this schema:
       "due_window_hint": "ISO 8601 datetime OR relative phrase OR null",
       "confidence": 0.0-1.0,
       "channel_bound": true | false,
+      "recipient_name": "person's name or handle this commitment is FOR, or null",
       "suggested_reminder": "what to say at delivery, <=200 chars"
     }
   ]
@@ -104,6 +105,10 @@ Rules:
   (someone's PR, draft post); "routine" for ops/work tracking.
 - due_window_hint: pass through what the source says ("Thursday",
   "next sprint", "soon", "tomorrow"). Null only if truly absent.
+- recipient_name: set to the person's name/handle when the commitment
+  is explicitly directed at someone ("send Bob the draft", "remind
+  Alice about the PR"). Null for agent-internal obligations or when
+  no specific person is named.
 
 Recognize passive phrasing. "Remain live", "still-gated", "still-unfinished",
 "carry forward", "carried over", "carries forward" -- these signal commitments
@@ -240,6 +245,15 @@ def _coerce_to_record(
     if sensitivity not in _VALID_SENSITIVITIES:
         sensitivity = CommitmentSensitivity.ROUTINE.value
     suggested_reminder = (item.get("suggested_reminder") or text).strip()
+    # Chainlink #96: extract recipient_name from schema (raw display name
+    # or handle the LLM picked up from conversation context).  Not a
+    # resolved canonical identity — just whatever name appeared in the
+    # synthesis text ("Bob", "Jason", "mimir-carreira").  Store as
+    # recipient_identity so the delivery layer can @-mention it.
+    recipient_identity: str | None = None
+    raw_recipient = item.get("recipient_name")
+    if isinstance(raw_recipient, str) and raw_recipient.strip():
+        recipient_identity = raw_recipient.strip()[:100]
     # PR #125 review #5: default-False is safer than default-True for
     # poller-driven session-ends. Most poller channels (e.g.
     # ``poller:github-activity``) are non-personal; a missed
@@ -294,6 +308,7 @@ def _coerce_to_record(
         due_window_start_unix=due_window_start_unix,
         due_window_end_unix=None,
         due_window_hint=due_window_hint,
+        recipient_identity=recipient_identity,
         confidence=confidence,
         source_turn_id=source_turn_id,
         saga_session_id=saga_session_id,
@@ -306,7 +321,7 @@ def _coerce_to_record(
         channel_id=bound_channel,
         text=rec.text,
         due_window_start_unix=due_window_start_unix,
-        recipient_identity=None,
+        recipient_identity=recipient_identity,
     )
     return rec
 

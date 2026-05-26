@@ -252,6 +252,53 @@ def test_coerce_iso_datetime_dedupe_key_uses_day_bucket():
     assert rec.dedupe_key != no_date_key
 
 
+# ── chainlink #96: recipient_name → recipient_identity ──────────────
+
+
+def test_coerce_recipient_name_stored_as_recipient_identity():
+    """LLM-supplied recipient_name must land on the record's
+    recipient_identity field (chainlink #96)."""
+    rec = _coerce_to_record(
+        {"text": "send Bob the draft", "confidence": 0.9,
+         "recipient_name": "Bob"},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert rec is not None
+    assert rec.recipient_identity == "Bob"
+
+
+def test_coerce_recipient_name_missing_or_empty_leaves_none():
+    """Missing or empty recipient_name must leave recipient_identity as None."""
+    for item in [
+        {"text": "read the paper", "confidence": 0.9},
+        {"text": "read the paper", "confidence": 0.9, "recipient_name": None},
+        {"text": "read the paper", "confidence": 0.9, "recipient_name": ""},
+        {"text": "read the paper", "confidence": 0.9, "recipient_name": "   "},
+    ]:
+        rec = _coerce_to_record(
+            item, channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+        )
+        assert rec is not None
+        assert rec.recipient_identity is None, f"Expected None for item={item!r}"
+
+
+def test_coerce_recipient_name_affects_dedupe_key():
+    """Two commitments with the same text+channel but different
+    recipient_name values must have distinct dedupe keys so neither
+    silently absorbs the other (chainlink #96)."""
+    alice_rec = _coerce_to_record(
+        {"text": "send the draft", "confidence": 0.9, "recipient_name": "Alice"},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    bob_rec = _coerce_to_record(
+        {"text": "send the draft", "confidence": 0.9, "recipient_name": "Bob"},
+        channel_id="ch-1", saga_session_id="s1", source_turn_id="t1",
+    )
+    assert alice_rec is not None
+    assert bob_rec is not None
+    assert alice_rec.dedupe_key != bob_rec.dedupe_key
+
+
 # ── extract_commitments (end-to-end with stub model) ────────────────
 
 
