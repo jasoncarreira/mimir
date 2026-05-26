@@ -559,6 +559,7 @@ class Agent:
             default_limit_per_polarity=config.feedback_limit_per_polarity,
             events_snapshot=self._events_snapshot,
             turns_snapshot=self._turns_snapshot,
+            resolved_incidents_path=config.home / "resolved-incidents.jsonl",
         )
         # Plan-window rate-limit state — real RateLimitStore (replaces
         # the deprecated _RateLimitStub). The oauth_usage_poller writes
