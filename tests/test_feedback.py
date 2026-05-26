@@ -1477,3 +1477,113 @@ def test_alg3_below_threshold_no_escalation(tmp_path: Path):
         )
     finally:
         _reset_logger_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# chainlink #196 — poller circuit-breaker algedonic rendering
+# ---------------------------------------------------------------------------
+
+def test_poller_circuit_open_same_poller_deduplicates_to_one_entry(
+    tmp_path: Path,
+) -> None:
+    """Multiple poller_circuit_open events for the same poller collapse to one
+    algedonic entry via content-level dedup.  The renderer includes the poller
+    name but NOT remaining_seconds, so all same-poller events produce the same
+    content string.  The ×N count still reflects total fires in the window."""
+    log = _make_log(tmp_path, events=[
+        # 5 suppressed runs during a 5-minute backoff window, same poller.
+        {
+            "timestamp": _ts(0.1),
+            "type": "poller_circuit_open",
+            "poller": "social-cli-feed",
+            "remaining_seconds": 45,
+            "consecutive_failures": 3,
+        },
+        {
+            "timestamp": _ts(0.2),
+            "type": "poller_circuit_open",
+            "poller": "social-cli-feed",
+            "remaining_seconds": 105,
+            "consecutive_failures": 3,
+        },
+        {
+            "timestamp": _ts(0.3),
+            "type": "poller_circuit_open",
+            "poller": "social-cli-feed",
+            "remaining_seconds": 165,
+            "consecutive_failures": 3,
+        },
+        {
+            "timestamp": _ts(0.4),
+            "type": "poller_circuit_open",
+            "poller": "social-cli-feed",
+            "remaining_seconds": 225,
+            "consecutive_failures": 3,
+        },
+        {
+            "timestamp": _ts(0.5),
+            "type": "poller_circuit_open",
+            "poller": "social-cli-feed",
+            "remaining_seconds": 285,
+            "consecutive_failures": 3,
+        },
+    ])
+    negatives, _ = log.recent()
+    # Exactly one entry despite 5 events — content-level dedup works.
+    assert len(negatives) == 1
+    assert negatives[0].kind == "poller_circuit_open"
+    # Count reflects all 5 fires in the window.
+    assert negatives[0].count == 5
+    assert "social-cli-feed" in negatives[0].content
+
+
+def test_poller_circuit_open_different_pollers_surface_separately(
+    tmp_path: Path,
+) -> None:
+    """poller_circuit_open events for DIFFERENT pollers produce separate
+    algedonic entries — the per-poller content string is distinct.  This lets
+    the operator see which pollers are in a tripped state without having all
+    events collapsed into a single opaque line."""
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.1),
+            "type": "poller_circuit_open",
+            "poller": "social-cli-feed",
+            "remaining_seconds": 45,
+            "consecutive_failures": 3,
+        },
+        {
+            "timestamp": _ts(0.2),
+            "type": "poller_circuit_open",
+            "poller": "strix-cybernetics",
+            "remaining_seconds": 120,
+            "consecutive_failures": 4,
+        },
+    ])
+    negatives, _ = log.recent()
+    # Two entries — one per poller.
+    assert len(negatives) == 2
+    kinds = [s.kind for s in negatives]
+    assert kinds.count("poller_circuit_open") == 2
+    contents = [s.content for s in negatives]
+    assert any("social-cli-feed" in c for c in contents)
+    assert any("strix-cybernetics" in c for c in contents)
+
+
+def test_poller_circuit_tripped_renders_poller_name(tmp_path: Path) -> None:
+    """poller_circuit_tripped renderer includes the poller name and failure
+    count — the operator sees which poller tripped without reading raw logs."""
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.1),
+            "type": "poller_circuit_tripped",
+            "poller": "github-activity",
+            "consecutive_failures": 3,
+            "backoff_seconds": 300,
+        },
+    ])
+    negatives, _ = log.recent()
+    assert len(negatives) == 1
+    assert negatives[0].kind == "poller_circuit_tripped"
+    assert "github-activity" in negatives[0].content
+    assert "3" in negatives[0].content  # failure count present
