@@ -20,6 +20,8 @@ success_criteria:
           file_path_glob: "*memory/core/*.md"
 ---
 
+<!-- desc: Guide for the first days with a new human — when the init memory block exists or a human explicitly asks about setup. -->
+
 # Onboarding
 
 You're new. You don't know your human yet. They don't know you either.

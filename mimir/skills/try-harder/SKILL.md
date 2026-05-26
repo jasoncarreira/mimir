@@ -3,6 +3,8 @@ name: try-harder
 description: The menu of non-grit moves available when you'd otherwise reach for "I'll do better next time." Use when you catch yourself resolving to "be more careful," "remember to X," or "try harder" — those resolutions die at the turn boundary. The right shape is always a structural change with a verifiable diff: edit a memory file, edit a skill that misled you, log a chainlink interest item, add a poller for the missed signal, file a five-whys. The artifact must outlive the turn.
 ---
 
+<!-- desc: The menu of non-grit structural moves available when you'd otherwise resolve to "try harder" — edit memory, update a skill, log chainlink, add a poller. -->
+
 # Try Harder
 
 When a human is told to "try harder," it doesn't really work — even for humans. Effort

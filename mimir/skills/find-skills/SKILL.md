@@ -16,6 +16,8 @@ success_criteria:
           command_glob: "*.mimir_builtin_skills*"
 ---
 
+<!-- desc: Discover what bundled skills exist and what each does — reads SKILL.md frontmatter from each skill directory. -->
+
 # Find Skills
 
 mimir's bundled skills live under `skills/<name>/SKILL.md` (relative

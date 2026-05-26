@@ -95,7 +95,7 @@ Conventions:
 - Agent-facing voice (what the skill *does*), not engineer-facing (which chainlink filed it, what commit shipped it).
 - Stable across revisions — if the skill's purpose changes substantially, change the `<!-- desc: -->`; if just the body changed, leave the comment alone.
 
-The conformance test does NOT currently fail-loud on a missing `<!-- desc: -->`; the indexer falls back gracefully (see `tests/test_skill_conformance.py` for the current coverage shape). Treat it as a soft requirement — landing it improves your skill's discoverability without breaking CI.
+The conformance test (`test_skill_md_body_starts_with_desc_comment` in `tests/test_skill_conformance.py`) enforces this — a missing `<!-- desc: -->` is a CI failure (chainlink #102). The line is required; the indexer's `[auto]` fallback path is a lint-only safety net, not a production path.
 
 ## Why no `allowed-tools` field
 
@@ -110,7 +110,7 @@ The skill body still describes which tools the procedure uses in prose; that doc
 
 - **YAML folded scalars** (`description: >`): the bundled `mimir/skill_md.py` parser handles `description: >` and `description: |` blocks correctly (covered by `test_parse_frontmatter_handles_folded_description`; `mimir/skills/onboarding/SKILL.md` ships using folded form), so mimir's own catalog + INDEX rendering is fine. The pitfall is for *downstream* tooling that uses `yaml.safe_load` directly: if the next key sits at the same indent without a blank-line separator, `yaml.safe_load` can fold it into the description's value. Stick to plain quoted strings if you want maximum portability across tooling that doesn't go through `mimir/skill_md.py`.
 - **Stale catalog**: after editing a SKILL.md, run `mimir skills catalog` to regenerate `memory/skills-catalog.md`. The catalog isn't auto-regenerated on file write today.
-- **Missing `<!-- desc: -->`**: indexer falls back to `[auto]` + first sentence. Functional, but the per-skill prompt row gets less specific.
+- **Missing `<!-- desc: -->`**: CI fails (`test_skill_md_body_starts_with_desc_comment`). Add the comment immediately — see step 3 of the Authoring Checklist below.
 
 ## Authoring Checklist
 

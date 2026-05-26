@@ -74,6 +74,45 @@ def test_skill_md_has_required_frontmatter(skill_dir: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("skill_dir", _bundled_skill_dirs(), ids=lambda p: p.name)
+def test_skill_md_body_starts_with_desc_comment(skill_dir: Path) -> None:
+    """Each bundled SKILL.md body must start with ``<!-- desc: ... -->``
+    (chainlink #102).
+
+    The skill-creator authoring guide (mimir/skills/skill-creator/SKILL.md,
+    §"The ``<!-- desc: -->`` first-body-line convention") requires this as
+    step 3 of authoring a new skill. The conformance test now enforces it.
+
+    The body ``<!-- desc: -->`` describes "what's in this file" for the
+    indexer (``core_blocks.describe_file()``) and future tools. It is
+    distinct from the frontmatter ``description:`` (which drives the catalog
+    trigger phrase): the body desc is the file-content summary, the
+    frontmatter desc is the operator-facing "when to use" signal.
+    """
+    skill_md = skill_dir / "SKILL.md"
+    text = skill_md.read_text()
+    # Find body start: everything after the closing "---" of frontmatter.
+    lines = text.split("\n")
+    body_start = 0
+    if lines and lines[0].strip() == "---":
+        for i, line in enumerate(lines[1:], 1):
+            if line.strip() == "---":
+                body_start = i + 1
+                break
+    # First non-blank body line must be <!-- desc: ... -->.
+    first_body = next(
+        (ln.strip() for ln in lines[body_start:] if ln.strip()), ""
+    )
+    assert first_body.startswith("<!-- desc:") and first_body.endswith("-->"), (
+        f"{skill_dir.name}/SKILL.md: body does not start with ``<!-- desc: ... -->``.\n"
+        f"  First body line: {first_body[:80]!r}\n"
+        f"  Add ``<!-- desc: <one-line summary> -->`` as the first line of the "
+        f"skill body (after the closing ``---`` of frontmatter). See "
+        f"mimir/skills/skill-creator/SKILL.md §'The desc first-body-line "
+        f"convention' for the pattern."
+    )
+
+
 def test_parse_frontmatter_rejects_missing_opening_delim() -> None:
     """The parser must fail loudly on malformed frontmatter so the
     main parametrized test surfaces it correctly."""

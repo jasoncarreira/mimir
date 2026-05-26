@@ -3,6 +3,8 @@ name: ntfy
 description: Send a phone-push notification to the operator via ntfy.sh. Use ONLY for genuine algedonic alarms — events the operator needs to know about within minutes, not hours. The push lands on their phone; the cost of misuse is operator desensitization (they mute the topic and the channel goes dark). Do not use for routine surfacing, status updates, or things that can wait for the next chat turn.
 ---
 
+<!-- desc: Send a phone-push notification via ntfy.sh — for genuine algedonic alarms only (events the operator needs within minutes, not hours). -->
+
 # ntfy.sh phone push
 
 The operator-attention rung that survives chat-platform outage. It's the

@@ -20,6 +20,8 @@ success_criteria:
           file_path_glob: "*state/identities.yaml"
 ---
 
+<!-- desc: Look up who an alias belongs to (people) or what a channel id is (channels) using state/identities.yaml. -->
+
 # Identity Lookup
 
 Read-side query skill against `state/identities.yaml`. The file carries

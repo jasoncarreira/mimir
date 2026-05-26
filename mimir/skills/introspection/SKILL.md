@@ -21,6 +21,8 @@ success_criteria:
         name: memory_query
 ---
 
+<!-- desc: Diagnose your own behavior by reading structured logs — turns.jsonl, events.jsonl, chat_history.jsonl, scheduler.yaml. -->
+
 # Introspection
 
 You are a stateful agent. Your behavior leaves traces in structured logs. This skill

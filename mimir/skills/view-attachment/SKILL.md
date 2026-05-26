@@ -17,6 +17,8 @@ success_criteria:
           command_glob: "*state/attachments/*"
 ---
 
+<!-- desc: View image or file attachments that can't be seen directly — especially useful for text-only models that can't process images natively. -->
+
 # view-attachment
 
 When a message includes attachments, you see file paths like:

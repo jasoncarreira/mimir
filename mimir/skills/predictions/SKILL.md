@@ -3,6 +3,8 @@ name: predictions
 description: Use when making a forward-looking claim with a checkable outcome (reply within 24h, error rate will drop, this skill will see more use) — record to state/predictions.jsonl with a review horizon so reflection can grade you later. Closes the in-the-moment double-loop.
 ---
 
+<!-- desc: Record forward-looking claims with checkable outcomes and review horizons so reflection can grade them later. -->
+
 # Predictions
 
 When you make a forward-looking claim — "Tim will find this

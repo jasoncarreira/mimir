@@ -24,6 +24,8 @@ success_criteria:
         name: reload_pollers
 ---
 
+<!-- desc: Build and manage pollers — subprocess scripts that check external services on a schedule and emit events when something changes. -->
+
 # Pollers — Event-Driven Monitoring
 
 Pollers are lightweight scripts that check external services on a schedule and report back when something needs attention. They live inside skills and are discovered automatically by the scheduler.

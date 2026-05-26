@@ -3,6 +3,8 @@ name: five-whys
 description: Structured root cause analysis for arriving at a concrete action. Use when something went wrong, a pattern keeps recurring, behavior has drifted, or you catch yourself resolving to "do better" / "remember to X" without a concrete artifact. Five-whys forces behavioral resolutions into file edits, config changes, memory block updates, or scheduled jobs — the action item must produce a diff someone else can verify. Do not use for simple debugging with an obvious cause.
 ---
 
+<!-- desc: Structured root cause analysis that forces resolutions into concrete artifacts (file edits, config changes, memory updates, scheduled jobs). -->
+
 # Five Whys
 
 Five Whys is a method for finding root causes. You ask "why did this happen?" and

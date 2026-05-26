@@ -12,6 +12,8 @@ success_criteria:
           command_glob: "*get_weather.py*"
 ---
 
+<!-- desc: Get current conditions and 5-day forecast for a city via OpenWeatherMap — requires OPENWEATHER_API_KEY. -->
+
 # Weather
 
 Wraps the OpenWeatherMap API. The container needs `OPENWEATHER_API_KEY`

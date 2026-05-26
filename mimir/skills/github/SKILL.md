@@ -16,6 +16,8 @@ success_criteria:
           command_glob: "* gh *"
 ---
 
+<!-- desc: Interact with GitHub via the gh CLI — issues, pull requests, CI status, workflow runs, and gh api for uncovered queries. -->
+
 # GitHub
 
 The `gh` CLI is installed in the container and authenticated via `GITHUB_TOKEN`

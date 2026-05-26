@@ -3,6 +3,8 @@ name: circuit-breaker
 description: Recognize when you're in a runaway loop and stop yourself. Use when the same tool call has repeated 3× with the same args, when the same error class has fired 3× in a turn, when you've been told the same correction twice, when "let me try one more variation" is the third small variation, or when a refinement loop is orbiting rather than converging. The right move on a trip is to switch from action to inquiry — read events.jsonl, list assumptions, look for contradictions, ask the human, file a chainlink — not to retry harder.
 ---
 
+<!-- desc: Recognize when you're in a runaway loop and stop yourself — triggers on 3× same-error, 3× same-args, or repeated corrections. -->
+
 # Circuit Breaker: Recognizing When to Stop Yourself
 
 Mimir's algedonic feedback layer catches some runaway behaviors automatically —
