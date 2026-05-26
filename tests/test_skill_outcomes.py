@@ -188,7 +188,11 @@ def test_classify_read_file_non_skill_path_ignored():
 def test_classify_read_file_skill_load_falls_back_when_no_result():
     """If the agent reads SKILL.md but no tool_result lands in the same
     turn (streaming gap, agent pivoted), the fallback to turn_succeeded
-    applies — same as the existing Skill-tool path."""
+    applies — same as the existing Skill-tool path.
+
+    This is the empty-boundary-window case (no events at all after the
+    load) so Approach C's window scan finds nothing and the terminal
+    turn_succeeded fallback fires."""
     base = datetime(2026, 5, 22, 14, 0, tzinfo=timezone.utc)
     events = [
         {"type": "tool_call", "id": "r1", "name": "read_file",
@@ -206,6 +210,63 @@ def test_classify_read_file_skill_load_falls_back_when_no_result():
     # Turn outcome unknown → abandoned.
     out_unk = list(_classify_skill_calls(events, base))
     assert out_unk == [("heartbeat", "abandoned", base, "load")]
+
+
+def test_classify_approach_c_localizes_error_to_boundary_window():
+    """Approach C: when two inline skills load in the same turn and a
+    tool_result error occurs in skill A's boundary window (before B
+    loads), only A is attributed failure. B's window is clean so B
+    yields success — even when turn_succeeded=False.
+
+    Approach A would give both A and B "failure" from the whole-turn
+    signal. Approach C narrows attribution to the inter-skill-load
+    window, preventing false-blame propagation."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    events = [
+        # Skill A loads — no tool_result (streaming gap)
+        {"type": "tool_call", "id": "rA", "name": "read_file",
+         "args": {"file_path": "/h/.mimir_builtin_skills/alert/SKILL.md"}},
+        # Error in A's boundary window (before B loads)
+        {"type": "tool_call", "id": "oA", "name": "send_message",
+         "args": {"channel_id": "x"}},
+        {"type": "tool_result", "id": "oA", "is_error": True,
+         "content": "connection refused"},
+        # Skill B loads — no tool_result (streaming gap)
+        {"type": "tool_call", "id": "rB", "name": "read_file",
+         "args": {"file_path": "/h/.mimir_builtin_skills/wiki/SKILL.md"}},
+        # Clean result in B's boundary window
+        {"type": "tool_call", "id": "oB", "name": "write_file",
+         "args": {"file_path": "state/wiki/foo.md"}},
+        {"type": "tool_result", "id": "oB", "is_error": False, "content": "ok"},
+    ]
+    # Turn failed overall — Approach A would blame both; Approach C localizes.
+    out = list(_classify_skill_calls(events, base, turn_succeeded=False))
+    outcomes = {skill: outcome for skill, outcome, _, _ in out}
+    assert outcomes["alert"] == "failure"   # A's window has error
+    assert outcomes["wiki"] == "success"   # B's window is clean
+
+
+def test_classify_approach_c_clean_window_overrides_failed_turn():
+    """Approach C: a single skill whose boundary window has only clean
+    tool_results yields 'success' even when turn_succeeded=False.
+
+    This covers the common case where the agent loads one inline skill,
+    the skill's work succeeds (tool_result is_error=False), but then the
+    turn fails for an unrelated reason AFTER the window closes (e.g. a
+    later, non-skill tool_call errors out)."""
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    events = [
+        # Skill A loads — no tool_result (streaming gap)
+        {"type": "tool_call", "id": "rA", "name": "read_file",
+         "args": {"file_path": "/h/.mimir_builtin_skills/memory/SKILL.md"}},
+        # Clean result in skill's boundary window
+        {"type": "tool_call", "id": "m1", "name": "memory_store",
+         "args": {"tier": "ATOMIC", "text": "some atom"}},
+        {"type": "tool_result", "id": "m1", "is_error": False},
+    ]
+    # Turn "failed" but only because of something after the skill window
+    out = list(_classify_skill_calls(events, base, turn_succeeded=False))
+    assert out == [("memory", "success", base, "load")]
 
 
 def test_classify_both_invocation_patterns_in_same_turn():
