@@ -6,6 +6,144 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-26
+
+23 commits since v0.1.1, dominated by **agent-behavior + observability**
+work — a wait-on-pending guard for `bash_async` (with wrapper-invariance
+follow-up), a poller circuit-breaker, expanded algedonic event coverage,
+plus a fix for the weather skill path-resolution and a turn-viewer scroll
+bug. Also a structural cleanup pass (saga relocated under `benchmarks/`,
+stale docs pruned, license attribution corrected).
+
+### Added
+
+- **Per-channel `bash_async` wait-on-pending guard** (#356, chainlink #189):
+  refuses respawns when a same-intent job is already running on the same
+  channel. Strips leading `export` and `VAR=val` tokens so env-export
+  retry variants map to the same intent. Catches the failure mode where
+  the agent spawns N parallel async jobs for the same operation when one
+  was already in flight.
+- **Wrapper-invariant `bash_async` guard** (#371, chainlink #192): extends
+  the above to also strip `/bin/bash -c '…'` wrappers, `cd /path && …`
+  chains, and absolute-path executables (`/usr/bin/node` → `node`). Adds
+  a URI-target secondary key — same `at://X` / `https://X` in two
+  commands triggers the guard even when executables differ. Closes the
+  command-wrapper escalation sub-pattern.
+- **Algedonic event on `bash_async` refusal** (#370, chainlink #193):
+  emits `bash_async_refused_same_intent` when the guard fires, surfaced
+  in `feedback.py`'s algedonic block. Closes the observability gap left
+  by the original guard (refusals were tool-string-only, invisible to
+  dashboards).
+- **Poller circuit-breaker** (#365, chainlink #94): suspends a poller for
+  5 minutes after 3 consecutive failures. Emits `poller_circuit_tripped`
+  (once at transition) + `poller_circuit_open` (each suppressed run with
+  `remaining_seconds`). Auto-resets on first clean run after backoff
+  expires.
+- **Circuit-breaker algedonic renderers** (#369, chainlink #196):
+  informative `feedback.py` renderers for the new circuit events.
+  `poller_circuit_open` deduplicates per-poller within a backoff window
+  (omits `remaining_seconds` from the rendered string so 5 suppressed
+  runs collapse to ONE entry with a count).
+- **Per-channel memory injection** (#343, chainlink #187 — landed in
+  v0.1.2 as the channel-memory load was wired post-v0.1.1 cut): turn
+  prompts now auto-load `memory/channels/<channel_id>/*.md`.
+- **`pollers.json` schema version field** (#360, chainlink #91):
+  `POLLER_MANIFEST_SCHEMA_VERSION = 1`. Absent → v1 (backwards-compat);
+  unknown values warn and parse best-effort.
+- **`poller.env` deny-list warning** (#361, chainlink #95): emits
+  `poller_env_secret_reintroduced` when a `poller.env` key matches
+  `*_API_KEY` / `*_TOKEN` / `*_SECRET` / `*_PASSWORD` / `MIMIR_*`.
+  Value is NOT logged in the event payload.
+- **`recipient_name` extraction** (#363, chainlink #96): commitments
+  extraction now surfaces a recipient identity. Threads through
+  `dedupe_key` so "remind Alice about X" and "remind Bob about X" no
+  longer collapse to the same commitment record.
+- **GitHub poller commit subjects** (#362, chainlink #92): `pr_synchronize`
+  events now include up to 3 commit subjects via the `/repos/.../compare`
+  endpoint. Graceful degradation on API failure.
+- **Skill-catalog schema marker** (#359, chainlink #103): generated
+  `skills-catalog.md` starts with `<!-- catalog-schema: v1 -->`.
+  Column-stability contract documented in `render_catalog()`.
+- **Auto-regenerate `skills-catalog.md` on memory flush** (#366,
+  chainlink #109): closes a drift gap — catalog feeds every-turn prompt,
+  shouldn't lag SKILL.md edits.
+- **Skill-catalog `--strict` exit code + stderr warnings** (#358,
+  chainlink #105): malformed SKILL.md parse errors now emit a clear
+  stderr warning + `--strict` exits non-zero for CI gating.
+- **`<!-- desc: -->` conformance** (#357, chainlink #102): parametrized
+  test enforces the first-body-line convention across all 27 bundled
+  SKILL.md files.
+
+### Changed
+
+- **Saga relocated to `benchmarks/saga/`** (#352): the top-level `saga/`
+  workspace package (LongMemEval bench harness, not the runtime memory
+  backend) moved under `benchmarks/` to make the runtime-vs-bench split
+  legible. Imports unchanged (package name is still `saga`); the bench
+  shell's `config.py` path-resolution still works via the
+  `parents[3]`-walk. Hand-edits to update path references in 9 files
+  (FEEDBACK-LOOPS.md, SPEC.md, README.md, CONTRIBUTING.md, runner.py,
+  score.py, etc.).
+- **README + `saga/LICENSE` attribution corrected** (#350): the
+  runtime/bench-shell conflation was untangled in the README; the
+  dual-copyright (Jaden Schwab + Jason Carreira) was removed — the
+  rewrite cleared all of Jaden's MSAM code from both the runtime and
+  the bench shell, so the prior attribution was inaccurate.
+- **`scaffold-docker` defaults `MIMIR_WEB_HOST=0.0.0.0`** (#348):
+  generated `compose.yml` bakes the inside-container bind so the
+  loopback default doesn't silently break the docker port-forward.
+  Host exposure stays loopback-only via the `127.0.0.1:<port>` binding
+  in `ports:`.
+- **`docs/` pruning** (#351): 8 stale planning docs deleted (close-out
+  of pre-OSS review backlog, v0.4/v0.5 historical roadmaps, abandoned
+  spec docs). 4 KEEP specs got status banner refreshes from "filed /
+  not started" → "shipped" where the feature actually landed.
+
+### Fixed
+
+- **Weather skill path resolution** (#368): `SKILL.md` now invokes via
+  `python3 -m mimir.skills.weather.get_weather` instead of the broken
+  relative path `python3 skills/weather/get_weather.py`. The latter
+  didn't resolve from the shell-tool's cwd; agents had been guessing
+  path variants for days with 0/7 successful invocations on muninn.
+- **Turn-viewer inner-scroll preservation** (#367): the 5s poll's
+  `innerHTML` replace destroys + rebuilds every `.event-bdy` scrollable
+  box (reasoning, tool_call, tool_result, saga), resetting each
+  `scrollTop` to 0. Long reasoning blocks were impossible to read past
+  the 360px window. Captures + restores scroll positions on each poll.
+- **`asyncio` strong-ref discipline at 3 fire-and-forget sites** (#349,
+  chainlink #118): `loop.create_task(...)` without a retained reference
+  can be GC'd before completion. `scheduler._on_job_missed`,
+  `scheduler._dispatch_invalid_manifest_events`, and
+  `budget_gate._emit_event_sync` now hold their tasks in module/instance
+  sets with `task.add_done_callback(set.discard)` for cleanup.
+- **Commitments `store.add` per-record exception isolation** (#353,
+  chainlink #98): pinned with a regression test — when `store.add`
+  raises for one record in a batch, the loop continues to attempt the
+  remaining records.
+- **Commitments large-store warning** (#364, chainlink #106):
+  `current_state()` now warns when the JSONL replay count exceeds 500
+  events. Per-instance flag prevents duplicate warnings across repeated
+  calls in the same poller sweep.
+- **Commitments `due_window_hint` ISO 8601 with non-UTC offset** (review
+  follow-up via #346): test pin added in the v0.1.1 → v0.1.2 cycle for
+  the non-UTC case (e.g. `-05:00` EST).
+- **`commitments_due_check_error` + `saga_consolidate_error` tracebacks**
+  (#346): both events now include `traceback=traceback.format_exc()` for
+  operator diagnosis without trawling container logs.
+- **Skill-md folded-scalar parser**: pre-existing in v0.1.1 (#347).
+- **Integration test skips cleanly without claude CLI auth** (#354,
+  chainlink #191): `_claude_sdk_can_invoke()` probes whether the CLI
+  can complete an API call; if not, the integration test SKIPS with a
+  clear message instead of failing with a misleading empty-events
+  assertion.
+- **Mock companion for the integration test** (#355): two new mock-based
+  tests pin the hook-pairing contract even when the integration test
+  skips (CI without OAuth keychain, fresh contributors).
+
+[Unreleased]: https://github.com/jasoncarreira/mimir/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/jasoncarreira/mimir/releases/tag/v0.1.2
+
 ## [0.1.1] — 2026-05-25
 
 First post-release fix sweep — 13 PRs since v0.1.0, mostly addressing
@@ -64,7 +202,6 @@ two feature additions for fresh-install ergonomics.
   `key: |` folded-scalar blocks now raise `ValueError` instead of
   silently swallowing subsequent keys (#347, chainlink #104).
 
-[Unreleased]: https://github.com/jasoncarreira/mimir/compare/v0.1.1...HEAD
 [0.1.1]: https://github.com/jasoncarreira/mimir/releases/tag/v0.1.1
 
 ## [0.1.0] — 2026-05-24
