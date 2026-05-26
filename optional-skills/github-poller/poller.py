@@ -483,9 +483,40 @@ def _check_pr_pushes(
             elif prev_sha != current_sha:
                 title = pr.get("title", "")
                 url = pr.get("html_url", "")
+                # Fetch commit list between previous and new head so the
+                # agent sees individual commit subjects, not just a sha
+                # delta.  GitHub caps the ``commits`` array at 250 items;
+                # ``ahead_by`` is the canonical count when the list is
+                # truncated.  On API failure we fall back to sha-only.
+                compare = _gh_api(
+                    f"repos/{repo}/compare/{prev_sha}...{current_sha}",
+                    token,
+                )
+                commits: list = []
+                total_commits = 0
+                if isinstance(compare, dict):
+                    commits = compare.get("commits") or []
+                    total_commits = compare.get("ahead_by") or len(commits)
+                if total_commits and commits:
+                    subjects = [
+                        (c.get("commit") or {}).get("message", "")
+                        .split("\n")[0][:72]
+                        for c in commits[:3]
+                    ]
+                    bullets = "\n".join(
+                        f"  • {s}" for s in subjects if s
+                    )
+                    shown = sum(1 for s in subjects if s)
+                    remaining = total_commits - shown
+                    commit_block = f"{total_commits} commit(s):\n{bullets}"
+                    if remaining > 0:
+                        commit_block += f"\n  • … ({remaining} more)"
+                else:
+                    commit_block = "(commit details unavailable)"
                 prompt = (
                     f"PR #{number} updated on {repo}: {title} "
                     f"(by @{pr_author or 'unknown'})\n"
+                    f"{commit_block}\n"
                     f"Previous head: {prev_sha[:8]}, new head: "
                     f"{current_sha[:8]}\n{url}"
                 )

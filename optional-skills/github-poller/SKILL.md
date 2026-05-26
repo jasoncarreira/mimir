@@ -62,6 +62,12 @@ For each repo in `GITHUB_REPOS`:
 - **New issue comments** (covers both issue + PR conversation comments)
 - **New PR review comments** (inline diff comments — distinct from conversation comments)
 - **New PR reviews** (approve / changes-requested / commented with body)
+- **PR pushes/updates** (`pr_synchronize`) — new commits pushed to an existing open PR.
+  The poller calls `GET /repos/{repo}/compare/{prev}...{new}` to fetch up to 3
+  commit subjects inline. If multiple commits land between polls, all are
+  surfaced (total count + first 3 subjects + "… N more" when truncated).
+  Force-pushes that change the SHA but not the diff also fire — this is a
+  known false-positive; compare-diff diffing on every poll is too expensive.
 
 All filtered by `created_at > cursor` and (when set) `user.login != MIMIR_GITHUB_SELF_LOGIN`.
 
