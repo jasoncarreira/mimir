@@ -132,6 +132,7 @@ POLLER_CHANNEL_PREFIX = "poller:"
 POLLER_MANIFEST_SCHEMA_VERSION = 1
 
 
+
 @dataclass
 class _CircuitBreakerState:
     """Per-poller failure-run tracker for the circuit-breaker guard.
