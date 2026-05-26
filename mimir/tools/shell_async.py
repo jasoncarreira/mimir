@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -32,6 +33,51 @@ from ..shell_jobs import (
 )
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Intent normalization for wait-on-pending guard (chainlink #189)
+# ---------------------------------------------------------------------------
+
+_INTENT_PREFIX_MAX_CHARS = 100
+_ENV_VAR_TOKEN_RE = re.compile(r"^[A-Z_][A-Z0-9_]*=")
+
+
+def _intent_prefix(command: str) -> str:
+    """Return a normalized intent string for duplicate-spawn detection.
+
+    Strips leading env-var assignment tokens so env-export variant retries
+    map to the same intent key as the original command.  Handles:
+
+    - ``export FOO=bar social-cli …``  (``export`` keyword + VAR=val tokens)
+    - ``FOO=bar BAZ=qux social-cli …``  (bare VAR=val prefix, no ``export``)
+    - Multiline variants (each leading line stripped)
+    - Mixed same-line and multi-line patterns
+
+    Returns the first ``_INTENT_PREFIX_MAX_CHARS`` characters of the
+    remaining command body, lower-cased with whitespace collapsed.
+
+    Intent equality is heuristic — identical prefixes are sufficient evidence
+    of same-intent for the guard.  Commands with different syntax but the
+    same logical goal may not match; the guard is tuned for the observed
+    ``bash_async`` retry pattern (env-export prefix variations before the
+    same executable + args).
+    """
+    # Tokenise and skip leading ``export`` keywords and ``VAR=val`` tokens.
+    tokens = command.split()
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "export":
+            # ``export`` keyword: consume it and keep scanning VAR=val tokens.
+            i += 1
+        elif _ENV_VAR_TOKEN_RE.match(tok):
+            # ``VAR=val`` assignment — skip.
+            i += 1
+        else:
+            break
+    remaining = " ".join(tokens[i:])
+    normalized = " ".join(remaining.lower().split())
+    return normalized[:_INTENT_PREFIX_MAX_CHARS]
 
 
 # Module-level dependency injection — populated by ``server.py:build_app``
@@ -101,6 +147,29 @@ async def bash_async(
         channel_id = getattr(ctx, "channel_id", None)
     if not channel_id:
         channel_id = (_registry_state.get("current_channel_id") or "").strip() or None
+
+    # Wait-on-pending guard (chainlink #189): refuse if a same-intent job is
+    # already running on this channel.  Prevents the retry-escalation failure
+    # mode where the agent spawns N async variants of the same command without
+    # ever seeing results from the first (each variant has slightly different
+    # env exports, so the generic 3× circuit-breaker doesn't trip).
+    #
+    # Scope: per-channel.  Jobs running on other channels (unrelated pollers,
+    # other conversations) don't block each other — they have different intents
+    # by nature.
+    if channel_id is not None:
+        new_intent = _intent_prefix(command)
+        for running_job in _REGISTRY.running_jobs():
+            if running_job.channel_id != channel_id:
+                continue
+            if _intent_prefix(running_job.command) == new_intent:
+                return (
+                    f"bash_async refused: a job with the same intent is already "
+                    f"running (job_id={running_job.job_id!r}, pid={running_job.pid}). "
+                    f"Check its status with "
+                    f"bash_job_output(job_id={running_job.job_id!r}) before spawning "
+                    f"a retry.  To see all in-flight jobs: bash_jobs_list()."
+                )
 
     try:
         job = _REGISTRY.spawn(

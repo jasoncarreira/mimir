@@ -42,6 +42,7 @@ class _FakeJob:
         channel_id: str | None = "ch-1",
         status: str = "running",
         exit_code: int | None = None,
+        started_at: float = 0.0,
     ) -> None:
         self.job_id = job_id
         self.pid = pid
@@ -50,6 +51,7 @@ class _FakeJob:
         self.status = status
         self.exit_code = exit_code
         self.elapsed_seconds = 1.5
+        self.started_at = started_at
 
 
 @pytest.fixture
@@ -172,3 +174,204 @@ def test_all_mimir_tools_includes_shell_async_trio(
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "claude-code:foo")
     names = {t.name for t in all_mimir_tools()}
     assert {"bash_async", "bash_jobs_list", "bash_job_output"}.issubset(names)
+
+
+# ─── _intent_prefix unit tests ────────────────────────────────────────
+
+
+def test_intent_prefix_plain_command() -> None:
+    from mimir.tools.shell_async import _intent_prefix
+
+    result = _intent_prefix("social-cli dispatch /path/to/file.yaml")
+    assert result == "social-cli dispatch /path/to/file.yaml"
+
+
+def test_intent_prefix_strips_env_export() -> None:
+    from mimir.tools.shell_async import _intent_prefix
+
+    base = "social-cli dispatch /path/to/file.yaml"
+    with_exports = f"export ATPROTO_HANDLE=alice ATPROTO_APP_PASSWORD=secret {base}"
+    assert _intent_prefix(with_exports) == _intent_prefix(base)
+
+
+def test_intent_prefix_strips_bare_env_assignment() -> None:
+    from mimir.tools.shell_async import _intent_prefix
+
+    base = "social-cli dispatch /file.yaml"
+    variant = f"STATE_DIR=/tmp {base}"
+    assert _intent_prefix(variant) == _intent_prefix(base)
+
+
+def test_intent_prefix_truncates_to_max_chars() -> None:
+    from mimir.tools.shell_async import _INTENT_PREFIX_MAX_CHARS, _intent_prefix
+
+    long_cmd = "a" * (_INTENT_PREFIX_MAX_CHARS + 50)
+    result = _intent_prefix(long_cmd)
+    assert len(result) == _INTENT_PREFIX_MAX_CHARS
+
+
+def test_intent_prefix_different_commands_differ() -> None:
+    from mimir.tools.shell_async import _intent_prefix
+
+    assert _intent_prefix("git fetch origin") != _intent_prefix("social-cli dispatch x")
+
+
+# ─── wait-on-pending guard ────────────────────────────────────────────
+
+
+class _FakeTurnCtx:
+    """Minimal turn context stub for channel_id injection."""
+
+    def __init__(self, channel_id: str) -> None:
+        self.channel_id = channel_id
+
+
+@pytest.fixture
+def fake_registry_with_channel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> ShellJobRegistry:
+    """Like fake_registry but with a channel_id=test-ch wired via turn context."""
+    import mimir._context as ctx_mod
+
+    reg = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
+    spawned: list[dict] = []
+
+    def _fake_spawn(command: str, *, argv: list[str], channel_id: str | None, on_complete=None) -> _FakeJob:
+        spawned.append({"command": command, "argv": argv, "channel_id": channel_id})
+        return _FakeJob(command=command, channel_id=channel_id, job_id="j_new")
+
+    monkeypatch.setattr(reg, "spawn", _fake_spawn)
+    monkeypatch.setattr(reg, "_spawned_log", spawned, raising=False)
+    shell_async.set_shell_job_registry(reg, on_complete=None)
+
+    # Wire a channel_id so the guard is in scope.
+    monkeypatch.setattr(ctx_mod, "get_current_turn", lambda: _FakeTurnCtx("test-ch"))
+
+    yield reg
+    shell_async.set_shell_job_registry(None, on_complete=None)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_bash_async_refuses_same_intent_running_job(
+    fake_registry_with_channel: ShellJobRegistry,
+) -> None:
+    """Guard refuses when a same-intent job is already running on this channel."""
+    # Seed a running job with the same intent.
+    running = _FakeJob(
+        job_id="j_running",
+        pid=999,
+        command="social-cli dispatch /path/to/file.yaml",
+        channel_id="test-ch",
+        exit_code=None,
+    )
+    fake_registry_with_channel._jobs["j_running"] = running
+
+    out = await shell_async.bash_async.ainvoke(
+        {"command": "social-cli dispatch /path/to/file.yaml"}
+    )
+    assert "bash_async refused" in out
+    assert "j_running" in out
+    assert "bash_job_output" in out
+
+
+@pytest.mark.asyncio
+async def test_bash_async_refuses_after_env_export_stripping(
+    fake_registry_with_channel: ShellJobRegistry,
+) -> None:
+    """Guard fires even when the retry wraps the same command in env exports."""
+    running = _FakeJob(
+        job_id="j_orig",
+        pid=100,
+        command="social-cli dispatch /file.yaml",
+        channel_id="test-ch",
+        exit_code=None,
+    )
+    fake_registry_with_channel._jobs["j_orig"] = running
+
+    retry = "export ATPROTO_HANDLE=alice STATE_DIR=/tmp social-cli dispatch /file.yaml"
+    out = await shell_async.bash_async.ainvoke({"command": retry})
+    assert "bash_async refused" in out
+    assert "j_orig" in out
+
+
+@pytest.mark.asyncio
+async def test_bash_async_allows_different_intent(
+    fake_registry_with_channel: ShellJobRegistry,
+) -> None:
+    """Guard does not fire when the running job has a different intent."""
+    running = _FakeJob(
+        job_id="j_other",
+        pid=200,
+        command="git fetch origin",
+        channel_id="test-ch",
+        exit_code=None,
+    )
+    fake_registry_with_channel._jobs["j_other"] = running
+
+    out = await shell_async.bash_async.ainvoke(
+        {"command": "social-cli dispatch /file.yaml"}
+    )
+    assert "Spawned job" in out  # allowed through
+
+
+@pytest.mark.asyncio
+async def test_bash_async_allows_no_running_jobs(
+    fake_registry_with_channel: ShellJobRegistry,
+) -> None:
+    """Guard does not fire when no jobs are running."""
+    out = await shell_async.bash_async.ainvoke({"command": "social-cli dispatch /file.yaml"})
+    assert "Spawned job" in out
+
+
+@pytest.mark.asyncio
+async def test_bash_async_allows_different_channel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard does not fire for a running job on a DIFFERENT channel."""
+    import mimir._context as ctx_mod
+
+    reg = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
+
+    def _fake_spawn(command: str, *, argv: list[str], channel_id: str | None, on_complete=None) -> _FakeJob:
+        return _FakeJob(command=command, channel_id=channel_id)
+
+    monkeypatch.setattr(reg, "spawn", _fake_spawn)
+    shell_async.set_shell_job_registry(reg, on_complete=None)
+    monkeypatch.setattr(ctx_mod, "get_current_turn", lambda: _FakeTurnCtx("channel-A"))
+
+    # Running job is on channel-B.
+    running = _FakeJob(
+        job_id="j_other_ch",
+        pid=300,
+        command="social-cli dispatch /file.yaml",
+        channel_id="channel-B",
+        exit_code=None,
+    )
+    reg._jobs["j_other_ch"] = running
+
+    out = await shell_async.bash_async.ainvoke({"command": "social-cli dispatch /file.yaml"})
+    assert "Spawned job" in out  # different channel → allowed
+
+    shell_async.set_shell_job_registry(None, on_complete=None)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_bash_async_skips_guard_when_finished_job(
+    fake_registry_with_channel: ShellJobRegistry,
+) -> None:
+    """Guard ignores finished (non-running) jobs — exit_code set."""
+    finished = _FakeJob(
+        job_id="j_done",
+        pid=400,
+        command="social-cli dispatch /file.yaml",
+        channel_id="test-ch",
+        exit_code=0,  # finished
+    )
+    fake_registry_with_channel._jobs["j_done"] = finished
+
+    out = await shell_async.bash_async.ainvoke(
+        {"command": "social-cli dispatch /file.yaml"}
+    )
+    assert "Spawned job" in out  # finished job → guard skips it
