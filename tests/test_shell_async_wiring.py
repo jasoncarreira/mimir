@@ -558,3 +558,54 @@ async def test_bash_async_skips_guard_when_finished_job(
         {"command": "social-cli dispatch /file.yaml"}
     )
     assert "Spawned job" in out  # finished job → guard skips it
+
+
+# ─── chainlink #193: algedonic event on refusal ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_bash_async_refused_emits_algedonic_event(
+    fake_registry_with_channel: ShellJobRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard emits bash_async_refused_same_intent event when refusing a respawn.
+
+    The tool's return-string is the agent-visible signal; the event is the
+    operator/introspection-visible audit trail (chainlink #193).
+    """
+    emitted: list[dict] = []
+
+    async def _fake_safe_log_event(event_type: str, **payload: Any) -> None:
+        emitted.append({"type": event_type, **payload})
+
+    monkeypatch.setattr(
+        "mimir.event_logger.safe_log_event",
+        _fake_safe_log_event,
+        raising=False,
+    )
+
+    # Seed a running job with the same intent.
+    running = _FakeJob(
+        job_id="j_running",
+        pid=999,
+        command="social-cli dispatch /path/to/file.yaml",
+        channel_id="test-ch",
+        exit_code=None,
+    )
+    fake_registry_with_channel._jobs["j_running"] = running
+
+    out = await shell_async.bash_async.ainvoke(
+        {"command": "social-cli dispatch /path/to/file.yaml"}
+    )
+
+    # Tool return should still be the refusal message.
+    assert "bash_async refused" in out
+
+    # Exactly one event should have been emitted.
+    assert len(emitted) == 1, f"Expected 1 event, got {emitted}"
+    ev = emitted[0]
+    assert ev["type"] == "bash_async_refused_same_intent"
+    assert ev["channel_id"] == "test-ch"
+    assert ev["running_job_id"] == "j_running"
+    assert "social-cli dispatch" in ev["new_command"]
+    assert isinstance(ev["intent_prefix"], str)
