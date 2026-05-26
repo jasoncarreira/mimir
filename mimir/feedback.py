@@ -1588,6 +1588,27 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"running on prior version, flag cleared, operator can "
             f"re-approve via request_mimir_update once cause is known"
         )
+    if rule_kind == "poller_circuit_tripped":
+        # chainlink #196: include poller name so operator knows which poller
+        # tripped; omit remaining_seconds (not present on the tripped event).
+        name = ev.get("poller") or "?"
+        failures = ev.get("consecutive_failures") or "?"
+        return (
+            f"poller circuit tripped: {name} ({failures} consecutive failures"
+            f" — backing off {ev.get('backoff_seconds', 300)}s)"
+        )
+    if rule_kind == "poller_circuit_open":
+        # chainlink #196: include poller name but NOT remaining_seconds.
+        # Omitting remaining_seconds keeps the content string stable across
+        # all suppressed-run events for the same poller, so content-level
+        # dedup in build_feedback_block() collapses N same-poller events
+        # into one entry.  The ×N count still shows total fires in the window.
+        name = ev.get("poller") or "?"
+        failures = ev.get("consecutive_failures") or "?"
+        return (
+            f"poller circuit-breaker open: {name} ({failures} consecutive"
+            f" failures — runs suppressed)"
+        )
     return rule_kind
 
 
