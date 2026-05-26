@@ -18,23 +18,57 @@ from pathlib import Path
 # Known event types (for advisory --type validation)
 # ---------------------------------------------------------------------------
 
-_KNOWN_EVENT_TYPES: frozenset[str] = frozenset(
-    {
-        "error",
-        "tool_call_denied",
-        "tool_call_budget_warning",
-        "quota_anomaly",
-        "algedonic_escalation",
-        "cross_turn_send_duplicate",
-        "core_prompt_degraded",
-        "bash_async_refused_same_intent",
-        "poller_circuit_tripped",
-        "poller_circuit_open",
-        "poller_env_secret_reintroduced",
-        "dispatch_skipped_no_tools",
-        "loop_detected",
-    }
-)
+
+def _known_event_types() -> frozenset[str]:
+    """Derive valid event types from the canonical _EVENT_RULES dict.
+
+    Lazy import so the CLI layer doesn't pull in all of feedback.py at
+    module load time. Single source of truth: adding a new rule in
+    feedback._EVENT_RULES automatically updates the advisory validator.
+    """
+    from .feedback import _EVENT_RULES  # noqa: PLC0415
+
+    return frozenset(_EVENT_RULES.keys())
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _count_filtered_events_in_window(
+    home: Path, rule: dict, hours: int = 24
+) -> int:
+    """Count events in the most recent ``hours``-hour window that would be
+    filtered by ``rule`` via ``_is_event_resolved``.
+
+    ``tail_jsonl_records`` yields newest-first; iteration stops as soon as
+    the timestamp falls below the cutoff, so memory use is O(window) not
+    O(file).
+    """
+    from .feedback import _is_event_resolved
+    from ._jsonl_tail import tail_jsonl_records
+    from datetime import timedelta
+
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=hours)
+    events_path = home / "logs" / "events.jsonl"
+    count = 0
+    if events_path.exists():
+        for ev in tail_jsonl_records(events_path):
+            ts_str = ev.get("timestamp", "")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str)
+            except ValueError:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts < cutoff:
+                break
+            if _is_event_resolved(ev, [rule]):
+                count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -78,11 +112,11 @@ def run_mark_resolved(
         resolved_at_final = datetime.now(tz=timezone.utc).isoformat()
 
     # ── Advisory type check ─────────────────────────────────────────────────
-    if event_type != "*" and event_type not in _KNOWN_EVENT_TYPES:
+    if event_type != "*" and event_type not in _known_event_types():
         print(
             f"warning: event type '{event_type}' not in known _EVENT_RULES keys — "
             f"the rule will still be written (unknown types are allowed), but check "
-            f"for typos.  Known types: {', '.join(sorted(_KNOWN_EVENT_TYPES))}",
+            f"for typos.  Known types: {', '.join(sorted(_known_event_types()))}",
             file=sys.stderr,
         )
 
@@ -96,30 +130,7 @@ def run_mark_resolved(
 
     # ── Dry run: count matching events in the current 24h window ────────────
     if dry_run:
-        from .feedback import _is_event_resolved
-        from ._jsonl_tail import tail_jsonl_records
-        from datetime import timedelta
-
-        cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=24)
-        events_path = home / "logs" / "events.jsonl"
-        raw_events: list[dict] = []
-        if events_path.exists():
-            for ev in tail_jsonl_records(events_path, max_records=5000):
-                ts_str = ev.get("timestamp", "")
-                if not ts_str:
-                    continue
-                try:
-                    ts = datetime.fromisoformat(ts_str)
-                except ValueError:
-                    continue
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                if ts >= cutoff:
-                    raw_events.append(ev)
-
-        would_filter = sum(
-            1 for ev in raw_events if _is_event_resolved(ev, [rule])
-        )
+        would_filter = _count_filtered_events_in_window(home, rule)
         print(
             f"dry-run: rule would filter {would_filter} event(s) from the "
             f"current 24h window (not written)."
@@ -139,29 +150,7 @@ def run_mark_resolved(
         return 1
 
     # ── Confirm ─────────────────────────────────────────────────────────────
-    # Count events in the 24h window that would now be filtered.
-    from .feedback import _is_event_resolved
-    from ._jsonl_tail import tail_jsonl_records
-    from datetime import timedelta
-
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=24)
-    events_path = home / "logs" / "events.jsonl"
-    would_filter = 0
-    if events_path.exists():
-        for ev in tail_jsonl_records(events_path, max_records=5000):
-            ts_str = ev.get("timestamp", "")
-            if not ts_str:
-                continue
-            try:
-                ts = datetime.fromisoformat(ts_str)
-            except ValueError:
-                continue
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            if ts >= cutoff:
-                if _is_event_resolved(ev, [rule]):
-                    would_filter += 1
-
+    would_filter = _count_filtered_events_in_window(home, rule)
     print(
         f"marked resolved: event_type={event_type!r} pattern={pattern!r} "
         f"resolved_at={resolved_at_final}"
