@@ -1587,3 +1587,148 @@ def test_poller_circuit_tripped_renders_poller_name(tmp_path: Path) -> None:
     assert negatives[0].kind == "poller_circuit_tripped"
     assert "github-activity" in negatives[0].content
     assert "3" in negatives[0].content  # failure count present
+
+
+# ---- Resolved-incident filtering (chainlink #197) -----------------------
+
+
+def _make_log_with_incidents(
+    tmp_path: Path,
+    events: list[dict],
+    incidents: list[dict],
+) -> FeedbackLog:
+    """Helper: write events.jsonl + resolved-incidents.jsonl and return log."""
+    events_path = tmp_path / "logs" / "events.jsonl"
+    turns_path = tmp_path / "logs" / "turns.jsonl"
+    incidents_path = tmp_path / "resolved-incidents.jsonl"
+    _write_jsonl(events_path, events)
+    incidents_path.write_text(
+        "\n".join(json.dumps(r) for r in incidents) + "\n", encoding="utf-8"
+    )
+    return FeedbackLog(
+        events_path=events_path,
+        turns_path=turns_path,
+        resolved_incidents_path=incidents_path,
+    )
+
+
+def test_resolved_incident_suppresses_matching_event(tmp_path: Path) -> None:
+    """An event whose type + pattern + timestamp all satisfy a resolved-incident
+    rule must be absent from the negative bucket."""
+    resolved_at = _ts(1.0)  # 1 hour ago = "fix landed 1h ago"
+    event_ts = _ts(2.0)     # event happened 2h ago = before the fix
+    log = _make_log_with_incidents(
+        tmp_path,
+        events=[
+            {
+                "timestamp": event_ts,
+                "type": "error",
+                "error": "ImportError: langchain-claude-code required",
+                "channel_id": "scheduler:heartbeat",
+            }
+        ],
+        incidents=[
+            {
+                "event_type": "error",
+                "pattern": "langchain-claude-code",
+                "resolved_at": resolved_at,
+                "reason": "start.sh now installs the package",
+            }
+        ],
+    )
+    negatives, _ = log.recent()
+    assert negatives == [], "resolved event must be filtered out"
+
+
+def test_resolved_incident_does_not_suppress_post_fix_events(tmp_path: Path) -> None:
+    """An event timestamped AFTER resolved_at must NOT be suppressed — the fix
+    didn't hold and the signal is live."""
+    resolved_at = _ts(2.0)  # fix was 2 hours ago
+    event_ts = _ts(0.5)     # event happened 30 min ago = after the fix
+    log = _make_log_with_incidents(
+        tmp_path,
+        events=[
+            {
+                "timestamp": event_ts,
+                "type": "error",
+                "error": "ImportError: langchain-claude-code required",
+                "channel_id": "scheduler:heartbeat",
+            }
+        ],
+        incidents=[
+            {
+                "event_type": "error",
+                "pattern": "langchain-claude-code",
+                "resolved_at": resolved_at,
+                "reason": "start.sh fix",
+            }
+        ],
+    )
+    negatives, _ = log.recent()
+    assert len(negatives) == 1, "post-fix event must still surface"
+
+
+def test_resolved_incident_type_mismatch_does_not_suppress(tmp_path: Path) -> None:
+    """A rule for event_type='tool_call_denied' must not suppress events of
+    type 'error'."""
+    resolved_at = _ts(0.5)
+    event_ts = _ts(2.0)
+    log = _make_log_with_incidents(
+        tmp_path,
+        events=[
+            {
+                "timestamp": event_ts,
+                "type": "error",
+                "error": "some unrelated error",
+            }
+        ],
+        incidents=[
+            {
+                "event_type": "tool_call_denied",  # different type
+                "pattern": "unrelated",
+                "resolved_at": resolved_at,
+            }
+        ],
+    )
+    negatives, _ = log.recent()
+    assert len(negatives) == 1, "type mismatch must not suppress"
+
+
+def test_resolved_incident_wildcard_type_suppresses_any_event_type(
+    tmp_path: Path,
+) -> None:
+    """event_type='*' matches any event type."""
+    resolved_at = _ts(0.5)
+    event_ts = _ts(2.0)
+    log = _make_log_with_incidents(
+        tmp_path,
+        events=[
+            {
+                "timestamp": event_ts,
+                "type": "error",
+                "error": "anything goes here",
+            }
+        ],
+        incidents=[
+            {
+                "event_type": "*",
+                "pattern": "anything",
+                "resolved_at": resolved_at,
+            }
+        ],
+    )
+    negatives, _ = log.recent()
+    assert negatives == [], "wildcard type must suppress matching event"
+
+
+def test_resolved_incident_no_file_falls_back_gracefully(tmp_path: Path) -> None:
+    """When resolved_incidents_path points to a non-existent file, no error
+    is raised and events surface normally."""
+    log = FeedbackLog(
+        events_path=tmp_path / "logs" / "events.jsonl",
+        turns_path=tmp_path / "logs" / "turns.jsonl",
+        resolved_incidents_path=tmp_path / "no-such-file.jsonl",
+    )
+    # No events file either — should return empty cleanly.
+    negatives, positives = log.recent()
+    assert negatives == [] and positives == []

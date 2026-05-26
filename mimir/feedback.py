@@ -13,6 +13,7 @@ the time window or the per-polarity cap, whichever hits first."""
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -1728,6 +1729,82 @@ def _detect_cross_turn_send_loops(
     return signals
 
 
+# ---------------------------------------------------------------------------
+# Resolved-incident filtering (chainlink #197)
+# ---------------------------------------------------------------------------
+
+def _load_resolved_incidents(path: Path) -> list[dict]:
+    """Read ``resolved-incidents.jsonl`` from ``path``.
+
+    Each line is a JSON object::
+
+        {"event_type": "dispatcher_error", "pattern": "langchain-claude-code",
+         "resolved_at": "2026-05-25T19:30:00+00:00", "reason": "start.sh fix"}
+
+    ``event_type`` may be ``"*"`` to match any event type.
+    ``pattern`` is matched as a substring of ``json.dumps(event)``; an empty
+    string matches every event of the matching type.
+    ``resolved_at`` is an ISO-8601 timestamp string; events timestamped
+    *before* this value are suppressed.
+
+    Returns an empty list if the file does not exist or is unreadable.
+    """
+    if not path.exists():
+        return []
+    rules: list[dict] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                rules.append(obj)
+    except OSError:
+        pass
+    return rules
+
+
+def _is_event_resolved(ev: dict, rules: list[dict]) -> bool:
+    """Return True if ``ev`` should be hidden because a resolved-incident
+    rule covers it.
+
+    A rule covers an event when ALL three conditions hold:
+    1. ``rule["event_type"]`` is ``"*"`` or matches ``ev["type"]``.
+    2. ``rule["pattern"]`` (if non-empty) is a substring of the JSON
+       serialisation of the event.
+    3. ``ev["timestamp"] < rule["resolved_at"]`` (the event predates the fix).
+    """
+    ev_type = ev.get("type", "")
+    ev_ts = ev.get("timestamp", "")
+    if not isinstance(ev_ts, str):
+        return False
+    ev_json: str | None = None  # lazy — only serialise if needed
+    for rule in rules:
+        rule_type = rule.get("event_type", "*")
+        rule_pattern = rule.get("pattern", "")
+        rule_resolved_at = rule.get("resolved_at", "")
+        if not isinstance(rule_resolved_at, str) or not rule_resolved_at:
+            continue
+        # 1. Type match
+        if rule_type != "*" and ev_type != rule_type:
+            continue
+        # 2. Pattern match (substring of JSON — covers nested fields)
+        if rule_pattern:
+            if ev_json is None:
+                ev_json = json.dumps(ev)
+            if rule_pattern not in ev_json:
+                continue
+        # 3. Timestamp: event must predate the resolution
+        if ev_ts >= rule_resolved_at:
+            continue
+        return True
+    return False
+
+
 @dataclass
 class FeedbackLog:
     """Tails events.jsonl + turns.jsonl, surfaces recent feedback signals.
@@ -1760,6 +1837,12 @@ class FeedbackLog:
     # disable escalation entirely (e.g. in tests that don't want side-effects
     # from _emit_new_escalations writing to events.jsonl). Same propagation
     # semantics as ``arousal_thresholds``.
+    resolved_incidents_path: Path | None = None
+    # Path to ``resolved-incidents.jsonl`` (chainlink #197). Events matching
+    # an entry there are filtered from the feedback block until the rolling
+    # window naturally clears them. None → no filtering (default for tests /
+    # back-compat). The live agent wires this to
+    # ``config.home / "resolved-incidents.jsonl"``.
 
     def recent(
         self,
@@ -1779,6 +1862,15 @@ class FeedbackLog:
 
         cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=window_hours)
         cutoff_iso = cutoff.isoformat()
+
+        # Resolved-incident filter (chainlink #197): load rules once per
+        # recent() call. Events matching a rule are silently dropped from
+        # both polarities so stale-but-fixed errors don't re-surface.
+        resolved_rules = (
+            _load_resolved_incidents(self.resolved_incidents_path)
+            if self.resolved_incidents_path is not None
+            else []
+        )
 
         # Arousal filter pre-pass (Beer Ch.7): count all rule-matched
         # event-kind occurrences in the window before the display loop.
@@ -1858,6 +1950,12 @@ class FeedbackLog:
             evtype = ev.get("type")
             rule = _EVENT_RULES.get(evtype) if isinstance(evtype, str) else None
             if rule is None:
+                continue
+            # Resolved-incident filter: skip events covered by an operator-
+            # marked resolution rule.  Applied after the rule lookup (unknown
+            # event types are already dropped above) so we don't penalise the
+            # common case (no rules file → list is empty, no work done).
+            if resolved_rules and _is_event_resolved(ev, resolved_rules):
                 continue
             polarity, kind = rule
             # react_received carries its own polarity (positive/negative/
