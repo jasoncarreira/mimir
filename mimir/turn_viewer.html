@@ -497,6 +497,38 @@ function bindEventToggles(container) {
   });
 }
 
+// Preserve scroll position across re-renders for every ``.event-bdy``
+// box (reasoning, tool_call, tool_result, saga). The CSS has each of
+// these capped at ``max-height:360px`` with ``overflow-y:auto`` — so
+// they're independently scrollable. The 5-second poll's
+// ``innerHTML = ...`` destroys + rebuilds them, which without this
+// pair would reset every box's scrollTop to 0 mid-read.
+//
+// Index-within-container is the key. New events append at the end, so
+// existing indices stay stable; a freshly-arrived event gets a default
+// scrollTop=0 (correct), and the boxes you were reading keep their
+// position.
+function captureEventBdyScrolls(container) {
+  if (!container) return [];
+  return Array.prototype.map.call(
+    container.querySelectorAll('.event-bdy'),
+    function(b) { return b.scrollTop; }
+  );
+}
+function restoreEventBdyScrolls(container, saved) {
+  if (!container || !saved || !saved.length) return;
+  // rAF: same reason the outer-panel restore uses one — wait for the
+  // browser to commit the new layout before setting scrollTop, else
+  // the assignment races against layout and silently no-ops.
+  requestAnimationFrame(function() {
+    var boxes = container.querySelectorAll('.event-bdy');
+    var n = Math.min(boxes.length, saved.length);
+    for (var i = 0; i < n; i++) {
+      if (saved[i] > 0) boxes[i].scrollTop = saved[i];
+    }
+  });
+}
+
 function openDetail(turn) {
   if (!turn) return;
   // Preserve scroll position across re-renders for the SAME turn —
@@ -555,6 +587,7 @@ function openDetail(turn) {
     sagaInlineCount.style.display = '';
     document.getElementById('detailSagaInlineCount').textContent = sagaCalls.length;
     var evList = document.getElementById('detailEvents');
+    var savedEvScrolls = isRefresh ? captureEventBdyScrolls(evList) : [];
     var seq = {ev: 0, saga: 0};
     evList.innerHTML = combined.map(function(entry){
       if (entry.kind === 'event') {
@@ -568,6 +601,7 @@ function openDetail(turn) {
       }
     }).join('') || '<div class="no-events">No events recorded for this turn.</div>';
     bindEventToggles(evList);
+    restoreEventBdyScrolls(evList, savedEvScrolls);
   } else {
     // Legacy layout: separate saga-calls section above events. Used
     // for pre-t_ms turns (any turn recorded before the schema added
@@ -577,18 +611,22 @@ function openDetail(turn) {
       sagaSection.style.display = '';
       document.getElementById('detailSagaCallsCount').textContent = sagaCalls.length;
       var sagaList = document.getElementById('detailSagaCalls');
+      var savedSagaScrolls = isRefresh ? captureEventBdyScrolls(sagaList) : [];
       sagaList.innerHTML = sagaCalls.map(renderSagaCall).join('');
       bindEventToggles(sagaList);
+      restoreEventBdyScrolls(sagaList, savedSagaScrolls);
     } else {
       sagaSection.style.display = 'none';
     }
 
     document.getElementById('detailEventsCount').textContent = events.length;
     var evList = document.getElementById('detailEvents');
+    var savedEvScrolls = isRefresh ? captureEventBdyScrolls(evList) : [];
     evList.innerHTML = events.length===0
       ? '<div class="no-events">No events recorded for this turn.</div>'
       : events.map(renderEvent).join('');
     bindEventToggles(evList);
+    restoreEventBdyScrolls(evList, savedEvScrolls);
   }
 
   document.getElementById('detailPanel').classList.add('open');
