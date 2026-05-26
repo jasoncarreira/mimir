@@ -35,49 +35,142 @@ from ..shell_jobs import (
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Intent normalization for wait-on-pending guard (chainlink #189)
+# Intent normalization for wait-on-pending guard (chainlink #189 / #192)
 # ---------------------------------------------------------------------------
 
-_INTENT_PREFIX_MAX_CHARS = 100
+# Bumped from 100 → 200 to reduce false-positive truncation collisions where
+# two genuinely-different commands share a long common prefix (chainlink #192).
+_INTENT_PREFIX_MAX_CHARS = 200
 _ENV_VAR_TOKEN_RE = re.compile(r"^[A-Z_][A-Z0-9_]*=")
+
+# Matches shell-wrapper invocations: /bin/bash -c, bash -lc, /bin/sh -c, etc.
+# Used to unwrap the inner command before intent normalisation.
+_SHELL_WRAPPER_RE = re.compile(
+    r"^\s*(?:/[^\s]*/)?(?:ba)?sh\s+(?:-[a-z]+\s+)+",
+    re.IGNORECASE,
+)
+
+# Matches AT-protocol and HTTP/S URIs — used as a supplementary intent key.
+_URI_RE = re.compile(r"(?:at://|https?://)\S+")
+
+
+def _unwrap_shell_wrapper(command: str) -> str:
+    """Strip a shell-wrapper prefix and return the inner command.
+
+    If ``command`` is of the form ``/bin/bash -c '...'`` (or any
+    ``[/path/]bash``/``sh`` with ``-c`` / ``-lc`` / etc.), extract the
+    quoted inner body and return it.  Handles both single-quoted and
+    double-quoted bodies.  Returns ``command`` unchanged if it does not
+    start with a recognised shell wrapper.
+
+    Examples::
+
+        '/bin/bash -c "cd /tmp && echo hi"'  →  'cd /tmp && echo hi'
+        "bash -lc 'export X=1 && foo bar'"   →  'export X=1 && foo bar'
+        'echo hello'                          →  'echo hello'  (unchanged)
+    """
+    stripped = command.strip()
+    m = _SHELL_WRAPPER_RE.match(stripped)
+    if not m:
+        return command
+    after_shell = stripped[m.end():]
+    if not after_shell:
+        return command
+    # Strip outer single or double quotes if the remainder is fully quoted.
+    if after_shell[0] in ("'", '"'):
+        quote_char = after_shell[0]
+        close = after_shell.rfind(quote_char)
+        if close > 0:
+            return after_shell[1:close]
+    return after_shell
+
+
+def _take_last_chain_segment(command: str) -> str:
+    """Return the last ``&&``-separated segment of a shell command chain.
+
+    Strips leading ``cd /path &&`` patterns and similar multi-step setup
+    chains so the core executable is what remains.
+
+    Examples::
+
+        'cd /mimir-home && social-cli like at://...'  →  'social-cli like at://...'
+        'cd /a && export X=1 && node cli.js foo'      →  'node cli.js foo'
+        'git fetch origin'                             →  'git fetch origin' (unchanged)
+    """
+    parts = [p.strip() for p in command.split("&&")]
+    parts = [p for p in parts if p]
+    return parts[-1] if parts else command
 
 
 def _intent_prefix(command: str) -> str:
     """Return a normalized intent string for duplicate-spawn detection.
 
-    Strips leading env-var assignment tokens so env-export variant retries
-    map to the same intent key as the original command.  Handles:
+    Handles (in order):
 
-    - ``export FOO=bar social-cli …``  (``export`` keyword + VAR=val tokens)
-    - ``FOO=bar BAZ=qux social-cli …``  (bare VAR=val prefix, no ``export``)
-    - Multiline variants (each leading line stripped)
-    - Mixed same-line and multi-line patterns
+    1. **Shell-wrapper escalation** (chainlink #192) — strips ``/bin/bash -c '...'``
+       wrappers so the inner command is what's compared.
+    2. **``&&``-chain prefixes** — takes the last segment of chains like
+       ``cd /path && export X=1 && <real-command>``.
+    3. **Leading env-var exports** — strips ``export FOO=bar`` and bare
+       ``VAR=val`` prefix tokens (original chainlink #189 logic).
+    4. **Absolute-path executables** — normalises ``/usr/bin/node`` →
+       ``node`` so the guard is insensitive to whether the caller used a
+       symbolic name or the full binary path.
 
-    Returns the first ``_INTENT_PREFIX_MAX_CHARS`` characters of the
-    remaining command body, lower-cased with whitespace collapsed.
-
-    Intent equality is heuristic — identical prefixes are sufficient evidence
-    of same-intent for the guard.  Commands with different syntax but the
-    same logical goal may not match; the guard is tuned for the observed
-    ``bash_async`` retry pattern (env-export prefix variations before the
-    same executable + args).
+    Returns the first ``_INTENT_PREFIX_MAX_CHARS`` characters lower-cased
+    with whitespace collapsed.  Intent equality is heuristic; see also
+    ``_intent_suffix_key`` for the URI-based supplementary check.
     """
-    # Tokenise and skip leading ``export`` keywords and ``VAR=val`` tokens.
-    tokens = command.split()
+    cmd = command.strip()
+
+    # 1. Unwrap shell wrappers (e.g. /bin/bash -c '...')
+    cmd = _unwrap_shell_wrapper(cmd)
+
+    # 2. Take the last segment of a && chain (strips cd /path && ... prefixes)
+    cmd = _take_last_chain_segment(cmd)
+
+    # 3. Tokenise and skip leading ``export`` keywords and ``VAR=val`` tokens.
+    tokens = cmd.split()
     i = 0
     while i < len(tokens):
         tok = tokens[i]
         if tok == "export":
-            # ``export`` keyword: consume it and keep scanning VAR=val tokens.
             i += 1
         elif _ENV_VAR_TOKEN_RE.match(tok):
-            # ``VAR=val`` assignment — skip.
             i += 1
         else:
             break
-    remaining = " ".join(tokens[i:])
+    tokens = tokens[i:]
+
+    # 4. Normalise the executable: absolute paths → basename.
+    if tokens and "/" in tokens[0]:
+        tokens[0] = tokens[0].rsplit("/", 1)[-1]
+
+    remaining = " ".join(tokens)
     normalized = " ".join(remaining.lower().split())
     return normalized[:_INTENT_PREFIX_MAX_CHARS]
+
+
+def _intent_suffix_key(command: str) -> str | None:
+    """Return the rightmost URI in the command, or ``None`` if absent.
+
+    Supplementary intent key for wrapper-invariance (chainlink #192): when
+    an agent escalates from ``social-cli like at://X`` to a bash-wrapped
+    ``/usr/bin/node cli.js dispatch at://X``, the executables and verb differ
+    so ``_intent_prefix`` misses the match.  The AT-URI ``at://X`` is constant
+    across all escalation levels and serves as a reliable secondary signal.
+
+    Matches ``at://…``, ``https://…``, and ``http://…`` URIs.  Strips
+    trailing shell-quote artefacts (``'``, ``"``).  Returns the rightmost
+    match lower-cased so the check is case-insensitive.
+    """
+    # Strip trailing quotes that bash -c wrappers leave on the last token.
+    cmd = command.strip().rstrip("'\"")
+    matches = _URI_RE.findall(cmd)
+    if not matches:
+        return None
+    uri = matches[-1].rstrip("'\".,;)")
+    return uri.lower()
 
 
 # Module-level dependency injection — populated by ``server.py:build_app``
@@ -148,24 +241,39 @@ async def bash_async(
     if not channel_id:
         channel_id = (_registry_state.get("current_channel_id") or "").strip() or None
 
-    # Wait-on-pending guard (chainlink #189): refuse if a same-intent job is
-    # already running on this channel.  Prevents the retry-escalation failure
-    # mode where the agent spawns N async variants of the same command without
-    # ever seeing results from the first (each variant has slightly different
-    # env exports, so the generic 3× circuit-breaker doesn't trip).
+    # Wait-on-pending guard (chainlink #189 / #192): refuse if a same-intent
+    # job is already running on this channel.  Prevents the retry-escalation
+    # failure mode where the agent spawns N async variants of the same command
+    # without ever seeing results from the first.
     #
-    # Scope: per-channel.  Jobs running on other channels (unrelated pollers,
-    # other conversations) don't block each other — they have different intents
-    # by nature.
+    # Two-key match (chainlink #192 — wrapper-invariance):
+    #   1. Prefix key — normalised first N chars after stripping wrappers,
+    #      cd-chains, env-exports, and path prefixes on the executable.
+    #      Catches plain retries and env-export variants.
+    #   2. Suffix key — rightmost AT-URI / HTTP-URI in the raw command.
+    #      Catches wrapper-escalation where the caller swaps
+    #      ``social-cli like at://X`` for ``/bin/bash -c '… node cli.js
+    #      dispatch at://X'``: the executable + verb differ so the prefix
+    #      key misses, but the URI target is constant across all levels.
+    #
+    # Scope: per-channel.  Jobs on other channels don't block each other.
     if channel_id is not None:
         new_intent = _intent_prefix(command)
+        new_suffix = _intent_suffix_key(command)
         for running_job in _REGISTRY.running_jobs():
             if running_job.channel_id != channel_id:
                 continue
-            if _intent_prefix(running_job.command) == new_intent:
+            prefix_match = _intent_prefix(running_job.command) == new_intent
+            suffix_match = (
+                new_suffix is not None
+                and new_suffix == _intent_suffix_key(running_job.command)
+            )
+            if prefix_match or suffix_match:
+                match_kind = "prefix" if prefix_match else "uri-target"
                 return (
                     f"bash_async refused: a job with the same intent is already "
-                    f"running (job_id={running_job.job_id!r}, pid={running_job.pid}). "
+                    f"running (job_id={running_job.job_id!r}, pid={running_job.pid}, "
+                    f"match={match_kind!r}). "
                     f"Check its status with "
                     f"bash_job_output(job_id={running_job.job_id!r}) before spawning "
                     f"a retry.  To see all in-flight jobs: bash_jobs_list()."
@@ -286,4 +394,9 @@ __all__ = (
     "bash_jobs_list",
     "bash_job_output",
     "set_shell_job_registry",
+    # Exposed for testing:
+    "_intent_prefix",
+    "_intent_suffix_key",
+    "_unwrap_shell_wrapper",
+    "_take_last_chain_segment",
 )

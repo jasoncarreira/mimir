@@ -216,6 +216,189 @@ def test_intent_prefix_different_commands_differ() -> None:
     assert _intent_prefix("git fetch origin") != _intent_prefix("social-cli dispatch x")
 
 
+# chainlink #192 — wrapper-invariance unit tests
+
+
+def test_intent_prefix_strips_cd_chain() -> None:
+    """cd path && cmd should reduce to cmd (case 2 from chainlink #192)."""
+    from mimir.tools.shell_async import _intent_prefix
+
+    base = "social-cli like at://did:plc:xxx/app.bsky.feed.post/yyy"
+    with_cd = f"cd /mimir-home/state/pollers/social-cli-feed && {base}"
+    assert _intent_prefix(with_cd) == _intent_prefix(base)
+
+
+def test_intent_prefix_strips_bash_c_wrapper_single_quoted() -> None:
+    """bash -c '...' wrapper is unwrapped before normalisation."""
+    from mimir.tools.shell_async import _intent_prefix
+
+    inner = "social-cli like at://did:plc:xxx/app.bsky.feed.post/yyy"
+    wrapped = f"/bin/bash -c '{inner}'"
+    assert _intent_prefix(wrapped) == _intent_prefix(inner)
+
+
+def test_intent_prefix_strips_bash_c_wrapper_double_quoted() -> None:
+    """bash -c \"...\" (double-quoted body) is also unwrapped."""
+    from mimir.tools.shell_async import _intent_prefix
+
+    inner = "social-cli like at://did:plc:xxx/app.bsky.feed.post/yyy"
+    wrapped = f'/bin/bash -c "{inner}"'
+    assert _intent_prefix(wrapped) == _intent_prefix(inner)
+
+
+def test_intent_prefix_normalises_executable_basename() -> None:
+    """Absolute-path executables are normalised to their basename."""
+    from mimir.tools.shell_async import _intent_prefix
+
+    full = "/usr/bin/node /mimir-home/.local/social-cli/dist/cli.js dispatch /file"
+    bare = "node /mimir-home/.local/social-cli/dist/cli.js dispatch /file"
+    assert _intent_prefix(full) == _intent_prefix(bare)
+
+
+def test_intent_prefix_complex_bash_c_chain() -> None:
+    """Full case-4 shape: bash -c 'cd && export && node cli.js …'
+    After wrapper-strip + chain-strip + env-strip + basename-norm the intent
+    should be 'node ... cli.js dispatch at://...'."""
+    from mimir.tools.shell_async import _intent_prefix
+
+    cmd4 = (
+        "/bin/bash -c 'cd /mimir-home/state/pollers/social-cli-feed "
+        "&& export ATPROTO_HANDLE=alice ATPROTO_APP_PASSWORD=secret "
+        "&& /usr/bin/node /mimir-home/.local/social-cli/dist/cli.js "
+        "dispatch at://did:plc:xxx/app.bsky.feed.post/yyy'"
+    )
+    # After normalisation: node ... cli.js dispatch at://...
+    result = _intent_prefix(cmd4)
+    assert "node" in result
+    assert "dispatch" in result
+    assert "at://did:plc:xxx/app.bsky.feed.post/yyy" in result
+
+
+# ─── _intent_suffix_key unit tests ──────────────────────────────────────
+
+
+def test_intent_suffix_key_extracts_at_uri() -> None:
+    from mimir.tools.shell_async import _intent_suffix_key
+
+    cmd = "social-cli like at://did:plc:xxx/app.bsky.feed.post/yyy"
+    assert _intent_suffix_key(cmd) == "at://did:plc:xxx/app.bsky.feed.post/yyy"
+
+
+def test_intent_suffix_key_extracts_https_uri() -> None:
+    from mimir.tools.shell_async import _intent_suffix_key
+
+    cmd = "curl -X POST https://api.example.com/data"
+    assert _intent_suffix_key(cmd) == "https://api.example.com/data"
+
+
+def test_intent_suffix_key_returns_rightmost_uri() -> None:
+    from mimir.tools.shell_async import _intent_suffix_key
+
+    cmd = "curl https://api.example.com/auth | curl https://api.example.com/data"
+    assert _intent_suffix_key(cmd) == "https://api.example.com/data"
+
+
+def test_intent_suffix_key_strips_trailing_quote() -> None:
+    """Trailing single-quote from bash -c wrappers is stripped."""
+    from mimir.tools.shell_async import _intent_suffix_key
+
+    cmd = "node cli.js dispatch at://did:plc:xxx/app.bsky.feed.post/yyy'"
+    assert _intent_suffix_key(cmd) == "at://did:plc:xxx/app.bsky.feed.post/yyy"
+
+
+def test_intent_suffix_key_returns_none_for_no_uri() -> None:
+    from mimir.tools.shell_async import _intent_suffix_key
+
+    assert _intent_suffix_key("git fetch origin") is None
+    assert _intent_suffix_key("social-cli dispatch /path/file.yaml") is None
+
+
+def test_intent_suffix_key_different_uris_differ() -> None:
+    from mimir.tools.shell_async import _intent_suffix_key
+
+    uri1 = _intent_suffix_key("social-cli like at://did:plc:aaa/app.bsky.feed.post/111")
+    uri2 = _intent_suffix_key("social-cli like at://did:plc:bbb/app.bsky.feed.post/222")
+    assert uri1 != uri2
+
+
+# ─── wait-on-pending guard — wrapper escalation integration tests ──────────
+
+
+@pytest.mark.asyncio
+async def test_bash_async_refuses_via_suffix_key_wrapper_escalation(
+    fake_registry_with_channel: ShellJobRegistry,
+) -> None:
+    """Guard fires via URI suffix when the agent escalates to a bash -c wrapper.
+
+    Observed failure mode (chainlink #192, turn 201c 2026-05-25):
+      Step 3 (running): export ATPROTO_HANDLE=alice social-cli like at://X
+      Step 4 (retry):   /bin/bash -c '… /usr/bin/node cli.js dispatch at://X'
+    The prefix keys differ (social-cli vs node/cli.js, like vs dispatch), but
+    the AT-URI ``at://X`` is identical — the suffix key fires the guard.
+    """
+    at_uri = "at://did:plc:xxx/app.bsky.feed.post/yyy"
+    running = _FakeJob(
+        job_id="j_step3",
+        pid=333,
+        command=f"export ATPROTO_HANDLE=alice social-cli like {at_uri}",
+        channel_id="test-ch",
+        exit_code=None,
+    )
+    fake_registry_with_channel._jobs["j_step3"] = running
+
+    # Step 4 — bash wrapper with node invoking cli.js + same AT-URI
+    cmd_step4 = (
+        f"/bin/bash -c 'cd /mimir-home/state/pollers/social-cli-feed "
+        f"&& export ATPROTO_HANDLE=alice ATPROTO_APP_PASSWORD=secret "
+        f"&& /usr/bin/node /mimir-home/.local/social-cli/dist/cli.js dispatch {at_uri}'"
+    )
+    out = await shell_async.bash_async.ainvoke({"command": cmd_step4})
+    assert "bash_async refused" in out
+    assert "j_step3" in out
+    assert "uri-target" in out  # match_kind should indicate suffix match
+
+
+@pytest.mark.asyncio
+async def test_bash_async_refuses_via_prefix_after_cd_strip(
+    fake_registry_with_channel: ShellJobRegistry,
+) -> None:
+    """Guard fires via prefix when the retry prepends cd /path && (case 2)."""
+    base_cmd = "social-cli like at://did:plc:xxx/app.bsky.feed.post/yyy"
+    running = _FakeJob(
+        job_id="j_step1",
+        pid=111,
+        command=base_cmd,
+        channel_id="test-ch",
+        exit_code=None,
+    )
+    fake_registry_with_channel._jobs["j_step1"] = running
+
+    retry = f"cd /mimir-home/state/pollers/social-cli-feed && {base_cmd}"
+    out = await shell_async.bash_async.ainvoke({"command": retry})
+    assert "bash_async refused" in out
+    assert "j_step1" in out
+
+
+@pytest.mark.asyncio
+async def test_bash_async_allows_different_uri_same_executable(
+    fake_registry_with_channel: ShellJobRegistry,
+) -> None:
+    """Guard does not fire when two commands use the same executable but different URIs."""
+    running = _FakeJob(
+        job_id="j_uri1",
+        pid=777,
+        command="social-cli like at://did:plc:aaa/app.bsky.feed.post/111",
+        channel_id="test-ch",
+        exit_code=None,
+    )
+    fake_registry_with_channel._jobs["j_uri1"] = running
+
+    out = await shell_async.bash_async.ainvoke(
+        {"command": "social-cli like at://did:plc:bbb/app.bsky.feed.post/222"}
+    )
+    assert "Spawned job" in out  # different URI → not blocked
+
+
 # ─── wait-on-pending guard ────────────────────────────────────────────
 
 
