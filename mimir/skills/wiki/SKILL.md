@@ -20,6 +20,8 @@ success_criteria:
         name: memory_store
 ---
 
+<!-- desc: Maintain a structured wiki under state/wiki/ — ingest raw sources, synthesize cross-linked pages, lint for health. -->
+
 # Wiki
 
 Based on Karpathy's LLM Wiki pattern (https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). The wiki is your synthesis of raw sources — not just summaries. Pages are cross-linked. The graph is the value.

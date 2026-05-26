@@ -10,6 +10,8 @@ success_criteria:
         name: send_message
 ---
 
+<!-- desc: Route high-priority signals to the operator alert channel without cluttering the current conversation. -->
+
 # Operator alert channel
 
 If `MIMIR_OPERATOR_ALERT_CHANNEL` is configured, the system prompt's

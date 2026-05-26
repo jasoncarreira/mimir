@@ -3,6 +3,8 @@ name: long-running-jobs
 description: Run shell commands in the background with output capture and completion callbacks. Use when a command might take more than ~30 seconds (builds, tests, deployments, data processing) and you want to keep working while it runs.
 ---
 
+<!-- desc: Run shell commands in the background with output capture and completion callbacks — use when a command might take more than ~30 seconds. -->
+
 # Long-Running Jobs
 
 Some commands take minutes or hours. Rather than blocking on them, you can launch them in the background, capture all output, and get notified when they finish.

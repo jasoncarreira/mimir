@@ -39,6 +39,8 @@ success_criteria:
           command_glob: "*cp *skills/*"
 ---
 
+<!-- desc: Discover, evaluate, install, and wrap external agent skills from ClawHub, skillflag-compliant CLI tools, and GitHub repos. -->
+
 # Skill Acquisition
 
 You help users discover and install agent skills from the ecosystem. There are three main sources:

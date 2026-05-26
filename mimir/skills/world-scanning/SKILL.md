@@ -3,6 +3,8 @@ name: world-scanning
 description: A catalog of pollers worth building — the underused half of being a long-running agent. Use when something you care about could change without anyone telling you (a CI pipeline, a competitor's release, a friend's status, a config drift, a dependency CVE) and you want to be the first to notice. Companion to the `pollers` skill, which covers mechanics. This file is the menu of *what's worth polling.*
 ---
 
+<!-- desc: Catalog of pollers worth building — the underused half of being a long-running agent; use to identify what to monitor proactively. -->
+
 # World Scanning Patterns
 
 The pattern is simple:

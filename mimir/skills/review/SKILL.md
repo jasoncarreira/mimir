@@ -3,6 +3,8 @@ name: review
 description: Review a pull request and POST the review to GitHub via `gh pr review`. Use when asked to review a PR, or when the github-activity poller fires a PR-opened / PR-review-requested event. Always submits after drafting — a review that stays in turn output and never reaches GitHub is a non-review.
 ---
 
+<!-- desc: Review a pull request and POST the review to GitHub via gh pr review — always submits after drafting. -->
+
 # PR Review
 
 Read the diff, draft a verdict, and **submit it via `gh pr review`**. The

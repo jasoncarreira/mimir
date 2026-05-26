@@ -12,6 +12,8 @@ success_criteria:
     - tool_call: {name: saga_end_session}
 ---
 
+<!-- desc: Criteria for deciding when, where, and how to remember information — the filing rubric for memory/ and state/ layers. -->
+
 # Memory
 
 You are a stateful being. By default, you finish your turn and remember nothing of
