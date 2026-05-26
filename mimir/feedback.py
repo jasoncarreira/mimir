@@ -152,6 +152,15 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # sees recurring failures even when the poller didn't classify the
     # root cause itself.
     "poller_nonzero_exit":   ("negative", "poller_nonzero_exit"),
+    # Circuit-breaker events (chainlink #94): emitted by the pollers
+    # framework when consecutive failures trip the breaker (tripped) or
+    # when a run is skipped because the circuit is still open (open).
+    # ``tripped`` is the load-bearing signal — operator sees it once per
+    # trip.  ``open`` repeats every suppressed fire but carries a
+    # ``remaining_seconds`` countdown so the operator can see the backoff
+    # window draining in events.jsonl.
+    "poller_circuit_tripped": ("negative", "poller_circuit_tripped"),
+    "poller_circuit_open":    ("negative", "poller_circuit_open"),
     # github-poller review-missed-submission (Mimir's PR #234 / #235
     # post-mortem). Fires when a PR-review-needed event reached the
     # agent (``pr_opened`` / ``pr_synchronize``) but the turn ended

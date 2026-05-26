@@ -23,8 +23,12 @@ import pytest
 from mimir.event_logger import init_logger
 from mimir.models import AgentEvent
 from mimir.pollers import (
+    POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
+    POLLER_CIRCUIT_BREAKER_THRESHOLD,
     POLLER_TIMEOUT_SECONDS,
     PollerConfig,
+    _CircuitBreakerState,
+    _circuit_breakers,
     discover_pollers,
     run_poller,
 )
@@ -1845,3 +1849,143 @@ print(json.dumps({{
     # recognized signal — the framework doesn't gate on classification.
     complete = [e for e in events if e.get("type") == "poller_complete"]
     assert complete[0]["signals_emitted"] == 1
+
+
+# ─── Circuit-breaker tests ────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def clear_circuit_breakers():
+    """Reset the module-level _circuit_breakers dict before/after every
+    test so circuit-breaker state doesn't bleed across tests.
+
+    ``autouse=True`` is intentional: ``_circuit_breakers`` is module-level
+    and persists across tests by default.  Without this fixture, a test
+    that trips the circuit for poller name ``"x"`` silently suppresses
+    subsequent tests that also use ``"x"``.
+    """
+    _circuit_breakers.clear()
+    yield
+    _circuit_breakers.clear()
+
+
+def _failing_poller_cfg(tmp_path: Path, name: str = "cb-test") -> PollerConfig:
+    """Return a PollerConfig whose script always exits non-zero."""
+    skill_dir = tmp_path / name
+    _install_script(skill_dir, "poller.py", "import sys; sys.exit(1)")
+    return PollerConfig(
+        name=name,
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=skill_dir,
+    )
+
+
+def _ok_poller_cfg(tmp_path: Path, name: str = "cb-test") -> PollerConfig:
+    """Return a PollerConfig whose script always exits 0 with no events."""
+    skill_dir = tmp_path / name
+    _install_script(skill_dir, "poller.py", "")  # exits 0, prints nothing
+    return PollerConfig(
+        name=name,
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=skill_dir,
+    )
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_trips_after_threshold(tmp_path, home, clear_circuit_breakers):
+    """After POLLER_CIRCUIT_BREAKER_THRESHOLD consecutive failures the
+    circuit-breaker trips: ``poller_circuit_tripped`` is emitted and
+    ``disabled_until`` is set in the future."""
+    cfg = _failing_poller_cfg(tmp_path)
+    enq = _CapturingEnqueue()
+
+    for _ in range(POLLER_CIRCUIT_BREAKER_THRESHOLD):
+        await run_poller(cfg, enqueue=enq)
+
+    events = _read_events(home)
+    tripped = [e for e in events if e.get("type") == "poller_circuit_tripped"]
+    assert len(tripped) == 1, "circuit_tripped should fire exactly once"
+    assert tripped[0]["poller"] == cfg.name
+    assert tripped[0]["consecutive_failures"] == POLLER_CIRCUIT_BREAKER_THRESHOLD
+    assert tripped[0]["backoff_seconds"] == POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS
+
+    state = _circuit_breakers[cfg.name]
+    assert state.disabled_until > 0, "disabled_until should be set after trip"
+    assert state.consecutive_failures == POLLER_CIRCUIT_BREAKER_THRESHOLD
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_open_suppresses_subsequent_runs(tmp_path, home, clear_circuit_breakers):
+    """When the circuit is open (tripped and backoff not yet elapsed),
+    ``run_poller`` returns 0 immediately and emits ``poller_circuit_open``
+    instead of running the subprocess."""
+    cfg = _failing_poller_cfg(tmp_path)
+    enq = _CapturingEnqueue()
+
+    # Trip the circuit.
+    for _ in range(POLLER_CIRCUIT_BREAKER_THRESHOLD):
+        await run_poller(cfg, enqueue=enq)
+
+    # One more run — should be suppressed.
+    result = await run_poller(cfg, enqueue=enq)
+    assert result == 0
+
+    events = _read_events(home)
+    open_events = [e for e in events if e.get("type") == "poller_circuit_open"]
+    assert len(open_events) >= 1
+    assert open_events[0]["poller"] == cfg.name
+    assert "remaining_seconds" in open_events[0]
+    assert open_events[0]["remaining_seconds"] > 0
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_resets_after_successful_run(tmp_path, home, clear_circuit_breakers):
+    """A successful run (exit 0) resets the circuit-breaker state so the
+    poller can fail again without carrying over the prior failure count.
+
+    fail_cfg and ok_cfg share the same poller *name* (so they share
+    circuit-breaker state) but use different script directories so the
+    ok-script doesn't clobber the failing one before it runs.
+    """
+    cfg_name = "cb-reset"
+    # Install into distinct sub-dirs to avoid script clobbering.
+    fail_dir = tmp_path / "cb-reset-fail"
+    ok_dir = tmp_path / "cb-reset-ok"
+    _install_script(fail_dir, "poller.py", "import sys; sys.exit(1)")
+    _install_script(ok_dir, "poller.py", "")  # exits 0, no events
+
+    fail_cfg = PollerConfig(
+        name=cfg_name,
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=fail_dir,
+    )
+    ok_cfg = PollerConfig(
+        name=cfg_name,
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=ok_dir,
+    )
+    enq = _CapturingEnqueue()
+
+    # Accumulate failures without reaching the threshold.
+    for _ in range(POLLER_CIRCUIT_BREAKER_THRESHOLD - 1):
+        await run_poller(fail_cfg, enqueue=enq)
+
+    assert _circuit_breakers[cfg_name].consecutive_failures == POLLER_CIRCUIT_BREAKER_THRESHOLD - 1
+
+    # One successful run should zero out the counter.
+    await run_poller(ok_cfg, enqueue=enq)
+    state = _circuit_breakers[cfg_name]
+    assert state.consecutive_failures == 0
+    assert state.disabled_until == 0.0
+
+    events = _read_events(home)
+    tripped = [e for e in events if e.get("type") == "poller_circuit_tripped"]
+    assert tripped == [], "no trip should have fired"
