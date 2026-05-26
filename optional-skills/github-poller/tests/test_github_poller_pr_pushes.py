@@ -43,10 +43,19 @@ def captured_emits(monkeypatch):
     return events
 
 
-def _patch_api(monkeypatch, response):
-    monkeypatch.setattr(
-        poller, "_gh_api", lambda endpoint, token: response,
-    )
+def _patch_api(monkeypatch, response, compare_response=None):
+    """Patch ``_gh_api`` to return ``response`` for PR-list calls and
+    ``compare_response`` (default None) for compare/ endpoint calls.
+
+    Most existing tests don't care about commit enrichment, so they pass
+    no ``compare_response`` and the compare call degrades gracefully to
+    ``"(commit details unavailable)"`` in the emitted prompt.
+    """
+    def fake_api(endpoint: str, token: str):
+        if "compare/" in endpoint:
+            return compare_response
+        return response
+    monkeypatch.setattr(poller, "_gh_api", fake_api)
 
 
 def test_first_sighting_does_not_emit(monkeypatch, captured_emits):
@@ -498,3 +507,69 @@ def test_review_requested_event_carries_submission_marker(monkeypatch):
     marker = ev.get("expected_tool_call")
     assert isinstance(marker, dict)
     assert marker["signal_on_missing"] == "poller_review_missed_submission"
+
+
+# ── commit-enrichment tests ───────────────────────────────────────────────────
+
+
+def _make_commit(message: str) -> dict:
+    return {"commit": {"message": message}, "sha": "aabbccdd"}
+
+
+def test_commit_subjects_included_in_prompt(monkeypatch, captured_emits):
+    """When the compare endpoint returns commits, their first-line subjects
+    appear in the prompt so the agent can act on individual changes."""
+    compare = {
+        "ahead_by": 2,
+        "commits": [
+            _make_commit("Add feature X\n\nDetails here"),
+            _make_commit("Fix edge case Y"),
+        ],
+    }
+    _patch_api(monkeypatch, [_pr(110, "new_sha")], compare_response=compare)
+    _, _, _ = poller._check_pr_pushes(
+        "o/r", token="t", me="",
+        pr_heads={"110": "old_sha"},
+    )
+    assert len(captured_emits) == 1
+    prompt = captured_emits[0]["prompt"]
+    assert "2 commit(s)" in prompt
+    assert "Add feature X" in prompt
+    assert "Fix edge case Y" in prompt
+    assert "Details here" not in prompt          # only first line of message
+    assert "old_sha" in prompt                   # sha delta preserved
+    assert "new_sha" in prompt
+
+
+def test_commit_subjects_truncated_at_three(monkeypatch, captured_emits):
+    """Only the first 3 commit subjects are shown inline; remainder shown
+    as '… (N more)' so the prompt doesn't balloon on large force-pushes."""
+    compare = {
+        "ahead_by": 5,
+        "commits": [_make_commit(f"Commit {i}") for i in range(5)],
+    }
+    _patch_api(monkeypatch, [_pr(111, "sha_b")], compare_response=compare)
+    _, _, _ = poller._check_pr_pushes(
+        "o/r", token="t", me="",
+        pr_heads={"111": "sha_a"},
+    )
+    prompt = captured_emits[0]["prompt"]
+    assert "Commit 0" in prompt
+    assert "Commit 1" in prompt
+    assert "Commit 2" in prompt
+    assert "Commit 3" not in prompt
+    assert "… (2 more)" in prompt
+
+
+def test_compare_api_failure_degrades_gracefully(monkeypatch, captured_emits):
+    """When the compare endpoint returns None (API error), the prompt falls
+    back to '(commit details unavailable)' — the event still fires."""
+    _patch_api(monkeypatch, [_pr(112, "sha_new")], compare_response=None)
+    count, _, _ = poller._check_pr_pushes(
+        "o/r", token="t", me="",
+        pr_heads={"112": "sha_old"},
+    )
+    assert count == 1
+    prompt = captured_emits[0]["prompt"]
+    assert "(commit details unavailable)" in prompt
+    assert "PR #112 updated on o/r" in prompt
