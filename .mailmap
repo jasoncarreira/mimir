@@ -1,11 +1,15 @@
 Jason Carreira <jcarreira@gmail.com> <jason@visotrust.com>
-# mimir's early commits (pre-2026-05-16) used mimir@anthropic.com — remap to the
-# neutral local address to avoid implying Anthropic-employee authorship.
-mimir <noreply@mimir-agent.local> <mimir@anthropic.com>
-# Historical commits from the early MSAM contribution path — remapped to
-# the neutral mimir identity since the rewrite cleared that code and the
-# project no longer carries it. .mailmap is display-only; on-disk history
-# is preserved.
-mimir <noreply@mimir-agent.local> <jaden@Jadens-MacBook-Pro.local>
-mimir <noreply@mimir-agent.local> <zoology_yin_7o@icloud.com>
-mimir <noreply@mimir-agent.local> <263241645+jadenschwab@users.noreply.github.com>
+
+# All historical mimir-bot identity variants collapse to the current
+# canonical mimir-carreira identity (mimir@muninnai.ai). Display-only
+# remap — on-disk history is preserved; only ``git log %aN/%aE`` output
+# and GitHub's web UI display are affected.
+mimir-carreira <mimir@muninnai.ai> <mimir@anthropic.com>
+mimir-carreira <mimir@muninnai.ai> <noreply@mimir-agent.local>
+
+# Historical contributions to the early MSAM path — remapped to the
+# canonical mimir-bot identity since the rewrite cleared that code and
+# the project no longer carries it.
+mimir-carreira <mimir@muninnai.ai> <jaden@Jadens-MacBook-Pro.local>
+mimir-carreira <mimir@muninnai.ai> <zoology_yin_7o@icloud.com>
+mimir-carreira <mimir@muninnai.ai> <263241645+jadenschwab@users.noreply.github.com>
