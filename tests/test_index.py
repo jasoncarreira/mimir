@@ -244,3 +244,82 @@ async def test_generator_wiki_overwrites_hand_edits(tmp_path: Path):
     body = wiki_idx.read_text()
     assert "Hand-curated" not in body
     assert "Wiki Index" in body  # auto-regen header replaces it
+
+
+# ── skills-catalog auto-regen (chainlink #109) ─────────────────────
+
+
+def _make_fake_skills_root(root: Path) -> Path:
+    """Seed a minimal skills root with one SKILL.md so catalog generation
+    produces deterministic non-empty output."""
+    skills_root = root / "skills"
+    skill_dir = skills_root / "dummy-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: dummy-skill\n"
+        "description: Use when you need a dummy skill for testing.\n"
+        "allowed-tools: Read\n"
+        "---\n"
+        "<!-- desc: a dummy test skill -->\n"
+        "# Dummy Skill\n"
+        "Body.\n",
+        encoding="utf-8",
+    )
+    return skills_root
+
+
+@pytest.mark.asyncio
+async def test_memory_flush_creates_skills_catalog_when_missing(tmp_path: Path):
+    """When memory/skills-catalog.md doesn't exist, _write_memory creates it."""
+    _seed_memory(tmp_path)
+    skills_root = _make_fake_skills_root(tmp_path)
+    gen = IndexGenerator(tmp_path, skills_root=skills_root)
+    gen.mark_dirty("memory")
+    await gen.flush()
+
+    catalog = tmp_path / "memory" / "skills-catalog.md"
+    assert catalog.is_file(), "skills-catalog.md should be created"
+    body = catalog.read_text()
+    assert "dummy-skill" in body
+    assert "<!-- desc:" in body
+
+
+@pytest.mark.asyncio
+async def test_memory_flush_updates_stale_skills_catalog(tmp_path: Path):
+    """When skills-catalog.md exists but is stale, _write_memory overwrites it."""
+    _seed_memory(tmp_path)
+    skills_root = _make_fake_skills_root(tmp_path)
+    catalog = tmp_path / "memory" / "skills-catalog.md"
+    catalog.write_text("<!-- desc: old stale content -->\nstale", encoding="utf-8")
+
+    gen = IndexGenerator(tmp_path, skills_root=skills_root)
+    gen.mark_dirty("memory")
+    await gen.flush()
+
+    body = catalog.read_text()
+    assert "dummy-skill" in body
+    assert "stale" not in body
+
+
+@pytest.mark.asyncio
+async def test_memory_flush_skips_write_when_catalog_already_current(tmp_path: Path):
+    """When skills-catalog.md already matches the fresh generation, no write occurs."""
+    _seed_memory(tmp_path)
+    skills_root = _make_fake_skills_root(tmp_path)
+
+    # First flush — creates the catalog
+    gen = IndexGenerator(tmp_path, skills_root=skills_root)
+    gen.mark_dirty("memory")
+    await gen.flush()
+
+    catalog = tmp_path / "memory" / "skills-catalog.md"
+    mtime_after_first_flush = catalog.stat().st_mtime_ns
+
+    # Second flush — catalog is already current; mtime should NOT change
+    gen.mark_dirty("memory")
+    await gen.flush()
+
+    assert catalog.stat().st_mtime_ns == mtime_after_first_flush, (
+        "skills-catalog.md should not be rewritten when already current"
+    )
