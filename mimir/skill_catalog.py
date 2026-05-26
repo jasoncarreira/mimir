@@ -31,6 +31,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from mimir.event_logger import log_event_sync
 from mimir.skill_md import extract_list_field, parse_frontmatter
 
 # Default bundled skills root, used when nothing is passed in.
@@ -123,6 +124,19 @@ def load_skill(skill_dir: Path) -> SkillEntry | None:
         fm = parse_frontmatter(text)
     except (OSError, ValueError) as exc:
         print(f"WARNING: {skill_md}: skipped (parse error: {exc})", file=sys.stderr)
+        # Emit an algedonic event so the failure surfaces in the per-turn
+        # feedback block.  Wrapped in try/except RuntimeError because the
+        # event logger singleton may not be initialised in CLI / test contexts
+        # — the stderr WARNING above is sufficient in those environments.
+        try:
+            log_event_sync(
+                "skill_frontmatter_error",
+                skill_name=skill_dir.name,
+                path=str(skill_md),
+                error=str(exc),
+            )
+        except RuntimeError:
+            pass
         return None
     name = fm.get("name", "").strip() or skill_dir.name
     description = fm.get("description", "").strip()

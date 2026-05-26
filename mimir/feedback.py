@@ -216,6 +216,11 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # attempted N respawns and was refused" as an observable pattern
     # without requiring reading turn transcripts.
     "bash_async_refused_same_intent": ("negative", "bash_async_refused"),
+    # chainlink #201: SKILL.md frontmatter failed to parse — the skill is
+    # silently omitted from the catalog.  Surfaces as a negative so the
+    # operator sees recurring failures in the algedonic block rather than
+    # noticing a missing skill by accident.
+    "skill_frontmatter_error": ("negative", "skill_frontmatter_error"),
     # chainlink #65 (sub B): paired positive counterparts for the
     # ntfy / git / shell-job failure kinds above. First-occurrence-only
     # dedup makes failures sticky for 24h regardless of recovery —
@@ -1626,6 +1631,15 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return (
             f"bash_async refused same-intent respawn on {channel}: "
             f"running job {running_job_id!r} — intent={intent!r}"
+        )
+    if rule_kind == "skill_frontmatter_error":
+        # chainlink #201: SKILL.md frontmatter failed to parse — the skill
+        # is silently omitted from the catalog until the SKILL.md is fixed.
+        name = ev.get("skill_name") or "?"
+        error = ev.get("error") or "(no detail)"
+        return (
+            f"skill SKILL.md malformed: {name!r} — {error} "
+            f"(skill omitted from catalog until fixed)"
         )
     return rule_kind
 

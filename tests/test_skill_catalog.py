@@ -331,6 +331,53 @@ def test_load_skill_no_stderr_when_skill_md_missing(
     assert captured.err == ""
 
 
+def test_load_skill_emits_algedonic_event_on_malformed_frontmatter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """load_skill emits skill_frontmatter_error via log_event_sync when frontmatter is broken.
+
+    This makes malformed skills visible in the per-turn algedonic feedback block
+    rather than requiring the operator to notice a missing skill by accident
+    (chainlink #201).
+    """
+    emitted: list[dict] = []
+
+    def _fake_log_event_sync(event_type: str, **payload) -> None:  # type: ignore[type-arg]
+        emitted.append({"type": event_type, **payload})
+
+    monkeypatch.setattr("mimir.skill_catalog.log_event_sync", _fake_log_event_sync)
+
+    skill_dir = _make_skill(tmp_path, "busted-skill", "not valid frontmatter at all\n")
+    result = load_skill(skill_dir)
+
+    assert result is None
+    assert len(emitted) == 1
+    ev = emitted[0]
+    assert ev["type"] == "skill_frontmatter_error"
+    assert ev["skill_name"] == "busted-skill"
+    assert "SKILL.md" in ev["path"]
+    assert ev.get("error")  # non-empty error message
+
+
+def test_load_skill_no_event_when_logger_not_initialized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When log_event_sync raises RuntimeError (logger not initialized), load_skill
+    still returns None without crashing — CLI / bench contexts run without a live logger.
+    """
+    monkeypatch.setattr(
+        "mimir.skill_catalog.log_event_sync",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("not initialized")),
+    )
+
+    skill_dir = _make_skill(tmp_path, "busted-skill2", "no frontmatter\n")
+    result = load_skill(skill_dir)  # must not raise
+
+    assert result is None
+
+
 def test_load_catalog_inner_counts_parse_errors(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
