@@ -107,6 +107,15 @@ POLLER_REJECTION_PREVIEW_CHARS = 200
 # heavy publish hours) opt into ``batch_size > 1`` to coalesce items
 # into fewer turns.
 POLLER_BATCH_SIZE_DEFAULT = 1
+# Circuit-breaker: after this many consecutive failures the poller is
+# suspended for ``POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS``. "Failure"
+# means a non-zero exit, timeout, or subprocess launch error — clean
+# exits (even with no events emitted) reset the count.
+POLLER_CIRCUIT_BREAKER_THRESHOLD = 3
+# How long (seconds) to hold the circuit open after tripping.  5 min
+# is long enough to avoid a storm-of-bad-runs while short enough not
+# to leave a flaky poller dark for too long.
+POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS = 300
 
 #: Channel-id prefix for synthetic poller-tick channels. Each registered
 #: poller emits events on ``poller:<name>``. Exported so other modules
@@ -114,6 +123,53 @@ POLLER_BATCH_SIZE_DEFAULT = 1
 #: prefix without duplicating the literal. Sibling of
 #: :data:`mimir.scheduler.SCHEDULER_CHANNEL_PREFIX`.
 POLLER_CHANNEL_PREFIX = "poller:"
+
+
+@dataclass
+class _CircuitBreakerState:
+    """Per-poller failure-run tracker for the circuit-breaker guard.
+
+    ``consecutive_failures`` counts runs that ended in a non-zero exit,
+    timeout, or subprocess launch error since the last clean exit.
+    ``disabled_until`` is a Unix timestamp; when it is in the future the
+    poller is suppressed and ``run_poller`` returns immediately.  Both
+    fields reset to their defaults on the first clean run after a trip.
+    """
+
+    consecutive_failures: int = 0
+    disabled_until: float = 0.0  # 0.0 → not disabled
+
+
+#: Module-level per-poller circuit-breaker state.  Keyed by
+#: :attr:`PollerConfig.name`.  Lives at module scope (not per-Scheduler)
+#: so it survives ``reload_pollers`` calls — a poller that was tripped
+#: stays tripped even after the manifest is reloaded.
+_circuit_breakers: dict[str, _CircuitBreakerState] = {}
+
+
+def _cb_record_failure(name: str) -> bool:
+    """Increment the consecutive-failure counter for *name*.
+
+    Returns ``True`` the first time the count reaches
+    ``POLLER_CIRCUIT_BREAKER_THRESHOLD`` (i.e. the circuit just tripped),
+    so the caller can emit a ``poller_circuit_tripped`` event exactly once.
+    Returns ``False`` on subsequent failures (circuit already open) or when
+    the threshold hasn't been reached yet.
+    """
+    cb = _circuit_breakers.setdefault(name, _CircuitBreakerState())
+    cb.consecutive_failures += 1
+    if cb.consecutive_failures == POLLER_CIRCUIT_BREAKER_THRESHOLD:
+        cb.disabled_until = time.time() + POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS
+        return True
+    return False
+
+
+def _cb_record_success(name: str) -> None:
+    """Reset the circuit-breaker state for *name* after a clean run."""
+    if name in _circuit_breakers:
+        state = _circuit_breakers[name]
+        state.consecutive_failures = 0
+        state.disabled_until = 0.0
 
 
 @dataclass
@@ -405,6 +461,25 @@ async def run_poller(
     enqueues) and ``events_rejected`` (dispatcher said no, indicating
     queue back-pressure) so a mismatch between them is grep-able.
     """
+    # --- Circuit-breaker guard -------------------------------------------
+    # Check whether this poller is currently suspended due to consecutive
+    # failures.  When the circuit is open we skip the subprocess entirely
+    # and emit a ``poller_circuit_open`` event so events.jsonl shows the
+    # suppression (operator can see "poller X is tripped" without needing
+    # to wonder why it went silent).
+    _cb = _circuit_breakers.setdefault(poller.name, _CircuitBreakerState())
+    _now = time.time()
+    if _cb.disabled_until > _now:
+        _remaining = int(_cb.disabled_until - _now)
+        await log_event(
+            "poller_circuit_open",
+            poller=poller.name,
+            remaining_seconds=_remaining,
+            consecutive_failures=_cb.consecutive_failures,
+        )
+        return 0
+    # --- End circuit-breaker guard ----------------------------------------
+
     persist_dir = poller.resolved_persist_dir()
     # Lazy-create the persist dir on first use. Skill authors who
     # write a cursor file to STATE_DIR can rely on the dir existing.
@@ -551,6 +626,14 @@ async def run_poller(
                 poller=poller.name,
                 timeout_seconds=int(timeout),
             )
+            if _cb_record_failure(poller.name):
+                await log_event(
+                    "poller_circuit_tripped",
+                    poller=poller.name,
+                    consecutive_failures=_circuit_breakers[poller.name].consecutive_failures,
+                    backoff_seconds=POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
+                    reason="timeout",
+                )
             return 0
         except Exception as exc:  # noqa: BLE001 — never let a poller break the scheduler
             fatal_error = f"{type(exc).__name__}: {exc}"
@@ -559,6 +642,14 @@ async def run_poller(
                 poller=poller.name,
                 error=fatal_error,
             )
+            if _cb_record_failure(poller.name):
+                await log_event(
+                    "poller_circuit_tripped",
+                    poller=poller.name,
+                    consecutive_failures=_circuit_breakers[poller.name].consecutive_failures,
+                    backoff_seconds=POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
+                    reason="exec_error",
+                )
             return 0
     finally:
         # Kill + reap on every exit path. The ``returncode is None``
@@ -595,7 +686,20 @@ async def run_poller(
             poller=poller.name,
             returncode=proc.returncode if proc is not None else None,
         )
+        if _cb_record_failure(poller.name):
+            await log_event(
+                "poller_circuit_tripped",
+                poller=poller.name,
+                consecutive_failures=_circuit_breakers[poller.name].consecutive_failures,
+                backoff_seconds=POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
+                reason="nonzero_exit",
+            )
         return 0
+
+    # Clean exit (returncode == 0) — reset the circuit breaker.  This
+    # covers both the "has events" and "silent / no events" outcomes;
+    # both mean the subprocess ran to successful completion.
+    _cb_record_success(poller.name)
 
     stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
 
@@ -875,4 +979,7 @@ __all__ = (
     "run_poller",
     "POLLER_TIMEOUT_SECONDS",
     "POLLER_PROMPT_CHARS",
+    "POLLER_CIRCUIT_BREAKER_THRESHOLD",
+    "POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS",
+    "_circuit_breakers",  # exposed for tests + introspection; prefixed as internal
 )

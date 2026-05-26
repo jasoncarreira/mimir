@@ -106,6 +106,8 @@ Plus any literal env vars from the `env` field, plus any pass-throughs declared 
 - **stderr:** Free-form diagnostic logging. Captured and emitted as a `poller_stderr` event in `events.jsonl` for observability — not forwarded as a turn-prompt, but greppable from `mimir introspection` / log scraping.
 - **Exit 0:** Success. **Non-zero:** Error — the framework drops stdout entirely (events AND signals from this run are NOT processed) and auto-emits `poller_nonzero_exit` (negative algedonic) so the operator sees recurring failures. The next cron tick retries.
 
+  **Circuit-breaker (chainlink #94):** after 3 consecutive failures (non-zero exit, timeout, or subprocess launch error) the framework suspends the poller for 5 minutes. A `poller_circuit_tripped` event fires once at trip time (negative algedonic — operator-visible). Subsequent suppressed runs emit `poller_circuit_open` with a `remaining_seconds` countdown. The circuit resets automatically on the first clean (exit-0) run after the backoff expires. This protects the scheduler from a persistently broken poller spinning up costly turns.
+
   **Implication for skill authors**: to surface a signal (e.g. "OAuth token expired"), emit the signal record then `return 0` — that's a successful detection, not a runtime failure. Reserve non-zero exit for catastrophic failures (script crashed, can't parse own config) where dropping stdout is the right move. The common pattern:
 
   ```python
