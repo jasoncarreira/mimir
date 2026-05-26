@@ -161,6 +161,13 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # window draining in events.jsonl.
     "poller_circuit_tripped": ("negative", "poller_circuit_tripped"),
     "poller_circuit_open":    ("negative", "poller_circuit_open"),
+    # chainlink #95: ``poller.env`` contained a key whose name matches a
+    # deny-list pattern (``*_API_KEY``, ``*_TOKEN``, etc.).  ``pass_env``
+    # is the documented path for forwarding live secrets; ``poller.env``
+    # is for static literal config values.  The operator likely put the
+    # wrong thing in the ``env`` block — surface as a negative so the
+    # algedonic block catches it without requiring a crash.
+    "poller_env_secret_reintroduced": ("negative", "poller_env_secret_reintroduced"),
     # github-poller review-missed-submission (Mimir's PR #234 / #235
     # post-mortem). Fires when a PR-review-needed event reached the
     # agent (``pr_opened`` / ``pr_synchronize``) but the turn ended

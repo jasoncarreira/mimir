@@ -1633,6 +1633,90 @@ print('{"poller": "x", "prompt": "ok"}')
     assert "ghp_secret_should_not_appear_in_event" not in payload
 
 
+# ─── chainlink #95: poller.env secret-key warning ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_poller_env_secret_key_emits_warning(tmp_path: Path, home: Path) -> None:
+    """When ``poller.env`` contains a key whose name matches a deny-list
+    pattern (``*_TOKEN``, ``*_API_KEY``, ``MIMIR_*``), the framework emits
+    a ``poller_env_secret_reintroduced`` warning event.
+
+    ``poller.env`` is the literal-value path for static config; ``pass_env``
+    is the documented path for forwarding live secrets.  A careless operator
+    who writes ``env: { MY_API_KEY: "..." }`` in pollers.json re-exposes a
+    deny-list key without realising it — the event surfaces this as an
+    algedonic negative so the misconfiguration is visible.
+    """
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print('{"poller": "x", "prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"MY_API_KEY": "literal_static_value"},
+        skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    warn_events = [e for e in events if e.get("type") == "poller_env_secret_reintroduced"]
+    assert len(warn_events) == 1
+    assert warn_events[0].get("poller") == "x"
+    assert warn_events[0].get("key") == "MY_API_KEY"
+    # Value must NOT appear in the event payload.
+    payload = json.dumps(warn_events[0])
+    assert "literal_static_value" not in payload
+
+
+@pytest.mark.asyncio
+async def test_run_poller_env_non_secret_key_no_warning(tmp_path: Path, home: Path) -> None:
+    """``poller.env`` keys whose names do NOT match deny-list patterns must
+    NOT emit a ``poller_env_secret_reintroduced`` event — only genuinely
+    secret-named keys trigger the warning."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print('{"poller": "x", "prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"GITHUB_REPOS": "owner/repo", "POLL_INTERVAL": "60"},
+        skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    warn_events = [e for e in events if e.get("type") == "poller_env_secret_reintroduced"]
+    assert warn_events == []
+
+
+@pytest.mark.asyncio
+async def test_run_poller_env_mimir_prefix_key_emits_warning(tmp_path: Path, home: Path) -> None:
+    """``MIMIR_*``-prefixed keys in ``poller.env`` also trigger the
+    ``poller_env_secret_reintroduced`` warning (same deny-prefix logic)."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print('{"poller": "x", "prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"MIMIR_SOME_INTERNAL_KEY": "value"},
+        skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    warn_events = [e for e in events if e.get("type") == "poller_env_secret_reintroduced"]
+    assert len(warn_events) == 1
+    assert warn_events[0].get("key") == "MIMIR_SOME_INTERNAL_KEY"
+
+
 # ─── Algedonic signals from pollers ──────────────────────────────────
 
 

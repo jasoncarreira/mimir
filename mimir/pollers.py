@@ -622,6 +622,26 @@ async def run_poller(
                 key=key,
             )
     env.update(poller.env)  # explicit per-skill overlay still wins
+    # chainlink #95: warn when poller.env re-introduces a key whose name
+    # matches the deny-list patterns.  ``pass_env`` is the documented path
+    # for forwarding live secrets from os.environ; ``poller.env`` is the
+    # literal-value path meant for static config — not secrets.  Operators
+    # who accidentally write ``env: { MY_API_KEY: "${MY_API_KEY}" }`` in
+    # pollers.json re-expose a denied key without realising it (the
+    # ``${…}`` is NOT shell-expanded — pollers.py coerces values to str
+    # at parse time, so the literal string "${MY_API_KEY}" reaches the
+    # subprocess, which is confusing but also signals the operator put
+    # the wrong thing in ``env``).  Emit a negative event so the algedonic
+    # block surfaces this configuration smell.  The value is NOT logged.
+    for key in poller.env:
+        if any(key.endswith(s) for s in _DENY_SUFFIXES) or any(
+            key.startswith(p) for p in _DENY_PREFIXES
+        ):
+            await log_event(
+                "poller_env_secret_reintroduced",
+                poller=poller.name,
+                key=key,
+            )
     env["STATE_DIR"] = str(persist_dir)
     env["POLLER_NAME"] = poller.name
 
