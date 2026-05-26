@@ -997,3 +997,103 @@ def test_commitments_init_exports_schema_version_constant():
     assert "COMMITMENTS_JSONL_SCHEMA_VERSION" in commitments.__all__
     assert isinstance(commitments.COMMITMENTS_JSONL_SCHEMA_VERSION, int)
     assert commitments.COMMITMENTS_JSONL_SCHEMA_VERSION >= 1
+
+
+# ─── Scale warning tests (chainlink #106) ───────────────────────────────
+
+
+def _make_pending_event(n: int) -> dict:
+    """Return a minimal ``commitment_added`` event for scale-warning tests."""
+    rid = f"c-scale-{n:05d}"
+    return {
+        "type": "commitment_added",
+        "v": 1,
+        "ts_unix": time.time(),
+        "id": rid,
+        "record": {
+            "id": rid,
+            "channel_id": "c1",
+            "text": f"scale test {n}",
+            "kind": CommitmentKind.AGENT_PROMISE.value,
+            "status": CommitmentStatus.PENDING.value,
+            "created_at_unix": time.time(),
+        },
+    }
+
+
+def test_current_state_no_warning_below_threshold(tmp_path: Path, caplog):
+    """Stores with few events produce no scale warning."""
+    import logging
+    from mimir.commitments.store import _LARGE_STORE_WARN_THRESHOLD
+
+    path = tmp_path / "commitments.jsonl"
+    # Write exactly _LARGE_STORE_WARN_THRESHOLD events (threshold, not over).
+    events = [_make_pending_event(i) for i in range(_LARGE_STORE_WARN_THRESHOLD)]
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+
+    store = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        store.current_state()
+
+    scale_warnings = [
+        r for r in caplog.records
+        if "store has" in r.getMessage() and "threshold" in r.getMessage()
+    ]
+    assert len(scale_warnings) == 0, (
+        f"expected no scale warning at or below threshold; got {scale_warnings}"
+    )
+
+
+def test_current_state_warns_once_above_threshold(tmp_path: Path, caplog):
+    """Stores exceeding the threshold emit exactly one warning, even across
+    multiple ``current_state()`` calls (the per-instance flag deduplicates)."""
+    import logging
+    from mimir.commitments.store import _LARGE_STORE_WARN_THRESHOLD
+
+    path = tmp_path / "commitments.jsonl"
+    # Write _LARGE_STORE_WARN_THRESHOLD + 1 events to cross the threshold.
+    over = _LARGE_STORE_WARN_THRESHOLD + 1
+    events = [_make_pending_event(i) for i in range(over)]
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+
+    store = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        store.current_state()
+        store.current_state()  # second call must not emit a duplicate
+
+    scale_warnings = [
+        r for r in caplog.records
+        if "store has" in r.getMessage() and "threshold" in r.getMessage()
+    ]
+    assert len(scale_warnings) == 1, (
+        f"expected exactly 1 scale warning for {over} events; got {scale_warnings}"
+    )
+    assert str(over) in scale_warnings[0].getMessage(), (
+        "warning should include the actual event count"
+    )
+
+
+def test_current_state_warning_flag_per_instance(tmp_path: Path, caplog):
+    """Two separate ``CommitmentsStore`` instances with the same large file
+    each warn independently (the flag is per-instance, not module-global)."""
+    import logging
+    from mimir.commitments.store import _LARGE_STORE_WARN_THRESHOLD
+
+    path = tmp_path / "commitments.jsonl"
+    over = _LARGE_STORE_WARN_THRESHOLD + 1
+    events = [_make_pending_event(i) for i in range(over)]
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+
+    store_a = CommitmentsStore(path=path)
+    store_b = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        store_a.current_state()
+        store_b.current_state()
+
+    scale_warnings = [
+        r for r in caplog.records
+        if "store has" in r.getMessage() and "threshold" in r.getMessage()
+    ]
+    assert len(scale_warnings) == 2, (
+        f"expected 2 scale warnings (one per instance); got {scale_warnings}"
+    )

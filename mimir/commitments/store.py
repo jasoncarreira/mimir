@@ -81,6 +81,17 @@ DEFAULT_TERMINAL_RETENTION_DAYS = 30
 COMMITMENTS_JSONL_SCHEMA_VERSION = 1
 
 
+
+#: Warn once (per process) when the JSONL event count exceeds this
+#: threshold.  Each lifecycle operation calls ``current_state()``
+#: which reads the whole file; at 5-min tick cadence, a chronic
+#: user accumulates events fast.  The warning surfaces the scaling
+#: smell early so the operator can run ``mimir commitments trim``
+#: before it becomes a latency issue.  Long-term fix: in-memory
+#: cache (chainlink #106).
+_LARGE_STORE_WARN_THRESHOLD = 500
+
+
 @dataclass
 class CommitmentsStore:
     """Owns ``<path>`` — typically ``<home>/.mimir/commitments.jsonl``.
@@ -96,6 +107,8 @@ class CommitmentsStore:
 
     def __post_init__(self) -> None:
         self._lock = asyncio.Lock()
+        # Guard: warn at most once per process instance to avoid log spam.
+        self._warned_large_store: bool = False
 
     # ─── Appenders ──────────────────────────────────────────────────
 
@@ -308,17 +321,33 @@ class CommitmentsStore:
         # JSONL is append-chronological; we read full-file (small,
         # bounded by trim policy). tail-streaming the FULL file via
         # ``tail_jsonl_records`` reverses order; use a forward scan.
+        event_count = 0
         with self.path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
+                event_count += 1
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     log.warning("commitments: skipping bad jsonl line")
                     continue
                 self._apply_event(records, event)
+        # Warn once when the store has grown large enough that per-call
+        # full-file replay (O(events) per ``_can_apply`` write) starts
+        # to matter. Run ``mimir commitments trim`` to prune terminal
+        # records and reset the count. Long-term fix: chainlink #106.
+        if event_count > _LARGE_STORE_WARN_THRESHOLD and not self._warned_large_store:
+            self._warned_large_store = True
+            log.warning(
+                "commitments: store has %d events (threshold %d) — "
+                "each lifecycle write replays the full file. "
+                "Run `mimir commitments trim` to prune terminal records. "
+                "Long-term fix: in-memory cache (chainlink #106).",
+                event_count,
+                _LARGE_STORE_WARN_THRESHOLD,
+            )
         return records
 
     @staticmethod
