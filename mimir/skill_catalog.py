@@ -179,9 +179,20 @@ def load_catalog(skills_root: Path) -> list[SkillEntry]:
 
 
 def render_catalog(entries: list[SkillEntry]) -> str:
-    """Render a list of :class:`SkillEntry` as the catalog markdown."""
+    """Render a list of :class:`SkillEntry` as the catalog markdown.
+
+    Column-stability contract (catalog-schema: v1):
+    - The table always has exactly three columns: ``Skill``, ``Trigger``,
+      ``Allowed tools``, in that order.
+    - Column names and order are stable across minor releases; a schema
+      version bump (``catalog-schema: v2``) is required to change them.
+    - Cell values may change as skills are added, renamed, or updated.
+    - Downstream parsers should key on the ``<!-- catalog-schema: vN -->``
+      comment in the first two lines, not on column indices alone.
+    """
     lines: list[str] = []
     lines.append("<!-- desc: All bundled mimir skills, one row per skill (name, trigger phrase, allowed tools). Use to find which skill applies to a problem. Regen via `mimir skills catalog`. -->")
+    lines.append("<!-- catalog-schema: v1 -->")
     lines.append("# Skills Catalog")
     lines.append("")
     lines.append(

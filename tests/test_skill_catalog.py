@@ -150,6 +150,22 @@ def test_render_catalog_smoke(tmp_path: Path) -> None:
     assert "### `beta`" in output
 
 
+def test_render_catalog_schema_version_marker() -> None:
+    """render_catalog emits a catalog-schema version comment near the top.
+
+    Downstream parsers that rely on the three-column shape (Skill / Trigger /
+    Allowed tools) should key on this marker rather than column indices alone.
+    A v1 → v2 bump signals a breaking column change.
+    """
+    output = render_catalog([])
+    assert "<!-- catalog-schema: v1 -->" in output
+    lines = output.splitlines()
+    # Marker must be in the first three lines (after the desc comment and
+    # before the h1 title) so parsers can detect it without scanning the
+    # full file.
+    assert any("catalog-schema: v1" in line for line in lines[:3])
+
+
 def test_render_catalog_handles_empty_allowed_tools() -> None:
     entries = [
         SkillEntry(
