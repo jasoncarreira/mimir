@@ -209,6 +209,12 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # never woke the spawning channel — the operator sees a missing
     # wake-up before they'd notice without surfacing here.
     "shell_job_complete_enqueue_failed": ("negative", "shell_job_complete_enqueue_failed"),
+    # chainlink #193: wait-on-pending guard refused a bash_async respawn
+    # because a same-intent job was already running on this channel.
+    # Negative so dashboards + introspection-report can surface "agent
+    # attempted N respawns and was refused" as an observable pattern
+    # without requiring reading turn transcripts.
+    "bash_async_refused_same_intent": ("negative", "bash_async_refused"),
     # chainlink #65 (sub B): paired positive counterparts for the
     # ntfy / git / shell-job failure kinds above. First-occurrence-only
     # dedup makes failures sticky for 24h regardless of recovery —
@@ -1608,6 +1614,17 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return (
             f"poller circuit-breaker open: {name} ({failures} consecutive"
             f" failures — runs suppressed)"
+        )
+    if rule_kind == "bash_async_refused":
+        # chainlink #193: wait-on-pending guard refused a respawn.
+        # Include running job id + intent prefix for operator audit
+        # without requiring reading turn transcripts.
+        running_job_id = ev.get("running_job_id") or "?"
+        intent = ev.get("intent_prefix") or "?"
+        channel = ev.get("channel_id") or "?"
+        return (
+            f"bash_async refused same-intent respawn on {channel}: "
+            f"running job {running_job_id!r} — intent={intent!r}"
         )
     return rule_kind
 

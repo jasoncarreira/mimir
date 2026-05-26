@@ -257,6 +257,11 @@ async def bash_async(
     #      key misses, but the URI target is constant across all levels.
     #
     # Scope: per-channel.  Jobs on other channels don't block each other.
+    #
+    # chainlink #193: emit algedonic event on refusal so the operator can
+    # audit "how many refused respawns happened" without reading turn
+    # transcripts.  The tool return-string is the agent-visible signal;
+    # the event is the operator/introspection-visible audit trail.
     if channel_id is not None:
         new_intent = _intent_prefix(command)
         new_suffix = _intent_suffix_key(command)
@@ -270,6 +275,17 @@ async def bash_async(
             )
             if prefix_match or suffix_match:
                 match_kind = "prefix" if prefix_match else "uri-target"
+                # chainlink #193: best-effort event so operator audit doesn't
+                # require reading turn transcripts.  ``safe_log_event`` silences
+                # logger-not-initialized in test harnesses / bench runners.
+                from ..event_logger import safe_log_event as _safe_log  # lazy — avoids top-level cycle
+                await _safe_log(
+                    "bash_async_refused_same_intent",
+                    channel_id=channel_id,
+                    running_job_id=running_job.job_id,
+                    new_command=command[:200],
+                    intent_prefix=new_intent,
+                )
                 return (
                     f"bash_async refused: a job with the same intent is already "
                     f"running (job_id={running_job.job_id!r}, pid={running_job.pid}, "
