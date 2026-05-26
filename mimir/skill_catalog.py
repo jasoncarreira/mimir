@@ -27,6 +27,7 @@ is what find-skills' semantic ranker keys off.
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -107,8 +108,12 @@ def load_skill(skill_dir: Path) -> SkillEntry | None:
     """Parse one ``<name>/SKILL.md`` into a :class:`SkillEntry`.
 
     Returns ``None`` if the directory is missing a SKILL.md or the
-    frontmatter is malformed (we don't fail the whole catalog on one
-    bad skill; conformance test is the place to fail on drift).
+    frontmatter is malformed.  On a malformed SKILL.md, emits a
+    ``WARNING:`` line to *stderr* so operators can diagnose silently-
+    omitted skills (the conformance test is the place to *fail*, but
+    stderr lets operators catch drift in non-CI environments too).
+    Use ``mimir skills catalog --strict`` to make the CLI exit non-zero
+    on any parse error.
     """
     skill_md = skill_dir / "SKILL.md"
     if not skill_md.is_file():
@@ -116,7 +121,8 @@ def load_skill(skill_dir: Path) -> SkillEntry | None:
     try:
         text = skill_md.read_text()
         fm = parse_frontmatter(text)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        print(f"WARNING: {skill_md}: skipped (parse error: {exc})", file=sys.stderr)
         return None
     name = fm.get("name", "").strip() or skill_dir.name
     description = fm.get("description", "").strip()
@@ -130,18 +136,45 @@ def load_skill(skill_dir: Path) -> SkillEntry | None:
     )
 
 
-def load_catalog(skills_root: Path) -> list[SkillEntry]:
-    """Walk ``skills_root``, return one :class:`SkillEntry` per skill
-    directory that has a parseable SKILL.md, sorted alphabetically."""
+def _load_catalog_inner(
+    skills_root: Path,
+) -> tuple[list[SkillEntry], int]:
+    """Internal: walk ``skills_root`` and return ``(entries, parse_error_count)``.
+
+    ``parse_error_count`` counts directories that *have* a SKILL.md but
+    couldn't be parsed (i.e. dirs without a SKILL.md are not counted as
+    errors).  Each parse failure also emits a ``WARNING:`` line to
+    *stderr* via :func:`load_skill`.
+    """
     if not skills_root.is_dir():
-        return []
+        return [], 0
     entries: list[SkillEntry] = []
+    error_count = 0
     for entry in sorted(skills_root.iterdir(), key=lambda p: p.name):
         if not entry.is_dir():
             continue
-        loaded = load_skill(entry)
+        skill_md = entry / "SKILL.md"
+        if not skill_md.is_file():
+            continue  # no SKILL.md — not a skill dir, not an error
+        loaded = load_skill(entry)  # emits stderr on parse failure
         if loaded is not None:
             entries.append(loaded)
+        else:
+            error_count += 1  # SKILL.md present but unparseable
+    return entries, error_count
+
+
+def load_catalog(skills_root: Path) -> list[SkillEntry]:
+    """Walk ``skills_root``, return one :class:`SkillEntry` per skill
+    directory that has a parseable SKILL.md, sorted alphabetically.
+
+    Directories missing a SKILL.md are silently skipped.  Directories
+    whose SKILL.md cannot be parsed emit a ``WARNING:`` line to *stderr*
+    (via :func:`load_skill`) and are excluded from the result.  Use
+    ``mimir skills catalog --strict`` to make the CLI exit non-zero on
+    any parse error.
+    """
+    entries, _ = _load_catalog_inner(skills_root)
     return entries
 
 
@@ -218,17 +251,29 @@ def add_argparse(parser) -> None:
         help="Skills root to walk (default: the bundled "
              "mimir/skills/ directory).",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        default=False,
+        help="Exit non-zero (status 1) if any SKILL.md could not be "
+             "parsed.  Each failure is always reported on stderr "
+             "regardless of this flag; --strict makes the catalog "
+             "command itself signal CI failure.",
+    )
     parser.set_defaults(skill_catalog_cmd=cmd)
 
 
 def cmd(args) -> int:
     """Entry point for ``mimir skills catalog``."""
     root = args.skills_root or DEFAULT_SKILLS_ROOT
-    catalog = generate(root)
+    entries, error_count = _load_catalog_inner(root)
+    catalog = render_catalog(entries)
     if args.out is None:
         print(catalog, end="")
     else:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(catalog)
         print(f"wrote {args.out} ({len(catalog)} bytes)")
+    if getattr(args, "strict", False) and error_count:
+        return 1
     return 0
