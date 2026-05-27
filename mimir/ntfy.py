@@ -50,9 +50,11 @@ block in mimir/feedback.py — wiring deferred to chainlink #65):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 import aiohttp
 
@@ -277,4 +279,115 @@ async def fire_cost_runaway_alarm_if_warranted(
         dedupe_key="cost-runaway:rate",
         priority=5,  # urgent
         tags=["warning", "money_with_wings"],
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Dead-man alarm: scheduler wedge (chainlink #66)
+# ────────────────────────────────────────────────────────────────────────────
+
+# How long without a scheduler:heartbeat tick before we consider the
+# scheduler wedged. 90 minutes is ~1.5× the hourly heartbeat cadence —
+# generous enough to ride out a single missed tick (quota suppression,
+# transient lock delay) without becoming noisy, tight enough to catch a
+# genuine wedge before it costs more than one idle hour.
+NTFY_SCHEDULER_WEDGE_MINUTES: int = 90
+
+_HEARTBEAT_CHANNEL_ID = "scheduler:heartbeat"
+
+
+def _last_heartbeat_timestamp(
+    events_path: Path,
+    *,
+    channel_id: str = _HEARTBEAT_CHANNEL_ID,
+) -> datetime | None:
+    """Scan ``events_path`` in reverse and return the timestamp of the most
+    recent ``scheduled_tick`` event for ``channel_id``.
+
+    Returns ``None`` if:
+    - the file does not exist or cannot be read,
+    - no matching event is found (e.g. first boot, very small log).
+
+    Never raises.
+    """
+    try:
+        text = events_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    for raw_line in reversed(text.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            event.get("type") == "scheduled_tick"
+            and event.get("channel_id") == channel_id
+        ):
+            ts_str = event.get("timestamp", "")
+            try:
+                return datetime.fromisoformat(ts_str)
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+async def fire_scheduler_wedge_alarm_if_warranted(
+    events_path: Path,
+    *,
+    threshold_minutes: int = NTFY_SCHEDULER_WEDGE_MINUTES,
+    channel_id: str = _HEARTBEAT_CHANNEL_ID,
+    now: datetime | None = None,
+) -> None:
+    """Send a phone-push alarm if the heartbeat scheduler hasn't fired recently.
+
+    Designed to be called by a lightweight non-LLM cron (every 10 min) that
+    remains runnable even when the heartbeat tick itself is wedged.  When
+    APScheduler is partially functional (the health-check job fires but the
+    heartbeat job doesn't), this function will detect and alarm on the gap.
+
+    Parameters
+    ----------
+    events_path:
+        Absolute path to ``events.jsonl``.  Passed explicitly so callers
+        (and tests) can point at any file without touching the environment.
+    threshold_minutes:
+        How many minutes without a heartbeat tick before the alarm fires.
+        Defaults to :data:`NTFY_SCHEDULER_WEDGE_MINUTES` (90 min).
+    channel_id:
+        The scheduler channel to watch.  Defaults to
+        ``"scheduler:heartbeat"``.  Override in tests or for other channels.
+    now:
+        Injected current time (UTC-aware).  Defaults to
+        ``datetime.now(timezone.utc)``.  Exposed for deterministic tests.
+
+    Always returns ``None``.  Never raises.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    last_tick = _last_heartbeat_timestamp(events_path, channel_id=channel_id)
+    if last_tick is None:
+        # No prior tick in the log — likely first boot or very small log
+        # window.  Don't alarm; we have no baseline.
+        return
+
+    elapsed_minutes = (now - last_tick).total_seconds() / 60.0
+    if elapsed_minutes < threshold_minutes:
+        return
+
+    await post_algedonic_alarm(
+        category="scheduler-wedge",
+        title="mimir: scheduler wedge — heartbeat stale",
+        body=(
+            f"scheduler:heartbeat hasn't fired in {elapsed_minutes:.0f} min "
+            f"(threshold: {threshold_minutes} min). "
+            "APScheduler may be wedged — check logs and consider restart."
+        ),
+        dedupe_key="scheduler-wedge:heartbeat",
+        priority=5,  # urgent
+        tags=["warning", "hourglass_not_done"],
     )
