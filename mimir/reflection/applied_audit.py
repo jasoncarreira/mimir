@@ -139,6 +139,54 @@ def _parse_proposal_body(heading: str, body: str) -> AppliedProposal:
     )
 
 
+def _list_pending_proposals(path: Path) -> list[tuple[int, str, str]]:
+    """Return ``[(num, heading, excerpt), ...]`` for every proposal in the
+    ``## Pending`` bucket of *path*, numbered 1..N in document order.
+
+    *heading* is the full heading text (e.g. ``"2026-05-27 — promote X"``).
+    *excerpt* is the first non-empty, non-``##`` line of the proposal body,
+    truncated to 120 chars.
+
+    Raises ``FileNotFoundError`` when *path* does not exist.
+    Raises ``ValueError`` when the file has no ``## Pending`` section.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    raw = path.read_text(encoding="utf-8")
+    sections = _split_md_sections(raw)
+
+    pending_idx = None
+    for i, (head, _) in enumerate(sections):
+        if head.lower() == "pending":
+            pending_idx = i
+            break
+    if pending_idx is None:
+        raise ValueError("missing '## Pending' section in proposed-changes.md")
+
+    # Find the end of the Pending bucket.
+    end_idx = len(sections)
+    for j in range(pending_idx + 1, len(sections)):
+        if sections[j][0].lower() in ("applied", "rejected"):
+            end_idx = j
+            break
+
+    out: list[tuple[int, str, str]] = []
+    num = 0
+    for j in range(pending_idx + 1, end_idx):
+        head, body = sections[j]
+        num += 1
+        # Excerpt: first non-empty non-## line in body.
+        excerpt = ""
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("##"):
+                excerpt = stripped[:120]
+                break
+        out.append((num, head, excerpt))
+    return out
+
+
 def mark_applied(
     proposed_changes_path: Path,
     applied_log_path: Path,

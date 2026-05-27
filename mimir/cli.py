@@ -2290,6 +2290,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Overwrite --dest if it exists",
     )
 
+    refl_lp_p = refl_sub.add_parser(
+        "list-pending",
+        help="List pending proposals from state/proposed-changes.md "
+             "(numbered in chronological order).",
+    )
+    refl_lp_p.add_argument(
+        "--json", dest="json_output", action="store_true",
+        help="Emit JSON array of {num, heading, excerpt} objects.",
+    )
+    refl_lp_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
     refl_audit_p = refl_sub.add_parser(
         "audit",
         help="Print the '## Effects of prior proposals' block — "
@@ -2576,6 +2590,39 @@ def main(argv: Sequence[str] | None = None) -> None:
                 print(f"mark-applied: {exc}", file=sys.stderr)
                 sys.exit(1)
             print(f"Applied: {proposal.id}")
+            sys.exit(0)
+        if args.reflection_action == "list-pending":
+            import json as _json
+            from .reflection import applied_audit as _applied_audit
+            home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+            try:
+                proposals = _applied_audit._list_pending_proposals(
+                    home / "state" / "proposed-changes.md"
+                )
+            except FileNotFoundError as exc:
+                print(f"list-pending: {exc}", file=sys.stderr)
+                sys.exit(1)
+            except ValueError as exc:
+                print(f"list-pending: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if not proposals:
+                if getattr(args, "json_output", False):
+                    print("[]")
+                else:
+                    print("0 pending proposals")
+                sys.exit(0)
+            if getattr(args, "json_output", False):
+                print(_json.dumps(
+                    [{"num": n, "heading": h, "excerpt": e}
+                     for n, h, e in proposals],
+                    ensure_ascii=False,
+                ))
+            else:
+                for num, heading, excerpt in proposals:
+                    line = f"{num}. {heading}"
+                    if excerpt:
+                        line += f"\n   {excerpt}"
+                    print(line)
             sys.exit(0)
         if args.reflection_action == "audit":
             from .reflection import applied_audit as _applied_audit
