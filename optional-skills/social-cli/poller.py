@@ -75,6 +75,19 @@ CURSOR_MAX_IDS = 1000
 # look uniform in the agent's view.
 TEXT_PREVIEW_CHARS = 300
 
+# Per-ancestor cap in the rendered thread context. social-cli writes
+# the full text of every ancestor (no upstream truncation); 5 ancestors
+# at ~600 chars each blow past the 16KB prompt budget by themselves.
+# 160 keeps the gist of each post intact while staying within batch
+# budget (3 events × 5 ancestors × 160 = ~2.4KB).
+THREAD_CTX_PER_LINE_CHARS = 160
+
+# Bluesky handle of the agent itself, lifted from STATE_DIR/.env's
+# ATPROTO_HANDLE when present. Used to mark "you" entries in the
+# threadContext block and compute ``agent_replies_in_thread``.
+# Looked up lazily per-platform and memoized for the poller run.
+_OWN_HANDLE_CACHE: dict[str, str] = {}
+
 
 def _eprint(*args, **kwargs) -> None:
     print(*args, file=sys.stderr, **kwargs)
@@ -174,6 +187,87 @@ def _load_inbox(platforms: list[str]) -> list[dict]:
     return out
 
 
+def _own_handle_for(platform: str) -> str:
+    """Return the agent's own handle on ``platform`` (lowercase).
+
+    Reads ``STATE_DIR/.env`` once per platform per poller run.
+    Returns empty string when the env file is missing, malformed, or
+    doesn't carry the platform-specific key — in which case the
+    ``(you)`` annotation in thread context just won't fire (degrades
+    to the pre-feature behavior).
+    """
+    if platform in _OWN_HANDLE_CACHE:
+        return _OWN_HANDLE_CACHE[platform]
+    env_key = {"bsky": "ATPROTO_HANDLE"}.get(platform)
+    # x.ts doesn't populate threadContext yet, so there's no X case
+    # to surface; revisit when it does. Other platforms similarly.
+    if not env_key:
+        _OWN_HANDLE_CACHE[platform] = ""
+        return ""
+    env_path = STATE_DIR / ".env"
+    val = ""
+    if env_path.exists():
+        try:
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith(f"{env_key}="):
+                    val = line[len(env_key) + 1 :].strip().strip("'\"").lower()
+                    break
+        except OSError:
+            val = ""
+    _OWN_HANDLE_CACHE[platform] = val
+    return val
+
+
+def _format_thread_context(
+    thread_context: list, own_handle: str,
+) -> tuple[int, int, str]:
+    """Render the threadContext array into a prompt block.
+
+    Returns ``(depth, agent_replies, block)`` where:
+        depth         — number of well-formed ancestor entries.
+        agent_replies — count of those entries whose author matches
+                        ``own_handle`` (case-insensitive). Zero when
+                        ``own_handle`` is empty.
+        block         — newline-prefixed string suitable for inline
+                        injection into the prompt; empty if no
+                        ancestors.
+
+    Each rendered line: ``@<author>[ (you)]: <text>`` with text capped
+    at ``THREAD_CTX_PER_LINE_CHARS``. Whitespace inside post text is
+    collapsed to single spaces so multi-paragraph ancestors don't
+    bleed across the rendered block.
+    """
+    if not isinstance(thread_context, list) or not thread_context:
+        return (0, 0, "")
+    lines: list[str] = []
+    agent_replies = 0
+    own_lower = own_handle.lower()
+    for entry in thread_context:
+        if not isinstance(entry, dict):
+            continue
+        author = str(entry.get("author") or "?")
+        text = " ".join((str(entry.get("text") or "")).split())
+        if len(text) > THREAD_CTX_PER_LINE_CHARS:
+            text = text[: THREAD_CTX_PER_LINE_CHARS - 1] + "…"
+        is_self = bool(own_lower) and author.lower() == own_lower
+        if is_self:
+            agent_replies += 1
+            lines.append(f"    @{author} (you): {text}")
+        else:
+            lines.append(f"    @{author}: {text}")
+    if not lines:
+        return (0, 0, "")
+    header = f"  thread ({len(lines)} prior post{'s' if len(lines) != 1 else ''}"
+    if agent_replies > 0:
+        header += f", {agent_replies} from you"
+    header += "):"
+    block = "\n" + header + "\n" + "\n".join(lines)
+    return (len(lines), agent_replies, block)
+
+
 def _format_event(notif: dict) -> dict | None:
     """Build the JSONL event for one notification. Returns None when
     the notification lacks a stable ID (can't cursor → don't emit).
@@ -205,6 +299,18 @@ def _format_event(notif: dict) -> dict | None:
             user_context = user_context[:499] + "…"
         user_ctx_block = f"\n  context: {user_context}"
 
+    # Thread depth + agent's own prior contributions in this thread.
+    # social-cli already does the upstream fetch (``getPostThread``
+    # with ``parentHeight: 5``) and writes the result as
+    # ``threadContext: [{author, text}, ...]`` on each notification.
+    # Surfacing the count and the rendered chain here is what gives
+    # the agent the structural feedback to apply the "don't rabbit-
+    # hole past N replies" rule — without it, every reply turn sees
+    # only the current notification and re-justifies engagement.
+    thread_depth, agent_replies, thread_block = _format_thread_context(
+        notif.get("threadContext") or [], _own_handle_for(platform),
+    )
+
     text_line = f"\n  > {text}" if text else ""
     # Action hint: identifies the right tool (outbox + dispatch) for any
     # response the agent makes to this notification. The bare event
@@ -232,6 +338,7 @@ def _format_event(notif: dict) -> dict | None:
     prompt = (
         f"[{platform}] {ntype} from {author}"
         f"{text_line}"
+        f"{thread_block}"
         f"\n  id: {nid}"
         f"{user_ctx_block}"
         f"{action_hint}"
@@ -245,6 +352,8 @@ def _format_event(notif: dict) -> dict | None:
         "author": author,
         "text": text,
         "timestamp": timestamp,
+        "thread_depth": thread_depth,
+        "agent_replies_in_thread": agent_replies,
     }
     if post_id:
         out["post_id"] = post_id

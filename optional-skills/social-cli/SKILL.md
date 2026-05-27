@@ -45,18 +45,22 @@ the platforms credentials are configured for.
 **Does not**: Auto-reply to mentions (the agent reads inbox + decides per
 item, even when batched); cross-post between Bluesky and X without explicit
 `platforms: [bsky, x]`; manage Discord / Slack delivery (that's
-`send_message`); fetch / hydrate full thread context (`social-cli` returns
-the surface event; if a reply needs more context, the agent fetches it
-separately).
+`send_message`); hydrate deep thread context past `parentHeight=5` (sync
+populates up to five ancestors per Bluesky notification — see "Thread
+context" below; for deeper chains there is no read tool today).
 
 ## The agent's loop
 
 The poller surfaces notifications. The agent responds:
 
-1. **Read `inbox.yaml`** in `STATE_DIR`
+1. **Read `inbox-<platform>.yaml`** in `STATE_DIR`
    (= `<home>/state/pollers/social-cli-notifications/`). Each entry
    has `id`, `platform`, `type`, `author`, `authorId`, `text`,
-   `timestamp`, optionally `userContext`.
+   `timestamp`, optionally `userContext`, and on Bluesky `reply` /
+   `mention` / `quote` notifications a `threadContext` array of
+   ancestor posts (`[{author, text}, ...]`, ordered oldest → newest,
+   up to 5 deep). The poller surfaces a summary of `threadContext`
+   in the wake-up prompt — see "Thread context" below.
 
 2. **Write `outbox.yaml`** in the same dir with a `dispatch:` list.
    Common action shapes inline below — see `AGENT_GUIDE.md` for the
@@ -113,6 +117,59 @@ The poller surfaces notifications. The agent responds:
    Dispatch validates, executes per-action (one failure doesn't
    block the rest), archives `outbox.yaml`, and removes dispatched
    notifications from `inbox.yaml`.
+
+### Thread context — depth and your own prior contributions
+
+For Bluesky `reply` / `mention` / `quote` notifications, `social-cli
+sync` walks up to **5 ancestors** of the notified post (Bluesky's
+`getPostThread` with `parentHeight=5`) and stores them on the
+notification as `threadContext: [{author, text}, ...]`, ordered
+oldest → newest. The poller renders a summary of this into the
+wake-up prompt:
+
+```
+[bsky] reply from someone.bsky.social
+  > the notification text
+  thread (4 prior posts, 2 from you):
+    @other.bsky.social: opening point of the thread...
+    @you.bsky.social (you): your first reply...
+    @other.bsky.social: their response...
+    @you.bsky.social (you): your second reply...
+  id: at://...
+  context: ...
+→ To reply or react: ...
+```
+
+The poller also emits two structured fields on the event:
+
+- `thread_depth` — number of ancestors in `threadContext` (0–5)
+- `agent_replies_in_thread` — how many of those ancestors were
+  authored by you (matched against `ATPROTO_HANDLE` from the
+  `.env`). When that count is ≥2, you've already participated in
+  the thread non-trivially.
+
+**Use this before composing.** Before drafting a reply, check the
+`(N from you)` figure in the thread header. The conversational
+gravity well — "but this one specific point is worth answering" —
+applies on every individual reply turn and lands the agent at six-
+deep before anyone realizes. Concrete rule of thumb:
+
+- **0 prior replies from you**: replying is the default if the
+  notification warrants a response.
+- **1 prior reply from you**: still fine to continue; you're in
+  dialogue.
+- **2 prior replies from you**: stop and re-justify. Is the next
+  thing you'd add actually new content, or just keeping the volley
+  going? Default to **not** replying — the thread is now visibly
+  yours-and-theirs and additional turns add diminishing signal.
+- **3+ prior replies from you**: extremely high bar; "I'm being
+  asked a direct question I haven't answered" is about it. Most
+  cases here belong in `ignore` with a reason.
+
+For ancestors more than 5 deep there is no read tool today
+(`parentHeight=5` is hard-coded in `bluesky.ts`). If the thread is
+load-bearing past the visible ancestors, surface that to the
+operator rather than guessing.
 
 ### `send_message` goes to chat channels, NOT to Bluesky / X
 
