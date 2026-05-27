@@ -36,12 +36,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from mimir.skill_defs import home_skills_dir
-from mimir.skill_md import parse_frontmatter
+from mimir.skill_md import parse_env_block, parse_frontmatter
 
 # Source root for optional-skills, relative to this file.
 #: ``mimir/skill_install.py`` lives at ``<repo>/mimir/skill_install.py``;
@@ -73,6 +75,17 @@ class OptionalSkill:
     description: str  # one-line from SKILL.md frontmatter ``description:``
     has_pollers_json: bool
     path: Path  # path on disk (source for list_available, installed for list_installed)
+
+
+@dataclass(frozen=True)
+class SkillEnvSpec:
+    """One env-var entry from a skill's SKILL.md ``env:`` frontmatter block."""
+
+    name: str
+    description: str
+    example: str
+    required: bool  # True → from ``required:`` list; False → from ``optional:``
+    only_if: str | None = None  # ``"VAR=value"`` — skip prompt unless condition holds
 
 
 # ─── Shared inventory helper ─────────────────────────────────────────
@@ -166,6 +179,7 @@ class InstallResult:
     dest: Path
     overwrote: bool
     pollers_registered_hint: bool
+    env_vars_written: list[str] = field(default_factory=list)
 
 
 def install(
@@ -225,6 +239,190 @@ def install(
         overwrote=overwrote,
         pollers_registered_hint=(src / "pollers.json").is_file(),
     )
+
+
+# ─── Env-var configure (mimir skills install --configure) ────────────
+
+#: Vars matching this pattern are prompted with getpass (no echo).
+_SECRET_VAR_RE = re.compile(
+    r"_TOKEN$|_SECRET$|_KEY$|_PASSWORD$", re.IGNORECASE
+)
+
+
+def _read_env_file(env_path: Path) -> dict[str, str]:
+    """Parse a Docker-style ``.env`` file into a ``key → value`` dict."""
+    if not env_path.is_file():
+        return {}
+    out: dict[str, str] = {}
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" in stripped:
+            k, _, v = stripped.partition("=")
+            out[k.strip()] = v
+    return out
+
+
+def _write_env_var(env_path: Path, var_name: str, value: str) -> None:
+    """Write or replace ``VAR_NAME=value`` in a Docker-style ``.env`` file."""
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    body = env_path.read_text(encoding="utf-8") if env_path.is_file() else ""
+    line_re = re.compile(
+        rf"^(\s*){re.escape(var_name)}\s*=.*$", re.MULTILINE
+    )
+    new_line = f"{var_name}={value}"
+    if line_re.search(body):
+        body = line_re.sub(lambda m: f"{m.group(1)}{new_line}", body, count=1)
+    else:
+        if body and not body.endswith("\n"):
+            body += "\n"
+        body += new_line + "\n"
+    env_path.write_text(body, encoding="utf-8")
+
+
+def read_env_specs(
+    skill_path: Path,
+) -> tuple[list[SkillEnvSpec], list[SkillEnvSpec]]:
+    """Return ``(required, optional)`` env-var specs from a skill's SKILL.md."""
+    skill_md = skill_path / "SKILL.md"
+    if not skill_md.is_file():
+        return [], []
+    try:
+        raw_required, raw_optional = parse_env_block(skill_md.read_text())
+    except Exception:
+        return [], []
+
+    def _make(items: list[dict], is_required: bool) -> list[SkillEnvSpec]:
+        return [
+            SkillEnvSpec(
+                name=item["name"],
+                description=item.get("description", ""),
+                example=item.get("example", ""),
+                required=is_required,
+                only_if=item.get("only_if"),
+            )
+            for item in items
+        ]
+
+    return _make(raw_required, True), _make(raw_optional, False)
+
+
+def prompt_and_write_env(
+    required: list[SkillEnvSpec],
+    optional: list[SkillEnvSpec],
+    env_path: Path,
+    *,
+    skill_name: str = "",
+    reconfigure: bool = False,
+) -> list[str]:
+    """Interactively prompt for env vars and write them to ``env_path``.
+
+    Returns the list of var names actually written.
+    """
+    import getpass  # lazy — only needed during interactive configure
+
+    existing = _read_env_file(env_path)
+    session_values: dict[str, str] = {}
+    written: list[str] = []
+
+    if skill_name:
+        print(f"\n# ─── {skill_name} env vars ───")
+
+    all_specs = [*required, *optional]
+    for spec in all_specs:
+        # Evaluate only_if condition.
+        if spec.only_if:
+            cond_var, _, cond_val = spec.only_if.partition("=")
+            current = session_values.get(cond_var) or existing.get(cond_var, "")
+            if current.strip().lower() != cond_val.strip().lower():
+                continue
+
+        # Skip if already set and not reconfiguring.
+        existing_val = existing.get(spec.name, "")
+        if existing_val and not reconfigure:
+            print(f"  {spec.name}: (already set — use --reconfigure to change)")
+            continue
+
+        # Build prompt text.
+        label = "[required]" if spec.required else "[optional]"
+        lines = [f"\n{label} {spec.name}"]
+        if spec.description:
+            lines.append(f"  {spec.description}")
+        if spec.example:
+            lines.append(f"  example: {spec.example}")
+        if existing_val and reconfigure:
+            is_secret = bool(_SECRET_VAR_RE.search(spec.name))
+            display = ("*" * min(len(existing_val), 8)) if is_secret else existing_val
+            lines.append(f"  current: {display}")
+        print("\n".join(lines))
+
+        prompt_str = "  Enter value (blank to skip): "
+        if _SECRET_VAR_RE.search(spec.name):
+            value = getpass.getpass(prompt_str)
+        else:
+            value = input(prompt_str)
+        value = value.strip()
+
+        if not value:
+            if spec.required:
+                print(
+                    f"  ⚠ {spec.name} is required but left blank — "
+                    f"set it in {env_path.name} manually before using this skill."
+                )
+            else:
+                print("  (skipped)")
+            continue
+
+        _write_env_var(env_path, spec.name, value)
+        session_values[spec.name] = value
+        written.append(spec.name)
+        print(f"  ✓ {spec.name} written")
+
+    return written
+
+
+def run_smoke_test(dest: Path, env_path: Path | None = None) -> tuple[int, str]:
+    """Run the installed poller script once and return ``(exit_code, snippet)``.
+
+    Tries ``python3 poller.py --once`` first; if the poller doesn't accept
+    ``--once``, retries without it. Returns ``(-1, 'no poller.py found')``
+    when the skill has no ``poller.py``.
+    """
+    poller = dest / "poller.py"
+    if not poller.is_file():
+        return -1, "no poller.py found"
+
+    env = os.environ.copy()
+    if env_path and env_path.is_file():
+        for k, v in _read_env_file(env_path).items():
+            env[k] = v  # .env is authoritative for the smoke-test
+
+    result: subprocess.CompletedProcess[str] | None = None
+    for args in (["--once"], []):
+        try:
+            result = subprocess.run(
+                ["python3", str(poller), *args],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+                cwd=str(dest),
+            )
+        except subprocess.TimeoutExpired:
+            return 124, "(smoke test timed out after 30s)"
+        if args and result.returncode != 0 and (
+            "unrecognized" in result.stderr.lower()
+            or "error: argument" in result.stderr.lower()
+        ):
+            continue
+        break
+
+    assert result is not None
+    output = (result.stdout or "").strip()
+    lines = output.splitlines()[:10]
+    snippet = "\n".join(lines) if lines else "(no output)"
+    return result.returncode, snippet
 
 
 # ─── Installed-skills inventory (mimir skills list) ──────────────────
@@ -294,6 +492,19 @@ def add_argparse_install(parser) -> None:
              "Recursive rm under <home>/skills/<name>/ — any "
              "custom edits there are lost.",
     )
+    parser.add_argument(
+        "--configure", action="store_true",
+        help="Interactively prompt for env vars declared in SKILL.md frontmatter "
+             "and write them to <home>/.env. Also runs a smoke test for poller skills.",
+    )
+    parser.add_argument(
+        "--reconfigure", action="store_true",
+        help="Like --configure but re-prompts vars already set in .env. Implies --configure.",
+    )
+    parser.add_argument(
+        "--no-smoke-test", action="store_true", dest="no_smoke_test",
+        help="With --configure: skip the poller smoke test.",
+    )
     parser.set_defaults(skill_install_cmd=cmd_install)
 
 
@@ -329,18 +540,52 @@ def cmd_install(args) -> int:
 
     verb = "overwrote" if result.overwrote else "installed"
     print(f"{verb} skill {result.name!r} into {result.dest}")
+
+    do_configure = getattr(args, "configure", False) or getattr(args, "reconfigure", False)
+    if do_configure:
+        env_path = home / ".env"
+        required_specs, optional_specs = read_env_specs(result.dest)
+        if required_specs or optional_specs:
+            written = prompt_and_write_env(
+                required_specs,
+                optional_specs,
+                env_path,
+                skill_name=result.name,
+                reconfigure=getattr(args, "reconfigure", False),
+            )
+            result.env_vars_written.extend(written)
+            if written:
+                print(f"\n  {len(written)} var(s) written to {env_path}")
+        else:
+            print("  (no env: block in SKILL.md — nothing to configure)")
+
+        if result.pollers_registered_hint and not getattr(args, "no_smoke_test", False):
+            print("\n  Running smoke test...")
+            exit_code, snippet = run_smoke_test(result.dest, env_path)
+            if exit_code == -1:
+                print(f"  smoke test: {snippet}")
+            elif exit_code == 0:
+                print(f"  smoke test: ✓ exited 0")
+                if snippet != "(no output)":
+                    print(f"  output:\n{snippet}")
+            else:
+                print(f"  smoke test: ✗ exited {exit_code}")
+                if snippet != "(no output)":
+                    print(f"  output:\n{snippet}")
+
     if result.pollers_registered_hint:
         print(
-            "  this skill ships a pollers.json — once mimir is running, "
-            "call the `reload_pollers` tool (or restart `mimir run`) so "
-            "the poller registers."
+            "\n  this skill ships a pollers.json — to activate, either:\n"
+            "    - Restart `mimir run`, OR\n"
+            '    - Ask mimir (in any channel it\'s listening on): "please call reload_pollers"'
         )
-    skill_md = result.dest / "SKILL.md"
-    if skill_md.is_file():
-        print(
-            f"  next: read {skill_md.relative_to(home)} for any required "
-            f"env vars / external setup (OAuth, API keys, etc.)."
-        )
+    elif not do_configure:
+        skill_md = result.dest / "SKILL.md"
+        if skill_md.is_file():
+            print(
+                f"  next: read {skill_md.relative_to(home)} for any required "
+                f"env vars / external setup (OAuth, API keys, etc.)."
+            )
     return 0
 
 
