@@ -108,7 +108,7 @@ Earlier versions of mimir tracked an `allowed-tools` frontmatter field listing t
 
 The skill body still describes which tools the procedure uses in prose; that documentation is the supported pattern today. Use `success_criteria` to *measure* whether the canonical tool actually fired.
 
-## Developer-facing sibling docs (`IMPL_SEAMS.md` and friends)
+## Developer-facing sibling docs (`DESIGN.md` and friends)
 
 When a skill has content that's useful to *developers* (impl cross-refs,
 architecture notes, migration history) but doesn't help the agent mid-turn,
@@ -123,7 +123,7 @@ file alongside SKILL.md:
 ```
 mimir/skills/<name>/
 ├── SKILL.md           # agent + operator-facing: prose, frontmatter, usage
-└── IMPL_SEAMS.md      # developer-facing: implementation cross-refs (optional)
+└── DESIGN.md          # developer-facing: implementation cross-refs (optional)
 ```
 
 Other potential siblings that may emerge:
@@ -136,18 +136,18 @@ Add a single blockquote near the relevant section (or in a footer):
 
 ```markdown
 > Implementation seams (code paths for each tier) are in
-> [`IMPL_SEAMS.md`](IMPL_SEAMS.md) — developer reference; not loaded by the agent.
+> [`DESIGN.md`](DESIGN.md) — developer reference; not loaded by the agent.
 ```
 
 The pointer is **prose**, not a structural element — it tells a developer
 where to look without making the agent load the file. The agent won't
-auto-surface IMPL_SEAMS.md unless it explicitly `Read`s the path.
+auto-surface DESIGN.md unless it explicitly `Read`s the path.
 
-### What goes in IMPL_SEAMS.md
+### What goes in DESIGN.md
 
 Typically: a heading per concept from SKILL.md (tier, step, mechanism) with
 a `_→ file.py:function()_` annotation pointing to the implementing code.
-The memory skill's `IMPL_SEAMS.md` (PR #388) is the canonical reference
+The memory skill's `DESIGN.md` (PR #388) is the canonical reference
 example — 12 tiers mapped to `core_blocks.py`, `prompts.py`, `searchtools.py`,
 etc.
 
@@ -156,7 +156,7 @@ etc.
 Each adopter should add a test that pins the invariant across both files.
 For the memory skill:
 - Test asserts: tier count in SKILL.md ≥ 12, seam annotation count in
-  IMPL_SEAMS.md ≥ 12.
+  DESIGN.md ≥ 12.
 - When one file changes without the other, the test fails loudly.
 
 See `tests/test_skill_defs.py:test_memory_skill_visibility_tiers` for the
@@ -189,6 +189,6 @@ For short skills (< 100 lines total), keep all content in SKILL.md.
 6. Keep scope narrow; split broad domains into multiple skills.
 7. Prefer deterministic instructions over generic advice.
 8. **Quality gate — read the skill as an outsider.** Before writing tests, re-read the complete SKILL.md as if you were a different agent seeing it for the first time. Ask: Is the trigger unambiguous? Would the procedure produce consistent output across different runs? Are the steps concrete enough to follow without context? Fix gaps now — tests lock in behavior, so verify quality *before* tests encode it.
-9. **Optional: sibling doc** — if the skill has ≥100 lines of developer-facing implementation notes (code paths, architecture rationale), move them to `IMPL_SEAMS.md` and add a pointer blockquote in SKILL.md. See "Developer-facing sibling docs" above.
+9. **Optional: sibling doc** — if the skill has ≥100 lines of developer-facing implementation notes (code paths, architecture rationale), move them to `DESIGN.md` and add a pointer blockquote in SKILL.md. See "Developer-facing sibling docs" above.
 10. Run `pytest tests/test_skill_conformance.py tests/test_skill_catalog.py` locally to catch frontmatter drift before pushing.
 11. After landing, run `mimir skills catalog` to refresh the catalog file.
