@@ -612,6 +612,28 @@ def _bucket_to_snapshot(bucket: Any) -> RateLimitSnapshot | None:
 ANOMALY_5H_JUMP_PP = 0.50   # 5h utilization rise that triggers cross-check
 ANOMALY_7D_DELTA_PP = 0.05  # 7d delta below this confirms the 5h jump is bogus
 
+# chainlink #220: symmetric anomaly check for the 7d overall vs its
+# per-model sub-buckets. The overall ``seven_day`` cap is a function
+# of cumulative spend across all models (cost-weighted by Anthropic's
+# pricing). When sub-buckets (``seven_day_sonnet``,
+# ``seven_day_omelette``, ...) barely move but the overall jumps by
+# tens of percentage points, the overall reading is internally
+# inconsistent and almost certainly an endpoint glitch.
+#
+# Live incident (2026-05-27 17:27Z → 20:51Z): overall ``seven_day``
+# rose 47% → 100% in 3.5 hours as a step-function (vertical cliff in
+# the ops dashboard chart) while ``seven_day_sonnet`` stayed on its
+# real smooth ramp (~50% at the same sample) and ``seven_day_omelette``
+# stayed at 0%. No physical spend pattern produces that shape; the
+# arbiter suppressed scheduled work until operator intervened.
+#
+# 30pp / 5pp thresholds: looser than the 5h check (50pp / 5pp)
+# because 7d windows move slower in absolute terms — a 30pp rise in
+# the overall 7d needs ~25% of the entire plan's weekly budget spent
+# inside one ~3-minute poll interval. Physically implausible.
+ANOMALY_7D_JUMP_PP = 0.30           # 7d overall rise that triggers cross-check
+ANOMALY_SUBBUCKET_DELTA_PP = 0.05   # max sub-bucket delta to call the 7d jump bogus
+
 # chainlink #17 (CR#22 layer b): cost-rate-back-derived 5h estimator.
 #
 # The factor encodes how much smaller the 5h dollar-budget is than the
@@ -713,6 +735,72 @@ def detect_5h_anomaly(
         f"five_hour jumped +{jump * 100:.0f}pp "
         f"({prev_5h * 100:.0f}% → {new_5h * 100:.0f}%) "
         f"but seven_day only moved {sevenday_delta * 100:.1f}pp — "
+        f"endpoint glitch suspected"
+    )
+
+
+def detect_seven_day_anomaly(
+    *,
+    new_7d: float | None,
+    prev_7d: float | None,
+    new_sub_buckets: dict[str, float],
+    prev_sub_buckets: dict[str, float],
+) -> str | None:
+    """Reject bogus ``seven_day`` overall readings (chainlink #220).
+
+    Returns a reason string when the new overall 7d reading is an
+    endpoint glitch (the caller should keep the prior trusted
+    value), else None.
+
+    Rule:
+      - 7d overall rose by >= ANOMALY_7D_JUMP_PP (30pp) since prior
+        reading,
+      - AND **every** known sub-bucket
+        (``seven_day_sonnet``, ``seven_day_omelette``, ...) moved
+        less than ANOMALY_SUBBUCKET_DELTA_PP (5pp).
+
+    The overall ``seven_day`` cap is a cost-weighted aggregate of
+    per-model spend, so a real 30pp overall jump requires at least
+    one model bucket to move proportionally. When every sub-bucket
+    is steady but the overall reading cliff-jumps, the overall
+    value is internally inconsistent.
+
+    ``new_sub_buckets`` / ``prev_sub_buckets`` are dicts keyed by
+    bucket name (e.g. ``"seven_day_sonnet"``) mapping to
+    utilization. Missing keys are skipped — the check fires only on
+    sub-buckets present in both maps. When no sub-buckets are
+    observable at all, returns None (no signal to distrust).
+
+    Skips the check when either 7d side is None — first poll,
+    missing data. "Trust the value" is the right fallback because
+    we have no cross-reference.
+    """
+    if new_7d is None or prev_7d is None:
+        return None
+    jump = new_7d - prev_7d
+    if jump < ANOMALY_7D_JUMP_PP:
+        return None
+    # Compute the max sub-bucket delta over keys present in BOTH maps.
+    # A sub-bucket that appeared for the first time in this poll (e.g.,
+    # a new model tier) has no prior reading to compare against — skip
+    # it rather than treating absence as zero delta.
+    observed_keys = set(new_sub_buckets.keys()) & set(prev_sub_buckets.keys())
+    if not observed_keys:
+        return None
+    max_delta = 0.0
+    max_key = ""
+    for key in observed_keys:
+        delta = abs(new_sub_buckets[key] - prev_sub_buckets[key])
+        if delta > max_delta:
+            max_delta = delta
+            max_key = key
+    if max_delta >= ANOMALY_SUBBUCKET_DELTA_PP:
+        return None
+    return (
+        f"seven_day jumped +{jump * 100:.0f}pp "
+        f"({prev_7d * 100:.0f}% → {new_7d * 100:.0f}%) "
+        f"but largest sub-bucket delta was {max_key}={max_delta * 100:.1f}pp "
+        f"(threshold {ANOMALY_SUBBUCKET_DELTA_PP * 100:.0f}pp) — "
         f"endpoint glitch suspected"
     )
 
@@ -863,7 +951,60 @@ async def record_usage(
         prior_7d.utilization if prior_7d else None,
     )
 
+    # chainlink #220: symmetric cross-check for ``seven_day`` against
+    # its per-model sub-buckets. Collect every ``seven_day_*`` key
+    # other than the unsuffixed overall — those are the model-specific
+    # sub-buckets Anthropic returns (currently ``seven_day_sonnet`` +
+    # ``seven_day_omelette``, more may appear as model tiers ship).
+    new_sub_buckets = {
+        k: s.utilization
+        for k, s in new_snaps.items()
+        if k.startswith("seven_day_") and s.utilization is not None
+    }
+    prior_sub_buckets = {
+        k: s.utilization
+        for k, s in prior_snaps.items()
+        if k.startswith("seven_day_") and s.utilization is not None
+    }
+    seven_day_anomaly_reason = detect_seven_day_anomaly(
+        new_7d=new_7d.utilization if new_7d else None,
+        prev_7d=prior_7d.utilization if prior_7d else None,
+        new_sub_buckets=new_sub_buckets,
+        prev_sub_buckets=prior_sub_buckets,
+    )
+
     for window_type, snapshot in new_snaps.items():
+        if window_type == "seven_day" and seven_day_anomaly_reason:
+            # Reject the bogus 7d-overall spike (chainlink #220).
+            # The arbiter (billing.py) gates scheduled work on the
+            # most-suppressive window across all providers — a 100%
+            # seven_day reading suppresses every scheduled tick even
+            # when every model-specific sub-bucket is fresh. Keep the
+            # prior trusted value so the arbiter has accurate data.
+            await log_event(
+                "quota_reading_anomalous",
+                window_type=window_type,
+                reason=seven_day_anomaly_reason,
+                rejected_utilization=snapshot.utilization,
+                kept_utilization=prior_7d.utilization if prior_7d else None,
+                kept_observed_at=prior_7d.observed_at if prior_7d else None,
+                sub_buckets_new=new_sub_buckets,
+                sub_buckets_prev=prior_sub_buckets,
+            )
+            # Skip the write — leaves the prior trusted ``seven_day``
+            # in place. Unlike the 5h-anomaly path, there's no
+            # cost-rate-back-derived estimator for 7d (the 7d window
+            # IS the cost-budget reference; nothing to back-derive
+            # from). Prior value persists. Mirror the 5h-anomaly
+            # recorded-metadata shape so callers / tests can detect
+            # the rejection via the return dict.
+            recorded[window_type] = {
+                "anomalous": True,
+                "rejected_utilization": snapshot.utilization,
+                "kept_utilization": prior_7d.utilization if prior_7d else None,
+                "reason": seven_day_anomaly_reason,
+            }
+            continue
         if window_type == "five_hour" and anomaly_reason:
             # Reject the spike. Surface the rejection so the operator
             # (and the agent's algedonic block) can investigate.
