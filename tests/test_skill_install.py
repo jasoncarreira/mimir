@@ -639,9 +639,10 @@ def test_apply_overwrites_changed_file(
     r = next(r for r in results if r.name == "fake-skill")
     assert "SKILL.md" in r.differs
 
-    updated, hint = apply_skill_update(r)
+    updated, failed, hint = apply_skill_update(r)
 
     assert "SKILL.md" in updated
+    assert failed == []
     assert hint is None  # no pollers.json in fake-skill
     # File should now match the source.
     src_text = (fake_optional_root / "fake-skill" / "SKILL.md").read_text()
@@ -666,9 +667,10 @@ def test_apply_differs_file_creates_backup(
     r = next(r for r in results if r.name == "fake-skill")
     assert "SKILL.md" in r.differs
 
-    updated, _ = apply_skill_update(r)
+    updated, failed, _ = apply_skill_update(r)
 
     assert "SKILL.md" in updated
+    assert failed == []
 
     # A backup directory must have been created under .pre-update-backup/.
     backup_parent = fake_home / "skills" / "fake-skill" / ".pre-update-backup"
@@ -683,9 +685,9 @@ def test_apply_differs_file_creates_backup(
     # Backup must contain the pre-update (hand-edited) content, not source.
     assert backup_file.read_text() == "---\nname: fake-skill\ndescription: hand-edited\n---\n"
 
-    # Warning must have been printed.
+    # A note must have been printed (neutral wording — no "local edits" claim).
     out = capsys.readouterr().out
-    assert "Warning" in out
+    assert "Note" in out
     assert "SKILL.md" in out
     assert "backed up" in out
 
@@ -728,9 +730,10 @@ def test_apply_copies_added_file(
     r = next(r for r in results if r.name == "fake-skill")
     assert "helper.py" in r.added
 
-    updated, _ = apply_skill_update(r)
+    updated, failed, _ = apply_skill_update(r)
 
     assert "helper.py" in updated
+    assert failed == []
     assert (fake_home / "skills" / "fake-skill" / "helper.py").read_text() == "# new\n"
 
 
@@ -746,9 +749,10 @@ def test_apply_skips_extra_without_force(
     r = next(r for r in results if r.name == "fake-skill")
     assert "local-note.md" in r.extra
 
-    updated, _ = apply_skill_update(r, force=False)
+    updated, failed, _ = apply_skill_update(r, force=False)
 
     assert "local-note.md" not in updated
+    assert failed == []
     assert extra_file.exists()  # preserved
     out = capsys.readouterr().out
     assert "local-note.md" in out
@@ -766,9 +770,10 @@ def test_apply_removes_extra_with_force(
     results = detect_skill_drift(fake_home, fake_optional_root)
     r = next(r for r in results if r.name == "fake-skill")
 
-    updated, _ = apply_skill_update(r, force=True)
+    updated, failed, _ = apply_skill_update(r, force=True)
 
     assert "local-note.md" in updated
+    assert failed == []
     assert not extra_file.exists()  # removed
 
 
@@ -785,11 +790,12 @@ def test_apply_emits_pollers_hint(
     r = next(r for r in results if r.name == "fake-poller")
     assert "pollers.json" in r.differs
 
-    updated, hint = apply_skill_update(r)
+    updated, failed, hint = apply_skill_update(r)
 
     assert "pollers.json" in updated
+    assert failed == []
     assert hint is not None
-    assert "mimir scheduler reload" in hint
+    assert "mcp__mimir__reload_pollers" in hint
 
 
 def test_apply_orphaned_skill_skipped(fake_home: Path, tmp_path: Path, capsys):
@@ -805,9 +811,10 @@ def test_apply_orphaned_skill_skipped(fake_home: Path, tmp_path: Path, capsys):
     r = results[0]
     assert r.orphaned
 
-    updated, hint = apply_skill_update(r)
+    updated, failed, hint = apply_skill_update(r)
 
     assert updated == []
+    assert failed == []
     assert hint is None
     out = capsys.readouterr().out
     assert "orphaned" in out
@@ -872,7 +879,68 @@ def test_cmd_update_skills_apply_pollers_hint_printed(
     ))
     assert rc == 0
     out = capsys.readouterr().out
-    assert "mimir scheduler reload" in out
+    assert "mcp__mimir__reload_pollers" in out
+
+
+def test_apply_skill_update_partial_copy_failure(
+    fake_optional_root: Path, fake_home: Path, monkeypatch, capsys,
+):
+    """apply_skill_update returns non-empty failed list when copy2 raises."""
+    import shutil as _shutil
+
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Introduce drift so there's something to copy.
+    (fake_optional_root / "fake-skill" / "SKILL.md").write_text(
+        "---\nname: fake-skill\ndescription: updated\n---\n"
+    )
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert "SKILL.md" in r.differs
+
+    original_copy2 = _shutil.copy2
+
+    def _failing_copy2(src, dst, **kw):
+        if Path(src).name == "SKILL.md" and ".pre-update-backup" not in str(src):
+            raise OSError("disk full (simulated)")
+        return original_copy2(src, dst, **kw)
+
+    monkeypatch.setattr("mimir.skill_install.shutil.copy2", _failing_copy2)
+
+    updated, failed, hint = apply_skill_update(r)
+
+    assert "SKILL.md" in failed
+    assert "SKILL.md" not in updated
+
+
+def test_cmd_update_skills_apply_copy_failure_exits_1(
+    fake_optional_root: Path, fake_home: Path, monkeypatch, capsys,
+):
+    """``mimir skills update --apply`` exits 1 when a per-file copy fails."""
+    import shutil as _shutil
+
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    (fake_optional_root / "fake-skill" / "SKILL.md").write_text(
+        "---\nname: fake-skill\ndescription: updated\n---\n"
+    )
+
+    original_copy2 = _shutil.copy2
+
+    def _failing_copy2(src, dst, **kw):
+        if Path(src).name == "SKILL.md" and ".pre-update-backup" not in str(src):
+            raise OSError("disk full (simulated)")
+        return original_copy2(src, dst, **kw)
+
+    monkeypatch.setattr("mimir.skill_install.shutil.copy2", _failing_copy2)
+
+    rc = cmd_update_skills(Namespace(
+        home=fake_home,
+        name=None,
+        optional_skills_root=fake_optional_root,
+        apply=True,
+        force=False,
+    ))
+    assert rc == 1  # copy failure → partial update → exit 1
 
 
 # ─── parse_env_block ─────────────────────────────────────────────────

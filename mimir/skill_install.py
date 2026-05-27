@@ -830,7 +830,7 @@ def apply_skill_update(
     result: SkillDriftResult,
     *,
     force: bool = False,
-) -> tuple[list[str], str | None]:
+) -> tuple[list[str], list[str], str | None]:
     """Apply pending updates from source to the installed copy of one skill.
 
     Parameters
@@ -847,18 +847,23 @@ def apply_skill_update(
     that exists in both the installed copy and source but has different
     content), a backup is written to
     ``.pre-update-backup/<ISO-timestamp>/<rel>`` relative to the installed
-    skill directory, and a warning is printed.  This prevents silent data
-    loss when the operator has hand-edited a tracked file.
+    skill directory, and a note is printed.  If the backup itself fails, the
+    overwrite is skipped and the file is added to ``failed`` — the safety
+    guarantee is absolute: either the backup succeeds and the overwrite is
+    recoverable, or the file is left untouched.
 
     Each ``shutil.copy2`` call is wrapped in ``try/except (OSError,
     IOError)``; per-file failures are logged, the update continues on
-    remaining files, and the caller receives the list of successfully
-    written files.
+    remaining files, and the caller receives the list of failed files so it
+    can set the exit code correctly.
 
     Returns
     -------
     updated_files:
         Relative paths of files that were actually written to disk.
+    failed_files:
+        Relative paths of files that could not be written (backup failure,
+        copy error, or remove error).  Non-empty means the update is partial.
     pollers_hint:
         If a ``pollers.json`` file was among the updated files, a
         human-readable hint string asking the operator to reload pollers.
@@ -869,7 +874,7 @@ def apply_skill_update(
             f"  {result.name}: orphaned (no source counterpart) — skipping; "
             "remove manually if no longer needed."
         )
-        return [], None
+        return [], [], None
 
     updated: list[str] = []
     failed: list[str] = []
@@ -893,21 +898,23 @@ def apply_skill_update(
         src_file = result.source_path / rel
         dst_file = result.installed_path / rel
 
-        # For files that differ (i.e. may contain local edits), write a backup
-        # before overwriting so no data is silently lost.
+        # For files that differ, write a backup before overwriting so no data
+        # is silently lost.  If the backup fails, skip the overwrite entirely
+        # and record as failed — never proceed with a destructive write without
+        # a functioning safety net.
         if rel in result.differs and dst_file.is_file():
             backup_dir = _ensure_backup_root()
             backup_path = backup_dir / rel
             try:
                 backup_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(dst_file, backup_path)
-                print(
-                    f"  Warning: {rel} has local edits — backed up to {backup_path}"
-                )
+                print(f"  Note: backed up {rel} → {backup_path} before overwrite")
             except (OSError, IOError) as exc:
                 print(
-                    f"  Warning: could not back up {rel} before overwrite: {exc}"
+                    f"  error: could not back up {rel} before overwrite: {exc} — skipping"
                 )
+                failed.append(rel)
+                continue
 
         try:
             dst_file.parent.mkdir(parents=True, exist_ok=True)
@@ -943,10 +950,11 @@ def apply_skill_update(
     if "pollers.json" in updated:
         pollers_hint = (
             f"{result.name}: pollers.json updated — "
-            "run `mimir scheduler reload` or restart the agent to register changes"
+            "use the `mcp__mimir__reload_pollers` tool or restart the agent "
+            "to register changes"
         )
 
-    return updated, pollers_hint
+    return updated, failed, pollers_hint
 
 
 def add_argparse_update(parser) -> None:
@@ -1005,7 +1013,8 @@ def cmd_update_skills(args) -> int:
     and copies new files added in source.  Extra files (local additions)
     are preserved unless ``--force`` is also given.  Exits 0 on success;
     exits 1 when any skill could not be fully updated (e.g. skipped extras
-    without --force); exits 2 on usage errors.
+    without --force, or per-file copy/backup failures); exits 2 on usage
+    errors.
     """
     home = _resolve_home(getattr(args, "home", None))
     if not home.is_dir():
@@ -1042,6 +1051,7 @@ def cmd_update_skills(args) -> int:
 
     # Apply mode: update each skill, collect pollers hints.
     any_skipped_extras = False
+    any_failures = False
     pollers_hints: list[str] = []
 
     for r in results:
@@ -1049,10 +1059,13 @@ def cmd_update_skills(args) -> int:
             print(f"{r.name}: up to date")
             continue
 
-        updated, hint = apply_skill_update(r, force=do_force)
+        updated, failed, hint = apply_skill_update(r, force=do_force)
 
         if hint:
             pollers_hints.append(hint)
+
+        if failed:
+            any_failures = True
 
         if updated:
             print(
@@ -1072,4 +1085,4 @@ def cmd_update_skills(args) -> int:
         for hint in pollers_hints:
             print(hint)
 
-    return 1 if any_skipped_extras else 0
+    return 1 if (any_failures or any_skipped_extras) else 0
