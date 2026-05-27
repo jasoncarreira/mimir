@@ -49,6 +49,36 @@ When `cwd` is inside a git checkout of the target repo, you don't need `--repo`
 elsewhere or operating on a different repo, pass `--repo owner/repo` (or use a
 URL).
 
+## Pre-merge CHANGES_REQUESTED gate (chainlink #214, rule via #217)
+
+**Before invoking `gh pr merge` on any PR, ALWAYS check the current review
+state.** A reviewer can flip to CHANGES_REQUESTED after the first approval —
+calling `gh pr merge` without a fresh check can merge a PR that has outstanding
+blocking feedback.
+
+```bash
+# Returns the login list of blocking reviewers (empty array [] if none)
+BLOCKING=$(gh pr view <PR> --json reviews --jq '
+  [.reviews | group_by(.author.login)[] | sort_by(.submittedAt)[-1]
+   | select(.state == "CHANGES_REQUESTED") | .author.login]')
+
+# Refuse if non-empty
+if [ "$BLOCKING" != "[]" ]; then
+    # blocked — do not merge; see steps below
+    echo "Merge blocked by CHANGES_REQUESTED from: $BLOCKING"
+fi
+```
+
+If `$BLOCKING` is non-empty (one or more reviewers in CHANGES_REQUESTED state):
+
+1. **Refuse the merge** — do not call `gh pr merge`.
+2. Post a `gh pr comment` explaining why the merge was blocked and listing the
+   blocking reviewers from `$BLOCKING` who need to re-approve.
+
+This is a non-negotiable hard gate — not a heuristic. "Operator approved once"
+is not sufficient if a subsequent CHANGES_REQUESTED arrived, even seconds later.
+(Structured event emission for blocked merges is tracked in chainlink #218.)
+
 ## Pull requests
 
 ```bash
