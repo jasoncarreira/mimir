@@ -867,12 +867,15 @@ def build_app(config: Config) -> web.Application:
             )
 
         # Scheduler-health check (chainlink #66 — scheduler wedge).
-        # Fires every 10 min, reads events.jsonl to detect a stale
-        # heartbeat and pushes an ntfy alarm if >90 min have elapsed.
+        # Fires every 10 min; reads events.jsonl + scheduler.yaml to detect
+        # a stale heartbeat and pushes an ntfy alarm if elapsed time exceeds
+        # (heartbeat cron period × 2.0).  Threshold auto-adapts when an
+        # operator changes the heartbeat cadence.
         scheduler_health_registered = False
         try:
             scheduler_health_registered = scheduler.add_scheduler_health_check_job(
                 config.events_log,
+                config.home / "scheduler.yaml",
             )
         except ValueError as exc:
             await log_event(
