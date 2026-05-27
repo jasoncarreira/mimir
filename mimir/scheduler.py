@@ -1754,29 +1754,36 @@ class Scheduler:
 
     # VSM: S2 — cross-job health sentinel. Runs every 10 min (non-LLM
     #      callable) and fires an ntfy alarm when the heartbeat tick
-    #      hasn't appeared in events.jsonl for >90 min.  Distinct from
+    #      hasn't appeared in events.jsonl for longer than (heartbeat
+    #      period × safety_factor).  Distinct from
     #      the bind-mount health probe: this checks the LLM-turn pipeline,
     #      not the filesystem layer.
     # loop_id: 4.14
     def add_scheduler_health_check_job(
         self,
         events_log: Path,
+        scheduler_yaml: Path,
         cron_expr: str = "*/10 * * * *",
         *,
-        threshold_minutes: int = 90,
+        safety_factor: float = 2.0,
         job_id: str = "scheduler-health-check",
     ) -> bool:
         """Register a cron that fires an ntfy alarm when the heartbeat is stale.
 
         Runs every 10 minutes by default.  Each tick reads ``events_log``
         and checks when ``scheduler:heartbeat`` last fired a
-        ``scheduled_tick`` event.  If the gap exceeds ``threshold_minutes``
-        (default 90), :func:`~mimir.ntfy.fire_scheduler_wedge_alarm_if_warranted`
-        is called.
+        ``scheduled_tick`` event.  The alarm threshold is derived from the
+        heartbeat job's cron expression in ``scheduler_yaml`` multiplied by
+        ``safety_factor`` (default 2.0) — so the threshold automatically
+        adapts when an operator changes the heartbeat cadence.
 
-        The check is intentionally lightweight (one file read, reversed
-        line scan, no network unless the alarm condition is met) so it
-        doesn't amplify cost when APScheduler is healthy.
+        If the heartbeat job is absent or has no cron in ``scheduler_yaml``
+        (intentionally disabled), the check silently skips — disabled
+        heartbeat is not a wedge.
+
+        The check is intentionally lightweight (one yaml read + one file read,
+        reversed line scan, no network unless the alarm condition is met) so
+        it doesn't amplify cost when APScheduler is healthy.
 
         Returns ``False`` on empty / unset cron so callers can no-op
         without an exception (consistent with ``add_health_probe_job``).
@@ -1787,7 +1794,8 @@ class Scheduler:
             try:
                 await fire_scheduler_wedge_alarm_if_warranted(
                     events_log,
-                    threshold_minutes=threshold_minutes,
+                    scheduler_yaml_path=scheduler_yaml,
+                    safety_factor=safety_factor,
                 )
             except Exception as exc:  # noqa: BLE001
                 await log_event(
