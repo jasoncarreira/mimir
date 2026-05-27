@@ -55,19 +55,19 @@ def test_memory_skill_references_wiki(tmp_path: Path):
 
 
 def test_memory_skill_visibility_tiers():
-    """Tier count (SKILL.md) and seam annotations (IMPL_SEAMS.md) must stay in sync.
+    """Tier count (SKILL.md) and seam annotations (DESIGN.md) must stay in sync.
 
     Tiers live in SKILL.md (operator/agent-facing); impl-seam annotations
-    live in the sibling IMPL_SEAMS.md (developer-facing, not loaded by the
+    live in the sibling DESIGN.md (developer-facing, not loaded by the
     agent). Pinning both counts prevents silent drift: adding a tier to
-    SKILL.md without a matching seam in IMPL_SEAMS.md (or vice versa)
+    SKILL.md without a matching seam in DESIGN.md (or vice versa)
     fails loudly. (chainlink #110)
     """
     import re
 
     skill_dir = Path(__file__).parent.parent / "mimir" / "skills" / "memory"
     skill_path = skill_dir / "SKILL.md"
-    seams_path = skill_dir / "IMPL_SEAMS.md"
+    seams_path = skill_dir / "DESIGN.md"
 
     body = skill_path.read_text()
 
@@ -89,23 +89,23 @@ def test_memory_skill_visibility_tiers():
         "Update this test if you intentionally add or remove a visibility tier."
     )
 
-    # SKILL.md must NOT contain impl-seam annotations (moved to IMPL_SEAMS.md).
+    # SKILL.md must NOT contain impl-seam annotations (moved to DESIGN.md).
     skill_seam_count = body.count("_→ ")
     assert skill_seam_count == 0, (
         f"memory/SKILL.md contains {skill_seam_count} impl-seam annotation(s) (_→ ...). "
-        "These belong in IMPL_SEAMS.md (developer reference), not SKILL.md."
+        "These belong in DESIGN.md (developer reference), not SKILL.md."
     )
 
-    # IMPL_SEAMS.md: must exist and have ≥12 impl-seam annotations.
+    # DESIGN.md: must exist and have ≥12 impl-seam annotations.
     assert seams_path.exists(), (
-        "memory/IMPL_SEAMS.md is missing. "
+        "memory/DESIGN.md is missing. "
         "Impl-seam annotations (code paths per tier) belong there, "
         "not in SKILL.md (developer reference; not loaded by the agent)."
     )
     seams_body = seams_path.read_text()
     seam_count = seams_body.count("_→ ")
     assert seam_count >= 12, (
-        f"Expected ≥12 impl-seam annotations (_→ ...) in memory/IMPL_SEAMS.md, "
+        f"Expected ≥12 impl-seam annotations (_→ ...) in memory/DESIGN.md, "
         f"found {seam_count}. Add a seam cross-reference for any new tier."
     )
 

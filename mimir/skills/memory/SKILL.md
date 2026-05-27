@@ -152,7 +152,7 @@ this here, under what symptom does the future-me actually surface
 it?"
 
 > Implementation seams (code paths for each tier) are in
-> [`IMPL_SEAMS.md`](IMPL_SEAMS.md) — developer reference; not loaded by the agent.
+> [`DESIGN.md`](DESIGN.md) — developer reference; not loaded by the agent.
 
 ### Every-turn (delivered in the system prompt)
 
