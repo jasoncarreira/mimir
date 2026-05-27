@@ -1829,3 +1829,25 @@ def test_is_event_resolved_naive_resolved_at_event_after() -> None:
         "reason": "fix at T",
     }
     assert not _is_event_resolved(ev, [rule])
+
+
+# ---- poller_missing_required_env renderer (chainlink #108) ----------------
+
+
+def test_poller_missing_required_env_renders_poller_and_missing_vars(tmp_path: Path) -> None:
+    """poller_missing_required_env renderer includes the poller name and all
+    missing var names — the operator can see exactly what to provision."""
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.1),
+            "type": "poller_missing_required_env",
+            "poller": "github-activity",
+            "missing": ["GITHUB_TOKEN", "MIMIR_GITHUB_SELF_LOGIN"],
+        },
+    ])
+    negatives, _ = log.recent()
+    assert len(negatives) == 1
+    assert negatives[0].kind == "poller_missing_required_env"
+    assert "github-activity" in negatives[0].content
+    assert "GITHUB_TOKEN" in negatives[0].content
+    assert "MIMIR_GITHUB_SELF_LOGIN" in negatives[0].content
