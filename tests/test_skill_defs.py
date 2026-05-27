@@ -55,22 +55,24 @@ def test_memory_skill_references_wiki(tmp_path: Path):
 
 
 def test_memory_skill_visibility_tiers():
-    """The 'What gets seen turn-to-turn' section must have exactly 12
-    numbered tiers, each with an impl seam cross-reference.
+    """Tier count (SKILL.md) and seam annotations (IMPL_SEAMS.md) must stay in sync.
 
-    Pinning the count prevents silent tier additions/removals from going
-    unnoticed, and the seam-reference check ensures cross-links are
-    present for each tier (chainlink #110).
+    Tiers live in SKILL.md (operator/agent-facing); impl-seam annotations
+    live in the sibling IMPL_SEAMS.md (developer-facing, not loaded by the
+    agent). Pinning both counts prevents silent drift: adding a tier to
+    SKILL.md without a matching seam in IMPL_SEAMS.md (or vice versa)
+    fails loudly. (chainlink #110)
     """
     import re
 
-    skill_path = (
-        Path(__file__).parent.parent / "mimir" / "skills" / "memory" / "SKILL.md"
-    )
+    skill_dir = Path(__file__).parent.parent / "mimir" / "skills" / "memory"
+    skill_path = skill_dir / "SKILL.md"
+    seams_path = skill_dir / "IMPL_SEAMS.md"
+
     body = skill_path.read_text()
 
     # Extract the visibility section bounded by the "What gets seen"
-    # section header and the next H2 ("## Things to Track").
+    # section header and the next H2.
     section_match = re.search(
         r"## What gets seen turn-to-turn(.*?)(?=\n## |\Z)",
         body,
@@ -79,19 +81,31 @@ def test_memory_skill_visibility_tiers():
     assert section_match, "memory/SKILL.md must contain '## What gets seen turn-to-turn'"
     section = section_match.group(1)
 
-    # Count numbered list items (lines starting with digits followed by ".").
+    # SKILL.md: exactly tiers 1-12.
     tier_lines = re.findall(r"^\s*(\d+)\.", section, re.MULTILINE)
     tier_numbers = [int(n) for n in tier_lines]
     assert tier_numbers == list(range(1, 13)), (
-        f"Expected tiers 1-12, got {tier_numbers}. "
+        f"Expected tiers 1-12 in memory/SKILL.md, got {tier_numbers}. "
         "Update this test if you intentionally add or remove a visibility tier."
     )
 
-    # Each tier must have an impl seam annotation (the → impl: line).
-    # We check by counting "_→" italic-arrow annotations — one per tier.
-    seam_count = body.count("_→ ")
+    # SKILL.md must NOT contain impl-seam annotations (moved to IMPL_SEAMS.md).
+    skill_seam_count = body.count("_→ ")
+    assert skill_seam_count == 0, (
+        f"memory/SKILL.md contains {skill_seam_count} impl-seam annotation(s) (_→ ...). "
+        "These belong in IMPL_SEAMS.md (developer reference), not SKILL.md."
+    )
+
+    # IMPL_SEAMS.md: must exist and have ≥12 impl-seam annotations.
+    assert seams_path.exists(), (
+        "memory/IMPL_SEAMS.md is missing. "
+        "Impl-seam annotations (code paths per tier) belong there, "
+        "not in SKILL.md (developer reference; not loaded by the agent)."
+    )
+    seams_body = seams_path.read_text()
+    seam_count = seams_body.count("_→ ")
     assert seam_count >= 12, (
-        f"Expected ≥12 impl-seam annotations (_→ ...) in memory/SKILL.md, "
+        f"Expected ≥12 impl-seam annotations (_→ ...) in memory/IMPL_SEAMS.md, "
         f"found {seam_count}. Add a seam cross-reference for any new tier."
     )
 
