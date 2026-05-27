@@ -2102,8 +2102,15 @@ class Agent:
             self._assemble_usage_block
         )
         # Flush deferred events on the running loop.
+        from .ntfy import fire_cost_runaway_alarm_if_warranted
         for event_kind, event_kwargs in deferred_usage_events:
             self._spawn_bg_task(log_event(event_kind, **event_kwargs))
+            # Dead-man alarm: cost-rate runaway (chainlink #66). Fires an ntfy
+            # push when the hourly rate exceeds the runaway threshold so the
+            # operator is notified even when not watching chat.
+            self._spawn_bg_task(
+                fire_cost_runaway_alarm_if_warranted(event_kind, event_kwargs)
+            )
         upcoming_block = self._assemble_upcoming_block()
         commitments_block = self._assemble_commitments_block(
             channel_id=event.channel_id,

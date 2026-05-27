@@ -335,3 +335,128 @@ async def test_headers_serialization(
     assert headers["Priority"] == "5"
     assert isinstance(headers["Priority"], str)
     assert headers["Tags"] == "warning,rotating_light"
+
+
+# ─── cost-runaway dead-man alarm tests (chainlink #66) ────────────────
+
+
+@pytest.mark.asyncio
+async def test_cost_runaway_alarm_fires_above_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """fire_cost_runaway_alarm_if_warranted calls post_algedonic_alarm when
+    the rate exceeds the threshold and NTFY_TOPIC is unset (emits skip event,
+    not a real push — but the alarm path is exercised)."""
+    # With no NTFY_TOPIC the helper emits ntfy_skip_no_topic, which is
+    # enough to prove the alarm function was invoked.
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+
+    await ntfy.fire_cost_runaway_alarm_if_warranted(
+        "cost_rate_alert",
+        {"rate_now_usd_per_hour": 75.0},
+        threshold_usd_per_hour=50.0,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds, (
+        "Expected ntfy_skip_no_topic (alarm invoked but no topic configured); "
+        f"got events: {kinds}"
+    )
+    # Confirm category is correct in the skip event.
+    skip_evt = next(e for e in captured_events if e[0] == "ntfy_skip_no_topic")
+    assert skip_evt[1]["category"] == "cost-runaway"
+
+
+@pytest.mark.asyncio
+async def test_cost_runaway_alarm_fires_for_advisory_kind(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """cost_rate_advisory (quota-billing mode) also triggers the alarm."""
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+
+    await ntfy.fire_cost_runaway_alarm_if_warranted(
+        "cost_rate_advisory",
+        {"rate_now_usd_per_hour": 60.0},
+        threshold_usd_per_hour=50.0,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds
+
+
+@pytest.mark.asyncio
+async def test_cost_runaway_alarm_silent_below_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """No alarm when rate is below the threshold, even with NTFY_TOPIC set."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+
+    await ntfy.fire_cost_runaway_alarm_if_warranted(
+        "cost_rate_alert",
+        {"rate_now_usd_per_hour": 25.0},
+        threshold_usd_per_hour=50.0,
+    )
+
+    # No events at all — short-circuited before calling post_algedonic_alarm.
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_cost_runaway_alarm_silent_for_unrelated_event(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Non-cost events are ignored, even with a very high rate field."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+
+    await ntfy.fire_cost_runaway_alarm_if_warranted(
+        "git_push_failed",
+        {"rate_now_usd_per_hour": 999.0},
+        threshold_usd_per_hour=50.0,
+    )
+
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_cost_runaway_alarm_fires_at_exact_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Rate exactly at threshold fires the alarm (>= semantics: rate < threshold
+    is the short-circuit condition, so rate == threshold passes through)."""
+    # No NTFY_TOPIC → alarm path is invoked but returns ntfy_skip_no_topic,
+    # proving we reached post_algedonic_alarm.
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+
+    await ntfy.fire_cost_runaway_alarm_if_warranted(
+        "cost_rate_alert",
+        {"rate_now_usd_per_hour": 50.0},
+        threshold_usd_per_hour=50.0,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds, (
+        "Alarm should fire at exactly the threshold (>= semantics); "
+        f"got events: {kinds}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_runaway_alarm_silent_just_below_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Rate just below threshold is silent."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+
+    await ntfy.fire_cost_runaway_alarm_if_warranted(
+        "cost_rate_alert",
+        {"rate_now_usd_per_hour": 49.99},
+        threshold_usd_per_hour=50.0,
+    )
+
+    assert captured_events == []

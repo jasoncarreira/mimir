@@ -139,6 +139,107 @@ def _parse_proposal_body(heading: str, body: str) -> AppliedProposal:
     )
 
 
+def _list_pending_proposals(path: Path) -> list[tuple[int, str, str]]:
+    """Return ``[(num, heading, excerpt), ...]`` for every proposal in the
+    ``## Pending`` bucket of *path*, numbered 1..N in document order.
+
+    *heading* is the full heading text (e.g. ``"2026-05-27 — promote X"``).
+    *excerpt* is the first non-empty, non-``##`` line of the proposal body,
+    truncated to 120 chars.
+
+    Raises ``FileNotFoundError`` when *path* does not exist.
+    Raises ``ValueError`` when the file has no ``## Pending`` section.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    raw = path.read_text(encoding="utf-8")
+    sections = _split_md_sections(raw)
+
+    pending_idx = None
+    for i, (head, _) in enumerate(sections):
+        if head.lower() == "pending":
+            pending_idx = i
+            break
+    if pending_idx is None:
+        raise ValueError("missing '## Pending' section in proposed-changes.md")
+
+    # Find the end of the Pending bucket.
+    end_idx = len(sections)
+    for j in range(pending_idx + 1, len(sections)):
+        if sections[j][0].lower() in ("applied", "rejected"):
+            end_idx = j
+            break
+
+    out: list[tuple[int, str, str]] = []
+    num = 0
+    for j in range(pending_idx + 1, end_idx):
+        head, body = sections[j]
+        num += 1
+        # Excerpt: first non-empty non-## line in body.
+        excerpt = ""
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("##"):
+                excerpt = stripped[:120]
+                break
+        out.append((num, head, excerpt))
+    return out
+
+
+# ─── Reflection digest formatting ──────────────────────────────────────
+
+_DIGEST_HEADING_MAX = 60
+_DIGEST_REPLY_HINT = (
+    "Reply: `accept 1 3` to apply, `reject 2 \"reason\"` to decline, `defer 1`"
+    " to re-surface at next reflection. Multiple items OK: `accept 1 3 / reject 2`."
+)
+
+
+def format_reflection_digest(
+    proposals: list[tuple[int, str, str]],
+) -> str | None:
+    """Format *proposals* into an operator digest message.
+
+    Returns ``None`` when *proposals* is empty (silent reflection —
+    no proposals written, no message needed).
+
+    Each tuple is ``(num, heading, excerpt)`` as returned by
+    ``_list_pending_proposals``.  The heading is truncated to
+    ``_DIGEST_HEADING_MAX`` (60) chars; the excerpt is shown on the
+    same line after a ``: ``.
+
+    Format::
+
+        Reflection complete — N pending proposals:
+
+        1. **<heading[:60]>**: <excerpt>
+        2. …
+
+        Reply: `accept 1 3` to apply, …
+    """
+    if not proposals:
+        return None
+
+    n = len(proposals)
+    header = f"Reflection complete — {n} pending proposal{'s' if n != 1 else ''}:\n"
+
+    lines: list[str] = [header]
+    for num, heading, excerpt in proposals:
+        truncated = heading[:_DIGEST_HEADING_MAX]
+        if len(heading) > _DIGEST_HEADING_MAX:
+            truncated = truncated.rstrip() + "…"
+        item = f"{num}. **{truncated}**"
+        if excerpt:
+            item += f": {excerpt}"
+        lines.append(item)
+
+    lines.append("")
+    lines.append(_DIGEST_REPLY_HINT)
+
+    return "\n".join(lines)
+
+
 def mark_applied(
     proposed_changes_path: Path,
     applied_log_path: Path,

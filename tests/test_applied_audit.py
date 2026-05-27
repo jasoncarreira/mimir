@@ -13,8 +13,10 @@ from mimir.reflection.applied_audit import (
     AppliedProposal,
     AuditRow,
     Signal,
+    _list_pending_proposals,
     audit_window,
     compute_signals,
+    format_reflection_digest,
     load_applied_proposals,
     mark_applied,
     render_audit_block,
@@ -633,3 +635,221 @@ async def test_scheduled_applied_audit_catches_exception(
     kinds = [k for k, _ in events]
     assert "applied_audit_error" in kinds
     assert "applied_audit_ok" not in kinds
+
+
+# ─── _list_pending_proposals ────────────────────────────────────────────
+
+
+_FIVE_PROPOSALS = """\
+# Proposed Changes
+
+Pending HITL items from the reflection skill.
+
+## Pending
+
+## 2026-05-01 — promote spawn-model-tier
+Source: reflection 2026-05-01
+Proposal: Promote spawn-model-tier heuristic to core/40-learned-behaviors.md.
+Impact: core memory addition (~200 chars).
+
+## 2026-05-02 — add wiki concept
+Source: reflection 2026-05-02
+Proposal: New eigenbehavior concept page from Von Foerster Ch 11 synthesis.
+Impact: wiki expansion.
+
+## 2026-05-03 — strengthen frame-check
+Source: reflection 2026-05-03
+Proposal: Strengthen source-frame check language in 05-non-goals.md.
+Impact: core memory edit.
+
+## 2026-05-04 — update heartbeat patterns
+Source: reflection 2026-05-04
+Proposal: Document the active-conversation-yield rule in 50-heartbeat-patterns.md.
+Impact: core memory addition.
+
+## 2026-05-05 — retire oauth-usage-poller issue
+Source: reflection 2026-05-05
+Proposal: Re-file oauth-usage-poller.md from memory/issues/ to state/wiki/topics/.
+Impact: drift-amplifier fix.
+
+## Applied
+
+## Rejected
+"""
+
+
+def test_list_pending_proposals_five_proposals(tmp_path: Path):
+    """Five proposals → correct numbers, headings, and excerpts."""
+    pc = tmp_path / "state" / "proposed-changes.md"
+    pc.parent.mkdir(parents=True, exist_ok=True)
+    pc.write_text(_FIVE_PROPOSALS, encoding="utf-8")
+
+    proposals = _list_pending_proposals(pc)
+
+    assert len(proposals) == 5
+    nums = [n for n, _, _ in proposals]
+    assert nums == [1, 2, 3, 4, 5]
+
+    # Heading check.
+    headings = [h for _, h, _ in proposals]
+    assert "2026-05-01 — promote spawn-model-tier" in headings[0]
+    assert "2026-05-05 — retire oauth-usage-poller issue" in headings[4]
+
+    # Excerpt check — should be the first non-empty non-## line of each body.
+    excerpts = [e for _, _, e in proposals]
+    assert "Source:" in excerpts[0]          # first line in body is Source:
+    assert len(excerpts[0]) <= 120
+
+
+def test_list_pending_proposals_fence_aware(tmp_path: Path):
+    """Inner ## inside fenced block must NOT create a new proposal."""
+    pc = tmp_path / "state" / "proposed-changes.md"
+    pc.parent.mkdir(parents=True, exist_ok=True)
+    pc.write_text(dedent("""\
+        # Proposed Changes
+
+        ## Pending
+
+        ## 2026-05-10 — add fenced example
+        Source: reflection 2026-05-10
+        Proposal: Add a fenced code sample.
+        ```
+        ## this is inside a fence, not a heading
+        some code here
+        ```
+        Impact: cosmetic.
+
+        ## Applied
+
+        ## Rejected
+    """), encoding="utf-8")
+
+    proposals = _list_pending_proposals(pc)
+
+    # Only ONE proposal should be found — the inner ## is inside a fence.
+    assert len(proposals) == 1
+    assert proposals[0][0] == 1
+    assert "add fenced example" in proposals[0][1]
+
+
+def test_list_pending_proposals_empty_backlog(tmp_path: Path):
+    """Empty Pending section → empty list, no exception."""
+    pc = tmp_path / "state" / "proposed-changes.md"
+    pc.parent.mkdir(parents=True, exist_ok=True)
+    pc.write_text(dedent("""\
+        # Proposed Changes
+
+        ## Pending
+
+        ## Applied
+
+        ## Rejected
+    """), encoding="utf-8")
+
+    proposals = _list_pending_proposals(pc)
+
+    assert proposals == []
+
+
+def test_list_pending_proposals_json_output(tmp_path: Path, capsys):
+    """--json mode: output is a valid JSON array of {num, heading, excerpt}."""
+    from mimir.cli import main as cli_main
+
+    pc = tmp_path / "state" / "proposed-changes.md"
+    pc.parent.mkdir(parents=True, exist_ok=True)
+    pc.write_text(_FIVE_PROPOSALS, encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main(["reflection", "list-pending", "--json", "--home", str(tmp_path)])
+    assert exc_info.value.code == 0
+
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert isinstance(data, list)
+    assert len(data) == 5
+    for item in data:
+        assert "num" in item
+        assert "heading" in item
+        assert "excerpt" in item
+    assert data[0]["num"] == 1
+    assert "2026-05-01" in data[0]["heading"]
+
+
+# ─── format_reflection_digest ───────────────────────────────────────────
+
+
+def test_format_reflection_digest_zero_proposals_returns_none():
+    """Empty proposal list → None (silent reflection, no message)."""
+    assert format_reflection_digest([]) is None
+
+
+def test_format_reflection_digest_single_proposal():
+    """One proposal → correctly formatted single-item digest."""
+    proposals = [(1, "2026-05-27 — promote spawn-model-tier", "Promote heuristic to core.")]
+    result = format_reflection_digest(proposals)
+
+    assert result is not None
+    assert "Reflection complete — 1 pending proposal:" in result
+    # Plural check: singular "proposal" not "proposals"
+    assert "proposals" not in result.split("—")[1].split(":")[0]
+    assert "1. **2026-05-27 — promote spawn-model-tier**:" in result
+    assert "Promote heuristic to core." in result
+    assert "accept 1" in result
+    assert "reject" in result
+
+
+def test_format_reflection_digest_multiple_proposals():
+    """Three proposals → numbered list with correct header count."""
+    proposals = [
+        (1, "2026-05-27 — promote spawn-model-tier", "Promote heuristic to core."),
+        (2, "2026-05-27 — add wiki concept", "New eigenbehavior concept page."),
+        (3, "2026-05-27 — strengthen frame-check", "Strengthen non-goals language."),
+    ]
+    result = format_reflection_digest(proposals)
+
+    assert result is not None
+    assert "Reflection complete — 3 pending proposals:" in result
+    assert "1. **2026-05-27 — promote spawn-model-tier**:" in result
+    assert "2. **2026-05-27 — add wiki concept**:" in result
+    assert "3. **2026-05-27 — strengthen frame-check**:" in result
+
+
+def test_format_reflection_digest_truncates_long_heading():
+    """Heading longer than 60 chars is truncated with ellipsis."""
+    long_heading = "2026-05-27 — " + "x" * 60  # total > 60 chars
+    proposals = [(1, long_heading, "Some excerpt.")]
+    result = format_reflection_digest(proposals)
+
+    assert result is not None
+    # The heading in bold should be ≤60 chars (plus ellipsis)
+    import re
+    match = re.search(r"\*\*(.+?)\*\*", result)
+    assert match is not None
+    bold_text = match.group(1)
+    # After truncation the text is at most 60 chars + "…"
+    assert len(bold_text) <= 61  # 60 + "…"
+    assert bold_text.endswith("…")
+
+
+def test_format_reflection_digest_empty_excerpt():
+    """Proposal with no excerpt omits the ': excerpt' suffix."""
+    proposals = [(1, "2026-05-27 — some proposal", "")]
+    result = format_reflection_digest(proposals)
+
+    assert result is not None
+    # Should have the bold heading but no trailing ": "
+    assert "1. **2026-05-27 — some proposal**\n" in result or (
+        "1. **2026-05-27 — some proposal**" in result
+        and not result.split("**2026-05-27 — some proposal**")[1].startswith(":")
+    )
+
+
+def test_format_reflection_digest_reply_hint_present():
+    """Digest always ends with the reply-format hint."""
+    proposals = [(1, "2026-05-27 — test", "excerpt")]
+    result = format_reflection_digest(proposals)
+
+    assert result is not None
+    assert "accept 1 3" in result
+    assert "reject 2" in result
+    assert "defer 1" in result

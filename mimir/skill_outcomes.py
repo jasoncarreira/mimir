@@ -13,10 +13,20 @@ the agent reads ``SKILL.md`` to pull the body into its own context and
 improvises with the parent's full tool surface. Signal:
 ``tool_call(name="read_file", args.file_path=".../SKILL.md")``.
 ``tool_result.is_error`` reflects whether the FILE was readable
-— **load** signal, not execution. Execution outcome of the
-subsequent improvised work is muddled with the parent turn —
-refined for some skills via the ``success_criteria`` frontmatter
-block (see :class:`SkillSuccessCriteria`).
+— **load** signal, not execution. **Inline-skill execution outcomes
+are heuristic; for clean per-invocation outcomes, declare
+``allowed-tools`` in the skill's frontmatter so it runs as a SubAgent
+and gets an explicit ``tool_result.is_error`` signal.**
+
+The fallback attribution strategy for inline loads where no
+``tool_result`` was captured (streaming gap) is **Approach C
+(boundary-based)**: errors in a skill's boundary window (from its
+``read_file`` load until the next skill load or end-of-turn) are
+attributed to that skill; a clean window yields success; an empty
+window falls back to the turn-level ``result_is_error`` signal.
+Outcome of the subsequent improvised work is refined per-skill via
+the ``success_criteria`` frontmatter block (see
+:class:`SkillSuccessCriteria`).
 
 A second pattern — ``task(subagent_type=...)`` for compiled SubAgent
 delegation — was tried in the PR #266 / #269 arc but removed
@@ -411,26 +421,37 @@ def _classify_skill_calls(
     ``turn_succeeded`` is the overall turn signal (False when
     ``result_is_error`` is True). When a skill invocation has no
     matching tool_result — happens on the ChatClaudeCode streaming
-    path for built-in tools, and on agent-pivots — we fall back to
-    ``turn_succeeded`` instead of always emitting "abandoned".
-    Without this fallback, every read_file load on a heartbeat
-    turn lands in the risky bucket even when the turn completed
-    cleanly.
+    path for built-in tools, and on agent-pivots — we use
+    **Approach C (boundary-based attribution)**: scan the events from
+    the skill's ``read_file`` call up to the next skill load (or
+    end-of-turn) for any ``tool_result`` events. An error in the
+    boundary window → ``"failure"``; a clean result → ``"success"``;
+    an empty window (no tool_results at all) falls back to
+    ``turn_succeeded`` as a terminal signal.
 
-    Resolution:
-      - Matching tool_result present → use is_error (exact)
-      - No tool_result + turn_succeeded=True  → "success" (inferred)
-      - No tool_result + turn_succeeded=False → "failure" (inferred)
-      - No tool_result + turn_succeeded=None  → "abandoned" (legacy /
-        turn outcome unavailable)
+    Resolution (no-tool_result fallback, Approach C):
+      - Matching tool_result present → use is_error (exact; not fallback)
+      - No tool_result, error in boundary window  → "failure"
+      - No tool_result, success in boundary window → "success"
+      - No tool_result, empty boundary window + turn_succeeded=True  → "success"
+      - No tool_result, empty boundary window + turn_succeeded=False → "failure"
+      - No tool_result, empty boundary window + turn_succeeded=None  → "abandoned"
 
-    **Inference imprecision** (aggregate-level correct, per-call-
-    level imprecise): turns with multiple tool kinds can't attribute
-    a turn-level error to the specific skill that caused it. Inline
-    skills are particularly affected (read_file load + N improvised
-    tool calls; turn fails → all loads in that turn get attributed
-    failure). Subagent-mode skills aren't affected — they have
-    explicit per-invocation tool_result outcomes.
+    **Approach C vs A:** Approach A used the whole-turn ``result_is_error``
+    as the outcome for every unmatched skill, which over-attributes a
+    turn-level error to ALL loaded skills regardless of where in the
+    turn the error occurred. Approach C narrows attribution to the
+    inter-skill-load window, so Skill B's window being clean yields
+    ``"success"`` even when Skill A's window had errors and the overall
+    turn ``result_is_error=True``. Boundary windows are still imprecise
+    (non-skill tool errors in the window contaminate attribution), but
+    less so than the full-turn baseline.
+
+    **Residual imprecision:** operator-declared ``success_criteria``
+    (via :class:`SkillSuccessCriteria`) is a more principled signal for
+    skills whose completion is declaratively definable. Approach C is
+    the correct default for skills without criteria; criteria checks
+    are the upgrade path.
     """
     pending: dict[str, tuple[str, str, int]] = {}   # tool_use_id → (skill name, kind, call_index)
     for idx, ev in enumerate(events):
@@ -484,17 +505,50 @@ def _classify_skill_calls(
                     yield skill, outcome, turn_ts, kind
 
     # Anything left in pending has no matching tool_result.
-    # Use the turn-level signal as a fallback (see classifier
-    # docstring for the imprecision tradeoff). Criteria don't apply
-    # here — without a tool_result anchor we don't know how to
-    # bound the "after the load" window.
-    for skill, kind, _ in pending.values():
-        if turn_succeeded is True:
-            yield skill, "success", turn_ts, kind
-        elif turn_succeeded is False:
-            yield skill, "failure", turn_ts, kind
-        else:
-            yield skill, "abandoned", turn_ts, kind
+    # Approach C (boundary-based attribution): for each unmatched skill,
+    # scan the events in its boundary window — from its tool_call index
+    # up to the next skill's tool_call index (or end of events) — for
+    # tool_result signals.  An error result in the window → "failure";
+    # a clean result → "success"; an empty window falls back to
+    # turn_succeeded (same as Approach A's terminal signal).
+    #
+    # This localizes errors to the skill that was "active" when they
+    # occurred, rather than blaming every loaded skill for a turn-level
+    # failure that may have nothing to do with most of them.
+    #
+    # Criteria don't apply here — without a tool_result anchor for the
+    # skill's own read_file, we can't bound the "after the load"
+    # success-criteria window reliably.
+    if pending:
+        ordered = sorted(pending.values(), key=lambda t: t[2])  # sort by call_idx
+        load_indices = [idx for _, _, idx in ordered]
+        for i, (skill, kind, call_idx) in enumerate(ordered):
+            window_end = (
+                load_indices[i + 1] if i + 1 < len(load_indices) else len(events)
+            )
+            window = events[call_idx + 1 : window_end]
+            has_error = any(
+                isinstance(ev, dict)
+                and ev.get("type") == "tool_result"
+                and bool(ev.get("is_error"))
+                for ev in window
+            )
+            has_success = any(
+                isinstance(ev, dict)
+                and ev.get("type") == "tool_result"
+                and not bool(ev.get("is_error"))
+                for ev in window
+            )
+            if has_error:
+                yield skill, "failure", turn_ts, kind
+            elif has_success:
+                yield skill, "success", turn_ts, kind
+            elif turn_succeeded is True:
+                yield skill, "success", turn_ts, kind
+            elif turn_succeeded is False:
+                yield skill, "failure", turn_ts, kind
+            else:
+                yield skill, "abandoned", turn_ts, kind
 
 
 def _refine_load_outcome(

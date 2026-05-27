@@ -220,3 +220,61 @@ def _reset_dedup_for_tests() -> None:
     callers rely on the table persisting across alarms within the
     process lifetime."""
     _LAST_POST.clear()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Dead-man alarm: cost-rate runaway (chainlink #66)
+# ────────────────────────────────────────────────────────────────────────────
+
+# Threshold above which a deferred ``cost_rate_alert`` / ``cost_rate_advisory``
+# event triggers a phone-push alarm. $50/hr is ~20× the typical working rate
+# ($2–3/hr) — clearly a runaway loop or an accidentally-unleashed benchmark,
+# not an active coding session.
+NTFY_COST_RUNAWAY_USD_PER_HOUR: float = 50.0
+
+_COST_RATE_EVENT_KINDS = frozenset({"cost_rate_alert", "cost_rate_advisory"})
+
+
+async def fire_cost_runaway_alarm_if_warranted(
+    event_kind: str,
+    event_kwargs: dict,
+    *,
+    threshold_usd_per_hour: float = NTFY_COST_RUNAWAY_USD_PER_HOUR,
+) -> None:
+    """Send a phone-push alarm if a cost-rate event crosses the runaway threshold.
+
+    Designed to be spawned as a background task alongside the normal
+    ``log_event`` call in the agent's deferred-event flush loop.  When the
+    event is irrelevant or the rate is below ``threshold_usd_per_hour``, the
+    function returns immediately without touching ntfy.
+
+    Parameters
+    ----------
+    event_kind:
+        The deferred event kind string (``"cost_rate_alert"`` or
+        ``"cost_rate_advisory"``).  Other kinds are ignored silently.
+    event_kwargs:
+        The event payload dict produced by ``_assemble_usage_block``.
+        Must contain ``"rate_now_usd_per_hour"``.
+    threshold_usd_per_hour:
+        Override the module-level default for tests or operator config.
+
+    Always returns ``None``.  Never raises.
+    """
+    if event_kind not in _COST_RATE_EVENT_KINDS:
+        return
+    rate = event_kwargs.get("rate_now_usd_per_hour", 0.0)
+    if not isinstance(rate, (int, float)) or rate < threshold_usd_per_hour:
+        return
+    await post_algedonic_alarm(
+        category="cost-runaway",
+        title=f"mimir: cost runaway ${rate:.0f}/hr",
+        body=(
+            f"Hourly spend ${rate:.1f}/hr exceeds alarm threshold "
+            f"${threshold_usd_per_hour:.0f}/hr. Possible runaway loop — "
+            f"check for stuck heartbeat or bash_async spawn storm."
+        ),
+        dedupe_key="cost-runaway:rate",
+        priority=5,  # urgent
+        tags=["warning", "money_with_wings"],
+    )
