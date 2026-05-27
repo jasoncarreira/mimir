@@ -2186,6 +2186,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     _skill_install.add_argparse_install(skills_install_p)
 
+    # mimir skills update — detect drift between installed and source skills
+    skills_update_p = skills_sub.add_parser(
+        "update",
+        help="Compare installed optional skills against their source counterparts "
+             "and report drift (dry-run by default). Exits 0 when all skills are "
+             "up-to-date, 1 when drift is found (CI-friendly). Pass a skill name "
+             "to check only that skill; omit to check all installed skills.",
+    )
+    _skill_install.add_argparse_update(skills_update_p)
+
     # mimir scaffold-docker — generate container-deploy files
     # (Dockerfile, compose.yml, compose.env, start.sh) into an agent
     # home. Inspects <home>/skills/ for per-skill OS-deps

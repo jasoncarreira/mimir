@@ -1,10 +1,11 @@
 """Tests for ``mimir.skill_install`` and its ``mimir skills install /
-list / list-optional`` CLI wiring.
+list / list-optional / update`` CLI wiring.
 
-Covers the install flow (copy from optional-skills/ → home/.claude/skills/),
-the conflict + --force semantics, the listing helpers, and the
+Covers the install flow (copy from optional-skills/ → home/skills/),
+the conflict + --force semantics, the listing helpers, the
 CLI-side argparse callbacks (so `mimir skills install bogus` returns
-a non-zero exit cleanly).
+a non-zero exit cleanly), and the drift-detection logic
+(``detect_skill_drift`` + ``mimir skills update``).
 """
 
 from __future__ import annotations
@@ -17,9 +18,12 @@ import pytest
 from mimir.skill_install import (
     DEFAULT_OPTIONAL_SKILLS_ROOT,
     OptionalSkill,
+    SkillDriftResult,
     cmd_install,
     cmd_list,
     cmd_list_optional,
+    cmd_update_skills,
+    detect_skill_drift,
     install,
     list_available,
     list_installed,
@@ -104,7 +108,7 @@ def test_install_copies_directory(fake_optional_root: Path, fake_home: Path):
         "fake-poller", fake_home,
         optional_skills_root=fake_optional_root,
     )
-    dest = fake_home / ".claude" / "skills" / "fake-poller"
+    dest = fake_home / "skills" / "fake-poller"
     assert dest.is_dir()
     assert (dest / "SKILL.md").is_file()
     assert (dest / "pollers.json").is_file()
@@ -151,7 +155,7 @@ def test_install_force_overwrites_existing(
 ):
     # First install. Add a marker file inside the dest to verify it gets cleared.
     install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
-    dest = fake_home / ".claude" / "skills" / "fake-skill"
+    dest = fake_home / "skills" / "fake-skill"
     (dest / "user-edit.md").write_text("custom content")
     assert (dest / "user-edit.md").is_file()
 
@@ -174,7 +178,7 @@ def test_install_excludes_pycache(fake_optional_root: Path, fake_home: Path):
     (pycache / "poller.cpython-313.pyc").write_text("binary stuff")
 
     install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
-    dest = fake_home / ".claude" / "skills" / "fake-poller"
+    dest = fake_home / "skills" / "fake-poller"
     assert not (dest / "__pycache__").exists()
 
 
@@ -270,7 +274,7 @@ def test_list_available_and_installed_share_helper(fake_optional_root: Path, tmp
     which differs by definition)."""
     # Build an agent home that has the same two skills installed.
     home = tmp_path / "home"
-    skills = home / ".claude" / "skills"
+    skills = home / "skills"
     skills.mkdir(parents=True)
     import shutil as _sh
     _sh.copytree(fake_optional_root / "fake-poller", skills / "fake-poller")
@@ -364,7 +368,7 @@ def test_truncate_desc_helper():
 
 def test_cmd_list_no_skills_dir_emits_setup_hint(tmp_path: Path, capsys):
     """``mimir skills list`` on a home that exists but has no
-    .claude/skills/ subdir should emit the "Did you run mimir setup?"
+    skills/ subdir should emit the "Did you run mimir setup?"
     hint, not crash."""
     home = tmp_path / "home"
     home.mkdir()
@@ -452,3 +456,158 @@ def test_cmd_install_no_poller_hint_for_plain_skill(
     assert rc == 0
     out = capsys.readouterr().out
     assert "ships a pollers.json" not in out
+
+
+# ─── detect_skill_drift ───────────────────────────────────────────────
+
+
+def test_drift_clean_skill(fake_optional_root: Path, fake_home: Path):
+    """An installed skill whose files are identical to source is clean."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert r.is_clean
+    assert r.modified == []
+    assert r.added == []
+    assert r.extra == []
+    assert not r.orphaned
+
+
+def test_drift_modified_file(fake_optional_root: Path, fake_home: Path):
+    """A file that differs between source and installed shows up as modified."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Mutate the installed copy so it differs from source.
+    installed_skill_md = fake_home / "skills" / "fake-skill" / "SKILL.md"
+    installed_skill_md.write_text("---\nname: fake-skill\ndescription: edited\n---\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert not r.is_clean
+    assert "SKILL.md" in r.modified
+    assert r.added == []
+    assert r.extra == []
+
+
+def test_drift_added_file_in_source(fake_optional_root: Path, fake_home: Path):
+    """A file added to source after install shows up as added-in-source."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Simulate a new file arriving in source that isn't in installed yet.
+    (fake_optional_root / "fake-skill" / "new-helper.py").write_text("# new\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert not r.is_clean
+    assert "new-helper.py" in r.added
+    assert r.modified == []
+    assert r.extra == []
+
+
+def test_drift_extra_file_in_installed(fake_optional_root: Path, fake_home: Path):
+    """A file present in installed but absent from source shows up as extra."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Add a file only in the installed copy (a local edit / leftover).
+    (fake_home / "skills" / "fake-skill" / "local-note.md").write_text("notes\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert not r.is_clean
+    assert "local-note.md" in r.extra
+    assert r.modified == []
+    assert r.added == []
+
+
+def test_drift_orphaned_skill(fake_home: Path, tmp_path: Path):
+    """An installed skill with no matching source directory is orphaned."""
+    # Create a skill in home that has no source counterpart.
+    orphan = fake_home / "skills" / "orphan-skill"
+    orphan.mkdir(parents=True)
+    (orphan / "SKILL.md").write_text("---\nname: orphan-skill\ndescription: x\n---\n")
+
+    # Empty optional-skills root — no counterpart for orphan-skill.
+    empty_src = tmp_path / "empty-optional-skills"
+    empty_src.mkdir()
+
+    results = detect_skill_drift(fake_home, empty_src)
+    assert len(results) == 1
+    r = results[0]
+    assert r.name == "orphan-skill"
+    assert r.orphaned
+    assert not r.is_clean
+    assert r.source_path is None
+
+
+def test_drift_by_name_not_installed_raises(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """detect_skill_drift(name=...) raises FileNotFoundError for unknown skills."""
+    with pytest.raises(FileNotFoundError, match="not installed"):
+        detect_skill_drift(fake_home, fake_optional_root, name="not-there")
+
+
+def test_drift_pycache_excluded(fake_optional_root: Path, fake_home: Path):
+    """__pycache__ files do not contribute to drift even when they differ."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    # Add __pycache__ to both sides with different content — should not appear.
+    src_cache = fake_optional_root / "fake-poller" / "__pycache__"
+    src_cache.mkdir(exist_ok=True)
+    (src_cache / "poller.pyc").write_text("source-bytecode")
+
+    inst_cache = fake_home / "skills" / "fake-poller" / "__pycache__"
+    inst_cache.mkdir(exist_ok=True)
+    (inst_cache / "poller.pyc").write_text("installed-bytecode-different")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-poller")
+    assert r.is_clean, f"Expected clean but got: {r}"
+
+
+# ─── cmd_update_skills CLI ────────────────────────────────────────────
+
+
+def test_cmd_update_skills_all_clean(
+    fake_optional_root: Path, fake_home: Path, capsys, monkeypatch,
+):
+    """``mimir skills update`` exits 0 and prints 'up to date' when clean."""
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT", fake_optional_root,
+    )
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    rc = cmd_update_skills(Namespace(
+        home=fake_home, name=None, optional_skills_root=fake_optional_root,
+    ))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "up to date" in out
+
+
+def test_cmd_update_skills_drift_exits_1(
+    fake_optional_root: Path, fake_home: Path, capsys, monkeypatch,
+):
+    """``mimir skills update`` exits 1 and reports file names when drift found."""
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT", fake_optional_root,
+    )
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Introduce drift in the source (simulating an upstream update).
+    (fake_optional_root / "fake-skill" / "SKILL.md").write_text(
+        "---\nname: fake-skill\ndescription: Updated description.\n---\n"
+    )
+    rc = cmd_update_skills(Namespace(
+        home=fake_home, name=None, optional_skills_root=fake_optional_root,
+    ))
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "modified" in out
+    assert "SKILL.md" in out
+    assert "1 skill" in out
+
+
+def test_cmd_update_skills_no_home(tmp_path: Path, capsys):
+    """``mimir skills update`` with a non-existent home exits 2."""
+    rc = cmd_update_skills(Namespace(
+        home=tmp_path / "no-such-home",
+        name=None,
+        optional_skills_root=None,
+    ))
+    assert rc == 2
+    assert "not a directory" in capsys.readouterr().out
