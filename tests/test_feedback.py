@@ -1851,3 +1851,44 @@ def test_poller_missing_required_env_renders_poller_and_missing_vars(tmp_path: P
     assert "github-activity" in negatives[0].content
     assert "GITHUB_TOKEN" in negatives[0].content
     assert "MIMIR_GITHUB_SELF_LOGIN" in negatives[0].content
+
+
+# ---- chainlink #214: pre-merge CHANGES_REQUESTED gate -------------------
+
+
+def test_pr_merge_blocked_renders_pr_number_and_reviewer(tmp_path: Path) -> None:
+    """pr_merge_blocked_by_changes_requested renderer surfaces PR number and
+    blocking reviewer — operator can see which PR/reviewer is blocking without
+    reading turn transcripts."""
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.1),
+            "type": "pr_merge_blocked_by_changes_requested",
+            "pr": 384,
+            "blocking_reviewers": [
+                {"author": "jasoncarreira", "submittedAt": "2026-05-27T12:00:00Z"}
+            ],
+        },
+    ])
+    negatives, _ = log.recent()
+    assert len(negatives) == 1
+    assert negatives[0].kind == "pr_merge_blocked"
+    assert "384" in negatives[0].content
+    assert "jasoncarreira" in negatives[0].content
+    assert "CHANGES_REQUESTED" in negatives[0].content
+
+
+def test_pr_merge_blocked_renders_without_reviewer_list(tmp_path: Path) -> None:
+    """pr_merge_blocked_by_changes_requested renderer handles missing
+    blocking_reviewers field gracefully — still surfaces PR number."""
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.1),
+            "type": "pr_merge_blocked_by_changes_requested",
+            "pr": 999,
+        },
+    ])
+    negatives, _ = log.recent()
+    assert len(negatives) == 1
+    assert "999" in negatives[0].content
+    assert "CHANGES_REQUESTED" in negatives[0].content

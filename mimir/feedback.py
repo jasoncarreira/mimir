@@ -300,6 +300,13 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # (rolled back to the prior version; operator should investigate).
     "mimir_update_applied": ("positive", "mimir_update_applied"),
     "mimir_update_failed": ("negative", "mimir_update_failed"),
+    # chainlink #214: pre-merge CHANGES_REQUESTED gate blocked an auto-merge.
+    # Surfaces when the agent's pre-merge review-state check finds any
+    # reviewer's current state is CHANGES_REQUESTED — the merge was refused
+    # and the PR stays open until the reviewer re-approves or withdraws the
+    # request.  Negative so the operator sees "I wanted to merge PR N but
+    # couldn't" without having to read turn transcripts.
+    "pr_merge_blocked_by_changes_requested": ("negative", "pr_merge_blocked"),
     "git_pull_ok": ("positive", "git_pull_ok"),
     "git_fetch_ok": ("positive", "git_fetch_ok"),
     "shell_job_complete_enqueue_ok": ("positive", "shell_job_complete_enqueue_ok"),
@@ -1661,6 +1668,22 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"poller {name!r} skipped — missing required env: {missing_str} "
             f"(add to pass_env + provision the var)"
         )
+    if rule_kind == "pr_merge_blocked":
+        # chainlink #214: pre-merge CHANGES_REQUESTED gate refused the merge.
+        # Include PR number + blocking reviewer(s) so the operator can see
+        # which review is blocking without reading turn transcripts.
+        pr_num = ev.get("pr") or ev.get("pr_number") or "?"
+        blocking = ev.get("blocking_reviewers") or ev.get("blocking") or []
+        if isinstance(blocking, list) and blocking:
+            authors = ", ".join(
+                b.get("author", "?") if isinstance(b, dict) else str(b)
+                for b in blocking
+            )
+            return (
+                f"pr_merge blocked: PR #{pr_num} has CHANGES_REQUESTED "
+                f"from {authors} — resolve before merge"
+            )
+        return f"pr_merge blocked: PR #{pr_num} has CHANGES_REQUESTED review"
     return rule_kind
 
 
