@@ -396,7 +396,7 @@ def run_smoke_test(dest: Path, env_path: Path | None = None) -> tuple[int, str]:
     env = os.environ.copy()
     if env_path and env_path.is_file():
         for k, v in _read_env_file(env_path).items():
-            env.setdefault(k, v)
+            env[k] = v  # .env is authoritative for the smoke-test
 
     result: subprocess.CompletedProcess[str] | None = None
     for args in (["--once"], []):
@@ -575,9 +575,9 @@ def cmd_install(args) -> int:
 
     if result.pollers_registered_hint:
         print(
-            "\n  this skill ships a pollers.json — once mimir is running, "
-            "call the `reload_pollers` tool (or restart `mimir run`) so "
-            "the poller registers."
+            "\n  this skill ships a pollers.json — to activate, either:\n"
+            "    - Restart `mimir run`, OR\n"
+            '    - Ask mimir (in any channel it\'s listening on): "please call reload_pollers"'
         )
     elif not do_configure:
         skill_md = result.dest / "SKILL.md"
