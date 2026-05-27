@@ -27,11 +27,18 @@ exported (set it in `mimirbot/.env` if running there).
 
 ## Usage
 
-Invoke via Python module syntax so the path works from any cwd —
-mimir's bundled skills live inside the installed `mimir` package
-(at `mimir/skills/weather/get_weather.py`), reachable via `-m`
-regardless of where the venv lands or what directory the shell
+Always invoke via Python module syntax — `python3 -m mimir.skills.weather.get_weather`.
+The script ships inside the installed `mimir` package, so the `-m`
+form resolves no matter where the venv lives or what cwd the shell
 tool spawns from.
+
+**Do not invoke as a filesystem path.** Forms like
+`python3 mimir/skills/weather/get_weather.py` only resolve from a
+source checkout — from a PyPI install (`pip install mimir-agent`)
+the script lives under `site-packages/` and the relative path will
+fail with "No such file or directory." To confirm the script is
+correctly installed, `python3 -c "import mimir.skills.weather.get_weather"`
+should exit 0.
 
 ```bash
 # Default location (set inside the script — Victor, NY, US).
@@ -41,6 +48,11 @@ python3 -m mimir.skills.weather.get_weather
 python3 -m mimir.skills.weather.get_weather "London,UK"
 python3 -m mimir.skills.weather.get_weather "San Francisco,CA,US"
 ```
+
+The script does NOT use argparse — anything that isn't `--json` is
+treated as the city name. So `python3 -m mimir.skills.weather.get_weather --help`
+sends `--help` to OpenWeatherMap as a city query and 404s. There is
+no `--help` flag; use the examples above as reference.
 
 Default output is plain text (current conditions + 5-day high/low/precip).
 Add `--json` when you want to format the output yourself or pull specific
