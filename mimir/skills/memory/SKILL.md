@@ -151,50 +151,41 @@ follow-ups.
 this here, under what symptom does the future-me actually surface
 it?"
 
+> Implementation seams (code paths for each tier) are in
+> [`DESIGN.md`](DESIGN.md) — developer reference; not loaded by the agent.
+
 ### Every-turn (delivered in the system prompt)
 
 1. **`memory/core/*.md`** — ordered by numeric prefix.
-   _→ `core_blocks.py:load_core()` → `prompts.py:build_system_prompt()`_
 2. **`memory/channels/<id>/*.md`** — only on that channel.
-   _→ `core_blocks.py:load_channel_memory()` → `prompts.py:build_turn_prompt(channel_memory_block=...)`_
 3. **SAGA "Possibly relevant memories"** — embedding-ranked against
    the inbound message, top-k only.
-   _→ `agent.py` pre-message hook (skipped for `NON_USER_QUERY_TRIGGERS`) → `prompts.py` "Possibly relevant memories" block_
 4. **Recent session summaries** — last N boundaries on this channel
    (written by `saga_end_session` at idle close).
-   _→ `agent.py:_assemble_session_summaries()` → `history.py:render_session_summaries()` → `prompts.py:build_turn_prompt(session_summaries_block=...)`_
 5. **Recent activity** — last N rendered messages on this channel.
    _Suppressed on synthetic `scheduler:*` / `poller:*` channels per
    chainlink #78._
-   _→ `history.py:render_recent_activity()` → `prompts.py:build_turn_prompt()`; gate: `SYNTHETIC_CHANNEL_PREFIXES`_
 6. **Recent feedback signals** — 24h algedonic in/out from
    `events.jsonl`.
-   _→ `feedback.py:FeedbackLog.recent_block()` → `prompts.py:build_turn_prompt(feedback_block=...)`_
 7. **`memory/INDEX.md` descriptions** — one-line `<!-- desc: -->`
    per file. The file content isn't loaded; the description is the
    discoverability hook.
-   _→ `index.py:IndexGenerator._write_memory()` (auto-regenerated; `<!-- desc: -->` first-line convention)_
 
 ### Read-on-demand (findable, not delivered)
 
 8. **`memory/{issues,learnings-pending,channels/*,...}` non-core**
    — `Read` by path or `mcp__mimir__file_search` by topic.
-   _→ `searchtools.py:file_search` MCP tool (hybrid BM25 + semantic + recency)_
 9. **`state/wiki/`, `state/spec/`, `state/proposed-changes.md`** —
    `file_search` or direct path; `state/INDEX.md` lives outside the
    prompt, and the wiki's own `index.md` + backlinks are the
    navigation layer.
-   _→ same `searchtools.py:file_search`; `state/INDEX.md` via `index.py:IndexGenerator._write_state()`_
 10. **SAGA atoms (full content)** — `memory_query` reaches
     beyond the auto-injected top-k.
-    _→ `sagatools.py:memory_query` MCP tool → `SagaStore.query()`_
 11. **`events.jsonl`** — `introspection` skill; ~30-day retention at
     default 75k cap.
-    _→ `agent.py:JsonlSnapshot(config.events_log)`; read via `introspection` skill or direct jq_
 12. **Subagent completion payloads** — delivered ONCE on the
     wake-up turn; capture anything durable to memory before that
     turn ends.
-    _→ `agent.py:_on_shell_job_complete()` fires a `shell_job_complete` turn on the spawning channel_
 
 ### Placement heuristic
 
