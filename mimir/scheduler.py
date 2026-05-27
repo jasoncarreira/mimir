@@ -1750,6 +1750,63 @@ class Scheduler:
             coalesce=True,
         )
 
+    # ---- scheduler-health-check cron (chainlink #66 — scheduler wedge) -----
+
+    # VSM: S2 — cross-job health sentinel. Runs every 10 min (non-LLM
+    #      callable) and fires an ntfy alarm when the heartbeat tick
+    #      hasn't appeared in events.jsonl for >90 min.  Distinct from
+    #      the bind-mount health probe: this checks the LLM-turn pipeline,
+    #      not the filesystem layer.
+    # loop_id: 4.14
+    def add_scheduler_health_check_job(
+        self,
+        events_log: Path,
+        cron_expr: str = "*/10 * * * *",
+        *,
+        threshold_minutes: int = 90,
+        job_id: str = "scheduler-health-check",
+    ) -> bool:
+        """Register a cron that fires an ntfy alarm when the heartbeat is stale.
+
+        Runs every 10 minutes by default.  Each tick reads ``events_log``
+        and checks when ``scheduler:heartbeat`` last fired a
+        ``scheduled_tick`` event.  If the gap exceeds ``threshold_minutes``
+        (default 90), :func:`~mimir.ntfy.fire_scheduler_wedge_alarm_if_warranted`
+        is called.
+
+        The check is intentionally lightweight (one file read, reversed
+        line scan, no network unless the alarm condition is met) so it
+        doesn't amplify cost when APScheduler is healthy.
+
+        Returns ``False`` on empty / unset cron so callers can no-op
+        without an exception (consistent with ``add_health_probe_job``).
+        """
+        from .ntfy import fire_scheduler_wedge_alarm_if_warranted
+
+        async def _check() -> None:
+            try:
+                await fire_scheduler_wedge_alarm_if_warranted(
+                    events_log,
+                    threshold_minutes=threshold_minutes,
+                )
+            except Exception as exc:  # noqa: BLE001
+                await log_event(
+                    "scheduler_health_check_failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+        return self.register_callable(
+            name=job_id,
+            fn=_check,
+            default_cron=cron_expr,
+            job_id=job_id,
+            # Grace of 600s = one full period; a delayed fire is still
+            # informative.  Never overlap checks.
+            misfire_grace_time=600,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # ---- identities-populate cron -----------------------------------
 
     # VSM: S3 — non-LLM background scrape of connected bridges into
