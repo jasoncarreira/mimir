@@ -16,6 +16,7 @@ from mimir.reflection.applied_audit import (
     _list_pending_proposals,
     audit_window,
     compute_signals,
+    format_reflection_digest,
     load_applied_proposals,
     mark_applied,
     render_audit_block,
@@ -772,3 +773,83 @@ def test_list_pending_proposals_json_output(tmp_path: Path, capsys):
         assert "excerpt" in item
     assert data[0]["num"] == 1
     assert "2026-05-01" in data[0]["heading"]
+
+
+# ─── format_reflection_digest ───────────────────────────────────────────
+
+
+def test_format_reflection_digest_zero_proposals_returns_none():
+    """Empty proposal list → None (silent reflection, no message)."""
+    assert format_reflection_digest([]) is None
+
+
+def test_format_reflection_digest_single_proposal():
+    """One proposal → correctly formatted single-item digest."""
+    proposals = [(1, "2026-05-27 — promote spawn-model-tier", "Promote heuristic to core.")]
+    result = format_reflection_digest(proposals)
+
+    assert result is not None
+    assert "Reflection complete — 1 pending proposal:" in result
+    # Plural check: singular "proposal" not "proposals"
+    assert "proposals" not in result.split("—")[1].split(":")[0]
+    assert "1. **2026-05-27 — promote spawn-model-tier**:" in result
+    assert "Promote heuristic to core." in result
+    assert "accept 1" in result
+    assert "reject" in result
+
+
+def test_format_reflection_digest_multiple_proposals():
+    """Three proposals → numbered list with correct header count."""
+    proposals = [
+        (1, "2026-05-27 — promote spawn-model-tier", "Promote heuristic to core."),
+        (2, "2026-05-27 — add wiki concept", "New eigenbehavior concept page."),
+        (3, "2026-05-27 — strengthen frame-check", "Strengthen non-goals language."),
+    ]
+    result = format_reflection_digest(proposals)
+
+    assert result is not None
+    assert "Reflection complete — 3 pending proposals:" in result
+    assert "1. **2026-05-27 — promote spawn-model-tier**:" in result
+    assert "2. **2026-05-27 — add wiki concept**:" in result
+    assert "3. **2026-05-27 — strengthen frame-check**:" in result
+
+
+def test_format_reflection_digest_truncates_long_heading():
+    """Heading longer than 60 chars is truncated with ellipsis."""
+    long_heading = "2026-05-27 — " + "x" * 60  # total > 60 chars
+    proposals = [(1, long_heading, "Some excerpt.")]
+    result = format_reflection_digest(proposals)
+
+    assert result is not None
+    # The heading in bold should be ≤60 chars (plus ellipsis)
+    import re
+    match = re.search(r"\*\*(.+?)\*\*", result)
+    assert match is not None
+    bold_text = match.group(1)
+    # After truncation the text is at most 60 chars + "…"
+    assert len(bold_text) <= 61  # 60 + "…"
+    assert bold_text.endswith("…")
+
+
+def test_format_reflection_digest_empty_excerpt():
+    """Proposal with no excerpt omits the ': excerpt' suffix."""
+    proposals = [(1, "2026-05-27 — some proposal", "")]
+    result = format_reflection_digest(proposals)
+
+    assert result is not None
+    # Should have the bold heading but no trailing ": "
+    assert "1. **2026-05-27 — some proposal**\n" in result or (
+        "1. **2026-05-27 — some proposal**" in result
+        and not result.split("**2026-05-27 — some proposal**")[1].startswith(":")
+    )
+
+
+def test_format_reflection_digest_reply_hint_present():
+    """Digest always ends with the reply-format hint."""
+    proposals = [(1, "2026-05-27 — test", "excerpt")]
+    result = format_reflection_digest(proposals)
+
+    assert result is not None
+    assert "accept 1 3" in result
+    assert "reject 2" in result
+    assert "defer 1" in result

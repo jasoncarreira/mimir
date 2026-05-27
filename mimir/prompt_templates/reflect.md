@@ -331,6 +331,35 @@ When in doubt, pick the narrowest event type that captures what you're
 fixing. The audit window is the same N days before vs after the
 applied timestamp, so the prediction is falsifiable.
 
+## Step 4.5 — Send pending-proposals digest (when proposals were written)
+
+After writing any proposals to `state/proposed-changes.md`, query the
+pending list and notify the operator if the backlog is non-empty:
+
+```bash
+mimir reflection list-pending --json
+```
+
+If the JSON output is a non-empty array, format a numbered digest and
+send it to the operator alert channel via `send_message`:
+
+```
+Reflection complete — N pending proposals:
+
+1. **<heading truncated to 60 chars>**: <first-line excerpt>
+2. …
+
+Reply: `accept 1 3` to apply, `reject 2 "reason"` to decline, `defer 1`
+to re-surface at next reflection. Multiple items OK: `accept 1 3 / reject 2`.
+```
+
+**Silent rule**: if you wrote NO proposals this reflection — only
+autonomous changes like `saga_feedback` or `40-learned-behaviors.md`
+additions — skip this step entirely. No digest, no message.
+
+If `MIMIR_OPERATOR_ALERT_CHANNEL` is not set, log a one-line warning
+to stderr and skip silently.
+
 ## Step 5 — End the turn
 
 Reflection turns end silently like heartbeats — no user-visible
