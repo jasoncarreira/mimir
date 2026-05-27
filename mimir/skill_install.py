@@ -34,6 +34,7 @@ custom edits.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import os
 import re
@@ -842,14 +843,26 @@ def apply_skill_update(
         present only in the installed copy, which may be local edits).
         When *False*, extra files are preserved and a warning is printed.
 
+    Before overwriting any file listed in ``result.differs`` (i.e. a file
+    that exists in both the installed copy and source but has different
+    content), a backup is written to
+    ``.pre-update-backup/<ISO-timestamp>/<rel>`` relative to the installed
+    skill directory, and a warning is printed.  This prevents silent data
+    loss when the operator has hand-edited a tracked file.
+
+    Each ``shutil.copy2`` call is wrapped in ``try/except (OSError,
+    IOError)``; per-file failures are logged, the update continues on
+    remaining files, and the caller receives the list of successfully
+    written files.
+
     Returns
     -------
     updated_files:
         Relative paths of files that were actually written to disk.
     pollers_hint:
         If a ``pollers.json`` file was among the updated files, a
-        human-readable hint string asking the operator to call
-        ``reload_pollers``.  ``None`` otherwise.
+        human-readable hint string asking the operator to reload pollers.
+        ``None`` otherwise.
     """
     if result.orphaned:
         print(
@@ -859,34 +872,78 @@ def apply_skill_update(
         return [], None
 
     updated: list[str] = []
+    failed: list[str] = []
 
     assert result.source_path is not None  # guaranteed when not orphaned
+
+    # Backup directory for differs files: .pre-update-backup/<timestamp>/ inside
+    # the installed skill directory.  Created lazily on first use.
+    backup_root: Path | None = None
+
+    def _ensure_backup_root() -> Path:
+        nonlocal backup_root
+        if backup_root is None:
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup_root = result.installed_path / ".pre-update-backup" / ts
+            backup_root.mkdir(parents=True, exist_ok=True)
+        return backup_root
 
     # Overwrite changed files and copy new files from source.
     for rel in result.differs + result.added:
         src_file = result.source_path / rel
         dst_file = result.installed_path / rel
-        dst_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_file, dst_file)
-        updated.append(rel)
+
+        # For files that differ (i.e. may contain local edits), write a backup
+        # before overwriting so no data is silently lost.
+        if rel in result.differs and dst_file.is_file():
+            backup_dir = _ensure_backup_root()
+            backup_path = backup_dir / rel
+            try:
+                backup_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dst_file, backup_path)
+                print(
+                    f"  Warning: {rel} has local edits — backed up to {backup_path}"
+                )
+            except (OSError, IOError) as exc:
+                print(
+                    f"  Warning: could not back up {rel} before overwrite: {exc}"
+                )
+
+        try:
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_file, dst_file)
+            updated.append(rel)
+        except (OSError, IOError) as exc:
+            print(f"  error: failed to copy {rel}: {exc}")
+            failed.append(rel)
 
     # Extra files (local additions or source deletions).
     for rel in result.extra:
         if force:
             extra_file = result.installed_path / rel
-            extra_file.unlink(missing_ok=True)
-            updated.append(rel)
+            try:
+                extra_file.unlink(missing_ok=True)
+                updated.append(rel)
+            except (OSError, IOError) as exc:
+                print(f"  error: failed to remove extra file {rel}: {exc}")
+                failed.append(rel)
         else:
             print(
                 f"  {result.name}: extra file {rel!r} kept "
                 "(local edit — use --force to overwrite)"
             )
 
+    if failed:
+        print(
+            f"  {result.name}: {len(failed)} file(s) could not be updated: "
+            f"{', '.join(failed)}"
+        )
+
     pollers_hint: str | None = None
     if "pollers.json" in updated:
         pollers_hint = (
             f"{result.name}: pollers.json updated — "
-            "call reload_pollers in the agent to register changes"
+            "run `mimir scheduler reload` or restart the agent to register changes"
         )
 
     return updated, pollers_hint

@@ -648,6 +648,74 @@ def test_apply_overwrites_changed_file(
     assert installed_md.read_text() == src_text
 
 
+def test_apply_differs_file_creates_backup(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """--apply does NOT silently overwrite a hand-edited differs file.
+
+    Before overwriting, a backup must be written to
+    ``.pre-update-backup/<timestamp>/`` inside the installed skill
+    directory, and a warning must be printed.
+    """
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    installed_md = fake_home / "skills" / "fake-skill" / "SKILL.md"
+    # Hand-edit the installed file so it shows up in .differs.
+    installed_md.write_text("---\nname: fake-skill\ndescription: hand-edited\n---\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert "SKILL.md" in r.differs
+
+    updated, _ = apply_skill_update(r)
+
+    assert "SKILL.md" in updated
+
+    # A backup directory must have been created under .pre-update-backup/.
+    backup_parent = fake_home / "skills" / "fake-skill" / ".pre-update-backup"
+    assert backup_parent.is_dir(), ".pre-update-backup/ directory was not created"
+
+    # Find the timestamped backup sub-directory.
+    ts_dirs = list(backup_parent.iterdir())
+    assert len(ts_dirs) == 1, f"Expected exactly one timestamp dir, found: {ts_dirs}"
+    backup_file = ts_dirs[0] / "SKILL.md"
+    assert backup_file.is_file(), f"Backup file not found at {backup_file}"
+
+    # Backup must contain the pre-update (hand-edited) content, not source.
+    assert backup_file.read_text() == "---\nname: fake-skill\ndescription: hand-edited\n---\n"
+
+    # Warning must have been printed.
+    out = capsys.readouterr().out
+    assert "Warning" in out
+    assert "SKILL.md" in out
+    assert "backed up" in out
+
+    # The installed file must now match source (update applied).
+    src_text = (fake_optional_root / "fake-skill" / "SKILL.md").read_text()
+    assert installed_md.read_text() == src_text
+
+
+def test_apply_added_file_does_not_create_backup(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """Files that are newly added in source (not in .differs) should not
+    trigger a backup — there is no pre-existing installed file to back up."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Add a new file to source only.
+    (fake_optional_root / "fake-skill" / "new-helper.py").write_text("# new\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert "new-helper.py" in r.added
+
+    apply_skill_update(r)
+
+    # No backup directory should exist for pure-add operations.
+    backup_parent = fake_home / "skills" / "fake-skill" / ".pre-update-backup"
+    assert not backup_parent.exists(), (
+        "Backup directory should not be created for added-only files"
+    )
+
+
 def test_apply_copies_added_file(
     fake_optional_root: Path, fake_home: Path,
 ):
@@ -721,7 +789,7 @@ def test_apply_emits_pollers_hint(
 
     assert "pollers.json" in updated
     assert hint is not None
-    assert "reload_pollers" in hint
+    assert "mimir scheduler reload" in hint
 
 
 def test_apply_orphaned_skill_skipped(fake_home: Path, tmp_path: Path, capsys):
@@ -804,7 +872,7 @@ def test_cmd_update_skills_apply_pollers_hint_printed(
     ))
     assert rc == 0
     out = capsys.readouterr().out
-    assert "reload_pollers" in out
+    assert "mimir scheduler reload" in out
 
 
 # ─── parse_env_block ─────────────────────────────────────────────────
