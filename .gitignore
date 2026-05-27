@@ -70,3 +70,4 @@ home/
 # etc. — none of which belongs in source control. A fresh agent home
 # generates its own ``state/`` on first run.
 /state/
+.bench-experiments-backup/
