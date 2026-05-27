@@ -21,7 +21,7 @@ The aiohttp mocking pattern matches ``tests/test_oauth_usage_poller.py``
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -460,3 +460,323 @@ async def test_cost_runaway_alarm_silent_just_below_threshold(
     )
 
     assert captured_events == []
+
+
+# ─── scheduler-wedge dead-man alarm tests (chainlink #66) ─────────────
+
+
+def _write_events(path, events: list[dict]) -> None:
+    """Write a list of event dicts to ``path`` as JSONL."""
+    import json as _json
+    path.write_text("\n".join(_json.dumps(e) for e in events) + "\n")
+
+
+def _heartbeat_event(ts: str) -> dict:
+    return {
+        "timestamp": ts,
+        "type": "scheduled_tick",
+        "channel_id": "scheduler:heartbeat",
+    }
+
+
+def _write_scheduler_yaml(tmp_path, cron: str = "*/45 * * * *"):
+    """Write a minimal scheduler.yaml with the given heartbeat cron to ``tmp_path``.
+
+    Default cron ``*/45 * * * *`` (45 min) × safety_factor 2.0 = 90 min
+    threshold — matching the intent of the original hardcoded constant.
+    """
+    import yaml as _yaml
+    content = [{"name": "heartbeat", "cron": cron, "prompt_file": "heartbeat.md"}]
+    sched_path = tmp_path / "scheduler.yaml"
+    sched_path.write_text(_yaml.safe_dump(content), encoding="utf-8")
+    return sched_path
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_fires_when_stale(
+    tmp_path: "pytest.fixture",
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Alarm fires when heartbeat hasn't appeared for >threshold minutes."""
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    # Last tick was 100 minutes ago; threshold is 90.
+    from datetime import timedelta
+
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=100)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds, (
+        "Expected ntfy_skip_no_topic (alarm invoked but no topic set); "
+        f"got events: {kinds}"
+    )
+    skip_evt = next(e for e in captured_events if e[0] == "ntfy_skip_no_topic")
+    assert skip_evt[1]["category"] == "scheduler-wedge"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_silent_when_recent(
+    tmp_path: "pytest.fixture",
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """No alarm when the last heartbeat is well within the threshold."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    from datetime import timedelta
+
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=30)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_silent_no_events_file(
+    tmp_path: "pytest.fixture",
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """No alarm (no crash) when events.jsonl does not exist yet."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    missing = tmp_path / "nonexistent.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(missing, scheduler_yaml_path=sched_yaml)
+
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_silent_no_heartbeat_in_log(
+    tmp_path: "pytest.fixture",
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """No alarm when the log exists but contains no heartbeat tick events."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+    import json as _json
+
+    # Only non-heartbeat events.
+    _write_events(events_file, [
+        {"timestamp": "2026-05-27T03:00:00+00:00", "type": "oauth_ok", "channel_id": "other"},
+    ])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+    )
+
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_picks_last_heartbeat(
+    tmp_path: "pytest.fixture",
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Uses the MOST RECENT heartbeat timestamp (not the oldest one)."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    from datetime import timedelta
+
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    old_tick_ts = (now - timedelta(minutes=200)).isoformat()
+    recent_tick_ts = (now - timedelta(minutes=20)).isoformat()
+
+    # Old tick first, then recent one — scanner should use the recent one.
+    _write_events(events_file, [
+        _heartbeat_event(old_tick_ts),
+        _heartbeat_event(recent_tick_ts),
+    ])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    # Recent tick is within threshold → no alarm.
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_exact_threshold_fires(
+    tmp_path: "pytest.fixture",
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Elapsed == threshold does NOT fire (strictly-less-than guard)."""
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    from datetime import timedelta
+
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    # Exactly at threshold — elapsed == 90 min.
+    last_tick_ts = (now - timedelta(minutes=90)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    # elapsed (90.0) is NOT < threshold (90) → alarm fires.
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds, (
+        "Alarm should fire at exactly the threshold (>= semantics); "
+        f"got events: {kinds}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_threshold_derives_from_30min_cron(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """*/30 cron × safety_factor 2.0 → 60 min threshold; 70 min stale fires."""
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path, cron="*/30 * * * *")
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=70)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds, (
+        f"Expected alarm: 70 min > threshold 60 min (*/30 × 2.0); got: {kinds}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_threshold_derives_from_2h_cron(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """0 */2 cron × safety_factor 2.0 → 240 min threshold; 90 min stale silent."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path, cron="0 */2 * * *")
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=90)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    assert captured_events == [], (
+        f"No alarm expected: 90 min < threshold 240 min (0 */2 × 2.0); got: {captured_events}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_heartbeat_in_scheduler_yaml_no_alarm(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """If scheduler.yaml has no heartbeat job, no alarm even with stale events."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+
+    import yaml as _yaml
+    sched_yaml = tmp_path / "scheduler.yaml"
+    sched_yaml.write_text(
+        _yaml.safe_dump([{"name": "reflect", "cron": "0 6 * * 0", "prompt_file": "reflect.md"}]),
+        encoding="utf-8",
+    )
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=300)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    assert captured_events == [], (
+        f"No alarm when heartbeat absent from scheduler.yaml; got: {captured_events}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_disabled_heartbeat_with_stale_events_no_alarm(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Operator removed heartbeat cron: stale last_tick must NOT alarm.
+
+    Regression guard: before this fix, disabling the heartbeat would still
+    fire alarms for ~30 days until the old tick rotated out of events.jsonl.
+    """
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+
+    import yaml as _yaml
+    sched_yaml = tmp_path / "scheduler.yaml"
+    sched_yaml.write_text(
+        _yaml.safe_dump([{"name": "heartbeat", "cron": "", "prompt_file": "heartbeat.md"}]),
+        encoding="utf-8",
+    )
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(days=5)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    assert captured_events == [], (
+        f"No alarm when heartbeat cron is empty (disabled); got: {captured_events}"
+    )

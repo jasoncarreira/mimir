@@ -866,6 +866,24 @@ def build_app(config: Config) -> web.Application:
                 error=str(exc),
             )
 
+        # Scheduler-health check (chainlink #66 — scheduler wedge).
+        # Fires every 10 min; reads events.jsonl + scheduler.yaml to detect
+        # a stale heartbeat and pushes an ntfy alarm if elapsed time exceeds
+        # (heartbeat cron period × 2.0).  Threshold auto-adapts when an
+        # operator changes the heartbeat cadence.
+        scheduler_health_registered = False
+        try:
+            scheduler_health_registered = scheduler.add_scheduler_health_check_job(
+                config.events_log,
+                config.home / "scheduler.yaml",
+            )
+        except ValueError as exc:
+            await log_event(
+                "scheduler_invalid_cron",
+                job="scheduler-health-check",
+                error=str(exc),
+            )
+
         # Load LLM-tick jobs from scheduler.yaml.
         reload_stats = scheduler.reload()
 
@@ -885,6 +903,7 @@ def build_app(config: Config) -> web.Application:
             or introspection_registered
             or oauth_poll_registered
             or health_probe_registered
+            or scheduler_health_registered
             or identities_populate_registered
             or reload_stats["registered"] > 0
             or installed_pollers > 0
