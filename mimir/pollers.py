@@ -244,6 +244,22 @@ class PollerConfig:
     persist_dir: Path | None = None
     batch_size: int = POLLER_BATCH_SIZE_DEFAULT
     pass_env: tuple[str, ...] = ()
+    #: ``env_required`` (chainlink #108): env var names the poller
+    #: **must** have in its subprocess env to function correctly.
+    #: Checked at the start of each ``run_poller`` invocation — after
+    #: the env dict is fully assembled (allowlist + pass_env + env
+    #: overrides). Any name that's absent from the final env causes the
+    #: poller to skip that run, emit ``poller_missing_required_env``
+    #: algedonically, and return 0 (no events enqueued). The intent
+    #: is "fail loudly at runtime rather than silently misfire" —
+    #: operators can see the algedonic signal and provision the missing
+    #: var. Names in ``env_required`` that ARE in ``pass_env`` will
+    #: naturally be present if the operator set the var; names that
+    #: AREN'T in ``pass_env`` but are in the global allowlist also flow
+    #: through. Secrets that aren't in either surface are always absent,
+    #: so listing a deny-filter secret in ``env_required`` WITHOUT
+    #: also listing it in ``pass_env`` is always a misconfiguration.
+    env_required: tuple[str, ...] = ()
     #: Absolute path to the ``pollers.json`` manifest this config was
     #: parsed from, as yielded by ``Path.rglob("pollers.json")`` over
     #: ``skills_dir``. Not explicitly symlink-resolved — two manifests
@@ -391,6 +407,27 @@ def discover_pollers(
                 key = item.strip()
                 if key:
                     pass_env_clean.append(key)
+            # chainlink #108: env_required — names the poller needs in its env.
+            env_required_raw = entry.get("env_required", [])
+            if not isinstance(env_required_raw, list):
+                log.warning(
+                    "poller_invalid_env_required: %s name=%r value=%r "
+                    "(expected list of strings); ignoring",
+                    pollers_file, name, env_required_raw,
+                )
+                env_required_raw = []
+            env_required_clean: list[str] = []
+            for item in env_required_raw:
+                if not isinstance(item, str):
+                    log.warning(
+                        "poller_invalid_env_required_item: %s name=%r "
+                        "item=%r (expected string); skipping",
+                        pollers_file, name, item,
+                    )
+                    continue
+                key = item.strip()
+                if key:
+                    env_required_clean.append(key)
             persist_dir = (
                 state_root / name if state_root is not None else None
             )
@@ -453,6 +490,7 @@ def discover_pollers(
                     persist_dir=persist_dir,
                     batch_size=batch_size,
                     pass_env=tuple(pass_env_clean),
+                    env_required=tuple(env_required_clean),
                     manifest_path=pollers_file,
                 ),
             )
@@ -652,6 +690,22 @@ async def run_poller(
             )
     env["STATE_DIR"] = str(persist_dir)
     env["POLLER_NAME"] = poller.name
+
+    # chainlink #108: env_required validation — check after the env dict is
+    # fully assembled (allowlist + pass_env + poller.env + injected vars).
+    # Missing vars mean "don't run this tick and surface an algedonic signal."
+    # The operator sees the event, provisions the var, and the next tick runs
+    # cleanly.  We collect ALL missing names (not short-circuit) so the
+    # operator can fix them all in one pass.
+    if poller.env_required:
+        missing = [k for k in poller.env_required if k not in env]
+        if missing:
+            await log_event(
+                "poller_missing_required_env",
+                poller=poller.name,
+                missing=missing,
+            )
+            return 0
 
     proc: asyncio.subprocess.Process | None = None
     stdout_bytes = b""

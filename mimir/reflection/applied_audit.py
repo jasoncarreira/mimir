@@ -187,6 +187,59 @@ def _list_pending_proposals(path: Path) -> list[tuple[int, str, str]]:
     return out
 
 
+# ─── Reflection digest formatting ──────────────────────────────────────
+
+_DIGEST_HEADING_MAX = 60
+_DIGEST_REPLY_HINT = (
+    "Reply: `accept 1 3` to apply, `reject 2 \"reason\"` to decline, `defer 1`"
+    " to re-surface at next reflection. Multiple items OK: `accept 1 3 / reject 2`."
+)
+
+
+def format_reflection_digest(
+    proposals: list[tuple[int, str, str]],
+) -> str | None:
+    """Format *proposals* into an operator digest message.
+
+    Returns ``None`` when *proposals* is empty (silent reflection —
+    no proposals written, no message needed).
+
+    Each tuple is ``(num, heading, excerpt)`` as returned by
+    ``_list_pending_proposals``.  The heading is truncated to
+    ``_DIGEST_HEADING_MAX`` (60) chars; the excerpt is shown on the
+    same line after a ``: ``.
+
+    Format::
+
+        Reflection complete — N pending proposals:
+
+        1. **<heading[:60]>**: <excerpt>
+        2. …
+
+        Reply: `accept 1 3` to apply, …
+    """
+    if not proposals:
+        return None
+
+    n = len(proposals)
+    header = f"Reflection complete — {n} pending proposal{'s' if n != 1 else ''}:\n"
+
+    lines: list[str] = [header]
+    for num, heading, excerpt in proposals:
+        truncated = heading[:_DIGEST_HEADING_MAX]
+        if len(heading) > _DIGEST_HEADING_MAX:
+            truncated = truncated.rstrip() + "…"
+        item = f"{num}. **{truncated}**"
+        if excerpt:
+            item += f": {excerpt}"
+        lines.append(item)
+
+    lines.append("")
+    lines.append(_DIGEST_REPLY_HINT)
+
+    return "\n".join(lines)
+
+
 def mark_applied(
     proposed_changes_path: Path,
     applied_log_path: Path,

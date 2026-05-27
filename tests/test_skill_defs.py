@@ -54,6 +54,48 @@ def test_memory_skill_references_wiki(tmp_path: Path):
     )
 
 
+def test_memory_skill_visibility_tiers():
+    """The 'What gets seen turn-to-turn' section must have exactly 12
+    numbered tiers, each with an impl seam cross-reference.
+
+    Pinning the count prevents silent tier additions/removals from going
+    unnoticed, and the seam-reference check ensures cross-links are
+    present for each tier (chainlink #110).
+    """
+    import re
+
+    skill_path = (
+        Path(__file__).parent.parent / "mimir" / "skills" / "memory" / "SKILL.md"
+    )
+    body = skill_path.read_text()
+
+    # Extract the visibility section bounded by the "What gets seen"
+    # section header and the next H2 ("## Things to Track").
+    section_match = re.search(
+        r"## What gets seen turn-to-turn(.*?)(?=\n## |\Z)",
+        body,
+        re.DOTALL,
+    )
+    assert section_match, "memory/SKILL.md must contain '## What gets seen turn-to-turn'"
+    section = section_match.group(1)
+
+    # Count numbered list items (lines starting with digits followed by ".").
+    tier_lines = re.findall(r"^\s*(\d+)\.", section, re.MULTILINE)
+    tier_numbers = [int(n) for n in tier_lines]
+    assert tier_numbers == list(range(1, 13)), (
+        f"Expected tiers 1-12, got {tier_numbers}. "
+        "Update this test if you intentionally add or remove a visibility tier."
+    )
+
+    # Each tier must have an impl seam annotation (the → impl: line).
+    # We check by counting "_→" italic-arrow annotations — one per tier.
+    seam_count = body.count("_→ ")
+    assert seam_count >= 12, (
+        f"Expected ≥12 impl-seam annotations (_→ ...) in memory/SKILL.md, "
+        f"found {seam_count}. Add a seam cross-reference for any new tier."
+    )
+
+
 def test_refresh_creates_builtin_skills(tmp_path: Path):
     """Bundled skills land under ``<home>/.mimir_builtin_skills/``
     on first refresh. Status is ``"refreshed"`` (always overwrite,
