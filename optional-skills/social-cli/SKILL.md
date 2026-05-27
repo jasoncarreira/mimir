@@ -45,9 +45,9 @@ the platforms credentials are configured for.
 **Does not**: Auto-reply to mentions (the agent reads inbox + decides per
 item, even when batched); cross-post between Bluesky and X without explicit
 `platforms: [bsky, x]`; manage Discord / Slack delivery (that's
-`send_message`); hydrate deep thread context past `parentHeight=5` (sync
-populates up to five ancestors per Bluesky notification — see "Thread
-context" below; for deeper chains there is no read tool today).
+`send_message`). For deeper thread context past sync's `parentHeight=5`,
+the bundled `thread.py` script fetches up to 100 ancestors + replies on
+demand — see "Fetching deeper thread context" below.
 
 ## The agent's loop
 
@@ -166,10 +166,64 @@ deep before anyone realizes. Concrete rule of thumb:
   asked a direct question I haven't answered" is about it. Most
   cases here belong in `ignore` with a reason.
 
-For ancestors more than 5 deep there is no read tool today
-(`parentHeight=5` is hard-coded in `bluesky.ts`). If the thread is
-load-bearing past the visible ancestors, surface that to the
-operator rather than guessing.
+For ancestors more than 5 deep, sync doesn't have them — fetch
+them explicitly via `thread.py` (next section).
+
+### Fetching deeper thread context
+
+The bundled `thread.py` script wraps Bluesky's `getPostThread` XRPC
+endpoint with the operator's existing credentials (no extra auth
+config). It walks up to 100 ancestors and 100 levels of replies on
+demand — call it when the visible 5-ancestor surface in the poller
+prompt is insufficient (long-running thread, you need to see the
+original framing, sibling replies the agent missed, etc.).
+
+```bash
+# Defaults: parent-height 20, depth 5, YAML output to stdout.
+python3 <home>/skills/social-cli/thread.py "at://did:plc:.../app.bsky.feed.post/abc"
+
+# Walk further up and skip the reply tree entirely.
+python3 <home>/skills/social-cli/thread.py "<uri>" --parent-height 50 --depth 0
+
+# JSON when piping into another tool.
+python3 <home>/skills/social-cli/thread.py "<uri>" --json
+```
+
+Output shape:
+
+```yaml
+focusUri: at://...
+focus: { uri, author, authorId, text, timestamp }
+ancestors:
+  - { uri, author, authorId, text, timestamp }   # oldest first
+  - ...
+replies:
+  - { uri, author, authorId, text, timestamp, depth }  # 1 = direct
+  - ...
+_meta:
+  parentHeight: 20
+  depth: 5
+  ancestorCount: 12
+  replyCount: 3
+  agentRepliesInAncestors: 4    # how many ancestors were authored by you
+  ownHandle: you.bsky.social
+```
+
+Notes:
+
+- Reads `ATPROTO_HANDLE` / `ATPROTO_APP_PASSWORD` from
+  `<home>/state/pollers/social-cli-notifications/.env` (set
+  `STATE_DIR` env var to override). No additional config needed.
+- `agentRepliesInAncestors` is the equivalent of the poller's
+  `agent_replies_in_thread` but counted across the full visible
+  ancestor chain rather than the 5-deep slice. Use it for the same
+  rabbit-hole guard at higher confidence — "I have actually
+  contributed N times across the whole conversation."
+- `parentHeight` and `depth` are clamped to [0, 100] (Bluesky's
+  spec limit); higher values silently snap to 100.
+- Costs 1 auth + 1 thread fetch per invocation (~2 API calls).
+  Don't loop this — for surveying many threads, write a wrapper
+  that reuses the session token.
 
 ### `send_message` goes to chat channels, NOT to Bluesky / X
 
