@@ -19,6 +19,7 @@ from mimir.skill_install import (
     DEFAULT_OPTIONAL_SKILLS_ROOT,
     OptionalSkill,
     SkillDriftResult,
+    SkillEnvSpec,
     cmd_install,
     cmd_list,
     cmd_list_optional,
@@ -27,7 +28,11 @@ from mimir.skill_install import (
     install,
     list_available,
     list_installed,
+    prompt_and_write_env,
+    read_env_specs,
+    run_smoke_test,
 )
+from mimir.skill_md import parse_env_block
 
 
 # ─── fixtures ────────────────────────────────────────────────────────
@@ -611,3 +616,270 @@ def test_cmd_update_skills_no_home(tmp_path: Path, capsys):
     ))
     assert rc == 2
     assert "not a directory" in capsys.readouterr().out
+
+
+# ─── parse_env_block ─────────────────────────────────────────────────
+
+_ENV_BLOCK_SKILL_MD = """\
+---
+name: test-skill
+description: A skill with an env block. Note the colon: here.
+env:
+  required:
+    - name: REQUIRED_VAR
+      description: A required variable
+      example: some-value
+  optional:
+    - name: OPTIONAL_VAR
+      description: An optional variable
+      example: opt-value
+    - name: CONDITIONAL_VAR
+      description: Only if OPTIONAL_VAR=yes
+      example: cond-value
+      only_if: "OPTIONAL_VAR=yes"
+---
+body
+"""
+
+_NO_ENV_SKILL_MD = """\
+---
+name: plain-skill
+description: No env block here.
+---
+body
+"""
+
+
+def test_parse_env_block_returns_required_and_optional():
+    req, opt = parse_env_block(_ENV_BLOCK_SKILL_MD)
+    assert [r["name"] for r in req] == ["REQUIRED_VAR"]
+    assert [o["name"] for o in opt] == ["OPTIONAL_VAR", "CONDITIONAL_VAR"]
+
+
+def test_parse_env_block_only_if_present():
+    _, opt = parse_env_block(_ENV_BLOCK_SKILL_MD)
+    cond = next(o for o in opt if o["name"] == "CONDITIONAL_VAR")
+    assert cond["only_if"] == "OPTIONAL_VAR=yes"
+    plain = next(o for o in opt if o["name"] == "OPTIONAL_VAR")
+    assert plain["only_if"] is None
+
+
+def test_parse_env_block_no_env_key_returns_empty():
+    req, opt = parse_env_block(_NO_ENV_SKILL_MD)
+    assert req == [] and opt == []
+
+
+def test_parse_env_block_description_with_colon_does_not_break():
+    req, opt = parse_env_block(_ENV_BLOCK_SKILL_MD)
+    assert len(req) == 1
+
+
+# ─── read_env_specs ──────────────────────────────────────────────────
+
+
+def test_read_env_specs_reads_from_skill_md(tmp_path):
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(_ENV_BLOCK_SKILL_MD)
+    req, opt = read_env_specs(skill_dir)
+    assert req[0].name == "REQUIRED_VAR"
+    assert req[0].required is True
+    assert opt[0].name == "OPTIONAL_VAR"
+    assert opt[0].required is False
+
+
+def test_read_env_specs_no_skill_md_returns_empty(tmp_path):
+    skill_dir = tmp_path / "no-skill"
+    skill_dir.mkdir()
+    req, opt = read_env_specs(skill_dir)
+    assert req == [] and opt == []
+
+
+def test_read_env_specs_github_poller_real_file():
+    from pathlib import Path as P
+    poller_dir = P(__file__).parent.parent / "optional-skills" / "github-poller"
+    if not poller_dir.is_dir():
+        pytest.skip("optional-skills/github-poller not on disk")
+    req, opt = read_env_specs(poller_dir)
+    assert any(s.name == "GITHUB_REPOS" for s in req)
+    assert any(s.name == "MIMIR_GITHUB_REVIEW_SKILL_PATH" for s in opt)
+    path_spec = next(s for s in opt if s.name == "MIMIR_GITHUB_REVIEW_SKILL_PATH")
+    assert path_spec.only_if == "MIMIR_GITHUB_PRELOAD_REVIEW_SKILL=true"
+
+
+# ─── prompt_and_write_env ────────────────────────────────────────────
+
+_REQ = SkillEnvSpec(
+    name="MY_REQUIRED", description="A required var", example="foo", required=True
+)
+_OPT = SkillEnvSpec(
+    name="MY_OPTIONAL", description="An optional var", example="bar", required=False
+)
+_COND = SkillEnvSpec(
+    name="MY_CONDITIONAL",
+    description="Only if MY_OPTIONAL=yes",
+    example="cond",
+    required=False,
+    only_if="MY_OPTIONAL=yes",
+)
+
+
+def test_prompt_and_write_env_writes_required_var(tmp_path, monkeypatch, capsys):
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr("builtins.input", lambda _: "my-value")
+    written = prompt_and_write_env([_REQ], [], env_path)
+    assert "MY_REQUIRED" in written
+    assert "MY_REQUIRED=my-value" in env_path.read_text()
+
+
+def test_prompt_and_write_env_skips_already_set_var(tmp_path, monkeypatch, capsys):
+    env_path = tmp_path / ".env"
+    env_path.write_text("MY_REQUIRED=existing-value\n")
+    calls = []
+    monkeypatch.setattr("builtins.input", lambda p: (calls.append(p), "new")[1])
+    written = prompt_and_write_env([_REQ], [], env_path)
+    assert written == []
+    assert calls == []
+    assert "MY_REQUIRED=existing-value" in env_path.read_text()
+
+
+def test_prompt_and_write_env_reconfigure_reprompts(tmp_path, monkeypatch, capsys):
+    env_path = tmp_path / ".env"
+    env_path.write_text("MY_REQUIRED=old-value\n")
+    monkeypatch.setattr("builtins.input", lambda _: "new-value")
+    written = prompt_and_write_env([_REQ], [], env_path, reconfigure=True)
+    assert "MY_REQUIRED" in written
+    assert "MY_REQUIRED=new-value" in env_path.read_text()
+
+
+def test_prompt_and_write_env_blank_skips_optional(tmp_path, monkeypatch, capsys):
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    written = prompt_and_write_env([], [_OPT], env_path)
+    assert written == []
+    assert not env_path.exists()
+
+
+def test_prompt_and_write_env_only_if_skips_when_condition_not_met(tmp_path, monkeypatch, capsys):
+    env_path = tmp_path / ".env"
+    responses = iter(["", ""])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    written = prompt_and_write_env([], [_OPT, _COND], env_path)
+    assert "MY_CONDITIONAL" not in written
+
+
+def test_prompt_and_write_env_only_if_prompts_when_condition_met(tmp_path, monkeypatch, capsys):
+    env_path = tmp_path / ".env"
+    responses = iter(["yes", "cond-value"])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    written = prompt_and_write_env([], [_OPT, _COND], env_path)
+    assert "MY_OPTIONAL" in written
+    assert "MY_CONDITIONAL" in written
+    assert "MY_CONDITIONAL=cond-value" in env_path.read_text()
+
+
+# ─── run_smoke_test ──────────────────────────────────────────────────
+
+
+def test_run_smoke_test_no_poller_py(tmp_path):
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    code, snippet = run_smoke_test(skill_dir)
+    assert code == -1
+    assert "no poller.py" in snippet
+
+
+def test_run_smoke_test_exit_zero(tmp_path):
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "poller.py").write_text(
+        "import sys\nprint('event emitted')\nsys.exit(0)\n"
+    )
+    code, snippet = run_smoke_test(skill_dir)
+    assert code == 0
+    assert "event emitted" in snippet
+
+
+def test_run_smoke_test_exit_nonzero(tmp_path):
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "poller.py").write_text(
+        "import sys\nprint('something failed', file=sys.stderr)\nsys.exit(1)\n"
+    )
+    code, snippet = run_smoke_test(skill_dir)
+    assert code == 1
+
+
+def test_run_smoke_test_once_fallback(tmp_path):
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "poller.py").write_text(
+        "import sys\n"
+        "if '--once' in sys.argv:\n"
+        "    print('unrecognized argument --once', file=sys.stderr)\n"
+        "    sys.exit(2)\n"
+        "print('ok without once')\n"
+        "sys.exit(0)\n"
+    )
+    code, snippet = run_smoke_test(skill_dir)
+    assert code == 0
+    assert "ok without once" in snippet
+
+
+# ─── cmd_install --configure integration ─────────────────────────────
+
+
+def _make_configure_skill(root):
+    skill_dir = root / "conf-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: conf-skill\n"
+        "description: A skill with configure support.\n"
+        "env:\n"
+        "  required:\n"
+        "    - name: CONF_REQUIRED\n"
+        "      description: Required config var\n"
+        "      example: required-val\n"
+        "  optional:\n"
+        "    - name: CONF_OPTIONAL\n"
+        "      description: Optional config var\n"
+        "      example: opt-val\n"
+        "---\n"
+        "body\n"
+    )
+    (skill_dir / "pollers.json").write_text(
+        '{"pollers": [{"name": "conf", "command": "true", "cron": "*/5 * * * *"}]}'
+    )
+    (skill_dir / "poller.py").write_text("print('smoke ok')\n")
+    return root
+
+
+def test_cmd_install_configure_writes_vars(tmp_path, monkeypatch, capsys):
+    opt_root = _make_configure_skill(tmp_path / "optional-skills")
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT", opt_root)
+    monkeypatch.setattr("builtins.input", lambda _: "my-conf-value")
+    rc = cmd_install(Namespace(
+        name="conf-skill", home=home, force=False,
+        configure=True, reconfigure=False, no_smoke_test=True,
+    ))
+    assert rc == 0
+    env_text = (home / ".env").read_text()
+    assert "CONF_REQUIRED=my-conf-value" in env_text
+
+
+def test_cmd_install_no_env_block_configure_is_noop(
+    fake_optional_root, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr("mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT", fake_optional_root)
+    home = tmp_path / "home"
+    home.mkdir()
+    rc = cmd_install(Namespace(
+        name="fake-skill", home=home, force=False,
+        configure=True, reconfigure=False, no_smoke_test=True,
+    ))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no env:" in out

@@ -1,6 +1,25 @@
 ---
 name: github-poller
 description: Watch one or more GitHub repositories for new issues, pull requests, comments, PR reviews, and inline diff comments — emits a fresh turn each time something actionable happens. Use when you've opened PRs / issues mimir should know about review activity for, when you want operator-actionable signals for repos mimir maintains, or when you need to track upstream activity on a watched repo. Filters out events authored by mimir's own GitHub identity (set ``MIMIR_GITHUB_SELF_LOGIN``) so the bot doesn't wake itself with its own comments. Companion to the ``pollers`` framework skill (mechanics) and the ``world-scanning`` skill (catalog of *what's worth polling*). Opt-in: copy this directory into ``<home>/.claude/skills/github-poller/`` then set the env vars below.
+env:
+  required:
+    - name: GITHUB_REPOS
+      description: "Comma-separated owner/repo list (e.g. jasoncarreira/mimir,jasoncarreira/mimirbot)"
+      example: "jasoncarreira/mimir"
+  optional:
+    - name: GITHUB_TOKEN
+      description: "GitHub PAT with repo scope. Falls back to gh auth token when unset."
+      example: "ghp_..."
+    - name: MIMIR_GITHUB_SELF_LOGIN
+      description: "GitHub login mimir authors as. Events from this login are filtered out."
+      example: "mimir-carreira"
+    - name: MIMIR_GITHUB_PRELOAD_REVIEW_SKILL
+      description: "Set to true to preload review SKILL.md on PR events. If yes also set MIMIR_GITHUB_REVIEW_SKILL_PATH."
+      example: "true"
+    - name: MIMIR_GITHUB_REVIEW_SKILL_PATH
+      description: "Absolute path to review SKILL.md on your install (only used when MIMIR_GITHUB_PRELOAD_REVIEW_SKILL=true)."
+      example: "<absolute path to review SKILL.md on your install>"
+      only_if: "MIMIR_GITHUB_PRELOAD_REVIEW_SKILL=true"
 ---
 
 # github-poller — watch GitHub repos for activity
