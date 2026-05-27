@@ -505,3 +505,84 @@ def test_turn_prompt_omits_channel_context_when_none():
     )
     prompt = build_turn_prompt(event, channel_memory_block=None)
     assert "## Channel context" not in prompt
+
+
+# ---- auto_skill_block — poller-channel skill surfacing (chainlink #212) -----
+
+
+def test_turn_prompt_auto_skill_block_renders_labeled_section():
+    """When ``auto_skill_block`` is provided, the turn prompt gains a
+    ``## Skill: <name>`` section containing the body prose."""
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    skill_body = "# social-cli\n\nThe outbox + dispatch loop.\n"
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:social-cli-feed",
+        content="new feed item",
+    )
+    prompt = build_turn_prompt(event, auto_skill_block=("social-cli", skill_body))
+    assert "## Skill: social-cli" in prompt
+    assert "outbox + dispatch loop" in prompt
+
+
+def test_turn_prompt_auto_skill_block_no_frontmatter(tmp_path):
+    """End-to-end pin (chainlink #212): ``find_skill_for_channel`` strips YAML
+    frontmatter before the body reaches ``build_turn_prompt``.  The
+    rendered prompt must not expose any of the frontmatter fields
+    (``name:``, ``description:``, ``trigger:``) under the Skill section.
+
+    The test builds a real on-disk skill with YAML frontmatter and runs
+    the full resolver → prompt pipeline to confirm the contract.
+    """
+    import json
+    from pathlib import Path
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+    from mimir.skill_resolver import find_skill_for_channel
+
+    # Seed a minimal skill on disk with frontmatter + prose body.
+    skill_dir = tmp_path / "social-cli"
+    skill_dir.mkdir()
+    (skill_dir / "pollers.json").write_text(
+        json.dumps({"pollers": [{"name": "social-cli-feed"}]}),
+        encoding="utf-8",
+    )
+    skill_md_text = (
+        "---\n"
+        "name: social-cli\n"
+        "description: Dispatch posts via the outbox pattern.\n"
+        "trigger: Use when a social-cli-feed event arrives.\n"
+        "---\n"
+        "\n"
+        "# social-cli\n"
+        "\n"
+        "The outbox + dispatch loop.\n"
+    )
+    (skill_dir / "SKILL.md").write_text(skill_md_text, encoding="utf-8")
+
+    # Resolve the skill — body should already be stripped.
+    result = find_skill_for_channel("poller:social-cli-feed", [tmp_path])
+    assert result is not None, "skill should resolve for this poller channel"
+    skill_name, skill_body = result
+
+    # Frontmatter fields must NOT appear in the body the resolver returns.
+    assert "name: social-cli" not in skill_body
+    assert "description:" not in skill_body
+    assert "trigger:" not in skill_body
+
+    # Same must hold in the fully-rendered turn prompt.
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:social-cli-feed",
+        content="new feed item",
+    )
+    prompt = build_turn_prompt(event, auto_skill_block=(skill_name, skill_body))
+    assert "## Skill: social-cli" in prompt
+    assert "outbox + dispatch loop" in prompt
+    # Frontmatter YAML must not leak into the prompt.
+    skill_section_start = prompt.index("## Skill: social-cli")
+    skill_section = prompt[skill_section_start:]
+    assert "name: social-cli" not in skill_section
+    assert "description:" not in skill_section

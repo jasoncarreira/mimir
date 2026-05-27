@@ -49,28 +49,12 @@ import logging
 from pathlib import Path
 from typing import Iterable
 
+from .skill_md import strip_frontmatter as _strip_frontmatter  # canonical; dedup via chainlink #212
+
 log = logging.getLogger(__name__)
 
 
 _POLLER_CHANNEL_PREFIX = "poller:"
-
-
-def _strip_frontmatter(text: str) -> str:
-    """Return the SKILL.md body with leading YAML frontmatter removed.
-
-    Frontmatter is the block between two ``---`` markers at the top
-    of the file. When no frontmatter is present the whole text is
-    returned unchanged.
-    """
-    lines = text.splitlines(keepends=True)
-    if not lines or lines[0].rstrip() != "---":
-        return text
-    for i in range(1, len(lines)):
-        if lines[i].rstrip() == "---":
-            return "".join(lines[i + 1:]).lstrip()
-    # Unterminated frontmatter — bail and return everything; safer
-    # than swallowing the file.
-    return text
 
 
 def _skill_dirs_for_poller(
