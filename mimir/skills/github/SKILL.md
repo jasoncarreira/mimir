@@ -77,6 +77,7 @@ If `$BLOCKING` is non-empty (one or more reviewers in CHANGES_REQUESTED state):
 
 This is a non-negotiable hard gate — not a heuristic. "Operator approved once"
 is not sufficient if a subsequent CHANGES_REQUESTED arrived, even seconds later.
+(Structured event emission for blocked merges is tracked in chainlink #218.)
 
 ## Pull requests
 
