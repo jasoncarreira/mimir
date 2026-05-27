@@ -686,9 +686,11 @@ class SkillDriftResult:
     source_path:
         Path to the source copy (``<repo>/optional-skills/<name>/``).
         ``None`` when the skill is orphaned (no matching source entry).
-    modified:
-        Relative file paths present in **both** but with different
-        content (source is newer/different).
+    differs:
+        Relative file paths present in **both** installed and source but
+        with different content.  Neutral language: the operator may or may
+        not have hand-edited these files locally; ``--apply`` will
+        overwrite them, so the label avoids implying directionality.
     added:
         Relative file paths present in source but **missing** from the
         installed copy (new files added in source since install).
@@ -704,7 +706,7 @@ class SkillDriftResult:
     name: str
     installed_path: Path
     source_path: Path | None
-    modified: list[str] = field(default_factory=list)
+    differs: list[str] = field(default_factory=list)
     added: list[str] = field(default_factory=list)
     extra: list[str] = field(default_factory=list)
     orphaned: bool = False
@@ -712,7 +714,7 @@ class SkillDriftResult:
     @property
     def is_clean(self) -> bool:
         """True when the installed skill is identical to its source."""
-        return not (self.modified or self.added or self.extra or self.orphaned)
+        return not (self.differs or self.added or self.extra or self.orphaned)
 
     @property
     def has_pollers_json(self) -> bool:
@@ -777,7 +779,7 @@ def detect_skill_drift(
         installed_hashes = _file_hashes(installed_dir)
         source_hashes = _file_hashes(source_dir)
 
-        modified = sorted(
+        differs = sorted(
             rel for rel in installed_hashes
             if rel in source_hashes
             and installed_hashes[rel] != source_hashes[rel]
@@ -789,7 +791,7 @@ def detect_skill_drift(
             name=skill_name,
             installed_path=installed_dir,
             source_path=source_dir,
-            modified=modified,
+            differs=differs,
             added=added,
             extra=extra,
         ))
@@ -810,11 +812,11 @@ def _print_drift_report(result: SkillDriftResult) -> None:
         print(f"{result.name}: up to date")
         return
 
-    total = len(result.modified) + len(result.added) + len(result.extra)
+    total = len(result.differs) + len(result.added) + len(result.extra)
     suffix = f" ({total} file{'s' if total != 1 else ''} differ)"
     print(f"{result.name}:{suffix}")
-    for rel in result.modified:
-        print(f"  modified: {rel}")
+    for rel in result.differs:
+        print(f"  differs from source: {rel}")
     for rel in result.added:
         print(f"  added in source: {rel}")
     for rel in result.extra:

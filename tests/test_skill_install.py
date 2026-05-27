@@ -472,14 +472,14 @@ def test_drift_clean_skill(fake_optional_root: Path, fake_home: Path):
     results = detect_skill_drift(fake_home, fake_optional_root)
     r = next(r for r in results if r.name == "fake-skill")
     assert r.is_clean
-    assert r.modified == []
+    assert r.differs == []
     assert r.added == []
     assert r.extra == []
     assert not r.orphaned
 
 
-def test_drift_modified_file(fake_optional_root: Path, fake_home: Path):
-    """A file that differs between source and installed shows up as modified."""
+def test_drift_differs_file(fake_optional_root: Path, fake_home: Path):
+    """A file that differs between source and installed shows up in .differs."""
     install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
     # Mutate the installed copy so it differs from source.
     installed_skill_md = fake_home / "skills" / "fake-skill" / "SKILL.md"
@@ -488,7 +488,7 @@ def test_drift_modified_file(fake_optional_root: Path, fake_home: Path):
     results = detect_skill_drift(fake_home, fake_optional_root)
     r = next(r for r in results if r.name == "fake-skill")
     assert not r.is_clean
-    assert "SKILL.md" in r.modified
+    assert "SKILL.md" in r.differs
     assert r.added == []
     assert r.extra == []
 
@@ -503,7 +503,7 @@ def test_drift_added_file_in_source(fake_optional_root: Path, fake_home: Path):
     r = next(r for r in results if r.name == "fake-skill")
     assert not r.is_clean
     assert "new-helper.py" in r.added
-    assert r.modified == []
+    assert r.differs == []
     assert r.extra == []
 
 
@@ -517,7 +517,7 @@ def test_drift_extra_file_in_installed(fake_optional_root: Path, fake_home: Path
     r = next(r for r in results if r.name == "fake-skill")
     assert not r.is_clean
     assert "local-note.md" in r.extra
-    assert r.modified == []
+    assert r.differs == []
     assert r.added == []
 
 
@@ -602,7 +602,7 @@ def test_cmd_update_skills_drift_exits_1(
     ))
     assert rc == 1
     out = capsys.readouterr().out
-    assert "modified" in out
+    assert "differs from source" in out
     assert "SKILL.md" in out
     assert "1 skill" in out
 
