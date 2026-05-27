@@ -825,13 +825,100 @@ def _print_drift_report(result: SkillDriftResult) -> None:
         print(f"  (source: {result.source_path})")
 
 
+def apply_skill_update(
+    result: SkillDriftResult,
+    *,
+    force: bool = False,
+) -> tuple[list[str], str | None]:
+    """Apply pending updates from source to the installed copy of one skill.
+
+    Parameters
+    ----------
+    result:
+        A ``SkillDriftResult`` describing what has drifted.  Orphaned
+        skills are skipped (a warning is printed; nothing is written).
+    force:
+        When *True*, also overwrite files in ``result.extra`` (files
+        present only in the installed copy, which may be local edits).
+        When *False*, extra files are preserved and a warning is printed.
+
+    Returns
+    -------
+    updated_files:
+        Relative paths of files that were actually written to disk.
+    pollers_hint:
+        If a ``pollers.json`` file was among the updated files, a
+        human-readable hint string asking the operator to call
+        ``reload_pollers``.  ``None`` otherwise.
+    """
+    if result.orphaned:
+        print(
+            f"  {result.name}: orphaned (no source counterpart) — skipping; "
+            "remove manually if no longer needed."
+        )
+        return [], None
+
+    updated: list[str] = []
+
+    assert result.source_path is not None  # guaranteed when not orphaned
+
+    # Overwrite changed files and copy new files from source.
+    for rel in result.differs + result.added:
+        src_file = result.source_path / rel
+        dst_file = result.installed_path / rel
+        dst_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_file, dst_file)
+        updated.append(rel)
+
+    # Extra files (local additions or source deletions).
+    for rel in result.extra:
+        if force:
+            extra_file = result.installed_path / rel
+            extra_file.unlink(missing_ok=True)
+            updated.append(rel)
+        else:
+            print(
+                f"  {result.name}: extra file {rel!r} kept "
+                "(local edit — use --force to overwrite)"
+            )
+
+    pollers_hint: str | None = None
+    if "pollers.json" in updated:
+        pollers_hint = (
+            f"{result.name}: pollers.json updated — "
+            "call reload_pollers in the agent to register changes"
+        )
+
+    return updated, pollers_hint
+
+
 def add_argparse_update(parser) -> None:
-    """Wire ``mimir skills update [<name>] [--home PATH]``."""
+    """Wire ``mimir skills update [<name>] [--apply] [--force] [--home PATH]``."""
     parser.add_argument(
         "name",
         nargs="?",
         default=None,
         help="Skill name to check.  Omit to check all installed optional skills.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        default=False,
+        help=(
+            "Overwrite installed files that differ from source and copy new "
+            "files added in source.  Without this flag the command is "
+            "read-only (dry-run)."
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help=(
+            "With --apply: also remove extra files that exist only in the "
+            "installed copy (possible local edits).  Has no effect without "
+            "--apply."
+        ),
     )
     parser.add_argument(
         "--home",
@@ -853,10 +940,15 @@ def add_argparse_update(parser) -> None:
 def cmd_update_skills(args) -> int:
     """``mimir skills update`` entry point.
 
-    Compares installed optional skills against their source counterparts
-    and prints a per-skill drift report.  Exits 0 when all skills are
-    up-to-date; exits 1 when any drift is found (useful for CI).
-    Exits 2 on usage errors (home not a directory, named skill not found).
+    Without ``--apply``: compares installed optional skills against their
+    source counterparts and prints a per-skill drift report.  Exits 0 when
+    all skills are up-to-date; exits 1 when any drift is found.
+
+    With ``--apply``: overwrites installed files that differ from source
+    and copies new files added in source.  Extra files (local additions)
+    are preserved unless ``--force`` is also given.  Exits 0 on success;
+    exits 1 when any skill could not be fully updated (e.g. skipped extras
+    without --force); exits 2 on usage errors.
     """
     home = _resolve_home(getattr(args, "home", None))
     if not home.is_dir():
@@ -864,6 +956,8 @@ def cmd_update_skills(args) -> int:
         return 2
 
     src_root: Path | None = getattr(args, "optional_skills_root", None)
+    do_apply: bool = getattr(args, "apply", False)
+    do_force: bool = getattr(args, "force", False)
 
     try:
         results = detect_skill_drift(home, src_root, name=getattr(args, "name", None))
@@ -875,14 +969,50 @@ def cmd_update_skills(args) -> int:
         print("no optional skills installed.")
         return 0
 
-    for r in results:
-        _print_drift_report(r)
+    if not do_apply:
+        # Dry-run: print drift report and exit.
+        for r in results:
+            _print_drift_report(r)
 
-    drift_found = any(not r.is_clean for r in results)
-    if drift_found:
-        dirty = [r.name for r in results if not r.is_clean]
-        print(
-            f"\n{len(dirty)} skill{'s' if len(dirty) != 1 else ''} out of date: "
-            f"{', '.join(dirty)}"
-        )
-    return 1 if drift_found else 0
+        drift_found = any(not r.is_clean for r in results)
+        if drift_found:
+            dirty = [r.name for r in results if not r.is_clean]
+            print(
+                f"\n{len(dirty)} skill{'s' if len(dirty) != 1 else ''} out of date: "
+                f"{', '.join(dirty)}"
+            )
+        return 1 if drift_found else 0
+
+    # Apply mode: update each skill, collect pollers hints.
+    any_skipped_extras = False
+    pollers_hints: list[str] = []
+
+    for r in results:
+        if r.is_clean:
+            print(f"{r.name}: up to date")
+            continue
+
+        updated, hint = apply_skill_update(r, force=do_force)
+
+        if hint:
+            pollers_hints.append(hint)
+
+        if updated:
+            print(
+                f"{r.name}: updated {len(updated)} "
+                f"file{'s' if len(updated) != 1 else ''} "
+                f"({', '.join(updated)})"
+            )
+        elif not r.orphaned:
+            # No files written — only had extra files but --force not set.
+            any_skipped_extras = True
+
+        if not do_force and r.extra and not r.orphaned:
+            any_skipped_extras = True
+
+    if pollers_hints:
+        print()
+        for hint in pollers_hints:
+            print(hint)
+
+    return 1 if any_skipped_extras else 0

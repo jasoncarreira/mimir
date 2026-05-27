@@ -20,6 +20,7 @@ from mimir.skill_install import (
     OptionalSkill,
     SkillDriftResult,
     SkillEnvSpec,
+    apply_skill_update,
     cmd_install,
     cmd_list,
     cmd_list_optional,
@@ -579,6 +580,7 @@ def test_cmd_update_skills_all_clean(
     install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
     rc = cmd_update_skills(Namespace(
         home=fake_home, name=None, optional_skills_root=fake_optional_root,
+        apply=False, force=False,
     ))
     assert rc == 0
     out = capsys.readouterr().out
@@ -599,6 +601,7 @@ def test_cmd_update_skills_drift_exits_1(
     )
     rc = cmd_update_skills(Namespace(
         home=fake_home, name=None, optional_skills_root=fake_optional_root,
+        apply=False, force=False,
     ))
     assert rc == 1
     out = capsys.readouterr().out
@@ -613,9 +616,195 @@ def test_cmd_update_skills_no_home(tmp_path: Path, capsys):
         home=tmp_path / "no-such-home",
         name=None,
         optional_skills_root=None,
+        apply=False,
+        force=False,
     ))
     assert rc == 2
     assert "not a directory" in capsys.readouterr().out
+
+
+# ─── apply_skill_update / cmd_update_skills --apply ──────────────────
+
+
+def test_apply_overwrites_changed_file(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """--apply overwrites a file that differs from source."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Mutate the installed copy.
+    installed_md = fake_home / "skills" / "fake-skill" / "SKILL.md"
+    installed_md.write_text("---\nname: fake-skill\ndescription: stale\n---\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert "SKILL.md" in r.differs
+
+    updated, hint = apply_skill_update(r)
+
+    assert "SKILL.md" in updated
+    assert hint is None  # no pollers.json in fake-skill
+    # File should now match the source.
+    src_text = (fake_optional_root / "fake-skill" / "SKILL.md").read_text()
+    assert installed_md.read_text() == src_text
+
+
+def test_apply_copies_added_file(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """--apply copies a file that was added in source after install."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Add a new file to source.
+    (fake_optional_root / "fake-skill" / "helper.py").write_text("# new\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert "helper.py" in r.added
+
+    updated, _ = apply_skill_update(r)
+
+    assert "helper.py" in updated
+    assert (fake_home / "skills" / "fake-skill" / "helper.py").read_text() == "# new\n"
+
+
+def test_apply_skips_extra_without_force(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """--apply without --force preserves extra (local-only) files and warns."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    extra_file = fake_home / "skills" / "fake-skill" / "local-note.md"
+    extra_file.write_text("my notes\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert "local-note.md" in r.extra
+
+    updated, _ = apply_skill_update(r, force=False)
+
+    assert "local-note.md" not in updated
+    assert extra_file.exists()  # preserved
+    out = capsys.readouterr().out
+    assert "local-note.md" in out
+    assert "force" in out.lower()
+
+
+def test_apply_removes_extra_with_force(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """--apply --force removes extra files in the installed copy."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    extra_file = fake_home / "skills" / "fake-skill" / "local-note.md"
+    extra_file.write_text("my notes\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+
+    updated, _ = apply_skill_update(r, force=True)
+
+    assert "local-note.md" in updated
+    assert not extra_file.exists()  # removed
+
+
+def test_apply_emits_pollers_hint(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """--apply emits the reload_pollers hint when pollers.json was updated."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    # Mutate the installed pollers.json.
+    installed_pj = fake_home / "skills" / "fake-poller" / "pollers.json"
+    installed_pj.write_text('{"pollers": []}')
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-poller")
+    assert "pollers.json" in r.differs
+
+    updated, hint = apply_skill_update(r)
+
+    assert "pollers.json" in updated
+    assert hint is not None
+    assert "reload_pollers" in hint
+
+
+def test_apply_orphaned_skill_skipped(fake_home: Path, tmp_path: Path, capsys):
+    """--apply skips orphaned skills (no source counterpart) with a warning."""
+    orphan = fake_home / "skills" / "orphan-skill"
+    orphan.mkdir(parents=True)
+    (orphan / "SKILL.md").write_text("---\nname: orphan-skill\ndescription: x\n---\n")
+
+    empty_src = tmp_path / "empty-optional-skills"
+    empty_src.mkdir()
+
+    results = detect_skill_drift(fake_home, empty_src)
+    r = results[0]
+    assert r.orphaned
+
+    updated, hint = apply_skill_update(r)
+
+    assert updated == []
+    assert hint is None
+    out = capsys.readouterr().out
+    assert "orphaned" in out
+
+
+def test_cmd_update_skills_apply_flag(
+    fake_optional_root: Path, fake_home: Path, capsys, monkeypatch,
+):
+    """``mimir skills update --apply`` updates files and exits 0 on success."""
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT", fake_optional_root,
+    )
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Introduce drift.
+    (fake_optional_root / "fake-skill" / "SKILL.md").write_text(
+        "---\nname: fake-skill\ndescription: Updated.\n---\n"
+    )
+    rc = cmd_update_skills(Namespace(
+        home=fake_home,
+        name=None,
+        optional_skills_root=fake_optional_root,
+        apply=True,
+        force=False,
+    ))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "updated" in out
+    assert "SKILL.md" in out
+
+
+def test_cmd_update_skills_apply_extra_exits_1(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """``mimir skills update --apply`` exits 1 when extra files were skipped."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    (fake_home / "skills" / "fake-skill" / "local-note.md").write_text("notes\n")
+
+    rc = cmd_update_skills(Namespace(
+        home=fake_home,
+        name=None,
+        optional_skills_root=fake_optional_root,
+        apply=True,
+        force=False,
+    ))
+    assert rc == 1  # extra file skipped — partial update
+
+
+def test_cmd_update_skills_apply_pollers_hint_printed(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """``mimir skills update --apply`` prints the reload_pollers hint."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    (fake_home / "skills" / "fake-poller" / "pollers.json").write_text(
+        '{"pollers": []}'
+    )
+    rc = cmd_update_skills(Namespace(
+        home=fake_home,
+        name=None,
+        optional_skills_root=fake_optional_root,
+        apply=True,
+        force=False,
+    ))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "reload_pollers" in out
 
 
 # ─── parse_env_block ─────────────────────────────────────────────────
