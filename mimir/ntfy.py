@@ -543,31 +543,29 @@ async def fire_scheduler_wedge_alarm_if_warranted(
 
     if classification == "suppressed":
         # Silence is explained by ``scheduled_tick_suppressed`` events
-        # in the window. Different category + dedupe_key so the
-        # operator's ntfy stream visibly distinguishes the two states.
-        # ``suppress_reason`` carries the framework-emitted reason
-        # string (e.g. ``quota_saturated:anthropic:seven_day@1.00``)
-        # so the operator can act on the actual cause without
-        # tail'ing events.jsonl.
-        reason_line = (
-            f"reason: {suppress_reason}. " if suppress_reason
-            else ""
-        )
-        await post_algedonic_alarm(
-            category="scheduler-suppressed",
-            title="mimir: scheduler suppressed — quota-blocked, not wedged",
-            body=(
-                f"scheduler:heartbeat ticks are being suppressed "
-                f"({elapsed_minutes:.0f} min since last completed turn; "
-                f"threshold: {threshold_minutes:.0f} min). "
-                f"{reason_line}"
-                "Scheduler is alive but intentionally not firing. "
-                "Check the upstream cause (quota state, scheduler config) "
-                "rather than restarting the agent."
-            ),
-            dedupe_key="scheduler-suppressed:heartbeat",
-            priority=4,  # high but not urgent — operator action upstream
-            tags=["warning", "no_entry_sign"],
+        # in the window. The scheduler is alive and intentionally not
+        # firing — operator action is upstream (fix the quota
+        # reading, switch model spec, wait for the window to roll).
+        # None of those are emergencies that warrant a phone push.
+        #
+        # The individual ``scheduled_tick_suppressed`` events
+        # already render in the per-turn algedonic block via
+        # ``feedback.py``, so the operator sees the suppression in
+        # the agent's normal turn output. Aggregating that into a
+        # wake-up ntfy on top would be redundant noise — the
+        # operator complained on first observation that the alarm
+        # implied "something to act on" when the situation
+        # required none.
+        #
+        # We do, however, log a one-time event in this poll
+        # for ops-dashboard surfacing — same observability without
+        # the phone push.
+        await log_event(
+            "scheduler_suppressed_window_observed",
+            channel_id=channel_id,
+            elapsed_minutes=round(elapsed_minutes, 1),
+            threshold_minutes=round(threshold_minutes, 1),
+            suppress_reason=suppress_reason,
         )
         return
 
