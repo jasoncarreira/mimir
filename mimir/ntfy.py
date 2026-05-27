@@ -366,6 +366,64 @@ def _cron_period_minutes(cron_expr: str) -> float:
     return 1440.0
 
 
+def _classify_silence(
+    events_path: Path,
+    *,
+    channel_id: str,
+    window_start: datetime,
+    window_end: datetime,
+) -> tuple[str, str | None]:
+    """Look at events in (window_start, window_end] for ``channel_id``.
+
+    Classifies why a scheduled channel has been silent (chainlink #221):
+
+    - **``("suppressed", reason_string)``** — one or more
+      ``scheduled_tick_suppressed`` events for this channel landed in
+      the window. The silence is intentional (e.g. quota saturated,
+      operator-disabled). ``reason_string`` is the most recent
+      suppress-event's ``reason`` field, suitable for surfacing to the
+      operator (e.g. ``quota_saturated:anthropic:seven_day@1.00``).
+    - **``("wedge", None)``** — no suppress events found in the
+      window. The scheduler is presumed genuinely stuck. Operator
+      action is on the scheduler itself (restart, deadlock check).
+
+    Doesn't distinguish "partial wedge" (some ticks suppressed, some
+    silently missing) — that's rare in practice and conservatively
+    flagging the whole window as wedge over-alerts rather than
+    under-alerts.
+
+    Reads the file in reverse so the freshest suppress reason wins.
+    Never raises; on read error returns ``("wedge", None)`` (no
+    cross-check possible → fall back to existing behavior).
+    """
+    try:
+        text = events_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ("wedge", None)
+
+    for raw_line in reversed(text.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            event.get("type") != "scheduled_tick_suppressed"
+            or event.get("channel_id") != channel_id
+        ):
+            continue
+        ts_str = event.get("timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except (ValueError, TypeError):
+            continue
+        if window_start < ts <= window_end:
+            return ("suppressed", event.get("reason"))
+    return ("wedge", None)
+
+
 def _last_heartbeat_timestamp(
     events_path: Path,
     *,
@@ -470,6 +528,52 @@ async def fire_scheduler_wedge_alarm_if_warranted(
     if elapsed_minutes < threshold_minutes:
         return
 
+    # chainlink #221: distinguish genuine wedge from intentional
+    # suppression. The legacy alarm fired identically when APScheduler
+    # was actually stuck and when the scheduler was correctly
+    # suppressing ticks (quota saturated, operator-disabled, etc.) —
+    # but the operator response differs (restart vs. fix the upstream
+    # cause), so the alarm shouldn't conflate them.
+    classification, suppress_reason = _classify_silence(
+        events_path,
+        channel_id=channel_id,
+        window_start=last_tick,
+        window_end=now,
+    )
+
+    if classification == "suppressed":
+        # Silence is explained by ``scheduled_tick_suppressed`` events
+        # in the window. Different category + dedupe_key so the
+        # operator's ntfy stream visibly distinguishes the two states.
+        # ``suppress_reason`` carries the framework-emitted reason
+        # string (e.g. ``quota_saturated:anthropic:seven_day@1.00``)
+        # so the operator can act on the actual cause without
+        # tail'ing events.jsonl.
+        reason_line = (
+            f"reason: {suppress_reason}. " if suppress_reason
+            else ""
+        )
+        await post_algedonic_alarm(
+            category="scheduler-suppressed",
+            title="mimir: scheduler suppressed — quota-blocked, not wedged",
+            body=(
+                f"scheduler:heartbeat ticks are being suppressed "
+                f"({elapsed_minutes:.0f} min since last completed turn; "
+                f"threshold: {threshold_minutes:.0f} min). "
+                f"{reason_line}"
+                "Scheduler is alive but intentionally not firing. "
+                "Check the upstream cause (quota state, scheduler config) "
+                "rather than restarting the agent."
+            ),
+            dedupe_key="scheduler-suppressed:heartbeat",
+            priority=4,  # high but not urgent — operator action upstream
+            tags=["warning", "no_entry_sign"],
+        )
+        return
+
+    # Genuine wedge — no suppress events in the window. Existing
+    # alarm + dedupe_key preserved so dashboards / runbooks pinned
+    # to the prior category-string keep working.
     await post_algedonic_alarm(
         category="scheduler-wedge",
         title="mimir: scheduler wedge — heartbeat stale",

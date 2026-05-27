@@ -780,3 +780,178 @@ async def test_disabled_heartbeat_with_stale_events_no_alarm(
     assert captured_events == [], (
         f"No alarm when heartbeat cron is empty (disabled); got: {captured_events}"
     )
+
+
+# ─── chainlink #221: classify silence as quota-blocked vs genuine wedge ───
+
+
+def _suppress_event(ts: str, reason: str = "quota_saturated:anthropic:seven_day@1.00") -> dict:
+    """One ``scheduled_tick_suppressed`` event on the heartbeat channel."""
+    return {
+        "timestamp": ts,
+        "type": "scheduled_tick_suppressed",
+        "channel_id": "scheduler:heartbeat",
+        "schedule_name": "heartbeat",
+        "reason": reason,
+    }
+
+
+@pytest.mark.asyncio
+async def test_wedge_alarm_classifies_as_suppressed_when_quota_blocked(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Today's mimirbot incident: heartbeat last completed 130 min ago,
+    threshold is 90 min, AND two ``scheduled_tick_suppressed`` events
+    landed in the window. Fire the ``scheduler-suppressed`` alarm
+    (not ``scheduler-wedge``) — the operator's response is to fix
+    the upstream cause (e.g. the bogus quota reading), not restart
+    the agent.
+    """
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)  # */45 * * * *, threshold 90 min
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=130)).isoformat()
+    suppress_1_ts = (now - timedelta(minutes=85)).isoformat()
+    suppress_2_ts = (now - timedelta(minutes=40)).isoformat()
+
+    _write_events(events_file, [
+        _heartbeat_event(last_tick_ts),
+        _suppress_event(suppress_1_ts),
+        _suppress_event(suppress_2_ts),
+    ])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds, (
+        f"Expected ntfy_skip_no_topic (alarm invoked, no topic); got: {kinds}"
+    )
+    skip_evt = next(e for e in captured_events if e[0] == "ntfy_skip_no_topic")
+    # Critical: must classify as suppressed, NOT wedge.
+    assert skip_evt[1]["category"] == "scheduler-suppressed"
+    # Different dedupe_key from the wedge alarm so the operator's
+    # ntfy stream visibly separates the two states.
+    assert skip_evt[1]["dedupe_key"] == "scheduler-suppressed:heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_wedge_alarm_classifies_as_wedge_when_no_suppress_events(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """No ``scheduled_tick_suppressed`` events in the window → existing
+    ``scheduler-wedge`` alarm fires (behavior preserved). This is the
+    genuine wedge case: APScheduler is actually stuck.
+    """
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=130)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds
+    skip_evt = next(e for e in captured_events if e[0] == "ntfy_skip_no_topic")
+    assert skip_evt[1]["category"] == "scheduler-wedge"
+    assert skip_evt[1]["dedupe_key"] == "scheduler-wedge:heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_wedge_alarm_ignores_suppress_events_outside_window(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """A ``scheduled_tick_suppressed`` event from BEFORE the last
+    completed heartbeat shouldn't classify the silence as suppressed —
+    it belongs to a prior incident. Fire the genuine-wedge alarm.
+    """
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    # Old suppress event (4h before now), then the heartbeat ran fine
+    # (2h before now), then silence. The 4h-ago suppress shouldn't
+    # poison the classification of the current silence window.
+    old_suppress_ts = (now - timedelta(hours=4)).isoformat()
+    last_tick_ts = (now - timedelta(hours=2)).isoformat()
+    _write_events(events_file, [
+        _suppress_event(old_suppress_ts),
+        _heartbeat_event(last_tick_ts),
+    ])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    skip_evt = next(e for e in captured_events if e[0] == "ntfy_skip_no_topic")
+    # Old suppress is outside the window → classifies as wedge.
+    assert skip_evt[1]["category"] == "scheduler-wedge"
+
+
+@pytest.mark.asyncio
+async def test_wedge_alarm_suppress_reason_surfaces_in_body(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """The suppress event's ``reason`` field surfaces in the alarm
+    body so the operator sees the upstream cause without tailing
+    events.jsonl.
+    """
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=130)).isoformat()
+    suppress_ts = (now - timedelta(minutes=40)).isoformat()
+
+    _write_events(events_file, [
+        _heartbeat_event(last_tick_ts),
+        _suppress_event(suppress_ts, reason="quota_saturated:anthropic:seven_day@1.00"),
+    ])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    skip_evt = next(e for e in captured_events if e[0] == "ntfy_skip_no_topic")
+    # The reason from the most-recent suppress event is in the body.
+    # The actual body text isn't captured by ntfy_skip_no_topic; check
+    # via the helper directly.
+    classification, reason = ntfy._classify_silence(
+        events_file,
+        channel_id="scheduler:heartbeat",
+        window_start=datetime.fromisoformat(last_tick_ts),
+        window_end=now,
+    )
+    assert classification == "suppressed"
+    assert reason == "quota_saturated:anthropic:seven_day@1.00"
