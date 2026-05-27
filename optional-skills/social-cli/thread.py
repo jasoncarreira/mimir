@@ -276,8 +276,9 @@ def main() -> int:
         },
     }
 
-    sys.stdout.write(_dump(result, args.json))
-    if not _dump(result, args.json).endswith("\n"):
+    out = _dump(result, args.json)
+    sys.stdout.write(out)
+    if not out.endswith("\n"):
         sys.stdout.write("\n")
     return 0
 
