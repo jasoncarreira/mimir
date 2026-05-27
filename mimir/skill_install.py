@@ -34,11 +34,13 @@ custom edits.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from mimir.skill_defs import home_skills_dir
 from mimir.skill_md import parse_frontmatter
 
 # Source root for optional-skills, relative to this file.
@@ -193,7 +195,7 @@ def install(
             f"Run `mimir skills list-optional` to see installable skills."
         )
 
-    dest_root = home / ".claude" / "skills"
+    dest_root = home_skills_dir(home)
     dest_root.mkdir(parents=True, exist_ok=True)
     dest = dest_root / name
 
@@ -234,7 +236,7 @@ def list_installed(home: Path) -> list[OptionalSkill]:
     Same shape as ``list_available`` (both reuse ``_walk_skills_dir``)
     so the CLI can format both listings the same way.
     """
-    return _walk_skills_dir(home / ".claude" / "skills")
+    return _walk_skills_dir(home_skills_dir(home))
 
 
 # ─── Listing-format helpers ─────────────────────────────────────────
@@ -380,7 +382,7 @@ def add_argparse_list(parser) -> None:
 def cmd_list(args) -> int:
     """``mimir skills list`` entry point — show installed skills in a home."""
     home = _resolve_home(args.home)
-    skills_dir = home / ".claude" / "skills"
+    skills_dir = home_skills_dir(home)
     if not skills_dir.is_dir():
         print(f"no skills installed at {skills_dir} "
               f"(home: {home}). Did you run `mimir setup` here?")
@@ -400,3 +402,240 @@ def cmd_list(args) -> int:
         f"available:   mimir skills list-optional"
     )
     return 0
+
+
+# ─── Drift detection (mimir skills update) ──────────────────────────
+
+#: Paths excluded from drift comparison on both sides (same as
+#: the ignore pattern used in ``install()``).
+_DRIFT_IGNORE: frozenset[str] = frozenset({"__pycache__", ".pytest_cache"})
+
+
+def _file_hashes(root: Path) -> dict[str, str]:
+    """Return ``relative-path-str → sha256-hex`` for every file under
+    *root*, recursively.  Skips any path whose components include a
+    name in ``_DRIFT_IGNORE`` (``__pycache__``, ``.pytest_cache``).
+    """
+    hashes: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        # Drop any path that passes through an ignored directory.
+        if any(part in _DRIFT_IGNORE for part in rel.parts):
+            continue
+        hashes[str(rel)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashes
+
+
+@dataclass
+class SkillDriftResult:
+    """Comparison result for one installed optional skill vs its source.
+
+    Attributes
+    ----------
+    name:
+        The skill directory name (e.g. ``"github-poller"``).
+    installed_path:
+        Path to the installed copy (``<home>/skills/<name>/``).
+    source_path:
+        Path to the source copy (``<repo>/optional-skills/<name>/``).
+        ``None`` when the skill is orphaned (no matching source entry).
+    modified:
+        Relative file paths present in **both** but with different
+        content (source is newer/different).
+    added:
+        Relative file paths present in source but **missing** from the
+        installed copy (new files added in source since install).
+    extra:
+        Relative file paths present in the installed copy but **absent**
+        from source (local additions, or source deletions).
+    orphaned:
+        ``True`` when the source root has no counterpart directory for
+        this skill — it was installed from somewhere else, or the source
+        tree was restructured.
+    """
+
+    name: str
+    installed_path: Path
+    source_path: Path | None
+    modified: list[str] = field(default_factory=list)
+    added: list[str] = field(default_factory=list)
+    extra: list[str] = field(default_factory=list)
+    orphaned: bool = False
+
+    @property
+    def is_clean(self) -> bool:
+        """True when the installed skill is identical to its source."""
+        return not (self.modified or self.added or self.extra or self.orphaned)
+
+    @property
+    def has_pollers_json(self) -> bool:
+        return (self.installed_path / "pollers.json").is_file()
+
+
+def detect_skill_drift(
+    home: Path,
+    optional_skills_root: Path | None = None,
+    *,
+    name: str | None = None,
+) -> list[SkillDriftResult]:
+    """Compare installed optional skills against their source counterparts.
+
+    For each installed skill found under ``<home>/skills/``, compares
+    file contents against ``<repo>/optional-skills/<name>/`` and returns
+    a ``SkillDriftResult`` describing any differences.
+
+    Parameters
+    ----------
+    home:
+        Agent home directory.
+    optional_skills_root:
+        Source root for optional skills.  Defaults to
+        ``DEFAULT_OPTIONAL_SKILLS_ROOT`` (repo-relative).
+    name:
+        If given, only the named skill is compared.  Raises
+        ``FileNotFoundError`` if the skill isn't installed.
+    """
+    installed_root = home_skills_dir(home)
+    src_root = _resolve_optional_skills_root(optional_skills_root)
+
+    if name is not None:
+        installed_dir = installed_root / name
+        if not installed_dir.is_dir():
+            raise FileNotFoundError(
+                f"optional skill {name!r} is not installed under {installed_root}."
+            )
+        installed_dirs = [installed_dir]
+    else:
+        if not installed_root.is_dir():
+            return []
+        installed_dirs = sorted(
+            d for d in installed_root.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
+
+    results: list[SkillDriftResult] = []
+    for installed_dir in installed_dirs:
+        skill_name = installed_dir.name
+        source_dir = (src_root / skill_name) if src_root is not None else None
+
+        if source_dir is None or not source_dir.is_dir():
+            results.append(SkillDriftResult(
+                name=skill_name,
+                installed_path=installed_dir,
+                source_path=None,
+                orphaned=True,
+            ))
+            continue
+
+        installed_hashes = _file_hashes(installed_dir)
+        source_hashes = _file_hashes(source_dir)
+
+        modified = sorted(
+            rel for rel in installed_hashes
+            if rel in source_hashes
+            and installed_hashes[rel] != source_hashes[rel]
+        )
+        added = sorted(rel for rel in source_hashes if rel not in installed_hashes)
+        extra = sorted(rel for rel in installed_hashes if rel not in source_hashes)
+
+        results.append(SkillDriftResult(
+            name=skill_name,
+            installed_path=installed_dir,
+            source_path=source_dir,
+            modified=modified,
+            added=added,
+            extra=extra,
+        ))
+
+    return results
+
+
+# ─── CLI wiring (mimir skills update) ────────────────────────────────
+
+
+def _print_drift_report(result: SkillDriftResult) -> None:
+    """Print one skill's drift result to stdout."""
+    if result.orphaned:
+        print(f"{result.name}: orphaned (no source counterpart in optional-skills/)")
+        return
+
+    if result.is_clean:
+        print(f"{result.name}: up to date")
+        return
+
+    total = len(result.modified) + len(result.added) + len(result.extra)
+    suffix = f" ({total} file{'s' if total != 1 else ''} differ)"
+    print(f"{result.name}:{suffix}")
+    for rel in result.modified:
+        print(f"  modified: {rel}")
+    for rel in result.added:
+        print(f"  added in source: {rel}")
+    for rel in result.extra:
+        print(f"  extra in installed: {rel}")
+    if result.source_path is not None:
+        print(f"  (source: {result.source_path})")
+
+
+def add_argparse_update(parser) -> None:
+    """Wire ``mimir skills update [<name>] [--home PATH]``."""
+    parser.add_argument(
+        "name",
+        nargs="?",
+        default=None,
+        help="Skill name to check.  Omit to check all installed optional skills.",
+    )
+    parser.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Mimir home (default: $MIMIR_HOME or cwd).",
+    )
+    parser.add_argument(
+        "--optional-skills-root",
+        type=Path,
+        default=None,
+        dest="optional_skills_root",
+        help="Source root for optional skills (default: <repo>/optional-skills/). "
+             "Only needed when running from outside the mimir source tree.",
+    )
+    parser.set_defaults(skill_install_cmd=cmd_update_skills)
+
+
+def cmd_update_skills(args) -> int:
+    """``mimir skills update`` entry point.
+
+    Compares installed optional skills against their source counterparts
+    and prints a per-skill drift report.  Exits 0 when all skills are
+    up-to-date; exits 1 when any drift is found (useful for CI).
+    Exits 2 on usage errors (home not a directory, named skill not found).
+    """
+    home = _resolve_home(getattr(args, "home", None))
+    if not home.is_dir():
+        print(f"home not a directory: {home}")
+        return 2
+
+    src_root: Path | None = getattr(args, "optional_skills_root", None)
+
+    try:
+        results = detect_skill_drift(home, src_root, name=getattr(args, "name", None))
+    except FileNotFoundError as exc:
+        print(str(exc))
+        return 2
+
+    if not results:
+        print("no optional skills installed.")
+        return 0
+
+    for r in results:
+        _print_drift_report(r)
+
+    drift_found = any(not r.is_clean for r in results)
+    if drift_found:
+        dirty = [r.name for r in results if not r.is_clean]
+        print(
+            f"\n{len(dirty)} skill{'s' if len(dirty) != 1 else ''} out of date: "
+            f"{', '.join(dirty)}"
+        )
+    return 1 if drift_found else 0
