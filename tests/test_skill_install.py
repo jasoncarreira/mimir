@@ -20,6 +20,7 @@ from mimir.skill_install import (
     OptionalSkill,
     SkillDriftResult,
     SkillEnvSpec,
+    apply_skill_update,
     cmd_install,
     cmd_list,
     cmd_list_optional,
@@ -579,6 +580,7 @@ def test_cmd_update_skills_all_clean(
     install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
     rc = cmd_update_skills(Namespace(
         home=fake_home, name=None, optional_skills_root=fake_optional_root,
+        apply=False, force=False,
     ))
     assert rc == 0
     out = capsys.readouterr().out
@@ -599,6 +601,7 @@ def test_cmd_update_skills_drift_exits_1(
     )
     rc = cmd_update_skills(Namespace(
         home=fake_home, name=None, optional_skills_root=fake_optional_root,
+        apply=False, force=False,
     ))
     assert rc == 1
     out = capsys.readouterr().out
@@ -613,9 +616,331 @@ def test_cmd_update_skills_no_home(tmp_path: Path, capsys):
         home=tmp_path / "no-such-home",
         name=None,
         optional_skills_root=None,
+        apply=False,
+        force=False,
     ))
     assert rc == 2
     assert "not a directory" in capsys.readouterr().out
+
+
+# ─── apply_skill_update / cmd_update_skills --apply ──────────────────
+
+
+def test_apply_overwrites_changed_file(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """--apply overwrites a file that differs from source."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Mutate the installed copy.
+    installed_md = fake_home / "skills" / "fake-skill" / "SKILL.md"
+    installed_md.write_text("---\nname: fake-skill\ndescription: stale\n---\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert "SKILL.md" in r.differs
+
+    updated, failed, hint = apply_skill_update(r)
+
+    assert "SKILL.md" in updated
+    assert failed == []
+    assert hint is None  # no pollers.json in fake-skill
+    # File should now match the source.
+    src_text = (fake_optional_root / "fake-skill" / "SKILL.md").read_text()
+    assert installed_md.read_text() == src_text
+
+
+def test_apply_differs_file_creates_backup(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """--apply does NOT silently overwrite a hand-edited differs file.
+
+    Before overwriting, a backup must be written to
+    ``.pre-update-backup/<timestamp>/`` inside the installed skill
+    directory, and a warning must be printed.
+    """
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    installed_md = fake_home / "skills" / "fake-skill" / "SKILL.md"
+    # Hand-edit the installed file so it shows up in .differs.
+    installed_md.write_text("---\nname: fake-skill\ndescription: hand-edited\n---\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert "SKILL.md" in r.differs
+
+    updated, failed, _ = apply_skill_update(r)
+
+    assert "SKILL.md" in updated
+    assert failed == []
+
+    # A backup directory must have been created under .pre-update-backup/.
+    backup_parent = fake_home / "skills" / "fake-skill" / ".pre-update-backup"
+    assert backup_parent.is_dir(), ".pre-update-backup/ directory was not created"
+
+    # Find the timestamped backup sub-directory.
+    ts_dirs = list(backup_parent.iterdir())
+    assert len(ts_dirs) == 1, f"Expected exactly one timestamp dir, found: {ts_dirs}"
+    backup_file = ts_dirs[0] / "SKILL.md"
+    assert backup_file.is_file(), f"Backup file not found at {backup_file}"
+
+    # Backup must contain the pre-update (hand-edited) content, not source.
+    assert backup_file.read_text() == "---\nname: fake-skill\ndescription: hand-edited\n---\n"
+
+    # A note must have been printed (neutral wording — no "local edits" claim).
+    out = capsys.readouterr().out
+    assert "Note" in out
+    assert "SKILL.md" in out
+    assert "backed up" in out
+
+    # The installed file must now match source (update applied).
+    src_text = (fake_optional_root / "fake-skill" / "SKILL.md").read_text()
+    assert installed_md.read_text() == src_text
+
+
+def test_apply_added_file_does_not_create_backup(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """Files that are newly added in source (not in .differs) should not
+    trigger a backup — there is no pre-existing installed file to back up."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Add a new file to source only.
+    (fake_optional_root / "fake-skill" / "new-helper.py").write_text("# new\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert "new-helper.py" in r.added
+
+    apply_skill_update(r)
+
+    # No backup directory should exist for pure-add operations.
+    backup_parent = fake_home / "skills" / "fake-skill" / ".pre-update-backup"
+    assert not backup_parent.exists(), (
+        "Backup directory should not be created for added-only files"
+    )
+
+
+def test_apply_copies_added_file(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """--apply copies a file that was added in source after install."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Add a new file to source.
+    (fake_optional_root / "fake-skill" / "helper.py").write_text("# new\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert "helper.py" in r.added
+
+    updated, failed, _ = apply_skill_update(r)
+
+    assert "helper.py" in updated
+    assert failed == []
+    assert (fake_home / "skills" / "fake-skill" / "helper.py").read_text() == "# new\n"
+
+
+def test_apply_skips_extra_without_force(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """--apply without --force preserves extra (local-only) files and warns."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    extra_file = fake_home / "skills" / "fake-skill" / "local-note.md"
+    extra_file.write_text("my notes\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert "local-note.md" in r.extra
+
+    updated, failed, _ = apply_skill_update(r, force=False)
+
+    assert "local-note.md" not in updated
+    assert failed == []
+    assert extra_file.exists()  # preserved
+    out = capsys.readouterr().out
+    assert "local-note.md" in out
+    assert "force" in out.lower()
+
+
+def test_apply_removes_extra_with_force(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """--apply --force removes extra files in the installed copy."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    extra_file = fake_home / "skills" / "fake-skill" / "local-note.md"
+    extra_file.write_text("my notes\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+
+    updated, failed, _ = apply_skill_update(r, force=True)
+
+    assert "local-note.md" in updated
+    assert failed == []
+    assert not extra_file.exists()  # removed
+
+
+def test_apply_emits_pollers_hint(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """--apply emits the reload_pollers hint when pollers.json was updated."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    # Mutate the installed pollers.json.
+    installed_pj = fake_home / "skills" / "fake-poller" / "pollers.json"
+    installed_pj.write_text('{"pollers": []}')
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-poller")
+    assert "pollers.json" in r.differs
+
+    updated, failed, hint = apply_skill_update(r)
+
+    assert "pollers.json" in updated
+    assert failed == []
+    assert hint is not None
+    assert "mcp__mimir__reload_pollers" in hint
+
+
+def test_apply_orphaned_skill_skipped(fake_home: Path, tmp_path: Path, capsys):
+    """--apply skips orphaned skills (no source counterpart) with a warning."""
+    orphan = fake_home / "skills" / "orphan-skill"
+    orphan.mkdir(parents=True)
+    (orphan / "SKILL.md").write_text("---\nname: orphan-skill\ndescription: x\n---\n")
+
+    empty_src = tmp_path / "empty-optional-skills"
+    empty_src.mkdir()
+
+    results = detect_skill_drift(fake_home, empty_src)
+    r = results[0]
+    assert r.orphaned
+
+    updated, failed, hint = apply_skill_update(r)
+
+    assert updated == []
+    assert failed == []
+    assert hint is None
+    out = capsys.readouterr().out
+    assert "orphaned" in out
+
+
+def test_cmd_update_skills_apply_flag(
+    fake_optional_root: Path, fake_home: Path, capsys, monkeypatch,
+):
+    """``mimir skills update --apply`` updates files and exits 0 on success."""
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT", fake_optional_root,
+    )
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Introduce drift.
+    (fake_optional_root / "fake-skill" / "SKILL.md").write_text(
+        "---\nname: fake-skill\ndescription: Updated.\n---\n"
+    )
+    rc = cmd_update_skills(Namespace(
+        home=fake_home,
+        name=None,
+        optional_skills_root=fake_optional_root,
+        apply=True,
+        force=False,
+    ))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "updated" in out
+    assert "SKILL.md" in out
+
+
+def test_cmd_update_skills_apply_extra_exits_1(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """``mimir skills update --apply`` exits 1 when extra files were skipped."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    (fake_home / "skills" / "fake-skill" / "local-note.md").write_text("notes\n")
+
+    rc = cmd_update_skills(Namespace(
+        home=fake_home,
+        name=None,
+        optional_skills_root=fake_optional_root,
+        apply=True,
+        force=False,
+    ))
+    assert rc == 1  # extra file skipped — partial update
+
+
+def test_cmd_update_skills_apply_pollers_hint_printed(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """``mimir skills update --apply`` prints the reload_pollers hint."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    (fake_home / "skills" / "fake-poller" / "pollers.json").write_text(
+        '{"pollers": []}'
+    )
+    rc = cmd_update_skills(Namespace(
+        home=fake_home,
+        name=None,
+        optional_skills_root=fake_optional_root,
+        apply=True,
+        force=False,
+    ))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "mcp__mimir__reload_pollers" in out
+
+
+def test_apply_skill_update_partial_copy_failure(
+    fake_optional_root: Path, fake_home: Path, monkeypatch, capsys,
+):
+    """apply_skill_update returns non-empty failed list when copy2 raises."""
+    import shutil as _shutil
+
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Introduce drift so there's something to copy.
+    (fake_optional_root / "fake-skill" / "SKILL.md").write_text(
+        "---\nname: fake-skill\ndescription: updated\n---\n"
+    )
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert "SKILL.md" in r.differs
+
+    original_copy2 = _shutil.copy2
+
+    def _failing_copy2(src, dst, **kw):
+        if Path(src).name == "SKILL.md" and ".pre-update-backup" not in str(src):
+            raise OSError("disk full (simulated)")
+        return original_copy2(src, dst, **kw)
+
+    monkeypatch.setattr("mimir.skill_install.shutil.copy2", _failing_copy2)
+
+    updated, failed, hint = apply_skill_update(r)
+
+    assert "SKILL.md" in failed
+    assert "SKILL.md" not in updated
+
+
+def test_cmd_update_skills_apply_copy_failure_exits_1(
+    fake_optional_root: Path, fake_home: Path, monkeypatch, capsys,
+):
+    """``mimir skills update --apply`` exits 1 when a per-file copy fails."""
+    import shutil as _shutil
+
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    (fake_optional_root / "fake-skill" / "SKILL.md").write_text(
+        "---\nname: fake-skill\ndescription: updated\n---\n"
+    )
+
+    original_copy2 = _shutil.copy2
+
+    def _failing_copy2(src, dst, **kw):
+        if Path(src).name == "SKILL.md" and ".pre-update-backup" not in str(src):
+            raise OSError("disk full (simulated)")
+        return original_copy2(src, dst, **kw)
+
+    monkeypatch.setattr("mimir.skill_install.shutil.copy2", _failing_copy2)
+
+    rc = cmd_update_skills(Namespace(
+        home=fake_home,
+        name=None,
+        optional_skills_root=fake_optional_root,
+        apply=True,
+        force=False,
+    ))
+    assert rc == 1  # copy failure → partial update → exit 1
 
 
 # ─── parse_env_block ─────────────────────────────────────────────────
