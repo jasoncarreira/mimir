@@ -169,6 +169,12 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # wrong thing in the ``env`` block — surface as a negative so the
     # algedonic block catches it without requiring a crash.
     "poller_env_secret_reintroduced": ("negative", "poller_env_secret_reintroduced"),
+    # chainlink #108: env_required validation — emitted when a poller's
+    # declared required env vars are absent from the assembled subprocess
+    # env.  The poller run is skipped entirely for that tick.  Negative so
+    # the operator sees the configuration gap algedonically; the poller name
+    # + list of missing vars lets them provision exactly what's needed.
+    "poller_missing_required_env": ("negative", "poller_missing_required_env"),
     # github-poller review-missed-submission (Mimir's PR #234 / #235
     # post-mortem). Fires when a PR-review-needed event reached the
     # agent (``pr_opened`` / ``pr_synchronize``) but the turn ended
@@ -1640,6 +1646,20 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return (
             f"skill SKILL.md malformed: {name!r} — {error} "
             f"(skill omitted from catalog until fixed)"
+        )
+    if rule_kind == "poller_missing_required_env":
+        # chainlink #108: env_required check failed — one or more declared
+        # required env vars are missing from the assembled subprocess env.
+        # The poller run was skipped for this tick.
+        name = ev.get("poller") or "?"
+        missing = ev.get("missing") or []
+        if isinstance(missing, list):
+            missing_str = ", ".join(missing) if missing else "?"
+        else:
+            missing_str = str(missing)
+        return (
+            f"poller {name!r} skipped — missing required env: {missing_str} "
+            f"(add to pass_env + provision the var)"
         )
     return rule_kind
 

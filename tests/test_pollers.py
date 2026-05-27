@@ -2145,3 +2145,143 @@ async def test_circuit_breaker_resets_after_successful_run(tmp_path, home, clear
     events = _read_events(home)
     tripped = [e for e in events if e.get("type") == "poller_circuit_tripped"]
     assert tripped == [], "no trip should have fired"
+
+
+# ─── chainlink #108: env_required validation ─────────────────────────────────
+
+
+def test_discover_pollers_parses_env_required_list(tmp_path: Path) -> None:
+    """``env_required`` field in pollers.json is parsed into PollerConfig.env_required."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "pollers.json").write_text(
+        '{"pollers": [{"name": "x", "command": "true",'
+        ' "cron": "* * * * *",'
+        ' "env_required": ["GITHUB_TOKEN", "MIMIR_GITHUB_SELF_LOGIN"]}]}'
+    )
+    configs = discover_pollers(tmp_path)
+    assert len(configs) == 1
+    assert configs[0].env_required == ("GITHUB_TOKEN", "MIMIR_GITHUB_SELF_LOGIN")
+
+
+def test_discover_pollers_env_required_missing_defaults_empty(tmp_path: Path) -> None:
+    """Absent ``env_required`` field → empty tuple (back-compat)."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "pollers.json").write_text(
+        '{"pollers": [{"name": "x", "command": "true",'
+        ' "cron": "* * * * *"}]}'
+    )
+    configs = discover_pollers(tmp_path)
+    assert configs[0].env_required == ()
+
+
+def test_discover_pollers_env_required_non_list_is_ignored(tmp_path: Path) -> None:
+    """Malformed ``env_required`` (scalar) is rejected with a log warning;
+    the poller still registers with an empty tuple."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "pollers.json").write_text(
+        '{"pollers": [{"name": "x", "command": "true",'
+        ' "cron": "* * * * *", "env_required": "GITHUB_TOKEN"}]}'
+    )
+    configs = discover_pollers(tmp_path)
+    assert len(configs) == 1
+    assert configs[0].env_required == ()
+
+
+def test_discover_pollers_env_required_non_string_items_are_dropped(tmp_path: Path) -> None:
+    """Per-item filter: non-strings and empty-after-strip entries are
+    dropped individually; surviving string entries preserve order."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "pollers.json").write_text(
+        '{"pollers": [{"name": "x", "command": "true",'
+        ' "cron": "* * * * *",'
+        ' "env_required": ["GITHUB_TOKEN", 42, null, "", "  ", "MY_VAR", true]}]}'
+    )
+    configs = discover_pollers(tmp_path)
+    assert len(configs) == 1
+    assert configs[0].env_required == ("GITHUB_TOKEN", "MY_VAR")
+
+
+@pytest.mark.asyncio
+async def test_run_poller_emits_missing_required_env_and_skips_run(
+    tmp_path: Path, home: Path, monkeypatch,
+):
+    """When a poller declares ``env_required`` containing a var that isn't
+    in the assembled subprocess env, ``run_poller`` must:
+    1. Emit a ``poller_missing_required_env`` event listing the missing names.
+    2. Return 0 (no events enqueued).
+    3. NOT launch the subprocess (the script would exit non-zero if run,
+       which we use to distinguish "skipped" from "launched then failed")."""
+    skill_dir = tmp_path / "skill"
+    # Script exits 1 — if this runs, the test would see a poller_nonzero_exit
+    # event, which confirms the skip guard failed.
+    _install_script(skill_dir, "poller.py", "import sys; sys.exit(1)")
+    # Ensure the var is NOT in the process env.
+    monkeypatch.delenv("_MIMIR_TEST_REQUIRED_VAR_NOT_SET", raising=False)
+
+    cfg = PollerConfig(
+        name="req-env-test",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=skill_dir,
+        env_required=("_MIMIR_TEST_REQUIRED_VAR_NOT_SET",),
+    )
+    enq = _CapturingEnqueue()
+    result = await run_poller(cfg, enqueue=enq)
+
+    assert result == 0, "should return 0 (skipped)"
+    assert enq.events == [], "no events should be enqueued"
+
+    events = _read_events(home)
+    missing_evs = [
+        e for e in events if e.get("type") == "poller_missing_required_env"
+    ]
+    assert len(missing_evs) == 1
+    ev = missing_evs[0]
+    assert ev.get("poller") == "req-env-test"
+    assert "_MIMIR_TEST_REQUIRED_VAR_NOT_SET" in ev.get("missing", [])
+
+    # No subprocess was launched — no poller_nonzero_exit should exist.
+    nonzero = [e for e in events if e.get("type") == "poller_nonzero_exit"]
+    assert nonzero == []
+
+
+@pytest.mark.asyncio
+async def test_run_poller_runs_when_all_required_env_present(
+    tmp_path: Path, home: Path, monkeypatch,
+):
+    """When all ``env_required`` vars are in the assembled env (here via
+    ``pass_env``), the poller runs normally and no missing-required-env
+    event is emitted."""
+    skill_dir = tmp_path / "skill"
+    # Script emits one event and exits 0.
+    _install_script(skill_dir, "poller.py", (
+        'import json, sys\n'
+        'print(json.dumps({"poller": "req-ok", "prompt": "ping"}))\n'
+    ))
+    monkeypatch.setenv("_MIMIR_TEST_REQUIRED_VAR", "present")
+
+    cfg = PollerConfig(
+        name="req-ok",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=skill_dir,
+        pass_env=("_MIMIR_TEST_REQUIRED_VAR",),
+        env_required=("_MIMIR_TEST_REQUIRED_VAR",),
+    )
+    enq = _CapturingEnqueue()
+    result = await run_poller(cfg, enqueue=enq)
+
+    assert result == 1, "one event should be enqueued"
+    assert len(enq.events) == 1
+
+    events = _read_events(home)
+    missing_evs = [
+        e for e in events if e.get("type") == "poller_missing_required_env"
+    ]
+    assert missing_evs == [], "no missing-env event when all vars are present"
