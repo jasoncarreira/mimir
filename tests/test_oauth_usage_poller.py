@@ -557,6 +557,209 @@ async def test_record_usage_passes_real_5h_growth(
     assert not [e for e in events if e[0] == "quota_reading_anomalous"]
 
 
+# ─── 7d-vs-sub-buckets anomaly check (chainlink #220) ─────────────────
+
+
+def test_detect_seven_day_anomaly_flags_cliff_jump() -> None:
+    """Today's incident shape: overall 7d jumped 50%→100% in one
+    sample while every sub-bucket stayed on its smooth ramp
+    (sonnet 48%→50%, omelette 0%→0%). Reject the overall reading."""
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    reason = detect_seven_day_anomaly(
+        new_7d=1.00, prev_7d=0.50,
+        new_sub_buckets={"seven_day_sonnet": 0.50, "seven_day_omelette": 0.00},
+        prev_sub_buckets={"seven_day_sonnet": 0.48, "seven_day_omelette": 0.00},
+    )
+    assert reason is not None
+    assert "seven_day jumped +50pp" in reason
+    assert "seven_day_sonnet" in reason  # names the largest sub-bucket delta
+
+
+def test_detect_seven_day_anomaly_passes_real_growth() -> None:
+    """A real saturation event has at least one sub-bucket moving
+    proportionally. 7d 50%→85% (+35pp) with sonnet 48%→78% (+30pp)
+    is plausible — should NOT be flagged."""
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    reason = detect_seven_day_anomaly(
+        new_7d=0.85, prev_7d=0.50,
+        new_sub_buckets={"seven_day_sonnet": 0.78, "seven_day_omelette": 0.00},
+        prev_sub_buckets={"seven_day_sonnet": 0.48, "seven_day_omelette": 0.00},
+    )
+    assert reason is None  # 30pp sub-bucket delta clears the threshold
+
+
+def test_detect_seven_day_anomaly_passes_small_jump() -> None:
+    """7d moved only 20pp; cross-check doesn't apply (below
+    the trigger threshold). No sub-bucket movement required."""
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    reason = detect_seven_day_anomaly(
+        new_7d=0.70, prev_7d=0.50,
+        new_sub_buckets={"seven_day_sonnet": 0.50, "seven_day_omelette": 0.00},
+        prev_sub_buckets={"seven_day_sonnet": 0.48, "seven_day_omelette": 0.00},
+    )
+    assert reason is None
+
+
+def test_detect_seven_day_anomaly_no_data_skips_check() -> None:
+    """First poll after restart (prev_7d=None) → trust the reading;
+    no cross-reference."""
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    assert detect_seven_day_anomaly(
+        new_7d=1.00, prev_7d=None,
+        new_sub_buckets={"seven_day_sonnet": 0.50},
+        prev_sub_buckets={"seven_day_sonnet": 0.48},
+    ) is None
+    # No sub-buckets present in BOTH maps → can't cross-check.
+    assert detect_seven_day_anomaly(
+        new_7d=1.00, prev_7d=0.50,
+        new_sub_buckets={"seven_day_sonnet": 0.50},
+        prev_sub_buckets={},  # cold start on sub-buckets
+    ) is None
+
+
+def test_detect_seven_day_anomaly_only_new_sub_bucket_ignored() -> None:
+    """A sub-bucket that first appeared in this poll (e.g. Anthropic
+    shipped a new model tier between polls) has no prior value to
+    compare against — should be skipped, not treated as zero delta.
+    With no OTHER sub-buckets to cross-check, the check returns None."""
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    reason = detect_seven_day_anomaly(
+        new_7d=1.00, prev_7d=0.50,
+        new_sub_buckets={
+            "seven_day_sonnet": 0.50,  # +2pp from prev
+            "seven_day_haiku_3": 0.99,  # new bucket — would be a big delta if counted
+        },
+        prev_sub_buckets={"seven_day_sonnet": 0.48},
+    )
+    # Sonnet delta is 2pp (below 5pp threshold); haiku_3 is ignored
+    # (not in prev) → anomaly fires. The flag is correct: only the
+    # observable sub-bucket (sonnet) is steady, overall jumped 50pp.
+    assert reason is not None
+
+
+@pytest.mark.asyncio
+async def test_record_usage_rejects_anomalous_7d_cliff(
+    rate_store: RateLimitStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end (chainlink #220): prior store has 7d=50% with
+    sonnet=48%/omelette=0%; new payload cliff-jumps 7d to 100% while
+    sub-buckets stay near their prior values. The 7d-overall reading
+    should be rejected and the prior 50% kept; sub-buckets update
+    normally; ``quota_reading_anomalous`` event fires with
+    ``window_type='seven_day'``."""
+    events: list[tuple[str, dict]] = []
+    async def _cap(t, **kw):
+        events.append((t, kw))
+    monkeypatch.setattr(op, "log_event", _cap)
+    rate_store._load = lambda: {  # type: ignore[method-assign]
+        "five_hour": {
+            "status": "allowed",
+            "utilization": 0.09,
+            "resets_at": int(time.time() + 3600),
+            "observed_at": "",
+        },
+        "seven_day": {
+            "status": "allowed",
+            "utilization": 0.50,
+            "resets_at": int(time.time() + 86400),
+            "observed_at": "",
+        },
+        "seven_day_sonnet": {
+            "status": "allowed",
+            "utilization": 0.48,
+            "resets_at": int(time.time() + 86400),
+            "observed_at": "",
+        },
+        "seven_day_omelette": {
+            "status": "allowed",
+            "utilization": 0.00,
+            "resets_at": int(time.time() + 86400),
+            "observed_at": "",
+        },
+    }
+    recorded = await record_usage(rate_store, {
+        "five_hour": {
+            "utilization": 9.0,
+            "resets_at": "2099-01-01T00:00:00Z",
+        },
+        "seven_day": {
+            "utilization": 100.0,  # cliff jump from 50% — bogus
+            "resets_at": "2099-01-01T00:00:00Z",
+        },
+        "seven_day_sonnet": {
+            "utilization": 50.0,  # +2pp — real
+            "resets_at": "2099-01-01T00:00:00Z",
+        },
+        "seven_day_omelette": {
+            "utilization": 0.0,
+            "resets_at": "2099-01-01T00:00:00Z",
+        },
+    })
+    # 7d-overall was rejected — anomaly metadata in recorded.
+    assert recorded["seven_day"]["anomalous"] is True
+    assert recorded["seven_day"]["rejected_utilization"] == pytest.approx(1.00)
+    assert recorded["seven_day"]["kept_utilization"] == pytest.approx(0.50)
+    # Sub-buckets wrote through normally.
+    assert recorded["seven_day_sonnet"]["utilization"] == pytest.approx(0.50)
+    assert recorded["seven_day_omelette"]["utilization"] == pytest.approx(0.00)
+    # Algedonic event fired with seven_day window_type + sub-bucket context.
+    anomaly_events = [e for e in events if e[0] == "quota_reading_anomalous"]
+    assert len(anomaly_events) == 1
+    payload = anomaly_events[0][1]
+    assert payload["window_type"] == "seven_day"
+    assert payload["rejected_utilization"] == pytest.approx(1.00)
+    assert payload["kept_utilization"] == pytest.approx(0.50)
+    assert "sub_buckets_new" in payload
+    assert payload["sub_buckets_new"]["seven_day_sonnet"] == pytest.approx(0.50)
+
+
+@pytest.mark.asyncio
+async def test_record_usage_passes_real_7d_growth(
+    rate_store: RateLimitStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inverse: 7d climbs 50%→85% AND sub-buckets climb in proportion
+    (sonnet 48%→78%). Real saturation — write through, no anomaly
+    event."""
+    events: list[tuple[str, dict]] = []
+    async def _cap(t, **kw):
+        events.append((t, kw))
+    monkeypatch.setattr(op, "log_event", _cap)
+    rate_store._load = lambda: {  # type: ignore[method-assign]
+        "seven_day": {
+            "status": "allowed",
+            "utilization": 0.50,
+            "resets_at": int(time.time() + 86400),
+            "observed_at": "",
+        },
+        "seven_day_sonnet": {
+            "status": "allowed",
+            "utilization": 0.48,
+            "resets_at": int(time.time() + 86400),
+            "observed_at": "",
+        },
+    }
+    recorded = await record_usage(rate_store, {
+        "seven_day": {
+            "utilization": 85.0,  # +35pp
+            "resets_at": "2099-01-01T00:00:00Z",
+        },
+        "seven_day_sonnet": {
+            "utilization": 78.0,  # +30pp — proportional
+            "resets_at": "2099-01-01T00:00:00Z",
+        },
+    })
+    assert recorded["seven_day"]["utilization"] == pytest.approx(0.85)
+    assert "anomalous" not in recorded["seven_day"]
+    assert not [e for e in events if e[0] == "quota_reading_anomalous"]
+
+
 # ─── poll_once orchestration ──────────────────────────────────────────
 
 
