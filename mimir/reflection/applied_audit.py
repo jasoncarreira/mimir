@@ -353,6 +353,154 @@ def mark_applied(
     return proposal
 
 
+# ─── mark_reject + resolve parser ─────────────────────────────────────
+
+
+def mark_reject(
+    proposed_changes_path: Path,
+    id_match: str,
+    reason: str,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Find a proposal in ``## Pending`` whose heading contains
+    ``id_match`` (case-insensitive substring), move it to ``## Rejected``,
+    and annotate it with a rejection timestamp + reason.
+
+    Returns the matched heading text. Raises ``LookupError`` when no
+    matching pending entry is found, ``ValueError`` when the file
+    structure isn't recognised.
+
+    Note: does NOT append to ``applied-proposals.jsonl``.
+    """
+    now = now or datetime.now(tz=timezone.utc)
+    reason = reason.strip() or "operator declined"
+
+    if not proposed_changes_path.is_file():
+        raise FileNotFoundError(proposed_changes_path)
+
+    raw = proposed_changes_path.read_text(encoding="utf-8")
+    sections = _split_md_sections(raw)
+    if not sections:
+        raise ValueError("no '## …' sections found in proposed-changes.md")
+
+    pending_idx = None
+    for i, (head, _) in enumerate(sections):
+        if head.lower() == "pending":
+            pending_idx = i
+            break
+    if pending_idx is None:
+        raise ValueError("missing '## Pending' section")
+
+    end_idx = len(sections)
+    for j in range(pending_idx + 1, len(sections)):
+        if sections[j][0].lower() in ("applied", "rejected"):
+            end_idx = j
+            break
+
+    match_pos: int | None = None
+    needle = id_match.lower()
+    for j in range(pending_idx + 1, end_idx):
+        if needle in sections[j][0].lower():
+            match_pos = j
+            break
+    if match_pos is None:
+        raise LookupError(
+            f"no pending proposal heading contains {id_match!r}"
+        )
+
+    head, body = sections[match_pos]
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    annotation = f"<!-- rejected: {ts} — {reason} -->"
+    new_body = (body.rstrip() + "\n\n" + annotation) if body.strip() else annotation
+
+    # Reassemble: drop from Pending, append under Rejected.
+    prelude = ""
+    first_section_pos = raw.find("\n## ")
+    if first_section_pos == -1 and raw.lstrip().startswith("## "):
+        first_section_pos = 0
+    if first_section_pos > 0:
+        prelude = raw[:first_section_pos].rstrip() + "\n\n"
+
+    new_sections = list(sections)
+    new_sections.pop(match_pos)
+
+    # Find or create Rejected bucket (re-scan after pop).
+    rejected_idx2: int | None = None
+    for i, (h, _) in enumerate(new_sections):
+        if h.lower() == "rejected":
+            rejected_idx2 = i
+            break
+    if rejected_idx2 is None:
+        new_sections.append(("Rejected", ""))
+        rejected_idx2 = len(new_sections) - 1
+
+    # Insert at end of Rejected bucket (before next top-level bucket or EOF).
+    insert_at = len(new_sections)
+    for j in range(rejected_idx2 + 1, len(new_sections)):
+        if new_sections[j][0].lower() in ("pending", "applied"):
+            insert_at = j
+            break
+    new_sections.insert(insert_at, (head, new_body))
+
+    rebuilt = prelude + "\n\n".join(
+        f"## {h}" + (("\n" + b) if b else "")
+        for h, b in new_sections
+    ).rstrip() + "\n"
+
+    proposed_changes_path.write_text(rebuilt, encoding="utf-8")
+    return head
+
+
+# ─── resolve string parser ─────────────────────────────────────────────
+
+_RESOLVE_CLAUSE_RE = re.compile(
+    r"(accept|reject)\s+"       # action keyword
+    r"([\d\s]+?)"               # one or more space-separated numbers
+    r"(?:[\"']([^\"']*)[\"'])?" # optional quoted reason
+    r"(?=\s*(?:/|$))",          # lookahead: clause separator or end
+    re.IGNORECASE,
+)
+
+
+def parse_resolve_string(
+    decision: str,
+) -> list[tuple[str, int, str]]:
+    """Parse an operator resolve string into ``[(action, num, reason), ...]``.
+
+    Supports::
+
+        "accept 1 3"
+        "reject 2 'not now'"
+        "accept 1 3 / reject 2 \"reason\""
+        "reject 2"          → reason defaults to empty string (CLI fills default)
+
+    Returns a list of ``(action, num, reason)`` triples where *action* is
+    ``"accept"`` or ``"reject"``, *num* is the proposal number (1-based),
+    and *reason* is the quoted string (or ``""`` when omitted).
+
+    Raises ``ValueError`` when no valid clauses are found.
+    """
+    ops: list[tuple[str, int, str]] = []
+    for m in _RESOLVE_CLAUSE_RE.finditer(decision):
+        action = m.group(1).lower()
+        nums_raw = m.group(2).split()
+        reason = m.group(3) or ""
+        for n_str in nums_raw:
+            try:
+                num = int(n_str)
+            except ValueError:
+                continue
+            if num < 1:
+                continue
+            ops.append((action, num, reason))
+    if not ops:
+        raise ValueError(
+            f"no valid accept/reject clauses found in {decision!r}"
+        )
+    return ops
+
+
 def load_applied_proposals(path: Path) -> list[AppliedProposal]:
     if not path.is_file():
         return []

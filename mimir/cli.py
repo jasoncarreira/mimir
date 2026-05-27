@@ -2304,6 +2304,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
 
+    refl_resolve_p = refl_sub.add_parser(
+        "resolve",
+        help="Apply operator accept/reject decisions to pending proposals. "
+             "Example: resolve \"accept 1 3 / reject 2 'not now'\"",
+    )
+    refl_resolve_p.add_argument(
+        "decision_string",
+        help="Accept/reject string, e.g. \"accept 1 3\" or "
+             "\"accept 1 / reject 2 'reason'\".",
+    )
+    refl_resolve_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
     refl_audit_p = refl_sub.add_parser(
         "audit",
         help="Print the '## Effects of prior proposals' block — "
@@ -2624,6 +2639,77 @@ def main(argv: Sequence[str] | None = None) -> None:
                         line += f"\n   {excerpt}"
                     print(line)
             sys.exit(0)
+        if args.reflection_action == "resolve":
+            from .reflection import applied_audit as _applied_audit
+            home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+            pc_path = home / "state" / "proposed-changes.md"
+            log_path = home / "state" / "applied-proposals.jsonl"
+
+            try:
+                ops = _applied_audit.parse_resolve_string(args.decision_string)
+            except ValueError as exc:
+                print(f"resolve: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+            # Number proposals once — snapshot before any mutation.
+            try:
+                snapshot = _applied_audit._list_pending_proposals(pc_path)
+            except FileNotFoundError as exc:
+                print(f"resolve: {exc}", file=sys.stderr)
+                sys.exit(1)
+            except ValueError as exc:
+                print(f"resolve: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+            # Resolve all (action, num) → heading before mutating so that
+            # numbering shifts after earlier mutations don't affect later ones.
+            resolved: list[tuple[str, str, str]] = []  # (action, heading, reason)
+            errors: list[str] = []
+            for action, num, reason in ops:
+                match = next((h for n, h, _ in snapshot if n == num), None)
+                if match is None:
+                    errors.append(
+                        f"  {num}: out of range (1–{len(snapshot)})"
+                        if snapshot else f"  {num}: no pending proposals"
+                    )
+                    continue
+                resolved.append((action, match, reason))
+
+            accepted: list[str] = []
+            rejected: list[str] = []
+
+            for action, heading, reason in resolved:
+                if action == "accept":
+                    try:
+                        _applied_audit.mark_applied(pc_path, log_path, heading)
+                        # Find original num for output label.
+                        num_label = next(
+                            str(n) for n, h, _ in snapshot if h == heading
+                        )
+                        accepted.append(num_label)
+                    except (LookupError, ValueError) as exc:
+                        errors.append(f"  {heading!r}: {exc}")
+                else:
+                    default_reason = "operator declined"
+                    effective_reason = reason.strip() if reason.strip() else default_reason
+                    try:
+                        _applied_audit.mark_reject(pc_path, heading, effective_reason)
+                        num_label = next(
+                            str(n) for n, h, _ in snapshot if h == heading
+                        )
+                        rejected.append(f"{num_label} ({effective_reason!r})")
+                    except (LookupError, ValueError) as exc:
+                        errors.append(f"  {heading!r}: {exc}")
+
+            parts = []
+            if accepted:
+                parts.append(f"Applied: {', '.join(accepted)}.")
+            if rejected:
+                parts.append(f"Rejected: {', '.join(rejected)}.")
+            if errors:
+                parts.append("Errors:\n" + "\n".join(errors))
+            print("\n".join(parts) if parts else "Nothing to do.")
+            sys.exit(1 if errors and not accepted and not rejected else 0)
         if args.reflection_action == "audit":
             from .reflection import applied_audit as _applied_audit
             home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()

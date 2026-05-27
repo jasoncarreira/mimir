@@ -19,6 +19,8 @@ from mimir.reflection.applied_audit import (
     format_reflection_digest,
     load_applied_proposals,
     mark_applied,
+    mark_reject,
+    parse_resolve_string,
     render_audit_block,
     run_scheduled_applied_audit,
 )
@@ -853,3 +855,196 @@ def test_format_reflection_digest_reply_hint_present():
     assert "accept 1 3" in result
     assert "reject 2" in result
     assert "defer 1" in result
+
+
+# ─── mark_reject ────────────────────────────────────────────────────────
+
+_FOUR_PROPOSAL_DOC = """\
+# Proposed Changes
+
+## Pending
+
+## 2026-05-01 — proposal alpha
+Proposal: Alpha change.
+
+## 2026-05-02 — proposal beta
+Proposal: Beta change.
+
+## 2026-05-03 — proposal gamma
+Proposal: Gamma change.
+
+## 2026-05-04 — proposal delta
+Proposal: Delta change.
+
+## Applied
+
+## Rejected
+"""
+
+
+def test_mark_reject_moves_to_rejected_with_reason(tmp_path: Path):
+    """mark_reject moves the matched proposal to ## Rejected with annotation."""
+    pc = tmp_path / "state" / "proposed-changes.md"
+    _seed_proposed_changes(pc, _FOUR_PROPOSAL_DOC)
+
+    heading = mark_reject(pc, "proposal beta", "not a priority", now=NOW)
+
+    assert "beta" in heading
+    body = pc.read_text()
+    pending_idx = body.find("## Pending")
+    rejected_idx = body.find("## Rejected")
+    beta_idx = body.find("proposal beta")
+    alpha_idx = body.find("proposal alpha")
+    # beta must now be under Rejected, not Pending.
+    assert rejected_idx < beta_idx
+    # alpha still under Pending.
+    assert pending_idx < alpha_idx < rejected_idx
+    # Rejection annotation present.
+    assert "not a priority" in body
+    assert "<!-- rejected:" in body
+    # No JSONL log (mark_reject does not write applied-proposals.jsonl).
+    assert not (tmp_path / "state" / "applied-proposals.jsonl").exists()
+
+
+def test_mark_reject_creates_rejected_section_when_missing(tmp_path: Path):
+    """mark_reject creates ## Rejected if it doesn't exist."""
+    pc = tmp_path / "state" / "proposed-changes.md"
+    _seed_proposed_changes(pc, """\
+## Pending
+
+## 2026-05-01 — alpha proposal
+Proposal: Alpha.
+
+## Applied
+""")
+
+    mark_reject(pc, "alpha", "no thanks", now=NOW)
+
+    body = pc.read_text()
+    assert "## Rejected" in body
+    rejected_idx = body.find("## Rejected")
+    alpha_idx = body.find("alpha proposal")
+    assert rejected_idx < alpha_idx
+    assert "no thanks" in body
+
+
+def test_mark_reject_empty_reason_defaults_to_operator_declined(tmp_path: Path):
+    """mark_reject uses 'operator declined' when reason is empty string."""
+    pc = tmp_path / "state" / "proposed-changes.md"
+    _seed_proposed_changes(pc, """\
+## Pending
+
+## 2026-05-01 — gamma proposal
+Proposal: Gamma.
+
+## Rejected
+""")
+
+    mark_reject(pc, "gamma", "", now=NOW)
+
+    body = pc.read_text()
+    assert "operator declined" in body
+
+
+# ─── parse_resolve_string ───────────────────────────────────────────────
+
+
+def test_parse_resolve_string_pure_accept():
+    """'accept 1 3' → two accept ops with no reason."""
+    ops = parse_resolve_string("accept 1 3")
+    assert len(ops) == 2
+    assert ops[0] == ("accept", 1, "")
+    assert ops[1] == ("accept", 3, "")
+
+
+def test_parse_resolve_string_pure_reject_with_reason():
+    """'reject 2 \"not now\"' → single reject op with reason."""
+    ops = parse_resolve_string('reject 2 "not now"')
+    assert len(ops) == 1
+    assert ops[0] == ("reject", 2, "not now")
+
+
+def test_parse_resolve_string_mixed_accept_reject():
+    """'accept 1 3 / reject 2 \"reason\"' → three ops in order."""
+    ops = parse_resolve_string("accept 1 3 / reject 2 'deferred'")
+    assert len(ops) == 3
+    actions = [(a, n) for a, n, _ in ops]
+    assert ("accept", 1) in actions
+    assert ("accept", 3) in actions
+    assert ("reject", 2) in actions
+    # Reason on the reject op.
+    reasons = {n: r for a, n, r in ops if a == "reject"}
+    assert reasons[2] == "deferred"
+
+
+# ─── resolve CLI integration ────────────────────────────────────────────
+
+def test_resolve_cli_mixed_apply_and_reject(tmp_path: Path, capsys):
+    """resolve: pure accept 1 3 + reject 2 on a 4-proposal file."""
+    from mimir.cli import main as _main
+
+    pc = tmp_path / "state" / "proposed-changes.md"
+    _seed_proposed_changes(pc, _FOUR_PROPOSAL_DOC)
+
+    with pytest.raises(SystemExit) as exc_info:
+        _main(["reflection", "resolve",
+               "--home", str(tmp_path),
+               "accept 1 3 / reject 2 'not now'"])
+    assert exc_info.value.code == 0
+
+    body = pc.read_text()
+    captured = capsys.readouterr()
+
+    # alpha (1) and gamma (3) in Applied; beta (2) in Rejected.
+    applied_idx = body.find("## Applied")
+    rejected_idx = body.find("## Rejected")
+    pending_idx = body.find("## Pending")
+    alpha_idx = body.find("proposal alpha")
+    beta_idx = body.find("proposal beta")
+    gamma_idx = body.find("proposal gamma")
+    delta_idx = body.find("proposal delta")
+
+    assert applied_idx < alpha_idx  # alpha moved to Applied
+    assert applied_idx < gamma_idx  # gamma moved to Applied
+    assert rejected_idx < beta_idx  # beta moved to Rejected
+    assert pending_idx < delta_idx < applied_idx  # delta still Pending
+
+    assert "not now" in body          # reject reason persisted
+    assert "Applied: 1, 3." in captured.out
+    assert "Rejected: 2" in captured.out
+
+
+def test_resolve_cli_invalid_number_still_processes_valid(tmp_path: Path, capsys):
+    """Invalid proposal number produces error but valid ops proceed."""
+    from mimir.cli import main as _main
+
+    pc = tmp_path / "state" / "proposed-changes.md"
+    _seed_proposed_changes(pc, """\
+## Pending
+
+## 2026-05-01 — proposal one
+Proposal: One.
+
+## Applied
+
+## Rejected
+""")
+
+    # Proposal 99 doesn't exist; proposal 1 does.
+    with pytest.raises(SystemExit) as exc_info:
+        _main(["reflection", "resolve",
+               "--home", str(tmp_path),
+               "accept 1 / reject 99"])
+    # non-zero because of the error on 99, but 1 was still applied
+    ret = exc_info.value.code
+
+    body = pc.read_text()
+    captured = capsys.readouterr()
+
+    # proposal 1 was applied despite the error on 99.
+    applied_idx = body.find("## Applied")
+    one_idx = body.find("proposal one")
+    assert applied_idx < one_idx
+
+    assert "Applied: 1." in captured.out
+    assert "99" in captured.out  # error mentions the invalid number
