@@ -601,6 +601,24 @@ ANOMALY_7D_DELTA_PP = 0.05  # 7d delta below this confirms the 5h jump is bogus
 ANOMALY_7D_JUMP_PP = 0.30           # 7d overall rise that triggers cross-check
 ANOMALY_SUBBUCKET_DELTA_PP = 0.05   # max sub-bucket delta to call the 7d jump bogus
 
+# chainlink #250: absolute-coherence check.  The 7d overall is the
+# cost-weighted aggregate of per-model spend.  When overall is high
+# (≥ ``ANOMALY_7D_COHERENCE_OVERALL_FLOOR``) BUT every observed
+# sub-bucket is near zero (< ``ANOMALY_7D_COHERENCE_SUBBUCKET_CEIL``),
+# the reading is internally inconsistent: the plan-wide aggregate
+# can't be huge while all the per-model components are empty.
+#
+# This catches the case where sub-buckets *drop* between polls
+# (clearing a prior glitch) while the overall *jumps* the same poll —
+# the delta-based check at chainlink #220 mis-classifies as
+# "sub-buckets moved, accept" because the drop counts as movement.
+#
+# Floor/ceil values chosen to leave realistic state untouched: a 43%
+# overall with sonnet at 24% (and opus untracked) is legitimate and
+# stays under the floor; a 100%/2% reading clears both thresholds.
+ANOMALY_7D_COHERENCE_OVERALL_FLOOR = 0.50
+ANOMALY_7D_COHERENCE_SUBBUCKET_CEIL = 0.10
+
 # chainlink #231: consecutive-confirmation recovery path for the 7d anomaly
 # detector. If the detector rejects the same anomalous value for this many
 # consecutive polls (~15 min at the default 3-min interval), the "this is a
@@ -791,36 +809,72 @@ def detect_seven_day_anomaly(
     new_sub_buckets: dict[str, float],
     prev_sub_buckets: dict[str, float],
 ) -> str | None:
-    """Reject bogus ``seven_day`` overall readings (chainlink #220).
+    """Reject bogus ``seven_day`` overall readings (chainlink #220 + #250).
 
     Returns a reason string when the new overall 7d reading is an
     endpoint glitch (the caller should keep the prior trusted
     value), else None.
 
-    Rule:
+    Two independent checks:
+
+    **Delta check (chainlink #220)** — fires when:
       - 7d overall rose by >= ANOMALY_7D_JUMP_PP (30pp) since prior
         reading,
       - AND **every** known sub-bucket
         (``seven_day_sonnet``, ``seven_day_omelette``, ...) moved
         less than ANOMALY_SUBBUCKET_DELTA_PP (5pp).
 
+    **Absolute-coherence check (chainlink #250)** — fires when:
+      - new_7d_overall > max(new_sub_buckets) + ANOMALY_7D_COHERENCE_SLACK_PP.
+
     The overall ``seven_day`` cap is a cost-weighted aggregate of
-    per-model spend, so a real 30pp overall jump requires at least
-    one model bucket to move proportionally. When every sub-bucket
-    is steady but the overall reading cliff-jumps, the overall
-    value is internally inconsistent.
+    per-model spend, so it physically cannot exceed the largest
+    sub-bucket by more than a small slack (untracked models).  The
+    delta check catches transient cliff-spikes when sub-buckets stay
+    flat; the absolute-coherence check catches the 2026-05-28
+    incident shape where sub-buckets *drop* between polls (resolving
+    a prior glitch) but the overall *jumps* the same poll — the
+    drop counts as "sub-buckets moved" under the delta rule and
+    bypasses it.
 
     ``new_sub_buckets`` / ``prev_sub_buckets`` are dicts keyed by
     bucket name (e.g. ``"seven_day_sonnet"``) mapping to
-    utilization. Missing keys are skipped — the check fires only on
-    sub-buckets present in both maps. When no sub-buckets are
-    observable at all, returns None (no signal to distrust).
+    utilization. Missing keys are skipped — the delta check fires
+    only on sub-buckets present in both maps. When no sub-buckets
+    are observable at all, returns None (no signal to distrust).
 
-    Skips the check when either 7d side is None — first poll,
-    missing data. "Trust the value" is the right fallback because
-    we have no cross-reference.
+    Skips both checks when ``new_7d`` is None. The delta check
+    additionally requires ``prev_7d`` (first poll has no prior).
     """
-    if new_7d is None or prev_7d is None:
+    if new_7d is None:
+        return None
+
+    # ── Absolute-coherence check (chainlink #250) ──────────────────
+    # Independent of prior readings — sanity check on the NEW value's
+    # internal coherence with NEW sub-buckets.  Fires when overall
+    # claims significant usage (≥ FLOOR) but every observed
+    # sub-bucket is near zero (< CEIL).  That state can't be real:
+    # the plan-wide aggregate is a function of per-model spend, and
+    # if every model bucket is empty the aggregate cannot be huge.
+    if new_sub_buckets:
+        max_sub = max(new_sub_buckets.values())
+        if (
+            new_7d >= ANOMALY_7D_COHERENCE_OVERALL_FLOOR
+            and max_sub < ANOMALY_7D_COHERENCE_SUBBUCKET_CEIL
+        ):
+            sub_summary = ", ".join(
+                f"{k}={v * 100:.0f}%"
+                for k, v in sorted(new_sub_buckets.items())
+            )
+            return (
+                f"seven_day={new_7d * 100:.0f}% but all observed "
+                f"sub-buckets < {ANOMALY_7D_COHERENCE_SUBBUCKET_CEIL * 100:.0f}% "
+                f"[{sub_summary}] — internally inconsistent, "
+                f"endpoint glitch suspected"
+            )
+
+    # ── Delta check (chainlink #220) ────────────────────────────────
+    if prev_7d is None:
         return None
     jump = new_7d - prev_7d
     if jump < ANOMALY_7D_JUMP_PP:
