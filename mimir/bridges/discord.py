@@ -35,6 +35,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
 
 from ..models import AgentEvent
 from ._history import ChannelMessage
+from ._seen_ids import SeenIdCache
 from .base import Bridge, SendResult
 
 log = logging.getLogger(__name__)
@@ -305,6 +306,14 @@ class DiscordBridge(Bridge):
     # turn finishes). See ``send_typing_indicator``.
     _typing_tasks: dict[str, asyncio.Task] = field(
         default_factory=dict, init=False, repr=False
+    )
+    # chainlink #232: inbound message dedup — Discord's gateway resume
+    # protocol redelivers around disconnects, which would otherwise cause
+    # the agent to run two turns answering the same message. Bounded LRU
+    # keyed on the Discord message id (a globally unique snowflake).
+    _seen_ids: SeenIdCache = field(
+        default_factory=SeenIdCache,
+        init=False, repr=False,
     )
 
     prefixes = ("discord-", "dm-discord-")
@@ -742,6 +751,24 @@ class DiscordBridge(Bridge):
         if author_is_bot and not self.respond_to_bots:
             return
 
+        # chainlink #232: dedup before any work — Discord's resume
+        # protocol can redeliver around disconnects, and we don't want
+        # to download attachments or burn an agent turn on a redelivery.
+        # Use explicit None-check so a hypothetical id=0 (snowflakes
+        # never are, but bridge adapters may copy the pattern) still
+        # dedupes rather than bypassing the cache.
+        _raw_message_id = getattr(message, "id", None)
+        source_id = str(_raw_message_id) if _raw_message_id is not None else None
+        # Truthy-check matches the Slack bridge pattern; SeenIdCache also
+        # treats empty strings as "no id" so this is doubly safe.
+        if source_id and not self._seen_ids.add_if_new(source_id):
+            log.debug(
+                "DiscordBridge: duplicate inbound message dropped "
+                "(source_id=%s) — Discord resume-protocol redelivery",
+                source_id,
+            )
+            return
+
         channel = message.channel
         channel_id = _channel_to_id(channel)
         conv_type = _channel_conversation_type(channel)
@@ -819,7 +846,7 @@ class DiscordBridge(Bridge):
             author=author_key,
             author_display=author_display,
             author_id=author_id,
-            source_id=str(getattr(message, "id", "") or "") or None,
+            source_id=source_id,
             source="discord",
             attachment_names=attachment_paths,
             extra={

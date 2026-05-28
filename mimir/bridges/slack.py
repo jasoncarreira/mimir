@@ -42,6 +42,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
 from ..models import AgentEvent
 from ._attachments import build_inbound_path, download_to_path
 from ._history import ChannelMessage
+from ._seen_ids import SeenIdCache
 from .base import Bridge, SendResult
 
 log = logging.getLogger(__name__)
@@ -255,6 +256,13 @@ class SlackBridge(Bridge):
     # if the operator adds the users:read scope post-deploy.
     _user_cache: dict[str, dict[str, str | None]] = field(
         default_factory=dict, init=False, repr=False
+    )
+    # chainlink #232: inbound message dedup — Slack Socket Mode is
+    # documented to redeliver events on ACK loss. Bounded LRU keyed on
+    # the message ``ts`` (unique within the workspace).
+    _seen_ids: SeenIdCache = field(
+        default_factory=SeenIdCache,
+        init=False, repr=False,
     )
 
     prefixes = ("slack-", "dm-slack-")
@@ -715,6 +723,18 @@ class SlackBridge(Bridge):
         # Skip other bots unless opted in.
         is_bot = bool(event.get("bot_id"))
         if is_bot and not self.respond_to_bots:
+            return
+
+        # chainlink #232: dedup before any work — Slack Socket Mode
+        # redelivers events on ACK loss; without the cache we'd burn a
+        # turn (plus an attachment download) on every redelivery.
+        source_id = event.get("ts")
+        if source_id and not self._seen_ids.add_if_new(source_id):
+            log.debug(
+                "SlackBridge: duplicate inbound message dropped "
+                "(source_id=%s) — Socket-Mode redelivery",
+                source_id,
+            )
             return
 
         slack_channel = event.get("channel") or ""
