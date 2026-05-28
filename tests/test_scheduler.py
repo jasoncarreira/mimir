@@ -1872,3 +1872,95 @@ async def test_dispatch_invalid_manifest_events_task_is_held_in_background_tasks
 
     assert len(sched._background_tasks) == 0
     assert len(logged) == 2
+
+
+# ─── chainlink #234: _resolve_prompt_file symlink hardening ─────────
+
+
+def test_resolve_prompt_file_accepts_direct_file(tmp_path):
+    """Direct (non-symlink) file inside <home>/prompts/ resolves OK."""
+    from mimir.scheduler import _resolve_prompt_file
+    home = tmp_path / "home"
+    prompts = home / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "heartbeat.md").write_text("hello")
+    result = _resolve_prompt_file(home, "heartbeat.md")
+    assert result is not None
+    assert result == (prompts / "heartbeat.md").resolve()
+
+
+def test_resolve_prompt_file_rejects_traversal(tmp_path):
+    """``../etc/passwd`` resolves outside the prompts root → rejected."""
+    from mimir.scheduler import _resolve_prompt_file
+    home = tmp_path / "home"
+    prompts = home / "prompts"
+    prompts.mkdir(parents=True)
+    result = _resolve_prompt_file(home, "../../../etc/passwd")
+    assert result is None
+
+
+def test_resolve_prompt_file_rejects_symlink_to_inside_root(tmp_path):
+    """chainlink #234: a symlink WITHIN <home>/prompts/ pointing at
+    another file inside <home>/prompts/ is rejected. Pre-fix, the
+    target stayed under the root and the containment check passed,
+    letting whatever-can-write-symlinks-here choose the content for a
+    cron-fired prompt.
+    """
+    from mimir.scheduler import _resolve_prompt_file
+    home = tmp_path / "home"
+    prompts = home / "prompts"
+    prompts.mkdir(parents=True)
+    real = prompts / "real.md"
+    real.write_text("real content")
+    link = prompts / "evil.md"
+    link.symlink_to(real)
+    result = _resolve_prompt_file(home, "evil.md")
+    assert result is None, (
+        f"symlink within root must be rejected; got {result}"
+    )
+
+
+def test_resolve_prompt_file_rejects_symlink_to_outside_root(tmp_path):
+    """A symlink pointing outside the root is rejected — same check
+    catches both the symlink AND the containment violation. Pre-fix
+    this already worked via the .parents check; we keep coverage."""
+    from mimir.scheduler import _resolve_prompt_file
+    home = tmp_path / "home"
+    prompts = home / "prompts"
+    prompts.mkdir(parents=True)
+    outside = tmp_path / "outside.md"
+    outside.write_text("attacker-chosen")
+    link = prompts / "leak.md"
+    link.symlink_to(outside)
+    result = _resolve_prompt_file(home, "leak.md")
+    assert result is None
+
+
+def test_resolve_prompt_file_rejects_symlink_at_intermediate_dir(tmp_path):
+    """chainlink #234: a symlinked DIRECTORY component (not just the
+    leaf file) must also be rejected — otherwise a symlinked subdir
+    inside prompts/ would let an attacker redirect every file under
+    it.
+    """
+    from mimir.scheduler import _resolve_prompt_file
+    home = tmp_path / "home"
+    prompts = home / "prompts"
+    prompts.mkdir(parents=True)
+    # real/ has a legit file; evil_dir is a symlink to real/.
+    real_dir = prompts / "real"
+    real_dir.mkdir()
+    (real_dir / "foo.md").write_text("real")
+    evil_dir = prompts / "evil_dir"
+    evil_dir.symlink_to(real_dir)
+    result = _resolve_prompt_file(home, "evil_dir/foo.md")
+    assert result is None
+
+
+def test_resolve_prompt_file_rejects_empty_and_none(tmp_path):
+    """Defensive guards for empty/whitespace/None inputs."""
+    from mimir.scheduler import _resolve_prompt_file
+    home = tmp_path / "home"
+    (home / "prompts").mkdir(parents=True)
+    assert _resolve_prompt_file(home, "") is None
+    assert _resolve_prompt_file(home, "   ") is None
+    assert _resolve_prompt_file(None, "foo.md") is None

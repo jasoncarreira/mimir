@@ -233,13 +233,41 @@ def _resolve_prompt_file(home: Path | None, prompt_file: str) -> Path | None:
     """Resolve ``prompt_file`` against ``<home>/prompts/`` and verify
     the result stays inside that directory. Returns None on escape,
     missing home, or empty input. Caller logs and falls back to the
-    inline prompt when None is returned."""
+    inline prompt when None is returned.
+
+    chainlink #234: symlinks anywhere along the path are rejected.
+    ``Path.resolve()`` follows symlinks; a symlink inside the prompts
+    dir pointing at content of an attacker's choice satisfies the
+    ``root in candidate.parents`` containment check (target is still
+    under root) while letting the attacker control what gets loaded.
+    The strict check: every component from root down to the candidate
+    must be a plain file/dir, not a symlink.
+    """
     if not home or not prompt_file or not prompt_file.strip():
         return None
     root = (home / "prompts").resolve()
-    candidate = (root / prompt_file.strip().lstrip("/")).resolve()
+    raw_candidate = root / prompt_file.strip().lstrip("/")
+    candidate = raw_candidate.resolve()
     if root not in candidate.parents and candidate != root:
         return None
+
+    # Walk the UN-resolved path component-by-component so a symlink
+    # near the leaf doesn't get silently followed by resolve() before
+    # we get to check it. Use is_symlink() (which lstats internally).
+    try:
+        relative = raw_candidate.relative_to(root)
+    except ValueError:
+        # raw_candidate isn't under root pre-resolution — defense-in-
+        # depth; parents-check above already covers this.
+        return None
+    accumulated = root
+    for part in relative.parts:
+        accumulated = accumulated / part
+        try:
+            if accumulated.is_symlink():
+                return None
+        except OSError:
+            return None
     return candidate
 
 
