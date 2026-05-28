@@ -1,4 +1,4 @@
-"""Turn-viewer + ops dashboard + log API + saga DB routes (SPEC §11).
+"""Turn-viewer + ops dashboard + log API + saga DB + memory routes (SPEC §11).
 
 Mounts onto the same aiohttp app that serves ``/event`` + ``/health`` and
 hosts the WebUI bridge's ``/chat``. Routes:
@@ -13,11 +13,16 @@ hosts the WebUI bridge's ``/chat``. Routes:
   GET /saga             — saga DB operator viewer (HTML)
   GET /api/saga         — JSON twin of /saga; view= selects the payload
                           shape (recent, atom, stats)
+  GET /memory           — file-based memory browser (HTML, two-pane)
+  GET /api/memory       — JSON twin of /memory; view=tree returns nested
+                          dir/file tree; view=file&path=... returns file
+                          content (only .md files)
 
 The HTML page polls ``/api/turns`` every 5s for live updates. ``/api/events``
 is exposed for the (deferred) Events tab + ad-hoc scripting. ``/ops``
 recomputes from events.jsonl on every request — no caching.
 ``/saga`` reads the saga SQLite DB on each request — no caching.
+``/memory`` reads the ``<home>/memory/`` directory on each request — no caching.
 """
 
 from __future__ import annotations
@@ -34,6 +39,11 @@ from .ops_dashboard import (
     build_dashboard_payload_async,
     parse_days_param,
     render_dashboard_html,
+)
+from .file_memory_dashboard import (
+    list_tree,
+    read_file_safe,
+    render_memory_html,
 )
 from .saga_dashboard import (
     build_atom_payload,
@@ -238,3 +248,40 @@ def register_routes(
         app.router.add_get("/saga", saga_page)
     if ("GET", "/api/saga") not in existing:
         app.router.add_get("/api/saga", saga_data)
+
+    # ── /memory — file-based memory viewer ──────────────────────────────
+
+    _memory_root = home / "memory" if home is not None else None
+
+    async def memory_page(_request: web.Request) -> web.Response:
+        return web.Response(text=render_memory_html(), content_type="text/html")
+
+    async def memory_data(request: web.Request) -> web.Response:
+        view = request.query.get("view", "tree")
+        if _memory_root is None:
+            return web.json_response({"error": "home not configured"}, status=503)
+
+        if view == "file":
+            rel = request.query.get("path", "").strip()
+            if not rel:
+                return web.json_response({"error": "path param required"}, status=400)
+            payload = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: read_file_safe(_memory_root, rel)
+            )
+            if "error" in payload:
+                err = payload["error"]
+                if "traversal" in err or "only .md" in err:
+                    return web.json_response(payload, status=400)
+                if "not found" in err:
+                    return web.json_response(payload, status=404)
+            return web.json_response(payload)
+        else:  # view == "tree"
+            payload = await asyncio.get_event_loop().run_in_executor(
+                None, list_tree, _memory_root
+            )
+            return web.json_response(payload)
+
+    if ("GET", "/memory") not in existing:
+        app.router.add_get("/memory", memory_page)
+    if ("GET", "/api/memory") not in existing:
+        app.router.add_get("/api/memory", memory_data)
