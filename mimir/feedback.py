@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1055,12 +1056,40 @@ def _synthesize_chain_signals(
     return chain_signals, chain_consumed_kinds
 
 
+# ---------------------------------------------------------------------------
+# Prompt-injection hardening helper
+# ---------------------------------------------------------------------------
+
+_FIELD_MAX_LEN = 240  # per-field cap for sanitized event-payload strings
+
+
+def _sanitize_field(value: object, max_len: int = _FIELD_MAX_LEN) -> str:
+    """Collapse whitespace, strip control chars, cap length.
+
+    Applied to every event-payload field that surfaces in the rendered
+    algedonic prompt block.  Prevents prompt-injection via external event
+    sources: GitHub PR author names, poller error strings, bridge errors,
+    shell intent prefixes, Discord/Slack display names.
+
+    Operations (in order):
+      1. Coerce to str.
+      2. Collapse all whitespace runs (including \\n, \\r, \\t) → single space.
+      3. Strip remaining C0 + DEL control characters (\\x00–\\x1f, \\x7f).
+      4. Truncate to *max_len* chars with "…" suffix on overflow.
+    """
+    s = " ".join(str(value).split())  # step 1+2: coerce + collapse whitespace
+    s = re.sub(r"[\x00-\x1f\x7f]", "", s)  # step 3: strip residual controls
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"  # step 4: cap
+    return s
+
+
 # Render hooks: per-kind one-liner builders. Defaults to a generic
 # "<kind>: <event-type-specific note>" if no specialized renderer fits.
 def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "tool_denied":
         tool = ev.get("tool") or ev.get("name") or "?"
-        reason = ev.get("reason") or ev.get("error") or ""
+        reason = _sanitize_field(ev.get("reason") or ev.get("error") or "")
         suffix = f": {reason}" if reason else ""
         return f"tool_denied {tool}{suffix}"
     if rule_kind == "tool_budget":
@@ -1080,17 +1109,17 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"check for repeated heartbeat alerts or autonomous send loops"
         )
     if rule_kind == "saga_query_error":
-        return f"SAGA query failed: {ev.get('error') or '(no detail)'}"
+        return f"SAGA query failed: {_sanitize_field(ev.get('error') or '(no detail)')}"
     if rule_kind == "saga_feedback_error":
-        return f"SAGA feedback failed: {ev.get('error') or '(no detail)'}"
+        return f"SAGA feedback failed: {_sanitize_field(ev.get('error') or '(no detail)')}"
     if rule_kind == "saga_consolidate_error":
-        return f"SAGA consolidation failed: {ev.get('error') or '(no detail)'}"
+        return f"SAGA consolidation failed: {_sanitize_field(ev.get('error') or '(no detail)')}"
     if rule_kind == "saga_decay_error":
-        return f"SAGA decay failed: {ev.get('error') or '(no detail)'}"
+        return f"SAGA decay failed: {_sanitize_field(ev.get('error') or '(no detail)')}"
     if rule_kind == "auto_dispatch_failed":
         bridge = ev.get("bridge") or "?"
         ch = ev.get("channel_id") or "?"
-        err = ev.get("error") or "(no detail)"
+        err = _sanitize_field(ev.get("error") or "(no detail)")
         return (
             f"auto-dispatch reply failed via {bridge} on {ch}: {err}. "
             f"Your text was generated but not delivered. "
@@ -1099,14 +1128,14 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "saga_forget_error":
         dry = ev.get("dry_run")
         suffix = " (dry_run)" if dry else ""
-        return f"SAGA forget failed{suffix}: {ev.get('error') or '(no detail)'}"
+        return f"SAGA forget failed{suffix}: {_sanitize_field(ev.get('error') or '(no detail)')}"
     if rule_kind == "synth_dispatch_fail":
-        return f"SAGA synthesis dispatch failed: {ev.get('error') or '(no detail)'}"
+        return f"SAGA synthesis dispatch failed: {_sanitize_field(ev.get('error') or '(no detail)')}"
     if rule_kind == "synth_empty_window":
         return (
             f"SAGA synthesis ran with empty turn window "
             f"(session={ev.get('saga_session_id') or '?'}); "
-            f"{ev.get('reason') or 'no detail'}"
+            f"{_sanitize_field(ev.get('reason') or 'no detail')}"
         )
     if rule_kind == "cost_rate":
         rate = ev.get("rate_now_usd_per_hour")
@@ -1169,7 +1198,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         )
     if rule_kind == "introspection_error":
         return (
-            f"introspection report failed: {ev.get('error') or '(no detail)'}"
+            f"introspection report failed: {_sanitize_field(ev.get('error') or '(no detail)')}"
         )
     if rule_kind == "predictions_pending":
         n = ev.get("count")
@@ -1282,7 +1311,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return "oauth usage poll ok"
     if rule_kind == "oauth_usage_failed":
         stage = ev.get("stage") or "?"
-        err = ev.get("error") or "(no detail)"
+        err = _sanitize_field(ev.get("error") or "(no detail)")
         status = ev.get("status")
         suffix = f" [HTTP {status}]" if status is not None else ""
         return f"oauth usage poll failed at {stage}{suffix}: {err}"
@@ -1347,14 +1376,14 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         )
     if rule_kind == "git_commit_failed":
         stage = ev.get("stage") or "?"
-        err = ev.get("error") or "(no detail)"
+        err = _sanitize_field(ev.get("error") or "(no detail)")
         return (
             f"git commit failed at {stage}: {err}. "
             f"Tracked-state changes from this turn are NOT staged. "
             f"Investigate /mimir-home git status; next successful turn re-tries."
         )
     if rule_kind == "git_push_failed":
-        reason = ev.get("reason") or "(no detail)"
+        reason = _sanitize_field(ev.get("reason") or "(no detail)")
         rc = ev.get("returncode")
         rc_suffix = f" [rc={rc}]" if rc is not None else ""
         return (
@@ -1363,7 +1392,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"once connectivity / auth is restored."
         )
     if rule_kind == "git_pull_blocked":
-        reason = ev.get("reason") or "(no detail)"
+        reason = _sanitize_field(ev.get("reason") or "(no detail)")
         return (
             f"git pull blocked: {reason}. Container's local branch has "
             f"diverged from remote — operator must reconcile manually "
@@ -1371,7 +1400,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         )
     if rule_kind == "shell_job_complete_enqueue_failed":
         job_id = ev.get("job_id") or "?"
-        err = ev.get("error") or "(no detail)"
+        err = _sanitize_field(ev.get("error") or "(no detail)")
         return (
             f"shell job {job_id} finished but the wake-up event "
             f"failed to enqueue: {err}. The job's exit + output are on "
@@ -1400,7 +1429,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "discord_bridge_retry":
         attempt = ev.get("attempt", "?")
         backoff = ev.get("backoff_seconds")
-        err = ev.get("error") or "(no detail)"
+        err = _sanitize_field(ev.get("error") or "(no detail)")
         backoff_str = f" (next retry in {backoff}s)" if backoff else ""
         return (
             f"Discord bridge supervisor: {attempt} consecutive retry "
@@ -1410,7 +1439,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"outbound Discord traffic is paused until reconnect."
         )
     if rule_kind == "discord_bridge_login_failure":
-        err = ev.get("error") or "(no detail)"
+        err = _sanitize_field(ev.get("error") or "(no detail)")
         return (
             f"Discord bridge: token auth permanently rejected ({err}). "
             f"Operator must rotate the bot token in `.env` "
@@ -1419,7 +1448,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"down for the rest of this container's lifetime."
         )
     if rule_kind == "discord_bridge_intents_failure":
-        err = ev.get("error") or "(no detail)"
+        err = _sanitize_field(ev.get("error") or "(no detail)")
         return (
             f"Discord bridge: privileged intents required ({err}). "
             f"Operator must enable members + message_content intents "
@@ -1429,8 +1458,8 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "slack_bridge_retry":
         attempt = ev.get("attempt", "?")
         backoff = ev.get("backoff_seconds")
-        slack_err = ev.get("slack_error") or ""
-        err = ev.get("error") or "(no detail)"
+        slack_err = _sanitize_field(ev.get("slack_error") or "")
+        err = _sanitize_field(ev.get("error") or "(no detail)")
         backoff_str = f" (next retry in {backoff}s)" if backoff else ""
         slack_err_str = f" slack-error={slack_err}" if slack_err else ""
         return (
@@ -1441,7 +1470,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"Inbound + outbound Slack traffic is paused until reconnect."
         )
     if rule_kind == "slack_bridge_auth_failure":
-        slack_err = ev.get("slack_error") or "(unknown)"
+        slack_err = _sanitize_field(ev.get("slack_error") or "(unknown)")
         return (
             f"Slack bridge: terminal auth failure ({slack_err}). "
             f"Operator must rotate the Slack bot/app tokens in `.env` "
@@ -1473,7 +1502,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
                 f"claude_code spawn {job_id} ({agent_name}){duration_str}{cost_str} "
                 f"completed cleanly"
             )
-        terminal = ev.get("terminal_reason") or "?"
+        terminal = _sanitize_field(ev.get("terminal_reason") or "?")
         if rule_kind == "spawn_auth_fail":
             status = ev.get("api_error_status")
             status_str = f" [HTTP {status}]" if status is not None else ""
@@ -1546,8 +1575,8 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"snoozing again."
         )
     if rule_kind == "react":
-        emoji = ev.get("emoji") or "?"
-        author = ev.get("author") or "?"
+        emoji = _sanitize_field(ev.get("emoji") or "?")
+        author = _sanitize_field(ev.get("author") or "?")
         target_age = ev.get("target_age_minutes")
         age_suffix = ""
         if isinstance(target_age, (int, float)):
@@ -1562,12 +1591,10 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f'react("{emoji}") from {author}{age_suffix}'
     if rule_kind == "error":
         # Generic error event; surface .where + .error if present.
-        # Collapse whitespace so multi-line tracebacks don't break the
-        # markdown bullet structure of the Recent feedback signals
-        # block.
+        # _sanitize_field collapses whitespace (including newlines from
+        # tracebacks) and strips control characters — chainlink #224.
         where = ev.get("where") or ev.get("source") or "?"
-        msg = ev.get("error") or ev.get("message") or "(no detail)"
-        msg = " ".join(str(msg).split())
+        msg = _sanitize_field(ev.get("error") or ev.get("message") or "(no detail)")
         return f"error in {where}: {msg}"
     if rule_kind == "algedonic_escalation":
         kind = ev.get("kind") or "?"
@@ -1593,7 +1620,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         detail = ", ".join(parts) if parts else "(no detail)"
         return f"proposed-changes backlog: {detail}"
     if rule_kind == "proposed_changes_backlog_error":
-        msg = ev.get("error") or "(no detail)"
+        msg = _sanitize_field(ev.get("error") or "(no detail)")
         return f"proposed-changes backlog check failed: {msg}"
     if rule_kind == "mimir_update_available":
         current = ev.get("current") or "?"
@@ -1604,7 +1631,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"`docker compose restart` installs on boot)"
         )
     if rule_kind == "mimir_update_check_error":
-        msg = ev.get("error") or "(no detail)"
+        msg = _sanitize_field(ev.get("error") or "(no detail)")
         return f"mimir update-check failed: {msg}"
     if rule_kind == "mimir_update_applied":
         spec = ev.get("spec") or "?"
@@ -1612,8 +1639,9 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "mimir_update_failed":
         spec = ev.get("spec") or "?"
         rc = ev.get("rc")
-        err = ev.get("error") or ev.get("stderr_tail") or ""
-        tail = f" ({err[:120]})" if err else ""
+        raw_err = ev.get("error") or ev.get("stderr_tail") or ""
+        err = _sanitize_field(raw_err, max_len=120) if raw_err else ""
+        tail = f" ({err})" if err else ""
         rc_part = f" rc={rc}" if rc is not None else ""
         return (
             f"mimir update FAILED for {spec}{rc_part}{tail} — "
@@ -1646,7 +1674,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         # Include running job id + intent prefix for operator audit
         # without requiring reading turn transcripts.
         running_job_id = ev.get("running_job_id") or "?"
-        intent = ev.get("intent_prefix") or "?"
+        intent = _sanitize_field(ev.get("intent_prefix") or "?")
         channel = ev.get("channel_id") or "?"
         return (
             f"bash_async refused same-intent respawn on {channel}: "
@@ -1656,7 +1684,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         # chainlink #201: SKILL.md frontmatter failed to parse — the skill
         # is silently omitted from the catalog until the SKILL.md is fixed.
         name = ev.get("skill_name") or "?"
-        error = ev.get("error") or "(no detail)"
+        error = _sanitize_field(ev.get("error") or "(no detail)")
         return (
             f"skill SKILL.md malformed: {name!r} — {error} "
             f"(skill omitted from catalog until fixed)"
@@ -1668,9 +1696,11 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         name = ev.get("poller") or "?"
         missing = ev.get("missing") or []
         if isinstance(missing, list):
-            missing_str = ", ".join(missing) if missing else "?"
+            missing_str = ", ".join(
+                _sanitize_field(m) for m in missing
+            ) if missing else "?"
         else:
-            missing_str = str(missing)
+            missing_str = _sanitize_field(missing)
         return (
             f"poller {name!r} skipped — missing required env: {missing_str} "
             f"(add to pass_env + provision the var)"
@@ -1679,11 +1709,13 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         # chainlink #214: pre-merge CHANGES_REQUESTED gate refused the merge.
         # Include PR number + blocking reviewer(s) so the operator can see
         # which review is blocking without reading turn transcripts.
+        # Author names come from GitHub API responses and must be sanitized
+        # before surfacing in the prompt — chainlink #224.
         pr_num = ev.get("pr") or ev.get("pr_number") or "?"
         blocking = ev.get("blocking_reviewers") or ev.get("blocking") or []
         if isinstance(blocking, list) and blocking:
             authors = ", ".join(
-                b.get("author", "?") if isinstance(b, dict) else str(b)
+                _sanitize_field(b.get("author", "?") if isinstance(b, dict) else str(b))
                 for b in blocking
             )
             return (
@@ -1695,7 +1727,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
 
 
 def _render_turn_error(rec: dict) -> str:
-    err = rec.get("error") or "(no detail)"
+    err = _sanitize_field(rec.get("error") or "(no detail)")
     return f"turn error: {err}"
 
 
