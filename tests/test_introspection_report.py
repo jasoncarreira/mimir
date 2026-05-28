@@ -89,8 +89,13 @@ def test_aggregate_groups_turns_by_trigger(tmp_path: Path):
 def test_aggregate_drops_old_turns(tmp_path: Path):
     turns = tmp_path / "turns.jsonl"
     events = tmp_path / "events.jsonl"
-    _write_turn(turns, ts=NOW - timedelta(days=1), trigger="user_message")
+    # Production-realistic append order: oldest-first (each turn is
+    # logged at the time it happens). The reader iterates the file
+    # tail newest-first and early-breaks on ts < scan_cutoff, so the
+    # file must be timestamp-monotonic for the early-break to be
+    # correct. (chainlink #244.)
     _write_turn(turns, ts=NOW - timedelta(days=30), trigger="user_message")
+    _write_turn(turns, ts=NOW - timedelta(days=1), trigger="user_message")
     rep = aggregate(turns, events, days=7, now=NOW)
     assert rep.turn_counts[0].total_turns == 1
 
