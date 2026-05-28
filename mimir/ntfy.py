@@ -392,32 +392,30 @@ def _classify_silence(
     flagging the whole window as wedge over-alerts rather than
     under-alerts.
 
-    Reads the file in reverse so the freshest suppress reason wins.
-    Never raises; on read error returns ``("wedge", None)`` (no
-    cross-check possible → fall back to existing behavior).
-    """
-    try:
-        text = events_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ("wedge", None)
+    Reads the file in reverse (via :func:`tail_jsonl_records` — 8 KiB
+    chunks from the tail, no full-file load) so the freshest suppress
+    reason wins. Early-breaks when the iterator goes past the window
+    start. Never raises; on read error returns ``("wedge", None)``.
 
-    for raw_line in reversed(text.splitlines()):
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if (
-            event.get("type") != "scheduled_tick_suppressed"
-            or event.get("channel_id") != channel_id
-        ):
-            continue
+    chainlink #244: prior shape did ``read_text()`` of a file capped at
+    300 MB, called every 10 minutes by the wedge probe — 1.8 GB/h of
+    disk reads to find a record from the last ~hour. Now O(window).
+    """
+    from ._jsonl_tail import tail_jsonl_records
+
+    for event in tail_jsonl_records(events_path):
         ts_str = event.get("timestamp", "")
         try:
             ts = datetime.fromisoformat(ts_str)
         except (ValueError, TypeError):
+            continue
+        if ts <= window_start:
+            # We're past the window — older records can't contribute.
+            break
+        if (
+            event.get("type") != "scheduled_tick_suppressed"
+            or event.get("channel_id") != channel_id
+        ):
             continue
         if window_start < ts <= window_end:
             return ("suppressed", event.get("reason"))
@@ -437,20 +435,15 @@ def _last_heartbeat_timestamp(
     - no matching event is found (e.g. first boot, very small log).
 
     Never raises.
-    """
-    try:
-        text = events_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
 
-    for raw_line in reversed(text.splitlines()):
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    chainlink #244: switched from ``read_text()`` (full file in memory)
+    to :func:`tail_jsonl_records` which yields newest-first via 8 KiB
+    chunks. The freshest matching tick wins, so most calls return
+    after a handful of records.
+    """
+    from ._jsonl_tail import tail_jsonl_records
+
+    for event in tail_jsonl_records(events_path):
         if (
             event.get("type") == "scheduled_tick"
             and event.get("channel_id") == channel_id

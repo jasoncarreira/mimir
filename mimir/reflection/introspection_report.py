@@ -178,20 +178,17 @@ def _parse_ts(raw: object) -> datetime | None:
 
 
 def _iter_jsonl(path: Path) -> Iterable[dict]:
-    if not path.is_file():
-        return
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    """Yield records newest-first from ``path``.
+
+    chainlink #244: prior shape was ``read_text()`` + chronological
+    splitlines (full file in memory). Both call sites filter by
+    ``ts >= cutoff`` and skip older records — iterating newest-first
+    via :func:`tail_jsonl_records` lets them produce identical results
+    on O(window) reads instead of O(file).
+    """
+    from .._jsonl_tail import tail_jsonl_records
+
+    for rec in tail_jsonl_records(path):
         if isinstance(rec, dict):
             yield rec
 
@@ -241,8 +238,12 @@ def aggregate(
 
     for rec in _iter_jsonl(turns_log):
         ts = _parse_ts(rec.get("ts"))
-        if ts is None or ts < scan_cutoff:
+        if ts is None:
             continue
+        if ts < scan_cutoff:
+            # chainlink #244: newest-first iteration — older records
+            # can't contribute, early-stop.
+            break
 
         # Non-drift sections (tool usage, errors, etc.) still respect
         # the requested ``days`` window — only drift looks further back.
@@ -392,8 +393,12 @@ def aggregate(
     pipeline = HeartbeatPipeline()
     for rec in _iter_jsonl(events_log):
         ts = _parse_ts(rec.get("timestamp"))
-        if ts is None or ts < cutoff:
+        if ts is None:
             continue
+        if ts < cutoff:
+            # chainlink #244: newest-first iteration — older records
+            # can't contribute, early-stop.
+            break
         etype = rec.get("type")
         if etype == "scheduled_tick":
             pipeline.fired += 1

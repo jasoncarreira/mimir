@@ -532,23 +532,19 @@ def _count_events_in_window(
     end: datetime,
     type_filter: callable | None = None,
 ) -> int:
-    """Walk events.jsonl, count records whose ``timestamp`` is in
-    [start, end) and match ``type_filter`` (if set)."""
-    if not events_log.is_file():
-        return 0
+    """Count events.jsonl records whose ``timestamp`` is in [start, end)
+    and match ``type_filter`` (if set).
+
+    chainlink #244: iterates newest-first via
+    :func:`tail_jsonl_records` and early-breaks once ``ts < start`` —
+    O(window) reads instead of O(file). The events log is capped at
+    ~300 MB; the prior ``read_text()`` shape was loading the whole
+    thing per call.
+    """
+    from .._jsonl_tail import tail_jsonl_records
+
     n = 0
-    try:
-        text = events_log.read_text(encoding="utf-8")
-    except OSError:
-        return 0
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for rec in tail_jsonl_records(events_log):
         ts_raw = rec.get("timestamp")
         if not isinstance(ts_raw, str):
             continue
@@ -556,7 +552,10 @@ def _count_events_in_window(
             ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
         except ValueError:
             continue
-        if ts < start or ts >= end:
+        if ts < start:
+            # Newest-first: every subsequent record is older → done.
+            break
+        if ts >= end:
             continue
         if type_filter is not None and not type_filter(rec):
             continue
@@ -571,23 +570,16 @@ def _count_tool_calls_in_window(
     end: datetime,
     tool_name: str | None = None,
 ) -> int:
-    """Walk turns.jsonl, count tool_call events in turns whose ``ts``
-    is in [start, end). Filter by tool name when given."""
-    if not turns_log.is_file():
-        return 0
+    """Count ``tool_call`` events in turns.jsonl turns whose ``ts`` is
+    in [start, end). Filter by tool name when given.
+
+    chainlink #244: same shape as :func:`_count_events_in_window` —
+    newest-first iteration + early-break on ``ts < start``.
+    """
+    from .._jsonl_tail import tail_jsonl_records
+
     n = 0
-    try:
-        text = turns_log.read_text(encoding="utf-8")
-    except OSError:
-        return 0
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for rec in tail_jsonl_records(turns_log):
         ts_raw = rec.get("ts")
         if not isinstance(ts_raw, str):
             continue
@@ -595,7 +587,9 @@ def _count_tool_calls_in_window(
             ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
         except ValueError:
             continue
-        if ts < start or ts >= end:
+        if ts < start:
+            break
+        if ts >= end:
             continue
         for ev in rec.get("events") or []:
             if not isinstance(ev, dict):
