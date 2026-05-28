@@ -1,6 +1,11 @@
 """CLI helpers for ``mimir feedback`` subcommands (chainlink #198).
 
-Currently ships: ``mark-resolved`` — writer side of resolved-incidents.jsonl.
+Currently ships:
+- ``mark-resolved`` — writer side of resolved-incidents.jsonl (chainlink #198).
+- ``emit`` — write a structured event to events.jsonl from a subprocess
+  (chainlink #218).  Useful for Bash-side skill code that wants to emit
+  auditable events without touching Python internals or requiring an in-process
+  logger singleton.
 
 The consumer side (filtering in FeedbackLog.recent) was shipped in PR #372
 (chainlink #197).  This module provides the ergonomic writer so operators
@@ -159,4 +164,75 @@ def run_mark_resolved(
         f"  {would_filter} event(s) in the current 24h window now filtered."
     )
     print(f"  written to: {incidents_path}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# ``mimir feedback emit`` -- write a structured event from a subprocess
+# (chainlink #218)
+# ---------------------------------------------------------------------------
+
+
+def _parse_kv_pairs(pairs: list[str]) -> tuple[dict, str | None]:
+    """Parse ``KEY=VALUE`` strings into a dict.
+
+    Returns ``(payload_dict, error_message)`` -- ``error_message`` is None
+    on success and a human-readable string on parse failure.
+    """
+    payload: dict = {}
+    for pair in pairs:
+        if "=" not in pair:
+            return {}, f"key-value pair must use '=' separator: {pair!r}"
+        k, v = pair.split("=", 1)
+        k = k.strip()
+        if not k:
+            return {}, f"empty key in pair: {pair!r}"
+        payload[k] = v
+    return payload, None
+
+
+def run_emit_event(
+    home: Path,
+    event_type: str,
+    pairs: list[str],
+) -> int:
+    """Implement ``mimir feedback emit <event_type> [KEY=VALUE ...]``.
+
+    Appends one structured event record to ``<home>/logs/events.jsonl`` using
+    a standalone ``EventLogger`` (no in-process singleton required).  The
+    event is indistinguishable from a server-emitted event -- same JSON
+    schema, same ``timestamp`` and ``session_id`` fields.
+
+    ``session_id`` is set to ``"cli"`` to signal the event came from a
+    subprocess rather than a live turn.
+
+    Returns an integer exit code (0 = success, 1 = error).
+    """
+    # -- Parse KEY=VALUE pairs -----------------------------------------------
+    payload, parse_err = _parse_kv_pairs(pairs)
+    if parse_err is not None:
+        print(f"error: {parse_err}", file=sys.stderr)
+        return 1
+
+    # -- Advisory type check -------------------------------------------------
+    if event_type not in _known_event_types():
+        print(
+            f"warning: event type {event_type!r} not in known _EVENT_RULES keys -- "
+            f"the event will still be written (unlisted types are silently ignored "
+            f"by FeedbackLog.recent but ARE stored in events.jsonl).  "
+            f"Known types: {', '.join(sorted(_known_event_types()))}",
+            file=sys.stderr,
+        )
+
+    # -- Write the event -----------------------------------------------------
+    from .event_logger import EventLogger  # noqa: PLC0415
+
+    events_path = home / "logs" / "events.jsonl"
+    logger = EventLogger(path=events_path, session_id="cli")
+    logger.log_sync(event_type, **payload)
+
+    # -- Confirm -------------------------------------------------------------
+    print(f"emitted: {event_type!r} -> {events_path}")
+    for k, v in payload.items():
+        print(f"  {k} = {v!r}")
     return 0

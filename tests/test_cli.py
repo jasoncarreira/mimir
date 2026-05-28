@@ -1004,3 +1004,101 @@ def test_feedback_mark_resolved_unknown_type_warns(
     assert "warning" in captured.err.lower() or "warning" in captured.out.lower()
     incidents = tmp_path / "resolved-incidents.jsonl"
     assert incidents.exists()
+
+
+# ``mimir feedback emit`` CLI (chainlink #218)
+# ---------------------------------------------------------------------------
+
+
+def test_feedback_emit_writes_event_to_jsonl(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``mimir feedback emit`` appends one valid JSON record to events.jsonl."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "emit",
+            "pr_merge_blocked_by_changes_requested",
+            "pr=42",
+            "author=mimir-bot",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "emitted" in captured.out
+    assert "pr_merge_blocked_by_changes_requested" in captured.out
+
+    events_path = tmp_path / "logs" / "events.jsonl"
+    assert events_path.exists()
+    records = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["type"] == "pr_merge_blocked_by_changes_requested"
+    assert rec["pr"] == "42"
+    assert rec["author"] == "mimir-bot"
+    assert rec["session_id"] == "cli"
+    assert "timestamp" in rec
+
+
+def test_feedback_emit_no_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``mimir feedback emit`` works with no KEY=VALUE pairs."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "emit",
+            "git_push_ok",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    events_path = tmp_path / "logs" / "events.jsonl"
+    records = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+    assert len(records) == 1
+    assert records[0]["type"] == "git_push_ok"
+    # No extra keys beyond the standard envelope fields
+    assert "pr" not in records[0]
+
+
+def test_feedback_emit_invalid_pair_exits_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A KEY=VALUE pair missing '=' exits with code 1 and writes nothing."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "emit",
+            "git_push_ok",
+            "bad-pair",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "error" in captured.err.lower()
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
+
+
+def test_feedback_emit_unknown_type_warns_but_writes(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """An unrecognised event type emits a warning but still writes the event."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "emit",
+            "totally_custom_event_type",
+            "key=val",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "warning" in captured.err.lower()
+    events_path = tmp_path / "logs" / "events.jsonl"
+    assert events_path.exists()
+    records = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+    assert records[0]["type"] == "totally_custom_event_type"
+    assert records[0]["key"] == "val"
