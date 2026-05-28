@@ -261,7 +261,7 @@ class SlackBridge(Bridge):
     # documented to redeliver events on ACK loss. Bounded LRU keyed on
     # the message ``ts`` (unique within the workspace).
     _seen_ids: SeenIdCache = field(
-        default_factory=lambda: SeenIdCache(maxlen=1000),
+        default_factory=SeenIdCache,
         init=False, repr=False,
     )
 

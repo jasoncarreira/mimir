@@ -416,6 +416,7 @@ async def test_on_message_dedupes_socket_mode_redelivery(bridge_with_fake_app):
     event = {
         "user": "U05ALICE",
         "channel": "C01ENG",
+        "channel_type": "channel",
         "text": "hello mimir",
         "ts": "1234567890.000042",
     }
@@ -435,6 +436,7 @@ async def test_on_message_does_not_dedupe_distinct_ts(bridge_with_fake_app):
             {
                 "user": "U05ALICE",
                 "channel": "C01ENG",
+                "channel_type": "channel",
                 "text": f"msg {ts}",
                 "ts": ts,
             }

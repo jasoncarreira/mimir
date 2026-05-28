@@ -31,10 +31,13 @@ class TestSeenIdCacheBasic:
 
     def test_empty_string_treated_as_new(self) -> None:
         """A bridge without a source_id must still forward the message —
-        we can't dedup what we can't identify."""
+        we can't dedup what we can't identify. The empty key is also NOT
+        stored, so a stream of unidentified messages can't fill the cache."""
         cache = SeenIdCache()
         assert cache.add_if_new("") is True
         assert cache.add_if_new("") is True  # not recorded, still True
+        assert len(cache) == 0
+        assert "" not in cache
 
 
 class TestSeenIdCacheEviction:

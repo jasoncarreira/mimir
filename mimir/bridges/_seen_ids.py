@@ -11,6 +11,13 @@ falls out when the cap is hit. Per-bridge instances live for the bridge
 process lifetime; the bridge supervisor's restart will reset the cache,
 which is fine: a redelivery that crosses a restart is already a
 boundary the protocol layer should have ACK'd.
+
+Scope: only the Slack and Discord bridges integrate this cache. The
+WebChat bridge generates its ``source_id`` via ``uuid.uuid4().hex[:12]``
+at enqueue time so redelivery isn't structurally possible — no cache
+needed. Bench / poller-injected events also bypass this bridge-side
+check; if cross-source dedup is ever needed, lift the check into
+``mimir.dispatcher``.
 """
 
 from __future__ import annotations

@@ -311,8 +311,8 @@ class DiscordBridge(Bridge):
     # protocol redelivers around disconnects, which would otherwise cause
     # the agent to run two turns answering the same message. Bounded LRU
     # keyed on the Discord message id (a globally unique snowflake).
-    _seen_ids: "SeenIdCache" = field(
-        default_factory=lambda: SeenIdCache(maxlen=1000),
+    _seen_ids: SeenIdCache = field(
+        default_factory=SeenIdCache,
         init=False, repr=False,
     )
 
@@ -754,8 +754,14 @@ class DiscordBridge(Bridge):
         # chainlink #232: dedup before any work — Discord's resume
         # protocol can redeliver around disconnects, and we don't want
         # to download attachments or burn an agent turn on a redelivery.
-        source_id = str(getattr(message, "id", "") or "") or None
-        if source_id is not None and not self._seen_ids.add_if_new(source_id):
+        # Use explicit None-check so a hypothetical id=0 (snowflakes
+        # never are, but bridge adapters may copy the pattern) still
+        # dedupes rather than bypassing the cache.
+        _raw_message_id = getattr(message, "id", None)
+        source_id = str(_raw_message_id) if _raw_message_id is not None else None
+        # Truthy-check matches the Slack bridge pattern; SeenIdCache also
+        # treats empty strings as "no id" so this is doubly safe.
+        if source_id and not self._seen_ids.add_if_new(source_id):
             log.debug(
                 "DiscordBridge: duplicate inbound message dropped "
                 "(source_id=%s) — Discord resume-protocol redelivery",
@@ -840,7 +846,7 @@ class DiscordBridge(Bridge):
             author=author_key,
             author_display=author_display,
             author_id=author_id,
-            source_id=str(getattr(message, "id", "") or "") or None,
+            source_id=source_id,
             source="discord",
             attachment_names=attachment_paths,
             extra={
