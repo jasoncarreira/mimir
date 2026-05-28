@@ -169,6 +169,13 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # wrong thing in the ``env`` block — surface as a negative so the
     # algedonic block catches it without requiring a crash.
     "poller_env_secret_reintroduced": ("negative", "poller_env_secret_reintroduced"),
+    # chainlink #229: hard-deny on process-control / loader env vars in
+    # ``pass_env`` (LD_PRELOAD, PYTHONPATH, DYLD_*, etc.). Unlike the
+    # named-secret event above which fires AND propagates the value, this
+    # one fires AND BLOCKS — the var is not passed to the subprocess.
+    # Operators see the block in the algedonic block so a manifest typo
+    # or supply-chain regression doesn't go silent.
+    "poller_env_process_control_blocked": ("negative", "poller_env_process_control_blocked"),
     # chainlink #108: env_required validation — emitted when a poller's
     # declared required env vars are absent from the assembled subprocess
     # env.  The poller run is skipped entirely for that tick.  Negative so
