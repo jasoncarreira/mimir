@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# .git/hooks/pre-push — staleness gate for mimir source-code branches.
+#
+# Refuses a push to origin when the branch's merge-base against
+# origin/main is not the current origin/main tip.  A stale base means
+# other PRs have merged to main since this branch was last rebased;
+# pushing anyway would silently revert their work when this PR is
+# squash-merged.
+#
+# Installed automatically by mimir server startup via
+# git_bootstrap.ensure_workspace_hooks().
+# See: mimir/skills/github/SKILL.md §"Pre-push staleness gate" (chainlink #219)
+#
+# Bypass (only when you have confirmed the diff is within scope):
+#   git push --no-verify
+
+set -euo pipefail
+
+remote="$1"
+
+# Only enforce against the canonical upstream.
+if [ "$remote" != "origin" ]; then
+    exit 0
+fi
+
+# Fetch latest origin/main so we have the current tip.
+if ! git fetch --quiet origin main 2>/dev/null; then
+    echo "pre-push: could not fetch origin/main — skipping staleness check" >&2
+    exit 0
+fi
+
+MERGE_BASE=$(git merge-base HEAD origin/main 2>/dev/null) || {
+    echo "pre-push: merge-base check failed — skipping" >&2
+    exit 0
+}
+MAIN_TIP=$(git rev-parse origin/main 2>/dev/null) || {
+    echo "pre-push: could not resolve origin/main — skipping" >&2
+    exit 0
+}
+
+if [ "$MERGE_BASE" != "$MAIN_TIP" ]; then
+    BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "<unknown>")
+    echo "pre-push: STALE BASE on branch '$BRANCH'" >&2
+    echo "  merge-base : $MERGE_BASE" >&2
+    echo "  origin/main: $MAIN_TIP" >&2
+    echo "" >&2
+    echo "  Other PRs have merged to main since this branch was last rebased." >&2
+    echo "  Pushing now would silently revert their work on squash-merge." >&2
+    echo "" >&2
+    echo "  Fix: git fetch origin main && git rebase origin/main" >&2
+    echo "  Then verify scope: git diff origin/main..HEAD --name-only" >&2
+    echo "" >&2
+    echo "  Bypass (only if diff is confirmed in-scope): git push --no-verify" >&2
+    exit 1
+fi
+
+exit 0

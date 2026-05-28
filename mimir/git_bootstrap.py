@@ -456,6 +456,38 @@ def _ensure_hook(home: Path, result: BootstrapResult) -> None:
     result.hook_written = True
 
 
+def ensure_workspace_hooks(workspace: Path) -> bool:
+    """Install the pre-push staleness-gate hook to a source-code workspace
+    repo (e.g., ``/workspace/mimir``).
+
+    Idempotent — overwrites the existing hook so a template update
+    propagates on the next server startup. Distinct from
+    ``_ensure_hook``, which manages the pre-commit secret-scan hook for
+    the state (home) repo: the pre-push hook is for source repos where
+    branch staleness matters (squash-merge silently reverts landed work).
+
+    Returns ``True`` if the hook was written, ``False`` on any soft failure
+    (missing template, no ``.git/hooks`` dir). Callers should treat False
+    as advisory — the workspace is still usable.
+
+    Called unconditionally from ``server._on_startup`` for
+    ``/workspace/mimir`` when that path exists; gate is independent of
+    ``git_tracking_enabled`` since it protects pushes, not state commits.
+    """
+    hook_dir = workspace / ".git" / "hooks"
+    if not hook_dir.is_dir():
+        return False
+    src = _TEMPLATES_DIR / "pre-push"
+    if not src.is_file():
+        log.warning("pre-push template missing at %s — staleness gate not installed", src)
+        return False
+    target = hook_dir / "pre-push"
+    shutil.copyfile(src, target)
+    target.chmod(0o755)
+    log.debug("pre-push staleness-gate hook installed at %s", target)
+    return True
+
+
 def _install_credential_helper(
     home: Path,
     state_repo: str,
