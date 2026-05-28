@@ -1061,6 +1061,7 @@ def _synthesize_chain_signals(
 # ---------------------------------------------------------------------------
 
 _FIELD_MAX_LEN = 240  # per-field cap for sanitized event-payload strings
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _sanitize_field(value: object, max_len: int = _FIELD_MAX_LEN) -> str:
@@ -1078,7 +1079,7 @@ def _sanitize_field(value: object, max_len: int = _FIELD_MAX_LEN) -> str:
       4. Truncate to *max_len* chars with "…" suffix on overflow.
     """
     s = " ".join(str(value).split())  # step 1+2: coerce + collapse whitespace
-    s = re.sub(r"[\x00-\x1f\x7f]", "", s)  # step 3: strip residual controls
+    s = _CONTROL_CHARS_RE.sub("", s)  # step 3: strip residual controls
     if len(s) > max_len:
         s = s[: max_len - 1] + "…"  # step 4: cap
     return s
@@ -1529,9 +1530,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         # carries the canonical pending list; this is the
         # attention-grabber on the most-recently-due one.
         cid = ev.get("commitment_id") or "?"
-        text = (ev.get("text") or "").strip()
-        if len(text) > 80:
-            text = text[:77] + "..."
+        text = _sanitize_field(ev.get("text") or "", max_len=80)
         channel = ev.get("channel_id")
         recipient = ev.get("recipient_identity")
         scope_parts: list[str] = []
@@ -1546,9 +1545,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         # in the agent's "things to notice" block. Same shape as the
         # _due line above; the polarity is the load-bearing difference.
         cid = ev.get("commitment_id") or "?"
-        text = (ev.get("text") or "").strip()
-        if len(text) > 80:
-            text = text[:77] + "..."
+        text = _sanitize_field(ev.get("text") or "", max_len=80)
         channel = ev.get("channel_id")
         scope = f" [chan={channel}]" if channel else ""
         return (
@@ -1564,9 +1561,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         # the line surfaces ONCE in the algedonic block even as the
         # poller fires it on every tick.
         cid = ev.get("commitment_id") or "?"
-        text = (ev.get("text") or "").strip()
-        if len(text) > 80:
-            text = text[:77] + "..."
+        text = _sanitize_field(ev.get("text") or "", max_len=80)
         n = ev.get("snooze_count", "?")
         threshold = ev.get("threshold", "?")
         return (
