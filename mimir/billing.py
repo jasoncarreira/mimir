@@ -179,25 +179,40 @@ _ANTHROPIC_WINDOW_HOURS: dict[str, float] = {
 }
 
 
-class AnthropicQuotaProvider(QuotaProvider):
-    """Reads from :class:`RateLimitStore`. The store is populated by
-    the OAuth usage poller (``mimir/oauth_usage_poller.py``) under
-    Max-OAuth and by the SDK rate-limit capture path under direct API
-    keys. The provider doesn't care which writer landed the data —
-    it just projects from whatever's current."""
+class _StorageBackedQuotaProvider(QuotaProvider):
+    """Shared base for providers that read :class:`RateLimitStore` with a
+    fixed ``{key → window_hours}`` mapping and an optional store-key
+    prefix.
+
+    Subclasses declare three class-level attributes:
+
+    - ``_provider_name``: the string returned by :prop:`provider_name`.
+    - ``_window_hours``: ``{logical_key: hours}`` mapping.
+    - ``_store_key_prefix``: empty for canonical Anthropic, non-empty
+      for vendor-prefixed snapshots (e.g. ``"minimax_"``).
+
+    chainlink #245: the three concrete providers had ~95% identical
+    ``get_windows`` implementations differing only in the dict + prefix.
+    The chainlink #17 derived-skip and ``project_window_end`` plumbing
+    now live in one place — adding a fourth provider takes ~10 lines.
+    """
+
+    _provider_name: str = ""
+    _window_hours: dict[str, float] = {}
+    _store_key_prefix: str = ""
 
     def __init__(self, store: RateLimitStore) -> None:
         self._store = store
 
     @property
     def provider_name(self) -> str:
-        return "anthropic"
+        return self._provider_name
 
     def get_windows(self) -> list[QuotaWindow]:
         out: list[QuotaWindow] = []
         snaps = self._store.current()
-        for key, hours in _ANTHROPIC_WINDOW_HOURS.items():
-            snap = snaps.get(key)
+        for key, hours in self._window_hours.items():
+            snap = snaps.get(f"{self._store_key_prefix}{key}")
             if snap is None:
                 continue
             is_derived = getattr(snap, "derived", False)
@@ -232,6 +247,18 @@ class AnthropicQuotaProvider(QuotaProvider):
         return out
 
 
+class AnthropicQuotaProvider(_StorageBackedQuotaProvider):
+    """Reads from :class:`RateLimitStore`. The store is populated by
+    the OAuth usage poller (``mimir/oauth_usage_poller.py``) under
+    Max-OAuth and by the SDK rate-limit capture path under direct API
+    keys. The provider doesn't care which writer landed the data —
+    it just projects from whatever's current."""
+
+    _provider_name = "anthropic"
+    _window_hours = _ANTHROPIC_WINDOW_HOURS
+    _store_key_prefix = ""
+
+
 # ─── Minimax concrete implementation (stub — Issue #243) ──────────────
 
 
@@ -248,7 +275,7 @@ _MINIMAX_WINDOW_HOURS: dict[str, float] = {
 }
 
 
-class MinimaxQuotaProvider(QuotaProvider):
+class MinimaxQuotaProvider(_StorageBackedQuotaProvider):
     """Reads Minimax subscription quota windows from
     :class:`RateLimitStore`. The store is populated by the Minimax-
     side usage poller (TODO — Issue #243), which mirrors the
@@ -259,9 +286,7 @@ class MinimaxQuotaProvider(QuotaProvider):
     **Today: stub.** Until the usage poller lands, ``get_windows``
     returns the empty list — the arbiter treats that as "no signal"
     and falls through to cost-rate-only suppression (or accepts the
-    spike-ratio default). Once the poller is wired, the snapshot read
-    here transcribes the cached values into ``QuotaWindow``
-    objects.
+    spike-ratio default).
 
     The provider is registered automatically for Minimax-compat
     deployments (``ANTHROPIC_BASE_URL`` pointing at
@@ -270,49 +295,9 @@ class MinimaxQuotaProvider(QuotaProvider):
     ``AnthropicQuotaProvider``.
     """
 
-    #: ``RateLimitStore`` key prefix for Minimax-side snapshots. The
-    #: poller writes keys like ``minimax_five_hour``; this provider
-    #: reads them back.
-    _STORE_KEY_PREFIX = "minimax_"
-
-    def __init__(self, store: RateLimitStore) -> None:
-        self._store = store
-
-    @property
-    def provider_name(self) -> str:
-        return "minimax"
-
-    def get_windows(self) -> list[QuotaWindow]:
-        # TODO(#243): once Minimax usage poller lands, walk
-        # _MINIMAX_WINDOW_HOURS and transcribe store snapshots to
-        # QuotaWindow with on_pace projections (same shape as
-        # AnthropicQuotaProvider above). For now: no data → empty
-        # list → arbiter treats as "no signal" (safe fallback).
-        out: list[QuotaWindow] = []
-        snaps = self._store.current()
-        for key, hours in _MINIMAX_WINDOW_HOURS.items():
-            snap = snaps.get(f"{self._STORE_KEY_PREFIX}{key}")
-            if snap is None:
-                continue
-            is_derived = getattr(snap, "derived", False)
-            if is_derived:
-                on_pace = None
-            else:
-                proj = project_window_end(snap, hours)
-                on_pace = (
-                    proj.on_pace_utilization if proj is not None else None
-                )
-            out.append(
-                QuotaWindow(
-                    key=key,
-                    window_hours=hours,
-                    utilization=snap.utilization,
-                    on_pace_utilization=on_pace,
-                    resets_at=snap.resets_at,
-                    derived=is_derived,
-                )
-            )
-        return out
+    _provider_name = "minimax"
+    _window_hours = _MINIMAX_WINDOW_HOURS
+    _store_key_prefix = "minimax_"
 
 
 # ─── OpenAI concrete implementation (stub — Codex Plus subscription) ──
@@ -329,7 +314,7 @@ _OPENAI_WINDOW_HOURS: dict[str, float] = {
 }
 
 
-class OpenAIQuotaProvider(QuotaProvider):
+class OpenAIQuotaProvider(_StorageBackedQuotaProvider):
     """Reads OpenAI Codex Plus / Pro subscription quota windows from
     :class:`RateLimitStore`.
 
@@ -343,17 +328,9 @@ class OpenAIQuotaProvider(QuotaProvider):
     * ``x-codex-secondary-*`` — long window (typically weekly)
     * ``x-codex-credits-*`` — credits balance
 
-    So the writer that populates ``openai_five_hour`` /
-    ``openai_seven_day`` in the store will be a response-header
-    interceptor on the LangChain Codex client (TODO — follow-up PR
-    requires a Codex Plus client integration first; the OpenAI Codex
-    subscription protocol hits ``chatgpt.com/backend-api/codex/
-    responses``, which is different from ``api.openai.com/v1/chat/
-    completions``).
-
-    **Today: stub.** Returns ``[]`` until the header extractor lands;
-    the arbiter treats empty as "no signal" and falls through to
-    cost-rate suppression — safe fallback.
+    The writer that populates ``openai_five_hour`` /
+    ``openai_seven_day`` in the store is :func:`make_codex_plus_rate_limit_callback`
+    — a response-header interceptor on the LangChain Codex client.
 
     Registered when ``MIMIR_MODEL_SPEC`` starts with ``openai:`` AND
     the billing mode is QUOTA (operator declared subscription tier
@@ -361,52 +338,15 @@ class OpenAIQuotaProvider(QuotaProvider):
     against ``api.openai.com`` get no quota provider — cost-rate
     handles that side.
 
-    Token storage (for the eventual Codex Plus client): Codex CLI
-    persists OAuth tokens at ``$CODEX_HOME/auth.json`` (defaults to
+    Token storage (for the Codex Plus client): Codex CLI persists
+    OAuth tokens at ``$CODEX_HOME/auth.json`` (defaults to
     ``~/.codex/auth.json``). Operators run ``codex login`` to
     populate it.
     """
 
-    _STORE_KEY_PREFIX = "openai_"
-
-    def __init__(self, store: RateLimitStore) -> None:
-        self._store = store
-
-    @property
-    def provider_name(self) -> str:
-        return "openai"
-
-    def get_windows(self) -> list[QuotaWindow]:
-        # TODO: once OpenAI usage poller lands, walk
-        # _OPENAI_WINDOW_HOURS and transcribe store snapshots to
-        # QuotaWindow with on_pace projections. Until then: no
-        # ``openai_*`` keys in the store → empty list → arbiter
-        # treats as "no signal" (safe fallback).
-        out: list[QuotaWindow] = []
-        snaps = self._store.current()
-        for key, hours in _OPENAI_WINDOW_HOURS.items():
-            snap = snaps.get(f"{self._STORE_KEY_PREFIX}{key}")
-            if snap is None:
-                continue
-            is_derived = getattr(snap, "derived", False)
-            if is_derived:
-                on_pace = None
-            else:
-                proj = project_window_end(snap, hours)
-                on_pace = (
-                    proj.on_pace_utilization if proj is not None else None
-                )
-            out.append(
-                QuotaWindow(
-                    key=key,
-                    window_hours=hours,
-                    utilization=snap.utilization,
-                    on_pace_utilization=on_pace,
-                    resets_at=snap.resets_at,
-                    derived=is_derived,
-                )
-            )
-        return out
+    _provider_name = "openai"
+    _window_hours = _OPENAI_WINDOW_HOURS
+    _store_key_prefix = "openai_"
 
 
 # ─── Writer side: ChatCodexPlus → RateLimitStore ──────────────────────
