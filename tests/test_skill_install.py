@@ -1326,6 +1326,49 @@ def _make_home_with_skills(tmp_path: Path) -> Path:
     return home
 
 
+# ─── _skill_env_summary ───────────────────────────────────────────────
+
+_SKILL_WITH_ENV = """\
+---
+name: needs-key
+description: A skill that needs an API key.
+env:
+  required:
+    - name: NEEDS_KEY_API_KEY
+      description: "The required API key"
+      example: "abc123"
+---
+body
+"""
+
+_SKILL_NO_ENV = """\
+---
+name: no-env-skill
+description: A plain skill with no env: block.
+---
+body
+"""
+
+
+def _make_fake_home(tmp_path: Path) -> Path:
+    """Create a minimal home structure with .mimir_builtin_skills/."""
+    home = tmp_path / "home"
+    builtin_root = home / ".mimir_builtin_skills"
+    builtin_root.mkdir(parents=True)
+
+    # Skill with env: block
+    skill_dir = builtin_root / "needs-key"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(_SKILL_WITH_ENV)
+
+    # Skill without env: block (should not appear in summary)
+    no_env_dir = builtin_root / "no-env-skill"
+    no_env_dir.mkdir()
+    (no_env_dir / "SKILL.md").write_text(_SKILL_NO_ENV)
+
+    return home
+
+
 def test_find_skill_path_installed_skill(tmp_path):
     home = _make_home_with_skills(tmp_path)
     result = find_skill_path(home, "opt-skill")
@@ -1492,3 +1535,66 @@ def test_cmd_configure_fresh_home_hint_mentions_setup(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "not found" in out
     assert "mimir setup" in out
+
+
+def test_skill_env_summary_returns_skills_with_env_blocks(tmp_path):
+    from mimir.cli import _skill_env_summary
+
+    home = _make_fake_home(tmp_path)
+    result = _skill_env_summary(str(home))
+    assert len(result) == 1
+    entry = result[0]
+    assert entry["name"] == "needs-key"
+    assert len(entry["required"]) == 1
+    assert entry["required"][0]["name"] == "NEEDS_KEY_API_KEY"
+    # Var not set in test env → set=False
+    assert entry["required"][0]["set"] is False
+    assert entry["optional"] == []
+
+
+def test_skill_env_summary_set_true_when_var_in_environ(tmp_path, monkeypatch):
+    from mimir.cli import _skill_env_summary
+
+    home = _make_fake_home(tmp_path)
+    monkeypatch.setenv("NEEDS_KEY_API_KEY", "test-key-value")
+    result = _skill_env_summary(str(home))
+    assert len(result) == 1
+    assert result[0]["required"][0]["set"] is True
+
+
+def test_skill_env_summary_operator_skill_shadows_builtin(tmp_path):
+    """An operator skill in <home>/skills/ shadows same-named builtin."""
+    from mimir.cli import _skill_env_summary
+
+    home = _make_fake_home(tmp_path)
+
+    # Operator version of the same skill — different (empty) env: block
+    op_skill_dir = home / "skills" / "needs-key"
+    op_skill_dir.mkdir(parents=True)
+    (op_skill_dir / "SKILL.md").write_text(_SKILL_NO_ENV.replace(
+        "name: no-env-skill", "name: needs-key"
+    ))
+
+    result = _skill_env_summary(str(home))
+    # Operator copy has no env: block → summary should be empty
+    assert result == []
+
+
+def test_skill_env_summary_weather_and_ntfy_have_env_blocks():
+    """Integration: bundled weather + ntfy SKILL.md declare env: blocks."""
+    from pathlib import Path as P
+    from mimir.skill_md import parse_env_block
+
+    bundled_root = P(__file__).parent.parent / "mimir" / "skills"
+    for skill_name, expected_var in [
+        ("weather", "OPENWEATHER_API_KEY"),
+        ("ntfy", "NTFY_TOPIC"),
+    ]:
+        skill_md = bundled_root / skill_name / "SKILL.md"
+        assert skill_md.is_file(), f"bundled skill SKILL.md not found: {skill_md}"
+        req, _ = parse_env_block(skill_md.read_text())
+        req_names = [r["name"] for r in req]
+        assert expected_var in req_names, (
+            f"{skill_name}/SKILL.md expected required env var {expected_var!r}; "
+            f"got: {req_names}"
+        )

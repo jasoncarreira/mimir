@@ -1,6 +1,11 @@
 ---
 name: weather
 description: Get current conditions and 5-day forecast for a city via OpenWeatherMap. Requires `OPENWEATHER_API_KEY` in the environment. Use when the user asks about weather or when planning anything where weather is load-bearing (outdoor events, travel, watering schedules).
+env:
+  required:
+    - name: OPENWEATHER_API_KEY
+      description: "API key from openweathermap.org — sign up for a free account at https://openweathermap.org/api to get one."
+      example: "abc1234def5678gh"
 success_criteria:
   # The skill's job is to run get_weather and report. If we loaded
   # the SKILL.md but never invoked the script, the question wasn't
