@@ -148,6 +148,104 @@ def test_install_missing_skill_raises_filenotfound(
         )
 
 
+# chainlink #225 — path-traversal guard on `name`. Each test exercises a
+# distinct attack shape and asserts ValueError is raised BEFORE any
+# filesystem mutation (no rmtree, no copytree).
+
+@pytest.mark.parametrize("bad_name", [
+    "../foo",
+    "../../tmp/foo",
+    "..",
+    "../",
+    "foo/../bar",
+])
+def test_install_rejects_path_traversal_via_dotdot(
+    bad_name: str, fake_optional_root: Path, fake_home: Path,
+):
+    """chainlink #225: install() must refuse a name that resolves outside
+    the skills root. Pre-fix, ``--force`` would rmtree the resolved path
+    happily.
+    """
+    with pytest.raises(ValueError, match="separator|'\\.\\.'|start with"):
+        install(
+            bad_name, fake_home, force=True,
+            optional_skills_root=fake_optional_root,
+        )
+
+
+@pytest.mark.parametrize("bad_name", [
+    "foo/bar",
+    "foo\\bar",
+    "/etc/passwd",
+])
+def test_install_rejects_path_separators(
+    bad_name: str, fake_optional_root: Path, fake_home: Path,
+):
+    """chainlink #225: forward and back slashes are rejected since the
+    skills root is a flat directory of skill names.
+    """
+    with pytest.raises(ValueError, match="separator"):
+        install(
+            bad_name, fake_home, force=True,
+            optional_skills_root=fake_optional_root,
+        )
+
+
+@pytest.mark.parametrize("bad_name", [
+    ".hidden",
+    ".",
+    ".cache",
+])
+def test_install_rejects_leading_dot(
+    bad_name: str, fake_optional_root: Path, fake_home: Path,
+):
+    """chainlink #225: leading-dot names are reserved + catch ``..`` too."""
+    with pytest.raises(ValueError, match="start with"):
+        install(
+            bad_name, fake_home, force=True,
+            optional_skills_root=fake_optional_root,
+        )
+
+
+@pytest.mark.parametrize("bad_name", ["", "   ", "\t"])
+def test_install_rejects_empty_name(
+    bad_name: str, fake_optional_root: Path, fake_home: Path,
+):
+    """chainlink #225: empty / whitespace-only names rejected."""
+    with pytest.raises(ValueError, match="empty"):
+        install(
+            bad_name, fake_home, force=True,
+            optional_skills_root=fake_optional_root,
+        )
+
+
+def test_install_force_with_bad_name_does_not_rmtree(
+    fake_optional_root: Path, fake_home: Path, tmp_path: Path,
+):
+    """chainlink #225: the headline scenario — ``--force`` with a traversal
+    name must NOT delete anything. Plant a sentinel directory outside the
+    skills root and verify it survives.
+    """
+    sentinel = tmp_path / "sentinel-must-survive"
+    sentinel.mkdir()
+    (sentinel / "important.txt").write_text("must not be deleted")
+
+    # The traversal target would resolve under the parent of skills/ —
+    # ``<home>/skills/../../sentinel-must-survive`` resolves to
+    # ``tmp_path/sentinel-must-survive``.
+    relative_target = "../../sentinel-must-survive"
+
+    with pytest.raises(ValueError):
+        install(
+            relative_target, fake_home, force=True,
+            optional_skills_root=fake_optional_root,
+        )
+
+    # Sentinel survives.
+    assert sentinel.exists()
+    assert (sentinel / "important.txt").read_text() == "must not be deleted"
+
+
 def test_install_existing_dest_raises_without_force(
     fake_optional_root: Path, fake_home: Path,
 ):
