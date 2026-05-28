@@ -1633,6 +1633,98 @@ print('{"poller": "x", "prompt": "ok"}')
     assert "ghp_secret_should_not_appear_in_event" not in payload
 
 
+# ─── chainlink #229: pass_env hard-deny on process-control vars ─────
+
+
+@pytest.mark.asyncio
+async def test_run_poller_pass_env_ld_preload_is_blocked(
+    tmp_path: Path, home: Path, monkeypatch,
+):
+    """chainlink #229: ``pass_env: ["LD_PRELOAD"]`` must NOT propagate the
+    value. The named-secret deny-list emits a warning but still passes the
+    value through; process-control vars are different — silently injecting
+    LD_PRELOAD into a subprocess is RCE-class.
+
+    The poller subprocess echoes its observed LD_PRELOAD into the event
+    ``content`` field so we can assert the value didn't leak through.
+    """
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/evil.so")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+# Echo what the subprocess saw for LD_PRELOAD into the prompt content,
+# or 'BLOCKED' if it didn't propagate.
+val = os.environ.get('LD_PRELOAD', 'BLOCKED')
+print(json.dumps({"poller": "x", "prompt": f"observed: {val}"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("LD_PRELOAD",),
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+
+    # Event surfaced for operator visibility.
+    events = _read_events(home)
+    blocked_events = [
+        e for e in events
+        if e.get("type") == "poller_env_process_control_blocked"
+    ]
+    assert len(blocked_events) == 1, (
+        f"expected one process_control_blocked event; got {len(blocked_events)}"
+    )
+    assert blocked_events[0].get("key") == "LD_PRELOAD"
+
+    # The poller subprocess ran and emitted an event; the content shows
+    # whether LD_PRELOAD made it through. Asserting that the LITERAL
+    # poisoned value didn't leak — independent of how the event is shaped.
+    serialized = json.dumps([
+        {k: getattr(e, k, None) for k in ("content", "trigger", "source")}
+        for e in enq.events
+    ])
+    assert "/tmp/evil.so" not in serialized, (
+        f"LD_PRELOAD value leaked into the AgentEvent: {serialized}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("var_name", [
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+])
+async def test_run_poller_pass_env_process_control_vars_all_blocked(
+    var_name: str, tmp_path: Path, home: Path, monkeypatch,
+):
+    """chainlink #229: each var in the hard-deny set must be blocked."""
+    monkeypatch.setenv(var_name, "/tmp/should-not-propagate")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({"poller": "x", "prompt": "ok"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=(var_name,),
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+
+    events = _read_events(home)
+    blocked = [
+        e for e in events
+        if e.get("type") == "poller_env_process_control_blocked"
+        and e.get("key") == var_name
+    ]
+    assert len(blocked) == 1, (
+        f"{var_name} not blocked; events: {[e.get('type') for e in events]}"
+    )
+
+
 # ─── chainlink #95: poller.env secret-key warning ────────────────────
 
 

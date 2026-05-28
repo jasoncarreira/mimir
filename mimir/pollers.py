@@ -614,6 +614,25 @@ async def run_poller(
     _allowed = _BUILTIN_ALLOWLIST | extra_keys
     _DENY_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
     _DENY_PREFIXES = ("MIMIR_",)
+    # chainlink #229: hard-deny on process-control / loader env vars that
+    # can hijack the subprocess. UNLIKE the suffix/prefix patterns above
+    # (which emit ``poller_env_passthrough_named_secret`` but still
+    # propagate the value), these are NEVER passed through — even via
+    # ``pass_env``. A skill manifest containing
+    # ``pass_env: ["LD_PRELOAD"]`` would otherwise silently inject an
+    # arbitrary shared library into the poller subprocess.
+    _PROCESS_CONTROL_DENY = frozenset({
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FORCE_FLAT_NAMESPACE",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONHOME",
+        "PYTHONUSERBASE",
+    })
 
     def _allowed_env_key(k: str) -> bool:
         if k not in _allowed:
@@ -656,6 +675,17 @@ async def run_poller(
     # absence is itself the operator's signal that the env var wasn't
     # provisioned.
     for key in poller.pass_env:
+        # chainlink #229: hard-deny process-control / loader vars BEFORE
+        # the os.environ check, so the deny fires even when the var is
+        # set in os.environ (the only interesting case from a security
+        # standpoint — if it's unset, propagation is moot).
+        if key in _PROCESS_CONTROL_DENY:
+            await log_event(
+                "poller_env_process_control_blocked",
+                poller=poller.name,
+                key=key,
+            )
+            continue
         if key not in os.environ:
             continue
         env[key] = os.environ[key]
