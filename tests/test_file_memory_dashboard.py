@@ -1,4 +1,4 @@
-"""Tests for mimir.file_memory_dashboard (chainlink #223 — Phase 1 + 2).
+"""Tests for mimir.file_memory_dashboard (chainlink #223 — Phase 1 + 2 + 3).
 
 Tests cover:
   - list_tree: tree structure, .md-only filter, desc extraction, dir-first sort
@@ -6,8 +6,9 @@ Tests cover:
   - read_file_safe: success, path traversal, non-.md rejection, not-found
   - read_file_safe_multi: dispatches to correct root; rejects unknown prefix
   - search_files: hits across multiple roots, empty query, truncation
+  - list_channel_dirs: basic, missing root, no channels subdir, files excluded
   - render_memory_html: valid HTML shell with expected tokens
-  - web_ui routes: /memory HTML + /api/memory view={tree,file,search}
+  - web_ui routes: /memory HTML + /api/memory view={tree,file,search,channels}
   - Path-safety: traversal → 400, non-.md → 400, missing → 404
   - Auth-exempt: /memory in _AUTH_EXEMPT
 """
@@ -22,6 +23,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from mimir import web_ui
 from mimir.file_memory_dashboard import (
+    list_channel_dirs,
     list_tree,
     list_trees,
     read_file_safe,
@@ -499,3 +501,92 @@ def test_memory_page_is_auth_exempt() -> None:
     from mimir.server import _AUTH_EXEMPT
 
     assert ("GET", "/memory") in _AUTH_EXEMPT
+
+
+# ─── list_channel_dirs (Phase 3) ──────────────────────────────────
+
+
+def test_list_channel_dirs_basic(tmp_path: Path) -> None:
+    mem = tmp_path / "memory"
+    (mem / "channels" / "chan1").mkdir(parents=True)
+    (mem / "channels" / "chan2").mkdir(parents=True)
+    result = list_channel_dirs(mem)
+    assert result == ["chan1", "chan2"]
+
+
+def test_list_channel_dirs_sorted(tmp_path: Path) -> None:
+    mem = tmp_path / "memory"
+    for name in ["zzz", "aaa", "mmm"]:
+        (mem / "channels" / name).mkdir(parents=True)
+    result = list_channel_dirs(mem)
+    assert result == ["aaa", "mmm", "zzz"]
+
+
+def test_list_channel_dirs_missing_root(tmp_path: Path) -> None:
+    result = list_channel_dirs(tmp_path / "memory")
+    assert result == []
+
+
+def test_list_channel_dirs_no_channels_subdir(tmp_path: Path) -> None:
+    mem = tmp_path / "memory"
+    mem.mkdir()
+    result = list_channel_dirs(mem)
+    assert result == []
+
+
+def test_list_channel_dirs_excludes_files(tmp_path: Path) -> None:
+    mem = tmp_path / "memory"
+    (mem / "channels" / "chan1").mkdir(parents=True)
+    (mem / "channels" / "notadir.md").write_text("# not a dir\n")
+    result = list_channel_dirs(mem)
+    assert result == ["chan1"]
+
+
+# ─── Phase 3 HTML assertions ──────────────────────────────────────
+
+
+def test_render_memory_html_has_channel_filter() -> None:
+    html = render_memory_html()
+    assert 'id="channel-filter"' in html
+    assert 'channel-filter-box' in html
+    assert 'channel-filter-select' in html
+
+
+def test_render_memory_html_has_index_landing_js() -> None:
+    html = render_memory_html()
+    assert "findIndexMd" in html
+    assert "INDEX.md" in html
+    assert "_pathToEl" in html
+    assert "expandAndScrollToDir" in html
+
+
+def test_render_memory_html_has_populate_channel_filter() -> None:
+    html = render_memory_html()
+    assert "populateChannelFilter" in html
+
+
+# ─── /api/memory?view=channels route (Phase 3) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_api_memory_channels_empty(memory_app) -> None:
+    """When no channels/ dir exists, view=channels returns empty list."""
+    app, _ = memory_app
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/memory?view=channels")
+        assert resp.status == 200
+        body = await resp.json()
+    assert body == {"channels": []}
+
+
+@pytest.mark.asyncio
+async def test_api_memory_channels_with_dirs(memory_app) -> None:
+    """Channels present in memory/channels/ are returned sorted."""
+    app, home = memory_app
+    (home / "memory" / "channels" / "discord-111").mkdir(parents=True)
+    (home / "memory" / "channels" / "slack-222").mkdir(parents=True)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/memory?view=channels")
+        assert resp.status == 200
+        body = await resp.json()
+    assert body == {"channels": ["discord-111", "slack-222"]}

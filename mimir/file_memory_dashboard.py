@@ -14,6 +14,14 @@ Chainlink #223 — Phase 2:
   /api/memory?view=search&q=...   — full-text search across memory/ + state/
   /api/memory?view=tree           — now returns a virtual "home" root whose
                                     children are memory/ and state/ sub-trees
+
+Chainlink #223 — Phase 3:
+  INDEX.md landing — clicking a collapsed dir with an INDEX.md child opens
+                     it AND loads the INDEX.md in the right pane.
+  Channel-filter   — ``<select>`` dropdown to jump directly to any
+                     ``memory/channels/<channel_id>/`` sub-tree.
+  /api/memory?view=channels — JSON list of channel dir names under
+                              ``memory/channels/``.
 """
 
 from __future__ import annotations
@@ -231,6 +239,19 @@ def read_file_safe(root: Path, rel: str) -> dict:
         return {"error": f"read error: {exc}"}
 
 
+def list_channel_dirs(memory_root: Path) -> list[str]:
+    """Return sorted channel-id directory names under ``memory_root/channels/``.
+
+    Returns an empty list if ``memory_root`` or its ``channels/`` sub-dir
+    does not exist.  Only directory entries are returned; plain files inside
+    ``channels/`` are skipped.
+    """
+    channels_dir = memory_root / "channels"
+    if not channels_dir.exists() or not channels_dir.is_dir():
+        return []
+    return sorted(p.name for p in channels_dir.iterdir() if p.is_dir())
+
+
 # ─── HTML shell ──────────────────────────────────────────────────
 
 
@@ -386,6 +407,13 @@ _MEMORY_HTML = """<!doctype html>
       font-size: 0.82rem; outline: none; font-family: inherit;
     }
     .search-input:focus { border-color: var(--accent); }
+    .channel-filter-box { padding: 0.35rem 0.6rem; border-bottom: 1px solid var(--line); }
+    .channel-filter-select {
+      width: 100%; background: var(--paper); border: 1px solid var(--line);
+      border-radius: 6px; color: var(--ink); padding: 0.28rem 0.5rem;
+      font-size: 0.82rem; outline: none; font-family: inherit; cursor: pointer;
+    }
+    .channel-filter-select:focus { border-color: var(--accent); }
     .search-results-header {
       padding: 0.35rem 0.7rem; color: var(--muted); font-size: 0.78rem;
       border-bottom: 1px solid var(--line);
@@ -414,8 +442,13 @@ _MEMORY_HTML = """<!doctype html>
   </header>
 
   <div class="panes">
-    <!-- Left pane: search + directory tree -->
+    <!-- Left pane: channel filter + search + directory tree -->
     <div class="left-pane" id="left-pane">
+      <div class="channel-filter-box" id="channel-filter-box" style="display:none">
+        <select id="channel-filter" class="channel-filter-select">
+          <option value="">Channel&#8230;</option>
+        </select>
+      </div>
       <div class="search-box">
         <input class="search-input" id="search-input" type="search"
                placeholder="Search files..." autocomplete="off" />
@@ -475,6 +508,17 @@ function esc(s) {
 
 // ── Tree rendering ────────────────────────────────────────────────
 let _selectedFileEl = null;
+// Phase 3: path → DOM element map; populated by renderNode.
+const _pathToEl = new Map();
+
+// Phase 3 helper: find INDEX.md file node in a dir's children array.
+function findIndexMd(node) {
+  if (!node.children) return null;
+  for (const child of node.children) {
+    if (child.type === "file" && child.name === "INDEX.md") return child;
+  }
+  return null;
+}
 
 // Dirs that start open by default.
 function _isDefaultOpen(nodePath) {
@@ -496,6 +540,8 @@ function renderNode(node, container) {
     const label = document.createElement("div");
     const isOpen = _isDefaultOpen(node.path);
     label.className = "tree-dir-label" + (isOpen ? " open" : "");
+    label.dataset.path = node.path || "";
+    _pathToEl.set(node.path || "", label);
 
     const caret = document.createElement("span");
     caret.className = "caret";
@@ -510,9 +556,14 @@ function renderNode(node, container) {
     const children = document.createElement("div");
     children.className = "tree-dir-children" + (isOpen ? " open" : "");
 
+    // Phase 3: when opening a dir that has INDEX.md, load the index file.
+    const indexChild = findIndexMd(node);
     label.addEventListener("click", () => {
       const open = label.classList.toggle("open");
       children.classList.toggle("open", open);
+      if (open && indexChild) {
+        loadFile(indexChild.path, null);
+      }
     });
 
     if (node.children && node.children.length) {
@@ -530,6 +581,7 @@ function renderNode(node, container) {
     const label = document.createElement("div");
     label.className = "tree-file-label";
     label.dataset.path = node.path;
+    _pathToEl.set(node.path, label);
 
     const nameSpan = document.createElement("span");
     nameSpan.className = "tree-file-name";
@@ -550,6 +602,60 @@ function renderNode(node, container) {
   }
 }
 
+// ── Phase 3: channel filter + dir expansion ───────────────────────
+
+// Expand a dir label without triggering INDEX.md load side-effects.
+function _expandDir(label) {
+  if (!label.classList.contains("open")) {
+    label.classList.add("open");
+    const wrapper = label.parentElement;
+    const kids = wrapper && wrapper.querySelector(".tree-dir-children");
+    if (kids) kids.classList.add("open");
+  }
+}
+
+// Expand the tree to a target dir path and scroll it into view.
+function expandAndScrollToDir(targetPath) {
+  const parts = targetPath.split("/").filter(Boolean);
+  for (let i = 1; i < parts.length; i++) {
+    const anc = parts.slice(0, i).join("/");
+    const el = _pathToEl.get(anc);
+    if (el) _expandDir(el);
+  }
+  const el = _pathToEl.get(targetPath);
+  if (el) el.scrollIntoView({behavior: "smooth", block: "nearest"});
+}
+
+// Populate the channel-filter <select> from tree data (Phase 3).
+function populateChannelFilter(treeData) {
+  const box = document.getElementById("channel-filter-box");
+  const select = document.getElementById("channel-filter");
+  let memNode = null;
+  for (const c of (treeData.children || [])) {
+    if (c.name === "memory" && c.type === "dir") { memNode = c; break; }
+  }
+  if (!memNode) return;
+  let chanNode = null;
+  for (const c of (memNode.children || [])) {
+    if (c.name === "channels" && c.type === "dir") { chanNode = c; break; }
+  }
+  const dirs = chanNode ? (chanNode.children || []).filter(function(c) { return c.type === "dir"; }) : [];
+  if (!dirs.length) return;
+  box.style.display = "";
+  for (const ch of dirs) {
+    const opt = document.createElement("option");
+    opt.value = ch.path;
+    opt.textContent = ch.name;
+    select.appendChild(opt);
+  }
+  select.addEventListener("change", function() {
+    const val = this.value;
+    if (!val) return;
+    expandAndScrollToDir(val);
+    this.value = "";
+  });
+}
+
 // ── Tree loading ──────────────────────────────────────────────────
 async function loadTree() {
   const loading = document.getElementById("tree-loading");
@@ -565,12 +671,15 @@ async function loadTree() {
     }
 
     treeRoot.innerHTML = "";
+    _pathToEl.clear();
     // data is the virtual "home" root from list_trees() — render its children
     // directly so the left pane shows memory/ and state/ as top-level entries.
     const tops = (data.children && data.children.length) ? data.children : [data];
     for (const child of tops) {
       renderNode(child, treeRoot);
     }
+
+    populateChannelFilter(data); // Phase 3: populate channel dropdown.
 
     // Auto-select memory/INDEX.md if it exists.
     const indexEl = treeRoot.querySelector('[data-path="memory/INDEX.md"]');
@@ -675,6 +784,7 @@ document.getElementById("search-input").addEventListener("input", function(e) {
 
 
 __all__ = [
+    "list_channel_dirs",
     "list_tree",
     "list_trees",
     "read_file_safe",
