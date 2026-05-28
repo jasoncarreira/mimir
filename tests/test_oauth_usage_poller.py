@@ -569,7 +569,11 @@ async def test_record_usage_passes_real_5h_growth(
 def test_detect_seven_day_anomaly_flags_cliff_jump() -> None:
     """Today's incident shape: overall 7d jumped 50%→100% in one
     sample while every sub-bucket stayed on its smooth ramp
-    (sonnet 48%→50%, omelette 0%→0%). Reject the overall reading."""
+    (sonnet 48%→50%, omelette 0%→0%). Reject the overall reading.
+
+    With the absolute-coherence check (chainlink #250), this case is now
+    caught by Check 2 first (1.00 > 0.50 + 0.10 = 0.60) rather than
+    Check 1 (jump+delta). The reason message changes accordingly."""
     from mimir.oauth_usage_poller import detect_seven_day_anomaly
 
     reason = detect_seven_day_anomaly(
@@ -578,8 +582,8 @@ def test_detect_seven_day_anomaly_flags_cliff_jump() -> None:
         prev_sub_buckets={"seven_day_sonnet": 0.48, "seven_day_omelette": 0.00},
     )
     assert reason is not None
-    assert "seven_day jumped +50pp" in reason
-    assert "seven_day_sonnet" in reason  # names the largest sub-bucket delta
+    assert "seven_day" in reason
+    assert "seven_day_sonnet" in reason  # names the incoherent sub-bucket
 
 
 def test_detect_seven_day_anomaly_passes_real_growth() -> None:
@@ -597,13 +601,16 @@ def test_detect_seven_day_anomaly_passes_real_growth() -> None:
 
 
 def test_detect_seven_day_anomaly_passes_small_jump() -> None:
-    """7d moved only 20pp; cross-check doesn't apply (below
-    the trigger threshold). No sub-bucket movement required."""
+    """7d moved only 10pp; cross-check doesn't apply (below
+    the trigger threshold). No sub-bucket movement required.
+
+    Numbers chosen so the overall is also within ANOMALY_7D_COHERENCE_SLACK
+    of the max sub-bucket (0.60 ≤ 0.55 + 0.10 = 0.65) — no coherence flag."""
     from mimir.oauth_usage_poller import detect_seven_day_anomaly
 
     reason = detect_seven_day_anomaly(
-        new_7d=0.70, prev_7d=0.50,
-        new_sub_buckets={"seven_day_sonnet": 0.50, "seven_day_omelette": 0.00},
+        new_7d=0.60, prev_7d=0.50,
+        new_sub_buckets={"seven_day_sonnet": 0.55, "seven_day_omelette": 0.00},
         prev_sub_buckets={"seven_day_sonnet": 0.48, "seven_day_omelette": 0.00},
     )
     assert reason is None
@@ -619,9 +626,10 @@ def test_detect_seven_day_anomaly_no_data_skips_check() -> None:
         new_sub_buckets={"seven_day_sonnet": 0.50},
         prev_sub_buckets={"seven_day_sonnet": 0.48},
     ) is None
-    # No sub-buckets present in BOTH maps → can't cross-check.
+    # No sub-buckets present in BOTH maps → delta check can't cross-check.
+    # Numbers chosen so the coherence check also passes (0.55 ≤ 0.50 + 0.10).
     assert detect_seven_day_anomaly(
-        new_7d=1.00, prev_7d=0.50,
+        new_7d=0.55, prev_7d=0.50,
         new_sub_buckets={"seven_day_sonnet": 0.50},
         prev_sub_buckets={},  # cold start on sub-buckets
     ) is None
@@ -646,6 +654,84 @@ def test_detect_seven_day_anomaly_only_new_sub_bucket_ignored() -> None:
     # (not in prev) → anomaly fires. The flag is correct: only the
     # observable sub-bucket (sonnet) is steady, overall jumped 50pp.
     assert reason is not None
+
+
+def test_detect_seven_day_anomaly_incoherent_absolute_2026_05_28() -> None:
+    """chainlink #250 — 2026-05-28 incident trace.
+
+    A prior glitch had pegged seven_day_sonnet=1.0 (matching the bogus
+    overall=1.0). Between polls the prior glitch resolved: sonnet dropped
+    back to its real value of ~0.02. The detector now saw:
+      - prev_7d kept at 0.0 (trusted prior, glitch was being rejected)
+      - new_7d=1.00  (still bogus, overall endpoint still pegged)
+      - prev_sonnet=1.00 (glitched value from last accepted state)
+      - new_sonnet=0.02  (now corrected to real value)
+      - delta=98pp  ≥  5pp threshold → delta-based check passed it through
+
+    The absolute-coherence check catches it: 1.00 > 0.02 + 0.10 = 0.12.
+    Without this fix, 140+ minutes of heartbeat suppression followed.
+    """
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    reason = detect_seven_day_anomaly(
+        new_7d=1.00,
+        prev_7d=0.00,  # prior trusted value (glitch being rejected)
+        new_sub_buckets={"seven_day_sonnet": 0.02, "seven_day_omelette": 0.00},
+        prev_sub_buckets={"seven_day_sonnet": 1.00, "seven_day_omelette": 0.00},
+    )
+    assert reason is not None, (
+        "should be flagged as incoherent: 7d=100% but max sub-bucket=2%"
+    )
+    assert "incoherent" in reason
+    assert "seven_day_sonnet" in reason
+
+
+def test_detect_seven_day_anomaly_coherent_high_usage_passes() -> None:
+    """chainlink #250 — legitimate high-usage should NOT trigger the
+    coherence check. 7d=95%, sonnet=90% → gap=5pp ≤ 10pp slack. Pass."""
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    reason = detect_seven_day_anomaly(
+        new_7d=0.95,
+        prev_7d=0.60,
+        new_sub_buckets={"seven_day_sonnet": 0.90, "seven_day_omelette": 0.00},
+        prev_sub_buckets={"seven_day_sonnet": 0.58, "seven_day_omelette": 0.00},
+    )
+    # 30pp delta → Check 1 fires; sonnet moved 32pp ≥ 5pp threshold → passes.
+    # Coherence: 0.95 ≤ 0.90 + 0.10 = 1.00 → passes.
+    assert reason is None
+
+
+def test_detect_seven_day_anomaly_coherence_slack_boundary() -> None:
+    """chainlink #250 — test right at the 10pp slack boundary.
+
+    Just inside: 7d=0.60, sonnet=0.55 → gap=5pp ≤ 10pp → no flag.
+    Just outside: 7d=0.66, sonnet=0.55 → gap=11pp > 10pp → flagged.
+    """
+    from mimir.oauth_usage_poller import (
+        ANOMALY_7D_COHERENCE_SLACK,
+        detect_seven_day_anomaly,
+    )
+
+    base_sub = {"seven_day_sonnet": 0.55, "seven_day_omelette": 0.00}
+
+    # At or within slack: no flag.
+    assert detect_seven_day_anomaly(
+        new_7d=0.55 + ANOMALY_7D_COHERENCE_SLACK,  # exactly at slack
+        prev_7d=0.50,
+        new_sub_buckets=base_sub,
+        prev_sub_buckets=base_sub,
+    ) is None
+
+    # One basis-point over slack: flag.
+    reason = detect_seven_day_anomaly(
+        new_7d=0.55 + ANOMALY_7D_COHERENCE_SLACK + 0.01,
+        prev_7d=0.50,
+        new_sub_buckets=base_sub,
+        prev_sub_buckets=base_sub,
+    )
+    assert reason is not None
+    assert "incoherent" in reason
 
 
 @pytest.mark.asyncio

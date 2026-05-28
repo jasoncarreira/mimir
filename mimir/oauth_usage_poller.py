@@ -600,6 +600,24 @@ ANOMALY_7D_DELTA_PP = 0.05  # 7d delta below this confirms the 5h jump is bogus
 # inside one ~3-minute poll interval. Physically implausible.
 ANOMALY_7D_JUMP_PP = 0.30           # 7d overall rise that triggers cross-check
 ANOMALY_SUBBUCKET_DELTA_PP = 0.05   # max sub-bucket delta to call the 7d jump bogus
+# chainlink #250: absolute-coherence slack for the 7d overall vs sub-buckets.
+# The 7d overall is a cost-weighted aggregate of all model sub-buckets; it
+# physically cannot exceed the largest sub-bucket by more than a small margin
+# (non-tracked models contributing minor usage + Anthropic rounding). When
+# the overall reads > max(sub-bucket) + SLACK, the state is internally
+# incoherent regardless of the delta trajectory that produced it.
+#
+# 10pp slack: allows for non-tracked models (e.g. Opus outside the named
+# buckets) and Anthropic endpoint rounding. A real 7d=1.00 / sonnet=0.90
+# spread is plausible only if non-tracked models spent 10pp; at 20pp the
+# mismatch is implausible.
+#
+# Live incident (2026-05-28 18:03Z): sub-bucket sonnet dropped 1.0→0.02
+# (prior glitch resolving). Next reading: 7d=1.00, sonnet=0.02, omelette=0.00.
+# Delta-based check accepted it (sub-bucket *moved* ≥5pp). Absolute check
+# would have rejected it (1.00 > 0.02 + 0.10 = 0.12). Heartbeats suppressed
+# for 140+ minutes.
+ANOMALY_7D_COHERENCE_SLACK = 0.10   # overall > max(sub-buckets) + SLACK → incoherent
 
 # chainlink #231: consecutive-confirmation recovery path for the 7d anomaly
 # detector. If the detector rejects the same anomalous value for this many
@@ -791,13 +809,15 @@ def detect_seven_day_anomaly(
     new_sub_buckets: dict[str, float],
     prev_sub_buckets: dict[str, float],
 ) -> str | None:
-    """Reject bogus ``seven_day`` overall readings (chainlink #220).
+    """Reject bogus ``seven_day`` overall readings (chainlink #220 + #250).
 
     Returns a reason string when the new overall 7d reading is an
     endpoint glitch (the caller should keep the prior trusted
     value), else None.
 
-    Rule:
+    Two independent checks, either triggers a rejection:
+
+    **Check 1 — delta-based (chainlink #220):**
       - 7d overall rose by >= ANOMALY_7D_JUMP_PP (30pp) since prior
         reading,
       - AND **every** known sub-bucket
@@ -810,18 +830,49 @@ def detect_seven_day_anomaly(
     is steady but the overall reading cliff-jumps, the overall
     value is internally inconsistent.
 
+    **Check 2 — absolute-coherence (chainlink #250):**
+      - new 7d overall > max(new sub-buckets) + ANOMALY_7D_COHERENCE_SLACK.
+
+    The 7d overall physically cannot exceed the largest sub-bucket by
+    more than a small margin. When it does, the state is internally
+    incoherent regardless of how the delta trajectory produced it.
+    This catches cases where a prior glitch *resolves* (sub-buckets
+    drop back to their true value) while the overall stays pegged —
+    the delta-based check passes (sub-buckets *moved*) but the
+    absolute relationship is wrong.
+
     ``new_sub_buckets`` / ``prev_sub_buckets`` are dicts keyed by
     bucket name (e.g. ``"seven_day_sonnet"``) mapping to
-    utilization. Missing keys are skipped — the check fires only on
+    utilization. Missing keys are skipped — Check 1 fires only on
     sub-buckets present in both maps. When no sub-buckets are
     observable at all, returns None (no signal to distrust).
 
-    Skips the check when either 7d side is None — first poll,
+    Skips both checks when either 7d side is None — first poll,
     missing data. "Trust the value" is the right fallback because
     we have no cross-reference.
     """
     if new_7d is None or prev_7d is None:
         return None
+
+    # Check 2 — absolute coherence: fires before the delta check so that
+    # an incoherent state is rejected even when sub-buckets happen to be
+    # moving (e.g., a prior glitch resolving while overall stays pegged).
+    if new_sub_buckets:
+        max_sub = max(new_sub_buckets.values())
+        max_sub_key = max(new_sub_buckets, key=new_sub_buckets.__getitem__)
+        if new_7d > max_sub + ANOMALY_7D_COHERENCE_SLACK:
+            return (
+                f"seven_day={new_7d * 100:.0f}% is incoherent: "
+                f"exceeds largest sub-bucket "
+                f"{max_sub_key}={max_sub * 100:.0f}% "
+                f"by >{ANOMALY_7D_COHERENCE_SLACK * 100:.0f}pp — "
+                f"endpoint glitch suspected"
+            )
+
+    # Check 1 — delta-based: fires when the overall jumps but sub-buckets
+    # stay flat. Handles the case where there is no prior sub-bucket glitch
+    # to compare against (sub-buckets were already at the inflated value
+    # when the first anomalous reading was taken).
     jump = new_7d - prev_7d
     if jump < ANOMALY_7D_JUMP_PP:
         return None
