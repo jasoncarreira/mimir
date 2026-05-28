@@ -648,6 +648,130 @@ def test_detect_seven_day_anomaly_only_new_sub_bucket_ignored() -> None:
     assert reason is not None
 
 
+# ── chainlink #250: absolute-coherence check ───────────────────────
+
+
+def test_detect_seven_day_anomaly_absolute_coherence_rejects_2026_05_28_trace() -> None:
+    """Models the 2026-05-28 incident the delta-based check missed.
+
+    Sub-buckets dropped between polls (1.0 → 0.02) — that's a 98pp
+    movement, which the chainlink #220 delta rule reads as "sub-buckets
+    are moving, accept." But the new overall=1.0 with new sub-buckets
+    at 2% / 0% (both well below the 10% near-zero ceiling) is
+    internally inconsistent. chainlink #250's absolute-coherence
+    check must reject regardless of the prior or the delta.
+    """
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    reason = detect_seven_day_anomaly(
+        new_7d=1.00,
+        prev_7d=0.0,
+        new_sub_buckets={
+            "seven_day_sonnet": 0.02,
+            "seven_day_omelette": 0.0,
+        },
+        prev_sub_buckets={
+            "seven_day_sonnet": 1.0,
+            "seven_day_omelette": 0.0,
+        },
+    )
+    assert reason is not None
+    assert "all observed sub-buckets" in reason
+    assert "internally inconsistent" in reason
+
+
+def test_detect_seven_day_anomaly_absolute_coherence_passes_real_high_usage() -> None:
+    """Overall above the floor with non-empty sub-buckets is fine —
+    legitimate plan utilization. Only the 'overall huge / all subs
+    near zero' incoherent state is rejected."""
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    # overall above floor, sub-bucket above ceil → real usage, pass.
+    reason = detect_seven_day_anomaly(
+        new_7d=0.85,
+        prev_7d=0.82,
+        new_sub_buckets={"seven_day_sonnet": 0.60, "seven_day_omelette": 0.30},
+        prev_sub_buckets={"seven_day_sonnet": 0.58, "seven_day_omelette": 0.28},
+    )
+    assert reason is None
+
+
+def test_detect_seven_day_anomaly_absolute_coherence_passes_normal_test_fixture() -> None:
+    """Pins the realistic test-fixture shape (overall=43%, sonnet=24%,
+    opus null) — neither the floor nor the ceil should fire here.
+    Regression guard against tightening the rule too much."""
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    reason = detect_seven_day_anomaly(
+        new_7d=0.43,
+        prev_7d=0.40,
+        new_sub_buckets={"seven_day_sonnet": 0.24},
+        prev_sub_buckets={"seven_day_sonnet": 0.22},
+    )
+    assert reason is None
+
+
+def test_detect_seven_day_anomaly_absolute_coherence_fires_on_first_poll() -> None:
+    """Chainlink #250's coherence check is independent of prior readings
+    — it runs even when prev_7d is None (first poll after restart).
+    A bogus first reading shouldn't anchor the store."""
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    reason = detect_seven_day_anomaly(
+        new_7d=1.00,
+        prev_7d=None,
+        new_sub_buckets={"seven_day_sonnet": 0.03, "seven_day_omelette": 0.0},
+        prev_sub_buckets={},
+    )
+    assert reason is not None
+    assert "all observed sub-buckets" in reason
+
+
+def test_detect_seven_day_anomaly_no_sub_buckets_skips_coherence_check() -> None:
+    """When no sub-buckets are observable at all, both checks return
+    None — no signal to distrust."""
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    reason = detect_seven_day_anomaly(
+        new_7d=1.00,
+        prev_7d=0.0,
+        new_sub_buckets={},
+        prev_sub_buckets={},
+    )
+    assert reason is None
+
+
+def test_detect_seven_day_anomaly_below_floor_skips_coherence_check() -> None:
+    """Below the overall floor (50%), the coherence check doesn't
+    fire even if sub-buckets are all zero — arbiter won't suppress
+    on a low overall anyway, so the cost of acting on it is
+    asymmetric to the value of catching it."""
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    reason = detect_seven_day_anomaly(
+        new_7d=0.40,  # below floor
+        prev_7d=0.38,
+        new_sub_buckets={"seven_day_sonnet": 0.0, "seven_day_omelette": 0.0},
+        prev_sub_buckets={"seven_day_sonnet": 0.0, "seven_day_omelette": 0.0},
+    )
+    assert reason is None
+
+
+def test_detect_seven_day_anomaly_real_growth_within_coherence_passes() -> None:
+    """Legitimate growth where overall + sub-buckets move together
+    must pass both checks. (Regression guard for chainlink #220 +
+    #250 — adding the coherence check mustn't reject real growth.)"""
+    from mimir.oauth_usage_poller import detect_seven_day_anomaly
+
+    reason = detect_seven_day_anomaly(
+        new_7d=0.55,
+        prev_7d=0.50,
+        new_sub_buckets={"seven_day_sonnet": 0.52, "seven_day_omelette": 0.10},
+        prev_sub_buckets={"seven_day_sonnet": 0.48, "seven_day_omelette": 0.08},
+    )
+    assert reason is None
+
+
 @pytest.mark.asyncio
 async def test_record_usage_rejects_anomalous_7d_cliff(
     rate_store: RateLimitStore,
