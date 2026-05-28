@@ -20,7 +20,6 @@ from .extra import (
     rebuild_index,
     set_index_generator,
     set_indexer,
-    set_shell_allowlist,
     set_turns_log_path,
     shell_exec,
 )
@@ -114,7 +113,6 @@ __all__ = [
     "set_indexer",
     "set_index_generator",
     "set_turns_log_path",
-    "set_shell_allowlist",
     "set_channel_registry",
     "set_dispatcher",
     "set_scheduler",

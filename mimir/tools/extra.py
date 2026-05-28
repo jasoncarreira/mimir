@@ -1,19 +1,17 @@
-"""Representative tool ports for the migration coverage matrix.
+"""Tool ports for the deepagents-backed agent.
 
-Three distinct patterns from mimir's existing tool surface translated
-to LangChain @tool. After these the remaining tools (channeltools,
-scheduletools, committools, spawn) are mechanical clones of the same
-patterns.
+Three distinct patterns from mimir's earlier tool surface translated to
+LangChain @tool. The remaining tools (channeltools, scheduletools,
+committools, spawn) follow the same patterns.
 
 Patterns covered:
-  1. Filter-args + dependency injection (mimir/searchtools.py)
-  2. JSONL read with structured-shape return (mimir/turntools.py)
-  3. Subprocess execution with permission scoping (mimir/shelltools.py)
+  1. Filter-args + dependency injection (file_search)
+  2. JSONL read with structured-shape return (get_turn / mimir_get_turn)
+  3. Subprocess execution within the operator-trust boundary (shell_exec)
 
-Each tool's *function-level* dependencies (Indexer, turns_log_path,
-shell allowlist) injected via module-level setter functions, parallel
-to memory_tool.py's set_memory_client pattern. Production cutover
-would wire these in the deepagent factory.
+Each tool's *function-level* dependencies (Indexer, turns_log_path) are
+injected via module-level setter functions, parallel to memory_tool.py's
+set_memory_client pattern; ``server.py:build_app`` wires them at startup.
 """
 from __future__ import annotations
 
@@ -247,47 +245,37 @@ def get_turn(turn_id: str) -> str:
 
 
 # ────────────────────────────────────────────────────────────────────
-# Pattern 3: shell_exec — subprocess execution + permission scoping
+# Pattern 3: shell_exec — subprocess execution within the trust boundary
 # ────────────────────────────────────────────────────────────────────
+#
+# Trust model (chainlink #226): mimir runs inside an operator-trusted
+# container. Both ``shell_exec`` (sync) and ``bash_async`` (long-running)
+# can execute arbitrary commands; the agent is trusted with shell access
+# the same way the operator who launched the container is. There is no
+# in-process allowlist gate — operator-side controls (container
+# isolation, capability drops, filesystem mounts) define the boundary.
+#
+# A previous ``set_shell_allowlist`` affordance existed but was never
+# wired in production and gave a misleading appearance of defence; it
+# was removed in chainlink #226. If you need to restrict shell access,
+# do it at the container layer, or gate ``bash_async`` and ``shell_exec``
+# together — half-gating only the sync path is security theatre.
 
 _SHELL_STATE: dict[str, Any] = {
-    "allowlist": None,  # set of allowed command prefixes; None = anything
     "cwd": None,
     "timeout_s": 60.0,
 }
-
-
-def set_shell_allowlist(
-    allowlist: list[str] | None,
-    *,
-    cwd: Path | None = None,
-    timeout_s: float = 60.0,
-) -> None:
-    """Configure shell_exec safety bounds.
-
-    Args:
-        allowlist: List of allowed command prefixes (e.g. ``["git ",
-            "ls", "rg "]``). Tool refuses commands not matching any
-            prefix. ``None`` disables allowlist (testing / trusted
-            contexts).
-        cwd: Working directory for command execution. ``None`` uses
-            process cwd.
-        timeout_s: Subprocess timeout in seconds (default 60).
-    """
-    _SHELL_STATE["allowlist"] = (
-        set(allowlist) if allowlist is not None else None
-    )
-    _SHELL_STATE["cwd"] = cwd
-    _SHELL_STATE["timeout_s"] = timeout_s
 
 
 @tool
 def shell_exec(command: str) -> str:
     """Execute a shell command and return stdout + stderr + exit code.
 
-    Subject to an operator-configured allowlist of command prefixes
-    (see ``set_shell_allowlist``). Always runs without shell-expansion
-    (``shell=False``) via ``shlex.split`` to prevent injection.
+    Runs commands via ``subprocess.run`` with ``shell=False`` after
+    ``shlex.split`` parsing — the real injection guard. There is no
+    allowlist; the agent is trusted with shell access within the
+    operator-configured container (see module docstring). Use
+    ``bash_async`` for jobs that may exceed the sync timeout.
 
     Args:
         command: The full command line (will be split via shlex).
@@ -297,13 +285,6 @@ def shell_exec(command: str) -> str:
     """
     if not command or not command.strip():
         return "shell_exec failed: command is required"
-    allowlist = _SHELL_STATE["allowlist"]
-    if allowlist is not None:
-        if not any(command.startswith(prefix) for prefix in allowlist):
-            return (
-                f"shell_exec rejected: '{command[:80]}...' does not match "
-                f"any allowlist prefix"
-            )
     try:
         argv = shlex.split(command)
     except ValueError as exc:
