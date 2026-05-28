@@ -212,6 +212,10 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # operator should know the upstream endpoint is glitching, even
     # though the arbiter is now insulated.
     "quota_reading_anomalous": ("negative", "quota_anomaly"),
+    # chainlink #231: after N consecutive anomalous readings, the detector
+    # accepts the value. Surface as positive so the operator sees the
+    # recovery (prior-stuck-low → accepted new reading).
+    "quota_reading_anomaly_confirmed": ("positive", "quota_anomaly_confirmed"),
     # PR 4a (git_tracking): post-turn commit/push failures. All three
     # are first-occurrence-only (see ``_FIRST_OCCURRENCE_ONLY_KINDS``)
     # because once git breaks every subsequent turn re-emits — without
@@ -1369,11 +1373,34 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"{rejected * 100:.0f}%"
             if isinstance(rejected, (int, float)) else "?"
         )
+        window = ev.get("window_type", "5h")
+        confirm_count = ev.get("confirm_count")
+        confirm_threshold = ev.get("confirm_threshold")
+        confirm_str = (
+            f" ({confirm_count}/{confirm_threshold} consecutive)"
+            if isinstance(confirm_count, int) and isinstance(confirm_threshold, int)
+            else ""
+        )
         return (
-            f"quota reading anomaly: 5h endpoint reported {rejected_str} "
+            f"quota reading anomaly: {window} endpoint reported {rejected_str} "
             f"(kept previous {kept_str}); arbiter consults the last "
             f"trusted value. Glitch is transient — usually clears within "
-            f"a poll cycle or two."
+            f"a poll cycle or two.{confirm_str}"
+        )
+    if rule_kind == "quota_anomaly_confirmed":
+        # chainlink #231: after N consecutive anomalous 7d readings, the
+        # detector accepted the new value as the real state.
+        confirmed = ev.get("confirmed_utilization")
+        consecutive = ev.get("consecutive_count")
+        confirmed_str = (
+            f"{confirmed * 100:.0f}%" if isinstance(confirmed, (int, float)) else "?"
+        )
+        n_str = str(consecutive) if isinstance(consecutive, int) else "?"
+        return (
+            f"quota reading anomaly confirmed: 7d endpoint reported "
+            f"{confirmed_str} for {n_str} consecutive polls — accepted as "
+            f"real (glitch hypothesis implausible); prior stuck-low value "
+            f"replaced."
         )
     if rule_kind == "git_commit_failed":
         stage = ev.get("stage") or "?"

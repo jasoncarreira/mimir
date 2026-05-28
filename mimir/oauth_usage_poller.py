@@ -634,6 +634,25 @@ ANOMALY_7D_DELTA_PP = 0.05  # 7d delta below this confirms the 5h jump is bogus
 ANOMALY_7D_JUMP_PP = 0.30           # 7d overall rise that triggers cross-check
 ANOMALY_SUBBUCKET_DELTA_PP = 0.05   # max sub-bucket delta to call the 7d jump bogus
 
+# chainlink #231: consecutive-confirmation recovery path for the 7d anomaly
+# detector. If the detector rejects the same anomalous value for this many
+# consecutive polls (~15 min at the default 3-min interval), the "this is a
+# transient glitch" hypothesis becomes implausible. Accept the reading, emit
+# ``quota_reading_anomaly_confirmed``, and reset the counter.
+#
+# The 5h-anomaly path has the cost-rate-back-derived estimator as its safety
+# valve (chainlink #17). The 7d path has no equivalent — this consecutive-
+# confirmation gate is the only automated escape from a stuck-low prior value
+# when a real plan-wide spend change is misclassified as a glitch.
+#
+# 5 polls ≈ 15 min at the default 3-min polling interval. Long enough that
+# a genuine transient spike (sub-minute endpoint noise observed in practice)
+# has almost certainly cleared; short enough that a real spend-burst is
+# accepted before the operator notices suppressed heartbeats.
+#
+# Override via ``MIMIR_QUOTA_7D_ANOMALY_CONFIRM_THRESHOLD`` env var.
+ANOMALY_7D_CONFIRM_THRESHOLD_DEFAULT = 5
+
 # chainlink #17 (CR#22 layer b): cost-rate-back-derived 5h estimator.
 #
 # The factor encodes how much smaller the 5h dollar-budget is than the
@@ -694,6 +713,65 @@ def _resolve_backderive_factor() -> float:
         raw, QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT,
     )
     return QUOTA_5H_BACKDERIVE_FACTOR_DEFAULT
+
+
+def _resolve_anomaly_confirm_threshold() -> int:
+    """Resolve ``MIMIR_QUOTA_7D_ANOMALY_CONFIRM_THRESHOLD`` env override or
+    fall back to the default. Empty / non-positive / non-integer values fall
+    back with a warning so a typo doesn't silently disable the recovery path."""
+    raw = os.environ.get("MIMIR_QUOTA_7D_ANOMALY_CONFIRM_THRESHOLD", "").strip()
+    if not raw:
+        return ANOMALY_7D_CONFIRM_THRESHOLD_DEFAULT
+    try:
+        v = int(raw)
+        if v > 0:
+            return v
+    except ValueError:
+        pass
+    log.warning(
+        "MIMIR_QUOTA_7D_ANOMALY_CONFIRM_THRESHOLD=%r invalid (expected positive "
+        "int); falling back to default %s",
+        raw, ANOMALY_7D_CONFIRM_THRESHOLD_DEFAULT,
+    )
+    return ANOMALY_7D_CONFIRM_THRESHOLD_DEFAULT
+
+
+def _anomaly_confirm_state_path(cfg: "PollerConfig") -> "Path":
+    """Return the sidecar path for the 7d anomaly confirmation counter.
+
+    Lives alongside the credentials file so it shares the same directory
+    lifetime and permissions (0o600 via _atomic_write_json).
+    """
+    return cfg.credentials_path.parent / "anomaly_confirm_state.json"
+
+
+def _load_anomaly_confirm_state(path: "Path") -> dict[str, int]:
+    """Load the 7d anomaly confirmation counter state from disk.
+
+    Returns an empty dict on missing file, JSON parse error, or unexpected
+    structure. Non-integer values are silently dropped (forward-compat guard).
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items()
+                    if isinstance(k, str) and isinstance(v, int)}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_anomaly_confirm_state(path: "Path", state: dict[str, int]) -> None:
+    """Persist the 7d anomaly confirmation counter state atomically.
+
+    Silently no-ops on I/O error so a disk hiccup doesn't abort the poll
+    cycle — the cost is one extra anomaly rejection at most (counter resets
+    to 0 on next load because state was not saved).
+    """
+    try:
+        _atomic_write_json(path, state)
+    except OSError:
+        log.warning("oauth_usage: failed to save anomaly confirm state to %s", path)
 
 
 def detect_5h_anomaly(
@@ -973,38 +1051,79 @@ async def record_usage(
         prev_sub_buckets=prior_sub_buckets,
     )
 
+    # chainlink #231: consecutive-confirmation recovery path. Load the
+    # persist counter state once before the loop; save it after. When cfg
+    # is None (tests / callers without a PollerConfig), the state is
+    # in-memory only — the counter resets to 0 every call. That matches
+    # the legacy behavior (no recovery path) for cfg-less callers, which
+    # is the correct default for unit tests that don't want side effects.
+    _confirm_state_path = (
+        _anomaly_confirm_state_path(cfg) if cfg is not None else None
+    )
+    anomaly_confirm_state: dict[str, int] = (
+        _load_anomaly_confirm_state(_confirm_state_path)
+        if _confirm_state_path is not None else {}
+    )
+    confirm_threshold = _resolve_anomaly_confirm_threshold()
+
     for window_type, snapshot in new_snaps.items():
         if window_type == "seven_day" and seven_day_anomaly_reason:
-            # Reject the bogus 7d-overall spike (chainlink #220).
-            # The arbiter (billing.py) gates scheduled work on the
-            # most-suppressive window across all providers — a 100%
-            # seven_day reading suppresses every scheduled tick even
-            # when every model-specific sub-bucket is fresh. Keep the
-            # prior trusted value so the arbiter has accurate data.
-            await log_event(
-                "quota_reading_anomalous",
-                window_type=window_type,
-                reason=seven_day_anomaly_reason,
-                rejected_utilization=snapshot.utilization,
-                kept_utilization=prior_7d.utilization if prior_7d else None,
-                kept_observed_at=prior_7d.observed_at if prior_7d else None,
-                sub_buckets_new=new_sub_buckets,
-                sub_buckets_prev=prior_sub_buckets,
-            )
-            # Skip the write — leaves the prior trusted ``seven_day``
-            # in place. Unlike the 5h-anomaly path, there's no
-            # cost-rate-back-derived estimator for 7d (the 7d window
-            # IS the cost-budget reference; nothing to back-derive
-            # from). Prior value persists. Mirror the 5h-anomaly
-            # recorded-metadata shape so callers / tests can detect
-            # the rejection via the return dict.
-            recorded[window_type] = {
-                "anomalous": True,
-                "rejected_utilization": snapshot.utilization,
-                "kept_utilization": prior_7d.utilization if prior_7d else None,
-                "reason": seven_day_anomaly_reason,
-            }
-            continue
+            # chainlink #220: reject the bogus 7d-overall spike.
+            # chainlink #231: but if the endpoint has reported the same
+            # anomalous value for confirm_threshold consecutive polls,
+            # the glitch hypothesis is implausible — accept and reset.
+            confirm_count = anomaly_confirm_state.get("seven_day", 0)
+            if confirm_count >= confirm_threshold:
+                # Threshold reached — write through and reset counter.
+                await log_event(
+                    "quota_reading_anomaly_confirmed",
+                    window_type="seven_day",
+                    confirmed_utilization=snapshot.utilization,
+                    consecutive_count=confirm_count,
+                    confirm_threshold=confirm_threshold,
+                )
+                anomaly_confirm_state["seven_day"] = 0
+                # Fall through to the normal write path below.
+            else:
+                # Still in rejection window — increment counter, reject.
+                anomaly_confirm_state["seven_day"] = confirm_count + 1
+                # The arbiter (billing.py) gates scheduled work on the
+                # most-suppressive window across all providers — a 100%
+                # seven_day reading suppresses every scheduled tick even
+                # when every model-specific sub-bucket is fresh. Keep the
+                # prior trusted value so the arbiter has accurate data.
+                await log_event(
+                    "quota_reading_anomalous",
+                    window_type=window_type,
+                    reason=seven_day_anomaly_reason,
+                    rejected_utilization=snapshot.utilization,
+                    kept_utilization=prior_7d.utilization if prior_7d else None,
+                    kept_observed_at=prior_7d.observed_at if prior_7d else None,
+                    sub_buckets_new=new_sub_buckets,
+                    sub_buckets_prev=prior_sub_buckets,
+                    confirm_count=anomaly_confirm_state["seven_day"],
+                    confirm_threshold=confirm_threshold,
+                )
+                # Skip the write — leaves the prior trusted ``seven_day``
+                # in place. Unlike the 5h-anomaly path, there's no
+                # cost-rate-back-derived estimator for 7d (the 7d window
+                # IS the cost-budget reference; nothing to back-derive
+                # from). Prior value persists. Mirror the 5h-anomaly
+                # recorded-metadata shape so callers / tests can detect
+                # the rejection via the return dict.
+                recorded[window_type] = {
+                    "anomalous": True,
+                    "rejected_utilization": snapshot.utilization,
+                    "kept_utilization": prior_7d.utilization if prior_7d else None,
+                    "reason": seven_day_anomaly_reason,
+                    "confirm_count": anomaly_confirm_state["seven_day"],
+                    "confirm_threshold": confirm_threshold,
+                }
+                continue
+        elif window_type == "seven_day":
+            # Non-anomalous 7d reading — reset the confirmation counter
+            # so prior anomaly runs don't carry over across a clean read.
+            anomaly_confirm_state.pop("seven_day", None)
         if window_type == "five_hour" and anomaly_reason:
             # Reject the spike. Surface the rejection so the operator
             # (and the agent's algedonic block) can investigate.
@@ -1130,6 +1249,12 @@ async def record_usage(
             "resets_at": snapshot.resets_at,
             "status": snapshot.status,
         }
+
+    # Persist the updated anomaly confirmation counter (chainlink #231).
+    # Only when cfg is set — cfg-less callers (tests) don't get file I/O.
+    if _confirm_state_path is not None:
+        _save_anomaly_confirm_state(_confirm_state_path, anomaly_confirm_state)
+
     return recorded
 
 
