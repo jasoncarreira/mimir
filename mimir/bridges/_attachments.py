@@ -112,12 +112,17 @@ def resolve_outbound_path(outbound_root: Path, raw_path: str) -> Path:
 async def download_to_path(
     url: str, target: Path, *, max_bytes: int | None = None,
     timeout_s: float = _DEFAULT_DOWNLOAD_TIMEOUT_S,
+    headers: dict[str, str] | None = None,
 ) -> bool:
     """Stream ``url`` to ``target``. Returns True on success, False on
     failure (logged at WARNING). When ``max_bytes`` is set and the
     download exceeds it mid-stream, the partial file is removed and
     False is returned — Discord/Slack tell us the size up-front so this
     is a defense-in-depth check, not the primary size gate.
+
+    ``headers`` are forwarded to the GET request. Useful for
+    authenticated endpoints (e.g. Slack ``url_private`` requires
+    ``Authorization: Bearer <bot-token>``).
 
     Uses aiohttp lazily so non-bridge deployments don't pay the import.
     """
@@ -132,7 +137,7 @@ async def download_to_path(
     try:
         timeout = aiohttp.ClientTimeout(total=timeout_s)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
+            async with session.get(url, headers=headers) as resp:
                 if resp.status >= 400:
                     log.warning(
                         "download_to_path: %s returned %s", url, resp.status,
