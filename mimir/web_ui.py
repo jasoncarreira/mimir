@@ -17,7 +17,8 @@ hosts the WebUI bridge's ``/chat``. Routes:
   GET /api/memory       — JSON twin of /memory; view=tree returns nested
                           dir/file tree (memory/ + state/); view=file&path=...
                           returns file content (only .md files);
-                          view=search&q=... returns full-text search hits
+                          view=search&q=... returns full-text search hits;
+                          view=channels returns channel dir names
 
 The HTML page polls ``/api/turns`` every 5s for live updates. ``/api/events``
 is exposed for the (deferred) Events tab + ad-hoc scripting. ``/ops``
@@ -43,6 +44,7 @@ from .ops_dashboard import (
     render_dashboard_html,
 )
 from .file_memory_dashboard import (
+    list_channel_dirs,
     list_trees,
     read_file_safe_multi,
     render_memory_html,
@@ -329,7 +331,7 @@ def register_routes(
         log.debug("saga SQL passthrough disabled (set MIMIR_SAGA_SQL_ENABLED=1 to enable)")
 
     # ── /memory — file-based memory viewer ──────────────────────────────
-    # Phase 2: multi-root (memory/ + state/) for tree, file, and search views.
+    # Phase 3: also exposes view=channels for the channel-filter dropdown.
 
     _memory_roots: list[Any] = (
         [home / "memory", home / "state"] if home is not None else []
@@ -368,6 +370,14 @@ def register_routes(
                 None, lambda: search_files(_memory_roots, q)
             )
             return web.json_response(payload)
+
+        if view == "channels":
+            # memory/ root is first in _memory_roots; channel dirs live under it.
+            mem_root = _memory_roots[0]
+            channels = await loop.run_in_executor(
+                None, lambda: list_channel_dirs(mem_root)
+            )
+            return web.json_response({"channels": channels})
 
         # Default: view == "tree"
         payload = await loop.run_in_executor(
