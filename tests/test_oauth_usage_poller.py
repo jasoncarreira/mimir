@@ -1492,3 +1492,208 @@ def test_record_first_seen_does_not_clear_on_same_tail(tmp_path):
     is_lo, since, _ = is_known_logged_out(creds)
     assert is_lo is True
     assert since == 2000.0
+
+
+# ─── chainlink #231: 7d anomaly confirm-counter tests ─────────────────
+
+
+def test_load_anomaly_confirm_state_missing_file_returns_empty(tmp_path: Path):
+    """Missing sidecar → empty dict (graceful bootstrap on first poll)."""
+    from mimir.oauth_usage_poller import _load_anomaly_confirm_state
+    result = _load_anomaly_confirm_state(tmp_path / "does_not_exist.json")
+    assert result == {}
+
+
+def test_load_save_anomaly_confirm_state_roundtrip(tmp_path: Path):
+    """Write state, read it back — values are preserved."""
+    from mimir.oauth_usage_poller import (
+        _load_anomaly_confirm_state, _save_anomaly_confirm_state,
+    )
+    path = tmp_path / "anomaly_confirm_state.json"
+    _save_anomaly_confirm_state(path, {"seven_day": 3})
+    loaded = _load_anomaly_confirm_state(path)
+    assert loaded == {"seven_day": 3}
+
+
+def test_load_anomaly_confirm_state_ignores_non_int_values(tmp_path: Path):
+    """Non-integer values in sidecar are silently dropped (forward-compat)."""
+    from mimir.oauth_usage_poller import _load_anomaly_confirm_state
+    path = tmp_path / "anomaly_confirm_state.json"
+    path.write_text('{"seven_day": 2, "other_key": "not-an-int", "five_hour": 1}',
+                    encoding="utf-8")
+    loaded = _load_anomaly_confirm_state(path)
+    assert loaded == {"seven_day": 2, "five_hour": 1}
+
+
+@pytest.mark.asyncio
+async def test_7d_anomaly_confirm_counter_increments_on_rejection(tmp_path: Path):
+    """Each anomalous 7d reading below the threshold increments the counter
+    and records confirm_count in the returned metadata."""
+    from mimir.oauth_usage_poller import (
+        PollerConfig, record_usage,
+        _load_anomaly_confirm_state, _anomaly_confirm_state_path,
+        ANOMALY_7D_CONFIRM_THRESHOLD_DEFAULT,
+    )
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op_mod
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+        observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day_sonnet", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+        observed_at="2026-05-09T00:00:00+00:00",
+    ))
+
+    # Payload: 7d jumps 50→100% while sub-bucket moves <5pp → anomaly.
+    payload = {
+        "seven_day": {"status": "allowed", "utilization": 1.00,
+                      "resets_at": 9999999999},
+        "seven_day_sonnet": {"status": "allowed", "utilization": 0.52,
+                             "resets_at": 9999999999},
+    }
+
+    cfg = PollerConfig(credentials_path=tmp_path / "creds.json")
+    state_path = _anomaly_confirm_state_path(cfg)
+
+    orig = op_mod.log_event
+    op_mod.log_event = AsyncMock()
+    try:
+        # First call: counter starts at 0 → increments to 1.
+        recorded = await record_usage(store, payload, cfg=cfg)
+    finally:
+        op_mod.log_event = orig
+
+    assert recorded["seven_day"]["anomalous"] is True
+    assert recorded["seven_day"]["confirm_count"] == 1
+    assert recorded["seven_day"]["confirm_threshold"] == ANOMALY_7D_CONFIRM_THRESHOLD_DEFAULT
+    # Prior value (0.50) preserved in store.
+    snap = store.current().get("seven_day")
+    assert snap is not None
+    assert snap.utilization == pytest.approx(0.50)
+    # Sidecar persisted counter = 1.
+    state = _load_anomaly_confirm_state(state_path)
+    assert state.get("seven_day") == 1
+
+
+@pytest.mark.asyncio
+async def test_7d_anomaly_confirm_threshold_accepts_after_n(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """After THRESHOLD consecutive anomalous readings, the value is
+    accepted, ``quota_reading_anomaly_confirmed`` fires, and the counter
+    resets to 0."""
+    from mimir.oauth_usage_poller import (
+        PollerConfig, record_usage,
+        _load_anomaly_confirm_state, _anomaly_confirm_state_path,
+        _save_anomaly_confirm_state,
+    )
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op_mod
+
+    # Force threshold to 2 so the test doesn't need 5 full async calls.
+    monkeypatch.setenv("MIMIR_QUOTA_7D_ANOMALY_CONFIRM_THRESHOLD", "2")
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+        observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day_sonnet", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+        observed_at="2026-05-09T00:00:00+00:00",
+    ))
+
+    payload = {
+        "seven_day": {"status": "allowed", "utilization": 1.00,
+                      "resets_at": 9999999999},
+        "seven_day_sonnet": {"status": "allowed", "utilization": 0.52,
+                             "resets_at": 9999999999},
+    }
+
+    cfg = PollerConfig(credentials_path=tmp_path / "creds.json")
+    state_path = _anomaly_confirm_state_path(cfg)
+
+    # Seed the sidecar with count=2 (already at threshold).
+    _save_anomaly_confirm_state(state_path, {"seven_day": 2})
+
+    events: list[str] = []
+    orig = op_mod.log_event
+
+    async def _cap(et, **kw):
+        events.append(et)
+
+    op_mod.log_event = _cap
+    try:
+        recorded = await record_usage(store, payload, cfg=cfg)
+    finally:
+        op_mod.log_event = orig
+
+    # Should NOT have "anomalous" key — fall-through to normal write.
+    assert "anomalous" not in recorded.get("seven_day", {})
+    # seven_day written through at the new value (1.00).
+    snap = store.current().get("seven_day")
+    assert snap is not None
+    assert snap.utilization == pytest.approx(1.00)
+    # Confirmed event fired.
+    assert "quota_reading_anomaly_confirmed" in events
+    # Counter reset to 0 in sidecar.
+    state = _load_anomaly_confirm_state(state_path)
+    assert state.get("seven_day", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_7d_anomaly_confirm_counter_resets_on_clean_reading(
+    tmp_path: Path,
+):
+    """A non-anomalous 7d reading resets the confirmation counter so
+    prior anomaly runs don't carry over."""
+    from mimir.oauth_usage_poller import (
+        PollerConfig, record_usage,
+        _load_anomaly_confirm_state, _anomaly_confirm_state_path,
+        _save_anomaly_confirm_state,
+    )
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op_mod
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+        observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day_sonnet", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+        observed_at="2026-05-09T00:00:00+00:00",
+    ))
+
+    # Non-anomalous payload: 7d stays flat (no big jump).
+    payload = {
+        "seven_day": {"status": "allowed", "utilization": 0.51,
+                      "resets_at": 9999999999},
+        "seven_day_sonnet": {"status": "allowed", "utilization": 0.51,
+                             "resets_at": 9999999999},
+    }
+
+    cfg = PollerConfig(credentials_path=tmp_path / "creds.json")
+    state_path = _anomaly_confirm_state_path(cfg)
+
+    # Seed the sidecar with count=3 from prior anomaly run.
+    _save_anomaly_confirm_state(state_path, {"seven_day": 3})
+
+    orig = op_mod.log_event
+    op_mod.log_event = AsyncMock()
+    try:
+        recorded = await record_usage(store, payload, cfg=cfg)
+    finally:
+        op_mod.log_event = orig
+
+    # 7d should have written through normally (no anomaly).
+    assert "anomalous" not in recorded.get("seven_day", {})
+    snap = store.current().get("seven_day")
+    assert snap is not None
+    assert snap.utilization == pytest.approx(0.51)
+    # Counter reset to 0 (key removed).
+    state = _load_anomaly_confirm_state(state_path)
+    assert "seven_day" not in state
