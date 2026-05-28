@@ -35,7 +35,6 @@ import asyncio
 import json
 import logging
 import os
-import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -43,34 +42,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# chainlink #239: this module's prior ``_write_json_atomic`` did NOT
+# fsync the file or the parent dir — a crash between os.replace and
+# writeback could revert the rename. ``mimir._atomic.atomic_write_json``
+# now applies the CR#7 invariant (fsync file + fsync parent dir)
+# uniformly across rate_limits, oauth_usage_poller, and quota_pause.
+from ._atomic import atomic_write_json
+
 log = logging.getLogger(__name__)
-
-
-def _write_json_atomic(path: Path, data: dict) -> None:
-    """Write JSON ``data`` to ``path`` atomically.
-
-    Uses write-to-temp + ``os.replace`` so that a partial write (e.g.
-    due to a crash or concurrent writer) never corrupts the target file.
-    POSIX guarantees that ``rename``/``os.replace`` on the same
-    filesystem is atomic; the temp file lives in the same directory as
-    ``path`` to ensure that invariant.
-
-    ``path.parent`` is created if it doesn't exist. Raises ``OSError``
-    on IO failure after the temp file is cleaned up.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    content = json.dumps(data, indent=2, default=str)
-    fd, tmp_name = tempfile.mkstemp(prefix=".rate_limits.tmp.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        os.replace(tmp_name, path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
 
 
 def running_on_claude_max() -> bool:
@@ -152,7 +131,7 @@ class RateLimitStore:
             data = self._load()
             data[rate_limit_type] = asdict(snapshot)
             try:
-                _write_json_atomic(self.path, data)
+                atomic_write_json(self.path, data)
             except OSError as exc:
                 log.warning("rate_limits.json write failed: %s", exc)
 
@@ -177,7 +156,7 @@ class RateLimitStore:
             data = self._load()
             data[rate_limit_type] = asdict(snapshot)
             try:
-                _write_json_atomic(self.path, data)
+                atomic_write_json(self.path, data)
             except OSError as exc:
                 log.warning("rate_limits.json write failed: %s", exc)
 

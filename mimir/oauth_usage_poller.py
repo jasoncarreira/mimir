@@ -57,6 +57,7 @@ from typing import Any
 
 import aiohttp
 
+from ._atomic import atomic_write_json
 from .event_logger import log_event
 from .rate_limits import (
     RateLimitSnapshot,
@@ -126,44 +127,10 @@ class PollerConfig:
 # ─── credentials I/O ───────────────────────────────────────────────────
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Write ``payload`` as pretty JSON to ``path`` durably.
-
-    CR#7: the previous shape used ``Path.write_text(...)`` + ``os.replace``
-    without an ``fsync`` on the temp file, so a crash between rename-commit
-    and content-flush left ``path`` pointing at a zero-length region. The
-    credentials file's refresh token rotates on every refresh — losing a
-    write here forces an operator re-``/login``. Same shape applies to the
-    sidecar (less catastrophic, but corrupting it triggered the CR#8 bug
-    where the age-warn countdown silently reset).
-
-    The standard atomic-write pattern: open tmp, write, ``fsync`` the file,
-    close, ``rename``, then ``fsync`` the parent directory so the rename
-    itself is durable. Mode 0o600 matches the prior chmod-after-write
-    behavior.
-    """
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    body = json.dumps(payload, indent=2).encode("utf-8")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, body)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
-    # Make the rename durable. Without this, on crash between rename and
-    # parent-dir writeback, the new entry can revert to the pre-rename
-    # state. Parent-dir fsync is cheap (single block usually) and the
-    # only way to actually commit the rename. Best-effort — Windows /
-    # exotic FS may reject O_RDONLY on directories.
-    try:
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass
+# chainlink #239: this module's prior ``_atomic_write_json`` was the
+# original CR#7-compliant implementation; it now lives in
+# ``mimir._atomic.atomic_write_json`` so rate_limits + quota_pause
+# inherit the same fsync-file + fsync-parent-dir guarantees.
 
 
 def read_credentials(path: Path) -> dict[str, Any]:
@@ -197,7 +164,7 @@ def write_credentials(path: Path, oauth_block: dict[str, Any]) -> None:
     except json.JSONDecodeError:
         log.warning("existing credentials.json is corrupt; overwriting")
     existing["claudeAiOauth"] = oauth_block
-    _atomic_write_json(path, existing)
+    atomic_write_json(path, existing)
 
 
 def is_access_token_expired(
@@ -301,7 +268,7 @@ def record_first_seen(
 
     try:
         sidecar.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_json(sidecar, existing)
+        atomic_write_json(sidecar, existing)
     except OSError as exc:
         log.warning("first-seen sidecar write failed: %s", exc)
     return existing
@@ -366,7 +333,7 @@ def mark_logged_out(
     existing["logged_out_last_reminder_unix"] = int(now)
     try:
         sidecar.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_json(sidecar, existing)
+        atomic_write_json(sidecar, existing)
     except OSError as exc:
         log.warning("logged_out sidecar write failed: %s", exc)
 
@@ -387,7 +354,7 @@ def clear_logged_out(credentials_path: Path) -> None:
     existing.pop("logged_out_since_unix", None)
     existing.pop("logged_out_last_reminder_unix", None)
     try:
-        _atomic_write_json(sidecar, existing)
+        atomic_write_json(sidecar, existing)
     except OSError as exc:
         log.warning("clear_logged_out sidecar write failed: %s", exc)
 
@@ -403,7 +370,7 @@ def reset_first_seen(credentials_path: Path, *, now: float | None = None) -> Non
     payload = {"first_login_at_unix": int(now), "last_seen_at_unix": int(now)}
     try:
         sidecar.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_json(sidecar, payload)
+        atomic_write_json(sidecar, payload)
     except OSError as exc:
         log.warning("first-seen sidecar reset failed: %s", exc)
 
@@ -740,7 +707,7 @@ def _anomaly_confirm_state_path(cfg: "PollerConfig") -> "Path":
     """Return the sidecar path for the 7d anomaly confirmation counter.
 
     Lives alongside the credentials file so it shares the same directory
-    lifetime and permissions (0o600 via _atomic_write_json).
+    lifetime and permissions (0o600 via atomic_write_json).
     """
     return cfg.credentials_path.parent / "anomaly_confirm_state.json"
 
@@ -769,7 +736,7 @@ def _save_anomaly_confirm_state(path: "Path", state: dict[str, int]) -> None:
     to 0 on next load because state was not saved).
     """
     try:
-        _atomic_write_json(path, state)
+        atomic_write_json(path, state)
     except OSError:
         log.warning("oauth_usage: failed to save anomaly confirm state to %s", path)
 

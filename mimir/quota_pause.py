@@ -36,13 +36,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from ._atomic import atomic_write_json
 
 log = logging.getLogger(__name__)
 
@@ -102,30 +102,20 @@ class QuotaPauseTracker:
         self._provider = data.get("provider") or None
 
     def _save(self) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            log.warning("quota_pause: can't create dir: %s", exc)
-            return
         payload: dict[str, Any] = {
             "reset_at": self._reset_at.isoformat() if self._reset_at else None,
             "reason": self._reason,
             "provider": self._provider,
         }
-        # Atomic write (tmpfile + rename in same dir) so a crash mid-
-        # write doesn't leave a half-truncated state file.
-        fd, tmp_str = tempfile.mkstemp(
-            prefix=self._path.name + ".", suffix=".tmp", dir=str(self._path.parent),
-        )
-        tmp = Path(tmp_str)
+        # chainlink #239: shared atomic-write helper applies the CR#7
+        # invariant (fsync file + fsync parent dir). Prior shape only
+        # fsynced the file — a crash between rename and writeback could
+        # revert the pause state. The helper raises on failure; we log
+        # + swallow here because a missed quota_pause.json write self-
+        # heals at the next pause_until call.
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(payload, f)
-                f.flush()
-                os.fsync(f.fileno())
-            tmp.replace(self._path)
+            atomic_write_json(self._path, payload)
         except OSError as exc:
-            tmp.unlink(missing_ok=True)
             log.warning("quota_pause: state write failed: %s", exc)
 
     # ── public API ──────────────────────────────────────────────────
