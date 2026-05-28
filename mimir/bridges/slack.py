@@ -40,6 +40,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
     ) from _exc
 
 from ..models import AgentEvent
+from ._attachments import build_inbound_path, download_to_path
 from ._history import ChannelMessage
 from .base import Bridge, SendResult
 
@@ -768,7 +769,6 @@ class SlackBridge(Bridge):
                     name, size, self.attachments_max_bytes,
                 )
                 continue
-            from ._attachments import build_inbound_path, download_to_path
             target = build_inbound_path(
                 self.attachments_dir,
                 channel="slack",
@@ -776,29 +776,17 @@ class SlackBridge(Bridge):
                 filename=str(name),
             )
             # Slack's url_private requires the bot token in the
-            # Authorization header; download_to_path passes through
-            # custom headers via aiohttp.
-            try:
-                import aiohttp
-                timeout = aiohttp.ClientTimeout(total=15.0)
-                async with aiohttp.ClientSession(
-                    timeout=timeout,
-                    headers={"Authorization": f"Bearer {self.bot_token}"},
-                ) as session:
-                    async with session.get(str(url)) as resp:
-                        if resp.status >= 400:
-                            log.warning(
-                                "SlackBridge: download %s returned %s",
-                                url, resp.status,
-                            )
-                            continue
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        with target.open("wb") as fh:
-                            async for chunk in resp.content.iter_chunked(64 * 1024):
-                                fh.write(chunk)
+            # Authorization header. Use the shared download_to_path
+            # helper so the streaming-size cap is enforced (no unbounded
+            # disk write if the endpoint streams more than advertised).
+            ok = await download_to_path(
+                str(url),
+                target,
+                max_bytes=self.attachments_max_bytes,
+                headers={"Authorization": f"Bearer {self.bot_token}"},
+            )
+            if ok:
                 attachment_paths.append(str(target))
-            except Exception as exc:  # noqa: BLE001
-                log.warning("SlackBridge: download %s failed: %s", url, exc)
 
         agent_event = AgentEvent(
             trigger="user_message",
