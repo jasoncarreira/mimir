@@ -1,4 +1,4 @@
-"""Turn-viewer + ops dashboard + log API routes (SPEC §11).
+"""Turn-viewer + ops dashboard + log API + saga DB routes (SPEC §11).
 
 Mounts onto the same aiohttp app that serves ``/event`` + ``/health`` and
 hosts the WebUI bridge's ``/chat``. Routes:
@@ -10,14 +10,19 @@ hosts the WebUI bridge's ``/chat``. Routes:
                           repeated to combine filters
   GET /ops              — live ops dashboard (HTML, Chart.js)
   GET /api/ops          — JSON twin of /ops for ad-hoc scripting
+  GET /saga             — saga DB operator viewer (HTML)
+  GET /api/saga         — JSON twin of /saga; view= selects the payload
+                          shape (recent, atom, stats)
 
 The HTML page polls ``/api/turns`` every 5s for live updates. ``/api/events``
 is exposed for the (deferred) Events tab + ad-hoc scripting. ``/ops``
 recomputes from events.jsonl on every request — no caching.
+``/saga`` reads the saga SQLite DB on each request — no caching.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -29,6 +34,12 @@ from .ops_dashboard import (
     build_dashboard_payload_async,
     parse_days_param,
     render_dashboard_html,
+)
+from .saga_dashboard import (
+    build_atom_payload,
+    build_db_stats_payload,
+    build_recent_atoms_payload,
+    render_saga_html,
 )
 
 log = logging.getLogger(__name__)
@@ -82,6 +93,7 @@ def register_routes(
     turns_log: Path,
     events_log: Path,
     home: Path | None = None,
+    saga_db: Path | None = None,
 ) -> None:
     """Add viewer + API routes to an existing aiohttp app.
 
@@ -91,7 +103,10 @@ def register_routes(
     ``home`` is passed to ``build_dashboard_payload`` so the /ops
     dashboard's Chainlink tab can run ``chainlink issue list --json``
     against the right repo. None disables the Chainlink tab gracefully
-    (renders an "unavailable" message)."""
+    (renders an "unavailable" message).
+
+    ``saga_db`` is the path to the saga SQLite DB for the /saga viewer.
+    If None the viewer renders but API calls return an error payload."""
 
     existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
 
@@ -161,6 +176,54 @@ def register_routes(
             await build_dashboard_payload_async(events_log, days, home=home),
         )
 
+    # ── /saga — saga DB viewer ───────────────────────────────────────
+
+    # Resolve the DB path: use the explicit ``saga_db`` kwarg when
+    # provided; otherwise derive from ``home`` (the standard location
+    # at ``<home>/state/saga.db``).
+    _saga_db: Path | None = saga_db
+    if _saga_db is None and home is not None:
+        _saga_db = home / "state" / "saga.db"
+
+    async def saga_page(_request: web.Request) -> web.Response:
+        return web.Response(text=render_saga_html(), content_type="text/html")
+
+    async def saga_data(request: web.Request) -> web.Response:
+        view = request.query.get("view", "recent")
+
+        if _saga_db is None:
+            return web.json_response(
+                {"error": "saga_db path not configured"}, status=503
+            )
+
+        if view == "stats":
+            payload = await asyncio.get_event_loop().run_in_executor(
+                None, build_db_stats_payload, _saga_db
+            )
+        elif view == "atom":
+            atom_id = request.query.get("id", "").strip()
+            if not atom_id:
+                return web.json_response({"error": "id param required"}, status=400)
+            payload = await asyncio.get_event_loop().run_in_executor(
+                None, build_atom_payload, _saga_db, atom_id
+            )
+        else:  # view == "recent" (default)
+            channel = request.query.get("channel", "").strip() or None
+            try:
+                limit = int(request.query.get("limit") or 50)
+            except ValueError:
+                limit = 50
+            payload = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: build_recent_atoms_payload(
+                    _saga_db, channel=channel, limit=limit  # type: ignore[arg-type]
+                ),
+            )
+
+        if "error" in payload and not payload.get("atoms") and view != "recent":
+            return web.json_response(payload, status=404 if "not found" in str(payload["error"]) else 503)
+        return web.json_response(payload)
+
     if ("GET", "/turns") not in existing:
         app.router.add_get("/turns", turns_page)
     if ("GET", "/api/turns") not in existing:
@@ -171,3 +234,7 @@ def register_routes(
         app.router.add_get("/ops", ops_page)
     if ("GET", "/api/ops") not in existing:
         app.router.add_get("/api/ops", ops_data)
+    if ("GET", "/saga") not in existing:
+        app.router.add_get("/saga", saga_page)
+    if ("GET", "/api/saga") not in existing:
+        app.router.add_get("/api/saga", saga_data)

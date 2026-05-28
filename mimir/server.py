@@ -106,6 +106,7 @@ _AUTH_EXEMPT: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/health"),
     ("GET", "/turns"),
     ("GET", "/ops"),
+    ("GET", "/saga"),
 })
 
 
