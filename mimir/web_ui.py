@@ -216,16 +216,12 @@ def register_routes(
             )
 
         if view == "stats":
-            payload = await asyncio.get_event_loop().run_in_executor(
-                None, build_db_stats_payload, _saga_db
-            )
+            payload = await asyncio.to_thread(build_db_stats_payload, _saga_db)
         elif view == "atom":
             atom_id = request.query.get("id", "").strip()
             if not atom_id:
                 return web.json_response({"error": "id param required"}, status=400)
-            payload = await asyncio.get_event_loop().run_in_executor(
-                None, build_atom_payload, _saga_db, atom_id
-            )
+            payload = await asyncio.to_thread(build_atom_payload, _saga_db, atom_id)
         elif view == "search":
             query = request.query.get("q", "").strip()
             if not query:
@@ -235,33 +231,27 @@ def register_routes(
                 limit = int(request.query.get("limit") or 100)
             except ValueError:
                 limit = 100
-            payload = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: build_search_payload(
-                    _saga_db, query, channel=channel, limit=limit  # type: ignore[arg-type]
-                ),
+            payload = await asyncio.to_thread(
+                build_search_payload,
+                _saga_db, query, channel=channel, limit=limit,  # type: ignore[arg-type]
             )
         elif view == "activation_hist":
             try:
                 days = int(request.query.get("days") or 7)
             except ValueError:
                 days = 7
-            payload = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: build_activation_hist_payload(
-                    _saga_db, days=days  # type: ignore[arg-type]
-                ),
+            payload = await asyncio.to_thread(
+                build_activation_hist_payload,
+                _saga_db, days=days,  # type: ignore[arg-type]
             )
         elif view == "clusters":
             try:
                 sample_size = int(request.query.get("sample_size") or 3)
             except ValueError:
                 sample_size = 3
-            payload = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: build_clusters_payload(
-                    _saga_db, sample_size=sample_size  # type: ignore[arg-type]
-                ),
+            payload = await asyncio.to_thread(
+                build_clusters_payload,
+                _saga_db, sample_size=sample_size,  # type: ignore[arg-type]
             )
         else:  # view == "recent" (default)
             channel = request.query.get("channel", "").strip() or None
@@ -269,11 +259,9 @@ def register_routes(
                 limit = int(request.query.get("limit") or 50)
             except ValueError:
                 limit = 50
-            payload = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: build_recent_atoms_payload(
-                    _saga_db, channel=channel, limit=limit  # type: ignore[arg-type]
-                ),
+            payload = await asyncio.to_thread(
+                build_recent_atoms_payload,
+                _saga_db, channel=channel, limit=limit,  # type: ignore[arg-type]
             )
 
         if "error" in payload and not payload.get("atoms") and view not in ("recent", "clusters", "activation_hist"):
@@ -310,9 +298,7 @@ def register_routes(
         if not sql:
             return web.json_response({"error": "sql field is required"}, status=400)
 
-        payload = await asyncio.get_event_loop().run_in_executor(
-            None, build_sql_payload, _saga_db, sql
-        )
+        payload = await asyncio.to_thread(build_sql_payload, _saga_db, sql)
         if payload.get("rejected"):
             return web.json_response(payload, status=400)
         if "error" in payload:
@@ -345,14 +331,12 @@ def register_routes(
         if not _memory_roots:
             return web.json_response({"error": "home not configured"}, status=503)
 
-        loop = asyncio.get_event_loop()
-
         if view == "file":
             rel = request.query.get("path", "").strip()
             if not rel:
                 return web.json_response({"error": "path param required"}, status=400)
-            payload = await loop.run_in_executor(
-                None, lambda: read_file_safe_multi(_memory_roots, rel)
+            payload = await asyncio.to_thread(
+                read_file_safe_multi, _memory_roots, rel,
             )
             if "error" in payload:
                 err = payload["error"]
@@ -366,23 +350,17 @@ def register_routes(
             q = request.query.get("q", "").strip()
             if not q:
                 return web.json_response({"error": "q param required"}, status=400)
-            payload = await loop.run_in_executor(
-                None, lambda: search_files(_memory_roots, q)
-            )
+            payload = await asyncio.to_thread(search_files, _memory_roots, q)
             return web.json_response(payload)
 
         if view == "channels":
             # memory/ root is first in _memory_roots; channel dirs live under it.
             mem_root = _memory_roots[0]
-            channels = await loop.run_in_executor(
-                None, lambda: list_channel_dirs(mem_root)
-            )
+            channels = await asyncio.to_thread(list_channel_dirs, mem_root)
             return web.json_response({"channels": channels})
 
         # Default: view == "tree"
-        payload = await loop.run_in_executor(
-            None, lambda: list_trees(_memory_roots)
-        )
+        payload = await asyncio.to_thread(list_trees, _memory_roots)
         return web.json_response(payload)
 
     if ("GET", "/memory") not in existing:
