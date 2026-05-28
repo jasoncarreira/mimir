@@ -231,19 +231,25 @@ def test_record_first_seen_does_not_reset_first_login_on_corrupt_sidecar(
 def test_atomic_write_json_fsyncs_and_replaces(tmp_path: Path) -> None:
     """CR#7: write_credentials must use the atomic helper that fsyncs.
 
-    We can't test actual durability across crashes, but we can verify
-    the helper produces a valid JSON file with mode 0o600 and that the
-    temp file is gone after the call (proving os.replace ran).
+    Chainlink #239: the helper moved to ``mimir._atomic`` so all three
+    sidecar paths (oauth_usage_poller, rate_limits, quota_pause) share
+    the same fsync-file + fsync-parent-dir contract. The contract test
+    lives in ``tests/test_atomic.py``; this one verifies oauth_usage_poller
+    still uses it (import-level assertion).
     """
+    from mimir import _atomic
+
     target = tmp_path / "out.json"
-    op._atomic_write_json(target, {"a": 1, "b": [2, 3]})
+    op.atomic_write_json(target, {"a": 1, "b": [2, 3]})
     assert target.exists()
     assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1, "b": [2, 3]}
     # Mode 0o600 (POSIX).
     mode = target.stat().st_mode & 0o777
     assert mode == 0o600
-    # Tmp file cleaned up.
-    assert not target.with_suffix(target.suffix + ".tmp").exists()
+    # oauth_usage_poller's atomic_write_json is the same object as
+    # _atomic.atomic_write_json — the unification (chainlink #239)
+    # didn't introduce a divergent copy.
+    assert op.atomic_write_json is _atomic.atomic_write_json
 
 
 # ─── refresh-grant HTTP ───────────────────────────────────────────────
