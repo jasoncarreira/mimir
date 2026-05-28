@@ -172,6 +172,27 @@ def test_read_file_safe_not_found(tmp_path: Path) -> None:
     assert "not found" in result["error"]
 
 
+@pytest.mark.skipif(
+    not hasattr(Path, "symlink_to"),
+    reason="symlinks not supported on this platform",
+)
+def test_read_file_safe_md_symlink_to_non_md_rejected(tmp_path: Path) -> None:
+    """A .md symlink whose resolved target has a non-.md suffix must be rejected.
+
+    This pins the post-resolve suffix check in read_file_safe — a future
+    refactor that moves the suffix check back to the unresolved path string
+    would silently break this protection.
+    """
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "real.txt").write_text("plain text\n")
+    (memory / "looks_like_md.md").symlink_to(memory / "real.txt")
+
+    result = read_file_safe(memory, "memory/looks_like_md.md")
+    assert "error" in result
+    assert "only .md" in result["error"]
+
+
 # ─── render_memory_html ───────────────────────────────────────────
 
 
