@@ -75,11 +75,26 @@ class TestOutputPreview:
         assert _output_preview("a\n\nb   c\td") == "a b c d"
 
     def test_long_truncated_with_char_count(self) -> None:
+        # The "(N chars total)" suffix reports len(output) — the ORIGINAL
+        # length — not len(flat) after whitespace collapse. This input has
+        # no whitespace so the two coincide; see
+        # test_long_count_is_original_not_collapsed_length for the case
+        # where they differ.
         text = "x" * 500
         result = _output_preview(text)
         assert result.startswith("x" * 200)
         assert "(500 chars total)" in result
         assert "…" in result
+
+    def test_long_count_is_original_not_collapsed_length(self) -> None:
+        """The char-count suffix reports the original output length, not the
+        whitespace-collapsed preview length — so an agent reading the
+        preview knows the true size of what mimir_get_turn would return."""
+        # 300 "x" + 300 spaces = 600 original chars; collapse drops the
+        # run of spaces, but the suffix must still say 600.
+        text = ("x" * 300) + (" " * 300)
+        result = _output_preview(text)
+        assert "(600 chars total)" in result
 
     def test_exactly_at_cap_not_truncated(self) -> None:
         text = "y" * 200
@@ -116,6 +131,19 @@ class TestTurnSummaryLines:
         turns = [{"turn_id": "t", "trigger": "x", "events": [], "output": ""}]
         out = _turn_summary_lines(turns)
         assert "$?" in out
+
+    def test_zero_cost_renders_dollar_zero_not_question_mark(self) -> None:
+        """0.0 is falsy but a real cost — the source uses
+        ``isinstance(cost, (int, float))`` rather than a truthy check, so a
+        genuinely-free turn must render ``$0.000``, not ``$?``. Pins the
+        not-falsy-check (the footgun the isinstance guard avoids)."""
+        turns = [{
+            "turn_id": "t", "trigger": "x", "total_cost_usd": 0.0,
+            "events": [], "output": "o",
+        }]
+        out = _turn_summary_lines(turns)
+        assert "$0.000" in out
+        assert "$?" not in out
 
     def test_no_atoms_renders_none(self) -> None:
         turns = [{"turn_id": "t", "trigger": "x", "events": [], "output": "o"}]
