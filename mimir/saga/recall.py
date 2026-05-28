@@ -390,6 +390,13 @@ def recall(
     # In its own transaction — mark_access is non-transactional; recall
     # wraps it. Failure here doesn't roll back the read pass (which had
     # no writes anyway).
+    #
+    # chainlink #236: thread ``reference_date`` to mark_access so bench
+    # replays of historical corpora write access_events with the
+    # corpus's epoch instead of the wall clock that ran the bench.
+    # Without this, replaying LongMemEval-S (2023 sessions) in 2026
+    # writes 2026 timestamps onto 2023-era atoms, corrupting downstream
+    # activation reads within the same bench run.
     if fire_access_events:
         events = [
             AccessEvent(atom_id=c.atom["id"], source="retrieval",
@@ -399,7 +406,7 @@ def recall(
         if events:
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                mark_access(conn, events)
+                mark_access(conn, events, now=reference_date)
                 conn.commit()
             except Exception:
                 conn.rollback()

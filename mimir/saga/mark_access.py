@@ -60,7 +60,12 @@ def _resolve_weight(source: str, override: float | None) -> float:
     return SOURCE_WEIGHTS.get(source, 1.0)
 
 
-def mark_access(conn: sqlite3.Connection, events: Iterable[AccessEvent]) -> int:
+def mark_access(
+    conn: sqlite3.Connection,
+    events: Iterable[AccessEvent],
+    *,
+    now: "datetime | str | None" = None,
+) -> int:
     """Persist one or more access events as a batch of statements.
 
     DOES NOT manage transactions. Caller wraps in `with conn:` or
@@ -77,12 +82,25 @@ def mark_access(conn: sqlite3.Connection, events: Iterable[AccessEvent]) -> int:
     Each event:
       1. Inserts one row into access_events
       2. Updates atom_access_summary for the affected atom
+
+    ``now`` (chainlink #236): timestamp to use for the events. Defaults
+    to wall clock when None — the normal production case. Bench replays
+    pass an explicit datetime so historical-corpus runs (LongMemEval-S
+    in 2023 replayed under a 2026 wall clock) write access_events with
+    the corpus's epoch rather than the bench-run clock. Mirrors the
+    ``reference_date`` plumbing in ``forget.py``.
     """
     events_list = list(events)
     if not events_list:
         return 0
 
-    now_iso = _utc_now_iso()
+    # Resolve the timestamp string. Accept datetime, ISO string, or None.
+    if now is None:
+        now_iso = _utc_now_iso()
+    elif isinstance(now, datetime):
+        now_iso = now.isoformat()
+    else:
+        now_iso = str(now)
 
     # Group events by atom_id so we update each summary once per atom
     # even when one atom has multiple events in the batch.
