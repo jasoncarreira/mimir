@@ -88,7 +88,14 @@ def atomic_write_json(
         tmp.unlink(missing_ok=True)
         raise
     else:
-        os.close(fd)
+        # NFS / FUSE can return errors from close() after the kernel
+        # flushes dirty pages — rare but the helper's contract is "no
+        # leaked temp file on any failure path." Same cleanup as above.
+        try:
+            os.close(fd)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
 
     try:
         os.replace(tmp, path)

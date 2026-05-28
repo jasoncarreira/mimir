@@ -42,15 +42,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-log = logging.getLogger(__name__)
-
-
 # chainlink #239: this module's prior ``_write_json_atomic`` did NOT
 # fsync the file or the parent dir — a crash between os.replace and
 # writeback could revert the rename. ``mimir._atomic.atomic_write_json``
 # now applies the CR#7 invariant (fsync file + fsync parent dir)
 # uniformly across rate_limits, oauth_usage_poller, and quota_pause.
 from ._atomic import atomic_write_json
+
+log = logging.getLogger(__name__)
 
 
 def running_on_claude_max() -> bool:

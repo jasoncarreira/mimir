@@ -66,7 +66,10 @@ class TestBasicWrite:
 
 
 class TestDurabilityContract:
-    """Pin the CR#7 invariant: fsync file + parent dir."""
+    """Pin the CR#7 invariant: fsync file + parent dir, and crucially
+    that the file fsync happens BEFORE the rename. A refactor that
+    moved fsync after os.replace would technically still "fsync the
+    file" but defeats the durability promise."""
 
     def test_calls_fsync_on_file(self, tmp_path: Path) -> None:
         with patch("mimir._atomic.os.fsync") as mock_fsync:
@@ -74,6 +77,39 @@ class TestDurabilityContract:
         assert mock_fsync.call_count >= 1, (
             "atomic_write_json must fsync the file before rename — "
             "CR#7 invariant. A non-fsynced rename can revert across a crash."
+        )
+
+    def test_fsync_runs_before_rename(self, tmp_path: Path) -> None:
+        """CR#7 explicitly requires: fsync(file) → os.replace → fsync(parent).
+        A refactor that swaps the first two would silently violate the
+        contract — durability of the rename hinges on the file's bytes
+        being on disk before the rename commits.
+        """
+        events: list[str] = []
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        def _track_fsync(fd: int) -> None:
+            events.append("fsync")
+            real_fsync(fd)
+
+        def _track_replace(src, dst) -> None:
+            events.append("replace")
+            real_replace(src, dst)
+
+        with patch("mimir._atomic.os.fsync", side_effect=_track_fsync), \
+             patch("mimir._atomic.os.replace", side_effect=_track_replace):
+            atomic_write_json(tmp_path / "out.json", {"ok": True})
+
+        # Expected order: fsync(file), replace, fsync(parent_dir).
+        assert events[0] == "fsync", (
+            f"first event must be fsync(file) before any replace; "
+            f"got order {events}"
+        )
+        assert "replace" in events, "os.replace must be called"
+        replace_idx = events.index("replace")
+        assert "fsync" in events[:replace_idx], (
+            f"no fsync before os.replace; order {events} violates CR#7"
         )
 
     def test_calls_fsync_on_parent_dir(self, tmp_path: Path) -> None:

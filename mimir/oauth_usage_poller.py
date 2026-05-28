@@ -707,7 +707,7 @@ def _anomaly_confirm_state_path(cfg: "PollerConfig") -> "Path":
     """Return the sidecar path for the 7d anomaly confirmation counter.
 
     Lives alongside the credentials file so it shares the same directory
-    lifetime and permissions (0o600 via _atomic_write_json).
+    lifetime and permissions (0o600 via atomic_write_json).
     """
     return cfg.credentials_path.parent / "anomaly_confirm_state.json"
 
