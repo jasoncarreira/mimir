@@ -1146,6 +1146,13 @@ async def poll_once(
     """One poll cycle: read creds → refresh if expired → fetch usage
     → record snapshots → emit events. Returns a summary dict for tests
     / introspection. Never raises — failures surface as events."""
+    # Resolve wall-clock now BEFORE any code path that subtracts it from
+    # a sidecar-loaded float (e.g. the logged-out-reminder throttle below).
+    # ``now=None`` is intended only as a hook for deterministic tests —
+    # production callers don't pass it, and ``None - float`` raises
+    # TypeError on the throttle-check path (chainlink #230).
+    if now is None:
+        now = time.time()
     # Read credentials.
     try:
         oauth = read_credentials(cfg.credentials_path)

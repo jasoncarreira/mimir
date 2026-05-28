@@ -868,6 +868,47 @@ async def test_poll_once_refresh_fails_logged_out(
 
 
 @pytest.mark.asyncio
+async def test_poll_once_default_now_handles_logged_out_throttle(
+    cfg: PollerConfig, rate_store: RateLimitStore,
+    monkeypatch: pytest.MonkeyPatch, credentials_path: Path, tmp_path: Path,
+) -> None:
+    """chainlink #230: poll_once(now=None) used to crash with TypeError on the
+    logged-out-reminder throttle path when the sidecar carried a
+    ``logged_out_last_reminder_unix`` float. The fix: resolve ``now`` to
+    ``time.time()`` at the top of poll_once so subsequent ``now - sidecar_float``
+    arithmetic always operates on two floats.
+    """
+    # Pre-seed sidecar with a sticky logged_out state + a recent reminder.
+    # If the throttle path subtracts None from these floats, we get TypeError.
+    # The credentials_path fixture writes refreshToken="sk-ant-ort01-test-refresh-original";
+    # last 12 chars = "sh-original". Sidecar's last_seen_refresh_tail must match,
+    # otherwise the tail-changed branch in record_first_seen clears logged_out state.
+    sidecar = credentials_path.parent / op.FIRST_SEEN_SIDECAR_NAME
+    refresh_token = "sk-ant-ort01-test-refresh-original"
+    sidecar.write_text(json.dumps({
+        "first_login_at_unix": int(time.time() - 86400),
+        "last_seen_refresh_tail": refresh_token[-12:],
+        "logged_out_since_unix": int(time.time() - 7200),
+        "logged_out_last_reminder_unix": int(time.time() - 60),  # recent → throttle should fire
+    }), encoding="utf-8")
+
+    events: list[tuple[str, dict]] = []
+    async def _cap(t, **kw):
+        events.append((t, kw))
+    monkeypatch.setattr(op, "log_event", _cap)
+
+    # Invoke with the production default (no now= kwarg). Pre-fix, this raised
+    # TypeError when computing ``now - last_reminder``.
+    result = await poll_once(cfg, rate_store, session=_MockSession())
+
+    # The throttle correctly short-circuited (recent reminder → no event spam).
+    assert result == {"ok": False, "stage": "logged_out_throttled"}
+    # No reminder event fired (the existing one is < interval).
+    types = [t for t, _ in events]
+    assert "oauth_logged_out_reminder" not in types
+
+
+@pytest.mark.asyncio
 async def test_poll_once_age_warn_emits(
     cfg: PollerConfig, rate_store: RateLimitStore,
     monkeypatch: pytest.MonkeyPatch, credentials_path: Path,
