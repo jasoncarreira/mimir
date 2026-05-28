@@ -616,6 +616,16 @@ WHERE a.source_type = 'session_boundary'
         conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        # chainlink #227: apply operator-configured busy_timeout so two
+        # concurrent writers (agent's store() + a cron-driven consolidate or
+        # forget in another thread/process) wait instead of raising
+        # OperationalError immediately. WAL serializes at the OS level but
+        # without busy_timeout the loser sees "database is locked" on the
+        # first millisecond of contention.
+        from ._config_io import get_config
+        _cfg = get_config()
+        _busy_timeout_ms = int(_cfg("storage", "db_busy_timeout_ms", 5000))
+        conn.execute(f"PRAGMA busy_timeout = {_busy_timeout_ms}")
         try:
             if fresh:
                 schema_path = Path(__file__).parent / "schema.sql"

@@ -484,3 +484,50 @@ def test_migration_ddl_strings_contain_no_pragma_foreign_keys():
             "which is a no-op inside executescript; the connection-level "
             "restore in _apply_pending_migrations handles this."
         )
+
+
+def test_ensure_conn_applies_busy_timeout_pragma(tmp_path):
+    """chainlink #227: ``saga.toml``'s ``db_busy_timeout_ms`` config dial must
+    actually flow into the SQLite connection. Pre-fix, the value was declared
+    but ``PRAGMA busy_timeout`` was never issued — concurrent writers raised
+    ``OperationalError: database is locked`` immediately instead of waiting up
+    to the configured window.
+    """
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=tmp_path / "busy.saga.db", embedding_dim=4)
+    # Force connection open via a trivial operation.
+    conn = store._ensure_conn()  # type: ignore[attr-defined]
+    busy_timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    # Default from _config_io.py is 5000ms; should be > 0 either way.
+    assert busy_timeout_ms > 0, (
+        f"PRAGMA busy_timeout returned {busy_timeout_ms}; expected the "
+        "configured value (default 5000ms). The config dial is dead if 0."
+    )
+    # Verify the configured value (not the SQLite hard-coded 0 default).
+    assert busy_timeout_ms == 5000, (
+        f"PRAGMA busy_timeout returned {busy_timeout_ms}; expected 5000 "
+        "from the default ``db_busy_timeout_ms`` in saga config."
+    )
+
+
+def test_migrate_init_includes_busy_timeout_pragma():
+    """chainlink #227: the migration-time connection setup in ``saga/migrate.py``
+    must issue ``PRAGMA busy_timeout``. We can't easily instrument the actual
+    connection (sqlite3.Connection.execute is a read-only C method); instead
+    verify by source-inspection that the PRAGMA call is present in the right
+    place. Brittle to refactors but pins the contract.
+    """
+    from pathlib import Path
+    src = Path(__import__("mimir.saga.migrate", fromlist=["__file__"]).__file__).read_text()
+    # Look for the chainlink #227 marker + the PRAGMA call together.
+    assert "chainlink #227" in src, (
+        "chainlink #227 marker missing from saga/migrate.py — the fix may have been removed"
+    )
+    assert "PRAGMA busy_timeout" in src, (
+        "PRAGMA busy_timeout not issued in saga/migrate.py per chainlink #227"
+    )
+    assert "db_busy_timeout_ms" in src, (
+        "saga/migrate.py should read db_busy_timeout_ms from config per chainlink #227"
+    )
