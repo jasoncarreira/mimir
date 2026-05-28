@@ -1111,3 +1111,192 @@ def cmd_update_skills(args) -> int:
             print(hint)
 
     return 1 if (any_failures or any_skipped_extras) else 0
+
+
+# ─── Configure (mimir skills configure) ─────────────────────────────
+
+
+def find_skill_path(home: Path, name: str) -> Path | None:
+    """Return the path to an installed skill's directory.
+
+    Checks operator-installed skills (``<home>/skills/<name>/``) first,
+    then bundled built-ins (``<home>/.mimir_builtin_skills/<name>/``).
+    Returns ``None`` when the skill isn't found in either location.
+    """
+    from mimir.skill_defs import home_builtin_skills_dir, home_skills_dir
+
+    for root in (home_skills_dir(home), home_builtin_skills_dir(home)):
+        candidate = root / name
+        if candidate.is_dir() and (candidate / "SKILL.md").is_file():
+            return candidate
+    return None
+
+
+def walk_configurable_skills(home: Path) -> list[tuple[str, Path]]:
+    """Return ``(name, path)`` pairs for every skill that has an
+    ``env:`` block in its ``SKILL.md`` (i.e., has env vars to configure).
+
+    Operator-installed skills shadow built-ins when names collide.  Only
+    skills with at least one required *or* optional env-var entry are
+    included — skills with no ``env:`` block are silently skipped.
+    """
+    from mimir.skill_defs import installed_skill_names
+
+    result: list[tuple[str, Path]] = []
+    for name in installed_skill_names(home):
+        path = find_skill_path(home, name)
+        if path is None:
+            continue
+        required, optional = read_env_specs(path)
+        if required or optional:
+            result.append((name, path))
+    return result
+
+
+def _configure_one(
+    name: str,
+    path: Path,
+    home: Path,
+    *,
+    reconfigure: bool,
+    no_smoke_test: bool,
+) -> int:
+    """Interactive env-var configuration for a single skill.
+
+    Prompts for required + optional vars declared in ``SKILL.md``,
+    writes them to ``<home>/.env``, and (unless ``no_smoke_test``)
+    runs the poller smoke test when the skill ships a ``pollers.json``.
+
+    Returns 0 on success; 0 even when no vars were written (the user
+    skipped prompts) so callers can proceed without special-casing.
+    """
+    env_path = home / ".env"
+    required_specs, optional_specs = read_env_specs(path)
+
+    if not required_specs and not optional_specs:
+        print(f"{name}: no env: block in SKILL.md — nothing to configure")
+        return 0
+
+    written = prompt_and_write_env(
+        required_specs,
+        optional_specs,
+        env_path,
+        skill_name=name,
+        reconfigure=reconfigure,
+    )
+    if written:
+        print(f"\n  {len(written)} var(s) written to {env_path}")
+
+    # Smoke test — only meaningful for poller skills.
+    if not no_smoke_test and (path / "pollers.json").is_file():
+        print("\n  Running smoke test...")
+        exit_code, snippet = run_smoke_test(path, env_path)
+        if exit_code == -1:
+            print(f"  smoke test: {snippet}")
+        elif exit_code == 0:
+            print("  smoke test: ✓ exited 0")
+            if snippet != "(no output)":
+                print(f"  output:\n{snippet}")
+        else:
+            print(f"  smoke test: ✗ exited {exit_code}")
+            if snippet != "(no output)":
+                print(f"  output:\n{snippet}")
+
+    # Reload hint — shown whether or not env vars were written.
+    if (path / "pollers.json").is_file():
+        print(
+            "\n  this skill ships a pollers.json — to activate changes:\n"
+            "    - Restart `mimir run`, OR\n"
+            '    - Ask mimir: "please call reload_pollers"'
+        )
+
+    return 0
+
+
+def add_argparse_configure(parser) -> None:
+    """Wire ``mimir skills configure [<name>] [--all] [--home PATH]``."""
+    name_group = parser.add_mutually_exclusive_group(required=True)
+    name_group.add_argument(
+        "name",
+        nargs="?",
+        default=None,
+        help="Skill name to configure (e.g. weather, github-poller). "
+             "Run `mimir skills list` to see installed skills.",
+    )
+    name_group.add_argument(
+        "--all",
+        dest="all_skills",
+        action="store_true",
+        default=False,
+        help="Configure every skill in the home that has env vars declared "
+             "in its SKILL.md. Skips skills with no env: block.",
+    )
+    parser.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Mimir home (default: $MIMIR_HOME or cwd).",
+    )
+    parser.add_argument(
+        "--reconfigure",
+        action="store_true",
+        help="Re-prompt even for vars already set in .env. "
+             "Without this flag, already-set vars are skipped.",
+    )
+    parser.add_argument(
+        "--no-smoke-test",
+        action="store_true",
+        dest="no_smoke_test",
+        help="Skip the poller smoke test (useful in non-interactive / CI contexts).",
+    )
+    parser.set_defaults(skill_install_cmd=cmd_configure)
+
+
+def cmd_configure(args) -> int:
+    """``mimir skills configure`` entry point.
+
+    Interactive env-var setup for an installed skill (including bundled
+    built-ins like ``weather`` and ``ntfy``).  Reads the skill's
+    ``SKILL.md`` ``env:`` block, prompts for each var, and writes the
+    results to ``<home>/.env``.  Use ``--reconfigure`` to re-prompt vars
+    that are already set.
+    """
+    home = _resolve_home(getattr(args, "home", None))
+    if not home.is_dir():
+        print(f"home not a directory: {home}")
+        return 2
+
+    reconfigure: bool = getattr(args, "reconfigure", False)
+    no_smoke_test: bool = getattr(args, "no_smoke_test", False)
+
+    if getattr(args, "all_skills", False):
+        skills = walk_configurable_skills(home)
+        if not skills:
+            print("no configurable skills found (none have env: blocks in their SKILL.md)")
+            return 0
+        for name, path in skills:
+            print(f"\n{'─' * 40}")
+            print(f"Configuring {name!r} …")
+            _configure_one(name, path, home, reconfigure=reconfigure, no_smoke_test=no_smoke_test)
+        return 0
+
+    name: str | None = getattr(args, "name", None)
+    if not name:
+        # argparse enforces the mutually_exclusive_group(required=True), but
+        # guard defensively for programmatic invocations.
+        print("error: specify a skill name or pass --all")
+        return 2
+
+    path = find_skill_path(home, name)
+    if path is None:
+        from mimir.skill_defs import home_builtin_skills_dir
+        builtin_root = home_builtin_skills_dir(home)
+        if not builtin_root.is_dir() or not any(builtin_root.iterdir()):
+            print(f"skill not found: {name!r}")
+            print(f"  tip: run `mimir setup --home {home}` first to seed bundled skills")
+        else:
+            print(f"skill not found: {name!r}")
+            print("  tip: run `mimir skills list` to see installed skills")
+        return 2
+
+    return _configure_one(name, path, home, reconfigure=reconfigure, no_smoke_test=no_smoke_test)
