@@ -102,6 +102,12 @@ fi
 git diff origin/main..HEAD --name-only
 ```
 
+**If the rebase fails with conflicts** (i.e. `git rebase origin/main` returned
+non-zero), abort with `git rebase --abort` and stop — **do not push**. A failed
+rebase leaves the branch in an intermediate state where the subsequent diff and
+push are both unsafe. Resolve the conflicts manually (or request operator
+guidance) before re-running the gate from step 1.
+
 After fetching (and rebasing if stale), inspect the path list:
 
 - If every path is **within the PR's declared scope** (the chainlink ID, PR
