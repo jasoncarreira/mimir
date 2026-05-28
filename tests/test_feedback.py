@@ -1892,3 +1892,29 @@ def test_pr_merge_blocked_renders_without_reviewer_list(tmp_path: Path) -> None:
     assert len(negatives) == 1
     assert "999" in negatives[0].content
     assert "CHANGES_REQUESTED" in negatives[0].content
+
+
+# ---- chainlink #218: feedback emit --json-values ----------------------------
+
+
+def test_feedback_emit_json_values(tmp_path: Path) -> None:
+    """``run_emit_event(..., json_values=True)`` JSON-parses values so
+    blocking_reviewers becomes a list and pr becomes an int — the rich
+    rendering path in feedback.py:1671 requires a list, not a string."""
+    from mimir.feedback_cmd import run_emit_event
+
+    rc = run_emit_event(
+        home=tmp_path,
+        event_type="pr_merge_blocked_by_changes_requested",
+        pairs=['blocking_reviewers=["jasoncarreira"]', "pr=42"],
+        json_values=True,
+    )
+    assert rc == 0
+
+    events_path = tmp_path / "logs" / "events.jsonl"
+    assert events_path.exists()
+    records = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["blocking_reviewers"] == ["jasoncarreira"]  # list, not string
+    assert rec["pr"] == 42  # int, not string

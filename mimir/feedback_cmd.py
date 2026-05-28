@@ -173,11 +173,20 @@ def run_mark_resolved(
 # ---------------------------------------------------------------------------
 
 
-def _parse_kv_pairs(pairs: list[str]) -> tuple[dict, str | None]:
+def _parse_kv_pairs(
+    pairs: list[str],
+    json_values: bool = False,
+) -> tuple[dict, str | None]:
     """Parse ``KEY=VALUE`` strings into a dict.
 
     Returns ``(payload_dict, error_message)`` -- ``error_message`` is None
     on success and a human-readable string on parse failure.
+
+    When *json_values* is ``True``, each value string is passed through
+    ``json.loads()``.  A malformed JSON value is **rejected** with an error
+    message (the caller explicitly opted in, so silent fall-back would hide
+    bugs).  Without the flag values are stored as plain strings, which is the
+    backwards-compatible default.
     """
     payload: dict = {}
     for pair in pairs:
@@ -187,6 +196,14 @@ def _parse_kv_pairs(pairs: list[str]) -> tuple[dict, str | None]:
         k = k.strip()
         if not k:
             return {}, f"empty key in pair: {pair!r}"
+        if json_values:
+            try:
+                v = json.loads(v)  # type: ignore[assignment]
+            except json.JSONDecodeError as exc:
+                return {}, (
+                    f"--json-values: value for key {k!r} is not valid JSON "
+                    f"({exc}); got {v!r}"
+                )
         payload[k] = v
     return payload, None
 
@@ -195,6 +212,7 @@ def run_emit_event(
     home: Path,
     event_type: str,
     pairs: list[str],
+    json_values: bool = False,
 ) -> int:
     """Implement ``mimir feedback emit <event_type> [KEY=VALUE ...]``.
 
@@ -209,7 +227,7 @@ def run_emit_event(
     Returns an integer exit code (0 = success, 1 = error).
     """
     # -- Parse KEY=VALUE pairs -----------------------------------------------
-    payload, parse_err = _parse_kv_pairs(pairs)
+    payload, parse_err = _parse_kv_pairs(pairs, json_values=json_values)
     if parse_err is not None:
         print(f"error: {parse_err}", file=sys.stderr)
         return 1

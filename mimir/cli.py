@@ -2281,11 +2281,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         "pairs",
         nargs="*",
         metavar="KEY=VALUE",
-        help="Optional key=value payload fields.  Values are stored as strings.",
+        help="Optional key=value payload fields.  Values are stored as strings "
+             "by default; use --json-values to JSON-parse them.",
     )
     feedback_emit_p.add_argument(
         "--home", type=Path, default=None,
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+    feedback_emit_p.add_argument(
+        "--json-values",
+        action="store_true",
+        dest="json_values",
+        default=False,
+        help="JSON-parse each KEY=VALUE value. Lets you pass structured data: "
+             "blocking_reviewers='[\"alice\",\"bob\"]' pr=42",
     )
 
     reindex_p = sub.add_parser(
@@ -2604,6 +2613,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 home=home,
                 event_type=args.event_type,
                 pairs=args.pairs,
+                json_values=getattr(args, "json_values", False),
             ))
         feedback_p.print_help()
         sys.exit(1)
