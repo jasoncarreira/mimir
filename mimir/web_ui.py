@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -308,5 +309,9 @@ def register_routes(
         app.router.add_get("/saga", saga_page)
     if ("GET", "/api/saga") not in existing:
         app.router.add_get("/api/saga", saga_data)
-    if ("POST", "/api/saga/sql") not in existing:
-        app.router.add_post("/api/saga/sql", saga_sql)
+    if os.environ.get("MIMIR_SAGA_SQL_ENABLED", "").strip() == "1":
+        if ("POST", "/api/saga/sql") not in existing:
+            app.router.add_post("/api/saga/sql", saga_sql)
+            log.info("saga SQL passthrough enabled (MIMIR_SAGA_SQL_ENABLED=1)")
+    else:
+        log.debug("saga SQL passthrough disabled (set MIMIR_SAGA_SQL_ENABLED=1 to enable)")

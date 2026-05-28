@@ -1,4 +1,4 @@
-"""Tests for mimir.saga_dashboard (chainlink #222 — Phase 1 + 2).
+"""Tests for mimir.saga_dashboard (chainlink #222 — Phases 1 + 2 + 3).
 
 Tests cover:
   - build_db_stats_payload: stats from a real in-memory SQLite DB
@@ -9,6 +9,7 @@ Tests cover:
   - build_clusters_payload: cluster grouping, NULL session, sample capping
   - render_saga_html: valid HTML shell with expected tokens
   - web_ui routes: /saga HTML + /api/saga view={recent,atom,stats,search,activation_hist,clusters}
+  - Phase 3: SQL passthrough — gated behind MIMIR_SAGA_SQL_ENABLED=1
   - Path-safety: missing DB returns error, not crash
   - Auth-exempt: /saga returns 200 without API key when key is set
 """
@@ -407,8 +408,14 @@ def test_render_saga_html_js_escapes_survive_python_rendering() -> None:
 
 
 @pytest.fixture
-def saga_app(tmp_path: Path):
-    """aiohttp app with /saga + /api/saga wired to a real saga DB."""
+def saga_app(tmp_path: Path, monkeypatch):
+    """aiohttp app with /saga + /api/saga wired to a real saga DB.
+
+    Sets MIMIR_SAGA_SQL_ENABLED=1 so the Phase 3 SQL passthrough route is
+    registered.  Tests that verify the *disabled* state use their own app
+    setup without this env var.
+    """
+    monkeypatch.setenv("MIMIR_SAGA_SQL_ENABLED", "1")
     db_path = tmp_path / "saga.db"
     conn = _make_db(db_path)
     _insert_session(conn, "sess-1", "discord-1")
@@ -1131,8 +1138,13 @@ async def test_api_saga_sql_invalid_json_400(saga_app: web.Application) -> None:
 
 
 @pytest.mark.asyncio
-async def test_api_saga_sql_no_db_configured_503(tmp_path: Path) -> None:
-    """POST /api/saga/sql without DB configured returns 503."""
+async def test_api_saga_sql_no_db_configured_503(monkeypatch, tmp_path: Path) -> None:
+    """POST /api/saga/sql without DB configured returns 503.
+
+    The env var must be set so the route is registered; we then verify it
+    returns 503 (not 404) when no saga_db path is configured.
+    """
+    monkeypatch.setenv("MIMIR_SAGA_SQL_ENABLED", "1")
     a = web.Application()
     web_ui.register_routes(
         a,
@@ -1142,3 +1154,23 @@ async def test_api_saga_sql_no_db_configured_503(tmp_path: Path) -> None:
     async with TestClient(TestServer(a)) as client:
         resp = await client.post("/api/saga/sql", json={"sql": "SELECT 1"})
         assert resp.status == 503
+
+
+@pytest.mark.asyncio
+async def test_api_saga_sql_disabled_when_env_unset(monkeypatch, tmp_path: Path) -> None:
+    """POST /api/saga/sql returns 404 when MIMIR_SAGA_SQL_ENABLED is not set."""
+    monkeypatch.delenv("MIMIR_SAGA_SQL_ENABLED", raising=False)
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    conn.close()
+
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        saga_db=db_path,
+    )
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/api/saga/sql", json={"sql": "SELECT 1"})
+        assert resp.status == 404
