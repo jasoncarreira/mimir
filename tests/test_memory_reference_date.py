@@ -141,3 +141,146 @@ def test_recall_passes_reference_date_to_activation(conn):
         act_now = next(c.activation for c in result_now.raws if c.atom["id"] == "a1")
         assert act_then > act_now
     # If 2026 produced no results, the demonstration holds trivially.
+
+
+def test_recall_writes_access_events_at_reference_date(conn):
+    """chainlink #236: when ``reference_date`` is passed, Pass 4's
+    access_event writes must use that timestamp instead of wall-clock now.
+
+    Before this fix, ``mark_access`` used ``_utc_now_iso()`` unconditionally;
+    bench replays of 2023-era corpora wrote 2026 timestamps onto atoms,
+    corrupting downstream activation reads within the same bench run.
+    """
+    haystack_ts = "2023-05-12T00:00:00+00:00"
+    _seed_atom(
+        conn, "a1", "Alice graduated with a CS degree",
+        accessed_at=haystack_ts, vec=[1.0, 0.0, 0.0],
+    )
+
+    def faiss_fn(q_emb, top_k):
+        return [("a1", 1.0)]
+    def fts_fn(q_str, top_k):
+        return [("a1", 5.0)]
+
+    ref_then = datetime(2023, 5, 12, 0, 0, 2, tzinfo=timezone.utc)
+    recall(
+        conn, "Alice degree",
+        query_embed_fn=lambda _: [1.0, 0.0, 0.0],
+        faiss_search_fn=faiss_fn,
+        fts_search_fn=fts_fn,
+        k=5,
+        reference_date=ref_then,
+        fire_access_events=True,
+    )
+
+    # Inspect the freshest access_event for a1 — should be at ref_then,
+    # not wall-clock 2026.
+    rows = conn.execute(
+        "SELECT ts FROM access_events WHERE atom_id = ? AND source = 'retrieval' "
+        "ORDER BY ts DESC LIMIT 1",
+        ("a1",),
+    ).fetchall()
+    assert rows, "expected at least one retrieval access_event for a1"
+    ts = rows[0][0]
+    # Must be the reference_date, not the current wall clock.
+    # ISO-formatted; allow either with or without microseconds.
+    assert ts.startswith("2023-05-12"), (
+        f"access_event timestamp {ts!r} doesn't match reference_date "
+        f"2023-05-12 — chainlink #236 regression (wall-clock leaked through)"
+    )
+
+
+def test_recall_default_no_reference_date_uses_wall_clock(conn):
+    """Sanity: when ``reference_date`` is None, mark_access falls back to
+    wall-clock now. Don't break the production path with the new plumbing.
+
+    Uses a recent atom (1 minute ago) so it clears the activation
+    threshold under wall-clock recall — otherwise Pass 4 doesn't fire
+    and we can't observe the access_event timestamp.
+    """
+    recent_ts = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    _seed_atom(
+        conn, "a1", "Alice graduated with a CS degree",
+        accessed_at=recent_ts, vec=[1.0, 0.0, 0.0],
+    )
+
+    def faiss_fn(q_emb, top_k):
+        return [("a1", 1.0)]
+    def fts_fn(q_str, top_k):
+        return [("a1", 5.0)]
+
+    # Capture wall-clock window around the call.
+    t_before = datetime.now(timezone.utc)
+    recall(
+        conn, "Alice degree",
+        query_embed_fn=lambda _: [1.0, 0.0, 0.0],
+        faiss_search_fn=faiss_fn,
+        fts_search_fn=fts_fn,
+        k=5,
+        reference_date=None,
+        fire_access_events=True,
+    )
+    t_after = datetime.now(timezone.utc)
+
+    rows = conn.execute(
+        "SELECT ts FROM access_events WHERE atom_id = ? AND source = 'retrieval' "
+        "ORDER BY ts DESC LIMIT 1",
+        ("a1",),
+    ).fetchall()
+    # If recall filtered the atom (activation below threshold under wall
+    # clock — varies by epsilon/decay), the end-to-end signal isn't
+    # observable. Either way is fine here: the unit-level test below pins
+    # the contract directly.
+    if rows:
+        ts = datetime.fromisoformat(rows[0][0])
+        assert t_before <= ts <= t_after, (
+            f"wall-clock fallback broken: ts={ts}, "
+            f"expected in [{t_before}, {t_after}]"
+        )
+
+
+def test_mark_access_default_now_uses_wall_clock(conn):
+    """Unit test: ``mark_access(now=None)`` uses wall-clock. Direct test on
+    the helper since the end-to-end recall path depends on activation
+    thresholds that can filter the atom out before Pass 4."""
+    from mimir.saga.mark_access import AccessEvent, mark_access
+
+    _seed_atom(conn, "a1", "x", accessed_at="2026-01-01T00:00:00+00:00",
+               vec=[1.0, 0.0, 0.0])
+
+    t_before = datetime.now(timezone.utc)
+    mark_access(conn, [AccessEvent(atom_id="a1", source="retrieval")])
+    t_after = datetime.now(timezone.utc)
+
+    rows = conn.execute(
+        "SELECT ts FROM access_events WHERE atom_id = ? AND source = 'retrieval'",
+        ("a1",),
+    ).fetchall()
+    assert rows
+    ts = datetime.fromisoformat(rows[0][0])
+    assert t_before <= ts <= t_after, (
+        f"default-now broken: ts={ts}, expected in [{t_before}, {t_after}]"
+    )
+
+
+def test_mark_access_with_explicit_now_uses_that_timestamp(conn):
+    """chainlink #236: ``mark_access(now=<datetime>)`` writes events at the
+    supplied timestamp, not wall-clock. Pins the helper-level contract.
+    """
+    from mimir.saga.mark_access import AccessEvent, mark_access
+
+    _seed_atom(conn, "a1", "x", accessed_at="2026-01-01T00:00:00+00:00",
+               vec=[1.0, 0.0, 0.0])
+
+    ref = datetime(2023, 5, 12, 14, 30, 0, tzinfo=timezone.utc)
+    mark_access(conn, [AccessEvent(atom_id="a1", source="retrieval")], now=ref)
+
+    rows = conn.execute(
+        "SELECT ts FROM access_events WHERE atom_id = ? AND source = 'retrieval'",
+        ("a1",),
+    ).fetchall()
+    assert rows
+    ts = rows[0][0]
+    assert ts == "2023-05-12T14:30:00+00:00", (
+        f"explicit-now broken: ts={ts!r}, expected '2023-05-12T14:30:00+00:00'"
+    )
