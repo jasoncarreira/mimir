@@ -15,7 +15,8 @@ Phase 2:
   /api/saga?view=activation_hist&days=7     — activation score histogram
   /api/saga?view=clusters                   — cluster browser by session
 
-Phase 3 (future): read-only SQL passthrough.
+Phase 3:
+  POST /api/saga/sql                        — read-only SQL passthrough
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -608,6 +610,116 @@ def build_clusters_payload(
         conn.close()
 
 
+# ─── Phase 3: read-only SQL passthrough ──────────────────────────
+
+# Maximum rows returned from a single SQL query.
+_SQL_MAX_ROWS = 1000
+
+# Write keywords that must not appear anywhere in a "read-only" statement.
+# Covers DML (INSERT/UPDATE/DELETE/REPLACE), DDL (CREATE/DROP/ALTER),
+# plus ATTACH/DETACH (mounting external DBs) and PRAGMA (many mutate state).
+_SQL_WRITE_KEYWORDS_RE = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|ATTACH|DETACH|PRAGMA)\b",
+    re.IGNORECASE,
+)
+
+# First keyword of a statement must be one of these.
+_SQL_ALLOWED_FIRST_WORDS = {"SELECT", "EXPLAIN", "WITH"}
+
+
+def _validate_sql_readonly(sql: str) -> str | None:
+    """Return an error message string if *sql* is not a safe read-only
+    statement, or ``None`` if it looks OK.
+
+    Two-layer check:
+    1. First keyword must be SELECT, EXPLAIN, or WITH (CTEs).
+    2. No write/mutating keywords anywhere in the statement.
+    """
+    stripped = sql.strip()
+    if not stripped:
+        return "SQL statement is empty"
+    first_word = stripped.split(None, 1)[0].upper()
+    if first_word not in _SQL_ALLOWED_FIRST_WORDS:
+        return (
+            f"Only SELECT, EXPLAIN, and WITH (CTEs) are allowed; "
+            f"got {first_word!r}"
+        )
+    m = _SQL_WRITE_KEYWORDS_RE.search(stripped)
+    if m:
+        return (
+            f"Write keyword {m.group(0).upper()!r} is not allowed — "
+            "only read-only queries are permitted"
+        )
+    return None
+
+
+def build_sql_payload(db_path: Path, sql: str) -> dict[str, Any]:
+    """Execute a read-only SQL query and return results as a JSON-serialisable dict.
+
+    Safety: only SELECT, EXPLAIN, and WITH (CTE→SELECT) are accepted.
+    Write keywords (INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, REPLACE,
+    ATTACH, DETACH, PRAGMA) are rejected before execution.
+
+    Results are capped at ``_SQL_MAX_ROWS`` rows (1 000).
+
+    Returns on success::
+
+        {
+          "columns": [str, ...],
+          "rows": [[Any, ...], ...],
+          "row_count": int,
+          "truncated": bool,   # True when >1 000 rows were available
+        }
+
+    Returns on rejection (safety gate) or SQL error::
+
+        {
+          "error": str,
+          "rejected": bool,   # True = safety gate fired, False = SQL error
+        }
+    """
+    err = _validate_sql_readonly(sql)
+    if err:
+        return {"error": err, "rejected": True}
+
+    conn = _open_conn(db_path)
+    if conn is None:
+        return {"error": "saga db not found or unreadable", "rejected": False}
+
+    try:
+        cur = conn.execute(sql)
+        columns = [desc[0] for desc in (cur.description or [])]
+        # Fetch one extra row to detect truncation without loading all rows.
+        rows_raw = cur.fetchmany(_SQL_MAX_ROWS + 1)
+        truncated = len(rows_raw) > _SQL_MAX_ROWS
+        rows_raw = rows_raw[:_SQL_MAX_ROWS]
+
+        # Coerce non-JSON-native types so json.dumps doesn't choke.
+        rows: list[list[Any]] = []
+        for row in rows_raw:
+            coerced = []
+            for val in row:
+                if isinstance(val, bytes):
+                    coerced.append(f"<bytes len={len(val)}>")
+                elif val is None or isinstance(val, (int, float, str, bool)):
+                    coerced.append(val)
+                else:
+                    coerced.append(str(val))
+            rows.append(coerced)
+
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": truncated,
+        }
+    except sqlite3.Error as exc:
+        log.warning("saga_dashboard: sql query failed: %s", exc)
+        return {"error": str(exc), "rejected": False}
+    finally:
+        conn.close()
+
+
 # ─── HTML shell ──────────────────────────────────────────────────
 
 
@@ -840,6 +952,34 @@ _SAGA_HTML = """<!doctype html>
       padding: 0.8rem 1rem;
       margin-bottom: 1.2rem;
     }
+    /* SQL result table */
+    .sql-result-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .sql-result-table th {
+      background: var(--paper-strong-2);
+      color: var(--muted);
+      text-align: left;
+      padding: 0.4rem 0.6rem;
+      border-bottom: 1px solid var(--line);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+    .sql-result-table td {
+      padding: 0.35rem 0.6rem;
+      border-bottom: 1px solid var(--line);
+      max-width: 400px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .sql-result-table tr:last-child td { border-bottom: none; }
+    .sql-result-table tr:hover td { background: var(--accent-soft); }
   </style>
 </head>
 <body>
@@ -868,6 +1008,7 @@ _SAGA_HTML = """<!doctype html>
     <button class="tab-btn" onclick="showSection('search', this)">Search</button>
     <button class="tab-btn" onclick="showSection('activation', this)">Activation</button>
     <button class="tab-btn" onclick="showSection('clusters', this)">Clusters</button>
+    <button class="tab-btn" onclick="showSection('sql', this)">SQL</button>
   </div>
 
   <!-- SECTION: Recent atoms -->
@@ -947,6 +1088,29 @@ _SAGA_HTML = """<!doctype html>
     </div>
     <div id="clusters-container">
       <div class="empty">Click Load to browse session clusters.</div>
+    </div>
+  </div>
+
+  <!-- SECTION: SQL (expert mode) -->
+  <div class="section" id="section-sql">
+    <div style="color:var(--warn); font-size:0.8rem; margin-bottom:0.6rem;">
+      &#9888; Expert mode — read-only queries only (SELECT / EXPLAIN / WITH).
+      Write keywords are rejected before execution. Results capped at 1&#8239;000 rows.
+    </div>
+    <div style="display:flex; flex-direction:column; gap:0.5rem; margin-bottom:0.8rem;">
+      <textarea id="sql-input" rows="5"
+        style="width:100%; font-family:'Courier New',monospace; font-size:0.82rem;
+               background:var(--paper); color:var(--ink); border:1px solid var(--line);
+               border-radius:6px; padding:0.55rem 0.7rem; resize:vertical;"
+        placeholder="SELECT id, content, memory_type, created_at FROM atoms WHERE tombstoned=0 ORDER BY created_at DESC LIMIT 20"
+        onkeydown="if((event.ctrlKey||event.metaKey) && event.key==='Enter') runSql()"></textarea>
+      <div style="display:flex; gap:0.5rem; align-items:center;">
+        <button onclick="runSql()">Run Query</button>
+        <span class="meta" style="font-size:0.78rem;">Ctrl+Enter to run</span>
+      </div>
+    </div>
+    <div id="sql-results">
+      <div class="empty">Enter a SELECT query above, then click Run Query.</div>
     </div>
   </div>
 
@@ -1279,6 +1443,64 @@ async function loadClusters() {
   }
 }
 
+// ── SQL passthrough ───────────────────────────────────────────────
+async function runSql() {
+  const sql = document.getElementById("sql-input").value.trim();
+  if (!sql) return;
+  const container = document.getElementById("sql-results");
+  container.innerHTML = '<div class="empty">Running\\u2026</div>';
+
+  try {
+    const k = getApiKey();
+    const headers = {"Content-Type": "application/json"};
+    if (k) headers["X-API-Key"] = k;
+    const r = await fetch("/api/saga/sql", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({sql}),
+    });
+    if (r.status === 401) {
+      localStorage.removeItem("mimir_api_key");
+      container.innerHTML = '<div class="error-msg">Unauthorized \\u2014 bad API key?</div>';
+      return;
+    }
+    const d = await r.json();
+    if (d.error) {
+      const label = d.rejected ? "Rejected" : "Error";
+      container.innerHTML = '<div class="error-msg">' + label + ': ' + esc(d.error) + "</div>";
+      return;
+    }
+    if (!d.columns || !d.columns.length) {
+      container.innerHTML = '<div class="empty">Query executed — no columns returned (EXPLAIN or empty result).</div>';
+      if (d.rows && d.rows.length) {
+        container.innerHTML = '<div class="empty">' + esc(JSON.stringify(d.rows)) + "</div>";
+      }
+      return;
+    }
+
+    const truncNote = d.truncated
+      ? '<div style="color:var(--warn); font-size:0.78rem; margin-bottom:0.4rem;">'
+        + "Results truncated at 1\\u202F000 rows.</div>"
+      : "";
+    const rowMeta = '<div style="color:var(--muted); font-size:0.78rem; margin-bottom:0.4rem;">'
+      + d.row_count + " row" + (d.row_count !== 1 ? "s" : "") + "</div>";
+
+    const thCells = d.columns.map(c => "<th>" + esc(c) + "</th>").join("");
+    const tHead = "<thead><tr>" + thCells + "</tr></thead>";
+    const tRows = d.rows.map(row => {
+      const cells = row.map(v => "<td>" + esc(v !== null ? String(v) : "NULL") + "</td>").join("");
+      return "<tr>" + cells + "</tr>";
+    }).join("");
+    const tBody = "<tbody>" + tRows + "</tbody>";
+
+    container.innerHTML = truncNote + rowMeta
+      + '<div style="overflow-x:auto"><table class="sql-result-table">'
+      + tHead + tBody + "</table></div>";
+  } catch (e) {
+    container.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
+  }
+}
+
 // ── Init ──────────────────────────────────────────────────────────
 loadStats();
 loadRecent();
@@ -1294,5 +1516,6 @@ __all__ = [
     "build_search_payload",
     "build_activation_hist_payload",
     "build_clusters_payload",
+    "build_sql_payload",
     "render_saga_html",
 ]

@@ -26,12 +26,14 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from mimir import web_ui
 from mimir.saga_dashboard import (
+    _validate_sql_readonly,
     build_activation_hist_payload,
     build_atom_payload,
     build_clusters_payload,
     build_db_stats_payload,
     build_recent_atoms_payload,
     build_search_payload,
+    build_sql_payload,
     render_saga_html,
 )
 
@@ -916,4 +918,227 @@ async def test_api_saga_search_no_db_configured(tmp_path: Path) -> None:
     )
     async with TestClient(TestServer(a)) as client:
         resp = await client.get("/api/saga?view=search&q=hello")
+        assert resp.status == 503
+
+
+# ─── Phase 3: SQL passthrough ─────────────────────────────────────
+
+
+class TestValidateSqlReadonly:
+    """Unit-tests for _validate_sql_readonly (no DB required)."""
+
+    def test_allows_select(self) -> None:
+        assert _validate_sql_readonly("SELECT * FROM atoms") is None
+
+    def test_allows_select_lowercase(self) -> None:
+        assert _validate_sql_readonly("select id from atoms limit 5") is None
+
+    def test_allows_explain(self) -> None:
+        assert _validate_sql_readonly("EXPLAIN SELECT * FROM atoms") is None
+
+    def test_allows_explain_query_plan(self) -> None:
+        assert _validate_sql_readonly("EXPLAIN QUERY PLAN SELECT * FROM atoms") is None
+
+    def test_allows_with_cte(self) -> None:
+        sql = "WITH x AS (SELECT id FROM atoms) SELECT * FROM x"
+        assert _validate_sql_readonly(sql) is None
+
+    def test_rejects_empty(self) -> None:
+        assert _validate_sql_readonly("") is not None
+        assert _validate_sql_readonly("   ") is not None
+
+    def test_rejects_insert(self) -> None:
+        err = _validate_sql_readonly("INSERT INTO atoms VALUES ('x', 'y')")
+        assert err is not None
+        assert "INSERT" in err.upper() or "read-only" in err.lower()
+
+    def test_rejects_update(self) -> None:
+        assert _validate_sql_readonly("UPDATE atoms SET content='x'") is not None
+
+    def test_rejects_delete(self) -> None:
+        assert _validate_sql_readonly("DELETE FROM atoms") is not None
+
+    def test_rejects_drop(self) -> None:
+        assert _validate_sql_readonly("DROP TABLE atoms") is not None
+
+    def test_rejects_alter(self) -> None:
+        assert _validate_sql_readonly("ALTER TABLE atoms ADD COLUMN x TEXT") is not None
+
+    def test_rejects_create(self) -> None:
+        assert _validate_sql_readonly("CREATE TABLE evil (x TEXT)") is not None
+
+    def test_rejects_replace(self) -> None:
+        assert _validate_sql_readonly("REPLACE INTO atoms VALUES ('x', 'y')") is not None
+
+    def test_rejects_pragma(self) -> None:
+        # PRAGMA can mutate DB settings — reject even PRAGMA-reads for safety.
+        assert _validate_sql_readonly("PRAGMA journal_mode=WAL") is not None
+
+    def test_rejects_attach(self) -> None:
+        assert _validate_sql_readonly("ATTACH DATABASE '/tmp/evil.db' AS evil") is not None
+
+    def test_rejects_detach(self) -> None:
+        assert _validate_sql_readonly("DETACH evil") is not None
+
+    def test_rejects_embedded_write_keyword_in_select(self) -> None:
+        # Belt-and-suspenders: even if first word is SELECT,
+        # an embedded DROP/DELETE triggers the secondary check.
+        assert _validate_sql_readonly("SELECT * FROM atoms; DELETE FROM atoms") is not None
+
+
+class TestBuildSqlPayload:
+    """Unit-tests for build_sql_payload (uses a real in-memory DB path)."""
+
+    def test_select_returns_columns_and_rows(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "saga.db"
+        conn = _make_db(db_path)
+        _insert_atom(conn, "sql-atom-1", content="hello world")
+        _insert_atom(conn, "sql-atom-2", content="foo bar")
+        conn.close()
+
+        result = build_sql_payload(db_path, "SELECT id, content FROM atoms ORDER BY id")
+        assert "error" not in result
+        assert result["columns"] == ["id", "content"]
+        assert result["row_count"] == 2
+        assert result["truncated"] is False
+        ids = [row[0] for row in result["rows"]]
+        assert "sql-atom-1" in ids
+        assert "sql-atom-2" in ids
+
+    def test_write_statement_rejected(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "saga.db"
+        _make_db(db_path).close()
+
+        result = build_sql_payload(db_path, "DELETE FROM atoms")
+        assert result.get("rejected") is True
+        assert "error" in result
+
+    def test_insert_rejected(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "saga.db"
+        _make_db(db_path).close()
+
+        result = build_sql_payload(db_path, "INSERT INTO atoms (id) VALUES ('x')")
+        assert result.get("rejected") is True
+
+    def test_missing_db_returns_error_not_crash(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "nonexistent.db"
+        result = build_sql_payload(db_path, "SELECT 1")
+        assert "error" in result
+        assert result.get("rejected") is False
+
+    def test_empty_result_set(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "saga.db"
+        _make_db(db_path).close()
+
+        result = build_sql_payload(db_path, "SELECT * FROM atoms WHERE tombstoned=99")
+        assert "error" not in result
+        assert result["row_count"] == 0
+        assert result["rows"] == []
+        assert result["truncated"] is False
+
+    def test_truncation_flag(self, tmp_path: Path, monkeypatch) -> None:
+        """Truncation flag is set when query returns more than the cap."""
+        import mimir.saga_dashboard as sd
+
+        monkeypatch.setattr(sd, "_SQL_MAX_ROWS", 2)
+        db_path = tmp_path / "saga.db"
+        conn = _make_db(db_path)
+        for i in range(5):
+            _insert_atom(conn, f"trunc-atom-{i}", content=f"content {i}")
+        conn.close()
+
+        result = build_sql_payload(db_path, "SELECT id FROM atoms")
+        assert result["truncated"] is True
+        assert result["row_count"] == 2  # capped at the patched max
+
+    def test_null_values_pass_through(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "saga.db"
+        conn = _make_db(db_path)
+        _insert_atom(conn, "null-atom", content="content", session_id=None)
+        conn.close()
+
+        result = build_sql_payload(db_path, "SELECT id, session_id FROM atoms")
+        assert "error" not in result
+        row = next(r for r in result["rows"] if r[0] == "null-atom")
+        assert row[1] is None
+
+
+@pytest.mark.asyncio
+async def test_api_saga_sql_select(saga_app: web.Application) -> None:
+    """POST /api/saga/sql with a valid SELECT returns 200 with columns + rows."""
+    async with TestClient(TestServer(saga_app)) as client:
+        resp = await client.post(
+            "/api/saga/sql",
+            json={"sql": "SELECT id FROM atoms ORDER BY id"},
+        )
+        assert resp.status == 200
+        body = await resp.json()
+    assert "columns" in body
+    assert "id" in body["columns"]
+    assert "rows" in body
+    ids = [r[0] for r in body["rows"]]
+    assert "atom-A" in ids
+    assert "atom-B" in ids
+
+
+@pytest.mark.asyncio
+async def test_api_saga_sql_write_rejected_400(saga_app: web.Application) -> None:
+    """POST with a DELETE statement returns 400 rejected=True."""
+    async with TestClient(TestServer(saga_app)) as client:
+        resp = await client.post(
+            "/api/saga/sql",
+            json={"sql": "DELETE FROM atoms"},
+        )
+        assert resp.status == 400
+        body = await resp.json()
+    assert body.get("rejected") is True
+    assert "error" in body
+
+
+@pytest.mark.asyncio
+async def test_api_saga_sql_insert_rejected_400(saga_app: web.Application) -> None:
+    """POST with an INSERT statement returns 400 rejected=True."""
+    async with TestClient(TestServer(saga_app)) as client:
+        resp = await client.post(
+            "/api/saga/sql",
+            json={"sql": "INSERT INTO atoms (id, content, content_hash, created_at) VALUES ('x','y','z','2026-01-01')"},
+        )
+        assert resp.status == 400
+        body = await resp.json()
+    assert body.get("rejected") is True
+
+
+@pytest.mark.asyncio
+async def test_api_saga_sql_missing_sql_field_400(saga_app: web.Application) -> None:
+    """POST without sql field returns 400."""
+    async with TestClient(TestServer(saga_app)) as client:
+        resp = await client.post("/api/saga/sql", json={})
+        assert resp.status == 400
+        body = await resp.json()
+    assert "error" in body
+
+
+@pytest.mark.asyncio
+async def test_api_saga_sql_invalid_json_400(saga_app: web.Application) -> None:
+    """POST with non-JSON body returns 400."""
+    async with TestClient(TestServer(saga_app)) as client:
+        resp = await client.post(
+            "/api/saga/sql",
+            data=b"not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_api_saga_sql_no_db_configured_503(tmp_path: Path) -> None:
+    """POST /api/saga/sql without DB configured returns 503."""
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+    )
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/api/saga/sql", json={"sql": "SELECT 1"})
         assert resp.status == 503

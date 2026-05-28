@@ -42,6 +42,7 @@ from .saga_dashboard import (
     build_db_stats_payload,
     build_recent_atoms_payload,
     build_search_payload,
+    build_sql_payload,
     render_saga_html,
 )
 
@@ -274,7 +275,38 @@ def register_routes(
         app.router.add_get("/ops", ops_page)
     if ("GET", "/api/ops") not in existing:
         app.router.add_get("/api/ops", ops_data)
+    async def saga_sql(request: web.Request) -> web.Response:
+        """POST /api/saga/sql — read-only SQL passthrough.
+
+        Accepts ``{"sql": "<SELECT ...>"}`` as a JSON body.
+        Rejects any statement that is not a SELECT / EXPLAIN / WITH, and
+        rejects any statement containing write keywords.  Results are
+        capped at 1 000 rows.
+        """
+        if _saga_db is None:
+            return web.json_response(
+                {"error": "saga_db path not configured"}, status=503
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        sql = (body.get("sql") or "").strip()
+        if not sql:
+            return web.json_response({"error": "sql field is required"}, status=400)
+
+        payload = await asyncio.get_event_loop().run_in_executor(
+            None, build_sql_payload, _saga_db, sql
+        )
+        if payload.get("rejected"):
+            return web.json_response(payload, status=400)
+        if "error" in payload:
+            return web.json_response(payload, status=500)
+        return web.json_response(payload)
+
     if ("GET", "/saga") not in existing:
         app.router.add_get("/saga", saga_page)
     if ("GET", "/api/saga") not in existing:
         app.router.add_get("/api/saga", saga_data)
+    if ("POST", "/api/saga/sql") not in existing:
+        app.router.add_post("/api/saga/sql", saga_sql)
