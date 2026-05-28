@@ -175,3 +175,71 @@ def test_remove_filters_from_search(conn):
     ids = [aid for aid, _ in results]
     assert "a1" not in ids
     assert "a2" in ids
+
+
+# ─── chainlink #235: re-add must mark old position removed ──────────
+
+
+def test_readd_same_atom_id_marks_old_position_removed(conn):
+    """chainlink #235: calling add() twice for the same atom_id used to
+    leak the old position — FAISS retained the prior vector but
+    ``_id_to_pos`` overwrote the position pointer, so search() could
+    return a stale-vector entry mapped back to the same id (with the
+    old content's similarity score).
+
+    Verify the old position lands in ``_removed`` so search filters it
+    correctly.
+    """
+    _insert_atom_with_embedding(conn, "a1", "old", [1.0, 0.0, 0.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+
+    # Initial state: a1 at position 0.
+    pos_a1_v1 = idx._id_to_pos["a1"]
+    assert pos_a1_v1 not in idx._removed
+
+    # Re-add a1 with a new vector — simulates a re-embed.
+    idx.add("a1", _vec_bytes([0.0, 1.0, 0.0]))
+
+    # The old position must now be in _removed.
+    assert pos_a1_v1 in idx._removed, (
+        "old position not marked removed on re-add — chainlink #235 regression"
+    )
+    # _pos_to_id at the old position must be cleared (so search can't
+    # walk back to a1 via the orphan slot).
+    assert pos_a1_v1 not in idx._pos_to_id, (
+        "_pos_to_id still maps the orphan position back to a1"
+    )
+    # _id_to_pos now points at the NEW position.
+    assert idx._id_to_pos["a1"] != pos_a1_v1
+
+
+def test_readd_search_returns_new_vector_not_stale(conn):
+    """Functional end-to-end: re-adding a1 with a different vector,
+    search() must not return the stale (old-vector) similarity score.
+    """
+    _insert_atom_with_embedding(conn, "a1", "old", [1.0, 0.0, 0.0])
+    _insert_atom_with_embedding(conn, "a2", "other", [0.0, 0.0, 1.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+
+    # Re-add a1 with a NEW vector pointing the opposite direction.
+    idx.add("a1", _vec_bytes([0.0, 1.0, 0.0]))
+
+    # Query for the OLD vector direction. With the fix, a1's old
+    # position is removed → a2 (the other unrelated atom) is closer
+    # OR a1 is returned but with the NEW vector's (low) similarity.
+    # Pre-fix, the stale a1 vector would have ~1.0 similarity for this
+    # query — the headline regression.
+    results = idx.search([1.0, 0.0, 0.0], top_k=3)
+    by_id = {aid: score for aid, score in results}
+
+    # If a1 is in the results, its similarity should reflect the NEW
+    # vector ([0,1,0] vs query [1,0,0] is orthogonal → ~0 similarity),
+    # not the OLD vector ([1,0,0] vs query [1,0,0] is identical → ~1.0).
+    if "a1" in by_id:
+        assert by_id["a1"] < 0.5, (
+            f"search returned a1 with stale-vector similarity "
+            f"{by_id['a1']:.3f}; expected <0.5 reflecting the new "
+            f"[0,1,0] vector. Pre-fix value was ~1.0."
+        )
