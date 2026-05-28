@@ -36,9 +36,12 @@ from .ops_dashboard import (
     render_dashboard_html,
 )
 from .saga_dashboard import (
+    build_activation_hist_payload,
     build_atom_payload,
+    build_clusters_payload,
     build_db_stats_payload,
     build_recent_atoms_payload,
+    build_search_payload,
     render_saga_html,
 )
 
@@ -207,6 +210,43 @@ def register_routes(
             payload = await asyncio.get_event_loop().run_in_executor(
                 None, build_atom_payload, _saga_db, atom_id
             )
+        elif view == "search":
+            query = request.query.get("q", "").strip()
+            if not query:
+                return web.json_response({"error": "q param required"}, status=400)
+            channel = request.query.get("channel", "").strip() or None
+            try:
+                limit = int(request.query.get("limit") or 100)
+            except ValueError:
+                limit = 100
+            payload = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: build_search_payload(
+                    _saga_db, query, channel=channel, limit=limit  # type: ignore[arg-type]
+                ),
+            )
+        elif view == "activation_hist":
+            try:
+                days = int(request.query.get("days") or 7)
+            except ValueError:
+                days = 7
+            payload = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: build_activation_hist_payload(
+                    _saga_db, days=days  # type: ignore[arg-type]
+                ),
+            )
+        elif view == "clusters":
+            try:
+                sample_size = int(request.query.get("sample_size") or 3)
+            except ValueError:
+                sample_size = 3
+            payload = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: build_clusters_payload(
+                    _saga_db, sample_size=sample_size  # type: ignore[arg-type]
+                ),
+            )
         else:  # view == "recent" (default)
             channel = request.query.get("channel", "").strip() or None
             try:
@@ -220,7 +260,7 @@ def register_routes(
                 ),
             )
 
-        if "error" in payload and not payload.get("atoms") and view != "recent":
+        if "error" in payload and not payload.get("atoms") and view not in ("recent", "clusters", "activation_hist"):
             return web.json_response(payload, status=404 if "not found" in str(payload["error"]) else 503)
         return web.json_response(payload)
 

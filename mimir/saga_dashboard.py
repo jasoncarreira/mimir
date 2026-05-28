@@ -10,7 +10,11 @@ Chainlink #222 — Phase 1:
   /api/saga?view=recent&channel=...&limit=N  — recent atoms
   /api/saga?view=atom&id=...                 — single atom inspector
 
-Phase 2 (future): search, activation histogram, cluster browser.
+Phase 2:
+  /api/saga?view=search&q=...&channel=...   — text search over atom content
+  /api/saga?view=activation_hist&days=7     — activation score histogram
+  /api/saga?view=clusters                   — cluster browser by session
+
 Phase 3 (future): read-only SQL passthrough.
 """
 
@@ -267,6 +271,343 @@ def build_db_stats_payload(db_path: Path) -> dict[str, Any]:
         conn.close()
 
 
+# ─── Phase 2 payload builders ────────────────────────────────────
+
+
+def build_search_payload(
+    db_path: Path,
+    query: str,
+    channel: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Full-text substring search over atom content.
+
+    Case-insensitive LIKE '%query%' over the ``content`` column.
+    Optionally scoped to a channel via a sessions join.
+    Capped at ``limit`` results (max 100).
+
+    Returns ``{atoms: [...], total_matched: int, query: str, channel_filter: str|None}``.
+    """
+    limit = max(1, min(limit, 100))
+
+    conn = _open_conn(db_path)
+    if conn is None:
+        return {"error": "saga db not found or unreadable", "atoms": [], "total_matched": 0}
+
+    if not query:
+        return {"error": "q param required", "atoms": [], "total_matched": 0}
+
+    try:
+        search_term = f"%{query}%"
+        base_sql = """
+            SELECT
+                a.id,
+                a.content,
+                a.memory_type,
+                a.stream,
+                a.source_type,
+                a.topics,
+                a.arousal,
+                a.valence,
+                a.is_pinned,
+                a.created_at,
+                a.session_id,
+                s.channel_id
+            FROM atoms a
+            LEFT JOIN sessions s ON s.id = a.session_id
+            WHERE a.tombstoned = 0
+              AND a.content LIKE ? ESCAPE '\\'
+        """
+        params: list[Any] = [search_term]
+        if channel:
+            base_sql += " AND s.channel_id = ?"
+            params.append(channel)
+        base_sql += " ORDER BY a.created_at DESC LIMIT ?"
+        params.append(limit)
+
+        rows = conn.execute(base_sql, params).fetchall()
+        atoms = []
+        for row in rows:
+            d = _row_to_dict(row)
+            d["topics"] = _parse_json_field(d.get("topics"), [])
+            content = d.get("content") or ""
+            d["content_preview"] = content[:200] + ("…" if len(content) > 200 else "")
+            d.pop("content", None)
+            atoms.append(d)
+
+        # Count total matches (without LIMIT) for the metadata line.
+        count_sql = """
+            SELECT COUNT(*) FROM atoms a
+            LEFT JOIN sessions s ON s.id = a.session_id
+            WHERE a.tombstoned = 0 AND a.content LIKE ? ESCAPE '\\'
+        """
+        count_params: list[Any] = [search_term]
+        if channel:
+            count_sql += " AND s.channel_id = ?"
+            count_params.append(channel)
+        total_matched = conn.execute(count_sql, count_params).fetchone()[0]
+
+        return {
+            "atoms": atoms,
+            "total_matched": total_matched,
+            "query": query,
+            "channel_filter": channel,
+            "limit": limit,
+        }
+    except sqlite3.Error as exc:
+        log.warning("saga_dashboard: search query failed: %s", exc)
+        return {"error": str(exc), "atoms": [], "total_matched": 0}
+    finally:
+        conn.close()
+
+
+def build_activation_hist_payload(
+    db_path: Path,
+    days: int = 7,
+) -> dict[str, Any]:
+    """Activation score histogram for atoms created within ``days``.
+
+    Computes the Petrov OL activation for each atom that has an entry
+    in ``atom_access_summary``, limiting to atoms created in the last
+    ``days`` days.  Atoms with no summary entry (never accessed since
+    the summary table was introduced) are counted as zero-accessed and
+    contribute a ``-inf`` activation — these are reported separately
+    as ``never_accessed`` rather than polluting the histogram buckets.
+
+    Buckets the finite activations into 10 equal-width intervals from
+    the minimum observed finite activation to the maximum.  Returns:
+
+      {
+        buckets: [{range_start, range_end, count}],   # 10 items
+        total: int,            # atoms with finite activation
+        never_accessed: int,   # atoms with no summary / -inf activation
+        days: int,
+      }
+
+    If no atoms have finite activation, returns empty buckets.
+    """
+    import math as _math
+
+    days = max(1, days)
+
+    conn = _open_conn(db_path)
+    if conn is None:
+        return {"error": "saga db not found or unreadable", "buckets": [], "total": 0}
+
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        rows = conn.execute(
+            """
+            SELECT
+                a.id,
+                aas.recent_ts_json,
+                aas.recent_weights_json,
+                aas.old_count,
+                aas.old_weight_sum,
+                aas.old_oldest_ts
+            FROM atoms a
+            LEFT JOIN atom_access_summary aas ON aas.atom_id = a.id
+            WHERE a.tombstoned = 0
+              AND a.created_at >= ?
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        now_utc = datetime.now(timezone.utc)
+        DECAY_D = 0.5
+        EPSILON = 1.0
+
+        def _petrov(row: sqlite3.Row) -> float:
+            """Compute Petrov OL activation for a summary row."""
+            recent_ts_json = row["recent_ts_json"]
+            if not recent_ts_json:
+                return float("-inf")
+            recent_ts = json.loads(recent_ts_json or "[]")
+            recent_weights = json.loads(row["recent_weights_json"] or "[]")
+            old_count = int(row["old_count"] or 0)
+            old_weight_sum = float(row["old_weight_sum"] or 0.0)
+            old_oldest_ts = row["old_oldest_ts"]
+
+            total = 0.0
+            for ts_str, weight in zip(recent_ts, recent_weights):
+                t = datetime.fromisoformat(ts_str)
+                age_s = max((now_utc - t.replace(tzinfo=timezone.utc) if t.tzinfo is None else now_utc - t).total_seconds(), EPSILON)
+                total += weight * (age_s ** (-DECAY_D))
+
+            if old_count > 0 and old_oldest_ts is not None and old_weight_sum > 0:
+                import math
+                oldest = datetime.fromisoformat(old_oldest_ts)
+                if oldest.tzinfo is None:
+                    oldest = oldest.replace(tzinfo=timezone.utc)
+                if recent_ts:
+                    recent_dts = sorted(
+                        (datetime.fromisoformat(t).replace(tzinfo=timezone.utc) if datetime.fromisoformat(t).tzinfo is None else datetime.fromisoformat(t))
+                        for t in recent_ts
+                    )
+                    upper = recent_dts[0]
+                else:
+                    upper = now_utc
+                mean_weight = old_weight_sum / old_count
+                upper_age = max((now_utc - upper).total_seconds(), EPSILON)
+                oldest_age = max((now_utc - oldest).total_seconds(), EPSILON)
+                if abs(1.0 - DECAY_D) < 1e-9:
+                    integral = math.log(oldest_age / upper_age)
+                else:
+                    integral = (
+                        (oldest_age ** (1.0 - DECAY_D)) - (upper_age ** (1.0 - DECAY_D))
+                    ) / (1.0 - DECAY_D)
+                window_seconds = max(oldest_age - upper_age, EPSILON)
+                total += old_count * mean_weight * (integral / window_seconds)
+
+            if total <= 0.0:
+                return float("-inf")
+            import math
+            return math.log(total)
+
+        activations = []
+        never_accessed = 0
+        for row in rows:
+            act = _petrov(row)
+            if _math.isfinite(act):
+                activations.append(act)
+            else:
+                never_accessed += 1
+
+        if not activations:
+            return {
+                "buckets": [],
+                "total": 0,
+                "never_accessed": never_accessed,
+                "days": days,
+            }
+
+        min_act = min(activations)
+        max_act = max(activations)
+        n_buckets = 10
+
+        if max_act == min_act:
+            # All activations identical — one meaningful bucket.
+            buckets = [
+                {
+                    "range_start": round(min_act, 4),
+                    "range_end": round(max_act, 4),
+                    "count": len(activations),
+                }
+            ]
+        else:
+            width = (max_act - min_act) / n_buckets
+            bucket_counts = [0] * n_buckets
+            for act in activations:
+                idx = min(int((act - min_act) / width), n_buckets - 1)
+                bucket_counts[idx] += 1
+            buckets = [
+                {
+                    "range_start": round(min_act + i * width, 4),
+                    "range_end": round(min_act + (i + 1) * width, 4),
+                    "count": bucket_counts[i],
+                }
+                for i in range(n_buckets)
+            ]
+
+        return {
+            "buckets": buckets,
+            "total": len(activations),
+            "never_accessed": never_accessed,
+            "days": days,
+        }
+    except sqlite3.Error as exc:
+        log.warning("saga_dashboard: activation_hist query failed: %s", exc)
+        return {"error": str(exc), "buckets": [], "total": 0}
+    finally:
+        conn.close()
+
+
+def build_clusters_payload(
+    db_path: Path,
+    sample_size: int = 3,
+) -> dict[str, Any]:
+    """List clusters by session with a sample of member atoms.
+
+    Groups non-tombstoned atoms by ``session_id`` (NULL session_id atoms
+    are grouped as "unclustered").  For each group returns the session_id
+    (used as cluster_id), the count of atoms in that group, and a sample
+    of up to ``sample_size`` atoms showing a truncated content preview.
+
+    Returns:
+      {
+        clusters: [
+          {
+            cluster_id: str | None,
+            size: int,
+            sample_atoms: [{id, content_preview}],
+          },
+          ...
+        ],
+        total_clusters: int,
+        total_atoms: int,
+      }
+
+    Clusters are sorted largest-first so the most active sessions appear
+    at the top of the operator view.
+    """
+    sample_size = max(1, min(sample_size, 20))
+
+    conn = _open_conn(db_path)
+    if conn is None:
+        return {"error": "saga db not found or unreadable", "clusters": []}
+
+    try:
+        # Fetch all non-tombstoned atoms ordered so we can group and sample.
+        rows = conn.execute(
+            """
+            SELECT id, content, session_id
+            FROM atoms
+            WHERE tombstoned = 0
+            ORDER BY session_id NULLS LAST, created_at DESC
+            """
+        ).fetchall()
+
+        # Group by session_id.
+        groups: dict[str | None, list[dict[str, Any]]] = {}
+        for row in rows:
+            key = row["session_id"]  # may be None
+            if key not in groups:
+                groups[key] = []
+            groups[key].append({"id": row["id"], "content": row["content"]})
+
+        clusters = []
+        for session_id, atoms_in_group in groups.items():
+            sample = []
+            for atom in atoms_in_group[:sample_size]:
+                content = atom["content"] or ""
+                sample.append({
+                    "id": atom["id"],
+                    "content_preview": content[:120] + ("…" if len(content) > 120 else ""),
+                })
+            clusters.append({
+                "cluster_id": session_id,
+                "size": len(atoms_in_group),
+                "sample_atoms": sample,
+            })
+
+        # Sort largest-first.
+        clusters.sort(key=lambda c: c["size"], reverse=True)
+
+        total_atoms = sum(c["size"] for c in clusters)
+        return {
+            "clusters": clusters,
+            "total_clusters": len(clusters),
+            "total_atoms": total_atoms,
+        }
+    except sqlite3.Error as exc:
+        log.warning("saga_dashboard: clusters query failed: %s", exc)
+        return {"error": str(exc), "clusters": []}
+    finally:
+        conn.close()
+
+
 # ─── HTML shell ──────────────────────────────────────────────────
 
 
@@ -442,6 +783,63 @@ _SAGA_HTML = """<!doctype html>
     .empty { color: var(--muted); font-size: 0.83rem; padding: 1.5rem; text-align: center; }
     .error-msg { color: var(--bad); font-size: 0.83rem; padding: 1rem; }
     #atom-id-input { font-family: "Courier New", monospace; font-size: 0.8rem; }
+    /* Phase 2: section tabs + search + histogram + clusters */
+    .section-tabs {
+      display: flex; gap: 0.3rem; margin-bottom: 1rem; flex-wrap: wrap;
+    }
+    .tab-btn {
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      border-radius: 6px;
+      padding: 0.35rem 0.9rem;
+      font-size: 0.83rem;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s;
+    }
+    .tab-btn:hover { background: var(--accent-soft); color: var(--accent); }
+    .tab-btn.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+    .section { display: none; }
+    .section.visible { display: block; }
+    /* Search section */
+    .search-controls {
+      display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap;
+      margin-bottom: 0.9rem;
+    }
+    .search-controls input[type=text] { width: 300px; }
+    /* Histogram */
+    .hist-bar-row {
+      display: flex; align-items: center; gap: 0.5rem;
+      margin-bottom: 0.25rem; font-size: 0.8rem;
+    }
+    .hist-label { width: 120px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+    .hist-bar-wrap { flex: 1; background: var(--paper-strong-2); border-radius: 3px; height: 18px; overflow: hidden; }
+    .hist-bar { background: var(--accent); height: 100%; border-radius: 3px; transition: width 0.3s; }
+    .hist-count { width: 40px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    /* Clusters */
+    .cluster-card {
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0.7rem 1rem;
+      margin-bottom: 0.6rem;
+    }
+    .cluster-header {
+      display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.4rem;
+    }
+    .cluster-id { font-size: 0.78rem; color: var(--muted); font-family: "Courier New", monospace; word-break: break-all; }
+    .cluster-size { font-size: 0.85rem; font-weight: 600; color: var(--accent); }
+    .cluster-sample { font-size: 0.8rem; color: var(--muted); line-height: 1.5; }
+    .cluster-atom-preview { padding: 0.15rem 0; border-bottom: 1px solid var(--line); }
+    .cluster-atom-preview:last-child { border-bottom: none; }
+    .section-wrap {
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0.8rem 1rem;
+      margin-bottom: 1.2rem;
+    }
   </style>
 </head>
 <body>
@@ -464,37 +862,94 @@ _SAGA_HTML = """<!doctype html>
     <div class="stat-card"><div class="label">schema</div><div class="value" id="stat-schema">—</div></div>
   </div>
 
-  <!-- Controls -->
-  <div class="controls">
-    <label>Channel</label>
-    <select id="channel-filter">
-      <option value="">all channels</option>
-    </select>
-    <label>Limit</label>
-    <select id="limit-select">
-      <option value="25">25</option>
-      <option value="50" selected>50</option>
-      <option value="100">100</option>
-      <option value="200">200</option>
-    </select>
-    <button id="refresh-btn" onclick="loadRecent()">Refresh</button>
-    <span style="margin-left:auto; display:flex; align-items:center; gap:0.5rem;">
-      <label>Atom ID</label>
-      <input type="text" id="atom-id-input" placeholder="paste atom id…" style="width:280px;" />
-      <button onclick="loadAtomFromInput()">Inspect</button>
-    </span>
+  <!-- Section tabs -->
+  <div class="section-tabs">
+    <button class="tab-btn active" onclick="showSection('recent', this)">Recent</button>
+    <button class="tab-btn" onclick="showSection('search', this)">Search</button>
+    <button class="tab-btn" onclick="showSection('activation', this)">Activation</button>
+    <button class="tab-btn" onclick="showSection('clusters', this)">Clusters</button>
   </div>
 
-  <!-- Atom list -->
-  <div class="atom-list" id="atom-list">
-    <div class="empty">Loading…</div>
+  <!-- SECTION: Recent atoms -->
+  <div class="section visible" id="section-recent">
+    <!-- Controls -->
+    <div class="controls">
+      <label>Channel</label>
+      <select id="channel-filter">
+        <option value="">all channels</option>
+      </select>
+      <label>Limit</label>
+      <select id="limit-select">
+        <option value="25">25</option>
+        <option value="50" selected>50</option>
+        <option value="100">100</option>
+        <option value="200">200</option>
+      </select>
+      <button id="refresh-btn" onclick="loadRecent()">Refresh</button>
+      <span style="margin-left:auto; display:flex; align-items:center; gap:0.5rem;">
+        <label>Atom ID</label>
+        <input type="text" id="atom-id-input" placeholder="paste atom id…" style="width:280px;" />
+        <button onclick="loadAtomFromInput()">Inspect</button>
+      </span>
+    </div>
+
+    <!-- Atom list -->
+    <div class="atom-list" id="atom-list">
+      <div class="empty">Loading…</div>
+    </div>
+
+    <!-- Atom detail panel -->
+    <div class="detail-panel" id="detail-panel">
+      <h2 id="detail-title">Atom detail</h2>
+      <div id="detail-body"></div>
+    </div>
   </div>
 
-  <!-- Atom detail panel -->
-  <div class="detail-panel" id="detail-panel">
-    <h2 id="detail-title">Atom detail</h2>
-    <div id="detail-body"></div>
+  <!-- SECTION: Search -->
+  <div class="section" id="section-search">
+    <div class="search-controls controls">
+      <label>Query</label>
+      <input type="text" id="search-input" placeholder="search atom content…" style="width:300px;"
+             onkeydown="if(event.key==='Enter') runSearch()" />
+      <label>Channel</label>
+      <select id="search-channel-filter">
+        <option value="">all channels</option>
+      </select>
+      <button onclick="runSearch()">Search</button>
+    </div>
+    <div id="search-results">
+      <div class="empty">Enter a query to search atoms.</div>
+    </div>
   </div>
+
+  <!-- SECTION: Activation histogram -->
+  <div class="section" id="section-activation">
+    <div class="controls">
+      <label>Days window</label>
+      <select id="hist-days">
+        <option value="1">1 day</option>
+        <option value="7" selected>7 days</option>
+        <option value="30">30 days</option>
+        <option value="90">90 days</option>
+      </select>
+      <button onclick="loadActivationHist()">Load</button>
+    </div>
+    <div id="hist-container">
+      <div class="empty">Click Load to compute activation histogram.</div>
+    </div>
+  </div>
+
+  <!-- SECTION: Clusters -->
+  <div class="section" id="section-clusters">
+    <div class="controls">
+      <button onclick="loadClusters()">Load clusters</button>
+      <span id="cluster-meta" class="meta"></span>
+    </div>
+    <div id="clusters-container">
+      <div class="empty">Click Load to browse session clusters.</div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -575,7 +1030,7 @@ async function loadRecent() {
     const d = await authedFetch(url);
     if (d.error) { list.innerHTML = '<div class="error-msg">Error: ' + esc(d.error) + "</div>"; return; }
 
-    // Populate channel dropdown from first load
+    // Populate channel dropdowns from first load
     if (d.channels && d.channels.length && !_channels.length) {
       _channels = d.channels;
       const sel = document.getElementById("channel-filter");
@@ -584,6 +1039,7 @@ async function loadRecent() {
         opt.value = ch; opt.textContent = ch;
         sel.appendChild(opt);
       }
+      _populateSearchChannels(_channels);
     }
 
     if (!d.atoms || !d.atoms.length) {
@@ -682,6 +1138,147 @@ async function loadAtom(atomId, rowEl) {
   }
 }
 
+// ── Section tabs ──────────────────────────────────────────────────
+function showSection(name, btn) {
+  document.querySelectorAll(".section").forEach(s => s.classList.remove("visible"));
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+  const sec = document.getElementById("section-" + name);
+  if (sec) sec.classList.add("visible");
+  if (btn) btn.classList.add("active");
+}
+
+// ── Search ────────────────────────────────────────────────────────
+async function runSearch() {
+  const q = document.getElementById("search-input").value.trim();
+  if (!q) return;
+  const channel = document.getElementById("search-channel-filter").value;
+  let url = "/api/saga?view=search&q=" + encodeURIComponent(q);
+  if (channel) url += "&channel=" + encodeURIComponent(channel);
+
+  const container = document.getElementById("search-results");
+  container.innerHTML = '<div class="empty">Searching…</div>';
+
+  try {
+    const d = await authedFetch(url);
+    if (d.error) { container.innerHTML = '<div class="error-msg">Error: ' + esc(d.error) + "</div>"; return; }
+
+    if (!d.atoms || !d.atoms.length) {
+      container.innerHTML = '<div class="empty">No results for <b>' + esc(q) + "</b>.</div>";
+      return;
+    }
+
+    const meta = '<div style="padding:0.4rem 0; color:var(--muted); font-size:0.78rem;">'
+      + d.atoms.length + ' of ' + (d.total_matched || '?') + ' matches for <b>' + esc(q) + "</b></div>";
+
+    const header = '<div class="atom-list-header"><span>Content</span><span>Type</span><span>Stream</span><span>Pinned</span><span>Created</span></div>';
+
+    const rows = d.atoms.map(a => {
+      const preview = esc(a.content_preview || "(empty)");
+      const typeClass = badgeClass(a.memory_type);
+      const typeBadge = '<span class="badge ' + typeClass + '">' + esc(a.memory_type || "raw") + "</span>";
+      const stream = esc(a.stream || "semantic");
+      const pinned = a.is_pinned ? '<span class="pinned-mark" title="Pinned">\\u{1F4CC}</span>' : '';
+      const ts = '<span class="ts">' + fmtTs(a.created_at) + "</span>";
+      return '<div class="atom-row" onclick="loadAtom(' + JSON.stringify(a.id) + ', this)">'
+        + '<span class="atom-preview">' + preview + "</span>"
+        + typeBadge
+        + '<span class="meta">' + stream + "</span>"
+        + pinned
+        + ts
+        + "</div>";
+    }).join("");
+
+    container.innerHTML = '<div class="atom-list">' + meta + header + rows + "</div>";
+  } catch (e) {
+    container.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
+  }
+}
+
+// Populate search channel dropdown from the same source as the recent view.
+function _populateSearchChannels(channels) {
+  const sel = document.getElementById("search-channel-filter");
+  if (!sel || sel.options.length > 1) return;
+  for (const ch of channels) {
+    const opt = document.createElement("option");
+    opt.value = ch; opt.textContent = ch;
+    sel.appendChild(opt);
+  }
+}
+
+// ── Activation histogram ───────────────────────────────────────────
+async function loadActivationHist() {
+  const days = document.getElementById("hist-days").value;
+  const container = document.getElementById("hist-container");
+  container.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const d = await authedFetch("/api/saga?view=activation_hist&days=" + days);
+    if (d.error) { container.innerHTML = '<div class="error-msg">Error: ' + esc(d.error) + "</div>"; return; }
+
+    if (!d.buckets || !d.buckets.length) {
+      container.innerHTML = '<div class="empty">No activation data for the last ' + esc(days) + ' day(s).'
+        + (d.never_accessed ? ' (' + d.never_accessed + ' atoms never accessed)' : '') + "</div>";
+      return;
+    }
+
+    const maxCount = Math.max(...d.buckets.map(b => b.count), 1);
+    const meta = '<div style="color:var(--muted); font-size:0.8rem; margin-bottom:0.6rem;">'
+      + d.total + ' atoms with finite activation; '
+      + (d.never_accessed || 0) + ' never accessed — last ' + d.days + ' day(s)</div>';
+
+    const bars = d.buckets.map(b => {
+      const pct = (b.count / maxCount * 100).toFixed(1);
+      return '<div class="hist-bar-row">'
+        + '<div class="hist-label">[' + b.range_start.toFixed(2) + ', ' + b.range_end.toFixed(2) + ')</div>'
+        + '<div class="hist-bar-wrap"><div class="hist-bar" style="width:' + pct + '%"></div></div>'
+        + '<div class="hist-count">' + b.count + "</div>"
+        + "</div>";
+    }).join("");
+
+    container.innerHTML = '<div class="section-wrap">' + meta + bars + "</div>";
+  } catch (e) {
+    container.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
+  }
+}
+
+// ── Clusters ──────────────────────────────────────────────────────
+async function loadClusters() {
+  const container = document.getElementById("clusters-container");
+  const metaEl = document.getElementById("cluster-meta");
+  container.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const d = await authedFetch("/api/saga?view=clusters");
+    if (d.error) { container.innerHTML = '<div class="error-msg">Error: ' + esc(d.error) + "</div>"; return; }
+
+    if (!d.clusters || !d.clusters.length) {
+      container.innerHTML = '<div class="empty">No clusters found.</div>';
+      return;
+    }
+
+    metaEl.textContent = d.total_clusters + ' clusters, ' + (d.total_atoms || 0) + ' atoms total';
+
+    const cards = d.clusters.map(c => {
+      const cid = c.cluster_id ? esc(c.cluster_id) : '<span style="color:var(--muted)">(no session)</span>';
+      const sample = (c.sample_atoms || []).map(a =>
+        '<div class="cluster-atom-preview">'
+        + '<span style="color:var(--accent); font-size:0.72rem; font-family:monospace">' + esc(a.id) + '</span> — '
+        + esc(a.content_preview || "")
+        + "</div>"
+      ).join("");
+      return '<div class="cluster-card">'
+        + '<div class="cluster-header">'
+        + '<span class="cluster-size">' + c.size + ' atoms</span>'
+        + '<span class="cluster-id">' + cid + "</span>"
+        + "</div>"
+        + '<div class="cluster-sample">' + (sample || '<span class="meta">no preview</span>') + "</div>"
+        + "</div>";
+    }).join("");
+
+    container.innerHTML = cards;
+  } catch (e) {
+    container.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
+  }
+}
+
 // ── Init ──────────────────────────────────────────────────────────
 loadStats();
 loadRecent();
@@ -694,5 +1291,8 @@ __all__ = [
     "build_recent_atoms_payload",
     "build_atom_payload",
     "build_db_stats_payload",
+    "build_search_payload",
+    "build_activation_hist_payload",
+    "build_clusters_payload",
     "render_saga_html",
 ]

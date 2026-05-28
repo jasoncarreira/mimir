@@ -1,11 +1,14 @@
-"""Tests for mimir.saga_dashboard (chainlink #222 — Phase 1).
+"""Tests for mimir.saga_dashboard (chainlink #222 — Phase 1 + 2).
 
 Tests cover:
   - build_db_stats_payload: stats from a real in-memory SQLite DB
   - build_recent_atoms_payload: returns rows, channel filter, limit cap
   - build_atom_payload: single atom + access_events + relations
+  - build_search_payload: text search, channel scope, missing DB
+  - build_activation_hist_payload: histogram buckets, empty DB, no-summary atoms
+  - build_clusters_payload: cluster grouping, NULL session, sample capping
   - render_saga_html: valid HTML shell with expected tokens
-  - web_ui routes: /saga HTML + /api/saga view={recent,atom,stats}
+  - web_ui routes: /saga HTML + /api/saga view={recent,atom,stats,search,activation_hist,clusters}
   - Path-safety: missing DB returns error, not crash
   - Auth-exempt: /saga returns 200 without API key when key is set
 """
@@ -23,9 +26,12 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from mimir import web_ui
 from mimir.saga_dashboard import (
+    build_activation_hist_payload,
     build_atom_payload,
+    build_clusters_payload,
     build_db_stats_payload,
     build_recent_atoms_payload,
+    build_search_payload,
     render_saga_html,
 )
 
@@ -103,6 +109,15 @@ def _make_db(path: Path) -> sqlite3.Connection:
             tombstoned INTEGER DEFAULT 0,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE atom_access_summary (
+            atom_id TEXT PRIMARY KEY,
+            recent_ts_json TEXT DEFAULT '[]',
+            recent_weights_json TEXT DEFAULT '[]',
+            old_count INTEGER DEFAULT 0,
+            old_weight_sum REAL DEFAULT 0.0,
+            old_oldest_ts TEXT,
+            last_updated_ts TEXT
+        );
         CREATE TABLE schema_version (
             version INTEGER PRIMARY KEY,
             applied_at TEXT NOT NULL
@@ -135,6 +150,35 @@ def _insert_atom(
            (id, content, content_hash, memory_type, session_id, tombstoned, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (atom_id, content, f"hash-{atom_id}", memory_type, session_id, tombstoned, created_at),
+    )
+    conn.commit()
+
+
+def _insert_access_summary(
+    conn: sqlite3.Connection,
+    atom_id: str,
+    recent_ts: list[str] | None = None,
+    recent_weights: list[float] | None = None,
+    old_count: int = 0,
+    old_weight_sum: float = 0.0,
+    old_oldest_ts: str | None = None,
+    last_updated_ts: str = "2026-05-28T05:00:00Z",
+) -> None:
+    """Insert an atom_access_summary row for activation tests."""
+    conn.execute(
+        """INSERT INTO atom_access_summary
+           (atom_id, recent_ts_json, recent_weights_json,
+            old_count, old_weight_sum, old_oldest_ts, last_updated_ts)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            atom_id,
+            json.dumps(recent_ts or ["2026-05-28T05:00:00Z"]),
+            json.dumps(recent_weights or [1.0]),
+            old_count,
+            old_weight_sum,
+            old_oldest_ts,
+            last_updated_ts,
+        ),
     )
     conn.commit()
 
@@ -474,3 +518,402 @@ async def test_saga_page_is_auth_exempt(tmp_path: Path) -> None:
     from mimir.server import _AUTH_EXEMPT
 
     assert ("GET", "/saga") in _AUTH_EXEMPT
+
+
+# ─── build_search_payload ─────────────────────────────────────────
+
+
+def test_search_missing_db(tmp_path: Path) -> None:
+    result = build_search_payload(tmp_path / "missing.db", "hello")
+    assert "error" in result
+    assert result["atoms"] == []
+
+
+def test_search_empty_query(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    conn.close()
+    result = build_search_payload(db_path, "")
+    assert "error" in result
+    assert result["atoms"] == []
+
+
+def test_search_finds_matching_atoms(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    _insert_atom(conn, "a1", content="the quick brown fox")
+    _insert_atom(conn, "a2", content="lazy dog napping")
+    _insert_atom(conn, "a3", content="quick silver ran away")
+    conn.close()
+
+    result = build_search_payload(db_path, "quick")
+    assert "error" not in result
+    ids = {a["id"] for a in result["atoms"]}
+    assert "a1" in ids
+    assert "a3" in ids
+    assert "a2" not in ids
+    assert result["total_matched"] == 2
+
+
+def test_search_case_insensitive(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    _insert_atom(conn, "b1", content="Hello World")
+    _insert_atom(conn, "b2", content="HELLO AGAIN")
+    _insert_atom(conn, "b3", content="goodbye")
+    conn.close()
+
+    result = build_search_payload(db_path, "hello")
+    ids = {a["id"] for a in result["atoms"]}
+    assert "b1" in ids
+    assert "b2" in ids
+    assert "b3" not in ids
+
+
+def test_search_channel_scope(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    _insert_session(conn, "sess-disc", "discord-1")
+    _insert_session(conn, "sess-slack", "slack-1")
+    _insert_atom(conn, "d1", content="found in discord", session_id="sess-disc")
+    _insert_atom(conn, "s1", content="found in slack", session_id="sess-slack")
+    _insert_atom(conn, "n1", content="found with no session")
+    conn.close()
+
+    result = build_search_payload(db_path, "found", channel="discord-1")
+    assert len(result["atoms"]) == 1
+    assert result["atoms"][0]["id"] == "d1"
+    assert result["channel_filter"] == "discord-1"
+
+
+def test_search_excludes_tombstoned(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    _insert_atom(conn, "alive", content="alive and well")
+    _insert_atom(conn, "dead", content="alive but tombstoned", tombstoned=1)
+    conn.close()
+
+    result = build_search_payload(db_path, "alive")
+    ids = {a["id"] for a in result["atoms"]}
+    assert "alive" in ids
+    assert "dead" not in ids
+
+
+def test_search_limit_cap(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    for i in range(20):
+        _insert_atom(conn, f"a{i}", content="match me please")
+    conn.close()
+
+    result = build_search_payload(db_path, "match", limit=5)
+    assert len(result["atoms"]) == 5
+    assert result["total_matched"] == 20
+
+
+def test_search_content_preview_in_results(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    long_content = "searchable " + "x" * 300
+    _insert_atom(conn, "long", content=long_content)
+    conn.close()
+
+    result = build_search_payload(db_path, "searchable")
+    assert len(result["atoms"]) == 1
+    atom = result["atoms"][0]
+    assert "content_preview" in atom
+    assert "content" not in atom
+    assert len(atom["content_preview"]) <= 201
+
+
+# ─── build_activation_hist_payload ───────────────────────────────
+
+
+def test_activation_hist_missing_db(tmp_path: Path) -> None:
+    result = build_activation_hist_payload(tmp_path / "missing.db")
+    assert "error" in result
+    assert result["buckets"] == []
+
+
+def test_activation_hist_empty_db(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    conn.close()
+    result = build_activation_hist_payload(db_path, days=7)
+    assert "error" not in result
+    assert result["buckets"] == []
+    assert result["total"] == 0
+
+
+def test_activation_hist_no_summary_counts_as_never_accessed(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    # Atom exists but has no atom_access_summary row.
+    _insert_atom(conn, "nosummary", created_at="2026-05-28T05:00:00Z")
+    conn.close()
+
+    result = build_activation_hist_payload(db_path, days=7)
+    assert "error" not in result
+    assert result["never_accessed"] >= 1
+    assert result["total"] == 0
+    assert result["buckets"] == []
+
+
+def test_activation_hist_produces_buckets(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    # Two atoms with access summaries — different recency → different activation.
+    _insert_atom(conn, "recent", created_at="2026-05-28T05:00:00Z")
+    _insert_access_summary(
+        conn, "recent",
+        recent_ts=["2026-05-28T04:00:00Z", "2026-05-28T03:00:00Z"],
+        recent_weights=[1.0, 1.0],
+    )
+    _insert_atom(conn, "old-atom", created_at="2026-05-28T05:00:00Z")
+    _insert_access_summary(
+        conn, "old-atom",
+        recent_ts=["2026-05-21T00:00:00Z"],
+        recent_weights=[1.0],
+    )
+    conn.close()
+
+    result = build_activation_hist_payload(db_path, days=30)
+    assert "error" not in result
+    assert result["total"] == 2
+    assert len(result["buckets"]) >= 1
+    total_in_buckets = sum(b["count"] for b in result["buckets"])
+    assert total_in_buckets == 2
+
+
+def test_activation_hist_respects_days_window(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    # One atom from today, one from 30 days ago.
+    _insert_atom(conn, "today", created_at="2026-05-28T05:00:00Z")
+    _insert_access_summary(conn, "today")
+    _insert_atom(conn, "old", created_at="2026-04-01T00:00:00Z")
+    _insert_access_summary(
+        conn, "old",
+        recent_ts=["2026-04-01T00:00:00Z"],
+        last_updated_ts="2026-04-01T00:00:00Z",
+    )
+    conn.close()
+
+    # 1-day window should only include "today".
+    result = build_activation_hist_payload(db_path, days=1)
+    assert result["total"] + result.get("never_accessed", 0) == 1
+
+
+def test_activation_hist_single_activation_produces_one_bucket(tmp_path: Path) -> None:
+    """When all activations are identical, should get one bucket (not error)."""
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    _insert_atom(conn, "a1", created_at="2026-05-28T05:00:00Z")
+    _insert_access_summary(conn, "a1", recent_ts=["2026-05-28T03:00:00Z"])
+    conn.close()
+
+    result = build_activation_hist_payload(db_path, days=7)
+    assert "error" not in result
+    # Single atom → either 0 (never accessed) or 1 bucket with count 1.
+    total_bucketed = sum(b["count"] for b in result.get("buckets", []))
+    assert total_bucketed + result.get("never_accessed", 0) == 1
+
+
+# ─── build_clusters_payload ───────────────────────────────────────
+
+
+def test_clusters_missing_db(tmp_path: Path) -> None:
+    result = build_clusters_payload(tmp_path / "missing.db")
+    assert "error" in result
+    assert result["clusters"] == []
+
+
+def test_clusters_empty_db(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    conn.close()
+    result = build_clusters_payload(db_path)
+    assert "error" not in result
+    assert result["clusters"] == []
+    assert result["total_clusters"] == 0
+
+
+def test_clusters_groups_by_session(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    _insert_session(conn, "sess-A", "discord-1")
+    _insert_session(conn, "sess-B", "discord-1")
+    # 3 atoms in sess-A, 1 in sess-B.
+    for i in range(3):
+        _insert_atom(conn, f"a{i}", session_id="sess-A")
+    _insert_atom(conn, "b0", session_id="sess-B")
+    conn.close()
+
+    result = build_clusters_payload(db_path)
+    assert "error" not in result
+    # Two sessions → at least 2 clusters (may also have a NULL cluster if any atom has no session).
+    cluster_ids = {c["cluster_id"] for c in result["clusters"]}
+    assert "sess-A" in cluster_ids
+    assert "sess-B" in cluster_ids
+    # Largest cluster first.
+    assert result["clusters"][0]["size"] >= result["clusters"][-1]["size"]
+
+
+def test_clusters_null_session_is_unclustered(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    _insert_atom(conn, "orphan1")
+    _insert_atom(conn, "orphan2")
+    conn.close()
+
+    result = build_clusters_payload(db_path)
+    assert "error" not in result
+    null_clusters = [c for c in result["clusters"] if c["cluster_id"] is None]
+    assert len(null_clusters) == 1
+    assert null_clusters[0]["size"] == 2
+
+
+def test_clusters_sample_atoms_present(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    _insert_session(conn, "sess-1", "discord-1")
+    for i in range(5):
+        _insert_atom(conn, f"atom{i}", content=f"content of atom {i}", session_id="sess-1")
+    conn.close()
+
+    result = build_clusters_payload(db_path, sample_size=3)
+    cluster = next(c for c in result["clusters"] if c["cluster_id"] == "sess-1")
+    assert cluster["size"] == 5
+    assert len(cluster["sample_atoms"]) == 3
+    for a in cluster["sample_atoms"]:
+        assert "id" in a
+        assert "content_preview" in a
+
+
+def test_clusters_excludes_tombstoned(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    _insert_session(conn, "sess-1", "discord-1")
+    _insert_atom(conn, "live", session_id="sess-1")
+    _insert_atom(conn, "dead", session_id="sess-1", tombstoned=1)
+    conn.close()
+
+    result = build_clusters_payload(db_path)
+    cluster = next((c for c in result["clusters"] if c["cluster_id"] == "sess-1"), None)
+    assert cluster is not None
+    assert cluster["size"] == 1  # tombstoned excluded
+
+
+def test_clusters_total_counts(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    _insert_session(conn, "s1", "discord-1")
+    _insert_session(conn, "s2", "discord-1")
+    _insert_atom(conn, "a1", session_id="s1")
+    _insert_atom(conn, "a2", session_id="s1")
+    _insert_atom(conn, "a3", session_id="s2")
+    conn.close()
+
+    result = build_clusters_payload(db_path)
+    assert result["total_clusters"] == 2
+    assert result["total_atoms"] == 3
+
+
+# ─── web_ui routes: Phase 2 ───────────────────────────────────────
+
+
+@pytest.fixture
+def saga_app_phase2(tmp_path: Path):
+    """aiohttp app with /saga + /api/saga wired to a Phase-2-ready saga DB."""
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    _insert_session(conn, "sess-1", "discord-1")
+    _insert_atom(conn, "atom-A", content="alpha atom content here", session_id="sess-1")
+    _insert_atom(conn, "atom-B", content="beta atom here too")
+    _insert_atom(conn, "atom-C", content="gamma content", session_id="sess-1")
+    _insert_access_summary(conn, "atom-A")
+    conn.close()
+
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        saga_db=db_path,
+    )
+    return a
+
+
+@pytest.mark.asyncio
+async def test_api_saga_search_returns_results(saga_app_phase2: web.Application) -> None:
+    async with TestClient(TestServer(saga_app_phase2)) as client:
+        resp = await client.get("/api/saga?view=search&q=alpha")
+        assert resp.status == 200
+        body = await resp.json()
+    assert "atoms" in body
+    assert len(body["atoms"]) == 1
+    assert body["atoms"][0]["id"] == "atom-A"
+
+
+@pytest.mark.asyncio
+async def test_api_saga_search_missing_q_param(saga_app_phase2: web.Application) -> None:
+    async with TestClient(TestServer(saga_app_phase2)) as client:
+        resp = await client.get("/api/saga?view=search")
+        assert resp.status == 400
+        body = await resp.json()
+    assert "error" in body
+
+
+@pytest.mark.asyncio
+async def test_api_saga_search_channel_scoped(saga_app_phase2: web.Application) -> None:
+    async with TestClient(TestServer(saga_app_phase2)) as client:
+        resp = await client.get("/api/saga?view=search&q=atom&channel=discord-1")
+        assert resp.status == 200
+        body = await resp.json()
+    # atom-B has no session so it's excluded from the discord-1 channel scope.
+    ids = {a["id"] for a in body["atoms"]}
+    assert "atom-A" in ids
+    assert "atom-B" not in ids
+
+
+@pytest.mark.asyncio
+async def test_api_saga_activation_hist_returns_payload(saga_app_phase2: web.Application) -> None:
+    async with TestClient(TestServer(saga_app_phase2)) as client:
+        resp = await client.get("/api/saga?view=activation_hist&days=7")
+        assert resp.status == 200
+        body = await resp.json()
+    assert "buckets" in body
+    assert "total" in body
+    assert "never_accessed" in body
+    assert "days" in body
+    # atom-A has a summary so it should have finite activation.
+    assert body["total"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_api_saga_clusters_returns_payload(saga_app_phase2: web.Application) -> None:
+    async with TestClient(TestServer(saga_app_phase2)) as client:
+        resp = await client.get("/api/saga?view=clusters")
+        assert resp.status == 200
+        body = await resp.json()
+    assert "clusters" in body
+    assert "total_clusters" in body
+    assert body["total_clusters"] >= 1
+    # sess-1 has two atoms (atom-A and atom-C)
+    sess_cluster = next((c for c in body["clusters"] if c["cluster_id"] == "sess-1"), None)
+    assert sess_cluster is not None
+    assert sess_cluster["size"] == 2
+
+
+@pytest.mark.asyncio
+async def test_api_saga_search_no_db_configured(tmp_path: Path) -> None:
+    """view=search with no DB configured returns 503."""
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+    )
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/saga?view=search&q=hello")
+        assert resp.status == 503
