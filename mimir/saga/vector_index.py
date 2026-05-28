@@ -240,6 +240,18 @@ class VectorIndex:
         faiss.normalize_L2(vec)
 
         with self._lock:
+            # chainlink #235: if this atom_id was added before (re-embed,
+            # calibration, future re-add path), mark the OLD position as
+            # removed BEFORE overwriting ``_id_to_pos``. Otherwise the prior
+            # vector remains queryable via FAISS but is unreachable from
+            # ``_id_to_pos`` — search() returns the stale-vector entry
+            # mapped back to this atom_id with the old content's similarity.
+            # Today's call sites only re-add on cold rebuild; this guard
+            # preserves the invariant for any future re-embed surface.
+            old_pos = self._id_to_pos.get(atom_id)
+            if old_pos is not None:
+                self._removed.add(old_pos)
+                self._pos_to_id.pop(old_pos, None)
             self._index.add(vec)
             pos = self._next_pos
             self._id_to_pos[atom_id] = pos
