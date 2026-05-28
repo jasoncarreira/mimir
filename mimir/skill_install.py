@@ -183,6 +183,37 @@ class InstallResult:
     env_vars_written: list[str] = field(default_factory=list)
 
 
+def _validate_skill_name(name: str) -> None:
+    """Reject skill names that would break out of the skills root via path
+    traversal. The CLI takes ``name`` directly from argparse; an operator
+    running ``mimir skills install --force ../../tmp/foo`` would otherwise
+    have ``shutil.rmtree(dest)`` happily delete the resolved path outside
+    ``<home>/skills/``. chainlink #225.
+
+    Rejects:
+    - Empty / whitespace-only.
+    - Path separators (``/`` or ``\\``) anywhere.
+    - Leading ``.`` (hidden + ``..`` both caught).
+    - ``..`` segments anywhere (defense-in-depth — ``/`` check already
+      catches the dotted-traversal forms, but explicit is better).
+    """
+    if not name or not name.strip():
+        raise ValueError("skill name cannot be empty")
+    if "/" in name or "\\" in name:
+        raise ValueError(
+            f"skill name cannot contain path separators: {name!r}"
+        )
+    if name.startswith("."):
+        raise ValueError(
+            f"skill name cannot start with '.': {name!r} "
+            "(reserved for hidden/dot-prefixed entries; also catches '..')"
+        )
+    if ".." in Path(name).parts:
+        raise ValueError(
+            f"skill name cannot contain '..': {name!r}"
+        )
+
+
 def install(
     name: str,
     home: Path,
@@ -193,11 +224,13 @@ def install(
     """Copy an opt-in skill into the agent home.
 
     Raises:
+        ValueError: ``name`` fails path-traversal validation (chainlink #225).
         FileNotFoundError: source skill doesn't exist (either the
             optional-skills root is missing entirely, or the named skill
             isn't under it).
         FileExistsError: destination exists and ``force`` is False.
     """
+    _validate_skill_name(name)
     root = _resolve_optional_skills_root(optional_skills_root)
     if root is None:
         expected = optional_skills_root or DEFAULT_OPTIONAL_SKILLS_ROOT
@@ -213,6 +246,19 @@ def install(
     dest_root = home_skills_dir(home)
     dest_root.mkdir(parents=True, exist_ok=True)
     dest = dest_root / name
+
+    # chainlink #225 belt-and-suspenders: after resolving the destination,
+    # confirm it's contained within ``dest_root``. The ``_validate_skill_name``
+    # check above catches obvious traversal patterns; this catches any
+    # residual edge cases (symlinks resolving outside, future bugs in name
+    # handling, etc.) before the destructive rmtree.
+    dest_resolved = dest.resolve()
+    dest_root_resolved = dest_root.resolve()
+    if not dest_resolved.is_relative_to(dest_root_resolved):
+        raise ValueError(
+            f"resolved destination {dest_resolved} escapes skills root "
+            f"{dest_root_resolved}; refusing install"
+        )
 
     overwrote = False
     if dest.exists():
