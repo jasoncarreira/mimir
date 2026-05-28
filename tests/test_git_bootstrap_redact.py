@@ -117,3 +117,102 @@ def test_redact_env_dump_with_multiple_tokens():
     assert "sk-ant-api03-" not in out
     assert "xoxb-1234-" not in out
     assert "ghp_AbCdEf" not in out
+
+
+# ─── chainlink #237: paired redact + pre-commit hook alphabet test ──
+
+
+def test_redact_and_pre_commit_hook_agree_on_openai_project_key(tmp_path):
+    """chainlink #237: the OpenAI ``sk-proj_…`` shape uses an underscore.
+    The redact regex catches it; pre-fix the pre-commit hook's
+    ``sk-[A-Za-z0-9]{40,}`` pattern (no underscore in the alphabet)
+    silently allowed it through.
+
+    The contract is "if redact masks it, the hook must refuse the
+    commit." Pair the same input against both layers.
+    """
+    import subprocess
+    from pathlib import Path
+
+    # Same value the existing redact test uses.
+    candidate = "OPENAI_API_KEY=sk-proj_AbCdEfGh1234567890_ijKlMnOpQrSt"
+
+    # Layer 1: redact masks the secret.
+    redacted = _redact(candidate)
+    assert "sk-proj_" not in redacted, (
+        f"redact didn't mask sk-proj_; chainlink #237 regression: {redacted}"
+    )
+
+    # Layer 2: the pre-commit hook refuses the commit.
+    # Build a tiny git repo, install the hook, stage the candidate, run.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@test"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        check=True,
+    )
+
+    # Install the bundled hook.
+    hook_src = (
+        Path(__file__).resolve().parent.parent
+        / "mimir" / "templates" / "git" / "pre-commit"
+    )
+    hook_dst = repo / ".git" / "hooks" / "pre-commit"
+    hook_dst.write_text(hook_src.read_text())
+    hook_dst.chmod(0o755)
+
+    # Stage a file containing the candidate value on a +line.
+    bad = repo / "config.txt"
+    bad.write_text(candidate + "\n")
+    subprocess.run(["git", "-C", str(repo), "add", "config.txt"], check=True)
+
+    # Commit should fail (non-zero exit from the hook).
+    result = subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "should be refused"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0, (
+        f"pre-commit hook accepted sk-proj_ key; chainlink #237 regression. "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    # The refusal message should mention the matching pattern.
+    assert "sk-" in (result.stdout + result.stderr).lower() or \
+        "refusing" in (result.stdout + result.stderr).lower()
+
+
+def test_pre_commit_hook_still_catches_traditional_sk_ant_keys(tmp_path):
+    """Sanity: the chainlink #237 alphabet change must not break the
+    existing sk-ant-… catch."""
+    import subprocess
+    from pathlib import Path
+
+    candidate = "ANTHROPIC_API_KEY=sk-ant-api03-LongValueABCDEFGhijklmn_xyz"
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+
+    hook_src = (
+        Path(__file__).resolve().parent.parent
+        / "mimir" / "templates" / "git" / "pre-commit"
+    )
+    hook_dst = repo / ".git" / "hooks" / "pre-commit"
+    hook_dst.write_text(hook_src.read_text())
+    hook_dst.chmod(0o755)
+
+    bad = repo / "config.txt"
+    bad.write_text(candidate + "\n")
+    subprocess.run(["git", "-C", str(repo), "add", "config.txt"], check=True)
+    result = subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "should be refused"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0
