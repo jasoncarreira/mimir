@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import re
 import secrets
@@ -30,6 +31,7 @@ from .identities import IdentityResolver
 from .skill_defs import seed_skills
 from .subagent_defs import seed_subagent_defs
 
+log = logging.getLogger(__name__)
 
 DEFAULT_ENV_TEMPLATE = dedent(
     """\
@@ -1433,6 +1435,87 @@ def setup_home(
     }
 
 
+def _skill_env_summary(home: str) -> list[dict]:
+    """Return env-dep info for installed skills that declare an ``env:`` block.
+
+    Scans ``<home>/.mimir_builtin_skills/`` and ``<home>/skills/`` for
+    SKILL.md files with ``env:`` frontmatter blocks. Returns a list of
+    dicts — one per skill that has at least one required or optional var:
+
+    .. code-block:: python
+
+        [
+            {
+                "name": "weather",
+                "required": [
+                    {"name": "OPENWEATHER_API_KEY", "description": "...",
+                     "example": "...", "set": False},
+                ],
+                "optional": [],
+            },
+        ]
+
+    ``"set"`` is ``True`` when the var is non-empty in the current
+    ``os.environ`` (i.e. already exported before ``mimir setup`` ran).
+
+    Operator-installed skills in ``skills/`` shadow same-named builtins so
+    each skill name appears at most once in the result.
+
+    Errors in a single SKILL.md are silently skipped — one bad file does
+    not abort the whole scan.
+    """
+    from .skill_md import parse_env_block
+
+    home_path = Path(home)
+    seen: set[str] = set()
+    result: list[dict] = []
+
+    # Operator-placed skills shadow builtins; process operator dir FIRST so
+    # ``seen`` prevents the builtin copy from overriding operator config.
+    roots = [
+        home_path / "skills",
+        home_path / ".mimir_builtin_skills",
+    ]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for skill_dir in sorted(root.iterdir()):
+            if not skill_dir.is_dir():
+                continue
+            name = skill_dir.name
+            if name in seen:
+                continue  # shadowed by earlier (higher-priority) copy
+            skill_md_path = skill_dir / "SKILL.md"
+            if not skill_md_path.exists():
+                continue
+            # Mark as seen BEFORE env-block check so operator skills
+            # (processed first) suppress same-named builtins even when
+            # the operator copy has no env: block.
+            seen.add(name)
+            try:
+                text = skill_md_path.read_text()
+                req, opt = parse_env_block(text)
+            except (OSError, ValueError, KeyError, yaml.YAMLError) as exc:
+                log.debug("_skill_env_summary: skipping %s: %s", skill_md_path, exc)
+                continue
+            if not req and not opt:
+                continue
+
+            def _augment(specs: list[dict]) -> list[dict]:
+                return [
+                    {**s, "set": bool(os.environ.get(s["name"]))}
+                    for s in specs
+                ]
+
+            result.append({
+                "name": name,
+                "required": _augment(req),
+                "optional": _augment(opt),
+            })
+
+    return result
+
+
 def _print_setup_report(status: dict[str, object]) -> None:
     home = status["home"]
     print(f"mimir home ready at: {home}")
@@ -1550,6 +1633,33 @@ def _print_setup_report(status: dict[str, object]) -> None:
         print(f"     no API key needed. First run downloads the ~33MB ONNX model.")
     print(f"  3. (optional) Edit {home}/memory/core/00-identity.md")
     print(f"  4. Run:  mimir run --home {home}")
+    # Passive skill env-deps summary — non-blocking, informational only.
+    # Lists skills with env: blocks so the operator knows what to configure.
+    # No prompts here (setup runs non-interactively from Dockerfiles / scripts).
+    # Phase 3 (chainlink #211) will add `mimir skills configure <name>` for the
+    # interactive flow; this block is the discovery surface that makes the gap visible.
+    env_deps = _skill_env_summary(str(home))
+    if env_deps:
+        print()
+        print("Skill env-var status (configure with `mimir skills configure <name>`):")
+        for sk in env_deps:
+            req = sk["required"]
+            opt = sk["optional"]
+            missing_req = [v["name"] for v in req if not v["set"]]
+            set_req = [v["name"] for v in req if v["set"]]
+            unset_opt = [v["name"] for v in opt if not v["set"]]
+            if missing_req:
+                label = f"required (not set): {', '.join(missing_req)}"
+            elif set_req:
+                if unset_opt:
+                    label = f"configured ✓ (optional unset: {', '.join(unset_opt)})"
+                else:
+                    label = "configured ✓"
+            elif unset_opt:
+                label = f"optional (not set): {', '.join(unset_opt)}"
+            else:
+                label = "configured ✓"
+            print(f"  {sk['name']:20s} {label}")
 
 
 # ---------------------------------------------------------------------------

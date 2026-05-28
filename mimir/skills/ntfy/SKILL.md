@@ -1,6 +1,11 @@
 ---
 name: ntfy
 description: Send a phone-push notification to the operator via ntfy.sh. Use ONLY for genuine algedonic alarms — events the operator needs to know about within minutes, not hours. The push lands on their phone; the cost of misuse is operator desensitization (they mute the topic and the channel goes dark). Do not use for routine surfacing, status updates, or things that can wait for the next chat turn.
+env:
+  required:
+    - name: NTFY_TOPIC
+      description: "ntfy.sh topic name for push notifications (e.g. mimir-alerts-abc123). Keep this private — anyone who knows it can subscribe. Create a free account at https://ntfy.sh."
+      example: "mimir-alerts-abc123"
 ---
 
 <!-- desc: Send a phone-push notification via ntfy.sh — for genuine algedonic alarms only (events the operator needs within minutes, not hours). -->
