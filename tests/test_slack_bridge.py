@@ -408,17 +408,55 @@ async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_app):
 
 
 @pytest.mark.asyncio
+async def test_on_message_dedupes_socket_mode_redelivery(bridge_with_fake_app):
+    """chainlink #232: Socket Mode is documented to redeliver events on
+    ACK loss. The bridge must enqueue exactly once for the same ts,
+    no matter how many times Slack redelivers."""
+    bridge, enqueued, _ = bridge_with_fake_app
+    event = {
+        "user": "U05ALICE",
+        "channel": "C01ENG",
+        "text": "hello mimir",
+        "ts": "1234567890.000042",
+    }
+    await bridge._on_message(event)
+    await bridge._on_message(event)  # simulated redelivery
+    await bridge._on_message(event)  # and again
+    assert len(enqueued) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_message_does_not_dedupe_distinct_ts(bridge_with_fake_app):
+    """Distinct ``ts`` values must each enqueue — guards against the
+    dedup cache short-circuiting all messages."""
+    bridge, enqueued, _ = bridge_with_fake_app
+    for ts in ("1.001", "1.002", "1.003"):
+        await bridge._on_message(
+            {
+                "user": "U05ALICE",
+                "channel": "C01ENG",
+                "text": f"msg {ts}",
+                "ts": ts,
+            }
+        )
+    assert len(enqueued) == 3
+    assert [e.source_id for e in enqueued] == ["1.001", "1.002", "1.003"]
+
+
+@pytest.mark.asyncio
 async def test_users_info_cached_per_user(bridge_with_fake_app):
     """Repeated messages from the same user hit users.info exactly once —
     the second message resolves from the in-memory cache."""
     bridge, enqueued, _ = bridge_with_fake_app
-    for _ in range(3):
+    # Distinct ts values per message — chainlink #232 dedup keys on ts,
+    # so reusing the same value would collapse to a single enqueue.
+    for i in range(3):
         await bridge._on_message(
             {
                 "user": "U05ALICE",
                 "channel": "C01ENG",
                 "text": "hello",
-                "ts": "1.000",
+                "ts": f"1.{i:03d}",
                 "channel_type": "channel",
             }
         )

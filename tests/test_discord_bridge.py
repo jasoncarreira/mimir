@@ -322,6 +322,51 @@ async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_client):
 
 
 @pytest.mark.asyncio
+async def test_on_message_dedupes_resume_protocol_redelivery(
+    bridge_with_fake_client,
+):
+    """chainlink #232: Discord's resume protocol can redeliver around
+    disconnects. The bridge must enqueue exactly once for the same
+    message id, no matter how many times it arrives."""
+    import discord
+
+    bridge, enqueued, _ = bridge_with_fake_client
+    channel = SimpleNamespace(
+        id=1, type=getattr(discord.ChannelType, "text", None), name="g"
+    )
+    author = SimpleNamespace(id=99, bot=False, display_name="Alice")
+    msg = SimpleNamespace(
+        id=12345, author=author, channel=channel, content="hello", mentions=[]
+    )
+    await bridge._on_message(msg)
+    await bridge._on_message(msg)  # simulated resume redelivery
+    await bridge._on_message(msg)  # and again
+    assert len(enqueued) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_message_does_not_dedupe_distinct_ids(
+    bridge_with_fake_client,
+):
+    """Distinct source_ids must each produce an enqueue — guards against
+    a regression where the dedup short-circuits all messages."""
+    import discord
+
+    bridge, enqueued, _ = bridge_with_fake_client
+    channel = SimpleNamespace(
+        id=1, type=getattr(discord.ChannelType, "text", None), name="g"
+    )
+    author = SimpleNamespace(id=99, bot=False, display_name="Alice")
+    for mid in (1, 2, 3):
+        msg = SimpleNamespace(
+            id=mid, author=author, channel=channel, content=f"m{mid}", mentions=[]
+        )
+        await bridge._on_message(msg)
+    assert len(enqueued) == 3
+    assert [e.source_id for e in enqueued] == ["1", "2", "3"]
+
+
+@pytest.mark.asyncio
 async def test_send_reports_disconnected_client(tmp_path: Path):
     """An unconnected bridge fails send rather than crashing."""
     bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))

@@ -35,6 +35,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
 
 from ..models import AgentEvent
 from ._history import ChannelMessage
+from ._seen_ids import SeenIdCache
 from .base import Bridge, SendResult
 
 log = logging.getLogger(__name__)
@@ -305,6 +306,14 @@ class DiscordBridge(Bridge):
     # turn finishes). See ``send_typing_indicator``.
     _typing_tasks: dict[str, asyncio.Task] = field(
         default_factory=dict, init=False, repr=False
+    )
+    # chainlink #232: inbound message dedup — Discord's gateway resume
+    # protocol redelivers around disconnects, which would otherwise cause
+    # the agent to run two turns answering the same message. Bounded LRU
+    # keyed on the Discord message id (a globally unique snowflake).
+    _seen_ids: "SeenIdCache" = field(
+        default_factory=lambda: SeenIdCache(maxlen=1000),
+        init=False, repr=False,
     )
 
     prefixes = ("discord-", "dm-discord-")
@@ -740,6 +749,18 @@ class DiscordBridge(Bridge):
             return
         author_is_bot = bool(getattr(message.author, "bot", False))
         if author_is_bot and not self.respond_to_bots:
+            return
+
+        # chainlink #232: dedup before any work — Discord's resume
+        # protocol can redeliver around disconnects, and we don't want
+        # to download attachments or burn an agent turn on a redelivery.
+        source_id = str(getattr(message, "id", "") or "") or None
+        if source_id is not None and not self._seen_ids.add_if_new(source_id):
+            log.debug(
+                "DiscordBridge: duplicate inbound message dropped "
+                "(source_id=%s) — Discord resume-protocol redelivery",
+                source_id,
+            )
             return
 
         channel = message.channel
