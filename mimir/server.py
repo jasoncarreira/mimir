@@ -662,6 +662,19 @@ def build_app(config: Config) -> web.Application:
                     error=str(exc)[:500],
                 )
 
+        # Install pre-push staleness-gate hook to source repo.
+        # Independent of git_tracking_enabled — protects pushes from
+        # any heartbeat, not just state commits. Non-fatal if missing.
+        # See: chainlink #249, mimir/skills/github/SKILL.md §"Pre-push staleness gate"
+        try:
+            from pathlib import Path as _Path
+            from .git_bootstrap import ensure_workspace_hooks as _ensure_ws_hooks
+            _source_repo = _Path("/workspace/mimir")
+            if _source_repo.is_dir():
+                await asyncio.to_thread(_ensure_ws_hooks, _source_repo)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("pre-push hook install failed for /workspace/mimir: %s", exc)
+
         await indexer.start(run_initial_sweep=False, sweep_loop=True)
         await channels.connect_all()
 

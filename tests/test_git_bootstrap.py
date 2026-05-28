@@ -869,3 +869,199 @@ def test_run_returns_completed_process_on_timeout_when_check_false(
     assert isinstance(result, subprocess.CompletedProcess)
     assert result.returncode == 124
     assert "timed out after 30s" in (result.stderr or "")
+
+
+# ─── ensure_workspace_hooks (chainlink #249) ─────────────────────────
+
+
+def _init_bare_repo(path: Path) -> None:
+    """Init a minimal git repo with .git/hooks/ dir for hook install tests."""
+    path.mkdir(parents=True, exist_ok=True)
+    _git("init", "-q", "-b", "main", cwd=path)
+    _git("config", "user.name", "Test", cwd=path)
+    _git("config", "user.email", "test@example.com", cwd=path)
+
+
+def test_ensure_workspace_hooks_installs_pre_push(tmp_path: Path) -> None:
+    """ensure_workspace_hooks() copies the pre-push template into the
+    workspace repo's .git/hooks/ directory, marks it executable,
+    and returns True."""
+    workspace = tmp_path / "workspace"
+    _init_bare_repo(workspace)
+
+    result = git_bootstrap.ensure_workspace_hooks(workspace)
+
+    assert result is True
+    hook = workspace / ".git" / "hooks" / "pre-push"
+    assert hook.is_file()
+    assert hook.stat().st_mode & stat.S_IXUSR
+    # Sanity-check contents — the hook must exit 0 for non-origin remotes.
+    content = hook.read_text()
+    assert "origin" in content
+    assert "stale" in content.lower()
+
+
+def test_ensure_workspace_hooks_idempotent(tmp_path: Path) -> None:
+    """Calling ensure_workspace_hooks() twice must not error and must
+    leave a valid hook (template update propagates on re-install)."""
+    workspace = tmp_path / "workspace"
+    _init_bare_repo(workspace)
+
+    r1 = git_bootstrap.ensure_workspace_hooks(workspace)
+    r2 = git_bootstrap.ensure_workspace_hooks(workspace)
+
+    assert r1 is True
+    assert r2 is True
+    assert (workspace / ".git" / "hooks" / "pre-push").is_file()
+
+
+def test_ensure_workspace_hooks_no_git_dir_returns_false(tmp_path: Path) -> None:
+    """If the path has no .git/hooks dir (not a git repo), the function
+    returns False without raising."""
+    not_a_repo = tmp_path / "not-a-repo"
+    not_a_repo.mkdir()
+
+    result = git_bootstrap.ensure_workspace_hooks(not_a_repo)
+
+    assert result is False
+    assert not (not_a_repo / ".git").exists()
+
+
+def test_ensure_workspace_hooks_missing_template_returns_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the pre-push template is missing, ensure_workspace_hooks returns
+    False and does not raise."""
+    workspace = tmp_path / "workspace"
+    _init_bare_repo(workspace)
+
+    # Point the bootstrap templates dir at an empty tmp dir.
+    empty_templates = tmp_path / "empty-templates"
+    empty_templates.mkdir()
+    monkeypatch.setattr(git_bootstrap, "_TEMPLATES_DIR", empty_templates)
+
+    result = git_bootstrap.ensure_workspace_hooks(workspace)
+
+    assert result is False
+    assert not (workspace / ".git" / "hooks" / "pre-push").is_file()
+
+
+def test_pre_push_hook_refuses_stale_branch(tmp_path: Path) -> None:
+    """The installed pre-push hook must exit 1 and print a staleness
+    message when the branch's merge-base is not origin/main's current tip.
+
+    Setup:
+      - Create a bare 'origin' repo with two commits on main.
+      - Clone into a workspace.
+      - Push one commit to advance origin/main WITHOUT updating local.
+      - Install the pre-push hook.
+      - Try to push; the hook should refuse because the branch is stale.
+    """
+    # Bare origin repo.
+    origin = tmp_path / "origin.git"
+    _git("init", "-q", "--bare", "-b", "main", cwd=tmp_path)
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+        check=True, capture_output=True,
+    )
+
+    # First clone (workspace A) — makes the initial commit.
+    ws_a = tmp_path / "ws_a"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(ws_a)],
+        check=True, capture_output=True,
+    )
+    _git("config", "user.name", "Test", cwd=ws_a)
+    _git("config", "user.email", "test@example.com", cwd=ws_a)
+    _git("config", "commit.gpgsign", "false", cwd=ws_a)
+    (ws_a / "README.md").write_text("initial\n")
+    _git("add", "README.md", cwd=ws_a)
+    _git("commit", "-q", "-m", "initial", cwd=ws_a)
+    _git("push", "-q", "origin", "main", cwd=ws_a)
+
+    # Second clone (workspace B) — our test workspace.
+    ws_b = tmp_path / "ws_b"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(ws_b)],
+        check=True, capture_output=True,
+    )
+    _git("config", "user.name", "Test", cwd=ws_b)
+    _git("config", "user.email", "test@example.com", cwd=ws_b)
+    _git("config", "commit.gpgsign", "false", cwd=ws_b)
+
+    # Advance origin/main via ws_a (simulates another PR merging).
+    (ws_a / "other.md").write_text("other PR\n")
+    _git("add", "other.md", cwd=ws_a)
+    _git("commit", "-q", "-m", "other PR merged to main", cwd=ws_a)
+    _git("push", "-q", "origin", "main", cwd=ws_a)
+
+    # Now ws_b creates a branch and commits — its base is stale.
+    _git("checkout", "-b", "my-feature", cwd=ws_b)
+    (ws_b / "feature.md").write_text("feature\n")
+    _git("add", "feature.md", cwd=ws_b)
+    _git("commit", "-q", "-m", "add feature", cwd=ws_b)
+
+    # Install the hook.
+    git_bootstrap.ensure_workspace_hooks(ws_b)
+
+    # Push should be refused by the hook.
+    proc = subprocess.run(
+        ["git", "push", "origin", "my-feature"],
+        cwd=ws_b, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode != 0
+    combined = proc.stdout + proc.stderr
+    assert "stale" in combined.lower() or "merge-base" in combined.lower()
+
+
+def test_pre_push_hook_passes_current_branch(tmp_path: Path) -> None:
+    """The hook must exit 0 when the branch's merge-base IS origin/main tip
+    (i.e., the branch was branched off current main)."""
+    # Bare origin.
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+        check=True, capture_output=True,
+    )
+
+    # Initial commit on main.
+    ws_a = tmp_path / "ws_a"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(ws_a)],
+        check=True, capture_output=True,
+    )
+    _git("config", "user.name", "Test", cwd=ws_a)
+    _git("config", "user.email", "test@example.com", cwd=ws_a)
+    _git("config", "commit.gpgsign", "false", cwd=ws_a)
+    (ws_a / "README.md").write_text("initial\n")
+    _git("add", "README.md", cwd=ws_a)
+    _git("commit", "-q", "-m", "initial", cwd=ws_a)
+    _git("push", "-q", "origin", "main", cwd=ws_a)
+
+    # Clone fresh (already on current main).
+    ws_b = tmp_path / "ws_b"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(ws_b)],
+        check=True, capture_output=True,
+    )
+    _git("config", "user.name", "Test", cwd=ws_b)
+    _git("config", "user.email", "test@example.com", cwd=ws_b)
+    _git("config", "commit.gpgsign", "false", cwd=ws_b)
+
+    # Branch off fresh main → NOT stale.
+    _git("checkout", "-b", "fresh-feature", cwd=ws_b)
+    (ws_b / "feat.md").write_text("new feature\n")
+    _git("add", "feat.md", cwd=ws_b)
+    _git("commit", "-q", "-m", "fresh feature", cwd=ws_b)
+
+    git_bootstrap.ensure_workspace_hooks(ws_b)
+
+    # Push should succeed (hook exits 0).
+    proc = subprocess.run(
+        ["git", "push", "origin", "fresh-feature"],
+        cwd=ws_b, capture_output=True, text=True, check=False,
+    )
+    # returncode 0 = hook passed; git itself may not error even if remote
+    # receives the branch fine.
+    assert proc.returncode == 0
