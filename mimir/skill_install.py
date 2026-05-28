@@ -958,12 +958,23 @@ def apply_skill_update(
 
 
 def add_argparse_update(parser) -> None:
-    """Wire ``mimir skills update [<name>] [--apply] [--force] [--home PATH]``."""
+    """Wire ``mimir skills update [<name>|--all] [--apply] [--force] [--home PATH]``."""
     parser.add_argument(
         "name",
         nargs="?",
         default=None,
-        help="Skill name to check.  Omit to check all installed optional skills.",
+        help="Skill name to check.  Omit (or use --all) to check all installed optional skills.",
+    )
+    parser.add_argument(
+        "--all",
+        dest="all_skills",
+        action="store_true",
+        default=False,
+        help=(
+            "Check (or update with --apply) all installed optional skills.  "
+            "Equivalent to omitting the skill name argument, but explicit.  "
+            "Cannot be combined with a positional skill name."
+        ),
     )
     parser.add_argument(
         "--apply",
@@ -1015,18 +1026,32 @@ def cmd_update_skills(args) -> int:
     exits 1 when any skill could not be fully updated (e.g. skipped extras
     without --force, or per-file copy/backup failures); exits 2 on usage
     errors.
+
+    ``--all``: explicit "check every installed skill" flag.  Equivalent to
+    omitting the positional name argument but makes the intent unambiguous.
+    Mutually exclusive with a positional skill name.
     """
     home = _resolve_home(getattr(args, "home", None))
     if not home.is_dir():
         print(f"home not a directory: {home}")
         return 2
 
+    skill_name: str | None = getattr(args, "name", None)
+    all_skills: bool = getattr(args, "all_skills", False)
+
+    if all_skills and skill_name is not None:
+        print("error: --all and a skill name are mutually exclusive.")
+        return 2
+
+    # --all is equivalent to omitting the name (name=None scans all skills).
+    resolved_name: str | None = None if all_skills else skill_name
+
     src_root: Path | None = getattr(args, "optional_skills_root", None)
     do_apply: bool = getattr(args, "apply", False)
     do_force: bool = getattr(args, "force", False)
 
     try:
-        results = detect_skill_drift(home, src_root, name=getattr(args, "name", None))
+        results = detect_skill_drift(home, src_root, name=resolved_name)
     except FileNotFoundError as exc:
         print(str(exc))
         return 2

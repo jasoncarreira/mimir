@@ -943,6 +943,71 @@ def test_cmd_update_skills_apply_copy_failure_exits_1(
     assert rc == 1  # copy failure → partial update → exit 1
 
 
+# ─── cmd_update_skills --all flag ────────────────────────────────────
+
+
+def test_cmd_update_skills_all_flag_equivalent_to_no_name(
+    fake_optional_root: Path, fake_home: Path, capsys, monkeypatch,
+):
+    """``mimir skills update --all`` behaves identically to omitting the name."""
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT", fake_optional_root,
+    )
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    rc = cmd_update_skills(Namespace(
+        home=fake_home,
+        name=None,
+        all_skills=True,
+        optional_skills_root=fake_optional_root,
+        apply=False,
+        force=False,
+    ))
+    assert rc == 0
+    assert "up to date" in capsys.readouterr().out
+
+
+def test_cmd_update_skills_all_flag_mutually_exclusive_with_name(
+    fake_home: Path, capsys,
+):
+    """``mimir skills update --all <name>`` exits 2 with an error message."""
+    rc = cmd_update_skills(Namespace(
+        home=fake_home,
+        name="some-skill",
+        all_skills=True,
+        optional_skills_root=None,
+        apply=False,
+        force=False,
+    ))
+    assert rc == 2
+    assert "--all" in capsys.readouterr().out
+
+
+def test_cmd_update_skills_all_flag_apply_updates_all_skills(
+    fake_optional_root: Path, fake_home: Path, capsys, monkeypatch,
+):
+    """``mimir skills update --all --apply`` updates every drifted skill."""
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT", fake_optional_root,
+    )
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    # Introduce drift in the installed copy.
+    installed_md = fake_home / "skills" / "fake-skill" / "SKILL.md"
+    installed_md.write_text("---\nname: fake-skill\ndescription: stale\n---\n")
+
+    rc = cmd_update_skills(Namespace(
+        home=fake_home,
+        name=None,
+        all_skills=True,
+        optional_skills_root=fake_optional_root,
+        apply=True,
+        force=False,
+    ))
+    assert rc == 0
+    # File should now match the source.
+    src_text = (fake_optional_root / "fake-skill" / "SKILL.md").read_text()
+    assert installed_md.read_text() == src_text
+
+
 # ─── parse_env_block ─────────────────────────────────────────────────
 
 _ENV_BLOCK_SKILL_MD = """\
