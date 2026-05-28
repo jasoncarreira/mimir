@@ -196,21 +196,97 @@ async def _handle_health(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+# chainlink #233: bound for caller-supplied max_clusters on the
+# /api/memory/consolidate endpoint. Each cluster fans out to one LLM
+# call in the thematic pass — 100 is high enough for any legitimate
+# bench/operator run, low enough to keep a misconfigured caller from
+# burning the budget in one shot.
+_CONSOLIDATE_MAX_CLUSTERS_CEILING = 100
+
+
+class _ConsolidateGuard:
+    """Single-flight guard for ``POST /api/memory/consolidate``.
+
+    Carried on ``app["consolidate_guard"]`` so the inflight bit can be
+    mutated post-startup without tripping aiohttp's "changing state of
+    started application is deprecated" warning.
+    """
+
+    def __init__(self) -> None:
+        self.inflight = False
+
+
 async def _handle_consolidate(request: web.Request) -> web.Response:
     # Bench surface: trigger one SagaStore.consolidate() pass on demand.
     # Replaces the legacy MSAM-sidecar /v1/consolidate at port 3002.
+    #
+    # chainlink #233: consolidate is the most expensive saga operation
+    # (LLM fan-out per cluster). A single inflight-guard prevents a
+    # legitimate API-keyed caller — or a runaway retry loop — from
+    # firing N parallel passes and burning the budget before
+    # ``cost-runaway`` ntfy fires. Also plumbs ``max_clusters`` and
+    # ``extra_canonical_subjects`` from the request body (previously
+    # silently dropped) with a 100-cluster ceiling on ``max_clusters``.
     saga_client: SagaClient = request.app["saga_client"]
+    guard: _ConsolidateGuard = request.app["consolidate_guard"]
     try:
         body: dict[str, Any] = await request.json()
     except json.JSONDecodeError:
         body = {}
+
+    raw_max = body.get("max_clusters")
+    max_clusters: int | None
+    if raw_max is None:
+        max_clusters = None
+    else:
+        if isinstance(raw_max, bool) or not isinstance(raw_max, int):
+            return web.json_response(
+                {"error": "max_clusters must be a positive integer"},
+                status=400,
+            )
+        if raw_max < 1 or raw_max > _CONSOLIDATE_MAX_CLUSTERS_CEILING:
+            return web.json_response(
+                {
+                    "error": (
+                        f"max_clusters must be between 1 and "
+                        f"{_CONSOLIDATE_MAX_CLUSTERS_CEILING}"
+                    )
+                },
+                status=400,
+            )
+        max_clusters = raw_max
+
+    raw_subjects = body.get("extra_canonical_subjects")
+    extra_canonical_subjects: list[str] | None
+    if raw_subjects is None:
+        extra_canonical_subjects = None
+    elif isinstance(raw_subjects, list) and all(
+        isinstance(s, str) for s in raw_subjects
+    ):
+        extra_canonical_subjects = raw_subjects
+    else:
+        return web.json_response(
+            {"error": "extra_canonical_subjects must be a list of strings"},
+            status=400,
+        )
+
+    if guard.inflight:
+        return web.json_response(
+            {"error": "consolidate already running"},
+            status=429,
+        )
+    guard.inflight = True
     try:
         result = await saga_client.consolidate(
             dry_run=bool(body.get("dry_run", False)),
+            max_clusters=max_clusters,
+            extra_canonical_subjects=extra_canonical_subjects,
         )
     except Exception as exc:
         log.exception("consolidate failed: %s", exc)
         return web.json_response({"error": str(exc)}, status=500)
+    finally:
+        guard.inflight = False
     return web.json_response(result or {})
 
 
@@ -520,6 +596,8 @@ def build_app(config: Config) -> web.Application:
     app["seeded_subagents"] = seeded
     app["seeded_skills"] = seeded_skills_map
     app["api_key"] = config.api_key
+    # chainlink #233: single-flight guard for POST /api/memory/consolidate.
+    app["consolidate_guard"] = _ConsolidateGuard()
 
     if not config.api_key:
         log.warning(
