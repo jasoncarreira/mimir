@@ -79,6 +79,48 @@ This is a non-negotiable hard gate — not a heuristic. "Operator approved once"
 is not sufficient if a subsequent CHANGES_REQUESTED arrived, even seconds later.
 (Structured event emission for blocked merges is tracked in chainlink #218.)
 
+## Pre-push staleness gate (chainlink #219)
+
+**Before pushing a PR branch for re-review, ALWAYS check that the branch is
+current against `origin/main`.** Between the last rebase and the next push,
+other PRs may have merged to `main`; a stale base makes the PR diff include
+complete reverts of unrelated landed work. A squash-merge would silently drop
+those commits from `main`.
+
+```bash
+# Step 1: fetch and check staleness
+git fetch origin main
+MERGE_BASE=$(git merge-base HEAD origin/main)
+MAIN_TIP=$(git rev-parse origin/main)
+
+if [ "$MERGE_BASE" != "$MAIN_TIP" ]; then
+    echo "Branch is stale — rebasing onto current origin/main"
+    git rebase origin/main
+fi
+
+# Step 2: inspect paths in the diff after rebase
+git diff origin/main..HEAD --name-only
+```
+
+After fetching (and rebasing if stale), inspect the path list:
+
+- If every path is **within the PR's declared scope** (the chainlink ID, PR
+  title, or known feature area), the push is safe — proceed.
+- If any path is **outside scope** (a revert of unrelated work, or an
+  accidentally-staged file), stop — do not push. Investigate whether a further
+  rebase is needed or whether a stale commit slipped onto the branch.
+
+**Non-negotiable rule**: do not push to a PR branch for re-review without this
+check. The cost of missing a stale base is silently reverting landed work when
+the PR is squash-merged. Pairs with the pre-merge gate above — both gates exist
+because the window between "last rebase" and "reviewer sees diff" is enough for
+main to advance.
+
+Four concrete instances from 2026-05-27 that this gate would have caught:
+#393 (would have wiped #391/#388/#389/#392), #394 round 1 (stacked on stale
+#393), #396 (would have reverted #395 ~520 lines), #394 round 2 (stale base
+after #395 merged).
+
 ## Pull requests
 
 ```bash
