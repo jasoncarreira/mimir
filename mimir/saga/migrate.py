@@ -493,6 +493,14 @@ def migrate(
     dest.parent.mkdir(parents=True, exist_ok=True)
     dst = sqlite3.connect(str(dest))
     dst.execute("PRAGMA journal_mode=WAL")
+    # chainlink #227: same busy_timeout PRAGMA as ``SagaStore._ensure_conn``
+    # so a migration that overlaps another writer (rare but possible during
+    # a force-migration that races a running mimir) waits instead of failing.
+    from ._config_io import get_config
+    _cfg = get_config()
+    dst.execute(
+        f"PRAGMA busy_timeout = {int(_cfg('storage', 'db_busy_timeout_ms', 5000))}"
+    )
     dst.executescript(schema.read_text())
     dst.commit()
 
