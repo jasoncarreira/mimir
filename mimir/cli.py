@@ -2228,7 +2228,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     # JSONL or risking timestamp format mismatch.
     feedback_p = sub.add_parser(
         "feedback",
-        help="Feedback observability helpers (mark-resolved, future list/delete).",
+        help="Feedback observability helpers (mark-resolved, emit).",
     )
     feedback_sub = feedback_p.add_subparsers(dest="feedback_action")
 
@@ -2263,6 +2263,38 @@ def main(argv: Sequence[str] | None = None) -> None:
     feedback_mr_p.add_argument(
         "--home", type=Path, default=None,
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
+    # ``mimir feedback emit`` -- write a structured event from a subprocess
+    # (chainlink #218). Lets Bash-side skill code emit auditable events without
+    # touching Python internals or requiring an in-process logger singleton.
+    feedback_emit_p = feedback_sub.add_parser(
+        "emit",
+        help="Write a structured event to events.jsonl.  Useful for Bash-side skill "
+             "code that wants to emit auditable events without touching Python internals.",
+    )
+    feedback_emit_p.add_argument(
+        "event_type",
+        help="Event type to emit (e.g. 'pr_merge_blocked_by_changes_requested').",
+    )
+    feedback_emit_p.add_argument(
+        "pairs",
+        nargs="*",
+        metavar="KEY=VALUE",
+        help="Optional key=value payload fields.  Values are stored as strings "
+             "by default; use --json-values to JSON-parse them.",
+    )
+    feedback_emit_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+    feedback_emit_p.add_argument(
+        "--json-values",
+        action="store_true",
+        dest="json_values",
+        default=False,
+        help="JSON-parse each KEY=VALUE value. Lets you pass structured data: "
+             "blocking_reviewers='[\"alice\",\"bob\"]' pr=42",
     )
 
     reindex_p = sub.add_parser(
@@ -2573,6 +2605,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 reason=args.reason,
                 resolved_at=args.resolved_at,
                 dry_run=args.dry_run,
+            ))
+        if args.feedback_action == "emit":
+            from .feedback_cmd import run_emit_event
+            home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+            sys.exit(run_emit_event(
+                home=home,
+                event_type=args.event_type,
+                pairs=args.pairs,
+                json_values=getattr(args, "json_values", False),
             ))
         feedback_p.print_help()
         sys.exit(1)
