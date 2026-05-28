@@ -67,31 +67,17 @@ _FATAL_DISCORD_EXCEPTIONS: tuple[type[BaseException], ...] = tuple(
 )
 
 
-def _should_emit_retry_algedonic(attempt: int) -> bool:
-    """Throttle ``*_bridge_retry`` events during sustained outages.
-
-    Fires every attempt from 3-9 inclusive (so the operator sees the
-    early "is this real?" signal fast), then every 10th attempt
-    thereafter (10, 20, 30...). A multi-hour outage at the 5-min
-    backoff cap would otherwise produce ~12 retry events/hour;
-    throttling drops that to ~1.2/hour for the sustained case while
-    keeping the early-warning shape."""
-    if attempt < 3:
-        return False
-    if attempt < 10:
-        return True
-    return attempt % 10 == 0
+# chainlink #246: throttle + safe-log helpers are shared with SlackBridge
+# in mimir/bridges/_supervisor.py. Bind locally with a bridge label so
+# any logger-side failure shows up under the right name.
+from ._supervisor import should_emit_retry_algedonic as _should_emit_retry_algedonic
+from ._supervisor import safe_log_event as _shared_safe_log_event
 
 
 async def _safe_log_event(event_kind: str, **fields: Any) -> None:
-    """Best-effort wrapper around ``mimir.event_logger.log_event`` for use
-    from the bridge supervisor — swallows any logger-side error so a
-    misbehaving event sink can never wedge the reconnect loop."""
-    try:
-        from ..event_logger import log_event
-        await log_event(event_kind, **fields)
-    except Exception:  # noqa: BLE001
-        log.exception("DiscordBridge: log_event(%r) failed", event_kind)
+    """Discord-flavored wrapper — preserves the prior log-message
+    prefix while delegating to the shared implementation."""
+    await _shared_safe_log_event("DiscordBridge", event_kind, **fields)
 
 
 # ---------------------------------------------------------------------------

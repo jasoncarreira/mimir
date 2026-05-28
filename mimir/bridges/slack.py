@@ -48,36 +48,17 @@ from .base import Bridge, SendResult
 log = logging.getLogger(__name__)
 
 
-def _should_emit_retry_algedonic(attempt: int) -> bool:
-    """Throttle ``slack_bridge_retry`` events during sustained outages.
-
-    Mirrors the Discord supervisor's helper — fires every attempt from
-    3-9 inclusive (early-warning), then every 10th thereafter
-    (throttled during multi-hour outages so events.jsonl doesn't fill
-    with retry rows). Kept per-bridge rather than lifted to a shared
-    module so each bridge stays importable in isolation."""
-    if attempt < 3:
-        return False
-    if attempt < 10:
-        return True
-    return attempt % 10 == 0
+# chainlink #246: throttle + safe-log helpers are shared with
+# DiscordBridge in mimir/bridges/_supervisor.py. Bind locally with a
+# bridge label so any logger-side failure shows up under the right name.
+from ._supervisor import should_emit_retry_algedonic as _should_emit_retry_algedonic
+from ._supervisor import safe_log_event as _shared_safe_log_event
 
 
 async def _safe_log_event(event_kind: str, **fields: Any) -> None:
-    """Best-effort wrapper around ``mimir.event_logger.log_event`` for use
-    from the bridge supervisor — swallows any logger-side error so a
-    misbehaving event sink can never wedge the reconnect loop.
-
-    Mirrors the helper in ``mimir/bridges/discord.py``. Kept per-bridge
-    rather than lifted to a shared module so each bridge stays
-    importable in isolation (e.g. when one of slack-bolt / discord-py
-    is missing in a slim deployment).
-    """
-    try:
-        from ..event_logger import log_event
-        await log_event(event_kind, **fields)
-    except Exception:  # noqa: BLE001
-        log.exception("SlackBridge: log_event(%r) failed", event_kind)
+    """Slack-flavored wrapper — preserves the prior log-message prefix
+    while delegating to the shared implementation."""
+    await _shared_safe_log_event("SlackBridge", event_kind, **fields)
 
 
 # Slack mrkdwn doesn't have a hard char cap on chat.postMessage like Discord's
