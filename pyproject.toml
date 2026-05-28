@@ -160,6 +160,11 @@ include = [
     "mimir/skills/**/*.py",
     "mimir/templates/**/*",
     "mimir/turn_viewer.html",
+    # chainlink #243: operator dashboards. HTML/JS lives in sibling .html
+    # files next to the dashboard module; loaders read them at runtime.
+    "mimir/ops_dashboard.html",
+    "mimir/saga_dashboard.html",
+    "mimir/file_memory_dashboard.html",
 ]
 # Belt-and-suspenders: nothing under ``deepagent_poc/`` (deleted in
 # the cutover, but the exclude prevents accidental re-add from sneaking

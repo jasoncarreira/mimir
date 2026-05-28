@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>mimir Saga</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --paper: #0f1117;
+      --paper-strong: #1a1d27;
+      --paper-strong-2: #22263a;
+      --ink: #e2e6f0;
+      --muted: #8b92a8;
+      --line: rgba(226, 230, 240, 0.12);
+      --accent: #6c8ef7;
+      --accent-soft: rgba(108, 142, 247, 0.16);
+      --warn: #fbbf24;
+      --bad: #f87171;
+      --good: #4ade80;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, rgba(108, 142, 247, 0.08), transparent 32rem),
+        linear-gradient(180deg, #0f1117 0%, #141823 60%, #0f1117 100%);
+      color: var(--ink);
+      font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 14px;
+    }
+    body { padding: 1rem 1.4rem 3rem; }
+    .shell { max-width: 1200px; margin: 0 auto; }
+    header {
+      display: flex; align-items: baseline; justify-content: space-between;
+      gap: 1rem; flex-wrap: wrap;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 1.2rem;
+    }
+    header h1 { margin: 0; font-size: 1.4rem; font-weight: 600; }
+    header a { color: var(--accent); text-decoration: none; font-size: 0.9rem; margin-left: 1rem; }
+    header a:hover { text-decoration: underline; }
+    .meta { color: var(--muted); font-size: 0.82rem; }
+    /* Summary cards */
+    .stats-row {
+      display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 1.2rem;
+    }
+    .stat-card {
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0.6rem 1rem;
+      min-width: 120px;
+    }
+    .stat-card .label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .stat-card .value { font-size: 1.3rem; font-weight: 600; margin-top: 0.15rem; }
+    /* Controls */
+    .controls {
+      display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap;
+      margin-bottom: 0.9rem;
+    }
+    .controls label { color: var(--muted); font-size: 0.82rem; }
+    .controls select, .controls input, .controls button {
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+      color: var(--ink);
+      border-radius: 6px;
+      padding: 0.35rem 0.6rem;
+      font-size: 0.85rem;
+      font-family: inherit;
+    }
+    .controls input[type=text] { width: 220px; }
+    .controls button {
+      cursor: pointer;
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .controls button:hover { background: var(--accent); color: white; }
+    /* Atom list */
+    .atom-list {
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      margin-bottom: 1.2rem;
+    }
+    .atom-list-header {
+      display: grid;
+      grid-template-columns: 3fr 1fr 1fr 1fr 1.5fr;
+      gap: 0.5rem;
+      padding: 0.55rem 1rem;
+      background: var(--paper-strong-2);
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .atom-row {
+      display: grid;
+      grid-template-columns: 3fr 1fr 1fr 1fr 1.5fr;
+      gap: 0.5rem;
+      padding: 0.65rem 1rem;
+      border-bottom: 1px solid var(--line);
+      cursor: pointer;
+      transition: background 0.12s;
+    }
+    .atom-row:last-child { border-bottom: none; }
+    .atom-row:hover { background: var(--accent-soft); }
+    .atom-row.selected { background: var(--accent-soft); border-left: 3px solid var(--accent); padding-left: calc(1rem - 3px); }
+    .atom-preview { font-size: 0.83rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .badge {
+      display: inline-block;
+      padding: 0.1rem 0.4rem;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-weight: 500;
+    }
+    .badge-raw { background: rgba(139, 146, 168, 0.2); color: var(--muted); }
+    .badge-obs { background: rgba(108, 142, 247, 0.2); color: var(--accent); }
+    .badge-model { background: rgba(74, 222, 128, 0.2); color: var(--good); }
+    .ts { color: var(--muted); font-size: 0.78rem; font-variant-numeric: tabular-nums; }
+    .pinned-mark { color: var(--warn); font-size: 0.8rem; }
+    /* Atom detail panel */
+    .detail-panel {
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 1rem 1.2rem;
+      display: none;
+    }
+    .detail-panel.visible { display: block; }
+    .detail-panel h2 { margin: 0 0 0.8rem; font-size: 1rem; font-weight: 600; }
+    .detail-kv { display: grid; grid-template-columns: 140px 1fr; gap: 0.3rem 0.8rem; margin-bottom: 0.8rem; }
+    .detail-kv .k { color: var(--muted); font-size: 0.8rem; }
+    .detail-kv .v { font-size: 0.83rem; word-break: break-all; }
+    .detail-content {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0.7rem 0.9rem;
+      font-size: 0.82rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin-bottom: 0.8rem;
+    }
+    .detail-section { margin-top: 0.8rem; }
+    .detail-section h3 { margin: 0 0 0.4rem; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+    .relation-row { font-size: 0.8rem; padding: 0.25rem 0; border-bottom: 1px solid var(--line); }
+    .relation-row:last-child { border-bottom: none; }
+    .empty { color: var(--muted); font-size: 0.83rem; padding: 1.5rem; text-align: center; }
+    .error-msg { color: var(--bad); font-size: 0.83rem; padding: 1rem; }
+    #atom-id-input { font-family: "Courier New", monospace; font-size: 0.8rem; }
+    /* Phase 2: section tabs + search + histogram + clusters */
+    .section-tabs {
+      display: flex; gap: 0.3rem; margin-bottom: 1rem; flex-wrap: wrap;
+    }
+    .tab-btn {
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      border-radius: 6px;
+      padding: 0.35rem 0.9rem;
+      font-size: 0.83rem;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s;
+    }
+    .tab-btn:hover { background: var(--accent-soft); color: var(--accent); }
+    .tab-btn.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+    .section { display: none; }
+    .section.visible { display: block; }
+    /* Search section */
+    .search-controls {
+      display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap;
+      margin-bottom: 0.9rem;
+    }
+    .search-controls input[type=text] { width: 300px; }
+    /* Histogram */
+    .hist-bar-row {
+      display: flex; align-items: center; gap: 0.5rem;
+      margin-bottom: 0.25rem; font-size: 0.8rem;
+    }
+    .hist-label { width: 120px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+    .hist-bar-wrap { flex: 1; background: var(--paper-strong-2); border-radius: 3px; height: 18px; overflow: hidden; }
+    .hist-bar { background: var(--accent); height: 100%; border-radius: 3px; transition: width 0.3s; }
+    .hist-count { width: 40px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    /* Clusters */
+    .cluster-card {
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0.7rem 1rem;
+      margin-bottom: 0.6rem;
+    }
+    .cluster-header {
+      display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.4rem;
+    }
+    .cluster-id { font-size: 0.78rem; color: var(--muted); font-family: "Courier New", monospace; word-break: break-all; }
+    .cluster-size { font-size: 0.85rem; font-weight: 600; color: var(--accent); }
+    .cluster-sample { font-size: 0.8rem; color: var(--muted); line-height: 1.5; }
+    .cluster-atom-preview { padding: 0.15rem 0; border-bottom: 1px solid var(--line); }
+    .cluster-atom-preview:last-child { border-bottom: none; }
+    .section-wrap {
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0.8rem 1rem;
+      margin-bottom: 1.2rem;
+    }
+    /* SQL result table */
+    .sql-result-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .sql-result-table th {
+      background: var(--paper-strong-2);
+      color: var(--muted);
+      text-align: left;
+      padding: 0.4rem 0.6rem;
+      border-bottom: 1px solid var(--line);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+    .sql-result-table td {
+      padding: 0.35rem 0.6rem;
+      border-bottom: 1px solid var(--line);
+      max-width: 400px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .sql-result-table tr:last-child td { border-bottom: none; }
+    .sql-result-table tr:hover td { background: var(--accent-soft); }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <h1>mimir <span style="color:var(--accent)">saga</span></h1>
+    <div>
+      <a href="/ops">ops</a>
+      <a href="/turns">turns</a>
+    </div>
+  </header>
+
+  <!-- Stats row -->
+  <div class="stats-row" id="stats-row">
+    <div class="stat-card"><div class="label">atoms</div><div class="value" id="stat-atoms">—</div></div>
+    <div class="stat-card"><div class="label">sessions</div><div class="value" id="stat-sessions">—</div></div>
+    <div class="stat-card"><div class="label">triples</div><div class="value" id="stat-triples">—</div></div>
+    <div class="stat-card"><div class="label">tombstoned</div><div class="value" id="stat-tombstoned">—</div></div>
+    <div class="stat-card"><div class="label">db size</div><div class="value" id="stat-dbsize">—</div></div>
+    <div class="stat-card"><div class="label">schema</div><div class="value" id="stat-schema">—</div></div>
+  </div>
+
+  <!-- Section tabs -->
+  <div class="section-tabs">
+    <button class="tab-btn active" onclick="showSection('recent', this)">Recent</button>
+    <button class="tab-btn" onclick="showSection('search', this)">Search</button>
+    <button class="tab-btn" onclick="showSection('activation', this)">Activation</button>
+    <button class="tab-btn" onclick="showSection('clusters', this)">Clusters</button>
+    <button class="tab-btn" onclick="showSection('sql', this)">SQL</button>
+  </div>
+
+  <!-- SECTION: Recent atoms -->
+  <div class="section visible" id="section-recent">
+    <!-- Controls -->
+    <div class="controls">
+      <label>Channel</label>
+      <select id="channel-filter">
+        <option value="">all channels</option>
+      </select>
+      <label>Limit</label>
+      <select id="limit-select">
+        <option value="25">25</option>
+        <option value="50" selected>50</option>
+        <option value="100">100</option>
+        <option value="200">200</option>
+      </select>
+      <button id="refresh-btn" onclick="loadRecent()">Refresh</button>
+      <span style="margin-left:auto; display:flex; align-items:center; gap:0.5rem;">
+        <label>Atom ID</label>
+        <input type="text" id="atom-id-input" placeholder="paste atom id…" style="width:280px;" />
+        <button onclick="loadAtomFromInput()">Inspect</button>
+      </span>
+    </div>
+
+    <!-- Atom list -->
+    <div class="atom-list" id="atom-list">
+      <div class="empty">Loading…</div>
+    </div>
+
+    <!-- Atom detail panel -->
+    <div class="detail-panel" id="detail-panel">
+      <h2 id="detail-title">Atom detail</h2>
+      <div id="detail-body"></div>
+    </div>
+  </div>
+
+  <!-- SECTION: Search -->
+  <div class="section" id="section-search">
+    <div class="search-controls controls">
+      <label>Query</label>
+      <input type="text" id="search-input" placeholder="search atom content…" style="width:300px;"
+             onkeydown="if(event.key==='Enter') runSearch()" />
+      <label>Channel</label>
+      <select id="search-channel-filter">
+        <option value="">all channels</option>
+      </select>
+      <button onclick="runSearch()">Search</button>
+    </div>
+    <div id="search-results">
+      <div class="empty">Enter a query to search atoms.</div>
+    </div>
+  </div>
+
+  <!-- SECTION: Activation histogram -->
+  <div class="section" id="section-activation">
+    <div class="controls">
+      <label>Days window</label>
+      <select id="hist-days">
+        <option value="1">1 day</option>
+        <option value="7" selected>7 days</option>
+        <option value="30">30 days</option>
+        <option value="90">90 days</option>
+      </select>
+      <button onclick="loadActivationHist()">Load</button>
+    </div>
+    <div id="hist-container">
+      <div class="empty">Click Load to compute activation histogram.</div>
+    </div>
+  </div>
+
+  <!-- SECTION: Clusters -->
+  <div class="section" id="section-clusters">
+    <div class="controls">
+      <button onclick="loadClusters()">Load clusters</button>
+      <span id="cluster-meta" class="meta"></span>
+    </div>
+    <div id="clusters-container">
+      <div class="empty">Click Load to browse session clusters.</div>
+    </div>
+  </div>
+
+  <!-- SECTION: SQL (expert mode) -->
+  <div class="section" id="section-sql">
+    <div style="color:var(--warn); font-size:0.8rem; margin-bottom:0.6rem;">
+      &#9888; Expert mode — read-only queries only (SELECT / EXPLAIN / WITH).
+      Write keywords are rejected before execution. Results capped at 1&#8239;000 rows.
+    </div>
+    <div style="display:flex; flex-direction:column; gap:0.5rem; margin-bottom:0.8rem;">
+      <textarea id="sql-input" rows="5"
+        style="width:100%; font-family:'Courier New',monospace; font-size:0.82rem;
+               background:var(--paper); color:var(--ink); border:1px solid var(--line);
+               border-radius:6px; padding:0.55rem 0.7rem; resize:vertical;"
+        placeholder="SELECT id, content, memory_type, created_at FROM atoms WHERE tombstoned=0 ORDER BY created_at DESC LIMIT 20"
+        onkeydown="if((event.ctrlKey||event.metaKey) && event.key==='Enter') runSql()"></textarea>
+      <div style="display:flex; gap:0.5rem; align-items:center;">
+        <button onclick="runSql()">Run Query</button>
+        <span class="meta" style="font-size:0.78rem;">Ctrl+Enter to run</span>
+      </div>
+    </div>
+    <div id="sql-results">
+      <div class="empty">Enter a SELECT query above, then click Run Query.</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── Auth ─────────────────────────────────────────────────────────
+function getApiKey() {
+  let k = localStorage.getItem("mimir_api_key") || "";
+  if (!k) {
+    k = prompt("API key (leave blank if none):") || "";
+    if (k) localStorage.setItem("mimir_api_key", k);
+  }
+  return k;
+}
+
+async function authedFetch(url) {
+  const k = getApiKey();
+  const headers = k ? {"X-API-Key": k} : {};
+  const r = await fetch(url, {headers});
+  if (r.status === 401) {
+    localStorage.removeItem("mimir_api_key");
+    throw new Error("Unauthorized — bad API key?");
+  }
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+// ── Formatting ────────────────────────────────────────────────────
+function fmtTs(ts) {
+  if (!ts) return "—";
+  try {
+    const d = new Date(ts);
+    return d.toISOString().replace("T", " ").slice(0, 19) + "Z";
+  } catch { return ts; }
+}
+
+function fmtBytes(b) {
+  if (b < 1024) return b + " B";
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB";
+  return (b / 1024 / 1024).toFixed(1) + " MB";
+}
+
+function badgeClass(memType) {
+  if (memType === "observation") return "badge-obs";
+  if (memType === "mental_model") return "badge-model";
+  return "badge-raw";
+}
+
+function esc(s) {
+  return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ── Stats ─────────────────────────────────────────────────────────
+async function loadStats() {
+  try {
+    const d = await authedFetch("/api/saga?view=stats");
+    if (d.error) { console.warn("stats:", d.error); return; }
+    document.getElementById("stat-atoms").textContent = (d.atom_count || 0).toLocaleString();
+    document.getElementById("stat-sessions").textContent = (d.session_count || 0).toLocaleString();
+    document.getElementById("stat-triples").textContent = (d.triple_count || 0).toLocaleString();
+    document.getElementById("stat-tombstoned").textContent = (d.tombstoned_count || 0).toLocaleString();
+    document.getElementById("stat-dbsize").textContent = d.db_size_bytes ? fmtBytes(d.db_size_bytes) : "—";
+    document.getElementById("stat-schema").textContent = d.schema_version != null ? "v" + d.schema_version : "—";
+  } catch (e) { console.warn("stats fetch failed:", e); }
+}
+
+// ── Recent atoms ──────────────────────────────────────────────────
+let _channels = [];
+
+async function loadRecent() {
+  const channel = document.getElementById("channel-filter").value;
+  const limit = document.getElementById("limit-select").value;
+  let url = "/api/saga?view=recent&limit=" + limit;
+  if (channel) url += "&channel=" + encodeURIComponent(channel);
+
+  const list = document.getElementById("atom-list");
+  list.innerHTML = '<div class="empty">Loading…</div>';
+
+  try {
+    const d = await authedFetch(url);
+    if (d.error) { list.innerHTML = '<div class="error-msg">Error: ' + esc(d.error) + "</div>"; return; }
+
+    // Populate channel dropdowns from first load
+    if (d.channels && d.channels.length && !_channels.length) {
+      _channels = d.channels;
+      const sel = document.getElementById("channel-filter");
+      for (const ch of _channels) {
+        const opt = document.createElement("option");
+        opt.value = ch; opt.textContent = ch;
+        sel.appendChild(opt);
+      }
+      _populateSearchChannels(_channels);
+    }
+
+    if (!d.atoms || !d.atoms.length) {
+      list.innerHTML = '<div class="empty">No atoms found.</div>';
+      return;
+    }
+
+    const totalLine = '<div style="padding:0.4rem 1rem; color:var(--muted); font-size:0.78rem;">'
+      + 'Showing ' + d.atoms.length + ' of ' + (d.total || '?').toLocaleString() + ' atoms</div>';
+
+    const header = '<div class="atom-list-header"><span>Content</span><span>Type</span><span>Stream</span><span>Pinned</span><span>Created</span></div>';
+
+    const rows = d.atoms.map(a => {
+      const preview = esc(a.content_preview || "(empty)");
+      const typeClass = badgeClass(a.memory_type);
+      const typeBadge = '<span class="badge ' + typeClass + '">' + esc(a.memory_type || "raw") + "</span>";
+      const stream = esc(a.stream || "semantic");
+      const pinned = a.is_pinned ? '<span class="pinned-mark" title="Pinned">📌</span>' : '';
+      const ts = '<span class="ts">' + fmtTs(a.created_at) + "</span>";
+      return '<div class="atom-row" onclick="loadAtom(' + JSON.stringify(a.id) + ', this)">'
+        + '<span class="atom-preview">' + preview + "</span>"
+        + typeBadge
+        + '<span class="meta">' + stream + "</span>"
+        + pinned
+        + ts
+        + "</div>";
+    }).join("");
+
+    list.innerHTML = totalLine + header + rows;
+  } catch (e) {
+    list.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
+  }
+}
+
+// ── Atom detail ───────────────────────────────────────────────────
+let _selectedRow = null;
+
+function loadAtomFromInput() {
+  const id = document.getElementById("atom-id-input").value.trim();
+  if (!id) return;
+  loadAtom(id, null);
+}
+
+async function loadAtom(atomId, rowEl) {
+  // Highlight selected row.
+  if (_selectedRow) _selectedRow.classList.remove("selected");
+  if (rowEl) { rowEl.classList.add("selected"); _selectedRow = rowEl; }
+
+  const panel = document.getElementById("detail-panel");
+  const body = document.getElementById("detail-body");
+  panel.classList.add("visible");
+  body.innerHTML = "<div class='empty'>Loading…</div>";
+  document.getElementById("detail-title").textContent = "Atom " + atomId;
+
+  try {
+    const d = await authedFetch("/api/saga?view=atom&id=" + encodeURIComponent(atomId));
+    if (d.error) { body.innerHTML = '<div class="error-msg">Error: ' + esc(d.error) + "</div>"; return; }
+
+    const kv = (k, v) => '<div class="k">' + esc(k) + ":</div><div class='v'>" + esc(v !== null && v !== undefined ? String(v) : "—") + "</div>";
+
+    const kvRows = [
+      ["ID", d.id],
+      ["Memory type", d.memory_type],
+      ["Stream", d.stream],
+      ["Source type", d.source_type],
+      ["Session", d.session_id || "—"],
+      ["Channel", d.channel_id || "—"],
+      ["Arousal", d.arousal != null ? d.arousal.toFixed(3) : "—"],
+      ["Valence", d.valence != null ? d.valence.toFixed(3) : "—"],
+      ["Confidence", d.encoding_confidence != null ? d.encoding_confidence.toFixed(3) : "—"],
+      ["Pinned", d.is_pinned ? "yes" : "no"],
+      ["Created", fmtTs(d.created_at)],
+      ["Access count", d.access_count != null ? d.access_count : "—"],
+      ["Last access", d.last_access_ts ? fmtTs(d.last_access_ts) + " (" + esc(d.last_access_source) + ")" : "—"],
+      ["Embedding", d.embedding ? d.embedding.provider + "/" + d.embedding.model + " dim=" + d.embedding.dim : "none"],
+      ["Tombstoned", d.tombstoned ? "yes (" + esc(d.tombstoned_reason || "?") + ")" : "no"],
+      ["Topics", Array.isArray(d.topics) ? d.topics.join(", ") || "—" : "—"],
+    ].map(([k, v]) => kv(k, v)).join("");
+
+    const relHtml = (d.relations_out && d.relations_out.length)
+      ? d.relations_out.map(r =>
+          '<div class="relation-row"><b>' + esc(r.relation_type) + '</b> → '
+          + esc(r.target_id) + ' (conf ' + (r.confidence || 1).toFixed(2) + ')'
+          + (r.target_preview ? ' — <span style="color:var(--muted)">' + esc(r.target_preview) + "…</span>" : "")
+          + "</div>"
+        ).join("")
+      : "<div class='meta' style='font-size:0.8rem'>none</div>";
+
+    body.innerHTML = [
+      '<div class="detail-kv">' + kvRows + "</div>",
+      '<div class="detail-content">' + esc(d.content || "") + "</div>",
+      '<div class="detail-section"><h3>Relations out (' + (d.relations_out || []).length + ")</h3>" + relHtml + "</div>",
+    ].join("");
+  } catch (e) {
+    body.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
+  }
+}
+
+// ── Section tabs ──────────────────────────────────────────────────
+function showSection(name, btn) {
+  document.querySelectorAll(".section").forEach(s => s.classList.remove("visible"));
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+  const sec = document.getElementById("section-" + name);
+  if (sec) sec.classList.add("visible");
+  if (btn) btn.classList.add("active");
+}
+
+// ── Search ────────────────────────────────────────────────────────
+async function runSearch() {
+  const q = document.getElementById("search-input").value.trim();
+  if (!q) return;
+  const channel = document.getElementById("search-channel-filter").value;
+  let url = "/api/saga?view=search&q=" + encodeURIComponent(q);
+  if (channel) url += "&channel=" + encodeURIComponent(channel);
+
+  const container = document.getElementById("search-results");
+  container.innerHTML = '<div class="empty">Searching…</div>';
+
+  try {
+    const d = await authedFetch(url);
+    if (d.error) { container.innerHTML = '<div class="error-msg">Error: ' + esc(d.error) + "</div>"; return; }
+
+    if (!d.atoms || !d.atoms.length) {
+      container.innerHTML = '<div class="empty">No results for <b>' + esc(q) + "</b>.</div>";
+      return;
+    }
+
+    const meta = '<div style="padding:0.4rem 0; color:var(--muted); font-size:0.78rem;">'
+      + d.atoms.length + ' of ' + (d.total_matched || '?') + ' matches for <b>' + esc(q) + "</b></div>";
+
+    const header = '<div class="atom-list-header"><span>Content</span><span>Type</span><span>Stream</span><span>Pinned</span><span>Created</span></div>';
+
+    const rows = d.atoms.map(a => {
+      const preview = esc(a.content_preview || "(empty)");
+      const typeClass = badgeClass(a.memory_type);
+      const typeBadge = '<span class="badge ' + typeClass + '">' + esc(a.memory_type || "raw") + "</span>";
+      const stream = esc(a.stream || "semantic");
+      const pinned = a.is_pinned ? '<span class="pinned-mark" title="Pinned">\u{1F4CC}</span>' : '';
+      const ts = '<span class="ts">' + fmtTs(a.created_at) + "</span>";
+      return '<div class="atom-row" onclick="loadAtom(' + JSON.stringify(a.id) + ', this)">'
+        + '<span class="atom-preview">' + preview + "</span>"
+        + typeBadge
+        + '<span class="meta">' + stream + "</span>"
+        + pinned
+        + ts
+        + "</div>";
+    }).join("");
+
+    container.innerHTML = '<div class="atom-list">' + meta + header + rows + "</div>";
+  } catch (e) {
+    container.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
+  }
+}
+
+// Populate search channel dropdown from the same source as the recent view.
+function _populateSearchChannels(channels) {
+  const sel = document.getElementById("search-channel-filter");
+  if (!sel || sel.options.length > 1) return;
+  for (const ch of channels) {
+    const opt = document.createElement("option");
+    opt.value = ch; opt.textContent = ch;
+    sel.appendChild(opt);
+  }
+}
+
+// ── Activation histogram ───────────────────────────────────────────
+async function loadActivationHist() {
+  const days = document.getElementById("hist-days").value;
+  const container = document.getElementById("hist-container");
+  container.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const d = await authedFetch("/api/saga?view=activation_hist&days=" + days);
+    if (d.error) { container.innerHTML = '<div class="error-msg">Error: ' + esc(d.error) + "</div>"; return; }
+
+    if (!d.buckets || !d.buckets.length) {
+      container.innerHTML = '<div class="empty">No activation data for the last ' + esc(days) + ' day(s).'
+        + (d.never_accessed ? ' (' + d.never_accessed + ' atoms never accessed)' : '') + "</div>";
+      return;
+    }
+
+    const maxCount = Math.max(...d.buckets.map(b => b.count), 1);
+    const meta = '<div style="color:var(--muted); font-size:0.8rem; margin-bottom:0.6rem;">'
+      + d.total + ' atoms with finite activation; '
+      + (d.never_accessed || 0) + ' never accessed — last ' + d.days + ' day(s)</div>';
+
+    const bars = d.buckets.map(b => {
+      const pct = (b.count / maxCount * 100).toFixed(1);
+      return '<div class="hist-bar-row">'
+        + '<div class="hist-label">[' + b.range_start.toFixed(2) + ', ' + b.range_end.toFixed(2) + ')</div>'
+        + '<div class="hist-bar-wrap"><div class="hist-bar" style="width:' + pct + '%"></div></div>'
+        + '<div class="hist-count">' + b.count + "</div>"
+        + "</div>";
+    }).join("");
+
+    container.innerHTML = '<div class="section-wrap">' + meta + bars + "</div>";
+  } catch (e) {
+    container.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
+  }
+}
+
+// ── Clusters ──────────────────────────────────────────────────────
+async function loadClusters() {
+  const container = document.getElementById("clusters-container");
+  const metaEl = document.getElementById("cluster-meta");
+  container.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const d = await authedFetch("/api/saga?view=clusters");
+    if (d.error) { container.innerHTML = '<div class="error-msg">Error: ' + esc(d.error) + "</div>"; return; }
+
+    if (!d.clusters || !d.clusters.length) {
+      container.innerHTML = '<div class="empty">No clusters found.</div>';
+      return;
+    }
+
+    metaEl.textContent = d.total_clusters + ' clusters, ' + (d.total_atoms || 0) + ' atoms total';
+
+    const cards = d.clusters.map(c => {
+      const cid = c.cluster_id ? esc(c.cluster_id) : '<span style="color:var(--muted)">(no session)</span>';
+      const sample = (c.sample_atoms || []).map(a =>
+        '<div class="cluster-atom-preview">'
+        + '<span style="color:var(--accent); font-size:0.72rem; font-family:monospace">' + esc(a.id) + '</span> — '
+        + esc(a.content_preview || "")
+        + "</div>"
+      ).join("");
+      return '<div class="cluster-card">'
+        + '<div class="cluster-header">'
+        + '<span class="cluster-size">' + c.size + ' atoms</span>'
+        + '<span class="cluster-id">' + cid + "</span>"
+        + "</div>"
+        + '<div class="cluster-sample">' + (sample || '<span class="meta">no preview</span>') + "</div>"
+        + "</div>";
+    }).join("");
+
+    container.innerHTML = cards;
+  } catch (e) {
+    container.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
+  }
+}
+
+// ── SQL passthrough ───────────────────────────────────────────────
+async function runSql() {
+  const sql = document.getElementById("sql-input").value.trim();
+  if (!sql) return;
+  const container = document.getElementById("sql-results");
+  container.innerHTML = '<div class="empty">Running\u2026</div>';
+
+  try {
+    const k = getApiKey();
+    const headers = {"Content-Type": "application/json"};
+    if (k) headers["X-API-Key"] = k;
+    const r = await fetch("/api/saga/sql", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({sql}),
+    });
+    if (r.status === 401) {
+      localStorage.removeItem("mimir_api_key");
+      container.innerHTML = '<div class="error-msg">Unauthorized \u2014 bad API key?</div>';
+      return;
+    }
+    const d = await r.json();
+    if (d.error) {
+      const label = d.rejected ? "Rejected" : "Error";
+      container.innerHTML = '<div class="error-msg">' + label + ': ' + esc(d.error) + "</div>";
+      return;
+    }
+    if (!d.columns || !d.columns.length) {
+      container.innerHTML = '<div class="empty">Query executed — no columns returned (EXPLAIN or empty result).</div>';
+      if (d.rows && d.rows.length) {
+        container.innerHTML = '<div class="empty">' + esc(JSON.stringify(d.rows)) + "</div>";
+      }
+      return;
+    }
+
+    const truncNote = d.truncated
+      ? '<div style="color:var(--warn); font-size:0.78rem; margin-bottom:0.4rem;">'
+        + "Results truncated at 1\u202F000 rows.</div>"
+      : "";
+    const rowMeta = '<div style="color:var(--muted); font-size:0.78rem; margin-bottom:0.4rem;">'
+      + d.row_count + " row" + (d.row_count !== 1 ? "s" : "") + "</div>";
+
+    const thCells = d.columns.map(c => "<th>" + esc(c) + "</th>").join("");
+    const tHead = "<thead><tr>" + thCells + "</tr></thead>";
+    const tRows = d.rows.map(row => {
+      const cells = row.map(v => "<td>" + esc(v !== null ? String(v) : "NULL") + "</td>").join("");
+      return "<tr>" + cells + "</tr>";
+    }).join("");
+    const tBody = "<tbody>" + tRows + "</tbody>";
+
+    container.innerHTML = truncNote + rowMeta
+      + '<div style="overflow-x:auto"><table class="sql-result-table">'
+      + tHead + tBody + "</table></div>";
+  } catch (e) {
+    container.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
+  }
+}
+
+// ── Init ──────────────────────────────────────────────────────────
+loadStats();
+loadRecent();
+</script>
+</body>
+</html>
