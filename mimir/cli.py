@@ -2196,6 +2196,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     _skill_install.add_argparse_update(skills_update_p)
 
+    # mimir skills configure — interactive env-var prompts for installed skills
+    skills_configure_p = skills_sub.add_parser(
+        "configure",
+        help="Interactively prompt for env vars declared in a skill's SKILL.md "
+             "and write them to <home>/.env. Works for bundled built-in skills "
+             "(weather, ntfy, …) as well as optional installed skills. "
+             "Pass a skill name to configure one skill, or --all to iterate "
+             "over every skill that has an env: block.",
+    )
+    _skill_install.add_argparse_configure(skills_configure_p)
+
     # mimir scaffold-docker — generate container-deploy files
     # (Dockerfile, compose.yml, compose.env, start.sh) into an agent
     # home. Inspects <home>/skills/ for per-skill OS-deps

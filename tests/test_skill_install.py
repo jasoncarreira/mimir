@@ -21,17 +21,20 @@ from mimir.skill_install import (
     SkillDriftResult,
     SkillEnvSpec,
     apply_skill_update,
+    cmd_configure,
     cmd_install,
     cmd_list,
     cmd_list_optional,
     cmd_update_skills,
     detect_skill_drift,
+    find_skill_path,
     install,
     list_available,
     list_installed,
     prompt_and_write_env,
     read_env_specs,
     run_smoke_test,
+    walk_configurable_skills,
 )
 from mimir.skill_md import parse_env_block
 
@@ -1208,3 +1211,162 @@ def test_cmd_install_no_env_block_configure_is_noop(
     assert rc == 0
     out = capsys.readouterr().out
     assert "no env:" in out
+
+
+# ─── find_skill_path + walk_configurable_skills ───────────────────────
+
+
+def _make_home_with_skills(tmp_path: Path) -> Path:
+    """Build a minimal home with one installed skill and one built-in skill."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    # Installed optional skill with env block.
+    opt_skill = home / "skills" / "opt-skill"
+    opt_skill.mkdir(parents=True)
+    (opt_skill / "SKILL.md").write_text(
+        "---\n"
+        "name: opt-skill\n"
+        "description: An installed optional skill.\n"
+        "env:\n"
+        "  required:\n"
+        "    - name: OPT_VAR\n"
+        "      description: A required var\n"
+        "      example: val\n"
+        "---\nbody\n"
+    )
+
+    # Built-in skill without env block.
+    builtin_skill = home / ".mimir_builtin_skills" / "builtin-plain"
+    builtin_skill.mkdir(parents=True)
+    (builtin_skill / "SKILL.md").write_text(
+        "---\nname: builtin-plain\ndescription: A plain built-in.\n---\nbody\n"
+    )
+
+    # Built-in skill WITH env block.
+    builtin_env = home / ".mimir_builtin_skills" / "builtin-env"
+    builtin_env.mkdir(parents=True)
+    (builtin_env / "SKILL.md").write_text(
+        "---\n"
+        "name: builtin-env\n"
+        "description: A built-in skill with env vars.\n"
+        "env:\n"
+        "  required:\n"
+        "    - name: BUILTIN_HOST\n"
+        "      description: Hostname for built-in service\n"
+        "      example: api.example.com\n"
+        "---\nbody\n"
+    )
+
+    return home
+
+
+def test_find_skill_path_installed_skill(tmp_path):
+    home = _make_home_with_skills(tmp_path)
+    result = find_skill_path(home, "opt-skill")
+    assert result is not None
+    assert result == home / "skills" / "opt-skill"
+
+
+def test_find_skill_path_builtin_skill(tmp_path):
+    home = _make_home_with_skills(tmp_path)
+    result = find_skill_path(home, "builtin-env")
+    assert result is not None
+    assert result == home / ".mimir_builtin_skills" / "builtin-env"
+
+
+def test_find_skill_path_not_found(tmp_path):
+    home = _make_home_with_skills(tmp_path)
+    assert find_skill_path(home, "no-such-skill") is None
+
+
+def test_find_skill_path_installed_shadows_builtin(tmp_path):
+    """Operator-installed skill takes precedence over same-named built-in."""
+    home = _make_home_with_skills(tmp_path)
+    # Install a "builtin-env" copy in skills/ (shadows the builtin).
+    override = home / "skills" / "builtin-env"
+    override.mkdir(parents=True)
+    (override / "SKILL.md").write_text(
+        "---\nname: builtin-env\ndescription: Override.\n---\nbody\n"
+    )
+    result = find_skill_path(home, "builtin-env")
+    assert result == override
+
+
+def test_walk_configurable_skills_returns_env_skills(tmp_path):
+    home = _make_home_with_skills(tmp_path)
+    results = walk_configurable_skills(home)
+    names = {name for name, _ in results}
+    assert "opt-skill" in names
+    assert "builtin-env" in names
+    assert "builtin-plain" not in names  # no env: block
+
+
+# ─── cmd_configure ────────────────────────────────────────────────────
+
+
+def test_cmd_configure_specific_skill(tmp_path, monkeypatch, capsys):
+    home = _make_home_with_skills(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda _: "my-api-key")
+    rc = cmd_configure(Namespace(
+        name="builtin-env", all_skills=False, home=home,
+        reconfigure=False, no_smoke_test=True,
+    ))
+    assert rc == 0
+    env_text = (home / ".env").read_text()
+    assert "BUILTIN_HOST=my-api-key" in env_text
+
+
+def test_cmd_configure_no_env_block_is_noop(tmp_path, capsys):
+    home = _make_home_with_skills(tmp_path)
+    rc = cmd_configure(Namespace(
+        name="builtin-plain", all_skills=False, home=home,
+        reconfigure=False, no_smoke_test=True,
+    ))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no env:" in out
+
+
+def test_cmd_configure_skill_not_found(tmp_path, capsys):
+    home = _make_home_with_skills(tmp_path)
+    rc = cmd_configure(Namespace(
+        name="missing-skill", all_skills=False, home=home,
+        reconfigure=False, no_smoke_test=True,
+    ))
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "not found" in out
+
+
+def test_cmd_configure_all_iterates_env_skills(tmp_path, monkeypatch, capsys):
+    home = _make_home_with_skills(tmp_path)
+    # Use a fixed value for all prompts — we're testing iteration, not ordering.
+    monkeypatch.setattr("builtins.input", lambda _: "test-value")
+    rc = cmd_configure(Namespace(
+        name=None, all_skills=True, home=home,
+        reconfigure=False, no_smoke_test=True,
+    ))
+    assert rc == 0
+    env_text = (home / ".env").read_text()
+    # Both configurable skills should have their vars written.
+    assert "BUILTIN_HOST=test-value" in env_text
+    assert "OPT_VAR=test-value" in env_text
+
+
+def test_cmd_configure_all_no_configurable_skills(tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    # A home with only a skill that has no env: block.
+    plain = home / ".mimir_builtin_skills" / "plain"
+    plain.mkdir(parents=True)
+    (plain / "SKILL.md").write_text(
+        "---\nname: plain\ndescription: Plain.\n---\nbody\n"
+    )
+    rc = cmd_configure(Namespace(
+        name=None, all_skills=True, home=home,
+        reconfigure=False, no_smoke_test=True,
+    ))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no configurable" in out
