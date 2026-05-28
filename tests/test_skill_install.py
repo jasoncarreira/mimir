@@ -1370,3 +1370,60 @@ def test_cmd_configure_all_no_configurable_skills(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "no configurable" in out
+
+
+def test_cmd_configure_no_smoke_test_flag_skips_smoke(tmp_path, monkeypatch, capsys):
+    """--no-smoke-test prevents the smoke test even when pollers.json is present."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    # Build a fake built-in skill with a pollers.json and an env: block.
+    skill_dir = home / ".mimir_builtin_skills" / "test-poller"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: test-poller\n"
+        "description: A poller skill for testing no-smoke-test.\n"
+        "env:\n"
+        "  required:\n"
+        "    - name: TEST_VAR\n"
+        "      description: A test variable\n"
+        "      example: test-val\n"
+        "---\nbody\n"
+    )
+    (skill_dir / "pollers.json").write_text(
+        '{"pollers": [{"name": "test", "command": "true", "cron": "*/5 * * * *"}]}'
+    )
+    # poller.py would run if smoke test fires; emit recognisable output so we
+    # can detect an accidental execution.
+    (skill_dir / "poller.py").write_text("print('SMOKE_TEST_RAN')\n")
+
+    # Suppress interactive prompt by returning a fixed value.
+    monkeypatch.setattr("builtins.input", lambda _: "test-value")
+
+    rc = cmd_configure(Namespace(
+        name="test-poller", all_skills=False, home=home,
+        reconfigure=False, no_smoke_test=True,
+    ))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Running smoke test" not in out
+    assert "SMOKE_TEST_RAN" not in out
+
+
+def test_cmd_configure_fresh_home_hint_mentions_setup(tmp_path, capsys):
+    """When built-ins aren't seeded yet, the error points at mimir setup."""
+    # Fresh home directory — no .mimir_builtin_skills/ and no skills/ subdir.
+    home = tmp_path / "fresh-home"
+    home.mkdir()
+
+    rc = cmd_configure(Namespace(
+        name="any-skill", all_skills=False, home=home,
+        reconfigure=False, no_smoke_test=True,
+    ))
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "not found" in out
+    assert "mimir setup" in out

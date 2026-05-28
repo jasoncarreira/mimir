@@ -1264,8 +1264,14 @@ def cmd_configure(args) -> int:
 
     path = find_skill_path(home, name)
     if path is None:
-        print(f"skill not found: {name!r}")
-        print("  tip: run `mimir skills list` to see installed skills")
+        from mimir.skill_defs import home_builtin_skills_dir
+        builtin_root = home_builtin_skills_dir(home)
+        if not builtin_root.is_dir() or not any(builtin_root.iterdir()):
+            print(f"skill not found: {name!r}")
+            print(f"  tip: run `mimir setup --home {home}` first to seed bundled skills")
+        else:
+            print(f"skill not found: {name!r}")
+            print("  tip: run `mimir skills list` to see installed skills")
         return 2
 
     return _configure_one(name, path, home, reconfigure=reconfigure, no_smoke_test=no_smoke_test)
