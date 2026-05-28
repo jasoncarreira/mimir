@@ -1,10 +1,13 @@
-"""Tests for mimir.file_memory_dashboard (chainlink #223 — Phase 1).
+"""Tests for mimir.file_memory_dashboard (chainlink #223 — Phase 1 + 2).
 
 Tests cover:
   - list_tree: tree structure, .md-only filter, desc extraction, dir-first sort
+  - list_trees: virtual home root with multiple roots
   - read_file_safe: success, path traversal, non-.md rejection, not-found
+  - read_file_safe_multi: dispatches to correct root; rejects unknown prefix
+  - search_files: hits across multiple roots, empty query, truncation
   - render_memory_html: valid HTML shell with expected tokens
-  - web_ui routes: /memory HTML + /api/memory view={tree,file}
+  - web_ui routes: /memory HTML + /api/memory view={tree,file,search}
   - Path-safety: traversal → 400, non-.md → 400, missing → 404
   - Auth-exempt: /memory in _AUTH_EXEMPT
 """
@@ -20,8 +23,11 @@ from aiohttp.test_utils import TestClient, TestServer
 from mimir import web_ui
 from mimir.file_memory_dashboard import (
     list_tree,
+    list_trees,
     read_file_safe,
+    read_file_safe_multi,
     render_memory_html,
+    search_files,
 )
 
 
@@ -172,6 +178,179 @@ def test_read_file_safe_not_found(tmp_path: Path) -> None:
     assert "not found" in result["error"]
 
 
+# ─── list_trees ───────────────────────────────────────────────────
+
+
+def test_list_trees_virtual_root(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    state = tmp_path / "state"
+    memory.mkdir()
+    state.mkdir()
+    (memory / "INDEX.md").write_text("# Index\n")
+    (state / "wiki.md").write_text("# Wiki\n")
+
+    result = list_trees([memory, state])
+    assert result["name"] == "home"
+    assert result["type"] == "dir"
+    assert result["path"] == ""
+    assert len(result["children"]) == 2
+    names = [c["name"] for c in result["children"]]
+    assert "memory" in names
+    assert "state" in names
+
+
+def test_list_trees_skips_missing_roots(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "notes.md").write_text("# notes\n")
+    missing = tmp_path / "nonexistent"
+
+    result = list_trees([memory, missing])
+    # Only the existing root appears.
+    assert len(result["children"]) == 1
+    assert result["children"][0]["name"] == "memory"
+
+
+def test_list_trees_empty_roots(tmp_path: Path) -> None:
+    result = list_trees([])
+    assert result["name"] == "home"
+    assert result["children"] == []
+
+
+# ─── read_file_safe_multi ─────────────────────────────────────────
+
+
+def test_read_file_safe_multi_dispatches_to_correct_root(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    state = tmp_path / "state"
+    memory.mkdir()
+    state.mkdir()
+    (memory / "notes.md").write_text("# Memory notes\n")
+    (state / "spec.md").write_text("# State spec\n")
+
+    result = read_file_safe_multi([memory, state], "memory/notes.md")
+    assert "error" not in result
+    assert "Memory notes" in result["content"]
+
+    result2 = read_file_safe_multi([memory, state], "state/spec.md")
+    assert "error" not in result2
+    assert "State spec" in result2["content"]
+
+
+def test_read_file_safe_multi_unknown_prefix_rejected(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "notes.md").write_text("# notes\n")
+
+    result = read_file_safe_multi([memory], "etc/passwd.md")
+    assert "error" in result
+    assert "not in any" in result["error"]
+
+
+def test_read_file_safe_multi_traversal_still_blocked(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+
+    # Even with a valid prefix, path traversal inside the root must be blocked.
+    result = read_file_safe_multi([memory], "memory/../etc/passwd.md")
+    assert "error" in result
+
+
+def test_read_file_safe_multi_empty_rel_rejected(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+
+    result = read_file_safe_multi([memory], "")
+    assert "error" in result
+
+
+# ─── search_files ─────────────────────────────────────────────────
+
+
+def test_search_files_basic_hit(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "notes.md").write_text("hello world\nfoo bar\n")
+
+    result = search_files([memory], "hello")
+    assert result["query"] == "hello"
+    assert result["total"] == 1
+    assert not result["truncated"]
+    assert result["hits"][0]["path"] == "memory/notes.md"
+    assert result["hits"][0]["line_no"] == 1
+    assert "hello world" in result["hits"][0]["snippet"]
+
+
+def test_search_files_case_insensitive(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "doc.md").write_text("UPPER case LINE\n")
+
+    result = search_files([memory], "upper case")
+    assert result["total"] == 1
+
+
+def test_search_files_across_multiple_roots(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    state = tmp_path / "state"
+    memory.mkdir()
+    state.mkdir()
+    (memory / "a.md").write_text("needle in memory\n")
+    (state / "b.md").write_text("needle in state\n")
+
+    result = search_files([memory, state], "needle")
+    assert result["total"] == 2
+    paths = {h["path"] for h in result["hits"]}
+    assert "memory/a.md" in paths
+    assert "state/b.md" in paths
+
+
+def test_search_files_empty_query(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "doc.md").write_text("content\n")
+
+    result = search_files([memory], "")
+    assert result["total"] == 0
+    assert result["hits"] == []
+    assert not result["truncated"]
+
+
+def test_search_files_truncation(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    # Create a file with 200 matching lines.
+    content = "\n".join(f"find me line {i}" for i in range(200)) + "\n"
+    (memory / "big.md").write_text(content)
+
+    result = search_files([memory], "find me", max_hits=10)
+    assert result["truncated"] is True
+    assert result["total"] == 10
+    assert len(result["hits"]) == 10
+
+
+def test_search_files_no_results(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "doc.md").write_text("nothing here\n")
+
+    result = search_files([memory], "xyzzy_not_present")
+    assert result["total"] == 0
+    assert result["hits"] == []
+    assert not result["truncated"]
+
+
+def test_search_files_snippet_capped_at_200(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    long_line = "find " + "x" * 300
+    (memory / "long.md").write_text(long_line + "\n")
+
+    result = search_files([memory], "find")
+    assert result["total"] == 1
+    assert len(result["hits"][0]["snippet"]) <= 200
+
+
 # ─── render_memory_html ───────────────────────────────────────────
 
 
@@ -183,6 +362,14 @@ def test_render_memory_html_is_valid_shell() -> None:
     # Auth pattern.
     assert "mimir_api_key" in html
     assert "X-API-Key" in html
+
+
+def test_render_memory_html_has_search_ui() -> None:
+    """Phase 2: the HTML shell must include the search box and loadSearch."""
+    html = render_memory_html()
+    assert "search-input" in html
+    assert "loadSearch" in html
+    assert "view=search" in html
 
 
 # ─── /memory web routes ────────────────────────────────────────────
@@ -197,6 +384,11 @@ def memory_app(tmp_path: Path):
     core = memory_root / "core"
     core.mkdir()
     (core / "00-identity.md").write_text("<!-- desc: identity -->\n# Identity\n")
+    # Phase 2: also create state/ subtree so it's included in tree + search.
+    state_root = home / "state"
+    wiki = state_root / "wiki"
+    wiki.mkdir(parents=True)
+    (wiki / "overview.md").write_text("# Wiki overview\nsearchable content\n")
 
     a = web.Application()
     web_ui.register_routes(
@@ -227,8 +419,12 @@ async def test_api_memory_tree(memory_app) -> None:
         resp = await client.get("/api/memory?view=tree")
         assert resp.status == 200
         body = await resp.json()
-    assert "children" in body
+    # Phase 2: tree returns virtual "home" root with memory/ + state/ children.
     assert body["type"] == "dir"
+    assert "children" in body
+    child_names = [c["name"] for c in body["children"]]
+    assert "memory" in child_names
+    assert "state" in child_names
 
 
 @pytest.mark.asyncio
@@ -251,6 +447,52 @@ async def test_api_memory_path_traversal_rejected(memory_app) -> None:
         assert resp.status == 400
         body = await resp.json()
     assert "error" in body
+
+
+@pytest.mark.asyncio
+async def test_api_memory_unknown_root_rejected(memory_app) -> None:
+    """A path whose first component isn't 'memory' or 'state' → 400."""
+    app, _ = memory_app
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/memory?view=file&path=etc/passwd.md")
+        assert resp.status == 400
+        body = await resp.json()
+    assert "error" in body
+
+
+@pytest.mark.asyncio
+async def test_api_memory_search_basic(memory_app) -> None:
+    app, _ = memory_app
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/memory?view=search&q=searchable")
+        assert resp.status == 200
+        body = await resp.json()
+    assert body["query"] == "searchable"
+    assert body["total"] >= 1
+    paths = [h["path"] for h in body["hits"]]
+    assert any("state" in p for p in paths)
+
+
+@pytest.mark.asyncio
+async def test_api_memory_search_empty_q(memory_app) -> None:
+    app, _ = memory_app
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/memory?view=search")
+        assert resp.status == 400
+        body = await resp.json()
+    assert "error" in body
+
+
+@pytest.mark.asyncio
+async def test_api_memory_file_in_state_subtree(memory_app) -> None:
+    """Phase 2: /api/memory?view=file can serve state/ files."""
+    app, _ = memory_app
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/memory?view=file&path=state/wiki/overview.md")
+        assert resp.status == 200
+        body = await resp.json()
+    assert "error" not in body
+    assert "Wiki overview" in body["content"]
 
 
 def test_memory_page_is_auth_exempt() -> None:
