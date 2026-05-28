@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
 from .billing import BillingMode, detect_billing_mode
+
+
+log = logging.getLogger(__name__)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -142,11 +146,41 @@ def _env_float(name: str, default: float) -> float:
     return float(raw) if raw else default
 
 
+# chainlink #238: canonical env-bool truthy/falsy alphabets.
+# Used by every Config bool field; pre-fix the file carried three
+# different parsers with subtly-different truthy semantics
+# (e.g. ``allow_unauthenticated`` rejected ``on`` while ``_env_bool``
+# accepted it). Garbage values now warn instead of silently coercing
+# to True (the prior inline pattern) or False (``allow_unauthenticated``).
+_ENV_BOOL_TRUTHY = frozenset({"1", "true", "yes", "on", "y"})
+_ENV_BOOL_FALSY = frozenset({"0", "false", "no", "off", "n"})
+
+
 def _env_bool(name: str, default: bool) -> bool:
+    """Parse an env-var value as boolean.
+
+    Truthy: ``{1, true, yes, on, y}`` (case-insensitive, whitespace-
+    trimmed).  Falsy: ``{0, false, no, off, n}``.  Empty / unset
+    returns *default*. Anything else emits ``log.warning`` and returns
+    *default* so a typo doesn't silently flip a flag.
+    """
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    norm = raw.strip().lower()
+    if norm in _ENV_BOOL_TRUTHY:
+        return True
+    if norm in _ENV_BOOL_FALSY:
+        return False
+    log.warning(
+        "%s=%r is not a recognised boolean (truthy=%s, falsy=%s); using default %r",
+        name,
+        raw,
+        sorted(_ENV_BOOL_TRUTHY),
+        sorted(_ENV_BOOL_FALSY),
+        default,
+    )
+    return default
 
 
 def _load_mcp_servers_from_env() -> list:
@@ -722,17 +756,14 @@ class Config:
             bsky_handle=_env("BSKY_HANDLE"),
             bsky_app_password=_env("BSKY_APP_PASSWORD"),
 
-            cross_platform_pull=_env("MIMIR_CROSS_PLATFORM_PULL", "true").lower()
-                not in {"false", "0", "no"},
+            cross_platform_pull=_env_bool("MIMIR_CROSS_PLATFORM_PULL", True),
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
             api_key=_env("MIMIR_API_KEY"),
             web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),
-            allow_unauthenticated=_env("MIMIR_ALLOW_UNAUTHENTICATED", "false").lower()
-                in {"true", "1", "yes"},
+            allow_unauthenticated=_env_bool("MIMIR_ALLOW_UNAUTHENTICATED", False),
             turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", 3600),
-            onboarding_mode=_env("MIMIR_ONBOARDING_MODE", "false").lower()
-                in {"true", "1", "yes"},
+            onboarding_mode=_env_bool("MIMIR_ONBOARDING_MODE", False),
 
             feedback_window_hours=_env_int("MIMIR_FEEDBACK_WINDOW_HOURS", 24),
             feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),
@@ -741,8 +772,7 @@ class Config:
             unfinished_stale_age_hours=_env_int("MIMIR_UNFINISHED_STALE_AGE_HOURS", 2),
             unfinished_stale_turns=_env_int("MIMIR_UNFINISHED_STALE_TURNS", 5),
 
-            usage_block_enabled=_env("MIMIR_USAGE_BLOCK", "true").lower()
-                not in {"false", "0", "no", "off"},
+            usage_block_enabled=_env_bool("MIMIR_USAGE_BLOCK", True),
             usage_5h_limit_usd=_env_float("MIMIR_USAGE_5H_LIMIT_USD", 0.0),
             usage_weekly_limit_usd=_env_float("MIMIR_USAGE_WEEKLY_LIMIT_USD", 0.0),
 
@@ -760,11 +790,9 @@ class Config:
                 oauth_credentials_path=oauth_credentials_path,
             ),
 
-            capture_rate_limits=_env("MIMIR_CAPTURE_RATE_LIMITS", "true").lower()
-                not in {"false", "0", "no", "off"},
+            capture_rate_limits=_env_bool("MIMIR_CAPTURE_RATE_LIMITS", True),
 
-            context_1m=_env("MIMIR_CONTEXT_1M", "true").lower()
-                not in {"false", "0", "no", "off"},
+            context_1m=_env_bool("MIMIR_CONTEXT_1M", True),
 
             oauth_credentials_path=oauth_credentials_path,
             oauth_usage_poll_cron=_env(
