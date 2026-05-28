@@ -1,16 +1,19 @@
-"""File-based memory viewer — reads ``memory/`` on demand and renders
-an operator-facing two-pane view at ``/memory``.
+"""File-based memory viewer — reads ``memory/`` and ``state/`` on demand
+and renders an operator-facing two-pane view at ``/memory``.
 
 Mirrors the shape of ``saga_dashboard.py``: pure-data functions return
 dicts; ``render_memory_html()`` returns the HTML shell.
 No HTML in the data functions — same separation as ops_dashboard.
 
 Chainlink #223 — Phase 1:
-  /memory              — HTML shell (two-pane file browser)
+  /memory                         — HTML shell (two-pane file browser)
   /api/memory?view=tree           — nested dir/file tree as JSON
   /api/memory?view=file&path=...  — safe file reader (only .md)
 
-Phase 2 (future): rendered markdown toggle, search, edit.
+Chainlink #223 — Phase 2:
+  /api/memory?view=search&q=...   — full-text search across memory/ + state/
+  /api/memory?view=tree           — now returns a virtual "home" root whose
+                                    children are memory/ and state/ sub-trees
 """
 
 from __future__ import annotations
@@ -78,6 +81,101 @@ def list_tree(root: Path) -> dict:
             }
 
     return _walk(root)
+
+
+def list_trees(roots: list[Path]) -> dict:
+    """Return a virtual combined root wrapping trees for each path in *roots*.
+
+    The returned dict has::
+
+        {"name": "home", "type": "dir", "path": "", "desc": None,
+         "children": [list_tree(r) for r in roots if r.exists()]}
+
+    Paths in leaf nodes remain relative to each ``root.parent``, so they
+    work unchanged with ``read_file_safe_multi``.
+    """
+    children = [list_tree(r) for r in roots if r.exists()]
+    return {
+        "name": "home",
+        "type": "dir",
+        "path": "",
+        "desc": None,
+        "children": children,
+    }
+
+
+def read_file_safe_multi(roots: list[Path], rel: str) -> dict:
+    """Dispatch ``read_file_safe`` to the matching root in *roots*.
+
+    ``rel`` uses the same path format as ``list_tree`` / ``list_trees``
+    (e.g. ``memory/core/00-identity.md`` or ``state/wiki/concepts/foo.md``).
+    The first path component of ``rel`` must exactly match one of the
+    ``root.name`` values in *roots*; otherwise a rejection dict is returned
+    rather than forwarding the path.
+
+    This is the multi-root analogue of ``read_file_safe``; it provides the
+    same path-traversal and `.md`-only guarantees via delegation.
+    """
+    from pathlib import PurePosixPath
+
+    parts = PurePosixPath(rel).parts
+    if not parts:
+        return {"error": "path not in any allowed root"}
+    first = parts[0]
+    for root in roots:
+        if root.name == first:
+            return read_file_safe(root, rel)
+    return {"error": "path not in any allowed root"}
+
+
+def search_files(roots: list[Path], query: str, max_hits: int = 100) -> dict:
+    """Case-insensitive full-text search across ``.md`` files under all *roots*.
+
+    Returns a dict::
+
+        {
+            "query":     str,
+            "hits":      [{"path": str, "line_no": int, "snippet": str}, ...],
+            "total":     int,   # number of hits returned (≤ max_hits)
+            "truncated": bool,  # True when additional matches exist
+        }
+
+    ``path`` in each hit is relative to ``root.parent`` (same format as
+    ``list_tree`` leaf nodes).  ``snippet`` is capped at 200 characters.
+    """
+    query_lower = query.lower().strip()
+    if not query_lower:
+        return {"query": query, "hits": [], "total": 0, "truncated": False}
+
+    hits: list[dict] = []
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*.md")):
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            rel = str(path.relative_to(root.parent))
+            for line_no, line in enumerate(lines, start=1):
+                if query_lower in line.lower():
+                    hits.append(
+                        {
+                            "path": rel,
+                            "line_no": line_no,
+                            "snippet": line[:200],
+                        }
+                    )
+                    if len(hits) >= max_hits:
+                        return {
+                            "query": query,
+                            "hits": hits,
+                            "total": max_hits,
+                            "truncated": True,
+                        }
+
+    return {"query": query, "hits": hits, "total": len(hits), "truncated": False}
 
 
 def read_file_safe(root: Path, rel: str) -> dict:
@@ -151,6 +249,7 @@ def render_memory_html() -> str:
 # IMPORTANT: this is a Python triple-double-quoted string.
 # JS backslash escapes MUST be doubled so Python doesn't consume them
 # before the browser sees them. See ops_dashboard.py's IMPORTANT note.
+# Phase 2 additions: search box + state/ subtree in the left pane tree.
 _MEMORY_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -279,6 +378,28 @@ _MEMORY_HTML = """<!doctype html>
     }
     .error-msg { color: var(--bad); font-size: 0.83rem; padding: 1rem; }
     .tree-loading { color: var(--muted); font-size: 0.82rem; padding: 1rem; }
+    /* Search */
+    .search-box { padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--line); }
+    .search-input {
+      width: 100%; background: var(--paper); border: 1px solid var(--line);
+      border-radius: 6px; color: var(--ink); padding: 0.3rem 0.5rem;
+      font-size: 0.82rem; outline: none; font-family: inherit;
+    }
+    .search-input:focus { border-color: var(--accent); }
+    .search-results-header {
+      padding: 0.35rem 0.7rem; color: var(--muted); font-size: 0.78rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .search-hit {
+      padding: 0.35rem 0.7rem; cursor: pointer;
+      border-bottom: 1px solid var(--line);
+    }
+    .search-hit:hover { background: var(--accent-soft); }
+    .search-hit-path { color: var(--accent); font-size: 0.78rem; margin-bottom: 0.1rem; }
+    .search-hit-snippet {
+      color: var(--muted); font-size: 0.76rem;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
   </style>
 </head>
 <body>
@@ -293,10 +414,15 @@ _MEMORY_HTML = """<!doctype html>
   </header>
 
   <div class="panes">
-    <!-- Left pane: directory tree -->
+    <!-- Left pane: search + directory tree -->
     <div class="left-pane" id="left-pane">
-      <div class="tree-loading" id="tree-loading">Loading tree…</div>
+      <div class="search-box">
+        <input class="search-input" id="search-input" type="search"
+               placeholder="Search files..." autocomplete="off" />
+      </div>
+      <div class="tree-loading" id="tree-loading">Loading tree...</div>
       <div id="tree-root"></div>
+      <div id="search-results" style="display:none"></div>
     </div>
 
     <!-- Right pane: file content -->
@@ -352,12 +478,13 @@ let _selectedFileEl = null;
 
 // Dirs that start open by default.
 function _isDefaultOpen(nodePath) {
-  // Top-level dirs are open. memory/core/ is open.
+  if (!nodePath) return true; // virtual home root
   const parts = nodePath.split("/").filter(Boolean);
-  if (parts.length <= 1) return true; // e.g. "memory" itself
-  if (nodePath === "memory/core" || nodePath === "memory\\\\core") return true;
-  // Second level dirs under memory are open (e.g. memory/core)
-  if (parts.length === 2) return true;
+  if (parts.length === 0) return true;
+  if (parts.length === 1) return true; // "memory" and "state" top-level dirs
+  // memory/core is always open so core blocks are visible immediately.
+  if (parts[0] === "memory" && parts[1] === "core") return true;
+  // Other second-level dirs start collapsed (state/ has many subdirs).
   return false;
 }
 
@@ -438,7 +565,12 @@ async function loadTree() {
     }
 
     treeRoot.innerHTML = "";
-    renderNode(data, treeRoot);
+    // data is the virtual "home" root from list_trees() — render its children
+    // directly so the left pane shows memory/ and state/ as top-level entries.
+    const tops = (data.children && data.children.length) ? data.children : [data];
+    for (const child of tops) {
+      renderNode(child, treeRoot);
+    }
 
     // Auto-select memory/INDEX.md if it exists.
     const indexEl = treeRoot.querySelector('[data-path="memory/INDEX.md"]');
@@ -448,6 +580,48 @@ async function loadTree() {
   } catch (e) {
     loading.textContent = "";
     treeRoot.innerHTML = '<div class="error-msg">Tree load failed: ' + esc(String(e)) + "</div>";
+  }
+}
+
+// ── Search ────────────────────────────────────────────────────────
+let _searchTimeout = null;
+
+function _showTree() {
+  document.getElementById("tree-root").style.display = "";
+  document.getElementById("search-results").style.display = "none";
+}
+
+function _showSearch() {
+  document.getElementById("tree-root").style.display = "none";
+  document.getElementById("search-results").style.display = "";
+}
+
+async function loadSearch(q) {
+  const searchResults = document.getElementById("search-results");
+  _showSearch();
+  searchResults.innerHTML = '<div class="tree-loading">Searching...</div>';
+  try {
+    const data = await authedFetch("/api/memory?view=search&q=" + encodeURIComponent(q));
+    let html = '<div class="search-results-header">'
+      + esc(String(data.total)) + " result(s)"
+      + (data.truncated ? " (truncated)" : "")
+      + "</div>";
+    if (!data.hits || !data.hits.length) {
+      html += '<div class="tree-loading">No results.</div>';
+    } else {
+      for (const hit of data.hits) {
+        html += '<div class="search-hit" data-path="' + esc(hit.path) + '">';
+        html += '<div class="search-hit-path">' + esc(hit.path) + ":" + esc(String(hit.line_no)) + "</div>";
+        html += '<div class="search-hit-snippet">' + esc(hit.snippet) + "</div>";
+        html += "</div>";
+      }
+    }
+    searchResults.innerHTML = html;
+    for (const el of searchResults.querySelectorAll(".search-hit")) {
+      el.addEventListener("click", () => loadFile(el.dataset.path, null));
+    }
+  } catch (e) {
+    searchResults.innerHTML = '<div class="error-msg">Search failed: ' + esc(String(e)) + "</div>";
   }
 }
 
@@ -488,6 +662,13 @@ async function loadFile(filePath, labelEl) {
 
 // ── Init ──────────────────────────────────────────────────────────
 loadTree();
+
+document.getElementById("search-input").addEventListener("input", function(e) {
+  clearTimeout(_searchTimeout);
+  const q = e.target.value.trim();
+  if (!q) { _showTree(); return; }
+  _searchTimeout = setTimeout(() => loadSearch(q), 300);
+});
 </script>
 </body>
 </html>"""
@@ -495,6 +676,9 @@ loadTree();
 
 __all__ = [
     "list_tree",
+    "list_trees",
     "read_file_safe",
+    "read_file_safe_multi",
     "render_memory_html",
+    "search_files",
 ]
