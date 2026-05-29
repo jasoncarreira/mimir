@@ -525,6 +525,13 @@ class RecordingSagaClient:
         )
 
     async def consolidate_skill_memories(self, *args, **kwargs):
+        # #266: per-skill dedup pass. Intentionally NOT on the SagaClient
+        # Protocol — it's implemented by the embedded ``SagaStore`` only;
+        # ``_HttpSaga`` (external-saga path) has no endpoint for it yet, so
+        # ``self._inner.consolidate_skill_memories`` raises AttributeError
+        # there. The scheduler's saga-consolidate job catches that and
+        # degrades to a "skipped" marker (see scheduler.py). Add a remote
+        # endpoint + Protocol method when external saga needs skill memory.
         return await self._call(
             "consolidate_skill_memories",
             self._inner.consolidate_skill_memories, args, kwargs,
