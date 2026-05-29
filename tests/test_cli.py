@@ -266,6 +266,38 @@ def test_setup_fills_in_blank_api_key(tmp_path: Path):
     assert status.get("api_key_action") == "generated"
 
 
+def test_setup_env_is_owner_readable_only(tmp_path: Path):
+    """setup_home must create .env with mode 0o600 (not world-readable)."""
+    home = tmp_path / "agent"
+    setup_home(home)
+    mode = (home / ".env").stat().st_mode & 0o777
+    assert mode == 0o600, f".env mode {oct(mode)} != 0o600"
+
+
+def test_setup_env_perms_tightened_on_rerun(tmp_path: Path):
+    """setup_home re-run must tighten an existing .env that had wide perms."""
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_path = home / ".env"
+    env_path.chmod(0o644)  # simulate wide perms from a prior run or cp
+    setup_home(home)
+    mode = env_path.stat().st_mode & 0o777
+    assert mode == 0o600, f".env mode {oct(mode)} after re-run != 0o600"
+
+
+def test_regenerate_api_key_tightens_env_perms(tmp_path: Path):
+    """regenerate_api_key must tighten .env to 0o600 after rotating the key."""
+    from mimir.cli import regenerate_api_key
+
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_path = home / ".env"
+    env_path.chmod(0o644)  # simulate wide perms
+    regenerate_api_key(home)
+    mode = env_path.stat().st_mode & 0o777
+    assert mode == 0o600, f".env mode {oct(mode)} after key rotation != 0o600"
+
+
 def test_regenerate_api_key_rotates_and_preserves_others(tmp_path: Path):
     from mimir.cli import regenerate_api_key
 
