@@ -12,6 +12,8 @@ import pytest
 from mimir.quota_pause import (
     PauseStatus,
     QuotaPauseTracker,
+    _MAX_RESET_WINDOW_DAYS,
+    _clamp_reset_at,
     extract_reset_at,
     is_quota_exhaustion,
 )
@@ -132,7 +134,10 @@ class _FakeResponse:
 def test_extract_reset_at_from_anthropic_headers():
     """Newer Anthropic responses include ISO timestamps in named
     rate-limit reset headers. Prefer those over Retry-After."""
-    target = datetime(2026, 5, 23, 22, 0, tzinfo=timezone.utc)
+    # Use a future target so the clamp doesn't modify it.
+    target = datetime.now(tz=timezone.utc) + timedelta(hours=3)
+    # Strip sub-second precision so fromisoformat round-trips cleanly.
+    target = target.replace(microsecond=0)
     response = _FakeResponse({
         "anthropic-ratelimit-tokens-reset": target.isoformat(),
     })
@@ -173,9 +178,74 @@ def test_extract_reset_at_fallback_default_5h(tmp_path):
 def test_extract_reset_at_from_exception_message():
     """ChatClaudeCode subprocess errors arrive as plain text strings.
     Best-effort regex pulls an ISO-ish timestamp out of the message."""
-    exc = Exception("Quota exhausted, resets at 2026-05-24T03:00:00Z")
+    # Use a future date so the clamp doesn't fire.
+    future = (datetime.now(tz=timezone.utc) + timedelta(hours=2)).replace(
+        microsecond=0, second=0, minute=0
+    )
+    exc = Exception(f"Quota exhausted, resets at {future.strftime('%Y-%m-%dT%H:%M:%SZ')}")
     reset, _ = extract_reset_at(exc)
-    assert reset == datetime(2026, 5, 24, 3, 0, tzinfo=timezone.utc)
+    assert reset == future
+
+
+# ── _clamp_reset_at ────────────────────────────────────────────────
+
+
+def test_clamp_reset_at_passes_through_valid_near_future():
+    """A sane near-future timestamp is returned unchanged."""
+    now = datetime(2026, 5, 29, 15, 0, tzinfo=timezone.utc)
+    reset = now + timedelta(hours=5)
+    assert _clamp_reset_at(reset, now) == reset
+
+
+def test_clamp_reset_at_clamps_far_future_to_max_window():
+    """A far-future (garbage) timestamp is clamped to now + MAX days."""
+    now = datetime(2026, 5, 29, 15, 0, tzinfo=timezone.utc)
+    far_future = datetime(9999, 1, 1, tzinfo=timezone.utc)
+    clamped = _clamp_reset_at(far_future, now)
+    assert clamped == now + timedelta(days=_MAX_RESET_WINDOW_DAYS)
+
+
+def test_clamp_reset_at_clamps_past_to_min_floor():
+    """A past timestamp is raised to now + 1s."""
+    now = datetime(2026, 5, 29, 15, 0, tzinfo=timezone.utc)
+    past = now - timedelta(hours=1)
+    clamped = _clamp_reset_at(past, now)
+    assert clamped == now + timedelta(seconds=1)
+
+
+def test_extract_reset_at_clamps_far_future_anthropic_header():
+    """A malformed Anthropic header with a far-future year is clamped."""
+    now = datetime.now(tz=timezone.utc)
+    response = _FakeResponse({
+        "anthropic-ratelimit-tokens-reset": "9999-12-31T23:59:59+00:00",
+    })
+    exc = Exception("rate limit hit")
+    exc.response = response  # type: ignore[attr-defined]
+    reset, provider = extract_reset_at(exc)
+    max_allowed = now + timedelta(days=_MAX_RESET_WINDOW_DAYS)
+    # Allow 1s for test wall-clock jitter.
+    assert reset <= max_allowed + timedelta(seconds=1)
+    assert provider == "anthropic"
+
+
+def test_extract_reset_at_clamps_huge_retry_after_seconds():
+    """A Retry-After of millions of seconds is clamped to max window."""
+    now = datetime.now(tz=timezone.utc)
+    response = _FakeResponse({"retry-after": str(10 * 365 * 24 * 3600)})  # 10 years
+    exc = Exception("rate limit")
+    exc.response = response  # type: ignore[attr-defined]
+    reset, _ = extract_reset_at(exc)
+    max_allowed = now + timedelta(days=_MAX_RESET_WINDOW_DAYS)
+    assert reset <= max_allowed + timedelta(seconds=1)
+
+
+def test_extract_reset_at_clamps_far_future_exception_message():
+    """A garbage year in the exception message is clamped, not used raw."""
+    now = datetime.now(tz=timezone.utc)
+    exc = Exception("Quota exhausted, resets at 9999-01-01T00:00:00Z")
+    reset, _ = extract_reset_at(exc)
+    max_allowed = now + timedelta(days=_MAX_RESET_WINDOW_DAYS)
+    assert reset <= max_allowed + timedelta(seconds=1)
 
 
 # ── exception classification ───────────────────────────────────────
