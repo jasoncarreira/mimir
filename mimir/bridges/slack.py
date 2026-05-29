@@ -40,7 +40,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
     ) from _exc
 
 from ..models import AgentEvent
-from ._attachments import build_inbound_path, download_to_path
+from ._attachments import _SLACK_CDN_HOSTS, build_inbound_path, download_to_path
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
 from .base import Bridge, SendResult
@@ -785,6 +785,7 @@ class SlackBridge(Bridge):
                 target,
                 max_bytes=self.attachments_max_bytes,
                 headers={"Authorization": f"Bearer {self.bot_token}"},
+                allowed_host_suffixes=_SLACK_CDN_HOSTS,
             )
             if ok:
                 attachment_paths.append(str(target))

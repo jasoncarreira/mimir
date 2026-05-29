@@ -22,17 +22,39 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 _DEFAULT_DOWNLOAD_TIMEOUT_S = 15.0
 
+# Per-bridge CDN host allowlists for SSRF validation (chainlink #251).
+# Suffix-matched: ``cdn.discordapp.com`` matches ``discordapp.com``.
+# Extend if a bridge adds a new CDN origin (e.g. a new Discord media subdomain).
+_DISCORD_CDN_HOSTS: frozenset[str] = frozenset({
+    "discordapp.com",
+    "discordapp.net",
+    "discord.com",
+})
+_SLACK_CDN_HOSTS: frozenset[str] = frozenset({
+    "slack.com",
+    "slack-files.com",
+    "slackb.com",  # Slack's CDN edge domain
+})
+
 
 class AttachmentPathError(ValueError):
     """Raised when an outbound attachment path escapes the outbound root
     or fails validation. Caller should surface this back to the agent
     so the next turn's feedback block reports the rejected directive."""
+
+
+class AttachmentURLError(ValueError):
+    """Raised when an attachment download URL fails SSRF security validation
+    (non-HTTPS scheme or host not in the per-bridge CDN allowlist). Caller
+    should log and skip the download rather than attempting a network request.
+    """
 
 
 def sanitize_filename(name: str) -> str:
@@ -109,6 +131,43 @@ def resolve_outbound_path(outbound_root: Path, raw_path: str) -> Path:
     return resolved
 
 
+def validate_download_url(url: str, allowed_host_suffixes: frozenset[str]) -> None:
+    """Validate that *url* is HTTPS and its host matches one of the allowed
+    CDN host suffixes (exact match OR ``host.endswith('.' + suffix)``).
+
+    Raises :exc:`AttachmentURLError` on any violation. Must be called
+    *before* opening a network connection (chainlink #251 — SSRF guard).
+
+    Guard contract
+    ~~~~~~~~~~~~~~
+    Without this check, ``download_to_path`` would GET whatever URL arrived
+    in the message payload — including ``http://169.254.169.254/...`` (cloud
+    metadata) or other internal targets. Two validations:
+
+    1. **Scheme**: must be ``https``. Blocks plain-HTTP downgrade and
+       non-HTTP schemes (``file://``, ``ftp://``, ``gopher://``, …).
+    2. **Host allowlist**: host must match a per-bridge CDN suffix. Blocks
+       requests to arbitrary external hosts and to RFC-1918 / link-local
+       addresses even if the scheme is ``https``.
+
+    Complements the redirect guard shipped in chainlink #252 (which blocks
+    token leakage *via* a redirect); this blocks SSRF on the *initial* URL.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise AttachmentURLError(
+            f"download: rejecting non-HTTPS URL (scheme={parsed.scheme!r}): {url!r}"
+        )
+    host = (parsed.hostname or "").lower()
+    if not host or not any(
+        host == s or host.endswith("." + s) for s in allowed_host_suffixes
+    ):
+        raise AttachmentURLError(
+            f"download: URL host {host!r} not in CDN allowlist "
+            f"({', '.join(sorted(allowed_host_suffixes))}): {url!r}"
+        )
+
+
 def _carries_auth(headers: dict[str, str] | None) -> bool:
     """True if *headers* carries an Authorization credential (case-
     insensitive key match). Used to decide whether following redirects
@@ -123,6 +182,7 @@ async def download_to_path(
     timeout_s: float = _DEFAULT_DOWNLOAD_TIMEOUT_S,
     headers: dict[str, str] | None = None,
     allow_redirects: bool | None = None,
+    allowed_host_suffixes: frozenset[str] | None = None,
 ) -> bool:
     """Stream ``url`` to ``target``. Returns True on success, False on
     failure (logged at WARNING). When ``max_bytes`` is set and the
@@ -147,8 +207,24 @@ async def download_to_path(
     legitimately redirect off Slack's domain, so disabling redirects
     for the authed path is safe.
 
+    ``allowed_host_suffixes`` (chainlink #251 — SSRF gate): when
+    provided, ``validate_download_url`` is called *before* opening any
+    network connection. The URL must be HTTPS and its host must match one
+    of the allowed CDN host suffixes. Pass ``_DISCORD_CDN_HOSTS`` or
+    ``_SLACK_CDN_HOSTS`` from the respective bridge. When ``None``
+    (default) validation is skipped — for backward compatibility in tests
+    and non-bridge call sites. New call sites from bridge code MUST pass
+    an allowlist.
+
     Uses aiohttp lazily so non-bridge deployments don't pay the import.
     """
+    if allowed_host_suffixes is not None:
+        try:
+            validate_download_url(url, allowed_host_suffixes)
+        except AttachmentURLError as exc:
+            log.warning("download_to_path: SSRF guard rejected URL — %s", exc)
+            return False
+
     try:
         import aiohttp
     except ImportError:
@@ -200,6 +276,10 @@ async def download_to_path(
 
 __all__ = [
     "AttachmentPathError",
+    "AttachmentURLError",
+    "validate_download_url",
+    "_DISCORD_CDN_HOSTS",
+    "_SLACK_CDN_HOSTS",
     "sanitize_filename",
     "build_inbound_path",
     "resolve_outbound_path",

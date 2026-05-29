@@ -794,7 +794,11 @@ class DiscordBridge(Bridge):
                     name, size, self.attachments_max_bytes,
                 )
                 continue
-            from ._attachments import build_inbound_path, download_to_path
+            from ._attachments import (
+                _DISCORD_CDN_HOSTS,
+                build_inbound_path,
+                download_to_path,
+            )
             target = build_inbound_path(
                 self.attachments_dir,
                 channel="discord",
@@ -803,6 +807,7 @@ class DiscordBridge(Bridge):
             )
             ok = await download_to_path(
                 str(url), target, max_bytes=self.attachments_max_bytes,
+                allowed_host_suffixes=_DISCORD_CDN_HOSTS,
             )
             if ok:
                 attachment_paths.append(str(target))
