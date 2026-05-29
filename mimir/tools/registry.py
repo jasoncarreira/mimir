@@ -998,12 +998,15 @@ def all_mimir_tools() -> list:
         saga_feedback,
         saga_forget,
         saga_mark_contributions,
+        saga_record_skill_learning,
     )
     tools = [
         # Memory (read + write)
         memory_query, memory_store,
-        # SAGA ops (outcome marker, manual credit, session boundary, forget)
+        # SAGA ops (outcome marker, manual credit, session boundary, forget,
+        # per-skill learning capture)
         saga_feedback, saga_mark_contributions, saga_end_session, saga_forget,
+        saga_record_skill_learning,
         # Indexer (file search + mid-turn index rebuild)
         file_search,
         rebuild_index,

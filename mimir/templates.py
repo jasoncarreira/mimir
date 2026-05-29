@@ -33,8 +33,8 @@ that fed that turn isn't useful for synthesis and re-embedding it is
 exactly the cost path we're avoiding). Be surgical — most turns won't
 be worth re-reading.
 
-Do three things, in order (plus an optional Step 1b for inline atom
-storage — see below):
+Do three things, in order (plus optional Steps 1b and 1c — inline atom
+storage and skill-specific learnings — see below):
 
 ### 1. Capture memories worth keeping
 
@@ -95,6 +95,26 @@ into a file under Step 1), call saga_store for each.
 
 One fact per call. Single self-contained sentence. Dates and numbers
 verbatim. If nothing fits, skip this step entirely — silence is fine.
+
+### 1c. Record skill-specific learnings
+
+If running a **skill** this session taught you something its *next* run
+should know — a gotcha that cost you time, an input quirk, a performance
+caveat, a tip, or an approach that worked — capture it with:
+
+  saga_record_skill_learning(
+    skill="<skill name>",      # e.g. "memory", "github-poller"
+    kind="<kind>",             # failure-mode | input-quirk | perf-caveat
+                               #   (cautionary) ·· tip | success-pattern (how-to)
+    content="<one self-contained sentence>",
+  )
+
+This is *scoped* memory: the learning resurfaces automatically the next
+time that skill loads and never leaks into unrelated turns — which is why
+it goes here, not in Step 1b's general atoms. Record the cautionary ones
+especially: a `failure-mode` you actually hit is the single most valuable
+thing to leave for the next run. One learning per call. Skip entirely if
+no skill taught you anything this session — don't manufacture entries.
 
 ### 2. Score SAGA atoms
 
@@ -185,8 +205,8 @@ that fed that turn isn't useful for synthesis and re-embedding it is
 exactly the cost path we're avoiding). Be surgical — most turns won't
 be worth re-reading.
 
-Do two things, in order (plus an optional Step 1b for inline atom
-storage — see below):
+Do two things, in order (plus optional Steps 1b and 1c — inline atom
+storage and skill-specific learnings — see below):
 
 ### 1. Capture memories worth keeping
 
@@ -247,6 +267,26 @@ into a file under Step 1), call saga_store for each.
 
 One fact per call. Single self-contained sentence. Dates and numbers
 verbatim. If nothing fits, skip this step entirely — silence is fine.
+
+### 1c. Record skill-specific learnings
+
+If running a **skill** this session taught you something its *next* run
+should know — a gotcha that cost you time, an input quirk, a performance
+caveat, a tip, or an approach that worked — capture it with:
+
+  saga_record_skill_learning(
+    skill="<skill name>",      # e.g. "memory", "github-poller"
+    kind="<kind>",             # failure-mode | input-quirk | perf-caveat
+                               #   (cautionary) ·· tip | success-pattern (how-to)
+    content="<one self-contained sentence>",
+  )
+
+This is *scoped* memory: the learning resurfaces automatically the next
+time that skill loads and never leaks into unrelated turns — which is why
+it goes here, not in Step 1b's general atoms. Record the cautionary ones
+especially: a `failure-mode` you actually hit is the single most valuable
+thing to leave for the next run. One learning per call. Skip entirely if
+no skill taught you anything this session — don't manufacture entries.
 
 ### 2. Record the session boundary
 
