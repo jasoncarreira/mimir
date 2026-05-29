@@ -9,10 +9,14 @@ import pytest
 
 from mimir.bridges._attachments import (
     AttachmentPathError,
+    AttachmentURLError,
+    _DISCORD_CDN_HOSTS,
+    _SLACK_CDN_HOSTS,
     build_inbound_path,
     download_to_path,
     resolve_outbound_path,
     sanitize_filename,
+    validate_download_url,
 )
 
 
@@ -421,3 +425,99 @@ async def test_download_explicit_allow_redirects_override(tmp_path: Path):
             allow_redirects=True,  # explicit override
         )
     assert captured["allow_redirects"] is True
+
+
+# ── SSRF guard: validate_download_url (chainlink #251) ───────────────
+#
+# Before any network I/O, download_to_path calls validate_download_url
+# when allowed_host_suffixes is provided. A URL with a non-HTTPS scheme
+# or a host outside the CDN allowlist is rejected without opening a
+# connection — the primary SSRF defense.
+
+
+def test_validate_discord_cdn_accepted():
+    """Standard Discord CDN URLs pass the SSRF guard."""
+    for url in [
+        "https://cdn.discordapp.com/attachments/123/456/file.png",
+        "https://media.discordapp.net/attachments/abc",
+        "https://images-ext-1.discordapp.net/external/foo",
+        "https://discord.com/assets/image.png",
+    ]:
+        validate_download_url(url, _DISCORD_CDN_HOSTS)  # must not raise
+
+
+def test_validate_slack_cdn_accepted():
+    """Standard Slack CDN URLs pass the SSRF guard."""
+    for url in [
+        "https://files.slack.com/files-pri/T0001/F001/photo.jpg",
+        "https://slack-files.com/T001-F001-abc",
+    ]:
+        validate_download_url(url, _SLACK_CDN_HOSTS)  # must not raise
+
+
+def test_validate_rejects_http_scheme():
+    """Plain HTTP is rejected — forces TLS for all attachment downloads."""
+    with pytest.raises(AttachmentURLError, match="non-HTTPS"):
+        validate_download_url("http://cdn.discordapp.com/x.png", _DISCORD_CDN_HOSTS)
+
+
+def test_validate_rejects_file_scheme():
+    """file:// URLs are rejected outright — not a CDN host."""
+    with pytest.raises(AttachmentURLError, match="non-HTTPS"):
+        validate_download_url("file:///etc/passwd", _DISCORD_CDN_HOSTS)
+
+
+def test_validate_rejects_off_allowlist_host():
+    """An HTTPS URL pointing at a host outside the CDN allowlist is rejected."""
+    with pytest.raises(AttachmentURLError, match="not in CDN allowlist"):
+        validate_download_url("https://evil.example.com/file.bin", _DISCORD_CDN_HOSTS)
+
+
+def test_validate_rejects_cloud_metadata_endpoint():
+    """The AWS metadata endpoint (169.254.169.254) is explicitly rejected
+    even if the scheme is https — it's not in any CDN allowlist."""
+    with pytest.raises(AttachmentURLError, match="not in CDN allowlist"):
+        validate_download_url(
+            "https://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            _DISCORD_CDN_HOSTS,
+        )
+
+
+def test_validate_rejects_cross_bridge_host():
+    """A Discord CDN URL is rejected when checked against the Slack allowlist."""
+    with pytest.raises(AttachmentURLError, match="not in CDN allowlist"):
+        validate_download_url(
+            "https://cdn.discordapp.com/file.png", _SLACK_CDN_HOSTS
+        )
+
+
+@pytest.mark.asyncio
+async def test_download_ssrf_rejected_before_network(tmp_path: Path):
+    """When allowed_host_suffixes is set and the URL fails validation,
+    download_to_path returns False without making any network call."""
+    target = tmp_path / "out.bin"
+
+    with patch("aiohttp.ClientSession") as mock_cls:
+        result = await download_to_path(
+            "https://169.254.169.254/iam/creds",
+            target,
+            allowed_host_suffixes=_DISCORD_CDN_HOSTS,
+        )
+
+    assert result is False
+    assert not target.exists()
+    mock_cls.assert_not_called()  # no network I/O attempted
+
+
+@pytest.mark.asyncio
+async def test_download_ssrf_guard_bypassed_when_no_allowlist(tmp_path: Path):
+    """Without allowed_host_suffixes, no URL validation occurs (backward compat).
+    The download proceeds; the URL is allowed by not setting a guard."""
+    payload = b"ok"
+    mock_session = _make_aiohttp_mock([payload])
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        result = await download_to_path(
+            "http://example.com/file", target=tmp_path / "out.bin",
+            # no allowed_host_suffixes — skip validation
+        )
+    assert result is True
