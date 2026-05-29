@@ -511,6 +511,11 @@ class Agent:
         self._indexes = index_generator
         self._indexer = indexer
         self._saga = saga_client
+        # chainlink #266: concrete SagaStore handle (peeled from the
+        # saga_client wrapper chain in _try_inject_memory_client), used by
+        # the skill-memory load injection. None until/unless a SagaStore
+        # is found.
+        self._saga_store: Any = None
         self._sessions = session_manager
         self._scheduler = scheduler
         self._inbox = subagent_inbox or SubagentInbox()
@@ -666,6 +671,12 @@ class Agent:
             if isinstance(candidate, SagaStore):
                 from .tools import set_memory_client
                 set_memory_client(candidate)
+                # chainlink #266: stash the concrete SagaStore so the
+                # skill-memory load injection can recall skill_learning
+                # atoms via its connection. None when no SagaStore is
+                # wired (legacy _InProcessSaga / test stubs) — injection
+                # then no-ops.
+                self._saga_store = candidate
                 return
             candidate = getattr(candidate, "_inner", None)
 
@@ -2144,6 +2155,19 @@ class Agent:
             event.channel_id,
             skills_dirs,
         )
+        # chainlink #266: when a skill auto-loads, its accumulated
+        # learnings (gotchas/tips stored as skill_learning atoms) load
+        # with it — appended under the same Skill section. Best-effort:
+        # only when a concrete SagaStore is wired; recall errors leave the
+        # body unchanged (skill load must not fail on a memory miss).
+        if auto_skill_block is not None and self._saga_store is not None:
+            from . import skill_memory
+            _skill_name, _skill_body = auto_skill_block
+            _conn = self._saga_store.connection()
+            _augmented = await asyncio.to_thread(
+                skill_memory.augment_skill_body, _conn, _skill_name, _skill_body,
+            )
+            auto_skill_block = (_skill_name, _augmented)
         # Channel memory injection (chainlink #187): load per-channel fact
         # files (operator name, preferences, patterns) from
         # ``memory/channels/<channel_id>/``.  Returns None for synthetic

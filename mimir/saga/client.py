@@ -241,6 +241,17 @@ class SagaStore:
                 return fn()
         return await asyncio.to_thread(_locked)
 
+    def connection(self) -> sqlite3.Connection:
+        """Public accessor for the underlying sqlite3 connection.
+
+        Used by the upper layer (chainlink #266: skill-memory load
+        injection) to run the skill-learning scoped recall, which lives
+        in ``mimir.skill_memory`` and can't be reached from this lower
+        layer (saga does not import up into ``mimir.*``). Reads under WAL
+        are safe across the ``asyncio.to_thread`` worker the caller uses.
+        """
+        return self._ensure_conn()
+
     def _ensure_conn(self) -> sqlite3.Connection:
         if self._conn is not None:
             return self._conn
