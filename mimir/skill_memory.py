@@ -154,7 +154,12 @@ def recall_skill_learnings(
     # No SQL LIMIT: skill atoms are sparse, and we rank by activation in
     # Python before taking the top-*limit*. A SQL ``LIMIT`` on created_at
     # would drop a high-activation older learning before it could be
-    # ranked.
+    # ranked. The fetch + sort is O(N) / O(N log N) over a skill's full
+    # live learning set; this assumes that set stays small — bounded by
+    # per-skill dedup (consolidate_skill_memories) + forget pruning +
+    # decay. If a heavily-used skill ever accumulates hundreds of live
+    # learnings, revisit with a recency pre-cap before the activation
+    # sort (#268).
     rows = conn.execute(
         f"""
         SELECT id, content, json_extract(metadata, '$.kind') AS kind, created_at
@@ -174,6 +179,11 @@ def recall_skill_learnings(
     # Sort by (activation desc, created_at desc). created_at is an ISO
     # string, so lexical desc == recency desc — a valid tiebreak when
     # activations match (e.g. all just-stored, never-curated learnings).
+    # This relies on the store layer writing created_at in a single
+    # uniform ISO-8601 format (UTC, consistent precision); a mixed format
+    # (naive local time, varying fractional digits) would lexically
+    # mis-sort the tiebreak. store.py writes uniform timestamps, so this
+    # holds for atoms this code creates.
     ranked = sorted(
         rows,
         key=lambda r: (activations.get(r[0], neg_inf), r[3]),
