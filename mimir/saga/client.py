@@ -1125,6 +1125,97 @@ class SagaStore:
             "dedup": dedup_payload,
         }
 
+    async def consolidate_skill_memories(
+        self, *, dry_run: bool = False,
+        lookback_days: int | None = None,
+        min_cluster_size: int = 2,
+        dedup_threshold: float | None = None,
+        dedup_max_clusters: int | None = None,
+    ) -> dict[str, Any]:
+        """Per-skill dedup pass for skill-learning atoms (#266).
+
+        The general :meth:`consolidate` EXCLUDES ``skill_learning`` atoms;
+        this runs a SEPARATE dedup pass scoped to each skill so a skill's
+        near-duplicate learnings collapse against each other only — never
+        across skills, never against a general raw. Run this alongside the
+        general pass (the scheduler's ``saga-consolidate`` job does both).
+
+        Thematic (LLM-synthesized observation) consolidation is
+        intentionally NOT applied to skill learnings: they are already
+        curated, kind-tagged notes authored with intent, not raw evidence
+        to summarize into a cross-session observation. Collapsing exact/
+        near-duplicate notes is the only safe automatic operation; merging
+        a ``failure-mode`` and a ``tip`` into one synthesized observation
+        would destroy the valence the surfacing layer (#267) depends on.
+
+        ``lookback_days=None`` (default) dedups a skill's learnings across
+        all time — skill atoms are sparse and long-lived, so an age window
+        would leave old duplicates uncollapsed. ``dedup_threshold`` /
+        ``dedup_max_clusters`` mirror :meth:`consolidate`'s dedup pass.
+
+        Returns ``{"skills_scanned", "threshold", "skills": {name: {...}}}``
+        with one per-skill dedup summary each.
+        """
+        from .consolidate import distinct_skill_scopes
+        from .cluster import make_default_cluster_fn
+        from .dedup import dedup_pass, DEFAULT_DEDUP_THRESHOLD
+        from .embeddings import resolve_auto_threshold
+        from ._config_io import get_config
+
+        conn = self._ensure_conn()
+        skills = await asyncio.to_thread(
+            distinct_skill_scopes, conn, agent_id=self._agent_id,
+        )
+        summary: dict[str, Any] = {
+            "skills_scanned": len(skills),
+            "threshold": None,
+            "skills": {},
+        }
+        if not skills:
+            return summary
+
+        # Same 0.92-floor threshold resolution as consolidate()'s dedup
+        # pass — the per-provider thematic threshold is too loose for
+        # near-duplicate collapse. Caller override wins.
+        cfg = get_config()
+        provider_name = cfg("embedding", "provider", "unknown")
+        effective_threshold = (
+            dedup_threshold
+            if dedup_threshold is not None
+            else max(
+                resolve_auto_threshold(provider_name),
+                DEFAULT_DEDUP_THRESHOLD,
+            )
+        )
+        summary["threshold"] = effective_threshold
+        # One clusterer for all skills — candidate selection inside
+        # dedup_pass (skill_scope) restricts each call to one skill's
+        # atoms, so a shared cluster_fn never crosses skills.
+        cluster_fn = make_default_cluster_fn(
+            conn, threshold=effective_threshold,
+        )
+
+        for skill in skills:
+            def _do_dedup(skill=skill):
+                return dedup_pass(
+                    conn,
+                    cluster_fn=cluster_fn,
+                    agent_id=self._agent_id,
+                    lookback_days=lookback_days,
+                    min_cluster_size=min_cluster_size,
+                    dry_run=dry_run,
+                    max_clusters=dedup_max_clusters,
+                    skill_scope=skill,
+                )
+            res = await self._write_locked(_do_dedup)
+            summary["skills"][skill] = {
+                "candidates_scanned": res.candidates_scanned,
+                "clusters_formed": res.clusters_formed,
+                "canonicals_kept": res.canonicals_kept,
+                "duplicates_tombstoned": res.duplicates_tombstoned,
+            }
+        return summary
+
     async def forget(
         self, *,
         dry_run: bool = True,

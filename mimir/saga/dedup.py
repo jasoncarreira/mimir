@@ -83,6 +83,12 @@ DEFAULT_DEDUP_THRESHOLD = 0.92
 # structural; merging them would corrupt the per-session evidence trail.
 NEVER_DEDUP_SOURCE_TYPES = ("session_boundary",)
 
+# Skill-learning atoms (#266) are partitioned out of the general dedup
+# pass and deduped per-skill instead (see ``skill_scope`` below). Local
+# copy of mimir.skill_memory.SKILL_LEARNING_SOURCE_TYPE — saga is the
+# lower layer and must not import up into mimir.*.
+_SKILL_LEARNING_SOURCE_TYPE = "skill_learning"
+
 
 @dataclass
 class DedupResult:
@@ -524,6 +530,7 @@ def _candidate_raws_for_dedup(
     *,
     lookback_days: int | None,
     agent_id: str,
+    skill_scope: str | None = None,
 ) -> list[dict]:
     """Atoms eligible for dedup. Difference from consolidate's
     candidate query:
@@ -534,16 +541,34 @@ def _candidate_raws_for_dedup(
       with no access history, but they still cluster.
     - We exclude session_boundary source_type — those are structural
       markers, not evidence.
+
+    *skill_scope* partitions skill-learning atoms (#266) so a skill's
+    near-duplicate gotchas collapse against each other but never against
+    another skill's learnings or a general raw:
+    - ``None`` (default, the general pass): EXCLUDE ``skill_learning``
+      atoms (on top of the structural exclusions above).
+    - ``"<skill>"`` (per-skill pass): include ONLY that skill's
+      ``skill_learning`` atoms.
     """
     where = [
         "a.memory_type = 'raw'",
         "a.tombstoned = 0",
-        "a.source_type NOT IN ({})".format(
-            ",".join("?" * len(NEVER_DEDUP_SOURCE_TYPES))
-        ),
         "a.agent_id = ?",
     ]
-    params: list = list(NEVER_DEDUP_SOURCE_TYPES) + [agent_id]
+    params: list = [agent_id]
+    if skill_scope is None:
+        where.append(
+            "a.source_type NOT IN ({})".format(
+                ",".join("?" * (len(NEVER_DEDUP_SOURCE_TYPES) + 1))
+            )
+        )
+        params.extend(NEVER_DEDUP_SOURCE_TYPES)
+        params.append(_SKILL_LEARNING_SOURCE_TYPE)
+    else:
+        where.append("a.source_type = ?")
+        where.append("json_extract(a.metadata, '$.skill') = ?")
+        params.append(_SKILL_LEARNING_SOURCE_TYPE)
+        params.append(skill_scope)
     if lookback_days is not None:
         from datetime import timedelta
         cutoff = (datetime.now(timezone.utc)
@@ -580,6 +605,7 @@ def dedup_pass(
     min_cluster_size: int = 2,
     dry_run: bool = False,
     max_clusters: int | None = None,
+    skill_scope: str | None = None,
 ) -> DedupResult:
     """Run the dedup pass over recent raws for one agent.
 
@@ -596,11 +622,17 @@ def dedup_pass(
     as one against the cap and tombstones (N-1) atoms. Use this to
     bound runtime on cold-start passes; leave None for unbounded.
 
+    ``skill_scope`` (#266) partitions skill-learning atoms: ``None``
+    dedups the general corpus and excludes ``skill_learning`` atoms;
+    a skill name dedups only that skill's learnings. See
+    ``_candidate_raws_for_dedup``.
+
     Returns a DedupResult with counts + per-canonical merge lists.
     """
     result = DedupResult()
     raws = _candidate_raws_for_dedup(
         conn, lookback_days=lookback_days, agent_id=agent_id,
+        skill_scope=skill_scope,
     )
     result.candidates_scanned = len(raws)
     if len(raws) < min_cluster_size:
