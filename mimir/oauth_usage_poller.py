@@ -46,6 +46,7 @@ Algedonic events emitted (see ``mimir/feedback.py``):
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import logging
 import os
@@ -802,61 +803,83 @@ def detect_5h_anomaly(
     )
 
 
-def detect_seven_day_anomaly(
+class SevenDayClassification(enum.Enum):
+    """Outcome of :func:`classify_seven_day_reading`.
+
+    ``ANOMALOUS`` — reading failed a detector check; caller should reject
+        it and keep the prior trusted value.
+    ``CLEAN`` — reading passed all applicable checks with positive signal;
+        caller may reset any anomaly confirm counter.
+    ``UNEVALUABLE`` — detector lacked the data needed to form a verdict;
+        caller should write through *without* resetting the confirm counter
+        (chainlink #253: distinguish "confirmed clean" from "no signal").
+    """
+
+    ANOMALOUS = "anomalous"
+    CLEAN = "clean"
+    UNEVALUABLE = "unevaluable"
+
+
+def classify_seven_day_reading(
     *,
     new_7d: float | None,
     prev_7d: float | None,
     new_sub_buckets: dict[str, float],
     prev_sub_buckets: dict[str, float],
-) -> str | None:
-    """Reject bogus ``seven_day`` overall readings (chainlink #220 + #250).
+) -> tuple[SevenDayClassification, str | None]:
+    """Single-source-of-truth classifier for a ``seven_day`` reading.
 
-    Returns a reason string when the new overall 7d reading is an
-    endpoint glitch (the caller should keep the prior trusted
-    value), else None.
+    Returns ``(classification, reason)`` where ``reason`` is a non-empty
+    string only when ``classification`` is
+    :attr:`SevenDayClassification.ANOMALOUS`.
 
     Two independent checks:
 
-    **Delta check (chainlink #220)** — fires when:
-      - 7d overall rose by >= ANOMALY_7D_JUMP_PP (30pp) since prior
-        reading,
-      - AND **every** known sub-bucket
-        (``seven_day_sonnet``, ``seven_day_omelette``, ...) moved
-        less than ANOMALY_SUBBUCKET_DELTA_PP (5pp).
+    **Absolute-coherence check (chainlink #250)** — fires when
+    ``new_sub_buckets`` is non-empty AND overall ≥
+    ``ANOMALY_7D_COHERENCE_OVERALL_FLOOR`` AND every observed sub-bucket <
+    ``ANOMALY_7D_COHERENCE_SUBBUCKET_CEIL``.  Checked first; when sub-buckets
+    are present the check is always attempted before falling through to the
+    delta check.
 
-    **Absolute-coherence check (chainlink #250)** — fires when:
-      - new_7d_overall > max(new_sub_buckets) + ANOMALY_7D_COHERENCE_SLACK_PP.
+    **Delta check (chainlink #220)** — fires when 7d overall rose by ≥
+    ``ANOMALY_7D_JUMP_PP`` AND every sub-bucket present in **both** maps
+    moved less than ``ANOMALY_SUBBUCKET_DELTA_PP``.  A small jump (< jump
+    threshold) is definitively CLEAN.  A large jump with no observable
+    sub-bucket overlap is UNEVALUABLE *unless* the sub-buckets' mere
+    presence already provided a positive CLEAN signal from the coherence
+    check path (see below).
 
-    The overall ``seven_day`` cap is a cost-weighted aggregate of
-    per-model spend, so it physically cannot exceed the largest
-    sub-bucket by more than a small slack (untracked models).  The
-    delta check catches transient cliff-spikes when sub-buckets stay
-    flat; the absolute-coherence check catches the 2026-05-28
-    incident shape where sub-buckets *drop* between polls (resolving
-    a prior glitch) but the overall *jumps* the same poll — the
-    drop counts as "sub-buckets moved" under the delta rule and
-    bypasses it.
+    **CLEAN vs UNEVALUABLE disambiguation** (chainlink #253):
+    ``record_usage`` confirm-counter must only reset on CLEAN, not on
+    UNEVALUABLE, so the distinction matters:
 
-    ``new_sub_buckets`` / ``prev_sub_buckets`` are dicts keyed by
-    bucket name (e.g. ``"seven_day_sonnet"``) mapping to
-    utilization. Missing keys are skipped — the delta check fires
-    only on sub-buckets present in both maps. When no sub-buckets
-    are observable at all, returns None (no signal to distrust).
+    - ANOMALOUS → increment / confirm counter
+    - CLEAN     → reset counter
+    - UNEVALUABLE → leave counter unchanged
 
-    Skips both checks when ``new_7d`` is None. The delta check
-    additionally requires ``prev_7d`` (first poll has no prior).
+    The CLEAN signal from the absolute-coherence check propagates even
+    when the delta check cannot run (no prior, no overlap) — sub-buckets
+    being present and internally coherent is positive evidence.  The
+    UNEVALUABLE path only fires when *neither* check could form a verdict.
     """
     if new_7d is None:
-        return None
+        # No reading — can't evaluate.
+        return SevenDayClassification.UNEVALUABLE, None
 
-    # ── Absolute-coherence check (chainlink #250) ──────────────────
+    # ── Absolute-coherence check (chainlink #250) ──────────────────────────
     # Independent of prior readings — sanity check on the NEW value's
-    # internal coherence with NEW sub-buckets.  Fires when overall
-    # claims significant usage (≥ FLOOR) but every observed
-    # sub-bucket is near zero (< CEIL).  That state can't be real:
-    # the plan-wide aggregate is a function of per-model spend, and
-    # if every model bucket is empty the aggregate cannot be huge.
-    if new_sub_buckets:
+    # internal coherence with NEW sub-buckets.  Fires when overall claims
+    # significant usage (≥ FLOOR) but every observed sub-bucket is near
+    # zero (< CEIL).  That state can't be real: the plan-wide aggregate is
+    # a function of per-model spend, and if every model bucket is empty the
+    # aggregate cannot be huge.
+    #
+    # We don't short-circuit to CLEAN here if the check passes — the delta
+    # check must still run.  But we record that sub-buckets were present so
+    # the "no prior / no overlap" delta-check returns can use it.
+    has_sub_buckets = bool(new_sub_buckets)
+    if has_sub_buckets:
         max_sub = max(new_sub_buckets.values())
         if (
             new_7d >= ANOMALY_7D_COHERENCE_OVERALL_FLOOR
@@ -866,26 +889,47 @@ def detect_seven_day_anomaly(
                 f"{k}={v * 100:.0f}%"
                 for k, v in sorted(new_sub_buckets.items())
             )
-            return (
+            return SevenDayClassification.ANOMALOUS, (
                 f"seven_day={new_7d * 100:.0f}% but all observed "
                 f"sub-buckets < {ANOMALY_7D_COHERENCE_SUBBUCKET_CEIL * 100:.0f}% "
                 f"[{sub_summary}] — internally inconsistent, "
                 f"endpoint glitch suspected"
             )
 
-    # ── Delta check (chainlink #220) ────────────────────────────────
+    # ── Delta check (chainlink #220) ────────────────────────────────────────
     if prev_7d is None:
-        return None
+        # First poll — no prior to compare against.
+        # When sub-buckets were present and coherent (coherence check passed),
+        # that counts as positive signal → CLEAN.  Otherwise unevaluable.
+        return (
+            SevenDayClassification.CLEAN
+            if has_sub_buckets
+            else SevenDayClassification.UNEVALUABLE
+        ), None
+
     jump = new_7d - prev_7d
     if jump < ANOMALY_7D_JUMP_PP:
-        return None
+        # Small or negative jump — definitively clean regardless of sub-bucket
+        # availability.
+        return SevenDayClassification.CLEAN, None
+
+    # Large jump — check sub-bucket deltas.
     # Compute the max sub-bucket delta over keys present in BOTH maps.
     # A sub-bucket that appeared for the first time in this poll (e.g.,
     # a new model tier) has no prior reading to compare against — skip
     # it rather than treating absence as zero delta.
     observed_keys = set(new_sub_buckets.keys()) & set(prev_sub_buckets.keys())
     if not observed_keys:
-        return None
+        # No overlap to check against.  If new sub-buckets were present and
+        # coherent (coherence check passed), their presence is still positive
+        # signal → CLEAN.  Without any sub-bucket evidence → unevaluable
+        # (chainlink #253 core case: large jump, sub-buckets flapping absent).
+        return (
+            SevenDayClassification.CLEAN
+            if has_sub_buckets
+            else SevenDayClassification.UNEVALUABLE
+        ), None
+
     max_delta = 0.0
     max_key = ""
     for key in observed_keys:
@@ -893,9 +937,13 @@ def detect_seven_day_anomaly(
         if delta > max_delta:
             max_delta = delta
             max_key = key
+
     if max_delta >= ANOMALY_SUBBUCKET_DELTA_PP:
-        return None
-    return (
+        # Sub-buckets moved consistently with the overall jump → clean.
+        return SevenDayClassification.CLEAN, None
+
+    # Large jump but sub-buckets stayed flat → anomaly.
+    return SevenDayClassification.ANOMALOUS, (
         f"seven_day jumped +{jump * 100:.0f}pp "
         f"({prev_7d * 100:.0f}% → {new_7d * 100:.0f}%) "
         f"but largest sub-bucket delta was {max_key}={max_delta * 100:.1f}pp "
@@ -904,57 +952,30 @@ def detect_seven_day_anomaly(
     )
 
 
-def _seven_day_anomaly_is_evaluable(
+def detect_seven_day_anomaly(
     *,
     new_7d: float | None,
     prev_7d: float | None,
     new_sub_buckets: dict[str, float],
     prev_sub_buckets: dict[str, float],
-) -> bool:
-    """Return True only when ``detect_seven_day_anomaly`` had sufficient
-    signal to positively confirm the 7d reading as clean (not anomalous).
+) -> str | None:
+    """Thin wrapper around :func:`classify_seven_day_reading`.
 
-    ``detect_seven_day_anomaly`` returns ``None`` for two distinct reasons:
+    Returns a reason string when the new overall 7d reading is an endpoint
+    glitch (the caller should keep the prior trusted value), else ``None``.
+    ``None`` covers both the CLEAN and UNEVALUABLE outcomes — call
+    :func:`classify_seven_day_reading` directly when that distinction matters
+    (e.g. the ``record_usage`` confirm-counter logic in chainlink #253).
 
-    1. **Confirmed clean** — the read passed all applicable checks (no big
-       jump, or sub-buckets moved consistently with it, or the value is
-       internally coherent).
-    2. **Unevaluable** — the detector lacked the data needed to form a
-       judgment (no reading, no prior, or no overlapping sub-buckets despite
-       a large 7d jump).
-
-    The confirm counter in ``record_usage`` (chainlink #231) should only be
-    reset on case 1.  Case 2 — specifically when sub-bucket presence flaps
-    between polls — must preserve the counter so that a genuine spend
-    increase isn't indefinitely misclassified as a glitch (chainlink #253).
-
-    Mirrors the early-return logic of ``detect_seven_day_anomaly``; must be
-    kept in sync when that function changes.
+    Signature preserved so existing unit tests remain valid.
     """
-    if new_7d is None:
-        # No reading — can't evaluate.
-        return False
-
-    # Absolute-coherence check (chainlink #250) uses new_sub_buckets only.
-    # If new_sub_buckets is present and the check didn't fire (we're on the
-    # non-anomaly path), the value is internally coherent → evaluable.
-    if new_sub_buckets:
-        return True
-
-    # No sub-buckets available for the absolute check.  Fall through to the
-    # delta check conditions.
-    if prev_7d is None:
-        # First poll — no prior to compare against → unevaluable.
-        return False
-    jump = new_7d - prev_7d
-    if jump < ANOMALY_7D_JUMP_PP:
-        # Small or negative jump — definitively clean regardless of
-        # sub-bucket availability.
-        return True
-    # Large 7d jump with no new sub-buckets at all → no overlap possible →
-    # delta check short-circuited at the ``not observed_keys`` guard →
-    # unevaluable (chainlink #253 core case).
-    return False
+    _, reason = classify_seven_day_reading(
+        new_7d=new_7d,
+        prev_7d=prev_7d,
+        new_sub_buckets=new_sub_buckets,
+        prev_sub_buckets=prev_sub_buckets,
+    )
+    return reason
 
 
 def derive_5h_from_cost(
@@ -1118,7 +1139,7 @@ async def record_usage(
         for k, s in prior_snaps.items()
         if k.startswith("seven_day_") and s.utilization is not None
     }
-    seven_day_anomaly_reason = detect_seven_day_anomaly(
+    seven_day_classification, seven_day_anomaly_reason = classify_seven_day_reading(
         new_7d=new_7d.utilization if new_7d else None,
         prev_7d=prior_7d.utilization if prior_7d else None,
         new_sub_buckets=new_sub_buckets,
@@ -1141,7 +1162,7 @@ async def record_usage(
     confirm_threshold = _resolve_anomaly_confirm_threshold()
 
     for window_type, snapshot in new_snaps.items():
-        if window_type == "seven_day" and seven_day_anomaly_reason:
+        if window_type == "seven_day" and seven_day_classification is SevenDayClassification.ANOMALOUS:
             # chainlink #220: reject the bogus 7d-overall spike.
             # chainlink #231: but if the endpoint has reported the same
             # anomalous value for confirm_threshold consecutive polls,
@@ -1196,18 +1217,12 @@ async def record_usage(
                 continue
         elif window_type == "seven_day":
             # Non-anomalous 7d reading — but only reset the confirmation
-            # counter if the detector had enough signal to confirm the read
-            # is genuinely clean.  When sub-bucket presence flaps between
-            # polls, detect_seven_day_anomaly returns None because it
-            # couldn't evaluate (not because it confirmed clean).  Resetting
-            # the counter in that case defeats the recovery mechanism
+            # counter when the classifier positively confirmed CLEAN.
+            # UNEVALUABLE (no reading, no prior, or large jump with no
+            # sub-bucket overlap) leaves the counter untouched so a genuine
+            # spend increase eventually confirms after N consecutive polls
             # (chainlink #253).
-            if _seven_day_anomaly_is_evaluable(
-                new_7d=new_7d.utilization if new_7d else None,
-                prev_7d=prior_7d.utilization if prior_7d else None,
-                new_sub_buckets=new_sub_buckets,
-                prev_sub_buckets=prior_sub_buckets,
-            ):
+            if seven_day_classification is SevenDayClassification.CLEAN:
                 anomaly_confirm_state.pop("seven_day", None)
         if window_type == "five_hour" and anomaly_reason:
             # Reject the spike. Surface the rejection so the operator

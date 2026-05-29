@@ -1936,3 +1936,63 @@ async def test_7d_anomaly_confirm_counter_reset_on_small_jump_without_sub_bucket
     # Counter SHOULD be reset (small jump is definitively clean).
     state = _load_anomaly_confirm_state(state_path)
     assert "seven_day" not in state
+
+
+@pytest.mark.asyncio
+async def test_7d_anomaly_confirm_counter_reset_when_sub_buckets_coherent(
+    tmp_path: Path,
+):
+    """When new_sub_buckets are present and the absolute-coherence check does
+    NOT fire (overall is consistent with sub-buckets), classify_seven_day_reading
+    returns CLEAN and the confirm counter should be reset.
+
+    This locks in the "sub-buckets present + coherent → CLEAN → counter reset"
+    shortcut — the case-2 path in classify_seven_day_reading (chainlink #253).
+    """
+    from mimir.oauth_usage_poller import (
+        PollerConfig, record_usage,
+        _load_anomaly_confirm_state, _anomaly_confirm_state_path,
+        _save_anomaly_confirm_state,
+    )
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op_mod
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    # Seed prior state.
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.30,
+        observed_at="2026-05-09T00:00:00+00:00",
+    ))
+
+    # New poll: overall 7d = 0.35, sub-bucket at 0.35 — internally coherent
+    # (overall ≈ sub-bucket, no incoherence).  Absolute-coherence check
+    # requires overall ≥ 0.50 to fire at all, so this is well below the floor.
+    # classify_seven_day_reading: new_sub_buckets non-empty, coherence check
+    # doesn't fire → CLEAN.
+    payload = {
+        "seven_day": {"status": "allowed", "utilization": 0.35,
+                      "resets_at": 9999999999},
+        "seven_day_sonnet": {"status": "allowed", "utilization": 0.35,
+                             "resets_at": 9999999999},
+    }
+
+    cfg = PollerConfig(credentials_path=tmp_path / "creds.json")
+    state_path = _anomaly_confirm_state_path(cfg)
+    # Seed counter at 2 from prior anomaly rejections.
+    _save_anomaly_confirm_state(state_path, {"seven_day": 2})
+
+    orig = op_mod.log_event
+    op_mod.log_event = AsyncMock()
+    try:
+        recorded = await record_usage(store, payload, cfg=cfg)
+    finally:
+        op_mod.log_event = orig
+
+    # Clean write-through — sub-bucket is coherent with overall.
+    assert "anomalous" not in recorded.get("seven_day", {})
+    snap = store.current().get("seven_day")
+    assert snap is not None
+    assert snap.utilization == pytest.approx(0.35)
+    # Counter MUST be reset (CLEAN path: sub-buckets present + coherent).
+    state = _load_anomaly_confirm_state(state_path)
+    assert "seven_day" not in state
