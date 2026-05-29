@@ -1081,6 +1081,17 @@ def _write_if_missing(path: Path, content: str) -> bool:
     return True
 
 
+def _ensure_env_secure(path: Path) -> None:
+    """Tighten ``path`` to 0o600 (owner read-write only).
+
+    Called after any write that puts API keys into ``.env`` files so that
+    secrets are not world-readable at the process umask default (0644).
+    No-op when the file does not exist (defensive).
+    """
+    if path.exists():
+        path.chmod(0o600)
+
+
 def _generate_api_key() -> str:
     """A 256-bit URL-safe random token. Roughly 43 chars; safe for shells
     and Docker env files (no quoting, no escaping)."""
@@ -1262,6 +1273,12 @@ def setup_home(
         saga_api_key_action = "generated"
     else:
         saga_key = _env_get_var(home / ".env", _SAGA_API_KEY_LINE_RE) or ""
+
+    # Tighten .env to 0o600 (owner read-write only) after all secrets are
+    # written. The file lands at the process umask default (typically 0644,
+    # world-readable) otherwise — leaking MIMIR_API_KEY and SAGA_API_KEY to
+    # any local user on a multi-tenant host.
+    _ensure_env_secure(home / ".env")
 
     # S5-2 onboarding bypass — default ON for FRESH deployments only.
     # The template (DEFAULT_ENV_TEMPLATE) already includes
@@ -1672,6 +1689,7 @@ def regenerate_api_key(home: Path) -> str:
         )
     new_key = _generate_api_key()
     _env_set_api_key(env_path, new_key)
+    _ensure_env_secure(env_path)
     return new_key
 
 
