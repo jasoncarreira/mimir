@@ -401,9 +401,12 @@ def bootstrap_git_repo(
 
 
 def _is_dir_effectively_empty(path: Path) -> bool:
-    """An empty volume — or one containing only known-safe scaffold —
-    can be cloned into. Anything else, refuse (clone target must be
-    empty or git refuses)."""
+    """True only when *path* is strictly empty (no entries) — the
+    precondition for cloning into it (git refuses a non-empty target).
+
+    chainlink #259: the body checks strict emptiness; an earlier
+    docstring promised "empty OR known-safe scaffold", but no scaffold
+    allowlist is implemented. Wording aligned to the actual behavior."""
     try:
         entries = list(path.iterdir())
     except OSError:
