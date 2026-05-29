@@ -989,3 +989,21 @@ def test_openai_provider_transcribes_store_snapshots(tmp_path, monkeypatch):
     five = next(w for w in windows if w.key == "five_hour")
     assert five.utilization == 0.45
     assert five.window_hours == 5.0
+
+
+def test_build_quota_providers_minimax_regional_host(tmp_path):
+    """chainlink #259: a regional/gateway Minimax host (api.minimaxi.com)
+    must still route to MinimaxQuotaProvider — an exact-literal match would
+    fall through to Anthropic, which reads empty keys → no quota signal."""
+    from mimir.billing import (
+        BillingMode, MinimaxQuotaProvider, build_quota_providers,
+    )
+    from mimir.rate_limits import RateLimitStore
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        anthropic_base_url="https://api.minimaxi.com/anthropic",
+    )
+    assert len(providers) == 1
+    assert isinstance(providers[0], MinimaxQuotaProvider)

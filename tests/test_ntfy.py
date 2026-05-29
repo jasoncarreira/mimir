@@ -950,3 +950,30 @@ def test_classify_silence_picks_freshest_suppress_reason(
     assert classification == "suppressed"
     # Freshest reason (the 1.00 one) wins.
     assert reason == "quota_saturated:anthropic:seven_day@1.00"
+
+
+class TestParseEventTs:
+    """chainlink #259: event-ts parsing is Z-normalized + naive-coerced so
+    the downstream tz-aware comparison can't raise a TypeError that escapes
+    _classify_silence's 'never raises' contract."""
+
+    def test_naive_coerced_to_utc(self):
+        from datetime import timezone
+        from mimir.ntfy import _parse_event_ts
+        ts = _parse_event_ts("2026-05-27T04:00:00")  # no tz
+        assert ts is not None and ts.utcoffset() == timezone.utc.utcoffset(None)
+
+    def test_z_suffix_parses(self):
+        from mimir.ntfy import _parse_event_ts
+        ts = _parse_event_ts("2026-05-27T04:00:00Z")
+        assert ts is not None and ts.utcoffset().total_seconds() == 0
+
+    def test_offset_preserved(self):
+        from mimir.ntfy import _parse_event_ts
+        assert _parse_event_ts("2026-05-27T04:00:00+00:00") is not None
+
+    def test_bad_inputs_return_none(self):
+        from mimir.ntfy import _parse_event_ts
+        assert _parse_event_ts("garbage") is None
+        assert _parse_event_ts("") is None
+        assert _parse_event_ts(None) is None

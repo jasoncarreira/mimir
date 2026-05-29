@@ -366,6 +366,27 @@ def _cron_period_minutes(cron_expr: str) -> float:
     return 1440.0
 
 
+def _parse_event_ts(ts_str: object) -> "datetime | None":
+    """Parse an events.jsonl ISO timestamp to a tz-aware UTC datetime.
+
+    chainlink #259: normalizes a trailing ``Z`` (so a bare-Z stamp isn't
+    silently dropped) and coerces a naive timestamp to UTC, so the
+    downstream ``ts <= window_start`` comparisons against tz-aware bounds
+    can't raise a ``TypeError`` that escapes this module's "never raises"
+    contract. Returns ``None`` on any parse failure — the caller skips
+    the record.
+    """
+    if not isinstance(ts_str, str) or not ts_str:
+        return None
+    try:
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
 def _classify_silence(
     events_path: Path,
     *,
@@ -404,10 +425,8 @@ def _classify_silence(
     from ._jsonl_tail import tail_jsonl_records
 
     for event in tail_jsonl_records(events_path):
-        ts_str = event.get("timestamp", "")
-        try:
-            ts = datetime.fromisoformat(ts_str)
-        except (ValueError, TypeError):
+        ts = _parse_event_ts(event.get("timestamp", ""))
+        if ts is None:
             continue
         if ts <= window_start:
             # We're past the window — older records can't contribute.
@@ -448,11 +467,10 @@ def _last_heartbeat_timestamp(
             event.get("type") == "scheduled_tick"
             and event.get("channel_id") == channel_id
         ):
-            ts_str = event.get("timestamp", "")
-            try:
-                return datetime.fromisoformat(ts_str)
-            except (ValueError, TypeError):
-                continue
+            ts = _parse_event_ts(event.get("timestamp", ""))
+            if ts is not None:
+                return ts
+            continue
     return None
 
 

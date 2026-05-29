@@ -491,7 +491,12 @@ def build_quota_providers(
             host = urlparse(base).hostname or ""
         except (ValueError, AttributeError):
             host = ""
-    if host == "api.minimax.io":
+    # chainlink #259: match the Minimax host by substring, not an exact
+    # literal — regional / gateway hosts (api.minimaxi.com, ...) must
+    # still route to MinimaxQuotaProvider. Falling through to Anthropic
+    # there reads empty keys → no quota signal → cost-rate demoted to
+    # advisory → no spend protection.
+    if host and "minimax" in host.lower():
         return [MinimaxQuotaProvider(store)]
     # Default: canonical Anthropic (unset URL OR api.anthropic.com OR
     # any other host where we don't have a wrapped quota API yet).

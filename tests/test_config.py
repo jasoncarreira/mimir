@@ -407,3 +407,26 @@ class TestConfigProperties:
         assert overrides["ANTHROPIC_BASE_URL"] == "https://proxy.example.com"
         assert overrides["ANTHROPIC_MODEL"] == "claude-opus-4-7"
         assert "ANTHROPIC_AUTH_TOKEN" not in overrides
+
+
+# ---------------------------------------------------------------------------
+# _env_int / _env_float garbage handling (chainlink #259)
+# ---------------------------------------------------------------------------
+
+class TestEnvNumericGarbage:
+    """Garbage numeric env vars warn + fall back to default rather than
+    crashing boot with an opaque ValueError traceback (matches _env_bool)."""
+
+    def test_env_int_garbage_returns_default_and_warns(self, monkeypatch, caplog):
+        import logging
+        monkeypatch.setenv("MIMIR_TEST_INT_X", "808O")  # typo: letter O
+        with caplog.at_level(logging.WARNING):
+            assert _env_int("MIMIR_TEST_INT_X", 8080) == 8080
+        assert any("not a valid integer" in r.getMessage() for r in caplog.records)
+
+    def test_env_float_garbage_returns_default_and_warns(self, monkeypatch, caplog):
+        import logging
+        monkeypatch.setenv("MIMIR_TEST_FLOAT_X", "3.1foo")
+        with caplog.at_level(logging.WARNING):
+            assert _env_float("MIMIR_TEST_FLOAT_X", 2.5) == pytest.approx(2.5)
+        assert any("not a valid float" in r.getMessage() for r in caplog.records)

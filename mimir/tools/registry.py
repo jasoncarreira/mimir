@@ -277,7 +277,10 @@ async def send_message(
                 pass  # non-fatal; directive failures don't abort the send
         # SendFileDirective: not yet implemented via this path
 
-    return f"send_message ok: channel={cid} message_id={result}"
+    # chainlink #259: surface the bare message_id, not the SendResult repr,
+    # so downstream parses/greps (e.g. a later react(message_id=...)) work.
+    _mid = getattr(result, "message_id", None) if result else None
+    return f"send_message ok: channel={cid} message_id={_mid}"
 
 
 @tool
