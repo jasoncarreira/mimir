@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from mimir.shell_jobs import (
+    EVICT_AFTER_SECONDS,
     POST_EXIT_GRACE_SECONDS,
     SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES,
     SHELL_JOB_OUTPUT_MAX_TAIL_LINES,
@@ -432,3 +433,80 @@ def test_read_output_no_marker_when_file_has_fewer_lines_than_tail(
     assert "[…truncated;" not in tail
     assert "line_1" in tail
     assert "line_5" in tail
+
+
+# ─── ShellJobRegistry._evict_stale (chainlink #256) ──────────────────
+
+
+def test_evict_stale_removes_old_finished_job_and_unlinks_files(tmp_path: Path):
+    """A finished job whose ``finished_at`` is >= EVICT_AFTER_SECONDS ago
+    must be removed from ``_jobs`` and its output files must be unlinked."""
+    registry = _make_registry(tmp_path)
+    job = registry.spawn("echo evict-me", argv=["bash", "-c", "echo evict-me"])
+    _wait_until_done(registry, job.job_id)
+
+    # Confirm output files exist before eviction.
+    assert job.stdout_path.exists()
+    assert job.stderr_path.exists()
+
+    # Wind the clock forward past the eviction window.
+    stale_now = time.time() + EVICT_AFTER_SECONDS + 1
+    evicted = registry._evict_stale(now=stale_now)
+
+    assert len(evicted) == 1
+    assert evicted[0].job_id == job.job_id
+    # Job must be gone from the registry.
+    assert registry.get(job.job_id) is None
+    assert not any(j.job_id == job.job_id for j in registry.all_jobs())
+    # Output files must be unlinked.
+    assert not job.stdout_path.exists()
+    assert not job.stderr_path.exists()
+
+
+def test_evict_stale_preserves_running_job(tmp_path: Path):
+    """A running job (exit_code is None) must never be evicted, regardless
+    of how far the clock advances."""
+    registry = _make_registry(tmp_path)
+    job = registry.spawn("sleep-long", argv=["bash", "-c", "sleep 60"])
+
+    far_future = time.time() + EVICT_AFTER_SECONDS * 10
+    evicted = registry._evict_stale(now=far_future)
+
+    assert len(evicted) == 0
+    assert registry.get(job.job_id) is not None
+    # Clean up the sleeping process.
+    if job._process is not None:
+        job._process.kill()
+
+
+def test_evict_stale_preserves_recently_finished_job(tmp_path: Path):
+    """A finished job whose ``finished_at`` is well within EVICT_AFTER_SECONDS
+    must not be evicted — the agent still has a retrieval window."""
+    registry = _make_registry(tmp_path)
+    job = registry.spawn("echo keep-me", argv=["bash", "-c", "echo keep-me"])
+    _wait_until_done(registry, job.job_id)
+
+    # Use current time — job just finished, far from the eviction window.
+    evicted = registry._evict_stale(now=time.time())
+
+    assert len(evicted) == 0
+    assert registry.get(job.job_id) is not None
+
+
+def test_spawn_triggers_eviction_of_old_jobs(tmp_path: Path):
+    """spawn() must call _evict_stale so stale entries are removed as a
+    side-effect of adding new work (no separate background thread needed)."""
+    registry = _make_registry(tmp_path)
+
+    # Spawn a job, wait for it to finish, then age its finished_at past
+    # the eviction window by patching the field directly.
+    old_job = registry.spawn("echo old", argv=["bash", "-c", "echo old"])
+    _wait_until_done(registry, old_job.job_id)
+    old_job.finished_at = time.time() - (EVICT_AFTER_SECONDS + 10)
+
+    # A new spawn must trigger eviction of the old job.
+    new_job = registry.spawn("echo new", argv=["bash", "-c", "echo new"])
+    _wait_until_done(registry, new_job.job_id)
+
+    assert registry.get(old_job.job_id) is None, "old job must be evicted by spawn()"
+    assert registry.get(new_job.job_id) is not None, "new job must still be in registry"
