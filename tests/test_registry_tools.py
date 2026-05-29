@@ -76,6 +76,10 @@ class _StubBridge:
         self.history_calls: list[dict] = []
         self.raise_on: str | None = None
         self._history: list[dict] = []
+        # Bridge.react return value. None (default) mirrors stubs that
+        # don't honor the bool contract; set False to exercise the
+        # declined-reaction path.
+        self.react_returns: bool | None = None
 
     async def send(self, cid: str, text: str):
         if self.raise_on == "send":
@@ -87,6 +91,7 @@ class _StubBridge:
         if self.raise_on == "react":
             raise RuntimeError("react boom")
         self.react_calls.append({"cid": cid, "message_id": message_id, "emoji": emoji})
+        return self.react_returns
 
     async def fetch_history(self, cid: str, limit: int):
         if self.raise_on == "fetch_history":
@@ -347,7 +352,9 @@ class TestReact:
         set_channel_registry(_StubRegistry(bridge))
         tok = set_current_channel_id("chan-1")
         try:
-            out = await react.ainvoke({"emoji": "👍"})
+            # Explicit message_id so we reach the bridge (the None path
+            # short-circuits on resolution before bridge.react).
+            out = await react.ainvoke({"emoji": "👍", "message_id": "m-1"})
             assert "react failed" in out
             assert "boom" in out
         finally:
@@ -361,9 +368,77 @@ class TestReact:
         try:
             out = await react.ainvoke({"emoji": "🎉", "message_id": "msg-99"})
             assert "react ok:" in out
+            assert "message_id=msg-99" in out
             assert len(bridge.react_calls) == 1
             assert bridge.react_calls[0]["emoji"] == "🎉"
             assert bridge.react_calls[0]["message_id"] == "msg-99"
+        finally:
+            reset_current_channel_id(tok)
+
+    @pytest.mark.asyncio
+    async def test_default_resolves_recent_message_from_buffer(
+        self, tmp_path,
+    ) -> None:
+        """message_id omitted → resolve the most recent id-bearing
+        message on the channel (kind-agnostic) from the history buffer."""
+        from mimir.history import (
+            MessageBuffer, get_global_buffer, set_global_buffer,
+        )
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge))
+        buf = MessageBuffer(history_path=tmp_path / "h.jsonl")
+        prev = get_global_buffer()
+        set_global_buffer(buf)
+        tok = set_current_channel_id("chan-1")
+        try:
+            # An inbound (user) message is a valid default target — the
+            # common "acknowledge the last thing said" case.
+            await buf.append(buf.make_message(
+                channel_id="chan-1", kind="user_message",
+                content="hi", msg_id="m-7",
+            ))
+            out = await react.ainvoke({"emoji": "👍"})
+            assert "react ok:" in out
+            assert "message_id=m-7" in out
+            assert bridge.react_calls[0]["message_id"] == "m-7"
+        finally:
+            reset_current_channel_id(tok)
+            set_global_buffer(prev)  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    async def test_default_unresolvable_returns_error(self, tmp_path) -> None:
+        """No message_id and nothing in the buffer to default to → a
+        clear error, and the bridge is never called."""
+        from mimir.history import (
+            MessageBuffer, get_global_buffer, set_global_buffer,
+        )
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge))
+        buf = MessageBuffer(history_path=tmp_path / "h.jsonl")  # empty
+        prev = get_global_buffer()
+        set_global_buffer(buf)
+        tok = set_current_channel_id("chan-1")
+        try:
+            out = await react.ainvoke({"emoji": "👍"})
+            assert "react failed" in out
+            assert "no message_id" in out
+            assert bridge.react_calls == []
+        finally:
+            reset_current_channel_id(tok)
+            set_global_buffer(prev)  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    async def test_bridge_declines_returns_failed(self) -> None:
+        """A False bridge return (declined reaction) is surfaced as a
+        failure rather than reported as ok."""
+        bridge = _StubBridge()
+        bridge.react_returns = False
+        set_channel_registry(_StubRegistry(bridge))
+        tok = set_current_channel_id("chan-1")
+        try:
+            out = await react.ainvoke({"emoji": "👍", "message_id": "m-9"})
+            assert "react failed" in out
+            assert "declined" in out
         finally:
             reset_current_channel_id(tok)
 

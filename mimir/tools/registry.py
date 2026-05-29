@@ -283,6 +283,26 @@ async def send_message(
     return f"send_message ok: channel={cid} message_id={_mid}"
 
 
+def _resolve_recent_message_id(channel_id: str) -> Optional[str]:
+    """Most recent buffered message on ``channel_id`` that carries an id.
+
+    Backs ``react``'s default target. Returns None when no buffer is
+    registered (test paths that bypass ``server.serve``) or the channel
+    has no id-bearing message in the recent window. ``recent_for_channel``
+    pools across public channels, so we filter to the requested channel
+    and walk newest-first for the first message with a usable id.
+    """
+    from ..history import get_global_buffer
+    buf = get_global_buffer()
+    if buf is None:
+        return None
+    recent = buf.recent_for_channel(channel_id, limit=50)
+    for msg in reversed(recent):
+        if msg.channel_id == channel_id and msg.msg_id:
+            return msg.msg_id
+    return None
+
+
 @tool
 async def react(
     emoji: str,
@@ -292,14 +312,15 @@ async def react(
 ) -> str:
     """React to a message with an emoji.
 
-    Defaults to the most recent assistant message on the current
-    channel. Bridges that don't support native reactions (e.g. Bluesky)
-    log a no-op.
+    When ``message_id`` is omitted, defaults to the most recent message
+    on the channel that carries an id — usually the message being
+    acknowledged — resolved from the shared history buffer. Bridges that
+    don't support native reactions (e.g. Bluesky) log a no-op.
 
     Args:
         emoji: Reaction emoji (e.g. "👍").
-        message_id: Specific message to react to. Defaults to most
-            recent on the channel.
+        message_id: Specific message to react to. Defaults to the most
+            recent id-bearing message on the channel.
         channel_id: Channel scope. Defaults to current turn's.
     """
     channels = _STATE["channel_registry"]
@@ -311,11 +332,30 @@ async def react(
     bridge = channels.find(cid)
     if bridge is None:
         return f"react failed: no bridge for channel {cid!r}"
+    # chainlink #259 item 11: the str-typed bridge.react raises / no-ops
+    # on a None message_id, and the documented "most recent" default was
+    # never actually implemented (None was forwarded verbatim). Resolve
+    # it here from the shared history buffer instead.
+    if message_id is None:
+        message_id = _resolve_recent_message_id(cid)
+        if message_id is None:
+            return (
+                f"react failed: no message_id given and no recent "
+                f"id-bearing message on channel {cid} to default to — "
+                f"pass message_id explicitly"
+            )
     try:
-        await bridge.react(cid, message_id, emoji)
+        ok = await bridge.react(cid, message_id, emoji)
     except Exception as exc:
         return f"react failed: {exc}"
-    return f"react ok: channel={cid} emoji={emoji}"
+    # Bridges signal a declined reaction (bad id, missing scope, …) with
+    # a False return rather than an exception. Don't report "ok" on it.
+    if ok is False:
+        return (
+            f"react failed: bridge declined "
+            f"(channel={cid}, message_id={message_id}, emoji={emoji})"
+        )
+    return f"react ok: channel={cid} emoji={emoji} message_id={message_id}"
 
 
 @tool
