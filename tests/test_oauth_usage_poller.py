@@ -1827,3 +1827,112 @@ async def test_7d_anomaly_confirm_counter_resets_on_clean_reading(
     # Counter reset to 0 (key removed).
     state = _load_anomaly_confirm_state(state_path)
     assert "seven_day" not in state
+
+
+@pytest.mark.asyncio
+async def test_7d_anomaly_confirm_counter_preserved_when_no_sub_bucket_overlap(
+    tmp_path: Path,
+):
+    """When the 7d overall jumps significantly but the new poll has NO
+    sub-buckets at all, detect_seven_day_anomaly returns None because it
+    *can't evaluate* (unevaluable, not confirmed clean).  The confirm counter
+    must be preserved — not reset — so a genuine spend increase eventually
+    confirms after N consecutive polls (chainlink #253)."""
+    from mimir.oauth_usage_poller import (
+        PollerConfig, record_usage,
+        _load_anomaly_confirm_state, _anomaly_confirm_state_path,
+        _save_anomaly_confirm_state,
+    )
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op_mod
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    # Seed prior state: 7d=0.50 with a sonnet sub-bucket also at 0.50.
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+        observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day_sonnet", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+        observed_at="2026-05-09T00:00:00+00:00",
+    ))
+
+    # New payload: 7d jumps to 1.00 (50pp jump → anomalous territory) but
+    # the poll response contains NO sub-buckets at all — endpoint flapping.
+    # detect_seven_day_anomaly: absolute check skipped (no new_sub_buckets),
+    # delta check: jump=0.50 ≥ ANOMALY_7D_JUMP_PP, observed_keys=∅ → return None.
+    # This is "unevaluable", not "confirmed clean".
+    payload = {
+        "seven_day": {"status": "allowed", "utilization": 1.00,
+                      "resets_at": 9999999999},
+        # Intentionally no seven_day_sonnet — simulates sub-bucket flap.
+    }
+
+    cfg = PollerConfig(credentials_path=tmp_path / "creds.json")
+    state_path = _anomaly_confirm_state_path(cfg)
+    # Seed counter at 2 from prior anomaly rejections.
+    _save_anomaly_confirm_state(state_path, {"seven_day": 2})
+
+    orig = op_mod.log_event
+    op_mod.log_event = AsyncMock()
+    try:
+        recorded = await record_usage(store, payload, cfg=cfg)
+    finally:
+        op_mod.log_event = orig
+
+    # The 7d SHOULD write through (detector returned None → no rejection).
+    assert "anomalous" not in recorded.get("seven_day", {})
+    snap = store.current().get("seven_day")
+    assert snap is not None
+    assert snap.utilization == pytest.approx(1.00)
+    # Counter must be PRESERVED at 2, not reset.
+    state = _load_anomaly_confirm_state(state_path)
+    assert state.get("seven_day") == 2
+
+
+@pytest.mark.asyncio
+async def test_7d_anomaly_confirm_counter_reset_on_small_jump_without_sub_buckets(
+    tmp_path: Path,
+):
+    """A small 7d jump (< ANOMALY_7D_JUMP_PP) with no sub-buckets is
+    definitively clean — the detector confirms it at the jump-threshold
+    check.  The counter SHOULD be reset in this case."""
+    from mimir.oauth_usage_poller import (
+        PollerConfig, record_usage,
+        _load_anomaly_confirm_state, _anomaly_confirm_state_path,
+        _save_anomaly_confirm_state,
+        ANOMALY_7D_JUMP_PP,
+    )
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op_mod
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+        observed_at="2026-05-09T00:00:00+00:00",
+    ))
+
+    # Small jump: 0.50 → 0.55 (5pp < 30pp threshold) — definitively clean.
+    small_jump = 0.50 + ANOMALY_7D_JUMP_PP * 0.1  # Well below threshold.
+    payload = {
+        "seven_day": {"status": "allowed", "utilization": small_jump,
+                      "resets_at": 9999999999},
+        # No sub-buckets.
+    }
+
+    cfg = PollerConfig(credentials_path=tmp_path / "creds.json")
+    state_path = _anomaly_confirm_state_path(cfg)
+    _save_anomaly_confirm_state(state_path, {"seven_day": 3})
+
+    orig = op_mod.log_event
+    op_mod.log_event = AsyncMock()
+    try:
+        recorded = await record_usage(store, payload, cfg=cfg)
+    finally:
+        op_mod.log_event = orig
+
+    # Clean write-through.
+    assert "anomalous" not in recorded.get("seven_day", {})
+    # Counter SHOULD be reset (small jump is definitively clean).
+    state = _load_anomaly_confirm_state(state_path)
+    assert "seven_day" not in state

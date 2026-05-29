@@ -904,6 +904,59 @@ def detect_seven_day_anomaly(
     )
 
 
+def _seven_day_anomaly_is_evaluable(
+    *,
+    new_7d: float | None,
+    prev_7d: float | None,
+    new_sub_buckets: dict[str, float],
+    prev_sub_buckets: dict[str, float],
+) -> bool:
+    """Return True only when ``detect_seven_day_anomaly`` had sufficient
+    signal to positively confirm the 7d reading as clean (not anomalous).
+
+    ``detect_seven_day_anomaly`` returns ``None`` for two distinct reasons:
+
+    1. **Confirmed clean** — the read passed all applicable checks (no big
+       jump, or sub-buckets moved consistently with it, or the value is
+       internally coherent).
+    2. **Unevaluable** — the detector lacked the data needed to form a
+       judgment (no reading, no prior, or no overlapping sub-buckets despite
+       a large 7d jump).
+
+    The confirm counter in ``record_usage`` (chainlink #231) should only be
+    reset on case 1.  Case 2 — specifically when sub-bucket presence flaps
+    between polls — must preserve the counter so that a genuine spend
+    increase isn't indefinitely misclassified as a glitch (chainlink #253).
+
+    Mirrors the early-return logic of ``detect_seven_day_anomaly``; must be
+    kept in sync when that function changes.
+    """
+    if new_7d is None:
+        # No reading — can't evaluate.
+        return False
+
+    # Absolute-coherence check (chainlink #250) uses new_sub_buckets only.
+    # If new_sub_buckets is present and the check didn't fire (we're on the
+    # non-anomaly path), the value is internally coherent → evaluable.
+    if new_sub_buckets:
+        return True
+
+    # No sub-buckets available for the absolute check.  Fall through to the
+    # delta check conditions.
+    if prev_7d is None:
+        # First poll — no prior to compare against → unevaluable.
+        return False
+    jump = new_7d - prev_7d
+    if jump < ANOMALY_7D_JUMP_PP:
+        # Small or negative jump — definitively clean regardless of
+        # sub-bucket availability.
+        return True
+    # Large 7d jump with no new sub-buckets at all → no overlap possible →
+    # delta check short-circuited at the ``not observed_keys`` guard →
+    # unevaluable (chainlink #253 core case).
+    return False
+
+
 def derive_5h_from_cost(
     turns_log_path: Path,
     *,
@@ -1142,9 +1195,20 @@ async def record_usage(
                 }
                 continue
         elif window_type == "seven_day":
-            # Non-anomalous 7d reading — reset the confirmation counter
-            # so prior anomaly runs don't carry over across a clean read.
-            anomaly_confirm_state.pop("seven_day", None)
+            # Non-anomalous 7d reading — but only reset the confirmation
+            # counter if the detector had enough signal to confirm the read
+            # is genuinely clean.  When sub-bucket presence flaps between
+            # polls, detect_seven_day_anomaly returns None because it
+            # couldn't evaluate (not because it confirmed clean).  Resetting
+            # the counter in that case defeats the recovery mechanism
+            # (chainlink #253).
+            if _seven_day_anomaly_is_evaluable(
+                new_7d=new_7d.utilization if new_7d else None,
+                prev_7d=prior_7d.utilization if prior_7d else None,
+                new_sub_buckets=new_sub_buckets,
+                prev_sub_buckets=prior_sub_buckets,
+            ):
+                anomaly_confirm_state.pop("seven_day", None)
         if window_type == "five_hour" and anomaly_reason:
             # Reject the spike. Surface the rejection so the operator
             # (and the agent's algedonic block) can investigate.
