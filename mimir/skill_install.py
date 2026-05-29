@@ -40,6 +40,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -432,9 +433,16 @@ def prompt_and_write_env(
 def run_smoke_test(dest: Path, env_path: Path | None = None) -> tuple[int, str]:
     """Run the installed poller script once and return ``(exit_code, snippet)``.
 
-    Tries ``python3 poller.py --once`` first; if the poller doesn't accept
+    Tries ``<python> poller.py --once`` first; if the poller doesn't accept
     ``--once``, retries without it. Returns ``(-1, 'no poller.py found')``
     when the skill has no ``poller.py``.
+
+    Uses ``sys.executable`` (the interpreter mimir itself runs under) rather
+    than a bare ``python3`` on PATH: the poller's deps live in mimir's
+    environment, and a bare ``python3`` can resolve to an unrelated
+    interpreter — or, under a version manager like asdf/pyenv, to a shim
+    that exits 126 ("no version set") when invoked from the skill's own
+    directory (no ``.tool-versions`` there).
     """
     poller = dest / "poller.py"
     if not poller.is_file():
@@ -449,7 +457,7 @@ def run_smoke_test(dest: Path, env_path: Path | None = None) -> tuple[int, str]:
     for args in (["--once"], []):
         try:
             result = subprocess.run(
-                ["python3", str(poller), *args],
+                [sys.executable, str(poller), *args],
                 capture_output=True,
                 text=True,
                 timeout=30,
