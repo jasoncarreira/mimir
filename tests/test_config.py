@@ -207,11 +207,12 @@ class TestConfigFromEnv:
         # Avoid picking up the live oauth credentials path from the container.
         monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
 
-    def test_home_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._base(monkeypatch)
+    def test_home_from_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
         from mimir.config import Config
         cfg = Config.from_env()
-        assert cfg.home == Path("/tmp")
+        assert cfg.home == tmp_path.resolve()
 
     def test_agent_id_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._base(monkeypatch)
@@ -358,24 +359,24 @@ class TestConfigProperties:
         from mimir.config import Config
         return Config.from_env()
 
-    def test_logs_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        cfg = self._cfg(monkeypatch)
-        assert cfg.logs_dir == Path("/tmp/logs")
+    def test_logs_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = self._cfg(monkeypatch, home=str(tmp_path))
+        assert cfg.logs_dir == tmp_path.resolve() / "logs"
 
-    def test_turns_log(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        cfg = self._cfg(monkeypatch)
-        assert cfg.turns_log == Path("/tmp/logs/turns.jsonl")
+    def test_turns_log(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = self._cfg(monkeypatch, home=str(tmp_path))
+        assert cfg.turns_log == tmp_path.resolve() / "logs" / "turns.jsonl"
 
-    def test_events_log(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        cfg = self._cfg(monkeypatch)
-        assert cfg.events_log == Path("/tmp/logs/events.jsonl")
+    def test_events_log(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = self._cfg(monkeypatch, home=str(tmp_path))
+        assert cfg.events_log == tmp_path.resolve() / "logs" / "events.jsonl"
 
-    def test_commitments_log(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_commitments_log(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """commitments_log lives under ``.mimir/`` (not ``logs/``) so the
         indexer doesn't treat it as searchable content.
         """
-        cfg = self._cfg(monkeypatch)
-        assert cfg.commitments_log == Path("/tmp/.mimir/commitments.jsonl")
+        cfg = self._cfg(monkeypatch, home=str(tmp_path))
+        assert cfg.commitments_log == tmp_path.resolve() / ".mimir" / "commitments.jsonl"
 
     def test_sdk_env_overrides_omits_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """sdk_env_overrides only includes non-empty override values."""
