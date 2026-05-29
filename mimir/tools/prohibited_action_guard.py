@@ -115,8 +115,10 @@ def check_prohibited_bash(command: str) -> str | None:
             return (
                 f"{_BLOCK_PREFIX}: {prohibition.message} is in the "
                 f"'prohibited' zone per memory/core/06-action-boundaries.md "
-                f"§Git/repo. This action is blocked at the harness level. "
-                f"If you believe this is an error, escalate to the operator."
+                f"§Git/repo. Refused by mimir's destructive-action "
+                f"guardrail (an accident deterrent — see "
+                f"prohibited_action_guard.py). Don't work around it; if "
+                f"you believe this is an error, escalate to the operator."
             )
     return None
 

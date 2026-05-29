@@ -898,3 +898,34 @@ async def test_negative_weight_raises(tmp_path: Path):
 
     with pytest.raises(ValueError, match="non-negative"):
         await idx.search("Boids", scope="all", k=5, semantic_weight=-0.1)
+
+
+@pytest.mark.asyncio
+async def test_semantic_fill_orders_by_mtime_deterministically(tmp_path: Path):
+    """chainlink #259: when FTS underfills (here: a non-matching query),
+    the semantic fill selects candidates by mtime DESC — deterministic,
+    newest-first — instead of arbitrary insertion order. With a bounded
+    candidate_pool the newest files win predictably."""
+    import os
+    (tmp_path / "memory" / "topics").mkdir(parents=True)
+    (tmp_path / "memory" / "INDEX.md").write_text("# auto")
+    paths = []
+    for name in ["a", "b", "c", "d"]:
+        p = tmp_path / "memory" / "topics" / f"{name}.md"
+        p.write_text(f"<!-- desc: topic {name} -->\nNotes about widgets {name}.")
+        paths.append(p)
+    # Distinct, increasing mtimes: a oldest … d newest.
+    base = 1_700_000_000
+    for i, p in enumerate(paths):
+        os.utime(p, (base + i * 1000, base + i * 1000))
+
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    # Non-matching token → FTS empty → semantic fill. Pool of 2 → the two
+    # newest files (c, d) deterministically; never the older a/b.
+    results = await idx.search(
+        "zzqnonmatchingtoken", scope="all", k=10, candidate_pool=2,
+    )
+    got = {r.path for r in results}
+    assert got == {"memory/topics/c.md", "memory/topics/d.md"}, got
