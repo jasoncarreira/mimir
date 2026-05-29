@@ -197,3 +197,61 @@ class TestGeneralRecallExcludesSkillLearning:
             "skill_learning atom leaked into general recall — it must only "
             "surface via the skill-load injection"
         )
+
+
+# ── load-injection helpers (chainlink #266, slice 2) ─────────────────
+
+
+class TestRenderAndAugment:
+    def test_render_empty(self):
+        from mimir.skill_memory import render_skill_learnings
+        assert render_skill_learnings([]) == ""
+
+    def test_render_one_bullet_per_learning_with_kind(self):
+        from mimir.skill_memory import render_skill_learnings
+        out = render_skill_learnings([
+            {"kind": "failure-mode", "content": "resets on reconnect"},
+            {"kind": "tip", "content": "pass --foo"},
+        ])
+        assert out == "- [failure-mode] resets on reconnect\n- [tip] pass --foo"
+
+    def test_render_single_lines_multiline_content(self):
+        from mimir.skill_memory import render_skill_learnings
+        out = render_skill_learnings([{"kind": "tip", "content": "line1\n\nline2"}])
+        assert "\n" not in out.split("] ", 1)[1]  # content portion is one line
+        assert out == "- [tip] line1 line2"
+
+    @pytest.mark.asyncio
+    async def test_augment_appends_learnings(self, store):
+        await _add_learning(store, "cb", "failure-mode", "resets on reconnect")
+        from mimir.skill_memory import augment_skill_body
+        conn = store._ensure_conn()
+        out = augment_skill_body(conn, "cb", "ORIGINAL BODY")
+        assert out.startswith("ORIGINAL BODY")
+        assert "## Learnings from past runs" in out
+        assert "[failure-mode] resets on reconnect" in out
+
+    @pytest.mark.asyncio
+    async def test_augment_no_learnings_returns_body_unchanged(self, store):
+        from mimir.skill_memory import augment_skill_body
+        conn = store._ensure_conn()
+        assert augment_skill_body(conn, "never-used", "ORIGINAL") == "ORIGINAL"
+
+    @pytest.mark.asyncio
+    async def test_augment_swallows_db_error(self, store, monkeypatch):
+        """A recall error must not fail the skill load — body returned as-is."""
+        import mimir.skill_memory as sm
+        monkeypatch.setattr(sm, "recall_skill_learnings",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        conn = store._ensure_conn()
+        assert sm.augment_skill_body(conn, "cb", "BODY") == "BODY"
+
+
+class TestSagaStoreConnection:
+    @pytest.mark.asyncio
+    async def test_connection_accessor_returns_usable_conn(self, store):
+        await _add_learning(store, "cb", "tip", "x")
+        from mimir.skill_memory import recall_skill_learnings
+        conn = store.connection()
+        # The public accessor returns a conn the skill_memory helpers can use.
+        assert recall_skill_learnings(conn, "cb")[0]["content"] == "x"
