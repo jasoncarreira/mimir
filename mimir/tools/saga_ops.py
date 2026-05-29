@@ -52,6 +52,30 @@ def _resolve_session_id(explicit: str | None) -> str | None:
     return getattr(ctx, "saga_session_id", None) if ctx is not None else None
 
 
+async def _emit_feedback_sent(
+    atom_count: int, feedback: str, session_id: str | None,
+) -> None:
+    """Best-effort ``saga_feedback_sent`` emit for the agent-curated
+    feedback path.
+
+    The per-turn auto-credit pass in ``agent.run_turn`` that used to emit
+    this was removed (operator decision 2026-05-29): activation should
+    rise only from the retrieval access event + DELIBERATE agent feedback.
+    This event now marks that deliberate feedback — driving viability loop
+    1.1 and the self-state feedback line off real curation rather than a
+    blanket "the turn didn't fail" boost. Never raises."""
+    try:
+        from ..event_logger import log_event
+        await log_event(
+            "saga_feedback_sent",
+            atom_count=atom_count,
+            feedback=feedback,
+            session_id=session_id,
+        )
+    except Exception:  # noqa: BLE001 — observability emit is best-effort
+        pass
+
+
 @tool
 async def saga_feedback(
     atom_id: str,
@@ -85,6 +109,7 @@ async def saga_feedback(
         await client.outcome([atom_id], feedback=wire, session_id=sid)
     except Exception as exc:  # noqa: BLE001 — SagaError surfaces via str
         return f"saga_feedback failed: {exc}"
+    await _emit_feedback_sent(1, wire, sid)
     return f"saga_feedback ok: {atom_id} → {wire}"
 
 
@@ -96,9 +121,11 @@ async def saga_mark_contributions(
 ) -> str:
     """Manually credit a list of atom_ids against a response.
 
-    The post-message hook handles this automatically with the union
-    of pre-injected and mid-turn-queried atoms — use this tool only
-    if you want to credit atoms outside the standard flow.
+    Credit is now agent-curated only — the per-turn auto-credit pass was
+    removed (operator decision 2026-05-29), so call this when atoms
+    genuinely informed your response and you want their activation lifted
+    (a ``feedback_positive`` event). Don't blanket-credit everything that
+    was merely in context.
 
     Args:
         atom_ids: SAGA atom ids to credit.
@@ -117,6 +144,7 @@ async def saga_mark_contributions(
         await client.feedback(atom_ids, response_text, session_id=sid)
     except Exception as exc:  # noqa: BLE001
         return f"saga_mark_contributions failed: {exc}"
+    await _emit_feedback_sent(len(atom_ids), "positive", sid)
     return f"saga_mark_contributions ok: credited {len(atom_ids)} atoms"
 
 

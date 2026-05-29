@@ -865,11 +865,16 @@ async def test_event_logger_stamps_agent_id_on_records(tmp_path: Path):
 # ─── Algedonic pipeline gaps (algedonic-gaps-5 PR) ──────────────────
 
 
-async def test_run_turn_emits_saga_feedback_sent_event(tmp_path: Path):
-    """Gap 1 fix: a ``saga_feedback_sent`` event must land in events.jsonl
-    after a turn whose saga.feedback() call succeeds. Pre-fix the call
-    happened but nothing logged it, leaving the positive algedonic bucket
-    empty each turn."""
+async def test_run_turn_does_not_auto_feedback(tmp_path: Path):
+    """Operator decision 2026-05-29: the per-turn auto-credit pass is gone.
+
+    run_turn must NOT call ``saga.feedback()`` just because a turn cited
+    atoms and didn't fail, and must NOT emit ``saga_feedback_sent`` — that
+    blanket positive-on-success boost inflated every retrieved atom
+    regardless of use. Activation now rises only from the retrieval access
+    event recall logs + DELIBERATE agent-curated feedback (the
+    ``saga_feedback`` / ``saga_mark_contributions`` tools carry the
+    ``saga_feedback_sent`` emit now)."""
     fake_agent = _FakeAgent(response_messages=[AIMessage(content="done")])
     fake_saga = _FakeSaga(query_hits=[
         {"atom_id": "a" * 16, "content": "prior memory", "stream": "semantic"},
@@ -878,11 +883,17 @@ async def test_run_turn_emits_saga_feedback_sent_event(tmp_path: Path):
     event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hello")
     await agent.run_turn(event)
 
+    # No automatic contribution-credit call, even though an atom was cited
+    # and the turn succeeded.
+    assert fake_saga.feedback_calls == [], (
+        "run_turn must not auto-call saga.feedback (per-turn auto-credit removed)"
+    )
     import json as _json
     events_path = tmp_path / "home" / "logs" / "events.jsonl"
     event_types = [_json.loads(l)["type"] for l in events_path.read_text().splitlines() if l]
-    assert "saga_feedback_sent" in event_types, (
-        "saga_feedback_sent must be emitted when saga.feedback() succeeds"
+    assert "saga_feedback_sent" not in event_types, (
+        "run_turn must not emit saga_feedback_sent — now carried by the "
+        "agent-curated feedback tools"
     )
 
 
@@ -1244,3 +1255,38 @@ def test_turn_matched_expected_tool_call_discriminates_review_from_review_commen
     assert _turn_matched_expected_tool_call(
         review_submit_events, markers,
     ) is True
+
+
+async def test_run_turn_folds_injected_skill_atoms_into_record_no_autofeedback(
+    tmp_path: Path, monkeypatch
+):
+    """slice 6 integration: skill-learning atom IDs recorded onto the turn
+    ctx during prompt build (poller auto_skill_block / non-poller middleware)
+    must land in the TurnRecord's saga_atom_ids — so the session-boundary
+    synthesis turn can vote them — WITHOUT triggering the (removed) per-turn
+    auto-feedback."""
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="done")])
+    fake_saga = _FakeSaga(query_hits=[
+        {"atom_id": "a" * 16, "content": "prior memory", "stream": "semantic"},
+    ])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=fake_saga)
+
+    skill_atom = "s" * 16
+    orig = agent._build_turn_prompt
+
+    async def _patched(ctx, event, **kw):
+        # Stand in for the injection sites populating the turn ctx.
+        ctx.injected_skill_atom_ids.append(skill_atom)
+        return await orig(ctx, event, **kw)
+
+    monkeypatch.setattr(agent, "_build_turn_prompt", _patched)
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hello")
+    record = await agent.run_turn(event)
+
+    # Skill atom folded into the record for synthesis voting...
+    assert skill_atom in record.saga_atom_ids
+    # ...alongside the pre-injected retrieval atom.
+    assert "a" * 16 in record.saga_atom_ids
+    # ...but NOT auto-credited (per-turn feedback removed).
+    assert fake_saga.feedback_calls == []

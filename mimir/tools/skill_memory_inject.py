@@ -91,20 +91,46 @@ def _is_success_text(result: Any) -> bool:
     )
 
 
-def _compute_augmented(file_path: str, content: Any, conn: Any) -> str | None:
-    """Return augmented content, or ``None`` to leave the read unchanged.
+def _compute_augmented(
+    file_path: str, content: Any, conn: Any,
+) -> tuple[str | None, list[str]]:
+    """Return ``(augmented_content_or_None, injected_atom_ids)``.
 
-    Pure/sync so the async path can offload it to a thread (the SQL in
+    ``None`` for the content leaves the read unchanged. The atom IDs are
+    the injected learnings, recorded onto the turn (slice 6) so the
+    session-boundary synthesis turn can curate feedback on them. Pure/sync
+    so the async path can offload it to a thread (the SQL in
     ``augment_skill_body`` shouldn't run on the event loop)."""
     skill = _skill_from_path(file_path)
     if skill is None or conn is None or not isinstance(content, str):
-        return None
+        return None, []
     try:
         from .. import skill_memory
-        augmented = skill_memory.augment_skill_body(conn, skill, content)
+        augmented, ids = skill_memory.augment_skill_body(conn, skill, content)
     except Exception:  # noqa: BLE001 — never break a file read
-        return None
-    return augmented if augmented != content else None
+        return None, []
+    if augmented == content:
+        return None, []
+    return augmented, ids
+
+
+def _record_injected_ids(ids: list[str]) -> None:
+    """Best-effort: append injected skill-learning atom IDs to the active
+    turn's ``injected_skill_atom_ids`` so run_turn folds them into the
+    TurnRecord for the synthesis turn to vote on. No-op off-turn."""
+    if not ids:
+        return
+    try:
+        from .._context import get_current_turn
+        ctx = get_current_turn()
+        bucket = getattr(ctx, "injected_skill_atom_ids", None)
+        if bucket is None:
+            return
+        for aid in ids:
+            if aid not in bucket:
+                bucket.append(aid)
+    except Exception:  # noqa: BLE001 — injection bookkeeping is best-effort
+        pass
 
 
 class SkillMemoryInjectionMiddleware(AgentMiddleware):
@@ -123,11 +149,12 @@ class SkillMemoryInjectionMiddleware(AgentMiddleware):
         result = handler(request)
         if _tool_name(request) != _READ_FILE_TOOL or not _is_success_text(result):
             return result
-        augmented = _compute_augmented(
+        augmented, ids = _compute_augmented(
             _file_path_arg(request), result.content, _resolve_conn(),
         )
         if augmented is not None:
             result.content = augmented
+            _record_injected_ids(ids)
         return result
 
     async def awrap_tool_call(
@@ -138,10 +165,11 @@ class SkillMemoryInjectionMiddleware(AgentMiddleware):
         result = await handler(request)
         if _tool_name(request) != _READ_FILE_TOOL or not _is_success_text(result):
             return result
-        augmented = await asyncio.to_thread(
+        augmented, ids = await asyncio.to_thread(
             _compute_augmented,
             _file_path_arg(request), result.content, _resolve_conn(),
         )
         if augmented is not None:
             result.content = augmented
+            _record_injected_ids(ids)
         return result

@@ -1227,48 +1227,34 @@ class Agent:
             except Exception:  # noqa: BLE001 — defensive boundary
                 log.exception("quota_pause emit failed; continuing")
 
-        # Result fields drive both the TurnRecord and the feedback-signal
-        # branch below, so compute once and reuse.
+        # Result fields drive the TurnRecord, so compute once and reuse.
         result_fields = derive_result_fields(messages)
 
-        # Post-message credit pass. Branch on result: a successful turn
-        # contributes positive evidence ("these atoms helped the agent
-        # answer"); an errored or max_turns-truncated turn is negative
-        # evidence ("retrieval surfaced these but the agent couldn't
-        # land an answer"). Saga's record_outcome routes the signal to
-        # the activation-log weight accordingly.
-        if saga_atom_ids and self._saga is not None:
-            stop_reason = result_fields.get("stop_reason")
-            is_failure = (
-                error is not None
-                or result_fields.get("result_is_error")
-                or stop_reason in ("max_turns", "max_tokens")
-            )
-            feedback_signal = "negative" if is_failure else "positive"
-            try:
-                # Union: pre-message atoms + atom IDs surfaced in tool results
-                tool_atom_ids = _extract_atom_ids_from_tool_results(messages)
-                seen2 = set(saga_atom_ids)
-                for aid in tool_atom_ids:
-                    if aid not in seen2:
-                        seen2.add(aid)
-                        saga_atom_ids.append(aid)
-                await self._saga.feedback(
-                    saga_atom_ids,
-                    output,
-                    session_id=saga_session_id,
-                    feedback=feedback_signal,
-                )
-                # Gap 1 fix: positive algedonic signal so the per-turn
-                # block shows at least one positive when feedback runs.
-                await safe_log_event(
-                    "saga_feedback_sent",
-                    atom_count=len(saga_atom_ids),
-                    feedback=feedback_signal,
-                    session_id=saga_session_id,
-                )
-            except Exception as exc:
-                log.warning("post-message saga.feedback failed: %s", exc)
+        # Assemble this turn's cited-atom set for the TurnRecord. NO
+        # automatic feedback (operator decision 2026-05-29): the old
+        # post-message credit pass wrote a weight-2.0 ``feedback_positive``
+        # boost on every cited atom whenever the turn merely "didn't fail"
+        # — a positive-only ratchet layered on top of the ``retrieval``
+        # access event recall already logs, crediting atoms for being in
+        # the context window rather than for being used. Activation now
+        # rises only from (a) that retrieval access event and (b)
+        # DELIBERATE agent-curated feedback: the session-boundary synthesis
+        # turn's ``saga_feedback`` votes and explicit
+        # ``saga_mark_contributions`` (both emit ``saga_feedback_sent``).
+        #
+        # We still build the cited-atom union — pre-injected retrievals +
+        # mid-turn ``saga_query`` hits + injected skill learnings (slice 6)
+        # — because that's the candidate list the synthesis turn curates
+        # over (it reaches the synthesis prompt via the TurnRecord's
+        # ``saga_atom_ids`` → turns.jsonl → ``_atom_feedback_lines``).
+        if self._saga is not None:
+            tool_atom_ids = _extract_atom_ids_from_tool_results(messages)
+            for aid in tool_atom_ids:
+                if aid not in saga_atom_ids:
+                    saga_atom_ids.append(aid)
+        for aid in ctx.injected_skill_atom_ids:
+            if aid not in saga_atom_ids:
+                saga_atom_ids.append(aid)
 
         # Build and write TurnRecord — matches the SDK schema.
         # Drain observability state captured during this turn:
@@ -2174,10 +2160,17 @@ class Agent:
             from . import skill_memory
             _skill_name, _skill_body = auto_skill_block
             _conn = self._saga_store.connection()
-            _augmented = await asyncio.to_thread(
+            _augmented, _injected_ids = await asyncio.to_thread(
                 skill_memory.augment_skill_body, _conn, _skill_name, _skill_body,
             )
             auto_skill_block = (_skill_name, _augmented)
+            # slice 6: record the injected learnings as this turn's cited
+            # atoms so the session-boundary synthesis turn curates feedback
+            # on them (run_turn folds ctx.injected_skill_atom_ids into the
+            # TurnRecord's saga_atom_ids).
+            for _aid in _injected_ids:
+                if _aid not in ctx.injected_skill_atom_ids:
+                    ctx.injected_skill_atom_ids.append(_aid)
         # Channel memory injection (chainlink #187): load per-channel fact
         # files (operator name, preferences, patterns) from
         # ``memory/channels/<channel_id>/``.  Returns None for synthetic

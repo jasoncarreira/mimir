@@ -29,7 +29,9 @@ from .loop_inventory import LoopTag, scan as scan_inventory, default_roots
 # get a custom probe in _measure_runtime.
 
 _LOOP_EVENT_MAP: dict[str, list[str]] = {
-    "1.1": ["saga_feedback_sent"],         # post-message credit pass
+    "1.1": ["saga_feedback_sent"],         # agent-curated feedback
+                                           # (saga_feedback / mark_contributions;
+                                           # per-turn auto-credit removed 2026-05-29)
     "1.3": ["send_message_loop_warning",
             "send_message_loop_hard_stop"],  # LoopDetector trips
     "1.4": ["tool_call_denied",

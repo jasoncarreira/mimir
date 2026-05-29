@@ -223,19 +223,22 @@ class TestRenderAndAugment:
 
     @pytest.mark.asyncio
     async def test_augment_appends_learnings(self, store):
-        await _add_learning(store, "cb", "failure-mode", "resets on reconnect")
+        sl = await _add_learning(store, "cb", "failure-mode", "resets on reconnect")
         from mimir.skill_memory import augment_skill_body
         conn = store._ensure_conn()
-        out = augment_skill_body(conn, "cb", "ORIGINAL BODY")
+        out, ids = augment_skill_body(conn, "cb", "ORIGINAL BODY")
         assert out.startswith("ORIGINAL BODY")
         assert "## Learnings from past runs" in out
         assert "[failure-mode] resets on reconnect" in out
+        # slice 6: the injected learning's atom_id is returned so the turn
+        # can record it for session-boundary voting.
+        assert ids == [sl["atom_id"]]
 
     @pytest.mark.asyncio
     async def test_augment_no_learnings_returns_body_unchanged(self, store):
         from mimir.skill_memory import augment_skill_body
         conn = store._ensure_conn()
-        assert augment_skill_body(conn, "never-used", "ORIGINAL") == "ORIGINAL"
+        assert augment_skill_body(conn, "never-used", "ORIGINAL") == ("ORIGINAL", [])
 
     @pytest.mark.asyncio
     async def test_augment_swallows_db_error(self, store, monkeypatch):
@@ -244,7 +247,7 @@ class TestRenderAndAugment:
         monkeypatch.setattr(sm, "recall_skill_learnings",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         conn = store._ensure_conn()
-        assert sm.augment_skill_body(conn, "cb", "BODY") == "BODY"
+        assert sm.augment_skill_body(conn, "cb", "BODY") == ("BODY", [])
 
 
 class TestSagaStoreConnection:
@@ -255,3 +258,40 @@ class TestSagaStoreConnection:
         conn = store.connection()
         # The public accessor returns a conn the skill_memory helpers can use.
         assert recall_skill_learnings(conn, "cb")[0]["content"] == "x"
+
+
+# ── activation ranking (chainlink #266 slice 6) ──────────────────────
+
+
+class TestActivationRanking:
+    @pytest.mark.asyncio
+    async def test_useful_voted_learning_outranks_newer_unvoted(self, store):
+        """A learning the agent later marked *useful* (a feedback_positive
+        access event, weight 2.0) must out-rank a newer, never-voted learning
+        — that's the point of activation ranking over pure recency."""
+        old = await _add_learning(store, "s", "tip", "old but useful")
+        await _add_learning(store, "s", "tip", "newer but unused")
+        conn = store._ensure_conn()
+
+        # Pre-vote: recency wins → newest first.
+        before = recall_skill_learnings(conn, "s")
+        assert before[0]["content"] == "newer but unused"
+
+        # The agent curates: marks the OLD learning useful (weight-2.0 event).
+        await store.outcome([old["atom_id"]], feedback="positive")
+
+        after = recall_skill_learnings(conn, "s")
+        assert after[0]["content"] == "old but useful", (
+            "a useful-voted learning should rise above a newer un-voted one"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unvoted_falls_back_to_recency(self, store):
+        """With no curation, activation == recency-decay, so ranking is
+        newest-first (degrades gracefully to the old behavior)."""
+        await _add_learning(store, "s", "tip", "first")
+        await _add_learning(store, "s", "tip", "second")
+        await _add_learning(store, "s", "tip", "third")
+        conn = store._ensure_conn()
+        got = recall_skill_learnings(conn, "s")
+        assert [r["content"] for r in got] == ["third", "second", "first"]
