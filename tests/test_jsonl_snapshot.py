@@ -235,3 +235,58 @@ def test_records_thread_safe(tmp_path: Path):
     # All workers see the same data — same list contents, same length.
     assert all(len(r) == 100 for r in results)
     assert all([r["i"] for r in res] == [r["i"] for r in results[0]] for res in results)
+
+
+# ─── Saturation observability (chainlink #259 item 15) ───────────────
+
+
+def test_not_saturated_when_under_cap(tmp_path: Path):
+    path = tmp_path / "events.jsonl"
+    _write_jsonl(path, [{"i": n} for n in range(5)])
+    snap = JsonlSnapshot(path, max_records=10)
+    out = snap.records()
+    assert len(out) == 5
+    assert snap.saturated is False
+
+
+def test_saturated_when_cap_hit(tmp_path: Path):
+    """A file with more records than the cap drains to exactly the cap
+    and reports saturated — the signal a time-windowed scan can be
+    silently truncated."""
+    path = tmp_path / "events.jsonl"
+    _write_jsonl(path, [{"i": n} for n in range(25)])
+    snap = JsonlSnapshot(path, max_records=10)
+    out = snap.records()
+    assert len(out) == 10
+    # Newest-first, capped at the 10 most recent.
+    assert [r["i"] for r in out] == list(range(24, 14, -1))
+    assert snap.saturated is True
+
+
+def test_saturation_warns_once(tmp_path: Path, caplog):
+    """Saturation logs a warning, but only once per process/path even
+    across re-reads, so a steady firehose doesn't spam the log."""
+    import logging
+    path = tmp_path / "events.jsonl"
+    _write_jsonl(path, [{"i": n} for n in range(15)])
+    snap = JsonlSnapshot(path, ttl_s=0.0, max_records=10)
+    with caplog.at_level(logging.WARNING, logger="mimir.jsonl_snapshot"):
+        snap.records()
+        _append_jsonl(path, [{"i": 99}])
+        _bump_mtime(path)
+        snap.records()  # second drain, still saturated
+    warnings = [r for r in caplog.records if "saturated" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_saturated_clears_when_file_shrinks_under_cap(tmp_path: Path):
+    """Saturation reflects the latest drain — if the tail later fits under
+    the cap, the flag clears."""
+    path = tmp_path / "events.jsonl"
+    _write_jsonl(path, [{"i": n} for n in range(15)])
+    snap = JsonlSnapshot(path, ttl_s=0.0, max_records=10)
+    assert snap.records() and snap.saturated is True
+    _write_jsonl(path, [{"i": 1}, {"i": 2}])  # rewrite smaller
+    _bump_mtime(path)
+    snap.records()
+    assert snap.saturated is False

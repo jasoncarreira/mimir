@@ -49,10 +49,19 @@ _DEFAULT_TTL_S = 5.0
 # Records older than the cached window are read by very few call sites
 # (the homeostat 7-day window is the deepest); those sites tolerate
 # missing-old-records since the data they care about is typically in
-# the last day. A mismatched cap is observable: ``misses`` (the count
-# of times the snapshot had to be re-read because an entry beyond the
-# tail was needed) shows up in events.jsonl, which CR#10 didn't pin
-# but is easy to add later if the cap proves too tight.
+# the last day.
+#
+# Failure mode under a firehose (chainlink #259 item 15): time-windowed
+# scans (e.g. cross-turn dedup / arousal counts over the last 24h) walk
+# the newest-first records and early-break at ``ts < cutoff``. If a day
+# produces >``_DEFAULT_MAX_RECORDS`` events, the cap is exhausted before
+# the cutoff is reached, so the scan silently sees only the newest 10k
+# and never reaches its window edge. We can't make the cap window-aware
+# without giving up the memory bound (an unbounded firehose would load
+# unbounded records), so instead we make the truncation OBSERVABLE: a
+# saturated snapshot exposes ``saturated`` and logs a one-time warning,
+# so a too-tight cap shows up in logs rather than as a silently short
+# window.
 _DEFAULT_MAX_RECORDS = 10000
 
 
@@ -82,10 +91,26 @@ class JsonlSnapshot:
         self._cached_mtime: float = -1.0
         self._cache_until: float = 0.0
         self._lock = threading.Lock()
+        # True when the last tail-drain hit the record cap, so the cached
+        # list may not reach back as far as a time-windowed caller wants
+        # (chainlink #259 item 15). One-time warning guard so a steady
+        # firehose doesn't spam the log every re-read.
+        self._saturated: bool = False
+        self._saturation_warned: bool = False
 
     @property
     def path(self) -> Path:
         return self._path
+
+    @property
+    def saturated(self) -> bool:
+        """True if the cached tail hit the ``max_records`` cap on its last
+        drain — a time-windowed scan that exhausts the snapshot without
+        reaching its cutoff may be silently truncated. Callers doing such
+        scans can check this to flag a short window. Reflects the most
+        recent drain; reads within the TTL keep the prior value."""
+        with self._lock:
+            return self._saturated
 
     def records(self) -> list[dict]:
         """Return the cached newest-first records, refreshing if stale.
@@ -121,6 +146,19 @@ class JsonlSnapshot:
             self._records = list(self._collect_tail())
             self._cached_mtime = stat.st_mtime
             self._cache_until = now + self._ttl
+            # Saturated when the drain filled to the cap — the tail may
+            # extend past what we cached, so time-windowed scans can be
+            # truncated (chainlink #259 item 15). Warn once per process
+            # per path so a too-tight cap is visible without log spam.
+            self._saturated = len(self._records) >= self._max
+            if self._saturated and not self._saturation_warned:
+                self._saturation_warned = True
+                log.warning(
+                    "JsonlSnapshot saturated: %s capped at %d records; "
+                    "time-windowed scans may see a shorter window than "
+                    "requested. Raise max_records or tighten retention.",
+                    self._path, self._max,
+                )
             return self._records
 
     def invalidate(self) -> None:
