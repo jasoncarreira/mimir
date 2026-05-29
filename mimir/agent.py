@@ -875,6 +875,13 @@ class Agent:
             # built-ins — production heartbeats hit 142 tool_calls
             # vs a budget of 120 with zero denials firing.
             from .tools.budget_gate import BudgetGateMiddleware
+            # chainlink #266 (slice 3): on non-poller turns the model
+            # loads a skill by read_file-ing its SKILL.md; this middleware
+            # appends that skill's recorded learnings to the result. Ordered
+            # AFTER the budget gate so a budget-denied read never triggers
+            # injection (it's order-robust regardless — it only augments
+            # successful read_file results on a <skill>/SKILL.md path).
+            from .tools.skill_memory_inject import SkillMemoryInjectionMiddleware
             self._agent = create_deep_agent(
                 model=_resolve_model(
                     model_spec,
@@ -885,7 +892,10 @@ class Agent:
                 system_prompt=system_prompt,
                 backend=backend,
                 skills=skill_sources or None,
-                middleware=(BudgetGateMiddleware(),),
+                middleware=(
+                    BudgetGateMiddleware(),
+                    SkillMemoryInjectionMiddleware(),
+                ),
             )
             return self._agent
 
