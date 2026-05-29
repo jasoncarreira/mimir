@@ -237,3 +237,55 @@ class TestSyncInjection:
             handler,
         )
         assert out.content == "BODY"
+
+
+# ── slice 6: injected IDs land on the turn for synthesis voting ──────
+
+
+class TestInjectedIdCapture:
+    @pytest.mark.asyncio
+    async def test_records_injected_ids_onto_turn_context(self, store):
+        """After augmenting a SKILL.md read, the injected learning atom IDs
+        must be recorded on the active turn's injected_skill_atom_ids so
+        run_turn folds them into the TurnRecord for synthesis voting."""
+        import time as _time
+        from mimir._context import set_current_turn, reset_current_turn
+        from mimir.models import TurnContext
+
+        sl = await _add_learning(store, "memory", "tip", "a useful tip")
+        ctx = TurnContext(
+            turn_id="t", session_id="c", trigger="user_message",
+            channel_id="c", started_at=_time.monotonic(),
+        )
+        tok = set_current_turn(ctx)
+        try:
+            mw = SkillMemoryInjectionMiddleware()
+            _, ahandler, _ = _make_handler(_read_result("BODY"))
+            out = await mw.awrap_tool_call(
+                _read_request("/x/skills/memory/SKILL.md"), ahandler,
+            )
+            assert "a useful tip" in out.content  # augmentation happened
+            assert ctx.injected_skill_atom_ids == [sl["atom_id"]]
+        finally:
+            reset_current_turn(tok)
+
+    @pytest.mark.asyncio
+    async def test_no_ids_recorded_when_no_learnings(self, store):
+        import time as _time
+        from mimir._context import set_current_turn, reset_current_turn
+        from mimir.models import TurnContext
+
+        ctx = TurnContext(
+            turn_id="t", session_id="c", trigger="user_message",
+            channel_id="c", started_at=_time.monotonic(),
+        )
+        tok = set_current_turn(ctx)
+        try:
+            mw = SkillMemoryInjectionMiddleware()
+            _, ahandler, _ = _make_handler(_read_result("BODY"))
+            await mw.awrap_tool_call(
+                _read_request("/x/skills/never-used/SKILL.md"), ahandler,
+            )
+            assert ctx.injected_skill_atom_ids == []
+        finally:
+            reset_current_turn(tok)

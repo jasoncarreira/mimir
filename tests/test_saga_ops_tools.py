@@ -276,3 +276,68 @@ async def test_forget_no_store_returns_error(
         assert "no SagaStore configured" in out
     finally:
         _MEMORY_STATE["client"] = prev
+
+
+# ─── agent-curated feedback emits saga_feedback_sent (chainlink #266 slice 6) ───
+# The per-turn auto-credit pass that used to emit saga_feedback_sent was
+# removed; the deliberate feedback tools carry the emit now so viability
+# loop 1.1 + the self-state feedback line stay alive off real curation.
+
+
+@pytest.mark.asyncio
+async def test_saga_feedback_emits_feedback_sent(
+    store: _StubStore, turn_with_session: TurnContext, monkeypatch
+) -> None:
+    import mimir.event_logger as _ev
+    captured: list[tuple] = []
+
+    async def _fake_log_event(etype, **kw):
+        captured.append((etype, kw))
+
+    monkeypatch.setattr(_ev, "log_event", _fake_log_event)
+    out = await saga_ops.saga_feedback.ainvoke(
+        {"atom_id": "a" * 16, "signal": "useful"}
+    )
+    assert "ok" in out
+    sent = [e for e in captured if e[0] == "saga_feedback_sent"]
+    assert sent, "saga_feedback must emit saga_feedback_sent on success"
+    assert sent[0][1].get("feedback") == "positive"
+
+
+@pytest.mark.asyncio
+async def test_mark_contributions_emits_feedback_sent(
+    store: _StubStore, turn_with_session: TurnContext, monkeypatch
+) -> None:
+    import mimir.event_logger as _ev
+    captured: list[tuple] = []
+
+    async def _fake_log_event(etype, **kw):
+        captured.append((etype, kw))
+
+    monkeypatch.setattr(_ev, "log_event", _fake_log_event)
+    out = await saga_ops.saga_mark_contributions.ainvoke(
+        {"atom_ids": ["a" * 16, "b" * 16], "response_text": "resp"}
+    )
+    assert "credited 2" in out
+    sent = [e for e in captured if e[0] == "saga_feedback_sent"]
+    assert sent and sent[0][1].get("atom_count") == 2
+
+
+@pytest.mark.asyncio
+async def test_saga_feedback_no_event_on_failure(
+    store: _StubStore, turn_with_session: TurnContext, monkeypatch
+) -> None:
+    """A failed outcome() must NOT emit saga_feedback_sent."""
+    import mimir.event_logger as _ev
+    captured: list[tuple] = []
+
+    async def _fake_log_event(etype, **kw):
+        captured.append((etype, kw))
+
+    monkeypatch.setattr(_ev, "log_event", _fake_log_event)
+    store.raise_on = "outcome"
+    out = await saga_ops.saga_feedback.ainvoke(
+        {"atom_id": "a" * 16, "signal": "useful"}
+    )
+    assert "failed" in out
+    assert not any(e[0] == "saga_feedback_sent" for e in captured)

@@ -64,6 +64,16 @@ class TurnContext:
     agent_id: str | None = None
     saga_session_id: str | None = None
     saga_atom_ids: list[str] = field(default_factory=list)
+    # chainlink #266 slice 6: skill-learning atom IDs injected into this
+    # turn's prompt (poller auto_skill_block + non-poller read_file
+    # middleware). run_turn folds these into the TurnRecord's
+    # ``saga_atom_ids`` so the session-boundary synthesis turn votes them
+    # via saga_feedback — but deliberately NOT into the per-turn
+    # auto-feedback credit pass, which writes a weight-2.0 boost on every
+    # cited atom each successful turn and would inflate every injected
+    # learning uniformly (defeating activation ranking). Populated
+    # best-effort; empty when no skill loads this turn.
+    injected_skill_atom_ids: list[str] = field(default_factory=list)
     # Tool-call budget tracking (SPEC §4.5 follow-on / FUTURE_WORK).
     # Incremented on every ALLOWED PreToolUse; the budget hook denies
     # once at-cap (without incrementing) and warns once when the soft
