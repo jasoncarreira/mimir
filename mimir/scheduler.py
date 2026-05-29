@@ -513,13 +513,32 @@ class Scheduler:
         Returns ``{registered, invalid}`` counts. Caller logs.
 
         ``registered`` and ``invalid`` only count prompt-style entries.
-        Callable entries are tracked separately via the registry."""
+        Callable entries are tracked separately via the registry.
+
+        Sync convenience (loads the yaml, then applies). Async callers on
+        the event loop should use ``_reload_async`` instead so the
+        APScheduler mutations run on the loop thread (chainlink #259
+        item 16)."""
+        return self._apply_reload(load_jobs(self._yaml_path))
+
+    async def _reload_async(self) -> dict[str, int]:
+        """``reload`` with the yaml read off the loop (``to_thread``) and
+        the APScheduler mutations on the loop thread. AsyncIOScheduler's
+        jobstore is only safe to mutate from the loop thread; running the
+        whole reload via ``asyncio.to_thread`` (the prior behavior) raced
+        the scheduler's own on-loop job dispatch (chainlink #259 item 16).
+        """
+        yaml_jobs = await asyncio.to_thread(load_jobs, self._yaml_path)
+        return self._apply_reload(yaml_jobs)
+
+    def _apply_reload(self, yaml_jobs: list[SchedulerJob]) -> dict[str, int]:
+        """APScheduler-mutating half of ``reload``. ``yaml_jobs`` is
+        pre-loaded by the caller (the only file IO), so this method does
+        no IO and MUST run on the loop thread."""
         # Drop existing scheduler:* jobs; leave non-prefixed (e.g. saga-consolidate).
         for job in list(self._scheduler.get_jobs()):
             if job.id.startswith(SCHEDULER_CHANNEL_PREFIX):
                 self._scheduler.remove_job(job.id)
-
-        yaml_jobs = load_jobs(self._yaml_path)
 
         # Re-resolve registered callables against the new yaml. A yaml
         # mutation that adds / removes / changes a ``callable:`` entry
@@ -676,7 +695,7 @@ class Scheduler:
             current = [j for j in current if j.name != job.name]
             current.append(job)
             await asyncio.to_thread(write_jobs, self._yaml_path, current)
-            await asyncio.to_thread(self.reload)
+            await self._reload_async()
         return job
 
     async def remove_job(self, name: str) -> bool:
@@ -686,7 +705,7 @@ class Scheduler:
             if len(kept) == len(current):
                 return False
             await asyncio.to_thread(write_jobs, self._yaml_path, kept)
-            await asyncio.to_thread(self.reload)
+            await self._reload_async()
         return True
 
     async def list_jobs(self) -> list[SchedulerJob]:
@@ -864,8 +883,8 @@ class Scheduler:
             self._last_invalid_manifest_events = []
             return {"registered": 0, "replaced": 0, "removed": 0, "total": 0}
         async with self._mutate_lock:
-            _installed_fresh, invalid_events = await asyncio.to_thread(
-                self._reinstall_pollers,
+            _installed_fresh, invalid_events = (
+                await self._reinstall_pollers_async()
             )
             # PR #141 review item #2: ``_reinstall_pollers`` returns
             # the count of pollers freshly registered in Phase 3, not
@@ -910,8 +929,66 @@ class Scheduler:
         }
 
     def _reinstall_pollers(self) -> tuple[int, list[dict[str, Any]]]:
-        """Wipe + re-discover + re-register. Sync — runs on the
-        APScheduler thread or via ``to_thread`` from async callers.
+        """Wipe + re-discover + re-register (sync): discovery IO then
+        apply. Used by the on-loop sync bootstrap ``add_poller_jobs``.
+        Async callers use ``_reinstall_pollers_async`` so the scheduler
+        mutations stay on the loop thread (chainlink #259 item 16)."""
+        if self._pollers_dir is None:
+            return 0, []
+        discovered, invalid_manifests = self._discover_pollers_io()
+        return self._apply_reinstall(discovered, invalid_manifests)
+
+    async def _reinstall_pollers_async(
+        self,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """``_reinstall_pollers`` with filesystem discovery off the loop
+        (``to_thread``) and the APScheduler / ``self._pollers`` mutations
+        on the loop thread. AsyncIOScheduler's jobstore is only safe to
+        mutate from the loop thread; running the whole reinstall via
+        ``asyncio.to_thread`` raced the scheduler's own on-loop job
+        dispatch (chainlink #259 item 16)."""
+        if self._pollers_dir is None:
+            return 0, []
+        discovered, invalid_manifests = await asyncio.to_thread(
+            self._discover_pollers_io,
+        )
+        return self._apply_reinstall(discovered, invalid_manifests)
+
+    def _discover_pollers_io(
+        self,
+    ) -> tuple[list[PollerConfig], list[tuple[Path, str]]]:
+        """Phase 1: filesystem discovery only. No APScheduler or
+        ``self._pollers`` mutation, so it is safe to run in a worker
+        thread. ``list(...)`` materializes the iterator so the caller
+        knows all pollers' names up-front for stale-entry cleanup.
+        Discovery is bounded by the number of skills' ``pollers.json``
+        files (~10s, not 1000s). ``invalid_manifests`` (chainlink #84)
+        collects ``pollers.json`` paths whose JSON parse failed — the
+        apply phase preserves previously-installed pollers from those
+        manifests instead of dropping them."""
+        state_root = (
+            self._home / "state" / "pollers"
+            if self._home is not None else None
+        )
+        invalid_manifests: list[tuple[Path, str]] = []
+        discovered = list(
+            discover_pollers(
+                self._pollers_dir,
+                state_root=state_root,
+                invalid_manifests=invalid_manifests,
+            )
+        )
+        return discovered, invalid_manifests
+
+    def _apply_reinstall(
+        self,
+        discovered: list[PollerConfig],
+        invalid_manifests: list[tuple[Path, str]],
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """Phases 2-3: drop stale jobs + register discovered pollers.
+        Mutates APScheduler and ``self._pollers``, so it MUST run on the
+        loop thread. ``discovered`` / ``invalid_manifests`` come from
+        ``_discover_pollers_io`` (the only IO).
 
         Returns ``(installed_count, invalid_manifest_events)``. The
         second element is a list of event payloads (one per
@@ -951,29 +1028,6 @@ class Scheduler:
         the failing path + parse error + preserved names so the
         operator sees the situation in events.jsonl.
         """
-        if self._pollers_dir is None:
-            return 0, []
-
-        # Phase 1: discover. ``list(...)`` materializes the iterator so
-        # we know all pollers' names up-front for the stale-entry
-        # cleanup below. Discovery is sync and bounded by the number
-        # of skills' ``pollers.json`` files (~10s, not 1000s).
-        # ``invalid_manifests`` (chainlink #84) collects ``pollers.json``
-        # paths whose JSON parse failed — we preserve previously
-        # -installed pollers from those manifests instead of dropping
-        # them.
-        state_root = (
-            self._home / "state" / "pollers"
-            if self._home is not None else None
-        )
-        invalid_manifests: list[tuple[Path, str]] = []
-        discovered = list(
-            discover_pollers(
-                self._pollers_dir,
-                state_root=state_root,
-                invalid_manifests=invalid_manifests,
-            )
-        )
         new_names = {p.name for p in discovered}
         invalid_paths = {path for path, _err in invalid_manifests}
 

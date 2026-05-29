@@ -2089,3 +2089,95 @@ def test_resolve_prompt_file_rejects_empty_and_none(tmp_path):
     assert _resolve_prompt_file(home, "") is None
     assert _resolve_prompt_file(home, "   ") is None
     assert _resolve_prompt_file(None, "foo.md") is None
+
+
+# ---- threading: scheduler mutations on the loop thread (#259 item 16) ---
+
+
+@pytest.mark.asyncio
+async def test_reload_async_io_off_loop_mutations_on_loop(
+    tmp_path: Path, monkeypatch,
+):
+    """``_reload_async`` reads scheduler.yaml off the loop (to_thread) but
+    applies APScheduler mutations ON the loop thread — AsyncIOScheduler's
+    jobstore is only safe to mutate from the loop thread."""
+    import threading
+    import mimir.scheduler as sched_mod
+
+    path = tmp_path / "scheduler.yaml"
+    write_jobs(path, [SchedulerJob(name="j", prompt="x", cron="0 8 * * *")])
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=path, enqueue=noop)
+
+    loop_thread = threading.get_ident()
+    io_threads: list[int] = []
+    mutate_threads: list[int] = []
+
+    real_load = sched_mod.load_jobs
+
+    def spy_load(p):
+        io_threads.append(threading.get_ident())
+        return real_load(p)
+    monkeypatch.setattr(sched_mod, "load_jobs", spy_load)
+
+    real_add = sched._scheduler.add_job
+
+    def spy_add(*a, **k):
+        mutate_threads.append(threading.get_ident())
+        return real_add(*a, **k)
+    monkeypatch.setattr(sched._scheduler, "add_job", spy_add)
+
+    await sched._reload_async()
+
+    assert io_threads, "load_jobs was not called"
+    assert all(t != loop_thread for t in io_threads), \
+        "yaml read ran on the loop thread (should be in to_thread)"
+    assert mutate_threads, "no APScheduler mutation happened"
+    assert all(t == loop_thread for t in mutate_threads), \
+        "APScheduler mutation ran off the loop thread"
+
+
+@pytest.mark.asyncio
+async def test_reinstall_pollers_async_io_off_loop_mutations_on_loop(
+    tmp_path: Path, monkeypatch,
+):
+    """``_reinstall_pollers_async`` runs filesystem discovery off the loop
+    (to_thread) but applies APScheduler mutations ON the loop thread."""
+    import threading
+    import mimir.scheduler as sched_mod
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)  # bootstrap install (sync, on-loop)
+
+    loop_thread = threading.get_ident()
+    io_threads: list[int] = []
+    mutate_threads: list[int] = []
+
+    real_discover = sched_mod.discover_pollers
+
+    def spy_discover(*a, **k):
+        io_threads.append(threading.get_ident())
+        return real_discover(*a, **k)
+    monkeypatch.setattr(sched_mod, "discover_pollers", spy_discover)
+
+    real_add = sched._scheduler.add_job
+
+    def spy_add(*a, **k):
+        mutate_threads.append(threading.get_ident())
+        return real_add(*a, **k)
+    monkeypatch.setattr(sched._scheduler, "add_job", spy_add)
+
+    await sched._reinstall_pollers_async()
+
+    assert io_threads, "discover_pollers was not called"
+    assert all(t != loop_thread for t in io_threads), \
+        "poller discovery ran on the loop thread (should be in to_thread)"
+    assert mutate_threads, "no APScheduler mutation happened"
+    assert all(t == loop_thread for t in mutate_threads), \
+        "APScheduler mutation ran off the loop thread"
