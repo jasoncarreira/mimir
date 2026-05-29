@@ -1292,7 +1292,7 @@ class SagaStore:
 
             rows = conn.execute(
                 f"""
-                SELECT id, channel_id, started_at, ended_at, summary
+                SELECT id, channel_id, started_at, ended_at, summary, reflected_at
                 FROM sessions
                 {channel_clause}
                 ORDER BY COALESCE(ended_at, reflected_at) DESC
@@ -1304,18 +1304,33 @@ class SagaStore:
             # ── Step 3: score each session ──
             now_ts = datetime.now(tz=timezone.utc).timestamp()
             results: list[dict] = []
-            for (sess_id, ch_id, started_at, ended_at, summary) in rows:
+            for (sess_id, ch_id, started_at, ended_at, summary, reflected_at) in rows:
                 sim = sim_map.get(sess_id, 0.0)
 
-                ref_str = ended_at or ""
+                # Recency reference: ended_at, falling back to reflected_at —
+                # mirrors the SQL ``ORDER BY COALESCE(ended_at, reflected_at)``.
+                # chainlink #253: previously this used ``ended_at`` only and,
+                # on a NULL/empty value, ``fromisoformat("")`` raised → except
+                # set ref_ts = now → recency 1.0 (scored NEWEST). That inverted
+                # the ranking for any session row with a NULL ended_at (e.g.
+                # the migration-2 backfill path) — a never-properly-ended
+                # session out-ranked genuinely recent ones. Now: consult
+                # reflected_at too, and when there's NO usable timestamp at
+                # all, score recency 0.0 (rank LAST), matching SQLite's
+                # NULLS-LAST ordering for the same COALESCE.
+                ref_str = ended_at or reflected_at or ""
+                ref_ts: float | None
                 try:
                     if ref_str.endswith("Z"):
                         ref_str = ref_str[:-1] + "+00:00"
                     ref_ts = datetime.fromisoformat(ref_str).timestamp()
                 except (ValueError, AttributeError):
-                    ref_ts = now_ts
-                age_days = max(0.0, (now_ts - ref_ts) / 86400.0)
-                recency = math.exp(-math.log(2) / 30.0 * age_days)
+                    ref_ts = None
+                if ref_ts is None:
+                    recency = 0.0
+                else:
+                    age_days = max(0.0, (now_ts - ref_ts) / 86400.0)
+                    recency = math.exp(-math.log(2) / 30.0 * age_days)
 
                 blended = alpha * sim + (1.0 - alpha) * recency
                 results.append({
