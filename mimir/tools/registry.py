@@ -235,14 +235,16 @@ async def send_message(
         # outbound path in production). No-op when no buffer is
         # registered (test paths that bypass ``server.serve``).
         #
-        # ``source`` is left ``None`` here — unlike the agent-fallback
-        # path which threads ``ctx.channel_source``, the tool runs
-        # detached from the active TurnContext. Render code treats
-        # missing source the same as a non-allowlisted source for
-        # the cross-author cross-pull check; in practice every
-        # cross-channel render path filters on the inbound channel's
-        # source, so an empty source on outbound just means it stays
-        # scoped to its own channel (which is the right default).
+        # Use ``bridge.name`` (e.g. "discord", "slack") as the source
+        # so this message passes the recent_sources allowlist filter
+        # in recent_for_channel. Without a source the message is
+        # silently excluded from ## Recent activity regardless of
+        # channel — the allowlist treats None the same as an
+        # unrecognised source. This matters especially for cross-
+        # channel sends from poller / heartbeat turns: a poller turn
+        # sending to discord needs source="discord" so the operator
+        # sees mimir's own messages interleaved with their own in
+        # the next discord turn's prompt. (chainlink #270)
         from ..history import get_global_buffer
         _buf = get_global_buffer()
         if _buf is not None and result is not None:
@@ -252,7 +254,7 @@ async def send_message(
                     kind="assistant_message",
                     content=clean_text,
                     msg_id=getattr(result, "message_id", None),
-                    source=None,
+                    source=bridge.name,
                 )
                 await _buf.append(msg)
             except Exception:  # noqa: BLE001
