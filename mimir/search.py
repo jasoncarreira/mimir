@@ -773,6 +773,7 @@ class Indexer:
                       FROM chunks AS c
                       JOIN files AS f ON f.path = c.path
                      WHERE 1=1{scope_filter}{exclude_clause}
+                     ORDER BY f.mtime DESC, c.path, c.chunk_index
                      LIMIT ?
                     """,
                     [*params, *exclude_params, candidate_pool - len(candidates)],

@@ -186,7 +186,11 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
 
-        # P0 safety: block prohibited bash patterns (force-push to main/master)
+        # Destructive-action guardrail (chainlink #259): an accident
+        # deterrent against force-push-to-main/master, NOT a security
+        # boundary — the regex screens the command arg and is bypassable
+        # (vars, $()); see prohibited_action_guard.py. Catches the honest
+        # mistake, doesn't claim to stop a determined caller.
         prohibition = _check_prohibited(tool_name, request)
         if prohibition is not None:
             _emit_event_sync("prohibited_action_blocked", tool=tool_name,
@@ -215,7 +219,11 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
 
-        # P0 safety: block prohibited bash patterns (force-push to main/master)
+        # Destructive-action guardrail (chainlink #259): an accident
+        # deterrent against force-push-to-main/master, NOT a security
+        # boundary — the regex screens the command arg and is bypassable
+        # (vars, $()); see prohibited_action_guard.py. Catches the honest
+        # mistake, doesn't claim to stop a determined caller.
         prohibition = _check_prohibited(tool_name, request)
         if prohibition is not None:
             _emit_event_sync("prohibited_action_blocked", tool=tool_name,
