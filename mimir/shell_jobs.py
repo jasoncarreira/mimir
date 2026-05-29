@@ -11,10 +11,13 @@ spawning channel resumes with full context (no polling needed).
 
 Design notes:
 
-- No lifecycle cleanup. Kills happen via the agent issuing a regular
-  ``Bash`` tool call (which has access to ``kill <pid>``). Finished
-  jobs linger in the registry so the agent can still retrieve their
-  final output via ``bash_job_output``.
+- Lifecycle cleanup via ``_evict_stale``. Kills happen via the agent
+  issuing a regular ``Bash`` tool call (which has access to ``kill
+  <pid>``). Finished jobs are evicted (and their on-disk output files
+  are unlinked) after ``EVICT_AFTER_SECONDS`` (default 1 hour). Eviction
+  runs eagerly on the next ``spawn()`` so no background thread is
+  needed. Jobs still within the window remain accessible via
+  ``bash_job_output`` / ``read_output``.
 - No algedonic signals on routine completion — the wake-up turn IS
   the signal. ``shell_job_complete_enqueue_failed`` fires only when
   the bridge to the dispatcher itself breaks (rare).
@@ -46,6 +49,7 @@ log = logging.getLogger(__name__)
 
 UI_VISIBILITY_THRESHOLD_SECONDS = 10
 POST_EXIT_GRACE_SECONDS = 15
+EVICT_AFTER_SECONDS = 3600  # evict finished jobs + unlink output files after this window
 SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES = 1000
 SHELL_JOB_OUTPUT_MAX_TAIL_LINES = 2000
 DEFAULT_SHELL_JOB_SCOPE = "running"
@@ -125,6 +129,39 @@ class ShellJobRegistry:
     def _make_job_id(self) -> str:
         return "j_" + uuid.uuid4().hex[:10]
 
+    def _evict_stale(self, *, now: Optional[float] = None) -> list[ShellJob]:
+        """Evict finished jobs older than ``EVICT_AFTER_SECONDS``.
+
+        Pops evicted entries from ``_jobs`` under ``self._lock``, then
+        unlinks their stdout/stderr files outside the lock (I/O while
+        holding a lock degrades throughput). Called from ``spawn()`` so
+        the registry doesn't grow unbounded over daemon lifetime.
+
+        ``now`` is injectable for deterministic testing.
+
+        Returns the evicted jobs (callers rarely need this; exposed for
+        test assertions).
+        """
+        now = now if now is not None else time.time()
+        evicted: list[ShellJob] = []
+        with self._lock:
+            to_evict = [
+                job_id
+                for job_id, job in self._jobs.items()
+                if job.exit_code is not None
+                and job.finished_at is not None
+                and (now - job.finished_at) >= EVICT_AFTER_SECONDS
+            ]
+            for job_id in to_evict:
+                evicted.append(self._jobs.pop(job_id))
+        for job in evicted:
+            for path in (job.stdout_path, job.stderr_path):
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    log.warning("failed to unlink %s during job eviction", path)
+        return evicted
+
     def spawn(
         self,
         command: str,
@@ -157,6 +194,10 @@ class ShellJobRegistry:
         without ``CLAUDECODE`` (so the spawn doesn't think it's
         nested in a Claude Code session).
         """
+        # Eagerly evict finished jobs that have aged out, bounding the
+        # registry size and freeing their on-disk output files.
+        self._evict_stale()
+
         job_id = self._make_job_id()
         stdout_path = self.jobs_dir / f"{job_id}.out"
         stderr_path = self.jobs_dir / f"{job_id}.err"
@@ -489,6 +530,7 @@ def shell_job_snapshots(
 __all__: tuple[str, ...] = (
     "DEFAULT_SHELL_JOB_SCOPE",
     "DEFAULT_SHELL_JOB_STREAM",
+    "EVICT_AFTER_SECONDS",
     "POST_EXIT_GRACE_SECONDS",
     "SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES",
     "SHELL_JOB_OUTPUT_MAX_TAIL_LINES",
