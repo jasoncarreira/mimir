@@ -125,6 +125,56 @@ def recall_skill_learnings(
     ]
 
 
+def render_skill_learnings(learnings: list[dict]) -> str:
+    """Render recalled skill-learning atoms as a compact prompt block.
+
+    One bullet per learning: ``- [<kind>] <content>``. Newest-first
+    (recall order preserved). Returns ``""`` for an empty list so callers
+    can cheaply skip the section. Content is single-lined so a multi-line
+    learning can't break the surrounding markdown structure.
+    """
+    if not learnings:
+        return ""
+    lines: list[str] = []
+    for item in learnings:
+        kind = item.get("kind") or "?"
+        content = " ".join(str(item.get("content") or "").split())
+        lines.append(f"- [{kind}] {content}")
+    return "\n".join(lines)
+
+
+# Heading the injected learnings block carries when appended to a skill's
+# SKILL.md body at load time. Distinct enough to be greppable.
+_LEARNINGS_HEADING = "## Learnings from past runs"
+
+
+def augment_skill_body(
+    conn: sqlite3.Connection,
+    skill: str,
+    body: str,
+    *,
+    limit: int = 8,
+) -> str:
+    """Append a skill's recalled learnings to its SKILL.md *body* for
+    load-time injection (chainlink #266 read path).
+
+    Recalls up to *limit* learnings for *skill* (ALL kinds — a tip and a
+    gotcha both help the next invocation) and appends them under
+    ``_LEARNINGS_HEADING``. Returns *body* unchanged when the skill has no
+    learnings (a skill with no accumulated memory injects exactly its
+    SKILL.md, no empty section). Best-effort: any DB error returns the
+    original body rather than failing the skill load.
+    """
+    try:
+        learnings = recall_skill_learnings(conn, skill, limit=limit)
+    except Exception:  # noqa: BLE001 — skill load must not fail on a recall error
+        return body
+    rendered = render_skill_learnings(learnings)
+    if not rendered:
+        return body
+    return f"{body}\n\n{_LEARNINGS_HEADING}\n{rendered}"
+
+
 def count_negative_learnings(
     conn: sqlite3.Connection,
     skill: str,

@@ -138,6 +138,49 @@ def test_agent_init_accepts_commitments_store(tmp_path: Path) -> None:
     assert agent._commitments is fake_store
 
 
+def _minimal_agent(tmp_path: Path, saga_client=None):
+    from mimir.agent import Agent
+    from mimir.config import Config
+    from mimir.history import MessageBuffer
+    from mimir.index import IndexGenerator
+    from mimir.turn_logger import TurnLogger
+    import os
+
+    os.environ.setdefault("MIMIR_HOME", str(tmp_path))
+    cfg = Config.from_env()
+    return Agent(
+        cfg,
+        TurnLogger(path=tmp_path / "turns.jsonl"),
+        MessageBuffer(history_path=tmp_path / "history.jsonl"),
+        IndexGenerator(home=cfg.home),
+        saga_client=saga_client,
+    )
+
+
+def test_agent_stashes_sagastore_for_skill_memory(tmp_path: Path) -> None:
+    """chainlink #266: _try_inject_memory_client peels the wrapper chain to
+    a concrete SagaStore and stashes it on _saga_store for the skill-memory
+    load injection."""
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=tmp_path / "saga.db", embedding_dim=4)
+
+    # Wrapped, as in production (RecordingSagaClient-style _inner chain).
+    class _Wrap:
+        def __init__(self, inner):
+            self._inner = inner
+
+    agent = _minimal_agent(tmp_path, saga_client=_Wrap(store))
+    assert agent._saga_store is store
+
+
+def test_agent_saga_store_none_when_no_sagastore(tmp_path: Path) -> None:
+    """A non-SagaStore client (legacy / stub) leaves _saga_store None, so
+    the skill-memory injection cleanly no-ops."""
+    agent = _minimal_agent(tmp_path, saga_client=object())
+    assert agent._saga_store is None
+
+
 # ─── set_commitments_store / set_spawn_config populate _STATE ──────
 
 
