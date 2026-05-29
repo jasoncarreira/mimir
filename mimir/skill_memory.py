@@ -147,6 +147,17 @@ def render_skill_learnings(learnings: list[dict]) -> str:
 # SKILL.md body at load time. Distinct enough to be greppable.
 _LEARNINGS_HEADING = "## Learnings from past runs"
 
+# One-line in-turn write nudge appended under the learnings block (#266
+# slice 3). Closes the loop: the model sees past learnings AND is reminded
+# it can record a new one the moment this run reveals it — not only at the
+# session-end synthesis turn. Only shown when learnings already render, so
+# no-memory skill loads stay byte-for-byte their SKILL.md.
+_LEARNINGS_NUDGE = (
+    "_Hit a new gotcha, quirk, or tip running this skill? Record it now "
+    "with `saga_record_skill_learning(skill, kind, content)` so the next "
+    "run gets it too._"
+)
+
 
 def augment_skill_body(
     conn: sqlite3.Connection,
@@ -172,7 +183,10 @@ def augment_skill_body(
     rendered = render_skill_learnings(learnings)
     if not rendered:
         return body
-    return f"{body}\n\n{_LEARNINGS_HEADING}\n{rendered}"
+    return (
+        f"{body}\n\n{_LEARNINGS_HEADING}\n{rendered}"
+        f"\n\n{_LEARNINGS_NUDGE}"
+    )
 
 
 def count_negative_learnings(
