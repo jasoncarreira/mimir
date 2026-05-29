@@ -1065,3 +1065,27 @@ def test_pre_push_hook_passes_current_branch(tmp_path: Path) -> None:
     # returncode 0 = hook passed; git itself may not error even if remote
     # receives the branch fine.
     assert proc.returncode == 0
+
+
+def test_credential_helper_idempotent_across_bootstraps(tmp_path: Path) -> None:
+    """Re-running bootstrap (happens on every container start) must NOT
+    accumulate duplicate ``credential.helper`` entries. Pre-fix the reset
+    used a bare ``git config credential.helper ""`` which errors on the
+    now multi-valued key AND fails to clear, so each boot appended another
+    ``store`` helper (observed: 273 on a long-lived dev container).
+    ``--replace-all`` keeps it at exactly ``[empty, store]``."""
+    home = tmp_path / "home"
+    home.mkdir()
+    for _ in range(3):
+        git_bootstrap.bootstrap_git_repo(
+            home,
+            state_repo="https://github.com/foo/bar.git",
+            github_token="abc",
+        )
+    values = _git(
+        "config", "--local", "--get-all", "credential.helper", cwd=home,
+    ).stdout.splitlines()
+    expected = (home / ".git" / "credentials").resolve()
+    assert values == ["", f"store --file={expected}"], (
+        f"credential.helper accumulated across bootstraps: {values!r}"
+    )

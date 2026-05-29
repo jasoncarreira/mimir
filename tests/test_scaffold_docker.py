@@ -1002,3 +1002,15 @@ def test_render_dockerfile_pypi_preserves_shell_extras_ref():
     # the shell would try to expand ``$anthropic``.)
     assert "$anthropic" not in out
     assert "$discord" not in out
+
+
+def test_workspace_start_sh_guards_safe_directory():
+    """``safe.directory`` must be registered only when absent. start.sh
+    runs on every container start, so a bare ``git config --global --add
+    safe.directory`` accumulates a duplicate ~/.gitconfig entry per boot
+    (observed: 5 dupes). The add must be guarded by a presence check."""
+    from mimir.scaffold_docker import _START_SH_TEMPLATE as tpl
+    assert "safe.directory" in tpl
+    assert "--get-all safe.directory" in tpl and "grep -qxF" in tpl, (
+        "safe.directory --add must be guarded by a presence check"
+    )
