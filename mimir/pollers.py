@@ -96,6 +96,16 @@ POLLER_INVALID_LINE_CHARS = 500
 # JSON line would otherwise blow the prompt-build cache and burn
 # budget on the next turn (Mimir's PR #88 review nit 4).
 POLLER_PROMPT_CHARS = 16_000
+# Hard byte ceilings on a poller subprocess's stdout/stderr (chainlink
+# #258). The POLLER_PROMPT_CHARS cap above only applies AFTER the bytes
+# are read — ``communicate()`` buffers the ENTIRE stream first, so a
+# runaway poller writing gigabytes in its timeout window would OOM mimir
+# before any char cap engaged. We instead drain incrementally and kill
+# the process once cumulative output crosses these ceilings. 8 MB is far
+# above any legitimate poller (the prompt cap is 16 KB) while bounding
+# worst-case memory; stderr is diagnostic, so a tighter 1 MB.
+MAX_POLLER_STDOUT_BYTES = 8 * 1024 * 1024
+MAX_POLLER_STDERR_BYTES = 1 * 1024 * 1024
 # Truncated preview of the rejected prompt kept in
 # ``poller_event_rejected`` events for back-pressure debugging.
 POLLER_REJECTION_PREVIEW_CHARS = 200
@@ -497,6 +507,38 @@ def discover_pollers(
     return pollers
 
 
+async def _drain_capped(
+    stream: "asyncio.StreamReader | None",
+    limit: int,
+    on_overflow: Callable[[], None],
+) -> bytes:
+    """Read from *stream* up to *limit* bytes, then stop accumulating.
+
+    chainlink #258: bounds memory regardless of how much the subprocess
+    writes. Once cumulative output exceeds *limit*, invoke *on_overflow*
+    (which kills the process so both pipes EOF) and keep draining to EOF
+    but discard the excess — so the killed process's pipe closes cleanly
+    without buffering gigabytes. Returns the first *limit* bytes.
+    """
+    if stream is None:
+        return b""
+    buf = bytearray()
+    overflowed = False
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        if not overflowed:
+            buf.extend(chunk)
+            if len(buf) > limit:
+                del buf[limit:]
+                overflowed = True
+                on_overflow()
+        # Past the cap: keep reading to EOF (the kill closes the pipe
+        # shortly) but discard — never grow `buf` beyond `limit`.
+    return bytes(buf)
+
+
 async def run_poller(
     poller: PollerConfig,
     *,
@@ -750,10 +792,52 @@ async def run_poller(
                 cwd=str(poller.skill_dir),
                 env=env,
             )
+            # chainlink #258: drain stdout/stderr with hard byte ceilings
+            # rather than communicate() (which buffers the WHOLE stream
+            # before any cap), so a runaway poller can't OOM mimir. On
+            # overflow we kill the process — both pipes EOF, the drains
+            # finish — and treat the tick as a failure instead of acting on
+            # truncated output.
+            _overflow = {"hit": False}
+
+            def _on_overflow() -> None:
+                if not _overflow["hit"]:
+                    _overflow["hit"] = True
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
+                asyncio.gather(
+                    _drain_capped(
+                        proc.stdout, MAX_POLLER_STDOUT_BYTES, _on_overflow,
+                    ),
+                    _drain_capped(
+                        proc.stderr, MAX_POLLER_STDERR_BYTES, _on_overflow,
+                    ),
+                ),
                 timeout=timeout,
             )
+            await proc.wait()
+            if _overflow["hit"]:
+                await log_event(
+                    "poller_output_overflow",
+                    poller=poller.name,
+                    stdout_limit_bytes=MAX_POLLER_STDOUT_BYTES,
+                    stderr_limit_bytes=MAX_POLLER_STDERR_BYTES,
+                )
+                if _cb_record_failure(poller.name):
+                    await log_event(
+                        "poller_circuit_tripped",
+                        poller=poller.name,
+                        consecutive_failures=_circuit_breakers[
+                            poller.name
+                        ].consecutive_failures,
+                        backoff_seconds=POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
+                        reason="output_overflow",
+                    )
+                return 0
         except asyncio.TimeoutError:
             await log_event(
                 "poller_timeout",

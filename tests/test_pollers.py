@@ -2377,3 +2377,79 @@ async def test_run_poller_runs_when_all_required_env_present(
         e for e in events if e.get("type") == "poller_missing_required_env"
     ]
     assert missing_evs == [], "no missing-env event when all vars are present"
+
+
+# ─── stdout/stderr byte ceiling (chainlink #258) ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_drain_capped_under_limit_reads_all():
+    import asyncio as _aio
+    from mimir.pollers import _drain_capped
+    r = _aio.StreamReader()
+    r.feed_data(b"x" * 100)
+    r.feed_eof()
+    calls = []
+    out = await _drain_capped(r, 1000, lambda: calls.append(1))
+    assert out == b"x" * 100
+    assert calls == []  # under the cap → no overflow
+
+
+@pytest.mark.asyncio
+async def test_drain_capped_over_limit_caps_and_signals():
+    import asyncio as _aio
+    from mimir.pollers import _drain_capped
+    r = _aio.StreamReader()
+    r.feed_data(b"x" * 5000)
+    r.feed_eof()
+    calls = []
+    out = await _drain_capped(r, 1000, lambda: calls.append(1))
+    assert len(out) == 1000        # bounded to the limit
+    assert calls == [1]            # overflow signaled exactly once
+
+
+@pytest.mark.asyncio
+async def test_drain_capped_exactly_limit_is_not_overflow():
+    import asyncio as _aio
+    from mimir.pollers import _drain_capped
+    r = _aio.StreamReader()
+    r.feed_data(b"x" * 1000)
+    r.feed_eof()
+    calls = []
+    out = await _drain_capped(r, 1000, lambda: calls.append(1))
+    assert len(out) == 1000
+    assert calls == []             # strict > limit, so exact size is fine
+
+
+@pytest.mark.asyncio
+async def test_drain_capped_none_stream():
+    from mimir.pollers import _drain_capped
+    assert await _drain_capped(None, 1000, lambda: None) == b""
+
+
+@pytest.mark.asyncio
+async def test_run_poller_output_overflow_kills_and_fails(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """A poller that floods stdout past the byte ceiling is killed, the
+    tick is failed (no events acted on), and poller_output_overflow logs."""
+    import mimir.pollers as pollers_mod
+    monkeypatch.setattr(pollers_mod, "MAX_POLLER_STDOUT_BYTES", 1024)
+    skill_dir = tmp_path / "skill"
+    # Emit a valid event line, then flood far past the 1 KB ceiling.
+    _install_script(skill_dir, "poller.py", (
+        "import sys, json\n"
+        "print(json.dumps({'poller': 'flood', 'prompt': 'hi'}))\n"
+        "sys.stdout.write('x' * 200000)\n"
+        "sys.stdout.flush()\n"
+    ))
+    cfg = PollerConfig(
+        name="flood", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 0                  # runaway output → nothing acted on
+    assert enq.events == []
+    types = [e["type"] for e in _read_events(home)]
+    assert "poller_output_overflow" in types
