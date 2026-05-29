@@ -52,6 +52,30 @@ log = logging.getLogger(__name__)
 # longer than the actual reset cycle.
 _DEFAULT_PAUSE_HOURS = 5
 
+# Maximum window we'll accept from a parsed reset timestamp. Longer
+# values indicate a malformed/garbage header (e.g. "9999-01-01") that
+# would wedge the agent indefinitely. Anthropic's longest real window
+# is 7 days; clamp to that.
+_MAX_RESET_WINDOW_DAYS = 7
+
+
+def _clamp_reset_at(reset: datetime, now: datetime) -> datetime:
+    """Return *reset* clamped to ``[now + 1s, now + _MAX_RESET_WINDOW_DAYS]``.
+
+    A parsed reset-at that lies more than ``_MAX_RESET_WINDOW_DAYS``
+    in the future (e.g. from a garbage ``9999-01-01`` header) is
+    silently clamped to the maximum. A value in the past or equal to
+    *now* is clamped up to ``now + 1s`` so we always record a
+    forward-looking pause.
+    """
+    max_reset = now + timedelta(days=_MAX_RESET_WINDOW_DAYS)
+    if reset > max_reset:
+        return max_reset
+    min_reset = now + timedelta(seconds=1)
+    if reset < min_reset:
+        return min_reset
+    return reset
+
 
 @dataclass(frozen=True)
 class PauseStatus:
@@ -218,7 +242,7 @@ def extract_reset_at(exc: BaseException) -> tuple[datetime, str | None]:
                 continue
             try:
                 reset = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-                return reset, "anthropic"
+                return _clamp_reset_at(reset, now), "anthropic"
             except ValueError:
                 continue
         # Generic Retry-After (seconds).
@@ -227,7 +251,7 @@ def extract_reset_at(exc: BaseException) -> tuple[datetime, str | None]:
         )
         seconds = _parse_retry_after_header(retry_after)
         if seconds is not None:
-            return (now + timedelta(seconds=seconds), None)
+            return _clamp_reset_at(now + timedelta(seconds=seconds), now), None
 
     # Fallback parse: scrape the exception message for an ISO-ish
     # timestamp. ChatClaudeCode surfaces 429s as plain text from the
@@ -242,7 +266,7 @@ def extract_reset_at(exc: BaseException) -> tuple[datetime, str | None]:
             reset = datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
             if reset.tzinfo is None:
                 reset = reset.replace(tzinfo=timezone.utc)
-            return reset, None
+            return _clamp_reset_at(reset, now), None
         except ValueError:
             pass
 
