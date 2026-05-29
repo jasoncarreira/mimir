@@ -20,7 +20,19 @@ def _env(name: str, default: str = "") -> str:
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
-    return int(raw) if raw else default
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        # chainlink #259: match _env_bool's posture — a typo
+        # (MIMIR_WEB_PORT=808O) warns + falls back rather than crashing
+        # boot with an opaque traceback.
+        log.warning(
+            "%s=%r is not a valid integer; using default %r",
+            name, raw, default,
+        )
+        return default
 
 
 # Hard ceilings on the JSONL log caps. The reflection skill filters to the
@@ -143,7 +155,16 @@ def _oauth_credentials_path() -> Path | None:
 
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
-    return float(raw) if raw else default
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning(
+            "%s=%r is not a valid float; using default %r",
+            name, raw, default,
+        )
+        return default
 
 
 # chainlink #238: canonical env-bool truthy/falsy alphabets.
