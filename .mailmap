@@ -5,6 +5,7 @@ Jason Carreira <jcarreira@gmail.com> <jason@visotrust.com>
 # remap — on-disk history is preserved; only ``git log %aN/%aE`` output
 # and GitHub's web UI display are affected.
 mimir-carreira <mimir@muninnai.ai> <mimir@anthropic.com>
+mimir-carreira <mimir@muninnai.ai> <claude-agent@anthropic.com>
 mimir-carreira <mimir@muninnai.ai> <noreply@mimir-agent.local>
 
 # Historical contributions to the early MSAM path — remapped to the

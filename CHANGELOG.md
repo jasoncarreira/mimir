@@ -6,6 +6,88 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-29
+
+74 commits since v0.1.3 — a minor bump carrying the first **skill-memory
+system**, a batch of **security hardening**, a 17-item code-review sweep,
+and several structural refactors splitting large modules.
+
+### Added
+
+- **Skill-memory system** (chainlink #266): skills accumulate their own
+  learnings — `failure-mode` / `input-quirk` / `perf-caveat` /
+  `tip` / `success-pattern` atoms stored under a dedicated
+  `skill_learning` source type, isolated from general recall. Recall is
+  activation-ranked and injected at skill-load time for both poller and
+  non-poller skills; the write path adds a `saga_record_skill_learning`
+  tool plus synthesis-prompt guidance. Per-skill consolidation + dedup
+  keep one skill's lessons from bleeding into another's. Feedback is
+  agent-curated only (the per-turn auto-feedback ratchet was removed).
+  (#447, #453, #454, #455, #456, #459, #461)
+- **Per-skill refine/retire candidates** in the introspection report
+  (chainlink #267): a `SkillHealth` view surfaces low-success-rate,
+  negative-learning-heavy, and zero-usage skills as refine/retire
+  candidates. (#462)
+
+### Changed
+
+- **Structural splits**: CLI subcommands extracted to
+  `mimir/commands/` (#443, chainlink #240); the 2349-line feedback module
+  split into a `mimir/feedback/` subpackage (#437, #241); saga migrations
+  lifted to `mimir/saga/migrations.py` (#436, #242); shared bridge
+  supervisor helpers to `_supervisor.py` (#435, #246); dashboard HTML/JS
+  to sibling `.html` files (#438, #243).
+- **Triples query path vectorized** — the `query()`-path cosine scan is
+  now a single NumPy op (#464, chainlink #257).
+- **git_bootstrap pre-push staleness gate** on `/workspace/mimir` (#434,
+  chainlink #249).
+- **skill-creator** gained a test-gate step in its authoring checklist
+  (#468, chainlink #265).
+
+### Fixed
+
+- **Code-review sweep — 17 items** (chainlink #258 + #259): poller
+  subprocess stdout/stderr now byte-capped (#466); consolidate/dedup
+  candidate selection threads `reference_date` so historical-corpus bench
+  replays measure the lookback window against the data, not wall-clock;
+  `react()` resolves its default target from the history buffer and
+  surfaces declined reactions instead of reporting "ok"; the JSONL
+  snapshot tail-cap exposes `saturated` so time-windowed scans can detect
+  truncation; and the scheduler now mutates the APScheduler jobstore on
+  the event-loop thread (file IO stays in `to_thread`) rather than racing
+  dispatch from a worker thread. Plus config int/float coercion, minimax
+  host matching, ntfy timestamp normalization, and stderr redaction.
+  (#467, #469, #470, #471, #472, #473, #474, #475)
+- **history**: mimir's own outbound messages surface in Recent activity
+  again (#465, chainlink #270).
+- **triples**: expired triples are filtered by `valid_until` in both
+  search paths (#463, chainlink #257).
+- **oauth/saga**: 7-day confirm counter preserved across sub-bucket
+  overlap gaps (#457); `search_sessions` recency falls back to
+  `reflected_at`, undateable sessions rank last (#446) (chainlink #253).
+- **dispatcher**: idle-worker retirement pops `_workers` (#452, #255);
+  **shell_jobs** evict finished jobs after 1h to bound registry growth
+  (#451, #256); **turn_logger** `_trim_sync` first-trim crash (#444);
+  **quota_pause** clamps `extract_reset_at` to now + 7 days (#450).
+
+### Security
+
+- **SSRF gate on attachment downloads** — validate scheme + CDN host
+  before fetching (#449, chainlink #251, HIGH); don't follow redirects on
+  credentialed attachment downloads (#445, #252); tighten `.env` to
+  `0o600` after writing secrets (#448, #252).
+- **Destructive-action guardrail** wording clarified as an accident
+  deterrent (not a security boundary) (#471, chainlink #259).
+
+### Internal
+
+- Dedicated test coverage for `config`, `registry`, `saga_ops`, `server`,
+  and `templates` (chainlink #247: #439, #440, #441, #442); smoke test
+  runs via `sys.executable`; longmemeval skip guard fixed (#458).
+- `.mailmap`: final agent-identity remaps make the display layer
+  (`%aE`/`%aN` + GitHub UI) free of anthropic/employer/hostname
+  addresses (closes chainlink #176).
+
 ## [0.1.3] — 2026-05-27
 
 25 commits since v0.1.2 — biggest single release in the agent-behavior
