@@ -12,8 +12,15 @@ report computed once. Produces a markdown summary covering:
 - Performance trends (daily avg duration)
 - Recurring error patterns (top-N with first/last seen)
 - Skill lifecycle (Skill tool calls)
+- Skill refine/retire candidates (chainlink #267): per-skill objective
+  signals — skill_outcomes success-rate, negative-kind skill_learning
+  count, zero-recent-usage — surfaced so the reflection turn can author
+  operator-gated refine/retire proposed-changes (#226; surface, not
+  auto-act).
 
-Two data sources: ``logs/turns.jsonl`` and ``logs/events.jsonl``.
+Data sources: ``logs/turns.jsonl``, ``logs/events.jsonl``, and (for the
+skill-health section) the installed-skill inventory + a read-only saga
+connection for the negative-learning count.
 
 Algedonic side-effect: when ``--emit-algedonic`` is set and heartbeat
 success rate falls below ``--health-threshold``, append a
@@ -27,12 +34,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
+
+log = logging.getLogger(__name__)
 
 # ─── Data model ────────────────────────────────────────────────────────
 
@@ -118,6 +128,23 @@ class HeartbeatPipeline:
 
 
 @dataclass
+class SkillHealth:
+    """Per-skill evaluate→refine signal for the reflection turn (chainlink
+    #267). Aggregates the objective per-skill signals so the reflection
+    turn can author a refine/retire proposed-change (operator-gated, #226 —
+    this never auto-acts). ``reasons`` is the human-readable evidence."""
+
+    skill: str
+    invocations: int
+    success_rate: float | None        # skill_outcomes; None if never ran in window
+    runs: int                         # outcome samples behind success_rate
+    negative_learnings: int           # count of negative-kind skill_learning atoms
+    refine_candidate: bool
+    retire_candidate: bool
+    reasons: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Report:
     days: int
     generated_at: datetime
@@ -131,6 +158,7 @@ class Report:
     performance_trends: list[PerformanceTrend] = field(default_factory=list)
     error_recurrence: list[ErrorRecurrence] = field(default_factory=list)
     skill_lifecycle: list[tuple[str, int]] = field(default_factory=list)
+    skill_health: list[SkillHealth] = field(default_factory=list)
 
 
 # ─── Aggregation ───────────────────────────────────────────────────────
@@ -193,12 +221,117 @@ def _iter_jsonl(path: Path) -> Iterable[dict]:
             yield rec
 
 
+# ─── Skill refine/retire candidates (chainlink #267) ───────────────────
+# Thresholds for surfacing a skill as a reflection refine/retire
+# candidate. Deliberately conservative — the reflection turn proposes,
+# the operator decides (#226); a false-positive candidate costs only a
+# glance, a missed one costs a silently-degrading skill.
+_SKILL_REFINE_SUCCESS_FLOOR = 0.5   # success rate under this → refine
+_SKILL_REFINE_MIN_RUNS = 3          # ...but only with enough samples to trust
+_SKILL_REFINE_NEG_LEARNINGS = 3     # negative-kind learnings in window → refine
+
+
+def _build_skill_health(
+    *,
+    home: "Path | None",
+    turns_log: Path,
+    days: int,
+    now: datetime,
+    skill_counts: "Counter[str]",
+    saga_conn: object | None = None,
+) -> list[SkillHealth]:
+    """Per-skill refine/retire candidates from the objective signals
+    (chainlink #267): skill_outcomes success-rate + negative-kind
+    ``skill_learning`` count + zero-recent-usage. The reflection turn reads
+    these and authors operator-gated refine/retire proposed-changes.
+
+    Best-effort: a missing input (no ``home``, no saga conn, an import or
+    DB error) degrades to the signals available rather than failing the
+    whole report. Returns only skills that crossed at least one threshold.
+    """
+    if home is None:
+        return []
+    outcomes: dict = {}
+    try:
+        from ..skill_outcomes import (
+            aggregate as _agg_outcomes,
+            load_skill_success_criteria,
+        )
+        outcomes = _agg_outcomes(
+            turns_log, window_hours=days * 24, now=now,
+            skill_criteria=load_skill_success_criteria(home),
+        )
+    except Exception:  # noqa: BLE001 — report must not fail on this section
+        log.warning("skill_health: skill_outcomes aggregate failed", exc_info=True)
+
+    installed: list[str] = []
+    try:
+        from ..skill_defs import installed_skill_names
+        installed = installed_skill_names(home)
+    except Exception:  # noqa: BLE001
+        installed = []
+
+    cutoff_iso = (now - timedelta(days=days)).isoformat()
+
+    def _negatives(skill: str) -> int:
+        if saga_conn is None:
+            return 0
+        try:
+            from ..skill_memory import count_negative_learnings
+            return count_negative_learnings(saga_conn, skill, since_iso=cutoff_iso)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    candidates: list[SkillHealth] = []
+    for skill in sorted(set(skill_counts) | set(outcomes) | set(installed)):
+        oc = outcomes.get(skill)
+        success_rate = oc.success_rate if oc is not None else None
+        runs = oc.total if oc is not None else 0
+        invocations = int(skill_counts.get(skill, 0))
+        negatives = _negatives(skill)
+
+        reasons: list[str] = []
+        refine = retire = False
+        if (
+            success_rate is not None
+            and runs >= _SKILL_REFINE_MIN_RUNS
+            and success_rate < _SKILL_REFINE_SUCCESS_FLOOR
+        ):
+            refine = True
+            reasons.append(
+                f"success rate {success_rate:.0%} over {runs} run(s)"
+            )
+        if negatives >= _SKILL_REFINE_NEG_LEARNINGS:
+            refine = True
+            reasons.append(f"{negatives} negative learning(s) in {days}d")
+        # Retire: installed but no sign of use this window (neither an
+        # explicit Skill() call nor any skill_outcomes sample).
+        if skill in installed and invocations == 0 and runs == 0:
+            retire = True
+            reasons.append(f"no usage in {days}d")
+
+        if refine or retire:
+            candidates.append(SkillHealth(
+                skill=skill,
+                invocations=invocations,
+                success_rate=success_rate,
+                runs=runs,
+                negative_learnings=negatives,
+                refine_candidate=refine,
+                retire_candidate=retire,
+                reasons=reasons,
+            ))
+    return candidates
+
+
 def aggregate(
     turns_log: Path,
     events_log: Path,
     *,
     days: int = 7,
     now: datetime | None = None,
+    home: "Path | None" = None,
+    saga_conn: object | None = None,
     recent_error_hours: int = 24,
     error_recurrence_top_n: int = 10,
 ) -> Report:
@@ -413,6 +546,14 @@ def aggregate(
         pipeline.successful = sched.successful
 
     skill_lifecycle = sorted(skill_counts.items(), key=lambda kv: -kv[1])
+    skill_health = _build_skill_health(
+        home=home,
+        turns_log=turns_log,
+        days=days,
+        now=now,
+        skill_counts=skill_counts,
+        saga_conn=saga_conn,
+    )
 
     return Report(
         days=days,
@@ -427,6 +568,7 @@ def aggregate(
         performance_trends=performance_trends,
         error_recurrence=recurrence_rows,
         skill_lifecycle=skill_lifecycle,
+        skill_health=skill_health,
     )
 
 
@@ -573,6 +715,28 @@ def render_markdown(report: Report) -> str:
             lines.append(f"| {skill} | {count} |")
         lines.append("")
 
+    # Skill refine/retire candidates (chainlink #267). The reflection turn
+    # reads this and authors operator-gated refine/retire proposed-changes
+    # (#226 — surface, don't auto-act). Empty section is omitted.
+    if report.skill_health:
+        lines.append("## Skill refine/retire candidates")
+        lines.append("")
+        lines.append(
+            "_Objective per-skill signals that crossed a threshold. "
+            "Consider a refine/retire proposed-change; the operator decides._"
+        )
+        lines.append("")
+        lines.append("| Skill | Action | Success | Runs | Neg. learnings | Why |")
+        lines.append("|-------|--------|---------|------|----------------|-----|")
+        for sh in report.skill_health:
+            action = "retire" if sh.retire_candidate and not sh.refine_candidate else "refine"
+            lines.append(
+                f"| {sh.skill} | {action} | {_fmt_pct(sh.success_rate)} | "
+                f"{sh.runs} | {sh.negative_learnings} | "
+                f"{'; '.join(sh.reasons)} |"
+            )
+        lines.append("")
+
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -637,7 +801,26 @@ def run(args: argparse.Namespace) -> int:
     turns = home / "logs" / "turns.jsonl"
     events = home / "logs" / "events.jsonl"
 
-    report = aggregate(turns, events, days=args.days)
+    # Best-effort read-only saga connection for the per-skill negative-
+    # learning count (#267). Missing db / open failure just drops that one
+    # evidence input — the rest of the skill-health section still computes.
+    saga_conn = None
+    saga_db = home / ".mimir" / "saga.db"
+    if saga_db.is_file():
+        try:
+            import sqlite3
+            saga_conn = sqlite3.connect(f"file:{saga_db}?mode=ro", uri=True)
+        except Exception:  # noqa: BLE001
+            log.warning("introspection: saga.db open failed", exc_info=True)
+            saga_conn = None
+
+    try:
+        report = aggregate(
+            turns, events, days=args.days, home=home, saga_conn=saga_conn,
+        )
+    finally:
+        if saga_conn is not None:
+            saga_conn.close()
     body = render_markdown(report)
 
     if args.output:
