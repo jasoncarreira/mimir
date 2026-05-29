@@ -2170,14 +2170,24 @@ class Agent:
         # with it — appended under the same Skill section. Best-effort:
         # only when a concrete SagaStore is wired; recall errors leave the
         # body unchanged (skill load must not fail on a memory miss).
+        #
+        # Slice 6: augment_skill_body now returns (body, atom_ids). The
+        # atom_ids are registered on ctx.saga_atom_ids so the synthesis
+        # turn can score them via saga_feedback, driving activation-based
+        # ranking on future skill loads.
         if auto_skill_block is not None and self._saga_store is not None:
             from . import skill_memory
             _skill_name, _skill_body = auto_skill_block
             _conn = self._saga_store.connection()
-            _augmented = await asyncio.to_thread(
+            _augmented, _skill_atom_ids = await asyncio.to_thread(
                 skill_memory.augment_skill_body, _conn, _skill_name, _skill_body,
             )
             auto_skill_block = (_skill_name, _augmented)
+            if _skill_atom_ids:
+                _existing = set(ctx.saga_atom_ids)
+                ctx.saga_atom_ids.extend(
+                    aid for aid in _skill_atom_ids if aid not in _existing
+                )
         # Channel memory injection (chainlink #187): load per-channel fact
         # files (operator name, preferences, patterns) from
         # ``memory/channels/<channel_id>/``.  Returns None for synthetic

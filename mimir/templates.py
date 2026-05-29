@@ -126,6 +126,14 @@ enough to score without re-reading turns. For each atom, call:
   saga_feedback(atom_id, "incorrect")  # was wrong or misleading
   saga_feedback(atom_id, "stale")      # outdated, should decay
 
+**Skill-learning atoms** (injected when a skill loaded this session) appear
+in the feedback section like any other atom.  Score them the same way: if a
+skill's recalled learning (a gotcha / tip / caveat that was injected into
+the SKILL.md body) accurately described what you encountered, mark it
+"useful"; if it was wrong or no longer applies, mark it "stale" or
+"incorrect".  These votes drive activation-based ranking on the next load
+— accurate learnings surface first, outdated ones decay out.
+
 Skip atoms that were neutral / not applicable — silence is a valid signal.
 
 ### 3. Record the session boundary

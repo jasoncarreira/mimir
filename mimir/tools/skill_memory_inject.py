@@ -91,20 +91,56 @@ def _is_success_text(result: Any) -> bool:
     )
 
 
-def _compute_augmented(file_path: str, content: Any, conn: Any) -> str | None:
-    """Return augmented content, or ``None`` to leave the read unchanged.
+def _compute_augmented(
+    file_path: str, content: Any, conn: Any
+) -> "tuple[str, list[str]] | None":
+    """Return ``(augmented_content, atom_ids)`` or ``None`` to leave unchanged.
 
     Pure/sync so the async path can offload it to a thread (the SQL in
-    ``augment_skill_body`` shouldn't run on the event loop)."""
+    ``augment_skill_body`` shouldn't run on the event loop).
+
+    Returns ``None`` when the path doesn't resolve to a skill, no learnings
+    exist, or any error occurs — the caller leaves the read result unchanged
+    in those cases.  Callers use the returned atom_ids to credit the
+    injected learning atoms on the turn's votable set (chainlink #266
+    slice 6)."""
     skill = _skill_from_path(file_path)
     if skill is None or conn is None or not isinstance(content, str):
         return None
     try:
         from .. import skill_memory
-        augmented = skill_memory.augment_skill_body(conn, skill, content)
+        augmented, atom_ids = skill_memory.augment_skill_body(conn, skill, content)
     except Exception:  # noqa: BLE001 — never break a file read
         return None
-    return augmented if augmented != content else None
+    if augmented == content:
+        return None
+    return augmented, atom_ids
+
+
+def _credit_skill_atom_ids(atom_ids: list[str]) -> None:
+    """Extend the current turn's votable atom set with *atom_ids*.
+
+    The synthesis turn scores every ``atom_id`` on the turn's votable set
+    via ``saga_feedback``.  By adding the injected skill-learning atom IDs
+    here, those atoms join the voting loop: useful learnings accrue weight-
+    2.0 feedback_positive events and rise in activation-based recall; stale
+    ones get marked and decay out.
+
+    Best-effort: no TurnContext in context (e.g. tests, synthetic channels)
+    → silently does nothing.  Duplicate IDs are deduplicated against the
+    existing set so an atom can't be added twice.
+    """
+    if not atom_ids:
+        return
+    try:
+        from .._context import get_current_turn
+        ctx = get_current_turn()
+        if ctx is None:
+            return
+        existing = set(ctx.saga_atom_ids)
+        ctx.saga_atom_ids.extend(aid for aid in atom_ids if aid not in existing)
+    except Exception:  # noqa: BLE001 — never interfere with the tool call
+        pass
 
 
 class SkillMemoryInjectionMiddleware(AgentMiddleware):
@@ -123,11 +159,13 @@ class SkillMemoryInjectionMiddleware(AgentMiddleware):
         result = handler(request)
         if _tool_name(request) != _READ_FILE_TOOL or not _is_success_text(result):
             return result
-        augmented = _compute_augmented(
+        outcome = _compute_augmented(
             _file_path_arg(request), result.content, _resolve_conn(),
         )
-        if augmented is not None:
-            result.content = augmented
+        if outcome is not None:
+            augmented_body, atom_ids = outcome
+            result.content = augmented_body
+            _credit_skill_atom_ids(atom_ids)
         return result
 
     async def awrap_tool_call(
@@ -138,10 +176,12 @@ class SkillMemoryInjectionMiddleware(AgentMiddleware):
         result = await handler(request)
         if _tool_name(request) != _READ_FILE_TOOL or not _is_success_text(result):
             return result
-        augmented = await asyncio.to_thread(
+        outcome = await asyncio.to_thread(
             _compute_augmented,
             _file_path_arg(request), result.content, _resolve_conn(),
         )
-        if augmented is not None:
-            result.content = augmented
+        if outcome is not None:
+            augmented_body, atom_ids = outcome
+            result.content = augmented_body
+            _credit_skill_atom_ids(atom_ids)
         return result

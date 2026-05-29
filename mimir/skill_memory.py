@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 # Atom source_type tag for skill-learning atoms. Recall (mimir/saga/recall.py)
 # excludes this source_type from general candidate hydration.
@@ -81,12 +82,22 @@ def recall_skill_learnings(
     limit: int = 10,
     kinds: frozenset[str] | set[str] | None = None,
 ) -> list[dict]:
-    """Return a skill's learning atoms, newest-first, for injection on load.
+    """Return a skill's learning atoms, ranked by ACT-R activation, for
+    injection on load (chainlink #266 slice 6).
 
-    Direct SQL (not the FAISS/FTS pipeline): at skill-load time the
-    "query" is just "I'm loading skill X", so we want all of that skill's
-    learnings ranked by recency, not semantic similarity to the turn.
-    Activation-aware ranking can layer on when the load injection wires in.
+    Direct SQL fetch (not the FAISS/FTS pipeline): at skill-load time the
+    "query" is just "I'm loading skill X", so semantic similarity is not
+    useful.  We fetch all learnings then rank by ACT-R activation so that
+    atoms the synthesis turn voted *useful* (weight-2.0 feedback_positive
+    events) surface first in the top-K.
+
+    Initial ordering is equivalent to recency because new atoms carry only
+    their 'store' access event.  After saga_feedback voting cycles the
+    activation of frequently-useful learnings diverges upward, driving the
+    "votes determine what survives the top-K" property described in the
+    chainlink spec.  We deliberately do NOT fire an access event on
+    injection — that would ossify the first-injected 8 regardless of
+    quality.
 
     *kinds* optionally restricts to a valence subset (e.g.
     ``NEGATIVE_KINDS`` for the #267 surfacing path). ``None`` = all kinds.
@@ -105,7 +116,10 @@ def recall_skill_learnings(
             f"({','.join(['?'] * len(kind_list))})"
         )
         params.extend(kind_list)
-    params.append(int(limit))
+    # Over-fetch slightly so the activation sort can pick the best *limit* from
+    # a wider pool.  Cap at 3× the requested limit to bound the SQL scan.
+    fetch_limit = min(int(limit) * 3, 100)
+    params.append(fetch_limit)
     rows = conn.execute(
         f"""
         SELECT id, content, json_extract(metadata, '$.kind') AS kind, created_at
@@ -119,10 +133,59 @@ def recall_skill_learnings(
         """,
         params,
     ).fetchall()
-    return [
+    if not rows:
+        return []
+
+    atoms = [
         {"id": r[0], "content": r[1], "kind": r[2], "created_at": r[3]}
         for r in rows
     ]
+
+    # ── Activation ranking ──────────────────────────────────────────
+    # Fetch the denormalized access summary for each candidate and compute
+    # Petrov OL activation.  Atoms with no summary (shouldn't happen after
+    # store(), but defensive) fall back to 0.0 (sorted last).
+    from .saga.activation import compute_activation  # local import avoids circular
+    atom_ids_list = [a["id"] for a in atoms]
+    placeholders = ",".join(["?"] * len(atom_ids_list))
+    summary_rows = conn.execute(
+        f"SELECT atom_id, recent_ts_json, recent_weights_json, "
+        f"old_count, old_weight_sum, old_oldest_ts "
+        f"FROM atom_access_summary WHERE atom_id IN ({placeholders})",
+        atom_ids_list,
+    ).fetchall()
+    summaries = {
+        r[0]: {
+            "recent_ts": json.loads(r[1] or "[]"),
+            "recent_weights": json.loads(r[2] or "[]"),
+            "old_count": r[3] or 0,
+            "old_weight_sum": r[4] or 0.0,
+            "old_oldest_ts": r[5],
+        }
+        for r in summary_rows
+    }
+    now = datetime.now(timezone.utc)
+    for atom in atoms:
+        s = summaries.get(atom["id"])
+        if s is None:
+            atom["_act"] = 0.0
+        else:
+            try:
+                atom["_act"] = compute_activation(
+                    recent_ts=s["recent_ts"],
+                    recent_weights=s["recent_weights"],
+                    old_count=s["old_count"],
+                    old_weight_sum=s["old_weight_sum"],
+                    old_oldest_ts=s["old_oldest_ts"],
+                    now=now,
+                )
+            except Exception:  # noqa: BLE001 — activation error must not drop atom
+                atom["_act"] = 0.0
+
+    atoms.sort(key=lambda a: a["_act"], reverse=True)
+    for atom in atoms:
+        del atom["_act"]
+    return atoms[:int(limit)]
 
 
 def render_skill_learnings(learnings: list[dict]) -> str:
@@ -165,28 +228,37 @@ def augment_skill_body(
     body: str,
     *,
     limit: int = 8,
-) -> str:
+) -> tuple[str, list[str]]:
     """Append a skill's recalled learnings to its SKILL.md *body* for
     load-time injection (chainlink #266 read path).
 
     Recalls up to *limit* learnings for *skill* (ALL kinds — a tip and a
     gotcha both help the next invocation) and appends them under
-    ``_LEARNINGS_HEADING``. Returns *body* unchanged when the skill has no
-    learnings (a skill with no accumulated memory injects exactly its
-    SKILL.md, no empty section). Best-effort: any DB error returns the
-    original body rather than failing the skill load.
+    ``_LEARNINGS_HEADING``.
+
+    Returns ``(augmented_body, atom_ids)`` so callers can register the
+    injected learning atoms on the turn's votable set (slice 6). The
+    synthesis turn then scores them via ``saga_feedback`` — useful learnings
+    accrue activation, stale ones decay out, driving activation-based
+    recall ranking on future skill loads.
+
+    When the skill has no learnings, returns ``(body, [])`` — body
+    unchanged, empty list, no votable atoms. Best-effort: any DB error
+    returns ``(body, [])`` rather than failing the skill load.
     """
     try:
         learnings = recall_skill_learnings(conn, skill, limit=limit)
     except Exception:  # noqa: BLE001 — skill load must not fail on a recall error
-        return body
+        return body, []
     rendered = render_skill_learnings(learnings)
     if not rendered:
-        return body
-    return (
+        return body, []
+    atom_ids = [item["id"] for item in learnings]
+    augmented = (
         f"{body}\n\n{_LEARNINGS_HEADING}\n{rendered}"
         f"\n\n{_LEARNINGS_NUDGE}"
     )
+    return augmented, atom_ids
 
 
 def count_negative_learnings(
