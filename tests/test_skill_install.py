@@ -1696,3 +1696,27 @@ def test_skill_env_summary_weather_and_ntfy_have_env_blocks():
             f"{skill_name}/SKILL.md expected required env var {expected_var!r}; "
             f"got: {req_names}"
         )
+
+
+def test_run_smoke_test_uses_minimal_env_not_host_secrets(tmp_path, monkeypatch):
+    """chainlink #259: the install-time smoke test runs with a minimal env
+    (essentials + the skill's .env), NOT the full inherited os.environ, so a
+    third-party skill can't read mimir's unrelated secrets at install time."""
+    monkeypatch.setenv("MIMIR_FAKE_HOST_SECRET", "should-not-leak")
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "poller.py").write_text(
+        "import os\n"
+        "print('SECRET=' + os.environ.get('MIMIR_FAKE_HOST_SECRET', 'ABSENT'))\n"
+        "print('SKILLVAR=' + os.environ.get('SKILL_DECLARED_VAR', 'ABSENT'))\n"
+    )
+    env_path = tmp_path / ".env"
+    env_path.write_text("SKILL_DECLARED_VAR=present\n")
+
+    code, snippet = run_smoke_test(skill_dir, env_path=env_path)
+    assert code == 0, snippet
+    # Host secret is NOT visible to the skill's smoke test.
+    assert "SECRET=ABSENT" in snippet
+    assert "should-not-leak" not in snippet
+    # The skill's own declared/configured var (from .env) IS visible.
+    assert "SKILLVAR=present" in snippet

@@ -231,11 +231,21 @@ def record_first_seen(
         )
         return {"corrupt": True}
 
-    # We care about login-age, not refresh-rotation-age. The "original
-    # login" is whatever the operator last did with /login. Heuristic:
-    # if the sidecar's first_login_at is older than the current
-    # access-token expiresAt by more than ~12h, assume operator
-    # re-/logged-in and reset. Otherwise preserve.
+    # We care about login-age, not refresh-rotation-age. ``first_login_at``
+    # is stamped once (``setdefault`` below) and then preserved across
+    # every poll — it's the first-observation timestamp the
+    # ``oauth_refresh_token_age_warn`` signal ages off.
+    #
+    # chainlink #259: an earlier comment here described a "~12h skew →
+    # assume re-login → reset the age clock" heuristic that was never
+    # implemented. It's also the wrong trigger — routine refresh rotates
+    # the token tail on every poll, so keying a reset off the tail change
+    # would reset perpetually. There is no age-clock reset on re-login
+    # today; the warn measures from first observation. A correct reset
+    # would key off a long ``last_seen`` gap (operator away → returned),
+    # left as a follow-up rather than shipping a wrong trigger. (The
+    # tail-change handling below is separate: it clears the sticky
+    # logged-out state, not the age clock.)
     first_login_at = existing.get("first_login_at_unix")
     if not isinstance(first_login_at, (int, float)):
         first_login_at = now
