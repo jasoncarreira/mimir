@@ -488,7 +488,7 @@ class RecordingSagaClient:
     # at runtime.
     _RECORDED_METHODS = frozenset({
         "query", "store", "feedback", "outcome", "end_session",
-        "consolidate", "forget",
+        "consolidate", "consolidate_skill_memories", "forget",
     })
 
     def __init__(self, inner: SagaClient) -> None:
@@ -522,6 +522,12 @@ class RecordingSagaClient:
     async def consolidate(self, *args, **kwargs):
         return await self._call(
             "consolidate", self._inner.consolidate, args, kwargs,
+        )
+
+    async def consolidate_skill_memories(self, *args, **kwargs):
+        return await self._call(
+            "consolidate_skill_memories",
+            self._inner.consolidate_skill_memories, args, kwargs,
         )
 
     async def forget(self, *args, **kwargs):

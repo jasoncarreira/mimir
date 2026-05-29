@@ -1235,10 +1235,31 @@ class Scheduler:
                     dry_run=False,
                     extra_canonical_subjects=extra_canonical_subjects,
                 )
+                # #266: a SEPARATE per-skill dedup pass for skill-learning
+                # atoms, which the general pass above deliberately excludes.
+                # Its own try/except so a skill-memory failure (or a remote
+                # saga without the method) doesn't flip the general run to
+                # error — the general consolidation already succeeded.
+                skill_summary: dict | None = None
+                try:
+                    skill_payload = await saga_client.consolidate_skill_memories(
+                        dry_run=False,
+                    )
+                    skill_summary = _summarize_skill_consolidate(skill_payload)
+                except AttributeError:
+                    # Remote saga (_HttpSaga) has no skill-memory endpoint
+                    # yet; embedded SagaStore is the supported path.
+                    skill_summary = {"skipped": "unsupported"}
+                except Exception as exc:  # noqa: BLE001
+                    skill_summary = {
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    log.exception("per-skill consolidation failed")
                 await log_event(
                     "saga_consolidate_ok",
                     dry_run=False,
                     result=_summarize_consolidate(payload),
+                    skill_memory=skill_summary,
                     extra_canonical_subjects_count=(
                         len(extra_canonical_subjects)
                         if extra_canonical_subjects else 0
@@ -1951,3 +1972,28 @@ def _summarize_consolidate(payload: Any) -> dict:
     return summary
 
 
+def _summarize_skill_consolidate(payload: Any) -> dict:
+    """Compact the per-skill dedup payload (#266) for the event log.
+
+    Rolls the per-skill dedup results into totals plus a list of the
+    skills that actually had duplicates collapsed — the per-skill detail
+    stays bounded even with many skills."""
+    if not isinstance(payload, dict):
+        return {"raw": str(payload)[:200]}
+    skills = payload.get("skills")
+    skills = skills if isinstance(skills, dict) else {}
+    total_tombstoned = 0
+    collapsed: list[str] = []
+    for name, res in skills.items():
+        n = len(res.get("duplicates_tombstoned", []) or []) if isinstance(
+            res, dict
+        ) else 0
+        total_tombstoned += n
+        if n:
+            collapsed.append(name)
+    return {
+        "skills_scanned": payload.get("skills_scanned", len(skills)),
+        "duplicates_tombstoned": total_tombstoned,
+        "skills_collapsed": sorted(collapsed),
+        "threshold": payload.get("threshold"),
+    }

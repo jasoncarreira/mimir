@@ -88,6 +88,12 @@ MAX_OBSERVATIONS_PER_RUN = 20
 # Default similarity threshold for clustering (matches cluster.py).
 DEFAULT_SIMILARITY_THRESHOLD = 0.80
 
+# Skill-learning atoms (#266) are partitioned out of the general
+# consolidation/dedup passes and processed per-skill instead. Local
+# copy of mimir.skill_memory.SKILL_LEARNING_SOURCE_TYPE — saga is the
+# lower layer and must not import up into mimir.*.
+_SKILL_LEARNING_SOURCE_TYPE = "skill_learning"
+
 
 # Injected callables — same shapes as in reflect.py
 ObservationSynthFn = Callable[[list[dict]], tuple[str, list[str]]]
@@ -114,6 +120,7 @@ def _candidate_raws(
     *,
     lookback_days: int,
     agent_id: str,
+    skill_scope: str | None = None,
 ) -> list[dict]:
     """Atoms eligible for cross-session consolidation.
 
@@ -134,10 +141,28 @@ def _candidate_raws(
     Equal-evidence redundancy (the cluster matches an existing
     observation's evidence exactly) is handled in the synthesis loop
     via ``find_equal_evidence_obs``.
+
+    *skill_scope* partitions skill-learning atoms (#266) into their own
+    consolidation passes, so a skill's gotchas never merge into a general
+    cross-session observation and two unrelated skills never cluster
+    together:
+    - ``None`` (default, the general pass): EXCLUDE all ``skill_learning``
+      atoms.
+    - ``"<skill>"`` (per-skill pass): include ONLY that skill's
+      ``skill_learning`` atoms.
     """
     cutoff = (datetime.now(timezone.utc)
               - timedelta(days=lookback_days)).isoformat()
-    rows = conn.execute("""
+    if skill_scope is None:
+        scope_clause = "AND a.source_type != ?"
+        scope_params: tuple = (_SKILL_LEARNING_SOURCE_TYPE,)
+    else:
+        scope_clause = (
+            "AND a.source_type = ? "
+            "AND json_extract(a.metadata, '$.skill') = ?"
+        )
+        scope_params = (_SKILL_LEARNING_SOURCE_TYPE, skill_scope)
+    rows = conn.execute(f"""
         SELECT DISTINCT a.id, a.content, a.stream, a.memory_type,
                a.source_type, a.created_at, a.topics, a.metadata,
                a.agent_id, a.session_id
@@ -147,10 +172,46 @@ def _candidate_raws(
           AND a.tombstoned = 0
           AND a.agent_id = ?
           AND e.ts >= ?
-    """, (agent_id, cutoff)).fetchall()
+          {scope_clause}
+    """, (agent_id, cutoff, *scope_params)).fetchall()
     cols = ("id", "content", "stream", "memory_type", "source_type",
             "created_at", "topics", "metadata", "agent_id", "session_id")
     return [dict(zip(cols, r)) for r in rows]
+
+
+def distinct_skill_scopes(
+    conn: sqlite3.Connection, *, agent_id: str | None = None,
+) -> list[str]:
+    """Distinct skill names with at least one live skill-learning atom.
+
+    Drives the per-skill consolidation loop (#266): general
+    consolidation excludes ``skill_learning`` atoms, so each skill's
+    learnings dedup in their own scoped pass. A skill whose atoms are
+    all tombstoned drops out (no pass needed). ``NULL``/empty skill
+    tags are skipped — those can't be scoped. *agent_id* optionally
+    restricts to one agent's atoms (the per-skill dedup runs per-agent,
+    matching the general pass).
+    """
+    where = [
+        "source_type = ?",
+        "tombstoned = 0",
+        "skill IS NOT NULL",
+        "skill != ''",
+    ]
+    params: list = [_SKILL_LEARNING_SOURCE_TYPE]
+    if agent_id is not None:
+        where.append("agent_id = ?")
+        params.append(agent_id)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT json_extract(metadata, '$.skill') AS skill
+        FROM atoms
+        WHERE {' AND '.join(where)}
+        ORDER BY skill
+        """,
+        params,
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 def consolidate(

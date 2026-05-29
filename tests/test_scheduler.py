@@ -16,6 +16,7 @@ from mimir.scheduler import (
     _build_trigger,
     _resolve_tz,
     _scheduler_channel_id,
+    _summarize_skill_consolidate,
     load_jobs,
     write_jobs,
 )
@@ -360,6 +361,130 @@ async def test_saga_consolidate_no_identities_yaml_no_subjects(tmp_path: Path):
     await job.func()
     # Either absent or None — both mean "didn't pass canonical subjects."
     assert not captured.get("extra_canonical_subjects")
+
+
+@pytest.mark.asyncio
+async def test_saga_consolidate_runs_per_skill_pass(tmp_path: Path):
+    """#266: the cron runs the general consolidate AND a separate
+    per-skill dedup pass; the OK event carries the skill-memory summary."""
+    import json
+
+    called = {"general": False, "skill": False}
+
+    class _FakeSagaClient:
+        async def consolidate(self, **kwargs):
+            called["general"] = True
+            return {"clusters_processed": 0}
+
+        async def consolidate_skill_memories(self, **kwargs):
+            called["skill"] = True
+            return {
+                "skills_scanned": 2,
+                "threshold": 0.92,
+                "skills": {
+                    "memory": {"duplicates_tombstoned": ["x"]},
+                    "github": {"duplicates_tombstoned": []},
+                },
+            }
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched.add_saga_consolidate_job(_FakeSagaClient(), "0 4 * * 0")
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    await sched._scheduler.get_job("saga-consolidate").func()
+
+    assert called["general"] and called["skill"]
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    ok = next(e for e in events if e["type"] == "saga_consolidate_ok")
+    assert ok["skill_memory"]["skills_scanned"] == 2
+    assert ok["skill_memory"]["duplicates_tombstoned"] == 1
+    assert ok["skill_memory"]["skills_collapsed"] == ["memory"]
+
+
+@pytest.mark.asyncio
+async def test_saga_consolidate_skill_failure_does_not_fail_general(tmp_path: Path):
+    """A per-skill dedup failure must NOT flip the run to error — the
+    general pass already succeeded. The OK event still fires, carrying
+    the skill-memory error for diagnosis."""
+    import json
+
+    class _FakeSagaClient:
+        async def consolidate(self, **kwargs):
+            return {"clusters_processed": 0}
+
+        async def consolidate_skill_memories(self, **kwargs):
+            raise RuntimeError("boom")
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched.add_saga_consolidate_job(_FakeSagaClient(), "0 4 * * 0")
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    await sched._scheduler.get_job("saga-consolidate").func()
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    types = [e["type"] for e in events]
+    assert "saga_consolidate_ok" in types
+    assert "saga_consolidate_error" not in types
+    ok = next(e for e in events if e["type"] == "saga_consolidate_ok")
+    assert "boom" in ok["skill_memory"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_saga_consolidate_skill_pass_unsupported_remote(tmp_path: Path):
+    """A remote saga without consolidate_skill_memories degrades to a
+    'skipped' marker rather than crashing the cron (AttributeError)."""
+    import json
+
+    class _FakeRemoteSaga:
+        async def consolidate(self, **kwargs):
+            return {"clusters_processed": 0}
+        # no consolidate_skill_memories method
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched.add_saga_consolidate_job(_FakeRemoteSaga(), "0 4 * * 0")
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    await sched._scheduler.get_job("saga-consolidate").func()
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    ok = next(e for e in events if e["type"] == "saga_consolidate_ok")
+    assert ok["skill_memory"] == {"skipped": "unsupported"}
+
+
+def test_summarize_skill_consolidate():
+    payload = {
+        "skills_scanned": 3,
+        "threshold": 0.92,
+        "skills": {
+            "a": {"duplicates_tombstoned": ["1", "2"]},
+            "b": {"duplicates_tombstoned": []},
+            "c": {"duplicates_tombstoned": ["3"]},
+        },
+    }
+    out = _summarize_skill_consolidate(payload)
+    assert out["skills_scanned"] == 3
+    assert out["duplicates_tombstoned"] == 3
+    assert out["skills_collapsed"] == ["a", "c"]
+    assert out["threshold"] == 0.92
+
+
+def test_summarize_skill_consolidate_non_dict():
+    assert "raw" in _summarize_skill_consolidate("nope")
 
 
 @pytest.mark.asyncio
