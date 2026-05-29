@@ -332,3 +332,92 @@ async def test_download_slack_attachment_enforces_cap(tmp_path: Path):
     call_kwargs = mock_dl.call_args.kwargs
     assert call_kwargs.get("max_bytes") == max_bytes
     assert call_kwargs.get("headers", {}).get("Authorization") == f"Bearer {bot_token}"
+
+
+# ── redirect / auth-token-leak guard (chainlink #252) ────────────────
+#
+# aiohttp re-sends the Authorization header on cross-origin redirects,
+# unlike curl/requests. A 30x on a credentialed Slack url_private
+# download would leak the live xoxb- bot token to the redirect target.
+# download_to_path now auto-disables redirect-following when the
+# request carries an Authorization header.
+
+
+def _capture_get_kwargs(captured: dict):
+    async def _iter_chunked(_size: int):
+        yield b"data"
+
+    mock_content = MagicMock()
+    mock_content.iter_chunked = _iter_chunked
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.content = mock_content
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    def _fake_get(url, headers=None, allow_redirects=None, **_kw):
+        captured["headers"] = headers
+        captured["allow_redirects"] = allow_redirects
+        return mock_resp
+
+    mock_session = MagicMock()
+    mock_session.get = _fake_get
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    return mock_session
+
+
+@pytest.mark.asyncio
+async def test_download_with_auth_header_disables_redirects(tmp_path: Path):
+    """A credentialed download (Authorization present) must NOT follow
+    redirects — otherwise aiohttp leaks the bearer token to the redirect
+    host. allow_redirects auto-resolves to False."""
+    captured: dict = {}
+    mock_session = _capture_get_kwargs(captured)
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        ok = await download_to_path(
+            "https://files.slack.com/priv", tmp_path / "o.bin",
+            headers={"Authorization": "Bearer xoxb-secret"},
+        )
+    assert ok is True
+    assert captured["allow_redirects"] is False
+
+
+@pytest.mark.asyncio
+async def test_download_auth_header_case_insensitive(tmp_path: Path):
+    """The auth detection is case-insensitive on the header key."""
+    captured: dict = {}
+    mock_session = _capture_get_kwargs(captured)
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        await download_to_path(
+            "https://files.slack.com/priv", tmp_path / "o.bin",
+            headers={"authorization": "Bearer xoxb-secret"},
+        )
+    assert captured["allow_redirects"] is False
+
+
+@pytest.mark.asyncio
+async def test_download_without_auth_follows_redirects(tmp_path: Path):
+    """Unauthenticated downloads (Discord CDN) keep following redirects —
+    they carry no credential to leak and the CDN legitimately redirects."""
+    captured: dict = {}
+    mock_session = _capture_get_kwargs(captured)
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        await download_to_path(
+            "https://cdn.discordapp.com/x", tmp_path / "o.bin",
+        )
+    assert captured["allow_redirects"] is True
+
+
+@pytest.mark.asyncio
+async def test_download_explicit_allow_redirects_override(tmp_path: Path):
+    """An explicit allow_redirects value wins over the auto-resolution."""
+    captured: dict = {}
+    mock_session = _capture_get_kwargs(captured)
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        await download_to_path(
+            "https://files.slack.com/priv", tmp_path / "o.bin",
+            headers={"Authorization": "Bearer tok"},
+            allow_redirects=True,  # explicit override
+        )
+    assert captured["allow_redirects"] is True

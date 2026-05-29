@@ -109,10 +109,20 @@ def resolve_outbound_path(outbound_root: Path, raw_path: str) -> Path:
     return resolved
 
 
+def _carries_auth(headers: dict[str, str] | None) -> bool:
+    """True if *headers* carries an Authorization credential (case-
+    insensitive key match). Used to decide whether following redirects
+    is safe."""
+    if not headers:
+        return False
+    return any(k.lower() == "authorization" for k in headers)
+
+
 async def download_to_path(
     url: str, target: Path, *, max_bytes: int | None = None,
     timeout_s: float = _DEFAULT_DOWNLOAD_TIMEOUT_S,
     headers: dict[str, str] | None = None,
+    allow_redirects: bool | None = None,
 ) -> bool:
     """Stream ``url`` to ``target``. Returns True on success, False on
     failure (logged at WARNING). When ``max_bytes`` is set and the
@@ -124,6 +134,19 @@ async def download_to_path(
     authenticated endpoints (e.g. Slack ``url_private`` requires
     ``Authorization: Bearer <bot-token>``).
 
+    ``allow_redirects`` (chainlink #252): aiohttp re-sends request
+    headers — including ``Authorization`` — on cross-origin redirects,
+    unlike curl/requests which strip credentials on a host change. A
+    30x to an attacker-controlled host would therefore receive the live
+    bearer token. When ``allow_redirects`` is left ``None`` (default),
+    it auto-resolves to ``False`` whenever the request carries an
+    ``Authorization`` header (so an authed download cannot leak its
+    credential across a redirect) and ``True`` otherwise (Discord CDN
+    downloads are unauthenticated and may legitimately redirect). Pass
+    an explicit bool to override. Slack ``url_private`` resources never
+    legitimately redirect off Slack's domain, so disabling redirects
+    for the authed path is safe.
+
     Uses aiohttp lazily so non-bridge deployments don't pay the import.
     """
     try:
@@ -132,12 +155,18 @@ async def download_to_path(
         log.error("download_to_path: aiohttp not installed")
         return False
 
+    if allow_redirects is None:
+        # Credentialed request → don't follow redirects (token-leak guard).
+        allow_redirects = not _carries_auth(headers)
+
     target.parent.mkdir(parents=True, exist_ok=True)
     written = 0
     try:
         timeout = aiohttp.ClientTimeout(total=timeout_s)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(
+                url, headers=headers, allow_redirects=allow_redirects,
+            ) as resp:
                 if resp.status >= 400:
                     log.warning(
                         "download_to_path: %s returned %s", url, resp.status,
