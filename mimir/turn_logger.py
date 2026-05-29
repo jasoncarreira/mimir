@@ -516,14 +516,36 @@ class TurnLogger:
         await asyncio.to_thread(self._trim_sync)
 
     def _trim_sync(self) -> None:
+        # ``_tail_lines`` is a single-arg, newest-first generator (it was
+        # rewritten to stream from the file tail in 8 KiB chunks). The
+        # prior call here passed ``self._max_turns`` as a second positional
+        # arg and treated the result as a bounded chronological list —
+        # both wrong post-rewrite: the 2-arg call raised ``TypeError``
+        # (NOT caught by the ``except OSError`` below, so it crashed the
+        # turn-write coroutine), and even without that it would have
+        # written the whole file reversed. Mirror ``EventLogger._trim_sync``:
+        # take the newest ``_max_turns`` lines, then reverse for a
+        # chronological rewrite.
+        kept_reversed: list[str] = []
         try:
-            keep = _tail_lines(self._path, self._max_turns)
-            tmp = self._path.with_suffix(".jsonl.tmp")
-            tmp.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
-            tmp.rename(self._path)
-            self._line_count = len(keep)
+            for line in _tail_lines(self._path):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                kept_reversed.append(stripped)
+                if len(kept_reversed) >= self._max_turns:
+                    break
         except OSError as exc:
             log.warning("Failed to trim turn log: %s", exc)
+            return
+        if not kept_reversed:
+            return
+        # tail yields newest-first; reverse for chronological rewrite.
+        kept = list(reversed(kept_reversed))
+        tmp = self._path.with_suffix(".jsonl.tmp")
+        tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        tmp.rename(self._path)
+        self._line_count = len(kept)
 
 
 def make_turn_id() -> str:
