@@ -39,7 +39,6 @@ import json
 import logging
 import re
 import sqlite3
-import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
@@ -378,6 +377,67 @@ def get_history(
 # ─── Retrieval: triple_augment_v2 pathway ────────────────────────────
 
 
+def _cosine_scores(
+    query_emb: list[float],
+    blobs_dims: list[tuple[bytes | None, int | None]],
+    *,
+    dim: int | None,
+) -> list[tuple[int, float]]:
+    """Cosine of *query_emb* against each ``(blob, t_dim)`` candidate, as
+    one numpy matmul. Returns ``(index, sim)`` for usable rows, in input
+    order (caller maps the index back to its row).
+
+    chainlink #257 perf half: replaces the former O(N·dim) pure-Python
+    cosine loop (``struct.unpack`` + ``math.sqrt`` + ``zip`` dot per
+    triple) with a single vectorized matmul, so the hot ``query()`` path
+    no longer scales linearly *in Python* with the triple corpus. The math
+    runs in float64 to match the original loop's precision (embeddings are
+    stored float32; upcast for the dot/norm).
+
+    Row-skip semantics are preserved exactly: a candidate is dropped when
+    its ``t_dim`` mismatches *dim*, its blob is too short, its unpacked
+    shape doesn't match the query, or its (or the query's) norm is zero.
+    No persistent ANN index — at the projected corpus size (tens of
+    thousands of triples) a vectorized matmul is sub-millisecond; a FAISS
+    triples index analogous to atoms would only pay off at million-scale
+    and is deferred (it would add a build/add/freshness lifecycle).
+    """
+    import numpy as np
+
+    q = np.asarray(query_emb, dtype=np.float64)
+    q_norm = float(np.linalg.norm(q))
+    if q_norm == 0.0:
+        return []
+    q_dim = int(q.shape[0])
+
+    kept_idx: list[int] = []
+    vecs: list[np.ndarray] = []
+    for i, (blob, t_dim) in enumerate(blobs_dims):
+        td = t_dim if t_dim is not None else q_dim
+        if dim is not None and t_dim is not None and t_dim != dim:
+            continue
+        if blob is None or len(blob) < td * 4:
+            continue
+        v = np.frombuffer(blob[: td * 4], dtype=np.float32)
+        if v.shape[0] != q_dim:
+            continue
+        kept_idx.append(i)
+        vecs.append(v.astype(np.float64))
+    if not vecs:
+        return []
+
+    mat = np.vstack(vecs)
+    norms = np.linalg.norm(mat, axis=1)
+    dots = mat @ q
+    out: list[tuple[int, float]] = []
+    for k, i in enumerate(kept_idx):
+        n = float(norms[k])
+        if n == 0.0:
+            continue
+        out.append((i, float(dots[k]) / (q_norm * n)))
+    return out
+
+
 def triple_augment_search(
     conn: sqlite3.Connection,
     query_emb: list[float],
@@ -416,42 +476,20 @@ def triple_augment_search(
     ).fetchall()
     if not rows:
         return []
-    # Unpack the query vector once into a numpy-like float list. Avoid
-    # numpy dependency here — the loop is small relative to FAISS-side
-    # work and we want this module to be import-cheap.
-    import math
-    q_norm = math.sqrt(sum(x * x for x in query_emb))
-    if q_norm == 0.0:
-        return []
-    # Score each candidate.
-    scored: dict[str, float] = {}
-    for triple_id, source_atom_id, blob, t_dim in rows:
-        if source_atom_id is None:
-            continue
-        if dim is not None and t_dim is not None and t_dim != dim:
-            continue
-        if t_dim is None:
-            # Best-effort: assume the blob matches the query dim.
-            t_dim = len(query_emb)
-        if len(blob) < t_dim * 4:
-            continue
-        try:
-            vec = list(struct.unpack(f"{t_dim}f", blob[: t_dim * 4]))
-        except struct.error:
-            continue
-        if len(vec) != len(query_emb):
-            continue
-        v_norm = math.sqrt(sum(x * x for x in vec))
-        if v_norm == 0.0:
-            continue
-        sim = sum(a * b for a, b in zip(query_emb, vec)) / (q_norm * v_norm)
-        # Multiple triples may point at the same source_atom_id; keep
-        # the best match per atom (saga does the same — atoms surface
-        # via their *strongest* triple).
-        prev = scored.get(source_atom_id, -1.0)
-        if sim > prev:
-            scored[source_atom_id] = sim
-    ordered = sorted(scored.items(), key=lambda x: -x[1])
+    # Candidates with a real source_atom_id (others can't surface an atom).
+    candidates = [r for r in rows if r[1] is not None]
+    # Vectorized cosine (chainlink #257): embedding=col 2, embedding_dim=col 3.
+    scores = _cosine_scores(
+        query_emb, [(r[2], r[3]) for r in candidates], dim=dim,
+    )
+    # Multiple triples may point at the same source_atom_id; keep the best
+    # match per atom (atoms surface via their *strongest* triple).
+    best: dict[str, float] = {}
+    for i, sim in scores:
+        source_atom_id = candidates[i][1]
+        if sim > best.get(source_atom_id, -1.0):
+            best[source_atom_id] = sim
+    ordered = sorted(best.items(), key=lambda x: -x[1])
     return ordered[:top_k]
 
 
@@ -497,31 +535,15 @@ def top_triples_with_payload(
     ).fetchall()
     if not rows:
         return []
-    import math
-    q_norm = math.sqrt(sum(x * x for x in query_emb))
-    if q_norm == 0.0:
-        return []
+    candidates = [r for r in rows if r[1] is not None]
+    # Vectorized cosine (chainlink #257): embedding=col 8, embedding_dim=col 9.
+    scores = _cosine_scores(
+        query_emb, [(r[8], r[9]) for r in candidates], dim=dim,
+    )
     scored: list[tuple[float, dict]] = []
-    for (triple_id, source_atom_id, subj, pred, obj,
-         valid_from, valid_until, confidence, blob, t_dim) in rows:
-        if source_atom_id is None:
-            continue
-        if dim is not None and t_dim is not None and t_dim != dim:
-            continue
-        if t_dim is None:
-            t_dim = len(query_emb)
-        if len(blob) < t_dim * 4:
-            continue
-        try:
-            vec = list(struct.unpack(f"{t_dim}f", blob[: t_dim * 4]))
-        except struct.error:
-            continue
-        if len(vec) != len(query_emb):
-            continue
-        v_norm = math.sqrt(sum(x * x for x in vec))
-        if v_norm == 0.0:
-            continue
-        sim = sum(a * b for a, b in zip(query_emb, vec)) / (q_norm * v_norm)
+    for i, sim in scores:
+        (triple_id, source_atom_id, subj, pred, obj,
+         valid_from, valid_until, confidence, _blob, _t_dim) = candidates[i]
         scored.append((sim, {
             "id": triple_id,
             "source_atom_id": source_atom_id,
