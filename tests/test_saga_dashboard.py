@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -697,14 +698,16 @@ def test_activation_hist_produces_buckets(tmp_path: Path) -> None:
 def test_activation_hist_respects_days_window(tmp_path: Path) -> None:
     db_path = tmp_path / "saga.db"
     conn = _make_db(db_path)
-    # One atom from today, one from 30 days ago.
-    _insert_atom(conn, "today", created_at="2026-05-28T05:00:00Z")
-    _insert_access_summary(conn, "today")
-    _insert_atom(conn, "old", created_at="2026-04-01T00:00:00Z")
+    # One atom from within the last hour, one from 30+ days ago.
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=35)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _insert_atom(conn, "today", created_at=now_ts)
+    _insert_access_summary(conn, "today", last_updated_ts=now_ts, recent_ts=[now_ts])
+    _insert_atom(conn, "old", created_at=old_ts)
     _insert_access_summary(
         conn, "old",
-        recent_ts=["2026-04-01T00:00:00Z"],
-        last_updated_ts="2026-04-01T00:00:00Z",
+        recent_ts=[old_ts],
+        last_updated_ts=old_ts,
     )
     conn.close()
 

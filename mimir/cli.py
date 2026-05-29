@@ -63,89 +63,6 @@ from .commands.identities import (  # noqa: E402
 )
 
 
-# ---------------------------------------------------------------------------
-# ``mimir update`` implementation (thin; no separate module warranted yet)
-# ---------------------------------------------------------------------------
-
-
-def _cmd_update(args) -> int:
-    """``mimir update`` — PyPI version-check + optional install.
-
-    Three modes:
-    - default: print current vs latest, exit 0 either way
-    - ``--check``: same status print, but exit 1 if an update is
-      available (useful in scripts / CI gates)
-    - ``--apply``: if newer version available, run
-      ``python -m pip install --upgrade mimir``. After install,
-      print a clear "restart agent" message — the running process
-      doesn't auto-pick up the new install.
-
-    ``--pre`` flag opts into pre-release surfacing (alpha / beta / rc
-    / dev). Default excludes them — stable releases only.
-    """
-    from .version_check import check_for_update, _pypi_package_name
-
-    pkg = _pypi_package_name()
-    result = check_for_update(include_prereleases=args.pre)
-
-    if result.error_msg:
-        print(f"Update check failed: {result.error_msg}", file=sys.stderr)
-        print(f"Current installed: {result.current}", file=sys.stderr)
-        # Exit 0 — failure isn't actionable; treat as "no signal".
-        # --check should NOT report "update available" on a failure.
-        return 0
-
-    print(f"Current installed: {result.current}")
-    print(f"Latest on PyPI:    {result.latest}")
-    if not result.is_newer:
-        print("Status: up to date")
-        return 0
-
-    print("Status: UPDATE AVAILABLE")
-    if not args.apply:
-        if args.check:
-            # CI / script flow — non-zero so callers can act.
-            return 1
-        print()
-        print("To install:  mimir update --apply")
-        print("After install, restart the agent:")
-        print("  docker compose restart   # containerized deployments")
-        print("  (or restart the mimir process by hand for bare-metal)")
-        return 0
-
-    # --apply path. Use python -m pip directly so this works regardless
-    # of whether the operator's environment uses pip, uv, or pipx for
-    # the original install — they all expose ``python -m pip``. The
-    # package name is whatever ``MIMIR_PYPI_PACKAGE_NAME`` resolves to
-    # (defaults to ``mimir`` for now; will be the real published name
-    # once the open-source release is on PyPI).
-    print()
-    print(f"Installing {pkg} {result.latest} via python -m pip...")
-    import subprocess
-    try:
-        completed = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", pkg],
-            check=False,
-        )
-    except OSError as exc:
-        print(f"pip invocation failed: {exc}", file=sys.stderr)
-        return 2
-    if completed.returncode != 0:
-        print(
-            f"pip exited {completed.returncode}; install did not succeed.",
-            file=sys.stderr,
-        )
-        return completed.returncode
-    print()
-    print(f"Installed {pkg} {result.latest}.")
-    print()
-    print("IMPORTANT: the running agent process is still on the OLD")
-    print("version until you restart it. To engage the new code:")
-    print("  docker compose restart   # containerized deployments")
-    print("  (or restart the mimir process by hand for bare-metal)")
-    return 0
-
-
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="mimir",
@@ -153,59 +70,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     sub = parser.add_subparsers(dest="command")
 
-    setup_p = sub.add_parser(
-        "setup",
-        help="Scaffold a mimir home (dirs, .env, scheduler.yaml, skills, subagents).",
-    )
-    setup_p.add_argument(
-        "--home", type=Path, default=Path.cwd(),
-        help="Target directory (default: current working dir).",
-    )
-    setup_p.add_argument(
-        "--embedding", type=str, default=DEFAULT_EMBEDDING_PRESET,
-        choices=list(EMBEDDING_PRESETS),
-        help=(
-            f"Embedding provider preset for the generated saga.toml "
-            f"(default: {DEFAULT_EMBEDDING_PRESET}). Voyage requires "
-            f"VOYAGE_API_KEY; openai requires OPENAI_API_KEY; "
-            f"nvidia-nim requires NVIDIA_NIM_API_KEY; fastembed is "
-            f"fully local. saga's [consolidation] similarity_threshold "
-            f"automatically tunes to the matching value (0.92 for "
-            f"voyage/fastembed, 0.80 for openai/nvidia-nim)."
-        ),
-    )
-    setup_p.add_argument(
-        "--model", type=str, default=None,
-        help=(
-            "Bare model name (no provider prefix needed). Setup "
-            "auto-routes based on the name: ``MiniMax-M2.7`` → Minimax "
-            "(via Anthropic-compat endpoint); ``kimi-k2-*`` → "
-            "Moonshot; ``gpt-*`` / ``o[1-4]-*`` → OpenAI; ``claude-*`` "
-            "→ direct Anthropic API. Generates the right "
-            "``MIMIR_MODEL_SPEC`` + ``ANTHROPIC_BASE_URL`` entries in "
-            ".env. Also wires the usage monitor that matches the "
-            "provider's billing model — subscription routes get quota "
-            "polling; API routes get per-turn cost tracking with a "
-            "default $/hr ceiling. Default model: claude-sonnet-4-6 "
-            "via direct API. See ``mimir/model_registry.py`` for the "
-            "full mapping."
-        ),
-    )
-    setup_p.add_argument(
-        "--subscription", action="store_true",
-        help=(
-            "Declare this deployment runs on a subscription plan for "
-            "the chosen provider (not pay-per-token API billing). "
-            "Effect is provider-polymorphic: Claude family swaps to "
-            "``claude-code:`` (Max OAuth via subprocess — the "
-            "protocol IS different); OpenAI / Minimax / Moonshot keep "
-            "the same model_spec (same HTTP endpoint, just a "
-            "different API token tier). Either way the usage monitor "
-            "flips from cost-tracking to quota-polling. Without this "
-            "flag, every route defaults to pay-per-token + cost "
-            "monitoring."
-        ),
-    )
+    # `mimir setup` — delegate to commands.setup
+    from .commands import setup as _setup_cmd
+    setup_p = _setup_cmd.add_argparse(sub)
 
     run_p = sub.add_parser("run", help="Run the mimir server (default).")
     run_p.add_argument(
@@ -335,33 +202,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
 
-    # ``mimir update``
-    update_p = sub.add_parser(
-        "update",
-        help="Check PyPI for a newer mimir release; with --apply, install it via pip.",
-    )
-    update_p.add_argument(
-        "--check",
-        action="store_true",
-        help=(
-            "Print status only; exit non-zero when an update is available "
-            "(useful in scripts / CI)."
-        ),
-    )
-    update_p.add_argument(
-        "--apply",
-        action="store_true",
-        help=(
-            "If a newer version is on PyPI, run `python -m pip install --upgrade mimir`. "
-            "You must restart the agent (e.g., `docker compose restart`) to engage "
-            "the new code."
-        ),
-    )
-    update_p.add_argument(
-        "--pre",
-        action="store_true",
-        help="Include pre-release versions (alpha / beta / rc / dev) when checking.",
-    )
+    # `mimir update` — delegate to commands.update
+    from .commands import update as _update_cmd
+    _update_cmd.add_argparse(sub)
 
     pred_p = sub.add_parser(
         "predictions",
@@ -387,77 +230,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     from . import wiki_backlinks as _wiki_backlinks
     _wiki_backlinks.add_argparse(wiki_bl_p)
 
-    # `mimir skills <action>`
-    skills_p = sub.add_parser(
-        "skills",
-        help="Skills maintenance helpers (catalog regeneration, future lint passes).",
-    )
-    skills_sub = skills_p.add_subparsers(dest="skills_action")
-    skills_cat_p = skills_sub.add_parser(
-        "catalog",
-        help=(
-            "Regenerate the skills catalog page (chainlink #81 / G5) — "
-            "walks SKILL.md frontmatter to produce a RESOLVER.md-style "
-            "dispatcher. Default output is stdout; pass --out to write "
-            "to state/wiki/topics/skills-catalog.md."
-        ),
-    )
-    from . import skill_catalog as _skill_catalog
-    _skill_catalog.add_argparse(skills_cat_p)
-
-    from . import skill_install as _skill_install
-    skills_list_p = skills_sub.add_parser(
-        "list",
-        help=(
-            "List skills installed in an agent home "
-            "(walks <home>/skills/). Shows name, [poller] flag "
-            "when a pollers.json is present, and the SKILL.md description."
-        ),
-    )
-    _skill_install.add_argparse_list(skills_list_p)
-
-    skills_list_opt_p = skills_sub.add_parser(
-        "list-optional",
-        help=(
-            "List skills available for opt-in install (walks "
-            "<repo>/optional-skills/). Use `mimir skills install <name>` "
-            "to copy one into an agent home."
-        ),
-    )
-    _skill_install.add_argparse_list_optional(skills_list_opt_p)
-
-    skills_install_p = skills_sub.add_parser(
-        "install",
-        help=(
-            "Install an opt-in skill from optional-skills/ into an agent "
-            "home's skills/. Pollers (skills with pollers.json) "
-            "register on next `reload_pollers` or `mimir run` boot."
-        ),
-    )
-    _skill_install.add_argparse_install(skills_install_p)
-
-    skills_update_p = skills_sub.add_parser(
-        "update",
-        help=(
-            "Compare installed optional skills against their source counterparts "
-            "and report drift (dry-run by default). Exits 0 when all skills are "
-            "up-to-date, 1 when drift is found (CI-friendly). Pass a skill name "
-            "to check only that skill; omit to check all installed skills."
-        ),
-    )
-    _skill_install.add_argparse_update(skills_update_p)
-
-    skills_configure_p = skills_sub.add_parser(
-        "configure",
-        help=(
-            "Interactively prompt for env vars declared in a skill's SKILL.md "
-            "and write them to <home>/.env. Works for bundled built-in skills "
-            "(weather, ntfy, …) as well as optional installed skills. "
-            "Pass a skill name to configure one skill, or --all to iterate "
-            "over every skill that has an env: block."
-        ),
-    )
-    _skill_install.add_argparse_configure(skills_configure_p)
+    # `mimir skills <action>` — delegate to commands.skills
+    from .commands import skills as _skills_cmd
+    skills_p = _skills_cmd.add_argparse(sub)
 
     # `mimir scaffold-docker`
     scaffold_docker_p = sub.add_parser(
@@ -646,7 +421,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(run_loops_cmd(home))
 
     if args.command == "update":
-        sys.exit(_cmd_update(args))
+        sys.exit(_update_cmd.dispatch(args))
 
     if args.command == "predictions":
         from .skills.predictions import script as _predictions_script
@@ -660,17 +435,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(1)
 
     if args.command == "skills":
-        if args.skills_action == "catalog":
-            from . import skill_catalog as _skill_catalog
-            sys.exit(_skill_catalog.cmd(args))
-        # list / list-optional / install / update / configure all set
-        # ``skill_install_cmd`` via their respective ``add_argparse_*``
-        # helpers in ``mimir.skill_install``.
-        skill_install_cmd = getattr(args, "skill_install_cmd", None)
-        if skill_install_cmd is not None:
-            sys.exit(skill_install_cmd(args))
-        skills_p.print_help()
-        sys.exit(1)
+        sys.exit(_skills_cmd.dispatch(args, skills_p))
 
     if args.command == "scaffold-docker":
         # _scaffold_docker was already imported at subparser-registration

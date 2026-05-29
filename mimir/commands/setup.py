@@ -1673,3 +1673,67 @@ def regenerate_api_key(home: Path) -> str:
     new_key = _generate_api_key()
     _env_set_api_key(env_path, new_key)
     return new_key
+
+
+# ---------------------------------------------------------------------------
+# Argparse registration (extracted to commands.setup so cli.py stays lean)
+# ---------------------------------------------------------------------------
+
+
+def add_argparse(sub: "argparse._SubParsersAction") -> "argparse.ArgumentParser":  # type: ignore[name-defined]
+    """Register ``mimir setup`` subcommand parser.  Returns the created parser."""
+    import argparse as _ap
+    setup_p = sub.add_parser(
+        "setup",
+        help="Scaffold a mimir home (dirs, .env, scheduler.yaml, skills, subagents).",
+    )
+    setup_p.add_argument(
+        "--home", type=Path, default=Path.cwd(),
+        help="Target directory (default: current working dir).",
+    )
+    setup_p.add_argument(
+        "--embedding", type=str, default=DEFAULT_EMBEDDING_PRESET,
+        choices=list(EMBEDDING_PRESETS),
+        help=(
+            f"Embedding provider preset for the generated saga.toml "
+            f"(default: {DEFAULT_EMBEDDING_PRESET}). Voyage requires "
+            f"VOYAGE_API_KEY; openai requires OPENAI_API_KEY; "
+            f"nvidia-nim requires NVIDIA_NIM_API_KEY; fastembed is "
+            f"fully local. saga's [consolidation] similarity_threshold "
+            f"automatically tunes to the matching value (0.92 for "
+            f"voyage/fastembed, 0.80 for openai/nvidia-nim)."
+        ),
+    )
+    setup_p.add_argument(
+        "--model", type=str, default=None,
+        help=(
+            "Bare model name (no provider prefix needed). Setup "
+            "auto-routes based on the name: ``MiniMax-M2.7`` → Minimax "
+            "(via Anthropic-compat endpoint); ``kimi-k2-*`` → "
+            "Moonshot; ``gpt-*`` / ``o[1-4]-*`` → OpenAI; ``claude-*`` "
+            "→ direct Anthropic API. Generates the right "
+            "``MIMIR_MODEL_SPEC`` + ``ANTHROPIC_BASE_URL`` entries in "
+            ".env. Also wires the usage monitor that matches the "
+            "provider's billing model — subscription routes get quota "
+            "polling; API routes get per-turn cost tracking with a "
+            "default $/hr ceiling. Default model: claude-sonnet-4-6 "
+            "via direct API. See ``mimir/model_registry.py`` for the "
+            "full mapping."
+        ),
+    )
+    setup_p.add_argument(
+        "--subscription", action="store_true",
+        help=(
+            "Declare this deployment runs on a subscription plan for "
+            "the chosen provider (not pay-per-token API billing). "
+            "Effect is provider-polymorphic: Claude family swaps to "
+            "``claude-code:`` (Max OAuth via subprocess — the "
+            "protocol IS different); OpenAI / Minimax / Moonshot keep "
+            "the same model_spec (same HTTP endpoint, just a "
+            "different API token tier). Either way the usage monitor "
+            "flips from cost-tracking to quota-polling. Without this "
+            "flag, every route defaults to pay-per-token + cost "
+            "monitoring."
+        ),
+    )
+    return setup_p
