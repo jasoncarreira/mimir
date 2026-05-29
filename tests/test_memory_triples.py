@@ -624,3 +624,66 @@ def test_rich_prompt_renders_with_blocks_empty():
     assert "{vocab_block}" not in out
     # Atoms section still flows cleanly even with empty prior block.
     assert "Atoms:\n[1] hello" in out
+
+
+# ─── vectorized cosine helper (chainlink #257 perf half) ─────────────
+
+
+class TestCosineScoresVectorized:
+    """_cosine_scores replaces the former O(N·dim) Python loop with one
+    numpy matmul; these lock in the ranking + the row-skip semantics it
+    must preserve."""
+
+    @staticmethod
+    def _blob(vec):
+        import numpy as np
+        return np.asarray(vec, dtype=np.float32).tobytes()
+
+    def test_ranks_by_cosine(self):
+        from mimir.saga.triples import _cosine_scores
+        q = [1.0, 0.0, 0.0, 0.0]
+        cands = [
+            (self._blob([1.0, 0.0, 0.0, 0.0]), 4),       # identical → 1.0
+            (self._blob([0.0, 1.0, 0.0, 0.0]), 4),       # orthogonal → 0.0
+            (self._blob([0.7071, 0.7071, 0.0, 0.0]), 4),  # 45° → ~0.707
+        ]
+        scores = dict(_cosine_scores(q, cands, dim=4))
+        assert scores[0] == pytest.approx(1.0, abs=1e-4)
+        assert scores[1] == pytest.approx(0.0, abs=1e-4)
+        assert scores[2] == pytest.approx(0.7071, abs=1e-3)
+
+    def test_skips_dim_mismatch(self):
+        from mimir.saga.triples import _cosine_scores
+        q = [1.0, 0.0, 0.0, 0.0]
+        cands = [
+            (self._blob([1.0, 0.0, 0.0, 0.0]), 4),
+            (self._blob([1.0, 0.0, 0.0]), 3),  # t_dim 3 ≠ requested dim 4
+        ]
+        assert [i for i, _ in _cosine_scores(q, cands, dim=4)] == [0]
+
+    def test_skips_short_blob(self):
+        from mimir.saga.triples import _cosine_scores
+        # 4 bytes (one float) for a t_dim=4 row → too short → skipped.
+        assert _cosine_scores([1.0, 0.0, 0.0, 0.0], [(b"\x00\x00\x00\x00", 4)],
+                              dim=4) == []
+
+    def test_zero_norm_query_returns_empty(self):
+        from mimir.saga.triples import _cosine_scores
+        cands = [(self._blob([1.0, 0.0, 0.0, 0.0]), 4)]
+        assert _cosine_scores([0.0, 0.0, 0.0, 0.0], cands, dim=4) == []
+
+    def test_skips_zero_norm_vector(self):
+        from mimir.saga.triples import _cosine_scores
+        q = [1.0, 0.0, 0.0, 0.0]
+        cands = [
+            (self._blob([0.0, 0.0, 0.0, 0.0]), 4),  # zero vector → skipped
+            (self._blob([1.0, 0.0, 0.0, 0.0]), 4),
+        ]
+        assert [i for i, _ in _cosine_scores(q, cands, dim=4)] == [1]
+
+    def test_none_dim_uses_query_dim(self):
+        from mimir.saga.triples import _cosine_scores
+        # t_dim None → assume query dim; no dim filter applied.
+        scores = _cosine_scores([1.0, 0.0, 0.0, 0.0],
+                                [(self._blob([1.0, 0.0, 0.0, 0.0]), None)], dim=None)
+        assert scores and scores[0][1] == pytest.approx(1.0, abs=1e-4)
