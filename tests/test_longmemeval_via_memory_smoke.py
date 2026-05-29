@@ -22,7 +22,13 @@ import pytest
 # package, the runner can't import ``saga.benchmarks.longmemeval``
 # and these tests can't exercise the pipeline. Operators who run
 # benches install ``[bench]`` from a workspace checkout.
-pytest.importorskip("saga.benchmarks")
+#
+# Guard on the EXACT module the test imports (``…longmemeval.harness``),
+# not just ``saga.benchmarks``: when a stray top-level ``saga`` package
+# shadows the workspace member, ``saga.benchmarks`` resolves as an empty
+# PEP-420 namespace (so a coarse guard passes) while the harness submodule
+# is missing — which turned a clean skip into a hard ModuleNotFoundError.
+pytest.importorskip("saga.benchmarks.longmemeval.harness")
 
 
 def _stub_provider():
