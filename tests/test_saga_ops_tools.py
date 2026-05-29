@@ -341,3 +341,24 @@ async def test_saga_feedback_no_event_on_failure(
     )
     assert "failed" in out
     assert not any(e[0] == "saga_feedback_sent" for e in captured)
+
+
+@pytest.mark.asyncio
+async def test_saga_feedback_stale_emits_negative(
+    store: _StubStore, turn_with_session: TurnContext, monkeypatch
+) -> None:
+    """#268: the stale signal (→ negative wire) must emit
+    saga_feedback_sent with feedback=negative, not just the useful path."""
+    import mimir.event_logger as _ev
+    captured: list[tuple] = []
+
+    async def _fake_log_event(etype, **kw):
+        captured.append((etype, kw))
+
+    monkeypatch.setattr(_ev, "log_event", _fake_log_event)
+    out = await saga_ops.saga_feedback.ainvoke(
+        {"atom_id": "a" * 16, "signal": "stale"}
+    )
+    assert "ok" in out and "negative" in out
+    sent = [e for e in captured if e[0] == "saga_feedback_sent"]
+    assert sent and sent[0][1].get("feedback") == "negative"

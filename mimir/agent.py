@@ -1252,9 +1252,12 @@ class Agent:
             for aid in tool_atom_ids:
                 if aid not in saga_atom_ids:
                     saga_atom_ids.append(aid)
-        for aid in ctx.injected_skill_atom_ids:
-            if aid not in saga_atom_ids:
-                saga_atom_ids.append(aid)
+            # Injected skill learnings only exist when a SagaStore is wired
+            # (augment_skill_body needs one), so they belong under the same
+            # guard — keeps the cited-atom assembly symmetric (#268).
+            for aid in ctx.injected_skill_atom_ids:
+                if aid not in saga_atom_ids:
+                    saga_atom_ids.append(aid)
 
         # Build and write TurnRecord — matches the SDK schema.
         # Drain observability state captured during this turn:
