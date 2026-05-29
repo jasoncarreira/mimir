@@ -128,6 +128,32 @@ def test_top_triples_with_payload_respects_top_n(conn):
     assert len(results) == 2
 
 
+def test_top_triples_with_payload_excludes_expired_triples(conn):
+    """Triples with valid_until <= reference_date are excluded (chainlink #257)."""
+    from datetime import datetime, timezone
+    from mimir.saga.triples import store_triples, top_triples_with_payload
+    _seed_atom(conn, "obs1", "atom about current job")
+    _seed_atom(conn, "obs2", "atom about former job")
+    vec_bytes = struct.pack("4f", 1.0, 0.0, 0.0, 0.0)
+    def embed(text):
+        return vec_bytes, "stub", "stub", 4
+    # Live triple — no valid_until
+    store_triples(conn, [
+        {"subject": "Alice", "predicate": "works_at", "object": "CurrentCo"},
+    ], source_atom_id="obs1", embed_fn=embed)
+    # Expired triple
+    store_triples(conn, [
+        {"subject": "Alice", "predicate": "works_at", "object": "OldCo",
+         "valid_until": "2020-01-01T00:00:00+00:00"},
+    ], source_atom_id="obs2", embed_fn=embed)
+    ref = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    results = top_triples_with_payload(conn, [1.0, 0.0, 0.0, 0.0], top_n=10,
+                                       reference_date=ref)
+    objects = {r["object"] for r in results}
+    assert "CurrentCo" in objects   # live triple surfaces
+    assert "OldCo" not in objects   # expired triple excluded
+
+
 # ─── End-to-end via SagaStore ─────────────────────────────────────
 
 

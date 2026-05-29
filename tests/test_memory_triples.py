@@ -260,6 +260,44 @@ def test_triple_augment_search_skips_no_embedding(conn):
     assert results == []
 
 
+def test_triple_augment_search_excludes_expired_triples(conn):
+    """Triples whose valid_until <= reference_date are excluded (chainlink #257)."""
+    from datetime import datetime, timezone
+    _seed_atom(conn, "obs1", "atom about current employer")
+    _seed_atom(conn, "obs2", "atom about past employer")
+    embed_fn = _stub_embed([1.0, 0.0, 0.0, 0.0])
+    # Live triple — no valid_until
+    store_triples(conn, [
+        {"subject": "Alice", "predicate": "works_at", "object": "Acme"},
+    ], source_atom_id="obs1", embed_fn=embed_fn)
+    # Expired triple — valid_until in the past
+    store_triples(conn, [
+        {"subject": "Alice", "predicate": "works_at", "object": "OldCo",
+         "valid_until": "2020-01-01T00:00:00+00:00"},
+    ], source_atom_id="obs2", embed_fn=embed_fn)
+    ref = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    results = triple_augment_search(conn, [1.0, 0.0, 0.0, 0.0], top_k=5,
+                                    reference_date=ref)
+    atom_ids = [r[0] for r in results]
+    assert "obs1" in atom_ids   # live triple surfaces
+    assert "obs2" not in atom_ids  # expired triple excluded
+
+
+def test_triple_augment_search_includes_future_valid_until(conn):
+    """Triples with valid_until in the future are included."""
+    from datetime import datetime, timezone
+    _seed_atom(conn, "obs1", "atom about future employer")
+    embed_fn = _stub_embed([1.0, 0.0, 0.0, 0.0])
+    store_triples(conn, [
+        {"subject": "Alice", "predicate": "works_at", "object": "FutureCo",
+         "valid_until": "2099-12-31T00:00:00+00:00"},
+    ], source_atom_id="obs1", embed_fn=embed_fn)
+    ref = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    results = triple_augment_search(conn, [1.0, 0.0, 0.0, 0.0], top_k=5,
+                                    reference_date=ref)
+    assert results  # not expired
+
+
 # ─── retrieve_by_entity ──────────────────────────────────────────────
 
 

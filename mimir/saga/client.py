@@ -122,15 +122,28 @@ def _make_fts_search_fn(
     return _fn
 
 
-def _make_triple_search_fn(conn: sqlite3.Connection, *, dim: int | None):
+def _make_triple_search_fn(
+    conn: sqlite3.Connection,
+    *,
+    dim: int | None,
+    reference_date=None,
+):
     """Closure over the connection matching recall.TripleSearchFn shape.
     Returns None when triples are disabled (the dim arg is None, meaning
     the FAISS index isn't built — same condition under which the
-    semantic pathway would also be empty)."""
+    semantic pathway would also be empty).
+
+    ``reference_date`` is captured in the closure so expired triples
+    (valid_until ≤ reference_date) are excluded from retrieval —
+    consistent with the valid_until filter in top_triples_with_payload.
+    """
     from .triples import triple_augment_search
 
     def _fn(query_emb: list[float], top_k: int) -> list[tuple[str, float]]:
-        return triple_augment_search(conn, query_emb, top_k=top_k, dim=dim)
+        return triple_augment_search(
+            conn, query_emb, top_k=top_k, dim=dim,
+            reference_date=reference_date,
+        )
     return _fn
 
 
@@ -515,7 +528,9 @@ class SagaStore:
                     conn, agent_id=self._agent_id,
                     synonyms=self._synonyms,
                 ),
-                triple_search_fn=_make_triple_search_fn(conn, dim=triple_dim),
+                triple_search_fn=_make_triple_search_fn(
+                    conn, dim=triple_dim, reference_date=reference_date,
+                ),
                 k=top_k,
                 session_id=session_id,
                 agent_id=self._agent_id,
@@ -536,6 +551,7 @@ class SagaStore:
                 rich = top_triples_with_payload(
                     conn, query_emb,
                     top_n=self._triples_top_n, dim=triple_dim,
+                    reference_date=reference_date,
                 )
                 # Strip the internal _cosine field from the wire shape;
                 # keep it out of the agent-facing dict.

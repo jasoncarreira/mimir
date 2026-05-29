@@ -384,6 +384,7 @@ def triple_augment_search(
     *,
     top_k: int = 10,
     dim: int | None = None,
+    reference_date=None,
 ) -> list[tuple[str, float]]:
     """P41-style triple-augmented retrieval.
 
@@ -396,10 +397,22 @@ def triple_augment_search(
     by entity name via ``retrieve_by_entity``). Triples whose
     embedding dim doesn't match ``dim`` are skipped — protects against
     provider switches that produced mixed-dim triples.
+
+    ``reference_date`` (datetime or None) anchors the ``valid_until``
+    expiry filter. Expired triples (valid_until ≤ reference_date) are
+    excluded from the candidate set — they represent superseded facts
+    and should not surface in retrieval. Defaults to utcnow when None.
     """
+    ref_iso = (
+        reference_date.isoformat()
+        if reference_date is not None
+        else datetime.now(timezone.utc).isoformat()
+    )
     rows = conn.execute(
         "SELECT id, source_atom_id, embedding, embedding_dim "
-        "FROM triples WHERE tombstoned = 0 AND embedding IS NOT NULL",
+        "FROM triples WHERE tombstoned = 0 AND embedding IS NOT NULL "
+        "AND (valid_until IS NULL OR valid_until > ?)",
+        (ref_iso,),
     ).fetchall()
     if not rows:
         return []
@@ -448,6 +461,7 @@ def top_triples_with_payload(
     *,
     top_n: int = 10,
     dim: int | None = None,
+    reference_date=None,
 ) -> list[dict]:
     """Same cosine match as ``triple_augment_search`` but returns the
     FULL triple data — subject/predicate/object/source_atom_id/valid
@@ -461,11 +475,25 @@ def top_triples_with_payload(
     duplicates ranking the same atom), but the response-payload view
     wants each individual triple match so the agent reads structured
     facts directly.
+
+    ``reference_date`` (datetime or None) anchors the ``valid_until``
+    expiry filter. Expired triples are excluded so stale facts (e.g.
+    "user works at X" after a close-out event) don't surface as current.
+    Defaults to utcnow when None. Documents the behaviour the config
+    key ``include_triples_in_response`` claims: "Filters out triples
+    whose valid_until has expired."
     """
+    ref_iso = (
+        reference_date.isoformat()
+        if reference_date is not None
+        else datetime.now(timezone.utc).isoformat()
+    )
     rows = conn.execute(
         "SELECT id, source_atom_id, subject, predicate, object, "
         "valid_from, valid_until, confidence, embedding, embedding_dim "
-        "FROM triples WHERE tombstoned = 0 AND embedding IS NOT NULL",
+        "FROM triples WHERE tombstoned = 0 AND embedding IS NOT NULL "
+        "AND (valid_until IS NULL OR valid_until > ?)",
+        (ref_iso,),
     ).fetchall()
     if not rows:
         return []
