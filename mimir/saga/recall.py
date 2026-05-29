@@ -130,6 +130,13 @@ TREND_MODIFIERS = {
 #: ``w_rrf=20`` dominant term — strictly a tiebreaker among
 #: similar-relevance candidates, never enough to surface a marginally-
 #: relevant repeatedly-encoded fact over a highly-relevant one-shot.
+# chainlink #266: source_type tag for skill-learning atoms, excluded from
+# general recall (see the filter loop in ``recall``). Defined locally to
+# keep mimir.saga a self-contained lower layer (it does not import up into
+# mimir.*); the source of truth for the convention is
+# ``mimir/skill_memory.py:SKILL_LEARNING_SOURCE_TYPE`` — keep in sync.
+_SKILL_LEARNING_SOURCE_TYPE = "skill_learning"
+
 ENCODING_CONFIDENCE_WEIGHT = 0.05
 
 # Default top-k for candidate generation passes. FAISS returns 3× the
@@ -293,6 +300,13 @@ def recall(
         if atom["agent_id"] != agent_id and atom["agent_id"] != "shared":
             continue
         if stream_filter and atom["stream"] != stream_filter:
+            continue
+        # chainlink #266: skill-learning atoms are skill-scoped memory —
+        # surfaced only via the skill-load injection, never in general
+        # recall (a circuit-breaker gotcha must not appear as a "memory"
+        # in an unrelated turn). They're embedded/FTS-indexed like any
+        # atom, so they can land in the candidate set; drop them here.
+        if atom["source_type"] == _SKILL_LEARNING_SOURCE_TYPE:
             continue
         filtered[atom_id] = atom
 
