@@ -448,7 +448,19 @@ def run_smoke_test(dest: Path, env_path: Path | None = None) -> tuple[int, str]:
     if not poller.is_file():
         return -1, "no poller.py found"
 
-    env = os.environ.copy()
+    # chainlink #259: run the smoke test with a MINIMAL env — a small set
+    # of process essentials plus the skill's own .env — NOT the full
+    # inherited os.environ. A third-party skill's install-time smoke test
+    # has no business seeing mimir's unrelated secrets (ANTHROPIC_API_KEY,
+    # SLACK_BOT_TOKEN, GITHUB_TOKEN, ...); its declared/configured vars
+    # arrive via .env (env_path). The essentials keep the interpreter +
+    # any tools it shells out to functional (PATH, locale, tempdir; the
+    # Windows-only names are harmless no-ops elsewhere).
+    _SMOKE_ENV_ESSENTIALS = (
+        "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+        "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "PATHEXT", "COMSPEC",
+    )
+    env = {k: os.environ[k] for k in _SMOKE_ENV_ESSENTIALS if k in os.environ}
     if env_path and env_path.is_file():
         for k, v in _read_env_file(env_path).items():
             env[k] = v  # .env is authoritative for the smoke-test
