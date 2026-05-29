@@ -973,6 +973,15 @@ class Agent:
             # this off the TurnContext and refuse tool calls past
             # the cap. 0 disables (matches main's contract).
             tool_call_budget=self._config.tool_call_budget,
+            # Source of the inbound channel (e.g. "discord", "slack").
+            # Carried through to _append_outbound_to_buffer so the
+            # agent's own replies get source="discord" (etc.) in
+            # chat_history.jsonl and pass the recent_sources allowlist
+            # filter in recent_for_channel. Without this the field
+            # defaults to None and all assistant messages are silently
+            # excluded from the ## Recent activity prompt block.
+            # (chainlink #270)
+            channel_source=event.source,
         )
         # WikiBacklinksHook pre-snapshot — capture mtimes of every
         # state/wiki/ content page BEFORE the model loop runs so the

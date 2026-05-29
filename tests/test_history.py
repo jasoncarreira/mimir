@@ -678,3 +678,86 @@ def test_set_global_buffer_makes_it_resolvable(tmp_path: Path):
         assert get_global_buffer() is buf
     finally:
         set_global_buffer(None)  # type: ignore[arg-type]
+
+
+# ── Source attribution for outbound messages (chainlink #270) ────────
+
+
+@pytest.mark.asyncio
+async def test_outbound_message_with_correct_source_survives_allowlist(tmp_path: Path):
+    """Mimir's own replies must pass the production source_allowlist filter
+    so they appear in ## Recent activity on the next turn (chainlink #270).
+
+    The fix: send_message uses bridge.name and the TurnContext.channel_source
+    is set from event.source, so outbound messages get source='discord'
+    (etc.) instead of None. This test pins the allowlist behaviour from
+    the buffer side — the equivalent send_message-side test is
+    test_send_message_records_bridge_name_as_source in test_bridge_directives.
+    """
+    from mimir.history import get_global_buffer, set_global_buffer
+
+    buf = _make_buffer(tmp_path)
+    prod_allowlist = frozenset({"discord", "slack", "bluesky", "web", "stdin"})
+
+    # Simulate what send_message (post-fix) writes: source=bridge.name.
+    await buf.append(
+        buf.make_message(
+            channel_id="discord-1500672382166110321",
+            kind="assistant_message",
+            content="PR #457 is ready for force-push.",
+            source="discord",  # bridge.name — the post-fix behaviour
+        )
+    )
+    # Also add a user message to confirm interleaving.
+    await buf.append(
+        buf.make_message(
+            channel_id="discord-1500672382166110321",
+            kind="user_message",
+            content="Yes force push",
+            author="jason",
+            source="discord",
+        )
+    )
+
+    # Without allowlist: both visible.
+    msgs = buf.recent_for_channel("discord-1500672382166110321", limit=10)
+    assert len(msgs) == 2
+
+    # With production allowlist: both still visible (source='discord' passes).
+    msgs_filtered = buf.recent_for_channel(
+        "discord-1500672382166110321", limit=10, source_allowlist=prod_allowlist
+    )
+    assert len(msgs_filtered) == 2, (
+        "Outbound message was filtered — source='discord' should pass the allowlist. "
+        "Pre-fix, source=None caused all assistant messages to be excluded."
+    )
+    contents = {m.content for m in msgs_filtered}
+    assert "PR #457 is ready for force-push." in contents
+    assert "Yes force push" in contents
+
+
+@pytest.mark.asyncio
+async def test_outbound_source_none_excluded_by_allowlist(tmp_path: Path):
+    """Pre-fix regression: source=None is excluded by the production
+    allowlist. This test documents the old (broken) behaviour so the
+    contrast is clear — any code that emits source=None will lose messages
+    from ## Recent activity."""
+    buf = _make_buffer(tmp_path)
+    prod_allowlist = frozenset({"discord", "slack", "bluesky", "web", "stdin"})
+
+    await buf.append(
+        buf.make_message(
+            channel_id="discord-1500672382166110321",
+            kind="assistant_message",
+            content="message with no source",
+            source=None,  # the old broken behaviour
+        )
+    )
+
+    msgs_filtered = buf.recent_for_channel(
+        "discord-1500672382166110321", limit=10, source_allowlist=prod_allowlist
+    )
+    assert len(msgs_filtered) == 0, (
+        "source=None should be excluded by the allowlist. "
+        "If this fails the filter logic changed."
+    )

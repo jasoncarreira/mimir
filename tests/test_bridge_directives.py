@@ -398,3 +398,55 @@ async def test_send_message_without_actions_unchanged():
     finally:
         reset_current_channel_id(cid_token)
         set_channel_registry(None)
+
+
+@pytest.mark.asyncio
+async def test_send_message_records_bridge_name_as_source(tmp_path):
+    """send_message buffer append uses bridge.name as source so the
+    message passes the recent_sources allowlist filter (chainlink #270).
+
+    Previously source=None was hard-coded, which caused all outbound
+    messages — including cross-channel sends from poller/heartbeat turns
+    — to be excluded from ## Recent activity when the production
+    allowlist (discord,slack,bluesky,web,stdin) was active.
+    """
+    from pathlib import Path
+    from mimir.history import MessageBuffer, get_global_buffer, set_global_buffer
+
+    buf = MessageBuffer(
+        history_path=tmp_path / "chat_history.jsonl",
+        global_max=50,
+        per_channel_max=20,
+    )
+    prev_buf = get_global_buffer()
+    set_global_buffer(buf)
+    # Use a bridge whose name matches a known recent_sources entry.
+    bridge = _CaptureBridge(name="discord", prefixes=("discord-",))
+    set_channel_registry(_make_registry(bridge))
+    cid_token = set_current_channel_id("discord-test-chan")
+    try:
+        result = await send_message.ainvoke({"text": "hello from poller turn"})
+        assert "send_message ok" in result
+
+        # Buffer should have one assistant message with source="discord".
+        msgs = buf.recent_for_channel("discord-test-chan", limit=10)
+        assert len(msgs) == 1
+        assert msgs[0].source == "discord", (
+            f"Expected source='discord', got {msgs[0].source!r}. "
+            "Without this, messages are filtered by the production allowlist."
+        )
+
+        # Critically: it survives the production allowlist filter used in
+        # recent_for_channel / assemble_recent_activity.
+        prod_allowlist = frozenset({"discord", "slack", "bluesky", "web", "stdin"})
+        msgs_filtered = buf.recent_for_channel(
+            "discord-test-chan", limit=10, source_allowlist=prod_allowlist
+        )
+        assert len(msgs_filtered) == 1, (
+            "Message was filtered out by prod allowlist — "
+            "source=None not in allowlist."
+        )
+    finally:
+        reset_current_channel_id(cid_token)
+        set_channel_registry(None)
+        set_global_buffer(prev_buf)  # type: ignore[arg-type]
