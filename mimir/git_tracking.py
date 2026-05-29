@@ -519,11 +519,19 @@ async def _count_unpushed_commits(home: Path) -> int:
 
 
 def _short_err(exc: BaseException) -> str:
-    """Single-line, safely-truncated error description for events.jsonl.
-    Long stderr (e.g. multi-line git error blocks) gets squashed to a
-    single line so the algedonic block stays readable."""
+    """Single-line, safely-truncated, redacted error description for
+    events.jsonl. Long stderr (e.g. multi-line git error blocks) gets
+    squashed to a single line so the algedonic block stays readable.
+
+    chainlink #259: routes through git_bootstrap._redact so a credential
+    that slipped into a git error message (a token in a remote URL, a
+    credential path) is stripped before it lands in events.jsonl — which
+    git_tracking then auto-commits. Matches git_bootstrap, which already
+    redacts every comparable stderr. Redact BEFORE truncating so a token
+    straddling the 500-char boundary can't survive."""
+    from .git_bootstrap import _redact
     text = str(exc) or exc.__class__.__name__
-    return " ".join(text.split())[:500]
+    return _redact(" ".join(text.split()))[:500]
 
 
 __all__: tuple[str, ...] = (

@@ -679,9 +679,11 @@ class SagaStore:
           access event on each atom (weight 2.0). Same as the credit
           pass.
         - ``feedback="negative"`` → write a ``feedback_negative`` event
-          (weight 0.0 — no activation contribution; the event is the
-          flag). ``forget_by_criteria`` can later use this to surface
-          atoms for review by joining on access_events.
+          (weight **-1.0** per ``SOURCE_WEIGHTS`` — subtracts one
+          access-equivalent, cancelling a prior retrieval/credit event so
+          the atom's activation actually drops, not just stays flat). The
+          event also serves as a flag ``forget_by_criteria`` can join on
+          to surface atoms for review.
         - other values → no-op.
 
         Returns ``{"marked": n, "total": len(atom_ids), "signal": ...}``.

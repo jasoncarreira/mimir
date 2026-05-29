@@ -793,3 +793,27 @@ async def test_new_commit_cancels_retry(
             await second_debounce
         except asyncio.CancelledError:
             pass
+
+
+def test_short_err_redacts_secrets():
+    """chainlink #259: _short_err routes through git_bootstrap._redact so a
+    credential in a git error message (token-in-URL, etc.) is stripped
+    before it lands in the auto-committed events.jsonl."""
+    from mimir.git_tracking import _short_err
+    exc = Exception(
+        "fatal: unable to access "
+        "https://x:ghp_0123456789abcdefghijklmnopqrstuvwxyz@github.com/o/r.git"
+    )
+    out = _short_err(exc)
+    assert "ghp_0123456789abcdefghijklmnopqrstuvwxyz" not in out
+    assert "[REDACTED]" in out
+    # Still single-lined + bounded.
+    assert "\n" not in out and len(out) <= 500
+
+
+def test_short_err_plain_message_unchanged():
+    """A secret-free error is passed through (minus whitespace collapse)."""
+    from mimir.git_tracking import _short_err
+    assert _short_err(Exception("fatal: not a git repository")) == (
+        "fatal: not a git repository"
+    )
