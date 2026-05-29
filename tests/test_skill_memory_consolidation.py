@@ -334,3 +334,45 @@ class TestDriver:
         assert out["skills_scanned"] == 1
         assert set(out["skills"]) == {"A"}
         assert out["skills"]["A"]["candidates_scanned"] == 1
+
+
+# ── reference_date threading (chainlink #259 item 1) ─────────────────
+
+
+class TestConsolidateReferenceDate:
+    """consolidate/dedup candidate selection anchors the lookback window
+    to reference_date (corpus epoch on a bench replay), not wall-clock —
+    inert by default (None → now)."""
+
+    def test_candidate_raws_default_includes_recent(self, conn):
+        embed_fn = _embed_fn_factory({"x": [1.0, 0, 0, 0]})
+        store(conn, "x", embed_fn=embed_fn)  # access event ~now
+        got = _candidate_raws(conn, lookback_days=30, agent_id="default")
+        assert [r["content"] for r in got] == ["x"]
+
+    def test_candidate_raws_reference_date_shifts_window(self, conn):
+        import datetime as _dt
+        embed_fn = _embed_fn_factory({"x": [1.0, 0, 0, 0]})
+        store(conn, "x", embed_fn=embed_fn)  # access event ~now
+        # A reference_date 60d in the future moves the cutoff (ref - 30d)
+        # past the atom's access event → excluded. Proves the window is
+        # measured against reference_date, not wall-clock.
+        future = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=60)
+        got = _candidate_raws(
+            conn, lookback_days=30, agent_id="default", reference_date=future,
+        )
+        assert got == []
+
+    def test_dedup_candidates_reference_date_shifts_window(self, conn):
+        import datetime as _dt
+        embed_fn = _embed_fn_factory({"x": [1.0, 0, 0, 0]})
+        store(conn, "x", embed_fn=embed_fn)  # created_at ~now
+        # Default window includes it.
+        assert len(_candidate_raws_for_dedup(
+            conn, lookback_days=30, agent_id="default",
+        )) == 1
+        # Future reference_date → cutoff past created_at → excluded.
+        future = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=60)
+        assert _candidate_raws_for_dedup(
+            conn, lookback_days=30, agent_id="default", reference_date=future,
+        ) == []

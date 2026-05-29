@@ -531,6 +531,7 @@ def _candidate_raws_for_dedup(
     lookback_days: int | None,
     agent_id: str,
     skill_scope: str | None = None,
+    reference_date: "datetime | None" = None,
 ) -> list[dict]:
     """Atoms eligible for dedup. Difference from consolidate's
     candidate query:
@@ -571,8 +572,14 @@ def _candidate_raws_for_dedup(
         params.append(skill_scope)
     if lookback_days is not None:
         from datetime import timedelta
-        cutoff = (datetime.now(timezone.utc)
-                  - timedelta(days=lookback_days)).isoformat()
+        # chainlink #259: anchor the window to reference_date (corpus epoch
+        # on a bench replay) when given, else wall-clock now. Inert by
+        # default — None preserves production behavior.
+        now = (
+            reference_date if reference_date is not None
+            else datetime.now(timezone.utc)
+        )
+        cutoff = (now - timedelta(days=lookback_days)).isoformat()
         where.append("a.created_at >= ?")
         params.append(cutoff)
 
@@ -606,6 +613,7 @@ def dedup_pass(
     dry_run: bool = False,
     max_clusters: int | None = None,
     skill_scope: str | None = None,
+    reference_date: "datetime | None" = None,
 ) -> DedupResult:
     """Run the dedup pass over recent raws for one agent.
 
@@ -632,7 +640,7 @@ def dedup_pass(
     result = DedupResult()
     raws = _candidate_raws_for_dedup(
         conn, lookback_days=lookback_days, agent_id=agent_id,
-        skill_scope=skill_scope,
+        skill_scope=skill_scope, reference_date=reference_date,
     )
     result.candidates_scanned = len(raws)
     if len(raws) < min_cluster_size:

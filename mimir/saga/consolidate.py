@@ -121,6 +121,7 @@ def _candidate_raws(
     lookback_days: int,
     agent_id: str,
     skill_scope: str | None = None,
+    reference_date: "datetime | None" = None,
 ) -> list[dict]:
     """Atoms eligible for cross-session consolidation.
 
@@ -150,9 +151,16 @@ def _candidate_raws(
       atoms.
     - ``"<skill>"`` (per-skill pass): include ONLY that skill's
       ``skill_learning`` atoms.
+
+    *reference_date* (chainlink #259) anchors the lookback window — the
+    cutoff is ``reference_date - lookback_days``. ``None`` defaults to
+    wall-clock now (production behavior). A historical-corpus bench replay
+    passes the corpus epoch so the window measures against the data, not
+    today — otherwise every atom is older than ``now - lookback_days`` and
+    consolidation scans zero candidates. Mirrors recall()/forget().
     """
-    cutoff = (datetime.now(timezone.utc)
-              - timedelta(days=lookback_days)).isoformat()
+    now = reference_date if reference_date is not None else datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=lookback_days)).isoformat()
     if skill_scope is None:
         scope_clause = "AND a.source_type != ?"
         scope_params: tuple = (_SKILL_LEARNING_SOURCE_TYPE,)
@@ -224,6 +232,7 @@ def consolidate(
     agent_id: str = "default",
     max_observations: int = MAX_OBSERVATIONS_PER_RUN,
     min_cluster_size: int = MIN_CLUSTER_SIZE_FOR_OBSERVATION,
+    reference_date: "datetime | None" = None,
 ) -> ConsolidateResult:
     """Run a global cross-session consolidation pass.
 
@@ -235,10 +244,14 @@ def consolidate(
     LLM cost: bounded by ``max_observations``. A pass over 1000 raws
     might produce 10-20 cluster candidates above threshold; we emit
     at most ``max_observations``.
+
+    ``reference_date`` (chainlink #259) anchors the lookback window; see
+    ``_candidate_raws``. ``None`` = wall-clock now.
     """
     result = ConsolidateResult()
     raws = _candidate_raws(
         conn, lookback_days=lookback_days, agent_id=agent_id,
+        reference_date=reference_date,
     )
     result.candidates_scanned = len(raws)
     if len(raws) < min_cluster_size:

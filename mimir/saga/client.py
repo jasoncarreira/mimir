@@ -770,6 +770,7 @@ class SagaStore:
         dedup_first: bool = True,
         dedup_threshold: float | None = None,
         dedup_max_clusters: int | None = None,
+        reference_date=None,
     ) -> dict[str, Any]:
         """Two-pass cross-session consolidation.
 
@@ -870,6 +871,7 @@ class SagaStore:
                     min_cluster_size=2,
                     dry_run=dry_run,
                     max_clusters=dedup_max_clusters,
+                    reference_date=reference_date,
                 )
             dedup_result = await self._write_locked(_do_dedup)
             dedup_payload = {
@@ -892,6 +894,7 @@ class SagaStore:
             conn,
             lookback_days=lookback_days,
             agent_id=self._agent_id,
+            reference_date=reference_date,
         )
         if len(raws) < min_cluster_size:
             return {
