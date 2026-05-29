@@ -615,3 +615,72 @@ def test_migration_v6_is_idempotent_on_fresh_db(tmp_path):
     orphans = conn2.execute("PRAGMA foreign_key_check").fetchall()
     conn2.close()
     assert orphans == [], f"fresh v6 DB must have no orphans; got: {orphans}"
+
+
+# ── recency fallback: NULL ended_at (chainlink #253) ─────────────────
+#
+# Regression: search_sessions previously used ended_at only; a NULL
+# ended_at made fromisoformat("") raise → recency defaulted to 1.0
+# (NEWEST), so a never-ended session out-ranked genuinely recent ones.
+# Fix consults reflected_at, and scores an undateable session recency
+# 0.0 (LAST), matching the SQL COALESCE(ended_at, reflected_at) ordering.
+
+
+@pytest.mark.asyncio
+async def test_search_sessions_null_ended_at_falls_back_to_reflected_at(
+    store, monkeypatch
+):
+    """A session with NULL ended_at but a recent reflected_at must score
+    recency from reflected_at, not jump to 1.0."""
+    import mimir.saga.client as client_mod
+
+    conn = store._ensure_conn()
+    now = datetime.now(timezone.utc)
+    recent = (now - timedelta(days=1)).isoformat()
+    old = (now - timedelta(days=90)).isoformat()
+    # sess-A: NULL ended_at, recent reflected_at.
+    conn.execute(
+        "INSERT INTO sessions (id, channel_id, started_at, ended_at, summary, reflected_at) "
+        "VALUES ('sess-A', 'c', ?, NULL, 'a', ?)", (old, recent),
+    )
+    # sess-B: NULL ended_at, OLD reflected_at.
+    conn.execute(
+        "INSERT INTO sessions (id, channel_id, started_at, ended_at, summary, reflected_at) "
+        "VALUES ('sess-B', 'c', ?, NULL, 'b', ?)", (old, old),
+    )
+    conn.commit()
+
+    results = await store.search_sessions("anything", limit=10, alpha=0.0)
+    by_id = {r["session_id"]: r for r in results}
+    # A (recent reflected_at) must out-score B (old reflected_at) —
+    # neither should be 1.0-by-accident.
+    assert by_id["sess-A"]["recency_score"] > by_id["sess-B"]["recency_score"]
+    # And A's recency reflects ~1 day old, not a bogus 1.0.
+    assert by_id["sess-A"]["recency_score"] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_search_sessions_no_timestamp_ranks_last(store, monkeypatch):
+    """A session with NEITHER ended_at NOR reflected_at scores recency 0.0
+    (ranks last), matching SQLite NULLS-LAST — not 1.0 (newest)."""
+    conn = store._ensure_conn()
+    now = datetime.now(timezone.utc)
+    recent = (now - timedelta(days=2)).isoformat()
+    # undateable session.
+    conn.execute(
+        "INSERT INTO sessions (id, channel_id, started_at, ended_at, summary, reflected_at) "
+        "VALUES ('sess-null', 'c', ?, NULL, 'x', NULL)", (recent,),
+    )
+    # a normal recent session.
+    conn.execute(
+        "INSERT INTO sessions (id, channel_id, started_at, ended_at, summary, reflected_at) "
+        "VALUES ('sess-real', 'c', ?, ?, 'y', ?)", (recent, recent, recent),
+    )
+    conn.commit()
+
+    results = await store.search_sessions("anything", limit=10, alpha=0.0)
+    by_id = {r["session_id"]: r for r in results}
+    assert by_id["sess-null"]["recency_score"] == 0.0
+    assert by_id["sess-real"]["recency_score"] > 0.0
+    # The undateable one must NOT out-rank the real recent one.
+    assert by_id["sess-real"]["blended_score"] > by_id["sess-null"]["blended_score"]
