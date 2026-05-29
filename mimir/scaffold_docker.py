@@ -701,7 +701,12 @@ else
 fi
 
 cd "${REPO_DIR}"
-git config --global --add safe.directory "${REPO_DIR}"
+# Idempotent: only register safe.directory when it's not already there.
+# A bare ``--add`` runs on every container start, so without this guard
+# ~/.gitconfig accumulates a duplicate ``safe.directory`` line per boot.
+git config --global --get-all safe.directory 2>/dev/null \
+    | grep -qxF "${REPO_DIR}" \
+    || git config --global --add safe.directory "${REPO_DIR}"
 
 # ─── deps sync ─────────────────────────────────────────────────────
 # Extras templated from ``mimir scaffold-docker --uv-extras`` so the

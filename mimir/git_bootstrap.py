@@ -575,9 +575,20 @@ def _install_credential_helper(
     # at the head of the local chain clears the inherited entries
     # (documented behavior; see ``git-config(1)`` under
     # ``credential.helper``).
+    #
+    # ``--replace-all`` (not a bare set) is load-bearing because
+    # bootstrap runs on EVERY container start. After the first run the
+    # local ``credential.helper`` is already multi-valued
+    # (``[empty, store]``), so a bare ``git config credential.helper ""``
+    # fails with "cannot overwrite multiple values with a single value":
+    # it leaks that error to stderr AND fails to clear, so the ``--add``
+    # below appends another ``store`` entry every boot (observed: 273
+    # accumulated entries on a long-lived dev container). ``--replace-all``
+    # collapses any existing values to the single empty, making the pair
+    # idempotent (``[empty, store]``) and self-healing on next bootstrap.
     helper_value = f"store --file={creds_path}"
     _run(
-        ["git", "-C", str(home), "config", "--local",
+        ["git", "-C", str(home), "config", "--local", "--replace-all",
          "credential.helper", ""],
         check=False,
     )
