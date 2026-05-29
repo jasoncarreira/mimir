@@ -230,9 +230,76 @@ async def saga_forget(
     return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
 
 
+@tool
+async def saga_record_skill_learning(
+    skill: str,
+    kind: str,
+    content: str,
+    session_id: Optional[str] = None,
+) -> str:
+    """Record a durable, skill-specific learning as a SAGA atom (#266).
+
+    Use this when running a skill taught you something reusable that the
+    *next* run of that skill should know — a gotcha, an input quirk, a
+    performance caveat, a tip, or a pattern that worked. The learning is
+    scoped to the skill: it surfaces automatically the next time that
+    skill loads and never leaks into unrelated turns.
+
+    Capture skill learnings here (NOT plain ``memory_store``) so they
+    ride the per-skill recall, decay, and dedup built for skill memory.
+    Record the cautionary ones especially — a ``failure-mode`` you hit is
+    the most valuable thing to leave for the next run. One learning per
+    call; a single self-contained sentence.
+
+    Args:
+        skill: The skill name (its SKILL.md directory / identifier), e.g.
+            ``"memory"``, ``"github-poller"``.
+        kind: The learning's type/valence — one of:
+            NEGATIVE (cautionary): ``"failure-mode"``, ``"input-quirk"``,
+            ``"perf-caveat"``; POSITIVE (how-to): ``"tip"``,
+            ``"success-pattern"``.
+        content: The learning, one self-contained sentence — written so a
+            future run understands it without this session's context.
+        session_id: Optional override; defaults to the active turn's.
+
+    Returns:
+        A short confirmation with the atom_id, or an error message.
+    """
+    client = _MEMORY_STATE["client"]
+    if client is None:
+        return "saga_record_skill_learning failed: no SagaStore configured"
+    from .. import skill_memory
+    try:
+        metadata = skill_memory.build_metadata(skill, kind)
+    except ValueError as exc:
+        return f"saga_record_skill_learning failed: {exc}"
+    if not content or not content.strip():
+        return "saga_record_skill_learning failed: content is required"
+    try:
+        result = await client.store(
+            content.strip(),
+            stream="procedural",
+            source_type=skill_memory.SKILL_LEARNING_SOURCE_TYPE,
+            metadata=metadata,
+            session_id=_resolve_session_id(session_id),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"saga_record_skill_learning failed: {exc}"
+    if not isinstance(result, dict):
+        return f"saga_record_skill_learning unexpected return: {result!r}"
+    atom_id = result.get("atom_id")
+    if result.get("stored") is False:
+        return (
+            f"saga_record_skill_learning: learning already present "
+            f"(atom_id={atom_id})"
+        )
+    return f"saga_record_skill_learning ok: {skill}/{kind} atom_id={atom_id}"
+
+
 __all__ = (
     "saga_feedback",
     "saga_mark_contributions",
     "saga_end_session",
     "saga_forget",
+    "saga_record_skill_learning",
 )

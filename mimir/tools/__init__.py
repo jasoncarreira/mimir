@@ -66,6 +66,7 @@ from .saga_ops import (
     saga_feedback,
     saga_forget,
     saga_mark_contributions,
+    saga_record_skill_learning,
 )
 
 __all__ = [
@@ -108,6 +109,7 @@ __all__ = [
     "saga_mark_contributions",
     "saga_end_session",
     "saga_forget",
+    "saga_record_skill_learning",
     # Dep-injection setters (called by server.py:build_app)
     "set_memory_client",
     "set_indexer",
