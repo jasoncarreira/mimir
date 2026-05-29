@@ -131,6 +131,14 @@ class Dispatcher:
                     if queue.qsize() == 0 and not self._closed:
                         self._queues.pop(channel_id, None)
                         self._high_water_logged.pop(channel_id, None)
+                        # CR2 completion: also pop the worker task entry.
+                        # Pre-fix, _workers[channel_id] held the now-done
+                        # Task indefinitely — the original CR2 comment called
+                        # out exactly this case ("ephemeral channel_ids...
+                        # accumulated indefinitely") but the pop was missing
+                        # for _workers. The worker is mid-return here, so
+                        # popping its own entry is safe.
+                        self._workers.pop(channel_id, None)
                     return
 
                 # CR2-#4: ``queue.task_done()`` MUST be called for every

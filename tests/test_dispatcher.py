@@ -289,6 +289,9 @@ async def test_idle_worker_retires_and_cleans_up_per_channel_dicts(
             break
     assert "c-ephemeral" not in disp._queues
     assert "c-ephemeral" not in disp._high_water_logged
+    # chainlink #255: _workers was missing from the CR2 cleanup — the
+    # done() Task lingered forever for ephemeral channel_ids.
+    assert "c-ephemeral" not in disp._workers
     await disp.drain()
 
 
