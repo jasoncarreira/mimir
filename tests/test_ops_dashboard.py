@@ -824,3 +824,21 @@ def test_dashboards_cross_link_to_each_other():
         assert 'href="/memory"' not in html, (
             f"{fname} still links to /memory (route was renamed to /state)"
         )
+
+
+def test_dashboards_share_one_localstorage_api_key():
+    """All four dashboards must read/write the SAME localStorage key so the
+    API key is shared across pages (chainlink #271). saga/state previously
+    used 'mimir_api_key' while ops/turns used 'mimir.api_key', so the key
+    wasn't shared — navigating between pages re-prompted, and reset-key on
+    one page didn't clear the others."""
+    import mimir
+    root = Path(mimir.__file__).parent
+    for fname in ("ops_dashboard.html", "saga_dashboard.html",
+                  "file_memory_dashboard.html", "turn_viewer.html"):
+        html = (root / fname).read_text()
+        assert "mimir.api_key" in html, f"{fname} missing the canonical key"
+        assert "mimir_api_key" not in html, (
+            f"{fname} still uses the old 'mimir_api_key' "
+            "(must be the shared 'mimir.api_key')"
+        )

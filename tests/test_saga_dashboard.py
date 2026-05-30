@@ -386,8 +386,8 @@ def test_render_saga_html_is_valid_shell() -> None:
     assert "loadRecent()" in html
     assert "loadAtom(" in html
     assert "loadStats()" in html
-    # Auth pattern — fetches API key from localStorage.
-    assert "mimir_api_key" in html
+    # Auth pattern — shared localStorage key across all dashboards (#271).
+    assert "mimir.api_key" in html
     # No actual key is baked in.
     assert "X-API-Key" in html
 

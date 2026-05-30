@@ -382,8 +382,8 @@ def test_render_memory_html_is_valid_shell() -> None:
     assert "<!doctype html>" in html
     assert "/api/memory" in html
     assert "loadTree()" in html
-    # Auth pattern.
-    assert "mimir_api_key" in html
+    # Auth pattern — shared localStorage key across all dashboards (#271).
+    assert "mimir.api_key" in html
     assert "X-API-Key" in html
 
 

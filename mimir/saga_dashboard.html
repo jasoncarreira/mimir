@@ -252,7 +252,7 @@
       <a href="/ops">ops</a>
       <a href="/state">state</a>
       <a href="/turns">turns</a>
-      <a href="#" onclick="event.preventDefault();localStorage.removeItem('mimir_api_key');location.reload();" title="Clear the stored API key and re-prompt">↻ reset key</a>
+      <a href="#" onclick="event.preventDefault();localStorage.removeItem('mimir.api_key');location.reload();" title="Clear the stored API key and re-prompt">↻ reset key</a>
     </div>
   </header>
 
@@ -383,10 +383,10 @@
 <script>
 // ── Auth ─────────────────────────────────────────────────────────
 function getApiKey() {
-  let k = localStorage.getItem("mimir_api_key") || "";
+  let k = localStorage.getItem("mimir.api_key") || "";
   if (!k) {
     k = prompt("API key (leave blank if none):") || "";
-    if (k) localStorage.setItem("mimir_api_key", k);
+    if (k) localStorage.setItem("mimir.api_key", k);
   }
   return k;
 }
@@ -396,7 +396,7 @@ async function authedFetch(url) {
   const headers = k ? {"X-API-Key": k} : {};
   const r = await fetch(url, {headers});
   if (r.status === 401) {
-    localStorage.removeItem("mimir_api_key");
+    localStorage.removeItem("mimir.api_key");
     throw new Error("Unauthorized — bad API key?");
   }
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -724,7 +724,7 @@ async function runSql() {
       body: JSON.stringify({sql}),
     });
     if (r.status === 401) {
-      localStorage.removeItem("mimir_api_key");
+      localStorage.removeItem("mimir.api_key");
       container.innerHTML = '<div class="error-msg">Unauthorized \u2014 bad API key?</div>';
       return;
     }
