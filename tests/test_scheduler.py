@@ -2181,3 +2181,55 @@ async def test_reinstall_pollers_async_io_off_loop_mutations_on_loop(
     assert mutate_threads, "no APScheduler mutation happened"
     assert all(t == loop_thread for t in mutate_threads), \
         "APScheduler mutation ran off the loop thread"
+
+
+# ── bundled audit ticks (chainlink #164 issues-audit / #283 commitments) ──
+
+
+def test_bundled_scheduler_template_ships_audit_ticks():
+    """The shipped scheduler_template.yaml carries the issues-audit
+    (monthly) + commitments-review (weekly) ticks, each with a parseable
+    cron and a prompt_file that exists as a bundled template."""
+    from apscheduler.triggers.cron import CronTrigger
+
+    from mimir.skill_defs import _BUNDLED_SCHEDULER
+    import mimir.prompt_templates as pt
+
+    jobs = {j.name: j for j in load_jobs(_BUNDLED_SCHEDULER)}
+    for name in ("heartbeat", "reflect", "issues-audit", "commitments-review"):
+        assert name in jobs, f"{name} missing from bundled scheduler template"
+
+    tpl_dir = Path(pt.__file__).parent
+    for name, expect_cron in (
+        ("issues-audit", "0 7 1 * *"),
+        ("commitments-review", "0 7 * * 1"),
+    ):
+        job = jobs[name]
+        assert job.cron == expect_cron, (name, job.cron)
+        # cron must be valid for the scheduler's own from_crontab validation
+        CronTrigger.from_crontab(job.cron)
+        assert job.prompt_file, f"{name} has no prompt_file"
+        assert (tpl_dir / job.prompt_file).is_file(), (
+            f"{name} prompt_file {job.prompt_file!r} not bundled"
+        )
+
+
+def test_audit_prompt_templates_have_frontmatter():
+    """issues-audit.md + commitments-review.md ship with skill-style
+    frontmatter (name/description/allowed-tools), like reflect.md, so the
+    scheduled tick has a well-formed body to run."""
+    import mimir.prompt_templates as pt
+
+    tpl_dir = Path(pt.__file__).parent
+    for fname, expect_name in (
+        ("issues-audit.md", "issues-audit"),
+        ("commitments-review.md", "commitments-review"),
+    ):
+        text = (tpl_dir / fname).read_text(encoding="utf-8")
+        assert text.startswith("---\n"), f"{fname} missing frontmatter"
+        frontmatter = text.split("---", 2)[1]
+        assert f"name: {expect_name}" in frontmatter, fname
+        assert "description:" in frontmatter, fname
+        assert "allowed-tools:" in frontmatter, fname
+        # the audit's chainlink-log target id appears in the body
+        assert ("#164" in text) or ("#283" in text), fname

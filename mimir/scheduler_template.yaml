@@ -1,7 +1,7 @@
 # mimir scheduler — APScheduler cron jobs that enqueue LLM ticks.
 # Each job triggers a turn on ``channel_id`` with ``trigger=scheduled_tick``.
 #
-# Two recurring LLM ticks are enabled by default:
+# Four recurring LLM ticks are enabled by default:
 #
 #   - heartbeat: hourly autonomous-work cadence. Pulls one item from
 #     state/heartbeat-backlog.md and does it. The §12.4 homeostat
@@ -11,6 +11,15 @@
 #     SAGA consolidation cron runs nightly at 04:00 UTC, so by the
 #     time reflection fires Sunday morning the most recent
 #     consolidation pass is two hours old.
+#   - issues-audit: monthly triage of the memory/issues/ gotcha layer
+#     (1st of month, 07:00 UTC). Retires resolved entries, files
+#     chainlink bugs for real code-level gotchas, escalates judgment
+#     calls. Budget-aware — batches ~25-30 files/run across months.
+#   - commitments-review: weekly validity pass over non-terminal
+#     durable commitments (Mondays 07:00 UTC). Completes-on-evidence,
+#     dismisses moot loops (escalate-by-default), files bugs for stuck
+#     ones. Kept separate from issues-audit so neither turn exceeds the
+#     per-turn tool-call budget.
 #
 # Two non-LLM crons are auto-installed by the runtime (no entry
 # needed here):
@@ -44,3 +53,13 @@
   cron: "0 6 * * 0"
   channel_id: null   # synthetic scheduler:reflect channel
   prompt_file: reflect.md
+
+- name: issues-audit
+  cron: "0 7 1 * *"   # 1st of month, 07:00 UTC
+  channel_id: null    # synthetic scheduler:issues-audit channel
+  prompt_file: issues-audit.md
+
+- name: commitments-review
+  cron: "0 7 * * 1"   # Mondays 07:00 UTC
+  channel_id: null    # synthetic scheduler:commitments-review channel
+  prompt_file: commitments-review.md
