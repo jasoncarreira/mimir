@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -346,10 +348,16 @@ def test_unique_tmp_names_differ(tmp_path: Path):
 
 
 def test_sweep_removes_orphaned_tmps(tmp_path: Path):
-    """_sweep_orphaned_tmps deletes leftover .tmp.* files next to the target."""
+    """_sweep_orphaned_tmps deletes .tmp.* files whose PID is no longer alive."""
     target = tmp_path / "INDEX.md"
-    orphan_a = tmp_path / "INDEX.md.tmp.99999.aaaaaaaa"
-    orphan_b = tmp_path / "INDEX.md.tmp.88888.bbbbbbbb"
+
+    # Spawn a trivial process and wait for it — its PID is provably dead afterward.
+    dead_proc = subprocess.Popen(["true"])
+    dead_proc.wait()
+    dead_pid = dead_proc.pid
+
+    orphan_a = tmp_path / f"INDEX.md.tmp.{dead_pid}.aaaaaaaa"
+    orphan_b = tmp_path / f"INDEX.md.tmp.{dead_pid}.bbbbbbbb"
     bystander = tmp_path / "OTHER.md.tmp.11111.cccccccc"  # different base name — must survive
 
     for f in (orphan_a, orphan_b, bystander):
@@ -360,6 +368,23 @@ def test_sweep_removes_orphaned_tmps(tmp_path: Path):
     assert not orphan_a.exists(), "orphan_a should be removed by sweep"
     assert not orphan_b.exists(), "orphan_b should be removed by sweep"
     assert bystander.exists(), "bystander (different base name) must not be touched"
+
+
+def test_sweep_preserves_live_process_tmp(tmp_path: Path):
+    """_sweep_orphaned_tmps must NOT remove a tmp whose PID is still running.
+
+    This simulates a concurrent writer's in-flight file — the scenario that
+    the original sweep re-opened (chainlink #272 CR from jasoncarreira).
+    """
+    target = tmp_path / "INDEX.md"
+    # Encode the current (live) process's PID — os.kill(os.getpid(), 0) succeeds
+    # → sweep must skip this file.
+    live_tmp = tmp_path / f"INDEX.md.tmp.{os.getpid()}.cafecafe"
+    live_tmp.write_text("in-flight", encoding="utf-8")
+
+    _sweep_orphaned_tmps(target)
+
+    assert live_tmp.exists(), "tmp whose PID is still alive must not be swept"
 
 
 def test_sweep_tolerates_already_gone_files(tmp_path: Path):

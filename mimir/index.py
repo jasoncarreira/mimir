@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,9 @@ from pathlib import Path
 from .core_blocks import describe_file
 
 log = logging.getLogger(__name__)
+
+# Matches the PID embedded in ``_unique_tmp``'s suffix: ``.tmp.<pid>.<8-hex>``.
+_ORPHAN_TMP_PAT = re.compile(r"\.tmp\.(\d+)\.[0-9a-f]{8}$")
 
 
 def _unique_tmp(path: Path) -> Path:
@@ -48,15 +52,32 @@ def _unique_tmp(path: Path) -> Path:
 def _sweep_orphaned_tmps(path: Path) -> None:
     """Remove leftover ``*.tmp.*`` files adjacent to *path* from prior crashes.
 
-    Called at the start of each ``_write_*`` method.  Orphans accumulate when
-    a writer crashes between the ``write_text`` and ``replace`` steps.  The
-    sweep runs *before* this writer creates its own unique tmp, so it cannot
-    accidentally remove a live concurrent writer's file that was created by
-    the same process (the ``asyncio.Lock`` inside ``IndexManager.flush``
-    serialises within-process writes; cross-process concurrent writers each
-    use unique PID-tagged names, so the window is small).
+    Called at the start of each ``_write_*`` method.  Only unlinks tmps whose
+    encoded PID is no longer alive — a concurrent writer's in-flight tmp is
+    protected because ``os.kill(live_pid, 0)`` succeeds and the file is skipped.
+
+    Guard logic (per-PID liveness, chainlink #272):
+
+    - Parse the PID from the ``.tmp.<pid>.<8-hex>`` suffix via ``_ORPHAN_TMP_PAT``.
+    - ``os.kill(pid, 0)`` raises ``ProcessLookupError`` when the PID is dead
+      → safe to unlink.  Raises ``PermissionError`` when the PID exists but we
+      cannot signal it → treat as alive (conservative).  Returns normally when
+      the process is alive → skip.
+    - Files whose name doesn't match ``_ORPHAN_TMP_PAT`` are skipped
+      (unrecognised format → conservative).
     """
     for orphan in path.parent.glob(path.name + ".tmp.*"):
+        m = _ORPHAN_TMP_PAT.search(orphan.name)
+        if m is None:
+            continue  # unrecognised suffix — skip conservatively
+        pid = int(m.group(1))
+        try:
+            os.kill(pid, 0)
+            continue  # PID alive → in-flight tmp; leave it alone
+        except ProcessLookupError:
+            pass  # PID dead → safe to unlink
+        except PermissionError:
+            continue  # PID exists but we can't probe it → treat as alive
         try:
             orphan.unlink(missing_ok=True)
         except OSError:
