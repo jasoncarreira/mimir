@@ -6,7 +6,7 @@ here so the container has no Postgres dependency. Hybrid score weights:
     score = 0.5 * cosine + 0.2 * fts_bm25 + 0.3 * recency
 
 Embeddings route through saga's configured provider (voyage / openai /
-fastembed / nvidia-nim) via ``SagaProviderEmbedder`` so file_search and
+fastembed) via ``SagaProviderEmbedder`` so file_search and
 saga atoms share one vector space. Tests pass ``HashEmbedder`` to stay
 offline; ``FastEmbedder`` is kept as a back-compat / pin-to-bge-small
 option but is no longer the default.
@@ -123,7 +123,7 @@ class SagaProviderEmbedder:
 
     Default Indexer embedder. Same provider as saga atoms — one model
     download, one cosine space, one config knob in saga.toml drives
-    both surfaces. Picks up voyage / openai / fastembed / nvidia-nim
+    both surfaces. Picks up voyage / openai / fastembed
     based on the ``[embedding] provider`` in the active saga.toml.
 
     Lazy initialization: defer the provider instantiation until first

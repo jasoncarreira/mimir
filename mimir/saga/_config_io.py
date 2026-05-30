@@ -52,14 +52,14 @@ except ImportError:
 
 _DEFAULTS = {
     "embedding": {
-        "provider": "nvidia-nim",
-        "url": "https://integrate.api.nvidia.com/v1/embeddings",
-        "model": "nvidia/nv-embedqa-e5-v5",
+        "provider": "voyage",
+        "url": "https://api.voyageai.com/v1/embeddings",
+        "model": "voyage-4-lite",
         "dimensions": 1024,
         "max_input_chars": 2000,
         "timeout_seconds": 10,
         "api_key": None,
-        "api_key_env": "OPENAI_API_KEY",
+        "api_key_env": "VOYAGE_API_KEY",
         "batch_size": 50,
     },
     "storage": {
