@@ -581,7 +581,7 @@ DEFAULT_ISSUES_README = dedent(
 #: ``mimir setup --embedding fastembed`` shortcut is meant to be
 #: discoverable; operators reading saga.toml will see
 #: ``provider = "onnx"`` and need to know they're the same thing.
-EMBEDDING_PRESETS: tuple[str, ...] = ("voyage", "openai", "fastembed", "nvidia-nim")
+EMBEDDING_PRESETS: tuple[str, ...] = ("voyage", "openai", "fastembed")
 DEFAULT_EMBEDDING_PRESET = "voyage"
 
 
@@ -638,21 +638,6 @@ def _embedding_block_for_preset(preset: str) -> str:
             dimensions = 384
             """
         )
-    if preset == "nvidia-nim":
-        return dedent(
-            """\
-            [embedding]
-            # NVIDIA NIM nv-embedqa-e5-v5 — saga's historical default.
-            # 1024d retrieval-tuned via NIM hosted API. Untested on the
-            # 2026-05 LongMemEval bench; kept for legacy compatibility
-            # with saga deployments that already use NIM.
-            provider = "nvidia-nim"
-            url = "https://integrate.api.nvidia.com/v1/embeddings"
-            model = "nvidia/nv-embedqa-e5-v5"
-            dimensions = 1024
-            api_key_env = "NVIDIA_NIM_API_KEY"
-            """
-        )
     raise ValueError(
         f"unknown embedding preset: {preset!r}. "
         f"valid: {EMBEDDING_PRESETS}"
@@ -681,7 +666,7 @@ def _default_saga_toml(
       Phase 3 LongMemEval cross-bench result.
     - ``[consolidation] similarity_threshold = "auto"`` resolves to the
       per-provider recommended value at boot — 0.92 for voyage / fastembed,
-      0.80 for openai / nvidia-nim. See saga README for the sweep table.
+      0.80 for openai. See saga README for the sweep table.
     - ``[retrieval].enable_contextual_rewrite = true`` — mimir already
       passes ``context=`` on every query; flipping rewrite on means short
       referential queries ("yes, look for that") get resolved before
@@ -772,9 +757,9 @@ def _default_saga_toml(
         enable_llm = true
         # "auto" resolves to a per-provider value at boot — 0.92 for
         # voyage and fastembed (tight cosine distributions cap-saturate
-        # at saga's historical default 0.80), 0.80 for openai and
-        # nvidia-nim. See saga README for the full sweep table; swap
-        # to a literal float here to override.
+        # at saga's historical default 0.80), 0.80 for openai. See saga
+        # README for the full sweep table; swap to a literal float here
+        # to override.
         similarity_threshold = "auto"
 
         [server]
@@ -1631,9 +1616,6 @@ def _print_setup_report(status: dict[str, object]) -> None:
     elif preset == "openai":
         print(f"  2. (optional) set OPENAI_API_KEY in .env for saga's embeddings;")
         print(f"     leave blank to fall back to local fastembed (no API needed).")
-    elif preset == "nvidia-nim":
-        print(f"  2. (optional) set NVIDIA_NIM_API_KEY in .env for saga's embeddings;")
-        print(f"     leave blank to fall back to local fastembed (no API needed).")
     else:  # fastembed
         print(f"  2. saga embeddings configured for local fastembed —")
         print(f"     no API key needed. First run downloads the ~33MB ONNX model.")
@@ -1716,10 +1698,9 @@ def add_argparse(sub: "argparse._SubParsersAction") -> "argparse.ArgumentParser"
             f"Embedding provider preset for the generated saga.toml "
             f"(default: {DEFAULT_EMBEDDING_PRESET}). Voyage requires "
             f"VOYAGE_API_KEY; openai requires OPENAI_API_KEY; "
-            f"nvidia-nim requires NVIDIA_NIM_API_KEY; fastembed is "
-            f"fully local. saga's [consolidation] similarity_threshold "
-            f"automatically tunes to the matching value (0.92 for "
-            f"voyage/fastembed, 0.80 for openai/nvidia-nim)."
+            f"fastembed is fully local. saga's [consolidation] "
+            f"similarity_threshold automatically tunes to the matching "
+            f"value (0.92 for voyage/fastembed, 0.80 for openai)."
         ),
     )
     setup_p.add_argument(

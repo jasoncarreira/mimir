@@ -62,8 +62,6 @@ _MODEL_COST_PER_M_TOKENS: dict[str, float | None] = {
     "voyage-3.5-lite": 0.02,
     "voyage-3.5": 0.06,
     "voyage-3-large": 0.18,
-    # NVIDIA NIM — hosted but free under typical signup credits
-    "nvidia/nv-embedqa-e5-v5": 0.00,
     # Local / fastembed / ONNX — no per-token cost
     "BAAI/bge-small-en-v1.5": None,
     "BAAI/bge-base-en-v1.5": None,
@@ -101,7 +99,7 @@ def _provider_info() -> tuple[str, int]:
     from .saga.embeddings import get_provider
 
     cfg = get_config()
-    provider_name = cfg("embedding", "provider", "nvidia-nim")
+    provider_name = cfg("embedding", "provider", "voyage")
     provider = get_provider()
     return provider_name, provider.dimensions()
 

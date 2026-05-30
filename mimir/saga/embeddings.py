@@ -2,10 +2,14 @@
 SAGA Embeddings -- Pluggable embedding provider interface.
 
 Supports:
-  - nvidia-nim: NVIDIA NIM API (nv-embedqa-e5-v5, etc.)
+  - voyage: Voyage AI API (voyage-4-lite, etc.) — the default
   - openai: OpenAI-compatible API (text-embedding-3-small, etc.)
   - onnx: ONNX Runtime local inference (bge-small-en-v1.5, no API needed)
   - local: sentence-transformers (no API key needed, runs on CPU/GPU)
+
+When the configured provider is API-keyed (voyage/openai) and its API
+key env var is unset, ``get_provider()`` auto-falls back to ``onnx`` so
+a keyless install still works.
 
 Provider is configured via saga.toml [embedding] section.
 """
@@ -59,49 +63,6 @@ class EmbeddingProvider:
         return _cfg('embedding', 'dimensions', 1024)
 
 
-class NvidiaNimProvider(EmbeddingProvider):
-    """NVIDIA NIM API provider (default)."""
-
-    def __init__(self):
-        self.url = _cfg('embedding', 'url', 'https://integrate.api.nvidia.com/v1/embeddings')
-        self.model = _cfg('embedding', 'model', 'nvidia/nv-embedqa-e5-v5')
-        self.timeout = _cfg('embedding', 'timeout_seconds', 10)
-        self.max_chars = _cfg('embedding', 'max_input_chars', 2000)
-        self.api_key_env = 'NVIDIA_NIM_API_KEY'
-
-    def _call_api(self, inputs: list[str], input_type: str = "passage") -> list[list[float]]:
-        import requests
-        api_key = os.environ.get(self.api_key_env)
-        if not api_key:
-            raise RuntimeError(f"{self.api_key_env} not set. Run: export {self.api_key_env}=\"your-key\" or switch to provider=\"onnx\" in saga.toml for local embeddings.")
-
-        def _do_request():
-            r = requests.post(
-                self.url,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"input": inputs, "model": self.model, "input_type": input_type},
-                timeout=self.timeout,
-            )
-            r.raise_for_status()
-            return r
-
-        r = _retry_with_backoff(_do_request)
-        data = r.json()["data"]
-        return [d["embedding"] for d in sorted(data, key=lambda x: x["index"])]
-
-    def embed(self, text: str, input_type: str = "passage") -> list[float]:
-        return self._call_api([text[:self.max_chars]], input_type)[0]
-
-    def batch_embed(self, texts: list[str], input_type: str = "passage") -> list[list[float]]:
-        """Batch embed via NIM API."""
-        results = []
-        batch_size = _cfg('embedding', 'batch_size', 50)
-        for i in range(0, len(texts), batch_size):
-            chunk = [t[:self.max_chars] for t in texts[i:i + batch_size]]
-            results.extend(self._call_api(chunk, input_type))
-        return results
-
-
 class OpenAIProvider(EmbeddingProvider):
     """OpenAI-compatible API provider (works with OpenAI, Azure, local vLLM,
     and — with ``send_input_type=true`` — Voyage AI).
@@ -117,9 +78,8 @@ class OpenAIProvider(EmbeddingProvider):
     The flag also maps saga's internal ``"passage"`` → ``"document"`` to
     match Voyage's accepted vocabulary. Voyage's two valid values are
     ``"query"`` and ``"document"``; saga internally uses
-    ``"query"`` / ``"passage"`` (a holdover from the NIM provider's
-    convention). The mapping is one-way: ``passage → document``,
-    ``query → query``.
+    ``"query"`` / ``"passage"`` (a historical holdover). The mapping is
+    one-way: ``passage → document``, ``query → query``.
     """
 
     def __init__(self):
@@ -291,12 +251,12 @@ class VoyageProvider(OpenAIProvider):
         # post-override.
         super().__init__()
         # Apply voyage defaults only for keys the operator didn't
-        # explicitly set in saga.toml. Earlier this checked
-        # ``self.url == openai-default-url``, but saga's
-        # ``_DEFAULTS["embedding"]`` is nvidia-nim — so a minimal
-        # voyage saga.toml without an explicit ``url`` left
-        # ``self.url`` pointing at nvidia-nim and the override never
-        # fired. See issue #149.
+        # explicitly set in saga.toml. We check ``was_set_in_toml``
+        # rather than comparing against a default URL: the base
+        # ``OpenAIProvider.__init__`` reads ``url``/``model`` from
+        # ``_cfg`` with OpenAI-shaped fallbacks, so a minimal voyage
+        # saga.toml that omits those keys must still get voyage's
+        # values patched on here. See issue #149.
         from ._config_io import was_set_in_toml
         if not was_set_in_toml("embedding", "url"):
             self.url = "https://api.voyageai.com/v1/embeddings"
@@ -324,7 +284,6 @@ class VoyageProvider(OpenAIProvider):
 # ─── Provider Registry ────────────────────────────────────────────
 
 _PROVIDERS = {
-    "nvidia-nim": NvidiaNimProvider,
     "openai": OpenAIProvider,
     "voyage": VoyageProvider,
     "onnx": ONNXProvider,
@@ -355,7 +314,6 @@ _PROVIDERS = {
 #: Falls back to 0.80 (saga's historical default) for providers without
 #: an explicit entry.
 _PROVIDER_AUTO_THRESHOLDS: dict[str, float] = {
-    "nvidia-nim": 0.80,
     "openai": 0.80,
     "voyage": 0.80,
     "onnx": 0.80,
@@ -387,12 +345,12 @@ _provider_lock = threading.Lock()
 def get_provider() -> EmbeddingProvider:
     """Get the configured embedding provider (singleton).
 
-    Auto-fallback: if the configured provider is API-keyed (``openai``,
-    ``nvidia-nim``) and the required API key env var isn't set,
+    Auto-fallback: if the configured provider is API-keyed (``voyage``,
+    ``openai``) and the required API key env var isn't set,
     transparently fall through to the ``onnx`` (fastembed) provider
     instead of raising on the first ``embed()`` call. Lets fresh
-    ``mimir setup``-only installs work out of the box without an
-    OpenAI key, while paid-tier users keep the better embeddings as
+    ``mimir setup``-only installs work out of the box without a
+    Voyage key, while paid-tier users keep the better embeddings as
     long as their key is in the environment.
     """
     global _provider_instance
@@ -405,18 +363,17 @@ def get_provider() -> EmbeddingProvider:
         if _provider_instance is not None:
             return _provider_instance
         import os
-        provider_name = _cfg('embedding', 'provider', 'nvidia-nim')
+        provider_name = _cfg('embedding', 'provider', 'voyage')
 
         # API-keyed providers — auto-fall-back to onnx when the
-        # required env var isn't set. Voyage is included since
-        # ``mimir setup --embedding voyage`` is the new default; a
-        # fresh install without VOYAGE_API_KEY should fall back to
-        # local fastembed rather than raising on first embed.
-        _API_KEYED_PROVIDERS = ("openai", "voyage", "nvidia-nim")
+        # required env var isn't set. Voyage is the default
+        # (``mimir setup --embedding voyage``); a fresh install
+        # without VOYAGE_API_KEY should fall back to local fastembed
+        # rather than raising on first embed.
+        _API_KEYED_PROVIDERS = ("openai", "voyage")
         _DEFAULT_KEY_ENVS = {
             "openai": "OPENAI_API_KEY",
             "voyage": "VOYAGE_API_KEY",
-            "nvidia-nim": "NVIDIA_NIM_API_KEY",
         }
         if provider_name in _API_KEYED_PROVIDERS:
             api_key_env = _cfg(

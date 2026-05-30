@@ -152,16 +152,6 @@ def test_setup_embedding_fastembed_preset(tmp_path: Path):
     assert "api_key_env" not in body.split("[llm]")[0]
 
 
-def test_setup_embedding_nvidia_nim_preset(tmp_path: Path):
-    home = tmp_path / "agent"
-    status = setup_home(home, embedding="nvidia-nim")
-    assert status["embedding_preset"] == "nvidia-nim"
-    body = (home / "saga.toml").read_text()
-    assert 'provider = "nvidia-nim"' in body
-    assert 'model = "nvidia/nv-embedqa-e5-v5"' in body
-    assert 'api_key_env = "NVIDIA_NIM_API_KEY"' in body
-
-
 def test_setup_all_presets_write_auto_threshold_sentinel(tmp_path: Path):
     """Regardless of preset, [consolidation] similarity_threshold should
     be the "auto" sentinel — saga resolves per-provider at boot."""
