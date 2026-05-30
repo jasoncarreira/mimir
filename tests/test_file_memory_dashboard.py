@@ -8,9 +8,9 @@ Tests cover:
   - search_files: hits across multiple roots, empty query, truncation
   - list_channel_dirs: basic, missing root, no channels subdir, files excluded
   - render_memory_html: valid HTML shell with expected tokens
-  - web_ui routes: /memory HTML + /api/memory view={tree,file,search,channels}
+  - web_ui routes: /state HTML + /api/memory view={tree,file,search,channels}
   - Path-safety: traversal → 400, non-.md → 400, missing → 404
-  - Auth-exempt: /memory in _AUTH_EXEMPT
+  - Auth-exempt: /state in _AUTH_EXEMPT
 """
 
 from __future__ import annotations
@@ -427,7 +427,7 @@ def memory_app(tmp_path: Path):
 async def test_memory_page_serves_html(memory_app) -> None:
     app, _ = memory_app
     async with TestClient(TestServer(app)) as client:
-        resp = await client.get("/memory")
+        resp = await client.get("/state")  # renamed from /memory
         assert resp.status == 200
         assert resp.content_type == "text/html"
         body = await resp.text()
@@ -521,7 +521,8 @@ async def test_api_memory_file_in_state_subtree(memory_app) -> None:
 def test_memory_page_is_auth_exempt() -> None:
     from mimir.server import _AUTH_EXEMPT
 
-    assert ("GET", "/memory") in _AUTH_EXEMPT
+    assert ("GET", "/state") in _AUTH_EXEMPT  # renamed from /memory
+    assert ("GET", "/memory") not in _AUTH_EXEMPT
 
 
 # ─── list_channel_dirs (Phase 3) ──────────────────────────────────
