@@ -21,7 +21,7 @@ set -euo pipefail
 PATTERNS=(
   'Bearer [A-Za-z0-9_\-]{20,}'
   'sk-ant-[A-Za-z0-9_\-]{20,}'
-  'sk-[A-Za-z0-9_\-]{20,}'             # OpenAI-shaped (incl. sk-proj_… which uses _)
+  'sk-[A-Za-z0-9_]{20,}'               # OpenAI-shaped (incl. sk-proj_… which uses _; no hyphen — avoids false-positives on file paths like pask-approach-to-cybernetics)
   'ghp_[A-Za-z0-9]{30,}'               # GitHub PAT (classic)
   'gho_[A-Za-z0-9]{30,}'               # GitHub OAuth
   'github_pat_[A-Za-z0-9_]{60,}'       # GitHub fine-grained PAT
