@@ -6,6 +6,52 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-30
+
+13 commits since v0.2.0 — dashboard polish, **Voyage as the default
+embedding provider**, the backlog-audit scheduler ticks, and a batch of
+container/boot bug fixes.
+
+### Added
+
+- **Backlog-audit scheduler ticks** (chainlink #283, #164): a monthly
+  `issues-audit` tick triages the `memory/issues/` gotcha layer (retire
+  resolved entries, file chainlink bugs for real code-level gotchas,
+  escalate judgment calls) and a weekly `commitments-review` tick runs a
+  validity pass over non-terminal durable commitments. Split into two jobs
+  so neither turn exceeds the per-turn tool-call budget; both are
+  budget-aware. (#489)
+- **longmemeval category-skew warning** — `--limit N` now warns when the
+  truncated sample is category-skewed, so partial bench runs aren't
+  mistaken for representative. (#485)
+
+### Changed
+
+- **Voyage is now the default embedding provider** — the unused NVIDIA NIM
+  embedding provider was removed. No-API-key deployments still fall back to
+  on-device bge-small. (#492)
+- **Removed the vestigial `allowed-tools` skill field** and the dead
+  skill-as-subagent wiring (no skill used either; the general-purpose
+  subagent path is unaffected). (chainlink #285, #494)
+- **Dashboards** — unified headers and added cross-navigation links across
+  all four pages; the memory page is now **state**. (#480, #482)
+
+### Fixed
+
+- **git_bootstrap** no longer re-appends `credential.helper` and
+  `safe.directory` on every container boot — the git config stopped
+  growing without bound. (chainlink #248, #477)
+- **/saga dashboard** reads the live `.mimir/saga.db` instead of a stale
+  `state/saga.db` path that never existed. (#481)
+- **Dashboard API key** is now stored under one shared localStorage key
+  across all four pages, so entering it once works everywhere. (chainlink
+  #271, #486)
+- **Index writes** use unique per-call temp names and sweep orphaned temp
+  files, fixing a collision window under concurrent rebuilds. (chainlink
+  #272, #484)
+- **Pre-commit secret scan** tightened its `sk-` pattern so hyphenated
+  slugs no longer trip a false positive. (#479)
+
 ## [0.2.0] — 2026-05-29
 
 74 commits since v0.1.3 — a minor bump carrying the first **skill-memory
@@ -359,7 +405,8 @@ stale docs pruned, license attribution corrected).
   tests pin the hook-pairing contract even when the integration test
   skips (CI without OAuth keychain, fresh contributors).
 
-[Unreleased]: https://github.com/jasoncarreira/mimir/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jasoncarreira/mimir/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.1
 [0.2.0]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.0
 [0.1.3]: https://github.com/jasoncarreira/mimir/releases/tag/v0.1.3
 [0.1.2]: https://github.com/jasoncarreira/mimir/releases/tag/v0.1.2
