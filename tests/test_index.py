@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from mimir.index import (
     IndexGenerator,
+    _sweep_orphaned_tmps,
+    _unique_tmp,
     build_memory_index,
     build_state_index,
     build_wiki_index,
@@ -323,3 +327,92 @@ async def test_memory_flush_skips_write_when_catalog_already_current(tmp_path: P
     assert catalog.stat().st_mtime_ns == mtime_after_first_flush, (
         "skills-catalog.md should not be rewritten when already current"
     )
+
+
+# ── unique tmp + orphan sweep (chainlink #272) ─────────────────────
+
+
+def test_unique_tmp_names_differ(tmp_path: Path):
+    """Two successive calls to _unique_tmp for the same path must return
+    distinct filenames so concurrent writers never collide."""
+    target = tmp_path / "INDEX.md"
+    t1 = _unique_tmp(target)
+    t2 = _unique_tmp(target)
+    assert t1 != t2, "_unique_tmp must return a different path each call"
+    # Both should share the same parent directory.
+    assert t1.parent == target.parent
+    assert t2.parent == target.parent
+    # Both names must start with the target stem.
+    assert t1.name.startswith("INDEX.md.tmp.")
+    assert t2.name.startswith("INDEX.md.tmp.")
+
+
+def test_sweep_removes_orphaned_tmps(tmp_path: Path):
+    """_sweep_orphaned_tmps deletes .tmp.* files whose PID is no longer alive."""
+    target = tmp_path / "INDEX.md"
+
+    # Spawn a trivial process and wait for it — its PID is provably dead afterward.
+    dead_proc = subprocess.Popen(["true"])
+    dead_proc.wait()
+    dead_pid = dead_proc.pid
+
+    orphan_a = tmp_path / f"INDEX.md.tmp.{dead_pid}.aaaaaaaa"
+    orphan_b = tmp_path / f"INDEX.md.tmp.{dead_pid}.bbbbbbbb"
+    bystander = tmp_path / "OTHER.md.tmp.11111.cccccccc"  # different base name — must survive
+
+    for f in (orphan_a, orphan_b, bystander):
+        f.write_text("stale", encoding="utf-8")
+
+    _sweep_orphaned_tmps(target)
+
+    assert not orphan_a.exists(), "orphan_a should be removed by sweep"
+    assert not orphan_b.exists(), "orphan_b should be removed by sweep"
+    assert bystander.exists(), "bystander (different base name) must not be touched"
+
+
+def test_sweep_preserves_live_process_tmp(tmp_path: Path):
+    """_sweep_orphaned_tmps must NOT remove a tmp whose PID is still running.
+
+    This simulates a concurrent writer's in-flight file — the scenario that
+    the original sweep re-opened (chainlink #272 CR from jasoncarreira).
+    """
+    target = tmp_path / "INDEX.md"
+    # Encode the current (live) process's PID — os.kill(os.getpid(), 0) succeeds
+    # → sweep must skip this file.
+    live_tmp = tmp_path / f"INDEX.md.tmp.{os.getpid()}.cafecafe"
+    live_tmp.write_text("in-flight", encoding="utf-8")
+
+    _sweep_orphaned_tmps(target)
+
+    assert live_tmp.exists(), "tmp whose PID is still alive must not be swept"
+
+
+def test_sweep_tolerates_already_gone_files(tmp_path: Path):
+    """_sweep_orphaned_tmps must not raise if a matched orphan disappears mid-sweep
+    (e.g. another sweeper removed it concurrently)."""
+    target = tmp_path / "INDEX.md"
+    orphan = tmp_path / "INDEX.md.tmp.12345.deaddead"
+    orphan.write_text("stale", encoding="utf-8")
+    orphan.unlink()  # simulate concurrent removal before our sweep runs
+    _sweep_orphaned_tmps(target)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_flush_leaves_no_tmp_files_on_success(tmp_path: Path):
+    """After a successful flush, no .tmp.* orphan files should remain next to
+    any of the three generated indexes."""
+    _seed_memory(tmp_path)
+    _seed_wiki(tmp_path)
+    (tmp_path / "state" / "doc.md").write_text("# doc")
+
+    gen = IndexGenerator(tmp_path)
+    gen.mark_dirty("all")
+    await gen.flush()
+
+    for directory in (
+        tmp_path / "memory",
+        tmp_path / "state",
+        tmp_path / "state" / "wiki",
+    ):
+        orphans = list(directory.glob("*.tmp.*"))
+        assert orphans == [], f"unexpected tmp files in {directory}: {orphans}"

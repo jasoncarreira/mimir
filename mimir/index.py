@@ -22,12 +22,66 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 from .core_blocks import describe_file
 
 log = logging.getLogger(__name__)
+
+# Matches the PID embedded in ``_unique_tmp``'s suffix: ``.tmp.<pid>.<8-hex>``.
+_ORPHAN_TMP_PAT = re.compile(r"\.tmp\.(\d+)\.[0-9a-f]{8}$")
+
+
+def _unique_tmp(path: Path) -> Path:
+    """Return a unique per-call tmp path next to *path*.
+
+    Using a fixed suffix like ``.md.tmp`` is a race — two concurrent writers
+    share the same name and one writer's ``tmp.replace(path)`` raises
+    ``FileNotFoundError`` when the other already consumed the file.  A
+    PID + random-hex suffix makes each writer's tmp unique so concurrent
+    writers never step on each other (chainlink #272).
+    """
+    tag = f"{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    return path.with_name(path.name + f".tmp.{tag}")
+
+
+def _sweep_orphaned_tmps(path: Path) -> None:
+    """Remove leftover ``*.tmp.*`` files adjacent to *path* from prior crashes.
+
+    Called at the start of each ``_write_*`` method.  Only unlinks tmps whose
+    encoded PID is no longer alive — a concurrent writer's in-flight tmp is
+    protected because ``os.kill(live_pid, 0)`` succeeds and the file is skipped.
+
+    Guard logic (per-PID liveness, chainlink #272):
+
+    - Parse the PID from the ``.tmp.<pid>.<8-hex>`` suffix via ``_ORPHAN_TMP_PAT``.
+    - ``os.kill(pid, 0)`` raises ``ProcessLookupError`` when the PID is dead
+      → safe to unlink.  Raises ``PermissionError`` when the PID exists but we
+      cannot signal it → treat as alive (conservative).  Returns normally when
+      the process is alive → skip.
+    - Files whose name doesn't match ``_ORPHAN_TMP_PAT`` are skipped
+      (unrecognised format → conservative).
+    """
+    for orphan in path.parent.glob(path.name + ".tmp.*"):
+        m = _ORPHAN_TMP_PAT.search(orphan.name)
+        if m is None:
+            continue  # unrecognised suffix — skip conservatively
+        pid = int(m.group(1))
+        try:
+            os.kill(pid, 0)
+            continue  # PID alive → in-flight tmp; leave it alone
+        except ProcessLookupError:
+            pass  # PID dead → safe to unlink
+        except PermissionError:
+            continue  # PID exists but we can't probe it → treat as alive
+        try:
+            orphan.unlink(missing_ok=True)
+        except OSError:
+            pass  # already gone — race with another sweeper; harmless
 
 
 @dataclass
@@ -274,8 +328,9 @@ class IndexGenerator:
     def _write_memory(self) -> None:
         path = self._home / "memory" / "INDEX.md"
         path.parent.mkdir(parents=True, exist_ok=True)
+        _sweep_orphaned_tmps(path)
         body = build_memory_index(self._home)
-        tmp = path.with_suffix(".md.tmp")
+        tmp = _unique_tmp(path)
         tmp.write_text(body, encoding="utf-8")
         tmp.replace(path)
         # Regenerate skills-catalog.md if drift detected (chainlink #109).
@@ -303,7 +358,8 @@ class IndexGenerator:
                 pass  # treat missing/unreadable as empty → always write
         if fresh == existing:
             return  # already current; skip the write
-        tmp = catalog_path.with_suffix(".md.tmp")
+        _sweep_orphaned_tmps(catalog_path)
+        tmp = _unique_tmp(catalog_path)
         try:
             tmp.write_text(fresh, encoding="utf-8")
             tmp.replace(catalog_path)
@@ -313,8 +369,9 @@ class IndexGenerator:
     def _write_state(self) -> None:
         path = self._home / "state" / "INDEX.md"
         path.parent.mkdir(parents=True, exist_ok=True)
+        _sweep_orphaned_tmps(path)
         body = build_state_index(self._home)
-        tmp = path.with_suffix(".md.tmp")
+        tmp = _unique_tmp(path)
         tmp.write_text(body, encoding="utf-8")
         tmp.replace(path)
 
@@ -325,8 +382,9 @@ class IndexGenerator:
         # link reference.
         path = self._home / "state" / "wiki" / "index.md"
         path.parent.mkdir(parents=True, exist_ok=True)
+        _sweep_orphaned_tmps(path)
         body = build_wiki_index(self._home)
-        tmp = path.with_suffix(".md.tmp")
+        tmp = _unique_tmp(path)
         tmp.write_text(body, encoding="utf-8")
         tmp.replace(path)
 
