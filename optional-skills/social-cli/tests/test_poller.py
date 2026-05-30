@@ -275,3 +275,126 @@ def test_empty_platforms_returns_1(fresh_poller, monkeypatch, capsys):
     monkeypatch.setenv("MIMIR_SOCIAL_PLATFORMS", "")
     rc = fresh_poller.main()
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Thread-context coverage (PR #395 — surfacing threadContext from inbox)
+# ---------------------------------------------------------------------------
+
+
+def test_event_shape_includes_thread_fields_when_absent(
+    fresh_poller, monkeypatch, capsys, tmp_path
+):
+    """Events without threadContext carry thread_depth=0 and
+    agent_replies_in_thread=0 as explicit keys (not missing)."""
+    _write_inbox(tmp_path, [_notif("n1")])
+    monkeypatch.setattr(fresh_poller, "_sync", lambda *a, **k: None)
+
+    fresh_poller.main()
+    events = _capture_emits(capsys)
+    ev = events[0]
+    assert ev["thread_depth"] == 0
+    assert ev["agent_replies_in_thread"] == 0
+    # No thread block injected into prompt
+    assert "thread (" not in ev["prompt"]
+
+
+def test_thread_context_rendered_in_prompt(fresh_poller, monkeypatch, capsys, tmp_path):
+    """When threadContext is populated the rendered block appears in the
+    prompt, and thread_depth + agent_replies_in_thread are set correctly."""
+    notif = _notif("n1", ntype="reply")
+    notif["threadContext"] = [
+        {"author": "alice.bsky.social", "text": "original question"},
+        {"author": "bob.bsky.social", "text": "bob's response"},
+    ]
+    _write_inbox(tmp_path, [notif])
+    monkeypatch.setattr(fresh_poller, "_sync", lambda *a, **k: None)
+
+    fresh_poller.main()
+    events = _capture_emits(capsys)
+    ev = events[0]
+    assert ev["thread_depth"] == 2
+    assert ev["agent_replies_in_thread"] == 0
+    assert "thread (2 prior posts)" in ev["prompt"]
+    assert "@alice.bsky.social: original question" in ev["prompt"]
+    assert "@bob.bsky.social: bob" in ev["prompt"]
+
+
+def test_thread_context_marks_own_replies(fresh_poller, monkeypatch, capsys, tmp_path):
+    """Ancestor entries authored by the agent's own handle get a (you)
+    marker and increment agent_replies_in_thread."""
+    env_path = tmp_path / ".env"
+    env_path.write_text("ATPROTO_HANDLE=mimir.bsky.social\n")
+
+    notif = _notif("n1", ntype="reply")
+    notif["threadContext"] = [
+        {"author": "alice.bsky.social", "text": "first"},
+        {"author": "mimir.bsky.social", "text": "my reply"},
+        {"author": "alice.bsky.social", "text": "her response"},
+    ]
+    _write_inbox(tmp_path, [notif])
+    monkeypatch.setattr(fresh_poller, "_sync", lambda *a, **k: None)
+
+    fresh_poller.main()
+    events = _capture_emits(capsys)
+    ev = events[0]
+    assert ev["thread_depth"] == 3
+    assert ev["agent_replies_in_thread"] == 1
+    assert "(you)" in ev["prompt"]
+    assert "1 from you" in ev["prompt"]
+
+
+def test_format_thread_context_empty_input(fresh_poller):
+    """Empty / None threadContext yields zeros and empty block."""
+    depth, replies, block = fresh_poller._format_thread_context([], "")
+    assert (depth, replies, block) == (0, 0, "")
+
+    depth, replies, block = fresh_poller._format_thread_context(None, "")
+    assert (depth, replies, block) == (0, 0, "")
+
+
+def test_format_thread_context_malformed_entries_skipped(fresh_poller):
+    """Non-dict entries (strings, None) are skipped; dict entries with a
+    missing author key are kept with author defaulting to '?'."""
+    ctx = [
+        "not-a-dict",          # skipped — not a dict
+        None,                  # skipped — not a dict
+        {"text": "no author key"},        # kept — author defaults to "?"
+        {"author": "good.bsky.social", "text": "fine"},  # kept
+    ]
+    depth, replies, block = fresh_poller._format_thread_context(ctx, "")
+    # Two dict entries survive; non-dicts are filtered out
+    assert depth == 2
+    assert "@good.bsky.social: fine" in block
+    # Missing-author entry rendered with fallback "?"
+    assert "@?: no author key" in block
+
+
+def test_format_thread_context_text_truncation(fresh_poller):
+    """Ancestor text longer than THREAD_CTX_PER_LINE_CHARS gets truncated."""
+    long_text = "a" * 300
+    ctx = [{"author": "x.bsky.social", "text": long_text}]
+    _, _, block = fresh_poller._format_thread_context(ctx, "")
+    line = [ln for ln in block.splitlines() if "@x.bsky.social" in ln][0]
+    assert "…" in line
+    assert len(line) < 250
+
+
+def test_own_handle_read_from_env_file(fresh_poller, monkeypatch, tmp_path):
+    """_own_handle_for reads ATPROTO_HANDLE from STATE_DIR/.env, lowercased."""
+    env_path = tmp_path / ".env"
+    env_path.write_text("ATPROTO_HANDLE=MyAgent.bsky.Social\n")
+    monkeypatch.setattr(fresh_poller, "STATE_DIR", tmp_path)
+    fresh_poller._OWN_HANDLE_CACHE.clear()
+
+    handle = fresh_poller._own_handle_for("bsky")
+    assert handle == "myagent.bsky.social"
+
+
+def test_own_handle_missing_env_returns_empty(fresh_poller, monkeypatch, tmp_path):
+    """Missing .env degrades gracefully — own_handle is empty string."""
+    monkeypatch.setattr(fresh_poller, "STATE_DIR", tmp_path)
+    fresh_poller._OWN_HANDLE_CACHE.clear()
+
+    handle = fresh_poller._own_handle_for("bsky")
+    assert handle == ""
