@@ -324,6 +324,57 @@ def _compute_update_digest(home: Path, prior_version: str) -> UpdateDigest:
     )
 
 
+def _write_update_digest_sidecar(home: Path, digest: UpdateDigest) -> None:
+    """Persist the post-update digest to ``<home>/.mimir/post-update-digest.json``
+    so it survives the ``os.execv`` that follows. Consumed on the next boot by
+    ``consume_update_digest``.
+
+    Overwrites any prior sidecar (shouldn't exist at this point, but defensive
+    against a mid-install crash that left a stale file).  Best-effort: filesystem
+    failure here doesn't abort the install — the digest is informational.
+    """
+    sidecar = home / _FLAG_DIRNAME / _UPDATE_DIGEST_BASENAME
+    try:
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps(digest.to_dict(), indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("post-update digest sidecar write failed: %s", exc)
+
+
+async def consume_update_digest(
+    home: Path,
+    async_log_event: Callable[..., Awaitable[None]],
+) -> int:
+    """Drain the post-update digest sidecar, emitting a ``mimir_update_digest``
+    event into ``events.jsonl``.  Returns 1 if drained, 0 if absent.
+
+    Called from ``server._on_startup`` AFTER ``init_logger`` is up, alongside
+    ``consume_startup_events``.  The sidecar is written by ``apply_pending_update``
+    pre-execv; if no update ran this boot, the file won't exist (no-op).
+
+    Idempotency: the sidecar is deleted after a successful emit.  A crash between
+    emit and delete means the next restart re-emits one extra algedonic line
+    (acceptable).  A crash before emit means the digest was never surfaced — also
+    acceptable for informational content.
+    """
+    sidecar = home / _FLAG_DIRNAME / _UPDATE_DIGEST_BASENAME
+    if not sidecar.is_file():
+        return 0
+    try:
+        raw = sidecar.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        digest = UpdateDigest.from_dict(data)
+        await async_log_event("mimir_update_digest", **digest.to_dict())
+        try:
+            sidecar.unlink()
+        except OSError as exc:
+            log.warning("post-update digest sidecar unlink failed: %s", exc)
+        return 1
+    except Exception:  # noqa: BLE001 — drain is best-effort
+        log.exception("post-update digest drain failed")
+        return 0
+
+
 @dataclass(frozen=True)
 class PendingUpdate:
     """Parsed contents of the pending-update flag file.
@@ -647,6 +698,7 @@ def apply_pending_update(
     parsed = _read_flag(path)
     pkg = _pypi_package_name()
     spec = _install_spec(pkg, parsed)
+    prior_version = _current_version()
     rc = _run_pip_install(spec, parsed.include_prereleases, emit)
 
     # Always delete the flag — success means we don't re-attempt;
@@ -662,6 +714,14 @@ def apply_pending_update(
         # ``_run_pip_install`` (and written to the sidecar so the
         # algedonic block surfaces it on next turn).
         return True
+
+    # Compute + persist the deployment diff before execv so the next boot
+    # can surface "what changed" to the operator via the algedonic block.
+    try:
+        digest = _compute_update_digest(home, prior_version)
+        _write_update_digest_sidecar(home, digest)
+    except Exception as exc:  # noqa: BLE001 — digest is informational
+        log.warning("post-update digest computation failed: %s", exc)
 
     emit("mimir_update_applied", spec=spec, approved_at=parsed.approved_at)
     # Re-exec to pick up the new code. Same PID — supervisor stays

@@ -610,6 +610,29 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "mimir_update_applied":
         spec = ev.get("spec") or "?"
         return f"mimir update applied on restart: {spec}"
+    if rule_kind == "mimir_update_digest":
+        prior = ev.get("prior_version") or "?"
+        new = ev.get("new_version") or "?"
+        sched = ev.get("scheduler_delta") or []
+        drift = ev.get("skills_drift") or []
+        gaps = ev.get("env_gaps") or []
+        parts: list[str] = []
+        if sched:
+            names = ", ".join(_sanitize_field(str(n)) for n in sched)
+            parts.append(f"scheduler +{len(sched)} tick(s): {names}")
+        if drift:
+            names = ", ".join(_sanitize_field(str(n)) for n in drift)
+            parts.append(f"skills drifted: {names}")
+        if gaps:
+            pairs = ", ".join(
+                f"{_sanitize_field(str(g[0]))}/{_sanitize_field(str(g[1]))}"
+                if isinstance(g, (list, tuple)) and len(g) >= 2
+                else _sanitize_field(str(g))
+                for g in gaps
+            )
+            parts.append(f"env missing: {pairs}")
+        detail = "; ".join(parts) if parts else "nothing requires action"
+        return f"[mimir v{prior}→{new}] {detail}"
     if rule_kind == "mimir_update_failed":
         spec = ev.get("spec") or "?"
         rc = ev.get("rc")

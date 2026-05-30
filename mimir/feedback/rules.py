@@ -239,6 +239,13 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # (rolled back to the prior version; operator should investigate).
     "mimir_update_applied": ("positive", "mimir_update_applied"),
     "mimir_update_failed": ("negative", "mimir_update_failed"),
+    # Post-update deployment digest — surfaces scheduler delta, skills drift,
+    # and env gaps discovered during apply_pending_update, on the first turn
+    # after the restart. Positive polarity: the update succeeded and the
+    # operator needs to see the actionable diff (new ticks to add, skills to
+    # refresh, env vars to provision). If all diffs are empty: "nothing requires
+    # action" — still positive (update was clean).
+    "mimir_update_digest": ("positive", "mimir_update_digest"),
     # chainlink #214: pre-merge CHANGES_REQUESTED gate blocked an auto-merge.
     # Surfaces when the agent's pre-merge review-state check finds any
     # reviewer's current state is CHANGES_REQUESTED — the merge was refused
@@ -436,6 +443,10 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # commitment. The full pending list lives in the Phase 3 prompt
     # block so the agent can see all the offenders if needed.
     "commitment_snooze_pileup",
+    # chainlink #287: fires once per update cycle (written before execv,
+    # drained on next boot). Re-emitting on subsequent turns confuses the
+    # operator — the digest is the one-shot "what changed on upgrade" signal.
+    "mimir_update_digest",
 }
 
 # CR2 (memory & retrieval) invariant: polarity-dynamic kinds (their
