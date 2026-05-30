@@ -2216,8 +2216,10 @@ def test_bundled_scheduler_template_ships_audit_ticks():
 
 def test_audit_prompt_templates_have_frontmatter():
     """issues-audit.md + commitments-review.md ship with skill-style
-    frontmatter (name/description/allowed-tools), like reflect.md, so the
-    scheduled tick has a well-formed body to run."""
+    frontmatter (name/description), like reflect.md, so the scheduled tick
+    has a well-formed body to run. The ``allowed-tools:`` field was removed
+    in chainlink #285 — it was vestigial after the SubAgent delegation
+    rip-out."""
     import mimir.prompt_templates as pt
 
     tpl_dir = Path(pt.__file__).parent
@@ -2230,6 +2232,6 @@ def test_audit_prompt_templates_have_frontmatter():
         frontmatter = text.split("---", 2)[1]
         assert f"name: {expect_name}" in frontmatter, fname
         assert "description:" in frontmatter, fname
-        assert "allowed-tools:" in frontmatter, fname
+        assert "allowed-tools:" not in frontmatter, f"{fname} still has vestigial allowed-tools"
         # the audit's chainlink-log target id appears in the body
         assert ("#164" in text) or ("#283" in text), fname

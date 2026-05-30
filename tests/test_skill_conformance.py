@@ -30,7 +30,6 @@ from pathlib import Path
 import pytest
 
 from mimir.skill_md import (
-    extract_list_field as _extract_list_field,
     parse_frontmatter as _parse_frontmatter,
 )
 
@@ -180,52 +179,3 @@ def test_parse_frontmatter_folded_block_rejects_unindented_continuation() -> Non
         _parse_frontmatter(text)
 
 
-def test_extract_list_field_block_form() -> None:
-    text = (
-        "---\n"
-        "name: example\n"
-        "allowed-tools:\n"
-        "  - Read\n"
-        "  - Write\n"
-        "  - Bash\n"
-        "---\n"
-    )
-    assert _extract_list_field(text, "allowed-tools") == ["Read", "Write", "Bash"]
-
-
-def test_extract_list_field_missing_returns_none() -> None:
-    text = "---\nname: example\ndescription: foo\n---\n"
-    assert _extract_list_field(text, "allowed-tools") is None
-
-
-def test_extract_list_field_explicitly_empty() -> None:
-    text = "---\nname: example\nallowed-tools: []\n---\n"
-    assert _extract_list_field(text, "allowed-tools") == []
-
-
-def test_extract_list_field_inline_array_form() -> None:
-    text = "---\nname: example\nallowed-tools: [Read, Write]\n---\n"
-    assert _extract_list_field(text, "allowed-tools") == ["Read", "Write"]
-
-
-def test_extract_list_field_rejects_scalar_form() -> None:
-    """``<key>: Foo`` (scalar, not list) must return None — callers
-    that want a list should not be handed a silently-coerced ``[Foo]``.
-    The ``allowed-tools`` field itself is no longer used (removed
-    2026-05-23), but the parser-utility behavior is still load-bearing
-    for any future list-shaped frontmatter field."""
-    text = "---\nname: example\nallowed-tools: Foo\n---\n"
-    assert _extract_list_field(text, "allowed-tools") is None
-
-
-def test_extract_list_field_stops_at_next_key() -> None:
-    """List block should NOT swallow the following frontmatter key."""
-    text = (
-        "---\n"
-        "name: example\n"
-        "allowed-tools:\n"
-        "  - Read\n"
-        "description: foo\n"
-        "---\n"
-    )
-    assert _extract_list_field(text, "allowed-tools") == ["Read"]

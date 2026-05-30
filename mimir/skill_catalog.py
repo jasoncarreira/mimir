@@ -2,9 +2,9 @@
 
 Walks ``mimir/skills/<name>/SKILL.md`` (or any skills root passed in)
 and produces a single markdown page that surfaces every skill's name,
-description, allowed-tools, and an auto-derived trigger phrase. The
-intent is a RESOLVER.md-style dispatcher — operators (and the agent
-itself) get a single map of what skills exist and how to invoke them.
+description, and an auto-derived trigger phrase. The intent is a
+RESOLVER.md-style dispatcher — operators (and the agent itself) get a
+single map of what skills exist and how to invoke them.
 
 Wired into the ``mimir`` CLI as ``mimir skills catalog`` (writes to
 the path passed in, defaulting to stdout). The catalog file lives at
@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mimir.event_logger import log_event_sync
-from mimir.skill_md import extract_list_field, parse_frontmatter
+from mimir.skill_md import parse_frontmatter
 
 # Default bundled skills root, used when nothing is passed in.
 DEFAULT_SKILLS_ROOT = Path(__file__).parent / "skills"
@@ -76,7 +76,6 @@ class SkillEntry:
 
     name: str
     description: str
-    allowed_tools: list[str]
     trigger: str
 
 
@@ -140,12 +139,10 @@ def load_skill(skill_dir: Path) -> SkillEntry | None:
         return None
     name = fm.get("name", "").strip() or skill_dir.name
     description = fm.get("description", "").strip()
-    allowed = extract_list_field(text, "allowed-tools") or []
     trigger = _extract_trigger(description)
     return SkillEntry(
         name=name,
         description=description,
-        allowed_tools=list(allowed),
         trigger=trigger,
     )
 
@@ -195,11 +192,11 @@ def load_catalog(skills_root: Path) -> list[SkillEntry]:
 def render_catalog(entries: list[SkillEntry]) -> str:
     """Render a list of :class:`SkillEntry` as the catalog markdown.
 
-    Column-stability contract (catalog-schema: v1):
-    - The table always has exactly three columns: ``Skill``, ``Trigger``,
-      ``Allowed tools``, in that order.
+    Column-stability contract (catalog-schema: v2):
+    - The table has exactly two columns: ``Skill`` and ``Trigger``,
+      in that order.
     - Column names and order are stable across minor releases; a schema
-      version bump (``catalog-schema: v2``) is required to change them.
+      version bump (``catalog-schema: v3``) is required to change them.
     - Cell values may change as skills are added, renamed, or updated.
     - Downstream parsers should key on the ``<!-- catalog-schema: vN -->``
       comment in the first two lines, not on column indices alone.
@@ -207,12 +204,14 @@ def render_catalog(entries: list[SkillEntry]) -> str:
     Catalog schema version history:
 
     v1 (2026-05-26, chainlink #103): initial schema.  Three columns
-      (``Skill``, ``Trigger``, ``Allowed tools``) with stable names and
-      order.  Breaking changes require a ``catalog-schema: v2`` bump.
+      (``Skill``, ``Trigger``, ``Allowed tools``).
+    v2 (2026-05-30, chainlink #285): dropped ``Allowed tools`` column
+      (field was vestigial — no skill declared it; the subagent delegation
+      path that would have enforced it was removed 2026-05-23).
     """
     lines: list[str] = []
-    lines.append("<!-- desc: All bundled mimir skills, one row per skill (name, trigger phrase, allowed tools). Use to find which skill applies to a problem. Regen via `mimir skills catalog`. -->")
-    lines.append("<!-- catalog-schema: v1 -->")
+    lines.append("<!-- desc: All bundled mimir skills, one row per skill (name, trigger phrase). Use to find which skill applies to a problem. Regen via `mimir skills catalog`. -->")
+    lines.append("<!-- catalog-schema: v2 -->")
     lines.append("# Skills Catalog")
     lines.append("")
     lines.append(
@@ -226,21 +225,20 @@ def render_catalog(entries: list[SkillEntry]) -> str:
     lines.append("")
     lines.append(f"_{len(entries)} skills indexed._")
     lines.append("")
-    lines.append("| Skill | Trigger | Allowed tools |")
-    lines.append("|-------|---------|---------------|")
+    lines.append("| Skill | Trigger |")
+    lines.append("|-------|---------|")
     for entry in entries:
         # ``entry.trigger`` is already passed through ``_trim_trailing_punct``
         # by ``_extract_trigger``; it is empty only when ``description`` is
         # empty, in which case ``_trim_trailing_punct(entry.description)``
         # is also empty — so the old ``or _trim_trailing_punct(...)``
         # fallback was always-empty dead code (PR #131 review). Use the
-        # em-dash sentinel for consistency with the empty-tools cell.
+        # em-dash sentinel for consistency with the empty-trigger cell.
         trigger = entry.trigger or "—"
-        tools = ", ".join(f"`{t}`" for t in entry.allowed_tools) or "—"
         # Escape pipes inside cells so the table layout doesn't break.
         trigger_cell = trigger.replace("|", r"\|")
         name_cell = entry.name.replace("|", r"\|")
-        lines.append(f"| `{name_cell}` | {trigger_cell} | {tools} |")
+        lines.append(f"| `{name_cell}` | {trigger_cell} |")
     lines.append("")
     lines.append("## Per-skill descriptions")
     lines.append("")

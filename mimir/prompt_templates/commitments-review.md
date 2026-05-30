@@ -1,9 +1,6 @@
 ---
 name: commitments-review
 description: Weekly validity review of durable commitments. Run when a turn fires with trigger=scheduled_tick on channel scheduler:commitments-review (the operator wires the cron entry; this prompt drives the review). For each non-terminal commitment (pending/delivered/snoozed) decide keep / mark-completed / dismiss / raise-as-chainlink-bug / escalate-to-operator. Autonomous for clear-cut (mark completed only on hard evidence, file chainlink bugs); propose-to-operator for judgment calls like dismissing a still-maybe-relevant loop. Sibling of issues-audit. Tracked as chainlink #283.
-allowed-tools:
-  - Bash
-  - Read
 ---
 
 # Commitments review

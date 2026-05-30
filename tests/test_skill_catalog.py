@@ -34,9 +34,6 @@ def test_load_skill_parses_frontmatter(tmp_path: Path) -> None:
         "---\n"
         "name: demo\n"
         "description: A demo skill. Use when smoke-testing the loader.\n"
-        "allowed-tools:\n"
-        "  - Read\n"
-        "  - Write\n"
         "---\n"
         "# Demo\n",
     )
@@ -44,7 +41,6 @@ def test_load_skill_parses_frontmatter(tmp_path: Path) -> None:
     assert entry is not None
     assert entry.name == "demo"
     assert "A demo skill" in entry.description
-    assert entry.allowed_tools == ["Read", "Write"]
     assert entry.trigger == "Use when smoke-testing the loader"
 
 
@@ -69,20 +65,6 @@ def test_load_skill_falls_back_to_dir_name_if_name_missing(tmp_path: Path) -> No
     entry = load_skill(skill_dir)
     assert entry is not None
     assert entry.name == "no-name-field"
-
-
-def test_load_skill_handles_missing_allowed_tools(tmp_path: Path) -> None:
-    skill_dir = _make_skill(
-        tmp_path,
-        "no-tools",
-        "---\n"
-        "name: no-tools\n"
-        "description: Skill with no allowed-tools field yet.\n"
-        "---\n",
-    )
-    entry = load_skill(skill_dir)
-    assert entry is not None
-    assert entry.allowed_tools == []
 
 
 def test_load_catalog_sorts_alphabetically(tmp_path: Path) -> None:
@@ -131,13 +113,11 @@ def test_render_catalog_smoke(tmp_path: Path) -> None:
         SkillEntry(
             name="alpha",
             description="A skill. Use when alpha-ing.",
-            allowed_tools=["Read"],
             trigger="Use when alpha-ing",
         ),
         SkillEntry(
             name="beta",
             description="B skill. Use when beta-ing.",
-            allowed_tools=["Bash", "Read"],
             trigger="Use when beta-ing",
         ),
     ]
@@ -145,7 +125,7 @@ def test_render_catalog_smoke(tmp_path: Path) -> None:
     assert "# Skills Catalog" in output
     assert "_2 skills indexed._" in output
     assert "| `alpha` | Use when alpha-ing |" in output
-    assert "| `beta` | Use when beta-ing | `Bash`, `Read` |" in output
+    assert "| `beta` | Use when beta-ing |" in output
     assert "### `alpha`" in output
     assert "### `beta`" in output
 
@@ -153,47 +133,30 @@ def test_render_catalog_smoke(tmp_path: Path) -> None:
 def test_render_catalog_schema_version_marker() -> None:
     """render_catalog emits a catalog-schema version comment near the top.
 
-    Downstream parsers that rely on the three-column shape (Skill / Trigger /
-    Allowed tools) should key on this marker rather than column indices alone.
-    A v1 → v2 bump signals a breaking column change.
+    Downstream parsers that rely on the two-column shape (Skill / Trigger)
+    should key on this marker rather than column indices alone.
+    A v2 → v3 bump signals a breaking column change.
     """
     output = render_catalog([])
-    assert "<!-- catalog-schema: v1 -->" in output
+    assert "<!-- catalog-schema: v2 -->" in output
     lines = output.splitlines()
     # Marker must be in the first three lines (after the desc comment and
     # before the h1 title) so parsers can detect it without scanning the
     # full file.
-    assert any("catalog-schema: v1" in line for line in lines[:3])
-
-
-def test_render_catalog_handles_empty_allowed_tools() -> None:
-    entries = [
-        SkillEntry(
-            name="silent",
-            description="No tools needed.",
-            allowed_tools=[],
-            trigger="No tools needed",
-        ),
-    ]
-    output = render_catalog(entries)
-    # Empty list renders as em-dash sentinel.
-    assert "| `silent` | No tools needed | — |" in output
+    assert any("catalog-schema: v2" in line for line in lines[:3])
 
 
 def test_load_skill_handles_empty_description(tmp_path: Path) -> None:
     """``description:`` present but empty — both ``_extract_trigger`` and
     the row renderer must handle it cleanly (em-dash sentinel, no crash).
     PR #131 review feedback: the other edge cases (missing SKILL.md,
-    malformed frontmatter, missing name, missing allowed-tools) are
-    pinned; this one wasn't."""
+    malformed frontmatter, missing name) are pinned; this one wasn't."""
     skill_dir = _make_skill(
         tmp_path,
         "blank-desc",
         "---\n"
         "name: blank-desc\n"
         "description: \n"
-        "allowed-tools:\n"
-        "  - Read\n"
         "---\n",
     )
     entry = load_skill(skill_dir)
@@ -201,9 +164,8 @@ def test_load_skill_handles_empty_description(tmp_path: Path) -> None:
     assert entry.description == ""
     assert entry.trigger == ""
     output = render_catalog([entry])
-    # Empty trigger renders as the em-dash sentinel (matches empty-tools
-    # cell convention, so the table doesn't have visually-empty cells).
-    assert "| `blank-desc` | — | `Read` |" in output
+    # Empty trigger renders as the em-dash sentinel.
+    assert "| `blank-desc` | — |" in output
     # Per-skill section falls back to the explicit "no description" stub.
     assert "_(no description)_" in output
 
@@ -216,7 +178,6 @@ def test_load_skill_handles_omitted_description(tmp_path: Path) -> None:
         "no-desc",
         "---\n"
         "name: no-desc\n"
-        "allowed-tools: []\n"
         "---\n",
     )
     entry = load_skill(skill_dir)
@@ -230,7 +191,6 @@ def test_render_catalog_escapes_pipes_in_trigger() -> None:
         SkillEntry(
             name="piped",
             description="Trigger | with | pipes.",
-            allowed_tools=[],
             trigger="Trigger | with | pipes",
         ),
     ]
