@@ -29,7 +29,7 @@ async def test_turns_page_serves_html(app):
         assert resp.status == 200
         assert resp.content_type == "text/html"
         body = await resp.text()
-        assert "Turn Viewer" in body
+        assert "mimir turns" in body  # header title (renamed from "Turn Viewer")
         assert "/api/turns" in body  # the page polls this endpoint
 
 

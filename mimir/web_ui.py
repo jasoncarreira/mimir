@@ -366,7 +366,8 @@ def register_routes(
         payload = await asyncio.to_thread(list_trees, _memory_roots)
         return web.json_response(payload)
 
-    if ("GET", "/memory") not in existing:
-        app.router.add_get("/memory", memory_page)
+    # Renamed /memory → /state (the page surfaces <home>/state/ + memory/).
+    if ("GET", "/state") not in existing:
+        app.router.add_get("/state", memory_page)
     if ("GET", "/api/memory") not in existing:
         app.router.add_get("/api/memory", memory_data)

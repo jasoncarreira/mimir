@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="robots" content="noindex,nofollow" />
-  <title>mimir Memory</title>
+  <title>mimir state</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -160,11 +160,12 @@
 <body>
 <div class="shell">
   <header>
-    <h1>mimir <span style="color:var(--accent)">memory</span></h1>
+    <h1>mimir <span style="color:var(--accent)">state</span></h1>
     <div>
       <a href="/ops">ops</a>
       <a href="/saga">saga</a>
       <a href="/turns">turns</a>
+      <a href="#" onclick="event.preventDefault();localStorage.removeItem('mimir_api_key');location.reload();" title="Clear the stored API key and re-prompt">↻ reset key</a>
     </div>
   </header>
 

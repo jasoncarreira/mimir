@@ -83,8 +83,8 @@ class TestAuthExemptSet:
     def test_saga_get_is_exempt(self) -> None:
         assert ("GET", "/saga") in _AUTH_EXEMPT
 
-    def test_memory_get_is_exempt(self) -> None:
-        assert ("GET", "/memory") in _AUTH_EXEMPT
+    def test_state_get_is_exempt(self) -> None:
+        assert ("GET", "/state") in _AUTH_EXEMPT  # renamed from /memory
 
     def test_event_post_is_not_exempt(self) -> None:
         assert ("POST", "/event") not in _AUTH_EXEMPT
@@ -235,7 +235,7 @@ def _auth_app(expected_key: str) -> web.Application:
     app.router.add_get("/turns", _ok_handler)
     app.router.add_get("/ops", _ok_handler)
     app.router.add_get("/saga", _ok_handler)
-    app.router.add_get("/memory", _ok_handler)
+    app.router.add_get("/state", _ok_handler)
     return app
 
 
@@ -353,9 +353,9 @@ class TestAuthMiddlewareExemptRoutes:
         assert resp.status == 200
 
     @pytest.mark.asyncio
-    async def test_memory_is_exempt(self) -> None:
+    async def test_state_is_exempt(self) -> None:
         async with TestClient(TestServer(_auth_app("secret"))) as client:
-            resp = await client.get("/memory")
+            resp = await client.get("/state")
         assert resp.status == 200
 
 

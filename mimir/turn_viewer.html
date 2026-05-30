@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Turn Viewer — mimir</title>
+<title>mimir turns</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -17,12 +17,12 @@
   --treb:#2d1a1a;--trebd:#dc2626;
 }
 body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
-.header{padding:12px 20px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-shrink:0}
-.header h1{font-size:16px;font-weight:600}
-.header-links{margin-left:auto;display:flex;gap:14px;font-size:13px}
+.header{padding:10px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px;flex-shrink:0}
+.header h1{font-size:1.4rem;font-weight:600}
+.header-links{margin-left:auto;display:flex;gap:1rem;font-size:0.9rem}
 .header-links a{color:var(--accent);text-decoration:none}
 .header-links a:hover{text-decoration:underline}
-.turn-count{font-size:12px;color:var(--text2);margin-left:auto}
+.turn-count{font-size:12px;color:var(--text2)}
 .status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0}
 .status-dot.live{animation:pulse 2s infinite}
 .status-dot.stale{background:var(--text3)}
@@ -113,14 +113,14 @@ tr:hover td{background:var(--surface2);cursor:pointer}
 </head>
 <body>
 <div class="header">
-  <h1>Turn Viewer</h1>
+  <h1>mimir <span style="color:var(--accent)">turns</span></h1>
   <span class="turn-count" id="turnCount"></span>
   <div class="status-dot stale" id="statusDot" title="Connecting&hellip;"></div>
   <nav class="header-links">
-    <a href="/ops" title="Live ops dashboard">Ops</a>
-    <a href="/saga" title="SAGA memory dashboard">Saga</a>
-    <a href="/memory" title="File memory dashboard">Memory</a>
-    <a href="#" id="reset-key-link" style="display:none" onclick="event.preventDefault();window.__mimir_resetApiKey()" title="Clear the stored MIMIR_API_KEY and re-prompt — useful when the server-side key was rotated">↻ Reset key</a>
+    <a href="/ops" title="Live ops dashboard">ops</a>
+    <a href="/saga" title="SAGA memory dashboard">saga</a>
+    <a href="/state" title="State + file-memory dashboard">state</a>
+    <a href="#" id="reset-key-link" style="display:none" onclick="event.preventDefault();window.__mimir_resetApiKey()" title="Clear the stored MIMIR_API_KEY and re-prompt — useful when the server-side key was rotated">↻ reset key</a>
   </nav>
 </div>
 

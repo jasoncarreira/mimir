@@ -360,7 +360,7 @@ def test_render_dashboard_html_returns_static_shell(tmp_path: Path):
     # historical shape, so check the script-tag form specifically.)
     assert '<script id="data"' not in html
     assert "<!doctype html>" in html
-    assert "mimir Ops" in html
+    assert "mimir ops" in html
     # The shell must NOT contain the actual stats — those come via AJAX.
     assert '"window_days": 1' not in html
     assert '"window_days":1' not in html
@@ -377,7 +377,7 @@ def test_render_dashboard_html_handles_empty_payload(tmp_path: Path):
     payload-arg-passing path stays callable for one release."""
     html = render_dashboard_html()
     assert "<!doctype html>" in html
-    assert "mimir Ops" in html
+    assert "mimir ops" in html
     payload = build_dashboard_payload(tmp_path / "nonexistent.jsonl", days=7)
     assert render_dashboard_html(payload) == html  # arg ignored
 
@@ -399,7 +399,7 @@ def test_ops_dashboard_html_file_bundled() -> None:
     assert sibling.is_file(), f"ops_dashboard.html missing at {sibling}"
     body = sibling.read_text(encoding="utf-8")
     assert "<!doctype html>" in body
-    assert "mimir Ops" in body
+    assert "mimir ops" in body
     assert "/api/ops" in body
     # Auth bootstrap shape.
     assert "getApiKey" in body
@@ -442,7 +442,7 @@ async def test_route_ops_html_renders(web_app, aiohttp_client):
     assert resp.status == 200
     assert resp.content_type == "text/html"
     text = await resp.text()
-    assert "mimir Ops" in text
+    assert "mimir ops" in text
 
 
 @pytest.mark.asyncio
@@ -803,15 +803,15 @@ async def test_route_ops_renders_chainlink_unavailable_when_home_unset(tmp_path:
 
 
 def test_dashboards_cross_link_to_each_other():
-    """Every dashboard nav links to the other three pages. The ops page
-    used to be a dead end (no /saga or /memory links), so operators
-    couldn't reach those views without typing the URL by hand."""
+    """Every dashboard nav links to the other three pages (ops/saga/state/
+    turns), and none still reference the old /memory route (renamed to
+    /state). The ops page used to be a dead end with no cross-links."""
     import mimir
     root = Path(mimir.__file__).parent
     pages = {
         "ops_dashboard.html": "/ops",
         "saga_dashboard.html": "/saga",
-        "file_memory_dashboard.html": "/memory",
+        "file_memory_dashboard.html": "/state",
         "turn_viewer.html": "/turns",
     }
     routes = set(pages.values())
@@ -821,3 +821,6 @@ def test_dashboards_cross_link_to_each_other():
             assert f'href="{route}"' in html, (
                 f"{fname} nav is missing a cross-link to {route}"
             )
+        assert 'href="/memory"' not in html, (
+            f"{fname} still links to /memory (route was renamed to /state)"
+        )
