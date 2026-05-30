@@ -800,3 +800,24 @@ async def test_route_ops_renders_chainlink_unavailable_when_home_unset(tmp_path:
     assert resp.status == 200
     body = await resp.json()
     assert body["chainlink_issues"]["available"] is False
+
+
+def test_dashboards_cross_link_to_each_other():
+    """Every dashboard nav links to the other three pages. The ops page
+    used to be a dead end (no /saga or /memory links), so operators
+    couldn't reach those views without typing the URL by hand."""
+    import mimir
+    root = Path(mimir.__file__).parent
+    pages = {
+        "ops_dashboard.html": "/ops",
+        "saga_dashboard.html": "/saga",
+        "file_memory_dashboard.html": "/memory",
+        "turn_viewer.html": "/turns",
+    }
+    routes = set(pages.values())
+    for fname, self_route in pages.items():
+        html = (root / fname).read_text()
+        for route in sorted(routes - {self_route}):
+            assert f'href="{route}"' in html, (
+                f"{fname} nav is missing a cross-link to {route}"
+            )
