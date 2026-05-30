@@ -618,6 +618,12 @@ def build_app(config: Config) -> web.Application:
         turns_log=config.turns_log,
         events_log=config.events_log,
         home=config.home,
+        # Hand the /saga dashboard the SAME saga.toml-resolved path the
+        # saga client uses (``<home>/.mimir/saga.db`` by default), so it
+        # reads the live DB instead of web_ui's stale
+        # ``<home>/state/saga.db`` fallback — which no longer exists and
+        # produced "saga db not found or unreadable" on the page.
+        saga_db=_db_path,
     )
     # Web chat bridge — POST /chat + GET /chat/stream for the local UI.
     web_chat.register_routes(app)
