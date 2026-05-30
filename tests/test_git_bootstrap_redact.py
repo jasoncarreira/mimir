@@ -216,3 +216,53 @@ def test_pre_commit_hook_still_catches_traditional_sk_ant_keys(tmp_path):
         capture_output=True, text=True,
     )
     assert result.returncode != 0
+
+
+def test_pre_commit_hook_allows_wiki_slug_shaped_sk_strings(tmp_path):
+    """Regression: wiki slugs like ``sk-hyphen-false-positive`` and
+    ``sk-approach-to-cybernetics-1961`` must NOT trigger the hook.
+
+    The old ``sk-[A-Za-z0-9_\\-]{20,}`` pattern included hyphens in the
+    alphabet, so any 20+ char wiki slug starting with ``sk-`` was refused.
+    The fixed pattern ``sk-[A-Za-z0-9]{20,}`` is base62 only — hyphens in
+    the body disqualify the match.  This test pins that invariant.
+    """
+    import subprocess
+    from pathlib import Path
+
+    # Two real slugs that triggered the bug in the wild (2026-05-29).
+    innocent_lines = (
+        "see also [[sk-hyphen-false-positive]] and [[sk-approach-to-cybernetics-1961]]\n"
+        "- Last completed: 2026-05-29 23:00 -- 0 stale-open-closes (sk-foo-bar-baz-qux-quux stuff)\n"
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+
+    hook_src = (
+        Path(__file__).resolve().parent.parent
+        / "mimir" / "templates" / "git" / "pre-commit"
+    )
+    hook_dst = repo / ".git" / "hooks" / "pre-commit"
+    hook_dst.write_text(hook_src.read_text())
+    hook_dst.chmod(0o755)
+
+    ok = repo / "notes.md"
+    ok.write_text(innocent_lines)
+    subprocess.run(["git", "-C", str(repo), "add", "notes.md"], check=True)
+    # Commit must SUCCEED — wiki slugs are not secrets.
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True
+    )
+    result = subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "innocent content"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, (
+        f"pre-commit hook falsely refused wiki-slug content (regression from "
+        f"sk-[A-Za-z0-9_\\-]{{20,}} over-broad pattern). "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
