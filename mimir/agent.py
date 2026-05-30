@@ -542,6 +542,15 @@ class Agent:
             self._hooks: list[TurnHook] = [
                 CommitmentExtractionHook(commitments_store),
             ]
+            # Subconscious SAGA retrieval hook (chainlink #145 #282): fires a
+            # background-framed query in ``pre_query`` to surface episodic
+            # context the literal user message might miss.  Only registered
+            # when a saga client is present so that agents without memory
+            # (bench-runners, test fixtures) are unaffected.  Test paths that
+            # pass ``turn_hooks=[]`` to opt out of all hooks also skip this.
+            if self._saga is not None:
+                from .hooks.subconscious import SubconsciousQueryHook
+                self._hooks.append(SubconsciousQueryHook(saga=self._saga))
         else:
             self._hooks = list(turn_hooks)
 
@@ -2224,5 +2233,6 @@ class Agent:
             auto_skill_block=auto_skill_block,
             saga_session_id=ctx.saga_session_id,
             channel_memory_block=channel_memory_block,
+            subconscious_block=ctx.subconscious_block,
         )
         return turn_prompt, recent
