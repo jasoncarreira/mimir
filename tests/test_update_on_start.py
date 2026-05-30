@@ -813,3 +813,114 @@ def test_compute_update_digest_no_delta(tmp_path: Path) -> None:
         _sd._BUNDLED_SCHEDULER = orig
 
     assert digest.scheduler_delta == []
+
+
+# ─── consume_update_digest sidecar roundtrip ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_digest_sidecar_roundtrip(tmp_path: Path) -> None:
+    """``_write_update_digest_sidecar`` + ``consume_update_digest`` round-trip:
+    writing a digest, then consuming it, emits a ``mimir_update_digest`` event
+    with the correct field values and deletes the sidecar so a second restart
+    doesn't re-emit."""
+    from mimir.update_on_start import (
+        UpdateDigest,
+        _write_update_digest_sidecar,
+        _UPDATE_DIGEST_BASENAME,
+        consume_update_digest,
+    )
+
+    digest = UpdateDigest(
+        prior_version="0.2.1",
+        new_version="0.2.2",
+        scheduler_delta=["issues-audit", "commitments-review"],
+        skills_drift=["github"],
+        env_gaps=[("weather", "OPENWEATHER_API_KEY")],
+    )
+    _write_update_digest_sidecar(tmp_path, digest)
+
+    captured: list[tuple[str, dict]] = []
+
+    async def _async_log(kind: str, **fields):  # type: ignore[misc]
+        captured.append((kind, fields))
+
+    drained = await consume_update_digest(tmp_path, _async_log)
+
+    assert drained == 1
+    assert len(captured) == 1
+    kind, fields = captured[0]
+    assert kind == "mimir_update_digest"
+    assert fields["prior_version"] == "0.2.1"
+    assert fields["new_version"] == "0.2.2"
+    assert "issues-audit" in fields["scheduler_delta"]
+    assert "github" in fields["skills_drift"]
+    assert ("weather", "OPENWEATHER_API_KEY") in [
+        tuple(g) for g in fields["env_gaps"]
+    ]
+    # Sidecar deleted after successful drain.
+    sidecar = tmp_path / ".mimir" / _UPDATE_DIGEST_BASENAME
+    assert not sidecar.exists()
+
+
+@pytest.mark.asyncio
+async def test_update_digest_consume_no_sidecar(tmp_path: Path) -> None:
+    """When no sidecar file exists (common path — no update on this restart),
+    ``consume_update_digest`` returns 0 and emits no events."""
+    from mimir.update_on_start import consume_update_digest
+
+    calls: list = []
+
+    async def _async_log(*args, **kwargs):  # type: ignore[misc]
+        calls.append((args, kwargs))
+
+    drained = await consume_update_digest(tmp_path, _async_log)
+
+    assert drained == 0
+    assert calls == []
+
+
+# ─── mimir_update_digest feedback renderer ───────────────────────────
+
+
+def test_mimir_update_digest_render_all_surfaces() -> None:
+    """When all three diff surfaces are non-empty the renderer produces
+    a one-liner covering scheduler delta, skills drift, and env gaps."""
+    from mimir.feedback import _render_event_line
+
+    line = _render_event_line(
+        "mimir_update_digest",
+        {
+            "prior_version": "0.2.1",
+            "new_version": "0.2.2",
+            "scheduler_delta": ["issues-audit", "commitments-review"],
+            "skills_drift": ["github"],
+            "env_gaps": [["weather", "OPENWEATHER_API_KEY"]],
+        },
+    )
+
+    assert "[mimir v0.2.1→0.2.2]" in line
+    assert "scheduler +2 tick(s)" in line
+    assert "issues-audit" in line
+    assert "skills drifted: github" in line
+    assert "env missing: weather/OPENWEATHER_API_KEY" in line
+
+
+def test_mimir_update_digest_render_nothing_required() -> None:
+    """When all three diff surfaces are empty the renderer returns the
+    'nothing requires action' fallback — the update was a no-op."""
+    from mimir.feedback import _render_event_line
+
+    line = _render_event_line(
+        "mimir_update_digest",
+        {
+            "prior_version": "0.2.2",
+            "new_version": "0.2.3",
+            "scheduler_delta": [],
+            "skills_drift": [],
+            "env_gaps": [],
+        },
+    )
+
+    assert "[mimir v0.2.2→0.2.3]" in line
+    assert "nothing requires action" in line
