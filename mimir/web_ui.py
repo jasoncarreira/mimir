@@ -198,11 +198,14 @@ def register_routes(
     # ── /saga — saga DB viewer ───────────────────────────────────────
 
     # Resolve the DB path: use the explicit ``saga_db`` kwarg when
-    # provided; otherwise derive from ``home`` (the standard location
-    # at ``<home>/state/saga.db``).
+    # provided (server.py passes the saga.toml-resolved path); otherwise
+    # derive from ``home``. The canonical location is
+    # ``<home>/.mimir/saga.db`` (saga's default ``[storage].db_path``);
+    # the older ``<home>/state/saga.db`` fallback predated the move to
+    # ``.mimir/`` and pointed at a file that no longer exists.
     _saga_db: Path | None = saga_db
     if _saga_db is None and home is not None:
-        _saga_db = home / "state" / "saga.db"
+        _saga_db = home / ".mimir" / "saga.db"
 
     async def saga_page(_request: web.Request) -> web.Response:
         return web.Response(text=render_saga_html(), content_type="text/html")

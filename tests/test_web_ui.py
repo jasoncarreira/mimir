@@ -148,3 +148,60 @@ async def test_register_routes_is_idempotent(app):
     async with TestClient(TestServer(a)) as client:
         resp = await client.get("/health" if False else "/api/turns")
         assert resp.status == 200
+
+
+def _make_min_saga_db(path: Path) -> None:
+    """Minimal saga DB with just the tables build_db_stats_payload reads."""
+    import sqlite3
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        "CREATE TABLE atoms (id TEXT, tombstoned INTEGER DEFAULT 0);"
+        "CREATE TABLE sessions (id TEXT);"
+        "CREATE TABLE triples (id TEXT, tombstoned INTEGER DEFAULT 0);"
+        "CREATE TABLE schema_version (version INTEGER);"
+        "INSERT INTO atoms (id, tombstoned) VALUES ('a1', 0);"
+        "INSERT INTO schema_version (version) VALUES (1);"
+    )
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_saga_db_fallback_uses_dot_mimir_not_state(tmp_path: Path):
+    """Regression (saga page 'db not found or unreadable'): with home set
+    and no explicit saga_db, the /saga dashboard must read
+    <home>/.mimir/saga.db (saga's canonical default), not the stale
+    <home>/state/saga.db that no longer exists."""
+    _make_min_saga_db(tmp_path / ".mimir" / "saga.db")
+    a = web.Application()
+    web_ui.register_routes(
+        a, turns_log=tmp_path / "t.jsonl", events_log=tmp_path / "e.jsonl",
+        home=tmp_path,  # no saga_db → exercises the fallback
+    )
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/saga?view=stats")
+        assert resp.status == 200
+        payload = await resp.json()
+        assert payload.get("ready") is True, payload
+        assert payload["db_path"].replace("\\", "/").endswith("/.mimir/saga.db"), \
+            payload["db_path"]
+
+
+@pytest.mark.asyncio
+async def test_saga_db_explicit_kwarg_wins(tmp_path: Path):
+    """server.py passes the saga.toml-resolved path as saga_db=; it must
+    take precedence over the home-derived fallback."""
+    db = tmp_path / "custom" / "saga.db"
+    _make_min_saga_db(db)
+    a = web.Application()
+    web_ui.register_routes(
+        a, turns_log=tmp_path / "t.jsonl", events_log=tmp_path / "e.jsonl",
+        home=tmp_path, saga_db=db,
+    )
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/saga?view=stats")
+        payload = await resp.json()
+        assert payload.get("ready") is True, payload
+        assert payload["db_path"].replace("\\", "/").endswith("/custom/saga.db"), \
+            payload["db_path"]
