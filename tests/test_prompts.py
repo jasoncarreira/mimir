@@ -586,3 +586,48 @@ def test_turn_prompt_auto_skill_block_no_frontmatter(tmp_path):
     skill_section = prompt[skill_section_start:]
     assert "name: social-cli" not in skill_section
     assert "description:" not in skill_section
+
+
+# ── subconscious_block rendering tests (chainlink #280) ───────────────────
+
+
+def _make_event():
+    from mimir.models import AgentEvent
+    return AgentEvent(trigger="user_message", channel_id="ch-1", content="hello")
+
+
+def test_subconscious_block_none_suppresses_section():
+    """Passing subconscious_block=None must NOT add a subconscious section."""
+    from mimir.prompts import build_turn_prompt
+    prompt = build_turn_prompt(_make_event(), subconscious_block=None)
+    assert "Subconscious retrieval" not in prompt
+
+
+def test_subconscious_block_renders_labeled_section():
+    """When subconscious_block is a non-empty string the section header
+    and its body must both appear in the prompt."""
+    from mimir.prompts import build_turn_prompt
+    prompt = build_turn_prompt(_make_event(), subconscious_block="some context")
+    assert "Subconscious retrieval (background)" in prompt
+    assert "some context" in prompt
+
+
+def test_subconscious_block_appears_after_saga_block():
+    """The subconscious section must come after the SAGA memory section."""
+    from mimir.prompts import build_turn_prompt
+    prompt = build_turn_prompt(
+        _make_event(),
+        saga_block="memories",
+        subconscious_block="subconscious",
+    )
+    assert "Possibly relevant memories" in prompt
+    assert "Subconscious retrieval" in prompt
+    assert prompt.index("Possibly relevant memories") < prompt.index("Subconscious retrieval")
+
+
+def test_subconscious_block_empty_string_suppressed():
+    """An empty string for subconscious_block must be treated as falsy
+    and suppress the section (mirrors the pattern used for other blocks)."""
+    from mimir.prompts import build_turn_prompt
+    prompt = build_turn_prompt(_make_event(), subconscious_block="")
+    assert "Subconscious retrieval" not in prompt

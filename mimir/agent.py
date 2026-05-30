@@ -1040,6 +1040,14 @@ class Agent:
         # (scheduled_tick / saga_session_end / shell_job_complete).
         await self._append_inbound_to_buffer(event)
 
+        # Fire pre_query hooks: after TurnContext setup and inbound
+        # buffer append, before memory-block assembly. Hooks can inspect
+        # or mutate ctx (e.g. set ctx.subconscious_block) so that the
+        # prompt assembly phase sees hook-provided data. Per-hook
+        # exception isolation via fire_hooks — a failing hook does NOT
+        # abort the turn.
+        await fire_hooks("pre_query", self._hooks, ctx, event)
+
         # Pre-message memory inject. Builds the "Possibly relevant
         # memories" block + collects atom_ids for the post-turn
         # feedback credit pass. Skipped for triggers in
@@ -1238,6 +1246,13 @@ class Agent:
 
         # Result fields drive the TurnRecord, so compute once and reuse.
         result_fields = derive_result_fields(messages)
+
+        # Fire post_query hooks: after the LLM completes and result
+        # fields are derived, before the TurnRecord is constructed and
+        # written. Hooks receive the raw message list and the final
+        # output text. Per-hook exception isolation — a failing hook
+        # does NOT prevent the TurnRecord from being written.
+        await fire_hooks("post_query", self._hooks, ctx, event, messages, output)
 
         # Assemble this turn's cited-atom set for the TurnRecord. NO
         # automatic feedback (operator decision 2026-05-29): the old

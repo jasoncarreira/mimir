@@ -1290,3 +1290,81 @@ async def test_run_turn_folds_injected_skill_atoms_into_record_no_autofeedback(
     assert "a" * 16 in record.saga_atom_ids
     # ...but NOT auto-credited (per-turn feedback removed).
     assert fake_saga.feedback_calls == []
+
+
+# ── TurnHook pre_query / post_query wiring tests (chainlink #279) ─────────
+
+
+async def test_pre_query_hook_fires_before_memory_assembly(tmp_path: Path):
+    """A hook's pre_query method must be called during run_turn (before
+    memory-block assembly). Verified by recording the call in a log list
+    and asserting it's populated after the turn completes."""
+    from mimir.turn_hooks import TurnHook
+
+    call_log: list[str] = []
+
+    class _LoggingHook(TurnHook):
+        async def pre_query(self, ctx, event):
+            call_log.append("pre_query")
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent)
+    agent.add_hook(_LoggingHook())
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hello")
+    await agent.run_turn(event)
+
+    assert "pre_query" in call_log
+
+
+async def test_post_query_hook_fires_after_astream(tmp_path: Path):
+    """A hook's post_query method must be called after astream completes
+    (before TurnRecord is written). Verified by recording the call."""
+    from mimir.turn_hooks import TurnHook
+
+    call_log: list[str] = []
+
+    class _LoggingHook(TurnHook):
+        async def post_query(self, ctx, event, messages, output):
+            call_log.append("post_query")
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="result")])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent)
+    agent.add_hook(_LoggingHook())
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hello")
+    await agent.run_turn(event)
+
+    assert "post_query" in call_log
+
+
+async def test_turn_hook_exception_does_not_crash_turn(tmp_path: Path, monkeypatch):
+    """A hook that raises in pre_query must NOT crash the turn. The turn
+    should still complete (return a TurnRecord) and a 'turn_hook_failed'
+    event must be emitted."""
+    from mimir.turn_hooks import TurnHook
+    import mimir.turn_hooks as _turn_hooks_mod
+
+    emitted_events: list[dict] = []
+
+    async def _fake_log_event(kind, **kwargs):
+        emitted_events.append({"kind": kind, **kwargs})
+
+    monkeypatch.setattr(_turn_hooks_mod, "log_event", _fake_log_event)
+
+    class _RaisingHook(TurnHook):
+        async def pre_query(self, ctx, event):
+            raise RuntimeError("hook intentionally raised")
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent)
+    agent.add_hook(_RaisingHook())
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hello")
+    # Turn must complete without raising despite the hook failure.
+    record = await agent.run_turn(event)
+    assert record is not None
+
+    # A 'turn_hook_failed' event must have been emitted.
+    kinds = [e["kind"] for e in emitted_events]
+    assert "turn_hook_failed" in kinds

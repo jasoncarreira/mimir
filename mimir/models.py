@@ -133,6 +133,14 @@ class TurnContext:
     # summary, latency_ms, error). Empty when no saga calls fired (e.g.
     # synthetic ticks with no inbound, scheduled callables).
     saga_calls: list[SagaCallRecord] = field(default_factory=list)
+    # Subconscious retrieval result (chainlink #145 / #280). Populated
+    # by a SubconsciousQueryHook in its ``pre_query`` stage before
+    # memory-block assembly begins. When non-None and non-empty, the
+    # prompt assembler renders it as a labeled "Subconscious retrieval
+    # (background)" section. None (default) suppresses the section
+    # entirely — turns without a wired SubconsciousQueryHook are
+    # unaffected.
+    subconscious_block: str | None = None
 
 
 @dataclass

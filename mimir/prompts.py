@@ -208,6 +208,7 @@ def build_turn_prompt(
     auto_skill_block: tuple[str, str] | None = None,
     saga_session_id: str | None = None,
     channel_memory_block: str | None = None,
+    subconscious_block: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, SAGA
     atom hits, subagent completion notifications (from prior turns), event
@@ -319,6 +320,9 @@ def build_turn_prompt(
 
     if saga_block:
         _add_labeled("Possibly relevant memories (from SAGA)", saga_block)
+
+    if subconscious_block:
+        _add_labeled("Subconscious retrieval (background)", subconscious_block)
 
     if subagent_block:
         _add_labeled("Subagent updates", subagent_block)

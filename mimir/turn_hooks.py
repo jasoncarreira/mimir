@@ -30,13 +30,13 @@ Lifecycle stages (call order during ``Agent.run_turn``):
                 work (extraction, wiki updates, etc.) that shouldn't
                 block the user-visible reply path.
 
-Currently only ``finalize`` is wired into ``agent.py``; ``pre_query``
-and ``post_query`` are stubs callers can subclass but the agent
-runtime doesn't fire yet (will land when the next inlined logic
-gets migrated). Sketch-only-now is intentional — the hook chain
-adds value once there's at least one real subclass calling through
-it, and migrating wholesale risks the same drop-a-call regression
-that #181 produced.
+All three stages (``pre_query``, ``post_query``, and ``finalize``)
+are now wired into ``agent.py``. ``pre_query`` fires after
+TurnContext setup and inbound buffer append, before memory-block
+assembly. ``post_query`` fires after ``agent.astream`` completes
+and result fields are derived, before the TurnRecord is written.
+``finalize`` fires after the TurnRecord is written to
+``turns.jsonl``.
 """
 
 from __future__ import annotations
