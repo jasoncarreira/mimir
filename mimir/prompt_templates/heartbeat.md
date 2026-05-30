@@ -1,13 +1,6 @@
 ---
 name: heartbeat
 description: How to use scheduled heartbeat ticks for autonomous work. Use this skill when a turn fires with trigger=scheduled_tick (no inbound message, scheduler-initiated). Covers the librarian drift check, the backlog protocol, and when to end silently vs. escalate.
-allowed-tools:
-  - Bash
-  - Edit
-  - Read
-  - Task
-  - Write
-  - send_message
 ---
 
 # Heartbeat ticks

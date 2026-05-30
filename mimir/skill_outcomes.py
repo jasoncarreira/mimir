@@ -13,10 +13,10 @@ the agent reads ``SKILL.md`` to pull the body into its own context and
 improvises with the parent's full tool surface. Signal:
 ``tool_call(name="read_file", args.file_path=".../SKILL.md")``.
 ``tool_result.is_error`` reflects whether the FILE was readable
-— **load** signal, not execution. **Inline-skill execution outcomes
-are heuristic; for clean per-invocation outcomes, declare
-``allowed-tools`` in the skill's frontmatter so it runs as a SubAgent
-and gets an explicit ``tool_result.is_error`` signal.**
+— **load** signal, not execution. Inline-skill execution outcomes
+are heuristic; the ``success_criteria`` frontmatter block (see
+:class:`SkillSuccessCriteria`) is the upgrade path for skills where
+a declarative completion signal can be defined.
 
 The fallback attribution strategy for inline loads where no
 ``tool_result`` was captured (streaming gap) is **Approach C
@@ -270,9 +270,11 @@ class SkillOutcome:
     operator can tell apart "skill ran cleanly" from "skill loaded
     cleanly":
 
-    * **execution** — ``task(subagent_type=X)`` call returns a
-      ``tool_result`` whose ``is_error`` flag *directly* reflects
-      whether the subagent's workflow finished cleanly. Clean signal.
+    * **execution** — ``task(subagent_type=X)`` call (framework's
+      auto-injected ``general-purpose`` subagent, or operator-supplied
+      subagent specs) returns a ``tool_result`` whose ``is_error`` flag
+      *directly* reflects whether the subagent's workflow finished
+      cleanly. Clean signal.
     * **load** — ``read_file(.../SKILL.md)`` call's ``is_error`` only
       tells us the SKILL.md file opened, NOT whether the agent
       followed the procedure it described. Proxy signal coupled to
@@ -393,15 +395,14 @@ def _classify_skill_calls(
 
     **Two invocation patterns on the deepagents runtime:**
 
-    1. ``tool_call(name="task", args.subagent_type="<skill>")`` —
-       still detected for the framework's auto-injected
-       ``general-purpose`` subagent and any future operator-supplied
-       subagent specs. Emitted with ``kind="execution"`` — a clean
-       per-invocation signal. Mimir no longer compiles its own
-       skills to SubAgents (the spike was removed 2026-05-23), so
-       this path's ``skill`` field is usually ``general-purpose``
-       and gets filtered downstream because it isn't in the seeded
-       skill list.
+    1. ``tool_call(name="task", args.subagent_type="<subagent>")`` —
+       the framework's auto-injected ``general-purpose`` subagent or
+       operator-supplied subagent specs. Emitted with
+       ``kind="execution"`` — a clean per-invocation signal. The
+       ``skill`` field is usually ``general-purpose``; it gets filtered
+       downstream because it isn't in the seeded skill list. (Mimir
+       used to compile its own skills to SubAgents, but that spike was
+       removed 2026-05-23 — no mimir skill is compiled to a SubAgent.)
 
     2. ``tool_call(name="read_file", args.file_path="…/SKILL.md")``
        — inline load. Skill stays in the catalog; agent reads
@@ -467,11 +468,10 @@ def _classify_skill_calls(
             kind: str = ""
             if name == "task":
                 # deepagents subagent-execution path: ``task`` tool
-                # invokes a registered SubAgent. For mimir-skill-derived
-                # SubAgents the subagent_type IS the skill name.
-                # Framework's ``general-purpose`` subagent task calls
-                # also land here but get filtered downstream because
-                # they're not in the seeded skill list.
+                # invokes a registered SubAgent. Typically the framework's
+                # auto-injected ``general-purpose`` subagent or an
+                # operator-supplied subagent spec. Gets filtered downstream
+                # when the subagent_type isn't in the seeded skill list.
                 sub = args.get("subagent_type")
                 if isinstance(sub, str) and sub:
                     skill = sub

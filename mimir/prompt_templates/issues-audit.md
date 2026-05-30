@@ -1,12 +1,6 @@
 ---
 name: issues-audit
 description: Monthly triage of the memory/issues/ operational-gotcha layer. Run when a turn fires with trigger=scheduled_tick on channel scheduler:issues-audit (the operator wires the cron entry; this prompt drives the audit). For each gotcha file decide keep / retire / raise-as-chainlink-bug / escalate-to-operator. Autonomous for clear-cut cases (retire already-RESOLVED files, file chainlink bugs); propose-to-operator for judgment calls. Batches across runs to stay within the tool-call budget. Sibling of commitments-review. Tracked as chainlink #164.
-allowed-tools:
-  - Bash
-  - Read
-  - Glob
-  - Edit
-  - Write
 ---
 
 # Issues audit
