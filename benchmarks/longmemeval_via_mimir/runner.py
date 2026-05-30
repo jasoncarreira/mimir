@@ -216,6 +216,51 @@ api_key = ""
 """
 
 
+# The six question types in LongMemEval-S. The dataset front-loads
+# ``single-session-user`` (70 questions) and ``multi-session`` (30 questions),
+# so ``--limit 100`` silently samples only 2 of 6 categories.
+_LONGMEMEVAL_CATEGORIES: frozenset[str] = frozenset({
+    "single-session-user",
+    "multi-session",
+    "single-session-assistant",
+    "single-session-preference",
+    "knowledge-update",
+    "temporal-reasoning",
+})
+
+
+def _warn_category_skew(dataset: list[dict], limit: int) -> None:
+    """Warn when ``--limit N`` produces category-unbalanced results.
+
+    LongMemEval-S orders questions by type, so small ``--limit`` values
+    only see a prefix of the distribution.  Operators running quick
+    iteration benches can mistake 2-category results for 6-category ones.
+
+    Prints to stderr; does not affect the return value or the dataset.
+    """
+    counts: dict[str, int] = {}
+    for item in dataset:
+        cat = item.get("question_type", "unknown")
+        counts[cat] = counts.get(cat, 0) + 1
+
+    zero_cats = sorted(c for c in _LONGMEMEVAL_CATEGORIES if counts.get(c, 0) == 0)
+    if not zero_cats:
+        return
+
+    present = sorted(
+        f"{c}={counts[c]}" for c in _LONGMEMEVAL_CATEGORIES if counts.get(c, 0) > 0
+    )
+    print(
+        f"WARNING: --limit {limit} produces category-skewed results — "
+        f"{len(zero_cats)} of {len(_LONGMEMEVAL_CATEGORIES)} categories have 0 "
+        f"questions: {', '.join(zero_cats)}. "
+        f"Present: {', '.join(present)}. "
+        f"Scores for missing categories will be NaN; "
+        f"aggregate accuracy only covers the sampled types.",
+        file=sys.stderr,
+    )
+
+
 def _write_bench_saga_toml(home: Path) -> None:
     """Overwrite ``<home>/saga.toml`` with bench-friendly settings.
 
@@ -448,6 +493,7 @@ async def _amain(argv: list[str] | None = None) -> int:
     dataset = json.loads(dataset_path.read_text())
     if args.limit:
         dataset = dataset[: args.limit]
+        _warn_category_skew(dataset, args.limit)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
