@@ -6,6 +6,35 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-05-30
+
+Packaging fix. The published wheel was missing several runtime data files,
+so a fresh `pip install mimir-agent` was broken at first run. Existing
+deployments (with persistent saga DBs + already-seeded homes) were
+unaffected — this only bit new installs.
+
+### Fixed
+
+- **Wheel now bundles all runtime data files** (chainlink #290). The
+  `[tool.hatch.build]` include list is an allowlist that silently drops
+  any file it doesn't match — and several files the installed package
+  reads at runtime weren't matched:
+  - `saga/schema.sql` — `SagaStore` `executescript()`s it on fresh-DB
+    init, so a first-run install crashed with `FileNotFoundError` before
+    saga could come up.
+  - `prompt_templates/*.md` — the glob pointed at `mimir/prompts/` (a
+    directory that doesn't exist; the templates live in
+    `prompt_templates/`), so no default scheduler-tick prompts seeded.
+  - `scheduler_template.yaml` — no default scheduler seeded on setup.
+  - `credentials.yaml` — the mimir-core credential manifest never loaded.
+  - `skills/**/*.sh` (tmux) and `skills/**/*.fragment` (chainlink) — skill
+    support files outside the old `.md`/`.json`/`.py` allowlist.
+
+  The skills entry is now the whole subtree (`mimir/skills/**/*`) so a new
+  support-file type can't silently drop, and a stdlib regression test
+  (`tests/test_wheel_package_data.py`) asserts the include config covers
+  every runtime data file. Pre-existing since 0.2.0 and earlier.
+
 ## [0.2.1] — 2026-05-30
 
 13 commits since v0.2.0 — dashboard polish, **Voyage as the default
@@ -405,7 +434,8 @@ stale docs pruned, license attribution corrected).
   tests pin the hook-pairing contract even when the integration test
   skips (CI without OAuth keychain, fresh contributors).
 
-[Unreleased]: https://github.com/jasoncarreira/mimir/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/jasoncarreira/mimir/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.2
 [0.2.1]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.1
 [0.2.0]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.0
 [0.1.3]: https://github.com/jasoncarreira/mimir/releases/tag/v0.1.3

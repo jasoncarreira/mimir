@@ -6,7 +6,7 @@
 # code keeps writing ``from mimir.agent import ...`` — only the
 # install incantation changes: ``pip install mimir-agent``.
 name = "mimir-agent"
-version = "0.2.1"
+version = "0.2.2"
 description = "Memory-centric agent harness on deepagents / LangGraph"
 requires-python = ">=3.11"
 authors = [{ name = "Jason Carreira" }]
@@ -152,12 +152,33 @@ build-backend = "hatchling.build"
 packages = ["mimir"]
 
 [tool.hatch.build]
+# chainlink #290: everything below the .py line is a runtime data file
+# read by the INSTALLED package — it MUST ship in the wheel. This include
+# list is an allowlist intersected with VCS-tracked files, so anything not
+# matched here silently drops from the wheel (which is exactly how the
+# bugs noted below shipped in 0.2.0/0.2.1, breaking fresh `pip install`s).
 include = [
     "mimir/**/*.py",
-    "mimir/prompts/**/*.md",
-    "mimir/skills/**/*.md",
-    "mimir/skills/**/*.json",
-    "mimir/skills/**/*.py",
+    # Default operator prompt templates — seed_prompts() copies these into
+    # <home>/prompts/ on setup. The directory is prompt_templates/, NOT
+    # prompts/; the previous "mimir/prompts/**/*.md" glob was a dead path,
+    # so none of the templates ever shipped.
+    "mimir/prompt_templates/**/*.md",
+    # Default scheduler (seed_scheduler copies this to <home>/scheduler.yaml)
+    # and the mimir-core credential manifest (cred_verify loads it at import
+    # via _PACKAGE_MANIFEST). No glob covered top-level mimir/*.yaml before.
+    "mimir/scheduler_template.yaml",
+    "mimir/credentials.yaml",
+    # Saga DB schema — SagaStore executescript()s this on fresh-DB init
+    # (saga/client.py, under "if fresh:"). Without it a first-run install
+    # crashes with FileNotFoundError before saga can come up.
+    "mimir/saga/*.sql",
+    # Skills bundle arbitrary support files next to their .md/.py — shell
+    # scripts (tmux), scaffold fragments (chainlink), etc. Glob the whole
+    # subtree so a new support-file type can't silently drop (the old
+    # .md/.json/.py allowlist dropped tmux's .sh and chainlink's .fragment).
+    # .pyc / __pycache__ stay out — gitignored, and hatchling respects VCS.
+    "mimir/skills/**/*",
     "mimir/templates/**/*",
     "mimir/turn_viewer.html",
     # chainlink #243: operator dashboards. HTML/JS lives in sibling .html
