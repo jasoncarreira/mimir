@@ -21,7 +21,7 @@ set -euo pipefail
 PATTERNS=(
   'Bearer [A-Za-z0-9_\-]{20,}'
   'sk-ant-[A-Za-z0-9_\-]{20,}'
-  'sk-proj-[A-Za-z0-9_\-]{20,}'         # OpenAI project keys (sk-proj-…; body may contain hyphens)
+  'sk-proj[-_][A-Za-z0-9_\-]{20,}'      # OpenAI project keys (sk-proj- or sk-proj_; body may contain -/_)
   'sk-[A-Za-z0-9]{20,}'                 # OpenAI classic keys (base62 body — no hyphens; keeps wiki slugs like sk-foo-bar from matching)
   'ghp_[A-Za-z0-9]{30,}'               # GitHub PAT (classic)
   'gho_[A-Za-z0-9]{30,}'               # GitHub OAuth
