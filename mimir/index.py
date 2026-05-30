@@ -22,12 +22,45 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 from .core_blocks import describe_file
 
 log = logging.getLogger(__name__)
+
+
+def _unique_tmp(path: Path) -> Path:
+    """Return a unique per-call tmp path next to *path*.
+
+    Using a fixed suffix like ``.md.tmp`` is a race — two concurrent writers
+    share the same name and one writer's ``tmp.replace(path)`` raises
+    ``FileNotFoundError`` when the other already consumed the file.  A
+    PID + random-hex suffix makes each writer's tmp unique so concurrent
+    writers never step on each other (chainlink #272).
+    """
+    tag = f"{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    return path.with_name(path.name + f".tmp.{tag}")
+
+
+def _sweep_orphaned_tmps(path: Path) -> None:
+    """Remove leftover ``*.tmp.*`` files adjacent to *path* from prior crashes.
+
+    Called at the start of each ``_write_*`` method.  Orphans accumulate when
+    a writer crashes between the ``write_text`` and ``replace`` steps.  The
+    sweep runs *before* this writer creates its own unique tmp, so it cannot
+    accidentally remove a live concurrent writer's file that was created by
+    the same process (the ``asyncio.Lock`` inside ``IndexManager.flush``
+    serialises within-process writes; cross-process concurrent writers each
+    use unique PID-tagged names, so the window is small).
+    """
+    for orphan in path.parent.glob(path.name + ".tmp.*"):
+        try:
+            orphan.unlink(missing_ok=True)
+        except OSError:
+            pass  # already gone — race with another sweeper; harmless
 
 
 @dataclass
@@ -274,8 +307,9 @@ class IndexGenerator:
     def _write_memory(self) -> None:
         path = self._home / "memory" / "INDEX.md"
         path.parent.mkdir(parents=True, exist_ok=True)
+        _sweep_orphaned_tmps(path)
         body = build_memory_index(self._home)
-        tmp = path.with_suffix(".md.tmp")
+        tmp = _unique_tmp(path)
         tmp.write_text(body, encoding="utf-8")
         tmp.replace(path)
         # Regenerate skills-catalog.md if drift detected (chainlink #109).
@@ -303,7 +337,8 @@ class IndexGenerator:
                 pass  # treat missing/unreadable as empty → always write
         if fresh == existing:
             return  # already current; skip the write
-        tmp = catalog_path.with_suffix(".md.tmp")
+        _sweep_orphaned_tmps(catalog_path)
+        tmp = _unique_tmp(catalog_path)
         try:
             tmp.write_text(fresh, encoding="utf-8")
             tmp.replace(catalog_path)
@@ -313,8 +348,9 @@ class IndexGenerator:
     def _write_state(self) -> None:
         path = self._home / "state" / "INDEX.md"
         path.parent.mkdir(parents=True, exist_ok=True)
+        _sweep_orphaned_tmps(path)
         body = build_state_index(self._home)
-        tmp = path.with_suffix(".md.tmp")
+        tmp = _unique_tmp(path)
         tmp.write_text(body, encoding="utf-8")
         tmp.replace(path)
 
@@ -325,8 +361,9 @@ class IndexGenerator:
         # link reference.
         path = self._home / "state" / "wiki" / "index.md"
         path.parent.mkdir(parents=True, exist_ok=True)
+        _sweep_orphaned_tmps(path)
         body = build_wiki_index(self._home)
-        tmp = path.with_suffix(".md.tmp")
+        tmp = _unique_tmp(path)
         tmp.write_text(body, encoding="utf-8")
         tmp.replace(path)
 
