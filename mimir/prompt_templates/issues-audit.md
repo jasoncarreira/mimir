@@ -34,8 +34,8 @@ There are usually dozens of files; one turn can't read + verify all of
 them inside the tool-call budget. Work a **batch of ~25–30 files per
 run**, oldest-by-mtime first (recently-edited gotchas are usually still
 active and can wait). Track where you stopped in
-`state/issues-audit-cursor.md` — a single line with the last filename
-audited and the date. Next month, resume *after* that file, wrapping to
+`state/audit/issues-audit-cursor.md` — a single line with the last
+filename audited and the date. Next month, resume *after* that file, wrapping to
 the top when you reach the end. A full cycle therefore spans as many
 monthly runs as the file count needs — that's expected, not a failure.
 

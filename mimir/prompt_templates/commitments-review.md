@@ -20,14 +20,18 @@ exceed the per-turn tool-call budget.
 
 ## Step 1 — List the non-terminal set
 
+`mimir commitments list` defaults to `--status pending`. The non-terminal
+set is the three live statuses — pull each:
+
 ```bash
-mimir commitments list
+mimir commitments list --status pending
+mimir commitments list --status delivered
+mimir commitments list --status snoozed
 ```
 
-Focus on the **non-terminal** states — PENDING / DELIVERED / SNOOZED.
-The terminal states (COMPLETED / DISMISSED / EXPIRED) are frozen; skip
-them. (Use whatever status/open filter `mimir commitments list --help`
-exposes to scope the output.) The live set is usually small — single
+(or `mimir commitments list --status all` and skip the terminal
+COMPLETED / DISMISSED / EXPIRED rows.) Those terminal states are frozen —
+don't touch them. The live set is usually small — single
 digits to low dozens — so the weekly cadence fits comfortably in one
 turn.
 
