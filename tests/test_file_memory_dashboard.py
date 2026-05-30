@@ -382,8 +382,9 @@ def test_render_memory_html_is_valid_shell() -> None:
     assert "<!doctype html>" in html
     assert "/api/memory" in html
     assert "loadTree()" in html
-    # Auth pattern.
-    assert "mimir_api_key" in html
+    # Auth pattern — unified key shared across all four dashboards.
+    assert "mimir.api_key" in html
+    assert "API_KEY_LS" in html
     assert "X-API-Key" in html
 
 

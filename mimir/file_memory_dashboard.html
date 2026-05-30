@@ -165,7 +165,7 @@
       <a href="/ops">ops</a>
       <a href="/saga">saga</a>
       <a href="/turns">turns</a>
-      <a href="#" onclick="event.preventDefault();localStorage.removeItem('mimir_api_key');location.reload();" title="Clear the stored API key and re-prompt">↻ reset key</a>
+      <a href="#" id="reset-key-link" style="display:none" onclick="event.preventDefault();window.__mimir_resetApiKey()" title="Clear the stored MIMIR_API_KEY and re-prompt — useful when the server-side key was rotated">↻ reset key</a>
     </div>
   </header>
 
@@ -195,11 +195,14 @@
 
 <script>
 // ── Auth ─────────────────────────────────────────────────────────
+// Shared localStorage key across all four dashboards (/ops /saga /state /turns)
+// so an operator who enters the key on any page is signed in for all.
+const API_KEY_LS = 'mimir.api_key';
 function getApiKey() {
-  let k = localStorage.getItem("mimir_api_key") || "";
+  let k = localStorage.getItem(API_KEY_LS) || "";
   if (!k) {
     k = prompt("API key (leave blank if none):") || "";
-    if (k) localStorage.setItem("mimir_api_key", k);
+    if (k) localStorage.setItem(API_KEY_LS, k);
   }
   return k;
 }
@@ -209,12 +212,25 @@ async function authedFetch(url) {
   const headers = k ? {"X-API-Key": k} : {};
   const r = await fetch(url, {headers});
   if (r.status === 401) {
-    localStorage.removeItem("mimir_api_key");
+    localStorage.removeItem(API_KEY_LS);
     throw new Error("Unauthorized — bad API key?");
   }
   if (!r.ok) throw new Error("HTTP " + r.status);
   return r.json();
 }
+
+// Manual key reset — surfaces only when a key IS stored.
+// Lets the operator swap to a freshly rotated server-side key without
+// first being denied.
+window.__mimir_resetApiKey = function() {
+  localStorage.removeItem(API_KEY_LS);
+  location.reload();
+};
+// Toggle the "↻ reset key" link: only visible when a key is stored.
+document.addEventListener('DOMContentLoaded', function() {
+  var link = document.getElementById('reset-key-link');
+  if (link) link.style.display = getApiKey() ? '' : 'none';
+});
 
 // ── Formatting ────────────────────────────────────────────────────
 function fmtBytes(b) {
