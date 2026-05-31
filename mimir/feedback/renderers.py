@@ -720,6 +720,31 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
                 f"from {authors} — resolve before merge"
             )
         return f"pr_merge blocked: PR #{pr_num} has CHANGES_REQUESTED review"
+    if rule_kind == "gave_up":
+        # A poller abandoned a retried action after exhausting its budget
+        # (chainlink #299). The concrete event type names what was given up
+        # on (``pr_review_request_gave_up`` → "pr review request"); the event
+        # may carry ``attempts`` and a target (``repo``+``number`` / ``url`` /
+        # ``detail``). Render a one-liner for the agent's negative algedonic
+        # block, sanitizing any GitHub-sourced target (chainlink #224) and
+        # degrading gracefully when fields are absent — emitters vary by poller.
+        et = ev.get("type")
+        what = "a retried action"
+        if isinstance(et, str) and et.endswith("_gave_up"):
+            stripped = et[: -len("_gave_up")].replace("_", " ").strip()
+            if stripped:
+                what = stripped
+        attempts = ev.get("attempts")
+        suffix = f" after {attempts} attempts" if attempts else ""
+        repo, num = ev.get("repo"), ev.get("number")
+        raw_target = (
+            f"{repo}#{num}" if repo and num
+            else (ev.get("url") or ev.get("detail") or "")
+        )
+        line = f"poller gave up on {what}{suffix}"
+        if raw_target:
+            return f"{line} — {_sanitize_field(str(raw_target))}"
+        return line
     return rule_kind
 
 

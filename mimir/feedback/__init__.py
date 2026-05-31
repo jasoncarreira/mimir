@@ -46,6 +46,7 @@ from ._models import (  # noqa: F401
 )
 from .rules import (  # noqa: F401
     _EVENT_RULES,
+    classify,
     _ESCALATION_THRESHOLDS,
     _AROUSAL_THRESHOLDS,
     _VALENCE_GROUPS,
@@ -224,7 +225,7 @@ class FeedbackLog:
                     break
                 continue
             evtype = ev.get("type")
-            rule = _EVENT_RULES.get(evtype) if isinstance(evtype, str) else None
+            rule = classify(evtype)
             if rule is None:
                 continue
             # Resolved-incident filter: skip events covered by an operator-

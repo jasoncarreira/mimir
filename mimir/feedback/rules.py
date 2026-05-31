@@ -326,6 +326,38 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
 }
 
 
+def classify(evtype: object) -> tuple[Polarity, str] | None:
+    """Map an event type to ``(polarity, short-tag)``, or ``None`` if unrecognized.
+
+    Two-tier lookup:
+
+    1. Exact match in :data:`_EVENT_RULES` (the canonical table).
+    2. Suffix convention — any event type ending in ``_gave_up`` is a
+       NEGATIVE ``gave_up`` signal, even without its own table entry.
+
+    Tier 2 lets a poller that exhausts its retry budget surface in the
+    agent's algedonic block without a per-poller rule. github-poller's
+    ``pr_review_request_gave_up`` (emitted when a re-review nudge is
+    abandoned after N attempts) and any future poller's ``<thing>_gave_up``
+    both classify as negative automatically. (chainlink #299)
+
+    All three feedback read-paths — algedonic ``recent()``, Alg-2 run
+    detection, Alg-3 escalation counts — route their event→rule lookup
+    through here, so the convention is honoured uniformly. A ``gave_up``
+    kind isn't in any valence group, so (like the other ``poller_*``
+    negatives) it surfaces as a standalone negative algedonic signal
+    rather than as part of a paired pos/neg run.
+    """
+    if not isinstance(evtype, str):
+        return None
+    rule = _EVENT_RULES.get(evtype)
+    if rule is not None:
+        return rule
+    if evtype.endswith("_gave_up"):
+        return ("negative", "gave_up")
+    return None
+
+
 # Kinds where only the most recent occurrence in the window should
 # render. Cron-fired events (weekly maintenance) re-appear on every
 # heartbeat in the 24h algedonic window, otherwise — same line × 24
@@ -721,7 +753,7 @@ def _count_kinds_in_window(
                 break
             continue
         evtype = ev.get("type")
-        rule = _EVENT_RULES.get(evtype) if isinstance(evtype, str) else None
+        rule = classify(evtype)
         if rule is None:
             continue
         _, kind = rule
