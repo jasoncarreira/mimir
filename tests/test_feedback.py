@@ -212,6 +212,60 @@ def test_turn_records_without_error_are_ignored(tmp_path: Path):
     assert log.recent_block() is None
 
 
+# ---- gave_up suffix convention (chainlink #299) -------------------------
+
+
+def test_classify_gave_up_suffix_is_negative():
+    """Any ``*_gave_up`` event type classifies as a negative ``gave_up``
+    signal via the suffix convention — even without an explicit
+    ``_EVENT_RULES`` entry — so a poller that exhausts its retry budget
+    surfaces algedonically (chainlink #299). Exact-match canonical rules
+    still win (tier 1 before tier 2); unknown / non-string types are None."""
+    from mimir.feedback import classify, _EVENT_RULES
+
+    # Suffix convention: the motivating case + the generalization to any poller.
+    assert classify("pr_review_request_gave_up") == ("negative", "gave_up")
+    assert classify("some_other_poller_gave_up") == ("negative", "gave_up")
+    # Exact-match canonical rules are returned unchanged.
+    assert classify("tool_call_denied") == _EVENT_RULES["tool_call_denied"]
+    assert classify("algedonic_escalation") == _EVENT_RULES["algedonic_escalation"]
+    # No false positives: unknown types + non-strings classify to None.
+    assert classify("totally_unknown_event") is None
+    assert classify("gave_up") is None  # bare word, not the ``_gave_up`` suffix
+    assert classify("") is None
+    assert classify(None) is None
+    assert classify(123) is None
+
+
+def test_pr_review_request_gave_up_surfaces_as_negative(tmp_path: Path):
+    """End-to-end: a ``*_gave_up`` poller event surfaces in the agent's
+    negative algedonic block with a human one-liner naming what was
+    abandoned, the attempt count, and the target — even though ``gave_up``
+    has no explicit ``_EVENT_RULES`` entry (chainlink #299)."""
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "timestamp": _ts(0.1),
+                "type": "pr_review_request_gave_up",
+                "repo": "jasoncarreira/mimir",
+                "number": 511,
+                "attempts": 3,
+                "url": "https://github.com/jasoncarreira/mimir/pull/511",
+                "channel_id": "poller:github-poller",
+            }
+        ],
+    )
+    block = log.recent_block()
+    assert block is not None
+    assert "Negative (last 24h):" in block
+    assert "poller gave up on pr review request" in block
+    assert "after 3 attempts" in block
+    # repo+number target is preferred over the raw url.
+    assert "jasoncarreira/mimir#511" in block
+    assert "[poller:github-poller]" in block
+
+
 # ---- Channel scoping (no scoping — feedback is global) ------------------
 
 

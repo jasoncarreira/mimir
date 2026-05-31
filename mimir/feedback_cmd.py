@@ -36,6 +36,20 @@ def _known_event_types() -> frozenset[str]:
     return frozenset(_EVENT_RULES.keys())
 
 
+def _is_recognized_event_type(event_type: str) -> bool:
+    """True if ``event_type`` is a canonical ``_EVENT_RULES`` key OR matches a
+    recognized suffix convention (notably ``*_gave_up``).
+
+    Routes through :func:`mimir.feedback.classify` so this advisory validator
+    stays in lock-step with the actual classifier: a poller-emitted
+    ``<thing>_gave_up`` is a real negative algedonic signal, not a typo, so it
+    must not draw an "unknown event type" warning (chainlink #299).
+    """
+    from .feedback import classify  # noqa: PLC0415
+
+    return classify(event_type) is not None
+
+
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
@@ -117,7 +131,7 @@ def run_mark_resolved(
         resolved_at_final = datetime.now(tz=timezone.utc).isoformat()
 
     # ── Advisory type check ─────────────────────────────────────────────────
-    if event_type != "*" and event_type not in _known_event_types():
+    if event_type != "*" and not _is_recognized_event_type(event_type):
         print(
             f"warning: event type '{event_type}' not in known _EVENT_RULES keys — "
             f"the rule will still be written (unknown types are allowed), but check "
@@ -233,7 +247,7 @@ def run_emit_event(
         return 1
 
     # -- Advisory type check -------------------------------------------------
-    if event_type not in _known_event_types():
+    if not _is_recognized_event_type(event_type):
         print(
             f"warning: event type {event_type!r} not in known _EVENT_RULES keys -- "
             f"the event will still be written (unlisted types are silently ignored "

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from ._models import Polarity, ValenceGroup, Run, AnnotatedRun, FeedbackSignal
-from .rules import _EVENT_RULES, _VALENCE_GROUPS
+from .rules import _VALENCE_GROUPS, classify
 from .._jsonl_tail import tail_jsonl_records
 from ..jsonl_snapshot import JsonlSnapshot, iter_snapshot_or_tail
 
@@ -48,7 +48,7 @@ def _compute_group_runs(
                 break
             continue
         evtype = ev.get("type")
-        rule = _EVENT_RULES.get(evtype) if isinstance(evtype, str) else None
+        rule = classify(evtype)
         if rule is None:
             continue
         _, kind = rule
