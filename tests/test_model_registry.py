@@ -118,6 +118,34 @@ def test_subscription_flips_openai_to_codex_plus():
     assert o3_sub.billing_mode == BILLING_SUBSCRIPTION
 
 
+def test_prequalified_codex_plus_spec_routes_subscription():
+    """An explicit ``codex-plus:<model>`` spec (e.g. set straight into
+    compose.env / MIMIR_MODEL_SPEC) is the OpenAI provider's subscription
+    wire protocol: OpenAI provider, subscription billing, Codex monitor.
+
+    chainlink #297 regression: the pre-qualified-spec branch handled
+    ``claude-code:`` and ``openai:`` but NOT ``codex-plus:``, so a
+    ``codex-plus:*`` spec fell through to the anthropic-api / API default
+    and was mislabeled (provider "anthropic-api", billing "api")."""
+    route = detect_route("codex-plus:gpt-5.4")
+    assert route.model_spec == "codex-plus:gpt-5.4"
+    assert route.provider_name == PROVIDER_OPENAI
+    assert route.billing_mode == BILLING_SUBSCRIPTION
+    assert "codex" in route.monitor_label.lower()
+    # Subscription monitor flag, not the API cost ceiling.
+    assert route.monitor_env == {"MIMIR_QUOTA_POLL_ENABLED": "1"}
+
+
+def test_prequalified_codex_plus_ignores_subscription_flag():
+    """``codex-plus:`` IS the subscription protocol, so an explicit spec
+    is subscription billing regardless of ``--subscription`` — the same
+    invariant the explicit ``claude-code:`` branch holds."""
+    off = detect_route("codex-plus:gpt-5.4-mini", subscription=False)
+    on = detect_route("codex-plus:gpt-5.4-mini", subscription=True)
+    assert off.model_spec == on.model_spec == "codex-plus:gpt-5.4-mini"
+    assert off.billing_mode == on.billing_mode == BILLING_SUBSCRIPTION
+
+
 def test_subscription_flips_monitor_for_minimax_moonshot():
     """The actual operator-facing difference for Minimax / Moonshot
     when subscription is set: monitor switches from cost-tracking to
