@@ -237,6 +237,46 @@ def test_running_on_claude_max_false_with_base_url_override(monkeypatch):
     assert running_on_claude_max() is False
 
 
+# ---- provider quota windows (chainlink #298) ----------------------------
+
+
+def test_render_uses_clean_labels_for_minimax_and_codex():
+    """Provider-prefixed windows render with their registry labels, not
+    the raw "minimax five hour" key fallback. chainlink #298."""
+    snaps = {
+        "minimax_five_hour": RateLimitSnapshot(
+            status="allowed", utilization=0.30, resets_at=None,
+        ),
+        "openai_seven_day": RateLimitSnapshot(
+            status="allowed", utilization=0.50, resets_at=None,
+        ),
+    }
+    blob = "\n".join(render_plan_quota_lines(snaps))
+    assert "Minimax 5-hour" in blob
+    assert "Codex Plus 7-day" in blob
+    # No raw underscore-key fallback leaked through.
+    assert "minimax five hour" not in blob
+    assert "openai seven day" not in blob
+
+
+def test_off_pace_fires_for_provider_windows():
+    """off_pace_buckets must project burn rate for minimax_* / openai_*
+    too (now that they're in _WINDOW_HOURS) — otherwise non-Anthropic
+    deployments get no scale-back warning. chainlink #298."""
+    from mimir.rate_limits import off_pace_buckets
+
+    # 50% used with ~1h elapsed of a 5h window (resets in 4h) → off pace.
+    resets = int(time.time()) + 4 * 3600
+    for key in ("minimax_five_hour", "openai_five_hour"):
+        snaps = {key: RateLimitSnapshot(
+            status="allowed", utilization=0.50, resets_at=resets, observed_at=None,
+        )}
+        buckets = off_pace_buckets(snaps)
+        assert [k for k, _, _ in buckets] == [key], (
+            f"expected off-pace projection for {key}; got {buckets}"
+        )
+
+
 # ---- RateLimitStore -----------------------------------------------------
 
 

@@ -48,6 +48,7 @@ from typing import Any
 # now applies the CR#7 invariant (fsync file + fsync parent dir)
 # uniformly across rate_limits, oauth_usage_poller, and quota_pause.
 from ._atomic import atomic_write_json
+from .quota_windows import store_key_order, store_label_map, store_window_hours
 
 log = logging.getLogger(__name__)
 
@@ -215,7 +216,10 @@ def render_plan_quota_lines(
     then overage. Unknown / future types fall through alphabetically."""
     if not snapshots:
         return []
-    order = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "overage")
+    # Render order comes from the per-provider registry (Anthropic, then
+    # the vendor-prefixed providers, windows as declared). Unknown /
+    # future keys still fall through alphabetically below.
+    order = store_key_order()
     keys = list(order) + sorted(k for k in snapshots if k not in order)
     lines: list[str] = []
     for key in keys:
@@ -309,24 +313,21 @@ def _render_one(key: str, snap: RateLimitSnapshot) -> str:
     return " — ".join(parts)
 
 
-_LABEL: dict[str, str] = {
-    "five_hour": "5-hour rolling",
-    "seven_day": "7-day plan-wide",
-    "seven_day_opus": "7-day Opus",
-    "seven_day_sonnet": "7-day Sonnet",
-    "overage": "Overage / pay-as-you-go",
-}
+# Agent-facing labels + window lengths per store key, DERIVED from the
+# per-provider quota-window registry (mimir/quota_windows.py) rather than
+# enumerated here. Each subscription type (Anthropic / Minimax / Codex
+# Plus) owns its windows there, so adding a provider or window is a
+# one-place edit and this renderer stays in lockstep with what the
+# pollers actually write — no central key list to keep in sync.
+# (chainlink #298)
+_LABEL: dict[str, str] = store_label_map()
 
 
-# Window length per rate_limit_type, in hours. Used to project
-# end-of-window utilization from current rate. Overage is open-ended;
-# excluded so we don't print a misleading projection.
-_WINDOW_HOURS: dict[str, float] = {
-    "five_hour": 5.0,
-    "seven_day": 24.0 * 7,
-    "seven_day_opus": 24.0 * 7,
-    "seven_day_sonnet": 24.0 * 7,
-}
+# Window length per store key, in hours — drives the off-pace burn-rate
+# projection uniformly across providers. Open-ended windows (Anthropic's
+# ``overage``) carry ``hours=None`` in the registry and are omitted here,
+# so we don't print a misleading projection for them.
+_WINDOW_HOURS: dict[str, float] = store_window_hours()
 
 
 @dataclass(frozen=True)
